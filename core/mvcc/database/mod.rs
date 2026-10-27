@@ -65,6 +65,10 @@ pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
 
+mod background_checkpoint;
+use background_checkpoint::BackgroundCheckpoint;
+pub use background_checkpoint::background_checkpoint_stats;
+
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
@@ -3745,7 +3749,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-                if appended_to_log && mvcc_store.storage.should_checkpoint() {
+                // With the background checkpoint on, the main database's checkpoint runs on its
+                // thread, so this commit returns now.
+                let handed_off = appended_to_log
+                    && self.db_id == crate::MAIN_DB_ID
+                    && mvcc_store.storage.should_checkpoint()
+                    && mvcc_store.background_checkpoint.request(&self.connection);
+                if !handed_off && appended_to_log && mvcc_store.storage.should_checkpoint() {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
                             upper_bound_inclusive: None,
@@ -4569,6 +4579,9 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// checkpoint's full sweep.
     gc_last_lwm: AtomicU64,
     experimental_mvcc_passive_checkpoint: bool,
+    /// Runs the auto passive checkpoint off the commit path when turned on; passive checkpoints
+    /// are the only ones that can run beside commits.
+    background_checkpoint: BackgroundCheckpoint,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -4698,7 +4711,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             gc_in_progress: AtomicBool::new(false),
             gc_last_lwm: AtomicU64::new(u64::MAX),
             experimental_mvcc_passive_checkpoint,
+            background_checkpoint: BackgroundCheckpoint::new(false),
         })
+    }
+
+    /// Whether commits hand the auto checkpoint to the background thread.
+    pub fn background_checkpoint_enabled(&self) -> bool {
+        self.background_checkpoint.enabled()
+    }
+
+    /// On, a commit that crosses the threshold hands the checkpoint to a background thread;
+    /// off, it checkpoints inline. It stays off without passive checkpoints, the only ones that
+    /// can run beside commits.
+    pub fn set_background_checkpoint(&self, enabled: bool) {
+        self.background_checkpoint
+            .set_enabled(enabled && self.experimental_mvcc_passive_checkpoint);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn background_checkpoint_probe(
+        &self,
+    ) -> background_checkpoint::BackgroundCheckpointProbe {
+        self.background_checkpoint.probe()
     }
 
     /// Get the table ID from the root page, resolving against the current (live) mapping.

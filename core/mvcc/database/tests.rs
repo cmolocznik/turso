@@ -3168,6 +3168,79 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
     assert_integrity_ok(&conn);
 }
 
+/// A passive checkpoint that keeps the logical log, because a commit landed after its snapshot,
+/// must count only the bytes it did not cover against the threshold. Counting the whole log, the
+/// threshold stays tripped by bytes already checkpointed, and every later commit starts another
+/// checkpoint.
+#[test]
+fn test_passive_checkpoint_that_keeps_the_log_counts_only_uncovered_bytes() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'collected')")
+        .unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let covered = mvcc_store.storage.logical_log_offset();
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    while checkpoint_sm.state_for_test() != CheckpointState::BeginPagerTxn {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => panic!("checkpoint finished before collecting rows"),
+        }
+    }
+    let sibling = db.connect();
+    sibling
+        .execute("INSERT INTO t VALUES (2, 'after-snapshot')")
+        .unwrap();
+    let mut finished = false;
+    for _ in 0..50_000 {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        finished,
+        "passive checkpoint must complete after the sibling commit"
+    );
+    let end = mvcc_store.storage.logical_log_offset();
+    assert!(
+        end > covered,
+        "the log must keep the commit that landed after the snapshot"
+    );
+
+    // Only the sibling's bytes are uncovered: a threshold above them and below the log's size
+    // must not ask for a checkpoint, and one at them must.
+    let uncovered = end - covered;
+    mvcc_store.set_checkpoint_threshold(uncovered as i64 + 1);
+    assert!(
+        !mvcc_store.storage.should_checkpoint(),
+        "{covered} checkpointed bytes of a {end}-byte log still counted against the threshold"
+    );
+    mvcc_store.set_checkpoint_threshold(uncovered as i64);
+    assert!(mvcc_store.storage.should_checkpoint());
+}
+
 /// What this test checks: Checkpoint accepts sqlite_schema index-row updates for already-checkpointed indexes
 /// (e.g. column rename), without requiring create/destroy special writes.
 /// Why this matters: RENAME COLUMN on indexed tables rewrites sqlite_schema index SQL text while preserving rootpage.

@@ -97,6 +97,10 @@ impl Context {
     }
 
     pub fn set_waker(&self, waker: &Waker) {
+        // Shuttle cannot see the std `OnceLock` holding a completion's result, so yield here to
+        // let it run a completion between a test of that result and this store.
+        #[cfg(shuttle)]
+        crate::thread::yield_now();
         self.inner.lock().set_waker(waker);
     }
 }
@@ -390,11 +394,17 @@ impl Completion {
         }
     }
 
+    /// Registers the waker before testing for completion: a completion finished on another thread
+    /// between a test and the registration would otherwise wake no one.
     pub fn set_waker(&self, waker: &Waker) {
-        if self.finished() || self.inner.is_none() {
-            waker.wake_by_ref();
-        } else {
-            self.get_inner().context.set_waker(waker);
+        match &self.inner {
+            None => waker.wake_by_ref(),
+            Some(inner) => {
+                inner.context.set_waker(waker);
+                if self.finished() {
+                    inner.context.wake();
+                }
+            }
         }
     }
 
@@ -1291,5 +1301,40 @@ mod tests {
         // Callback should only be called once
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(c.failed());
+    }
+
+    /// A waker registered while another thread completes the completion must be woken, in every
+    /// interleaving of the two, including a completion that finishes after `set_waker` tested it
+    /// and before the waker was stored.
+    #[cfg(shuttle)]
+    #[test]
+    fn shuttle_set_waker_racing_complete_always_wakes() {
+        use std::task::Wake;
+
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        shuttle::check_dfs(
+            || {
+                let c = Completion::new_wait();
+                let count = Arc::new(Count(AtomicUsize::new(0)));
+                let completer = {
+                    let c = c.clone();
+                    crate::thread::spawn(move || c.complete(0))
+                };
+                c.set_waker(&Waker::from(count.clone()));
+                completer.join().unwrap();
+                assert_ne!(
+                    count.0.load(Ordering::SeqCst),
+                    0,
+                    "the completion finished without waking its waker"
+                );
+            },
+            None,
+        );
     }
 }

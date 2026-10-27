@@ -51,8 +51,13 @@ material stays on the connections given it. Under writes that never pause the lo
 bounding that needs log rotation.
 Tests: `test_background_checkpoint_runs_off_the_commit_and_truncates_when_writes_pause`,
 `test_background_checkpoint_is_off_by_default`, `test_background_checkpoint_thread_exits_with_its_database`.
-On 0.8.3 at mt1, 20 runs each way: writer commit p99 22.1 ms inline → 4.6 ms with the thread,
-and the log 0 bytes after writes pause in all 20 runs.
+mt1, this fork, the bench's `mvcc_control` (2 writers, a maintainer rewriting 64-row batches, a
+reader; 256 KB threshold), 20 runs each way, all passing: writer commit p99 19.9 ms inline → 5.3
+ms with the thread (medians of the runs; worst run 25.3 → 6.9 ms), worst commit 28.7 → 9.1 ms
+(medians), and the log 0 bytes after writes pause in all 20 runs against 160 KB left inline. Every
+commit over 100 ms is matched by an fsync of about its length in the same run. `ivf_mvcc`
+(8 writers × 4,000 vectors of 128 dimensions under maintenance) passed its 520 checks in all 7
+runs, 97-110 s each with the thread against 137-211 s inline.
 
 ### Logical-log fsync stats
 `core/mvcc/persistent_storage/mod.rs`. `mvcc::persistent_storage::logical_log_sync_stats()`

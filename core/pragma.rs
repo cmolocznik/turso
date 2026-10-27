@@ -188,6 +188,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_gc_threshold"],
         ),
+        PragmaName::MvccBackgroundCheckpoint => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["mvcc_background_checkpoint"],
+        ),
         PragmaName::MvccGroupCommit => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_group_commit"],

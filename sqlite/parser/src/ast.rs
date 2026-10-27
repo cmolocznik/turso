@@ -2021,6 +2021,9 @@ pub enum PragmaName {
     /// Sets or queries whether concurrent MVCC commits batch their logical-log
     /// appends behind a single fsync.
     MvccGroupCommit,
+    /// Sets or queries whether a commit that crosses the MVCC checkpoint threshold hands the
+    /// checkpoint to a background thread instead of running it inline. Passive checkpoints only.
+    MvccBackgroundCheckpoint,
     /// Sets or queries the number of visible FTS index segments a statement
     /// flush may leave behind before the write path merges them. 0 disables
     /// write-path merging.

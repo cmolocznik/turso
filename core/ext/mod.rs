@@ -263,6 +263,10 @@ impl Database {
                 Arc::new(VectorSparseInvertedIndexMethod),
             );
             syms.index_methods.insert(
+                crate::index_method::ivf_rq::IVF_RQ_INDEX_METHOD_NAME.to_string(),
+                Arc::new(crate::index_method::ivf_rq::IvfRqIndexMethod),
+            );
+            syms.index_methods.insert(
                 BACKING_BTREE_INDEX_METHOD_NAME.to_string(),
                 Arc::new(BackingBtreeIndexMethod),
             );

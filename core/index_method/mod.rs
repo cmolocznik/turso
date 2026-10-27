@@ -24,6 +24,7 @@ pub mod backing_btree;
 pub mod backing_store;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 pub mod fts;
+pub mod ivf_rq;
 pub mod toy_vector_sparse_ivf;
 
 pub use backing_store::{

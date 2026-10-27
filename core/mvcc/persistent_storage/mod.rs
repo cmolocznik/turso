@@ -144,6 +144,20 @@ pub struct Storage {
     checkpoint_threshold: AtomicI64,
 }
 
+static LOG_SYNCS: AtomicU64 = AtomicU64::new(0);
+static LOG_SYNC_MICROS: AtomicU64 = AtomicU64::new(0);
+static LOG_SYNC_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide logical-log fsyncs: (count, total µs, longest µs). The fsync is the one wait a
+/// durable commit cannot avoid, so a commit no slower than the longest fsync waited on the disk.
+pub fn logical_log_sync_stats() -> (u64, u64, u64) {
+    (
+        LOG_SYNCS.load(Ordering::Relaxed),
+        LOG_SYNC_MICROS.load(Ordering::Relaxed),
+        LOG_SYNC_MICROS_MAX.load(Ordering::Relaxed),
+    )
+}
+
 impl Storage {
     pub fn new(
         file: Arc<dyn File>,
@@ -222,7 +236,13 @@ impl DurableStorage for Storage {
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
-        self.logical_log.write().sync(sync_type)
+        let started = std::time::Instant::now();
+        let completion = self.logical_log.write().sync(sync_type);
+        let micros = started.elapsed().as_micros() as u64;
+        LOG_SYNCS.fetch_add(1, Ordering::Relaxed);
+        LOG_SYNC_MICROS.fetch_add(micros, Ordering::Relaxed);
+        LOG_SYNC_MICROS_MAX.fetch_max(micros, Ordering::Relaxed);
+        completion
     }
 
     fn update_header(&self) -> Result<Completion> {

@@ -570,6 +570,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     // we keep count_state separate to be able to call other public functions like rewind and next
     count_state: Option<CountState>,
     btree_advance_state: Option<AdvanceBtreeState>,
+    /// The rowid a forward B-tree advance stops at, as its caller's walk ends there.
+    forward_bound: Option<i64>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
@@ -643,6 +645,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             state: None,
             count_state: None,
             btree_advance_state: None,
+            forward_bound: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             index_peek_epoch: 0,
@@ -827,6 +830,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.current_pos.clone()
     }
 
+    /// Whether a forward advance reached its caller's bound.
+    fn past_forward_bound(&self, key: &Option<RowKey>) -> bool {
+        matches!((self.forward_bound, key), (Some(bound), Some(RowKey::Int(k))) if *k >= bound)
+    }
+
     fn is_btree_allocated(&mut self) -> bool {
         // Dual gate (logical base-validity AND physical visibility): a PASSIVE checkpoint may
         // materialize this object's btree during collection. This cursor may read it only if the binding
@@ -963,6 +971,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
+                    if self.past_forward_bound(&key) {
+                        self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                        self.btree_advance_state = None;
+                        return Ok(IOResult::Done(()));
+                    }
                     match key {
                         Some(k) if self.btree_row_is_valid_forward(&k)? => {
                             self.dual_peek.btree_peek = CursorPeek::Row {
@@ -997,6 +1010,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
+                    if self.past_forward_bound(&key) {
+                        self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                        self.btree_advance_state = None;
+                        return Ok(IOResult::Done(()));
+                    }
                     if let Some(key) = key {
                         if self.btree_row_is_valid_forward(&key)? {
                             self.dual_peek.btree_peek = CursorPeek::Row {
@@ -2355,6 +2373,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
+    }
+
+    fn set_forward_bound(&mut self, bound: Option<i64>) {
+        self.forward_bound = bound;
     }
 
     fn has_rowid(&self) -> bool {

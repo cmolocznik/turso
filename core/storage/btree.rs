@@ -841,6 +841,11 @@ pub trait CursorTrait: Any + Send + Sync {
         false
     }
 
+    /// Stops forward advances, as exhausted, at the first row whose rowid is at or past `bound`,
+    /// so a walk over a rowid range does not step through the rows after it. A cursor that does
+    /// not support it ignores it.
+    fn set_forward_bound(&mut self, _bound: Option<i64>) {}
+
     // --- start: BTreeCursor specific functions ----
     fn invalidate_record(&mut self);
     fn has_rowid(&self) -> bool;

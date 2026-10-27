@@ -93,7 +93,12 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn reset_to_fresh_header(&self) -> Result<Completion>;
     fn get_logical_log_file(&self) -> Arc<dyn File>;
     fn logical_log_offset(&self) -> u64;
+    /// Whether the log holds at least the threshold of bytes no checkpoint has covered yet.
     fn should_checkpoint(&self) -> bool;
+    /// Records that a checkpoint covered the log up to `offset`, so the threshold counts only the
+    /// bytes after it. A log a passive checkpoint cannot truncate keeps its size, and a trigger on
+    /// size alone would ask for a checkpoint at every commit.
+    fn set_checkpoint_floor(&self, _offset: u64) {}
     /// Set the checkpoint threshold in bytes of logical-log data written.
     /// A negative value disables automatic checkpointing.
     fn set_checkpoint_threshold(&self, threshold: i64);
@@ -134,6 +139,8 @@ pub struct Storage {
     pub logical_log: RwLock<LogicalLog>,
     /// Shadowed from LogicalLog::offset for lock-free should_checkpoint() reads.
     log_offset: AtomicU64,
+    /// The offset the last checkpoint covered; zero once the log is truncated.
+    checkpoint_floor: AtomicU64,
     checkpoint_threshold: AtomicI64,
 }
 
@@ -146,6 +153,7 @@ impl Storage {
         Self {
             logical_log: RwLock::new(LogicalLog::new(file, io, encryption_ctx)),
             log_offset: AtomicU64::new(0),
+            checkpoint_floor: AtomicU64::new(0),
             checkpoint_threshold: AtomicI64::new(DEFAULT_LOG_CHECKPOINT_THRESHOLD),
         }
     }
@@ -155,6 +163,10 @@ impl Storage {
     #[inline(always)]
     fn shadow_offset_store(&self, value: u64) {
         self.log_offset.store(value, Ordering::Relaxed);
+        // A floor past the end means the log restarted below it.
+        if self.checkpoint_floor.load(Ordering::Relaxed) > value {
+            self.checkpoint_floor.store(value, Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]
@@ -257,7 +269,17 @@ impl DurableStorage for Storage {
         if threshold < 0 {
             return false;
         }
-        self.log_offset.load(Ordering::Relaxed) >= threshold as u64
+        let uncovered = self
+            .log_offset
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.checkpoint_floor.load(Ordering::Relaxed));
+        uncovered >= threshold as u64
+    }
+
+    fn set_checkpoint_floor(&self, offset: u64) {
+        let end = self.log_offset.load(Ordering::Relaxed);
+        self.checkpoint_floor
+            .store(offset.min(end), Ordering::Relaxed);
     }
 
     fn set_checkpoint_threshold(&self, threshold: i64) {

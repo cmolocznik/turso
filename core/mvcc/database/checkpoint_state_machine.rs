@@ -371,6 +371,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     pending_seq_deletes: Vec<(RowID, usize)>,
     /// Collection upper bound (`last_committed_tx_ts` at snapshot). `u64::MAX` = no bound.
     snapshot_ts: u64,
+    /// The logical log's offset when `snapshot_ts` was taken: what this checkpoint covers.
+    snapshot_log_offset: u64,
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
     build_local_schema_began_read_tx: bool,
     /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index` in PASSIVE mode.
@@ -978,6 +980,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // Set in PrepareCheckpoint once the collection snapshot is taken; until
             // then `u64::MAX` disables the upper-bound filter (collect everything).
             snapshot_ts: u64::MAX,
+            snapshot_log_offset: 0,
             build_local_schema_sm: None,
             build_local_schema_began_read_tx: false,
             local_schema: None,
@@ -2487,6 +2490,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
 
                 if passive {
+                    // The offset first: every frame before it is a commit the snapshot covers or one
+                    // still in flight, which the next checkpoint takes.
+                    self.snapshot_log_offset = self.mvstore.storage.logical_log_offset();
                     self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
                     self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
                     // Checkpoint state machines can be created before they are run.
@@ -2512,6 +2518,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 // Sample the snapshot only after the stop-the-world lock: no concurrent
                 // commits can land between snapshot_ts and collection on this path.
+                self.snapshot_log_offset = self.mvstore.storage.logical_log_offset();
                 self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
                 self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
                 // Checkpoint state machines can be created before they are run.
@@ -3323,6 +3330,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
+                self.mvstore
+                    .storage
+                    .set_checkpoint_floor(self.snapshot_log_offset);
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue

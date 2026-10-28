@@ -149,7 +149,10 @@ const PACK_AT: usize = 8;
 /// The stale copies a block holds at which maintenance rewrites it without them.
 const COMPACT_AT: usize = 8;
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+/// The rounds of sign flips and transforms a rotation makes over a width that is a power of two,
+/// and over any other, an even number.
 const ROUNDS: usize = 3;
+const KAC_ROUNDS: usize = 4;
 /// The most centroids k-means seeds by k-means++.
 const SEEDED_CENTROIDS: usize = 64;
 /// Lloyd iterations: a rebuild's training over its sample, and a split's 2-means.
@@ -160,10 +163,9 @@ const SPLIT_ITERATIONS: usize = 8;
 const ASSUMED_LIMIT: f64 = 10.0;
 /// The codes a page of blocks holds, for a filtered query's cost estimate, in the planner's pages:
 /// it prices a table row at a fiftieth of a page whatever the row's width, and a code is priced at
-/// that rate scaled by its bytes against its vector's. A 768-dimensional vector's code, padded to
-/// 1,024 dimensions by the rotation, with its rowid, factors and 7-bit parts, is 916 bytes, and the
-/// vector 3,072: 50 * 3,072 / 916.
-const CODES_PER_PAGE: f64 = 168.0;
+/// that rate scaled by its bytes against its vector's. A 768-dimensional vector's code, with its
+/// rowid, factors and 7-bit parts, is 692 bytes, and the vector 3,072: 50 * 3,072 / 692.
+const CODES_PER_PAGE: f64 = 222.0;
 /// The pages a rerank reads per vector, for a filtered query's cost estimate: its row in the table.
 const FETCH_PAGES: f64 = 1.0;
 /// The memory, in MiB, an index holds the blocks of the partitions queries probe in, unless its
@@ -420,50 +422,85 @@ fn fit_body(x: &[f32], t: f32) -> (f32, f32) {
     (a, l)
 }
 
+/// A fast Walsh-Hadamard transform of `x`, whose length is a power of two, scaled by `scale`.
+#[inline(always)]
+fn walsh_body(x: &mut [f32], scale: f32) {
+    let mut h = 1;
+    while h < x.len() {
+        for block in x.chunks_exact_mut(2 * h) {
+            let (low, high) = block.split_at_mut(h);
+            for (a, b) in low.iter_mut().zip(high.iter_mut()) {
+                let (p, q) = (*a, *b);
+                *a = p + q;
+                *b = p - q;
+            }
+        }
+        h *= 2;
+    }
+    x.iter_mut().for_each(|a| *a *= scale);
+}
+
 #[inline(always)]
 fn hadamard_body(x: &mut [f32], signs: &[f32], scale: f32) {
-    let padded = x.len();
-    for round in signs.chunks_exact(padded) {
+    for round in signs.chunks_exact(x.len()) {
         x.iter_mut().zip(round).for_each(|(a, s)| *a *= s);
-        let mut h = 1;
-        while h < padded {
-            for block in x.chunks_exact_mut(2 * h) {
-                let (low, high) = block.split_at_mut(h);
-                for (a, b) in low.iter_mut().zip(high.iter_mut()) {
-                    let (p, q) = (*a, *b);
-                    *a = p + q;
-                    *b = p - q;
-                }
-            }
-            h *= 2;
-        }
-        x.iter_mut().for_each(|a| *a *= scale);
+        walsh_body(x, scale);
     }
+}
+
+/// Each round's sign flips over the whole of `x`, a transform of its leading `span`, or in the
+/// next round its trailing one, and a step of a Kac walk, which sums and differences the halves of
+/// `x`; the growth of lengths the steps make, the square root of two each, is undone at the end.
+#[inline(always)]
+fn kac_hadamard_body(x: &mut [f32], signs: &[f32], span: usize, scale: f32) {
+    let (width, half) = (x.len(), x.len() / 2);
+    for (round, flips) in signs.chunks_exact(width).enumerate() {
+        x.iter_mut().zip(flips).for_each(|(a, s)| *a *= s);
+        let at = if round % 2 == 0 { 0 } else { width - span };
+        walsh_body(&mut x[at..at + span], scale);
+        let (low, high) = x.split_at_mut(half);
+        for (a, b) in low.iter_mut().zip(high.iter_mut()) {
+            let (p, q) = (*a, *b);
+            *a = p + q;
+            *b = p - q;
+        }
+    }
+    let rescale = 0.5f32.powi((signs.len() / width / 2) as i32);
+    x.iter_mut().for_each(|a| *a *= rescale);
 }
 
 kernel!(l2, l2_wide, l2_body, (a: &[f32], b: &[f32]) -> f32);
 kernel!(dot32, dot_wide, dot_body, (a: &[f32], b: &[f32]) -> f32);
 kernel!(fit, fit_wide, fit_body, (x: &[f32], t: f32) -> (f32, f32));
 kernel!(hadamard, hadamard_wide, hadamard_body, (x: &mut [f32], signs: &[f32], scale: f32) -> ());
+kernel!(kac_hadamard, kac_hadamard_wide, kac_hadamard_body, (x: &mut [f32], signs: &[f32], span: usize, scale: f32) -> ());
 
-/// A randomized Hadamard rotation of vectors padded to a power of two: seeded sign flips, each
-/// followed by a fast Walsh-Hadamard transform, normalized so lengths are kept.
+/// A randomized Hadamard rotation of vectors padded to a multiple of 32: seeded sign flips, each
+/// followed by a fast Walsh-Hadamard transform, normalized so lengths are kept. A width that is a
+/// power of two is transformed whole in each of [`ROUNDS`] rounds; any other, as the RaBitQ
+/// library rotates it, by its largest power-of-two span, leading and trailing in turn, in each of
+/// [`KAC_ROUNDS`] rounds, each round followed by a step of a Kac walk across its halves. A
+/// 768-dimensional vector is so coded in 768 dimensions rather than 1,024.
 #[derive(Debug, Clone)]
 struct Rotation {
     padded: usize,
+    /// The largest power of two within `padded`, which each transform spans.
+    span: usize,
     signs: Vec<f32>,
 }
 
 impl Rotation {
     /// The width vectors of `dims` dimensions are padded to.
     fn padded(dims: usize) -> usize {
-        dims.next_power_of_two().max(8)
+        dims.next_multiple_of(32).max(32)
     }
 
     fn new(dims: usize) -> Self {
         let padded = Rotation::padded(dims);
+        let span = 1 << padded.ilog2();
+        let rounds = if span == padded { ROUNDS } else { KAC_ROUNDS };
         let mut state = SEED;
-        let signs = (0..ROUNDS * padded)
+        let signs = (0..rounds * padded)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 7;
@@ -475,13 +512,17 @@ impl Rotation {
                 }
             })
             .collect();
-        Self { padded, signs }
+        Self { padded, span, signs }
     }
 
     fn apply(&self, v: &[f32]) -> Vec<f32> {
         let mut x = vec![0.0f32; self.padded];
         x[..v.len()].copy_from_slice(v);
-        hadamard(&mut x, &self.signs, 1.0 / (self.padded as f32).sqrt());
+        let scale = 1.0 / (self.span as f32).sqrt();
+        match self.span == self.padded {
+            true => hadamard(&mut x, &self.signs, scale),
+            false => kac_hadamard(&mut x, &self.signs, self.span, scale),
+        }
         x
     }
 
@@ -4089,6 +4130,30 @@ mod tests {
         }
     }
 
+    /// A rotation pads a vector to the next multiple of 32, keeps its length and its products, and
+    /// spreads a basis vector over the width as a uniformly random rotation does, its largest
+    /// share of the length under three times the log of the width (a random rotation's is about
+    /// twice it, the identity's the whole width), whether or not the width is a power of two.
+    #[test]
+    fn a_rotation_pads_to_a_multiple_of_32_and_keeps_lengths_and_products() {
+        for (dims, padded) in [(16, 32), (100, 128), (200, 224), (768, 768), (1000, 1024), (1536, 1536)] {
+            let rotation = Rotation::new(dims);
+            assert_eq!(rotation.padded, padded, "dims {dims}");
+            let mut state = 17;
+            let (a, b) = (random(&mut state, dims), random(&mut state, dims));
+            let (ra, rb) = (rotation.apply(&a), rotation.apply(&b));
+            let length = dot(&a, &a);
+            assert!((dot(&ra, &ra) - length).abs() < 1e-4 * length, "dims {dims}: length {} against {length}", dot(&ra, &ra));
+            assert!((dot(&ra, &rb) - dot(&a, &b)).abs() < 1e-4 * length, "dims {dims}: product {} against {}", dot(&ra, &rb), dot(&a, &b));
+            for at in [0, dims - 1] {
+                let mut basis = vec![0.0f32; dims];
+                basis[at] = 1.0;
+                let largest = rotation.apply(&basis).iter().map(|x| x * x).fold(0.0f32, f32::max) * padded as f32;
+                assert!(largest < 3.0 * (padded as f32).ln(), "dims {dims}: dimension {at}'s largest share is {largest} times an even one");
+            }
+        }
+    }
+
     /// At 3072 dimensions the scan widens its 16-bit sums several times within one group.
     #[test]
     fn the_simd_scan_sums_as_the_scalar_one_does() {
@@ -4765,24 +4830,25 @@ mod tests {
     /// The estimates rank well enough that a query reranking only the rows it returns, at a refine
     /// of one, finds nearly all of the exact top ten: probing every partition, at least 95% of them
     /// over fifty queries of random vectors, whose best products lie closer together than the
-    /// estimates' error.
+    /// estimates' error, of 64 dimensions and of 200, which the rotation pads to 224.
     #[test]
     fn a_query_reranking_only_its_answer_finds_the_exact_top_ten() {
-        const DIMS: usize = 64;
-        let (_db, conn) = database("ivf-rq-refine-one.db", false);
-        let mut state = 97;
-        let vectors: Vec<(i64, Vec<f32>)> = (1..=2000i64).map(|id| (id, random(&mut state, DIMS))).collect();
-        insert_all(&conn, &vectors);
-        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 1)").unwrap();
-        let live: HashMap<i64, Vec<f32>> = vectors.into_iter().collect();
-        let (mut found, queries) = (0, 50);
-        for _ in 0..queries {
-            let q = random(&mut state, DIMS);
-            let exact = exact_top_ten(&live, &q);
-            found += top_ten(&conn, &q).iter().filter(|id| exact.contains(id)).count();
+        for dims in [64, 200] {
+            let (_db, conn) = database(&format!("ivf-rq-refine-one-{dims}.db"), false);
+            let mut state = 97;
+            let vectors: Vec<(i64, Vec<f32>)> = (1..=2000i64).map(|id| (id, random(&mut state, dims))).collect();
+            insert_all(&conn, &vectors);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 1)").unwrap();
+            let live: HashMap<i64, Vec<f32>> = vectors.into_iter().collect();
+            let (mut found, queries) = (0, 50);
+            for _ in 0..queries {
+                let q = random(&mut state, dims);
+                let exact = exact_top_ten(&live, &q);
+                found += top_ten(&conn, &q).iter().filter(|id| exact.contains(id)).count();
+            }
+            let recall = found as f64 / (10 * queries) as f64;
+            assert!(recall >= 0.95, "dims {dims}: recall@10 {recall} at a refine of one");
         }
-        let recall = found as f64 / (10 * queries) as f64;
-        assert!(recall >= 0.95, "recall@10 {recall} at a refine of one");
     }
 
     /// The blocks a query read are held for the next: a second query over the same partitions reads

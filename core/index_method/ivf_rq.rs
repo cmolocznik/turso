@@ -168,6 +168,11 @@ const ASSUMED_LIMIT: f64 = 10.0;
 const CODES_PER_PAGE: f64 = 222.0;
 /// The pages a rerank reads per vector, for a filtered query's cost estimate: its row in the table.
 const FETCH_PAGES: f64 = 1.0;
+/// The bytes at the start of each held block a probe prefetches, for codes of `dims` padded
+/// dimensions: a full block's count, rowids, gains and slacks, and its first scan group.
+fn held_prefetch(dims: usize) -> usize {
+    Layout::new(BLOCK, dims / 8).scan() + Layout::new(BLOCK, dims / 8).group_bytes()
+}
 /// The memory, in MiB, an index holds the blocks of the partitions queries probe in, unless its
 /// `cache_mib` parameter says otherwise.
 const DEFAULT_CACHE_MIB: usize = 256;
@@ -3014,6 +3019,11 @@ impl IvfRqCursor {
                                     Some(held) => {
                                         tally(&CACHE_HITS, 1);
                                         end = partition_key(partition, BLOCK_ROW, 0)?;
+                                        let ahead = held_prefetch(self.query.as_ref().map_or(0, |q| q.rotated.len()));
+                                        for (_, _, codes) in &held.blocks {
+                                            let start = &held.codes[codes.clone()];
+                                            prefetch(&start[..start.len().min(ahead)]);
+                                        }
                                         Blocks::Held(held)
                                     }
                                     None if shared.cache.admits(partition, version) => {

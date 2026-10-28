@@ -12,6 +12,13 @@
 //! rewrites the block, so the delete names the block in the vector's dead row, and a query skips
 //! that stale copy before it can raise the bar the live entries are held to.
 //!
+//! A query reads a partition's bookkeeping first. The blocks of the partitions queries probe are
+//! held in memory, shared by the index's cursors, each partition's under the version its
+//! bookkeeping held when they were read: a query whose snapshot holds that version scores them
+//! there and reads only the partition's dead rows and tail from pages. The memory is bounded by
+//! the index's `cache_mib` parameter (default [`DEFAULT_CACHE_MIB`]), not by the index's size: the
+//! least recently probed partition gives way first.
+//!
 //! A statement that writes the index does the maintenance its writes made due before they are
 //! released, at most one job for each row it wrote, and `OPTIMIZE INDEX t_idx` does every job
 //! there is. Maintenance conflicts only with a write to a row it changes, and on a conflict it
@@ -49,7 +56,7 @@
 //! maintenance change to them, under which cursors share the loaded model. Only maintenance writes
 //! blocks, centroids and bookkeeping.
 use std::{
-    collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -60,7 +67,7 @@ use crate::{
     index_method::{
         parse_patterns, BackingColumn, BackingSchema, BackingStoreOp, BackingTable, IndexMethod,
         IndexMethodAttachment, IndexMethodConfiguration, IndexMethodContext, IndexMethodCostContext,
-        IndexMethodCostEstimate, IndexMethodCursor, IndexMethodDefinition,
+        IndexMethodCostEstimate, IndexMethodCursor, IndexMethodDefinition, IndexMethodSnapshotIdentity,
     },
     storage::btree::{BTreeKey, CursorTrait},
     sync::Arc,
@@ -113,6 +120,13 @@ pub static SCANNED: AtomicUsize = AtomicUsize::new(0);
 pub static REFINED: AtomicUsize = AtomicUsize::new(0);
 /// Entries whose raised 1-bit estimate from the fast scan reached a query's bar.
 pub static CANDIDATES: AtomicUsize = AtomicUsize::new(0);
+/// Partitions a query found held in memory under its snapshot's version, and those it read from
+/// pages.
+pub static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+pub static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+/// A process-wide byte budget for every index's held partitions, for measurement sweeps;
+/// `usize::MAX` leaves each index its own.
+pub static CACHE_BYTES_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Nanoseconds queries spent in each phase (scoring includes the 7-bit refine), and the records
 /// they read, for measurement.
 pub static READ_NANOS: AtomicUsize = AtomicUsize::new(0);
@@ -147,6 +161,9 @@ const ASSUMED_LIMIT: f64 = 10.0;
 const CODES_PER_PAGE: f64 = 168.0;
 /// The pages a rerank reads per vector, for a filtered query's cost estimate: its row in the table.
 const FETCH_PAGES: f64 = 1.0;
+/// The memory, in MiB, an index holds the blocks of the partitions queries probe in, unless its
+/// `cache_mib` parameter says otherwise.
+const DEFAULT_CACHE_MIB: usize = 256;
 /// The rounds a rebuild balances its trained partitions over.
 const BALANCE_ROUNDS: usize = 4;
 /// The vector-centroid products below which an assignment pass runs on one core.
@@ -1463,9 +1480,14 @@ impl IndexMethod for IvfRqIndexMethod {
     fn attach(&self, configuration: &IndexMethodConfiguration) -> Result<Arc<dyn IndexMethodAttachment>> {
         let column = &configuration.columns[0].name;
         let table = &configuration.table_name;
+        let budget = match configuration.parameters.get("cache_mib") {
+            Some(Value::Numeric(Numeric::Integer(n))) if *n >= 0 => *n as usize,
+            _ => DEFAULT_CACHE_MIB,
+        };
+        let cache = PartitionCache { budget: budget.saturating_mul(1 << 20), ..PartitionCache::default() };
         Ok(Arc::new(IvfRqIndexMethodAttachment {
             configuration: configuration.clone(),
-            shared: Shared::default(),
+            shared: Arc::new(std::sync::Mutex::new(SharedState { cache, ..SharedState::default() })),
             patterns: parse_patterns(&[
                 &format!("SELECT vector_distance_dot({column}, ?) as distance FROM {table} ORDER BY distance LIMIT ?"),
                 &format!("SELECT vector_distance_dot(?, {column}) as distance FROM {table} ORDER BY distance LIMIT ?"),
@@ -1515,6 +1537,123 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
 struct SharedState {
     model: Option<(i64, Arc<Model>)>,
     moving: BTreeSet<i64>,
+    cache: PartitionCache,
+}
+
+/// The blocks of partitions as queries read them, each partition's under the version of its
+/// bookkeeping it was read at, within a byte budget, the least recently probed giving way first.
+/// Until a partition first has to give way every partition read is held; from then on, one is
+/// held only when queries have lately probed it more often than the partition it would push out,
+/// so probes spread evenly over more than the budget holds copy nothing in vain, and the partitions
+/// queries keep coming back to stay.
+/// A version is drawn afresh by each write of the bookkeeping, which every change to a partition's
+/// blocks makes in its own transaction, so a partition's blocks are the same for every snapshot
+/// that holds a version, and a version a rolled-back write drew is never seen again.
+#[derive(Default, Debug)]
+struct PartitionCache {
+    budget: usize,
+    bytes: usize,
+    tick: u64,
+    entries: HashMap<(i64, i64), (Arc<HeldBlocks>, u64)>,
+    order: BTreeMap<u64, (i64, i64)>,
+    /// Whether a partition has had to give way, and how often each partition was probed lately:
+    /// the counts halve whenever the probes counted reach ten times the partitions held.
+    full: bool,
+    probed: HashMap<(i64, i64), u32>,
+    counted: usize,
+}
+
+/// A partition's blocks: each one's key, centroid version and the range of its codes in `codes`.
+#[derive(Default, Debug)]
+struct HeldBlocks {
+    blocks: Vec<(i64, i64, std::ops::Range<usize>)>,
+    codes: Vec<u8>,
+}
+
+impl HeldBlocks {
+    fn push(&mut self, key: i64, version: i64, codes: &[u8]) {
+        let at = self.codes.len();
+        self.codes.extend_from_slice(codes);
+        self.blocks.push((key, version, at..self.codes.len()));
+    }
+}
+
+impl PartitionCache {
+    fn budget(&self) -> usize {
+        match CACHE_BYTES_OVERRIDE.load(Ordering::Relaxed) {
+            usize::MAX => self.budget,
+            bytes => bytes,
+        }
+    }
+
+    /// Count a probe of `partition` under `version`: how often it was probed lately.
+    fn probe(&mut self, partition: i64, version: i64) -> u32 {
+        self.counted += 1;
+        if self.counted >= 10 * self.entries.len().max(64) {
+            self.counted = 0;
+            self.probed.retain(|_, count| {
+                *count /= 2;
+                *count > 0
+            });
+        }
+        let count = self.probed.entry((partition, version)).or_default();
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// The blocks held for `partition` under `version`, now the most recently probed.
+    fn get(&mut self, partition: i64, version: i64) -> Option<Arc<HeldBlocks>> {
+        self.probe(partition, version);
+        let (blocks, tick) = self.entries.get_mut(&(partition, version))?;
+        self.order.remove(tick);
+        self.tick += 1;
+        *tick = self.tick;
+        self.order.insert(self.tick, (partition, version));
+        Some(blocks.clone())
+    }
+
+    /// Whether blocks about to be read for `partition` under `version`, which [`Self::get`] did not
+    /// hold, are to be held: until a partition first had to give way, or when this one was probed
+    /// lately more often than the least recently probed held partition.
+    fn admits(&mut self, partition: i64, version: i64) -> bool {
+        if self.budget() == 0 {
+            return false;
+        }
+        let count = self.probed.get(&(partition, version)).copied().unwrap_or(0);
+        let victim = self.order.first_key_value().and_then(|(_, oldest)| self.probed.get(oldest)).copied().unwrap_or(0);
+        !self.full || count > victim
+    }
+
+    /// Hold `blocks` for `partition` under `version`, letting the least recently probed go until
+    /// they fit; blocks larger than the whole budget are not held.
+    fn insert(&mut self, partition: i64, version: i64, blocks: HeldBlocks) {
+        let (budget, size) = (self.budget(), blocks.codes.len());
+        if size > budget || self.entries.contains_key(&(partition, version)) {
+            return;
+        }
+        while self.bytes + size > budget {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            self.full = true;
+            if let Some((evicted, _)) = self.entries.remove(&oldest) {
+                self.bytes -= evicted.codes.len();
+            }
+        }
+        self.tick += 1;
+        self.bytes += size;
+        self.order.insert(self.tick, (partition, version));
+        self.entries.insert((partition, version), (Arc::new(blocks), self.tick));
+    }
+}
+
+/// What a probe knows of a partition's blocks once its bookkeeping is read: held, so they are
+/// scored from memory; to be read from pages and held under the version; or neither, when the
+/// partition has no bookkeeping or the budget is none.
+enum Blocks {
+    Unread,
+    Held(Arc<HeldBlocks>),
+    Holding(HeldBlocks, i64),
 }
 
 type Shared = Arc<std::sync::Mutex<SharedState>>;
@@ -1544,9 +1683,10 @@ enum Stage {
 
 enum Search {
     Init,
-    /// Read a partition's rows in key order: its dead rows, so its stale copies are known before
-    /// its blocks are scored, then its tail entries and blocks.
-    Probe { probes: VecDeque<i64>, partition: i64, walk: Walk },
+    /// Read a partition's rows in key order, up to `end`: its bookkeeping, whose version says
+    /// whether its blocks are held; its dead rows, so its stale copies are known before its blocks
+    /// are scored; its tail entries; and its blocks, unless they are held.
+    Probe { probes: VecDeque<i64>, partition: i64, walk: Walk, end: i64, blocks: Blocks },
     Rerank { candidates: VecDeque<i64>, rowid: Option<i64> },
 }
 
@@ -1862,9 +2002,11 @@ thread_local! {
     /// The point reads made on this thread, and the entries queries on it scored from 7-bit codes.
     static POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUERY_REFINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// The seeks walks made on this thread, and the partitions queries on it probed.
+    /// The seeks walks made on this thread, the partitions queries on it probed, and the blocks
+    /// they read from pages.
     static WALK_SEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOCK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Count a row a survey read, for the tests' bound on maintenance work.
@@ -1987,6 +2129,9 @@ pub struct IvfRqCursor {
     /// The rows the CREATE INDEX statement creating the index has inserted: past the first
     /// [`BULK_AT`] they are only recorded, for the statement's rebuild to code.
     building: Option<Vec<i64>>,
+    /// Whether the cursor runs under MVCC, where a concurrent writer can code against a model older
+    /// than the one its snapshot holds.
+    concurrent: bool,
     /// The model and generation before a job that changes them, until the job is written.
     saved: Option<(Arc<Model>, Option<i64>)>,
     /// The partitions the job being planned changes, to survey again once it is written.
@@ -2026,6 +2171,7 @@ impl IvfRqCursor {
             written: 0,
             inserted: 0,
             building: None,
+            concurrent: false,
             saved: None,
             dirty: Vec::new(),
             generation: None,
@@ -2305,11 +2451,13 @@ impl IndexMethodCursor for IvfRqCursor {
 
     fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let _timer = timer(&OPEN_NANOS);
+        self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
         self.open_stores(context)?;
         self.load()
     }
 
     fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
         self.open_stores(context)?;
         self.load()
     }
@@ -2526,8 +2674,8 @@ impl IvfRqCursor {
     /// Start the query's next round: probe the `nprobes` live partitions nearest the query for the
     /// rows it asks for, and for each earlier round of a filtered query four times as many of both,
     /// so a query whose other terms reject most rows reaches as far as it must. A query asking for
-    /// every row probes every partition. Partitions retired since a writer coded against them are
-    /// read too, for tail entries left there.
+    /// every row probes every partition. Under MVCC, partitions retired since a concurrent writer
+    /// coded against them are read too, for tail entries left there.
     fn round(&mut self) -> Result<Search> {
         let nprobes = match NPROBES_OVERRIDE.load(Ordering::Relaxed) {
             0 => self.nprobes,
@@ -2569,10 +2717,11 @@ impl IvfRqCursor {
                 ranked.select_nth_unstable_by(take - 1, |a, b| a.0.total_cmp(&b.0));
             }
             ranked.truncate(take);
-            // A retired partition holds no block, but a writer coding against a model
-            // older than its retirement can still have left a tail entry there, which
-            // maintenance moves out; until it does, the query reads it.
-            let retired = (0..self.model.centroids.len() as i64).filter(|p| self.model.states[*p as usize] == State::Retired);
+            // A retired partition holds no block, but under MVCC a writer coding against a
+            // model older than its retirement can still have left a tail entry there, which
+            // maintenance moves out; until it does, the query reads it. A WAL writer codes
+            // against the latest model, which never assigns to a retired partition.
+            let retired = (0..self.model.centroids.len() as i64).filter(|p| self.concurrent && self.model.states[*p as usize] == State::Retired);
             ranked.into_iter().map(|(_, p)| p).chain(retired).collect()
         };
         if let Some(filter) = self.filter.as_mut() {
@@ -2589,43 +2738,84 @@ impl IvfRqCursor {
         loop {
             match std::mem::replace(&mut self.search, Search::Init) {
                 Search::Init => return Err(error("no query is in progress")),
-                Search::Probe { probes, partition, mut walk } => {
-                    let (start, end) = rows_from(partition, DEAD_ROW)?;
+                Search::Probe { probes, partition, mut walk, mut end, mut blocks } => {
                     let reading = timer(&READ_NANOS);
-                    let row = match walk_held(&mut self.stores[PARTITIONS], start, end, &mut walk)? {
+                    let row = match walk_held(&mut self.stores[PARTITIONS], part_key(partition)?, end, &mut walk)? {
                         IOResult::Done(row) => row,
                         IOResult::IO(io) => {
-                            self.search = Search::Probe { probes, partition, walk };
+                            self.search = Search::Probe { probes, partition, walk, end, blocks };
                             return Ok(IOResult::IO(io));
                         }
                     };
                     drop(reading);
+                    let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
                     let Some(key) = row else {
+                        match blocks {
+                            Blocks::Held(held) => {
+                                for (key, version, codes) in &held.blocks {
+                                    let centre = query.centre(&self.model, partition, *version)?;
+                                    let _scoring = timer(&SCORE_NANOS);
+                                    score_block(query, &held.codes[codes.clone()], centre, Location::Block(*key))?;
+                                }
+                            }
+                            Blocks::Holding(read, version) => self.shared.lock().expect("index state").cache.insert(partition, version, read),
+                            Blocks::Unread => {}
+                        }
                         self.search = self.next_probe(probes)?;
                         continue;
                     };
-                    // Decoded and scored where the cursor holds it, so no block is copied.
+                    // Decoded and scored where the cursor holds it, so no block is copied unless it
+                    // is to be held.
                     let record = ImmutableRecordRef::from_bin_record(held_payload(&mut self.stores[PARTITIONS])?);
-                    let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
-                    if kind_of(key) == DEAD_ROW {
-                        let blocks = match record.get_value_opt(0) {
-                            Some(ValueRef::Blob(blocks)) => dead_blocks(blocks)?,
-                            _ => return Err(LimboError::Corrupt("ivf_rq: a dead row holds no blocks".into()).into()),
-                        };
-                        let rowid = key & ((1 << ROWID_BITS) - 1);
-                        query.dead.extend(blocks.into_iter().map(|block| (rowid, block)));
-                    } else {
-                        tally(&RECORDS, 1);
-                        let source = match kind_of(key) {
-                            TAIL_ROW => Location::Tail(key),
-                            _ => Location::Block(key),
-                        };
-                        let (version, codes) = version_and_codes(&record)?;
-                        let centre = query.centre(&self.model, partition, version)?;
-                        let _scoring = timer(&SCORE_NANOS);
-                        score_block(query, codes, centre, source)?;
+                    match kind_of(key) {
+                        PART_ROW => {
+                            if let Some(ValueRef::Numeric(Numeric::Integer(version))) = record.get_value_opt(7) {
+                                let mut shared = self.shared.lock().expect("index state");
+                                blocks = match shared.cache.get(partition, version) {
+                                    Some(held) => {
+                                        tally(&CACHE_HITS, 1);
+                                        end = partition_key(partition, BLOCK_ROW, 0)?;
+                                        Blocks::Held(held)
+                                    }
+                                    None if shared.cache.admits(partition, version) => {
+                                        tally(&CACHE_MISSES, 1);
+                                        Blocks::Holding(HeldBlocks::default(), version)
+                                    }
+                                    None => {
+                                        tally(&CACHE_MISSES, 1);
+                                        Blocks::Unread
+                                    }
+                                };
+                            }
+                        }
+                        DEAD_ROW => {
+                            let dead = match record.get_value_opt(0) {
+                                Some(ValueRef::Blob(dead)) => dead_blocks(dead)?,
+                                _ => return Err(LimboError::Corrupt("ivf_rq: a dead row holds no blocks".into()).into()),
+                            };
+                            let rowid = key & ((1 << ROWID_BITS) - 1);
+                            query.dead.extend(dead.into_iter().map(|block| (rowid, block)));
+                        }
+                        kind => {
+                            tally(&RECORDS, 1);
+                            let (version, codes) = version_and_codes(&record)?;
+                            let source = match kind {
+                                TAIL_ROW => Location::Tail(key),
+                                _ => {
+                                    #[cfg(test)]
+                                    BLOCK_READS.with(|count| count.set(count.get() + 1));
+                                    if let Blocks::Holding(read, _) = &mut blocks {
+                                        read.push(key, version, codes);
+                                    }
+                                    Location::Block(key)
+                                }
+                            };
+                            let centre = query.centre(&self.model, partition, version)?;
+                            let _scoring = timer(&SCORE_NANOS);
+                            score_block(query, codes, centre, source)?;
+                        }
                     }
-                    self.search = Search::Probe { probes, partition, walk };
+                    self.search = Search::Probe { probes, partition, walk, end, blocks };
                 }
                 Search::Rerank { mut candidates, rowid } => {
                     let _timer = timer(&RERANK_NANOS);
@@ -2692,7 +2882,8 @@ impl IvfRqCursor {
         if let Some(partition) = probes.pop_front() {
             #[cfg(test)]
             PROBES.with(|count| count.set(count.get() + 1));
-            return Ok(Search::Probe { probes, partition, walk: Walk::Seek });
+            let (_, end) = rows_from(partition, PART_ROW)?;
+            return Ok(Search::Probe { probes, partition, walk: Walk::Seek, end, blocks: Blocks::Unread });
         }
         Ok(Search::Rerank { candidates: VecDeque::new(), rowid: None })
     }
@@ -4350,7 +4541,9 @@ mod tests {
     }
 
     /// Deleting every vector of half the clusters retires the partitions that held them: none is
-    /// left live with fewer entries than the retirement bound, and the queries stay exact.
+    /// left live with fewer entries than the retirement bound, and the queries stay exact. A query
+    /// probes the retired partitions only under MVCC, where a concurrent writer coding against an
+    /// older model can leave a tail entry in one.
     #[test]
     fn emptied_partitions_retire() {
         const DIMS: usize = 16;
@@ -4378,6 +4571,11 @@ mod tests {
                 let q = near(&mut state, std::slice::from_ref(centre), 0.2);
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
             }
+            let probes = PROBES.with(|c| c.get());
+            top_ten(&conn, &near(&mut state, &centres, 0.2));
+            let probed = PROBES.with(|c| c.get()) - probes;
+            let wanted = index.live().len() + if mvcc { retired } else { 0 };
+            assert_eq!(probed, wanted, "mvcc={mvcc}: {probed} partitions probed, {} live and {retired} retired", index.live().len());
         }
     }
 
@@ -4428,6 +4626,101 @@ mod tests {
         }
         let recall = found as f64 / (10 * queries) as f64;
         assert!(recall >= 0.95, "recall@10 {recall} at a refine of one");
+    }
+
+    /// The blocks a query read are held for the next: a second query over the same partitions reads
+    /// no block from pages, until a pack rewrites them under a new version, when the next query reads
+    /// those again, and every answer is the exact top ten.
+    #[test]
+    fn a_query_scores_held_partitions_from_memory_until_a_write_rewrites_them() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-held-{mvcc}.db"), mvcc);
+            let mut state = 109;
+            let mut live: HashMap<i64, Vec<f32>> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            let mut vectors: Vec<(i64, Vec<f32>)> = live.iter().map(|(id, v)| (*id, v.clone())).collect();
+            vectors.sort_by_key(|(id, _)| *id);
+            insert_all(&conn, &vectors);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let q = random(&mut state, DIMS);
+            let reads = |conn: &Arc<crate::Connection>, live: &HashMap<i64, Vec<f32>>| {
+                let before = BLOCK_READS.with(|c| c.get());
+                assert_eq!(top_ten(conn, &q), exact_top_ten(live, &q), "mvcc={mvcc}");
+                BLOCK_READS.with(|c| c.get()) - before
+            };
+            assert!(reads(&conn, &live) > 0, "mvcc={mvcc}: the first query read no block");
+            assert_eq!(reads(&conn, &live), 0, "mvcc={mvcc}: the second query read blocks its first had read");
+            // Rows near the query land in the partitions it probes; their packs rewrite blocks there.
+            let near: Vec<(i64, Vec<f32>)> = (3001..=3100i64).map(|id| (id, q.iter().zip(random(&mut state, DIMS)).map(|(a, n)| a + 0.05 * n).collect())).collect();
+            insert_all(&conn, &near);
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            live.extend(near);
+            assert!(reads(&conn, &live) > 0, "mvcc={mvcc}: the query after the packs read no block");
+            assert_eq!(reads(&conn, &live), 0, "mvcc={mvcc}: the query after that read blocks again");
+        }
+    }
+
+    /// A transaction that read the index keeps its snapshot's answers while another connection
+    /// rewrites the partitions it probes, the blocks it holds being those of its own snapshot's
+    /// version, and sees the rewrite once it ends.
+    #[test]
+    fn a_snapshot_keeps_its_answers_while_another_connection_rewrites_the_partitions() {
+        const DIMS: usize = 16;
+        let (db, writer) = database("ivf-rq-held-snapshot.db", false);
+        let mut state = 113;
+        let mut live: HashMap<i64, Vec<f32>> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+        let mut vectors: Vec<(i64, Vec<f32>)> = live.iter().map(|(id, v)| (*id, v.clone())).collect();
+        vectors.sort_by_key(|(id, _)| *id);
+        insert_all(&writer, &vectors);
+        writer.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+        let reader = db.connect(crate::ConnectOpts::new()).unwrap();
+        let q = random(&mut state, DIMS);
+        let before = exact_top_ten(&live, &q);
+        reader.execute("BEGIN").unwrap();
+        assert_eq!(top_ten(&reader, &q), before);
+        let near: Vec<(i64, Vec<f32>)> = (3001..=3100i64).map(|id| (id, q.iter().zip(random(&mut state, DIMS)).map(|(a, n)| a + 0.05 * n).collect())).collect();
+        insert_all(&writer, &near);
+        writer.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        live.extend(near);
+        let after = exact_top_ten(&live, &q);
+        assert_ne!(before, after, "the rows near the query do not change its top ten");
+        assert_eq!(top_ten(&writer, &q), after, "the writer's answer");
+        assert_eq!(top_ten(&reader, &q), before, "the reader's snapshot answer");
+        reader.execute("COMMIT").unwrap();
+        assert_eq!(top_ten(&reader, &q), after, "the reader's answer after its snapshot");
+    }
+
+    /// The held blocks stay within the budget, the least recently probed partition giving way
+    /// first, and blocks larger than the whole budget are not held.
+    #[test]
+    fn the_held_partitions_stay_within_the_budget_least_recent_first() {
+        let held = |bytes: usize| {
+            let mut blocks = HeldBlocks::default();
+            blocks.push(0, 0, &vec![0u8; bytes]);
+            blocks
+        };
+        let mut cache = PartitionCache { budget: 1000, ..PartitionCache::default() };
+        for partition in 0..4 {
+            cache.insert(partition, 7, held(300));
+        }
+        assert!(cache.bytes <= 1000, "{} bytes held", cache.bytes);
+        assert!(cache.get(0, 7).is_none(), "the oldest partition is still held");
+        assert!(cache.get(1, 7).is_some() && cache.get(2, 7).is_some() && cache.get(3, 7).is_some());
+        // Probing partition 1 again leaves 2 the least recently probed.
+        assert!(cache.get(1, 7).is_some());
+        cache.insert(4, 7, held(300));
+        assert!(cache.get(2, 7).is_none() && cache.get(1, 7).is_some() && cache.get(4, 7).is_some());
+        assert!(cache.get(4, 8).is_none(), "a version the partition was not held under");
+        cache.insert(5, 7, held(1001));
+        assert!(cache.get(5, 7).is_none(), "blocks larger than the budget are held");
+        // A partition has given way: one is held only when probed lately more often than the least
+        // recently probed held partition, 3, probed once.
+        assert!(cache.get(6, 7).is_none());
+        assert!(!cache.admits(6, 7), "a partition probed once is held over one probed more");
+        cache.get(6, 7);
+        cache.get(6, 7);
+        assert!(cache.admits(6, 7), "a partition probed most is not held");
+        assert!(!PartitionCache::default().admits(0, 0), "an empty budget holds a partition");
     }
 
     /// A query reads each partition it probes with one seek: its bookkeeping, dead rows, tail and

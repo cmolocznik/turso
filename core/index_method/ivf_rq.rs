@@ -8,17 +8,19 @@
 //! different rows never conflict. An insert codes the vector against its nearest partition's
 //! centroid and writes two rows: a tail entry keyed by partition and rowid, and the vector's own
 //! row (where its code lives, and its 4-bit code's lower bits). A delete removes the vector's row,
-//! and its tail entry if it has one; an entry it leaves in a packed block is stale, and a query
-//! skips it because the vector's row no longer points there.
+//! and its tail entry if it has one. A code packed in a block stays there until maintenance
+//! rewrites the block, so the delete names the block in the vector's dead row, and a query skips
+//! that stale copy before it can raise the bar the live entries are held to.
 //!
 //! `OPTIMIZE INDEX t_idx` is maintenance, bounded per run and itself a BEGIN CONCURRENT writer
-//! that conflicts only with a write to a vector it is moving: it packs a partition's tail into
-//! blocks of [`BLOCK`], and splits a partition grown past twice the partition count by 2-means
-//! over its members' vectors read back from the table, so partitions stay near the square root of
-//! the row count. A split never overwrites a centroid: it writes new versions, and every entry
-//! names the version it was coded against, so an insert committed from a snapshot older than the
-//! split still scores correctly until maintenance recodes it. The index starts as one partition
-//! about the origin.
+//! that conflicts only with a write to a vector it moves or whose dead row it rewrites: it packs a
+//! partition's tail into blocks of [`BLOCK`], rewrites a block holding [`COMPACT_AT`] stale copies
+//! without them, and splits a partition grown past twice the partition count by 2-means over its
+//! members' vectors read back from the table, so partitions stay near the square root of the row
+//! count. Every rewrite of a block takes it off the dead rows of the copies it drops. A split
+//! never overwrites a centroid: it writes new versions, and every entry names the version it was
+//! coded against, so an insert committed from a snapshot older than the split still scores
+//! correctly until maintenance recodes it. The index starts as one partition about the origin.
 //!
 //! Each vector carries a 4-bit extended RaBitQ code whose top bit is its 1-bit code. The 1-bit
 //! codes are interleaved 32 vectors at a time for a fast scan over per-query nibble tables of
@@ -26,14 +28,15 @@
 //! `limit`th best lowered one, scores those from their 4-bit codes in order of that bound until no
 //! other can enter, and reranks the best `refine * limit` exactly from the table's vectors.
 //!
-//! Five backing tables, every key an integer so a seek compares no payload: blocks
+//! Six backing tables, every key an integer so a seek compares no payload: blocks
 //! (`partition << 32 | sequence` -> version, codes), tail (`partition << 40 | rowid` -> version,
 //! code), vectors (rowid -> location, 4-bit correction and lower bits), centroids
 //! (`partition << 24 | version` -> centroid; -1 -> a generation drawn afresh by each maintenance
 //! change to them, under which cursors share the loaded model), parts (partition -> next block
-//! sequence, packed size). Only maintenance writes blocks, centroids and parts.
+//! sequence, packed size), dead (`partition << 40 | rowid` -> the blocks holding a stale copy of
+//! the vector's code). Only maintenance writes blocks, centroids and parts.
 use std::{
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -79,6 +82,8 @@ pub static MOVES: AtomicUsize = AtomicUsize::new(0);
 pub static SPLITS: AtomicUsize = AtomicUsize::new(0);
 pub static RECODED: AtomicUsize = AtomicUsize::new(0);
 pub static DROPPED: AtomicUsize = AtomicUsize::new(0);
+/// Blocks rewritten without their stale copies.
+pub static COMPACTS: AtomicUsize = AtomicUsize::new(0);
 pub static SPLIT_MICROS: AtomicUsize = AtomicUsize::new(0);
 pub static SPLIT_MICROS_MAX: AtomicUsize = AtomicUsize::new(0);
 /// Entries a query estimated from 1-bit codes, and those it went on to score from 4-bit codes.
@@ -103,6 +108,8 @@ const BLOCK: usize = 64;
 /// The tail length at which maintenance packs a partition, merging it into the partition's open
 /// block, so a partition holds full blocks, at most one open block, and a short tail.
 const PACK_AT: usize = 8;
+/// The stale copies a block holds at which maintenance rewrites it without them.
+const COMPACT_AT: usize = 8;
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const ROUNDS: usize = 3;
 const KMEANS_ITERATIONS: usize = 8;
@@ -122,12 +129,14 @@ const TAIL: usize = 1;
 const VECTORS: usize = 2;
 const CENTROIDS: usize = 3;
 const PARTS: usize = 4;
-const STORES: [(&str, &[(&str, Type)]); 5] = [
+const DEAD: usize = 5;
+const STORES: [(&str, &[(&str, Type)]); 6] = [
     ("blocks", &[("version", Type::Integer), ("codes", Type::Blob)]),
     ("tail", &[("version", Type::Integer), ("codes", Type::Blob)]),
     ("vectors", &[("location", Type::Integer), ("codes", Type::Blob)]),
     ("centroids", &[("value", Type::Blob)]),
     ("parts", &[("next", Type::Integer), ("size", Type::Integer), ("open", Type::Integer), ("move_next", Type::Integer), ("move_end", Type::Integer)]),
+    ("dead", &[("blocks", Type::Blob)]),
 ];
 /// The centroids table's rowid for the generation.
 const GENERATION: i64 = -1;
@@ -162,6 +171,11 @@ fn tail_key(partition: i64, rowid: i64) -> Result<i64> {
         return Err(*error("rows indexed by ivf_rq need rowids in 0..2^40"));
     }
     Ok(partition << ROWID_BITS | rowid)
+}
+
+/// A dead row's key: the partition of the block holding the stale copy, then the vector's rowid.
+fn dead_key(block: i64, rowid: i64) -> Result<i64> {
+    tail_key(block >> 32, rowid)
 }
 
 fn centroid_key(partition: i64, version: i64) -> Result<i64> {
@@ -764,6 +778,19 @@ fn centroid_record(c: &[f32]) -> Result<ImmutableRecord> {
     blob_record(&bytes)
 }
 
+/// A dead row's blocks: each packed block that holds a stale copy of the vector's code.
+fn dead_blocks(bytes: &[u8]) -> Result<Vec<i64>> {
+    if bytes.len() % 8 != 0 {
+        return Err(LimboError::Corrupt("ivf_rq: dead row length is not a count of blocks".into()));
+    }
+    Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
+}
+
+fn dead_record(blocks: &[i64]) -> Result<ImmutableRecord> {
+    let bytes: Vec<u8> = blocks.iter().flat_map(|b| b.to_le_bytes()).collect();
+    blob_record(&bytes)
+}
+
 /// A resumable read of one row by rowid.
 #[derive(Clone, Copy)]
 enum Get {
@@ -1087,10 +1114,12 @@ enum Load {
     Walk(Walk),
 }
 
-/// A delete in progress: read the vector's row, then remove it and its tail entry.
+/// A delete in progress: read the vector's row, then remove it and its tail entry, or name its
+/// packed block in its dead row.
 enum Change {
     Idle,
     Remove { rowid: i64, get: Get },
+    Bury { rowid: i64, block: i64, get: Get },
     Apply(VecDeque<Step>),
 }
 
@@ -1113,6 +1142,8 @@ enum Stage {
 
 enum Search {
     Init,
+    /// Read a partition's dead rows, so its stale copies are known before its blocks are scored.
+    Dead { probes: VecDeque<i64>, partition: i64, walk: Walk },
     Probe { probes: VecDeque<i64>, partition: i64, stage: Stage, walk: Walk },
     Refine { order: VecDeque<Candidate>, get: Get },
     Rerank { candidates: VecDeque<i64>, rowid: Option<i64> },
@@ -1161,6 +1192,8 @@ enum Job {
     /// Recode up to a block of entries coded against a superseded centroid into the partitions now
     /// nearest them.
     Move(i64),
+    /// Rewrite the block with this key without the stale copies it holds.
+    Compact(i64),
 }
 
 /// A maintenance run: count every partition's tail and read the bookkeeping, choose the job, read
@@ -1171,10 +1204,15 @@ enum Upkeep {
     Load,
     Count { walk: Walk, tails: HashMap<i64, usize> },
     Parts { walk: Walk, tails: HashMap<i64, usize>, parts: Parts },
+    /// Count the stale copies the dead rows name in each block.
+    Dead { walk: Walk, tails: HashMap<i64, usize>, parts: Parts, stale: HashMap<i64, usize> },
     /// Read the entries of `job`: the open block and the tail for a pack, every member for a
-    /// split's sample, the first superseded block or tail entries for a move.
+    /// split's sample, the first superseded block or tail entries for a move, the block for a
+    /// compaction.
     Read { job: Job, part: Part, stage: Stage, walk: Walk, get: Get, rows: Vec<Tailed> },
     Check { job: Job, part: Part, rows: Vec<Tailed>, at: usize, get: Get, sorted: Sorted },
+    /// Read the dead row of each stale copy a rewritten block drops, to take the block off it.
+    Unbury { job: Job, part: Part, sorted: Sorted, at: usize, get: Get },
     Fetch { job: Job, part: Part, sorted: Sorted, vectors: Vec<Vec<f32>> },
     Apply { steps: VecDeque<Step> },
 }
@@ -1194,6 +1232,10 @@ struct Sorted {
     version: i64,
     /// Live entries a pack read from the open block, with that block's key.
     kept: Vec<(i64, i64)>,
+    /// Stale copies dropped from a block the job rewrites, as rowid and block.
+    buried: Vec<(i64, i64)>,
+    /// The writes that take those blocks off the copies' dead rows.
+    unbury: Vec<Step>,
 }
 
 /// Members a split samples for its 2-means.
@@ -1214,8 +1256,10 @@ struct Query {
     keep: usize,
     /// The query's product with each centroid version it has met.
     centres: HashMap<(i64, i64), f64>,
-    /// The `limit` best lowered 1-bit estimates, negated: the top is the bar an entry's raised
-    /// estimate must reach.
+    /// The stale copies the probed partitions' dead rows name, as rowid and block.
+    dead: HashSet<(i64, i64)>,
+    /// The `limit` best lowered 1-bit estimates of live entries, negated: the top is the bar an
+    /// entry's raised estimate must reach.
     floors: BinaryHeap<Ordered>,
     candidates: Vec<Candidate>,
     estimates: BinaryHeap<Ordered>,
@@ -1426,11 +1470,26 @@ impl IvfRqCursor {
                             return Ok(IOResult::IO(io));
                         }
                     };
-                    let mut steps = VecDeque::from([remove(VECTORS, rowid)]);
-                    if let Location::Tail(key) = Location::decode(integer(&found, 0)?) {
-                        steps.push_back(remove(TAIL, key));
-                    }
-                    self.change = Change::Apply(steps);
+                    self.change = match Location::decode(integer(&found, 0)?) {
+                        Location::Tail(key) => Change::Apply(VecDeque::from([remove(VECTORS, rowid), remove(TAIL, key)])),
+                        Location::Block(block) => Change::Bury { rowid, block, get: Get::Seek },
+                    };
+                }
+                Change::Bury { rowid, block, mut get } => {
+                    let key = dead_key(block, rowid)?;
+                    let found = match get_row(&mut self.stores[DEAD], key, &mut get)? {
+                        IOResult::Done(found) => found,
+                        IOResult::IO(io) => {
+                            self.change = Change::Bury { rowid, block, get };
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    let mut blocks = match &found {
+                        Some(r) => dead_blocks(bytes_at(r, 0)?)?,
+                        None => Vec::new(),
+                    };
+                    blocks.push(block);
+                    self.change = Change::Apply(VecDeque::from([remove(VECTORS, rowid), put(DEAD, key, dead_record(&blocks)?)]));
                 }
                 Change::Apply(mut steps) => {
                     let Some(step) = steps.front_mut() else {
@@ -1580,6 +1639,7 @@ impl IndexMethodCursor for IvfRqCursor {
                         limit: limit.max(1),
                         keep: (refine * limit).max(1),
                         centres: HashMap::new(),
+                        dead: HashSet::new(),
                         floors: BinaryHeap::new(),
                         candidates: Vec::new(),
                         estimates: BinaryHeap::new(),
@@ -1587,6 +1647,26 @@ impl IndexMethodCursor for IvfRqCursor {
                     });
                     self.answer.clear();
                     self.search = self.next_probe(probes)?;
+                }
+                Search::Dead { probes, partition, mut walk } => {
+                    let start = tail_key(partition, 0)?;
+                    let reading = timer(&READ_NANOS);
+                    let row = match walk_row(&mut self.stores[DEAD], start, start + (1 << ROWID_BITS), &mut walk)? {
+                        IOResult::Done(row) => row,
+                        IOResult::IO(io) => {
+                            self.search = Search::Dead { probes, partition, walk };
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    drop(reading);
+                    let Some((key, found)) = row else {
+                        self.search = Search::Probe { probes, partition, stage: Stage::Blocks, walk: Walk::Seek };
+                        continue;
+                    };
+                    let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
+                    let rowid = key & ((1 << ROWID_BITS) - 1);
+                    query.dead.extend(dead_blocks(bytes_at(&found, 0)?)?.into_iter().map(|block| (rowid, block)));
+                    self.search = Search::Dead { probes, partition, walk };
                 }
                 Search::Probe { probes, partition, stage, mut walk } => {
                     let (store, start, end) = match stage {
@@ -1754,8 +1834,21 @@ impl IndexMethodCursor for IvfRqCursor {
                         parts.insert(partition, part);
                         self.upkeep = Upkeep::Parts { walk, tails, parts };
                     }
+                    IOResult::Done(None) => self.upkeep = Upkeep::Dead { walk: Walk::Seek, tails, parts, stale: HashMap::new() },
+                },
+                Upkeep::Dead { mut walk, tails, parts, mut stale } => match walk_row(&mut self.stores[DEAD], 0, i64::MAX, &mut walk)? {
+                    IOResult::IO(io) => {
+                        self.upkeep = Upkeep::Dead { walk, tails, parts, stale };
+                        return Ok(IOResult::IO(io));
+                    }
+                    IOResult::Done(Some((_, found))) => {
+                        for block in dead_blocks(bytes_at(&found, 0)?)? {
+                            *stale.entry(block).or_default() += 1;
+                        }
+                        self.upkeep = Upkeep::Dead { walk, tails, parts, stale };
+                    }
                     IOResult::Done(None) => {
-                        let Some(job) = self.choose(&tails, &parts) else {
+                        let Some(job) = self.choose(&tails, &parts, &stale) else {
                             return Ok(IOResult::Done(()));
                         };
                         JOBS.fetch_add(1, Ordering::Relaxed);
@@ -1811,6 +1904,22 @@ impl IndexMethodCursor for IvfRqCursor {
                             }
                             self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted };
                         }
+                        (Job::Compact(key), Stage::Blocks) => {
+                            let found = match get_row(&mut self.stores[BLOCKS], key, &mut get)? {
+                                IOResult::Done(found) => found,
+                                IOResult::IO(io) => {
+                                    self.upkeep = Upkeep::Read { job, part, stage, walk, get, rows };
+                                    return Ok(IOResult::IO(io));
+                                }
+                            };
+                            let mut sorted = Sorted::default();
+                            if let Some(found) = found {
+                                let version = integer(&found, 0)?;
+                                sorted.version = version;
+                                rows.extend(unpack(bytes_at(&found, 1)?)?.into_iter().map(|entry| Tailed { location: Location::Block(key), version, entry }));
+                            }
+                            self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted };
+                        }
                         (Job::Split(_), Stage::Blocks) => {
                             let start = block_key(partition, 0)?;
                             match walk_row(&mut self.stores[BLOCKS], start, start + (1 << 32), &mut walk)? {
@@ -1861,8 +1970,7 @@ impl IndexMethodCursor for IvfRqCursor {
                 }
                 Upkeep::Check { job, part, rows, at, mut get, mut sorted } => {
                     let Some(row) = rows.get(at) else {
-                        let vectors = Vec::with_capacity(sorted.recode.len());
-                        self.upkeep = Upkeep::Fetch { job, part, sorted, vectors };
+                        self.upkeep = Upkeep::Unbury { job, part, sorted, at: 0, get: Get::Seek };
                         continue;
                     };
                     let found = match get_row(&mut self.stores[VECTORS], row.entry.rowid, &mut get)? {
@@ -1895,22 +2003,55 @@ impl IndexMethodCursor for IvfRqCursor {
                                     sorted.live.push((row.entry.clone(), Vec::new()));
                                     sorted.recode.push(row.entry.rowid);
                                 }
+                                // A compaction keeps each live entry as it is.
+                                Job::Compact(_) => sorted.live.push((row.entry.clone(), Vec::new())),
                                 _ => sorted.recode.push(row.entry.rowid),
                             }
                         }
                         _ => {
                             DROPPED.fetch_add(1, Ordering::Relaxed);
+                            // A pack, move or compaction rewrites the block the stale copy was read
+                            // from, so the copy leaves it and its dead row must no longer name it.
+                            if let (Job::Pack(_) | Job::Move(_) | Job::Compact(_), Location::Block(key)) = (job, row.location) {
+                                sorted.buried.push((row.entry.rowid, key));
+                            }
                         }
                     }
                     self.upkeep = Upkeep::Check { job, part, rows, at: at + 1, get: Get::Seek, sorted };
                 }
-                Upkeep::Fetch { job, part, sorted, mut vectors } => {
+                Upkeep::Unbury { job, part, mut sorted, at, mut get } => {
+                    let Some(&(rowid, block)) = sorted.buried.get(at) else {
+                        let vectors = Vec::with_capacity(sorted.recode.len());
+                        self.upkeep = Upkeep::Fetch { job, part, sorted, vectors };
+                        continue;
+                    };
+                    let key = dead_key(block, rowid)?;
+                    let found = match get_row(&mut self.stores[DEAD], key, &mut get)? {
+                        IOResult::Done(found) => found,
+                        IOResult::IO(io) => {
+                            self.upkeep = Upkeep::Unbury { job, part, sorted, at, get };
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    let found = found.ok_or_else(|| error("a stale copy has no dead row"))?;
+                    let mut blocks = dead_blocks(bytes_at(&found, 0)?)?;
+                    blocks.retain(|b| *b != block);
+                    sorted.unbury.push(match blocks.is_empty() {
+                        true => remove(DEAD, key),
+                        false => put(DEAD, key, dead_record(&blocks)?),
+                    });
+                    self.upkeep = Upkeep::Unbury { job, part, sorted, at: at + 1, get: Get::Seek };
+                }
+                Upkeep::Fetch { job, part, mut sorted, mut vectors } => {
                     let Some(&rowid) = sorted.recode.get(vectors.len()) else {
-                        let steps = match job {
+                        let unbury = std::mem::take(&mut sorted.unbury);
+                        let mut steps = match job {
                             Job::Pack(p) => self.plan_pack(p, part, sorted, vectors)?,
                             Job::Split(p) => self.plan_split(p, part, &vectors)?,
                             Job::Move(p) => self.plan_move(p, part, sorted, vectors)?,
+                            Job::Compact(block) => self.plan_compact(block, part, sorted)?,
                         };
+                        steps.extend(unbury);
                         self.upkeep = Upkeep::Apply { steps };
                         continue;
                     };
@@ -1969,7 +2110,7 @@ impl IndexMethodCursor for IvfRqCursor {
 impl IvfRqCursor {
     fn next_probe(&mut self, mut probes: VecDeque<i64>) -> Result<Search> {
         if let Some(partition) = probes.pop_front() {
-            return Ok(Search::Probe { probes, partition, stage: Stage::Blocks, walk: Walk::Seek });
+            return Ok(Search::Dead { probes, partition, walk: Walk::Seek });
         }
         let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
         let bar = query.bar();
@@ -1980,13 +2121,17 @@ impl IvfRqCursor {
 
     /// The run's job: check a block of a partition being split, else pack the longest tail of at
     /// least [`PACK_AT`] (which also recodes tail entries coded against a superseded centroid), else
-    /// split the largest partition past the bound.
-    fn choose(&self, tails: &HashMap<i64, usize>, parts: &Parts) -> Option<Job> {
+    /// compact the block holding the most stale copies, at least [`COMPACT_AT`], else split the
+    /// largest partition past the bound.
+    fn choose(&self, tails: &HashMap<i64, usize>, parts: &Parts, stale: &HashMap<i64, usize>) -> Option<Job> {
         if let Some(p) = parts.iter().filter(|(_, part)| part.moving()).map(|(p, _)| *p).min() {
             return Some(Job::Move(p));
         }
         if let Some((p, _)) = tails.iter().filter(|(_, count)| **count >= PACK_AT).max_by_key(|(p, count)| (**count, -**p)) {
             return Some(Job::Pack(*p));
+        }
+        if let Some((block, _)) = stale.iter().filter(|(_, count)| **count >= COMPACT_AT).max_by_key(|(block, count)| (**count, -**block)) {
+            return Some(Job::Compact(*block));
         }
         let bound = self.split_bound();
         let size = |p: i64| parts.get(&p).map_or(0, |part| part.size) + *tails.get(&p).unwrap_or(&0) as i64;
@@ -2103,6 +2248,29 @@ impl IvfRqCursor {
         steps.push_back(put(PARTS, partition, part.record()?));
         Ok(steps)
     }
+
+    /// Rewrite a block without the stale copies it holds, or remove it when none of its entries is
+    /// live. The live entries stay as they are, under the centroid version they were coded against,
+    /// so their vectors' rows still name the block.
+    fn plan_compact(&mut self, block: i64, mut part: Part, sorted: Sorted) -> Result<VecDeque<Step>> {
+        if sorted.buried.is_empty() {
+            return Err(*error("a dead row names a block that holds no stale copy"));
+        }
+        let partition = block >> 32;
+        let staying: Vec<Entry> = sorted.live.into_iter().map(|(entry, _)| entry).collect();
+        let mut steps = VecDeque::from([match staying.is_empty() {
+            true => remove(BLOCKS, block),
+            false => put(BLOCKS, block, record(&[Value::from_i64(sorted.version), blob(&pack(&staying))?])?),
+        }]);
+        part.size = (part.size - sorted.buried.len() as i64).max(0);
+        // The open block is the partition's last; it stays open with the entries it keeps.
+        if part.open > 0 && block == block_key(partition, part.next - 1)? {
+            part.open = staying.len() as i64;
+        }
+        COMPACTS.fetch_add(1, Ordering::Relaxed);
+        steps.push_back(put(PARTS, partition, part.record()?));
+        Ok(steps)
+    }
 }
 
 /// The steps that remove the blocks and tail entries a job read.
@@ -2119,12 +2287,14 @@ fn removals(removed: &[Location]) -> VecDeque<Step> {
 fn job_partition(job: Job) -> i64 {
     match job {
         Job::Pack(p) | Job::Split(p) | Job::Move(p) => p,
+        Job::Compact(block) => block >> 32,
     }
 }
 
 /// Estimate a block's entries from their 1-bit codes, each group in one fast-scan pass (a sparse
 /// group, a tail entry above all, summed exactly), and keep as candidates those whose estimate,
-/// raised by its error bound, reaches the bar of the `limit` best lowered ones so far.
+/// raised by its error bound, reaches the bar of the `limit` best lowered ones so far. A stale
+/// copy the partition's dead rows name is skipped before it can raise the bar.
 fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location) -> Result<()> {
     let dims = query.rotated.len();
     let count = block_count(payload)?;
@@ -2134,6 +2304,10 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
     }
     let scale = 1.0 / (dims as f64).sqrt();
     let spread = EPSILON * query.length / ((dims - 1) as f64).sqrt();
+    let screened = match source {
+        Location::Block(key) if !query.dead.is_empty() => Some(key),
+        _ => None,
+    };
     let mut sums = [0u32; GROUP];
     for group in 0..layout.groups() {
         let codes = &payload[layout.scan() + group * layout.group_bytes()..][..layout.group_bytes()];
@@ -2158,9 +2332,12 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
             if estimate + bound + slack < query.bar() {
                 continue;
             }
+            let rowid = i64_at(payload, layout.rowids() + 8 * n);
+            if screened.is_some_and(|key| query.dead.contains(&(rowid, key))) {
+                continue;
+            }
             let signed = if scanned { exact(slot) } else { chosen };
             let estimate = centre + norm * (2.0 * signed - query.sum) * scale / factor;
-            let rowid = i64_at(payload, layout.rowids() + 8 * n);
             query.floors.push(Ordered(-(estimate - bound), rowid));
             if query.floors.len() > query.limit {
                 query.floors.pop();
@@ -2211,6 +2388,7 @@ mod tests {
             limit,
             keep,
             centres: HashMap::new(),
+            dead: HashSet::new(),
             floors: BinaryHeap::new(),
             candidates: Vec::new(),
             estimates: BinaryHeap::new(),
@@ -2387,6 +2565,134 @@ mod tests {
                     assert!((summed - exact).abs() <= table.error + 1e-3, "dims {dims} slot {slot} {kernel}: fast-scan sum {summed} against exact {exact}");
                 }
             }
+        }
+    }
+
+    /// A query near vectors that were packed into blocks and then updated away returns the live
+    /// top ten: the stale entries their blocks keep must not raise the bar the live entries meet.
+    #[test]
+    fn a_query_near_vectors_updated_away_returns_the_live_top_ten() {
+        use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect};
+        const DIMS: usize = 128;
+        for mvcc in [false, true] {
+            let db = Database::open_file_with_flags(
+                Arc::new(MemoryIO::new()),
+                &format!("ivf-rq-stale-bar-{mvcc}.db"),
+                OpenFlags::default(),
+                DatabaseOpts::new().with_index_method(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 64, refine = 4)").unwrap();
+            let mut state = 23;
+            let q = random(&mut state, DIMS);
+            let mut live: HashMap<i64, Vec<f32>> = HashMap::new();
+            for id in 1..=216i64 {
+                let v = if id > 200 { q.iter().zip(random(&mut state, DIMS)).map(|(a, n)| a + 0.002 * n).collect() } else { random(&mut state, DIMS) };
+                conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&v))).unwrap();
+                live.insert(id, v);
+            }
+            for _ in 0..50 {
+                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            }
+            for id in 201..=216i64 {
+                let v = random(&mut state, DIMS);
+                conn.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&v))).unwrap();
+                live.insert(id, v);
+            }
+            let sql = format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT 10", literal(&q));
+            let plan = rows(&conn, &format!("EXPLAIN {sql}"));
+            assert!(plan.iter().any(|row| row[1].to_string() == "IndexMethodQuery"), "mvcc={mvcc}: the query does not go through the index");
+            let got: Vec<i64> = rows(&conn, &sql).iter().map(|row| row[0].as_int().unwrap()).collect();
+            let mut exact: Vec<(f64, i64)> = live.iter().map(|(id, v)| (dot(&q, v), *id)).collect();
+            exact.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let expected: Vec<i64> = exact[..10].iter().map(|(_, id)| *id).collect();
+            assert_eq!(got, expected, "mvcc={mvcc}");
+        }
+    }
+
+    /// Revising vectors near a query round after round, with maintenance between the rounds, keeps
+    /// each top ten exact; once maintenance has run out of work no block holds [`COMPACT_AT`] stale
+    /// copies, and every dead row names blocks that still hold a copy of its vector that the
+    /// vector's row does not point to.
+    #[test]
+    fn revisions_keep_the_top_ten_exact_and_every_dead_row_true() {
+        use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect};
+        const DIMS: usize = 128;
+        for mvcc in [false, true] {
+            let db = Database::open_file_with_flags(
+                Arc::new(MemoryIO::new()),
+                &format!("ivf-rq-revisions-{mvcc}.db"),
+                OpenFlags::default(),
+                DatabaseOpts::new().with_index_method(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 64, refine = 4)").unwrap();
+            let mut state = 29;
+            let q = random(&mut state, DIMS);
+            let near = |state: &mut u64| -> Vec<f32> { q.iter().zip(random(state, DIMS)).map(|(a, n)| a + 0.002 * n).collect() };
+            let exact_top = |live: &HashMap<i64, Vec<f32>>| -> Vec<i64> {
+                let mut exact: Vec<(f64, i64)> = live.iter().map(|(id, v)| (dot(&q, v), *id)).collect();
+                exact.sort_by(|a, b| b.0.total_cmp(&a.0));
+                exact[..10].iter().map(|(_, id)| *id).collect()
+            };
+            let sql = format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT 10", literal(&q));
+            let mut live: HashMap<i64, Vec<f32>> = HashMap::new();
+            for id in 1..=300i64 {
+                let v = if id > 280 { near(&mut state) } else { random(&mut state, DIMS) };
+                conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&v))).unwrap();
+                live.insert(id, v);
+            }
+            for round in 0..4 {
+                for _ in 0..30 {
+                    conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                }
+                // Three rounds revise the vectors near the query again; the last moves them away.
+                for id in 281..=300i64 {
+                    let v = if round < 3 { near(&mut state) } else { random(&mut state, DIMS) };
+                    conn.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&v))).unwrap();
+                    live.insert(id, v);
+                }
+                let got: Vec<i64> = rows(&conn, &sql).iter().map(|row| row[0].as_int().unwrap()).collect();
+                assert_eq!(got, exact_top(&live), "mvcc={mvcc} round {round}");
+            }
+            for _ in 0..100 {
+                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            }
+            let got: Vec<i64> = rows(&conn, &sql).iter().map(|row| row[0].as_int().unwrap()).collect();
+            assert_eq!(got, exact_top(&live), "mvcc={mvcc} after maintenance");
+            let mut stale: HashMap<i64, usize> = HashMap::new();
+            for row in rows(&conn, "SELECT rowid, blocks FROM __turso_internal_v_ivf_dead") {
+                let rowid = row[0].as_int().unwrap() & ((1 << ROWID_BITS) - 1);
+                let blocks = dead_blocks(row[1].to_blob().unwrap()).unwrap();
+                assert!(!blocks.is_empty(), "mvcc={mvcc}: the dead row of {rowid} names no block");
+                let location = rows(&conn, &format!("SELECT location FROM __turso_internal_v_ivf_vectors WHERE rowid = {rowid}"));
+                for block in blocks {
+                    assert!(
+                        location.iter().all(|r| r[0].as_int() != Some(Location::Block(block).encode())),
+                        "mvcc={mvcc}: the dead row of {rowid} names block {block}, where its vector lives"
+                    );
+                    let payload = rows(&conn, &format!("SELECT codes FROM __turso_internal_v_ivf_blocks WHERE rowid = {block}"));
+                    let payload = payload.first().unwrap_or_else(|| panic!("mvcc={mvcc}: the dead row of {rowid} names missing block {block}"));
+                    let entries = unpack(payload[0].to_blob().unwrap()).unwrap();
+                    assert!(entries.iter().any(|e| e.rowid == rowid), "mvcc={mvcc}: block {block} holds no copy of {rowid}");
+                    *stale.entry(block).or_default() += 1;
+                }
+            }
+            assert!(stale.values().all(|count| *count < COMPACT_AT), "mvcc={mvcc}: blocks left with stale copies {stale:?}");
         }
     }
 }

@@ -499,35 +499,38 @@ fn tile_products_body(v: &[f32], tile: &[f32], out: &mut [f32; TILE]) {
 
 kernel!(tile_products, tile_products_wide, tile_products_body, (v: &[f32], tile: &[f32], out: &mut [f32; TILE]) -> ());
 
-/// [`tile_products_body`] over a tile of bfloat16 values.
+/// [`tile_products_body`] over a tile of int8 values, each centroid's products still to be scaled.
 #[inline(always)]
-fn tile_products_halves_body(v: &[f32], tile: &[u16], out: &mut [f32; TILE]) {
+fn tile_products_bytes_body(v: &[f32], tile: &[i8], out: &mut [f32; TILE]) {
     let mut acc = [0.0f32; TILE];
     for (x, column) in v.iter().zip(tile.chunks_exact(TILE)) {
         for k in 0..TILE {
-            acc[k] += x * f32::from_bits((column[k] as u32) << 16);
+            acc[k] += x * column[k] as f32;
         }
     }
     *out = acc;
 }
 
-kernel!(tile_products_halves, tile_products_halves_wide, tile_products_halves_body, (v: &[f32], tile: &[u16], out: &mut [f32; TILE]) -> ());
+kernel!(tile_products_bytes, tile_products_bytes_wide, tile_products_bytes_body, (v: &[f32], tile: &[i8], out: &mut [f32; TILE]) -> ());
 
-/// `x` rounded to the nearest bfloat16, ties to even: its top sixteen bits.
-fn bfloat16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+/// `x` in units of `scale`, rounded to int8.
+fn quantized(x: f32, scale: f32) -> i8 {
+    match scale > 0.0 {
+        true => (x / scale).round().clamp(-127.0, 127.0) as i8,
+        false => 0,
+    }
 }
 
 /// A model's centroids in tiles of [`TILE`], each tile dimension-major, so a vector's products with
 /// a tile's centroids are one pass over its dimensions. A tile's slots past the last centroid are
-/// zero. `halves` holds the same values rounded to bfloat16, which a query ranks the partitions
-/// from, reading half the bytes.
+/// zero. `bytes` holds the same values rounded to int8 in units of each centroid's `scales`, its
+/// largest value over 127, which a query ranks the partitions over, reading a quarter of the bytes.
 #[derive(Debug, Clone, Default)]
 struct Tiles {
     dims: usize,
     values: Vec<f32>,
-    halves: Vec<u16>,
+    bytes: Vec<i8>,
+    scales: Vec<f32>,
 }
 
 impl Tiles {
@@ -538,11 +541,14 @@ impl Tiles {
         let size = self.dims * TILE;
         if self.values.len() < (tile + 1) * size {
             self.values.resize((tile + 1) * size, 0.0);
-            self.halves.resize((tile + 1) * size, 0);
+            self.bytes.resize((tile + 1) * size, 0);
+            self.scales.resize((tile + 1) * TILE, 0.0);
         }
+        let scale = c.iter().fold(0.0f32, |m, x| m.max(x.abs())) / 127.0;
+        self.scales[p] = scale;
         for (d, x) in c.iter().enumerate() {
             self.values[tile * size + d * TILE + lane] = *x;
-            self.halves[tile * size + d * TILE + lane] = bfloat16(*x);
+            self.bytes[tile * size + d * TILE + lane] = quantized(*x, scale);
         }
     }
 
@@ -551,9 +557,9 @@ impl Tiles {
         self.values.chunks_exact((self.dims * TILE).max(1)).enumerate().map(|(t, tile)| (t * TILE, tile))
     }
 
-    /// The tiles of bfloat16 values in partition order, each with its first partition.
-    fn halves(&self) -> impl Iterator<Item = (usize, &[u16])> + '_ {
-        self.halves.chunks_exact((self.dims * TILE).max(1)).enumerate().map(|(t, tile)| (t * TILE, tile))
+    /// The tiles of int8 values in partition order, each with its first partition.
+    fn bytes(&self) -> impl Iterator<Item = (usize, &[i8])> + '_ {
+        self.bytes.chunks_exact((self.dims * TILE).max(1)).enumerate().map(|(t, tile)| (t * TILE, tile))
     }
 }
 
@@ -1127,19 +1133,52 @@ impl Model {
 
     /// The partitions a query may probe, every one not retired, each with what ranks it: its
     /// distance from `q` less `q`'s squared length, or its product with `q` negated, the products
-    /// taken over the centroids rounded to bfloat16.
+    /// taken over the centroids rounded to int8, within a few thousandths of the exact ones.
     fn ranked(&self, q: &[f32], by_product: bool) -> Vec<(f32, i64)> {
         let mut ranked = Vec::with_capacity(self.centroids.len());
         let mut products = [0.0f32; TILE];
-        for (first, tile) in self.tiles.halves() {
-            tile_products_halves(q, tile, &mut products);
+        for (first, tile) in self.tiles.bytes() {
+            tile_products_bytes(q, tile, &mut products);
             for (k, product) in products[..(self.centroids.len() - first).min(TILE)].iter().enumerate() {
                 let i = first + k;
                 if self.states[i] != State::Retired {
+                    let product = product * self.tiles.scales[i];
                     ranked.push((if by_product { -product } else { self.squares[i] - 2.0 * product }, i as i64));
                 }
             }
         }
+        ranked
+    }
+
+    /// What ranks partition `p` for `q`, exactly, as [`Self::ranked`] gives it approximately.
+    fn rank(&self, q: &[f32], p: usize, by_product: bool) -> f32 {
+        let product = dot32(&self.centroids[p], q);
+        if by_product {
+            -product
+        } else {
+            self.squares[p] - 2.0 * product
+        }
+    }
+
+    /// The `take` partitions not retired that rank nearest `q`: every partition is ranked over the
+    /// int8 centroids, and the best quarter again as many as are taken, and thirty-two, again
+    /// exactly, so the rounding, a few thousandths, moves none across the cut.
+    fn probes(&self, q: &[f32], take: usize, by_product: bool) -> Vec<(f32, i64)> {
+        let mut ranked = self.ranked(q, by_product);
+        if take >= ranked.len() {
+            return ranked;
+        }
+        let order = |a: &(f32, i64), b: &(f32, i64)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
+        let near = (take + take / 4 + 32).min(ranked.len());
+        ranked.select_nth_unstable_by(near - 1, order);
+        ranked.truncate(near);
+        for entry in &mut ranked {
+            entry.0 = self.rank(q, entry.1 as usize, by_product);
+        }
+        if take > 0 {
+            ranked.select_nth_unstable_by(take - 1, order);
+        }
+        ranked.truncate(take);
         ranked
     }
 
@@ -2981,16 +3020,13 @@ impl IvfRqCursor {
         let probes: VecDeque<i64> = if self.model.centroids.is_empty() {
             VecDeque::from([0])
         } else {
-            let mut ranked = self.model.ranked(&query.vector, PROBE_BY_PRODUCT.load(Ordering::Relaxed) != 0);
+            let probeable = self.model.states.iter().filter(|s| **s != State::Retired).count();
             let take = match query.wanted {
-                usize::MAX => ranked.len(),
-                _ => nprobes.saturating_mul(widen).min(ranked.len()),
+                usize::MAX => probeable,
+                _ => nprobes.saturating_mul(widen).min(probeable),
             };
-            probed_all = take == ranked.len();
-            if take > 0 {
-                ranked.select_nth_unstable_by(take - 1, |a, b| a.0.total_cmp(&b.0));
-            }
-            ranked.truncate(take);
+            probed_all = take == probeable;
+            let ranked = self.model.probes(&query.vector, take, PROBE_BY_PRODUCT.load(Ordering::Relaxed) != 0);
             // A retired partition holds no block, but under MVCC a writer coding against a
             // model older than its retirement can still have left a tail entry there, which
             // maintenance moves out; until it does, the query reads it. A WAL writer codes
@@ -4333,7 +4369,7 @@ mod tests {
 
     /// The tiles give each vector the nearest live partition the direct products give it, and a
     /// query the same ranking of the partitions not retired as direct products over the centroids
-    /// rounded to bfloat16, after a centroid is placed over another and one past the last tile.
+    /// rounded to int8, after a centroid is placed over another and one past the last tile.
     #[test]
     fn the_tiles_assign_and_rank_as_the_direct_products_do() {
         for dims in [100, 768] {
@@ -4356,15 +4392,44 @@ mod tests {
                 ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
                 ranked.into_iter().map(|(_, p)| p).collect::<Vec<_>>()
             };
-            // The ranking reads the centroids rounded to bfloat16.
-            let rounded = |c: &[f32]| c.iter().map(|x| f32::from_bits((bfloat16(*x) as u32) << 16)).collect::<Vec<f32>>();
+            // The ranking reads the centroids rounded to int8 at each one's scale.
+            let rounded = |c: &[f32]| {
+                let scale = c.iter().fold(0.0f32, |m, x| m.max(x.abs())) / 127.0;
+                (c.iter().map(|x| quantized(*x, scale) as f32).collect::<Vec<f32>>(), scale)
+            };
             let direct = (0..model.centroids.len())
                 .filter(|i| model.states[*i] != State::Retired)
-                .map(|i| (model.squares[i] - 2.0 * dot32(&rounded(&model.centroids[i]), &q), i as i64))
+                .map(|i| {
+                    let (bytes, scale) = rounded(&model.centroids[i]);
+                    (model.squares[i] - 2.0 * dot32(&bytes, &q) * scale, i as i64)
+                })
                 .collect();
             assert_eq!(order(model.ranked(&q, false)), order(direct), "dims {dims}");
         }
     }
+
+    /// A query probes the partitions nearest it by the exact ranking, though it ranks them all over
+    /// centroids rounded to int8: the rounding moves none across the cut.
+    #[test]
+    fn a_query_probes_the_partitions_nearest_it_exactly() {
+        const DIMS: usize = 100;
+        let mut state = 23;
+        let mut model = Model::new((0..1000).map(|_| random(&mut state, DIMS)).collect(), 0.0);
+        model.states[5] = State::Retired;
+        for _ in 0..50 {
+            let q = random(&mut state, DIMS);
+            let mut exact: Vec<(f32, i64)> = (0..1000).filter(|i| model.states[*i] != State::Retired).map(|i| (model.rank(&q, i, false), i as i64)).collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for take in [1, 10, 64] {
+                let mut probed: Vec<i64> = model.probes(&q, take, false).into_iter().map(|(_, p)| p).collect();
+                let mut nearest: Vec<i64> = exact[..take].iter().map(|(_, p)| *p).collect();
+                probed.sort_unstable();
+                nearest.sort_unstable();
+                assert_eq!(probed, nearest, "take {take}");
+            }
+        }
+    }
+
 
     /// At 3072 dimensions the scan widens its 16-bit sums several times within one group.
     #[test]

@@ -1887,6 +1887,16 @@ impl HeldBlocks {
         self.codes.extend_from_slice(codes);
         self.blocks.push((key, version, at..self.codes.len()));
     }
+
+    /// Start the start of each block, for codes of `dims` padded dimensions, on its way to the
+    /// cache.
+    fn prefetch(&self, dims: usize) {
+        let ahead = held_prefetch(dims);
+        for (_, _, codes) in &self.blocks {
+            let start = &self.codes[codes.clone()];
+            prefetch(&start[..start.len().min(ahead)]);
+        }
+    }
 }
 
 /// A partition's rows but its blocks as a probe read them under `snapshot`: its bookkeeping's
@@ -3428,11 +3438,7 @@ impl IvfRqCursor {
                                     Some(held) => {
                                         tally(&CACHE_HITS, 1);
                                         end = partition_key(partition, BLOCK_ROW, 0)?;
-                                        let ahead = held_prefetch(self.query.as_ref().map_or(0, |q| q.rotated.len()));
-                                        for (_, _, codes) in &held.blocks {
-                                            let start = &held.codes[codes.clone()];
-                                            prefetch(&start[..start.len().min(ahead)]);
-                                        }
+                                        held.prefetch(self.query.as_ref().map_or(0, |q| q.rotated.len()));
                                         Blocks::Held(held)
                                     }
                                     None if shared.cache.admits(partition, version) => {
@@ -3570,42 +3576,42 @@ impl IvfRqCursor {
     }
 
     /// Probe the next partitions, scoring from memory those whose held rows serve this snapshot,
-    /// until one must be read from pages; with none left, the rerank.
+    /// the next one's blocks started on their way to the cache while each is scored, until one
+    /// must be read from pages; with none left, the rerank.
     fn next_probe(&mut self, mut probes: VecDeque<i64>) -> Result<Search> {
-        while let Some(partition) = probes.pop_front() {
+        let dims = self.query.as_ref().map_or(0, |q| q.rotated.len());
+        let mut next = probes.pop_front().map(|p| (p, self.held(p)));
+        while let Some((partition, held)) = next.take() {
             #[cfg(test)]
             PROBES.with(|count| count.set(count.get() + 1));
-            if self.score_held(partition)? {
-                continue;
+            let Some((rows, blocks)) = held else {
+                let (_, end) = rows_from(partition, PART_ROW)?;
+                return Ok(Search::Probe { probes, partition, walk: Walk::Seek, end, blocks: Blocks::Unread, rows: None });
+            };
+            next = probes.pop_front().map(|p| (p, self.held(p)));
+            if let Some((_, Some((_, ahead)))) = &next {
+                ahead.prefetch(dims);
             }
-            let (_, end) = rows_from(partition, PART_ROW)?;
-            return Ok(Search::Probe { probes, partition, walk: Walk::Seek, end, blocks: Blocks::Unread, rows: None });
+            self.score_held(partition, &rows, &blocks)?;
         }
         Ok(Search::Rerank { candidates: VecDeque::new(), rowid: None })
     }
 
-    /// Score `partition` from memory, reading no page, when the rows held for it serve this
-    /// cursor's snapshot and its blocks are held under their version.
-    fn score_held(&mut self, partition: i64) -> Result<bool> {
-        let Some(sharing) = &self.sharing else {
-            return Ok(false);
-        };
-        let Some(snapshot) = sharing.snapshot else {
-            return Ok(false);
-        };
-        let (rows, blocks) = {
-            let mut shared = self.shared.lock().expect("index state");
-            let Some(rows) = shared.cache.rows.get(&partition).cloned() else {
-                return Ok(false);
-            };
-            if !sharing.writes.lock().expect("index writes").serves(partition, rows.snapshot, snapshot, || sharing.clock.now()) {
-                return Ok(false);
-            }
-            let Some(blocks) = shared.cache.get(partition, rows.version) else {
-                return Ok(false);
-            };
-            (rows, blocks)
-        };
+    /// The rows held for `partition` and its blocks, held under their version, when the rows serve
+    /// this cursor's snapshot, so the partition is scored from memory, reading no page.
+    fn held(&self, partition: i64) -> Option<(Arc<HeldRows>, Arc<HeldBlocks>)> {
+        let sharing = self.sharing.as_ref()?;
+        let snapshot = sharing.snapshot?;
+        let mut shared = self.shared.lock().expect("index state");
+        let rows = shared.cache.rows.get(&partition).cloned()?;
+        if !sharing.writes.lock().expect("index writes").serves(partition, rows.snapshot, snapshot, || sharing.clock.now()) {
+            return None;
+        }
+        let blocks = shared.cache.get(partition, rows.version)?;
+        Some((rows, blocks))
+    }
+
+    fn score_held(&mut self, partition: i64, rows: &HeldRows, blocks: &HeldBlocks) -> Result<()> {
         tally(&CACHE_HITS, 1);
         tally(&ROW_HITS, 1);
         let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
@@ -3617,7 +3623,7 @@ impl IvfRqCursor {
             let _scoring = timer(&SCORE_NANOS);
             score_block(query, codes, centre, source)?;
         }
-        Ok(true)
+        Ok(())
     }
 
     /// The maintenance [`IndexMethodCursor::stage_statement_commit`] does before the statement's

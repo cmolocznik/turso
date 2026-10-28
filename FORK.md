@@ -220,8 +220,25 @@ recall@10 0.90 / 0.95, from 585 / 336:
   (`a_query_probes_the_partitions_nearest_it_exactly`): within the runs' spread of bfloat16.
 - A query probes its partitions nearest first, so its bar rises soonest and fewer entries of the
   later partitions are refined: 7 to 11% faster at every setting, 1,766 / 881.
+- A partition's bookkeeping, dead rows and tail are held beside its blocks with the snapshot they
+  were read under, and a probe under another snapshot scores the partition from memory, reading no
+  page, while no transaction writing the index is open and both snapshots are at or past the last
+  commit that wrote the partition. Inserts and deletes leave the version alone, so two writers into
+  one partition never write one row, and the version can't say whether its tail or dead rows moved.
+  Each transaction is entered in a record every attachment of the index shares before its first
+  write to the partitions table reaches a page, and taken off as it ends, raising the partitions it
+  wrote to the commit position then: the WAL's last committed frame under its checkpoint sequence,
+  or a timestamp drawn from the MVCC clock. A rolled-back one is raised too, as a rollback can follow
+  a commit made durable before its statement was dropped; a WAL writer's rows are not held, its
+  snapshot counting frames a rollback gives back. Off in attached databases and under multiprocess
+  WAL, whose other processes' commits run no hook here. The next probe is resolved and the start of
+  its blocks prefetched while each is scored, as the page reads used to hide that latency: 21 to 32%
+  faster at every setting, 2,159 / 1,136
+  (`held_rows_serve_later_snapshots_until_a_commit_writes_their_partition`, which also checks a
+  commit inside a transaction, a rollback, OPTIMIZE INDEX and a checkpoint that restarts the WAL,
+  `a_snapshot_never_takes_rows_held_under_a_later_one`, `held_rows_come_and_go_with_their_blocks`).
 ScaNN runs 3,121 / 1,365 and the RaBitQ library at 7 bits 2,808 / 1,272 on the same core: ivf_rq is
-1.6x / 1.45x behind the library, from 4.8x / 3.8x. The index is 181 bytes a vector at 100
+1.3x / 1.1x behind the library, from 4.8x / 3.8x. The index is 181 bytes a vector at 100
 dimensions, the library's 140.
 
 An index created `WITH (rerank = 0)` answers with its best 7-bit estimates at their estimated
@@ -238,10 +255,11 @@ dimensions the index is 213 MB instead of 264, recall at a refine of two is unch
 place, and queries run 8 to 17% faster at each setting: 1,752-1,796 a second at 48 probes (0.908)
 against 1,579-1,671, 1,302-1,340 at 96 (0.955) against 1,176-1,225.
 `a_rotation_pads_to_a_multiple_of_32_and_keeps_lengths_and_products`. With the changes after it,
-the Cohere slice runs 3,532 / 2,062 queries a second at recall@10 0.90 / 0.95 on one core, against
+the Cohere slice runs 3,803 / 2,394 queries a second at recall@10 0.90 / 0.95 on one core, against
 3,774 / 2,785 for the RaBitQ library at 7 bits and 1,942 / 1,061 for ScaNN; at 768 dimensions the
 bfloat16 ranking alone was worth 24% at 0.90, the ranking having read 6 MB of f32 centroids a query,
-and probing nearest first 12% more.
+probing nearest first 12% more, and the held rows 4 to 29%, more the more partitions a query
+probes.
 
 A statement's maintenance shares the partitions where it found work its jobs did not cover with the
 index's other cursors, and the next statements survey as many of them as they may do jobs, so that
@@ -262,8 +280,8 @@ unbalanced, and at 48 probes they hold 4.3% of the vectors against ivf_rq's 2.9%
 scanned ivf_rq's partitions find more of the top ten (0.910 against 0.901 near 2.9%, 0.957 against
 0.951 near 5.8%), and its estimates lose none of them (`tmp/ann/partcmp/partcmp.py`). Still owed: the
 rest of the gap at one query at a time, which is the cost of each scanned vector (about 56 ns all in
-at 768 dimensions against the library's 30) and of each probe's page reads; the build takes 26 s on
-glove-100 over the laptop's cores.
+at 768 dimensions against the library's 30), and a probe's page reads while a transaction writing
+the index is open; the build takes 26 s on glove-100 over the laptop's cores.
 
 ## Considered and not taken
 

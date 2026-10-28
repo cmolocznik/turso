@@ -44,7 +44,9 @@
 //! codes are interleaved 32 vectors at a time for a fast scan over per-query nibble tables of
 //! bytes. A query scores from its 7-bit code, where its block lies, each entry whose 1-bit
 //! estimate raised by its error bound reaches the worst of the `refine * limit` best 7-bit
-//! estimates so far, and reranks those best exactly from the table's vectors.
+//! estimates so far, and reranks those best exactly from the table's vectors; an index created
+//! `WITH (rerank = 0)` answers with those best estimates and their estimated distances instead,
+//! reading no table row.
 //!
 //! Three backing tables, every key an integer so a seek compares no payload. Partitions holds each
 //! partition's rows under one key range, `partition << 42 | kind << 40 | id`, so a query reads a
@@ -94,6 +96,9 @@ pub static ANISOTROPY_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// Nonzero ranks partitions to probe by the query's inner product with their centroids rather than
 /// by distance, for measurement.
 pub static PROBE_BY_PRODUCT: AtomicUsize = AtomicUsize::new(0);
+/// A process-wide rerank switch for measurement sweeps: 1 reranks, 2 answers from the 7-bit
+/// estimates; zero leaves the index's own `rerank`.
+pub static RERANK_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// Maintenance done in this process: packs, splits, entries recoded, stale entries dropped, and
 /// the summed and longest split durations, for measurement.
 pub static PACKS: AtomicUsize = AtomicUsize::new(0);
@@ -2310,8 +2315,9 @@ thread_local! {
     /// The point reads made on this thread, and the entries queries on it scored from 7-bit codes.
     static POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUERY_REFINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// The exact 1-bit sums queries on this thread took.
+    /// The exact 1-bit sums queries on this thread took, and the table rows their reranks read.
     static EXACT_SUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The seeks walks made on this thread, the partitions queries on it probed, and the blocks
     /// they read from pages.
     static WALK_SEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2423,6 +2429,9 @@ pub struct IvfRqCursor {
     configuration: IndexMethodConfiguration,
     nprobes: usize,
     refine: usize,
+    /// Whether a query reranks its best estimates exactly from the table's vectors; without, it
+    /// answers with the estimates and their estimated distances, reading no table row.
+    rerank: bool,
     /// The anisotropic threshold T in hundredths: the weight on an error along the vector is
     /// `(D - 1) T^2 / (1 - T^2)` times the weight across it. Zero assigns by plain distance.
     anisotropy: usize,
@@ -2470,6 +2479,7 @@ impl IvfRqCursor {
         Self {
             nprobes: parameter("nprobes", 16).max(1),
             refine: parameter("refine", 4).max(1),
+            rerank: parameter("rerank", 1) != 0,
             anisotropy: parameter("anisotropy", 0).min(99),
             configuration,
             schema,
@@ -3137,9 +3147,25 @@ impl IvfRqCursor {
                 }
                 Search::Rerank { mut candidates, rowid } => {
                     let _timer = timer(&RERANK_NANOS);
+                    let rerank = match RERANK_OVERRIDE.load(Ordering::Relaxed) {
+                        0 => self.rerank,
+                        n => n == 1,
+                    };
                     let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
                     if candidates.is_empty() && rowid.is_none() && !query.estimates.is_empty() {
-                        candidates = std::mem::take(&mut query.estimates).into_iter().map(|o| o.1).collect();
+                        let estimates = std::mem::take(&mut query.estimates);
+                        match rerank {
+                            true => candidates = estimates.into_iter().map(|o| o.1).collect(),
+                            // The best estimates are the answer, at their estimated distances.
+                            false => {
+                                for estimate in estimates {
+                                    query.results.push(estimate);
+                                    if query.results.len() > query.limit {
+                                        query.results.pop();
+                                    }
+                                }
+                            }
+                        }
                     }
                     let Some(current) = rowid.or_else(|| candidates.pop_front()) else {
                         let mut results: Vec<Ordered> = std::mem::take(&mut query.results).into_vec();
@@ -3164,6 +3190,8 @@ impl IvfRqCursor {
                         }
                         return Ok(IOResult::Done(!self.answer.is_empty()));
                     };
+                    #[cfg(test)]
+                    TABLE_READS.with(|count| count.set(count.get() + 1));
                     let main = self.main.as_mut().ok_or_else(|| error("table cursor must be open"))?;
                     match main.seek(SeekKey::TableRowId(current), SeekOp::GE { eq_only: true })? {
                         IOResult::Done(SeekResult::Found) => {}
@@ -4408,6 +4436,44 @@ mod tests {
                 })
                 .collect();
             assert_eq!(order(model.ranked(&q, false)), order(direct), "dims {dims}");
+        }
+    }
+
+    /// An index created with `rerank = 0` answers from its best 7-bit estimates and reads no table
+    /// row: at a refine of one, the same ten rows a reranking index returns, each at an estimated
+    /// distance near its exact one.
+    #[test]
+    fn a_query_without_the_rerank_answers_from_its_estimates_and_reads_no_table_row() {
+        const DIMS: usize = 64;
+        let mut answers = Vec::new();
+        for rerank in [1, 0] {
+            let (_db, conn) = database(&format!("ivf-rq-rerank-{rerank}.db"), false);
+            let mut state = 139;
+            let vectors: Vec<(i64, Vec<f32>)> = (1..=2000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &vectors);
+            conn.execute(format!("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 1, rerank = {rerank})")).unwrap();
+            let q = random(&mut state, DIMS);
+            top_ten(&conn, &q);
+            let reads = TABLE_READS.with(|c| c.get());
+            let answer: Vec<(i64, f64)> = rows(&conn, &format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT 10", literal(&q)))
+                .iter()
+                .map(|row| (row[0].as_int().unwrap(), row[1].as_float()))
+                .collect();
+            let reads = TABLE_READS.with(|c| c.get()) - reads;
+            let live: HashMap<i64, Vec<f32>> = vectors.into_iter().collect();
+            answers.push((answer, reads, live, q));
+        }
+        let ((reranked, reranked_reads, _, _), (estimated, estimated_reads, live, q)) = (&answers[0], &answers[1]);
+        assert!(*reranked_reads >= 10 && *estimated_reads == 0, "table rows read: {reranked_reads} reranking, {estimated_reads} without");
+        let ids = |answer: &[(i64, f64)]| {
+            let mut ids: Vec<i64> = answer.iter().map(|(id, _)| *id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(reranked), ids(estimated));
+        for (id, distance) in estimated {
+            let exact = -dot(q, &live[id]);
+            assert!((distance - exact).abs() < 0.1, "row {id}: estimated distance {distance}, exact {exact}");
         }
     }
 

@@ -20,24 +20,25 @@
 //! least recently probed partition gives way first.
 //!
 //! A statement that writes the index does the maintenance its writes made due before they are
-//! released, at most one job for each row it wrote, and `OPTIMIZE INDEX t_idx` does every job
-//! there is. Maintenance conflicts only with a write to a row it changes, and on a conflict it
-//! undoes its job and leaves the rows to the writer holding them. Its jobs: pack a partition's tail
-//! into blocks of [`BLOCK`]; rewrite a block holding [`COMPACT_AT`] stale copies without them;
-//! split a partition grown past an eighth of the partition count, and two blocks, by 2-means over
-//! its members' vectors read back from the table, so partitions stay near four times the square
-//! root of the row count, marking it and its [`NEIGHBOURS`] nearest partitions moving, so moves
-//! recheck every entry there, move each to its nearest partition and recode those that stay
-//! against their partition's new centroid; retire a partition left with under a sixteenth of the
-//! split bound, moving its entries to their nearest partitions; and rebuild, training partitions
-//! afresh by k-means over a sample of every vector, when a statement inserting [`BULK_AT`] rows or
-//! more finds the index trained for under a quarter of the partitions its rows call for. CREATE
-//! INDEX over [`BULK_AT`] rows or more writes tail entries for its first rows only and rebuilds
-//! over all of them, so each of the rest is coded into its block once. Every rewrite of a block
-//! takes it off the dead rows of the copies it drops. A split never overwrites a centroid: it
-//! writes new versions, and every entry names the version it was coded against, so an insert
-//! committed from a snapshot older than the split still scores correctly until maintenance
-//! recodes it. The index starts as one partition about the origin.
+//! released, at most one job for each row it wrote, leaving the work it finds due past that to the
+//! next statement's, and `OPTIMIZE INDEX t_idx` does every job there is. Maintenance conflicts
+//! only with a write to a row it changes, and on a conflict it undoes its job and leaves the rows
+//! to the writer holding them. Its jobs: pack a partition's tail into blocks of [`BLOCK`]; rewrite
+//! a block holding [`COMPACT_AT`] stale copies without them; split a partition grown past an
+//! eighth of the partition count, and two blocks, by 2-means over its members' vectors read back
+//! from the table, so partitions stay near four times the square root of the row count, marking
+//! it and its [`NEIGHBOURS`] nearest partitions moving, so moves recheck every entry there, move
+//! each to its nearest partition and recode those that stay against their partition's new
+//! centroid; retire a partition left with under a sixteenth of the split bound, moving its entries
+//! to their nearest partitions; and rebuild, training partitions afresh by k-means over a sample
+//! of every vector, when a statement inserting [`BULK_AT`] rows or more finds the index trained
+//! for under a quarter of the partitions its rows call for. CREATE INDEX over [`BULK_AT`] rows or
+//! more writes tail entries for its first rows only and rebuilds over all of them, so each of the
+//! rest is coded into its block once. Every rewrite of a block takes it off the dead rows of the
+//! copies it drops. A split never overwrites a centroid: it writes new versions, and every entry
+//! names the version it was coded against, so an insert committed from a snapshot older than the
+//! split still scores correctly until maintenance recodes it. The index starts as one partition
+//! about the origin.
 //!
 //! Each vector carries a 7-bit extended RaBitQ code whose top bit is its 1-bit code. The 1-bit
 //! codes are interleaved 32 vectors at a time for a fast scan over per-query nibble tables of
@@ -1581,12 +1582,14 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
     BackingSchema::new(tables, Vec::new())
 }
 
-/// What the index's cursors share: the model last loaded or written, under its generation, and
-/// the partitions known to be moving, which any writer's maintenance moves along.
+/// What the index's cursors share: the model last loaded or written, under its generation; the
+/// partitions known to be moving, which any writer's maintenance moves along; and those a run left
+/// work due in, its jobs spent, which the next statements' maintenance surveys beside its own.
 #[derive(Default, Debug)]
 struct SharedState {
     model: Option<(i64, Arc<Model>)>,
     moving: BTreeSet<i64>,
+    due: BTreeSet<i64>,
     cache: PartitionCache,
 }
 
@@ -1834,14 +1837,14 @@ enum Job {
 }
 
 /// What a survey read of the partitions maintenance chooses from: their tails, bookkeeping and the
-/// stale copies their blocks hold. A statement's maintenance reads the partitions it wrote and
-/// those known to be moving; `OPTIMIZE INDEX` reads them all.
+/// stale copies their blocks hold. A statement's maintenance reads the partitions it wrote, those
+/// known to be moving and those earlier runs left work due in; `OPTIMIZE INDEX` reads them all.
 #[derive(Default)]
 struct Survey {
     tails: HashMap<i64, usize>,
     parts: Parts,
-    /// Stale copies per block, from the dead rows.
-    stale: HashMap<i64, usize>,
+    /// Stale copies per block, from the dead rows, in key order: a partition's blocks are a range.
+    stale: BTreeMap<i64, usize>,
     /// The partitions read.
     read: BTreeSet<i64>,
     /// The vectors the index holds, when the survey read them all.
@@ -1852,7 +1855,16 @@ impl Survey {
     fn forget(&mut self, partition: i64) {
         self.tails.remove(&partition);
         self.parts.remove(&partition);
-        self.stale.retain(|block, _| partition_of(*block) != partition);
+        let blocks: Vec<i64> = self.stale_in(partition).map(|(block, _)| block).collect();
+        for block in blocks {
+            self.stale.remove(&block);
+        }
+    }
+
+    /// The stale copies each of a partition's blocks holds.
+    fn stale_in(&self, partition: i64) -> impl Iterator<Item = (i64, usize)> + '_ {
+        let start = partition << PARTITION_SHIFT | BLOCK_ROW << ROWID_BITS;
+        self.stale.range(start..(partition + 1) << PARTITION_SHIFT).map(|(block, count)| (*block, *count))
     }
 
     fn part(&self, partition: i64) -> Part {
@@ -1865,7 +1877,7 @@ impl Survey {
 
     /// The entries a partition holds that are live: packed and tail entries, less stale copies.
     fn live(&self, partition: i64) -> i64 {
-        let stale: usize = self.stale.iter().filter(|(block, _)| partition_of(**block) == partition).map(|(_, count)| *count).sum();
+        let stale: usize = self.stale_in(partition).map(|(_, count)| count).sum();
         self.part(partition).size + self.tail(partition) as i64 - stale as i64
     }
 }
@@ -2077,8 +2089,10 @@ fn surveyed() {
 
 #[cfg(test)]
 thread_local! {
-    /// Whether statements on this thread maintain the index, which tests turn off to leave a backlog.
+    /// Whether statements on this thread maintain the index, which tests turn off to leave a backlog,
+    /// and the most jobs a statement's maintenance on it does, which tests lower to leave work due.
     static STATEMENT_UPKEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static STATEMENT_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 fn statement_upkeep() -> bool {
@@ -2086,6 +2100,15 @@ fn statement_upkeep() -> bool {
     return STATEMENT_UPKEEP.with(|on| on.get());
     #[cfg(not(test))]
     true
+}
+
+/// The jobs the maintenance of a statement that wrote `written` rows of the index may do: one for
+/// each.
+fn statement_budget(written: usize) -> usize {
+    #[cfg(test)]
+    return written.min(STATEMENT_BUDGET.with(|budget| budget.get()));
+    #[cfg(not(test))]
+    written
 }
 
 /// What a filtered query has given out: the rowids, so a later round gives none out again, and the
@@ -2681,10 +2704,11 @@ impl IndexMethodCursor for IvfRqCursor {
     }
 
     /// Before the statement's writes are released, do the maintenance they made due, chosen among
-    /// the partitions it wrote and a few known to be moving, so moves finish whichever partitions
-    /// writers touch: at most one job for each row the statement wrote, when statements of a hundred
-    /// random rows cost about half a job a row to keep maintained, so a run ends with nothing due
-    /// well before its bound.
+    /// the partitions it wrote, a few known to be moving, so moves finish whichever partitions
+    /// writers touch, and as many as it may do jobs of those earlier runs left work due in, so work
+    /// a statement found and had no job left for is done by the next: at most one job for each row
+    /// the statement wrote, when statements of a hundred random rows cost about half a job a row to
+    /// keep maintained, so a run ends with nothing due well before its bound.
     fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         if let Some(rowids) = self.building.take().filter(|rowids| rowids.len() >= BULK_AT) {
             // A CREATE INDEX over BULK_AT rows or more: a rebuild over them clears the tail entries
@@ -2701,12 +2725,16 @@ impl IndexMethodCursor for IvfRqCursor {
                 self.inserted = 0;
                 return Ok(IOResult::Done(()));
             }
+            let budget = statement_budget(self.written);
             let mut first = std::mem::take(&mut self.touched);
-            first.extend(self.shared.lock().expect("index state").moving.iter().take(HINTED).copied());
+            let shared = self.shared.lock().expect("index state");
+            first.extend(shared.moving.iter().take(HINTED).copied());
+            first.extend(shared.due.iter().take(budget).copied());
+            drop(shared);
             // A statement that inserted many rows surveys every partition, so a rebuild is chosen
             // when its rows have outgrown the partitions.
             let all = self.inserted >= BULK_AT;
-            self.run = Some(Run { budget: self.written, survey: Survey::default(), all, first: first.into_iter().collect(), build: None });
+            self.run = Some(Run { budget, survey: Survey::default(), all, first: first.into_iter().collect(), build: None });
             self.written = 0;
             self.inserted = 0;
         }
@@ -3428,7 +3456,10 @@ impl IvfRqCursor {
                             self.model = Arc::new(*model);
                             self.generation = Some(generation);
                             self.publish();
-                            self.shared.lock().expect("index state").moving.clear();
+                            let mut shared = self.shared.lock().expect("index state");
+                            shared.moving.clear();
+                            shared.due.clear();
+                            drop(shared);
                             REBUILDS.fetch_add(1, Ordering::Relaxed);
                             JOBS.fetch_add(1, Ordering::Relaxed);
                             self.saved = None;
@@ -3523,6 +3554,18 @@ impl IvfRqCursor {
         let run = self.run.as_ref().ok_or_else(|| error("maintenance without a run"))?;
         let job = if run.budget == 0 { None } else { self.choose(&run.survey) };
         let Some(job) = job else {
+            // The partitions the run read that it leaves work due in, its jobs spent, are the next
+            // statements' to survey; those it leaves none in no longer are.
+            let settled = self.settled(&run.survey);
+            let read: Vec<(i64, bool)> = run.survey.read.iter().map(|p| (*p, self.choose_among(&run.survey, &BTreeSet::from([*p]), settled).is_some())).collect();
+            let mut shared = self.shared.lock().expect("index state");
+            for (p, due) in read {
+                match due {
+                    true => shared.due.insert(p),
+                    false => shared.due.remove(&p),
+                };
+            }
+            drop(shared);
             self.run = None;
             return Ok(None);
         };
@@ -3545,7 +3588,18 @@ impl IvfRqCursor {
                 return Some(Job::Rebuild);
             }
         }
-        let read = || survey.read.iter().copied();
+        self.choose_among(survey, &survey.read, self.settled(survey))
+    }
+
+    /// Whether no partition is moving: none the survey read, and none a run has found moving.
+    fn settled(&self, survey: &Survey) -> bool {
+        survey.parts.values().all(|part| !part.moving()) && self.shared.lock().expect("index state").moving.is_empty()
+    }
+
+    /// The job [`Self::choose`] picks among `partitions`, which the survey read: a partition too
+    /// small to keep is retired only once no partition is moving, which `settled` says.
+    fn choose_among(&self, survey: &Survey, partitions: &BTreeSet<i64>, settled: bool) -> Option<Job> {
+        let read = || partitions.iter().copied();
         let live = |p: i64| self.model.state(p) == State::Live && survey.part(p).state == State::Live;
         // A tail long enough to stop a survey's count is packed before anything else: queries
         // read a tail entry by entry, and moves keep adding to their targets' tails.
@@ -3561,10 +3615,9 @@ impl IvfRqCursor {
         if let Some(p) = read().filter(|p| live(*p) && survey.tail(*p) >= PACK_AT).max_by_key(|p| (survey.tail(*p), -*p)) {
             return Some(Job::Pack(p));
         }
-        if let Some((block, _)) = survey.stale.iter().filter(|(block, count)| **count >= COMPACT_AT && live(partition_of(**block))).max_by_key(|(block, count)| (**count, -**block)) {
-            return Some(Job::Compact(*block));
+        if let Some((block, _)) = read().flat_map(|p| survey.stale_in(p)).filter(|(block, count)| *count >= COMPACT_AT && live(partition_of(*block))).max_by_key(|(block, count)| (*count, -*block)) {
+            return Some(Job::Compact(block));
         }
-        let settled = survey.parts.values().all(|part| !part.moving()) && self.shared.lock().expect("index state").moving.is_empty();
         if settled && self.model.live() > 1 {
             if let Some(p) = read().find(|p| live(*p) && survey.live(*p) < self.retire_bound()) {
                 return Some(Job::Retire(p));
@@ -4524,6 +4577,43 @@ mod tests {
                 let q = random(&mut state, DIMS);
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
             }
+        }
+    }
+
+    /// Work a statement's maintenance found due but had no job left for is done by the next
+    /// statement's, though that one writes none of the partitions the work lies in.
+    #[test]
+    fn work_a_statement_left_due_is_done_by_the_next() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-left-{mvcc}.db"), mvcc);
+            let mut state = 127;
+            let centres: Vec<Vec<f32>> = (0..12).map(|_| random(&mut state, DIMS).iter().map(|x| 3.0 * x).collect()).collect();
+            let rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, near(&mut state, &centres, 0.4))).collect();
+            insert_all(&conn, &rows);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            assert!(stored(&conn).pending().is_empty(), "mvcc={mvcc}: {:?}", stored(&conn).pending());
+            let mut next = 3000i64;
+            let mut around = |state: &mut u64, c: usize, n: usize| -> Vec<(i64, Vec<f32>)> {
+                (0..n)
+                    .map(|_| {
+                        next += 1;
+                        (next, near(state, &centres[c..=c], 0.01))
+                    })
+                    .collect()
+            };
+            // One statement grows two tails past the pack length with one job to spend: it packs one.
+            let mut two = around(&mut state, 0, 20);
+            two.extend(around(&mut state, 1, 20));
+            STATEMENT_BUDGET.with(|budget| budget.set(1));
+            insert_all(&conn, &two);
+            STATEMENT_BUDGET.with(|budget| budget.set(usize::MAX));
+            let left = stored(&conn).pending();
+            assert_eq!(left.len(), 1, "mvcc={mvcc}: the statement left {left:?}");
+            // The next writes one row, into a third partition.
+            insert_all(&conn, &around(&mut state, 2, 1));
+            let left = stored(&conn).pending();
+            assert!(left.is_empty(), "mvcc={mvcc}: the next statement left {left:?}");
         }
     }
 

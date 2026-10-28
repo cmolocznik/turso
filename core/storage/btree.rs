@@ -1636,8 +1636,15 @@ impl BTreeCursor {
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                let payload =
-                    crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
+                // Reserve the whole payload once, so the chain's pages copy in without regrowing it.
+                let mut whole = crate::with_btree_allocation_site!(
+                    OverflowRead,
+                    <crate::alloc::Vec<u8> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+                        payload_size as usize
+                    )
+                )?;
+                whole.extend_from_slice(payload);
+                let payload = whole;
                 self.read_overflow_state.replace(ReadPayloadOverflow {
                     payload,
                     next_page: start_next_page,
@@ -1683,10 +1690,8 @@ impl BTreeCursor {
                 page,
             } = self.read_overflow_state.as_mut().unwrap();
             let buf = page.get_contents().as_ptr();
-            crate::with_btree_allocation_site!(
-                OverflowRead,
-                payload.try_extend(buf[4..4 + to_read].iter().copied())
-            )?;
+            crate::with_btree_allocation_site!(OverflowRead, payload.try_reserve(to_read))?;
+            payload.extend_from_slice(&buf[4..4 + to_read]);
             *remaining_to_read -= to_read;
 
             if let Some((new_page, c)) = new_page_and_c {

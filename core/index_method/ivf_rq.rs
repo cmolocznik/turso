@@ -572,25 +572,68 @@ fn extra(entry: &Entry) -> Vec<u8> {
     out
 }
 
-kernel!(lower_product, lower_product_wide, lower_product_body, (rotated: &[f32], ex: &[u8]) -> f64);
-
 /// The rotated query's product with an entry's lower bits: the 7-bit code's part below the sign.
-#[inline(always)]
-fn lower_product_body(rotated: &[f32], ex: &[u8]) -> f64 {
-    // Eight dimensions a step, one lane each: their six-bit values unpack from two 24-bit words.
-    let mut sums = [0.0f32; 8];
-    for (bytes, q) in ex.chunks_exact(6).zip(rotated.chunks_exact(8)) {
+fn lower_product(rotated: &[f32], ex: &[u8]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is present, and `ex` holds six bytes for each eight dimensions of `rotated`.
+        return unsafe { lower_product_avx2(rotated, ex) };
+    }
+    lower_product_scalar(rotated, ex)
+}
+
+fn lower_product_scalar(rotated: &[f32], ex: &[u8]) -> f64 {
+    // Eight dimensions a step, their six-bit values unpacked from two 24-bit words: the even steps
+    // in the first eight lanes, the odd in the last eight.
+    let mut sums = [0.0f32; 16];
+    for (step, (bytes, q)) in ex.chunks_exact(6).zip(rotated.chunks_exact(8)).enumerate() {
+        let lanes = &mut sums[8 * (step % 2)..][..8];
         let low = bytes[0] as u32 | (bytes[1] as u32) << 8 | (bytes[2] as u32) << 16;
         let high = bytes[3] as u32 | (bytes[4] as u32) << 8 | (bytes[5] as u32) << 16;
         for k in 0..4 {
-            sums[k] += q[k] * ((low >> (6 * k)) & 63) as f32;
-            sums[4 + k] += q[4 + k] * ((high >> (6 * k)) & 63) as f32;
+            lanes[k] += q[k] * ((low >> (6 * k)) & 63) as f32;
+            lanes[4 + k] += q[4 + k] * ((high >> (6 * k)) & 63) as f32;
         }
     }
     sums.iter().map(|&s| s as f64).sum()
 }
 
-const _: () = assert!(EX_BITS == 6, "lower_product_body unpacks, and code packs, six lower bits");
+/// [`lower_product_scalar`] eight dimensions to a register: each 32-bit lane takes the 24-bit
+/// word its dimension lies in and shifts its six bits down, and the lanes add as the scalar ones
+/// do, the even steps in one register and the odd in another.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn lower_product_avx2(rotated: &[f32], ex: &[u8]) -> f64 {
+    use std::arch::x86_64::*;
+    debug_assert!(rotated.len() % 8 == 0 && ex.len() == rotated.len() / 8 * 6);
+    let words = _mm256_setr_epi8(0, 1, 2, -1, 0, 1, 2, -1, 0, 1, 2, -1, 0, 1, 2, -1, 3, 4, 5, -1, 3, 4, 5, -1, 3, 4, 5, -1, 3, 4, 5, -1);
+    let shifts = _mm256_setr_epi32(0, 6, 12, 18, 0, 6, 12, 18);
+    let mask = _mm256_set1_epi32(63);
+    let mut sums = [_mm256_setzero_ps(); 2];
+    let steps = rotated.len() / 8;
+    for step in 0..steps {
+        // Eight bytes read from the step's six, but the last step's bytes copied out first, so no
+        // read passes the code's end.
+        let mut last = [0u8; 8];
+        let bytes = match step + 1 < steps {
+            true => ex.as_ptr().add(6 * step),
+            false => {
+                last[..6].copy_from_slice(&ex[6 * step..6 * step + 6]);
+                last.as_ptr()
+            }
+        };
+        let both = _mm256_broadcastsi128_si256(_mm_loadl_epi64(bytes as *const __m128i));
+        let values = _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(both, words), shifts), mask);
+        let q = _mm256_loadu_ps(rotated.as_ptr().add(8 * step));
+        sums[step % 2] = _mm256_add_ps(sums[step % 2], _mm256_mul_ps(q, _mm256_cvtepi32_ps(values)));
+    }
+    let mut lanes = [0.0f32; 16];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), sums[0]);
+    _mm256_storeu_ps(lanes.as_mut_ptr().add(8), sums[1]);
+    lanes.iter().map(|&s| s as f64).sum()
+}
+
+const _: () = assert!(EX_BITS == 6, "lower_product unpacks, and code packs, six lower bits");
 
 /// The 7-bit code's product with the rotated query, `signed` being the query summed over the
 /// entry's set sign bits and `lower` its product with the lower bits: the code's values are
@@ -670,6 +713,66 @@ unsafe fn scan_group_avx2(codes: &[u8], table: &[u8], out: &mut [u32; GROUP]) {
     for (k, total) in totals.iter().enumerate() {
         _mm256_storeu_si256(out.as_mut_ptr().add(8 * k) as *mut __m256i, *total);
     }
+}
+
+/// What a block's 1-bit bound test reads from the query: the block's centroid product, the scan's
+/// quantization (step, base and worst-case error), the query's summed components and spread, and
+/// the bar.
+struct Bound {
+    centre: f64,
+    step: f64,
+    base: f64,
+    error: f64,
+    sum: f64,
+    spread: f64,
+    bar: f64,
+}
+
+impl Bound {
+    /// A member's 1-bit estimate raised by its error bound and, from the fast scan's `quantized`
+    /// sum, by the scan's quantization error.
+    #[inline(always)]
+    fn raised(&self, gain: f64, slack: f64, quantized: u32) -> f64 {
+        let chosen = self.step * quantized as f64 + self.base;
+        self.centre + gain * (2.0 * chosen - self.sum) + self.spread * slack + 2.0 * gain * self.error
+    }
+}
+
+/// The members of a fast-scanned group whose raised estimate is not below the bar, one bit each:
+/// [`Bound::raised`] for all 32 at once, deciding as it does.
+fn reaching(sums: &[u32; GROUP], gains: &[f32; GROUP], slacks: &[f32; GROUP], bound: &Bound) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is present.
+        return unsafe { reaching_avx2(sums, gains, slacks, bound) };
+    }
+    reaching_scalar(sums, gains, slacks, bound)
+}
+
+fn reaching_scalar(sums: &[u32; GROUP], gains: &[f32; GROUP], slacks: &[f32; GROUP], bound: &Bound) -> u32 {
+    let reaches = |slot: usize| bound.raised(gains[slot] as f64, slacks[slot] as f64, sums[slot]).partial_cmp(&bound.bar) != Some(std::cmp::Ordering::Less);
+    (0..GROUP).filter(|&slot| reaches(slot)).fold(0, |mask, slot| mask | 1 << slot)
+}
+
+/// [`reaching_scalar`] four members to a register, each step the scalar's in the scalar's order, so
+/// every member is decided alike.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn reaching_avx2(sums: &[u32; GROUP], gains: &[f32; GROUP], slacks: &[f32; GROUP], bound: &Bound) -> u32 {
+    use std::arch::x86_64::*;
+    let [step, base, error, sum, spread, centre, bar] = [bound.step, bound.base, bound.error, bound.sum, bound.spread, bound.centre, bound.bar].map(|v| _mm256_set1_pd(v));
+    let two = _mm256_set1_pd(2.0);
+    let mut mask = 0u32;
+    for at in (0..GROUP).step_by(4) {
+        let gain = _mm256_cvtps_pd(_mm_loadu_ps(gains.as_ptr().add(at)));
+        let slack = _mm256_cvtps_pd(_mm_loadu_ps(slacks.as_ptr().add(at)));
+        let quantized = _mm256_cvtepi32_pd(_mm_loadu_si128(sums.as_ptr().add(at) as *const __m128i));
+        let chosen = _mm256_add_pd(_mm256_mul_pd(step, quantized), base);
+        let estimate = _mm256_add_pd(centre, _mm256_mul_pd(gain, _mm256_sub_pd(_mm256_mul_pd(two, chosen), sum)));
+        let raised = _mm256_add_pd(_mm256_add_pd(estimate, _mm256_mul_pd(spread, slack)), _mm256_mul_pd(_mm256_mul_pd(two, gain), error));
+        mask |= (_mm256_movemask_pd(_mm256_cmp_pd::<_CMP_NLT_UQ>(raised, bar)) as u32) << at;
+    }
+    mask
 }
 
 /// A query's fast-scan tables: per nibble position, the rotated query summed over each nibble's
@@ -3450,24 +3553,43 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
         Location::Block(key) if !query.dead.is_empty() => Some(key),
         _ => None,
     };
-    let mut bar = query.bar();
-    let mut sums = [0u32; GROUP];
+    let mut bound = Bound { centre, step: query.scan.step, base: query.scan.base, error: query.scan.error, sum: query.sum, spread: query.spread, bar: query.bar() };
+    let (mut sums, mut gains, mut slacks) = ([0u32; GROUP], [0f32; GROUP], [0f32; GROUP]);
     for group in 0..layout.groups() {
         let first = group * GROUP;
         let codes = &payload[layout.scan() + group * layout.group_bytes()..][..layout.group_bytes()];
         let members = GROUP.min(count - first);
         tally(&SCANNED, members);
         let scanned = members >= SCAN_MEMBERS;
+        for slot in 0..members {
+            gains[slot] = f32_at(payload, layout.gains() + 4 * (first + slot));
+            slacks[slot] = f32_at(payload, layout.slacks() + 4 * (first + slot));
+        }
+        let present = u32::MAX >> (GROUP - members);
+        // A scanned group's members are tested together against the bar the group starts with;
+        // those that reach it are tested again against the bar as it rises.
+        let mut left = present;
         if scanned {
             scan_group(codes, &query.scan.bytes, &mut sums);
+            left &= reaching(&sums, &gains, &slacks, &bound);
         }
         let exact = |slot: usize| exact_sum(codes, &query.scan.exact, slot);
-        for slot in 0..members {
+        while left != 0 {
+            let slot = left.trailing_zeros() as usize;
+            left &= left - 1;
             let n = first + slot;
-            let gain = f32_at(payload, layout.gains() + 4 * n) as f64;
-            let reach = query.spread * f32_at(payload, layout.slacks() + 4 * n) as f64;
-            let (chosen, quantized) = if scanned { (query.scan.step * sums[slot] as f64 + query.scan.base, query.scan.error) } else { (exact(slot), 0.0) };
-            if centre + gain * (2.0 * chosen - query.sum) + reach + 2.0 * gain * quantized < bar {
+            let (gain, slack) = (gains[slot] as f64, slacks[slot] as f64);
+            let reach = bound.spread * slack;
+            let signed = match scanned {
+                true => {
+                    if bound.raised(gain, slack, sums[slot]) < bound.bar {
+                        continue;
+                    }
+                    None
+                }
+                false => Some(exact(slot)),
+            };
+            if signed.is_some_and(|signed| centre + gain * (2.0 * signed - bound.sum) + reach < bound.bar) {
                 continue;
             }
             tally(&CANDIDATES, 1);
@@ -3475,8 +3597,8 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
             if screened.is_some_and(|key| query.dead.contains(&(rowid, key))) {
                 continue;
             }
-            let signed = if scanned { exact(slot) } else { chosen };
-            if centre + gain * (2.0 * signed - query.sum) + reach < bar {
+            let signed = signed.unwrap_or_else(|| exact(slot));
+            if centre + gain * (2.0 * signed - bound.sum) + reach < bound.bar {
                 continue;
             }
             tally(&REFINED, 1);
@@ -3489,7 +3611,7 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
             if query.estimates.len() > query.keep {
                 query.estimates.pop();
             }
-            bar = query.bar();
+            bound.bar = query.bar();
         }
     }
     Ok(())
@@ -3608,6 +3730,30 @@ mod tests {
                 exact.sort_by(|a, b| b.0.total_cmp(&a.0));
                 assert_eq!(got, exact[..10].iter().map(|(_, id)| *id).collect::<Vec<_>>(), "mvcc={mvcc}");
             }
+        }
+    }
+
+    /// The bound test over a group and the lower bits' product decide and add exactly as their
+    /// scalar forms do, the bar set among the members' raised estimates so they go both ways.
+    #[test]
+    fn the_group_bound_test_and_the_lower_product_match_their_scalar_forms() {
+        let mut state = 31;
+        for dims in [8, 128, 1024, 4096] {
+            let rotated = random(&mut state, dims);
+            let ex: Vec<u8> = random(&mut state, dims / 8 * 6).iter().map(|x| ((x + 0.5) * 256.0) as u8).collect();
+            assert_eq!(lower_product(&rotated, &ex).to_bits(), lower_product_scalar(&rotated, &ex).to_bits(), "dims {dims}");
+        }
+        for round in 0..8 {
+            let draw = |state: &mut u64, scale: f32| -> [f32; GROUP] { random(state, GROUP).iter().map(|x| (x + 0.5) * scale).collect::<Vec<_>>().try_into().unwrap() };
+            let sums: [u32; GROUP] = draw(&mut state, 4000.0).map(|x| x as u32);
+            let (gains, slacks) = (draw(&mut state, 0.01), draw(&mut state, 1.0));
+            let mut bound = Bound { centre: 0.1, step: 0.002, base: -2.0, error: 0.05, sum: 0.3, spread: 0.02, bar: 0.0 };
+            let mut raised: Vec<f64> = (0..GROUP).map(|slot| bound.raised(gains[slot] as f64, slacks[slot] as f64, sums[slot])).collect();
+            raised.sort_by(f64::total_cmp);
+            bound.bar = raised[4 * round % GROUP];
+            let mask = reaching(&sums, &gains, &slacks, &bound);
+            assert_eq!(mask, reaching_scalar(&sums, &gains, &slacks, &bound), "round {round}");
+            assert!(mask.count_ones() as usize == GROUP - 4 * round % GROUP, "round {round}: {} members reach the bar", mask.count_ones());
         }
     }
 

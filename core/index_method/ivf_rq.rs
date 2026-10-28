@@ -24,7 +24,9 @@
 //! retire a partition left with under a sixteenth of the split bound, moving its entries to their
 //! nearest partitions; and rebuild, training partitions afresh by k-means over a sample of every
 //! vector, when a statement inserting [`BULK_AT`] rows or more finds the index trained for under a
-//! quarter of the partitions its rows call for, as CREATE INDEX over a populated table does. Every
+//! quarter of the partitions its rows call for. CREATE INDEX over [`BULK_AT`] rows or more writes
+//! tail entries for its first rows only and rebuilds over all of them, so each of the rest is
+//! coded into its block once. Every
 //! rewrite of a block takes it off the dead rows of the copies it drops. A split never overwrites
 //! a centroid: it writes new versions, and every entry names the version it was coded against, so
 //! an insert committed from a snapshot older than the split still scores correctly until
@@ -1654,6 +1656,8 @@ struct Run {
     all: bool,
     /// The partitions a run that does not survey them all starts from.
     first: Vec<i64>,
+    /// The rows a CREATE INDEX statement gave the index, which the run starts by rebuilding over.
+    build: Option<Vec<i64>>,
 }
 
 /// Maintenance: survey, choose a job, read the entries it concerns, check each against its
@@ -1696,6 +1700,14 @@ enum Rebuilding {
     Code { rowids: Vec<i64>, model: Box<Model>, at: usize, get: Get, stream: Stream },
     /// Every write is made: the model under its new generation is the index's.
     Done { model: Box<Model>, generation: i64 },
+}
+
+/// A rebuild's first phase over `rowids`, every vector of the index: reading the vectors of every
+/// n-th, n spreading the sample over the whole table.
+fn sampling(rowids: Vec<i64>) -> Rebuilding {
+    let wanted = (TRAIN_PER_PARTITION * trained_partitions(rowids.len())).min(TRAIN_SAMPLE_MAX).min(rowids.len()).max(1);
+    let sample = rowids.iter().step_by((rowids.len() / wanted).max(1)).take(wanted).copied().collect();
+    Rebuilding::Sample { rowids, sample, vectors: Vec::new(), get: Get::Seek }
 }
 
 /// Codes written into packed blocks as they come: a partition's block is written once full, and
@@ -1928,6 +1940,9 @@ pub struct IvfRqCursor {
     touched: BTreeSet<i64>,
     written: usize,
     inserted: usize,
+    /// The rows the CREATE INDEX statement creating the index has inserted: past the first
+    /// [`BULK_AT`] they are only recorded, for the statement's rebuild to code.
+    building: Option<Vec<i64>>,
     /// The model and generation before a job that changes them, until the job is written.
     saved: Option<(Arc<Model>, Option<i64>)>,
     /// The partitions the job being planned changes, to survey again once it is written.
@@ -1966,6 +1981,7 @@ impl IvfRqCursor {
             touched: BTreeSet::new(),
             written: 0,
             inserted: 0,
+            building: None,
             saved: None,
             dirty: Vec::new(),
             generation: None,
@@ -2211,7 +2227,13 @@ impl IndexMethodCursor for IvfRqCursor {
         if self.pending.is_empty() {
             self.pending.push_back(context.create_backing_schema(&self.schema)?);
         }
-        self.drive_pending()
+        let created = self.drive_pending()?;
+        // The statement goes on to insert the table's rows. A statement that does not maintain
+        // the index writes them all.
+        if matches!(created, IOResult::Done(())) && statement_upkeep() {
+            self.building = Some(Vec::new());
+        }
+        Ok(created)
     }
 
     fn destroy(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
@@ -2239,8 +2261,15 @@ impl IndexMethodCursor for IvfRqCursor {
 
     fn insert(&mut self, values: &[Register]) -> IOResultOr<()> {
         if matches!(self.change, Change::Idle) {
-            let vector = dense(values[0].get_value().to_blob())?;
             let rowid = values[1].get_value().as_int().ok_or_else(|| error("rowid must be an integer"))?;
+            if let Some(rowids) = self.building.as_mut() {
+                rowids.push(rowid);
+                // The statement's rebuild codes this row, and the rows before it, into blocks.
+                if rowids.len() >= BULK_AT {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+            let vector = dense(values[0].get_value().to_blob())?;
             let encoding = timer(&ENCODE_NANOS);
             let (partition, steps) = self.tail_steps(rowid, &vector)?;
             drop(encoding);
@@ -2378,7 +2407,7 @@ impl IndexMethodCursor for IvfRqCursor {
     /// `OPTIMIZE INDEX`: survey every partition and do every job there is, until none is left.
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         if self.run.is_none() {
-            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new() });
+            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new(), build: None });
         }
         self.maintain(context)
     }
@@ -2389,6 +2418,14 @@ impl IndexMethodCursor for IvfRqCursor {
     /// random rows cost about half a job a row to keep maintained, so a run ends with nothing due
     /// well before its bound.
     fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        if let Some(rowids) = self.building.take().filter(|rowids| rowids.len() >= BULK_AT) {
+            // A CREATE INDEX over BULK_AT rows or more: a rebuild over them clears the tail entries
+            // the first wrote and codes every row into its block.
+            self.run = Some(Run { budget: rowids.len(), survey: Survey::default(), all: false, first: Vec::new(), build: Some(rowids) });
+            self.touched.clear();
+            self.written = 0;
+            self.inserted = 0;
+        }
         if self.run.is_none() {
             if self.written == 0 || !statement_upkeep() {
                 self.touched.clear();
@@ -2401,7 +2438,7 @@ impl IndexMethodCursor for IvfRqCursor {
             // A statement that inserted many rows surveys every partition, so a rebuild is chosen
             // when its rows have outgrown the partitions.
             let all = self.inserted >= BULK_AT;
-            self.run = Some(Run { budget: self.written, survey: Survey::default(), all, first: first.into_iter().collect() });
+            self.run = Some(Run { budget: self.written, survey: Survey::default(), all, first: first.into_iter().collect(), build: None });
             self.written = 0;
             self.inserted = 0;
         }
@@ -2413,6 +2450,7 @@ impl IndexMethodCursor for IvfRqCursor {
         self.touched.clear();
         self.written = 0;
         self.inserted = 0;
+        self.building = None;
     }
 
     fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {
@@ -2657,6 +2695,11 @@ impl IvfRqCursor {
                         return Ok(IOResult::IO(io));
                     }
                     let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
+                    if let Some(rowids) = run.build.take() {
+                        self.save_model();
+                        self.upkeep = Upkeep::Rebuild { phase: sampling(rowids), steps: VecDeque::new() };
+                        continue;
+                    }
                     self.upkeep = Upkeep::Survey(match run.all {
                         true => Surveying::All(Reading::Tail, Walk::Seek),
                         false => Surveying::Some { pending: std::mem::take(&mut run.first).into(), reading: Reading::Tail, walk: Walk::Seek, get: Get::Seek },
@@ -3084,12 +3127,7 @@ impl IvfRqCursor {
                                 rowids.push(rowid);
                                 self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Rowids { walk, rowids }, steps };
                             }
-                            IOResult::Done(None) => {
-                                // Every n-th vector, n spreading the sample over the whole table.
-                                let wanted = (TRAIN_PER_PARTITION * trained_partitions(rowids.len())).min(TRAIN_SAMPLE_MAX).min(rowids.len()).max(1);
-                                let sample = rowids.iter().step_by((rowids.len() / wanted).max(1)).take(wanted).copied().collect();
-                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Sample { rowids, sample, vectors: Vec::new(), get: Get::Seek }, steps };
-                            }
+                            IOResult::Done(None) => self.upkeep = Upkeep::Rebuild { phase: sampling(rowids), steps },
                         },
                         Rebuilding::Sample { rowids, sample, mut vectors, mut get } => {
                             let Some(&rowid) = sample.get(vectors.len()) else {
@@ -4401,6 +4439,23 @@ mod tests {
         }
         let recall = found as f64 / (10 * queries) as f64;
         assert!(recall >= 0.95, "recall@10 {recall} at a refine of one");
+    }
+
+    /// CREATE INDEX over a populated table writes each vector's code once, into its block, so the
+    /// file it leaves holds almost no free pages.
+    #[test]
+    fn create_index_over_rows_leaves_almost_no_free_pages() {
+        const DIMS: usize = 16;
+        let (_db, conn) = database("ivf-rq-build-once.db", false);
+        let mut state = 103;
+        let vectors: Vec<(i64, Vec<f32>)> = (1..=20_000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+        for chunk in vectors.chunks(2_000) {
+            insert_all(&conn, chunk);
+        }
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 64, refine = 4)").unwrap();
+        let pragma = |name: &str| rows(&conn, &format!("PRAGMA {name}"))[0][0].as_int().unwrap();
+        let (pages, free) = (pragma("page_count"), pragma("freelist_count"));
+        assert!(free * 20 <= pages, "{free} of {pages} pages free after the build");
     }
 
     /// A vector's row in the index names only where its code is, the code itself being in its block

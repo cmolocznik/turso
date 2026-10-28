@@ -2233,6 +2233,8 @@ thread_local! {
     /// The point reads made on this thread, and the entries queries on it scored from 7-bit codes.
     static POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUERY_REFINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The exact 1-bit sums queries on this thread took.
+    static EXACT_SUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The seeks walks made on this thread, the partitions queries on it probed, and the blocks
     /// they read from pages.
     static WALK_SEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -4062,23 +4064,36 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
             prefetch(&payload[layout.rowids() + 8 * n..][..8]);
             prefetch(&payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()]);
         }
-        let exact = |slot: usize| exact_sum(codes, &query.scan.exact, slot);
+        let exact = |slot: usize| {
+            #[cfg(test)]
+            EXACT_SUMS.with(|count| count.set(count.get() + 1));
+            exact_sum(codes, &query.scan.exact, slot)
+        };
         while left != 0 {
             let slot = left.trailing_zeros() as usize;
             left &= left - 1;
             let n = first + slot;
             let (gain, slack) = (gains[slot] as f64, slacks[slot] as f64);
             let reach = bound.spread * slack;
+            // A scanned member's fast-scan sum lies within the quantization's error of its exact
+            // sum: a member that clears the bar by more than twice that error, in the estimate's
+            // terms, can't be dropped by the exact test, and its fast-scan sum serves its 7-bit
+            // estimate; one nearer the bar, or in a group too small to scan, is summed exactly.
             let signed = match scanned {
                 true => {
-                    if bound.raised(gain, slack, sums[slot]) < bound.bar {
+                    let raised = bound.raised(gain, slack, sums[slot]);
+                    if raised < bound.bar {
                         continue;
                     }
-                    None
+                    (raised - 4.0 * gain * bound.error >= bound.bar).then(|| bound.step * sums[slot] as f64 + bound.base)
                 }
                 false => Some(exact(slot)),
             };
-            if signed.is_some_and(|signed| centre + gain * (2.0 * signed - bound.sum) + reach < bound.bar) {
+            let (signed, tested) = match signed {
+                Some(signed) if scanned => (Some(signed), true),
+                signed => (signed, false),
+            };
+            if !tested && signed.is_some_and(|signed| centre + gain * (2.0 * signed - bound.sum) + reach < bound.bar) {
                 continue;
             }
             tally(&CANDIDATES, 1);
@@ -4086,10 +4101,16 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
             if screened.is_some_and(|key| query.dead.contains(&(rowid, key))) {
                 continue;
             }
-            let signed = signed.unwrap_or_else(|| exact(slot));
-            if centre + gain * (2.0 * signed - bound.sum) + reach < bound.bar {
-                continue;
-            }
+            let signed = match signed {
+                Some(signed) => signed,
+                None => {
+                    let signed = exact(slot);
+                    if centre + gain * (2.0 * signed - bound.sum) + reach < bound.bar {
+                        continue;
+                    }
+                    signed
+                }
+            };
             tally(&REFINED, 1);
             #[cfg(test)]
             QUERY_REFINES.with(|count| count.set(count.get() + 1));
@@ -4995,6 +5016,26 @@ mod tests {
             let recall = found as f64 / (10 * queries) as f64;
             assert!(recall >= 0.95, "dims {dims}: recall@10 {recall} at a refine of one");
         }
+    }
+
+    /// A fast-scanned member is summed exactly only near the bar, where the exact sum can drop it:
+    /// a query over a trained index refines more entries than it sums exactly, and still finds the
+    /// exact top ten.
+    #[test]
+    fn a_query_sums_exactly_only_the_members_near_the_bar() {
+        const DIMS: usize = 64;
+        let (_db, conn) = database("ivf-rq-exact-sums.db", false);
+        let mut state = 131;
+        let vectors: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+        insert_all(&conn, &vectors);
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+        let live: HashMap<i64, Vec<f32>> = vectors.into_iter().collect();
+        let q = random(&mut state, DIMS);
+        top_ten(&conn, &q);
+        let (sums, refines) = (EXACT_SUMS.with(|c| c.get()), QUERY_REFINES.with(|c| c.get()));
+        assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
+        let (sums, refines) = (EXACT_SUMS.with(|c| c.get()) - sums, QUERY_REFINES.with(|c| c.get()) - refines);
+        assert!(refines > 0 && sums < refines, "{sums} exact sums for {refines} refined entries");
     }
 
     /// The blocks a query read are held for the next: a second query over the same partitions reads

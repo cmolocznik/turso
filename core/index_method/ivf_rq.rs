@@ -499,13 +499,35 @@ fn tile_products_body(v: &[f32], tile: &[f32], out: &mut [f32; TILE]) {
 
 kernel!(tile_products, tile_products_wide, tile_products_body, (v: &[f32], tile: &[f32], out: &mut [f32; TILE]) -> ());
 
+/// [`tile_products_body`] over a tile of bfloat16 values.
+#[inline(always)]
+fn tile_products_halves_body(v: &[f32], tile: &[u16], out: &mut [f32; TILE]) {
+    let mut acc = [0.0f32; TILE];
+    for (x, column) in v.iter().zip(tile.chunks_exact(TILE)) {
+        for k in 0..TILE {
+            acc[k] += x * f32::from_bits((column[k] as u32) << 16);
+        }
+    }
+    *out = acc;
+}
+
+kernel!(tile_products_halves, tile_products_halves_wide, tile_products_halves_body, (v: &[f32], tile: &[u16], out: &mut [f32; TILE]) -> ());
+
+/// `x` rounded to the nearest bfloat16, ties to even: its top sixteen bits.
+fn bfloat16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
 /// A model's centroids in tiles of [`TILE`], each tile dimension-major, so a vector's products with
 /// a tile's centroids are one pass over its dimensions. A tile's slots past the last centroid are
-/// zero.
+/// zero. `halves` holds the same values rounded to bfloat16, which a query ranks the partitions
+/// from, reading half the bytes.
 #[derive(Debug, Clone, Default)]
 struct Tiles {
     dims: usize,
     values: Vec<f32>,
+    halves: Vec<u16>,
 }
 
 impl Tiles {
@@ -516,15 +538,22 @@ impl Tiles {
         let size = self.dims * TILE;
         if self.values.len() < (tile + 1) * size {
             self.values.resize((tile + 1) * size, 0.0);
+            self.halves.resize((tile + 1) * size, 0);
         }
         for (d, x) in c.iter().enumerate() {
             self.values[tile * size + d * TILE + lane] = *x;
+            self.halves[tile * size + d * TILE + lane] = bfloat16(*x);
         }
     }
 
     /// The tiles in partition order, each with its first partition.
     fn tiles(&self) -> impl Iterator<Item = (usize, &[f32])> + '_ {
         self.values.chunks_exact((self.dims * TILE).max(1)).enumerate().map(|(t, tile)| (t * TILE, tile))
+    }
+
+    /// The tiles of bfloat16 values in partition order, each with its first partition.
+    fn halves(&self) -> impl Iterator<Item = (usize, &[u16])> + '_ {
+        self.halves.chunks_exact((self.dims * TILE).max(1)).enumerate().map(|(t, tile)| (t * TILE, tile))
     }
 }
 
@@ -1097,12 +1126,13 @@ impl Model {
     }
 
     /// The partitions a query may probe, every one not retired, each with what ranks it: its
-    /// distance from `q` less `q`'s squared length, or its product with `q` negated.
+    /// distance from `q` less `q`'s squared length, or its product with `q` negated, the products
+    /// taken over the centroids rounded to bfloat16.
     fn ranked(&self, q: &[f32], by_product: bool) -> Vec<(f32, i64)> {
         let mut ranked = Vec::with_capacity(self.centroids.len());
         let mut products = [0.0f32; TILE];
-        for (first, tile) in self.tiles.tiles() {
-            tile_products(q, tile, &mut products);
+        for (first, tile) in self.tiles.halves() {
+            tile_products_halves(q, tile, &mut products);
             for (k, product) in products[..(self.centroids.len() - first).min(TILE)].iter().enumerate() {
                 let i = first + k;
                 if self.states[i] != State::Retired {
@@ -4302,8 +4332,8 @@ mod tests {
     }
 
     /// The tiles give each vector the nearest live partition the direct products give it, and a
-    /// query the same ranking of the partitions not retired, after a centroid is placed over
-    /// another and one past the last tile.
+    /// query the same ranking of the partitions not retired as direct products over the centroids
+    /// rounded to bfloat16, after a centroid is placed over another and one past the last tile.
     #[test]
     fn the_tiles_assign_and_rank_as_the_direct_products_do() {
         for dims in [100, 768] {
@@ -4326,7 +4356,12 @@ mod tests {
                 ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
                 ranked.into_iter().map(|(_, p)| p).collect::<Vec<_>>()
             };
-            let direct = (0..model.centroids.len()).filter(|i| model.states[*i] != State::Retired).map(|i| (l2(&model.centroids[i], &q), i as i64)).collect();
+            // The ranking reads the centroids rounded to bfloat16.
+            let rounded = |c: &[f32]| c.iter().map(|x| f32::from_bits((bfloat16(*x) as u32) << 16)).collect::<Vec<f32>>();
+            let direct = (0..model.centroids.len())
+                .filter(|i| model.states[*i] != State::Retired)
+                .map(|i| (model.squares[i] - 2.0 * dot32(&rounded(&model.centroids[i]), &q), i as i64))
+                .collect();
             assert_eq!(order(model.ranked(&q, false)), order(direct), "dims {dims}");
         }
     }

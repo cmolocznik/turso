@@ -14855,6 +14855,21 @@ pub fn op_index_method_query(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_index_method_accept(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IndexMethodAccept { cursor_id }, insn);
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist");
+    cursor.as_index_method_mut().query_accept()?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub enum OpDestroyState {
     CreateCursor,
     DestroyBtree(Arc<RwLock<BTreeCursor>>),

@@ -133,7 +133,17 @@ pub struct IndexMethodDefinition<'a> {
     /// When `true`, the cursor is safe to use during DML because it does not lazily stream from
     /// a live data structure that writes could invalidate.
     /// When `false`, the emitter will collect rowids into a RowSet/ephemeral table before writing.
+    /// A filtered query (see `filtered_queries`) may read the index again in `query_next()`, but
+    /// the planner gives one only to a SELECT, never to the scan of an UPDATE or DELETE.
     pub results_materialized: bool,
+    /// Whether a pattern with ORDER BY and LIMIT may serve a query whose WHERE clause has terms the
+    /// pattern does not cover. The planner then keeps the query's ORDER BY and LIMIT, applied after
+    /// those terms, and `query_start()` gets one more value after the captured ones, `Integer(1)`:
+    /// the cursor gives out rows in the pattern's order, is told by `query_accept()` of each row the
+    /// other terms accept, and ends once no row still to come could displace one of the LIMIT best
+    /// it was told of. The planner uses the pattern only where `estimate_cost()`, given the share of
+    /// rows those terms keep, costs less than the plan without it.
+    pub filtered_queries: bool,
     /// Declares how this method participates in MVCC transactions.
     pub mvcc_support: IndexMethodMvccSupport,
 }
@@ -497,6 +507,9 @@ pub struct IndexMethodCostContext<'a> {
     pub pattern_idx: usize,
     pub base_table_rows: f64,
     pub arguments: &'a [ast::Expr],
+    /// For a filtered query, the planner's estimate of the share of the table's rows the WHERE
+    /// terms the pattern does not cover keep; `None` when the pattern covers the whole query.
+    pub filter_selectivity: Option<f64>,
 }
 
 /// Internal index state exposed only to test-helper builds.
@@ -633,6 +646,13 @@ pub trait IndexMethodCursor: Send {
     /// enrich its result with name, comment, rating columns from original table accessing original row by its rowid
     /// returned from query_rowid(...) method
     fn query_rowid(&mut self) -> IOResultOr<Option<i64>>;
+
+    /// For a filtered query (see [IndexMethodDefinition::filtered_queries]), the WHERE terms the
+    /// pattern does not cover accepted the current row: called after the call that made the row
+    /// current and before the next `query_next()`.
+    fn query_accept(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Stage all pending index changes before the statement savepoint is
     /// released. Any fallible work or I/O belongs in this phase.
@@ -794,6 +814,7 @@ mod tests {
             patterns: &[],
             backing_btree: false,
             results_materialized: true,
+            filtered_queries: false,
             mvcc_support: support,
         }
     }

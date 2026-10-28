@@ -47,6 +47,7 @@ impl crate::index_method::IndexMethodAttachment for FailingPrepareAttachment {
             patterns: &[],
             backing_btree: false,
             results_materialized: true,
+            filtered_queries: false,
             mvcc_support: crate::index_method::IndexMethodMvccSupport::ExternalTransactional,
         }
     }

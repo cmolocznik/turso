@@ -182,6 +182,7 @@ fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstima
             pattern_idx: pattern_idx as usize,
             base_table_rows: 100_000.0,
             arguments: &arguments,
+            filter_selectivity: None,
         })
         .unwrap()
 }

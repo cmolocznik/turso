@@ -1708,6 +1708,11 @@ pub enum Insn {
         count_reg: usize,
         pc_if_empty: BranchOffset,
     },
+    /// Tell a filtered index method query that the query's other WHERE terms accepted its current
+    /// row (calls [crate::index_method::IndexMethodCursor::query_accept] under the hood)
+    IndexMethodAccept {
+        cursor_id: CursorID,
+    },
 
     /// Delete all contents from a persistent table or index b-tree while keeping its root page.
     ClearBtree {
@@ -2547,6 +2552,7 @@ impl InsnVariants {
             InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
             InsnVariants::IndexMethodOptimize => execute::op_index_method_optimize,
             InsnVariants::IndexMethodQuery => execute::op_index_method_query,
+            InsnVariants::IndexMethodAccept => execute::op_index_method_accept,
             InsnVariants::ClearBtree => execute::op_clear_btree,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,

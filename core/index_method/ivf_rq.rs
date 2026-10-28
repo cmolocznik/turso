@@ -60,7 +60,7 @@ use crate::{
     },
     storage::btree::{BTreeKey, CursorTrait},
     sync::Arc,
-    types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult},
+    types::{IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
     vector::{
         operations,
@@ -107,6 +107,8 @@ pub static MEASURE: AtomicBool = AtomicBool::new(false);
 /// Entries a query estimated from 1-bit codes, and those it went on to score from 4-bit codes.
 pub static SCANNED: AtomicUsize = AtomicUsize::new(0);
 pub static REFINED: AtomicUsize = AtomicUsize::new(0);
+/// Entries a query kept as candidates from their raised 1-bit estimates.
+pub static CANDIDATES: AtomicUsize = AtomicUsize::new(0);
 /// Nanoseconds queries spent in each phase, and the records they read, for measurement.
 pub static READ_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static SCORE_NANOS: AtomicUsize = AtomicUsize::new(0);
@@ -560,24 +562,40 @@ fn extra(entry: &Entry) -> Vec<u8> {
     out
 }
 
+kernel!(lower_product, lower_product_wide, lower_product_body, (rotated: &[f32], ex: &[u8]) -> f64);
+
 /// The rotated query's product with an entry's lower bits: the 4-bit code's part below the sign.
-fn lower_product(rotated: &[f32], ex: &[u8]) -> f64 {
-    let mut lower = 0.0f64;
+#[inline(always)]
+fn lower_product_body(rotated: &[f32], ex: &[u8]) -> f64 {
+    // Eight dimensions a step, one lane each, so the eight 3-bit values unpack with one shift.
+    let mut sums = [0.0f32; 8];
     for (bytes, q) in ex.chunks_exact(3).zip(rotated.chunks_exact(8)) {
         let word = bytes[0] as u32 | (bytes[1] as u32) << 8 | (bytes[2] as u32) << 16;
-        let mut part = 0.0f32;
-        for (k, x) in q.iter().enumerate() {
-            part += *x * ((word >> (3 * k)) & 7) as f32;
+        for k in 0..8 {
+            sums[k] += q[k] * ((word >> (3 * k)) & 7) as f32;
         }
-        lower += part as f64;
     }
-    lower
+    sums.iter().map(|&s| s as f64).sum()
 }
 
 /// The 4-bit estimate of the residual's product with the rotated query, `signed` being the query
 /// summed over the entry's set sign bits: the code's values are `code - 7.5`.
 fn refined_product(signed: f64, lower: f64, sum: f64, refined: f64) -> f64 {
     (8.0 * signed + lower - 7.5 * sum) / refined
+}
+
+/// The query summed over one member's set code bits, exactly: its table value at each nibble
+/// position, from `codes`, one group's fast-scan bytes, and `table`, the query's 16 unquantized
+/// values per position. Four independent sums keep the adds from waiting on each other.
+fn exact_sum(codes: &[u8], table: &[f32], slot: usize) -> f64 {
+    let (lane, shift) = (slot % 16, if slot < 16 { 0 } else { 4 });
+    let mut sums = [0.0f32; 4];
+    for (j, (bytes, values)) in codes.chunks_exact(16).zip(table.chunks_exact(16)).enumerate() {
+        let bytes: &[u8; 16] = bytes.try_into().expect("16 bytes a position");
+        let values: &[f32; 16] = values.try_into().expect("16 values a position");
+        sums[j % 4] += values[((bytes[lane] >> shift) & 0xf) as usize];
+    }
+    ((sums[0] + sums[1]) + (sums[2] + sums[3])) as f64
 }
 
 /// Sum each group's 32 entries' table values over every nibble position: `codes` is one group's
@@ -933,9 +951,10 @@ fn walk(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut Wal
                 if rowid >= end {
                     return Ok(IOResult::Done(None));
                 }
-                // Read the record before moving on, so a retry after I/O reads this row again.
+                // Read the record before moving on, so a retry after I/O reads this row again: in
+                // place for a cell inside its page, assembled and kept for one that overflows it.
                 if read {
-                    if let IOResult::IO(io) = cursor.record()? {
+                    if let IOResult::IO(io) = cursor.record_payload()? {
                         return Ok(IOResult::IO(io));
                     }
                 }
@@ -954,6 +973,24 @@ fn walk_key(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut
 /// The next rowid of the walk over `start..end`, its record read and held by the cursor.
 fn walk_held(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut Walk) -> IOResultOr<Option<i64>> {
     walk(cursor, start, end, state, true)
+}
+
+/// The serialized record a walk left its cursor on, for decoding in place: [`walk_held`] has read
+/// it, so it is held without I/O.
+fn held_payload(cursor: &mut Box<dyn CursorTrait>) -> Result<&[u8]> {
+    match cursor.record_payload()? {
+        IOResult::Done(Some(payload)) => Ok(payload),
+        IOResult::Done(None) => Err(*error("positioned cursor has no record")),
+        IOResult::IO(_) => Err(*error("a walk's record was not read before it was held")),
+    }
+}
+
+/// A block or tail entry's centroid version and codes, decoded in place.
+fn version_and_codes<'r>(record: &'r ImmutableRecordRef<'_>) -> Result<(i64, &'r [u8])> {
+    match record.get_two_values(0, 1)? {
+        (ValueRef::Numeric(Numeric::Integer(version)), ValueRef::Blob(codes)) => Ok((version, codes)),
+        _ => Err(LimboError::Corrupt("ivf_rq: a block's record is not a version and codes".into())),
+    }
 }
 
 /// The record a walk left its cursor on: [`walk_held`] has read it, so it is held without I/O.
@@ -2358,10 +2395,13 @@ impl IvfRqCursor {
                         self.search = Search::Probe { probes, partition, stage: Stage::Blocks, walk: Walk::Seek };
                         continue;
                     };
-                    let found = held_record(&mut self.stores[DEAD])?;
+                    let blocks = match ImmutableRecordRef::from_bin_record(held_payload(&mut self.stores[DEAD])?).get_value_opt(0) {
+                        Some(ValueRef::Blob(blocks)) => dead_blocks(blocks)?,
+                        _ => return Err(LimboError::Corrupt("ivf_rq: a dead row holds no blocks".into()).into()),
+                    };
                     let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
                     let rowid = key & ((1 << ROWID_BITS) - 1);
-                    query.dead.extend(dead_blocks(bytes_at(found, 0)?)?.into_iter().map(|block| (rowid, block)));
+                    query.dead.extend(blocks.into_iter().map(|block| (rowid, block)));
                     self.search = Search::Dead { probes, partition, walk };
                 }
                 Search::Probe { probes, partition, stage, mut walk } => {
@@ -2385,12 +2425,13 @@ impl IvfRqCursor {
                                 Stage::Blocks => Location::Block(key),
                                 Stage::Tail => Location::Tail(key),
                             };
-                            // Scored where the cursor holds it, so no block is copied.
-                            let found = held_record(&mut self.stores[store])?;
+                            // Decoded and scored where the cursor holds it, so no block is copied.
+                            let record = ImmutableRecordRef::from_bin_record(held_payload(&mut self.stores[store])?);
+                            let (version, codes) = version_and_codes(&record)?;
                             let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
-                            let centre = query.centre(&self.model, partition, integer(found, 0)?)?;
+                            let centre = query.centre(&self.model, partition, version)?;
                             let _scoring = timer(&SCORE_NANOS);
-                            score_block(query, bytes_at(found, 1)?, centre, source)?;
+                            score_block(query, codes, centre, source)?;
                             self.search = Search::Probe { probes, partition, stage, walk };
                         }
                         (None, Stage::Blocks) => self.search = Search::Probe { probes, partition, stage: Stage::Tail, walk: Walk::Seek },
@@ -2465,10 +2506,11 @@ impl IvfRqCursor {
         let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
         let _timer = timer(&REFINE_NANOS);
         let bar = query.bar();
-        let mut order: Vec<Candidate> = std::mem::take(&mut query.candidates).into_iter().filter(|c| c.upper >= bar).collect();
-        order.sort_unstable_by(|a, b| b.upper.total_cmp(&a.upper));
+        let candidates = std::mem::take(&mut query.candidates);
+        let mut order: Vec<(f64, u32)> = candidates.iter().enumerate().filter(|(_, c)| c.upper >= bar).map(|(n, c)| (c.upper, n as u32)).collect();
+        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         let extra_bytes = 4 + EX_BITS * query.rotated.len() / 8;
-        for candidate in &order {
+        for candidate in order.iter().map(|&(_, n)| &candidates[n as usize]) {
             // Candidates come in order of the bound they may reach: once one cannot enter the full
             // set of 4-bit estimates, none after it can.
             if query.estimates.len() >= query.keep && query.estimates.peek().is_some_and(|worst| -candidate.upper >= worst.0) {
@@ -3448,10 +3490,7 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
             gain[slot] = norm * scale / factor;
             reach[slot] = norm * spread * (1.0 - factor * factor).max(0.0).sqrt() / factor;
         }
-        let exact = |slot: usize| {
-            let (lane, shift) = (slot % 16, if slot < 16 { 0 } else { 4 });
-            (0..layout.positions).map(|j| query.scan.exact[j * 16 + ((codes[j * 16 + lane] >> shift) & 0xf) as usize] as f64).sum::<f64>()
-        };
+        let exact = |slot: usize| exact_sum(codes, &query.scan.exact, slot);
         for slot in 0..members {
             let (chosen, quantized) = if scanned { (query.scan.step * sums[slot] as f64 + query.scan.base, query.scan.error) } else { (exact(slot), 0.0) };
             let estimate = centre + gain[slot] * (2.0 * chosen - query.sum);
@@ -3475,6 +3514,7 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
                 let extra = query.extras.len();
                 query.extras.extend_from_slice(&payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()]);
                 query.candidates.push(Candidate { upper: estimate + reach[slot], rowid, centre, norm, signed, extra });
+                tally(&CANDIDATES, 1);
             }
         }
     }

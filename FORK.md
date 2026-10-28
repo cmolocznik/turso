@@ -6,8 +6,8 @@ Upstream Turso (`tursodatabase/turso`, `main`) with the changes below on top, on
   `git log upstream/main..main`.
 - `feat/additions` is `main` plus the additions, listed by `git log main..feat/additions`.
 - `fix/set-waker-lost-wakeup`, `fix/mvcc-checkpoint-trigger`, `fix/mvcc-exact-rowid-seek`,
-  `fix/index-method-limit-before-aggregates` and `fix/index-method-column-collation` each hold one
-  of `main`'s fixes alone on `upstream/main`.
+  `fix/index-method-limit-before-aggregates`, `fix/index-method-column-collation` and
+  `fix/btree-overflow-copy` each hold one of `main`'s fixes alone on `upstream/main`.
 
 This file is only on `feat/additions`, so `main`'s commits can go upstream as they are. Keep it in
 step with the two logs: a change lands here when it lands, with what it fixes and what proves it.
@@ -72,6 +72,16 @@ the table's own. Every collation decision looks a referenced column up in its ta
 SELECTs and an IN subquery over the score each failed to prepare with "column not found". The value
 now has no column collation, as the expression translator already treats it.
 Test: `index_method::fts::tests::fts_score_from_the_index_has_no_column_collation`.
+
+### An overflow chain was copied into its payload a byte at a time
+`core/storage/btree.rs`, `process_overflow_read`. Each page of a record's overflow chain was
+appended through `try_extend` over a byte iterator, which on stable is `Vec::extend` over
+`Copied<slice::Iter<u8>>` and compiled to a loop writing one byte at a time, the payload regrowing
+as pages came in: ivf_rq queries over 5.6 KB block rows spent about 14% of their time in it. The
+payload is now reserved at its full size when the chain is first read, and each page is copied in
+with `extend_from_slice` after a fallible `try_reserve`, as `copy_payload_range` does. At 256 probes
+over glove-100 the blocks' reads took 3,535 µs a query instead of 4,524. No behaviour changes, so
+no new test; every read of an overflowing record goes through it. Its PR waits for Clay's go.
 
 ## Additions
 
@@ -149,6 +159,46 @@ Four gaps, each closed with tests that fail with the gap put back:
   under a sixteenth of the split bound retires into its neighbours. Over a uniform blob of 3,000
   vectors, 1.7% end up outside their nearest partition, against 5.3% rechecking 4 neighbours and
   9.7% rechecking none.
+
+The query path, measured on glove-100 (1,183,514 vectors, 2,000 queries, one thread on the
+laptop's performance core, alternating builds), after ScaNN, the RaBitQ library and FAISS were
+run on the same data on mt1 (`/home/me/cognition-data/ann`): at the same 5.9% of the data scanned
+ScaNN reached 0.907 recall@10 and ivf_rq 0.885, so the partitions were not what lost; the cost of
+each scanned vector was, about 3.5 ns for ScaNN on mt1 against over 100 for ivf_rq. Each change
+below left the recall of every setting the same to the fourth place.
+- A candidate's 4-bit code was a point read of its vector's row, about 1 µs each at this size: at
+  64 probes and a rerank of ten times the LIMIT, 2,930 of the query's 5,523 µs. A block now holds
+  each entry's 4-bit correction and lower bits after its scan groups, the query copies a
+  candidate's as it scores it and refines in memory, and the vector's row no longer vouches for
+  the entry: the dead rows, read for each partition before its blocks, name every stale copy, as
+  the tests of revised and deleted vectors check. 181 to 364 queries a second, and 85 to 123 at 256
+  probes. `a_query_refines_its_candidates_without_a_point_read` counts the point reads a query makes
+  (264 for 263 refined candidates before, the model's generation alone after) and
+  `a_block_unpacks_to_the_codes_it_packed` checks the 4-bit parts round-trip. The filtered-query
+  cost estimate prices a code at the planner's price of a table row scaled by its bytes against its
+  vector's (289 codes to a page at 768 dimensions; it counted 35 real pages' worth) and a rerank at
+  one page, since refining reads none.
+- A block is decoded and scored where its cursor holds it, from the page's own bytes when the cell
+  fits its page (`walk_held`, `held_payload`, `version_and_codes`; one walk, `walk`, serves the
+  key-only, held and copied reads). Each group's gains and error bounds are computed before any
+  member is compared, the bar is read again only when the floors move, the exact 1-bit sum walks
+  16-byte chunks into four f32 sums (it was a quarter of a query, now under a tenth), candidates
+  are ordered as (bound, index) pairs, and the lower bits' product is an AVX2 kernel.
+- The counters and timers above cost a load each unless `MEASURE` is on; on, they were about 7%
+  of a query.
+At 4 KB pages a 64-entry block of 128-dimensional codes is 5.6 KB, and of 768-dimensional ones
+34 KB, so every block read assembles an overflow chain, and a 3 KB 768-dimensional table row takes
+a page to itself. At 64 KB pages glove-100 ran 600 queries a second at 64 probes and 217 at 256
+(667 and 229 with a rerank of four), and a 200,000-vector slice of Cohere at 768 dimensions 647 at
+64 probes (recall 0.973) against 346 before these changes at 4 KB pages, and 1,480 at 16 probes
+against 705. The page size is the database's, so it is the application's choice; a database that
+holds mostly vectors gains from 64 KB pages.
+
+After CREATE INDEX over a populated table 44 to 48% of the file is on the freelist: the build
+writes its entries twice, as tail entries and then into blocks. Index sizes are measured from the
+pages in use. Still owed: a build that writes once; the three seeks each probed partition costs
+(dead rows, blocks, tail); and scoring, now over half of a query, at about 13 ns a scanned vector
+against ScaNN's few.
 
 ## Considered and not taken
 

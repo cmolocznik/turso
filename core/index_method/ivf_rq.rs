@@ -808,6 +808,17 @@ fn exact_sum(codes: &[u8], table: &[f32], slot: usize) -> f64 {
     ((sums[0] + sums[1]) + (sums[2] + sums[3])) as f64
 }
 
+/// Ask for `bytes` to be brought into the caches ahead of their use.
+fn prefetch(bytes: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    for line in bytes.chunks(64) {
+        // SAFETY: a prefetch reads nothing and cannot fault; the address lies within `bytes`.
+        unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(line.as_ptr() as *const i8) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = bytes;
+}
+
 /// Sum each group's 32 entries' table values over every nibble position: `codes` is one group's
 /// fast-scan bytes, `table` the query's 16 quantized values per position. A sum can pass 65535 once
 /// a code has more than 257 positions, so it is kept in 32 bits.
@@ -4043,6 +4054,13 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
         if scanned {
             scan_group(codes, &query.scan.bytes, &mut sums);
             left &= reaching(&sums, &gains, &slacks, &bound);
+        }
+        let mut ahead = left;
+        while ahead != 0 {
+            let n = first + ahead.trailing_zeros() as usize;
+            ahead &= ahead - 1;
+            prefetch(&payload[layout.rowids() + 8 * n..][..8]);
+            prefetch(&payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()]);
         }
         let exact = |slot: usize| exact_sum(codes, &query.scan.exact, slot);
         while left != 0 {

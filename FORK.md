@@ -5,6 +5,8 @@ Upstream Turso (`tursodatabase/turso`, `main`) with the changes below on top, on
 - `main` holds the fixes, which are headed upstream: one commit each with its test, listed by
   `git log upstream/main..main`.
 - `feat/additions` is `main` plus the additions, listed by `git log main..feat/additions`.
+- `fix/set-waker-lost-wakeup`, `fix/mvcc-checkpoint-trigger` and `fix/mvcc-exact-rowid-seek` each
+  hold one of `main`'s fixes alone on `upstream/main`.
 
 This file is only on `feat/additions`, so `main`'s commits can go upstream as they are. Keep it in
 step with the two logs: a change lands here when it lands, with what it fixes and what proves it.
@@ -16,8 +18,11 @@ step with the two logs: a change lands here when it lands, with what it fixes an
 context lock, so a completion finished on another thread between the two woke no one, and the task
 that registered was never polled again: a hang that happens now and then. The waker is now stored
 first and the completion tested after.
-Test: `io::completions::tests::set_waker_racing_complete_on_another_thread_always_wakes`, which
-races `set_waker` against `complete` 200,000 times. Upstream `main` lost 133 wakeups; fixed, 0.
+Test: `io::completions::tests::shuttle_set_waker_racing_complete_always_wakes`, run by
+`make test-shuttle`. It runs every interleaving of `set_waker` against `complete` on another
+thread; on upstream `main` it finds the one that loses the wakeup. Shuttle cannot see the std
+`OnceLock` holding a completion's result, so under `cfg(shuttle)` `Context::set_waker` yields
+before its store.
 
 ### The checkpoint trigger counts only uncheckpointed log bytes
 `core/mvcc/persistent_storage/mod.rs`, `core/mvcc/database/checkpoint_state_machine.rs`. A
@@ -34,11 +39,14 @@ On 0.8.3, 2 writers at a 256 KB threshold: inline writer commit p99 165-194 ms â
 ### An exact rowid seek walked every shadowed B-tree row after its target
 `core/mvcc/cursor.rs`. An eq-only `TableRowId` seek that reached a B-tree row shadowed by a newer
 MVCC version advanced to the next B-tree row, and kept going while rows were shadowed. Over a
-checkpointed table whose rows were all updated, point lookups went quadratic: on upstream `main`,
-2,000, 4,000 and 8,000 lookups took 311, 1,648 and 5,239 ms (`fork-repro`'s `shadow_seek`). An
-exact seek has at most one B-tree match, so it now stops when that row is shadowed or the row
-reached is not its target; the MVCC side still supplies the newer version.
-Test: `mvcc::database::tests::test_exact_rowid_seek_over_shadowed_btree_rows`.
+checkpointed table whose rows were all updated, point lookups went quadratic: on upstream `main`
+(`e9a8b0d25`), 2,000, 4,000 and 8,000 lookups took 222, 920 and 3,571 ms, against 16, 31 and 66 ms
+with the fix (`fork-repro`'s `shadow_seek`). An exact seek has at most one B-tree match, so it now
+stops when that row is shadowed or the row reached is not its target; the MVCC side still supplies
+the newer version.
+Test: `mvcc::database::tests::test_exact_rowid_seek_over_shadowed_btree_rows`, which counts each
+exact seek's B-tree steps through the cursor's yield hook: the seek for row 1 takes 155 on upstream
+`main` and 2 with the fix.
 
 ## Additions
 

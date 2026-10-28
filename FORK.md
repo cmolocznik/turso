@@ -160,45 +160,76 @@ Four gaps, each closed with tests that fail with the gap put back:
   vectors, 1.7% end up outside their nearest partition, against 5.3% rechecking 4 neighbours and
   9.7% rechecking none.
 
-The query path, measured on glove-100 (1,183,514 vectors, 2,000 queries, one thread on the
-laptop's performance core, alternating builds), after ScaNN, the RaBitQ library and FAISS were
-run on the same data on mt1 (`/home/me/cognition-data/ann`): at the same 5.9% of the data scanned
-ScaNN reached 0.907 recall@10 and ivf_rq 0.885, so the partitions were not what lost; the cost of
-each scanned vector was, about 3.5 ns for ScaNN on mt1 against over 100 for ivf_rq. Each change
-below left the recall of every setting the same to the fourth place.
-- A candidate's 4-bit code was a point read of its vector's row, about 1 µs each at this size: at
-  64 probes and a rerank of ten times the LIMIT, 2,930 of the query's 5,523 µs. A block now holds
-  each entry's 4-bit correction and lower bits after its scan groups, the query copies a
-  candidate's as it scores it and refines in memory, and the vector's row no longer vouches for
-  the entry: the dead rows, read for each partition before its blocks, name every stale copy, as
-  the tests of revised and deleted vectors check. 181 to 364 queries a second, and 85 to 123 at 256
-  probes. `a_query_refines_its_candidates_without_a_point_read` counts the point reads a query makes
-  (264 for 263 refined candidates before, the model's generation alone after) and
-  `a_block_unpacks_to_the_codes_it_packed` checks the 4-bit parts round-trip. The filtered-query
-  cost estimate prices a code at the planner's price of a table row scaled by its bytes against its
-  vector's (289 codes to a page at 768 dimensions; it counted 35 real pages' worth) and a rerank at
-  one page, since refining reads none.
+The query path, measured on glove-100 (1,183,514 vectors, 2,000 queries, one query at a time on the
+laptop's performance core 4, alternating builds), after ScaNN, the RaBitQ library and FAISS were run
+on the same data on mt1 (`/home/me/cognition-data/ann`): at the same 5.9% of the data scanned ScaNN
+reached 0.907 recall@10 and ivf_rq 0.885, so the partitions were not what lost; the cost of each
+scanned vector was, about 3.5 ns for ScaNN on mt1 against over 100 for ivf_rq.
+- A candidate's code was a point read of its vector's row, about 1 µs each at this size: at 64
+  probes and a rerank of ten times the LIMIT, 2,930 of the query's 5,523 µs. A block now holds each
+  entry's extended code after its scan groups and the query refines in memory, and the vector's row
+  no longer vouches for the entry: the dead rows, read for each partition before its blocks, name
+  every stale copy, as the tests of revised and deleted vectors check. 181 to 364 queries a second,
+  and 85 to 123 at 256 probes. `a_query_refines_its_candidates_without_a_point_read` counts the
+  point reads a query makes (264 for 263 refined candidates before, the model's generation alone
+  after) and `a_block_unpacks_to_the_codes_it_packed` checks the codes round-trip. The
+  filtered-query cost estimate prices a code at the planner's price of a table row scaled by its
+  bytes against its vector's (222 codes to a page at 768 dimensions) and a rerank at one page.
 - A block is decoded and scored where its cursor holds it, from the page's own bytes when the cell
   fits its page (`walk_held`, `held_payload`, `version_and_codes`; one walk, `walk`, serves the
-  key-only, held and copied reads). Each group's gains and error bounds are computed before any
-  member is compared, the bar is read again only when the floors move, the exact 1-bit sum walks
-  16-byte chunks into four f32 sums (it was a quarter of a query, now under a tenth), candidates
-  are ordered as (bound, index) pairs, and the lower bits' product is an AVX2 kernel.
-- The counters and timers above cost a load each unless `MEASURE` is on; on, they were about 7%
-  of a query.
-At 4 KB pages a 64-entry block of 128-dimensional codes is 5.6 KB, and of 768-dimensional ones
-34 KB, so every block read assembles an overflow chain, and a 3 KB 768-dimensional table row takes
-a page to itself. At 64 KB pages glove-100 ran 600 queries a second at 64 probes and 217 at 256
-(667 and 229 with a rerank of four), and a 200,000-vector slice of Cohere at 768 dimensions 647 at
-64 probes (recall 0.973) against 346 before these changes at 4 KB pages, and 1,480 at 16 probes
-against 705. The page size is the database's, so it is the application's choice; a database that
-holds mostly vectors gains from 64 KB pages.
+  key-only, held and copied reads). The counters and timers cost a load each unless `MEASURE` is
+  on; on, they were about 7% of a query.
 
-After CREATE INDEX over a populated table 44 to 48% of the file is on the freelist: the build
-writes its entries twice, as tail entries and then into blocks. Index sizes are measured from the
-pages in use. Still owed: a build that writes once; the three seeks each probed partition costs
-(dead rows, blocks, tail); and scoring, now over half of a query, at about 13 ns a scanned vector
-against ScaNN's few.
+Then, measured on that core against ScaNN and the RaBitQ library run on it too
+(`/home/me/cognition-data/tmp/ann/samecore*.sh`, results in `samecore/`), queries a second at
+recall@10 0.90 / 0.95, from 585 / 336:
+- Each entry carries a 7-bit extended RaBitQ code whose top bit is its 1-bit code, stored once; an
+  entry is scored from its 7-bit code as soon as its 1-bit estimate raised by its error bound
+  reaches the worst of the `refine * LIMIT` best 7-bit estimates so far, the RaBitQ library's order,
+  and those best are reranked exactly: 688 / 376. At a refine of one the query finds 97% of the
+  exact top ten, where 4-bit codes found 89%.
+- The bound test runs over a group of 32 entries at once, AVX2 in f64 with the scalar test's
+  decisions, and the lower bits' product is an AVX2 kernel: 796 / 439.
+- CREATE INDEX writes each code past its first 1,024 rows once, straight into its block, where
+  every row was written as a tail entry and then again: the file is 704 MB, all of it in use, where
+  it was 1,262 MB with 558 MB free: 817 / 451.
+- A partition's bookkeeping, dead rows, tail and blocks lie under one key range,
+  `partition << 42 | kind << 40 | id`, read with one seek where it took three: 857 / 472.
+- The blocks of the partitions queries probe are held in memory, shared by the index's cursors,
+  within `cache_mib` (default 256): each partition's under a version its bookkeeping draws afresh
+  at every rewrite, so a snapshot scores only blocks of its own version. Past the budget a
+  partition is held only when queries probed it lately more often than the one it would push out.
+  WAL queries no longer probe retired partitions: 947 / 525.
+- Partitions number four times the square root of the rows, as the library's IVF index has them,
+  trained by spherical k-means over unit vectors, 20 Lloyd iterations seeded from distinct samples
+  past 64 centroids, and a rebuild codes its vectors over the cores: 1,248 / 691 (the square root,
+  spherical: 1,044-1,100 / 544-590; four times it, plain k-means: 1,074 / 582).
+ScaNN runs 3,121 / 1,365 and the RaBitQ library at 7 bits 2,808 / 1,272 on the same core: ivf_rq is
+2.2x / 1.8x behind the library, from 4.8x / 3.8x. The index is 181 bytes a vector at 100
+dimensions, the library's 140.
+
+Vectors are padded to a multiple of 32 rather than to a power of two, rotated as the library's
+FhtKac rotator does where the width is not one: four rounds of sign flips, each followed by a
+transform of the largest power-of-two span, leading and trailing in turn, and a step of a Kac walk.
+A 768-dimensional code is 692 bytes, not 916. On a 200,000-vector slice of Cohere at 768
+dimensions the index is 213 MB instead of 264, recall at a refine of two is unchanged to the third
+place, and queries run 8 to 17% faster at each setting: 1,752-1,796 a second at 48 probes (0.908)
+against 1,579-1,671, 1,302-1,340 at 96 (0.955) against 1,176-1,225.
+`a_rotation_pads_to_a_multiple_of_32_and_keeps_lengths_and_products`.
+
+A statement's maintenance shares the partitions where it found work its jobs did not cover with the
+index's other cursors, and the next statements survey as many of them as they may do jobs, so that
+work no longer waits for a statement that writes its partition or for OPTIMIZE INDEX
+(`work_a_statement_left_due_is_done_by_the_next`, which left "partition 5 has a tail of 16"
+before).
+
+At 4 KB pages a 64-entry block of 128-dimensional codes is 8.4 KB and of 768-dimensional ones 44 KB,
+so every block read assembles an overflow chain, and a 3 KB 768-dimensional table row takes a page
+to itself; at 64 KB pages each fits one page. The page size is the database's, so it is the
+application's choice; the measurements above are at 64 KB.
+
+Still owed: the 2.2x to the library at one query at a time, and the build: 83 s on glove-100 over
+the laptop's cores, against 12 s for ScaNN and 29 s for the library on mt1.
 
 ## Considered and not taken
 

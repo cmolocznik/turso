@@ -15,9 +15,13 @@
 //! A query reads a partition's bookkeeping first. The blocks of the partitions queries probe are
 //! held in memory, shared by the index's cursors, each partition's under the version its
 //! bookkeeping held when they were read: a query whose snapshot holds that version scores them
-//! there and reads only the partition's dead rows and tail from pages. The memory is bounded by
-//! the index's `cache_mib` parameter (default [`DEFAULT_CACHE_MIB`]), not by the index's size: the
-//! least recently probed partition gives way first.
+//! there and reads only the partition's dead rows and tail from pages. Its bookkeeping, dead rows
+//! and tail are held beside the blocks with the snapshot they were read under, and serve a probe
+//! under another snapshot, which then reads no page, while no transaction writing the index is
+//! open and both snapshots are past the last commit that wrote the partition, as the index's
+//! writers record it ([`Writes`]); not where other processes write the database. The memory is
+//! bounded by the index's `cache_mib` parameter (default [`DEFAULT_CACHE_MIB`]), not by the index's
+//! size: the least recently probed partition gives way first.
 //!
 //! A statement that writes the index does the maintenance its writes made due before they are
 //! released, at most one job for each row it wrote, leaving the work it finds due past that to the
@@ -71,8 +75,12 @@ use crate::{
         parse_patterns, BackingColumn, BackingSchema, BackingStoreOp, BackingTable, IndexMethod,
         IndexMethodAttachment, IndexMethodConfiguration, IndexMethodContext, IndexMethodCostContext,
         IndexMethodCostEstimate, IndexMethodCursor, IndexMethodDefinition, IndexMethodSnapshotIdentity,
+        IndexMethodTransactionMode,
     },
-    storage::btree::{BTreeKey, CursorTrait},
+    storage::{
+        btree::{BTreeKey, CursorTrait},
+        wal::Wal,
+    },
     sync::Arc,
     types::{IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
@@ -80,7 +88,7 @@ use crate::{
         operations,
         vector_types::{Vector, VectorType},
     },
-    LimboError, Result, Value, ValueRef,
+    Connection, LimboError, MvStore, Result, Value, ValueRef,
 };
 use turso_parser::ast;
 
@@ -130,6 +138,8 @@ pub static CANDIDATES: AtomicUsize = AtomicUsize::new(0);
 /// pages.
 pub static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 pub static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+/// Probes a query served from memory alone, the partition's rows held under an earlier snapshot.
+pub static ROW_HITS: AtomicUsize = AtomicUsize::new(0);
 /// A process-wide byte budget for every index's held partitions, for measurement sweeps;
 /// `usize::MAX` leaves each index its own.
 pub static CACHE_BYTES_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -153,6 +163,8 @@ const BLOCK: usize = 64;
 const PACK_AT: usize = 8;
 /// The stale copies a block holds at which maintenance rewrites it without them.
 const COMPACT_AT: usize = 8;
+/// The most tail entries held with a partition's rows: one with more is about to be packed.
+const HELD_TAIL: usize = 2 * PACK_AT;
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 /// The rounds of sign flips and transforms a rotation makes over a width that is a power of two,
 /// and over any other, an even number.
@@ -1824,14 +1836,16 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
 }
 
 /// What the index's cursors share: the model last loaded or written, under its generation; the
-/// partitions known to be moving, which any writer's maintenance moves along; and those a run left
-/// work due in, its jobs spent, which the next statements' maintenance surveys beside its own.
+/// partitions known to be moving, which any writer's maintenance moves along; those a run left work
+/// due in, its jobs spent, which the next statements' maintenance surveys beside its own; the held
+/// partitions; and the index's [`Writes`], under its database's incarnation.
 #[derive(Default, Debug)]
 struct SharedState {
     model: Option<(i64, Arc<Model>)>,
     moving: BTreeSet<i64>,
     due: BTreeSet<i64>,
     cache: PartitionCache,
+    writes: Option<(u64, SharedWrites)>,
 }
 
 /// The blocks of partitions as queries read them, each partition's under the version of its
@@ -1855,6 +1869,9 @@ struct PartitionCache {
     full: bool,
     probed: HashMap<(i64, i64), u32>,
     counted: usize,
+    /// Each held partition's rows but its blocks, which come and go with the blocks they were read
+    /// with.
+    rows: HashMap<i64, Arc<HeldRows>>,
 }
 
 /// A partition's blocks: each one's key, centroid version and the range of its codes in `codes`.
@@ -1869,6 +1886,36 @@ impl HeldBlocks {
         let at = self.codes.len();
         self.codes.extend_from_slice(codes);
         self.blocks.push((key, version, at..self.codes.len()));
+    }
+}
+
+/// A partition's rows but its blocks as a probe read them under `snapshot`: its bookkeeping's
+/// version, the stale copies its dead rows name, as rowid and block, and its tail entries, each
+/// one's key, centroid version and the range of its codes in `codes`. They serve a probe under
+/// another snapshot when [`Writes::serves`] finds that the two see the same rows of the partition.
+#[derive(Debug)]
+struct HeldRows {
+    snapshot: Position,
+    version: i64,
+    dead: Vec<(i64, i64)>,
+    tail: Vec<(i64, i64, std::ops::Range<usize>)>,
+    codes: Vec<u8>,
+}
+
+impl HeldRows {
+    fn new(snapshot: Position, version: i64) -> Self {
+        HeldRows { snapshot, version, dead: Vec::new(), tail: Vec::new(), codes: Vec::new() }
+    }
+
+    fn push_tail(&mut self, key: i64, version: i64, codes: &[u8]) {
+        let at = self.codes.len();
+        self.codes.extend_from_slice(codes);
+        self.tail.push((key, version, at..self.codes.len()));
+    }
+
+    /// The bytes they take, counted against the budget with the blocks.
+    fn bytes(&self) -> usize {
+        self.codes.len() + 16 * self.dead.len() + 32 * self.tail.len()
     }
 }
 
@@ -1921,10 +1968,37 @@ impl PartitionCache {
     /// Hold `blocks` for `partition` under `version`, letting the least recently probed go until
     /// they fit; blocks larger than the whole budget are not held.
     fn insert(&mut self, partition: i64, version: i64, blocks: HeldBlocks) {
-        let (budget, size) = (self.budget(), blocks.codes.len());
-        if size > budget || self.entries.contains_key(&(partition, version)) {
+        let size = blocks.codes.len();
+        if size > self.budget() || self.entries.contains_key(&(partition, version)) {
             return;
         }
+        self.make_room(size);
+        self.tick += 1;
+        self.bytes += size;
+        self.order.insert(self.tick, (partition, version));
+        self.entries.insert((partition, version), (Arc::new(blocks), self.tick));
+    }
+
+    /// Hold `rows` for `partition` beside its blocks held under their version, in place of any held
+    /// before; none are held without those blocks.
+    fn hold(&mut self, partition: i64, rows: HeldRows) {
+        if let Some(old) = self.rows.remove(&partition) {
+            self.bytes -= old.bytes();
+        }
+        let size = rows.bytes();
+        if size > self.budget() || !self.entries.contains_key(&(partition, rows.version)) {
+            return;
+        }
+        self.make_room(size);
+        if self.entries.contains_key(&(partition, rows.version)) {
+            self.bytes += size;
+            self.rows.insert(partition, Arc::new(rows));
+        }
+    }
+
+    /// Let the least recently probed partitions go, with their rows, until `size` more bytes fit.
+    fn make_room(&mut self, size: usize) {
+        let budget = self.budget();
         while self.bytes + size > budget {
             let Some((_, oldest)) = self.order.pop_first() else {
                 break;
@@ -1933,11 +2007,11 @@ impl PartitionCache {
             if let Some((evicted, _)) = self.entries.remove(&oldest) {
                 self.bytes -= evicted.codes.len();
             }
+            if self.rows.get(&oldest.0).is_some_and(|rows| rows.version == oldest.1) {
+                let rows = self.rows.remove(&oldest.0).expect("rows held");
+                self.bytes -= rows.bytes();
+            }
         }
-        self.tick += 1;
-        self.bytes += size;
-        self.order.insert(self.tick, (partition, version));
-        self.entries.insert((partition, version), (Arc::new(blocks), self.tick));
     }
 }
 
@@ -1951,6 +2025,139 @@ enum Blocks {
 }
 
 type Shared = Arc<std::sync::Mutex<SharedState>>;
+
+/// A snapshot's place in commit order, compared as a pair: `(checkpoint sequence, frame)` under
+/// WAL, and `(MVCC_POSITIONS, begin timestamp)` under MVCC, past every WAL position, as a database
+/// switched to MVCC sees every commit made under WAL. A snapshot sees every commit at or before it.
+type Position = (u64, u64);
+const MVCC_POSITIONS: u64 = 1 << 32;
+
+/// A snapshot's position, unless the snapshot names none: no WAL, or an MVCC transaction the store
+/// does not track, whose cursor still records its writes.
+fn position(snapshot: IndexMethodSnapshotIdentity) -> Option<Position> {
+    match snapshot {
+        IndexMethodSnapshotIdentity::Wal { checkpoint_sequence: u32::MAX, .. } => None,
+        IndexMethodSnapshotIdentity::Wal { checkpoint_sequence, max_frame } => Some((checkpoint_sequence as u64, max_frame)),
+        IndexMethodSnapshotIdentity::Mvcc { begin_timestamp: u64::MAX, .. } => None,
+        IndexMethodSnapshotIdentity::Mvcc { begin_timestamp, .. } => Some((MVCC_POSITIONS, begin_timestamp)),
+    }
+}
+
+/// What every attachment of one index in this process knows of the transactions writing it, so the
+/// rows a probe held under one snapshot can serve another. A transaction is entered in `open`
+/// before its first write to the partitions table reaches a page, and taken off when it ends, each
+/// partition it wrote then raised in `changed` to the commit position. Its commit is visible before
+/// that, and a snapshot can't tell whether a write it sees was committed before it or after, so
+/// rows held under one snapshot serve another only while no writer is open and both are at or past
+/// the partition's `changed` position: every commit that wrote it precedes both, and a writer that
+/// begins after the check commits too late for either to see.
+#[derive(Debug)]
+struct Writes {
+    open: HashMap<usize, Writer>,
+    changed: HashMap<i64, Position>,
+    /// The commit position when the record began, standing for every partition not in `changed`:
+    /// commits before it went unrecorded.
+    floor: Position,
+}
+
+/// A transaction writing the index, entered under its connection: the partitions it wrote, its
+/// statements writing the index now, and whether one of them staged its writes.
+#[derive(Debug)]
+struct Writer {
+    connection: std::sync::Weak<Connection>,
+    partitions: HashSet<i64>,
+    statements: usize,
+    staged: bool,
+}
+
+impl Writes {
+    fn changed(&self, partition: i64) -> Position {
+        self.changed.get(&partition).copied().unwrap_or(self.floor)
+    }
+
+    fn raise(&mut self, partitions: HashSet<i64>, to: Position) {
+        for partition in partitions {
+            let changed = self.changed(partition).max(to);
+            self.changed.insert(partition, changed);
+        }
+    }
+
+    /// Take off the writers whose connection is gone, their transaction ended unheard: their
+    /// partitions are raised to `now`, past any commit they made.
+    fn settle(&mut self, now: impl FnOnce() -> Position) {
+        if self.open.values().all(|writer| writer.connection.strong_count() > 0) {
+            return;
+        }
+        let now = now();
+        let gone: Vec<usize> = self.open.iter().filter(|(_, writer)| writer.connection.strong_count() == 0).map(|(key, _)| *key).collect();
+        for key in gone {
+            if let Some(writer) = self.open.remove(&key) {
+                self.raise(writer.partitions, now);
+            }
+        }
+    }
+
+    /// Whether rows of `partition` held under `held` serve a probe under `snapshot`.
+    fn serves(&mut self, partition: i64, held: Position, snapshot: Position, now: impl FnOnce() -> Position) -> bool {
+        self.settle(now);
+        let changed = self.changed(partition);
+        self.open.is_empty() && held >= changed && snapshot >= changed
+    }
+
+    /// Whether rows of `partition` read under `snapshot` may be held: no writer is open, so none of
+    /// them is a writer's own, and the snapshot is at or past the partition's last commit, so they
+    /// can serve another.
+    fn holds(&mut self, partition: i64, snapshot: Position, now: impl FnOnce() -> Position) -> bool {
+        self.settle(now);
+        self.open.is_empty() && snapshot >= self.changed(partition)
+    }
+}
+
+type SharedWrites = std::sync::Arc<std::sync::Mutex<Writes>>;
+
+/// Each index's [`Writes`], by its database's incarnation and its name: a schema read afresh
+/// attaches the index again, and the new attachment's cursors must see the old one's writers.
+static WRITES: std::sync::LazyLock<std::sync::Mutex<HashMap<(u64, String), std::sync::Weak<std::sync::Mutex<Writes>>>>> = std::sync::LazyLock::new(Default::default);
+
+/// Where a cursor reads the latest commit position: its database's WAL, or its MVCC store.
+enum Clock {
+    Wal(Arc<dyn Wal>),
+    Mvcc(Arc<MvStore>),
+}
+
+impl Clock {
+    /// A position at or past every commit made so far: the WAL's last committed frame, read before
+    /// its checkpoint sequence, so a restart between the two can only make it later; or a timestamp
+    /// drawn now, past every commit's.
+    fn now(&self) -> Position {
+        match self {
+            Clock::Wal(wal) => {
+                let frame = wal.get_max_frame_in_wal();
+                (wal.get_checkpoint_seq() as u64, frame)
+            }
+            Clock::Mvcc(store) => (MVCC_POSITIONS, store.get_begin_timestamp()),
+        }
+    }
+}
+
+/// How a cursor records its writes in the index's [`Writes`] and its queries use and hold
+/// partitions' rows across snapshots: its clock, its connection, which keys its transaction's
+/// writes, its snapshot, unless that names no position, and whether rows it reads may be held. A
+/// WAL writer's snapshot counts the frames it has written, which a rollback hands to later commits,
+/// so rows it reads are not held.
+struct Sharing {
+    writes: SharedWrites,
+    clock: Clock,
+    connection: std::sync::Weak<Connection>,
+    snapshot: Option<Position>,
+    holds: bool,
+}
+
+impl Sharing {
+    fn key(&self) -> usize {
+        self.connection.as_ptr() as usize
+    }
+}
 
 enum Load {
     /// Read the generation: a model cached under it is the stored model, so nothing else is read.
@@ -1979,8 +2186,9 @@ enum Search {
     Init,
     /// Read a partition's rows in key order, up to `end`: its bookkeeping, whose version says
     /// whether its blocks are held; its dead rows, so its stale copies are known before its blocks
-    /// are scored; its tail entries; and its blocks, unless they are held.
-    Probe { probes: VecDeque<i64>, partition: i64, walk: Walk, end: i64, blocks: Blocks },
+    /// are scored; its tail entries; and its blocks, unless they are held. Where its blocks are to
+    /// be held, its other rows are kept in `rows`, to be held beside them.
+    Probe { probes: VecDeque<i64>, partition: i64, walk: Walk, end: i64, blocks: Blocks, rows: Option<HeldRows> },
     Rerank { candidates: VecDeque<i64>, rowid: Option<i64> },
 }
 
@@ -2467,6 +2675,12 @@ pub struct IvfRqCursor {
     /// The partitions the job being planned changes, to survey again once it is written.
     dirty: Vec<i64>,
     generation: Option<i64>,
+    /// How this statement's queries use and hold partitions' rows across snapshots, none where they
+    /// don't; the partitions its writes entered in [`Writes`] for its transaction; and whether its
+    /// statement is entered there as writing the index.
+    sharing: Option<Sharing>,
+    recorded: HashSet<i64>,
+    writing: bool,
 }
 
 impl IvfRqCursor {
@@ -2506,6 +2720,9 @@ impl IvfRqCursor {
             saved: None,
             dirty: Vec::new(),
             generation: None,
+            sharing: None,
+            recorded: HashSet::new(),
+            writing: false,
         }
     }
 
@@ -2688,6 +2905,7 @@ impl IvfRqCursor {
                     let Some(step) = steps.front_mut() else {
                         return Ok(IOResult::Done(()));
                     };
+                    self.record(step);
                     match apply_step(&mut self.stores, step, None)? {
                         IOResult::Done(()) => {
                             steps.pop_front();
@@ -2700,6 +2918,123 @@ impl IvfRqCursor {
                     }
                 }
             }
+        }
+    }
+
+    /// Set up how this statement records its writes and its queries use and hold partitions' rows
+    /// across snapshots: not in an attached database, nor where other processes write the
+    /// database, whose commits run no hook here.
+    fn share(&mut self, context: &IndexMethodContext) -> Result<()> {
+        self.sharing = None;
+        self.recorded.clear();
+        self.writing = false;
+        if context.database().id != crate::MAIN_DB_ID {
+            return Ok(());
+        }
+        let connection = context.connection()?;
+        if connection.db.opts.enable_multiprocess_wal {
+            return Ok(());
+        }
+        let (clock, holds) = match context.snapshot() {
+            IndexMethodSnapshotIdentity::Mvcc { .. } => match connection.mv_store_for_db(crate::MAIN_DB_ID) {
+                Some(store) => (Clock::Mvcc(store), true),
+                None => return Ok(()),
+            },
+            IndexMethodSnapshotIdentity::Wal { .. } => match connection.get_pager_from_database_index(&crate::MAIN_DB_ID)?.wal.clone() {
+                Some(wal) => (Clock::Wal(wal), context.transaction_mode() == IndexMethodTransactionMode::Read),
+                None => return Ok(()),
+            },
+        };
+        let writes = self.writes(context.database().incarnation, &clock);
+        let snapshot = position(context.snapshot());
+        self.sharing = Some(Sharing { writes, clock, connection: std::sync::Arc::downgrade(&connection), snapshot, holds: holds && snapshot.is_some() });
+        Ok(())
+    }
+
+    /// The index's [`Writes`], found by its database's incarnation and its name, and kept with the
+    /// attachment's state.
+    fn writes(&self, incarnation: u64, clock: &Clock) -> SharedWrites {
+        let mut shared = self.shared.lock().expect("index state");
+        if let Some((at, writes)) = &shared.writes {
+            if *at == incarnation {
+                return writes.clone();
+            }
+        }
+        let mut registry = WRITES.lock().expect("index writes");
+        registry.retain(|_, writes| writes.strong_count() > 0);
+        let key = (incarnation, self.configuration.index_name.clone());
+        let writes = match registry.get(&key).and_then(std::sync::Weak::upgrade) {
+            Some(writes) => writes,
+            None => {
+                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { open: HashMap::new(), changed: HashMap::new(), floor: clock.now() }));
+                registry.insert(key, std::sync::Arc::downgrade(&writes));
+                writes
+            }
+        };
+        shared.writes = Some((incarnation, writes.clone()));
+        writes
+    }
+
+    /// Enter, before a step on the partitions table reaches a page, that this cursor's transaction
+    /// writes the partition the step changes.
+    fn record(&mut self, step: &Step) {
+        let (Step::Put { store, rowid, .. } | Step::Remove { store, rowid, .. }) = step;
+        if *store != PARTITIONS {
+            return;
+        }
+        let partition = partition_of(*rowid);
+        if self.recorded.contains(&partition) {
+            return;
+        }
+        let Some(sharing) = &self.sharing else {
+            return;
+        };
+        let mut writes = sharing.writes.lock().expect("index writes");
+        let writer = writes.open.entry(sharing.key()).or_insert_with(|| Writer { connection: sharing.connection.clone(), partitions: HashSet::new(), statements: 0, staged: false });
+        if !self.writing {
+            writer.statements += 1;
+            self.writing = true;
+        }
+        writer.partitions.insert(partition);
+        drop(writes);
+        self.recorded.insert(partition);
+    }
+
+    /// This cursor's statement staged its writes, or undid them: it no longer writes the index. A
+    /// transaction none of whose statements staged a write to it, and none still writing it, has
+    /// nothing to commit there, and comes off the open writers.
+    fn finish_statement(&mut self, staged: bool) {
+        self.recorded.clear();
+        if !std::mem::take(&mut self.writing) {
+            return;
+        }
+        let Some(sharing) = &self.sharing else {
+            return;
+        };
+        let key = sharing.key();
+        let mut writes = sharing.writes.lock().expect("index writes");
+        if let Some(writer) = writes.open.get_mut(&key) {
+            writer.statements = writer.statements.saturating_sub(1);
+            writer.staged |= staged;
+            if writer.statements == 0 && !writer.staged {
+                writes.open.remove(&key);
+            }
+        }
+    }
+
+    /// This cursor's transaction has ended: the partitions it wrote are raised to the commit
+    /// position now, past its commit, and it comes off the open writers. A rolled-back one is
+    /// raised as well, as a rollback can follow a commit made durable before its statement was
+    /// dropped.
+    fn end_transaction(&mut self) {
+        self.recorded.clear();
+        self.writing = false;
+        let Some(sharing) = &self.sharing else {
+            return;
+        };
+        let mut writes = sharing.writes.lock().expect("index writes");
+        if let Some(writer) = writes.open.remove(&sharing.key()) {
+            writes.raise(writer.partitions, sharing.clock.now());
         }
     }
 
@@ -2784,12 +3119,14 @@ impl IndexMethodCursor for IvfRqCursor {
         let _timer = timer(&OPEN_NANOS);
         self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
         self.open_stores(context)?;
+        self.share(context)?;
         self.load()
     }
 
     fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
         self.open_stores(context)?;
+        self.share(context)?;
         self.load()
     }
 
@@ -2958,38 +3295,15 @@ impl IndexMethodCursor for IvfRqCursor {
     /// the statement wrote, when statements of a hundred random rows cost about half a job a row to
     /// keep maintained, so a run ends with nothing due well before its bound.
     fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
-        if let Some(rowids) = self.building.take().filter(|rowids| rowids.len() >= BULK_AT) {
-            // A CREATE INDEX over BULK_AT rows or more: a rebuild over them clears the tail entries
-            // the first wrote and codes every row into its block.
-            self.run = Some(Run { budget: rowids.len(), survey: Survey::default(), all: false, first: Vec::new(), build: Some(rowids) });
-            self.touched.clear();
-            self.written = 0;
-            self.inserted = 0;
+        let staged = self.stage(context)?;
+        if matches!(staged, IOResult::Done(())) {
+            self.finish_statement(true);
         }
-        if self.run.is_none() {
-            if self.written == 0 || !statement_upkeep() {
-                self.touched.clear();
-                self.written = 0;
-                self.inserted = 0;
-                return Ok(IOResult::Done(()));
-            }
-            let budget = statement_budget(self.written);
-            let mut first = std::mem::take(&mut self.touched);
-            let shared = self.shared.lock().expect("index state");
-            first.extend(shared.moving.iter().take(HINTED).copied());
-            first.extend(shared.due.iter().take(budget).copied());
-            drop(shared);
-            // A statement that inserted many rows surveys every partition, so a rebuild is chosen
-            // when its rows have outgrown the partitions.
-            let all = self.inserted >= BULK_AT;
-            self.run = Some(Run { budget, survey: Survey::default(), all, first: first.into_iter().collect(), build: None });
-            self.written = 0;
-            self.inserted = 0;
-        }
-        self.maintain(context)
+        Ok(staged)
     }
 
     fn abort_statement(&mut self, _context: &IndexMethodContext) {
+        self.finish_statement(false);
         self.forget_run();
         self.touched.clear();
         self.written = 0;
@@ -2997,7 +3311,12 @@ impl IndexMethodCursor for IvfRqCursor {
         self.building = None;
     }
 
+    fn on_transaction_committed(&mut self, _context: &IndexMethodContext) {
+        self.end_transaction();
+    }
+
     fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {
+        self.end_transaction();
         self.forget_run();
     }
 
@@ -3061,28 +3380,39 @@ impl IvfRqCursor {
         loop {
             match std::mem::replace(&mut self.search, Search::Init) {
                 Search::Init => return Err(error("no query is in progress")),
-                Search::Probe { probes, partition, mut walk, mut end, mut blocks } => {
+                Search::Probe { probes, partition, mut walk, mut end, mut blocks, mut rows } => {
                     let reading = timer(&READ_NANOS);
                     let row = match walk_held(&mut self.stores[PARTITIONS], part_key(partition)?, end, &mut walk)? {
                         IOResult::Done(row) => row,
                         IOResult::IO(io) => {
-                            self.search = Search::Probe { probes, partition, walk, end, blocks };
+                            self.search = Search::Probe { probes, partition, walk, end, blocks, rows };
                             return Ok(IOResult::IO(io));
                         }
                     };
                     drop(reading);
                     let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
                     let Some(key) = row else {
-                        match blocks {
-                            Blocks::Held(held) => {
-                                for (key, version, codes) in &held.blocks {
-                                    let centre = query.centre(&self.model, partition, *version)?;
-                                    let _scoring = timer(&SCORE_NANOS);
-                                    score_block(query, &held.codes[codes.clone()], centre, Location::Block(*key))?;
+                        if let Blocks::Held(held) = &blocks {
+                            for (key, version, codes) in &held.blocks {
+                                let centre = query.centre(&self.model, partition, *version)?;
+                                let _scoring = timer(&SCORE_NANOS);
+                                score_block(query, &held.codes[codes.clone()], centre, Location::Block(*key))?;
+                            }
+                        }
+                        let holding = match blocks {
+                            Blocks::Holding(read, version) => Some((read, version)),
+                            _ => None,
+                        };
+                        if holding.is_some() || rows.is_some() {
+                            let mut shared = self.shared.lock().expect("index state");
+                            if let Some((read, version)) = holding {
+                                shared.cache.insert(partition, version, read);
+                            }
+                            if let (Some(rows), Some(sharing)) = (rows, &self.sharing) {
+                                if sharing.writes.lock().expect("index writes").holds(partition, rows.snapshot, || sharing.clock.now()) {
+                                    shared.cache.hold(partition, rows);
                                 }
                             }
-                            Blocks::Holding(read, version) => self.shared.lock().expect("index state").cache.insert(partition, version, read),
-                            Blocks::Unread => {}
                         }
                         self.search = self.next_probe(probes)?;
                         continue;
@@ -3114,6 +3444,10 @@ impl IvfRqCursor {
                                         Blocks::Unread
                                     }
                                 };
+                                rows = match (&blocks, &self.sharing) {
+                                    (Blocks::Held(_) | Blocks::Holding(..), Some(Sharing { snapshot: Some(snapshot), holds: true, .. })) => Some(HeldRows::new(*snapshot, version)),
+                                    _ => None,
+                                };
                             }
                         }
                         DEAD_ROW => {
@@ -3122,13 +3456,24 @@ impl IvfRqCursor {
                                 _ => return Err(LimboError::Corrupt("ivf_rq: a dead row holds no blocks".into()).into()),
                             };
                             let rowid = key & ((1 << ROWID_BITS) - 1);
+                            if let Some(rows) = rows.as_mut() {
+                                rows.dead.extend(dead.iter().map(|block| (rowid, *block)));
+                            }
                             query.dead.extend(dead.into_iter().map(|block| (rowid, block)));
                         }
                         kind => {
                             tally(&RECORDS, 1);
                             let (version, codes) = version_and_codes(&record)?;
                             let source = match kind {
-                                TAIL_ROW => Location::Tail(key),
+                                TAIL_ROW => {
+                                    if rows.as_ref().is_some_and(|rows| rows.tail.len() >= HELD_TAIL) {
+                                        rows = None;
+                                    }
+                                    if let Some(rows) = rows.as_mut() {
+                                        rows.push_tail(key, version, codes);
+                                    }
+                                    Location::Tail(key)
+                                }
                                 _ => {
                                     #[cfg(test)]
                                     BLOCK_READS.with(|count| count.set(count.get() + 1));
@@ -3143,7 +3488,7 @@ impl IvfRqCursor {
                             score_block(query, codes, centre, source)?;
                         }
                     }
-                    self.search = Search::Probe { probes, partition, walk, end, blocks };
+                    self.search = Search::Probe { probes, partition, walk, end, blocks, rows };
                 }
                 Search::Rerank { mut candidates, rowid } => {
                     let _timer = timer(&RERANK_NANOS);
@@ -3224,14 +3569,89 @@ impl IvfRqCursor {
         }
     }
 
+    /// Probe the next partitions, scoring from memory those whose held rows serve this snapshot,
+    /// until one must be read from pages; with none left, the rerank.
     fn next_probe(&mut self, mut probes: VecDeque<i64>) -> Result<Search> {
-        if let Some(partition) = probes.pop_front() {
+        while let Some(partition) = probes.pop_front() {
             #[cfg(test)]
             PROBES.with(|count| count.set(count.get() + 1));
+            if self.score_held(partition)? {
+                continue;
+            }
             let (_, end) = rows_from(partition, PART_ROW)?;
-            return Ok(Search::Probe { probes, partition, walk: Walk::Seek, end, blocks: Blocks::Unread });
+            return Ok(Search::Probe { probes, partition, walk: Walk::Seek, end, blocks: Blocks::Unread, rows: None });
         }
         Ok(Search::Rerank { candidates: VecDeque::new(), rowid: None })
+    }
+
+    /// Score `partition` from memory, reading no page, when the rows held for it serve this
+    /// cursor's snapshot and its blocks are held under their version.
+    fn score_held(&mut self, partition: i64) -> Result<bool> {
+        let Some(sharing) = &self.sharing else {
+            return Ok(false);
+        };
+        let Some(snapshot) = sharing.snapshot else {
+            return Ok(false);
+        };
+        let (rows, blocks) = {
+            let mut shared = self.shared.lock().expect("index state");
+            let Some(rows) = shared.cache.rows.get(&partition).cloned() else {
+                return Ok(false);
+            };
+            if !sharing.writes.lock().expect("index writes").serves(partition, rows.snapshot, snapshot, || sharing.clock.now()) {
+                return Ok(false);
+            }
+            let Some(blocks) = shared.cache.get(partition, rows.version) else {
+                return Ok(false);
+            };
+            (rows, blocks)
+        };
+        tally(&CACHE_HITS, 1);
+        tally(&ROW_HITS, 1);
+        let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
+        query.dead.extend(rows.dead.iter().copied());
+        let tail = rows.tail.iter().map(|(key, version, codes)| (Location::Tail(*key), *version, &rows.codes[codes.clone()]));
+        let packed = blocks.blocks.iter().map(|(key, version, codes)| (Location::Block(*key), *version, &blocks.codes[codes.clone()]));
+        for (source, version, codes) in tail.chain(packed) {
+            let centre = query.centre(&self.model, partition, version)?;
+            let _scoring = timer(&SCORE_NANOS);
+            score_block(query, codes, centre, source)?;
+        }
+        Ok(true)
+    }
+
+    /// The maintenance [`IndexMethodCursor::stage_statement_commit`] does before the statement's
+    /// writes are released.
+    fn stage(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        if let Some(rowids) = self.building.take().filter(|rowids| rowids.len() >= BULK_AT) {
+            // A CREATE INDEX over BULK_AT rows or more: a rebuild over them clears the tail entries
+            // the first wrote and codes every row into its block.
+            self.run = Some(Run { budget: rowids.len(), survey: Survey::default(), all: false, first: Vec::new(), build: Some(rowids) });
+            self.touched.clear();
+            self.written = 0;
+            self.inserted = 0;
+        }
+        if self.run.is_none() {
+            if self.written == 0 || !statement_upkeep() {
+                self.touched.clear();
+                self.written = 0;
+                self.inserted = 0;
+                return Ok(IOResult::Done(()));
+            }
+            let budget = statement_budget(self.written);
+            let mut first = std::mem::take(&mut self.touched);
+            let shared = self.shared.lock().expect("index state");
+            first.extend(shared.moving.iter().take(HINTED).copied());
+            first.extend(shared.due.iter().take(budget).copied());
+            drop(shared);
+            // A statement that inserted many rows surveys every partition, so a rebuild is chosen
+            // when its rows have outgrown the partitions.
+            let all = self.inserted >= BULK_AT;
+            self.run = Some(Run { budget, survey: Survey::default(), all, first: first.into_iter().collect(), build: None });
+            self.written = 0;
+            self.inserted = 0;
+        }
+        self.maintain(context)
     }
 
     /// Drop a run that will not finish, and the model a job it abandoned had changed; the model is
@@ -3266,6 +3686,11 @@ impl IvfRqCursor {
             match std::mem::replace(&mut self.upkeep, Upkeep::Idle) {
                 Upkeep::Idle => {
                     self.open_stores(context)?;
+                    // OPTIMIZE INDEX opens no cursor before it maintains, and its writes are
+                    // recorded like any other.
+                    if self.sharing.is_none() {
+                        self.share(context)?;
+                    }
                     self.upkeep = Upkeep::Load;
                 }
                 Upkeep::Load => {
@@ -3606,6 +4031,7 @@ impl IvfRqCursor {
                         self.finish_job(job)?;
                         continue;
                     };
+                    self.record(step);
                     match apply_step(&mut self.stores, step, Some(&mut undo)) {
                         Ok(IOResult::Done(())) => {
                             steps.pop_front();
@@ -3626,6 +4052,7 @@ impl IvfRqCursor {
                     // The steps a phase made are written before it goes on, and no walk is open
                     // while they are: a phase walks a store only to collect keys.
                     if let Some(step) = steps.front_mut() {
+                        self.record(step);
                         if let IOResult::IO(io) = apply_step(&mut self.stores, step, None)? {
                             self.upkeep = Upkeep::Rebuild { phase, steps };
                             return Ok(IOResult::IO(io));
@@ -3735,6 +4162,7 @@ impl IvfRqCursor {
                         self.loaded = true;
                         return Ok(IOResult::Done(()));
                     };
+                    self.record(step);
                     match apply_step(&mut self.stores, step, None)? {
                         IOResult::Done(()) => {
                             undo.pop();
@@ -5281,6 +5709,144 @@ mod tests {
         assert_eq!(top_ten(&reader, &q), after, "the reader's answer after its snapshot");
     }
 
+    /// A partition's rows held under one snapshot serve the next query, which reads no page, until a
+    /// commit writes the partition, when the next query reads it again and finds the row: committed
+    /// on its own, in a transaction whose own query found it first, or after a checkpoint restarted
+    /// the WAL, under WAL and under MVCC. While the transaction is open, probes read pages, and a
+    /// rolled-back row is never found.
+    #[test]
+    fn held_rows_serve_later_snapshots_until_a_commit_writes_their_partition() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (db, writer) = database(&format!("ivf-rq-held-rows-{mvcc}.db"), mvcc);
+            let mut state = 211;
+            let mut live: HashMap<i64, Vec<f32>> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            let mut vectors: Vec<(i64, Vec<f32>)> = live.iter().map(|(id, v)| (*id, v.clone())).collect();
+            vectors.sort_by_key(|(id, _)| *id);
+            insert_all(&writer, &vectors);
+            writer.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let reader = db.connect(crate::ConnectOpts::new()).unwrap();
+            let q = random(&mut state, DIMS);
+            // The reader's answer, the exact top ten, and the seeks its probes made.
+            let seeks = |live: &HashMap<i64, Vec<f32>>| {
+                let before = WALK_SEEKS.with(|c| c.get());
+                assert_eq!(top_ten(&reader, &q), exact_top_ten(live, &q), "mvcc={mvcc}");
+                WALK_SEEKS.with(|c| c.get()) - before
+            };
+            // A row nearer the query than any other.
+            let nearest = |id: i64| format!("INSERT INTO v VALUES ({id}, {})", literal(&q.iter().map(|a| 2.0 * a).collect::<Vec<f32>>()));
+            let add = |live: &mut HashMap<i64, Vec<f32>>, id: i64| {
+                live.insert(id, q.iter().map(|a| 2.0 * a).collect());
+            };
+            // The first query holds the rows; under MVCC its snapshot predates the index's record
+            // of writes, begun by its own statement, so the second holds them again.
+            seeks(&live);
+            seeks(&live);
+            assert_eq!(seeks(&live), 0, "mvcc={mvcc}: a query over held partitions read pages");
+
+            writer.execute(nearest(3001)).unwrap();
+            add(&mut live, 3001);
+            assert!(seeks(&live) > 0, "mvcc={mvcc}: the query after a commit read no page");
+            assert_eq!(seeks(&live), 0, "mvcc={mvcc}: the partitions read again were not held");
+
+            writer.execute("BEGIN").unwrap();
+            writer.execute(nearest(3002)).unwrap();
+            let mut with = live.clone();
+            add(&mut with, 3002);
+            assert_eq!(top_ten(&writer, &q), exact_top_ten(&with, &q), "mvcc={mvcc}: the writer's own row");
+            assert!(seeks(&live) > 0, "mvcc={mvcc}: a query took held rows while a writer was open");
+            writer.execute("COMMIT").unwrap();
+            assert!(seeks(&with) > 0, "mvcc={mvcc}: the query after the transaction read no page");
+            assert_eq!(seeks(&with), 0, "mvcc={mvcc}: the partitions read after the transaction were not held");
+            live = with;
+
+            writer.execute("BEGIN").unwrap();
+            writer.execute(nearest(3003)).unwrap();
+            writer.execute("ROLLBACK").unwrap();
+            seeks(&live);
+            assert_eq!(seeks(&live), 0, "mvcc={mvcc}: the partitions read after the rollback were not held");
+
+            // A tail left long enough to pack, and packed by OPTIMIZE INDEX alone.
+            STATEMENT_UPKEEP.with(|on| on.set(false));
+            for id in 3101..=3112i64 {
+                writer.execute(nearest(id)).unwrap();
+                add(&mut live, id);
+            }
+            STATEMENT_UPKEEP.with(|on| on.set(true));
+            seeks(&live);
+            assert_eq!(seeks(&live), 0, "mvcc={mvcc}: the partitions read after the inserts were not held");
+            writer.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            assert!(seeks(&live) > 0, "mvcc={mvcc}: the query after OPTIMIZE INDEX read no page");
+            assert_eq!(seeks(&live), 0, "mvcc={mvcc}: the partitions read after OPTIMIZE INDEX were not held");
+
+            if !mvcc {
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                writer.execute(nearest(3004)).unwrap();
+                add(&mut live, 3004);
+                assert!(seeks(&live) > 0, "the query after a checkpoint and a commit read no page");
+                assert_eq!(seeks(&live), 0, "the partitions read after the checkpoint were not held");
+            }
+        }
+    }
+
+    /// A reader inside a transaction keeps its snapshot's answer while another connection commits a
+    /// row near its query and a third holds the partitions' rows under its later snapshot, under WAL
+    /// and under MVCC; once its transaction ends, the reader finds the row.
+    #[test]
+    fn a_snapshot_never_takes_rows_held_under_a_later_one() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (db, writer) = database(&format!("ivf-rq-later-rows-{mvcc}.db"), mvcc);
+            let mut state = 223;
+            let mut live: HashMap<i64, Vec<f32>> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            let mut vectors: Vec<(i64, Vec<f32>)> = live.iter().map(|(id, v)| (*id, v.clone())).collect();
+            vectors.sort_by_key(|(id, _)| *id);
+            insert_all(&writer, &vectors);
+            writer.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let (reader, other) = (db.connect(crate::ConnectOpts::new()).unwrap(), db.connect(crate::ConnectOpts::new()).unwrap());
+            let q = random(&mut state, DIMS);
+            let before = exact_top_ten(&live, &q);
+            reader.execute("BEGIN").unwrap();
+            assert_eq!(top_ten(&reader, &q), before, "mvcc={mvcc}");
+            let v: Vec<f32> = q.iter().map(|a| 2.0 * a).collect();
+            writer.execute(format!("INSERT INTO v VALUES (3001, {})", literal(&v))).unwrap();
+            live.insert(3001, v);
+            let after = exact_top_ten(&live, &q);
+            assert_ne!(before, after, "the row does not change the query's top ten");
+            assert_eq!(top_ten(&other, &q), after, "mvcc={mvcc}: the third connection's answer");
+            assert_eq!(top_ten(&other, &q), after, "mvcc={mvcc}: the third connection's answer from its held rows");
+            assert_eq!(top_ten(&reader, &q), before, "mvcc={mvcc}: the reader took rows held under a later snapshot");
+            reader.execute("COMMIT").unwrap();
+            assert_eq!(top_ten(&reader, &q), after, "mvcc={mvcc}: the reader's answer after its transaction");
+        }
+    }
+
+    /// A partition's rows are held only beside its blocks, count against the budget with them, and
+    /// give way with them.
+    #[test]
+    fn held_rows_come_and_go_with_their_blocks() {
+        let mut cache = PartitionCache { budget: 1000, ..PartitionCache::default() };
+        let rows = |version: i64| {
+            let mut rows = HeldRows::new((0, 1), version);
+            rows.push_tail(5, 0, &[0u8; 68]);
+            rows
+        };
+        cache.hold(0, rows(7));
+        assert!(cache.rows.is_empty() && cache.bytes == 0, "rows held without their blocks");
+        let mut blocks = HeldBlocks::default();
+        blocks.push(0, 0, &[0u8; 300]);
+        cache.insert(0, 7, blocks);
+        cache.hold(0, rows(8));
+        assert!(cache.rows.is_empty(), "rows held beside blocks of another version");
+        cache.hold(0, rows(7));
+        assert_eq!(cache.bytes, 300 + 100, "the rows' bytes are not counted");
+        let mut more = HeldBlocks::default();
+        more.push(0, 0, &[0u8; 700]);
+        cache.insert(1, 7, more);
+        assert!(cache.get(0, 7).is_none() && cache.rows.is_empty(), "the rows outlived their blocks");
+        assert_eq!(cache.bytes, 700);
+    }
+
     /// The held blocks stay within the budget, the least recently probed partition giving way
     /// first, and blocks larger than the whole budget are not held.
     #[test]
@@ -5322,7 +5888,8 @@ mod tests {
         let mut state = 107;
         let vectors: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, 16))).collect();
         insert_all(&conn, &vectors);
-        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 8, refine = 4)").unwrap();
+        // Nothing held, so every probe reads its partition from pages.
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 8, refine = 4, cache_mib = 0)").unwrap();
         // Tail entries and dead rows beside the blocks.
         for id in 3001..=3040i64 {
             conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&random(&mut state, 16)))).unwrap();

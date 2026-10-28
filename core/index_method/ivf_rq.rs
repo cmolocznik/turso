@@ -55,8 +55,8 @@ use crate::types::IOResultOr;
 use crate::{
     index_method::{
         parse_patterns, BackingColumn, BackingSchema, BackingStoreOp, BackingTable, IndexMethod,
-        IndexMethodAttachment, IndexMethodConfiguration, IndexMethodContext, IndexMethodCursor,
-        IndexMethodDefinition,
+        IndexMethodAttachment, IndexMethodConfiguration, IndexMethodContext, IndexMethodCostContext,
+        IndexMethodCostEstimate, IndexMethodCursor, IndexMethodDefinition,
     },
     storage::btree::{BTreeKey, CursorTrait},
     sync::Arc,
@@ -128,6 +128,15 @@ const COMPACT_AT: usize = 8;
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const ROUNDS: usize = 3;
 const KMEANS_ITERATIONS: usize = 8;
+/// The rows a filtered query is taken to ask for when its LIMIT is not a literal, for its cost
+/// estimate: the depth most vector searches ask for.
+const ASSUMED_LIMIT: f64 = 10.0;
+/// The 1-bit codes a page of blocks holds, for a filtered query's cost estimate: those of
+/// 768-dimensional vectors, with their factors and rowids about 116 bytes each.
+const CODES_PER_PAGE: f64 = 35.0;
+/// The pages a rerank reads per vector, for a filtered query's cost estimate: its row in the
+/// vectors table and its row in the table.
+const FETCH_PAGES: f64 = 2.0;
 /// The rounds a rebuild balances its trained partitions over.
 const BALANCE_ROUNDS: usize = 4;
 /// The vector-centroid products below which an assignment pass runs on one core.
@@ -1185,6 +1194,14 @@ fn balance(sample: &[Vec<f32>], mut centroids: Vec<Vec<f32>>, vectors: usize, et
     centroids
 }
 
+/// The value of a literal LIMIT, for a filtered query's cost estimate.
+fn literal_rows(expr: &ast::Expr) -> Option<f64> {
+    match crate::util::parse_signed_number(expr).ok()? {
+        Value::Numeric(Numeric::Integer(n)) if n >= 0 => Some(n as f64),
+        _ => None,
+    }
+}
+
 fn dense(value: Option<&[u8]>) -> Result<Vec<f32>> {
     let blob = value.ok_or_else(|| LimboError::InternalError("ivf_rq: value must be a vector blob".into()))?;
     let vector = Vector::from_slice_owned(blob)?;
@@ -1228,6 +1245,7 @@ impl IndexMethodAttachment for IvfRqIndexMethodAttachment {
             patterns: self.patterns.as_slice(),
             backing_btree: false,
             results_materialized: true,
+            filtered_queries: true,
             mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
         }
     }
@@ -1604,6 +1622,12 @@ thread_local! {
     static SURVEYED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The query rounds started on this thread.
+    static QUERY_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Count a row a survey read, for the tests' bound on maintenance work.
 fn surveyed() {
     #[cfg(test)]
@@ -1623,6 +1647,32 @@ fn statement_upkeep() -> bool {
     true
 }
 
+/// What a filtered query has given out: the rowids, so a later round gives none out again, and the
+/// `limit` nearest rows the query's other terms accepted, the farthest on top.
+struct Filter {
+    limit: usize,
+    round: u32,
+    /// Whether the current round probes every live partition, and whether it kept every row of the
+    /// index, leaving no later round anything to find.
+    probed_all: bool,
+    whole: bool,
+    /// The distance of the farthest row the current round kept, past which lie the rows of its
+    /// partitions it did not keep; infinite when it kept them all.
+    reach: f64,
+    given: HashSet<i64>,
+    accepted: BinaryHeap<Ordered>,
+}
+
+impl Filter {
+    /// Whether no row still to come can displace one of the `limit` nearest accepted rows: the
+    /// round's next row at `next`, or with none left the rows past the round's reach, is no nearer
+    /// than the farthest of them. A row an earlier, narrower round accepted can lie past the reach
+    /// of the current one.
+    fn settled(&self, next: Option<f64>) -> bool {
+        self.accepted.len() >= self.limit && self.accepted.peek().is_some_and(|farthest| next.unwrap_or(self.reach) >= farthest.0)
+    }
+}
+
 struct Query {
     vector: Vec<f32>,
     /// The query as the engine's vector, for the exact rerank.
@@ -1632,6 +1682,9 @@ struct Query {
     length: f64,
     sum: f64,
     scan: ScanTable,
+    /// The rows the query asks for; the rows the current round asks for, more for each earlier
+    /// round of a filtered query; and the 4-bit estimates the round keeps.
+    wanted: usize,
     limit: usize,
     keep: usize,
     /// The query's product with each centroid version it has met.
@@ -1684,6 +1737,8 @@ pub struct IvfRqCursor {
     change: Change,
     search: Search,
     query: Option<Query>,
+    /// A filtered query's state; none for a query no other term filters.
+    filter: Option<Filter>,
     answer: VecDeque<(i64, f64)>,
     upkeep: Upkeep,
     run: Option<Run>,
@@ -1722,6 +1777,7 @@ impl IvfRqCursor {
             change: Change::Idle,
             search: Search::Init,
             query: None,
+            filter: None,
             answer: VecDeque::new(),
             upkeep: Upkeep::Idle,
             run: None,
@@ -2018,68 +2074,235 @@ impl IndexMethodCursor for IvfRqCursor {
     }
 
     fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool> {
+        if matches!(self.search, Search::Init) {
+            let _timer = timer(&INIT_NANOS);
+            // A negative LIMIT asks for every row.
+            let limit = values[2].get_value().as_int().ok_or_else(|| error("limit must be an integer"))?;
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            if limit == 0 {
+                self.answer.clear();
+                return Ok(IOResult::Done(false));
+            }
+            let vector = dense(values[1].get_value().to_blob())?;
+            // The planner passes a filtered query one more value, 1, after the captured ones.
+            let filtered = values.get(3).and_then(|v| v.get_value().as_int()) == Some(1);
+            let rotation = self.rotation(vector.len());
+            let rotated = rotation.apply(&vector);
+            let sum = rotated.iter().map(|x| *x as f64).sum();
+            let length = rotated.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+            let scan = ScanTable::new(&rotated);
+            let asked = Vector::from_slice_owned(values[1].get_value().to_blob().ok_or_else(|| error("query is not a vector"))?)?;
+            self.query = Some(Query {
+                vector,
+                asked,
+                rotated,
+                length,
+                sum,
+                scan,
+                wanted: limit,
+                limit,
+                keep: limit,
+                centres: HashMap::new(),
+                dead: HashSet::new(),
+                floors: BinaryHeap::new(),
+                candidates: Vec::new(),
+                estimates: BinaryHeap::new(),
+                results: BinaryHeap::new(),
+            });
+            self.filter = filtered.then(|| Filter { limit, round: 0, probed_all: false, whole: false, reach: f64::INFINITY, given: HashSet::new(), accepted: BinaryHeap::new() });
+            self.search = self.round()?;
+        }
+        self.search()
+    }
+
+    fn query_next(&mut self) -> IOResultOr<bool> {
+        // A round a filtered query started in an earlier call is waiting on I/O.
+        if !matches!(self.search, Search::Init) {
+            return self.search();
+        }
+        let given = self.answer.pop_front();
+        let Some(filter) = self.filter.as_mut() else {
+            return Ok(IOResult::Done(!self.answer.is_empty()));
+        };
+        if let Some((rowid, _)) = given {
+            filter.given.insert(rowid);
+        }
+        if filter.settled(self.answer.front().map(|(_, distance)| *distance)) {
+            self.answer.clear();
+            return Ok(IOResult::Done(false));
+        }
+        if self.answer.is_empty() && !filter.whole {
+            filter.round += 1;
+            self.search = self.round()?;
+            return self.search();
+        }
+        Ok(IOResult::Done(!self.answer.is_empty()))
+    }
+
+    fn query_accept(&mut self) -> Result<()> {
+        let Some(filter) = self.filter.as_mut() else {
+            return Err(*error("a row was accepted for a query no other term filters"));
+        };
+        let &(rowid, distance) = self.answer.front().ok_or_else(|| error("no current row"))?;
+        filter.accepted.push(Ordered(distance, rowid));
+        if filter.accepted.len() > filter.limit {
+            filter.accepted.pop();
+        }
+        Ok(())
+    }
+
+    /// A filtered query's cost in the planner's units, a page read being one. It gives out about
+    /// `limit / selectivity` rows before `limit` are accepted, in rounds of four times the rows and
+    /// partitions of the last, and each round reads its partitions' blocks and fetches `refine`
+    /// vectors for each row it asks for. The index is taken to hold as many partitions as the
+    /// square root of the table's rows, as maintenance keeps it.
+    fn estimate_cost(&self, context: &IndexMethodCostContext<'_>) -> Option<IndexMethodCostEstimate> {
+        let selectivity = context.filter_selectivity?;
+        let rows = context.base_table_rows.max(1.0);
+        let partitions = rows.sqrt().round().max(1.0);
+        let limit = context.arguments.get(1).and_then(literal_rows).unwrap_or(ASSUMED_LIMIT).clamp(1.0, rows);
+        let wanted = (limit / selectivity.max(1.0 / rows)).min(rows);
+        let (mut asked, mut probes, mut cost) = (limit, self.nprobes as f64, 0.0);
+        loop {
+            let probed = probes.min(partitions);
+            cost += probed * (rows / partitions) / CODES_PER_PAGE + self.refine as f64 * asked.min(rows) * FETCH_PAGES;
+            if asked >= wanted || probed >= partitions && asked >= rows {
+                break;
+            }
+            asked *= 4.0;
+            probes *= 4.0;
+        }
+        Some(IndexMethodCostEstimate { estimated_cost: cost, estimated_rows: wanted.ceil() as u64 })
+    }
+
+    fn query_column(&mut self, _: usize) -> IOResultOr<Value> {
+        let (_, distance) = self.answer.front().ok_or_else(|| error("no current row"))?;
+        Ok(IOResult::Done(Value::from_f64(*distance)))
+    }
+
+    fn query_rowid(&mut self) -> IOResultOr<Option<i64>> {
+        let (rowid, _) = self.answer.front().ok_or_else(|| error("no current row"))?;
+        Ok(IOResult::Done(Some(*rowid)))
+    }
+
+    /// `OPTIMIZE INDEX`: survey every partition and do every job there is, until none is left.
+    fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        if self.run.is_none() {
+            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new() });
+        }
+        self.maintain(context)
+    }
+
+    /// Before the statement's writes are released, do the maintenance they made due, chosen among
+    /// the partitions it wrote and a few known to be moving, so moves finish whichever partitions
+    /// writers touch: at most one job for each row the statement wrote, when statements of a hundred
+    /// random rows cost about half a job a row to keep maintained, so a run ends with nothing due
+    /// well before its bound.
+    fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        if self.run.is_none() {
+            if self.written == 0 || !statement_upkeep() {
+                self.touched.clear();
+                self.written = 0;
+                self.inserted = 0;
+                return Ok(IOResult::Done(()));
+            }
+            let mut first = std::mem::take(&mut self.touched);
+            first.extend(self.shared.lock().expect("index state").moving.iter().take(HINTED).copied());
+            // A statement that inserted many rows surveys every partition, so a rebuild is chosen
+            // when its rows have outgrown the partitions.
+            let all = self.inserted >= BULK_AT;
+            self.run = Some(Run { budget: self.written, survey: Survey::default(), all, first: first.into_iter().collect() });
+            self.written = 0;
+            self.inserted = 0;
+        }
+        self.maintain(context)
+    }
+
+    fn abort_statement(&mut self, _context: &IndexMethodContext) {
+        self.forget_run();
+        self.touched.clear();
+        self.written = 0;
+        self.inserted = 0;
+    }
+
+    fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {
+        self.forget_run();
+    }
+
+    fn on_savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {
+        self.forget_run();
+    }
+}
+
+impl IvfRqCursor {
+    /// Start the query's next round: probe the `nprobes` live partitions nearest the query for the
+    /// rows it asks for, and for each earlier round of a filtered query four times as many of both,
+    /// so a query whose other terms reject most rows reaches as far as it must. A query asking for
+    /// every row probes every partition. Partitions retired since a writer coded against them are
+    /// read too, for tail entries left there.
+    fn round(&mut self) -> Result<Search> {
+        let nprobes = match NPROBES_OVERRIDE.load(Ordering::Relaxed) {
+            0 => self.nprobes,
+            n => n,
+        };
+        let refine = match REFINE_OVERRIDE.load(Ordering::Relaxed) {
+            0 => self.refine,
+            n => n,
+        };
+        #[cfg(test)]
+        QUERY_ROUNDS.with(|count| count.set(count.get() + 1));
+        let widen = self.filter.as_ref().map_or(1, |filter| 4usize.saturating_pow(filter.round));
+        let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
+        query.limit = query.wanted.saturating_mul(widen);
+        query.keep = refine.saturating_mul(query.limit);
+        query.floors.clear();
+        query.candidates.clear();
+        query.estimates.clear();
+        query.results.clear();
+        let mut probed_all = true;
+        let probes: VecDeque<i64> = if self.model.centroids.is_empty() {
+            VecDeque::from([0])
+        } else {
+            let mut ranked: Vec<(f32, i64)> = self
+                .model
+                .centroids
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.model.states[*i] != State::Retired)
+                .map(|(i, c)| match PROBE_BY_PRODUCT.load(Ordering::Relaxed) {
+                    0 => (l2(c, &query.vector), i as i64),
+                    _ => (-dot32(c, &query.vector), i as i64),
+                })
+                .collect();
+            let take = match query.wanted {
+                usize::MAX => ranked.len(),
+                _ => nprobes.saturating_mul(widen).min(ranked.len()),
+            };
+            probed_all = take == ranked.len();
+            if take > 0 {
+                ranked.select_nth_unstable_by(take - 1, |a, b| a.0.total_cmp(&b.0));
+            }
+            ranked.truncate(take);
+            // A retired partition holds no block, but a writer coding against a model
+            // older than its retirement can still have left a tail entry there, which
+            // maintenance moves out; until it does, the query reads it.
+            let retired = (0..self.model.centroids.len() as i64).filter(|p| self.model.states[*p as usize] == State::Retired);
+            ranked.into_iter().map(|(_, p)| p).chain(retired).collect()
+        };
+        if let Some(filter) = self.filter.as_mut() {
+            filter.probed_all = probed_all;
+        }
+        self.answer.clear();
+        self.next_probe(probes)
+    }
+
+    /// Drive the query's round to its end: the answer then holds the round's rows in order of
+    /// distance, less those an earlier round of a filtered query gave out, and a filtered round
+    /// left with none goes on to the next.
+    fn search(&mut self) -> IOResultOr<bool> {
         loop {
             match std::mem::replace(&mut self.search, Search::Init) {
-                Search::Init => {
-                    let _timer = timer(&INIT_NANOS);
-                    let vector = dense(values[1].get_value().to_blob())?;
-                    let limit = values[2].get_value().as_int().ok_or_else(|| error("limit must be an integer"))?.max(0) as usize;
-                    let rotation = self.rotation(vector.len());
-                    let rotated = rotation.apply(&vector);
-                    let sum = rotated.iter().map(|x| *x as f64).sum();
-                    let length = rotated.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
-                    let scan = ScanTable::new(&rotated);
-                    let nprobes = match NPROBES_OVERRIDE.load(Ordering::Relaxed) {
-                        0 => self.nprobes,
-                        n => n,
-                    };
-                    let refine = match REFINE_OVERRIDE.load(Ordering::Relaxed) {
-                        0 => self.refine,
-                        n => n,
-                    };
-                    let probes: VecDeque<i64> = if self.model.centroids.is_empty() {
-                        VecDeque::from([0])
-                    } else {
-                        let mut ranked: Vec<(f32, i64)> = self
-                            .model
-                            .centroids
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| self.model.states[*i] != State::Retired)
-                            .map(|(i, c)| match PROBE_BY_PRODUCT.load(Ordering::Relaxed) {
-                                0 => (l2(c, &vector), i as i64),
-                                _ => (-dot32(c, &vector), i as i64),
-                            })
-                            .collect();
-                        let take = nprobes.min(ranked.len()).max(1);
-                        ranked.select_nth_unstable_by(take - 1, |a, b| a.0.total_cmp(&b.0));
-                        ranked.truncate(take);
-                        // A retired partition holds no block, but a writer coding against a model
-                        // older than its retirement can still have left a tail entry there, which
-                        // maintenance moves out; until it does, the query reads it.
-                        let retired = (0..self.model.centroids.len() as i64).filter(|p| self.model.states[*p as usize] == State::Retired);
-                        ranked.into_iter().map(|(_, p)| p).chain(retired).collect()
-                    };
-                    let asked = Vector::from_slice_owned(values[1].get_value().to_blob().ok_or_else(|| error("query is not a vector"))?)?;
-                    self.query = Some(Query {
-                        vector,
-                        asked,
-                        rotated,
-                        length,
-                        sum,
-                        scan,
-                        limit: limit.max(1),
-                        keep: (refine * limit).max(1),
-                        centres: HashMap::new(),
-                        dead: HashSet::new(),
-                        floors: BinaryHeap::new(),
-                        candidates: Vec::new(),
-                        estimates: BinaryHeap::new(),
-                        results: BinaryHeap::new(),
-                    });
-                    self.answer.clear();
-                    self.search = self.next_probe(probes)?;
-                }
+                Search::Init => return Err(error("no query is in progress")),
                 Search::Dead { probes, partition, mut walk } => {
                     let start = tail_key(partition, 0)?;
                     let reading = timer(&READ_NANOS);
@@ -2176,8 +2399,24 @@ impl IndexMethodCursor for IvfRqCursor {
                     let Some(current) = rowid.or_else(|| candidates.pop_front()) else {
                         let mut results: Vec<Ordered> = std::mem::take(&mut query.results).into_vec();
                         results.sort();
+                        let short = results.len() < query.limit;
+                        let reach = match short {
+                            true => f64::INFINITY,
+                            false => results.last().map_or(f64::INFINITY, |o| o.0),
+                        };
                         self.answer = results.into_iter().map(|o| (o.1, o.0)).collect();
-                        self.search = Search::Init;
+                        if let Some(filter) = self.filter.as_mut() {
+                            // A round that probed every live partition and kept fewer rows than it
+                            // asked for kept every row of the index.
+                            filter.whole = filter.probed_all && short;
+                            filter.reach = reach;
+                            self.answer.retain(|(rowid, _)| !filter.given.contains(rowid));
+                            if self.answer.is_empty() && !filter.whole && !filter.settled(None) {
+                                filter.round += 1;
+                                self.search = self.round()?;
+                                continue;
+                            }
+                        }
                         return Ok(IOResult::Done(!self.answer.is_empty()));
                     };
                     let main = self.main.as_mut().ok_or_else(|| error("table cursor must be open"))?;
@@ -2212,71 +2451,6 @@ impl IndexMethodCursor for IvfRqCursor {
         }
     }
 
-    fn query_next(&mut self) -> IOResultOr<bool> {
-        let _ = self.answer.pop_front();
-        Ok(IOResult::Done(!self.answer.is_empty()))
-    }
-
-    fn query_column(&mut self, _: usize) -> IOResultOr<Value> {
-        let (_, distance) = self.answer.front().ok_or_else(|| error("no current row"))?;
-        Ok(IOResult::Done(Value::from_f64(*distance)))
-    }
-
-    fn query_rowid(&mut self) -> IOResultOr<Option<i64>> {
-        let (rowid, _) = self.answer.front().ok_or_else(|| error("no current row"))?;
-        Ok(IOResult::Done(Some(*rowid)))
-    }
-
-    /// `OPTIMIZE INDEX`: survey every partition and do every job there is, until none is left.
-    fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
-        if self.run.is_none() {
-            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new() });
-        }
-        self.maintain(context)
-    }
-
-    /// Before the statement's writes are released, do the maintenance they made due, chosen among
-    /// the partitions it wrote and a few known to be moving, so moves finish whichever partitions
-    /// writers touch: at most one job for each row the statement wrote, when statements of a hundred
-    /// random rows cost about half a job a row to keep maintained, so a run ends with nothing due
-    /// well before its bound.
-    fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
-        if self.run.is_none() {
-            if self.written == 0 || !statement_upkeep() {
-                self.touched.clear();
-                self.written = 0;
-                self.inserted = 0;
-                return Ok(IOResult::Done(()));
-            }
-            let mut first = std::mem::take(&mut self.touched);
-            first.extend(self.shared.lock().expect("index state").moving.iter().take(HINTED).copied());
-            // A statement that inserted many rows surveys every partition, so a rebuild is chosen
-            // when its rows have outgrown the partitions.
-            let all = self.inserted >= BULK_AT;
-            self.run = Some(Run { budget: self.written, survey: Survey::default(), all, first: first.into_iter().collect() });
-            self.written = 0;
-            self.inserted = 0;
-        }
-        self.maintain(context)
-    }
-
-    fn abort_statement(&mut self, _context: &IndexMethodContext) {
-        self.forget_run();
-        self.touched.clear();
-        self.written = 0;
-        self.inserted = 0;
-    }
-
-    fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {
-        self.forget_run();
-    }
-
-    fn on_savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {
-        self.forget_run();
-    }
-}
-
-impl IvfRqCursor {
     fn next_probe(&mut self, mut probes: VecDeque<i64>) -> Result<Search> {
         if let Some(partition) = probes.pop_front() {
             return Ok(Search::Dead { probes, partition, walk: Walk::Seek });
@@ -3303,6 +3477,7 @@ mod tests {
             length: rotated.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt(),
             scan: ScanTable::new(&rotated),
             rotated,
+            wanted: limit,
             limit,
             keep,
             centres: HashMap::new(),
@@ -3996,6 +4171,158 @@ mod tests {
             let (wrong, total) = misplaced(&conn, &live);
             eprintln!("mvcc={mvcc}: {wrong} of {total} vectors outside their nearest partition, {} partitions", stored(&conn).live().len());
             assert!(wrong * 100 < total * MISPLACED_PERCENT, "mvcc={mvcc}: {wrong} of {total} vectors outside their nearest partition");
+        }
+    }
+
+    /// A database, a connection to it, and the rows of its table `f`.
+    type Tagged = (Arc<crate::Database>, Arc<crate::Connection>, Vec<(i64, Vec<f32>)>);
+
+    /// A table `f` of 3000 random vectors, each tagged with its id modulo 10, and rare when its id
+    /// is a multiple of 200, under an ivf_rq index probing 16 partitions, about a third of them.
+    fn tagged(name: &str, mvcc: bool) -> Tagged {
+        let (db, conn) = database(name, mvcc);
+        conn.execute("CREATE TABLE f(id INTEGER PRIMARY KEY, e BLOB NOT NULL, tag INTEGER NOT NULL, rare INTEGER NOT NULL)").unwrap();
+        let mut state = 73;
+        let rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, 16))).collect();
+        let values: Vec<String> = rows.iter().map(|(id, v)| format!("({id}, {}, {}, {})", literal(v), id % 10, i64::from(id % 200 == 0))).collect();
+        conn.execute(format!("INSERT INTO f VALUES {}", values.join(","))).unwrap();
+        conn.execute("CREATE INDEX f_ivf ON f USING ivf_rq (e) WITH (nprobes = 16, refine = 4)").unwrap();
+        (db, conn, rows)
+    }
+
+    /// The ids of the ten rows nearest `q` among those whose id `keep` accepts.
+    fn exact_filtered(rows: &[(i64, Vec<f32>)], q: &[f32], keep: impl Fn(i64) -> bool) -> Vec<i64> {
+        let mut exact: Vec<(f64, i64)> = rows.iter().filter(|(id, _)| keep(*id)).map(|(id, v)| (dot(q, v), *id)).collect();
+        exact.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        exact.iter().take(10).map(|(_, id)| *id).collect()
+    }
+
+    fn opcodes(conn: &Arc<crate::Connection>, sql: &str) -> Vec<String> {
+        rows(conn, &format!("EXPLAIN {sql}")).iter().map(|row| row[1].to_string()).collect()
+    }
+
+    fn ids(conn: &Arc<crate::Connection>, sql: &str) -> Vec<i64> {
+        rows(conn, sql).iter().map(|row| row[0].as_int().unwrap()).collect()
+    }
+
+    /// A WHERE term the pattern does not cover no longer keeps a query off the index: the index
+    /// gives out rows in order of distance and is told which the term accepts, and the answer is
+    /// the exact top ten of the rows the term keeps, after no more than the four rounds a term
+    /// keeping one row in ten needs.
+    #[test]
+    fn a_filtered_query_returns_the_exact_top_ten_of_the_rows_its_filter_keeps() {
+        for mvcc in [false, true] {
+            let (_db, conn, rows) = tagged(&format!("ivf-rq-filtered-{mvcc}.db"), mvcc);
+            let mut state = 79;
+            for _ in 0..3 {
+                let q = random(&mut state, 16);
+                let sql = format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM f WHERE tag = 3 ORDER BY distance LIMIT 10", literal(&q));
+                let plan = opcodes(&conn, &sql);
+                assert!(plan.iter().any(|op| op == "IndexMethodQuery") && plan.iter().any(|op| op == "IndexMethodAccept"), "mvcc={mvcc}: the filtered query does not go through the index: {plan:?}");
+                let before = QUERY_ROUNDS.with(|count| count.get());
+                let got = ids(&conn, &sql);
+                let rounds = QUERY_ROUNDS.with(|count| count.get()) - before;
+                assert_eq!(got, exact_filtered(&rows, &q, |id| id % 10 == 3), "mvcc={mvcc}");
+                assert!(rounds <= 4, "mvcc={mvcc}: a filter keeping one row in ten took {rounds} rounds");
+            }
+        }
+    }
+
+    /// A filtered query is settled only when no row still to come can displace one of its accepted
+    /// rows: a far row an earlier, narrower round accepted leaves it searching while the current
+    /// round's next row is nearer, or, its rows all given out, while that far row lies past the
+    /// round's reach, beyond which rows the round did not keep can still be nearer.
+    #[test]
+    fn a_far_row_an_earlier_round_accepted_does_not_settle_the_query() {
+        let mut filter = Filter { limit: 2, round: 1, probed_all: true, whole: false, reach: 0.5, given: HashSet::new(), accepted: BinaryHeap::new() };
+        filter.accepted.push(Ordered(0.9, 1));
+        assert!(!filter.settled(Some(0.3)), "one accepted row cannot settle a query asking for two");
+        filter.accepted.push(Ordered(0.1, 2));
+        assert!(!filter.settled(Some(0.3)), "a nearer next row can still displace the far accepted row");
+        assert!(filter.settled(Some(0.95)));
+        assert!(!filter.settled(None), "rows past the round's reach can still be nearer than the far accepted row");
+        filter.accepted.push(Ordered(0.2, 3));
+        filter.accepted.pop();
+        assert!(filter.settled(None), "with both accepted rows within the round's reach nothing past it can displace them");
+    }
+
+    /// A filter keeping one row in two hundred widens the search round by round until the rows the
+    /// index gave out hold the ten nearest it keeps, so its answer is exact too.
+    #[test]
+    fn a_rare_filter_widens_the_search_until_its_answer_is_exact() {
+        for mvcc in [false, true] {
+            let (_db, conn, rows) = tagged(&format!("ivf-rq-rare-{mvcc}.db"), mvcc);
+            let mut state = 83;
+            for _ in 0..3 {
+                let q = random(&mut state, 16);
+                let sql = format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM f WHERE rare = 1 ORDER BY distance LIMIT 10", literal(&q));
+                assert!(opcodes(&conn, &sql).iter().any(|op| op == "IndexMethodAccept"), "mvcc={mvcc}: the filtered query does not go through the index");
+                assert_eq!(ids(&conn, &sql), exact_filtered(&rows, &q, |id| id % 200 == 0), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// The planner keeps a filtered query off the index where the plan without it costs less: a
+    /// rowid lookup, and a filter a B-tree index serves and the planner takes to keep few rows.
+    /// Each answer stays exact.
+    #[test]
+    fn a_filter_cheaper_served_without_the_index_keeps_its_plan() {
+        for mvcc in [false, true] {
+            let (_db, conn, rows) = tagged(&format!("ivf-rq-selective-{mvcc}.db"), mvcc);
+            conn.execute("CREATE INDEX f_tag ON f(tag)").unwrap();
+            let mut state = 89;
+            let vector = random(&mut state, 16);
+            let q = literal(&vector);
+            let by_rowid = format!("SELECT id, vector_distance_dot(e, {q}) AS distance FROM f WHERE id = 1234 ORDER BY distance LIMIT 10");
+            let by_tag = format!("SELECT id, vector_distance_dot(e, {q}) AS distance FROM f WHERE tag = 3 ORDER BY distance LIMIT 10");
+            for sql in [&by_rowid, &by_tag] {
+                let plan = opcodes(&conn, sql);
+                assert!(!plan.iter().any(|op| op == "IndexMethodQuery"), "mvcc={mvcc}: {sql} goes through the index: {plan:?}");
+            }
+            assert_eq!(ids(&conn, &by_rowid), vec![1234], "mvcc={mvcc}");
+            assert_eq!(ids(&conn, &by_tag), exact_filtered(&rows, &vector, |id| id % 10 == 3), "mvcc={mvcc}");
+        }
+    }
+
+    /// The index applies the LIMIT to the rows it gives out, before a DISTINCT would thin them, so a
+    /// DISTINCT query, filtered or not, is planned without it and applies its LIMIT after its
+    /// DISTINCT; each answer is exact.
+    #[test]
+    fn a_distinct_query_applies_its_limit_after_its_distinct() {
+        for mvcc in [false, true] {
+            let (_db, conn, rows) = tagged(&format!("ivf-rq-distinct-{mvcc}.db"), mvcc);
+            let mut state = 97;
+            let vector = random(&mut state, 16);
+            let q = literal(&vector);
+            let all = format!("SELECT DISTINCT id, vector_distance_dot(e, {q}) AS distance FROM f ORDER BY distance LIMIT 10");
+            let rare = format!("SELECT DISTINCT id, vector_distance_dot(e, {q}) AS distance FROM f WHERE rare = 1 ORDER BY distance LIMIT 10");
+            for sql in [&all, &rare] {
+                let plan = opcodes(&conn, sql);
+                assert!(!plan.iter().any(|op| op == "IndexMethodQuery"), "mvcc={mvcc}: {sql} goes through the index: {plan:?}");
+            }
+            assert_eq!(ids(&conn, &all), exact_filtered(&rows, &vector, |_| true), "mvcc={mvcc}");
+            assert_eq!(ids(&conn, &rare), exact_filtered(&rows, &vector, |id| id % 200 == 0), "mvcc={mvcc}");
+        }
+    }
+
+    /// LIMIT 0 asks the index for no rows, and a negative LIMIT for every row, in order of distance
+    /// from every partition, not only the probed ones.
+    #[test]
+    fn a_zero_limit_gives_no_rows_and_a_negative_one_every_row() {
+        for mvcc in [false, true] {
+            let (_db, conn, rows) = tagged(&format!("ivf-rq-limits-{mvcc}.db"), mvcc);
+            let mut state = 101;
+            let vector = random(&mut state, 16);
+            let q = literal(&vector);
+            let none = format!("SELECT id, vector_distance_dot(e, {q}) AS distance FROM f ORDER BY distance LIMIT 0");
+            let every = format!("SELECT id, vector_distance_dot(e, {q}) AS distance FROM f ORDER BY distance LIMIT -1");
+            for sql in [&none, &every] {
+                assert!(opcodes(&conn, sql).iter().any(|op| op == "IndexMethodQuery"), "mvcc={mvcc}: {sql} does not go through the index");
+            }
+            assert!(ids(&conn, &none).is_empty(), "mvcc={mvcc}");
+            let mut exact: Vec<(f64, i64)> = rows.iter().map(|(id, v)| (dot(&vector, v), *id)).collect();
+            exact.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            assert_eq!(ids(&conn, &every), exact.iter().map(|(_, id)| *id).collect::<Vec<_>>(), "mvcc={mvcc}");
         }
     }
 

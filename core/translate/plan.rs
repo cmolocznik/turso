@@ -3943,6 +3943,9 @@ pub struct IndexMethodQuery {
     pub arguments: Vec<Expr>,
     /// mapping from index of [ast::Expr::Column] to the column index of IndexMethod response
     pub covered_columns: HashMap<usize, usize>,
+    /// whether WHERE terms the pattern does not cover filter the rows the index method gives out,
+    /// which it is told of row by row (see [crate::index_method::IndexMethodDefinition::filtered_queries])
+    pub filtered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

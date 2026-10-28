@@ -222,13 +222,14 @@ impl IndexMethodCandidate {
             pattern_idx: self.pattern_idx,
             arguments: self.arguments.clone(),
             covered_columns: self.covered_columns.clone(),
+            filtered: false,
         }
     }
 }
 
 /// Result of successfully matching an index method pattern against a query.
 /// This intermediate struct allows both `collect_index_method_candidates` and
-/// `optimize_table_access_with_custom_modules` to share pattern matching logic.
+/// `find_custom_module_access` to share pattern matching logic.
 #[derive(Debug, Clone)]
 struct IndexMethodPatternMatch {
     /// Pattern index from the index method definition that matched
@@ -243,6 +244,9 @@ struct IndexMethodPatternMatch {
     pattern_has_limit: bool,
     /// Pattern result columns (needed for covered columns calculation)
     pattern_columns: Vec<ast::ResultColumn>,
+    /// Whether the query's WHERE has terms the pattern does not cover, which then filter the rows
+    /// the pattern gives out
+    filtered: bool,
 }
 
 pub(crate) fn plan_index_method_predicate<'a>(
@@ -272,6 +276,7 @@ pub(crate) fn plan_index_method_predicate<'a>(
                     &None,
                     pattern_idx,
                     true,
+                    false,
                 ) else {
                     continue;
                 };
@@ -285,6 +290,7 @@ pub(crate) fn plan_index_method_predicate<'a>(
                         pattern_idx,
                         arguments: sorted_arguments_from_parameters(&matched.parameters),
                         covered_columns: HashMap::default(),
+                        filtered: false,
                     },
                 ));
             }
@@ -293,7 +299,9 @@ pub(crate) fn plan_index_method_predicate<'a>(
     None
 }
 
-/// Try to match an index method pattern against a query's clauses.
+/// Try to match an index method pattern against a query's clauses. With `filters`, a pattern with
+/// ORDER BY and LIMIT also matches a query whose WHERE has terms it does not cover, as a filtered
+/// match.
 #[allow(clippy::too_many_arguments)]
 fn try_match_index_method_pattern(
     pattern: &ast::Select,
@@ -308,6 +316,7 @@ fn try_match_index_method_pattern(
     offset: &Option<Box<Expr>>,
     pattern_idx: usize,
     soft_bind_errors: bool,
+    filters: bool,
 ) -> Option<IndexMethodPatternMatch> {
     let mut pattern = pattern.clone();
     if pattern.with.is_some() || !pattern.body.compounds.is_empty() {
@@ -475,8 +484,11 @@ fn try_match_index_method_pattern(
         || (where_query_covered.is_some() && query_where_terms.len() == 1);
 
     // When WHERE is not completely covered, skip patterns with ORDER BY/LIMIT
-    // because post-filtering would disrupt the order or apply limits incorrectly
-    if !where_covered_completely && (pattern_has_order_by || pattern_has_limit) {
+    // because post-filtering would disrupt the order or apply limits incorrectly,
+    // unless the method serves filtered queries: it then gives out rows in order
+    // until it has given out enough that the other terms accept.
+    let filtered = !where_covered_completely && (pattern_has_order_by || pattern_has_limit);
+    if filtered && !(filters && pattern_has_order_by && pattern_has_limit) {
         return None;
     }
 
@@ -487,6 +499,7 @@ fn try_match_index_method_pattern(
         pattern_has_order_by,
         pattern_has_limit,
         pattern_columns: columns.clone(),
+        filtered,
     })
 }
 
@@ -571,6 +584,7 @@ fn collect_index_method_candidates(
                     offset,
                     pattern_idx,
                     true, // continue on binding failures
+                    false,
                 ) else {
                     continue;
                 };
@@ -596,6 +610,7 @@ fn collect_index_method_candidates(
                         pattern_idx: pattern_match.pattern_idx,
                         base_table_rows: base_rows,
                         arguments: &arguments,
+                        filter_selectivity: None,
                     })
                 });
 
@@ -1905,38 +1920,48 @@ fn optimize_plan_for_calls(
     }
 }
 
+/// An index method pattern a single-table query matched, not yet applied to the plan.
+struct CustomModuleAccess {
+    index: Arc<Index>,
+    pattern_match: IndexMethodPatternMatch,
+}
+
+/// Find the first index method pattern that serves this single-table query. A pattern with LIMIT
+/// applies the query's LIMIT to the rows it gives out, so it serves only a query whose rows reach
+/// the LIMIT as they leave the WHERE clause, with no aggregate or DISTINCT between
+/// (`rows_pass_through`). A pattern with ORDER BY and LIMIT serves a query whose WHERE has other
+/// terms only when its method serves filtered queries.
 #[allow(clippy::too_many_arguments)]
-fn optimize_table_access_with_custom_modules(
-    result_columns: &mut [ResultSetColumn],
-    table_references: &mut TableReferences,
+fn find_custom_module_access(
+    table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
-    where_query: &mut [WhereTerm],
-    order_by: &mut Vec<(
+    where_query: &[WhereTerm],
+    order_by: &[(
         Box<ast::Expr>,
         SortOrder,
         Option<turso_parser::ast::NullsOrder>,
-    )>,
-    group_by: &mut Option<GroupBy>,
-    limit: &mut Option<Box<Expr>>,
-    offset: &mut Option<Box<Expr>>,
+    )],
+    group_by: &Option<GroupBy>,
+    limit: &Option<Box<Expr>>,
+    offset: &Option<Box<Expr>>,
     rows_pass_through: bool,
-) -> Result<bool> {
+) -> Result<Option<CustomModuleAccess>> {
     let tables = table_references.joined_tables();
     if tables.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
     // group by is not supported for now
     if group_by.is_some() {
-        return Ok(false);
+        return Ok(None);
     }
 
     // Only optimize the first table with custom index methods.
     // This allows FTS to be used as the driving table in joins.
     let table = &tables[0];
     let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
-        return Ok(false);
+        return Ok(None);
     };
     for index in indexes {
         let Some(module) = &index.index_method else {
@@ -1946,6 +1971,7 @@ fn optimize_table_access_with_custom_modules(
             continue;
         }
         let definition = module.definition();
+        let filters = definition.filtered_queries;
         'patterns: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
             let Some(pattern_match) = try_match_index_method_pattern(
                 pattern,
@@ -1956,6 +1982,7 @@ fn optimize_table_access_with_custom_modules(
                 offset,
                 pattern_idx,
                 false, // panic on binding failures
+                filters,
             ) else {
                 continue;
             };
@@ -1972,73 +1999,127 @@ fn optimize_table_access_with_custom_modules(
             if pattern_match.pattern_has_limit && !rows_pass_through {
                 continue;
             }
-
-            // Mark WHERE clause as consumed
-            if let Some(where_covered) = pattern_match.where_covered {
-                where_query[where_covered].consumed = true;
-            }
-
-            // Build covered columns mapping and update result_columns.
-            // This differs from collect_index_method_candidates: we modify result_columns
-            // and increment covered_column_id per matching query column, not per pattern column.
-            let mut covered_column_id = 1_000_000;
-            let mut covered_columns = HashMap::default();
-            for (pattern_column_id, pattern_column) in
-                pattern_match.pattern_columns.iter().enumerate()
-            {
-                let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
-                    continue;
-                };
-                let Some(substituted) =
-                    module.result_column(pattern_expr, &pattern_match.parameters)
-                else {
-                    continue;
-                };
-                for query_column in result_columns.iter_mut() {
-                    if !exprs_are_equivalent(&query_column.expr, &substituted) {
-                        continue;
-                    }
-                    query_column.expr = ast::Expr::Column {
-                        database: None,
-                        table: table.internal_id,
-                        column: covered_column_id,
-                        is_rowid_alias: false,
-                    };
-                    covered_columns.insert(covered_column_id, pattern_column_id);
-                    covered_column_id += 1;
-                }
-            }
-
-            // Calculate whether WHERE is completely covered for ORDER BY/LIMIT clearing
-            let where_covered_completely = where_query.is_empty()
-                || (pattern_match.where_covered.is_some() && where_query.len() == 1);
-
-            // Only clear ORDER BY/LIMIT/OFFSET if:
-            // 1. The pattern explicitly handles them (has ORDER BY/LIMIT), AND
-            // 2. WHERE is completely covered (no post-filtering needed)
-            // Otherwise, keep them so they're applied after post-filtering
-            if pattern_match.pattern_has_order_by && where_covered_completely {
-                let _ = order_by.drain(..);
-            }
-            if pattern_match.pattern_has_limit && where_covered_completely {
-                let _ = limit.take();
-                let _ = offset.take();
-            }
-
-            // Sort and collect arguments
-            let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
-
-            table_references.joined_tables_mut()[0].op =
-                Operation::IndexMethodQuery(IndexMethodQuery {
-                    index: index.clone(),
-                    pattern_idx: pattern_match.pattern_idx,
-                    covered_columns,
-                    arguments,
-                });
-            return Ok(true);
+            return Ok(Some(CustomModuleAccess {
+                index: index.clone(),
+                pattern_match,
+            }));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// Make a matched pattern the table's access: consume the WHERE term it covers, read the result
+/// columns it provides from the index method, and drop the ORDER BY and LIMIT it applies itself.
+fn apply_custom_module_access(
+    access: CustomModuleAccess,
+    result_columns: &mut [ResultSetColumn],
+    table_references: &mut TableReferences,
+    where_query: &mut [WhereTerm],
+    order_by: &mut Vec<(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )>,
+    limit: &mut Option<Box<Expr>>,
+    offset: &mut Option<Box<Expr>>,
+) {
+    let CustomModuleAccess {
+        index,
+        pattern_match,
+    } = access;
+    let module = index
+        .index_method
+        .as_ref()
+        .expect("a custom module access has an index method");
+    let table_id = table_references.joined_tables()[0].internal_id;
+
+    // Mark WHERE clause as consumed
+    if let Some(where_covered) = pattern_match.where_covered {
+        where_query[where_covered].consumed = true;
+    }
+
+    // Build covered columns mapping and update result_columns.
+    // This differs from collect_index_method_candidates: we modify result_columns
+    // and increment covered_column_id per matching query column, not per pattern column.
+    let mut covered_column_id = 1_000_000;
+    let mut covered_columns = HashMap::default();
+    for (pattern_column_id, pattern_column) in pattern_match.pattern_columns.iter().enumerate() {
+        let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
+            continue;
+        };
+        let Some(substituted) = module.result_column(pattern_expr, &pattern_match.parameters)
+        else {
+            continue;
+        };
+        for query_column in result_columns.iter_mut() {
+            if !exprs_are_equivalent(&query_column.expr, &substituted) {
+                continue;
+            }
+            query_column.expr = ast::Expr::Column {
+                database: None,
+                table: table_id,
+                column: covered_column_id,
+                is_rowid_alias: false,
+            };
+            covered_columns.insert(covered_column_id, pattern_column_id);
+            covered_column_id += 1;
+        }
+    }
+
+    // Only clear ORDER BY/LIMIT/OFFSET if:
+    // 1. The pattern explicitly handles them (has ORDER BY/LIMIT), AND
+    // 2. WHERE is completely covered (no post-filtering needed)
+    // Otherwise, keep them so they're applied after post-filtering
+    if pattern_match.pattern_has_order_by && !pattern_match.filtered {
+        let _ = order_by.drain(..);
+    }
+    if pattern_match.pattern_has_limit && !pattern_match.filtered {
+        let _ = limit.take();
+        let _ = offset.take();
+    }
+
+    // Sort and collect arguments
+    let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
+
+    table_references.joined_tables_mut()[0].op = Operation::IndexMethodQuery(IndexMethodQuery {
+        index: index.clone(),
+        pattern_idx: pattern_match.pattern_idx,
+        covered_columns,
+        arguments,
+        filtered: pattern_match.filtered,
+    });
+}
+
+/// Whether a filtered index method query costs less than `regular`, the best plan without it,
+/// which must also compute the pattern's ORDER BY term for every row the WHERE clause keeps and
+/// sort those rows. The method estimates its own cost from the share of rows `regular` keeps; a
+/// method that gives no estimate is not used.
+fn filtered_access_is_cheaper(
+    access: &CustomModuleAccess,
+    regular: &JoinN,
+    base_rows: f64,
+    params: &cost_params::CostModelParams,
+) -> bool {
+    let rows = base_rows.max(1.0);
+    let kept = regular.output_cardinality.clamp(1.0, rows);
+    let Some(module) = &access.index.index_method else {
+        return false;
+    };
+    let arguments = sorted_arguments_from_parameters(&access.pattern_match.parameters);
+    let estimate = module.init().ok().and_then(|cursor| {
+        cursor.estimate_cost(&IndexMethodCostContext {
+            pattern_idx: access.pattern_match.pattern_idx,
+            base_table_rows: rows,
+            arguments: &arguments,
+            filter_selectivity: Some(kept / rows),
+        })
+    });
+    let Some(estimate) = estimate else {
+        return false;
+    };
+    let regular_cost =
+        *regular.cost + *estimate_sort_cpu_cost(kept, params) + kept * params.cpu_cost_per_row;
+    estimate.estimated_cost < regular_cost
 }
 
 /// We do a single pass over projected, grouping, filtering, and ordering expressions to
@@ -2641,9 +2722,9 @@ fn find_table_access_plan(
         .joined_tables()
         .iter()
         .any(|t| t.indexed.is_some());
+    let mut filtered_access = None;
     if is_single_table && !has_indexed_by_hint {
-        let optimized = optimize_table_access_with_custom_modules(
-            result_columns,
+        if let Some(access) = find_custom_module_access(
             table_references,
             available_indexes,
             subqueries,
@@ -2653,9 +2734,22 @@ fn find_table_access_plan(
             limit,
             offset,
             rows_pass_through,
-        )?;
-        if optimized {
-            return Ok(None);
+        )? {
+            if !access.pattern_match.filtered {
+                apply_custom_module_access(
+                    access,
+                    result_columns,
+                    table_references,
+                    where_clause,
+                    order_by,
+                    limit,
+                    offset,
+                );
+                return Ok(None);
+            }
+            // A filtered query is planned without the pattern first: the pattern serves it
+            // only when it costs less than that plan.
+            filtered_access = Some(access);
         }
     }
 
@@ -2794,6 +2888,21 @@ fn find_table_access_plan(
         schema,
         params,
     )?;
+
+    if let Some(access) = filtered_access {
+        if filtered_access_is_cheaper(&access, &best_plan, *base_table_rows[0], params) {
+            apply_custom_module_access(
+                access,
+                result_columns,
+                table_references,
+                where_clause,
+                order_by,
+                limit,
+                offset,
+            );
+            return Ok(None);
+        }
+    }
 
     Ok(Some(TableAccessPlan {
         access_methods: access_methods_arena,

@@ -246,6 +246,17 @@ impl OpenLoop {
             )
             .emit()?;
 
+            // A filtered index method query is told of each row the WHERE terms its pattern
+            // does not cover accept, so it can stop once no row still to come could reach the
+            // LIMIT.
+            if let Operation::IndexMethodQuery(query) = &table.op {
+                if query.filtered {
+                    program.emit_insn(Insn::IndexMethodAccept {
+                        cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
+                    });
+                }
+            }
+
             // ANTI-JOIN: all conditions passed means a match was found.
             // Skip the outer row by jumping to the outer loop's Next.
             // label_body is resolved later in emit_loop, right before the body is emitted.
@@ -637,7 +648,9 @@ pub(super) fn emit_table_read_start(
             }
         }
         Operation::IndexMethodQuery(query) => {
-            let start_reg = program.alloc_registers(query.arguments.len() + 1);
+            // A filtered query passes one more value, 1, after the captured arguments.
+            let count = query.arguments.len() + 1 + usize::from(query.filtered);
+            let start_reg = program.alloc_registers(count);
             program.emit_int(query.pattern_idx as i64, start_reg);
             for i in 0..query.arguments.len() {
                 translate_expr(
@@ -648,11 +661,14 @@ pub(super) fn emit_table_read_start(
                     &t_ctx.resolver,
                 )?;
             }
+            if query.filtered {
+                program.emit_int(1, start_reg + 1 + query.arguments.len());
+            }
             program.emit_insn(Insn::IndexMethodQuery {
                 db: crate::MAIN_DB_ID,
                 cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
                 start_reg,
-                count_reg: query.arguments.len() + 1,
+                count_reg: count,
                 pc_if_empty: loop_end,
             });
             program.preassign_label_to_next_insn(loop_start);

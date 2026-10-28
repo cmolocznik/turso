@@ -343,6 +343,7 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
             patterns: self.patterns.as_slice(),
             backing_btree: false,
             results_materialized: true,
+            filtered_queries: false,
             mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
         }
     }

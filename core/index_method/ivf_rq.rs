@@ -46,7 +46,7 @@
 //! of the vector's code). Only maintenance writes blocks, centroids and parts.
 use std::{
     collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crate::numeric::Numeric;
@@ -101,6 +101,9 @@ pub static CONFLICTS: AtomicUsize = AtomicUsize::new(0);
 pub static REBUILDS: AtomicUsize = AtomicUsize::new(0);
 pub static SPLIT_MICROS: AtomicUsize = AtomicUsize::new(0);
 pub static SPLIT_MICROS_MAX: AtomicUsize = AtomicUsize::new(0);
+/// Whether queries and inserts record the counts and timings below, for measurement; while it
+/// is off each costs one load.
+pub static MEASURE: AtomicBool = AtomicBool::new(false);
 /// Entries a query estimated from 1-bit codes, and those it went on to score from 4-bit codes.
 pub static SCANNED: AtomicUsize = AtomicUsize::new(0);
 pub static REFINED: AtomicUsize = AtomicUsize::new(0);
@@ -109,7 +112,7 @@ pub static READ_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static SCORE_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static RECORDS: AtomicUsize = AtomicUsize::new(0);
 pub static NEXT_NANOS: AtomicUsize = AtomicUsize::new(0);
-pub static SEEK_NANOS: AtomicUsize = AtomicUsize::new(0);
+pub static REFINE_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static RERANK_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static OPEN_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_NANOS: AtomicUsize = AtomicUsize::new(0);
@@ -131,12 +134,14 @@ const KMEANS_ITERATIONS: usize = 8;
 /// The rows a filtered query is taken to ask for when its LIMIT is not a literal, for its cost
 /// estimate: the depth most vector searches ask for.
 const ASSUMED_LIMIT: f64 = 10.0;
-/// The 1-bit codes a page of blocks holds, for a filtered query's cost estimate: those of
-/// 768-dimensional vectors, with their factors and rowids about 116 bytes each.
-const CODES_PER_PAGE: f64 = 35.0;
-/// The pages a rerank reads per vector, for a filtered query's cost estimate: its row in the
-/// vectors table and its row in the table.
-const FETCH_PAGES: f64 = 2.0;
+/// The codes a page of blocks holds, for a filtered query's cost estimate, in the planner's pages:
+/// it prices a table row at a fiftieth of a page whatever the row's width, and a code is priced at
+/// that rate scaled by its bytes against its vector's. A 768-dimensional vector's code, padded to
+/// 1,024 dimensions by the rotation, with its rowid, factors and 4-bit parts, is 532 bytes, and the
+/// vector 3,072: 50 * 3,072 / 532.
+const CODES_PER_PAGE: f64 = 289.0;
+/// The pages a rerank reads per vector, for a filtered query's cost estimate: its row in the table.
+const FETCH_PAGES: f64 = 1.0;
 /// The rounds a rebuild balances its trained partitions over.
 const BALANCE_ROUNDS: usize = 4;
 /// The vector-centroid products below which an assignment pass runs on one core.
@@ -376,8 +381,13 @@ struct Rotation {
 }
 
 impl Rotation {
+    /// The width vectors of `dims` dimensions are padded to.
+    fn padded(dims: usize) -> usize {
+        dims.next_power_of_two().max(8)
+    }
+
     fn new(dims: usize) -> Self {
-        let padded = dims.next_power_of_two().max(8);
+        let padded = Rotation::padded(dims);
         let mut state = SEED;
         let signs = (0..ROUNDS * padded)
             .map(|_| {
@@ -425,11 +435,12 @@ struct Entry {
 struct Layout {
     count: usize,
     positions: usize,
+    code_bytes: usize,
 }
 
 impl Layout {
     fn new(count: usize, code_bytes: usize) -> Self {
-        Self { count, positions: code_bytes * 2 }
+        Self { count, positions: code_bytes * 2, code_bytes }
     }
     fn groups(&self) -> usize {
         self.count.div_ceil(GROUP)
@@ -449,8 +460,16 @@ impl Layout {
     fn scan(&self) -> usize {
         self.factors() + 4 * self.count
     }
-    fn len(&self) -> usize {
+    /// Each entry's 4-bit parts, as its vector's row also holds them: the correction, then the
+    /// lower bits.
+    fn extras(&self) -> usize {
         self.scan() + self.groups() * self.group_bytes()
+    }
+    fn extra_bytes(&self) -> usize {
+        4 + EX_BITS * self.code_bytes
+    }
+    fn len(&self) -> usize {
+        self.extras() + self.count * self.extra_bytes()
     }
 }
 
@@ -466,12 +485,16 @@ fn block_count(payload: &[u8]) -> Result<usize> {
     Ok(u16::from_le_bytes(payload.get(..2).ok_or_else(|| LimboError::Corrupt("ivf_rq: short block".into()))?.try_into().unwrap()) as usize)
 }
 
-fn pack(entries: &[Entry]) -> Vec<u8> {
+fn pack(entries: &[Entry]) -> Result<Vec<u8>> {
     let code_bytes = entries.first().map_or(0, |e| e.bits.len());
     let layout = Layout::new(entries.len(), code_bytes);
     let mut out = vec![0u8; layout.len()];
     out[..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
     for (n, e) in entries.iter().enumerate() {
+        if e.ex.len() != EX_BITS * code_bytes {
+            return Err(*error("an entry to pack lacks its 4-bit code"));
+        }
+        out[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()].copy_from_slice(&extra(e));
         out[layout.rowids() + 8 * n..][..8].copy_from_slice(&e.rowid.to_le_bytes());
         out[layout.norms() + 4 * n..][..4].copy_from_slice(&e.norm.to_le_bytes());
         out[layout.factors() + 4 * n..][..4].copy_from_slice(&e.factor.to_le_bytes());
@@ -482,7 +505,7 @@ fn pack(entries: &[Entry]) -> Vec<u8> {
             out[group + j * 16 + slot] |= nibble << shift;
         }
     }
-    out
+    Ok(out)
 }
 
 /// The code width a block of `count` entries and `len` bytes was packed at.
@@ -490,14 +513,16 @@ fn block_code_bytes(payload: &[u8]) -> Result<usize> {
     let count = block_count(payload)?;
     let fixed = Layout::new(count, 0).len();
     let groups = count.div_ceil(GROUP).max(1);
-    let scanned = payload.len().checked_sub(fixed).ok_or_else(|| LimboError::Corrupt("ivf_rq: short block".into()))?;
-    if count == 0 || scanned % (groups * 32) != 0 {
+    let coded = payload.len().checked_sub(fixed).ok_or_else(|| LimboError::Corrupt("ivf_rq: short block".into()))?;
+    // Each code byte takes 32 bytes of each scan group and EX_BITS bytes of each entry's lower bits.
+    let per_code_byte = groups * 32 + EX_BITS * count;
+    if count == 0 || coded % per_code_byte != 0 {
         return Err(LimboError::Corrupt("ivf_rq: block length differs from its count".into()));
     }
-    Ok(scanned / (groups * 32))
+    Ok(coded / per_code_byte)
 }
 
-/// A block's entries, without the 4-bit parts that live in the vectors table.
+/// A block's entries, with their 4-bit parts.
 fn unpack(payload: &[u8]) -> Result<Vec<Entry>> {
     let count = block_count(payload)?;
     let code_bytes = block_code_bytes(payload)?;
@@ -514,13 +539,14 @@ fn unpack(payload: &[u8]) -> Result<Vec<Entry>> {
                 let nibble = (payload[group + j * 16 + slot] >> shift) & 0xf;
                 bits[j / 2] |= nibble << (4 * (j & 1));
             }
+            let extra = &payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()];
             Entry {
                 rowid: i64_at(payload, layout.rowids() + 8 * n),
                 norm: f32_at(payload, layout.norms() + 4 * n),
                 factor: f32_at(payload, layout.factors() + 4 * n),
-                refined: 0.0,
+                refined: f32_at(extra, 0),
                 bits,
-                ex: Vec::new(),
+                ex: extra[4..].to_vec(),
             }
         })
         .collect())
@@ -844,6 +870,10 @@ enum Get {
 }
 
 fn get_row(cursor: &mut Box<dyn CursorTrait>, rowid: i64, state: &mut Get) -> IOResultOr<Option<ImmutableRecord>> {
+    #[cfg(test)]
+    if matches!(*state, Get::Seek) {
+        POINT_READS.with(|count| count.set(count.get() + 1));
+    }
     loop {
         match *state {
             Get::Seek => match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
@@ -872,7 +902,9 @@ enum Walk {
 }
 
 /// The next row of the walk over `start..end`, or none once it is past the end.
-fn walk_row(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut Walk) -> IOResultOr<Option<(i64, ImmutableRecord)>> {
+/// Step a walk over the keys in `start..end` to its next row: the row's key, or none past the range.
+/// With `read`, the row's record is read before the walk moves on and left held by the cursor.
+fn walk(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut Walk, read: bool) -> IOResultOr<Option<i64>> {
     loop {
         match *state {
             Walk::Seek => match {
@@ -901,14 +933,44 @@ fn walk_row(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut
                 if rowid >= end {
                     return Ok(IOResult::Done(None));
                 }
-                let found = match cursor.record()? {
-                    IOResult::Done(found) => found.ok_or_else(|| error("positioned cursor has no record"))?.clone(),
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                };
+                // Read the record before moving on, so a retry after I/O reads this row again.
+                if read {
+                    if let IOResult::IO(io) = cursor.record()? {
+                        return Ok(IOResult::IO(io));
+                    }
+                }
                 *state = Walk::Next;
-                return Ok(IOResult::Done(Some((rowid, found))));
+                return Ok(IOResult::Done(Some(rowid)));
             }
         }
+    }
+}
+
+/// The next rowid of the walk over `start..end`, its record left unread, or none past the end.
+fn walk_key(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut Walk) -> IOResultOr<Option<i64>> {
+    walk(cursor, start, end, state, false)
+}
+
+/// The next rowid of the walk over `start..end`, its record read and held by the cursor.
+fn walk_held(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut Walk) -> IOResultOr<Option<i64>> {
+    walk(cursor, start, end, state, true)
+}
+
+/// The record a walk left its cursor on: [`walk_held`] has read it, so it is held without I/O.
+fn held_record(cursor: &mut Box<dyn CursorTrait>) -> Result<&ImmutableRecord> {
+    match cursor.record()? {
+        IOResult::Done(Some(record)) => Ok(record),
+        IOResult::Done(None) => Err(*error("positioned cursor has no record")),
+        IOResult::IO(_) => Err(*error("a walk's record was not read before it was held")),
+    }
+}
+
+/// [`walk_held`], with an owned copy of the row's record.
+fn walk_row(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut Walk) -> IOResultOr<Option<(i64, ImmutableRecord)>> {
+    match walk_held(cursor, start, end, state)? {
+        IOResult::Done(Some(rowid)) => Ok(IOResult::Done(Some((rowid, held_record(cursor)?.clone())))),
+        IOResult::Done(None) => Ok(IOResult::Done(None)),
+        IOResult::IO(io) => Ok(IOResult::IO(io)),
     }
 }
 
@@ -995,43 +1057,6 @@ fn conflicted(error: &LimboError) -> bool {
     matches!(error, LimboError::WriteWriteConflict)
 }
 
-
-/// The next rowid of the walk over `start..end`, its record left unread, or none past the end.
-fn walk_key(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut Walk) -> IOResultOr<Option<i64>> {
-    loop {
-        match *state {
-            Walk::Seek => match {
-                cursor.set_forward_bound(Some(end));
-                cursor.seek(SeekKey::TableRowId(start), SeekOp::GE { eq_only: false })?
-            } {
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                IOResult::Done(SeekResult::Found) => *state = Walk::Read,
-                IOResult::Done(SeekResult::TryAdvance) => *state = Walk::Next,
-                IOResult::Done(SeekResult::NotFound) => return Ok(IOResult::Done(None)),
-            },
-            Walk::Next => {
-                if let IOResult::IO(io) = cursor.next()? {
-                    return Ok(IOResult::IO(io));
-                }
-                *state = Walk::Read;
-            }
-            Walk::Read => {
-                if !cursor.has_record() {
-                    return Ok(IOResult::Done(None));
-                }
-                let rowid = match cursor.rowid()? {
-                    IOResult::Done(rowid) => rowid.ok_or_else(|| error("positioned cursor has no rowid"))?,
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                };
-                if rowid >= end {
-                    return Ok(IOResult::Done(None));
-                }
-                *state = Walk::Next;
-                return Ok(IOResult::Done(Some(rowid)));
-            }
-        }
-    }
-}
 
 /// The 4-bit code of a rotated unit vector: values on the half-integer grid -7.5..=7.5 at the
 /// scale whose code points closest to the vector's direction. A value's sign is the vector's.
@@ -1298,15 +1323,15 @@ enum Change {
     Apply(VecDeque<Step>),
 }
 
-/// An entry a query kept from its 1-bit estimate: the bound it may reach, what its 4-bit estimate
-/// needs, and where it was read, which the vector's row must still name.
+/// An entry a query kept from its 1-bit estimate: the bound it may reach, and what its 4-bit
+/// estimate needs, its 4-bit parts at `extra` in the query's copy of them.
 struct Candidate {
     upper: f64,
     rowid: i64,
     centre: f64,
     norm: f64,
     signed: f64,
-    source: Location,
+    extra: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1320,7 +1345,6 @@ enum Search {
     /// Read a partition's dead rows, so its stale copies are known before its blocks are scored.
     Dead { probes: VecDeque<i64>, partition: i64, walk: Walk },
     Probe { probes: VecDeque<i64>, partition: i64, stage: Stage, walk: Walk },
-    Refine { order: VecDeque<Candidate>, get: Get },
     Rerank { candidates: VecDeque<i64>, rowid: Option<i64> },
 }
 
@@ -1541,7 +1565,7 @@ impl Stream {
     fn write(&mut self, partition: i64, version: i64, entries: Vec<Entry>, steps: &mut VecDeque<Step>) -> Result<()> {
         let part = self.parts.entry(partition).or_default();
         let key = block_key(partition, part.next)?;
-        steps.push_back(put(BLOCKS, key, record(&[Value::from_i64(version), blob(&pack(&entries))?])?));
+        steps.push_back(put(BLOCKS, key, record(&[Value::from_i64(version), blob(&pack(&entries)?)?])?));
         for e in &entries {
             steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode()), blob(&extra(e))?])?));
         }
@@ -1626,6 +1650,9 @@ thread_local! {
 thread_local! {
     /// The query rounds started on this thread.
     static QUERY_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The point reads made on this thread, and the candidates queries on it scored from 4-bit codes.
+    static POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static QUERY_REFINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Count a row a survey read, for the tests' bound on maintenance work.
@@ -1695,6 +1722,8 @@ struct Query {
     /// entry's raised estimate must reach.
     floors: BinaryHeap<Ordered>,
     candidates: Vec<Candidate>,
+    /// The candidates' 4-bit parts, copied from the blocks and tail entries they were read from.
+    extras: Vec<u8>,
     estimates: BinaryHeap<Ordered>,
     results: BinaryHeap<Ordered>,
 }
@@ -1815,7 +1844,7 @@ impl IvfRqCursor {
     }
 
     fn rotation(&mut self, dims: usize) -> Rotation {
-        if self.rotation.as_ref().is_none_or(|r| r.padded != dims.next_power_of_two().max(8)) {
+        if self.rotation.as_ref().is_none_or(|r| r.padded != Rotation::padded(dims)) {
             self.rotation = Some(Rotation::new(dims));
         }
         self.rotation.clone().expect("rotation built")
@@ -1995,24 +2024,33 @@ impl IvfRqCursor {
         Ok((
             partition,
             [
-                put(TAIL, key, record(&[Value::from_i64(version), blob(&pack(std::slice::from_ref(&entry)))?])?),
+                put(TAIL, key, record(&[Value::from_i64(version), blob(&pack(std::slice::from_ref(&entry))?)?])?),
                 put(VECTORS, rowid, record(&[Value::from_i64(Location::Tail(key).encode()), blob(&extra(&entry))?])?),
             ],
         ))
     }
 }
 
-/// Adds the time since its start to a counter when dropped.
-struct Timer<'a>(&'a AtomicUsize, std::time::Instant);
+/// Adds the time since its start to a counter when dropped, while [`MEASURE`] is on.
+struct Timer<'a>(&'a AtomicUsize, Option<std::time::Instant>);
 
 impl Drop for Timer<'_> {
     fn drop(&mut self) {
-        self.0.fetch_add(self.1.elapsed().as_nanos() as usize, Ordering::Relaxed);
+        if let Some(started) = self.1 {
+            self.0.fetch_add(started.elapsed().as_nanos() as usize, Ordering::Relaxed);
+        }
     }
 }
 
 fn timer(counter: &AtomicUsize) -> Timer<'_> {
-    Timer(counter, std::time::Instant::now())
+    Timer(counter, MEASURE.load(Ordering::Relaxed).then(std::time::Instant::now))
+}
+
+/// Count `n` on a measurement counter, while [`MEASURE`] is on.
+fn tally(counter: &AtomicUsize, n: usize) {
+    if MEASURE.load(Ordering::Relaxed) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 impl IndexMethodCursor for IvfRqCursor {
@@ -2053,7 +2091,7 @@ impl IndexMethodCursor for IvfRqCursor {
             let encoding = timer(&ENCODE_NANOS);
             let (partition, steps) = self.tail_steps(rowid, &vector)?;
             drop(encoding);
-            INSERTS.fetch_add(1, Ordering::Relaxed);
+            tally(&INSERTS, 1);
             self.touched.insert(partition);
             self.written += 1;
             self.inserted += 1;
@@ -2106,6 +2144,7 @@ impl IndexMethodCursor for IvfRqCursor {
                 dead: HashSet::new(),
                 floors: BinaryHeap::new(),
                 candidates: Vec::new(),
+                extras: Vec::new(),
                 estimates: BinaryHeap::new(),
                 results: BinaryHeap::new(),
             });
@@ -2257,6 +2296,7 @@ impl IvfRqCursor {
         query.keep = refine.saturating_mul(query.limit);
         query.floors.clear();
         query.candidates.clear();
+        query.extras.clear();
         query.estimates.clear();
         query.results.clear();
         let mut probed_all = true;
@@ -2306,7 +2346,7 @@ impl IvfRqCursor {
                 Search::Dead { probes, partition, mut walk } => {
                     let start = tail_key(partition, 0)?;
                     let reading = timer(&READ_NANOS);
-                    let row = match walk_row(&mut self.stores[DEAD], start, start + (1 << ROWID_BITS), &mut walk)? {
+                    let row = match walk_held(&mut self.stores[DEAD], start, start + (1 << ROWID_BITS), &mut walk)? {
                         IOResult::Done(row) => row,
                         IOResult::IO(io) => {
                             self.search = Search::Dead { probes, partition, walk };
@@ -2314,13 +2354,14 @@ impl IvfRqCursor {
                         }
                     };
                     drop(reading);
-                    let Some((key, found)) = row else {
+                    let Some(key) = row else {
                         self.search = Search::Probe { probes, partition, stage: Stage::Blocks, walk: Walk::Seek };
                         continue;
                     };
+                    let found = held_record(&mut self.stores[DEAD])?;
                     let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
                     let rowid = key & ((1 << ROWID_BITS) - 1);
-                    query.dead.extend(dead_blocks(bytes_at(&found, 0)?)?.into_iter().map(|block| (rowid, block)));
+                    query.dead.extend(dead_blocks(bytes_at(found, 0)?)?.into_iter().map(|block| (rowid, block)));
                     self.search = Search::Dead { probes, partition, walk };
                 }
                 Search::Probe { probes, partition, stage, mut walk } => {
@@ -2329,7 +2370,7 @@ impl IvfRqCursor {
                         Stage::Tail => (TAIL, tail_key(partition, 0)?, tail_key(partition, 0)? + (1 << ROWID_BITS)),
                     };
                     let reading = timer(&READ_NANOS);
-                    let row = match walk_row(&mut self.stores[store], start, end, &mut walk)? {
+                    let row = match walk_held(&mut self.stores[store], start, end, &mut walk)? {
                         IOResult::Done(row) => row,
                         IOResult::IO(io) => {
                             self.search = Search::Probe { probes, partition, stage, walk };
@@ -2338,57 +2379,23 @@ impl IvfRqCursor {
                     };
                     drop(reading);
                     match (row, stage) {
-                        (Some((key, found)), _) => {
-                            RECORDS.fetch_add(1, Ordering::Relaxed);
+                        (Some(key), _) => {
+                            tally(&RECORDS, 1);
                             let source = match stage {
                                 Stage::Blocks => Location::Block(key),
                                 Stage::Tail => Location::Tail(key),
                             };
+                            // Scored where the cursor holds it, so no block is copied.
+                            let found = held_record(&mut self.stores[store])?;
                             let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
-                            let centre = query.centre(&self.model, partition, integer(&found, 0)?)?;
+                            let centre = query.centre(&self.model, partition, integer(found, 0)?)?;
                             let _scoring = timer(&SCORE_NANOS);
-                            score_block(query, bytes_at(&found, 1)?, centre, source)?;
+                            score_block(query, bytes_at(found, 1)?, centre, source)?;
                             self.search = Search::Probe { probes, partition, stage, walk };
                         }
                         (None, Stage::Blocks) => self.search = Search::Probe { probes, partition, stage: Stage::Tail, walk: Walk::Seek },
                         (None, Stage::Tail) => self.search = self.next_probe(probes)?,
                     }
-                }
-                Search::Refine { mut order, mut get } => {
-                    let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
-                    let Some(candidate) = order.front() else {
-                        self.search = Search::Rerank { candidates: VecDeque::new(), rowid: None };
-                        continue;
-                    };
-                    // Candidates come in order of the bound they may reach: once one cannot enter
-                    // the full set of 4-bit estimates, none after it can.
-                    if query.estimates.len() >= query.keep && query.estimates.peek().is_some_and(|worst| -candidate.upper >= worst.0) {
-                        self.search = Search::Rerank { candidates: VecDeque::new(), rowid: None };
-                        continue;
-                    }
-                    let fetching = timer(&SEEK_NANOS);
-                    let found = match get_row(&mut self.stores[VECTORS], candidate.rowid, &mut get)? {
-                        IOResult::Done(found) => found,
-                        IOResult::IO(io) => {
-                            self.search = Search::Refine { order, get };
-                            return Ok(IOResult::IO(io));
-                        }
-                    };
-                    drop(fetching);
-                    // An entry its vector's row no longer names is stale: deleted, revised or moved.
-                    if let Some(found) = found.filter(|r| integer(r, 0).is_ok_and(|l| Location::decode(l) == candidate.source)) {
-                        REFINED.fetch_add(1, Ordering::Relaxed);
-                        let codes = bytes_at(&found, 1)?;
-                        let refined = f32_at(codes, 0) as f64;
-                        let lower = lower_product(&query.rotated, &codes[4..]);
-                        let estimate = candidate.centre + candidate.norm * refined_product(candidate.signed, lower, query.sum, refined);
-                        query.estimates.push(Ordered(-estimate, candidate.rowid));
-                        if query.estimates.len() > query.keep {
-                            query.estimates.pop();
-                        }
-                    }
-                    order.pop_front();
-                    self.search = Search::Refine { order, get: Get::Seek };
                 }
                 Search::Rerank { mut candidates, rowid } => {
                     let _timer = timer(&RERANK_NANOS);
@@ -2456,10 +2463,29 @@ impl IvfRqCursor {
             return Ok(Search::Dead { probes, partition, walk: Walk::Seek });
         }
         let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
+        let _timer = timer(&REFINE_NANOS);
         let bar = query.bar();
         let mut order: Vec<Candidate> = std::mem::take(&mut query.candidates).into_iter().filter(|c| c.upper >= bar).collect();
         order.sort_unstable_by(|a, b| b.upper.total_cmp(&a.upper));
-        Ok(Search::Refine { order: order.into(), get: Get::Seek })
+        let extra_bytes = 4 + EX_BITS * query.rotated.len() / 8;
+        for candidate in &order {
+            // Candidates come in order of the bound they may reach: once one cannot enter the full
+            // set of 4-bit estimates, none after it can.
+            if query.estimates.len() >= query.keep && query.estimates.peek().is_some_and(|worst| -candidate.upper >= worst.0) {
+                break;
+            }
+            tally(&REFINED, 1);
+            #[cfg(test)]
+            QUERY_REFINES.with(|count| count.set(count.get() + 1));
+            let codes = &query.extras[candidate.extra..][..extra_bytes];
+            let lower = lower_product(&query.rotated, &codes[4..]);
+            let estimate = candidate.centre + candidate.norm * refined_product(candidate.signed, lower, query.sum, f32_at(codes, 0) as f64);
+            query.estimates.push(Ordered(-estimate, candidate.rowid));
+            if query.estimates.len() > query.keep {
+                query.estimates.pop();
+            }
+        }
+        Ok(Search::Rerank { candidates: VecDeque::new(), rowid: None })
     }
 
     /// Drop a run that will not finish, and the model a job it abandoned had changed; the model is
@@ -3178,7 +3204,7 @@ impl IvfRqCursor {
         for chunk in live.chunks(BLOCK) {
             let key = block_key(partition, part.next)?;
             let entries: Vec<Entry> = chunk.iter().map(|(e, _)| e.clone()).collect();
-            steps.push_back(put(BLOCKS, key, record(&[Value::from_i64(version), blob(&pack(&entries))?])?));
+            steps.push_back(put(BLOCKS, key, record(&[Value::from_i64(version), blob(&pack(&entries)?)?])?));
             for (e, codes) in chunk {
                 if !opened_here.contains(&(e.rowid, key)) {
                     steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode()), blob(codes)?])?));
@@ -3298,7 +3324,7 @@ impl IvfRqCursor {
             if moved + dropped + recoded > 0 {
                 steps.push_front(match staying.is_empty() {
                     true => remove(BLOCKS, key),
-                    false => put(BLOCKS, key, record(&[Value::from_i64(current), blob(&pack(&staying))?])?),
+                    false => put(BLOCKS, key, record(&[Value::from_i64(current), blob(&pack(&staying)?)?])?),
                 });
                 part.size = (part.size - moved - dropped).max(0);
             }
@@ -3323,7 +3349,7 @@ impl IvfRqCursor {
         let staying: Vec<Entry> = sorted.live.into_iter().map(|(entry, _)| entry).collect();
         let mut steps = VecDeque::from([match staying.is_empty() {
             true => remove(BLOCKS, block),
-            false => put(BLOCKS, block, record(&[Value::from_i64(sorted.version), blob(&pack(&staying))?])?),
+            false => put(BLOCKS, block, record(&[Value::from_i64(sorted.version), blob(&pack(&staying)?)?])?),
         }]);
         part.size = (part.size - sorted.buried.len() as i64).max(0);
         // The open block is the partition's last; it stays open with the entries it keeps.
@@ -3400,42 +3426,55 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
         Location::Block(key) if !query.dead.is_empty() => Some(key),
         _ => None,
     };
+    let mut bar = query.bar();
     let mut sums = [0u32; GROUP];
+    // Each member's gain, what its 1-bit sum is scaled by into an estimate, and the reach of its
+    // error bound: one group's at a time, before any is compared with the bar.
+    let (mut gain, mut reach) = ([0f64; GROUP], [0f64; GROUP]);
     for group in 0..layout.groups() {
+        let first = group * GROUP;
         let codes = &payload[layout.scan() + group * layout.group_bytes()..][..layout.group_bytes()];
-        let members = GROUP.min(count - group * GROUP);
-        SCANNED.fetch_add(members, Ordering::Relaxed);
+        let members = GROUP.min(count - first);
+        tally(&SCANNED, members);
         let scanned = members >= SCAN_MEMBERS;
         if scanned {
             scan_group(codes, &query.scan.bytes, &mut sums);
+        }
+        let norms = payload[layout.norms() + 4 * first..][..4 * members].chunks_exact(4);
+        let factors = payload[layout.factors() + 4 * first..][..4 * members].chunks_exact(4);
+        for ((slot, norm), factor) in norms.enumerate().zip(factors) {
+            let norm = f32::from_le_bytes(norm.try_into().unwrap()) as f64;
+            let factor = f32::from_le_bytes(factor.try_into().unwrap()) as f64;
+            gain[slot] = norm * scale / factor;
+            reach[slot] = norm * spread * (1.0 - factor * factor).max(0.0).sqrt() / factor;
         }
         let exact = |slot: usize| {
             let (lane, shift) = (slot % 16, if slot < 16 { 0 } else { 4 });
             (0..layout.positions).map(|j| query.scan.exact[j * 16 + ((codes[j * 16 + lane] >> shift) & 0xf) as usize] as f64).sum::<f64>()
         };
         for slot in 0..members {
-            let n = group * GROUP + slot;
-            let norm = f32_at(payload, layout.norms() + 4 * n) as f64;
-            let factor = f32_at(payload, layout.factors() + 4 * n) as f64;
             let (chosen, quantized) = if scanned { (query.scan.step * sums[slot] as f64 + query.scan.base, query.scan.error) } else { (exact(slot), 0.0) };
-            let estimate = centre + norm * (2.0 * chosen - query.sum) * scale / factor;
-            let bound = norm * spread * ((1.0 - factor * factor).max(0.0) / (factor * factor)).sqrt();
-            let slack = norm * 2.0 * quantized * scale / factor;
-            if estimate + bound + slack < query.bar() {
+            let estimate = centre + gain[slot] * (2.0 * chosen - query.sum);
+            if estimate + reach[slot] + 2.0 * gain[slot] * quantized < bar {
                 continue;
             }
+            let n = first + slot;
             let rowid = i64_at(payload, layout.rowids() + 8 * n);
             if screened.is_some_and(|key| query.dead.contains(&(rowid, key))) {
                 continue;
             }
             let signed = if scanned { exact(slot) } else { chosen };
-            let estimate = centre + norm * (2.0 * signed - query.sum) * scale / factor;
-            query.floors.push(Ordered(-(estimate - bound), rowid));
+            let estimate = centre + gain[slot] * (2.0 * signed - query.sum);
+            query.floors.push(Ordered(-(estimate - reach[slot]), rowid));
             if query.floors.len() > query.limit {
                 query.floors.pop();
             }
-            if estimate + bound >= query.bar() {
-                query.candidates.push(Candidate { upper: estimate + bound, rowid, centre, norm, signed, source });
+            bar = query.bar();
+            if estimate + reach[slot] >= bar {
+                let norm = f32_at(payload, layout.norms() + 4 * n) as f64;
+                let extra = query.extras.len();
+                query.extras.extend_from_slice(&payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()]);
+                query.candidates.push(Candidate { upper: estimate + reach[slot], rowid, centre, norm, signed, extra });
             }
         }
     }
@@ -3484,6 +3523,7 @@ mod tests {
             dead: HashSet::new(),
             floors: BinaryHeap::new(),
             candidates: Vec::new(),
+            extras: Vec::new(),
             estimates: BinaryHeap::new(),
             results: BinaryHeap::new(),
         }
@@ -3492,10 +3532,70 @@ mod tests {
     #[test]
     fn a_block_unpacks_to_the_codes_it_packed() {
         let (_, _, coded) = entries(45, 768);
-        let back = unpack(&pack(&coded)).unwrap();
+        let back = unpack(&pack(&coded).unwrap()).unwrap();
         assert_eq!(back.len(), 45);
         for (a, b) in coded.iter().zip(&back) {
             assert_eq!((a.rowid, a.norm, a.factor, &a.bits), (b.rowid, b.norm, b.factor, &b.bits));
+            assert_eq!((a.refined, &a.ex), (b.refined, &b.ex), "the 4-bit parts of entry {}", a.rowid);
+        }
+    }
+
+    /// A query scores its candidates' 4-bit codes from the blocks and tail entries it read: past the
+    /// model's generation it makes no point read, however many candidates it refines, in a packed
+    /// index with a tail and stale copies, and its answer is the exact top ten.
+    #[test]
+    fn a_query_refines_its_candidates_without_a_point_read() {
+        use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect};
+        const DIMS: usize = 64;
+        for mvcc in [false, true] {
+            let db = Database::open_file_with_flags(
+                Arc::new(MemoryIO::new()),
+                &format!("ivf-rq-no-point-reads-{mvcc}.db"),
+                OpenFlags::default(),
+                DatabaseOpts::new().with_index_method(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 64, refine = 4)").unwrap();
+            let mut state = 41;
+            let mut live: HashMap<i64, Vec<f32>> = HashMap::new();
+            for id in 1..=600i64 {
+                let v = random(&mut state, DIMS);
+                conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&v))).unwrap();
+                live.insert(id, v);
+            }
+            for _ in 0..30 {
+                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            }
+            // Stale copies in packed blocks, and fresh entries in the tails.
+            for id in (3..=600i64).step_by(3) {
+                let v = random(&mut state, DIMS);
+                conn.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&v))).unwrap();
+                live.insert(id, v);
+            }
+            for id in (10..=600i64).step_by(10) {
+                conn.execute(format!("DELETE FROM v WHERE id = {id}")).unwrap();
+                live.remove(&id);
+            }
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                let sql = format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT 10", literal(&q));
+                let (reads, refines) = (POINT_READS.with(|c| c.get()), QUERY_REFINES.with(|c| c.get()));
+                let got = ids(&conn, &sql);
+                let reads = POINT_READS.with(|c| c.get()) - reads;
+                let refines = QUERY_REFINES.with(|c| c.get()) - refines;
+                assert!(refines > 0, "mvcc={mvcc}: the query refined no candidate, so its reads measure nothing");
+                assert!(reads <= 1, "mvcc={mvcc}: refining {refines} candidates made {reads} point reads past the generation's");
+                let mut exact: Vec<(f64, i64)> = live.iter().map(|(id, v)| (dot(&q, v), *id)).collect();
+                exact.sort_by(|a, b| b.0.total_cmp(&a.0));
+                assert_eq!(got, exact[..10].iter().map(|(_, id)| *id).collect::<Vec<_>>(), "mvcc={mvcc}");
+            }
         }
     }
 
@@ -3504,7 +3604,7 @@ mod tests {
     fn the_simd_scan_sums_as_the_scalar_one_does() {
         for dims in [768, 3072] {
             let (rotation, _, coded) = entries(32, dims);
-            let block = pack(&coded);
+            let block = pack(&coded).unwrap();
             let layout = Layout::new(32, rotation.code_bytes());
             let codes = &block[layout.scan()..][..layout.group_bytes()];
             let mut state = 11;
@@ -3526,7 +3626,7 @@ mod tests {
         let mut state = 13;
         let q = random(&mut state, 768);
         let mut query = query(&q, &rotation, 10, 40);
-        score_block(&mut query, &pack(&coded), 0.0, Location::Block(0)).unwrap();
+        score_block(&mut query, &pack(&coded).unwrap(), 0.0, Location::Block(0)).unwrap();
         let mut truth: Vec<(f64, i64)> = vectors.iter().enumerate().map(|(n, v)| (dot(&q, v), n as i64)).collect();
         truth.sort_by(|a, b| b.0.total_cmp(&a.0));
         let bar = query.bar();
@@ -3540,9 +3640,10 @@ mod tests {
             let e = &coded[c.rowid as usize];
             let true_product = dot(&q, &vectors[c.rowid as usize]);
             let estimate_one = c.norm * (2.0 * c.signed - query.sum) / (padded as f64).sqrt() / e.factor as f64;
-            let codes = extra(e);
+            let codes = &query.extras[c.extra..][..4 + EX_BITS * padded / 8];
+            assert_eq!(codes, &extra(e)[..], "the 4-bit parts the scan copied for row {}", c.rowid);
             let lower = lower_product(&query.rotated, &codes[4..]);
-            let estimate_four = c.norm * refined_product(c.signed, lower, query.sum, f32_at(&codes, 0) as f64);
+            let estimate_four = c.norm * refined_product(c.signed, lower, query.sum, f32_at(codes, 0) as f64);
             one += (estimate_one - true_product).abs();
             four += (estimate_four - true_product).abs();
         }
@@ -3643,7 +3744,7 @@ mod tests {
     fn the_fast_scan_sums_a_wide_codes_best_match_without_wrapping() {
         for dims in [768, 1536, 3072] {
             let (rotation, vectors, coded) = entries(32, dims);
-            let block = pack(&coded);
+            let block = pack(&coded).unwrap();
             let layout = Layout::new(32, rotation.code_bytes());
             let codes = &block[layout.scan()..][..layout.group_bytes()];
             let table = ScanTable::new(&rotation.apply(&vectors[0]));

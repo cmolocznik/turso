@@ -5,8 +5,9 @@ Upstream Turso (`tursodatabase/turso`, `main`) with the changes below on top, on
 - `main` holds the fixes, which are headed upstream: one commit each with its test, listed by
   `git log upstream/main..main`.
 - `feat/additions` is `main` plus the additions, listed by `git log main..feat/additions`.
-- `fix/set-waker-lost-wakeup`, `fix/mvcc-checkpoint-trigger` and `fix/mvcc-exact-rowid-seek` each
-  hold one of `main`'s fixes alone on `upstream/main`.
+- `fix/set-waker-lost-wakeup`, `fix/mvcc-checkpoint-trigger`, `fix/mvcc-exact-rowid-seek`,
+  `fix/index-method-limit-before-aggregates` and `fix/index-method-column-collation` each hold one
+  of `main`'s fixes alone on `upstream/main`.
 
 This file is only on `feat/additions`, so `main`'s commits can go upstream as they are. Keep it in
 step with the two logs: a change lands here when it lands, with what it fixes and what proves it.
@@ -50,6 +51,28 @@ the newer version.
 Test: `mvcc::database::tests::test_exact_rowid_seek_over_shadowed_btree_rows`, which counts each
 exact seek's B-tree steps through the cursor's yield hook: the seek for row 1 takes 155 on upstream
 `main` and 2 with the fix.
+
+### An index method's LIMIT applied before an aggregate or DISTINCT
+`core/translate/optimizer/mod.rs`. A pattern with LIMIT applies the query's LIMIT to the rows the
+index gives out, and the single-table planner gave one to any query whose WHERE and LIMIT matched
+it, so an aggregate or DISTINCT ran over the first LIMIT matches. On upstream `main`
+(`c2a90cc3f`), over 20 FTS matches, `SELECT count(*) ... WHERE fts_match(...) LIMIT 5` returned 5,
+and `SELECT DISTINCT cat ... WHERE fts_match(...) LIMIT 2` returned one of the two categories. A
+pattern with LIMIT now serves only a query whose rows reach the LIMIT as they leave the WHERE
+clause. A window function was never affected: its query reads the table through a subquery
+without the LIMIT.
+Test: `index_method::fts::tests::fts_limit_applies_after_aggregates_and_distinct`.
+
+### A value an index method provides failed the collation lookup
+`core/translate/collate.rs`, `core/translate/plan.rs`. The planner puts a value an index method
+provides, such as an FTS score, in place of the expression it computes, as a column numbered past
+the table's own; the collation lookups for a comparison operand and for an expression looked it up
+in the table and failed. On upstream `main`, `SELECT DISTINCT fts_score(...) ... WHERE
+fts_match(...)`, a UNION of two such SELECTs and an IN subquery over the score each failed to
+prepare with "column not found". The value now contributes no column collation, as the expression
+translator already treats it. `get_expr_collation_ctx_with_symbols` makes the same lookup, but none
+of the queries tried reaches it with such a value, so it is unchanged.
+Test: `index_method::fts::tests::fts_score_from_the_index_has_no_column_collation`.
 
 ## Additions
 
@@ -107,10 +130,10 @@ Four gaps, each closed with tests that fail with the gap put back:
   `core/translate/optimizer/mod.rs`) plans the query without the pattern first and uses the
   pattern only where the method's cost estimate, given the share of rows the plan keeps
   (`IndexMethodCostContext::filter_selectivity`), is below that plan's cost plus its sort: a rowid
-  lookup and a selective indexed filter keep their plans. Single-table SELECTs only. A pattern
-  that applies the LIMIT itself no longer serves a query with a DISTINCT, aggregate or window
-  function between its rows and the LIMIT: a DISTINCT query over the index failed to plan
-  ("column not found"), and would have thinned rows after the LIMIT.
+  lookup and a selective indexed filter keep their plans. Single-table SELECTs only. A DISTINCT or
+  aggregate query keeps its plan without the index, by the fix for an index method's LIMIT above;
+  ivf_rq's `a_distinct_query_applies_its_limit_after_its_distinct` covers it, and an ivf_rq LIMIT
+  of 0 or below now gives no rows or every row, where it gave one.
 - Building was quadratic: every partition came from bisecting splits of one. A statement inserting
   1,024 rows or more into an index trained for under a quarter of the partitions they call for,
   CREATE INDEX over a populated table among them, now rebuilds it: k-means over a sample, balanced

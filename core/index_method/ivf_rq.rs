@@ -475,6 +475,54 @@ kernel!(fit, fit_wide, fit_body, (x: &[f32], t: f32) -> (f32, f32));
 kernel!(hadamard, hadamard_wide, hadamard_body, (x: &mut [f32], signs: &[f32], scale: f32) -> ());
 kernel!(kac_hadamard, kac_hadamard_wide, kac_hadamard_body, (x: &mut [f32], signs: &[f32], span: usize, scale: f32) -> ());
 
+/// The centroids a tile holds: enough independent multiply-adds a dimension to fill the AVX2 units.
+const TILE: usize = 64;
+/// The vectors [`Model::nearest_of`] runs over each tile while it is in cache.
+const NEAREST_GROUP: usize = 16;
+
+/// `v`'s products with a tile's centroids, the tile laid out dimension by dimension.
+#[inline(always)]
+fn tile_products_body(v: &[f32], tile: &[f32], out: &mut [f32; TILE]) {
+    let mut acc = [0.0f32; TILE];
+    for (x, column) in v.iter().zip(tile.chunks_exact(TILE)) {
+        for k in 0..TILE {
+            acc[k] += x * column[k];
+        }
+    }
+    *out = acc;
+}
+
+kernel!(tile_products, tile_products_wide, tile_products_body, (v: &[f32], tile: &[f32], out: &mut [f32; TILE]) -> ());
+
+/// A model's centroids in tiles of [`TILE`], each tile dimension-major, so a vector's products with
+/// a tile's centroids are one pass over its dimensions. A tile's slots past the last centroid are
+/// zero.
+#[derive(Debug, Clone, Default)]
+struct Tiles {
+    dims: usize,
+    values: Vec<f32>,
+}
+
+impl Tiles {
+    /// Set partition `p`'s centroid, adding a tile when `p` lies past the last.
+    fn set(&mut self, p: usize, c: &[f32]) {
+        self.dims = c.len();
+        let (tile, lane) = (p / TILE, p % TILE);
+        let size = self.dims * TILE;
+        if self.values.len() < (tile + 1) * size {
+            self.values.resize((tile + 1) * size, 0.0);
+        }
+        for (d, x) in c.iter().enumerate() {
+            self.values[tile * size + d * TILE + lane] = *x;
+        }
+    }
+
+    /// The tiles in partition order, each with its first partition.
+    fn tiles(&self) -> impl Iterator<Item = (usize, &[f32])> + '_ {
+        self.values.chunks_exact((self.dims * TILE).max(1)).enumerate().map(|(t, tile)| (t * TILE, tile))
+    }
+}
+
 /// A randomized Hadamard rotation of vectors padded to a multiple of 32: seeded sign flips, each
 /// followed by a fast Walsh-Hadamard transform, normalized so lengths are kept. A width that is a
 /// power of two is transformed whole in each of [`ROUNDS`] rounds; any other, as the RaBitQ
@@ -932,6 +980,8 @@ struct Model {
     /// Each partition's state, from its bookkeeping.
     states: Vec<State>,
     eta: f32,
+    /// The current centroids again, in tiles: every change to `centroids` changes them.
+    tiles: Tiles,
 }
 
 impl Model {
@@ -939,12 +989,17 @@ impl Model {
         let squares = centroids.iter().map(|c| dot32(c, c)).collect();
         let versions = vec![0; centroids.len()];
         let states = vec![State::Live; centroids.len()];
-        Self { centroids, squares, versions, older: HashMap::new(), states, eta }
+        let mut tiles = Tiles::default();
+        for (p, c) in centroids.iter().enumerate() {
+            tiles.set(p, c);
+        }
+        Self { centroids, squares, versions, older: HashMap::new(), states, eta, tiles }
     }
 
     /// Set a partition's centroid at a version, keeping the one it supersedes.
     fn place(&mut self, partition: usize, version: i64, c: Vec<f32>) {
         let square = dot32(&c, &c);
+        self.tiles.set(partition, &c);
         if partition == self.centroids.len() {
             self.centroids.push(c);
             self.squares.push(square);
@@ -986,24 +1041,60 @@ impl Model {
     }
 
     fn nearest(&self, v: &[f32]) -> usize {
-        let square = dot32(v, v);
-        let length = square.sqrt().max(f32::MIN_POSITIVE);
-        let mut best = (f32::INFINITY, 0);
-        for (i, (c, c_square)) in self.centroids.iter().zip(&self.squares).enumerate() {
-            if self.states[i] != State::Live {
-                continue;
-            }
-            let product = dot32(c, v);
-            let mut loss = square + c_square - 2.0 * product;
-            if self.eta > 1.0 {
-                let along = length - product / length;
-                loss += (self.eta - 1.0) * along * along;
-            }
-            if loss < best.0 {
-                best = (loss, i);
+        self.nearest_of(&[v])[0]
+    }
+
+    /// The nearest live partition to each of `group`'s vectors by the loss above, the first of
+    /// equals: each tile's products with the whole group are taken while the tile is in cache.
+    fn nearest_of(&self, group: &[&[f32]]) -> Vec<usize> {
+        let lengths: Vec<(f32, f32)> = group
+            .iter()
+            .map(|v| {
+                let square = dot32(v, v);
+                (square, square.sqrt().max(f32::MIN_POSITIVE))
+            })
+            .collect();
+        let mut best = vec![(f32::INFINITY, 0); group.len()];
+        let mut products = [0.0f32; TILE];
+        for (first, tile) in self.tiles.tiles() {
+            let lanes = (self.centroids.len() - first).min(TILE);
+            for (n, v) in group.iter().enumerate() {
+                tile_products(v, tile, &mut products);
+                let (square, length) = lengths[n];
+                for (k, product) in products[..lanes].iter().enumerate() {
+                    let i = first + k;
+                    if self.states[i] != State::Live {
+                        continue;
+                    }
+                    let mut loss = square + self.squares[i] - 2.0 * product;
+                    if self.eta > 1.0 {
+                        let along = length - product / length;
+                        loss += (self.eta - 1.0) * along * along;
+                    }
+                    if loss < best[n].0 {
+                        best[n] = (loss, i);
+                    }
+                }
             }
         }
-        best.1
+        best.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// The partitions a query may probe, every one not retired, each with what ranks it: its
+    /// distance from `q` less `q`'s squared length, or its product with `q` negated.
+    fn ranked(&self, q: &[f32], by_product: bool) -> Vec<(f32, i64)> {
+        let mut ranked = Vec::with_capacity(self.centroids.len());
+        let mut products = [0.0f32; TILE];
+        for (first, tile) in self.tiles.tiles() {
+            tile_products(q, tile, &mut products);
+            for (k, product) in products[..(self.centroids.len() - first).min(TILE)].iter().enumerate() {
+                let i = first + k;
+                if self.states[i] != State::Retired {
+                    ranked.push((if by_product { -product } else { self.squares[i] - 2.0 * product }, i as i64));
+                }
+            }
+        }
+        ranked
     }
 
     /// Code a vector against its nearest partition's current centroid: the partition, the
@@ -1012,7 +1103,11 @@ impl Model {
         if self.centroids.is_empty() {
             return (0, 0, code(rotation, rowid, v.to_vec()));
         }
-        let p = self.nearest(v);
+        self.encode_in(rotation, rowid, v, self.nearest(v))
+    }
+
+    /// Code a vector against partition `p`'s current centroid.
+    fn encode_in(&self, rotation: &Rotation, rowid: i64, v: &[f32], p: usize) -> (i64, i64, Entry) {
         let residual = v.iter().zip(&self.centroids[p]).map(|(a, b)| a - b).collect();
         (p as i64, self.versions[p], code(rotation, rowid, residual))
     }
@@ -1431,15 +1526,16 @@ fn lloyd(sample: &[Vec<f32>], mut centroids: Vec<Vec<f32>>, iterations: usize, e
 /// Each vector's nearest live partition, the vectors split over the cores when there are enough
 /// products to pay for the threads.
 fn nearest_all(model: &Model, vectors: &[Vec<f32>]) -> Vec<usize> {
+    let nearest = |part: &[Vec<f32>]| nearest_all_in(model, part);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     if threads == 1 || vectors.len() * model.centroids.len() < PARALLEL_PRODUCTS {
-        return vectors.iter().map(|v| model.nearest(v)).collect();
+        return nearest(vectors);
     }
     let chunk = vectors.len().div_ceil(threads);
     std::thread::scope(|scope| {
         vectors
             .chunks(chunk)
-            .map(|part| scope.spawn(move || part.iter().map(|v| model.nearest(v)).collect::<Vec<_>>()))
+            .map(|part| scope.spawn(move || nearest(part)))
             .collect::<Vec<_>>()
             .into_iter()
             .flat_map(|h| h.join().expect("assignment worker"))
@@ -1447,20 +1543,31 @@ fn nearest_all(model: &Model, vectors: &[Vec<f32>]) -> Vec<usize> {
     })
 }
 
+/// Each vector's nearest live partition on this thread, [`NEAREST_GROUP`] vectors at a time.
+fn nearest_all_in(model: &Model, vectors: &[Vec<f32>]) -> Vec<usize> {
+    vectors.chunks(NEAREST_GROUP).flat_map(|group| model.nearest_of(&group.iter().map(Vec::as_slice).collect::<Vec<_>>())).collect()
+}
+
 /// Each vector coded against its nearest live partition, as [`Model::encode`] does, the vectors
 /// split over the cores when there are enough products to pay for the threads.
 fn encode_all(model: &Model, rotation: &Rotation, rowids: &[i64], vectors: &[Vec<f32>]) -> Vec<(i64, i64, Entry)> {
+    let code = |rowids: &[i64], vectors: &[Vec<f32>]| -> Vec<(i64, i64, Entry)> {
+        if model.centroids.is_empty() {
+            return rowids.iter().zip(vectors).map(|(rowid, v)| model.encode(rotation, *rowid, v)).collect();
+        }
+        let nearest = nearest_all_in(model, vectors);
+        rowids.iter().zip(vectors).zip(nearest).map(|((rowid, v), p)| model.encode_in(rotation, *rowid, v, p)).collect()
+    };
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let code = |(rowid, v): (&i64, &Vec<f32>)| model.encode(rotation, *rowid, v);
     if threads == 1 || vectors.len() * model.centroids.len().max(1) < PARALLEL_PRODUCTS {
-        return rowids.iter().zip(vectors).map(code).collect();
+        return code(rowids, vectors);
     }
     let chunk = vectors.len().div_ceil(threads);
     std::thread::scope(|scope| {
         rowids
             .chunks(chunk)
             .zip(vectors.chunks(chunk))
-            .map(|(rowids, vectors)| scope.spawn(move || rowids.iter().zip(vectors).map(code).collect::<Vec<_>>()))
+            .map(|(rowids, vectors)| scope.spawn(move || code(rowids, vectors)))
             .collect::<Vec<_>>()
             .into_iter()
             .flat_map(|h| h.join().expect("coding worker"))
@@ -2826,17 +2933,7 @@ impl IvfRqCursor {
         let probes: VecDeque<i64> = if self.model.centroids.is_empty() {
             VecDeque::from([0])
         } else {
-            let mut ranked: Vec<(f32, i64)> = self
-                .model
-                .centroids
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| self.model.states[*i] != State::Retired)
-                .map(|(i, c)| match PROBE_BY_PRODUCT.load(Ordering::Relaxed) {
-                    0 => (l2(c, &query.vector), i as i64),
-                    _ => (-dot32(c, &query.vector), i as i64),
-                })
-                .collect();
+            let mut ranked = self.model.ranked(&query.vector, PROBE_BY_PRODUCT.load(Ordering::Relaxed) != 0);
             let take = match query.wanted {
                 usize::MAX => ranked.len(),
                 _ => nprobes.saturating_mul(widen).min(ranked.len()),
@@ -3565,6 +3662,7 @@ impl IvfRqCursor {
                 None => (old.centroids[p].clone(), old.versions[p], State::Retired),
             };
             model.squares.push(dot32(&centroid, &centroid));
+            model.tiles.set(p, &centroid);
             model.centroids.push(centroid);
             model.versions.push(version);
             model.states.push(state);
@@ -4151,6 +4249,36 @@ mod tests {
                 let largest = rotation.apply(&basis).iter().map(|x| x * x).fold(0.0f32, f32::max) * padded as f32;
                 assert!(largest < 3.0 * (padded as f32).ln(), "dims {dims}: dimension {at}'s largest share is {largest} times an even one");
             }
+        }
+    }
+
+    /// The tiles give each vector the nearest live partition the direct products give it, and a
+    /// query the same ranking of the partitions not retired, after a centroid is placed over
+    /// another and one past the last tile.
+    #[test]
+    fn the_tiles_assign_and_rank_as_the_direct_products_do() {
+        for dims in [100, 768] {
+            let mut state = 19;
+            let vectors: Vec<Vec<f32>> = (0..40).map(|_| random(&mut state, dims)).collect();
+            let mut model = Model::new((0..128).map(|_| random(&mut state, dims)).collect(), 0.0);
+            model.place(3, 1, vectors[0].clone());
+            model.place(128, 0, vectors[1].clone());
+            model.states[7] = State::Retired;
+            model.states[9] = State::Retiring;
+            for v in &vectors {
+                let live = (0..model.centroids.len()).filter(|i| model.states[*i] == State::Live);
+                let direct = live.min_by(|a, b| l2(&model.centroids[*a], v).total_cmp(&l2(&model.centroids[*b], v))).unwrap();
+                assert_eq!(model.nearest(v), direct, "dims {dims}");
+            }
+            assert_eq!((model.nearest(&vectors[0]), model.nearest(&vectors[1])), (3, 128), "dims {dims}");
+            assert_eq!(nearest_all(&model, &vectors), vectors.iter().map(|v| model.nearest(v)).collect::<Vec<_>>(), "dims {dims}");
+            let q = random(&mut state, dims);
+            let order = |mut ranked: Vec<(f32, i64)>| {
+                ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+                ranked.into_iter().map(|(_, p)| p).collect::<Vec<_>>()
+            };
+            let direct = (0..model.centroids.len()).filter(|i| model.states[*i] != State::Retired).map(|i| (l2(&model.centroids[i], &q), i as i64)).collect();
+            assert_eq!(order(model.ranked(&q, false)), order(direct), "dims {dims}");
         }
     }
 

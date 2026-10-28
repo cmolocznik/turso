@@ -2127,7 +2127,8 @@ type SharedWrites = std::sync::Arc<std::sync::Mutex<Writes>>;
 
 /// Each index's [`Writes`], by its database's incarnation and its name: a schema read afresh
 /// attaches the index again, and the new attachment's cursors must see the old one's writers.
-static WRITES: std::sync::LazyLock<std::sync::Mutex<HashMap<(u64, String), std::sync::Weak<std::sync::Mutex<Writes>>>>> = std::sync::LazyLock::new(Default::default);
+type Registry = HashMap<(u64, String), std::sync::Weak<std::sync::Mutex<Writes>>>;
+static WRITES: std::sync::LazyLock<std::sync::Mutex<Registry>> = std::sync::LazyLock::new(Default::default);
 
 /// Where a cursor reads the latest commit position: its database's WAL, or its MVCC store.
 enum Clock {

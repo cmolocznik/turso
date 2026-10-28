@@ -84,6 +84,15 @@ cursor in `core/mvcc/cursor.rs`) so they stop at their range's end instead of st
 the rows after it. A RaBitQ IVF vector index over rowid backing tables, transactional under MVCC.
 Tests: `index_method::ivf_rq::tests`.
 
+Two defects found by reading it, each reproduced by a test that failed before its fix:
+- A deleted or updated vector's code stayed in its packed block, and that stale copy counted toward
+  the 1-bit bar the live entries must reach: a query near 16 vectors packed and then updated away
+  returned no rows. A delete now names the block in the vector's dead row, a query skips those
+  copies before they score, and maintenance takes a block off the dead rows when it rewrites it
+  and compacts a block holding 8 stale copies.
+- The fast scan summed in 16 bits, which wraps past 1024 padded dimensions: at 3,072 dimensions the
+  query's own vector summed to -88.5 instead of 400.7. It sums in 32 bits.
+
 ## Considered and not taken
 
 ### Parking a commit that waits on a commit dependency

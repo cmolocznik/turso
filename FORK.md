@@ -34,7 +34,10 @@ snapshot, raised once the durable boundary has advanced, reset by any truncate),
 the bytes past it. Truncation is unchanged: it still tests the highest appended commit.
 Test: `mvcc::database::tests::test_passive_checkpoint_that_keeps_the_log_counts_only_uncovered_bytes`.
 Upstream `main`: "316 checkpointed bytes of a 373-byte log still counted against the threshold".
-On 0.8.3, 2 writers at a 256 KB threshold: inline writer commit p99 165-194 ms → 9.4-12.8 ms.
+On 0.8.3, 2 writers at a 256 KB threshold: inline writer commit p99 165-194 ms → 9.4-12.8 ms. On
+upstream `main` the same A/B shows no gain: 15 idle runs each of `fork-repro`'s `mvcc_inline` (2
+writers, 4,000 commits, 256 KB threshold) put the writer commit p99 median at 13.5 ms without the
+fix and 14.1 ms with it.
 
 ### An exact rowid seek walked every shadowed B-tree row after its target
 `core/mvcc/cursor.rs`. An eq-only `TableRowId` seek that reached a B-tree row shadowed by a newer
@@ -92,6 +95,38 @@ Two defects found by reading it, each reproduced by a test that failed before it
   and compacts a block holding 8 stale copies.
 - The fast scan summed in 16 bits, which wraps past 1024 padded dimensions: at 3,072 dimensions the
   query's own vector summed to -88.5 instead of 400.7. It sums in 32 bits.
+
+Four gaps, each closed with tests that fail with the gap put back:
+- Any WHERE term the pattern did not cover kept the query off the index. An index method can now
+  declare `filtered_queries` (`core/index_method/mod.rs`): the planner keeps the query's ORDER BY
+  and LIMIT after those terms, passes the cursor one more value, and tells it of each row they
+  accept (`Insn::IndexMethodAccept`, calling `IndexMethodCursor::query_accept`;
+  `core/translate/main_loop/open.rs`). ivf_rq gives out rows in order of exact distance, in rounds
+  of four times the rows and partitions of the last, until no row still to come can displace one of
+  the LIMIT nearest accepted. The planner (`find_table_access_plan` in
+  `core/translate/optimizer/mod.rs`) plans the query without the pattern first and uses the
+  pattern only where the method's cost estimate, given the share of rows the plan keeps
+  (`IndexMethodCostContext::filter_selectivity`), is below that plan's cost plus its sort: a rowid
+  lookup and a selective indexed filter keep their plans. Single-table SELECTs only. A pattern
+  that applies the LIMIT itself no longer serves a query with a DISTINCT, aggregate or window
+  function between its rows and the LIMIT: a DISTINCT query over the index failed to plan
+  ("column not found"), and would have thinned rows after the LIMIT.
+- Building was quadratic: every partition came from bisecting splits of one. A statement inserting
+  1,024 rows or more into an index trained for under a quarter of the partitions they call for,
+  CREATE INDEX over a populated table among them, now rebuilds it: k-means over a sample, balanced
+  on the sample so no partition starts past the split bound or under the retirement bound, then one
+  pass coding every vector into packed blocks.
+- Maintenance ran only on OPTIMIZE INDEX, one job per call. Every statement that writes the index
+  now does the maintenance its writes made due, up to one job per row written (40 statements of 100
+  random rows needed 0.47 a row; one job per 64 rows left all 4,000 rows in one partition), and one
+  OPTIMIZE INDEX does every job. A job claims its partition first and keeps an undo log; on a
+  write-write conflict it reverts and leaves the rows to the writer holding them.
+- Partitions drifted: a split left its neighbours' entries where they were, entries that stayed kept
+  codes against the old centroid, and nothing merged. A split now rechecks its 8 nearest neighbours,
+  moving each entry to its nearest partition and recoding those that stay, and a partition left
+  under a sixteenth of the split bound retires into its neighbours. Over a uniform blob of 3,000
+  vectors, 1.7% end up outside their nearest partition, against 5.3% rechecking 4 neighbours and
+  9.7% rechecking none.
 
 ## Considered and not taken
 

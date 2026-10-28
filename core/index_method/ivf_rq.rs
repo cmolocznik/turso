@@ -1160,15 +1160,17 @@ impl Model {
         }
     }
 
-    /// The `take` partitions not retired that rank nearest `q`: every partition is ranked over the
-    /// int8 centroids, and the best quarter again as many as are taken, and thirty-two, again
-    /// exactly, so the rounding, a few thousandths, moves none across the cut.
+    /// The `take` partitions not retired that rank nearest `q`, nearest first, so a query's bar
+    /// rises soonest: every partition is ranked over the int8 centroids, and the best quarter again
+    /// as many as are taken, and thirty-two, again exactly, so the rounding, a few thousandths,
+    /// moves none across the cut.
     fn probes(&self, q: &[f32], take: usize, by_product: bool) -> Vec<(f32, i64)> {
         let mut ranked = self.ranked(q, by_product);
+        let order = |a: &(f32, i64), b: &(f32, i64)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
         if take >= ranked.len() {
+            ranked.sort_unstable_by(order);
             return ranked;
         }
-        let order = |a: &(f32, i64), b: &(f32, i64)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
         let near = (take + take / 4 + 32).min(ranked.len());
         ranked.select_nth_unstable_by(near - 1, order);
         ranked.truncate(near);
@@ -1179,6 +1181,7 @@ impl Model {
             ranked.select_nth_unstable_by(take - 1, order);
         }
         ranked.truncate(take);
+        ranked.sort_unstable_by(order);
         ranked
     }
 
@@ -4408,8 +4411,8 @@ mod tests {
         }
     }
 
-    /// A query probes the partitions nearest it by the exact ranking, though it ranks them all over
-    /// centroids rounded to int8: the rounding moves none across the cut.
+    /// A query probes the partitions nearest it by the exact ranking, nearest first, though it ranks
+    /// them all over centroids rounded to int8: the rounding moves none across the cut.
     #[test]
     fn a_query_probes_the_partitions_nearest_it_exactly() {
         const DIMS: usize = 100;
@@ -4421,7 +4424,9 @@ mod tests {
             let mut exact: Vec<(f32, i64)> = (0..1000).filter(|i| model.states[*i] != State::Retired).map(|i| (model.rank(&q, i, false), i as i64)).collect();
             exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             for take in [1, 10, 64] {
-                let mut probed: Vec<i64> = model.probes(&q, take, false).into_iter().map(|(_, p)| p).collect();
+                let probes = model.probes(&q, take, false);
+                assert!(probes.windows(2).all(|w| w[0].0 <= w[1].0), "take {take}: not nearest first");
+                let mut probed: Vec<i64> = probes.into_iter().map(|(_, p)| p).collect();
                 let mut nearest: Vec<i64> = exact[..take].iter().map(|(_, p)| *p).collect();
                 probed.sort_unstable();
                 nearest.sort_unstable();

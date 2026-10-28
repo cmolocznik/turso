@@ -204,8 +204,19 @@ recall@10 0.90 / 0.95, from 585 / 336:
   trained by spherical k-means over unit vectors, 20 Lloyd iterations seeded from distinct samples
   past 64 centroids, and a rebuild codes its vectors over the cores: 1,248 / 691 (the square root,
   spherical: 1,044-1,100 / 544-590; four times it, plain k-means: 1,074 / 582).
+- The centroids are also held in tiles of 64, dimension-major, so the nearest partition to a group
+  of 16 vectors is found a tile at a time and a query ranks from the tiles' products: builds 3x
+  faster (26 s against 81-83), queries unchanged.
+- The rowids and 7-bit parts of a group's members that reach the bar are prefetched before the
+  first is refined: 4 to 7% faster at every setting, 1,393 / 756.
+- A fast-scanned member is summed exactly only within the quantization's error of the bar, where
+  the exact sum can drop it; elsewhere its fast-scan sum serves its 7-bit estimate, as the library
+  takes it (`a_query_sums_exactly_only_the_members_near_the_bar`): 1,436 / 762.
+- The start of each held block is prefetched when a probe finds the blocks held, overlapping the
+  reads of the partition's dead rows and tail: 10 to 17% faster, 1,585 / 872.
+- The ranking reads the centroids rounded to bfloat16, half the bytes: 1,622 / 880.
 ScaNN runs 3,121 / 1,365 and the RaBitQ library at 7 bits 2,808 / 1,272 on the same core: ivf_rq is
-2.2x / 1.8x behind the library, from 4.8x / 3.8x. The index is 181 bytes a vector at 100
+1.7x / 1.45x behind the library, from 4.8x / 3.8x. The index is 181 bytes a vector at 100
 dimensions, the library's 140.
 
 Vectors are padded to a multiple of 32 rather than to a power of two, rotated as the library's
@@ -215,7 +226,10 @@ A 768-dimensional code is 692 bytes, not 916. On a 200,000-vector slice of Coher
 dimensions the index is 213 MB instead of 264, recall at a refine of two is unchanged to the third
 place, and queries run 8 to 17% faster at each setting: 1,752-1,796 a second at 48 probes (0.908)
 against 1,579-1,671, 1,302-1,340 at 96 (0.955) against 1,176-1,225.
-`a_rotation_pads_to_a_multiple_of_32_and_keeps_lengths_and_products`.
+`a_rotation_pads_to_a_multiple_of_32_and_keeps_lengths_and_products`. With the changes after it,
+the Cohere slice runs 3,019 / 1,779 queries a second at recall@10 0.90 / 0.95 on one core, against
+3,774 / 2,785 for the RaBitQ library at 7 bits and 1,942 / 1,061 for ScaNN; at 768 dimensions the
+bfloat16 ranking alone was worth 24% at 0.90, the ranking having read 6 MB of f32 centroids a query.
 
 A statement's maintenance shares the partitions where it found work its jobs did not cover with the
 index's other cursors, and the next statements survey as many of them as they may do jobs, so that
@@ -228,8 +242,12 @@ so every block read assembles an overflow chain, and a 3 KB 768-dimensional tabl
 to itself; at 64 KB pages each fits one page. The page size is the database's, so it is the
 application's choice; the measurements above are at 64 KB.
 
-Still owed: the 2.2x to the library at one query at a time, and the build: 83 s on glove-100 over
-the laptop's cores, against 12 s for ScaNN and 29 s for the library on mt1.
+Building without the balancing, or splitting only past the split bound, gives more recall a probe
+but slower queries at each recall target (Cohere at 0.90: 2,540 and 2,839 against 3,007), so the
+balancing stays. Still owed: the rest of the gap to the library at one query at a time (1.25x to
+1.7x), and its higher recall at the same probes and partition count (on Cohere at 48 probes 0.931
+against 0.916 with splits only past the bound), unexplained; the build takes 26 s on glove-100
+over the laptop's cores.
 
 ## Considered and not taken
 

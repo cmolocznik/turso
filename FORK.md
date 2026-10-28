@@ -1,8 +1,13 @@
 # This fork
 
-Upstream Turso (`tursodatabase/turso`, `main`) with the changes below on top. Each change is one
-commit with its test; `git log upstream/main..main` lists them. Keep this file in step with that
-log: a change lands here when it lands, with what it fixes and what proves it.
+Upstream Turso (`tursodatabase/turso`, `main`) with the changes below on top, on two branches:
+
+- `main` holds the fixes, which are headed upstream: one commit each with its test, listed by
+  `git log upstream/main..main`.
+- `feat/additions` is `main` plus the additions, listed by `git log main..feat/additions`.
+
+This file is only on `feat/additions`, so `main`'s commits can go upstream as they are. Keep it in
+step with the two logs: a change lands here when it lands, with what it fixes and what proves it.
 
 ## Fixes
 

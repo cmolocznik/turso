@@ -56,7 +56,7 @@ exact seek's B-tree steps through the cursor's yield hook: the seek for row 1 ta
 `core/translate/optimizer/mod.rs`. A pattern with LIMIT applies the query's LIMIT to the rows the
 index gives out, and the single-table planner gave one to any query whose WHERE and LIMIT matched
 it, so an aggregate or DISTINCT ran over the first LIMIT matches. On upstream `main`
-(`c2a90cc3f`), over 20 FTS matches, `SELECT count(*) ... WHERE fts_match(...) LIMIT 5` returned 5,
+(`818977eb4`), over 20 FTS matches, `SELECT count(*) ... WHERE fts_match(...) LIMIT 5` returned 5,
 and `SELECT DISTINCT cat ... WHERE fts_match(...) LIMIT 2` returned one of the two categories. A
 pattern with LIMIT now serves only a query whose rows reach the LIMIT as they leave the WHERE
 clause. A window function was never affected: its query reads the table through a subquery
@@ -66,12 +66,11 @@ Test: `index_method::fts::tests::fts_limit_applies_after_aggregates_and_distinct
 ### A value an index method provides failed the collation lookup
 `core/translate/collate.rs`, `core/translate/plan.rs`. The planner puts a value an index method
 provides, such as an FTS score, in place of the expression it computes, as a column numbered past
-the table's own; the collation lookups for a comparison operand and for an expression looked it up
-in the table and failed. On upstream `main`, `SELECT DISTINCT fts_score(...) ... WHERE
-fts_match(...)`, a UNION of two such SELECTs and an IN subquery over the score each failed to
-prepare with "column not found". The value now contributes no column collation, as the expression
-translator already treats it. `get_expr_collation_ctx_with_symbols` makes the same lookup, but none
-of the queries tried reaches it with such a value, so it is unchanged.
+the table's own. Every collation decision looks a referenced column up in its table
+(`referenced_column_collation`), which has no such column, so the statement failed: on upstream
+`main` (`818977eb4`), `SELECT DISTINCT fts_score(...) ... WHERE fts_match(...)`, a UNION of two such
+SELECTs and an IN subquery over the score each failed to prepare with "column not found". The value
+now has no column collation, as the expression translator already treats it.
 Test: `index_method::fts::tests::fts_score_from_the_index_has_no_column_collation`.
 
 ## Additions

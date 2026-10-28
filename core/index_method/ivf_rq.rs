@@ -7,7 +7,7 @@
 //! A write touches only rows owned by its own vector, so concurrent BEGIN CONCURRENT writers of
 //! different rows never conflict. An insert codes the vector against its nearest partition's
 //! centroid and writes two rows: a tail entry keyed by partition and rowid, and the vector's own
-//! row (where its code lives, and its 4-bit code's lower bits). A delete removes the vector's row,
+//! row, naming where its code lives. A delete removes the vector's row,
 //! and its tail entry if it has one. A code packed in a block stays there until maintenance
 //! rewrites the block, so the delete names the block in the vector's dead row, and a query skips
 //! that stale copy before it can raise the bar the live entries are held to.
@@ -30,15 +30,15 @@
 //! an insert committed from a snapshot older than the split still scores correctly until
 //! maintenance recodes it. The index starts as one partition about the origin.
 //!
-//! Each vector carries a 4-bit extended RaBitQ code whose top bit is its 1-bit code. The 1-bit
+//! Each vector carries a 7-bit extended RaBitQ code whose top bit is its 1-bit code. The 1-bit
 //! codes are interleaved 32 vectors at a time for a fast scan over per-query nibble tables of
-//! bytes. A query keeps the entries whose 1-bit estimate, raised by its error bound, reaches the
-//! `limit`th best lowered one, scores those from their 4-bit codes in order of that bound until no
-//! other can enter, and reranks the best `refine * limit` exactly from the table's vectors.
+//! bytes. A query scores from its 7-bit code, where its block lies, each entry whose 1-bit
+//! estimate raised by its error bound reaches the worst of the `refine * limit` best 7-bit
+//! estimates so far, and reranks those best exactly from the table's vectors.
 //!
 //! Six backing tables, every key an integer so a seek compares no payload: blocks
 //! (`partition << 32 | sequence` -> version, codes), tail (`partition << 40 | rowid` -> version,
-//! code), vectors (rowid -> location, 4-bit correction and lower bits), centroids
+//! code), vectors (rowid -> location), centroids
 //! (`partition << 24 | version` -> centroid; -1 -> a generation drawn afresh by each maintenance
 //! change to them, under which cursors share the loaded model), parts (partition -> next block
 //! sequence, packed size, entries in the open block, the blocks still to move, state, and the size
@@ -104,17 +104,16 @@ pub static SPLIT_MICROS_MAX: AtomicUsize = AtomicUsize::new(0);
 /// Whether queries and inserts record the counts and timings below, for measurement; while it
 /// is off each costs one load.
 pub static MEASURE: AtomicBool = AtomicBool::new(false);
-/// Entries a query estimated from 1-bit codes, and those it went on to score from 4-bit codes.
+/// Entries a query estimated from 1-bit codes, and those it went on to score from 7-bit codes.
 pub static SCANNED: AtomicUsize = AtomicUsize::new(0);
 pub static REFINED: AtomicUsize = AtomicUsize::new(0);
-/// Entries a query kept as candidates from their raised 1-bit estimates.
+/// Entries whose raised 1-bit estimate from the fast scan reached a query's bar.
 pub static CANDIDATES: AtomicUsize = AtomicUsize::new(0);
-/// Nanoseconds queries spent in each phase, and the records they read, for measurement.
+/// Nanoseconds queries spent in each phase (scoring includes the 7-bit refine), and the records
+/// they read, for measurement.
 pub static READ_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static SCORE_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static RECORDS: AtomicUsize = AtomicUsize::new(0);
-pub static NEXT_NANOS: AtomicUsize = AtomicUsize::new(0);
-pub static REFINE_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static RERANK_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static OPEN_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_NANOS: AtomicUsize = AtomicUsize::new(0);
@@ -139,24 +138,27 @@ const ASSUMED_LIMIT: f64 = 10.0;
 /// The codes a page of blocks holds, for a filtered query's cost estimate, in the planner's pages:
 /// it prices a table row at a fiftieth of a page whatever the row's width, and a code is priced at
 /// that rate scaled by its bytes against its vector's. A 768-dimensional vector's code, padded to
-/// 1,024 dimensions by the rotation, with its rowid, factors and 4-bit parts, is 532 bytes, and the
-/// vector 3,072: 50 * 3,072 / 532.
-const CODES_PER_PAGE: f64 = 289.0;
+/// 1,024 dimensions by the rotation, with its rowid, factors and 7-bit parts, is 916 bytes, and the
+/// vector 3,072: 50 * 3,072 / 916.
+const CODES_PER_PAGE: f64 = 168.0;
 /// The pages a rerank reads per vector, for a filtered query's cost estimate: its row in the table.
 const FETCH_PAGES: f64 = 1.0;
 /// The rounds a rebuild balances its trained partitions over.
 const BALANCE_ROUNDS: usize = 4;
 /// The vector-centroid products below which an assignment pass runs on one core.
 const PARALLEL_PRODUCTS: usize = 1 << 16;
-/// Bits per dimension past the sign: the extended code is 4 bits, its top bit the 1-bit code.
-const EX_BITS: usize = 3;
+/// Bits per dimension past the sign: the extended code is 7 bits, its top bit the 1-bit code.
+const EX_BITS: usize = 6;
+/// The extended code's values, `0..LEVELS`, each standing for itself less `CENTRE`.
+const LEVELS: u32 = 1 << (EX_BITS + 1);
+const CENTRE: f64 = (LEVELS - 1) as f64 / 2.0;
 /// Vectors scored together by one pass over the fast-scan tables.
 const GROUP: usize = 32;
 /// The fewest members a group needs to be fast-scanned rather than summed one by one.
 const SCAN_MEMBERS: usize = 8;
 /// The RaBitQ confidence multiplier on the 1-bit estimate's error.
 const EPSILON: f64 = 1.9;
-/// Scales tried when choosing a vector's 4-bit grid.
+/// Scales tried when choosing a vector's 7-bit grid.
 const GRID_SCALES: usize = 48;
 
 const BLOCKS: usize = 0;
@@ -168,7 +170,7 @@ const DEAD: usize = 5;
 const STORES: [(&str, &[(&str, Type)]); 6] = [
     ("blocks", &[("version", Type::Integer), ("codes", Type::Blob)]),
     ("tail", &[("version", Type::Integer), ("codes", Type::Blob)]),
-    ("vectors", &[("location", Type::Integer), ("codes", Type::Blob)]),
+    ("vectors", &[("location", Type::Integer)]),
     ("centroids", &[("value", Type::Blob)]),
     ("parts", &[("next", Type::Integer), ("size", Type::Integer), ("open", Type::Integer), ("move_next", Type::Integer), ("move_end", Type::Integer), ("state", Type::Integer), ("retry", Type::Integer)]),
     ("dead", &[("blocks", Type::Blob)]),
@@ -326,7 +328,14 @@ fn dot_body(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
-/// The direction-fit of the 4-bit grid at scale `t`: the code's product with `x` and its squared
+/// A rotated coordinate's extended code at scale `t`: `floor(v t)` raised by half the levels, so
+/// the code's top bit is the coordinate's sign, within the levels.
+#[inline(always)]
+fn grid_code(v: f32, t: f32) -> f32 {
+    ((v * t).floor() + (LEVELS / 2) as f32).clamp(0.0, (LEVELS - 1) as f32)
+}
+
+/// The direction-fit of the 7-bit grid at scale `t`: the code's product with `x` and its squared
 /// length.
 #[inline(always)]
 fn fit_body(x: &[f32], t: f32) -> (f32, f32) {
@@ -334,14 +343,14 @@ fn fit_body(x: &[f32], t: f32) -> (f32, f32) {
     let (head, tail) = x.split_at(x.len() / LANES * LANES);
     for chunk in head.chunks_exact(LANES) {
         for k in 0..LANES {
-            let value = ((chunk[k] * t).floor() + 8.0).clamp(0.0, 15.0) - 7.5;
+            let value = grid_code(chunk[k], t) - CENTRE as f32;
             along[k] += chunk[k] * value;
             length[k] += value * value;
         }
     }
     let (mut a, mut l): (f32, f32) = (along.iter().sum(), length.iter().sum());
     for v in tail {
-        let value = ((v * t).floor() + 8.0).clamp(0.0, 15.0) - 7.5;
+        let value = grid_code(*v, t) - CENTRE as f32;
         a += v * value;
         l += value * value;
     }
@@ -418,22 +427,24 @@ impl Rotation {
     }
 }
 
-/// A vector's code: its rowid, the residual's length, the 1-bit and 4-bit codes' corrections (each
-/// the inner product of the true unit residual with its code), the rotated signs, and the three
-/// lower bits of each dimension's 4-bit code, packed eight dimensions to three bytes.
+/// A vector's code: its rowid; what its 1-bit estimate is scaled by, what its error bound grows
+/// with, and what its 7-bit estimate is scaled by, each folding in the residual's length and the
+/// code's correction (the inner product of the true unit residual with its code); the rotated
+/// signs; and the six lower bits of each dimension's 7-bit code, four dimensions to three bytes.
 #[derive(Clone)]
 struct Entry {
     rowid: i64,
-    norm: f32,
-    factor: f32,
-    refined: f32,
+    gain: f32,
+    slack: f32,
+    scale: f32,
     bits: Vec<u8>,
     ex: Vec<u8>,
 }
 
-/// A block, laid out so a query reads it in place: count u16; rowids i64[n]; norms and factors
+/// A block, laid out so a query reads it in place: count u16; rowids i64[n]; gains and slacks
 /// f32[n] each; then per group of 32 entries, for each nibble position j of the 1-bit code, 16
-/// bytes whose low nibbles are entries 0..16's nibble j and high nibbles entries 16..32's.
+/// bytes whose low nibbles are entries 0..16's nibble j and high nibbles entries 16..32's; then
+/// each entry's 7-bit parts.
 struct Layout {
     count: usize,
     positions: usize,
@@ -453,17 +464,16 @@ impl Layout {
     fn rowids(&self) -> usize {
         2
     }
-    fn norms(&self) -> usize {
+    fn gains(&self) -> usize {
         self.rowids() + 8 * self.count
     }
-    fn factors(&self) -> usize {
-        self.norms() + 4 * self.count
+    fn slacks(&self) -> usize {
+        self.gains() + 4 * self.count
     }
     fn scan(&self) -> usize {
-        self.factors() + 4 * self.count
+        self.slacks() + 4 * self.count
     }
-    /// Each entry's 4-bit parts, as its vector's row also holds them: the correction, then the
-    /// lower bits.
+    /// Each entry's 7-bit parts: its scale, then its lower bits.
     fn extras(&self) -> usize {
         self.scan() + self.groups() * self.group_bytes()
     }
@@ -494,12 +504,12 @@ fn pack(entries: &[Entry]) -> Result<Vec<u8>> {
     out[..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
     for (n, e) in entries.iter().enumerate() {
         if e.ex.len() != EX_BITS * code_bytes {
-            return Err(*error("an entry to pack lacks its 4-bit code"));
+            return Err(*error("an entry to pack lacks its 7-bit code"));
         }
         out[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()].copy_from_slice(&extra(e));
         out[layout.rowids() + 8 * n..][..8].copy_from_slice(&e.rowid.to_le_bytes());
-        out[layout.norms() + 4 * n..][..4].copy_from_slice(&e.norm.to_le_bytes());
-        out[layout.factors() + 4 * n..][..4].copy_from_slice(&e.factor.to_le_bytes());
+        out[layout.gains() + 4 * n..][..4].copy_from_slice(&e.gain.to_le_bytes());
+        out[layout.slacks() + 4 * n..][..4].copy_from_slice(&e.slack.to_le_bytes());
         let group = layout.scan() + (n / GROUP) * layout.group_bytes();
         let (slot, shift) = (n % 16, if n % GROUP < 16 { 0 } else { 4 });
         for j in 0..layout.positions {
@@ -524,7 +534,7 @@ fn block_code_bytes(payload: &[u8]) -> Result<usize> {
     Ok(coded / per_code_byte)
 }
 
-/// A block's entries, with their 4-bit parts.
+/// A block's entries, with their 7-bit parts.
 fn unpack(payload: &[u8]) -> Result<Vec<Entry>> {
     let count = block_count(payload)?;
     let code_bytes = block_code_bytes(payload)?;
@@ -544,9 +554,9 @@ fn unpack(payload: &[u8]) -> Result<Vec<Entry>> {
             let extra = &payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()];
             Entry {
                 rowid: i64_at(payload, layout.rowids() + 8 * n),
-                norm: f32_at(payload, layout.norms() + 4 * n),
-                factor: f32_at(payload, layout.factors() + 4 * n),
-                refined: f32_at(extra, 0),
+                gain: f32_at(payload, layout.gains() + 4 * n),
+                slack: f32_at(payload, layout.slacks() + 4 * n),
+                scale: f32_at(extra, 0),
                 bits,
                 ex: extra[4..].to_vec(),
             }
@@ -554,34 +564,39 @@ fn unpack(payload: &[u8]) -> Result<Vec<Entry>> {
         .collect())
 }
 
-/// An entry's extra record: its 4-bit correction, then its lower bits.
+/// An entry's 7-bit parts as its block holds them: its scale, then its lower bits.
 fn extra(entry: &Entry) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + entry.ex.len());
-    out.extend_from_slice(&entry.refined.to_le_bytes());
+    out.extend_from_slice(&entry.scale.to_le_bytes());
     out.extend_from_slice(&entry.ex);
     out
 }
 
 kernel!(lower_product, lower_product_wide, lower_product_body, (rotated: &[f32], ex: &[u8]) -> f64);
 
-/// The rotated query's product with an entry's lower bits: the 4-bit code's part below the sign.
+/// The rotated query's product with an entry's lower bits: the 7-bit code's part below the sign.
 #[inline(always)]
 fn lower_product_body(rotated: &[f32], ex: &[u8]) -> f64 {
-    // Eight dimensions a step, one lane each, so the eight 3-bit values unpack with one shift.
+    // Eight dimensions a step, one lane each: their six-bit values unpack from two 24-bit words.
     let mut sums = [0.0f32; 8];
-    for (bytes, q) in ex.chunks_exact(3).zip(rotated.chunks_exact(8)) {
-        let word = bytes[0] as u32 | (bytes[1] as u32) << 8 | (bytes[2] as u32) << 16;
-        for k in 0..8 {
-            sums[k] += q[k] * ((word >> (3 * k)) & 7) as f32;
+    for (bytes, q) in ex.chunks_exact(6).zip(rotated.chunks_exact(8)) {
+        let low = bytes[0] as u32 | (bytes[1] as u32) << 8 | (bytes[2] as u32) << 16;
+        let high = bytes[3] as u32 | (bytes[4] as u32) << 8 | (bytes[5] as u32) << 16;
+        for k in 0..4 {
+            sums[k] += q[k] * ((low >> (6 * k)) & 63) as f32;
+            sums[4 + k] += q[4 + k] * ((high >> (6 * k)) & 63) as f32;
         }
     }
     sums.iter().map(|&s| s as f64).sum()
 }
 
-/// The 4-bit estimate of the residual's product with the rotated query, `signed` being the query
-/// summed over the entry's set sign bits: the code's values are `code - 7.5`.
-fn refined_product(signed: f64, lower: f64, sum: f64, refined: f64) -> f64 {
-    (8.0 * signed + lower - 7.5 * sum) / refined
+const _: () = assert!(EX_BITS == 6, "lower_product_body unpacks, and code packs, six lower bits");
+
+/// The 7-bit code's product with the rotated query, `signed` being the query summed over the
+/// entry's set sign bits and `lower` its product with the lower bits: the code's values are
+/// `code - CENTRE`. An entry's 7-bit estimate is its centre's product plus its scale times this.
+fn refined_product(signed: f64, lower: f64, sum: f64) -> f64 {
+    (1u32 << EX_BITS) as f64 * signed + lower - CENTRE * sum
 }
 
 /// The query summed over one member's set code bits, exactly: its table value at each nibble
@@ -803,7 +818,7 @@ fn code(rotation: &Rotation, rowid: i64, residual: Vec<f32>) -> Entry {
     let mut bits = vec![0u8; code_bytes];
     let mut ex = vec![0u8; code_bytes * EX_BITS];
     if norm == 0.0 {
-        return Entry { rowid, norm: 0.0, factor: 1.0, refined: 1.0, bits, ex };
+        return Entry { rowid, gain: 0.0, slack: 0.0, scale: 0.0, bits, ex };
     }
     let unit: Vec<f32> = residual.iter().map(|x| (*x as f64 / norm) as f32).collect();
     let rotated = rotation.apply(&unit);
@@ -811,17 +826,29 @@ fn code(rotation: &Rotation, rowid: i64, residual: Vec<f32>) -> Entry {
     let mut absolute = 0.0f64;
     let mut refined = 0.0f64;
     for (i, (x, c)) in rotated.iter().zip(&codes).enumerate() {
-        bits[i / 8] |= ((c >> 3) as u8) << (i % 8);
-        let at = (i / 8) * 3;
-        let word = (c & 7) << (3 * (i % 8));
+        bits[i / 8] |= ((c >> EX_BITS) as u8) << (i % 8);
+        // Four dimensions to three bytes.
+        let at = (i / 4) * 3;
+        let word = (c & ((1 << EX_BITS) - 1)) << (EX_BITS * (i % 4));
         ex[at] |= word as u8;
         ex[at + 1] |= (word >> 8) as u8;
         ex[at + 2] |= (word >> 16) as u8;
         absolute += x.abs() as f64;
-        refined += *x as f64 * (*c as f64 - 7.5);
+        refined += *x as f64 * (*c as f64 - CENTRE);
     }
-    let factor = (absolute / (rotation.padded as f64).sqrt()).max(f64::MIN_POSITIVE);
-    Entry { rowid, norm: norm as f32, factor: factor as f32, refined: refined.max(f64::MIN_POSITIVE) as f32, bits, ex }
+    let root = (rotation.padded as f64).sqrt();
+    // The corrections: the unit residual's products with its 1-bit code, unit length, and with
+    // its 7-bit code.
+    let factor = (absolute / root).max(f64::MIN_POSITIVE);
+    let refined = refined.max(f64::MIN_POSITIVE);
+    Entry {
+        rowid,
+        gain: (norm / (factor * root)) as f32,
+        slack: (norm * (1.0 - factor * factor).max(0.0).sqrt() / factor) as f32,
+        scale: (norm / refined) as f32,
+        bits,
+        ex,
+    }
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
@@ -1095,14 +1122,14 @@ fn conflicted(error: &LimboError) -> bool {
 }
 
 
-/// The 4-bit code of a rotated unit vector: values on the half-integer grid -7.5..=7.5 at the
+/// The 7-bit code of a rotated unit vector: values on the half-integer grid -63.5..=63.5 at the
 /// scale whose code points closest to the vector's direction. A value's sign is the vector's.
 fn grid(x: &[f32]) -> Vec<u32> {
     let peak = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let code = |v: f32, t: f32| ((v * t).floor() + 8.0).clamp(0.0, 15.0) as u32;
+    let code = |v: f32, t: f32| grid_code(v, t) as u32;
     let mut best = (f32::NEG_INFINITY, 1.0f32);
     if peak > 0.0 {
-        let top = 8.0 / peak;
+        let top = (LEVELS / 2) as f32 / peak;
         for s in 0..GRID_SCALES {
             let t = top * (0.15 + 1.35 * s as f32 / (GRID_SCALES - 1) as f32);
             let (along, length) = fit(x, t);
@@ -1360,17 +1387,6 @@ enum Change {
     Apply(VecDeque<Step>),
 }
 
-/// An entry a query kept from its 1-bit estimate: the bound it may reach, and what its 4-bit
-/// estimate needs, its 4-bit parts at `extra` in the query's copy of them.
-struct Candidate {
-    upper: f64,
-    rowid: i64,
-    centre: f64,
-    norm: f64,
-    signed: f64,
-    extra: usize,
-}
-
 #[derive(Clone, Copy)]
 enum Stage {
     Blocks,
@@ -1604,7 +1620,7 @@ impl Stream {
         let key = block_key(partition, part.next)?;
         steps.push_back(put(BLOCKS, key, record(&[Value::from_i64(version), blob(&pack(&entries)?)?])?));
         for e in &entries {
-            steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode()), blob(&extra(e))?])?));
+            steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode())])?));
         }
         part.next += 1;
         part.size += entries.len() as i64;
@@ -1638,8 +1654,8 @@ fn trained_partitions(vectors: usize) -> usize {
 /// A job's entries, sorted by what their check found.
 #[derive(Default)]
 struct Sorted {
-    /// Current, with their extra codes as their vector's row holds them.
-    live: Vec<(Entry, Vec<u8>)>,
+    /// Current.
+    live: Vec<Entry>,
     /// To be recoded from the table's vector.
     recode: Vec<i64>,
     /// Every tail entry and block the job read and replaces.
@@ -1687,7 +1703,7 @@ thread_local! {
 thread_local! {
     /// The query rounds started on this thread.
     static QUERY_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// The point reads made on this thread, and the candidates queries on it scored from 4-bit codes.
+    /// The point reads made on this thread, and the entries queries on it scored from 7-bit codes.
     static POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUERY_REFINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1741,13 +1757,15 @@ struct Query {
     vector: Vec<f32>,
     /// The query as the engine's vector, for the exact rerank.
     asked: Vector<'static>,
-    /// The query under the index's rotation, its length and its summed components.
+    /// The query under the index's rotation, its summed components, and what an entry's slack
+    /// is scaled by into the reach of its 1-bit estimate's error bound: the bound's confidence times
+    /// the query's length over the root of one less than the rotation's width.
     rotated: Vec<f32>,
-    length: f64,
     sum: f64,
+    spread: f64,
     scan: ScanTable,
     /// The rows the query asks for; the rows the current round asks for, more for each earlier
-    /// round of a filtered query; and the 4-bit estimates the round keeps.
+    /// round of a filtered query; and the 7-bit estimates the round keeps.
     wanted: usize,
     limit: usize,
     keep: usize,
@@ -1755,22 +1773,17 @@ struct Query {
     centres: HashMap<(i64, i64), f64>,
     /// The stale copies the probed partitions' dead rows name, as rowid and block.
     dead: HashSet<(i64, i64)>,
-    /// The `limit` best lowered 1-bit estimates of live entries, negated: the top is the bar an
-    /// entry's raised estimate must reach.
-    floors: BinaryHeap<Ordered>,
-    candidates: Vec<Candidate>,
-    /// The candidates' 4-bit parts, copied from the blocks and tail entries they were read from.
-    extras: Vec<u8>,
+    /// The `keep` best 7-bit estimates of live entries so far, negated: the top is the bar an
+    /// entry's raised 1-bit estimate must reach.
     estimates: BinaryHeap<Ordered>,
     results: BinaryHeap<Ordered>,
 }
 
 impl Query {
     fn bar(&self) -> f64 {
-        if self.floors.len() < self.limit {
-            f64::NEG_INFINITY
-        } else {
-            self.floors.peek().map_or(f64::NEG_INFINITY, |o| -o.0)
+        match self.estimates.peek() {
+            Some(worst) if self.estimates.len() >= self.keep => -worst.0,
+            _ => f64::NEG_INFINITY,
         }
     }
 
@@ -2062,7 +2075,7 @@ impl IvfRqCursor {
             partition,
             [
                 put(TAIL, key, record(&[Value::from_i64(version), blob(&pack(std::slice::from_ref(&entry))?)?])?),
-                put(VECTORS, rowid, record(&[Value::from_i64(Location::Tail(key).encode()), blob(&extra(&entry))?])?),
+                put(VECTORS, rowid, record(&[Value::from_i64(Location::Tail(key).encode())])?),
             ],
         ))
     }
@@ -2165,23 +2178,21 @@ impl IndexMethodCursor for IvfRqCursor {
             let rotated = rotation.apply(&vector);
             let sum = rotated.iter().map(|x| *x as f64).sum();
             let length = rotated.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+            let spread = EPSILON * length / ((rotated.len() - 1) as f64).sqrt();
             let scan = ScanTable::new(&rotated);
             let asked = Vector::from_slice_owned(values[1].get_value().to_blob().ok_or_else(|| error("query is not a vector"))?)?;
             self.query = Some(Query {
                 vector,
                 asked,
                 rotated,
-                length,
                 sum,
+                spread,
                 scan,
                 wanted: limit,
                 limit,
                 keep: limit,
                 centres: HashMap::new(),
                 dead: HashSet::new(),
-                floors: BinaryHeap::new(),
-                candidates: Vec::new(),
-                extras: Vec::new(),
                 estimates: BinaryHeap::new(),
                 results: BinaryHeap::new(),
             });
@@ -2331,9 +2342,6 @@ impl IvfRqCursor {
         let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
         query.limit = query.wanted.saturating_mul(widen);
         query.keep = refine.saturating_mul(query.limit);
-        query.floors.clear();
-        query.candidates.clear();
-        query.extras.clear();
         query.estimates.clear();
         query.results.clear();
         let mut probed_all = true;
@@ -2502,30 +2510,6 @@ impl IvfRqCursor {
     fn next_probe(&mut self, mut probes: VecDeque<i64>) -> Result<Search> {
         if let Some(partition) = probes.pop_front() {
             return Ok(Search::Dead { probes, partition, walk: Walk::Seek });
-        }
-        let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
-        let _timer = timer(&REFINE_NANOS);
-        let bar = query.bar();
-        let candidates = std::mem::take(&mut query.candidates);
-        let mut order: Vec<(f64, u32)> = candidates.iter().enumerate().filter(|(_, c)| c.upper >= bar).map(|(n, c)| (c.upper, n as u32)).collect();
-        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-        let extra_bytes = 4 + EX_BITS * query.rotated.len() / 8;
-        for candidate in order.iter().map(|&(_, n)| &candidates[n as usize]) {
-            // Candidates come in order of the bound they may reach: once one cannot enter the full
-            // set of 4-bit estimates, none after it can.
-            if query.estimates.len() >= query.keep && query.estimates.peek().is_some_and(|worst| -candidate.upper >= worst.0) {
-                break;
-            }
-            tally(&REFINED, 1);
-            #[cfg(test)]
-            QUERY_REFINES.with(|count| count.set(count.get() + 1));
-            let codes = &query.extras[candidate.extra..][..extra_bytes];
-            let lower = lower_product(&query.rotated, &codes[4..]);
-            let estimate = candidate.centre + candidate.norm * refined_product(candidate.signed, lower, query.sum, f32_at(codes, 0) as f64);
-            query.estimates.push(Ordered(-estimate, candidate.rowid));
-            if query.estimates.len() > query.keep {
-                query.estimates.pop();
-            }
         }
         Ok(Search::Rerank { candidates: VecDeque::new(), rowid: None })
     }
@@ -2868,16 +2852,16 @@ impl IvfRqCursor {
                                     if let Location::Block(key) = row.location {
                                         sorted.kept.push((row.entry.rowid, key));
                                     }
-                                    sorted.live.push((row.entry.clone(), bytes_at(&r, 1)?.to_vec()));
+                                    sorted.live.push(row.entry.clone());
                                 }
                                 // A move needs each entry, to keep it where it is when it stays, and its vector,
                                 // to see where it belongs.
                                 Job::Move(_) => {
-                                    sorted.live.push((row.entry.clone(), Vec::new()));
+                                    sorted.live.push(row.entry.clone());
                                     sorted.recode.push(row.entry.rowid);
                                 }
                                 // A compaction keeps each live entry as it is.
-                                Job::Compact(_) => sorted.live.push((row.entry.clone(), Vec::new())),
+                                Job::Compact(_) => sorted.live.push(row.entry.clone()),
                                 _ => sorted.recode.push(row.entry.rowid),
                             }
                         }
@@ -3234,7 +3218,7 @@ impl IvfRqCursor {
     fn plan_pack(&mut self, partition: i64, mut part: Part, sorted: Sorted, vectors: Vec<Vec<f32>>) -> Result<VecDeque<Step>> {
         let mut steps = removals(&sorted.removed);
         let mut live = sorted.live;
-        live.sort_unstable_by_key(|(e, _)| e.rowid);
+        live.sort_unstable_by_key(|e| e.rowid);
         let version = self.model.version(partition);
         // Entries already in the open block keep their row when they land in it again.
         let opened_here: std::collections::HashSet<(i64, i64)> = sorted.kept.iter().copied().collect();
@@ -3245,11 +3229,10 @@ impl IvfRqCursor {
         part.open = 0;
         for chunk in live.chunks(BLOCK) {
             let key = block_key(partition, part.next)?;
-            let entries: Vec<Entry> = chunk.iter().map(|(e, _)| e.clone()).collect();
-            steps.push_back(put(BLOCKS, key, record(&[Value::from_i64(version), blob(&pack(&entries)?)?])?));
-            for (e, codes) in chunk {
+            steps.push_back(put(BLOCKS, key, record(&[Value::from_i64(version), blob(&pack(chunk)?)?])?));
+            for e in chunk {
                 if !opened_here.contains(&(e.rowid, key)) {
-                    steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode()), blob(codes)?])?));
+                    steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode())])?));
                 }
             }
             part.next += 1;
@@ -3340,7 +3323,7 @@ impl IvfRqCursor {
         let mut staying = Vec::new();
         let mut recoded = 0;
         let mut moved = 0;
-        for ((entry, _), vector) in sorted.live.into_iter().zip(&vectors) {
+        for (entry, vector) in sorted.live.into_iter().zip(&vectors) {
             let nearest = self.model.nearest(vector) as i64;
             if from_block && nearest == partition && self.model.state(partition) == State::Live {
                 if sorted.version == current {
@@ -3351,7 +3334,7 @@ impl IvfRqCursor {
                 let residual: Vec<f32> = vector.iter().zip(centroid).map(|(a, b)| a - b).collect();
                 let rotation = rotation.as_ref().ok_or_else(|| error("a recoded entry has no vector"))?;
                 let fresh = code(rotation, entry.rowid, residual);
-                steps.push_back(put(VECTORS, fresh.rowid, record(&[Value::from_i64(Location::Block(key).encode()), blob(&extra(&fresh))?])?));
+                steps.push_back(put(VECTORS, fresh.rowid, record(&[Value::from_i64(Location::Block(key).encode())])?));
                 staying.push(fresh);
                 recoded += 1;
             } else {
@@ -3388,7 +3371,7 @@ impl IvfRqCursor {
             return Err(*error("a dead row names a block that holds no stale copy"));
         }
         let partition = block >> 32;
-        let staying: Vec<Entry> = sorted.live.into_iter().map(|(entry, _)| entry).collect();
+        let staying = sorted.live;
         let mut steps = VecDeque::from([match staying.is_empty() {
             true => remove(BLOCKS, block),
             false => put(BLOCKS, block, record(&[Value::from_i64(sorted.version), blob(&pack(&staying)?)?])?),
@@ -3452,9 +3435,10 @@ fn job_partition(job: Job) -> i64 {
 }
 
 /// Estimate a block's entries from their 1-bit codes, each group in one fast-scan pass (a sparse
-/// group, a tail entry above all, summed exactly), and keep as candidates those whose estimate,
-/// raised by its error bound, reaches the bar of the `limit` best lowered ones so far. A stale
-/// copy the partition's dead rows name is skipped before it can raise the bar.
+/// group, a tail entry above all, summed exactly), and score from its 7-bit code, where the block
+/// lies, each entry whose estimate raised by its error bound reaches the bar of the `keep` best
+/// 7-bit estimates so far. A stale copy the partition's dead rows name is skipped before it can
+/// raise the bar.
 fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location) -> Result<()> {
     let dims = query.rotated.len();
     let count = block_count(payload)?;
@@ -3462,17 +3446,12 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
     if payload.len() != layout.len() {
         return Err(*error("block length differs from its count"));
     }
-    let scale = 1.0 / (dims as f64).sqrt();
-    let spread = EPSILON * query.length / ((dims - 1) as f64).sqrt();
     let screened = match source {
         Location::Block(key) if !query.dead.is_empty() => Some(key),
         _ => None,
     };
     let mut bar = query.bar();
     let mut sums = [0u32; GROUP];
-    // Each member's gain, what its 1-bit sum is scaled by into an estimate, and the reach of its
-    // error bound: one group's at a time, before any is compared with the bar.
-    let (mut gain, mut reach) = ([0f64; GROUP], [0f64; GROUP]);
     for group in 0..layout.groups() {
         let first = group * GROUP;
         let codes = &payload[layout.scan() + group * layout.group_bytes()..][..layout.group_bytes()];
@@ -3482,40 +3461,35 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
         if scanned {
             scan_group(codes, &query.scan.bytes, &mut sums);
         }
-        let norms = payload[layout.norms() + 4 * first..][..4 * members].chunks_exact(4);
-        let factors = payload[layout.factors() + 4 * first..][..4 * members].chunks_exact(4);
-        for ((slot, norm), factor) in norms.enumerate().zip(factors) {
-            let norm = f32::from_le_bytes(norm.try_into().unwrap()) as f64;
-            let factor = f32::from_le_bytes(factor.try_into().unwrap()) as f64;
-            gain[slot] = norm * scale / factor;
-            reach[slot] = norm * spread * (1.0 - factor * factor).max(0.0).sqrt() / factor;
-        }
         let exact = |slot: usize| exact_sum(codes, &query.scan.exact, slot);
         for slot in 0..members {
+            let n = first + slot;
+            let gain = f32_at(payload, layout.gains() + 4 * n) as f64;
+            let reach = query.spread * f32_at(payload, layout.slacks() + 4 * n) as f64;
             let (chosen, quantized) = if scanned { (query.scan.step * sums[slot] as f64 + query.scan.base, query.scan.error) } else { (exact(slot), 0.0) };
-            let estimate = centre + gain[slot] * (2.0 * chosen - query.sum);
-            if estimate + reach[slot] + 2.0 * gain[slot] * quantized < bar {
+            if centre + gain * (2.0 * chosen - query.sum) + reach + 2.0 * gain * quantized < bar {
                 continue;
             }
-            let n = first + slot;
+            tally(&CANDIDATES, 1);
             let rowid = i64_at(payload, layout.rowids() + 8 * n);
             if screened.is_some_and(|key| query.dead.contains(&(rowid, key))) {
                 continue;
             }
             let signed = if scanned { exact(slot) } else { chosen };
-            let estimate = centre + gain[slot] * (2.0 * signed - query.sum);
-            query.floors.push(Ordered(-(estimate - reach[slot]), rowid));
-            if query.floors.len() > query.limit {
-                query.floors.pop();
+            if centre + gain * (2.0 * signed - query.sum) + reach < bar {
+                continue;
+            }
+            tally(&REFINED, 1);
+            #[cfg(test)]
+            QUERY_REFINES.with(|count| count.set(count.get() + 1));
+            let extra = &payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()];
+            let lower = lower_product(&query.rotated, &extra[4..]);
+            let estimate = centre + f32_at(extra, 0) as f64 * refined_product(signed, lower, query.sum);
+            query.estimates.push(Ordered(-estimate, rowid));
+            if query.estimates.len() > query.keep {
+                query.estimates.pop();
             }
             bar = query.bar();
-            if estimate + reach[slot] >= bar {
-                let norm = f32_at(payload, layout.norms() + 4 * n) as f64;
-                let extra = query.extras.len();
-                query.extras.extend_from_slice(&payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()]);
-                query.candidates.push(Candidate { upper: estimate + reach[slot], rowid, centre, norm, signed, extra });
-                tally(&CANDIDATES, 1);
-            }
         }
     }
     Ok(())
@@ -3549,11 +3523,12 @@ mod tests {
 
     fn query(q: &[f32], rotation: &Rotation, limit: usize, keep: usize) -> Query {
         let rotated = rotation.apply(q);
+        let length = rotated.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         Query {
             vector: q.to_vec(),
             asked: Vector::from_f32(q.to_vec()),
             sum: rotated.iter().map(|x| *x as f64).sum(),
-            length: rotated.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt(),
+            spread: EPSILON * length / ((rotated.len() - 1) as f64).sqrt(),
             scan: ScanTable::new(&rotated),
             rotated,
             wanted: limit,
@@ -3561,9 +3536,6 @@ mod tests {
             keep,
             centres: HashMap::new(),
             dead: HashSet::new(),
-            floors: BinaryHeap::new(),
-            candidates: Vec::new(),
-            extras: Vec::new(),
             estimates: BinaryHeap::new(),
             results: BinaryHeap::new(),
         }
@@ -3575,13 +3547,13 @@ mod tests {
         let back = unpack(&pack(&coded).unwrap()).unwrap();
         assert_eq!(back.len(), 45);
         for (a, b) in coded.iter().zip(&back) {
-            assert_eq!((a.rowid, a.norm, a.factor, &a.bits), (b.rowid, b.norm, b.factor, &b.bits));
-            assert_eq!((a.refined, &a.ex), (b.refined, &b.ex), "the 4-bit parts of entry {}", a.rowid);
+            assert_eq!((a.rowid, a.gain, a.slack, &a.bits), (b.rowid, b.gain, b.slack, &b.bits));
+            assert_eq!((a.scale, &a.ex), (b.scale, &b.ex), "the 7-bit parts of entry {}", a.rowid);
         }
     }
 
-    /// A query scores its candidates' 4-bit codes from the blocks and tail entries it read: past the
-    /// model's generation it makes no point read, however many candidates it refines, in a packed
+    /// A query scores entries' 7-bit codes from the blocks and tail entries it read: past the
+    /// model's generation it makes no point read, however many entries it refines, in a packed
     /// index with a tail and stale copies, and its answer is the exact top ten.
     #[test]
     fn a_query_refines_its_candidates_without_a_point_read() {
@@ -3657,11 +3629,11 @@ mod tests {
         }
     }
 
-    /// The block scan keeps every entry whose true product is among the best, and the 4-bit
-    /// estimate built from a kept candidate and its extra row is far closer to the truth than the
-    /// 1-bit one.
+    /// One block's scan refines every entry whose true product is among the best into the `keep`
+    /// best 7-bit estimates, and those estimates are far closer to the truth than the entries' 1-bit
+    /// ones.
     #[test]
-    fn the_scan_keeps_the_true_best_and_the_four_bit_estimate_beats_the_one_bit_one() {
+    fn the_scan_keeps_the_true_best_and_the_seven_bit_estimate_beats_the_one_bit_one() {
         let (rotation, vectors, coded) = entries(64, 768);
         let mut state = 13;
         let q = random(&mut state, 768);
@@ -3669,26 +3641,22 @@ mod tests {
         score_block(&mut query, &pack(&coded).unwrap(), 0.0, Location::Block(0)).unwrap();
         let mut truth: Vec<(f64, i64)> = vectors.iter().enumerate().map(|(n, v)| (dot(&q, v), n as i64)).collect();
         truth.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let bar = query.bar();
-        let kept: Vec<i64> = query.candidates.iter().filter(|c| c.upper >= bar).map(|c| c.rowid).collect();
+        let kept: Vec<(f64, i64)> = query.estimates.iter().map(|o| (-o.0, o.1)).collect();
+        assert_eq!(kept.len(), 40);
         for (_, rowid) in &truth[..10] {
-            assert!(kept.contains(rowid), "true top-10 row {rowid} was dropped by the scan");
+            assert!(kept.iter().any(|(_, r)| r == rowid), "true top-10 row {rowid} is not among the best 7-bit estimates");
         }
-        let padded = query.rotated.len();
-        let (mut one, mut four) = (0.0f64, 0.0f64);
-        for c in &query.candidates {
-            let e = &coded[c.rowid as usize];
-            let true_product = dot(&q, &vectors[c.rowid as usize]);
-            let estimate_one = c.norm * (2.0 * c.signed - query.sum) / (padded as f64).sqrt() / e.factor as f64;
-            let codes = &query.extras[c.extra..][..4 + EX_BITS * padded / 8];
-            assert_eq!(codes, &extra(e)[..], "the 4-bit parts the scan copied for row {}", c.rowid);
-            let lower = lower_product(&query.rotated, &codes[4..]);
-            let estimate_four = c.norm * refined_product(c.signed, lower, query.sum, f32_at(codes, 0) as f64);
-            one += (estimate_one - true_product).abs();
-            four += (estimate_four - true_product).abs();
+        let rotated = rotation.apply(&q);
+        let sum: f64 = rotated.iter().map(|x| *x as f64).sum();
+        let (mut one, mut seven) = (0.0f64, 0.0f64);
+        for (estimate, rowid) in &kept {
+            let e = &coded[*rowid as usize];
+            let signed: f64 = (0..rotated.len()).filter(|i| e.bits[i / 8] >> (i % 8) & 1 == 1).map(|i| rotated[i] as f64).sum();
+            let true_product = dot(&q, &vectors[*rowid as usize]);
+            one += (e.gain as f64 * (2.0 * signed - sum) - true_product).abs();
+            seven += (estimate - true_product).abs();
         }
-        assert!(!query.candidates.is_empty());
-        assert!(four < one / 4.0, "4-bit error {four} against 1-bit {one}");
+        assert!(seven < one / 16.0, "7-bit error {seven} against 1-bit {one}");
     }
 
     fn rows(conn: &Arc<crate::Connection>, sql: &str) -> Vec<Vec<Value>> {
@@ -4263,6 +4231,48 @@ mod tests {
                 let q = near(&mut state, &centres, 0.4);
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
             }
+        }
+    }
+
+    /// The estimates rank well enough that a query reranking only the rows it returns, at a refine
+    /// of one, finds nearly all of the exact top ten: probing every partition, at least 95% of them
+    /// over fifty queries of random vectors, whose best products lie closer together than the
+    /// estimates' error.
+    #[test]
+    fn a_query_reranking_only_its_answer_finds_the_exact_top_ten() {
+        const DIMS: usize = 64;
+        let (_db, conn) = database("ivf-rq-refine-one.db", false);
+        let mut state = 97;
+        let vectors: Vec<(i64, Vec<f32>)> = (1..=2000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+        insert_all(&conn, &vectors);
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 1)").unwrap();
+        let live: HashMap<i64, Vec<f32>> = vectors.into_iter().collect();
+        let (mut found, queries) = (0, 50);
+        for _ in 0..queries {
+            let q = random(&mut state, DIMS);
+            let exact = exact_top_ten(&live, &q);
+            found += top_ten(&conn, &q).iter().filter(|id| exact.contains(id)).count();
+        }
+        let recall = found as f64 / (10 * queries) as f64;
+        assert!(recall >= 0.95, "recall@10 {recall} at a refine of one");
+    }
+
+    /// A vector's row in the index names only where its code is, the code itself being in its block
+    /// or tail entry, so each code is stored once: after a build and after single inserts.
+    #[test]
+    fn a_vectors_row_holds_only_where_its_code_is() {
+        let (_db, conn) = database("ivf-rq-one-copy.db", false);
+        let mut state = 101;
+        let vectors: Vec<(i64, Vec<f32>)> = (1..=300i64).map(|id| (id, random(&mut state, 32))).collect();
+        insert_all(&conn, &vectors);
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 64, refine = 4)").unwrap();
+        for id in 301..=320i64 {
+            conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&random(&mut state, 32)))).unwrap();
+        }
+        let stored = rows(&conn, "SELECT * FROM __turso_internal_v_ivf_vectors");
+        assert_eq!(stored.len(), 320);
+        for row in &stored {
+            assert_eq!(row.len(), 1, "a vector's row holds {} values: {row:?}", row.len());
         }
     }
 

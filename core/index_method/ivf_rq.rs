@@ -24,20 +24,20 @@
 //! there is. Maintenance conflicts only with a write to a row it changes, and on a conflict it
 //! undoes its job and leaves the rows to the writer holding them. Its jobs: pack a partition's tail
 //! into blocks of [`BLOCK`]; rewrite a block holding [`COMPACT_AT`] stale copies without them;
-//! split a partition grown past twice the partition count by 2-means over its members' vectors
-//! read back from the table, so partitions stay near the square root of the row count, marking it
-//! and its [`NEIGHBOURS`] nearest partitions moving, so moves recheck every entry there, move each
-//! to its nearest partition and recode those that stay against their partition's new centroid;
-//! retire a partition left with under a sixteenth of the split bound, moving its entries to their
-//! nearest partitions; and rebuild, training partitions afresh by k-means over a sample of every
-//! vector, when a statement inserting [`BULK_AT`] rows or more finds the index trained for under a
-//! quarter of the partitions its rows call for. CREATE INDEX over [`BULK_AT`] rows or more writes
-//! tail entries for its first rows only and rebuilds over all of them, so each of the rest is
-//! coded into its block once. Every
-//! rewrite of a block takes it off the dead rows of the copies it drops. A split never overwrites
-//! a centroid: it writes new versions, and every entry names the version it was coded against, so
-//! an insert committed from a snapshot older than the split still scores correctly until
-//! maintenance recodes it. The index starts as one partition about the origin.
+//! split a partition grown past an eighth of the partition count, and two blocks, by 2-means over
+//! its members' vectors read back from the table, so partitions stay near four times the square
+//! root of the row count, marking it and its [`NEIGHBOURS`] nearest partitions moving, so moves
+//! recheck every entry there, move each to its nearest partition and recode those that stay
+//! against their partition's new centroid; retire a partition left with under a sixteenth of the
+//! split bound, moving its entries to their nearest partitions; and rebuild, training partitions
+//! afresh by k-means over a sample of every vector, when a statement inserting [`BULK_AT`] rows or
+//! more finds the index trained for under a quarter of the partitions its rows call for. CREATE
+//! INDEX over [`BULK_AT`] rows or more writes tail entries for its first rows only and rebuilds
+//! over all of them, so each of the rest is coded into its block once. Every rewrite of a block
+//! takes it off the dead rows of the copies it drops. A split never overwrites a centroid: it
+//! writes new versions, and every entry names the version it was coded against, so an insert
+//! committed from a snapshot older than the split still scores correctly until maintenance
+//! recodes it. The index starts as one partition about the origin.
 //!
 //! Each vector carries a 7-bit extended RaBitQ code whose top bit is its 1-bit code. The 1-bit
 //! codes are interleaved 32 vectors at a time for a fast scan over per-query nibble tables of
@@ -149,7 +149,11 @@ const PACK_AT: usize = 8;
 const COMPACT_AT: usize = 8;
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const ROUNDS: usize = 3;
-const KMEANS_ITERATIONS: usize = 8;
+/// The most centroids k-means seeds by k-means++.
+const SEEDED_CENTROIDS: usize = 64;
+/// Lloyd iterations: a rebuild's training over its sample, and a split's 2-means.
+const TRAIN_ITERATIONS: usize = 20;
+const SPLIT_ITERATIONS: usize = 8;
 /// The rows a filtered query is taken to ask for when its LIMIT is not a literal, for its cost
 /// estimate: the depth most vector searches ask for.
 const ASSUMED_LIMIT: f64 = 10.0;
@@ -1308,10 +1312,14 @@ fn grid(x: &[f32]) -> Vec<u32> {
     x.iter().map(|v| code(*v, best.1)).collect()
 }
 
-/// Lloyd's k-means over `sample`, seeded by k-means++.
-fn kmeans(sample: &[Vec<f32>], k: usize, eta: f32) -> Vec<Vec<f32>> {
+/// Lloyd's k-means over `sample`, seeded by k-means++ for a few centroids and, as FAISS seeds its
+/// training, by distinct sampled vectors for many, where k-means++ would make a pass over the
+/// sample for each. Over vectors of unit length, as embeddings are, each centroid is the direction
+/// of its members' mean (spherical k-means): the partitions a query probes, nearest first, are
+/// then those its products with the members are highest in.
+fn kmeans(sample: &[Vec<f32>], k: usize, iterations: usize, eta: f32) -> Vec<Vec<f32>> {
     let k = k.min(sample.len()).max(1);
-    let dims = sample[0].len();
+    let spherical = sample.iter().all(|v| (dot32(v, v) - 1.0).abs() < 1e-3);
     let mut state = SEED ^ 0x5bd1_e995;
     let mut random = move || {
         state ^= state << 13;
@@ -1319,6 +1327,16 @@ fn kmeans(sample: &[Vec<f32>], k: usize, eta: f32) -> Vec<Vec<f32>> {
         state ^= state << 17;
         state
     };
+    if k > SEEDED_CENTROIDS {
+        // Distinct sampled vectors, by a partial shuffle of the sample's indices.
+        let mut order: Vec<usize> = (0..sample.len()).collect();
+        for i in 0..k {
+            let j = i + (random() as usize) % (sample.len() - i);
+            order.swap(i, j);
+        }
+        let centroids = order[..k].iter().map(|i| sample[*i].clone()).collect();
+        return lloyd(sample, centroids, iterations, eta, spherical);
+    }
     let mut centroids = vec![sample[(random() as usize) % sample.len()].clone()];
     let mut nearest: Vec<f32> = sample.iter().map(|v| l2(v, &centroids[0])).collect();
     while centroids.len() < k {
@@ -1338,7 +1356,13 @@ fn kmeans(sample: &[Vec<f32>], k: usize, eta: f32) -> Vec<Vec<f32>> {
         }
         centroids.push(c);
     }
-    for _ in 0..KMEANS_ITERATIONS {
+    lloyd(sample, centroids, iterations, eta, spherical)
+}
+
+/// Lloyd's iterations over `sample` from `centroids`.
+fn lloyd(sample: &[Vec<f32>], mut centroids: Vec<Vec<f32>>, iterations: usize, eta: f32, spherical: bool) -> Vec<Vec<f32>> {
+    let (k, dims) = (centroids.len(), sample[0].len());
+    for _ in 0..iterations {
         let assigned = nearest_all(&Model::new(centroids.clone(), eta), sample);
         let mut sums = vec![vec![0.0f64; dims]; k];
         let mut counts = vec![0usize; k];
@@ -1350,8 +1374,12 @@ fn kmeans(sample: &[Vec<f32>], k: usize, eta: f32) -> Vec<Vec<f32>> {
             if counts[p] == 0 {
                 continue;
             }
+            let length = match spherical {
+                true => sums[p].iter().map(|x| x * x).sum::<f64>().sqrt().max(f64::MIN_POSITIVE),
+                false => counts[p] as f64,
+            };
             for d in 0..dims {
-                centroids[p][d] = (sums[p][d] / counts[p] as f64) as f32;
+                centroids[p][d] = (sums[p][d] / length) as f32;
             }
         }
     }
@@ -1377,13 +1405,34 @@ fn nearest_all(model: &Model, vectors: &[Vec<f32>]) -> Vec<usize> {
     })
 }
 
+/// Each vector coded against its nearest live partition, as [`Model::encode`] does, the vectors
+/// split over the cores when there are enough products to pay for the threads.
+fn encode_all(model: &Model, rotation: &Rotation, rowids: &[i64], vectors: &[Vec<f32>]) -> Vec<(i64, i64, Entry)> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let code = |(rowid, v): (&i64, &Vec<f32>)| model.encode(rotation, *rowid, v);
+    if threads == 1 || vectors.len() * model.centroids.len().max(1) < PARALLEL_PRODUCTS {
+        return rowids.iter().zip(vectors).map(code).collect();
+    }
+    let chunk = vectors.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        rowids
+            .chunks(chunk)
+            .zip(vectors.chunks(chunk))
+            .map(|(rowids, vectors)| scope.spawn(move || rowids.iter().zip(vectors).map(code).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().expect("coding worker"))
+            .collect()
+    })
+}
+
 /// The centroids 2-means splits `vectors` into, unless the smaller half would take under a
 /// sixteenth of them: a split that lopsided leaves the partition about as large as it was.
 fn halves(vectors: &[Vec<f32>], eta: f32) -> Option<[Vec<f32>; 2]> {
     if vectors.len() < 2 {
         return None;
     }
-    let model = Model::new(kmeans(vectors, 2, eta), eta);
+    let model = Model::new(kmeans(vectors, 2, SPLIT_ITERATIONS, eta), eta);
     let first = nearest_all(&model, vectors).iter().filter(|p| **p == 0).count();
     if first.min(vectors.len() - first) * 16 < vectors.len() {
         return None;
@@ -1391,10 +1440,11 @@ fn halves(vectors: &[Vec<f32>], eta: f32) -> Option<[Vec<f32>; 2]> {
     <[Vec<f32>; 2]>::try_from(model.centroids).ok()
 }
 
-/// The size past which a partition of an index with `live` live partitions is split: twice their
-/// count, so partitions stay near the square root of the row count.
+/// The size past which a partition of an index with `live` live partitions is split: twice the
+/// size of a partition when the partitions number [`PARTITIONS_PER_ROOT`] times the square root of
+/// the row count, `live` over its square, and at least two blocks.
 fn split_bound(live: usize) -> i64 {
-    (2 * live).max(2 * BLOCK) as i64
+    (2 * live / (PARTITIONS_PER_ROOT * PARTITIONS_PER_ROOT)).max(2 * BLOCK) as i64
 }
 
 /// Balance trained `centroids` by the sample's assignment, each sampled vector standing for
@@ -1878,7 +1928,9 @@ enum Rebuilding {
     Sample { rowids: Vec<i64>, sample: Vec<i64>, vectors: Vec<Vec<f32>>, get: Get },
     /// Collect the keys of every block, tail entry and dead row, to remove.
     Clear { rowids: Vec<i64>, model: Box<Model>, walk: Walk, keys: Vec<i64> },
-    Code { rowids: Vec<i64>, model: Box<Model>, at: usize, get: Get, stream: Stream },
+    /// Read the vectors from `at` on a batch at a time, code each batch over the cores, and write
+    /// each partition's blocks as they fill.
+    Code { rowids: Vec<i64>, model: Box<Model>, at: usize, get: Get, stream: Stream, batch: Vec<Vec<f32>> },
     /// Every write is made: the model under its new generation is the index's.
     Done { model: Box<Model>, generation: i64 },
 }
@@ -1941,10 +1993,11 @@ impl Stream {
     }
 }
 
-/// The partitions trained for `vectors` vectors: their square root, so a partition holds about as
-/// many vectors as there are partitions, half the bound past which one is split.
+/// The partitions trained for `vectors` vectors: [`PARTITIONS_PER_ROOT`] times their square root,
+/// none holding under a block of them, so a partition holds about half the bound past which one is
+/// split.
 fn trained_partitions(vectors: usize) -> usize {
-    ((vectors as f64).sqrt().round() as usize).max(1)
+    ((PARTITIONS_PER_ROOT as f64 * (vectors as f64).sqrt()).round() as usize).min(vectors / BLOCK).max(1)
 }
 
 /// A job's entries, sorted by what their check found.
@@ -1985,9 +2038,16 @@ const SURVEYED_TAIL: usize = 2 * MOVE_BATCH;
 /// The vectors at which an index trained for under a quarter of the partitions it holds vectors for
 /// is rebuilt, and the rows a statement inserts that make its maintenance check for it.
 const BULK_AT: usize = 1024;
-/// The sampled vectors a rebuild trains each partition from, and the most it samples.
-const TRAIN_PER_PARTITION: usize = 32;
-const TRAIN_SAMPLE_MAX: usize = 32_768;
+/// The partitions an index is trained to and kept at, per square root of its rows: finer
+/// partitions, as the RaBitQ library's IVF index uses, let a query reach its recall scanning less
+/// of the index, for a few more probes.
+const PARTITIONS_PER_ROOT: usize = 4;
+/// The vectors a rebuild reads before coding them together over the cores.
+const CODE_BATCH: usize = 4096;
+/// The sampled vectors a rebuild trains each partition from, and the most it samples, those for
+/// the 4,096 partitions of 2^20 rows.
+const TRAIN_PER_PARTITION: usize = 64;
+const TRAIN_SAMPLE_MAX: usize = 262_144;
 
 #[cfg(test)]
 thread_local! {
@@ -2581,12 +2641,12 @@ impl IndexMethodCursor for IvfRqCursor {
     /// A filtered query's cost in the planner's units, a page read being one. It gives out about
     /// `limit / selectivity` rows before `limit` are accepted, in rounds of four times the rows and
     /// partitions of the last, and each round reads its partitions' blocks and fetches `refine`
-    /// vectors for each row it asks for. The index is taken to hold as many partitions as the
-    /// square root of the table's rows, as maintenance keeps it.
+    /// vectors for each row it asks for. The index is taken to hold the partitions a rebuild
+    /// trains for the table's rows, as maintenance keeps it.
     fn estimate_cost(&self, context: &IndexMethodCostContext<'_>) -> Option<IndexMethodCostEstimate> {
         let selectivity = context.filter_selectivity?;
         let rows = context.base_table_rows.max(1.0);
-        let partitions = rows.sqrt().round().max(1.0);
+        let partitions = trained_partitions(rows as usize) as f64;
         let limit = context.arguments.get(1).and_then(literal_rows).unwrap_or(ASSUMED_LIMIT).clamp(1.0, rows);
         let wanted = (limit / selectivity.max(1.0 / rows)).min(rows);
         let (mut asked, mut probes, mut cost) = (limit, self.nprobes as f64, 0.0);
@@ -3330,32 +3390,39 @@ impl IvfRqCursor {
                             }
                             IOResult::Done(None) => {
                                 steps.extend(keys.into_iter().map(|key| remove(PARTITIONS, key)));
-                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at: 0, get: Get::Seek, stream: Stream::default() }, steps };
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at: 0, get: Get::Seek, stream: Stream::default(), batch: Vec::new() }, steps };
                             }
                         },
-                        Rebuilding::Code { rowids, model, at, mut get, mut stream } => {
-                            let Some(&rowid) = rowids.get(at) else {
-                                stream.finish(&model, &mut steps)?;
-                                for p in (0..model.centroids.len()).filter(|p| model.states[*p] == State::Live) {
-                                    steps.push_back(put(CENTROIDS, centroid_key(p as i64, model.versions[p])?, centroid_record(&model.centroids[p])?));
+                        Rebuilding::Code { rowids, model, at, mut get, mut stream, mut batch } => {
+                            if let Some(&rowid) = rowids.get(at + batch.len()).filter(|_| batch.len() < CODE_BATCH) {
+                                match self.table_vector(rowid, &mut get)? {
+                                    IOResult::IO(io) => {
+                                        self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at, get, stream, batch }, steps };
+                                        return Ok(IOResult::IO(io));
+                                    }
+                                    IOResult::Done(vector) => batch.push(vector),
                                 }
-                                let next = generation();
-                                steps.push_back(put(CENTROIDS, GENERATION, record(&[Value::from_i64(next)])?));
-                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Done { model, generation: next }, steps };
+                                surveyed();
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at, get: Get::Seek, stream, batch }, steps };
                                 continue;
-                            };
-                            let vector = match self.table_vector(rowid, &mut get)? {
-                                IOResult::IO(io) => {
-                                    self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at, get, stream }, steps };
-                                    return Ok(IOResult::IO(io));
+                            }
+                            if let Some(first) = batch.first() {
+                                let rotation = self.rotation(first.len());
+                                for (partition, version, entry) in encode_all(&model, &rotation, &rowids[at..at + batch.len()], &batch) {
+                                    stream.add(partition, version, entry, &mut steps)?;
                                 }
-                                IOResult::Done(vector) => vector,
-                            };
-                            surveyed();
-                            let rotation = self.rotation(vector.len());
-                            let (partition, version, entry) = model.encode(&rotation, rowid, &vector);
-                            stream.add(partition, version, entry, &mut steps)?;
-                            self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at: at + 1, get: Get::Seek, stream }, steps };
+                                let at = at + batch.len();
+                                batch.clear();
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at, get: Get::Seek, stream, batch }, steps };
+                                continue;
+                            }
+                            stream.finish(&model, &mut steps)?;
+                            for p in (0..model.centroids.len()).filter(|p| model.states[*p] == State::Live) {
+                                steps.push_back(put(CENTROIDS, centroid_key(p as i64, model.versions[p])?, centroid_record(&model.centroids[p])?));
+                            }
+                            let next = generation();
+                            steps.push_back(put(CENTROIDS, GENERATION, record(&[Value::from_i64(next)])?));
+                            self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Done { model, generation: next }, steps };
                         }
                         Rebuilding::Done { model, generation } => {
                             self.model = Arc::new(*model);
@@ -3414,7 +3481,7 @@ impl IvfRqCursor {
     fn rebuilt(&self, sample: &[Vec<f32>], vectors: usize) -> Model {
         let old = &self.model;
         let eta = sample.first().map_or(0.0, |v| self.eta(v.len()));
-        let centroids = balance(sample, kmeans(sample, trained_partitions(vectors), eta), vectors, eta);
+        let centroids = balance(sample, kmeans(sample, trained_partitions(vectors), TRAIN_ITERATIONS, eta), vectors, eta);
         let trained = centroids.len();
         let mut model = Model { older: old.older.clone(), eta, ..Model::default() };
         for (p, c) in old.centroids.iter().enumerate() {

@@ -12,15 +12,23 @@
 //! rewrites the block, so the delete names the block in the vector's dead row, and a query skips
 //! that stale copy before it can raise the bar the live entries are held to.
 //!
-//! `OPTIMIZE INDEX t_idx` is maintenance, bounded per run and itself a BEGIN CONCURRENT writer
-//! that conflicts only with a write to a vector it moves or whose dead row it rewrites: it packs a
-//! partition's tail into blocks of [`BLOCK`], rewrites a block holding [`COMPACT_AT`] stale copies
-//! without them, and splits a partition grown past twice the partition count by 2-means over its
-//! members' vectors read back from the table, so partitions stay near the square root of the row
-//! count. Every rewrite of a block takes it off the dead rows of the copies it drops. A split
-//! never overwrites a centroid: it writes new versions, and every entry names the version it was
-//! coded against, so an insert committed from a snapshot older than the split still scores
-//! correctly until maintenance recodes it. The index starts as one partition about the origin.
+//! A statement that writes the index does the maintenance its writes made due before they are
+//! released, at most one job for each row it wrote, and `OPTIMIZE INDEX t_idx` does every job
+//! there is. Maintenance conflicts only with a write to a row it changes, and on a conflict it
+//! undoes its job and leaves the rows to the writer holding them. Its jobs: pack a partition's tail
+//! into blocks of [`BLOCK`]; rewrite a block holding [`COMPACT_AT`] stale copies without them;
+//! split a partition grown past twice the partition count by 2-means over its members' vectors
+//! read back from the table, so partitions stay near the square root of the row count, marking it
+//! and its [`NEIGHBOURS`] nearest partitions moving, so moves recheck every entry there, move each
+//! to its nearest partition and recode those that stay against their partition's new centroid;
+//! retire a partition left with under a sixteenth of the split bound, moving its entries to their
+//! nearest partitions; and rebuild, training partitions afresh by k-means over a sample of every
+//! vector, when a statement inserting [`BULK_AT`] rows or more finds the index trained for under a
+//! quarter of the partitions its rows call for, as CREATE INDEX over a populated table does. Every
+//! rewrite of a block takes it off the dead rows of the copies it drops. A split never overwrites
+//! a centroid: it writes new versions, and every entry names the version it was coded against, so
+//! an insert committed from a snapshot older than the split still scores correctly until
+//! maintenance recodes it. The index starts as one partition about the origin.
 //!
 //! Each vector carries a 4-bit extended RaBitQ code whose top bit is its 1-bit code. The 1-bit
 //! codes are interleaved 32 vectors at a time for a fast scan over per-query nibble tables of
@@ -33,10 +41,11 @@
 //! code), vectors (rowid -> location, 4-bit correction and lower bits), centroids
 //! (`partition << 24 | version` -> centroid; -1 -> a generation drawn afresh by each maintenance
 //! change to them, under which cursors share the loaded model), parts (partition -> next block
-//! sequence, packed size), dead (`partition << 40 | rowid` -> the blocks holding a stale copy of
-//! the vector's code). Only maintenance writes blocks, centroids and parts.
+//! sequence, packed size, entries in the open block, the blocks still to move, state, and the size
+//! a refused split waits for), dead (`partition << 40 | rowid` -> the blocks holding a stale copy
+//! of the vector's code). Only maintenance writes blocks, centroids and parts.
 use std::{
-    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -76,7 +85,7 @@ pub static PROBE_BY_PRODUCT: AtomicUsize = AtomicUsize::new(0);
 /// Maintenance done in this process: packs, splits, entries recoded, stale entries dropped, and
 /// the summed and longest split durations, for measurement.
 pub static PACKS: AtomicUsize = AtomicUsize::new(0);
-/// Maintenance runs that found a job.
+/// Maintenance jobs done.
 pub static JOBS: AtomicUsize = AtomicUsize::new(0);
 pub static MOVES: AtomicUsize = AtomicUsize::new(0);
 pub static SPLITS: AtomicUsize = AtomicUsize::new(0);
@@ -84,6 +93,12 @@ pub static RECODED: AtomicUsize = AtomicUsize::new(0);
 pub static DROPPED: AtomicUsize = AtomicUsize::new(0);
 /// Blocks rewritten without their stale copies.
 pub static COMPACTS: AtomicUsize = AtomicUsize::new(0);
+/// Retirements started and finished.
+pub static RETIRES: AtomicUsize = AtomicUsize::new(0);
+/// Jobs reverted because another transaction held a row they wrote.
+pub static CONFLICTS: AtomicUsize = AtomicUsize::new(0);
+/// Rebuilds of the whole index.
+pub static REBUILDS: AtomicUsize = AtomicUsize::new(0);
 pub static SPLIT_MICROS: AtomicUsize = AtomicUsize::new(0);
 pub static SPLIT_MICROS_MAX: AtomicUsize = AtomicUsize::new(0);
 /// Entries a query estimated from 1-bit codes, and those it went on to score from 4-bit codes.
@@ -103,7 +118,7 @@ pub static ENCODE_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static CHANGE_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static INSERTS: AtomicUsize = AtomicUsize::new(0);
 
-/// The most codes one block packs, and the tail length at which maintenance packs a partition.
+/// The most codes one block packs.
 const BLOCK: usize = 64;
 /// The tail length at which maintenance packs a partition, merging it into the partition's open
 /// block, so a partition holds full blocks, at most one open block, and a short tail.
@@ -113,6 +128,10 @@ const COMPACT_AT: usize = 8;
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const ROUNDS: usize = 3;
 const KMEANS_ITERATIONS: usize = 8;
+/// The rounds a rebuild balances its trained partitions over.
+const BALANCE_ROUNDS: usize = 4;
+/// The vector-centroid products below which an assignment pass runs on one core.
+const PARALLEL_PRODUCTS: usize = 1 << 16;
 /// Bits per dimension past the sign: the extended code is 4 bits, its top bit the 1-bit code.
 const EX_BITS: usize = 3;
 /// Vectors scored together by one pass over the fast-scan tables.
@@ -135,7 +154,7 @@ const STORES: [(&str, &[(&str, Type)]); 6] = [
     ("tail", &[("version", Type::Integer), ("codes", Type::Blob)]),
     ("vectors", &[("location", Type::Integer), ("codes", Type::Blob)]),
     ("centroids", &[("value", Type::Blob)]),
-    ("parts", &[("next", Type::Integer), ("size", Type::Integer), ("open", Type::Integer), ("move_next", Type::Integer), ("move_end", Type::Integer)]),
+    ("parts", &[("next", Type::Integer), ("size", Type::Integer), ("open", Type::Integer), ("move_next", Type::Integer), ("move_end", Type::Integer), ("state", Type::Integer), ("retry", Type::Integer)]),
     ("dead", &[("blocks", Type::Blob)]),
 ];
 /// The centroids table's rowid for the generation.
@@ -624,7 +643,8 @@ impl ScanTable {
 /// distorts its high inner products, the ones a search must rank, and is weighted the more.
 ///
 /// Each partition has a current centroid version; earlier versions are kept for entries coded
-/// against them. Partition 0 at version 0 with no stored centroid is the untrained origin.
+/// against them. Partition 0 at version 0 with no stored centroid is the untrained origin. Only a
+/// live partition is assigned vectors.
 #[derive(Debug, Clone, Default)]
 struct Model {
     centroids: Vec<Vec<f32>>,
@@ -634,6 +654,8 @@ struct Model {
     versions: Vec<i64>,
     /// Superseded centroids, by partition and version.
     older: HashMap<(i64, i64), Vec<f32>>,
+    /// Each partition's state, from its bookkeeping.
+    states: Vec<State>,
     eta: f32,
 }
 
@@ -641,7 +663,8 @@ impl Model {
     fn new(centroids: Vec<Vec<f32>>, eta: f32) -> Self {
         let squares = centroids.iter().map(|c| dot32(c, c)).collect();
         let versions = vec![0; centroids.len()];
-        Self { centroids, squares, versions, older: HashMap::new(), eta }
+        let states = vec![State::Live; centroids.len()];
+        Self { centroids, squares, versions, older: HashMap::new(), states, eta }
     }
 
     /// Set a partition's centroid at a version, keeping the one it supersedes.
@@ -651,6 +674,7 @@ impl Model {
             self.centroids.push(c);
             self.squares.push(square);
             self.versions.push(version);
+            self.states.push(State::Live);
             return;
         }
         let previous = std::mem::replace(&mut self.centroids[partition], c);
@@ -661,6 +685,15 @@ impl Model {
 
     fn version(&self, partition: i64) -> i64 {
         self.versions.get(partition as usize).copied().unwrap_or(0)
+    }
+
+    fn state(&self, partition: i64) -> State {
+        self.states.get(partition as usize).copied().unwrap_or_default()
+    }
+
+    /// The live partitions, at least one: an untrained index is its origin.
+    fn live(&self) -> usize {
+        self.states.iter().filter(|s| **s == State::Live).count().max(1)
     }
 
     /// The centroid an entry of `partition` was coded against at `version`; none for the origin.
@@ -682,6 +715,9 @@ impl Model {
         let length = square.sqrt().max(f32::MIN_POSITIVE);
         let mut best = (f32::INFINITY, 0);
         for (i, (c, c_square)) in self.centroids.iter().zip(&self.squares).enumerate() {
+            if self.states[i] != State::Live {
+                continue;
+            }
             let product = dot32(c, v);
             let mut loss = square + c_square - 2.0 * product;
             if self.eta > 1.0 {
@@ -869,45 +905,85 @@ fn walk_row(cursor: &mut Box<dyn CursorTrait>, start: i64, end: i64, state: &mut
 
 /// One write to one backing table, resumable.
 enum Step {
-    /// Write the row, replacing any with its rowid; `true` once its position is sought.
-    Put(usize, i64, ImmutableRecord, bool),
-    /// Delete the row; it must exist unless `required` is false. `true` once it is sought.
-    Remove { store: usize, rowid: i64, required: bool, sought: bool },
+    /// Write the row, replacing any with its rowid.
+    Put { store: usize, rowid: i64, row: ImmutableRecord, at: Progress },
+    /// Delete the row; it must exist unless `required` is false.
+    Remove { store: usize, rowid: i64, required: bool, at: Progress },
 }
 
-fn apply_step(stores: &mut [Box<dyn CursorTrait>], step: &mut Step) -> IOResultOr<()> {
-    match step {
-        Step::Put(store, rowid, row, sought) => {
-            let cursor = &mut stores[*store];
-            if !*sought {
-                if let IOResult::IO(io) = cursor.seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true })? {
-                    return Ok(IOResult::IO(io));
-                }
-                *sought = true;
-            }
-            cursor.insert(&BTreeKey::new_table_rowid(*rowid, Some(row)))
-        }
-        Step::Remove { store, rowid, required, sought } => {
-            let cursor = &mut stores[*store];
-            if !*sought {
-                match cursor.seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true })? {
+/// How far a step has gone: its row is sought, then (when the step's prior state is kept) read,
+/// then written.
+enum Progress {
+    Seek,
+    Read,
+    Write(Option<ImmutableRecord>),
+}
+
+/// Apply a step. With `undo`, the step that restores the row's prior state is pushed once the
+/// write is done; a write another transaction holds fails with [`LimboError::WriteWriteConflict`]
+/// and changes nothing.
+fn apply_step(stores: &mut [Box<dyn CursorTrait>], step: &mut Step, undo: Option<&mut Vec<Step>>) -> IOResultOr<()> {
+    let keep = undo.is_some();
+    let (store, rowid) = match step {
+        Step::Put { store, rowid, .. } | Step::Remove { store, rowid, .. } => (*store, *rowid),
+    };
+    let cursor = &mut stores[store];
+    loop {
+        let (at, required) = match step {
+            Step::Put { at, .. } => (at, None),
+            Step::Remove { at, required, .. } => (at, Some(*required)),
+        };
+        match at {
+            Progress::Seek => match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                IOResult::Done(SeekResult::Found) => *at = if keep { Progress::Read } else { Progress::Write(None) },
+                IOResult::Done(_) => match required {
+                    Some(true) => return Err(error("removed row is absent")),
+                    Some(false) => return Ok(IOResult::Done(())),
+                    None => *at = Progress::Write(None),
+                },
+            },
+            Progress::Read => {
+                let prior = match cursor.record()? {
+                    IOResult::Done(found) => found.ok_or_else(|| error("positioned cursor has no record"))?.clone(),
                     IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                    IOResult::Done(SeekResult::Found) => *sought = true,
-                    IOResult::Done(_) if *required => return Err(error("removed row is absent")),
-                    IOResult::Done(_) => return Ok(IOResult::Done(())),
-                }
+                };
+                *at = Progress::Write(Some(prior));
             }
-            cursor.delete()
+            Progress::Write(_) => break,
         }
     }
+    let written = match step {
+        Step::Put { row, .. } => cursor.insert(&BTreeKey::new_table_rowid(rowid, Some(row)))?,
+        Step::Remove { .. } => cursor.delete()?,
+    };
+    if let IOResult::IO(io) = written {
+        return Ok(IOResult::IO(io));
+    }
+    if let Some(undo) = undo {
+        let (Step::Put { at, .. } | Step::Remove { at, .. }) = step;
+        let Progress::Write(prior) = std::mem::replace(at, Progress::Seek) else {
+            unreachable!("the step was written")
+        };
+        undo.push(match prior {
+            Some(row) => put(store, rowid, row),
+            None => remove(store, rowid),
+        });
+    }
+    Ok(IOResult::Done(()))
 }
 
 fn put(store: usize, rowid: i64, row: ImmutableRecord) -> Step {
-    Step::Put(store, rowid, row, false)
+    Step::Put { store, rowid, row, at: Progress::Seek }
 }
 
 fn remove(store: usize, rowid: i64) -> Step {
-    Step::Remove { store, rowid, required: true, sought: false }
+    Step::Remove { store, rowid, required: true, at: Progress::Seek }
+}
+
+/// Whether an error is a write to a row another transaction holds.
+fn conflicted(error: &LimboError) -> bool {
+    matches!(error, LimboError::WriteWriteConflict)
 }
 
 
@@ -968,7 +1044,7 @@ fn grid(x: &[f32]) -> Vec<u32> {
     x.iter().map(|v| code(*v, best.1)).collect()
 }
 
-/// Lloyd's k-means over `sample`, seeded by k-means++, its assignment passes split over the cores.
+/// Lloyd's k-means over `sample`, seeded by k-means++.
 fn kmeans(sample: &[Vec<f32>], k: usize, eta: f32) -> Vec<Vec<f32>> {
     let k = k.min(sample.len()).max(1);
     let dims = sample[0].len();
@@ -998,40 +1074,112 @@ fn kmeans(sample: &[Vec<f32>], k: usize, eta: f32) -> Vec<Vec<f32>> {
         }
         centroids.push(c);
     }
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let chunk = sample.len().div_ceil(threads);
     for _ in 0..KMEANS_ITERATIONS {
-        let model = Model::new(centroids.clone(), eta);
-        let partial: Vec<(Vec<Vec<f64>>, Vec<usize>)> = std::thread::scope(|scope| {
-            sample
-                .chunks(chunk)
-                .map(|part| {
-                    let model = &model;
-                    scope.spawn(move || {
-                        let mut sums = vec![vec![0.0f64; dims]; k];
-                        let mut counts = vec![0usize; k];
-                        for v in part {
-                            let p = model.nearest(v);
-                            counts[p] += 1;
-                            sums[p].iter_mut().zip(v).for_each(|(s, x)| *s += *x as f64);
-                        }
-                        (sums, counts)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("k-means worker"))
-                .collect()
-        });
+        let assigned = nearest_all(&Model::new(centroids.clone(), eta), sample);
+        let mut sums = vec![vec![0.0f64; dims]; k];
+        let mut counts = vec![0usize; k];
+        for (v, p) in sample.iter().zip(assigned) {
+            counts[p] += 1;
+            sums[p].iter_mut().zip(v).for_each(|(s, x)| *s += *x as f64);
+        }
         for p in 0..k {
-            let count: usize = partial.iter().map(|(_, c)| c[p]).sum();
-            if count == 0 {
+            if counts[p] == 0 {
                 continue;
             }
             for d in 0..dims {
-                let s: f64 = partial.iter().map(|(sums, _)| sums[p][d]).sum();
-                centroids[p][d] = (s / count as f64) as f32;
+                centroids[p][d] = (sums[p][d] / counts[p] as f64) as f32;
             }
+        }
+    }
+    centroids
+}
+
+/// Each vector's nearest live partition, the vectors split over the cores when there are enough
+/// products to pay for the threads.
+fn nearest_all(model: &Model, vectors: &[Vec<f32>]) -> Vec<usize> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads == 1 || vectors.len() * model.centroids.len() < PARALLEL_PRODUCTS {
+        return vectors.iter().map(|v| model.nearest(v)).collect();
+    }
+    let chunk = vectors.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        vectors
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().map(|v| model.nearest(v)).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().expect("assignment worker"))
+            .collect()
+    })
+}
+
+/// The centroids 2-means splits `vectors` into, unless the smaller half would take under a
+/// sixteenth of them: a split that lopsided leaves the partition about as large as it was.
+fn halves(vectors: &[Vec<f32>], eta: f32) -> Option<[Vec<f32>; 2]> {
+    if vectors.len() < 2 {
+        return None;
+    }
+    let model = Model::new(kmeans(vectors, 2, eta), eta);
+    let first = nearest_all(&model, vectors).iter().filter(|p| **p == 0).count();
+    if first.min(vectors.len() - first) * 16 < vectors.len() {
+        return None;
+    }
+    <[Vec<f32>; 2]>::try_from(model.centroids).ok()
+}
+
+/// The size past which a partition of an index with `live` live partitions is split: twice their
+/// count, so partitions stay near the square root of the row count.
+fn split_bound(live: usize) -> i64 {
+    (2 * live).max(2 * BLOCK) as i64
+}
+
+/// Balance trained `centroids` by the sample's assignment, each sampled vector standing for
+/// `vectors / sample.len()` of the table's: split every partition the sample puts at three
+/// quarters of the split bound or more by 2-means over its sampled members, and drop every one it
+/// puts under the retirement bound, a sixteenth of the split bound, its members going to their
+/// next nearest, until a round changes nothing. Maintenance then has no split or retirement to
+/// start a rebuilt index with. The margin under the bound is two standard errors of the share of a
+/// partition at the bound when 32 vectors are sampled per partition.
+fn balance(sample: &[Vec<f32>], mut centroids: Vec<Vec<f32>>, vectors: usize, eta: f32) -> Vec<Vec<f32>> {
+    let scale = vectors as f64 / sample.len().max(1) as f64;
+    // A partition whose split was refused as lopsided is not tried again.
+    let mut whole = vec![false; centroids.len()];
+    for _ in 0..BALANCE_ROUNDS {
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); centroids.len()];
+        for (i, p) in nearest_all(&Model::new(centroids.clone(), eta), sample).into_iter().enumerate() {
+            members[p].push(i);
+        }
+        let bound = split_bound(centroids.len()) as f64;
+        let mut left = centroids.len();
+        let mut kept = Vec::with_capacity(centroids.len());
+        let mut kept_whole = Vec::with_capacity(centroids.len());
+        let mut changed = false;
+        for ((centroid, members), whole) in centroids.into_iter().zip(members).zip(whole) {
+            let share = members.len() as f64 * scale;
+            if share * 16.0 < bound && left > 1 {
+                left -= 1;
+                changed = true;
+                continue;
+            }
+            if !whole && share * 4.0 >= bound * 3.0 {
+                let sampled: Vec<Vec<f32>> = members.iter().map(|i| sample[*i].clone()).collect();
+                if let Some(halves) = halves(&sampled, eta) {
+                    kept.extend(halves);
+                    kept_whole.extend([false, false]);
+                    changed = true;
+                    continue;
+                }
+                kept.push(centroid);
+                kept_whole.push(true);
+                continue;
+            }
+            kept.push(centroid);
+            kept_whole.push(whole);
+        }
+        centroids = kept;
+        whole = kept_whole;
+        if !changed {
+            break;
         }
     }
     centroids
@@ -1105,13 +1253,22 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
     BackingSchema::new(tables, Vec::new())
 }
 
-/// The model last loaded or written under each generation, shared by the index's cursors.
-type Shared = Arc<std::sync::Mutex<Option<(i64, Arc<Model>)>>>;
+/// What the index's cursors share: the model last loaded or written, under its generation, and
+/// the partitions known to be moving, which any writer's maintenance moves along.
+#[derive(Default, Debug)]
+struct SharedState {
+    model: Option<(i64, Arc<Model>)>,
+    moving: BTreeSet<i64>,
+}
+
+type Shared = Arc<std::sync::Mutex<SharedState>>;
 
 enum Load {
     /// Read the generation: a model cached under it is the stored model, so nothing else is read.
     Generation(Get),
+    /// Read the centroids, then each partition's state.
     Walk(Walk),
+    Parts(Walk),
 }
 
 /// A delete in progress: read the vector's row, then remove it and its tail entry, or name its
@@ -1157,20 +1314,59 @@ struct Tailed {
 }
 
 /// What maintenance knows of a partition's blocks: the next sequence, the packed entries, how many
-/// the last block holds when it is not full (zero when it is), and, after a split, the blocks
-/// still to check for entries now nearer another partition: sequences `move_next..move_end`.
-#[derive(Clone, Copy, Default)]
+/// the last block holds when it is not full (zero when it is), the blocks still to check for
+/// entries now nearer another partition (sequences `move_next..move_end`, set by a split of this
+/// partition or of a neighbour, and by a retirement), the partition's [`State`], and the size at
+/// which a split refused as lopsided is tried again (zero when none was).
+#[derive(Clone, Copy, Default, Debug)]
 struct Part {
     next: i64,
     size: i64,
     open: i64,
     move_next: i64,
     move_end: i64,
+    state: State,
+    retry: i64,
+}
+
+/// A partition is live, retiring (its entries move to the live partitions nearest them, and none
+/// is coded into it, while queries still probe it) or retired (empty and never probed, its slot
+/// free for the next split).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+enum State {
+    #[default]
+    Live,
+    Retiring,
+    Retired,
+}
+
+impl State {
+    fn code(self) -> i64 {
+        match self {
+            State::Live => 0,
+            State::Retiring => 1,
+            State::Retired => 2,
+        }
+    }
+
+    fn decode(code: i64) -> Result<Self> {
+        match code {
+            0 => Ok(State::Live),
+            1 => Ok(State::Retiring),
+            2 => Ok(State::Retired),
+            _ => Err(LimboError::Corrupt("ivf_rq: unknown partition state".into())),
+        }
+    }
 }
 
 impl Part {
     fn record(&self) -> Result<ImmutableRecord> {
-        record(&[self.next, self.size, self.open, self.move_next, self.move_end].map(Value::from_i64))
+        record(&[self.next, self.size, self.open, self.move_next, self.move_end, self.state.code(), self.retry].map(Value::from_i64))
+    }
+
+    fn parse(found: &ImmutableRecord) -> Result<Self> {
+        let field = |at| integer(found, at);
+        Ok(Part { next: field(0)?, size: field(1)?, open: field(2)?, move_next: field(3)?, move_end: field(4)?, state: State::decode(field(5)?)?, retry: field(6)? })
     }
 
     fn moving(&self) -> bool {
@@ -1180,41 +1376,184 @@ impl Part {
 
 type Parts = HashMap<i64, Part>;
 
-/// The one job a maintenance run does. Each touches a bounded number of rows, so a run is a short
-/// transaction that conflicts with a writer only on a vector both change, and retrying it is cheap.
+/// One maintenance job. Each touches a bounded number of rows, except a rebuild, which recodes the
+/// whole index once it holds four times the vectors its partitions were trained for.
 #[derive(Clone, Copy, Debug)]
 enum Job {
     /// Merge up to [`MOVE_BATCH`] tail entries into the partition's open block.
     Pack(i64),
-    /// Choose the partition's two new centroids from a sample of its members and write them; the
-    /// entries move later, batch by batch.
+    /// Choose the partition's two new centroids from a sample of its members and write them; its
+    /// entries and those of the partitions nearest it move later, block by block.
     Split(i64),
-    /// Recode up to a block of entries coded against a superseded centroid into the partitions now
-    /// nearest them.
+    /// Check a block of a partition marked moving: an entry now nearer another live partition
+    /// moves there, and the rest are recoded against the partition's current centroid.
     Move(i64),
     /// Rewrite the block with this key without the stale copies it holds.
     Compact(i64),
+    /// Start retiring a partition too small to keep, or retire one a retirement has emptied.
+    Retire(i64),
+    /// Train the partitions afresh by k-means over a sample of every vector, and recode them all.
+    Rebuild,
 }
 
-/// A maintenance run: count every partition's tail and read the bookkeeping, choose the job, read
-/// the entries it concerns, check each against its vector's row, read the vectors it recodes, and
-/// write.
+/// What a survey read of the partitions maintenance chooses from: their tails, bookkeeping and the
+/// stale copies their blocks hold. A statement's maintenance reads the partitions it wrote and
+/// those known to be moving; `OPTIMIZE INDEX` reads them all.
+#[derive(Default)]
+struct Survey {
+    tails: HashMap<i64, usize>,
+    parts: Parts,
+    /// Stale copies per block, from the dead rows.
+    stale: HashMap<i64, usize>,
+    /// The partitions read.
+    read: BTreeSet<i64>,
+    /// The vectors the index holds, when the survey read them all.
+    vectors: Option<i64>,
+}
+
+impl Survey {
+    fn forget(&mut self, partition: i64) {
+        self.tails.remove(&partition);
+        self.parts.remove(&partition);
+        self.stale.retain(|block, _| block >> 32 != partition);
+    }
+
+    fn part(&self, partition: i64) -> Part {
+        self.parts.get(&partition).copied().unwrap_or_default()
+    }
+
+    fn tail(&self, partition: i64) -> usize {
+        self.tails.get(&partition).copied().unwrap_or(0)
+    }
+
+    /// The entries a partition holds that are live: packed and tail entries, less stale copies.
+    fn live(&self, partition: i64) -> i64 {
+        let stale: usize = self.stale.iter().filter(|(block, _)| *block >> 32 == partition).map(|(_, count)| *count).sum();
+        self.part(partition).size + self.tail(partition) as i64 - stale as i64
+    }
+}
+
+/// Where a survey is: the partitions still to read, and what of the current one.
+enum Surveying {
+    /// Read every tail key, then every partition's bookkeeping, then every dead row.
+    All(Reading, Walk),
+    /// Read one partition at a time: its tail, its bookkeeping, its dead rows.
+    Some { pending: VecDeque<i64>, reading: Reading, walk: Walk, get: Get },
+}
+
+#[derive(Clone, Copy)]
+enum Reading {
+    Tail,
+    Part,
+    Dead,
+}
+
+/// A maintenance run: the jobs it may still do, what its surveys found, and where it starts.
+struct Run {
+    budget: usize,
+    survey: Survey,
+    /// Whether the run surveys every partition.
+    all: bool,
+    /// The partitions a run that does not survey them all starts from.
+    first: Vec<i64>,
+}
+
+/// Maintenance: survey, choose a job, read the entries it concerns, check each against its
+/// vector's row, read the vectors it recodes, write, and survey again what the job changed, until
+/// no job is left or the run's budget is spent. A job's first write claims it (the bookkeeping row
+/// of its partition, or the generation); a write another transaction holds stops the job, and the
+/// writes it made are reverted, so a run never commits half a job.
 enum Upkeep {
-    Init,
+    Idle,
     Load,
-    Count { walk: Walk, tails: HashMap<i64, usize> },
-    Parts { walk: Walk, tails: HashMap<i64, usize>, parts: Parts },
-    /// Count the stale copies the dead rows name in each block.
-    Dead { walk: Walk, tails: HashMap<i64, usize>, parts: Parts, stale: HashMap<i64, usize> },
+    Survey(Surveying),
     /// Read the entries of `job`: the open block and the tail for a pack, every member for a
-    /// split's sample, the first superseded block or tail entries for a move, the block for a
-    /// compaction.
+    /// split's sample, a block for a move or a compaction, every vector for a rebuild.
     Read { job: Job, part: Part, stage: Stage, walk: Walk, get: Get, rows: Vec<Tailed> },
+    /// Read the bookkeeping of the live partitions nearest one being split, which the split marks
+    /// moving, so their entries now nearer a new centroid move to it.
+    Neighbours { job: Job, part: Part, rows: Vec<Tailed>, members: i64, neighbours: Vec<i64>, at: usize, get: Get, parts: Vec<(i64, Part)> },
     Check { job: Job, part: Part, rows: Vec<Tailed>, at: usize, get: Get, sorted: Sorted },
     /// Read the dead row of each stale copy a rewritten block drops, to take the block off it.
     Unbury { job: Job, part: Part, sorted: Sorted, at: usize, get: Get },
     Fetch { job: Job, part: Part, sorted: Sorted, vectors: Vec<Vec<f32>> },
-    Apply { steps: VecDeque<Step> },
+    /// Write the job's steps in order, keeping each row's prior state until the job is done.
+    Apply { job: Job, steps: VecDeque<Step>, undo: Vec<Step> },
+    /// Restore the rows the abandoned job wrote, latest first.
+    Revert { undo: Vec<Step> },
+    /// A rebuild, writing `steps` before it goes on to its next phase.
+    Rebuild { phase: Rebuilding, steps: VecDeque<Step> },
+}
+
+/// A rebuild: read every vector's rowid, train partitions afresh by k-means over a sample of the
+/// vectors, remove every block, tail entry and dead row, recode every vector into the trained
+/// partitions, writing each partition's blocks as they fill, and write the bookkeeping, the
+/// centroids and the generation. Centroid rows are never removed, so an entry a concurrent writer
+/// coded against an older model still scores; packs recode it.
+enum Rebuilding {
+    Rowids { walk: Walk, rowids: Vec<i64> },
+    Sample { rowids: Vec<i64>, sample: Vec<i64>, vectors: Vec<Vec<f32>>, get: Get },
+    /// Collect the keys of `store` (blocks, then tail, then dead rows) to remove.
+    Clear { rowids: Vec<i64>, model: Box<Model>, store: usize, walk: Walk, keys: Vec<i64> },
+    Code { rowids: Vec<i64>, model: Box<Model>, at: usize, get: Get, stream: Stream },
+    /// Every write is made: the model under its new generation is the index's.
+    Done { model: Box<Model>, generation: i64 },
+}
+
+/// Codes written into packed blocks as they come: a partition's block is written once full, and
+/// what is left of it becomes its open block at the end.
+#[derive(Default)]
+struct Stream {
+    open: HashMap<i64, Vec<Entry>>,
+    parts: HashMap<i64, Part>,
+}
+
+impl Stream {
+    /// Add an entry coded against `version` of `partition`, writing the block it fills.
+    fn add(&mut self, partition: i64, version: i64, entry: Entry, steps: &mut VecDeque<Step>) -> Result<()> {
+        let open = self.open.entry(partition).or_default();
+        open.push(entry);
+        if open.len() == BLOCK {
+            let entries = std::mem::take(open);
+            self.write(partition, version, entries, steps)?;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, partition: i64, version: i64, entries: Vec<Entry>, steps: &mut VecDeque<Step>) -> Result<()> {
+        let part = self.parts.entry(partition).or_default();
+        let key = block_key(partition, part.next)?;
+        steps.push_back(put(BLOCKS, key, record(&[Value::from_i64(version), blob(&pack(&entries))?])?));
+        for e in &entries {
+            steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode()), blob(&extra(e))?])?));
+        }
+        part.next += 1;
+        part.size += entries.len() as i64;
+        part.open = if entries.len() < BLOCK { entries.len() as i64 } else { 0 };
+        Ok(())
+    }
+
+    /// Write each partition's open block and the bookkeeping of every partition of `model`, in the
+    /// state the model gives it: those it trained are live, the slots past them retired.
+    fn finish(mut self, model: &Model, steps: &mut VecDeque<Step>) -> Result<()> {
+        let mut open: Vec<(i64, Vec<Entry>)> = self.open.drain().filter(|(_, entries)| !entries.is_empty()).collect();
+        open.sort_unstable_by_key(|(p, _)| *p);
+        for (p, entries) in open {
+            self.write(p, model.version(p), entries, steps)?;
+        }
+        for p in 0..model.centroids.len() as i64 {
+            let mut part = self.parts.get(&p).copied().unwrap_or_default();
+            part.state = model.state(p);
+            steps.push_back(put(PARTS, p, part.record()?));
+        }
+        Ok(())
+    }
+}
+
+/// The partitions trained for `vectors` vectors: their square root, so a partition holds about as
+/// many vectors as there are partitions, half the bound past which one is split.
+fn trained_partitions(vectors: usize) -> usize {
+    ((vectors as f64).sqrt().round() as usize).max(1)
 }
 
 /// A job's entries, sorted by what their check found.
@@ -1236,12 +1575,53 @@ struct Sorted {
     buried: Vec<(i64, i64)>,
     /// The writes that take those blocks off the copies' dead rows.
     unbury: Vec<Step>,
+    /// The partitions a split marks moving, with their bookkeeping.
+    neighbours: Vec<(i64, Part)>,
+    /// The members of a partition being split.
+    members: i64,
 }
 
 /// Members a split samples for its 2-means.
 const SPLIT_SAMPLE: usize = 256;
 /// The most entries a pack or move rewrites in one run.
 const MOVE_BATCH: usize = 64;
+/// The live partitions nearest a partition being split that the split marks moving.
+const NEIGHBOURS: usize = 8;
+/// The partitions known to be moving that a statement's maintenance surveys beside its own.
+const HINTED: usize = 4;
+/// The tail entries a survey of one partition counts before it stops.
+const SURVEYED_TAIL: usize = 2 * MOVE_BATCH;
+/// The vectors at which an index trained for under a quarter of the partitions it holds vectors for
+/// is rebuilt, and the rows a statement inserts that make its maintenance check for it.
+const BULK_AT: usize = 1024;
+/// The sampled vectors a rebuild trains each partition from, and the most it samples.
+const TRAIN_PER_PARTITION: usize = 32;
+const TRAIN_SAMPLE_MAX: usize = 32_768;
+
+#[cfg(test)]
+thread_local! {
+    /// The rows maintenance surveys have read on this thread.
+    static SURVEYED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count a row a survey read, for the tests' bound on maintenance work.
+fn surveyed() {
+    #[cfg(test)]
+    SURVEYED.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether statements on this thread maintain the index, which tests turn off to leave a backlog.
+    static STATEMENT_UPKEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn statement_upkeep() -> bool {
+    #[cfg(test)]
+    return STATEMENT_UPKEEP.with(|on| on.get());
+    #[cfg(not(test))]
+    true
+}
 
 struct Query {
     vector: Vec<f32>,
@@ -1306,6 +1686,15 @@ pub struct IvfRqCursor {
     query: Option<Query>,
     answer: VecDeque<(i64, f64)>,
     upkeep: Upkeep,
+    run: Option<Run>,
+    /// The partitions this statement wrote, and the rows it wrote, for its maintenance.
+    touched: BTreeSet<i64>,
+    written: usize,
+    inserted: usize,
+    /// The model and generation before a job that changes them, until the job is written.
+    saved: Option<(Arc<Model>, Option<i64>)>,
+    /// The partitions the job being planned changes, to survey again once it is written.
+    dirty: Vec<i64>,
     generation: Option<i64>,
 }
 
@@ -1334,7 +1723,13 @@ impl IvfRqCursor {
             search: Search::Init,
             query: None,
             answer: VecDeque::new(),
-            upkeep: Upkeep::Init,
+            upkeep: Upkeep::Idle,
+            run: None,
+            touched: BTreeSet::new(),
+            written: 0,
+            inserted: 0,
+            saved: None,
+            dirty: Vec::new(),
             generation: None,
         }
     }
@@ -1386,14 +1781,13 @@ impl IvfRqCursor {
 
     fn publish(&self) {
         if let Some(g) = self.generation {
-            *self.shared.lock().expect("model cache") = Some((g, self.model.clone()));
+            self.shared.lock().expect("index state").model = Some((g, self.model.clone()));
         }
     }
 
-    /// The size past which a partition is split: twice the partition count, so partitions stay
-    /// near the square root of the row count.
+    /// The size past which a partition is split.
     fn split_bound(&self) -> i64 {
-        (2 * self.model.centroids.len()).max(2 * BLOCK) as i64
+        split_bound(self.model.live())
     }
 
     /// Read the centroids into the model, unless the model cached under the stored generation is
@@ -1414,7 +1808,7 @@ impl IvfRqCursor {
                         }
                     };
                     let stored = found.as_ref().map(|r| integer(r, 0)).transpose()?;
-                    let cached = self.shared.lock().expect("model cache").as_ref().filter(|(g, _)| Some(*g) == stored).map(|(_, m)| m.clone());
+                    let cached = self.shared.lock().expect("index state").model.as_ref().filter(|(g, _)| Some(*g) == stored).map(|(_, m)| m.clone());
                     if let Some(model) = cached {
                         self.load = Load::Generation(Get::Seek);
                         self.model = model;
@@ -1436,6 +1830,27 @@ impl IvfRqCursor {
                     };
                     self.load = Load::Walk(walk);
                     let Some((key, found)) = row else {
+                        self.load = Load::Parts(Walk::Seek);
+                        continue;
+                    };
+                    let (partition, version) = (key >> VERSION_BITS, key & ((1 << VERSION_BITS) - 1));
+                    let centroid = dense(Some(bytes_at(&found, 0)?))?;
+                    let model = Arc::make_mut(&mut self.model);
+                    if partition as usize > model.centroids.len() {
+                        return Err(LimboError::Corrupt("ivf_rq: centroid partitions are not dense".into()).into());
+                    }
+                    model.place(partition as usize, version, centroid);
+                }
+                Load::Parts(mut walk) => {
+                    let row = match walk_row(&mut self.stores[PARTS], 0, i64::MAX, &mut walk)? {
+                        IOResult::Done(row) => row,
+                        IOResult::IO(io) => {
+                            self.load = Load::Parts(walk);
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    self.load = Load::Parts(walk);
+                    let Some((partition, found)) = row else {
                         self.load = Load::Generation(Get::Seek);
                         self.loaded = true;
                         if let Some(dims) = self.model.centroids.first().map(Vec::len) {
@@ -1445,13 +1860,11 @@ impl IvfRqCursor {
                         self.publish();
                         return Ok(IOResult::Done(()));
                     };
-                    let (partition, version) = (key >> VERSION_BITS, key & ((1 << VERSION_BITS) - 1));
-                    let centroid = dense(Some(bytes_at(&found, 0)?))?;
+                    let state = Part::parse(&found)?.state;
                     let model = Arc::make_mut(&mut self.model);
-                    if partition as usize > model.centroids.len() {
-                        return Err(LimboError::Corrupt("ivf_rq: centroid partitions are not dense".into()).into());
+                    if let Some(slot) = model.states.get_mut(partition as usize) {
+                        *slot = state;
                     }
-                    model.place(partition as usize, version, centroid);
                 }
             }
         }
@@ -1470,9 +1883,16 @@ impl IvfRqCursor {
                             return Ok(IOResult::IO(io));
                         }
                     };
+                    self.written += 1;
                     self.change = match Location::decode(integer(&found, 0)?) {
-                        Location::Tail(key) => Change::Apply(VecDeque::from([remove(VECTORS, rowid), remove(TAIL, key)])),
-                        Location::Block(block) => Change::Bury { rowid, block, get: Get::Seek },
+                        Location::Tail(key) => {
+                            self.touched.insert(key >> ROWID_BITS);
+                            Change::Apply(VecDeque::from([remove(VECTORS, rowid), remove(TAIL, key)]))
+                        }
+                        Location::Block(block) => {
+                            self.touched.insert(block >> 32);
+                            Change::Bury { rowid, block, get: Get::Seek }
+                        }
                     };
                 }
                 Change::Bury { rowid, block, mut get } => {
@@ -1495,7 +1915,7 @@ impl IvfRqCursor {
                     let Some(step) = steps.front_mut() else {
                         return Ok(IOResult::Done(()));
                     };
-                    match apply_step(&mut self.stores, step)? {
+                    match apply_step(&mut self.stores, step, None)? {
                         IOResult::Done(()) => {
                             steps.pop_front();
                             self.change = Change::Apply(steps);
@@ -1510,15 +1930,19 @@ impl IvfRqCursor {
         }
     }
 
-    /// The writes that give a vector its code at the end of its nearest partition's tail.
-    fn tail_steps(&mut self, rowid: i64, vector: &[f32]) -> Result<[Step; 2]> {
+    /// The writes that give a vector its code at the end of its nearest partition's tail, and that
+    /// partition.
+    fn tail_steps(&mut self, rowid: i64, vector: &[f32]) -> Result<(i64, [Step; 2])> {
         let rotation = self.rotation(vector.len());
         let (partition, version, entry) = self.model.encode(&rotation, rowid, vector);
         let key = tail_key(partition, rowid)?;
-        Ok([
-            put(TAIL, key, record(&[Value::from_i64(version), blob(&pack(std::slice::from_ref(&entry)))?])?),
-            put(VECTORS, rowid, record(&[Value::from_i64(Location::Tail(key).encode()), blob(&extra(&entry))?])?),
-        ])
+        Ok((
+            partition,
+            [
+                put(TAIL, key, record(&[Value::from_i64(version), blob(&pack(std::slice::from_ref(&entry)))?])?),
+                put(VECTORS, rowid, record(&[Value::from_i64(Location::Tail(key).encode()), blob(&extra(&entry))?])?),
+            ],
+        ))
     }
 }
 
@@ -1571,9 +1995,12 @@ impl IndexMethodCursor for IvfRqCursor {
             let vector = dense(values[0].get_value().to_blob())?;
             let rowid = values[1].get_value().as_int().ok_or_else(|| error("rowid must be an integer"))?;
             let encoding = timer(&ENCODE_NANOS);
-            let steps = self.tail_steps(rowid, &vector)?;
+            let (partition, steps) = self.tail_steps(rowid, &vector)?;
             drop(encoding);
             INSERTS.fetch_add(1, Ordering::Relaxed);
+            self.touched.insert(partition);
+            self.written += 1;
+            self.inserted += 1;
             self.change = Change::Apply(steps.into());
         }
         let _timer = timer(&CHANGE_NANOS);
@@ -1618,15 +2045,20 @@ impl IndexMethodCursor for IvfRqCursor {
                             .centroids
                             .iter()
                             .enumerate()
+                            .filter(|(i, _)| self.model.states[*i] != State::Retired)
                             .map(|(i, c)| match PROBE_BY_PRODUCT.load(Ordering::Relaxed) {
                                 0 => (l2(c, &vector), i as i64),
                                 _ => (-dot32(c, &vector), i as i64),
                             })
                             .collect();
-                        let take = nprobes.min(ranked.len());
+                        let take = nprobes.min(ranked.len()).max(1);
                         ranked.select_nth_unstable_by(take - 1, |a, b| a.0.total_cmp(&b.0));
                         ranked.truncate(take);
-                        ranked.into_iter().map(|(_, p)| p).collect()
+                        // A retired partition holds no block, but a writer coding against a model
+                        // older than its retirement can still have left a tail entry there, which
+                        // maintenance moves out; until it does, the query reads it.
+                        let retired = (0..self.model.centroids.len() as i64).filter(|p| self.model.states[*p as usize] == State::Retired);
+                        ranked.into_iter().map(|(_, p)| p).chain(retired).collect()
                     };
                     let asked = Vector::from_slice_owned(values[1].get_value().to_blob().ok_or_else(|| error("query is not a vector"))?)?;
                     self.query = Some(Query {
@@ -1795,13 +2227,98 @@ impl IndexMethodCursor for IvfRqCursor {
         Ok(IOResult::Done(Some(*rowid)))
     }
 
-    /// One maintenance run: one bounded job, chosen in order of moving superseded entries out,
-    /// splitting a partition past the bound, then packing the longest tail. A run with nothing to
-    /// do changes nothing.
+    /// `OPTIMIZE INDEX`: survey every partition and do every job there is, until none is left.
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        if self.run.is_none() {
+            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new() });
+        }
+        self.maintain(context)
+    }
+
+    /// Before the statement's writes are released, do the maintenance they made due, chosen among
+    /// the partitions it wrote and a few known to be moving, so moves finish whichever partitions
+    /// writers touch: at most one job for each row the statement wrote, when statements of a hundred
+    /// random rows cost about half a job a row to keep maintained, so a run ends with nothing due
+    /// well before its bound.
+    fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        if self.run.is_none() {
+            if self.written == 0 || !statement_upkeep() {
+                self.touched.clear();
+                self.written = 0;
+                self.inserted = 0;
+                return Ok(IOResult::Done(()));
+            }
+            let mut first = std::mem::take(&mut self.touched);
+            first.extend(self.shared.lock().expect("index state").moving.iter().take(HINTED).copied());
+            // A statement that inserted many rows surveys every partition, so a rebuild is chosen
+            // when its rows have outgrown the partitions.
+            let all = self.inserted >= BULK_AT;
+            self.run = Some(Run { budget: self.written, survey: Survey::default(), all, first: first.into_iter().collect() });
+            self.written = 0;
+            self.inserted = 0;
+        }
+        self.maintain(context)
+    }
+
+    fn abort_statement(&mut self, _context: &IndexMethodContext) {
+        self.forget_run();
+        self.touched.clear();
+        self.written = 0;
+        self.inserted = 0;
+    }
+
+    fn on_transaction_rolled_back(&mut self, _context: &IndexMethodContext) {
+        self.forget_run();
+    }
+
+    fn on_savepoint_rolled_back(&mut self, _context: &IndexMethodContext) {
+        self.forget_run();
+    }
+}
+
+impl IvfRqCursor {
+    fn next_probe(&mut self, mut probes: VecDeque<i64>) -> Result<Search> {
+        if let Some(partition) = probes.pop_front() {
+            return Ok(Search::Dead { probes, partition, walk: Walk::Seek });
+        }
+        let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
+        let bar = query.bar();
+        let mut order: Vec<Candidate> = std::mem::take(&mut query.candidates).into_iter().filter(|c| c.upper >= bar).collect();
+        order.sort_unstable_by(|a, b| b.upper.total_cmp(&a.upper));
+        Ok(Search::Refine { order: order.into(), get: Get::Seek })
+    }
+
+    /// Drop a run that will not finish, and the model a job it abandoned had changed; the model is
+    /// read again on next use.
+    fn forget_run(&mut self) {
+        self.run = None;
+        self.upkeep = Upkeep::Idle;
+        self.dirty.clear();
+        if let Some((model, generation)) = self.saved.take() {
+            self.model = model;
+            self.generation = generation;
+        }
+        self.loaded = false;
+    }
+
+    /// Keep the model and generation a job is about to change, to restore if the job is reverted.
+    fn save_model(&mut self) {
+        if self.saved.is_none() {
+            self.saved = Some((self.model.clone(), self.generation));
+        }
+    }
+
+    /// The size below which a live partition is retired: a sixteenth of the size past which one is
+    /// split, so a split's halves are never small enough to retire.
+    fn retire_bound(&self) -> i64 {
+        self.split_bound() / 16
+    }
+
+    /// Drive the run in `self.run` to its end.
+    fn maintain(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         loop {
-            match std::mem::replace(&mut self.upkeep, Upkeep::Init) {
-                Upkeep::Init => {
+            match std::mem::replace(&mut self.upkeep, Upkeep::Idle) {
+                Upkeep::Idle => {
                     self.open_stores(context)?;
                     self.upkeep = Upkeep::Load;
                 }
@@ -1810,58 +2327,149 @@ impl IndexMethodCursor for IvfRqCursor {
                         self.upkeep = Upkeep::Load;
                         return Ok(IOResult::IO(io));
                     }
-                    self.upkeep = Upkeep::Count { walk: Walk::Seek, tails: HashMap::new() };
+                    let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
+                    self.upkeep = Upkeep::Survey(match run.all {
+                        true => Surveying::All(Reading::Tail, Walk::Seek),
+                        false => Surveying::Some { pending: std::mem::take(&mut run.first).into(), reading: Reading::Tail, walk: Walk::Seek, get: Get::Seek },
+                    });
                 }
-                Upkeep::Count { mut walk, mut tails } => match walk_key(&mut self.stores[TAIL], 0, i64::MAX, &mut walk)? {
-                    IOResult::IO(io) => {
-                        self.upkeep = Upkeep::Count { walk, tails };
-                        return Ok(IOResult::IO(io));
+                Upkeep::Survey(Surveying::All(reading, mut walk)) => {
+                    let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
+                    let (store, next) = match reading {
+                        Reading::Tail => (TAIL, Reading::Part),
+                        Reading::Part => (PARTS, Reading::Dead),
+                        Reading::Dead => (DEAD, Reading::Dead),
+                    };
+                    let row = match reading {
+                        Reading::Tail => match walk_key(&mut self.stores[store], 0, i64::MAX, &mut walk)? {
+                            IOResult::IO(io) => {
+                                self.upkeep = Upkeep::Survey(Surveying::All(reading, walk));
+                                return Ok(IOResult::IO(io));
+                            }
+                            IOResult::Done(key) => key.map(|key| (key, None)),
+                        },
+                        _ => match walk_row(&mut self.stores[store], 0, i64::MAX, &mut walk)? {
+                            IOResult::IO(io) => {
+                                self.upkeep = Upkeep::Survey(Surveying::All(reading, walk));
+                                return Ok(IOResult::IO(io));
+                            }
+                            IOResult::Done(row) => row.map(|(key, found)| (key, Some(found))),
+                        },
+                    };
+                    if row.is_some() {
+                        surveyed();
                     }
-                    IOResult::Done(Some(key)) => {
-                        *tails.entry(key >> ROWID_BITS).or_default() += 1;
-                        self.upkeep = Upkeep::Count { walk, tails };
-                    }
-                    IOResult::Done(None) => self.upkeep = Upkeep::Parts { walk: Walk::Seek, tails, parts: HashMap::new() },
-                },
-                Upkeep::Parts { mut walk, tails, mut parts } => match walk_row(&mut self.stores[PARTS], 0, i64::MAX, &mut walk)? {
-                    IOResult::IO(io) => {
-                        self.upkeep = Upkeep::Parts { walk, tails, parts };
-                        return Ok(IOResult::IO(io));
-                    }
-                    IOResult::Done(Some((partition, found))) => {
-                        let field = |at| integer(&found, at);
-                        let part = Part { next: field(0)?, size: field(1)?, open: field(2)?, move_next: field(3)?, move_end: field(4)? };
-                        parts.insert(partition, part);
-                        self.upkeep = Upkeep::Parts { walk, tails, parts };
-                    }
-                    IOResult::Done(None) => self.upkeep = Upkeep::Dead { walk: Walk::Seek, tails, parts, stale: HashMap::new() },
-                },
-                Upkeep::Dead { mut walk, tails, parts, mut stale } => match walk_row(&mut self.stores[DEAD], 0, i64::MAX, &mut walk)? {
-                    IOResult::IO(io) => {
-                        self.upkeep = Upkeep::Dead { walk, tails, parts, stale };
-                        return Ok(IOResult::IO(io));
-                    }
-                    IOResult::Done(Some((_, found))) => {
-                        for block in dead_blocks(bytes_at(&found, 0)?)? {
-                            *stale.entry(block).or_default() += 1;
+                    match (row, reading) {
+                        (Some((key, _)), Reading::Tail) => *run.survey.tails.entry(key >> ROWID_BITS).or_default() += 1,
+                        (Some((partition, Some(found))), Reading::Part) => {
+                            run.survey.parts.insert(partition, Part::parse(&found)?);
                         }
-                        self.upkeep = Upkeep::Dead { walk, tails, parts, stale };
-                    }
-                    IOResult::Done(None) => {
-                        let Some(job) = self.choose(&tails, &parts, &stale) else {
-                            return Ok(IOResult::Done(()));
-                        };
-                        JOBS.fetch_add(1, Ordering::Relaxed);
-                        if matches!(job, Job::Move(_)) {
-                            MOVES.fetch_add(1, Ordering::Relaxed);
+                        (Some((_, Some(found))), Reading::Dead) => {
+                            for block in dead_blocks(bytes_at(&found, 0)?)? {
+                                *run.survey.stale.entry(block).or_default() += 1;
+                            }
                         }
-                        let part = parts.get(&job_partition(job)).copied().unwrap_or_default();
-                        if std::env::var_os("IVF_RQ_TRACE").is_some() {
-                            eprintln!("upkeep: {} partitions, tail rows {}, job {job:?}", self.model.centroids.len(), tails.values().sum::<usize>());
+                        (Some(_), _) => return Err(error("survey read a row without its record")),
+                        (None, Reading::Dead) => {
+                            let survey = &mut run.survey;
+                            survey.read.extend(0..self.model.centroids.len().max(1) as i64);
+                            survey.read.extend(survey.tails.keys().chain(survey.parts.keys()).copied());
+                            let read: Vec<i64> = survey.read.iter().copied().collect();
+                            survey.vectors = Some(read.iter().map(|p| survey.live(*p)).sum());
+                            match self.next_job()? {
+                                Some(upkeep) => self.upkeep = upkeep,
+                                None => return Ok(IOResult::Done(())),
+                            }
+                            continue;
                         }
-                        self.upkeep = Upkeep::Read { job, part, stage: Stage::Blocks, walk: Walk::Seek, get: Get::Seek, rows: Vec::new() };
+                        (None, _) => {
+                            self.upkeep = Upkeep::Survey(Surveying::All(next, Walk::Seek));
+                            continue;
+                        }
                     }
-                },
+                    self.upkeep = Upkeep::Survey(Surveying::All(reading, walk));
+                }
+                Upkeep::Survey(Surveying::Some { mut pending, reading, mut walk, mut get }) => {
+                    let Some(&partition) = pending.front() else {
+                        match self.next_job()? {
+                            Some(upkeep) => self.upkeep = upkeep,
+                            None => return Ok(IOResult::Done(())),
+                        }
+                        continue;
+                    };
+                    let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
+                    let start = tail_key(partition, 0)?;
+                    match reading {
+                        Reading::Tail => {
+                            if matches!(walk, Walk::Seek) {
+                                run.survey.forget(partition);
+                            }
+                            match walk_key(&mut self.stores[TAIL], start, start + (1 << ROWID_BITS), &mut walk)? {
+                                IOResult::IO(io) => {
+                                    self.upkeep = Upkeep::Survey(Surveying::Some { pending, reading, walk, get });
+                                    return Ok(IOResult::IO(io));
+                                }
+                                IOResult::Done(Some(_)) => {
+                                    surveyed();
+                                    let count = run.survey.tails.entry(partition).or_default();
+                                    *count += 1;
+                                    // A partition's tail is counted up to a bound: past it, a pack
+                                    // is due whatever the count, and walking a long tail once per
+                                    // job would make a backlog's maintenance quadratic.
+                                    if *count >= SURVEYED_TAIL {
+                                        self.upkeep = Upkeep::Survey(Surveying::Some { pending, reading: Reading::Part, walk: Walk::Seek, get: Get::Seek });
+                                        continue;
+                                    }
+                                }
+                                IOResult::Done(None) => {
+                                    self.upkeep = Upkeep::Survey(Surveying::Some { pending, reading: Reading::Part, walk: Walk::Seek, get: Get::Seek });
+                                    continue;
+                                }
+                            }
+                        }
+                        Reading::Part => {
+                            let found = match get_row(&mut self.stores[PARTS], partition, &mut get)? {
+                                IOResult::IO(io) => {
+                                    self.upkeep = Upkeep::Survey(Surveying::Some { pending, reading, walk, get });
+                                    return Ok(IOResult::IO(io));
+                                }
+                                IOResult::Done(found) => found,
+                            };
+                            surveyed();
+                            if let Some(found) = found {
+                                run.survey.parts.insert(partition, Part::parse(&found)?);
+                            }
+                            self.upkeep = Upkeep::Survey(Surveying::Some { pending, reading: Reading::Dead, walk: Walk::Seek, get: Get::Seek });
+                            continue;
+                        }
+                        Reading::Dead => match walk_row(&mut self.stores[DEAD], start, start + (1 << ROWID_BITS), &mut walk)? {
+                            IOResult::IO(io) => {
+                                self.upkeep = Upkeep::Survey(Surveying::Some { pending, reading, walk, get });
+                                return Ok(IOResult::IO(io));
+                            }
+                            IOResult::Done(Some((_, found))) => {
+                                surveyed();
+                                for block in dead_blocks(bytes_at(&found, 0)?)? {
+                                    *run.survey.stale.entry(block).or_default() += 1;
+                                }
+                            }
+                            IOResult::Done(None) => {
+                                run.survey.read.insert(partition);
+                                let part = run.survey.part(partition);
+                                let mut shared = self.shared.lock().expect("index state");
+                                match part.moving() || part.state != State::Live && run.survey.tail(partition) > 0 {
+                                    true => shared.moving.insert(partition),
+                                    false => shared.moving.remove(&partition),
+                                };
+                                drop(shared);
+                                pending.pop_front();
+                                self.upkeep = Upkeep::Survey(Surveying::Some { pending, reading: Reading::Tail, walk: Walk::Seek, get: Get::Seek });
+                                continue;
+                            }
+                        },
+                    }
+                    self.upkeep = Upkeep::Survey(Surveying::Some { pending, reading, walk, get });
+                }
                 Upkeep::Read { job, part, stage, mut walk, mut get, mut rows } => {
                     let partition = job_partition(job);
                     let current = self.model.version(partition);
@@ -1884,8 +2492,9 @@ impl IndexMethodCursor for IvfRqCursor {
                             }
                             self.upkeep = Upkeep::Read { job, part, stage: Stage::Tail, walk: Walk::Seek, get: Get::Seek, rows };
                         }
-                        // A move checks the next block of the split partition that predates the split.
-                        (Job::Move(_), Stage::Blocks) => {
+                        // A move checks the next block marked for it, and a retiring partition's
+                        // tail once its blocks are done.
+                        (Job::Move(_), Stage::Blocks) if part.moving() => {
                             let key = block_key(partition, part.move_next)?;
                             let found = match get_row(&mut self.stores[BLOCKS], key, &mut get)? {
                                 IOResult::Done(found) => found,
@@ -1897,13 +2506,12 @@ impl IndexMethodCursor for IvfRqCursor {
                             let mut sorted = Sorted::default();
                             if let Some(found) = found {
                                 let version = integer(&found, 0)?;
-                                if version != current {
-                                    sorted.version = version;
-                                    rows.extend(unpack(bytes_at(&found, 1)?)?.into_iter().map(|entry| Tailed { location: Location::Block(key), version, entry }));
-                                }
+                                sorted.version = version;
+                                rows.extend(unpack(bytes_at(&found, 1)?)?.into_iter().map(|entry| Tailed { location: Location::Block(key), version, entry }));
                             }
                             self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted };
                         }
+                        (Job::Move(_), Stage::Blocks) => self.upkeep = Upkeep::Read { job, part, stage: Stage::Tail, walk: Walk::Seek, get: Get::Seek, rows },
                         (Job::Compact(key), Stage::Blocks) => {
                             let found = match get_row(&mut self.stores[BLOCKS], key, &mut get)? {
                                 IOResult::Done(found) => found,
@@ -1920,6 +2528,10 @@ impl IndexMethodCursor for IvfRqCursor {
                             }
                             self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted };
                         }
+                        (Job::Retire(_), _) => {
+                            let vectors = Vec::new();
+                            self.upkeep = Upkeep::Fetch { job, part, sorted: Sorted::default(), vectors };
+                        }
                         (Job::Split(_), Stage::Blocks) => {
                             let start = block_key(partition, 0)?;
                             match walk_row(&mut self.stores[BLOCKS], start, start + (1 << 32), &mut walk)? {
@@ -1935,6 +2547,7 @@ impl IndexMethodCursor for IvfRqCursor {
                                 IOResult::Done(None) => self.upkeep = Upkeep::Read { job, part, stage: Stage::Tail, walk: Walk::Seek, get, rows },
                             }
                         }
+                        (Job::Rebuild, _) => return Err(error("a rebuild reads through its own stage")),
                         (_, Stage::Tail) => {
                             let start = tail_key(partition, 0)?;
                             let full = !matches!(job, Job::Split(_)) && rows.iter().filter(|r| matches!(r.location, Location::Tail(_))).count() >= MOVE_BATCH;
@@ -1950,23 +2563,41 @@ impl IndexMethodCursor for IvfRqCursor {
                                 }
                                 IOResult::Done(Some((key, found))) => {
                                     let version = integer(&found, 0)?;
-                                    if !matches!(job, Job::Move(_)) || version != current {
-                                        let entry = unpack(bytes_at(&found, 1)?)?.pop().ok_or_else(|| error("empty tail entry"))?;
-                                        rows.push(Tailed { location: Location::Tail(key), version, entry });
-                                    }
+                                    let entry = unpack(bytes_at(&found, 1)?)?.pop().ok_or_else(|| error("empty tail entry"))?;
+                                    rows.push(Tailed { location: Location::Tail(key), version, entry });
                                     self.upkeep = Upkeep::Read { job, part, stage, walk, get, rows };
                                 }
                                 IOResult::Done(None) => {
                                     if let Job::Split(_) = job {
                                         // The split's centroids come from a spread sample of its members.
+                                        let members = rows.len() as i64;
                                         let step = (rows.len() / SPLIT_SAMPLE).max(1);
                                         rows = rows.into_iter().step_by(step).collect();
+                                        let neighbours = self.neighbours(partition);
+                                        self.upkeep = Upkeep::Neighbours { job, part, rows, members, neighbours, at: 0, get: Get::Seek, parts: Vec::new() };
+                                        continue;
                                     }
                                     self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted: Sorted::default() };
                                 }
                             }
                         }
                     }
+                }
+                Upkeep::Neighbours { job, part, rows, members, neighbours, at, mut get, mut parts } => {
+                    let Some(&neighbour) = neighbours.get(at) else {
+                        let sorted = Sorted { neighbours: parts, members, ..Sorted::default() };
+                        self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted };
+                        continue;
+                    };
+                    let found = match get_row(&mut self.stores[PARTS], neighbour, &mut get)? {
+                        IOResult::IO(io) => {
+                            self.upkeep = Upkeep::Neighbours { job, part, rows, members, neighbours, at, get, parts };
+                            return Ok(IOResult::IO(io));
+                        }
+                        IOResult::Done(found) => found,
+                    };
+                    parts.push((neighbour, found.as_ref().map(Part::parse).transpose()?.unwrap_or_default()));
+                    self.upkeep = Upkeep::Neighbours { job, part, rows, members, neighbours, at: at + 1, get: Get::Seek, parts };
                 }
                 Upkeep::Check { job, part, rows, at, mut get, mut sorted } => {
                     let Some(row) = rows.get(at) else {
@@ -2047,12 +2678,14 @@ impl IndexMethodCursor for IvfRqCursor {
                         let unbury = std::mem::take(&mut sorted.unbury);
                         let mut steps = match job {
                             Job::Pack(p) => self.plan_pack(p, part, sorted, vectors)?,
-                            Job::Split(p) => self.plan_split(p, part, &vectors)?,
+                            Job::Split(p) => self.plan_split(p, part, sorted, &vectors)?,
                             Job::Move(p) => self.plan_move(p, part, sorted, vectors)?,
                             Job::Compact(block) => self.plan_compact(block, part, sorted)?,
+                            Job::Retire(p) => self.plan_retire(p, part)?,
+                            Job::Rebuild => return Err(error("a rebuild plans through its own stage")),
                         };
                         steps.extend(unbury);
-                        self.upkeep = Upkeep::Apply { steps };
+                        self.upkeep = Upkeep::Apply { job, steps, undo: Vec::new() };
                         continue;
                     };
                     let main = self.main.as_mut().ok_or_else(|| error("table cursor must be open"))?;
@@ -2078,26 +2711,145 @@ impl IndexMethodCursor for IvfRqCursor {
                     vectors.push(dense(Some(bytes))?);
                     self.upkeep = Upkeep::Fetch { job, part, sorted, vectors };
                 }
-                Upkeep::Apply { mut steps } => {
+                Upkeep::Apply { job, mut steps, mut undo } => {
                     let Some(step) = steps.front_mut() else {
+                        self.finish_job(job)?;
+                        continue;
+                    };
+                    match apply_step(&mut self.stores, step, Some(&mut undo)) {
+                        Ok(IOResult::Done(())) => {
+                            steps.pop_front();
+                            self.upkeep = Upkeep::Apply { job, steps, undo };
+                        }
+                        Ok(IOResult::IO(io)) => {
+                            self.upkeep = Upkeep::Apply { job, steps, undo };
+                            return Ok(IOResult::IO(io));
+                        }
+                        Err(e) if conflicted(&e) => {
+                            CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                            self.upkeep = Upkeep::Revert { undo };
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Upkeep::Rebuild { phase, mut steps } => {
+                    // The steps a phase made are written before it goes on, and no walk is open
+                    // while they are: a phase walks a store only to collect keys.
+                    if let Some(step) = steps.front_mut() {
+                        if let IOResult::IO(io) = apply_step(&mut self.stores, step, None)? {
+                            self.upkeep = Upkeep::Rebuild { phase, steps };
+                            return Ok(IOResult::IO(io));
+                        }
+                        steps.pop_front();
+                        self.upkeep = Upkeep::Rebuild { phase, steps };
+                        continue;
+                    }
+                    match phase {
+                        Rebuilding::Rowids { mut walk, mut rowids } => match walk_key(&mut self.stores[VECTORS], 0, i64::MAX, &mut walk)? {
+                            IOResult::IO(io) => {
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Rowids { walk, rowids }, steps };
+                                return Ok(IOResult::IO(io));
+                            }
+                            IOResult::Done(Some(rowid)) => {
+                                surveyed();
+                                rowids.push(rowid);
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Rowids { walk, rowids }, steps };
+                            }
+                            IOResult::Done(None) => {
+                                // Every n-th vector, n spreading the sample over the whole table.
+                                let wanted = (TRAIN_PER_PARTITION * trained_partitions(rowids.len())).min(TRAIN_SAMPLE_MAX).min(rowids.len()).max(1);
+                                let sample = rowids.iter().step_by((rowids.len() / wanted).max(1)).take(wanted).copied().collect();
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Sample { rowids, sample, vectors: Vec::new(), get: Get::Seek }, steps };
+                            }
+                        },
+                        Rebuilding::Sample { rowids, sample, mut vectors, mut get } => {
+                            let Some(&rowid) = sample.get(vectors.len()) else {
+                                let model = Box::new(self.rebuilt(&vectors, rowids.len()));
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Clear { rowids, model, store: BLOCKS, walk: Walk::Seek, keys: Vec::new() }, steps };
+                                continue;
+                            };
+                            match self.table_vector(rowid, &mut get)? {
+                                IOResult::IO(io) => {
+                                    self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Sample { rowids, sample, vectors, get }, steps };
+                                    return Ok(IOResult::IO(io));
+                                }
+                                IOResult::Done(vector) => vectors.push(vector),
+                            }
+                            self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Sample { rowids, sample, vectors, get: Get::Seek }, steps };
+                        }
+                        Rebuilding::Clear { rowids, model, store, mut walk, mut keys } => match walk_key(&mut self.stores[store], 0, i64::MAX, &mut walk)? {
+                            IOResult::IO(io) => {
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Clear { rowids, model, store, walk, keys }, steps };
+                                return Ok(IOResult::IO(io));
+                            }
+                            IOResult::Done(Some(key)) => {
+                                surveyed();
+                                keys.push(key);
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Clear { rowids, model, store, walk, keys }, steps };
+                            }
+                            IOResult::Done(None) => {
+                                steps.extend(keys.into_iter().map(|key| remove(store, key)));
+                                let phase = match store {
+                                    BLOCKS => Rebuilding::Clear { rowids, model, store: TAIL, walk: Walk::Seek, keys: Vec::new() },
+                                    TAIL => Rebuilding::Clear { rowids, model, store: DEAD, walk: Walk::Seek, keys: Vec::new() },
+                                    _ => Rebuilding::Code { rowids, model, at: 0, get: Get::Seek, stream: Stream::default() },
+                                };
+                                self.upkeep = Upkeep::Rebuild { phase, steps };
+                            }
+                        },
+                        Rebuilding::Code { rowids, model, at, mut get, mut stream } => {
+                            let Some(&rowid) = rowids.get(at) else {
+                                stream.finish(&model, &mut steps)?;
+                                for p in (0..model.centroids.len()).filter(|p| model.states[*p] == State::Live) {
+                                    steps.push_back(put(CENTROIDS, centroid_key(p as i64, model.versions[p])?, centroid_record(&model.centroids[p])?));
+                                }
+                                let next = generation();
+                                steps.push_back(put(CENTROIDS, GENERATION, record(&[Value::from_i64(next)])?));
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Done { model, generation: next }, steps };
+                                continue;
+                            };
+                            let vector = match self.table_vector(rowid, &mut get)? {
+                                IOResult::IO(io) => {
+                                    self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at, get, stream }, steps };
+                                    return Ok(IOResult::IO(io));
+                                }
+                                IOResult::Done(vector) => vector,
+                            };
+                            surveyed();
+                            let rotation = self.rotation(vector.len());
+                            let (partition, version, entry) = model.encode(&rotation, rowid, &vector);
+                            stream.add(partition, version, entry, &mut steps)?;
+                            self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Code { rowids, model, at: at + 1, get: Get::Seek, stream }, steps };
+                        }
+                        Rebuilding::Done { model, generation } => {
+                            self.model = Arc::new(*model);
+                            self.generation = Some(generation);
+                            self.publish();
+                            self.shared.lock().expect("index state").moving.clear();
+                            REBUILDS.fetch_add(1, Ordering::Relaxed);
+                            JOBS.fetch_add(1, Ordering::Relaxed);
+                            self.saved = None;
+                            let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
+                            run.budget = run.budget.saturating_sub(1);
+                            run.survey = Survey::default();
+                            self.upkeep = Upkeep::Survey(Surveying::All(Reading::Tail, Walk::Seek));
+                        }
+                    }
+                }
+                Upkeep::Revert { mut undo } => {
+                    let Some(step) = undo.last_mut() else {
+                        // Another writer holds a row this run needs; it maintains them itself.
+                        self.forget_run();
+                        self.loaded = true;
                         return Ok(IOResult::Done(()));
                     };
-                    let applied = apply_step(&mut self.stores, step);
-                    if let (Err(e), true) = (&applied, std::env::var_os("IVF_RQ_TRACE").is_some()) {
-                        let what = match step {
-                            Step::Put(store, rowid, _, _) => format!("put store {store} rowid {rowid}"),
-                            Step::Remove { store, rowid, .. } => format!("remove store {store} rowid {rowid}"),
-                        };
-                        let earlier: Vec<String> = Vec::new();
-                        eprintln!("upkeep step failed: {what}: {e}{}", earlier.join(""));
-                    }
-                    match applied? {
+                    match apply_step(&mut self.stores, step, None)? {
                         IOResult::Done(()) => {
-                            steps.pop_front();
-                            self.upkeep = Upkeep::Apply { steps };
+                            undo.pop();
+                            self.upkeep = Upkeep::Revert { undo };
                         }
                         IOResult::IO(io) => {
-                            self.upkeep = Upkeep::Apply { steps };
+                            self.upkeep = Upkeep::Revert { undo };
                             return Ok(IOResult::IO(io));
                         }
                     }
@@ -2105,43 +2857,138 @@ impl IndexMethodCursor for IvfRqCursor {
             }
         }
     }
-}
 
-impl IvfRqCursor {
-    fn next_probe(&mut self, mut probes: VecDeque<i64>) -> Result<Search> {
-        if let Some(partition) = probes.pop_front() {
-            return Ok(Search::Dead { probes, partition, walk: Walk::Seek });
-        }
-        let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
-        let bar = query.bar();
-        let mut order: Vec<Candidate> = std::mem::take(&mut query.candidates).into_iter().filter(|c| c.upper >= bar).collect();
-        order.sort_unstable_by(|a, b| b.upper.total_cmp(&a.upper));
-        Ok(Search::Refine { order: order.into(), get: Get::Seek })
+    /// A vector of the indexed column of the table row `rowid`.
+    fn table_vector(&mut self, rowid: i64, get: &mut Get) -> IOResultOr<Vec<f32>> {
+        let main = self.main.as_mut().ok_or_else(|| error("table cursor must be open"))?;
+        let found = match get_row(main, rowid, get)? {
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            IOResult::Done(found) => found.ok_or_else(|| error("a vector's row names a row the table lacks"))?,
+        };
+        let ValueRef::Blob(bytes) = found.get_value(self.configuration.columns[0].pos_in_table)? else {
+            return Err(error("table value is not a vector"));
+        };
+        Ok(IOResult::Done(dense(Some(bytes))?))
     }
 
-    /// The run's job: check a block of a partition being split, else pack the longest tail of at
-    /// least [`PACK_AT`] (which also recodes tail entries coded against a superseded centroid), else
-    /// compact the block holding the most stale copies, at least [`COMPACT_AT`], else split the
-    /// largest partition past the bound.
-    fn choose(&self, tails: &HashMap<i64, usize>, parts: &Parts, stale: &HashMap<i64, usize>) -> Option<Job> {
-        if let Some(p) = parts.iter().filter(|(_, part)| part.moving()).map(|(p, _)| *p).min() {
+    /// The model a rebuild trains for `vectors` vectors: k-means over `sample` for the partitions
+    /// [`trained_partitions`] gives them, balanced, each at a version past any it had, partition 0
+    /// past the untrained origin's. Every centroid the model held stays readable for entries coded
+    /// against it, and slots past the trained ones are retired.
+    fn rebuilt(&self, sample: &[Vec<f32>], vectors: usize) -> Model {
+        let old = &self.model;
+        let eta = sample.first().map_or(0.0, |v| self.eta(v.len()));
+        let centroids = balance(sample, kmeans(sample, trained_partitions(vectors), eta), vectors, eta);
+        let trained = centroids.len();
+        let mut model = Model { older: old.older.clone(), eta, ..Model::default() };
+        for (p, c) in old.centroids.iter().enumerate() {
+            model.older.insert((p as i64, old.versions[p]), c.clone());
+        }
+        for p in 0..trained.max(old.centroids.len()) {
+            let (centroid, version, state) = match centroids.get(p) {
+                Some(c) => (c.clone(), if p < old.centroids.len() || p == 0 { old.version(p as i64) + 1 } else { 0 }, State::Live),
+                None => (old.centroids[p].clone(), old.versions[p], State::Retired),
+            };
+            model.squares.push(dot32(&centroid, &centroid));
+            model.centroids.push(centroid);
+            model.versions.push(version);
+            model.states.push(state);
+        }
+        model
+    }
+
+    /// The job is written: count it, and survey again the partitions it changed before choosing
+    /// the next.
+    fn finish_job(&mut self, job: Job) -> Result<()> {
+        JOBS.fetch_add(1, Ordering::Relaxed);
+        self.saved = None;
+        let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
+        run.budget = run.budget.saturating_sub(1);
+        let mut dirty = std::mem::take(&mut self.dirty);
+        dirty.push(job_partition(job));
+        dirty.sort_unstable();
+        dirty.dedup();
+        if std::env::var_os("IVF_RQ_TRACE").is_some() {
+            eprintln!("upkeep: {} partitions, job {job:?}, dirty {dirty:?}", self.model.centroids.len());
+        }
+        self.upkeep = Upkeep::Survey(Surveying::Some { pending: dirty.into(), reading: Reading::Tail, walk: Walk::Seek, get: Get::Seek });
+        Ok(())
+    }
+
+    /// The next job of the run, or none, ending the run, when its budget is spent or nothing is due.
+    fn next_job(&mut self) -> Result<Option<Upkeep>> {
+        let run = self.run.as_ref().ok_or_else(|| error("maintenance without a run"))?;
+        let job = if run.budget == 0 { None } else { self.choose(&run.survey) };
+        let Some(job) = job else {
+            self.run = None;
+            return Ok(None);
+        };
+        if let Job::Rebuild = job {
+            self.save_model();
+            return Ok(Some(Upkeep::Rebuild { phase: Rebuilding::Rowids { walk: Walk::Seek, rowids: Vec::new() }, steps: VecDeque::new() }));
+        }
+        let part = run.survey.part(job_partition(job));
+        Ok(Some(Upkeep::Read { job, part, stage: Stage::Blocks, walk: Walk::Seek, get: Get::Seek, rows: Vec::new() }))
+    }
+
+    /// The job the survey's partitions most need, in order: a move (a block marked moving, or a
+    /// retiring partition's tail), a retirement whose moves are done, a pack of the longest tail of
+    /// at least [`PACK_AT`], a compaction of the block holding the most stale copies, at least
+    /// [`COMPACT_AT`], the retirement of a partition too small to keep, a split of the largest
+    /// partition past the bound.
+    fn choose(&self, survey: &Survey) -> Option<Job> {
+        if let Some(vectors) = survey.vectors {
+            if vectors as usize >= BULK_AT && 4 * self.model.live() < trained_partitions(vectors as usize) {
+                return Some(Job::Rebuild);
+            }
+        }
+        let read = || survey.read.iter().copied();
+        let live = |p: i64| self.model.state(p) == State::Live && survey.part(p).state == State::Live;
+        // A tail long enough to stop a survey's count is packed before anything else: queries
+        // read a tail entry by entry, and moves keep adding to their targets' tails.
+        if let Some(p) = read().filter(|p| live(*p) && survey.tail(*p) >= SURVEYED_TAIL).max_by_key(|p| (survey.tail(*p), -*p)) {
+            return Some(Job::Pack(p));
+        }
+        if let Some(p) = read().find(|p| survey.part(*p).moving() || survey.part(*p).state != State::Live && survey.tail(*p) > 0) {
             return Some(Job::Move(p));
         }
-        if let Some((p, _)) = tails.iter().filter(|(_, count)| **count >= PACK_AT).max_by_key(|(p, count)| (**count, -**p)) {
-            return Some(Job::Pack(*p));
+        if let Some(p) = read().find(|p| survey.part(*p).state == State::Retiring) {
+            return Some(Job::Retire(p));
         }
-        if let Some((block, _)) = stale.iter().filter(|(_, count)| **count >= COMPACT_AT).max_by_key(|(block, count)| (**count, -**block)) {
+        if let Some(p) = read().filter(|p| live(*p) && survey.tail(*p) >= PACK_AT).max_by_key(|p| (survey.tail(*p), -*p)) {
+            return Some(Job::Pack(p));
+        }
+        if let Some((block, _)) = survey.stale.iter().filter(|(block, count)| **count >= COMPACT_AT && live(*block >> 32)).max_by_key(|(block, count)| (**count, -**block)) {
             return Some(Job::Compact(*block));
         }
+        let settled = survey.parts.values().all(|part| !part.moving()) && self.shared.lock().expect("index state").moving.is_empty();
+        if settled && self.model.live() > 1 {
+            if let Some(p) = read().find(|p| live(*p) && survey.live(*p) < self.retire_bound()) {
+                return Some(Job::Retire(p));
+            }
+        }
+        let size = |p: i64| survey.part(p).size + survey.tail(p) as i64;
         let bound = self.split_bound();
-        let size = |p: i64| parts.get(&p).map_or(0, |part| part.size) + *tails.get(&p).unwrap_or(&0) as i64;
-        let (total, p) = (0..self.model.centroids.len().max(1) as i64).map(|p| (size(p), p)).max()?;
-        (total >= bound).then_some(Job::Split(p))
+        read().filter(|p| live(*p) && size(*p) >= bound.max(survey.part(*p).retry)).max_by_key(|p| (size(*p), -*p)).map(Job::Split)
+    }
+
+    /// The live partitions nearest a partition's current centroid, which a split of it marks moving.
+    fn neighbours(&self, partition: i64) -> Vec<i64> {
+        let Some(centre) = self.model.centroids.get(partition as usize) else {
+            return Vec::new();
+        };
+        let mut near: Vec<(f32, i64)> = (0..self.model.centroids.len() as i64)
+            .filter(|p| *p != partition && self.model.state(*p) == State::Live)
+            .map(|p| (l2(centre, &self.model.centroids[p as usize]), p))
+            .collect();
+        near.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        near.into_iter().take(NEIGHBOURS).map(|(_, p)| p).collect()
     }
 
     /// Merge a partition's current tail entries into its open block and write them as blocks from
     /// there on, give the entries coded against a superseded centroid fresh tail entries from their
-    /// vectors, and remove every tail entry read.
+    /// vectors, and remove every tail entry read. The partition's bookkeeping is written first: it
+    /// claims the partition.
     fn plan_pack(&mut self, partition: i64, mut part: Part, sorted: Sorted, vectors: Vec<Vec<f32>>) -> Result<VecDeque<Step>> {
         let mut steps = removals(&sorted.removed);
         let mut live = sorted.live;
@@ -2168,48 +3015,65 @@ impl IvfRqCursor {
         }
         part.size += live.len() as i64;
         for (rowid, vector) in sorted.recode.iter().zip(&vectors) {
-            steps.extend(self.tail_steps(*rowid, vector)?);
+            let (target, written) = self.tail_steps(*rowid, vector)?;
+            steps.extend(written);
+            self.dirty.push(target);
         }
         RECODED.fetch_add(sorted.recode.len(), Ordering::Relaxed);
         PACKS.fetch_add(1, Ordering::Relaxed);
-        steps.push_back(put(PARTS, partition, part.record()?));
+        steps.push_front(put(PARTS, partition, part.record()?));
         Ok(steps)
     }
 
     /// The first half of a split: 2-means over a sample of the partition's members gives it a new
-    /// centroid version and opens the next partition. Only the centroids and the bookkeeping are
-    /// written; the partition is marked moving, and moves recode its entries batch by batch.
-    fn plan_split(&mut self, partition: i64, mut part: Part, vectors: &[Vec<f32>]) -> Result<VecDeque<Step>> {
+    /// centroid version and opens a partition in the first retired slot, or past the last. Only
+    /// centroids and bookkeeping are written: the partition and its nearest live neighbours are
+    /// marked moving, and moves recode their entries block by block. A split whose smaller half
+    /// would take under a sixteenth of the sample is not made; the partition is tried again once
+    /// it has doubled. The generation is written first: it claims the model.
+    fn plan_split(&mut self, partition: i64, mut part: Part, sorted: Sorted, vectors: &[Vec<f32>]) -> Result<VecDeque<Step>> {
         let started = std::time::Instant::now();
-        if vectors.len() < 2 {
-            return Ok(VecDeque::new());
-        }
-        let eta = self.eta(vectors[0].len());
-        let halves = Model::new(kmeans(vectors, 2, eta), eta);
-        if halves.centroids.len() < 2 || vectors.iter().map(|v| halves.nearest(v)).all(|side| side == halves.nearest(&vectors[0])) {
-            return Ok(VecDeque::new());
-        }
+        let eta = vectors.first().map_or(0.0, |v| self.eta(v.len()));
+        let Some([kept, split]) = halves(vectors, eta) else {
+            part.retry = 2 * sorted.members.max(self.split_bound());
+            return Ok(VecDeque::from([put(PARTS, partition, part.record()?)]));
+        };
+        self.save_model();
         // The untrained origin is partition 0's version 0, so its first centroid is version 1.
         let version = self.model.version(partition) + 1;
-        let opened = self.model.centroids.len().max(1) as i64;
-        let [kept, split] = <[Vec<f32>; 2]>::try_from(halves.centroids).map_err(|_| error("2-means returned other than two"))?;
+        let reused = (0..self.model.centroids.len()).find(|p| self.model.states[*p] == State::Retired);
+        let opened = reused.unwrap_or_else(|| self.model.centroids.len().max(1)) as i64;
+        let opened_version = reused.map_or(0, |p| self.model.versions[p] + 1);
         let next = generation();
         part.move_next = 0;
         part.move_end = part.next;
         part.open = 0;
-        let steps = VecDeque::from([
-            put(CENTROIDS, centroid_key(partition, version)?, centroid_record(&kept)?),
-            put(CENTROIDS, centroid_key(opened, 0)?, centroid_record(&split)?),
+        part.retry = 0;
+        let mut steps = VecDeque::from([
             put(CENTROIDS, GENERATION, record(&[Value::from_i64(next)])?),
+            put(CENTROIDS, centroid_key(partition, version)?, centroid_record(&kept)?),
+            put(CENTROIDS, centroid_key(opened, opened_version)?, centroid_record(&split)?),
             put(PARTS, partition, part.record()?),
-            put(PARTS, opened, Part::default().record()?),
         ]);
+        // A retired slot holds no block: its retirement moved every entry out and removed them.
+        steps.push_back(put(PARTS, opened, Part::default().record()?));
+        for (neighbour, mut near) in sorted.neighbours {
+            if neighbour == opened {
+                continue;
+            }
+            near.move_next = 0;
+            near.move_end = near.next;
+            steps.push_back(put(PARTS, neighbour, near.record()?));
+            self.dirty.push(neighbour);
+        }
         let model = Arc::make_mut(&mut self.model);
         model.eta = eta;
         model.place(partition as usize, version, kept);
-        model.place(opened as usize, 0, split);
+        model.place(opened as usize, opened_version, split);
+        model.states[opened as usize] = State::Live;
         self.generation = Some(next);
         self.publish();
+        self.dirty.push(opened);
         let micros = started.elapsed().as_micros() as usize;
         SPLITS.fetch_add(1, Ordering::Relaxed);
         SPLIT_MICROS.fetch_add(micros, Ordering::Relaxed);
@@ -2217,41 +3081,66 @@ impl IvfRqCursor {
         Ok(steps)
     }
 
-    /// Check one block that predates the partition's split: an entry now nearest another
-    /// partition is recoded into that partition's tail, and the block keeps the rest as they are,
-    /// still scored against the centroid version they were coded under. A block nothing leaves is
-    /// not rewritten.
+    /// Check one block marked moving, or a batch of a retiring partition's tail: an entry now
+    /// nearest another live partition is recoded into that partition's tail, and one that stays is
+    /// recoded against the partition's current centroid when its block was coded against an
+    /// earlier one. A block nothing leaves and nothing changes in is not rewritten. The partition's
+    /// bookkeeping is written first: it claims the partition.
     fn plan_move(&mut self, partition: i64, mut part: Part, sorted: Sorted, vectors: Vec<Vec<f32>>) -> Result<VecDeque<Step>> {
+        let current = self.model.version(partition);
+        let from_block = part.moving();
         let key = block_key(partition, part.move_next)?;
-        part.move_next += 1;
+        if from_block {
+            part.move_next += 1;
+        }
+        let rotation = vectors.first().map(|v| self.rotation(v.len()));
         let mut steps = VecDeque::new();
         let mut staying = Vec::new();
+        let mut recoded = 0;
         let mut moved = 0;
         for ((entry, _), vector) in sorted.live.into_iter().zip(&vectors) {
-            if self.model.nearest(vector) as i64 == partition {
-                staying.push(entry);
+            let nearest = self.model.nearest(vector) as i64;
+            if from_block && nearest == partition && self.model.state(partition) == State::Live {
+                if sorted.version == current {
+                    staying.push(entry);
+                    continue;
+                }
+                let centroid = self.model.centroids.get(partition as usize).ok_or_else(|| error("a live partition has no centroid"))?;
+                let residual: Vec<f32> = vector.iter().zip(centroid).map(|(a, b)| a - b).collect();
+                let rotation = rotation.as_ref().ok_or_else(|| error("a recoded entry has no vector"))?;
+                let fresh = code(rotation, entry.rowid, residual);
+                steps.push_back(put(VECTORS, fresh.rowid, record(&[Value::from_i64(Location::Block(key).encode()), blob(&extra(&fresh))?])?));
+                staying.push(fresh);
+                recoded += 1;
             } else {
-                steps.extend(self.tail_steps(entry.rowid, vector)?);
+                let (target, written) = self.tail_steps(entry.rowid, vector)?;
+                steps.extend(written);
+                self.dirty.push(target);
                 moved += 1;
             }
         }
-        let dropped = sorted.from_blocks - staying.len() as i64 - moved;
-        if moved + dropped > 0 {
-            steps.push_front(match staying.is_empty() {
-                true => remove(BLOCKS, key),
-                false => put(BLOCKS, key, record(&[Value::from_i64(sorted.version), blob(&pack(&staying))?])?),
-            });
-            part.size = (part.size - moved - dropped).max(0);
+        if from_block {
+            let dropped = sorted.from_blocks - staying.len() as i64 - moved;
+            if moved + dropped + recoded > 0 {
+                steps.push_front(match staying.is_empty() {
+                    true => remove(BLOCKS, key),
+                    false => put(BLOCKS, key, record(&[Value::from_i64(current), blob(&pack(&staying))?])?),
+                });
+                part.size = (part.size - moved - dropped).max(0);
+            }
+        } else {
+            steps.extend(removals(&sorted.removed));
         }
         MOVES.fetch_add(1, Ordering::Relaxed);
-        RECODED.fetch_add(moved as usize, Ordering::Relaxed);
-        steps.push_back(put(PARTS, partition, part.record()?));
+        RECODED.fetch_add((moved + recoded) as usize, Ordering::Relaxed);
+        steps.push_front(put(PARTS, partition, part.record()?));
         Ok(steps)
     }
 
     /// Rewrite a block without the stale copies it holds, or remove it when none of its entries is
     /// live. The live entries stay as they are, under the centroid version they were coded against,
-    /// so their vectors' rows still name the block.
+    /// so their vectors' rows still name the block. The partition's bookkeeping is written first: it
+    /// claims the partition.
     fn plan_compact(&mut self, block: i64, mut part: Part, sorted: Sorted) -> Result<VecDeque<Step>> {
         if sorted.buried.is_empty() {
             return Err(*error("a dead row names a block that holds no stale copy"));
@@ -2268,8 +3157,36 @@ impl IvfRqCursor {
             part.open = staying.len() as i64;
         }
         COMPACTS.fetch_add(1, Ordering::Relaxed);
-        steps.push_back(put(PARTS, partition, part.record()?));
+        steps.push_front(put(PARTS, partition, part.record()?));
         Ok(steps)
+    }
+
+    /// Start retiring a live partition: no entry is coded into it any longer, and its blocks are
+    /// marked moving, so moves recode its entries into the live partitions nearest them while
+    /// queries still probe it. A retiring partition whose moves are done is retired: emptied, never
+    /// probed, its slot free for the next split. The generation is written first: it claims the
+    /// model, which every cursor reloads to learn the partition's state.
+    fn plan_retire(&mut self, partition: i64, mut part: Part) -> Result<VecDeque<Step>> {
+        self.save_model();
+        let state = match part.state {
+            State::Live => {
+                part.move_next = 0;
+                part.move_end = part.next;
+                State::Retiring
+            }
+            _ => {
+                part.size = 0;
+                part.open = 0;
+                State::Retired
+            }
+        };
+        part.state = state;
+        let next = generation();
+        Arc::make_mut(&mut self.model).states[partition as usize] = state;
+        self.generation = Some(next);
+        self.publish();
+        RETIRES.fetch_add(1, Ordering::Relaxed);
+        Ok(VecDeque::from([put(CENTROIDS, GENERATION, record(&[Value::from_i64(next)])?), put(PARTS, partition, part.record()?)]))
     }
 }
 
@@ -2286,8 +3203,9 @@ fn removals(removed: &[Location]) -> VecDeque<Step> {
 
 fn job_partition(job: Job) -> i64 {
     match job {
-        Job::Pack(p) | Job::Split(p) | Job::Move(p) => p,
+        Job::Pack(p) | Job::Split(p) | Job::Move(p) | Job::Retire(p) => p,
         Job::Compact(block) => block >> 32,
+        Job::Rebuild => 0,
     }
 }
 
@@ -2695,4 +3613,394 @@ mod tests {
             assert!(stale.values().all(|count| *count < COMPACT_AT), "mvcc={mvcc}: blocks left with stale copies {stale:?}");
         }
     }
+
+    fn database(name: &str, mvcc: bool) -> (Arc<crate::Database>, Arc<crate::Connection>) {
+        use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect};
+        let db = Database::open_file_with_flags(Arc::new(MemoryIO::new()), name, OpenFlags::default(), DatabaseOpts::new().with_index_method(true), None, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
+        (db, conn)
+    }
+
+    /// A vector near one of `centres`, the centre chosen by the generator.
+    fn near(state: &mut u64, centres: &[Vec<f32>], spread: f32) -> Vec<f32> {
+        let pick = ((random(state, 1)[0] + 0.5) * centres.len() as f32) as usize;
+        let centre = &centres[pick.min(centres.len() - 1)];
+        centre.iter().zip(random(state, centre.len())).map(|(c, n)| c + spread * n).collect()
+    }
+
+    /// One statement inserting every vector of `rows`.
+    fn insert_all(conn: &Arc<crate::Connection>, rows: &[(i64, Vec<f32>)]) {
+        let values: Vec<String> = rows.iter().map(|(id, v)| format!("({id}, {})", literal(v))).collect();
+        conn.execute(format!("INSERT INTO v VALUES {}", values.join(","))).unwrap();
+    }
+
+    fn top_ten(conn: &Arc<crate::Connection>, q: &[f32]) -> Vec<i64> {
+        rows(conn, &format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT 10", literal(q))).iter().map(|row| row[0].as_int().unwrap()).collect()
+    }
+
+    fn exact_top_ten(live: &HashMap<i64, Vec<f32>>, q: &[f32]) -> Vec<i64> {
+        let mut exact: Vec<(f64, i64)> = live.iter().map(|(id, v)| (dot(q, v), *id)).collect();
+        exact.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        exact.iter().take(10).map(|(_, id)| *id).collect()
+    }
+
+    /// The rows of one of index `v_ivf`'s backing tables: the rowid, then `columns`.
+    fn backing(conn: &Arc<crate::Connection>, store: &str, columns: &str) -> Vec<Vec<Value>> {
+        rows(conn, &format!("SELECT rowid, {columns} FROM __turso_internal_v_ivf_{store}"))
+    }
+
+    /// The index as its backing tables hold it: each partition's bookkeeping, tail length and current
+    /// centroid version, and the stale copies per block.
+    struct Stored {
+        parts: HashMap<i64, Part>,
+        tails: HashMap<i64, usize>,
+        versions: HashMap<i64, i64>,
+        stale: HashMap<i64, usize>,
+    }
+
+    fn stored(conn: &Arc<crate::Connection>) -> Stored {
+        let parts = backing(conn, "parts", "next, size, open, move_next, move_end, state, retry")
+            .iter()
+            .map(|r| {
+                let f = |i: usize| r[i].as_int().unwrap();
+                (f(0), Part { next: f(1), size: f(2), open: f(3), move_next: f(4), move_end: f(5), state: State::decode(f(6)).unwrap(), retry: f(7) })
+            })
+            .collect();
+        let mut tails = HashMap::new();
+        for r in backing(conn, "tail", "version") {
+            *tails.entry(r[0].as_int().unwrap() >> ROWID_BITS).or_default() += 1;
+        }
+        let mut versions: HashMap<i64, i64> = HashMap::new();
+        for r in backing(conn, "centroids", "value") {
+            let key = r[0].as_int().unwrap();
+            if key >= 0 {
+                let version = versions.entry(key >> VERSION_BITS).or_default();
+                *version = (*version).max(key & ((1 << VERSION_BITS) - 1));
+            }
+        }
+        let mut stale = HashMap::new();
+        for r in backing(conn, "dead", "blocks") {
+            for block in dead_blocks(r[1].to_blob().unwrap()).unwrap() {
+                *stale.entry(block).or_default() += 1;
+            }
+        }
+        Stored { parts, tails, versions, stale }
+    }
+
+    impl Stored {
+        fn part(&self, p: i64) -> Part {
+            self.parts.get(&p).copied().unwrap_or_default()
+        }
+
+        fn tail(&self, p: i64) -> usize {
+            self.tails.get(&p).copied().unwrap_or(0)
+        }
+
+        fn partitions(&self) -> Vec<i64> {
+            let last = self.versions.keys().chain(self.parts.keys()).chain(self.tails.keys()).copied().max().unwrap_or(0);
+            (0..=last).collect()
+        }
+
+        fn live(&self) -> Vec<i64> {
+            self.partitions().into_iter().filter(|p| self.part(*p).state == State::Live).collect()
+        }
+
+        fn live_entries(&self, p: i64) -> i64 {
+            let stale: usize = self.stale.iter().filter(|(block, _)| *block >> 32 == p).map(|(_, count)| *count).sum();
+            self.part(p).size + self.tail(p) as i64 - stale as i64
+        }
+
+        /// The jobs left, by the rules maintenance chooses them by.
+        fn pending(&self) -> Vec<String> {
+            let live = self.live();
+            let split_bound = split_bound(live.len().max(1));
+            let mut left = Vec::new();
+            for p in self.partitions() {
+                let part = self.part(p);
+                if part.moving() {
+                    left.push(format!("partition {p} is moving"));
+                }
+                if part.state != State::Live {
+                    if self.tail(p) > 0 {
+                        left.push(format!("{:?} partition {p} has a tail", part.state));
+                    }
+                    if part.state == State::Retiring {
+                        left.push(format!("partition {p} is retiring"));
+                    }
+                    continue;
+                }
+                if self.tail(p) >= PACK_AT {
+                    left.push(format!("partition {p} has a tail of {}", self.tail(p)));
+                }
+                if live.len() > 1 && self.live_entries(p) < split_bound / 16 {
+                    left.push(format!("partition {p} holds {} live entries", self.live_entries(p)));
+                }
+                let size = part.size + self.tail(p) as i64;
+                if size >= split_bound.max(part.retry) {
+                    left.push(format!("partition {p} holds {size}"));
+                }
+            }
+            for (block, count) in &self.stale {
+                if *count >= COMPACT_AT {
+                    left.push(format!("block {block} holds {count} stale copies"));
+                }
+            }
+            left
+        }
+    }
+
+    /// Plain inserts, with no OPTIMIZE INDEX, keep the index maintained: their statements pack the
+    /// tails they grow and split the partitions they fill.
+    #[test]
+    fn plain_writes_keep_the_index_maintained() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-writes-{mvcc}.db"), mvcc);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut state = 31;
+            let mut live = HashMap::new();
+            for id in 1..=1500i64 {
+                let v = random(&mut state, DIMS);
+                conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&v))).unwrap();
+                live.insert(id, v);
+            }
+            let index = stored(&conn);
+            let tails: usize = index.tails.values().sum();
+            assert!(index.live().len() >= 8, "mvcc={mvcc}: {} live partitions after 1500 inserts", index.live().len());
+            assert!(tails < 150, "mvcc={mvcc}: {tails} entries left in tails");
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// Statements inserting a hundred rows each, with no OPTIMIZE INDEX, keep the index maintained:
+    /// each pays for the maintenance its rows make due, so no partition grows to twice the split
+    /// bound and work a statement leaves, the moves of a split late in it, is done by the next.
+    #[test]
+    fn statements_of_many_rows_keep_the_index_maintained() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-statements-{mvcc}.db"), mvcc);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut state = 61;
+            let mut live = HashMap::new();
+            let mut before: Vec<String> = Vec::new();
+            for statement in 0..40i64 {
+                let rows: Vec<(i64, Vec<f32>)> = (1..=100).map(|i| (statement * 100 + i, random(&mut state, DIMS))).collect();
+                insert_all(&conn, &rows);
+                live.extend(rows);
+                let index = stored(&conn);
+                let bound = split_bound(index.live().len().max(1));
+                let biggest = index.live().iter().map(|p| index.part(*p).size + index.tail(*p) as i64).max().unwrap_or(0);
+                assert!(biggest < 2 * bound, "mvcc={mvcc}: a partition holds {biggest} after statement {statement}, the split bound being {bound}");
+                let left = index.pending();
+                assert!(before.is_empty() || left.is_empty(), "mvcc={mvcc}: statements {} and {statement} both left work: {before:?}, then {left:?}", statement - 1);
+                before = left;
+            }
+            let index = stored(&conn);
+            assert!(index.live().len() >= trained_partitions(4000) / 2, "mvcc={mvcc}: {} live partitions for 4000 rows", index.live().len());
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// One OPTIMIZE INDEX does every job a backlog holds: over a trained index, statements that do
+    /// not maintain it leave packs, splits and moves due, and after one call none is.
+    #[test]
+    fn one_optimize_finishes_every_job() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-backlog-{mvcc}.db"), mvcc);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut state = 37;
+            let mut rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &rows);
+            STATEMENT_UPKEEP.with(|on| on.set(false));
+            for statement in 0..15i64 {
+                let more: Vec<(i64, Vec<f32>)> = (1..=100).map(|i| (3000 + statement * 100 + i, random(&mut state, DIMS))).collect();
+                insert_all(&conn, &more);
+                rows.extend(more);
+            }
+            STATEMENT_UPKEEP.with(|on| on.set(true));
+            let backlog = stored(&conn).pending();
+            assert!(backlog.len() > 1, "mvcc={mvcc}: the writes left {backlog:?} to finish");
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let left = stored(&conn).pending();
+            assert!(left.is_empty(), "mvcc={mvcc}: work left after one OPTIMIZE: {left:?}");
+            let live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// The rows maintenance surveys while it works off a backlog grow with the backlog, not with
+    /// its square: doubling the rows one statement inserts less than triples them.
+    #[test]
+    fn maintenance_reads_grow_linearly_with_the_backlog() {
+        const DIMS: usize = 16;
+        let mut reads = Vec::new();
+        for count in [1500i64, 3000] {
+            let (_db, conn) = database(&format!("ivf-rq-linear-{count}.db"), false);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut state = 41;
+            let rows: Vec<(i64, Vec<f32>)> = (1..=count).map(|id| (id, random(&mut state, DIMS))).collect();
+            let before = SURVEYED.with(|c| c.get());
+            insert_all(&conn, &rows);
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            reads.push(SURVEYED.with(|c| c.get()) - before);
+            assert!(stored(&conn).pending().is_empty());
+        }
+        let ratio = reads[1] as f64 / reads[0] as f64;
+        assert!(ratio < 3.0, "surveys read {reads:?} rows: doubling the backlog multiplied them by {ratio:.2}");
+    }
+
+    /// Once maintenance has run out of work, every block and tail entry is coded against its
+    /// partition's current centroid: a move recodes the entries that stay, not only those it moves.
+    #[test]
+    fn every_entry_is_coded_against_its_partitions_current_centroid() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-recode-{mvcc}.db"), mvcc);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut state = 43;
+            let centres: Vec<Vec<f32>> = (0..8).map(|_| random(&mut state, DIMS).iter().map(|x| 4.0 * x).collect()).collect();
+            for id in 1..=2000i64 {
+                let v = near(&mut state, &centres, 0.3);
+                conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&v))).unwrap();
+            }
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let index = stored(&conn);
+            assert!(index.pending().is_empty(), "mvcc={mvcc}: {:?}", index.pending());
+            assert!(index.live().len() > 4, "mvcc={mvcc}: the index split into {} partitions", index.live().len());
+            for (store, bits) in [("blocks", 32), ("tail", ROWID_BITS)] {
+                for r in backing(&conn, store, "version") {
+                    let (key, version) = (r[0].as_int().unwrap(), r[1].as_int().unwrap());
+                    let current = index.versions.get(&(key >> bits)).copied().unwrap_or(0);
+                    assert_eq!(version, current, "mvcc={mvcc}: {store} row {key} is coded against version {version} of partition {}", key >> bits);
+                }
+            }
+        }
+    }
+
+    /// Deleting every vector of half the clusters retires the partitions that held them: none is
+    /// left live with fewer entries than the retirement bound, and the queries stay exact.
+    #[test]
+    fn emptied_partitions_retire() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-retire-{mvcc}.db"), mvcc);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut state = 47;
+            let centres: Vec<Vec<f32>> = (0..8).map(|_| random(&mut state, DIMS).iter().map(|x| 4.0 * x).collect()).collect();
+            let mut live = HashMap::new();
+            for (c, centre) in centres.iter().enumerate() {
+                let rows: Vec<(i64, Vec<f32>)> = (0..300).map(|i| ((c * 300 + i + 1) as i64, near(&mut state, std::slice::from_ref(centre), 0.2))).collect();
+                insert_all(&conn, &rows);
+                live.extend(rows);
+            }
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let before = stored(&conn).live().len();
+            conn.execute("DELETE FROM v WHERE id <= 1200").unwrap();
+            live.retain(|id, _| *id > 1200);
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let index = stored(&conn);
+            assert!(index.pending().is_empty(), "mvcc={mvcc}: {:?}", index.pending());
+            let retired = index.parts.values().filter(|part| part.state == State::Retired).count();
+            assert!(retired > 0, "mvcc={mvcc}: no partition of {before} retired");
+            for centre in &centres {
+                let q = near(&mut state, std::slice::from_ref(centre), 0.2);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// CREATE INDEX over a table that already holds 3000 rows trains its partitions by k-means over a
+    /// sample of them, in the statement itself: afterwards about the square root of the rows are
+    /// live partitions, every entry is packed, no job is due, and the queries are exact.
+    #[test]
+    fn create_index_over_rows_trains_its_partitions() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-build-{mvcc}.db"), mvcc);
+            let mut state = 59;
+            let centres: Vec<Vec<f32>> = (0..12).map(|_| random(&mut state, DIMS).iter().map(|x| 3.0 * x).collect()).collect();
+            let rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, near(&mut state, &centres, 0.4))).collect();
+            insert_all(&conn, &rows);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let index = stored(&conn);
+            let tails: usize = index.tails.values().sum();
+            assert!(index.live().len() >= trained_partitions(3000) / 2, "mvcc={mvcc}: {} live partitions for 3000 rows", index.live().len());
+            assert_eq!(tails, 0, "mvcc={mvcc}: entries left in tails");
+            assert!(index.pending().is_empty(), "mvcc={mvcc}: {:?}", index.pending());
+            let live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
+            for _ in 0..3 {
+                let q = near(&mut state, &centres, 0.4);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// Live vectors whose partition is not the live partition nearest them, of all live vectors.
+    fn misplaced(conn: &Arc<crate::Connection>, live: &HashMap<i64, Vec<f32>>) -> (usize, usize) {
+        let index = stored(conn);
+        let mut centroids: Vec<(i64, Vec<f32>)> = Vec::new();
+        for r in backing(conn, "centroids", "value") {
+            let key = r[0].as_int().unwrap();
+            let p = key >> VERSION_BITS;
+            if key < 0 || index.part(p).state != State::Live || index.versions.get(&p) != Some(&(key & ((1 << VERSION_BITS) - 1))) {
+                continue;
+            }
+            centroids.push((p, dense(r[1].to_blob()).unwrap()));
+        }
+        let mut wrong = 0;
+        for r in backing(conn, "vectors", "location") {
+            let rowid = r[0].as_int().unwrap();
+            let p = match Location::decode(r[1].as_int().unwrap()) {
+                Location::Block(key) => key >> 32,
+                Location::Tail(key) => key >> ROWID_BITS,
+            };
+            let v = &live[&rowid];
+            let nearest = centroids.iter().min_by(|a, b| l2(&a.1, v).total_cmp(&l2(&b.1, v))).map(|(p, _)| *p).unwrap();
+            wrong += (nearest != p) as usize;
+        }
+        (wrong, live.len())
+    }
+
+    /// Splits recheck the partitions beside them: once maintenance has run out of work over one
+    /// uniform blob of vectors, where every partition borders many others, almost every vector lives
+    /// in the live partition nearest it.
+    #[test]
+    fn vectors_live_in_their_nearest_partition() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-nearest-{mvcc}.db"), mvcc);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut state = 53;
+            let mut live = HashMap::new();
+            for id in 1..=3000i64 {
+                let v = random(&mut state, DIMS);
+                conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&v))).unwrap();
+                live.insert(id, v);
+            }
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let (wrong, total) = misplaced(&conn, &live);
+            eprintln!("mvcc={mvcc}: {wrong} of {total} vectors outside their nearest partition, {} partitions", stored(&conn).live().len());
+            assert!(wrong * 100 < total * MISPLACED_PERCENT, "mvcc={mvcc}: {wrong} of {total} vectors outside their nearest partition");
+        }
+    }
+
+    /// The share of live vectors outside their nearest partition the nearest-partition test allows:
+    /// over these 3000 vectors, rechecking 8 neighbours per split leaves 1.7%, 4 leave 5.3% and none
+    /// 9.7%.
+    const MISPLACED_PERCENT: usize = 3;
 }

@@ -513,43 +513,62 @@ fn refined_product(signed: f64, lower: f64, sum: f64, refined: f64) -> f64 {
 }
 
 /// Sum each group's 32 entries' table values over every nibble position: `codes` is one group's
-/// fast-scan bytes, `table` the query's 16 quantized values per position.
-fn scan_group(codes: &[u8], table: &[u8], out: &mut [u16; GROUP]) {
+/// fast-scan bytes, `table` the query's 16 quantized values per position. A sum can pass 65535 once
+/// a code has more than 257 positions, so it is kept in 32 bits.
+fn scan_group(codes: &[u8], table: &[u8], out: &mut [u32; GROUP]) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: AVX2 is present, and both slices hold 16 bytes for each of an even count of positions.
         unsafe { scan_group_avx2(codes, table, out) };
         return;
     }
+    scan_group_scalar(codes, table, out);
+}
+
+fn scan_group_scalar(codes: &[u8], table: &[u8], out: &mut [u32; GROUP]) {
     out.fill(0);
     for (c, t) in codes.chunks_exact(16).zip(table.chunks_exact(16)) {
         for b in 0..16 {
-            out[b] += t[(c[b] & 0xf) as usize] as u16;
-            out[16 + b] += t[(c[b] >> 4) as usize] as u16;
+            out[b] += t[(c[b] & 0xf) as usize] as u32;
+            out[16 + b] += t[(c[b] >> 4) as usize] as u32;
         }
     }
 }
 
+/// The steps of two positions each that a 16-bit lane sums before it is widened: a step adds two
+/// bytes, at most 510, so 128 of them stay within 65535.
+#[cfg(target_arch = "x86_64")]
+const SCAN_STEPS_PER_WIDEN: usize = 128;
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scan_group_avx2(codes: &[u8], table: &[u8], out: &mut [u16; GROUP]) {
+unsafe fn scan_group_avx2(codes: &[u8], table: &[u8], out: &mut [u32; GROUP]) {
     use std::arch::x86_64::*;
     debug_assert!(codes.len() == table.len() && codes.len() % 32 == 0);
     let mask = _mm256_set1_epi8(0x0f);
-    let (mut low, mut high) = (_mm256_setzero_si256(), _mm256_setzero_si256());
-    for at in (0..codes.len()).step_by(32) {
-        // Two positions per register: one in each 128-bit lane, as the shuffle works per lane.
-        let c = _mm256_loadu_si256(codes.as_ptr().add(at) as *const __m256i);
-        let t = _mm256_loadu_si256(table.as_ptr().add(at) as *const __m256i);
-        let first = _mm256_shuffle_epi8(t, _mm256_and_si256(c, mask));
-        let second = _mm256_shuffle_epi8(t, _mm256_and_si256(_mm256_srli_epi16(c, 4), mask));
-        low = _mm256_add_epi16(low, _mm256_cvtepu8_epi16(_mm256_castsi256_si128(first)));
-        low = _mm256_add_epi16(low, _mm256_cvtepu8_epi16(_mm256_extracti128_si256(first, 1)));
-        high = _mm256_add_epi16(high, _mm256_cvtepu8_epi16(_mm256_castsi256_si128(second)));
-        high = _mm256_add_epi16(high, _mm256_cvtepu8_epi16(_mm256_extracti128_si256(second, 1)));
+    let mut totals = [_mm256_setzero_si256(); 4];
+    for chunk in (0..codes.len()).step_by(32 * SCAN_STEPS_PER_WIDEN) {
+        let (mut low, mut high) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+        for at in (chunk..codes.len().min(chunk + 32 * SCAN_STEPS_PER_WIDEN)).step_by(32) {
+            // Two positions per register: one in each 128-bit lane, as the shuffle works per lane.
+            let c = _mm256_loadu_si256(codes.as_ptr().add(at) as *const __m256i);
+            let t = _mm256_loadu_si256(table.as_ptr().add(at) as *const __m256i);
+            let first = _mm256_shuffle_epi8(t, _mm256_and_si256(c, mask));
+            let second = _mm256_shuffle_epi8(t, _mm256_and_si256(_mm256_srli_epi16(c, 4), mask));
+            low = _mm256_add_epi16(low, _mm256_cvtepu8_epi16(_mm256_castsi256_si128(first)));
+            low = _mm256_add_epi16(low, _mm256_cvtepu8_epi16(_mm256_extracti128_si256(first, 1)));
+            high = _mm256_add_epi16(high, _mm256_cvtepu8_epi16(_mm256_castsi256_si128(second)));
+            high = _mm256_add_epi16(high, _mm256_cvtepu8_epi16(_mm256_extracti128_si256(second, 1)));
+        }
+        // Entries 0..8, 8..16, 16..24 and 24..32, each widened into its 32-bit totals.
+        totals[0] = _mm256_add_epi32(totals[0], _mm256_cvtepu16_epi32(_mm256_castsi256_si128(low)));
+        totals[1] = _mm256_add_epi32(totals[1], _mm256_cvtepu16_epi32(_mm256_extracti128_si256(low, 1)));
+        totals[2] = _mm256_add_epi32(totals[2], _mm256_cvtepu16_epi32(_mm256_castsi256_si128(high)));
+        totals[3] = _mm256_add_epi32(totals[3], _mm256_cvtepu16_epi32(_mm256_extracti128_si256(high, 1)));
     }
-    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, low);
-    _mm256_storeu_si256(out.as_mut_ptr().add(16) as *mut __m256i, high);
+    for (k, total) in totals.iter().enumerate() {
+        _mm256_storeu_si256(out.as_mut_ptr().add(8 * k) as *mut __m256i, *total);
+    }
 }
 
 /// A query's fast-scan tables: per nibble position, the rotated query summed over each nibble's
@@ -2115,7 +2134,7 @@ fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location)
     }
     let scale = 1.0 / (dims as f64).sqrt();
     let spread = EPSILON * query.length / ((dims - 1) as f64).sqrt();
-    let mut sums = [0u16; GROUP];
+    let mut sums = [0u32; GROUP];
     for group in 0..layout.groups() {
         let codes = &payload[layout.scan() + group * layout.group_bytes()..][..layout.group_bytes()];
         let members = GROUP.min(count - group * GROUP);
@@ -2209,24 +2228,22 @@ mod tests {
         }
     }
 
+    /// At 3072 dimensions the scan widens its 16-bit sums several times within one group.
     #[test]
     fn the_simd_scan_sums_as_the_scalar_one_does() {
-        let (rotation, _, coded) = entries(32, 768);
-        let block = pack(&coded);
-        let layout = Layout::new(32, rotation.code_bytes());
-        let codes = &block[layout.scan()..][..layout.group_bytes()];
-        let mut state = 11;
-        let table = ScanTable::new(&rotation.apply(&random(&mut state, 768)));
-        let mut fast = [0u16; GROUP];
-        scan_group(codes, &table.bytes, &mut fast);
-        let mut slow = [0u16; GROUP];
-        for (c, t) in codes.chunks_exact(16).zip(table.bytes.chunks_exact(16)) {
-            for b in 0..16 {
-                slow[b] += t[(c[b] & 0xf) as usize] as u16;
-                slow[16 + b] += t[(c[b] >> 4) as usize] as u16;
-            }
+        for dims in [768, 3072] {
+            let (rotation, _, coded) = entries(32, dims);
+            let block = pack(&coded);
+            let layout = Layout::new(32, rotation.code_bytes());
+            let codes = &block[layout.scan()..][..layout.group_bytes()];
+            let mut state = 11;
+            let table = ScanTable::new(&rotation.apply(&random(&mut state, dims)));
+            let mut fast = [0u32; GROUP];
+            scan_group(codes, &table.bytes, &mut fast);
+            let mut slow = [0u32; GROUP];
+            scan_group_scalar(codes, &table.bytes, &mut slow);
+            assert_eq!(fast, slow, "dims {dims}");
         }
-        assert_eq!(fast, slow);
     }
 
     /// The block scan keeps every entry whose true product is among the best, and the 4-bit
@@ -2345,6 +2362,30 @@ mod tests {
                 exact.sort_by(|a, b| b.0.total_cmp(&a.0));
                 let expected: Vec<i64> = exact[..10].iter().map(|(_, id)| *id).collect();
                 assert_eq!(got, expected, "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// The fast scan's 16-bit sums hold a wide code's best match: an entry equal to the query sums
+    /// each position's largest byte, and past 1024 padded dimensions that total can pass 65535.
+    #[test]
+    fn the_fast_scan_sums_a_wide_codes_best_match_without_wrapping() {
+        for dims in [768, 1536, 3072] {
+            let (rotation, vectors, coded) = entries(32, dims);
+            let block = pack(&coded);
+            let layout = Layout::new(32, rotation.code_bytes());
+            let codes = &block[layout.scan()..][..layout.group_bytes()];
+            let table = ScanTable::new(&rotation.apply(&vectors[0]));
+            let (mut fast, mut slow) = ([0u32; GROUP], [0u32; GROUP]);
+            scan_group(codes, &table.bytes, &mut fast);
+            scan_group_scalar(codes, &table.bytes, &mut slow);
+            for slot in 0..GROUP {
+                let (lane, shift) = (slot % 16, if slot < 16 { 0 } else { 4 });
+                let exact: f64 = (0..layout.positions).map(|j| table.exact[j * 16 + ((codes[j * 16 + lane] >> shift) & 0xf) as usize] as f64).sum();
+                for (kernel, sums) in [("simd", &fast), ("scalar", &slow)] {
+                    let summed = table.step * sums[slot] as f64 + table.base;
+                    assert!((summed - exact).abs() <= table.error + 1e-3, "dims {dims} slot {slot} {kernel}: fast-scan sum {summed} against exact {exact}");
+                }
             }
         }
     }

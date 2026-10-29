@@ -324,10 +324,25 @@ transactions at its pace (p99 16 ms, longest 19.5 ms, none failed) and the reade
 commit emptied the other connections' page caches until a read kept the pages no other connection
 wrote (below). On in-memory files (`IO=memory`), which take this host's disk out, that took stepped
 OPTIMIZE under WAL from 6.9 and 8.5 s to 5.1 and 7.7 s, and the readers beside it from 1,365 and
-1,201 queries a second to 1,898 and 1,789. The same runs show a writer waiting on the write lock
-while OPTIMIZE steps, in both builds: p99 532 ms to 1.7 s, longest 1.2 to 2.0 s, against 233 ms and
-630 ms on the file. A step's connection takes the lock again after its commit before the writer's
-busy handler wakes.
+1,201 queries a second to 1,898 and 1,789. The same runs showed a writer waiting on the write lock
+while OPTIMIZE stepped: p99 532 ms to 1.7 s, longest 1.2 to 2.0 s, against 233 ms and 630 ms on the
+file. A step took the lock again a moment after its commit, while a writer it had refused slept in
+its busy handler. The WAL now counts the write locks its connections take and the times one is
+refused (`Wal::write_lock_turns`), and a step that refused a writer leaves the lock until another
+connection takes it, or for 100 ms, the default busy handler's longest sleep (`GIVE_WAY`). In
+memory, three runs each: the writer's p99 24.3-25.9 ms and longest 34 ms, against p99 1.1-2.7 s and
+longest 1.4-2.7 s, keeping its pace (126-134 transactions against 47-76), with OPTIMIZE taking
+6.3-6.7 s against 5.0 and the readers beside it unchanged or faster.
+`a_writer_refused_during_a_step_of_optimize_takes_the_lock_before_the_next_steps`: a writer on its
+own thread inserting every 2 ms beside OPTIMIZE INDEX on another waited, before, while 68 steps
+took the lock (340 and 352 with no pause between its inserts); now at most 2.
+
+A statement's busy handler budget spanned all its waits, so a stepped OPTIMIZE INDEX gave up after a
+few waits that each kept within its busy timeout. Each step's taking of the lock now ends its wait
+for the busy handler (`ProgramState::lock_wait_over`), and the next wait starts afresh:
+`a_stepped_optimize_waits_for_each_writer_within_its_busy_timeout` (a 100 ms timeout and a writer
+holding the lock 30 ms at each of 8 steps; it failed at the third). Without the reset the fairness
+test passes, but the run's own busy sleeps reach 100 ms and it takes 77 s instead of 4.
 
 A step takes the partitions no other
 transaction holds: up to 16 of those known to be moving and 16 of those left due, the latter

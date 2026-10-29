@@ -44,6 +44,7 @@ impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
             results_materialized: false,
             filtered_queries: false,
             mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
+            optimize_in_steps: false,
         }
     }
 

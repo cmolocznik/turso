@@ -542,6 +542,11 @@ pub struct Connection {
     /// commit/rollback skip the mutex and sort when no index method was ever
     /// touched — the overwhelmingly common case.
     pub(crate) has_index_method_tx_cursors: crate::sync::atomic::AtomicBool,
+    /// On a connection [`Self::connect_beside`] opened for `OPTIMIZE INDEX` in steps, what its next
+    /// `OPTIMIZE INDEX` does, as [`crate::index_method::optimize_steps::OptimizeStep`], and whether
+    /// the last left work a further step can do.
+    pub(crate) index_method_optimize_step: AtomicU8,
+    pub(crate) index_method_optimize_left: AtomicBool,
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
@@ -2455,6 +2460,27 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    /// A connection of the engine's own to the database at `database_id`, as its main database, for
+    /// work that commits in transactions of its own: it reads and writes with this connection's
+    /// encryption key and page codec, synchronous level and automatic WAL maintenance.
+    pub(crate) fn connect_beside(&self, database_id: usize) -> Result<Arc<Connection>> {
+        let pager = self.get_pager_from_database_index(&database_id)?;
+        let key = match database_id {
+            MAIN_DB_ID => self.encryption_key.read().clone(),
+            _ => None,
+        };
+        let connection = self
+            .get_source_database(database_id)
+            .connect_internal(key, pager.page_codec_external())?;
+        connection.set_sync_mode(self.get_sync_mode_for_database(database_id)?);
+        connection.wal_auto_actions.store(
+            self.wal_auto_actions.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        connection.set_wal_autocheckpoint(self.get_wal_autocheckpoint());
+        Ok(connection)
     }
 
     pub(crate) fn get_wal_autocheckpoint(&self) -> u32 {

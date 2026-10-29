@@ -1877,6 +1877,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
+            Insn::IndexMethodOptimizeSteps { db, index } => (
+                "IndexMethodOptimizeSteps",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(index.clone()),
+                0,
+                "".to_string()
+            ),
             Insn::IndexMethodQuery { db, cursor_id, start_reg, .. } => (
                 "IndexMethodQuery",
                 *db as i64,

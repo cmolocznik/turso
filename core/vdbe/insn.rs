@@ -1700,6 +1700,12 @@ pub enum Insn {
         db: usize,
         cursor_id: CursorID,
     },
+    /// Optimize custom index method `index`, whose method optimizes in steps, from a statement that
+    /// holds no transaction: see [crate::index_method::optimize_steps].
+    IndexMethodOptimizeSteps {
+        db: usize,
+        index: String,
+    },
     /// Query custom index method (call [crate::index_method::IndexMethodCursor::query_start] under the hood)
     IndexMethodQuery {
         db: usize,
@@ -2551,6 +2557,7 @@ impl InsnVariants {
             InsnVariants::IndexMethodCreate => execute::op_index_method_create,
             InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
             InsnVariants::IndexMethodOptimize => execute::op_index_method_optimize,
+            InsnVariants::IndexMethodOptimizeSteps => execute::op_index_method_optimize_steps,
             InsnVariants::IndexMethodQuery => execute::op_index_method_query,
             InsnVariants::IndexMethodAccept => execute::op_index_method_accept,
             InsnVariants::ClearBtree => execute::op_clear_btree,
@@ -2673,6 +2680,7 @@ impl Insn {
             | Self::IndexMethodCreate { .. }
             | Self::IndexMethodDestroy { .. }
             | Self::IndexMethodOptimize { .. }
+            | Self::IndexMethodOptimizeSteps { .. }
             | Self::ClearBtree { .. }
             | Self::Destroy { .. }
             | Self::DropTable { .. }

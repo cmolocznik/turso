@@ -239,6 +239,8 @@ pub fn translate_inner(
         None
     };
 
+    // OPTIMIZE INDEX may begin a read transaction, or none, instead of a write transaction.
+    let mut optimize_transaction = index::OptimizeTransaction::Write;
     match stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?;
@@ -444,7 +446,7 @@ pub fn translate_inner(
         }
         ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
-            translate_optimize(idx_name, resolver, program, connection)?
+            optimize_transaction = translate_optimize(idx_name, resolver, program, connection)?;
         }
         ast::Stmt::Release { name } => translate_release(program, name)?,
         ast::Stmt::Rollback {
@@ -523,7 +525,10 @@ pub fn translate_inner(
         }
     };
 
-    if is_write {
+    if matches!(optimize_transaction, index::OptimizeTransaction::Read) {
+        program.begin_read_operation()?;
+    }
+    if is_write && matches!(optimize_transaction, index::OptimizeTransaction::Write) {
         if is_dml {
             // DML translators register their actual write database. Keep a
             // main read transaction to coordinate connection-level autocommit,

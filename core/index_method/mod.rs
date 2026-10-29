@@ -25,6 +25,7 @@ pub mod backing_store;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 pub mod fts;
 pub mod ivf_rq;
+pub(crate) mod optimize_steps;
 pub mod toy_vector_sparse_ivf;
 
 pub use backing_store::{
@@ -146,6 +147,11 @@ pub struct IndexMethodDefinition<'a> {
     pub filtered_queries: bool,
     /// Declares how this method participates in MVCC transactions.
     pub mvcc_support: IndexMethodMvccSupport,
+    /// Whether `OPTIMIZE INDEX` outside a transaction runs this method's work in steps, each
+    /// committed in a transaction of its own on a connection of the engine's, a concurrent one under
+    /// MVCC, with the statement yielding between steps: readers never wait for it, and a writer
+    /// waits for one step at most. Inside a transaction it does all the work there, as `optimize()`.
+    pub optimize_in_steps: bool,
 }
 
 /// Transaction mode exposed to index methods.
@@ -688,6 +694,17 @@ pub trait IndexMethodCursor: Send {
         Ok(IOResult::Done(()))
     }
 
+    /// One step of an `OPTIMIZE INDEX` of a method that optimizes in steps (see
+    /// [IndexMethodDefinition::optimize_in_steps]): a bounded share of the work, which commits in
+    /// the step's own transaction. The first step, `first`, runs in a read transaction and must not
+    /// write: it finds the work there is. Returns whether a further step has work it can do.
+    fn optimize_step(&mut self, context: &IndexMethodContext, _first: bool) -> IOResultOr<bool> {
+        match self.optimize(context)? {
+            IOResult::Done(()) => Ok(IOResult::Done(false)),
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        }
+    }
+
     /// Estimate the cost of executing a query with the given pattern.
     ///
     /// This method enables the optimizer to make cost-based decisions when choosing
@@ -816,6 +833,7 @@ mod tests {
             results_materialized: true,
             filtered_queries: false,
             mvcc_support: support,
+            optimize_in_steps: false,
         }
     }
 

@@ -951,6 +951,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
             results_materialized: false,
             filtered_queries: false,
             mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
+            optimize_in_steps: false,
         }
     }
 

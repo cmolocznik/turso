@@ -345,6 +345,7 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
             results_materialized: true,
             filtered_queries: false,
             mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
+            optimize_in_steps: false,
         }
     }
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {

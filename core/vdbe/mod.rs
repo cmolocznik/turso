@@ -1122,6 +1122,8 @@ pub struct ProgramState {
     /// Parked state for Insn::PopulateMaterializedViews: the population
     /// statement currently being stepped, re-entrant across I/O yields.
     pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
+    /// Where an `Insn::IndexMethodOptimizeSteps` is, re-entrant across its steps and waits.
+    pub(crate) optimize_steps: Option<Box<crate::index_method::optimize_steps::OptimizeSteps>>,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -1268,6 +1270,7 @@ impl ProgramState {
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaApplyState::NotStarted,
             populate_matviews_state: None,
+            optimize_steps: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -1433,6 +1436,7 @@ impl ProgramState {
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaApplyState::NotStarted;
         self.populate_matviews_state = None;
+        self.optimize_steps = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         self.fk_immediate_violation = None;

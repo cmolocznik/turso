@@ -108,6 +108,12 @@ pub static PROBE_BY_PRODUCT: AtomicUsize = AtomicUsize::new(0);
 /// A process-wide rerank switch for measurement sweeps: 1 reranks, 2 answers from the 7-bit
 /// estimates; zero leaves the index's own `rerank`.
 pub static RERANK_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+/// Whether statements maintain the index, for measurement: off, the work their writes make due is
+/// left to OPTIMIZE INDEX.
+pub static UPKEEP: AtomicBool = AtomicBool::new(true);
+/// Whether OPTIMIZE INDEX outside a transaction runs in steps, for measurement: off, it does all its
+/// work in one transaction, as before it ran in steps.
+pub static OPTIMIZE_IN_STEPS: AtomicBool = AtomicBool::new(true);
 /// Maintenance done in this process: packs, splits, entries recoded, stale entries dropped, and
 /// the summed and longest split durations, for measurement.
 pub static PACKS: AtomicUsize = AtomicUsize::new(0);
@@ -226,6 +232,9 @@ const STORES: [(&str, &[(&str, Type)]); 3] = [
 ];
 /// The centroids table's rowid for the generation.
 const GENERATION: i64 = -1;
+/// The key [`Writes`] records a write of the generation under, beside the partitions' keys: every
+/// split, retirement and rebuild writes it.
+const MODEL: i64 = -1;
 const PARTITION_BITS: u32 = 21;
 const ROWID_BITS: u32 = 40;
 const VERSION_BITS: u32 = 24;
@@ -1918,6 +1927,7 @@ impl IndexMethodAttachment for IvfRqIndexMethodAttachment {
             results_materialized: true,
             filtered_queries: true,
             mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
+            optimize_in_steps: OPTIMIZE_IN_STEPS.load(Ordering::Relaxed),
         }
     }
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
@@ -2175,11 +2185,26 @@ fn position(snapshot: IndexMethodSnapshotIdentity) -> Option<Position> {
 /// begins after the check commits too late for either to see.
 #[derive(Debug)]
 struct Writes {
+    /// The index's key in [`WRITES`].
+    key: (u64, String),
     open: HashMap<usize, Writer>,
     changed: HashMap<i64, Position>,
-    /// The commit position when the record began, standing for every partition not in `changed`:
-    /// commits before it went unrecorded.
+    /// A position at or past every commit the record did not see, standing for every partition not
+    /// in `changed`: the highest one the index's last record knew, or the commit position when the
+    /// record began, for the index's first.
     floor: Position,
+}
+
+impl Drop for Writes {
+    /// A record no attachment holds any longer leaves the highest position it knew, at or past every
+    /// commit it recorded, as the floor of the index's next record: no commit writes the index
+    /// meanwhile, as every cursor that writes it holds a record.
+    fn drop(&mut self) {
+        let high = self.changed.values().copied().fold(self.floor, Position::max);
+        if let Ok(mut floors) = FLOORS.lock() {
+            floors.insert(std::mem::take(&mut self.key), high);
+        }
+    }
 }
 
 /// A transaction writing the index, entered under its connection: the partitions it wrote, its
@@ -2241,6 +2266,8 @@ type SharedWrites = std::sync::Arc<std::sync::Mutex<Writes>>;
 /// attaches the index again, and the new attachment's cursors must see the old one's writers.
 type Registry = HashMap<(u64, String), std::sync::Weak<std::sync::Mutex<Writes>>>;
 static WRITES: std::sync::LazyLock<std::sync::Mutex<Registry>> = std::sync::LazyLock::new(Default::default);
+/// The floor a dropped record left for the index's next, by the same key.
+static FLOORS: std::sync::LazyLock<std::sync::Mutex<HashMap<(u64, String), Position>>> = std::sync::LazyLock::new(Default::default);
 
 /// Where a cursor reads the latest commit position: its database's WAL, or its MVCC store.
 enum Clock {
@@ -2473,6 +2500,9 @@ struct Run {
     first: Vec<i64>,
     /// The rows a CREATE INDEX statement gave the index, which the run starts by rebuilding over.
     build: Option<Vec<i64>>,
+    /// For a step of `OPTIMIZE INDEX`, the instant past which the run starts no job once it has
+    /// done one.
+    until: Option<std::time::Instant>,
 }
 
 /// Maintenance: survey, choose a job, read the entries it concerns, check each against its
@@ -2622,6 +2652,10 @@ const SURVEYED_TAIL: usize = 2 * MOVE_BATCH;
 /// The vectors at which an index trained for under a quarter of the partitions it holds vectors for
 /// is rebuilt, and the rows a statement inserts that make its maintenance check for it.
 const BULK_AT: usize = 1024;
+/// The most jobs one step of `OPTIMIZE INDEX` does, and the time past which it starts no other,
+/// before its transaction commits and the statement gives way.
+const STEP_JOBS: usize = 16;
+const STEP_TIME: std::time::Duration = std::time::Duration::from_millis(10);
 /// The partitions an index is trained to and kept at, per square root of its rows: finer
 /// partitions, as the RaBitQ library's IVF index uses, let a query reach its recall scanning less
 /// of the index, for a few more probes.
@@ -2672,11 +2706,17 @@ thread_local! {
     static STATEMENT_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
+/// The jobs one step of `OPTIMIZE INDEX` may do, and the instant past which it starts no other once
+/// it has done one; tests step by jobs alone.
+fn step_bounds() -> (usize, Option<std::time::Instant>) {
+    (STEP_JOBS, (!cfg!(test)).then(|| std::time::Instant::now() + STEP_TIME))
+}
+
 fn statement_upkeep() -> bool {
     #[cfg(test)]
     return STATEMENT_UPKEEP.with(|on| on.get());
     #[cfg(not(test))]
-    true
+    UPKEEP.load(Ordering::Relaxed)
 }
 
 /// The jobs the maintenance of a statement that wrote `written` rows of the index may do: one for
@@ -2816,6 +2856,8 @@ pub struct IvfRqCursor {
     sharing: Option<Sharing>,
     recorded: HashSet<i64>,
     writing: bool,
+    /// The maintenance jobs this cursor has done.
+    jobs: usize,
 }
 
 impl IvfRqCursor {
@@ -2858,6 +2900,7 @@ impl IvfRqCursor {
             sharing: None,
             recorded: HashSet::new(),
             writing: false,
+            jobs: 0,
         }
     }
 
@@ -3101,7 +3144,8 @@ impl IvfRqCursor {
         let writes = match registry.get(&key).and_then(std::sync::Weak::upgrade) {
             Some(writes) => writes,
             None => {
-                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { open: HashMap::new(), changed: HashMap::new(), floor: clock.now() }));
+                let floor = FLOORS.lock().expect("index floors").remove(&key).unwrap_or_else(|| clock.now());
+                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), floor }));
                 registry.insert(key, std::sync::Arc::downgrade(&writes));
                 writes
             }
@@ -3114,10 +3158,11 @@ impl IvfRqCursor {
     /// writes the partition the step changes.
     fn record(&mut self, step: &Step) {
         let (Step::Put { store, rowid, .. } | Step::Remove { store, rowid, .. }) = step;
-        if *store != PARTITIONS {
-            return;
-        }
-        let partition = partition_of(*rowid);
+        let partition = match *store {
+            PARTITIONS => partition_of(*rowid),
+            CENTROIDS if *rowid == GENERATION => MODEL,
+            _ => return,
+        };
         if self.recorded.contains(&partition) {
             return;
         }
@@ -3425,9 +3470,35 @@ impl IndexMethodCursor for IvfRqCursor {
     /// `OPTIMIZE INDEX`: survey every partition and do every job there is, until none is left.
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         if self.run.is_none() {
-            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new(), build: None });
+            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new(), build: None, until: None });
         }
         self.maintain(context)
+    }
+
+    /// A step of `OPTIMIZE INDEX`. The first surveys every partition and does no job, leaving
+    /// the partitions it finds work due in to the later steps. Each later one surveys up to
+    /// [`STEP_JOBS`] of the partitions known to be moving and as many of those runs left work due
+    /// in, and does up to [`STEP_JOBS`] jobs among them, starting none past [`STEP_TIME`] once it
+    /// has done one. A further step has work while runs leave some due, unless this one did no job,
+    /// its first giving way to a transaction holding a row it wrote, which maintains them itself.
+    fn optimize_step(&mut self, context: &IndexMethodContext, first: bool) -> IOResultOr<bool> {
+        if self.run.is_none() {
+            let mut start = Vec::new();
+            if !first {
+                let shared = self.shared.lock().expect("index state");
+                start.extend(shared.moving.iter().take(STEP_JOBS).chain(shared.due.iter().take(STEP_JOBS)).copied());
+            }
+            let (budget, until) = step_bounds();
+            let budget = if first { 0 } else { budget };
+            self.run = Some(Run { budget, survey: Survey::default(), all: first, first: start, build: None, until });
+            self.jobs = 0;
+        }
+        if let IOResult::IO(io) = self.maintain(context)? {
+            return Ok(IOResult::IO(io));
+        }
+        let shared = self.shared.lock().expect("index state");
+        let due = !(shared.due.is_empty() && shared.moving.is_empty());
+        Ok(IOResult::Done(due && (first || self.jobs > 0)))
     }
 
     /// Before the statement's writes are released, do the maintenance they made due, chosen among
@@ -3778,7 +3849,7 @@ impl IvfRqCursor {
         if let Some(rowids) = self.building.take().filter(|rowids| rowids.len() >= BULK_AT) {
             // A CREATE INDEX over BULK_AT rows or more: a rebuild over them clears the tail entries
             // the first wrote and codes every row into its block.
-            self.run = Some(Run { budget: rowids.len(), survey: Survey::default(), all: false, first: Vec::new(), build: Some(rowids) });
+            self.run = Some(Run { budget: rowids.len(), survey: Survey::default(), all: false, first: Vec::new(), build: Some(rowids), until: None });
             self.touched.clear();
             self.written = 0;
             self.inserted = 0;
@@ -3799,7 +3870,7 @@ impl IvfRqCursor {
             // A statement that inserted many rows surveys every partition, so a rebuild is chosen
             // when its rows have outgrown the partitions.
             let all = self.inserted >= BULK_AT;
-            self.run = Some(Run { budget, survey: Survey::default(), all, first: first.into_iter().collect(), build: None });
+            self.run = Some(Run { budget, survey: Survey::default(), all, first: first.into_iter().collect(), build: None, until: None });
             self.written = 0;
             self.inserted = 0;
         }
@@ -3837,6 +3908,7 @@ impl IvfRqCursor {
         loop {
             match std::mem::replace(&mut self.upkeep, Upkeep::Idle) {
                 Upkeep::Idle => {
+                    self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
                     self.open_stores(context)?;
                     // OPTIMIZE INDEX opens no cursor before it maintains, and its writes are
                     // recorded like any other.
@@ -4299,6 +4371,7 @@ impl IvfRqCursor {
                             drop(shared);
                             REBUILDS.fetch_add(1, Ordering::Relaxed);
                             JOBS.fetch_add(1, Ordering::Relaxed);
+                            self.jobs += 1;
                             self.saved = None;
                             let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
                             run.budget = run.budget.saturating_sub(1);
@@ -4309,8 +4382,13 @@ impl IvfRqCursor {
                 }
                 Upkeep::Revert { mut undo } => {
                     let Some(step) = undo.last_mut() else {
-                        // Another writer holds a row this run needs; it maintains them itself.
+                        // Another writer holds a row this run needs; it maintains them itself. The
+                        // partitions the run read that it leaves work due in stay due.
+                        let run = self.run.take();
                         self.forget_run();
+                        if let Some(run) = run {
+                            self.leave_due(&run);
+                        }
                         self.loaded = true;
                         return Ok(IOResult::Done(()));
                     };
@@ -4374,6 +4452,7 @@ impl IvfRqCursor {
     /// the next.
     fn finish_job(&mut self, job: Job) -> Result<()> {
         JOBS.fetch_add(1, Ordering::Relaxed);
+        self.jobs += 1;
         self.saved = None;
         let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
         run.budget = run.budget.saturating_sub(1);
@@ -4391,21 +4470,12 @@ impl IvfRqCursor {
     /// The next job of the run, or none, ending the run, when its budget is spent or nothing is due.
     fn next_job(&mut self) -> Result<Option<Upkeep>> {
         let run = self.run.as_ref().ok_or_else(|| error("maintenance without a run"))?;
-        let job = if run.budget == 0 { None } else { self.choose(&run.survey) };
+        let late = run.until.is_some_and(|until| self.jobs > 0 && std::time::Instant::now() >= until);
+        let job = if run.budget == 0 || late { None } else { self.choose(&run.survey) };
         let Some(job) = job else {
-            // The partitions the run read that it leaves work due in, its jobs spent, are the next
-            // statements' to survey; those it leaves none in no longer are.
-            let settled = self.settled(&run.survey);
-            let read: Vec<(i64, bool)> = run.survey.read.iter().map(|p| (*p, self.choose_among(&run.survey, &BTreeSet::from([*p]), settled).is_some())).collect();
-            let mut shared = self.shared.lock().expect("index state");
-            for (p, due) in read {
-                match due {
-                    true => shared.due.insert(p),
-                    false => shared.due.remove(&p),
-                };
+            if let Some(run) = self.run.take() {
+                self.leave_due(&run);
             }
-            drop(shared);
-            self.run = None;
             return Ok(None);
         };
         if let Job::Rebuild = job {
@@ -4416,6 +4486,20 @@ impl IvfRqCursor {
         Ok(Some(Upkeep::Read { job, part, stage: Stage::Blocks, walk: Walk::Seek, get: Get::Seek, rows: Vec::new() }))
     }
 
+    /// The partitions `run` read that it leaves work due in, its jobs spent, are the next
+    /// statements' to survey; those it leaves none in no longer are.
+    fn leave_due(&self, run: &Run) {
+        let settled = self.settled(&run.survey);
+        let read: Vec<(i64, bool)> = run.survey.read.iter().map(|p| (*p, self.choose_among(&run.survey, &BTreeSet::from([*p]), settled).is_some())).collect();
+        let mut shared = self.shared.lock().expect("index state");
+        for (p, due) in read {
+            match due {
+                true => shared.due.insert(p),
+                false => shared.due.remove(&p),
+            };
+        }
+    }
+
     /// The job the survey's partitions most need, in order: a move (a block marked moving, or a
     /// retiring partition's tail), a retirement whose moves are done, a pack of the longest tail of
     /// at least [`PACK_AT`], a compaction of the block holding the most stale copies, at least
@@ -4423,11 +4507,57 @@ impl IvfRqCursor {
     /// partition past the bound.
     fn choose(&self, survey: &Survey) -> Option<Job> {
         if let Some(vectors) = survey.vectors {
-            if vectors as usize >= BULK_AT && 4 * self.model.live() < trained_partitions(vectors as usize) {
+            if vectors as usize >= BULK_AT && 4 * self.model.live() < trained_partitions(vectors as usize) && self.claimable(&self.claims(Job::Rebuild)) {
                 return Some(Job::Rebuild);
             }
         }
-        self.choose_among(survey, &survey.read, self.settled(survey))
+        let settled = self.settled(survey);
+        if !self.concurrent {
+            return self.choose_among(survey, &survey.read, settled);
+        }
+        // Under MVCC a job another transaction's write would beat at commit is left for later.
+        let mut read = survey.read.clone();
+        loop {
+            let job = self.choose_among(survey, &read, settled)?;
+            if self.claimable(&self.claims(job)) {
+                return Some(job);
+            }
+            read.remove(&job_partition(job));
+        }
+    }
+
+    /// The rows a job writes that another transaction's maintenance may write too, by the key
+    /// [`Writes`] records them under: its partition's; for a split also the partition it opens,
+    /// the neighbours it marks moving and the generation; for a retirement the generation; and for
+    /// a rebuild every partition and the generation.
+    fn claims(&self, job: Job) -> Vec<i64> {
+        let count = self.model.centroids.len() as i64;
+        match job {
+            Job::Split(p) => {
+                let opened = (0..count).find(|q| self.model.states[*q as usize] == State::Retired).unwrap_or_else(|| count.max(1));
+                [p, opened, MODEL].into_iter().chain(self.neighbours(p)).collect()
+            }
+            Job::Retire(p) => vec![p, MODEL],
+            Job::Rebuild => (0..count.max(1)).chain([MODEL]).collect(),
+            job => vec![job_partition(job)],
+        }
+    }
+
+    /// Whether a job may write the rows of `claims`: under MVCC, no other transaction writing the
+    /// index holds one, and none committed a write to one that this cursor's snapshot does not see,
+    /// which would make this transaction's own write to it lose at commit. The record is this
+    /// process's; under WAL the one writer holds every row.
+    fn claimable(&self, claims: &[i64]) -> bool {
+        let Some(sharing) = self.sharing.as_ref().filter(|_| self.concurrent) else {
+            return true;
+        };
+        let Some(snapshot) = sharing.snapshot else {
+            return true;
+        };
+        let me = sharing.key();
+        let mut writes = sharing.writes.lock().expect("index writes");
+        writes.settle(|| sharing.clock.now());
+        claims.iter().all(|p| writes.changed(*p) <= snapshot && writes.open.iter().all(|(key, writer)| *key == me || !writer.partitions.contains(p)))
     }
 
     /// Whether no partition is moving: none the survey read, and none a run has found moving.
@@ -5673,27 +5803,258 @@ mod tests {
         const DIMS: usize = 16;
         for mvcc in [false, true] {
             let (_db, conn) = database(&format!("ivf-rq-backlog-{mvcc}.db"), mvcc);
-            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
             let mut state = 37;
-            let mut rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
-            insert_all(&conn, &rows);
-            STATEMENT_UPKEEP.with(|on| on.set(false));
-            for statement in 0..15i64 {
-                let more: Vec<(i64, Vec<f32>)> = (1..=100).map(|i| (3000 + statement * 100 + i, random(&mut state, DIMS))).collect();
-                insert_all(&conn, &more);
-                rows.extend(more);
-            }
-            STATEMENT_UPKEEP.with(|on| on.set(true));
+            let live = backlog(&conn, &mut state, DIMS);
             let backlog = stored(&conn).pending();
             assert!(backlog.len() > 1, "mvcc={mvcc}: the writes left {backlog:?} to finish");
             conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
             let left = stored(&conn).pending();
             assert!(left.is_empty(), "mvcc={mvcc}: work left after one OPTIMIZE: {left:?}");
-            let live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
             for _ in 0..3 {
                 let q = random(&mut state, DIMS);
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
             }
+        }
+    }
+
+    /// A trained index with a backlog: 3,000 rows inserted with maintenance, then 1,500 more by
+    /// statements of a hundred that do none, leaving packs, splits and moves due. The rows by id.
+    fn backlog(conn: &Arc<crate::Connection>, state: &mut u64, dims: usize) -> HashMap<i64, Vec<f32>> {
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+        let mut rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(state, dims))).collect();
+        insert_all(conn, &rows);
+        STATEMENT_UPKEEP.with(|on| on.set(false));
+        for statement in 0..15i64 {
+            let more: Vec<(i64, Vec<f32>)> = (1..=100).map(|i| (3000 + statement * 100 + i, random(state, dims))).collect();
+            insert_all(conn, &more);
+            rows.extend(more);
+        }
+        STATEMENT_UPKEEP.with(|on| on.set(true));
+        rows.into_iter().collect()
+    }
+
+    /// Step `statement` until it yields between steps of its work, true, or ends, false.
+    fn step_to_yield(db: &crate::Database, statement: &mut crate::Statement) -> bool {
+        loop {
+            match statement.step().unwrap() {
+                crate::StepResult::Yield => return true,
+                crate::StepResult::Done => return false,
+                crate::StepResult::IO => db.io.step().unwrap(),
+                other => panic!("the statement stepped to {other:?}"),
+            }
+        }
+    }
+
+    /// A transaction a host steps a little at a time beside another statement, as a host that runs
+    /// every connection on one thread does: each turn runs its current statement until it waits.
+    struct Interleaved {
+        connection: Arc<crate::Connection>,
+        sql: VecDeque<String>,
+        current: Option<crate::Statement>,
+    }
+
+    impl Interleaved {
+        fn new(connection: &Arc<crate::Connection>, sql: &[String]) -> Self {
+            Self { connection: connection.clone(), sql: sql.iter().cloned().collect(), current: None }
+        }
+
+        /// Run the current statement until it ends or waits, busy or on I/O; true once every
+        /// statement has ended.
+        fn turn(&mut self, db: &crate::Database) -> bool {
+            if self.current.is_none() {
+                let Some(sql) = self.sql.pop_front() else {
+                    return true;
+                };
+                self.current = Some(self.connection.prepare(sql).unwrap());
+            }
+            let statement = self.current.as_mut().expect("prepared above");
+            loop {
+                match statement.step().unwrap() {
+                    crate::StepResult::Done => {
+                        self.current = None;
+                        return self.sql.is_empty();
+                    }
+                    crate::StepResult::Row => {}
+                    crate::StepResult::IO => {
+                        db.io.step().unwrap();
+                        return false;
+                    }
+                    crate::StepResult::Yield | crate::StepResult::Busy | crate::StepResult::Sleep { .. } => return false,
+                    other => panic!("the statement stepped to {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// OPTIMIZE INDEX commits its work a step at a time and yields between steps, so a writer
+    /// stepped beside it commits while it still has work to do: under WAL its steps take the write
+    /// lock one at a time, and under MVCC each is a concurrent transaction. Once it ends no work is
+    /// due and the queries are exact, the rows written meanwhile among them.
+    #[test]
+    fn optimize_gives_way_to_writers_between_its_steps() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (db, conn) = database(&format!("ivf-rq-optimize-steps-{mvcc}.db"), mvcc);
+            let mut state = 223;
+            let mut live = backlog(&conn, &mut state, DIMS);
+            let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+            let mut optimize = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
+            let (mut yields, mut committed) = (0usize, 0usize);
+            let mut writing: Option<((i64, Vec<f32>), Interleaved)> = None;
+            let mut finished = false;
+            while !finished || writing.is_some() {
+                if !finished {
+                    finished = !step_to_yield(&db, &mut optimize);
+                    yields += 1;
+                    assert!(yields < 10_000, "mvcc={mvcc}: OPTIMIZE INDEX yielded ten thousand times, leaving {:?}", stored(&conn).pending());
+                }
+                let (row, transaction) = writing.get_or_insert_with(|| {
+                    let row = (100_000 + committed as i64, random(&mut state, DIMS));
+                    let insert = format!("INSERT INTO v VALUES ({}, {})", row.0, literal(&row.1));
+                    let sql = match mvcc {
+                        true => vec!["BEGIN CONCURRENT".to_string(), insert, "COMMIT".to_string()],
+                        false => vec![insert],
+                    };
+                    (row, Interleaved::new(&writer, &sql))
+                });
+                if transaction.turn(&db) {
+                    live.insert(row.0, row.1.clone());
+                    writing = None;
+                    if !finished {
+                        committed += 1;
+                    }
+                }
+            }
+            assert!(committed > 0, "mvcc={mvcc}: OPTIMIZE INDEX ended before a writer beside it committed");
+            let left = stored(&conn).pending();
+            assert!(left.is_empty(), "mvcc={mvcc}: work left after OPTIMIZE INDEX: {left:?}");
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// Inside an explicit transaction OPTIMIZE INDEX does all its work in that transaction, whether
+    /// it was prepared there or before it began: another connection sees the backlog until the
+    /// transaction commits, and none of it after.
+    #[test]
+    fn optimize_inside_a_transaction_does_its_work_there() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            for prepared_before in [false, true] {
+                let (db, conn) = database(&format!("ivf-rq-optimize-in-tx-{mvcc}-{prepared_before}.db"), mvcc);
+                let mut state = 227;
+                let live = backlog(&conn, &mut state, DIMS);
+                let other = db.connect(crate::ConnectOpts::new()).unwrap();
+                let early = prepared_before.then(|| conn.prepare("OPTIMIZE INDEX v_ivf").unwrap());
+                conn.execute(if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" }).unwrap();
+                match early {
+                    Some(mut optimize) => optimize.run_ignore_rows().unwrap(),
+                    None => conn.execute("OPTIMIZE INDEX v_ivf").unwrap(),
+                }
+                let case = format!("mvcc={mvcc}, prepared before the transaction={prepared_before}");
+                assert!(!conn.get_auto_commit(), "{case}: OPTIMIZE INDEX ended the transaction");
+                let left = stored(&conn).pending();
+                assert!(left.is_empty(), "{case}: work left inside the transaction: {left:?}");
+                assert!(!stored(&other).pending().is_empty(), "{case}: another connection saw the work before the commit");
+                conn.execute("COMMIT").unwrap();
+                let left = stored(&other).pending();
+                assert!(left.is_empty(), "{case}: work left after the commit: {left:?}");
+                for _ in 0..3 {
+                    let q = random(&mut state, DIMS);
+                    assert_eq!(top_ten(&other, &q), exact_top_ten(&live, &q), "{case}");
+                }
+            }
+        }
+    }
+
+    /// An OPTIMIZE INDEX dropped between its steps leaves its connection outside any transaction,
+    /// another connection free to write and the steps it committed in place, and the next one
+    /// finishes the work.
+    #[test]
+    fn an_optimize_dropped_between_steps_leaves_the_rest_to_the_next() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (db, conn) = database(&format!("ivf-rq-optimize-dropped-{mvcc}.db"), mvcc);
+            let mut state = 229;
+            let mut live = backlog(&conn, &mut state, DIMS);
+            let mut optimize = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
+            assert!(step_to_yield(&db, &mut optimize), "mvcc={mvcc}: OPTIMIZE INDEX did all its work in one step");
+            drop(optimize);
+            assert!(conn.get_auto_commit(), "mvcc={mvcc}: the dropped OPTIMIZE INDEX left its connection in a transaction");
+            let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+            let row = (100_001, random(&mut state, DIMS));
+            insert_all(&writer, std::slice::from_ref(&row));
+            live.insert(row.0, row.1);
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let left = stored(&conn).pending();
+            assert!(left.is_empty(), "mvcc={mvcc}: work left after the next OPTIMIZE INDEX: {left:?}");
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// Under MVCC concurrent writers whose statements maintain the index all commit, each
+    /// inserting rows near two centres and deleting older ones, their statements interleaved in a
+    /// random order: a maintenance job leaves for later a partition another transaction holds or
+    /// has committed past its snapshot, where its own write there would lose at commit. With the
+    /// jobs claiming every partition, a writer's COMMIT failed.
+    #[test]
+    fn concurrent_writers_maintaining_the_index_all_commit() {
+        const DIMS: usize = 16;
+        const WRITERS: usize = 3;
+        let (db, conn) = database("ivf-rq-concurrent-writers.db", true);
+        let mut state = 233;
+        let centres: Vec<Vec<f32>> = (0..4).map(|_| random(&mut state, DIMS).iter().map(|x| 3.0 * x).collect()).collect();
+        let mut live: HashMap<i64, Vec<f32>> = (1..=3000i64).map(|id| (id, near(&mut state, &centres, 0.4))).collect();
+        let mut vectors: Vec<(i64, Vec<f32>)> = live.iter().map(|(id, v)| (*id, v.clone())).collect();
+        vectors.sort_by_key(|(id, _)| *id);
+        insert_all(&conn, &vectors);
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+        let writers: Vec<Arc<crate::Connection>> = (0..WRITERS).map(|_| db.connect(crate::ConnectOpts::new()).unwrap()).collect();
+        let insert = |rows: &[(i64, Vec<f32>)]| format!("INSERT INTO v VALUES {}", rows.iter().map(|(id, v)| format!("({id}, {})", literal(v))).collect::<Vec<_>>().join(","));
+        let mut open: Vec<Option<(Vec<(i64, Vec<f32>)>, Vec<i64>, Interleaved)>> = (0..WRITERS).map(|_| None).collect();
+        let (mut next, mut committed) = (3000i64, 0usize);
+        // Each transaction also deletes rows of the first 3,000, each once, so blocks gather stale
+        // copies and compactions come due beside the packs.
+        let mut doomed: Vec<i64> = (1..=3000).collect();
+        while committed < 120 || open.iter().any(Option::is_some) {
+            let w = ((random(&mut state, 1)[0] + 0.5) * WRITERS as f32) as usize % WRITERS;
+            if open[w].is_none() {
+                if committed >= 120 {
+                    continue;
+                }
+                // Rows near two of the centres, so the writers keep landing in the same partitions.
+                let rows: Vec<(i64, Vec<f32>)> = (0..8)
+                    .map(|_| {
+                        next += 1;
+                        (next, near(&mut state, &centres[..2], 0.05))
+                    })
+                    .collect();
+                let gone: Vec<i64> = (0..8).map(|_| doomed.swap_remove(((random(&mut state, 1)[0] + 0.5) * doomed.len() as f32) as usize % doomed.len())).collect();
+                let delete = |ids: &[i64]| format!("DELETE FROM v WHERE id IN ({})", ids.iter().map(i64::to_string).collect::<Vec<_>>().join(","));
+                let sql = ["BEGIN CONCURRENT".to_string(), insert(&rows[..4]), delete(&gone[..4]), insert(&rows[4..]), delete(&gone[4..]), "COMMIT".to_string()];
+                open[w] = Some((rows, gone, Interleaved::new(&writers[w], &sql)));
+            }
+            let (rows, gone, transaction) = open[w].as_mut().expect("opened above");
+            if transaction.turn(&db) {
+                live.extend(rows.drain(..));
+                for id in gone.drain(..) {
+                    live.remove(&id);
+                }
+                open[w] = None;
+                committed += 1;
+            }
+        }
+        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        let left = stored(&conn).pending();
+        assert!(left.is_empty(), "work left after OPTIMIZE INDEX: {left:?}");
+        for _ in 0..3 {
+            let q = near(&mut state, &centres[..2], 0.05);
+            assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
         }
     }
 

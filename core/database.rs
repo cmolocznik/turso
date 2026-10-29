@@ -2496,6 +2496,23 @@ impl Database {
         )
     }
 
+    /// A connection for the engine's own work, with no statistics refresh: it runs no query the
+    /// planner chooses for.
+    pub(crate) fn connect_internal(
+        self: &Arc<Database>,
+        encryption_key: Option<EncryptionKey>,
+        page_codec: Option<Arc<dyn PageCodec>>,
+    ) -> Result<Arc<Connection>> {
+        self._connect(
+            false,
+            None,
+            encryption_key,
+            page_codec,
+            ConnectionContext::default(),
+            StatsRefresh::Deferred,
+        )
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect_with_context<C: Any + Send + Sync>(
         self: &Arc<Database>,
@@ -2747,6 +2764,8 @@ impl Database {
             vtab_txn_states: RwLock::new(HashSet::default()),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
             has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),
+            index_method_optimize_step: AtomicU8::new(0),
+            index_method_optimize_left: AtomicBool::new(false),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),

@@ -14817,10 +14817,55 @@ pub fn op_index_method_optimize(
         .as_mut()
         .expect("cursor should exist")
         .as_index_method_mut();
-    return_if_io!(state, cursor.optimize(&context));
+    // On a step connection the statement is one step of an OPTIMIZE INDEX in steps.
+    use crate::index_method::optimize_steps::OptimizeStep;
+    match OptimizeStep::of(&program.connection) {
+        OptimizeStep::Whole => {
+            return_if_io!(state, cursor.optimize(&context));
+        }
+        step => {
+            let first = step == OptimizeStep::First;
+            let left = return_if_io!(state, cursor.optimize_step(&context, first));
+            program
+                .connection
+                .index_method_optimize_left
+                .store(left, Ordering::Release);
+        }
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_index_method_optimize_steps(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IndexMethodOptimizeSteps { db, index }, insn);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly.into());
+    }
+    let steps = state.optimize_steps.get_or_insert_with(|| {
+        Box::new(crate::index_method::optimize_steps::OptimizeSteps::new(
+            *db, index,
+        ))
+    });
+    match steps.step(&program.connection) {
+        Ok(IOResult::Done(())) => {
+            state.optimize_steps = None;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
+        // A busy step goes on from where it is when the statement is stepped again.
+        Err(error) if matches!(*error, LimboError::Busy) => Err(error),
+        Err(error) => {
+            state.optimize_steps = None;
+            Err(error)
+        }
+    }
 }
 
 pub fn op_index_method_query(

@@ -1468,12 +1468,22 @@ pub fn translate_drop_index(
 /// Translate `OPTIMIZE INDEX [idx_name]` statement.
 /// If idx_name is provided, optimize that specific index.
 /// If idx_name is None, optimize all index method indexes.
+/// The transaction an `OPTIMIZE INDEX` statement begins.
+pub enum OptimizeTransaction {
+    Write,
+    /// The first step of an `OPTIMIZE INDEX` in steps, which reads what work there is.
+    Read,
+    /// None: every index it optimizes runs its work in steps on connections of the engine's.
+    None,
+}
+
+/// Translate `OPTIMIZE INDEX`, and say which transaction the statement begins.
 pub fn translate_optimize(
     idx_name: Option<ast::QualifiedName>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-) -> crate::Result<()> {
+) -> crate::Result<OptimizeTransaction> {
     if !connection.experimental_index_method_enabled() {
         crate::bail_parse_error!(
             "OPTIMIZE INDEX requires experimental index method feature. Enable with --experimental-index-method flag"
@@ -1531,12 +1541,39 @@ pub fn translate_optimize(
 
         if indexes_to_optimize.is_empty() {
             tracing::debug!("OPTIMIZE INDEX: no index method indexes found to optimize");
-            return Ok(());
+            return Ok(OptimizeTransaction::Write);
         }
     }
 
+    // Outside a transaction an index whose method optimizes in steps is optimized on a connection
+    // beside this one, which opens its database as its main database with this connection's key or
+    // page codec: an attached database with either of its own, or the temp database, is optimized
+    // in this statement's transaction instead.
+    let steps_beside = |database_id: usize| match database_id {
+        crate::MAIN_DB_ID => true,
+        crate::TEMP_DB_ID => false,
+        _ => connection
+            .get_pager_from_database_index(&database_id)
+            .is_ok_and(|pager| !pager.is_encryption_ctx_set() && !pager.has_external_page_codec()),
+    };
+    let stepped = connection.get_auto_commit()
+        && !connection.is_nested_stmt()
+        && indexes_to_optimize.iter().all(|(database_id, idx)| {
+            idx.index_method
+                .as_ref()
+                .is_some_and(|method| method.definition().optimize_in_steps)
+                && steps_beside(*database_id)
+        });
+
     // Emit optimize instructions for each index method index
     for (database_id, idx) in &indexes_to_optimize {
+        if stepped {
+            program.emit_insn(Insn::IndexMethodOptimizeSteps {
+                db: *database_id,
+                index: idx.name.clone(),
+            });
+            continue;
+        }
         let cursor_id = program.alloc_cursor_index(None, idx)?;
         program.emit_insn(Insn::IndexMethodOptimize {
             db: *database_id,
@@ -1544,7 +1581,16 @@ pub fn translate_optimize(
         });
     }
 
-    Ok(())
+    Ok(match stepped {
+        true => OptimizeTransaction::None,
+        false
+            if crate::index_method::optimize_steps::OptimizeStep::of(connection)
+                == crate::index_method::optimize_steps::OptimizeStep::First =>
+        {
+            OptimizeTransaction::Read
+        }
+        false => OptimizeTransaction::Write,
+    })
 }
 
 #[cfg(test)]

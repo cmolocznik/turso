@@ -6,8 +6,9 @@ Upstream Turso (`tursodatabase/turso`, `main`) with the changes below on top, on
   `git log upstream/main..main`.
 - `feat/additions` is `main` plus the additions, listed by `git log main..feat/additions`.
 - `fix/set-waker-lost-wakeup`, `fix/mvcc-checkpoint-trigger`, `fix/mvcc-exact-rowid-seek`,
-  `fix/index-method-limit-before-aggregates`, `fix/index-method-column-collation` and
-  `fix/btree-overflow-copy` each hold one of `main`'s fixes alone on `upstream/main`.
+  `fix/index-method-limit-before-aggregates`, `fix/index-method-column-collation`,
+  `fix/btree-overflow-copy` and `fix/mvcc-reopen-after-log-truncation` each hold one of `main`'s
+  fixes alone on `upstream/main`.
 
 This file is only on `feat/additions`, so `main`'s commits can go upstream as they are. Keep it in
 step with the two logs: a change lands here when it lands, with what it fixes and what proves it.
@@ -82,6 +83,22 @@ payload is now reserved at its full size when the chain is first read, and each 
 with `extend_from_slice` after a fallible `try_reserve`, as `copy_payload_range` does. At 256 probes
 over glove-100 the blocks' reads took 3,535 µs a query instead of 4,524. No behaviour changes, so
 no new test; every read of an overflowing record goes through it. Its PR waits for Clay's go.
+
+### An MVCC database killed between a checkpoint's two truncations would not open
+`core/mvcc/database/mod.rs`, the recovery of an interrupted checkpoint. A Truncate checkpoint (the
+default under MVCC) empties the logical log, syncs it, and then truncates the WAL, so a crash
+between the two leaves an empty log beside WAL frames the checkpoint had already backfilled into
+the synced database file. Opening such a database failed with "WAL has committed frames but
+logical log header is missing" unless passive checkpoints were enabled, where the same state is
+the steady one. On upstream `main` (`6d8f8b18a`) `fork-repro`'s `mvcc_reopen` (an MVCC table
+written by a process killed at a random 0.1 to 1.5 s, PRAGMA wal_checkpoint(TRUNCATE) every few
+commits) left a database that would not open within 3, 6 and 7 kills on three seeds. Upstream's
+passive checkpoint (`7e8aa5c58`) had made recovery accept this state; `b80c92fb9` then refused it
+again outside passive mode. Nothing in it is lost or left to replay, so recovery now backfills the
+WAL and writes a fresh header whatever the mode. With the fix the three seeds pass 200 kills each.
+Test: `mvcc::database::tests::test_reopen_after_crash_between_logical_log_and_wal_truncation`, which
+stops a checkpoint once the log is empty and the WAL file still holds its frames, and reopens.
+Found by the ivf_rq kill harness below. Its PR waits for Clay's go.
 
 ## Additions
 
@@ -433,6 +450,39 @@ during it, OPTIMIZE taking 8.9 s against 10.1. On the file (710,108 rows and 236
 disk decided the runs: the writer stalled 1.1 and 1.3 s in the build without the change and 17.6
 and 22.5 s in the one with it, which no in-memory run showed.
 
+### Checking an `ivf_rq` index against its table
+`ivf_rq::check(connection, index)` (`core/index_method/ivf_rq.rs`) reads an index whole, in the
+connection's open transaction or one of its own, and reports each way it disagrees with its table
+or with itself: a row with a vector and no row in the index, or the reverse; a code missing from
+where the vector's row in the index says, or held there twice; a copy in a block that is neither
+the live code nor on its vector's dead row; a dead row naming a block that holds no copy, or the
+block that holds the live code; a code that is not its row's vector coded against the centroid
+version it names, or that names a version the index does not hold; bookkeeping whose packed count
+differs from its blocks, a block past the next sequence, a move range outside the blocks, and a
+retired partition that holds anything. It holds a location per row and reads each indexed row's
+vector once. `PRAGMA integrity_check` walks the backing tables' B-trees but skips index-method
+indexes' contents. Tests: `the_check_finds_the_index_consistent_after_every_kind_of_write` (WAL and
+MVCC, every live code coded again and compared), `the_check_reports_each_way_the_index_can_disagree_with_its_table`
+(seven corruptions, each reported), and the check now ends `a_random_workload_keeps_every_answer_exact`
+and `concurrent_writers_maintaining_the_index_all_commit`.
+
+`fork-repro`'s `ivf_crash` kills a process writing an index (inserts, updates, deletes, alone and in
+transactions it commits or rolls back, stepped OPTIMIZE INDEX, checkpoints; a real file, synchronous
+NORMAL) at a random 0.2-2.5 s, reopens the database, and checks it: `PRAGMA integrity_check`,
+`ivf_rq::check`, and the top ten of three queries, every candidate reranked, against a brute-force
+scan. One thread: 200 of 200 rounds under WAL (to 351,834 rows) and 200 of 200 under MVCC (to
+542,741 rows). Four writers beside a thread running OPTIMIZE INDEX: 60 of 60 under WAL (one round
+went 2 s without a commit, one thread in an fsync of this host's disk).
+
+Its workload found, before any kill, that a split rolled back with its transaction left the
+partition it opened among those the next statements survey (`SharedState::due`), and the model,
+reloaded without the split, held no centroid for it. `Model::state` called such a partition live,
+so a statement found it live and empty, retired it and wrote past the end of the model's states:
+the process panicked. A partition the model holds no centroid for is now retired as far as any job
+goes, but for an untrained index's origin, and a retirement of one the model does not hold is an
+error rather than a panic. `transactions_rolled_back_over_maintenance_leave_the_index_consistent`
+(one connection, a sixth of its transactions rolled back) failed within 2 s before the fix.
+
 ## Considered and not taken
 
 ### Parking a commit that waits on a commit dependency
@@ -447,3 +497,16 @@ change.
 ### `PRAGMA wal_autocheckpoint` intercept
 Our 0.8.3 copy intercepted `wal_autocheckpoint` to turn the WAL auto-checkpoint off per
 connection. Upstream `main` implements the pragma.
+
+### SQLite's auto-checkpoint trigger
+Under WAL a commit runs the passive auto-checkpoint once more than the threshold (1,000 frames) is
+not yet backfilled (`WalFile::should_checkpoint`); SQLite runs it after every commit once the WAL
+holds the threshold. A reader on an older snapshot stops a passive checkpoint short of the WAL's
+end, and the WAL restarts only after a whole backfill, so beside overlapping readers Turso's WAL
+grows without bound. `fork-repro`'s `wal_growth` (one writer inserting a 200-byte row a
+transaction, readers counting the table, 6 s, synchronous NORMAL) restarted the WAL 0-4 times and
+grew it to 74,693-253,953 frames (0.3-1.0 GB); with SQLite's trigger the same build restarted it
+9-26 times and held it to 1,068-1,102 frames. The trigger costs the writer a checkpoint and its two
+fsyncs after nearly every commit while readers hold the WAL: 23,842 commits against 74,601 beside
+one reader, 9,051 against 219,790 beside four. Not taken. Four writers and no reader starve both
+engines: neither restarted in most 6 s runs, and SQLite 3.51.2 reached 341,741-576,519 frames.

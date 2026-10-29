@@ -280,8 +280,81 @@ unbalanced, and at 48 probes they hold 4.3% of the vectors against ivf_rq's 2.9%
 scanned ivf_rq's partitions find more of the top ten (0.910 against 0.901 near 2.9%, 0.957 against
 0.951 near 5.8%), and its estimates lose none of them (`tmp/ann/partcmp/partcmp.py`). Still owed: the
 rest of the gap at one query at a time, which is the cost of each scanned vector (about 56 ns all in
-at 768 dimensions against the library's 30), and a probe's page reads while a transaction writing
-the index is open; the build takes 26 s on glove-100 over the laptop's cores.
+at 768 dimensions against the library's 30); the build takes 26 s on glove-100 over the laptop's
+cores. A probe reads from pages only the partitions an open transaction has written (see
+`OPTIMIZE INDEX` in steps).
+
+### `OPTIMIZE INDEX` in steps
+`core/index_method/optimize_steps.rs`, `Insn::IndexMethodOptimizeSteps`, translated in
+`translate_optimize` (`core/translate/index.rs`), `Connection::connect_beside`. An index method can
+declare `optimize_in_steps` (`core/index_method/mod.rs`); ivf_rq does. Outside a transaction,
+`OPTIMIZE INDEX` of such indexes then holds no transaction of its own: it opens a connection beside
+the statement's, with its key, page codec, synchronous level and automatic WAL maintenance, and
+runs the method's work there one step to a transaction (`IndexMethodCursor::optimize_step`):
+`BEGIN CONCURRENT` under MVCC, `BEGIN IMMEDIATE` under WAL, the first step a read transaction that
+only finds the work. It yields between steps. A step that finds the write lock held reports busy
+to the statement's busy handler and goes on from where it was; one whose commit loses to a
+concurrent transaction is done again, up to 16 in a row. Inside a transaction, or for an index in
+the temp database or an attached database with a key or codec of its own, it does all the work in
+the statement's transaction, as before. Dropping the statement drops the step connection, which
+rolls back a step in flight.
+
+Before, `OPTIMIZE INDEX` did every job in one write transaction: under WAL every writer waited for
+all of it, and under MVCC it held the exclusive transaction, so every concurrent commit made
+during it failed. ivf_rq's steps do up to 16 jobs and start none past 10 ms once they have done
+one; the first surveys every partition and does no job, and each later one surveys at most 16 of
+the partitions known to be moving and 16 of those runs left work due in. Tests:
+`optimize_gives_way_to_writers_between_its_steps` (a writer stepped beside it commits between its
+steps; failed before with "ended without once giving way to a writer"),
+`an_optimize_dropped_between_steps_leaves_the_rest_to_the_next` (failed before: "did all its work
+in one step"), `optimize_inside_a_transaction_does_its_work_there`.
+
+Measured on glove-100 (355,054 rows indexed, then 118,351 more inserted with statement maintenance
+off, so 4.8-5.1 thousand jobs were due; 4 KB pages, synchronous NORMAL; a writer committing 20
+one-row transactions a second and two readers at 128 probes beside it, on efficiency cores;
+`ivfrq-load optimize`, `tmp/ann/optimize.sh`, `tmp/ann/load/optimize/*.wal2.*`, `*.mvcc2.*`). Under
+WAL, in one transaction OPTIMIZE took 4.5 s and the writer's longest transaction 4.1 s, blocked for
+the whole run (11.8 s of 17.8 s in an earlier run); in steps it took 17.3 s, the writer kept its pace
+(347 transactions, none failed, p50 1.9 ms, p99 233 ms, longest 630 ms, against p99 17 ms and a
+longest 22 ms before OPTIMIZE started), and the readers ran 1,597 queries a second against 878.
+Under MVCC in one transaction OPTIMIZE took 10.8 s, and the `BEGIN CONCURRENT` writer beside it
+committed once, 3,975 of its commits failing against OPTIMIZE's exclusive transaction, while the
+readers ran 200 queries a second; in steps it took 7.8 s, the writer committed all 156 of its
+transactions at its pace (p99 16 ms, longest 19.5 ms, none failed) and the readers ran 2,015. Every
+commit empties the other connections' page caches, the step connection's among them whenever the
+writer commits; how much of the slower stepped run under WAL that accounts for is not measured.
+
+A step takes the partitions no other
+transaction holds: up to 16 of those known to be moving and 16 of those left due, the latter
+from where the last step stopped, passing over any another transaction holds or committed past
+the step's snapshot; a step that finds all the work left held does none and waits, and after 64
+such steps in a row the statement ends (`OptimizeProgress`). The first steps took the 16
+lowest-numbered due partitions whatever held them, and a step that could do none of their jobs
+ended the run: beside the writer, OPTIMIZE stopped after 0.8 s with 96,645 tail entries left
+(`optimize_works_around_the_partitions_an_open_transaction_holds`, which left 30 tails unpacked
+outside the 16 partitions a writer's open transaction held).
+
+Under MVCC a maintenance job could write a partition's rows that another transaction had committed
+past the job's snapshot and then lose at commit, first committer winning, failing the whole
+transaction, a writer's included; the engine's write-time check sees only uncommitted versions. A
+job now leaves for later a partition another open transaction has written, or one committed past
+its snapshot (`IvfRqCursor::claimable`), by the index's record of its writers, which now also
+records the generation row and keeps across a schema reload the highest position it knew
+(`FLOORS`). `concurrent_writers_maintaining_the_index_all_commit`: three `BEGIN CONCURRENT`
+writers inserting and deleting, their statements interleaved at random, all commit; with every
+job claiming its partitions a writer's COMMIT failed with WriteWriteConflict, as the writer beside
+the stepped OPTIMIZE did. Still open under MVCC: a delete or update of a vector that maintenance
+moved after the deleting transaction's snapshot fails with WriteWriteConflict, as any write to a
+row a concurrent transaction changed does; `BEGIN CONCURRENT` clients retry.
+
+Held rows of a partition no open writer has written now serve other snapshots
+(`an_open_writer_keeps_from_the_held_rows_only_the_partitions_it_wrote`: a full-probe query beside
+a one-row insert read 46 partitions' pages before, one after). `a_random_workload_keeps_every_answer_exact`
+runs three connections' transactions and autocommit statements, inserting, deleting, updating,
+rolling back and querying, beside OPTIMIZE INDEX in steps, interleaved at random under WAL and
+MVCC, and checks each answer against the exact top ten of its snapshot and own writes (741 queries
+over the two default seeds of each mode; IVF_RQ_WORKLOAD_SEEDS for more). With the held rows served
+whatever writer was open, it failed at once.
 
 ## Considered and not taken
 

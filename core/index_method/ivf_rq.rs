@@ -17,9 +17,9 @@
 //! bookkeeping held when they were read: a query whose snapshot holds that version scores them
 //! there and reads only the partition's dead rows and tail from pages. Its bookkeeping, dead rows
 //! and tail are held beside the blocks with the snapshot they were read under, and serve a probe
-//! under another snapshot, which then reads no page, while no transaction writing the index is
-//! open and both snapshots are past the last commit that wrote the partition, as the index's
-//! writers record it ([`Writes`]); not where other processes write the database. The memory is
+//! under another snapshot, which then reads no page, while no open transaction has written the
+//! partition and both snapshots are past the last commit that wrote it, as the index's writers
+//! record it ([`Writes`]); not where other processes write the database. The memory is
 //! bounded by the index's `cache_mib` parameter (default [`DEFAULT_CACHE_MIB`]), not by the index's
 //! size: the least recently probed partition gives way first.
 //!
@@ -2176,13 +2176,14 @@ fn position(snapshot: IndexMethodSnapshotIdentity) -> Option<Position> {
 }
 
 /// What every attachment of one index in this process knows of the transactions writing it, so the
-/// rows a probe held under one snapshot can serve another. A transaction is entered in `open`
-/// before its first write to the partitions table reaches a page, and taken off when it ends, each
-/// partition it wrote then raised in `changed` to the commit position. Its commit is visible before
-/// that, and a snapshot can't tell whether a write it sees was committed before it or after, so
-/// rows held under one snapshot serve another only while no writer is open and both are at or past
-/// the partition's `changed` position: every commit that wrote it precedes both, and a writer that
-/// begins after the check commits too late for either to see.
+/// rows a probe held under one snapshot can serve another. A transaction is entered in `open` with
+/// each partition it writes before its write to the partition reaches a page, and taken off when it
+/// ends, each partition it wrote then raised in `changed` to the commit position. Its commit is
+/// visible before that, and a snapshot can't tell whether a write it sees was committed before it
+/// or after, so rows of a partition held under one snapshot serve another only while no open
+/// writer has written the partition and both are at or past its `changed` position: every commit
+/// that wrote it precedes both, and a writer that writes it after the check commits too late for
+/// either to see.
 #[derive(Debug)]
 struct Writes {
     /// The index's key in [`WRITES`].
@@ -2244,19 +2245,24 @@ impl Writes {
         }
     }
 
+    /// Whether an open writer has written `partition`.
+    fn written(&self, partition: i64) -> bool {
+        self.open.values().any(|writer| writer.partitions.contains(&partition))
+    }
+
     /// Whether rows of `partition` held under `held` serve a probe under `snapshot`.
     fn serves(&mut self, partition: i64, held: Position, snapshot: Position, now: impl FnOnce() -> Position) -> bool {
         self.settle(now);
         let changed = self.changed(partition);
-        self.open.is_empty() && held >= changed && snapshot >= changed
+        !self.written(partition) && held >= changed && snapshot >= changed
     }
 
-    /// Whether rows of `partition` read under `snapshot` may be held: no writer is open, so none of
-    /// them is a writer's own, and the snapshot is at or past the partition's last commit, so they
-    /// can serve another.
+    /// Whether rows of `partition` read under `snapshot` may be held: no open writer has written the
+    /// partition, so none of them is a writer's own, and the snapshot is at or past its last commit,
+    /// so they can serve another.
     fn holds(&mut self, partition: i64, snapshot: Position, now: impl FnOnce() -> Position) -> bool {
         self.settle(now);
-        self.open.is_empty() && snapshot >= self.changed(partition)
+        !self.written(partition) && snapshot >= self.changed(partition)
     }
 }
 
@@ -6355,6 +6361,45 @@ mod tests {
                 assert!(seeks(&live) > 0, "the query after a checkpoint and a commit read no page");
                 assert_eq!(seeks(&live), 0, "the partitions read after the checkpoint were not held");
             }
+        }
+    }
+
+    /// While a transaction writing one partition is open, a query probing every partition reads
+    /// that partition from pages and takes every other's held rows, under WAL and under MVCC; once
+    /// the transaction commits, the next query reads the partition again and finds its row.
+    #[test]
+    fn an_open_writer_keeps_from_the_held_rows_only_the_partitions_it_wrote() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (db, writer) = database(&format!("ivf-rq-open-writer-{mvcc}.db"), mvcc);
+            let mut state = 239;
+            let mut live: HashMap<i64, Vec<f32>> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            let mut vectors: Vec<(i64, Vec<f32>)> = live.iter().map(|(id, v)| (*id, v.clone())).collect();
+            vectors.sort_by_key(|(id, _)| *id);
+            insert_all(&writer, &vectors);
+            writer.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let reader = db.connect(crate::ConnectOpts::new()).unwrap();
+            let q = random(&mut state, DIMS);
+            let seeks = |live: &HashMap<i64, Vec<f32>>| {
+                let before = WALK_SEEKS.with(|c| c.get());
+                assert_eq!(top_ten(&reader, &q), exact_top_ten(live, &q), "mvcc={mvcc}");
+                WALK_SEEKS.with(|c| c.get()) - before
+            };
+            seeks(&live);
+            seeks(&live);
+            assert_eq!(seeks(&live), 0, "mvcc={mvcc}: a query over held partitions read pages");
+            // One row near the query, coded into one partition's tail and nothing else.
+            let near: Vec<f32> = q.iter().map(|a| 2.0 * a).collect();
+            writer.execute("BEGIN").unwrap();
+            STATEMENT_UPKEEP.with(|on| on.set(false));
+            writer.execute(format!("INSERT INTO v VALUES (3001, {})", literal(&near))).unwrap();
+            STATEMENT_UPKEEP.with(|on| on.set(true));
+            assert_eq!(seeks(&live), 1, "mvcc={mvcc}: beside a writer of one partition, a query read other partitions' pages");
+            assert_eq!(seeks(&live), 1, "mvcc={mvcc}: the partition the writer holds was held");
+            writer.execute("COMMIT").unwrap();
+            live.insert(3001, near);
+            assert_eq!(seeks(&live), 1, "mvcc={mvcc}: the query after the commit read other partitions' pages");
+            assert_eq!(seeks(&live), 0, "mvcc={mvcc}: the partition read after the commit was not held");
         }
     }
 

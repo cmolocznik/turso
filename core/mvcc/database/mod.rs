@@ -68,8 +68,8 @@ pub use checkpoint_state_machine::{
 };
 
 mod background_checkpoint;
-use background_checkpoint::BackgroundCheckpoint;
 pub use background_checkpoint::background_checkpoint_stats;
+use background_checkpoint::BackgroundCheckpoint;
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -5455,6 +5455,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row: Row,
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
+        self.insert_row(tx_id, row, maybe_index_id, false)
+    }
+
+    /// [`Self::insert_to_table_or_index`]; with `refuse_unseen`, a table row's insert over a write
+    /// the transaction's snapshot does not include ([`chain_has_unseen_write`]) fails at once with
+    /// [`LimboError::WriteWriteConflict`] and inserts nothing.
+    pub fn insert_row(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+        refuse_unseen: bool,
+    ) -> Result<()> {
         tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
         let tx = self
             .txs
@@ -5509,8 +5522,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     btree_resident: false,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
-                let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
+                let (row_versions, chain_in_write_set) = self.insert_version_refusing(
+                    id.clone(),
+                    row_version,
+                    refuse_unseen.then_some(tx),
+                )?;
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 tx.record_created_table_version(id.clone(), version_id);
@@ -5531,6 +5547,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
         row: Row,
         maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
+        self.insert_btree_resident_row(tx_id, row, maybe_index_id, false)
+    }
+
+    /// [`Self::insert_btree_resident_to_table_or_index`]; with `refuse_unseen`, a table row's
+    /// version over a write the transaction's snapshot does not include fails at once with
+    /// [`LimboError::WriteWriteConflict`]: another transaction's version of a row the B-tree holds,
+    /// or its deletion marker, is otherwise found only at commit.
+    pub fn insert_btree_resident_row(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+        refuse_unseen: bool,
     ) -> Result<()> {
         tracing::trace!(
             "insert_btree_resident(tx_id={}, row.id={:?})",
@@ -5582,8 +5612,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     btree_resident: true,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
-                let (row_versions, chain_in_write_set) =
-                    self.insert_version(id.clone(), row_version)?;
+                let (row_versions, chain_in_write_set) = self.insert_version_refusing(
+                    id.clone(),
+                    row_version,
+                    refuse_unseen.then_some(tx),
+                )?;
                 tx.record_created_table_version(id.clone(), version_id);
                 if !chain_in_write_set {
                     tx.add_to_write_set(id, row_versions);
@@ -5675,6 +5708,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
         btree_record: Option<&ImmutableRecord>,
     ) -> Result<bool> {
+        self.delete_row(tx_id, id, maybe_index_id, btree_record, false)
+    }
+
+    /// [`Self::delete_from_table_or_index`]; with `refuse_unseen`, a table row's delete over a write
+    /// the transaction's snapshot does not include fails at once with
+    /// [`LimboError::WriteWriteConflict`] and deletes nothing: another transaction's version of a
+    /// row the B-tree holds is otherwise found only at commit.
+    pub fn delete_row(
+        &self,
+        tx_id: TxID,
+        id: RowID,
+        maybe_index_id: Option<MVTableId>,
+        btree_record: Option<&ImmutableRecord>,
+        refuse_unseen: bool,
+    ) -> Result<bool> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
         let tx = self
             .txs
@@ -5756,6 +5804,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let mut locked_row_versions = row_versions.write();
                 if !self.table_versions_still_mapped(&id, &row_versions) {
                     continue;
+                }
+                if refuse_unseen
+                    && chain_has_unseen_write(
+                        &locked_row_versions,
+                        tx,
+                        &self.txs,
+                        &self.finalized_tx_states,
+                    )
+                {
+                    return Err(LimboError::WriteWriteConflict);
                 }
                 let chain_in_write_set = chain_has_version_written_by(&locked_row_versions, tx_id);
                 for rv in locked_row_versions.iter_mut().rev() {
@@ -5852,36 +5910,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Same as read() but can read from a table or an index, indicated by the `maybe_index_id` argument.
-    /// Whether `tx_id` inserting the table row `id`, which its snapshot does not see, would lose at
-    /// commit to another transaction's version of the row: one written by a transaction that is
-    /// still active, preparing or not yet finalized, or one committed after `tx_id` began. An insert
-    /// is checked only at commit (first committer wins), so a writer that can do something other
-    /// than fail asks first.
-    pub fn insert_would_conflict(&self, tx_id: TxID, id: &RowID) -> Result<bool> {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
-        let Some(row_versions) = self.rows.get(id) else {
-            return Ok(false);
-        };
-        let row_versions = row_versions.value().read();
-        for rv in row_versions.iter() {
-            match rv.begin() {
-                Some(TxTimestampOrID::TxID(other)) if other != tx_id => {
-                    match lookup_tx_state(&self.txs, &self.finalized_tx_states, other) {
-                        Some(TransactionState::Aborted | TransactionState::Terminated) => {}
-                        _ => return Ok(true),
-                    }
-                }
-                Some(TxTimestampOrID::Timestamp(begin)) if begin > tx.begin_ts => return Ok(true),
-                _ => {}
-            }
-        }
-        Ok(false)
-    }
-
     pub fn read_from_table_or_index(
         &self,
         tx_id: TxID,
@@ -8740,6 +8768,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// is inserted in the correct order. Returns a reference to the modified version chain,
     /// and whether the chain was already in the write set of the transaction that created
     /// `row_version`.
+    /// [`Self::insert_version`]; with `refuse`, the version is not inserted where the chain holds a
+    /// write the refusing transaction's snapshot does not include.
+    fn insert_version_refusing(
+        &self,
+        id: RowID,
+        row_version: RowVersion,
+        refuse: Option<&Transaction<A>>,
+    ) -> Result<(RowVersions<A>, bool)> {
+        let Some(tx) = refuse else {
+            return Ok(self.insert_version(id, row_version)?);
+        };
+        loop {
+            let row_versions = self.get_or_create_table_row_versions(id.clone())?;
+            let mut versions = row_versions.write();
+            if !self.table_versions_still_mapped(&id, &row_versions) {
+                continue;
+            }
+            if chain_has_unseen_write(&versions, tx, &self.txs, &self.finalized_tx_states) {
+                return Err(LimboError::WriteWriteConflict);
+            }
+            let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
+            self.insert_version_raw(&mut versions, row_version)?;
+            drop(versions);
+            return Ok((row_versions, chain_in_write_set));
+        }
+    }
+
     fn insert_version(
         &self,
         id: RowID,
@@ -11068,6 +11123,32 @@ fn register_commit_dependency<A: ConcurrentAllocator>(
             );
         }
     }
+}
+
+/// Whether a row's version chain holds a write `tx`'s snapshot does not include, by a transaction
+/// that has not rolled back: a version written, or a version ended, by another transaction still
+/// active, preparing, or committed after `tx` began, or one committed after it began. A write over
+/// such a chain loses at commit, the first committer winning.
+fn chain_has_unseen_write<A: ConcurrentAllocator>(
+    versions: &[RowVersion],
+    tx: &Transaction<A>,
+    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
+) -> bool {
+    let unseen = |stamp: Option<TxTimestampOrID>| match stamp {
+        Some(TxTimestampOrID::TxID(other)) if other != tx.tx_id => {
+            match lookup_tx_state(txs, finalized_tx_states, other) {
+                Some(TransactionState::Aborted | TransactionState::Terminated) => false,
+                Some(TransactionState::Committed(at)) => at > tx.begin_ts,
+                _ => true,
+            }
+        }
+        Some(TxTimestampOrID::Timestamp(at)) => at > tx.begin_ts,
+        _ => false,
+    };
+    versions
+        .iter()
+        .any(|rv| unseen(rv.begin()) || unseen(rv.end()))
 }
 
 fn lookup_tx_state<A: ConcurrentAllocator>(

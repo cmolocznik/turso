@@ -132,7 +132,11 @@ impl BackgroundCheckpoint {
                 return false;
             }
         }
-        let mut state = self.signal.state.lock().expect("checkpoint signal poisoned");
+        let mut state = self
+            .signal
+            .state
+            .lock()
+            .expect("checkpoint signal poisoned");
         state.wanted = true;
         self.signal.wake.notify_one();
         true
@@ -150,7 +154,11 @@ impl std::fmt::Debug for BackgroundCheckpoint {
 
 impl Drop for BackgroundCheckpoint {
     fn drop(&mut self) {
-        let mut state = self.signal.state.lock().expect("checkpoint signal poisoned");
+        let mut state = self
+            .signal
+            .state
+            .lock()
+            .expect("checkpoint signal poisoned");
         state.stopped = true;
         self.signal.wake.notify_one();
     }

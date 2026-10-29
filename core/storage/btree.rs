@@ -846,13 +846,12 @@ pub trait CursorTrait: Any + Send + Sync {
     /// not support it ignores it.
     fn set_forward_bound(&mut self, _bound: Option<i64>) {}
 
-    /// Whether inserting the row with `rowid`, which this cursor's snapshot does not see, would lose
-    /// at commit to another transaction's version of it: one not yet committed, or one committed
-    /// after the snapshot. Under MVCC an insert is checked only at commit, the first committer
-    /// winning; a cursor of a database with one writer has no other writer to lose to.
-    fn insert_would_conflict(&mut self, _rowid: i64) -> Result<bool> {
-        Ok(false)
-    }
+    /// Have this cursor's inserts and deletes of table rows refuse, as a write-write conflict at the
+    /// write, a row another transaction has written that this cursor's snapshot does not include,
+    /// which would make the write lose at commit: under MVCC an insert, and a delete of a row only
+    /// the B-tree holds, are otherwise checked only at commit, the first committer winning. A
+    /// cursor of a database with one writer has no other writer to refuse.
+    fn refuse_unseen_writes(&mut self) {}
 
     // --- start: BTreeCursor specific functions ----
     fn invalidate_record(&mut self);

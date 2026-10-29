@@ -572,6 +572,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     btree_advance_state: Option<AdvanceBtreeState>,
     /// The rowid a forward B-tree advance stops at, as its caller's walk ends there.
     forward_bound: Option<i64>,
+    /// Whether this cursor's inserts and deletes refuse rows other transactions wrote unseen.
+    refuse_unseen_writes: bool,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
@@ -646,6 +648,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             count_state: None,
             btree_advance_state: None,
             forward_bound: None,
+            refuse_unseen_writes: false,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             index_peek_epoch: 0,
@@ -1998,13 +2001,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
             self.db
-                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_btree_resident_row(
+                    self.tx_id,
+                    row,
+                    maybe_index_id,
+                    self.refuse_unseen_writes,
+                )
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
         } else {
             self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_row(self.tx_id, row, maybe_index_id, self.refuse_unseen_writes)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -2046,11 +2054,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         } else {
             None
         };
-        self.db.delete_from_table_or_index(
+        self.db.delete_row(
             self.tx_id,
             rowid,
             maybe_index_id,
             btree_record.as_ref(),
+            self.refuse_unseen_writes,
         )?;
         self.invalidate_record();
         Ok(IOResult::Done(()))
@@ -2396,13 +2405,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         true
     }
 
-    fn insert_would_conflict(&mut self, rowid: i64) -> Result<bool> {
-        match self.mv_cursor_type {
-            MvccCursorType::Table => self
-                .db
-                .insert_would_conflict(self.tx_id, &RowID::new(self.table_id, RowKey::Int(rowid))),
-            MvccCursorType::Index(_) => Ok(false),
-        }
+    fn refuse_unseen_writes(&mut self) {
+        self.refuse_unseen_writes = true;
     }
 }
 

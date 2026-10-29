@@ -1682,10 +1682,6 @@ fn apply_step(stores: &mut [Box<dyn CursorTrait>], step: &mut Step, undo: Option
                 IOResult::Done(_) => match required {
                     Some(true) => return Err(error("removed row is absent")),
                     Some(false) => return Ok(IOResult::Done(())),
-                    // A row another transaction inserted and has not committed, or committed past
-                    // this snapshot, makes this insert lose at commit: it conflicts now, while the
-                    // write can still be undone.
-                    None if cursor.insert_would_conflict(rowid)? => return Err(LimboError::WriteWriteConflict.into()),
                     None => *at = Progress::Write(None),
                 },
             },
@@ -3116,7 +3112,12 @@ impl IvfRqCursor {
     fn open_stores(&mut self, context: &IndexMethodContext) -> Result<()> {
         if self.stores.is_empty() {
             for table in &self.schema.tables {
-                self.stores.push(context.open_table_cursor(&table.table_name())?);
+                let mut cursor = context.open_table_cursor(&table.table_name())?;
+                // A write over a row another transaction wrote unseen would lose at commit, failing
+                // the whole transaction; refused at the write, a job is undone and a writer's change
+                // left to maintenance.
+                cursor.refuse_unseen_writes();
+                self.stores.push(cursor);
             }
         }
         if self.main.is_none() {

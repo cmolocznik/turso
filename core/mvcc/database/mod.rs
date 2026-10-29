@@ -9227,13 +9227,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             self.storage.set_header(header);
                         }
                         HeaderReadResult::NoLog => {
-                            if !connection.experimental_mvcc_passive_checkpoint_enabled() {
-                                return Err(LimboError::Corrupt(
-                                    "WAL has committed frames but logical log header is missing"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
+                            // A checkpoint empties the logical log only once every operation
+                            // in it is in the B-tree and the WAL is backfilled into the synced
+                            // database file. A Passive checkpoint then leaves the WAL in place,
+                            // and a Truncate checkpoint truncates it after the log, so a crash
+                            // between the two leaves it too. Nothing is left to replay: backfill
+                            // the WAL and write a fresh header in RetryHeader, as for an
+                            // interrupted checkpoint, with no header to reuse.
                         }
                         HeaderReadResult::Invalid => {
                             // Present but undecodable: a torn header write / genuine

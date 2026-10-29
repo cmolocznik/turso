@@ -3356,6 +3356,74 @@ fn test_checkpoint_allows_index_schema_update_after_rename_column() {
     assert_eq!(rows[0][1].as_int().unwrap(), 2);
 }
 
+/// A TRUNCATE checkpoint empties the logical log before it truncates the WAL, so a crash between
+/// the two leaves an empty log over WAL frames the checkpoint already backfilled into the synced
+/// database file. The database must open with every committed row, as after a Passive checkpoint.
+#[test]
+fn test_reopen_after_crash_between_logical_log_and_wal_truncation() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    let log_path = std::path::Path::new(&db_path).with_extension("db-log");
+    let wal_path = std::path::PathBuf::from(format!("{db_path}-wal"));
+    let size = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |m| m.len());
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint_sm = CheckpointStateMachine::new(
+            pager.clone(),
+            db.get_mvcc_store(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        // Step the checkpoint until it has emptied the logical log while the WAL file still
+        // holds its frames, and stop it there.
+        let mut stopped = false;
+        for _ in 0..10_000 {
+            if size(&log_path) == 0 && size(&wal_path) > WAL_HEADER_SIZE as u64 {
+                stopped = true;
+                break;
+            }
+            match checkpoint_sm.step(&()).unwrap() {
+                TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+                TransitionResult::Continue => {}
+                TransitionResult::Done(_) => break,
+            }
+        }
+        assert!(
+            stopped,
+            "the checkpoint never had an empty log beside committed WAL frames"
+        );
+    }
+
+    remove_file_from_database_registry(&db_path);
+
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("open should recover, not fail closed");
+    let conn = db
+        .connect(ConnectOpts::new())
+        .expect("connect should recover the committed WAL");
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1, "committed row must survive recovery");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "x");
+}
+
 #[test]
 fn test_bootstrap_recovers_committed_wal_without_log_file() {
     // A Passive checkpoint truncates the logical log to 0 but leaves the WAL non-empty,

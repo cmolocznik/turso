@@ -4889,9 +4889,6 @@ impl BTreeCursor {
                                 &child_buf[first_child_offset
                                     ..first_child_offset + header_and_pointer_size],
                             );
-                        // Between the child's pointers and its cells the parent keeps no byte
-                        // of what it held.
-                        parent_buf[parent_offset + header_and_pointer_size..child_top].fill(0);
 
                         sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
                         turso_assert_less_than!(sibling_count_new, balance_info.sibling_count);
@@ -10164,8 +10161,6 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         page.write_cell_content_area(usable_space);
         page.write_first_freeblock(0);
         page.write_fragmented_bytes_count(0);
-        let unallocated_start = page.unallocated_region_start();
-        page.as_ptr()[unallocated_start..usable_space].fill(0);
         debug_validate_cells!(page, usable_space);
         return Ok(());
     }
@@ -13871,6 +13866,39 @@ mod tests {
 
         for (i, cell) in cells.iter().enumerate() {
             ensure_cell(page_contents, i, &cell.payload);
+        }
+    }
+
+    /// Defragmentation packs the cells at the end of the page and keeps no copy of a cell it
+    /// moved: every byte between the cell pointers and the cells is zero, on the full path over
+    /// many freeblocks and on the fast path over one.
+    #[test]
+    pub fn defragmentation_keeps_no_copy_of_a_cell_it_moved() {
+        let (db, _temp_dir) = get_database();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let usable_space = 4096;
+        for (max_frag_bytes, dropped) in [(-1, vec![1, 3, 5, 7]), (60, vec![5])] {
+            let page = get_page(2);
+            let contents = page.get_contents();
+            let mut cells = Vec::new();
+            for i in 0..10 {
+                let blob = Value::from_slice(&vec![0xa0 + i as u8; 100 + 10 * i]).unwrap();
+                let record = ImmutableRecord::from_registers(&[Register::Value(blob)], 1).unwrap();
+                cells.push(add_record(i, i, page.clone(), record, &conn));
+            }
+            for (removed, at) in dropped.iter().enumerate() {
+                drop_cell(contents, at - removed, usable_space).unwrap();
+                cells.remove(at - removed);
+            }
+            defragment_page(contents, usable_space, max_frag_bytes).unwrap();
+            for (i, cell) in cells.iter().enumerate() {
+                ensure_cell(contents, i, cell);
+            }
+            let gap = contents.unallocated_region_start()..contents.cell_content_area() as usize;
+            assert!(
+                contents.as_ptr()[gap.clone()].iter().all(|byte| *byte == 0),
+                "max_frag_bytes={max_frag_bytes}: bytes left in {gap:?}"
+            );
         }
     }
 

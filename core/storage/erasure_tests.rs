@@ -636,3 +636,40 @@ fn secure_delete_is_set_for_the_database() {
     }
     assert!(conn.execute("PRAGMA secure_delete = 3").is_err());
 }
+
+/// Pages taken back off the freelist leave no pointer to them on its trunk page past the leaves it
+/// still lists.
+#[test]
+fn pages_taken_off_the_freelist_leave_no_pointer_behind() {
+    for mvcc in [false, true] {
+        let dir = scratch();
+        let path = dir.path().join("erase.db");
+        let (db, conn) = open(&path);
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("PRAGMA secure_delete = ON").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)")
+            .unwrap();
+        for id in 0..20 {
+            conn.execute(format!("INSERT INTO t VALUES ({id}, zeroblob(20000))"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("DELETE FROM t").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let free = integer(&conn, "PRAGMA freelist_count");
+        conn.execute("INSERT INTO t VALUES (100, zeroblob(9000))")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let taken = free - integer(&conn, "PRAGMA freelist_count");
+        drop(conn);
+        drop(db);
+        assert!(
+            free > 20 && taken > 1,
+            "mvcc={mvcc}: {free} pages freed, {taken} taken back"
+        );
+        let strays = stray_bytes(&path);
+        assert!(strays.is_empty(), "mvcc={mvcc}: {strays:#?}");
+    }
+}

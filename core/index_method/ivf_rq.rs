@@ -7321,14 +7321,14 @@ mod tests {
         let (deleted, updated) = moved.split_at(moved.len() / 2);
         let ids = |ids: &[i64]| ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         writer.execute(format!("DELETE FROM v WHERE id IN ({})", ids(deleted))).unwrap();
-        let before = POINT_READS.with(|count| count.get());
         for id in updated {
             let v = random(&mut state, DIMS);
+            let before = POINT_READS.with(|count| count.get());
             writer.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&v))).unwrap();
+            let reads = POINT_READS.with(|count| count.get()) - before;
+            assert!(reads < 400, "a one-row update of a transaction with {} rows left to maintenance read {reads} rows by key", deleted.len());
             live.insert(*id, v);
         }
-        let reads = (POINT_READS.with(|count| count.get()) - before) / updated.len();
-        assert!(reads < 400, "a one-row update read {reads} rows by key");
         writer.execute("COMMIT").unwrap();
         for id in deleted {
             live.remove(id);
@@ -7467,6 +7467,50 @@ mod tests {
             let found = check(&conn, "v_ivf").unwrap();
             assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
         }
+    }
+
+    /// OPTIMIZE INDEX settles every row left to maintenance before it ends, however many its steps
+    /// take: 1,100 rowids, more than one step settles.
+    #[test]
+    fn optimize_settles_every_row_left_to_maintenance() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-settle-all-{mvcc}.db"), mvcc);
+            let mut state = 263;
+            let rows: Vec<(i64, Vec<f32>)> = (1..=1500i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &rows);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
+            let chosen: Vec<i64> = (1..=1100).collect();
+            leave_to_maintenance(&conn, mvcc, "v_ivf", &chosen);
+            assert_eq!(check(&conn, "v_ivf").unwrap().pending, chosen.len() as u64, "mvcc={mvcc}");
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// OPTIMIZE INDEX with nothing due and no redo row ends at its first step, which only reads: under
+    /// WAL beside a transaction holding the write lock it ends without waiting for it.
+    #[test]
+    fn optimize_with_nothing_due_ends_at_its_first_step() {
+        const DIMS: usize = 16;
+        let (db, conn) = database("ivf-rq-nothing-due.db", false);
+        let mut state = 269;
+        let rows: Vec<(i64, Vec<f32>)> = (1..=300i64).map(|id| (id, random(&mut state, DIMS))).collect();
+        insert_all(&conn, &rows);
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer.execute("BEGIN IMMEDIATE").unwrap();
+        let mut optimize = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
+        assert!(!step_to_yield(&db, &mut optimize), "OPTIMIZE INDEX with nothing due went on past its first step");
+        writer.execute("ROLLBACK").unwrap();
     }
 
     /// A rebuild codes every vector but those of rows with redo rows, whose codes and vectors' rows it

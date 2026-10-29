@@ -503,6 +503,9 @@ kernel!(kac_hadamard, kac_hadamard_wide, kac_hadamard_body, (x: &mut [f32], sign
 const TILE: usize = 64;
 /// The vectors [`Model::nearest_of`] runs over each tile while it is in cache.
 const NEAREST_GROUP: usize = 16;
+/// The partitions an insert's assignment takes exact products with, after ranking every one over
+/// the int8 centroids.
+const ASSIGN_RECHECK: usize = 32;
 
 /// `v`'s products with a tile's centroids, the tile laid out dimension by dimension.
 #[inline(always)]
@@ -1114,6 +1117,71 @@ impl Model {
         self.nearest_of(&[v])[0]
     }
 
+    /// The partition an insert codes `v` into: its nearest live partition by the loss
+    /// [`Self::nearest_of`] takes, found as [`Self::probes`] ranks partitions. Every live
+    /// partition's loss is taken over the int8 centroids, and the [`ASSIGN_RECHECK`] lowest again
+    /// from exact products summed as a tile sums them, so the rounding, a few thousandths of a
+    /// product, moves none past the nearest and the partition is the one [`Self::nearest`] finds.
+    fn assign(&self, v: &[f32]) -> usize {
+        let square = dot32(v, v);
+        let length = square.sqrt().max(f32::MIN_POSITIVE);
+        let mut ranked = Vec::with_capacity(self.centroids.len());
+        let mut products = [0.0f32; TILE];
+        for (first, tile) in self.tiles.bytes() {
+            tile_products_bytes(v, tile, &mut products);
+            for (k, product) in products[..(self.centroids.len() - first).min(TILE)].iter().enumerate() {
+                let i = first + k;
+                if self.states[i] == State::Live {
+                    ranked.push((self.loss(square, length, product * self.tiles.scales[i], i), i));
+                }
+            }
+        }
+        if ranked.len() > ASSIGN_RECHECK {
+            ranked.select_nth_unstable_by(ASSIGN_RECHECK - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            ranked.truncate(ASSIGN_RECHECK);
+        }
+        let mut near: Vec<usize> = ranked.into_iter().map(|(_, i)| i).collect();
+        near.sort_unstable();
+        let mut best = (f32::INFINITY, 0);
+        for (i, product) in near.iter().zip(self.products_of(v, &near)) {
+            let loss = self.loss(square, length, product, *i);
+            if loss < best.0 {
+                best = (loss, *i);
+            }
+        }
+        best.1
+    }
+
+    /// `v`'s products with the centroids `near` names, each summed dimension by dimension as a
+    /// tile sums its lanes, so each equals the product [`tile_products`] gives.
+    fn products_of(&self, v: &[f32], near: &[usize]) -> Vec<f32> {
+        #[cfg(test)]
+        CENTROID_PRODUCTS.with(|count| count.set(count.get() + near.len()));
+        let mut out = Vec::with_capacity(near.len());
+        for group in near.chunks(8) {
+            let centroids: Vec<&[f32]> = group.iter().map(|i| self.centroids[*i].as_slice()).collect();
+            let mut sums = [0.0f32; 8];
+            for (d, x) in v.iter().enumerate() {
+                for (sum, c) in sums.iter_mut().zip(&centroids) {
+                    *sum += x * c[d];
+                }
+            }
+            out.extend_from_slice(&sums[..group.len()]);
+        }
+        out
+    }
+
+    /// The loss of coding a vector of squared length `square` and length `length` against partition
+    /// `i`, from their product.
+    fn loss(&self, square: f32, length: f32, product: f32, i: usize) -> f32 {
+        let mut loss = square + self.squares[i] - 2.0 * product;
+        if self.eta > 1.0 {
+            let along = length - product / length;
+            loss += (self.eta - 1.0) * along * along;
+        }
+        loss
+    }
+
     /// The nearest live partition to each of `group`'s vectors by the loss above, the first of
     /// equals: each tile's products with the whole group are taken while the tile is in cache.
     fn nearest_of(&self, group: &[&[f32]]) -> Vec<usize> {
@@ -1124,6 +1192,8 @@ impl Model {
                 (square, square.sqrt().max(f32::MIN_POSITIVE))
             })
             .collect();
+        #[cfg(test)]
+        CENTROID_PRODUCTS.with(|count| count.set(count.get() + group.len() * self.states.iter().filter(|s| **s == State::Live).count()));
         let mut best = vec![(f32::INFINITY, 0); group.len()];
         let mut products = [0.0f32; TILE];
         for (first, tile) in self.tiles.tiles() {
@@ -1136,11 +1206,7 @@ impl Model {
                     if self.states[i] != State::Live {
                         continue;
                     }
-                    let mut loss = square + self.squares[i] - 2.0 * product;
-                    if self.eta > 1.0 {
-                        let along = length - product / length;
-                        loss += (self.eta - 1.0) * along * along;
-                    }
+                    let loss = self.loss(square, length, *product, i);
                     if loss < best[n].0 {
                         best[n] = (loss, i);
                     }
@@ -1210,7 +1276,7 @@ impl Model {
         if self.centroids.is_empty() {
             return (0, 0, code(rotation, rowid, v.to_vec()));
         }
-        self.encode_in(rotation, rowid, v, self.nearest(v))
+        self.encode_in(rotation, rowid, v, self.assign(v))
     }
 
     /// Code a vector against partition `p`'s current centroid.
@@ -2553,6 +2619,8 @@ thread_local! {
     static WALK_SEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BLOCK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The products of vectors with f32 centroids taken on this thread.
+    static CENTROID_PRODUCTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Count a row a survey read, for the tests' bound on maintenance work.
@@ -4849,6 +4917,25 @@ mod tests {
                 basis[at] = 1.0;
                 let largest = rotation.apply(&basis).iter().map(|x| x * x).fold(0.0f32, f32::max) * padded as f32;
                 assert!(largest < 3.0 * (padded as f32).ln(), "dims {dims}: dimension {at}'s largest share is {largest} times an even one");
+            }
+        }
+    }
+
+    /// An insert ranks the partitions over the int8 centroids, as a query does, and takes exact
+    /// products only with the ASSIGN_RECHECK that rank best, however many partitions there are; the
+    /// partition it finds is the one exact products with every centroid find.
+    #[test]
+    fn an_insert_finds_its_partition_over_the_int8_centroids() {
+        let mut state = 97;
+        let centroids: Vec<Vec<f32>> = (0..400).map(|_| random(&mut state, 48)).collect();
+        for eta in [0.0, 4.0] {
+            let model = Model::new(centroids.clone(), eta);
+            for _ in 0..500 {
+                let v = random(&mut state, 48);
+                let nearest = model.nearest(&v);
+                CENTROID_PRODUCTS.with(|count| count.set(0));
+                assert_eq!(model.assign(&v), nearest, "eta {eta}");
+                assert_eq!(CENTROID_PRODUCTS.with(std::cell::Cell::get), ASSIGN_RECHECK, "eta {eta}");
             }
         }
     }

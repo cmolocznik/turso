@@ -6358,7 +6358,7 @@ mod tests {
             conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
             let begin = if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" };
             let mut state = 337u64;
-            let mut below = |state: &mut u64, n: u64| {
+            let below = |state: &mut u64, n: u64| {
                 *state ^= *state << 13;
                 *state ^= *state >> 7;
                 *state ^= *state << 17;
@@ -6366,7 +6366,7 @@ mod tests {
             };
             let centres: Vec<Vec<f32>> = (0..8).map(|_| random(&mut state, DIMS).iter().map(|x| 6.0 * x).collect()).collect();
             let mut next = 1i64;
-            let mut statement = |state: &mut u64, next: &mut i64| match below(state, 10) {
+            let statement = |state: &mut u64, next: &mut i64| match below(state, 10) {
                 0..=4 => {
                     let n = 1 + below(state, 20) as i64;
                     let rows: Vec<(i64, Vec<f32>)> = (0..n).map(|i| (*next + i, near(state, &centres, 0.5))).collect();
@@ -6421,7 +6421,7 @@ mod tests {
             assert!(fine.consistent() && fine.tail_entries > 0 && fine.stale_copies > 0, "{fine:?}");
             (db, conn)
         };
-        let one = |conn: &Arc<crate::Connection>, sql: &str| rows(conn, sql).first().map(|row| row.clone()).unwrap_or_else(|| panic!("{sql} found nothing"));
+        let one = |conn: &Arc<crate::Connection>, sql: &str| rows(conn, sql).first().cloned().unwrap_or_else(|| panic!("{sql} found nothing"));
         // A nested statement may write the index's tables; it commits with the write transaction
         // around it.
         let corrupt = |conn: &Arc<crate::Connection>, sql: String| {

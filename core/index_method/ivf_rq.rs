@@ -2272,6 +2272,10 @@ struct Writes {
     key: (u64, String),
     open: HashMap<usize, Writer>,
     changed: HashMap<i64, Position>,
+    /// The same, for the partitions maintenance jobs wrote: a job conflicts only with another job's
+    /// writes and with writes of the vectors it moves, which the engine refuses at the write, so a
+    /// job leaves for later only a partition another job holds or wrote past its snapshot.
+    jobs_changed: HashMap<i64, Position>,
     /// A position at or past every commit the record did not see, standing for every partition not
     /// in `changed`: the highest one the index's last record knew, or the commit position when the
     /// record began, for the index's first.
@@ -2290,12 +2294,14 @@ impl Drop for Writes {
     }
 }
 
-/// A transaction writing the index, entered under its connection: the partitions it wrote, its
-/// statements writing the index now, and whether one of them staged its writes.
+/// A transaction writing the index, entered under its connection: the partitions it wrote, those
+/// its maintenance jobs wrote, its statements writing the index now, and whether one of them staged
+/// its writes.
 #[derive(Debug)]
 struct Writer {
     connection: std::sync::Weak<Connection>,
     partitions: HashSet<i64>,
+    jobs: HashSet<i64>,
     statements: usize,
     staged: bool,
 }
@@ -2305,10 +2311,19 @@ impl Writes {
         self.changed.get(&partition).copied().unwrap_or(self.floor)
     }
 
-    fn raise(&mut self, partitions: HashSet<i64>, to: Position) {
-        for partition in partitions {
+    fn job_changed(&self, partition: i64) -> Position {
+        self.jobs_changed.get(&partition).copied().unwrap_or(self.floor)
+    }
+
+    /// Raise the partitions an ended writer wrote, and those its jobs wrote, to `to`.
+    fn raise(&mut self, writer: Writer, to: Position) {
+        for partition in writer.partitions {
             let changed = self.changed(partition).max(to);
             self.changed.insert(partition, changed);
+        }
+        for partition in writer.jobs {
+            let changed = self.job_changed(partition).max(to);
+            self.jobs_changed.insert(partition, changed);
         }
     }
 
@@ -2322,7 +2337,7 @@ impl Writes {
         let gone: Vec<usize> = self.open.iter().filter(|(_, writer)| writer.connection.strong_count() == 0).map(|(key, _)| *key).collect();
         for key in gone {
             if let Some(writer) = self.open.remove(&key) {
-                self.raise(writer.partitions, now);
+                self.raise(writer, now);
             }
         }
     }
@@ -3022,7 +3037,7 @@ pub struct IvfRqCursor {
     /// don't; the partitions its writes entered in [`Writes`] for its transaction; and whether its
     /// statement is entered there as writing the index.
     sharing: Option<Sharing>,
-    recorded: HashSet<i64>,
+    recorded: HashSet<(i64, bool)>,
     writing: bool,
     /// The maintenance jobs this cursor has done.
     jobs: usize,
@@ -3283,7 +3298,7 @@ impl IvfRqCursor {
                     let Some(step) = steps.front_mut() else {
                         return Ok(IOResult::Done(()));
                     };
-                    self.record(step);
+                    self.record(step, false);
                     match apply_step(&mut self.stores, step, Some(&mut undo)) {
                         Ok(IOResult::Done(())) => {
                             steps.pop_front();
@@ -3307,7 +3322,7 @@ impl IvfRqCursor {
                         self.change = Change::Redo(redo_step(rowid, 0, self.writer)?);
                         continue;
                     };
-                    self.record(step);
+                    self.record(step, false);
                     match apply_step(&mut self.stores, step, None)? {
                         IOResult::Done(()) => {
                             undo.pop();
@@ -3320,6 +3335,7 @@ impl IvfRqCursor {
                     }
                 }
                 Change::Redo(mut step) => {
+                    self.record(&step, false);
                     if let IOResult::IO(io) = apply_step(&mut self.stores, &mut step, None)? {
                         self.change = Change::Redo(step);
                         return Ok(IOResult::IO(io));
@@ -3376,7 +3392,7 @@ impl IvfRqCursor {
             Some(writes) => writes,
             None => {
                 let floor = FLOORS.lock().expect("index floors").remove(&key).unwrap_or_else(|| clock.now());
-                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), floor }));
+                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), floor }));
                 registry.insert(key, std::sync::Arc::downgrade(&writes));
                 writes
             }
@@ -3386,8 +3402,8 @@ impl IvfRqCursor {
     }
 
     /// Enter, before a step on the partitions table reaches a page, that this cursor's transaction
-    /// writes the partition the step changes.
-    fn record(&mut self, step: &Step) {
+    /// writes the partition the step changes, and whether a maintenance job does.
+    fn record(&mut self, step: &Step, job: bool) {
         let (Step::Put { store, rowid, .. } | Step::Remove { store, rowid, .. }) = step;
         let partition = match *store {
             PARTITIONS => partition_of(*rowid),
@@ -3395,21 +3411,24 @@ impl IvfRqCursor {
             REDO => REDO_ROWS,
             _ => return,
         };
-        if self.recorded.contains(&partition) {
+        if self.recorded.contains(&(partition, job)) {
             return;
         }
         let Some(sharing) = &self.sharing else {
             return;
         };
         let mut writes = sharing.writes.lock().expect("index writes");
-        let writer = writes.open.entry(sharing.key()).or_insert_with(|| Writer { connection: sharing.connection.clone(), partitions: HashSet::new(), statements: 0, staged: false });
+        let writer = writes.open.entry(sharing.key()).or_insert_with(|| Writer { connection: sharing.connection.clone(), partitions: HashSet::new(), jobs: HashSet::new(), statements: 0, staged: false });
         if !self.writing {
             writer.statements += 1;
             self.writing = true;
         }
         writer.partitions.insert(partition);
+        if job {
+            writer.jobs.insert(partition);
+        }
         drop(writes);
-        self.recorded.insert(partition);
+        self.recorded.insert((partition, job));
     }
 
     /// This cursor's statement staged its writes, or undid them: it no longer writes the index. A
@@ -3446,7 +3465,7 @@ impl IvfRqCursor {
         };
         let mut writes = sharing.writes.lock().expect("index writes");
         if let Some(writer) = writes.open.remove(&sharing.key()) {
-            writes.raise(writer.partitions, sharing.clock.now());
+            writes.raise(writer, sharing.clock.now());
         }
     }
 
@@ -4703,7 +4722,7 @@ impl IvfRqCursor {
                         self.finish_job(job)?;
                         continue;
                     };
-                    self.record(step);
+                    self.record(step, true);
                     match apply_step(&mut self.stores, step, Some(&mut undo)) {
                         Ok(IOResult::Done(())) => {
                             steps.pop_front();
@@ -4725,7 +4744,7 @@ impl IvfRqCursor {
                     // The steps a phase made are written before it goes on, and no walk is open
                     // while they are: a phase walks a store only to collect keys.
                     if let Some(step) = steps.front_mut() {
-                        self.record(step);
+                        self.record(step, true);
                         if let IOResult::IO(io) = apply_step(&mut self.stores, step, None)? {
                             self.upkeep = Upkeep::Rebuild { phase, steps };
                             return Ok(IOResult::IO(io));
@@ -4874,7 +4893,7 @@ impl IvfRqCursor {
                         self.loaded = true;
                         return Ok(IOResult::Done(()));
                     };
-                    self.record(step);
+                    self.record(step, true);
                     match apply_step(&mut self.stores, step, None)? {
                         IOResult::Done(()) => {
                             undo.pop();
@@ -5047,10 +5066,12 @@ impl IvfRqCursor {
         }
     }
 
-    /// Whether a job may write the rows of `claims`: under MVCC, no other transaction writing the
-    /// index holds one, and none committed a write to one that this cursor's snapshot does not see,
-    /// which would make this transaction's own write to it lose at commit. The record is this
-    /// process's; under WAL the one writer holds every row.
+    /// Whether a job may write the rows of `claims`: under MVCC, no other transaction's job holds
+    /// one, and no job committed a write to one that this cursor's snapshot does not see, where this
+    /// job's first write would meet it. Writes of the table's rows are no bar: they write fresh
+    /// rows, and the rows of a vector a job moves, which the engine refuses at the write, so the job
+    /// is undone and the writer's change left to maintenance. The record is this process's; under
+    /// WAL the one writer holds every row.
     fn claimable(&self, claims: &[i64]) -> bool {
         let Some(sharing) = self.sharing.as_ref().filter(|_| self.concurrent) else {
             return true;
@@ -5061,7 +5082,7 @@ impl IvfRqCursor {
         let me = sharing.key();
         let mut writes = sharing.writes.lock().expect("index writes");
         writes.settle(|| sharing.clock.now());
-        claims.iter().all(|p| writes.changed(*p) <= snapshot && writes.open.iter().all(|(key, writer)| *key == me || !writer.partitions.contains(p)))
+        claims.iter().all(|p| writes.job_changed(*p) <= snapshot && writes.open.iter().all(|(key, writer)| *key == me || !writer.jobs.contains(p)))
     }
 
     /// Whether no partition is moving: none the survey read, and none a run has found moving.
@@ -7304,7 +7325,8 @@ mod tests {
     /// Under MVCC, a transaction deletes and updates vectors whose codes maintenance moved after its
     /// snapshot: OPTIMIZE INDEX packs, splits and moves the backlog while a `BEGIN CONCURRENT`
     /// transaction holds an earlier snapshot, and the transaction's writes to the moved vectors then
-    /// commit, as writes to rows no other transaction wrote do. The maintenance each of its
+    /// commit, as writes to rows no other transaction wrote do; a query's held redo rows, read before
+    /// them, serve no snapshot after their commit. The maintenance each of its
     /// statements does passes over the redo rows the transaction wrote, so each one-row update reads
     /// a bounded number of rows by key, however many its transaction left to maintenance.
     #[test]
@@ -7318,6 +7340,10 @@ mod tests {
         assert_eq!(rows(&writer, "SELECT count(*) FROM v")[0][0].as_int(), Some(live.len() as i64));
         let before = locations(&conn);
         conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        // A query holds the redo rows, none yet, under a snapshot past OPTIMIZE INDEX's: the writes
+        // below must keep them from serving any later snapshot.
+        let q = random(&mut state, DIMS);
+        assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
         let after = locations(&conn);
         let mut moved: Vec<i64> = before.iter().filter(|(id, at)| after.get(id) != Some(at)).map(|(id, _)| *id).collect();
         moved.sort_unstable();
@@ -7600,6 +7626,36 @@ mod tests {
             assert_eq!(ids(&conn, &sql), exact_filtered(&rows, &q, |id| id % 10 == 3), "mvcc={mvcc}");
             let found = check(&conn, "f_ivf").unwrap();
             assert!(found.consistent() && found.pending == 0, "mvcc={mvcc}: {found:?}");
+        }
+    }
+
+    /// Under MVCC a writer's open transaction keeps no maintenance off the partitions it wrote: beside
+    /// one that has inserted a thousand rows across the backlog's partitions, OPTIMIZE INDEX does all
+    /// the work due in them, and the writer then commits.
+    #[test]
+    fn maintenance_works_the_partitions_an_open_writer_wrote() {
+        const DIMS: usize = 16;
+        let (db, conn) = database("ivf-rq-beside-an-open-writer.db", true);
+        let mut state = 271;
+        let mut live = backlog(&conn, &mut state, DIMS);
+        let rows: Vec<(i64, Vec<f32>)> = (1..=1000i64).map(|i| (300_000 + i, random(&mut state, DIMS))).collect();
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        STATEMENT_UPKEEP.with(|on| on.set(false));
+        insert_all(&writer, &rows);
+        STATEMENT_UPKEEP.with(|on| on.set(true));
+        assert!(!stored(&conn).pending().is_empty(), "the backlog left no work due");
+        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        let left = stored(&conn).pending();
+        assert!(left.is_empty(), "work left beside the open writer: {left:?}");
+        writer.execute("COMMIT").unwrap();
+        live.extend(rows);
+        let found = check(&conn, "v_ivf").unwrap();
+        assert!(found.consistent() && found.rows as usize == live.len(), "{found:?}");
+        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        for _ in 0..3 {
+            let q = random(&mut state, DIMS);
+            assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
         }
     }
 

@@ -1,21 +1,32 @@
 # This fork
 
-Upstream Turso (`tursodatabase/turso`, `main`) with the changes below on top, on two branches:
+Upstream Turso (`tursodatabase/turso`) with the changes below on top. Since 2026-10-29 nothing goes
+upstream: the fork keeps up with upstream and keeps its own changes.
 
-- `main` holds the fixes, which are headed upstream: one commit each with its test, listed by
-  `git log upstream/main..main`.
-- `feat/additions` is `main` plus the additions, listed by `git log main..feat/additions`.
-- `fix/set-waker-lost-wakeup`, `fix/mvcc-checkpoint-trigger`, `fix/mvcc-exact-rowid-seek`,
-  `fix/index-method-limit-before-aggregates`, `fix/index-method-column-collation`,
-  `fix/btree-overflow-copy` and `fix/mvcc-reopen-after-log-truncation` each hold one of `main`'s
-  fixes alone on `upstream/main`.
+- `main` mirrors upstream `main`. It only fast-forwards and holds no commit of ours.
+- `workreef`, the fork's default branch, is upstream plus every change below
+  (`git log --no-merges main..workreef`).
+- `workreef/sync-upstream.sh` merges `main` into `workreef` four times a day, at 05:17, 11:17,
+  17:17 and 23:17 Asia/Kuala_Lumpur (`workreef/turso-sync.timer`, a systemd user timer). It
+  fetches upstream, fast-forwards `main`, merges it, and commits and pushes the merge only once
+  the merged tree compiles with its tests, passes the core and FTS suites and clippy, and passes
+  `ivf_crash`'s kill rounds under WAL, MVCC and MVCC with four writers. A conflict or a failed
+  check leaves `workreef` as it was and alerts. Each merge's commit message names the upstream
+  commits it took and the checks it passed; each run's log and verdict are in
+  `/home/me/cognition-data/turso-sync`, and a `hold` file there skips runs while a timed
+  measurement needs the machine.
+- `workreef/repro` holds the harnesses the entries below cite (`ivf_crash`, `mvcc_reopen`,
+  `read_changes`, `wal_growth` and the rest), a crate of its own on the compiler WorkReef
+  cognition builds with.
 
-This file is only on `feat/additions`, so `main`'s commits can go upstream as they are. Keep it in
-step with the two logs: a change lands here when it lands, with what it fixes and what proves it.
+Each entry is one change of ours: when it landed and in which commits, what it changes, why, and
+what proves it. A change lands here in the commit that makes it. When upstream takes a change or
+fixes the same thing its own way, the entry moves to "Taken upstream".
 
 ## Fixes
 
 ### Lost wakeup in `Completion::set_waker`
+2026-10-28 `c07ac5ffc`, 2026-10-29 `c2e1ee261`; upstream PR #10948 holds the first alone.
 `core/io/completions.rs`. `set_waker` tested `finished()` and then stored the waker under the
 context lock, so a completion finished on another thread between the two woke no one, and the task
 that registered was never polled again: a hang that happens now and then. The waker is now stored
@@ -25,8 +36,16 @@ Test: `io::completions::tests::shuttle_set_waker_racing_complete_always_wakes`, 
 thread; on upstream `main` it finds the one that loses the wakeup. Shuttle cannot see the std
 `OnceLock` holding a completion's result, so under `cfg(shuttle)` `Context::set_waker` yields
 before its store.
+Storing first, `set_waker` now reaches `Context::wake` for a completion already finished, where it
+used to wake with no lock held, and `wake` woke the waker under the context lock: a waker that
+registers again on the same completion from its wake, as polling the completion inline does,
+deadlocked. The waker is now taken under the lock and woken once the lock is free.
+Test: `io::completions::tests::a_waker_registering_again_from_its_wake_does_not_deadlock` (a
+finished completion's waker registers again from its wake three times; under the lock, it
+deadlocked).
 
 ### The checkpoint trigger counts only uncheckpointed log bytes
+2026-10-28 `3776ed6be`.
 `core/mvcc/persistent_storage/mod.rs`, `core/mvcc/database/checkpoint_state_machine.rs`. A
 passive checkpoint truncates the logical log only when no commit landed after its snapshot, so
 under steady writes the log keeps its size; `should_checkpoint` compared that size with the
@@ -37,44 +56,25 @@ the bytes past it. Truncation is unchanged: it still tests the highest appended 
 Test: `mvcc::database::tests::test_passive_checkpoint_that_keeps_the_log_counts_only_uncovered_bytes`.
 Upstream `main`: "316 checkpointed bytes of a 373-byte log still counted against the threshold".
 On 0.8.3, 2 writers at a 256 KB threshold: inline writer commit p99 165-194 ms → 9.4-12.8 ms. On
-upstream `main` the same A/B shows no gain: 15 idle runs each of `fork-repro`'s `mvcc_inline` (2
+upstream `main` the same A/B shows no gain: 15 idle runs each of `workreef/repro`'s `mvcc_inline` (2
 writers, 4,000 commits, 256 KB threshold) put the writer commit p99 median at 13.5 ms without the
 fix and 14.1 ms with it.
 
 ### An exact rowid seek walked every shadowed B-tree row after its target
+2026-10-28 `6387b9142`; upstream PR #10949.
 `core/mvcc/cursor.rs`. An eq-only `TableRowId` seek that reached a B-tree row shadowed by a newer
 MVCC version advanced to the next B-tree row, and kept going while rows were shadowed. Over a
 checkpointed table whose rows were all updated, point lookups went quadratic: on upstream `main`
 (`e9a8b0d25`), 2,000, 4,000 and 8,000 lookups took 222, 920 and 3,571 ms, against 16, 31 and 66 ms
-with the fix (`fork-repro`'s `shadow_seek`). An exact seek has at most one B-tree match, so it now
+with the fix (`workreef/repro`'s `shadow_seek`). An exact seek has at most one B-tree match, so it now
 stops when that row is shadowed or the row reached is not its target; the MVCC side still supplies
 the newer version.
 Test: `mvcc::database::tests::test_exact_rowid_seek_over_shadowed_btree_rows`, which counts each
 exact seek's B-tree steps through the cursor's yield hook: the seek for row 1 takes 155 on upstream
 `main` and 2 with the fix.
 
-### An index method's LIMIT applied before an aggregate or DISTINCT
-`core/translate/optimizer/mod.rs`. A pattern with LIMIT applies the query's LIMIT to the rows the
-index gives out, and the single-table planner gave one to any query whose WHERE and LIMIT matched
-it, so an aggregate or DISTINCT ran over the first LIMIT matches. On upstream `main`
-(`818977eb4`), over 20 FTS matches, `SELECT count(*) ... WHERE fts_match(...) LIMIT 5` returned 5,
-and `SELECT DISTINCT cat ... WHERE fts_match(...) LIMIT 2` returned one of the two categories. A
-pattern with LIMIT now serves only a query whose rows reach the LIMIT as they leave the WHERE
-clause. A window function was never affected: its query reads the table through a subquery
-without the LIMIT.
-Test: `index_method::fts::tests::fts_limit_applies_after_aggregates_and_distinct`.
-
-### A value an index method provides failed the collation lookup
-`core/translate/collate.rs`, `core/translate/plan.rs`. The planner puts a value an index method
-provides, such as an FTS score, in place of the expression it computes, as a column numbered past
-the table's own. Every collation decision looks a referenced column up in its table
-(`referenced_column_collation`), which has no such column, so the statement failed: on upstream
-`main` (`818977eb4`), `SELECT DISTINCT fts_score(...) ... WHERE fts_match(...)`, a UNION of two such
-SELECTs and an IN subquery over the score each failed to prepare with "column not found". The value
-now has no column collation, as the expression translator already treats it.
-Test: `index_method::fts::tests::fts_score_from_the_index_has_no_column_collation`.
-
 ### An overflow chain was copied into its payload a byte at a time
+2026-10-28 `5b3da8244`.
 `core/storage/btree.rs`, `process_overflow_read`. Each page of a record's overflow chain was
 appended through `try_extend` over a byte iterator, which on stable is `Vec::extend` over
 `Copied<slice::Iter<u8>>` and compiled to a loop writing one byte at a time, the payload regrowing
@@ -82,15 +82,16 @@ as pages came in: ivf_rq queries over 5.6 KB block rows spent about 14% of their
 payload is now reserved at its full size when the chain is first read, and each page is copied in
 with `extend_from_slice` after a fallible `try_reserve`, as `copy_payload_range` does. At 256 probes
 over glove-100 the blocks' reads took 3,535 µs a query instead of 4,524. No behaviour changes, so
-no new test; every read of an overflowing record goes through it. Its PR waits for Clay's go.
+no new test; every read of an overflowing record goes through it.
 
 ### An MVCC database killed between a checkpoint's two truncations would not open
+2026-10-29 `f9a068905`.
 `core/mvcc/database/mod.rs`, the recovery of an interrupted checkpoint. A Truncate checkpoint (the
 default under MVCC) empties the logical log, syncs it, and then truncates the WAL, so a crash
 between the two leaves an empty log beside WAL frames the checkpoint had already backfilled into
 the synced database file. Opening such a database failed with "WAL has committed frames but
 logical log header is missing" unless passive checkpoints were enabled, where the same state is
-the steady one. On upstream `main` (`6d8f8b18a`) `fork-repro`'s `mvcc_reopen` (an MVCC table
+the steady one. On upstream `main` (`6d8f8b18a`) `workreef/repro`'s `mvcc_reopen` (an MVCC table
 written by a process killed at a random 0.1 to 1.5 s, PRAGMA wal_checkpoint(TRUNCATE) every few
 commits) left a database that would not open within 3, 6 and 7 kills on three seeds. Upstream's
 passive checkpoint (`7e8aa5c58`) had made recovery accept this state; `b80c92fb9` then refused it
@@ -98,11 +99,12 @@ again outside passive mode. Nothing in it is lost or left to replay, so recovery
 WAL and writes a fresh header whatever the mode. With the fix the three seeds pass 200 kills each.
 Test: `mvcc::database::tests::test_reopen_after_crash_between_logical_log_and_wal_truncation`, which
 stops a checkpoint once the log is empty and the WAL file still holds its frames, and reopens.
-Found by the ivf_rq kill harness below. Its PR waits for Clay's go.
+Found by the ivf_rq kill harness below.
 
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)
+2026-10-28 `b207b3dec`.
 `core/mvcc/database/background_checkpoint.rs`, wired in `core/mvcc/database/mod.rs`; the pragma
 in `sqlite/parser/src/ast.rs`, `core/pragma.rs`, `core/translate/pragma.rs`, `core/connection.rs`.
 On, the commit that crosses the MVCC checkpoint threshold hands the checkpoint to a per-store
@@ -125,11 +127,15 @@ commit over 100 ms is matched by an fsync of about its length in the same run. `
 runs, 97-110 s each with the thread against 137-211 s inline.
 
 ### Logical-log fsync stats
+2026-10-28 `dde381edb`.
 `core/mvcc/persistent_storage/mod.rs`. `mvcc::persistent_storage::logical_log_sync_stats()`
 returns the count, total and longest µs of logical-log fsyncs. A durable commit cannot be faster
 than its fsync, so a commit no slower than the longest fsync waited on the disk.
 
 ### The `ivf_rq` index method
+2026-10-28 to 2026-10-29: `4174498fa` (the index and its registration), `303f05e78` (the MVCC
+cursor's forward bound), `effd5c1db` (filtered queries), and the commits after them that touch
+`core/index_method/ivf_rq.rs` (`git log main..workreef -- core/index_method/ivf_rq.rs`).
 `core/index_method/ivf_rq.rs`, registered in `core/index_method/mod.rs` and `core/ext/mod.rs`;
 its rowid walks use a forward bound (`CursorTrait::set_forward_bound`, implemented by the MVCC
 cursor in `core/mvcc/cursor.rs`) so they stop at their range's end instead of stepping through
@@ -302,6 +308,7 @@ cores. A probe reads from pages only the partitions an open transaction has writ
 `OPTIMIZE INDEX` in steps).
 
 ### `OPTIMIZE INDEX` in steps
+2026-10-29 `634a20562`, `076aaa87b`, `71e92960a`, `e24c165f0`, `869453d67`.
 `core/index_method/optimize_steps.rs`, `Insn::IndexMethodOptimizeSteps`, translated in
 `translate_optimize` (`core/translate/index.rs`), `Connection::connect_beside`. An index method can
 declare `optimize_in_steps` (`core/index_method/mod.rs`); ivf_rq does. Outside a transaction,
@@ -394,6 +401,7 @@ over the two default seeds of each mode; IVF_RQ_WORKLOAD_SEEDS for more). With t
 whatever writer was open, it failed at once.
 
 ### A read keeps the cached pages no other connection wrote
+2026-10-29 `4ddd4353a`.
 `core/storage/wal.rs` (`FramePages`, `ReadChanges`, `WalCoordination::read_changes`,
 `WalFile::keep_unread_changes`), `core/storage/pager.rs` (`Pager::forget_changes`). A read that
 found the WAL changed since its connection's last read cleared the connection's whole page cache,
@@ -424,7 +432,7 @@ rows' old versions without the restart's changes kept), and
 pages long, reading in and out of transactions, rolling back and checkpointing in every mode,
 interleaved at random with 64-page caches and checked against a model of each snapshot
 (`READ_CHANGES_SEEDS`, default 2 a mode). It failed at MVCC seed 0 before the restart's changes
-were kept, and fails with a retired generation's frames skipped. `fork-repro`'s `read_changes` runs
+were kept, and fails with a retired generation's frames skipped. `workreef/repro`'s `read_changes` runs
 the same workload through the public API: 300 seeds in each mode pass.
 
 Measured with `tmp/ann/ivfrq/src/bin/page-reads.rs`: two readers looking up random rows of a
@@ -451,6 +459,7 @@ disk decided the runs: the writer stalled 1.1 and 1.3 s in the build without the
 and 22.5 s in the one with it, which no in-memory run showed.
 
 ### Checking an `ivf_rq` index against its table
+2026-10-29 `22d5d2322`, `56decd6c8`, `f79b852dd`.
 `ivf_rq::check(connection, index)` (`core/index_method/ivf_rq.rs`) reads an index whole, in the
 connection's open transaction or one of its own, and reports each way it disagrees with its table
 or with itself: a row with a vector and no row in the index, or the reverse; a code missing from
@@ -466,13 +475,14 @@ MVCC, every live code coded again and compared), `the_check_reports_each_way_the
 (seven corruptions, each reported), and the check now ends `a_random_workload_keeps_every_answer_exact`
 and `concurrent_writers_maintaining_the_index_all_commit`.
 
-`fork-repro`'s `ivf_crash` kills a process writing an index (inserts, updates, deletes, alone and in
+`workreef/repro`'s `ivf_crash` kills a process writing an index (inserts, updates, deletes, alone and in
 transactions it commits or rolls back, stepped OPTIMIZE INDEX, checkpoints; a real file, synchronous
 NORMAL) at a random 0.2-2.5 s, reopens the database, and checks it: `PRAGMA integrity_check`,
 `ivf_rq::check`, and the top ten of three queries, every candidate reranked, against a brute-force
 scan. One thread: 200 of 200 rounds under WAL (to 351,834 rows) and 200 of 200 under MVCC (to
 542,741 rows). Four writers beside a thread running OPTIMIZE INDEX: 60 of 60 under WAL (one round
-went 2 s without a commit, one thread in an fsync of this host's disk).
+went 2 s without a commit, one thread in an fsync of this host's disk) and 30 of 30 under MVCC
+(13,016 commits, 609 transactions rolled back on conflicts, 327 OPTIMIZE runs).
 
 Its workload found, before any kill, that a split rolled back with its transaction left the
 partition it opened among those the next statements survey (`SharedState::due`), and the model,
@@ -482,6 +492,25 @@ the process panicked. A partition the model holds no centroid for is now retired
 goes, but for an untrained index's origin, and a retirement of one the model does not hold is an
 error rather than a panic. `transactions_rolled_back_over_maintenance_leave_the_index_consistent`
 (one connection, a sixth of its transactions rolled back) failed within 2 s before the fix.
+
+The partitions table holds four kinds of rows under one key range, and only a partition's
+bookkeeping filled all eight of its columns: a dead row held one value and a tail entry or block
+two, the rest reading NULL, while the backing table declares every column NOT NULL. `PRAGMA
+integrity_check` reported NULL values in every ivf_rq database with a tail, a block or a stale
+copy. Every row now fills the columns its kind does not use with zeros; readers read by position
+and are unchanged. `the_check_finds_the_index_consistent_after_every_kind_of_write` asserts
+`PRAGMA integrity_check`; without the fill it fails with "NULL value in
+__turso_internal_v_ivf_partitions.c1".
+
+## Taken upstream
+
+### An index method's LIMIT applied before an aggregate or DISTINCT
+Ours 2026-10-28 `e6fd95447`; upstream took it the same day as `ad8e4895f`, the same patch.
+`index_method::fts::tests::fts_limit_applies_after_aggregates_and_distinct` came with it.
+
+### A value an index method provides failed the collation lookup
+Ours 2026-10-28 `917f0acbd`; upstream took it the same day as `c6f1cafdd`, the same patch.
+`index_method::fts::tests::fts_score_from_the_index_has_no_column_collation` came with it.
 
 ## Considered and not taken
 
@@ -503,7 +532,7 @@ Under WAL a commit runs the passive auto-checkpoint once more than the threshold
 not yet backfilled (`WalFile::should_checkpoint`); SQLite runs it after every commit once the WAL
 holds the threshold. A reader on an older snapshot stops a passive checkpoint short of the WAL's
 end, and the WAL restarts only after a whole backfill, so beside overlapping readers Turso's WAL
-grows without bound. `fork-repro`'s `wal_growth` (one writer inserting a 200-byte row a
+grows without bound. `workreef/repro`'s `wal_growth` (one writer inserting a 200-byte row a
 transaction, readers counting the table, 6 s, synchronous NORMAL) restarted the WAL 0-4 times and
 grew it to 74,693-253,953 frames (0.3-1.0 GB); with SQLite's trigger the same build restarted it
 9-26 times and held it to 1,068-1,102 frames. The trigger costs the writer a checkpoint and its two

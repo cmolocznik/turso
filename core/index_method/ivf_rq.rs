@@ -823,27 +823,44 @@ unsafe fn lower_product_avx2(rotated: &[f32], ex: &[u8]) -> f64 {
     let words = _mm256_setr_epi8(0, 1, 2, -1, 0, 1, 2, -1, 0, 1, 2, -1, 0, 1, 2, -1, 3, 4, 5, -1, 3, 4, 5, -1, 3, 4, 5, -1, 3, 4, 5, -1);
     let shifts = _mm256_setr_epi32(0, 6, 12, 18, 0, 6, 12, 18);
     let mask = _mm256_set1_epi32(63);
-    let mut sums = [_mm256_setzero_ps(); 2];
+    // Step `step`'s eight products with their six-bit values, the step's eight bytes read at `bytes`.
+    macro_rules! term {
+        ($step:expr, $bytes:expr) => {{
+            let both = _mm256_broadcastsi128_si256(_mm_loadl_epi64($bytes as *const __m128i));
+            let values = _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(both, words), shifts), mask);
+            _mm256_mul_ps(_mm256_loadu_ps(rotated.as_ptr().add(8 * $step)), _mm256_cvtepi32_ps(values))
+        }};
+    }
+    // Two steps a pass, so both sums stay in registers. Eight bytes are read from each step's six,
+    // so the last step's bytes are copied out first and no read passes the code's end.
     let steps = rotated.len() / 8;
-    for step in 0..steps {
-        // Eight bytes read from the step's six, but the last step's bytes copied out first, so no
-        // read passes the code's end.
-        let mut last = [0u8; 8];
-        let bytes = match step + 1 < steps {
+    let last = steps.saturating_sub(1);
+    let (mut even, mut odd) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    let mut step = 0;
+    while step + 1 < last {
+        even = _mm256_add_ps(even, term!(step, ex.as_ptr().add(6 * step)));
+        odd = _mm256_add_ps(odd, term!(step + 1, ex.as_ptr().add(6 * step + 6)));
+        step += 2;
+    }
+    let mut tail = [0u8; 8];
+    while step < steps {
+        let bytes = match step < last {
             true => ex.as_ptr().add(6 * step),
             false => {
-                last[..6].copy_from_slice(&ex[6 * step..6 * step + 6]);
-                last.as_ptr()
+                tail[..6].copy_from_slice(&ex[6 * step..6 * step + 6]);
+                tail.as_ptr()
             }
         };
-        let both = _mm256_broadcastsi128_si256(_mm_loadl_epi64(bytes as *const __m128i));
-        let values = _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(both, words), shifts), mask);
-        let q = _mm256_loadu_ps(rotated.as_ptr().add(8 * step));
-        sums[step % 2] = _mm256_add_ps(sums[step % 2], _mm256_mul_ps(q, _mm256_cvtepi32_ps(values)));
+        let product = term!(step, bytes);
+        match step % 2 {
+            0 => even = _mm256_add_ps(even, product),
+            _ => odd = _mm256_add_ps(odd, product),
+        }
+        step += 1;
     }
     let mut lanes = [0.0f32; 16];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), sums[0]);
-    _mm256_storeu_ps(lanes.as_mut_ptr().add(8), sums[1]);
+    _mm256_storeu_ps(lanes.as_mut_ptr(), even);
+    _mm256_storeu_ps(lanes.as_mut_ptr().add(8), odd);
     lanes.iter().map(|&s| s as f64).sum()
 }
 

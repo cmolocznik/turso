@@ -1420,6 +1420,23 @@ fn blob_record(bytes: &[u8]) -> Result<ImmutableRecord> {
     record(&[blob(bytes)?])
 }
 
+/// The partitions table's columns, which its backing table declares NOT NULL: a row of a kind
+/// that holds fewer values fills the rest with zeros.
+const PARTITION_COLUMNS: usize = 8;
+
+/// A partitions row's record of `values`, filled out with zeros to every column.
+fn partition_record<const N: usize>(values: [Value; N]) -> Result<ImmutableRecord> {
+    let mut all = Vec::with_capacity(PARTITION_COLUMNS);
+    all.extend(values);
+    all.resize_with(PARTITION_COLUMNS, || Value::from_i64(0));
+    record(&all)
+}
+
+/// A tail entry's or a block's record: the centroid version its codes are against, and the codes.
+fn codes_record(version: i64, codes: &[u8]) -> Result<ImmutableRecord> {
+    partition_record([Value::from_i64(version), blob(codes)?])
+}
+
 /// A fresh generation: distinct across processes and rolled-back changes with near certainty.
 fn generation() -> i64 {
     use std::hash::{BuildHasher, Hasher};
@@ -1443,7 +1460,7 @@ fn dead_blocks(bytes: &[u8]) -> Result<Vec<i64>> {
 
 fn dead_record(blocks: &[i64]) -> Result<ImmutableRecord> {
     let bytes: Vec<u8> = blocks.iter().flat_map(|b| b.to_le_bytes()).collect();
-    blob_record(&bytes)
+    partition_record([blob(&bytes)?])
 }
 
 /// A resumable read of one row by rowid.
@@ -2598,7 +2615,7 @@ impl Stream {
     fn write(&mut self, partition: i64, version: i64, entries: Vec<Entry>, steps: &mut VecDeque<Step>) -> Result<()> {
         let part = self.parts.entry(partition).or_default();
         let key = block_key(partition, part.next)?;
-        steps.push_back(put(PARTITIONS, key, record(&[Value::from_i64(version), blob(&pack(&entries)?)?])?));
+        steps.push_back(put(PARTITIONS, key, codes_record(version, &pack(&entries)?)?));
         for e in &entries {
             steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode())])?));
         }
@@ -3251,7 +3268,7 @@ fn tail_writes((partition, version, entry): (i64, i64, Entry)) -> Result<(i64, [
     Ok((
         partition,
         [
-            put(PARTITIONS, key, record(&[Value::from_i64(version), blob(&pack(std::slice::from_ref(&entry))?)?])?),
+            put(PARTITIONS, key, codes_record(version, &pack(std::slice::from_ref(&entry))?)?),
             put(VECTORS, entry.rowid, record(&[Value::from_i64(Location::Tail(key).encode())])?),
         ],
     ))
@@ -4665,7 +4682,7 @@ impl IvfRqCursor {
         part.open = 0;
         for chunk in live.chunks(BLOCK) {
             let key = block_key(partition, part.next)?;
-            steps.push_back(put(PARTITIONS, key, record(&[Value::from_i64(version), blob(&pack(chunk)?)?])?));
+            steps.push_back(put(PARTITIONS, key, codes_record(version, &pack(chunk)?)?));
             for e in chunk {
                 if !opened_here.contains(&(e.rowid, key)) {
                     steps.push_back(put(VECTORS, e.rowid, record(&[Value::from_i64(Location::Block(key).encode())])?));
@@ -4788,7 +4805,7 @@ impl IvfRqCursor {
             if moved + dropped + recoded > 0 {
                 steps.push_front(match staying.is_empty() {
                     true => remove(PARTITIONS, key),
-                    false => put(PARTITIONS, key, record(&[Value::from_i64(current), blob(&pack(&staying)?)?])?),
+                    false => put(PARTITIONS, key, codes_record(current, &pack(&staying)?)?),
                 });
                 part.size = (part.size - moved - dropped).max(0);
             }
@@ -4813,7 +4830,7 @@ impl IvfRqCursor {
         let staying = sorted.live;
         let mut steps = VecDeque::from([match staying.is_empty() {
             true => remove(PARTITIONS, block),
-            false => put(PARTITIONS, block, record(&[Value::from_i64(sorted.version), blob(&pack(&staying)?)?])?),
+            false => put(PARTITIONS, block, codes_record(sorted.version, &pack(&staying)?)?),
         }]);
         part.size = (part.size - sorted.buried.len() as i64).max(0);
         // The open block is the partition's last; it stays open with the entries it keeps.
@@ -6305,8 +6322,8 @@ mod tests {
             let (_db, conn) = database(&format!("ivf-rq-check-{mvcc}.db"), mvcc);
             let mut state = 311;
             let centres: Vec<Vec<f32>> = (0..6).map(|_| random(&mut state, DIMS).iter().map(|x| 3.0 * x).collect()).collect();
-            let rows: Vec<(i64, Vec<f32>)> = (1..=4000i64).map(|id| (id, near(&mut state, &centres, 0.5))).collect();
-            insert_all(&conn, &rows);
+            let table: Vec<(i64, Vec<f32>)> = (1..=4000i64).map(|id| (id, near(&mut state, &centres, 0.5))).collect();
+            insert_all(&conn, &table);
             conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
             for id in 4001..=5500i64 {
                 conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&near(&mut state, &centres, 0.5)))).unwrap();
@@ -6322,6 +6339,8 @@ mod tests {
             conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
             let after = check(&conn, "v_ivf").unwrap();
             assert!(after.consistent(), "mvcc={mvcc}: {after:?}");
+            let integrity = rows(&conn, "PRAGMA integrity_check");
+            assert!(integrity.len() == 1 && integrity[0][0].to_string() == "ok", "mvcc={mvcc}: integrity_check: {:?}", &integrity[..integrity.len().min(4)]);
             assert!(before.stale_copies > 0 && after.blocks > 0 && after.codes == after.rows, "mvcc={mvcc}: before {before:?}, after {after:?}");
             assert_eq!(after.rows, 5500 - 1100, "mvcc={mvcc}");
         }

@@ -542,11 +542,11 @@ pub struct Connection {
     /// commit/rollback skip the mutex and sort when no index method was ever
     /// touched — the overwhelmingly common case.
     pub(crate) has_index_method_tx_cursors: crate::sync::atomic::AtomicBool,
-    /// On a connection [`Self::connect_beside`] opened for `OPTIMIZE INDEX` in steps, what its next
-    /// `OPTIMIZE INDEX` does, as [`crate::index_method::optimize_steps::OptimizeStep`], and whether
-    /// the last left work a further step can do.
+    /// On a connection [`Self::connect_beside`] opened for `OPTIMIZE INDEX` in steps, what its
+    /// next `OPTIMIZE INDEX` does, as [`crate::index_method::optimize_steps::OptimizeStep`], and
+    /// what the last left, as [`crate::index_method::OptimizeProgress`].
     pub(crate) index_method_optimize_step: AtomicU8,
-    pub(crate) index_method_optimize_left: AtomicBool,
+    pub(crate) index_method_optimize_progress: AtomicU8,
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,

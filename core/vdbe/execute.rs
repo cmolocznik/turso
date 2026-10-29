@@ -14825,11 +14825,8 @@ pub fn op_index_method_optimize(
         }
         step => {
             let first = step == OptimizeStep::First;
-            let left = return_if_io!(state, cursor.optimize_step(&context, first));
-            program
-                .connection
-                .index_method_optimize_left
-                .store(left, Ordering::Release);
+            let progress = return_if_io!(state, cursor.optimize_step(&context, first));
+            crate::index_method::optimize_steps::record_progress(&program.connection, progress);
         }
     }
 

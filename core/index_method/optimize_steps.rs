@@ -9,6 +9,7 @@
 //! rolls back a step in flight. Inside a transaction the statement runs one `OPTIMIZE INDEX` there
 //! instead, which does all the work in that transaction.
 
+use super::OptimizeProgress;
 use crate::{
     io::Completion,
     sync::{atomic::Ordering, Arc},
@@ -52,9 +53,34 @@ impl OptimizeStep {
     }
 }
 
-/// Steps in a row whose commit may lose to a concurrent transaction before the statement ends its
-/// run, leaving the work due for the writers' own maintenance and the next `OPTIMIZE INDEX`.
+/// Record on a step connection what its step left.
+pub(crate) fn record_progress(connection: &Connection, progress: OptimizeProgress) {
+    let code = match progress {
+        OptimizeProgress::Done => 0,
+        OptimizeProgress::Moved => 1,
+        OptimizeProgress::Waiting => 2,
+    };
+    connection
+        .index_method_optimize_progress
+        .store(code, Ordering::Release);
+}
+
+fn recorded_progress(connection: &Connection) -> OptimizeProgress {
+    match connection
+        .index_method_optimize_progress
+        .load(Ordering::Acquire)
+    {
+        1 => OptimizeProgress::Moved,
+        2 => OptimizeProgress::Waiting,
+        _ => OptimizeProgress::Done,
+    }
+}
+
+/// Steps in a row whose commit may lose to a concurrent transaction, or that may find all the work
+/// left held by other transactions, before the statement ends its run, leaving the work due for
+/// the writers' own maintenance and the next `OPTIMIZE INDEX`.
 const LOST_IN_A_ROW: usize = 16;
+const WAITING_IN_A_ROW: usize = 64;
 
 /// An `OPTIMIZE INDEX` of one index in steps, and where it is.
 pub(crate) struct OptimizeSteps {
@@ -65,9 +91,10 @@ pub(crate) struct OptimizeSteps {
     steps: Option<Arc<Connection>>,
     phase: Phase,
     first: bool,
-    /// Whether the last step left work a further step can do.
-    left: bool,
+    /// What the last step left.
+    left: OptimizeProgress,
     lost: usize,
+    waiting: usize,
 }
 
 enum Phase {
@@ -124,8 +151,9 @@ impl OptimizeSteps {
             steps: None,
             phase: Phase::Start,
             first: true,
-            left: false,
+            left: OptimizeProgress::Done,
             lost: 0,
+            waiting: 0,
         }
     }
 
@@ -203,9 +231,7 @@ impl OptimizeSteps {
                                 OptimizeStep::Next
                             };
                             ask.set(&steps);
-                            steps
-                                .index_method_optimize_left
-                                .store(false, Ordering::Release);
+                            record_progress(&steps, OptimizeProgress::Done);
                             steps.prepare(format!("OPTIMIZE INDEX {}", quoted(&self.index)))?
                         }
                     };
@@ -215,7 +241,7 @@ impl OptimizeSteps {
                             return Ok(IOResult::IO(io));
                         }
                         Ok(IOResult::Done(())) => {
-                            self.left = steps.index_method_optimize_left.load(Ordering::Acquire);
+                            self.left = recorded_progress(&steps);
                             self.phase = Phase::Commit(None);
                         }
                         Err(error) => self.phase = Phase::Rollback(None, Some(error)),
@@ -235,8 +261,15 @@ impl OptimizeSteps {
                         Ok(IOResult::Done(())) => {
                             self.first = false;
                             self.lost = 0;
-                            if !self.left {
-                                return Ok(IOResult::Done(()));
+                            match self.left {
+                                OptimizeProgress::Done => return Ok(IOResult::Done(())),
+                                OptimizeProgress::Moved => self.waiting = 0,
+                                OptimizeProgress::Waiting => {
+                                    self.waiting += 1;
+                                    if self.waiting >= WAITING_IN_A_ROW {
+                                        return Ok(IOResult::Done(()));
+                                    }
+                                }
                             }
                             self.phase = Phase::Begin(None);
                             return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));

@@ -25,9 +25,12 @@
 //!
 //! A statement that writes the index does the maintenance its writes made due before they are
 //! released, at most one job for each row it wrote, leaving the work it finds due past that to the
-//! next statement's, and `OPTIMIZE INDEX t_idx` does every job there is. Maintenance conflicts
-//! only with a write to a row it changes, and on a conflict it undoes its job and leaves the rows
-//! to the writer holding them. Its jobs: pack a partition's tail into blocks of [`BLOCK`]; rewrite
+//! next statement's, and `OPTIMIZE INDEX t_idx` does every job there is: outside a transaction in
+//! steps on a connection of its own, each committed as it ends, so readers never wait for it and a
+//! writer waits for one step at most ([`super::optimize_steps`]). Maintenance conflicts only with a
+//! write to a row it changes: on a conflict it undoes its job and leaves the rows to the writer
+//! holding them, and under MVCC it leaves for later a partition another open transaction has
+//! written or one committed past its snapshot, where its own write would lose at commit. Its jobs: pack a partition's tail into blocks of [`BLOCK`]; rewrite
 //! a block holding [`COMPACT_AT`] stale copies without them; split a partition grown past an
 //! eighth of the partition count, and two blocks, by 2-means over its members' vectors read back
 //! from the table, so partitions stay near four times the square root of the row count, marking
@@ -75,7 +78,7 @@ use crate::{
         parse_patterns, BackingColumn, BackingSchema, BackingStoreOp, BackingTable, IndexMethod,
         IndexMethodAttachment, IndexMethodConfiguration, IndexMethodContext, IndexMethodCostContext,
         IndexMethodCostEstimate, IndexMethodCursor, IndexMethodDefinition, IndexMethodSnapshotIdentity,
-        IndexMethodTransactionMode,
+        IndexMethodTransactionMode, OptimizeProgress,
     },
     storage::{
         btree::{BTreeKey, CursorTrait},
@@ -1954,13 +1957,15 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
 
 /// What the index's cursors share: the model last loaded or written, under its generation; the
 /// partitions known to be moving, which any writer's maintenance moves along; those a run left work
-/// due in, its jobs spent, which the next statements' maintenance surveys beside its own; the held
-/// partitions; and the index's [`Writes`], under its database's incarnation.
+/// due in, its jobs spent, which the next statements' maintenance surveys beside its own, and the
+/// one from which the next step of OPTIMIZE INDEX takes them; the held partitions; and the index's
+/// [`Writes`], under its database's incarnation.
 #[derive(Default, Debug)]
 struct SharedState {
     model: Option<(i64, Arc<Model>)>,
     moving: BTreeSet<i64>,
     due: BTreeSet<i64>,
+    step_from: i64,
     cache: PartitionCache,
     writes: Option<(u64, SharedWrites)>,
 }
@@ -3484,15 +3489,31 @@ impl IndexMethodCursor for IvfRqCursor {
     /// A step of `OPTIMIZE INDEX`. The first surveys every partition and does no job, leaving
     /// the partitions it finds work due in to the later steps. Each later one surveys up to
     /// [`STEP_JOBS`] of the partitions known to be moving and as many of those runs left work due
-    /// in, and does up to [`STEP_JOBS`] jobs among them, starting none past [`STEP_TIME`] once it
-    /// has done one. A further step has work while runs leave some due, unless this one did no job,
-    /// its first giving way to a transaction holding a row it wrote, which maintains them itself.
-    fn optimize_step(&mut self, context: &IndexMethodContext, first: bool) -> IOResultOr<bool> {
+    /// in, these from where the last step stopped, passing over those another transaction holds or
+    /// committed past this step's snapshot, and does up to [`STEP_JOBS`] jobs among them, starting
+    /// none past [`STEP_TIME`] once it has done one. While other transactions hold all the work
+    /// left, it waits, doing none.
+    fn optimize_step(&mut self, context: &IndexMethodContext, first: bool) -> IOResultOr<OptimizeProgress> {
         if self.run.is_none() {
+            self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
+            self.open_stores(context)?;
+            if self.sharing.is_none() {
+                self.share(context)?;
+            }
             let mut start = Vec::new();
             if !first {
-                let shared = self.shared.lock().expect("index state");
-                start.extend(shared.moving.iter().take(STEP_JOBS).chain(shared.due.iter().take(STEP_JOBS)).copied());
+                let (moving, due) = {
+                    let shared = self.shared.lock().expect("index state");
+                    let from = shared.step_from;
+                    let due: Vec<i64> = shared.due.range(from..).chain(shared.due.range(..from)).copied().collect();
+                    (shared.moving.iter().copied().collect::<Vec<i64>>(), due)
+                };
+                start.extend(moving.into_iter().filter(|p| self.claimable(&[*p])).take(STEP_JOBS));
+                let taken: Vec<i64> = due.into_iter().filter(|p| self.claimable(&[*p])).take(STEP_JOBS).collect();
+                if let Some(last) = taken.last() {
+                    self.shared.lock().expect("index state").step_from = last + 1;
+                }
+                start.extend(taken);
             }
             let (budget, until) = step_bounds();
             let budget = if first { 0 } else { budget };
@@ -3503,8 +3524,11 @@ impl IndexMethodCursor for IvfRqCursor {
             return Ok(IOResult::IO(io));
         }
         let shared = self.shared.lock().expect("index state");
-        let due = !(shared.due.is_empty() && shared.moving.is_empty());
-        Ok(IOResult::Done(due && (first || self.jobs > 0)))
+        Ok(IOResult::Done(match (shared.due.is_empty() && shared.moving.is_empty(), first || self.jobs > 0) {
+            (true, _) => OptimizeProgress::Done,
+            (false, true) => OptimizeProgress::Moved,
+            (false, false) => OptimizeProgress::Waiting,
+        }))
     }
 
     /// Before the statement's writes are released, do the maintenance they made due, chosen among
@@ -5938,6 +5962,63 @@ mod tests {
                 let q = random(&mut state, DIMS);
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
             }
+        }
+    }
+
+    /// Under MVCC a step of OPTIMIZE INDEX takes work no other transaction holds: with a writer's
+    /// transaction open over the sixteen lowest-numbered partitions with work due, OPTIMIZE INDEX
+    /// packs every tail outside them, and after the writer commits the next does the rest. Steps
+    /// that looked only at those sixteen found no job they could do and ended the run.
+    #[test]
+    fn optimize_works_around_the_partitions_an_open_transaction_holds() {
+        const DIMS: usize = 16;
+        let (db, conn) = database("ivf-rq-optimize-around.db", true);
+        let mut state = 251;
+        let mut live = backlog(&conn, &mut state, DIMS);
+        let index = stored(&conn);
+        let mut due: Vec<i64> = index
+            .pending()
+            .iter()
+            .filter_map(|work| {
+                let rest = work.strip_prefix("partition ")?;
+                rest.split(' ').next()?.parse().ok()
+            })
+            .collect();
+        due.sort_unstable();
+        due.dedup();
+        let held: Vec<i64> = due.into_iter().take(16).collect();
+        assert!(held.len() == 16 && held.iter().all(|p| index.part(*p).state == State::Live), "the backlog left {held:?} due");
+        // Each held partition's current centroid, which a row equal to it is coded beside.
+        let mut centroids: HashMap<i64, (i64, Vec<f32>)> = HashMap::new();
+        for row in backing(&conn, "centroids", "value") {
+            let key = row[0].as_int().unwrap();
+            if key < 0 {
+                continue;
+            }
+            let (p, version) = (key >> VERSION_BITS, key & ((1 << VERSION_BITS) - 1));
+            let v: Vec<f32> = row[1].to_blob().unwrap().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+            if centroids.get(&p).is_none_or(|(at, _)| *at < version) {
+                centroids.insert(p, (version, v));
+            }
+        }
+        let rows: Vec<(i64, Vec<f32>)> = held.iter().enumerate().map(|(i, p)| (200_000 + i as i64, centroids[p].1.clone())).collect();
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        STATEMENT_UPKEEP.with(|on| on.set(false));
+        insert_all(&writer, &rows);
+        STATEMENT_UPKEEP.with(|on| on.set(true));
+        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        let index = stored(&conn);
+        let unpacked: Vec<(i64, usize)> = index.live().into_iter().filter(|p| !held.contains(p) && index.tail(*p) >= PACK_AT).map(|p| (p, index.tail(p))).collect();
+        assert!(unpacked.is_empty(), "tails left unpacked outside the held partitions: {unpacked:?}");
+        writer.execute("COMMIT").unwrap();
+        live.extend(rows);
+        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        let left = stored(&conn).pending();
+        assert!(left.is_empty(), "work left after the writer committed: {left:?}");
+        for _ in 0..3 {
+            let q = random(&mut state, DIMS);
+            assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
         }
     }
 

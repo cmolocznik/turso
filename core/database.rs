@@ -2765,7 +2765,7 @@ impl Database {
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
             has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),
             index_method_optimize_step: AtomicU8::new(0),
-            index_method_optimize_left: AtomicBool::new(false),
+            index_method_optimize_progress: AtomicU8::new(0),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),

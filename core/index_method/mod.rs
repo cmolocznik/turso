@@ -154,6 +154,18 @@ pub struct IndexMethodDefinition<'a> {
     pub optimize_in_steps: bool,
 }
 
+/// What a step of `OPTIMIZE INDEX` leaves (see [IndexMethodCursor::optimize_step]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimizeProgress {
+    /// No work a further step can do.
+    Done,
+    /// It did work, and a further step has more to do.
+    Moved,
+    /// It did none, other transactions holding all the work there is: a further step may find
+    /// some of it free.
+    Waiting,
+}
+
 /// Transaction mode exposed to index methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexMethodTransactionMode {
@@ -697,10 +709,14 @@ pub trait IndexMethodCursor: Send {
     /// One step of an `OPTIMIZE INDEX` of a method that optimizes in steps (see
     /// [IndexMethodDefinition::optimize_in_steps]): a bounded share of the work, which commits in
     /// the step's own transaction. The first step, `first`, runs in a read transaction and must not
-    /// write: it finds the work there is. Returns whether a further step has work it can do.
-    fn optimize_step(&mut self, context: &IndexMethodContext, _first: bool) -> IOResultOr<bool> {
+    /// write: it finds the work there is.
+    fn optimize_step(
+        &mut self,
+        context: &IndexMethodContext,
+        _first: bool,
+    ) -> IOResultOr<OptimizeProgress> {
         match self.optimize(context)? {
-            IOResult::Done(()) => Ok(IOResult::Done(false)),
+            IOResult::Done(()) => Ok(IOResult::Done(OptimizeProgress::Done)),
             IOResult::IO(io) => Ok(IOResult::IO(io)),
         }
     }

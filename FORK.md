@@ -620,11 +620,17 @@ Still open:
   - 51 finished.
 
   Two writers keep up.
-- **Stepped OPTIMIZE INDEX never rebuilds.** Run alone on that four-writer database, OPTIMIZE INDEX
-  split its 29 partitions into 1,259 one at a time, in 206 s, and left it consistent. It made no
-  rebuild, though the index held far more vectors than its partitions were trained for. A rebuild
-  is chosen only after a survey of every partition, and only the first step, which does no job,
-  surveys them all.
+
+### OPTIMIZE INDEX in steps rebuilds an `ivf_rq` index its rows outgrew
+2026-10-30 `41f8dd865`. `core/index_method/ivf_rq.rs`. A rebuild was chosen only after a survey of
+every partition, and only the first step of OPTIMIZE INDEX, which does no job, surveyed them all.
+So a stepped OPTIMIZE INDEX split an outgrown index a partition at a time: run alone on a
+four-writer `ivf_crash` database, it took 206 s to split 29 partitions holding 150,278 rows into
+1,259. A run that surveyed every partition now records whether a rebuild is due; the next step
+surveys them all again and makes it, and OPTIMIZE INDEX does not end while one is due. On another
+such database (`ivf_crash optimize`), 10 partitions holding 87,891 rows became 1,185 in 1.2 s,
+consistent and with no work left. `optimize_in_steps_rebuilds_an_index_its_rows_outgrew` (WAL and
+MVCC, 3,000 rows in one partition's tail) fails without the change.
 
 ## Taken upstream
 

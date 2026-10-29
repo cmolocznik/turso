@@ -6064,6 +6064,191 @@ mod tests {
         }
     }
 
+    /// One connection of [`a_random_workload_keeps_every_answer_exact`]: whether it has a
+    /// transaction open, the committed rows that transaction's first statement found, and its own
+    /// writes since, each row's vector or none for a row it deleted.
+    struct Session {
+        connection: Arc<crate::Connection>,
+        open: bool,
+        snapshot: Option<Arc<HashMap<i64, Vec<f32>>>>,
+        pending: HashMap<i64, Option<Vec<f32>>>,
+        /// Whether its transaction has done anything but insert.
+        changed: bool,
+    }
+
+    impl Session {
+        /// The rows this connection's next statement sees: its transaction's snapshot, taken now
+        /// if this is its first statement, with its own writes over it.
+        fn view(&mut self, committed: &Arc<HashMap<i64, Vec<f32>>>) -> HashMap<i64, Vec<f32>> {
+            let snapshot = self.snapshot.get_or_insert_with(|| committed.clone());
+            let mut view = (**snapshot).clone();
+            for (id, row) in &self.pending {
+                match row {
+                    Some(v) => view.insert(*id, v.clone()),
+                    None => view.remove(id),
+                };
+            }
+            view
+        }
+
+        fn end(&mut self) {
+            self.open = false;
+            self.snapshot = None;
+            self.pending.clear();
+            self.changed = false;
+        }
+    }
+
+    /// Random workloads over three connections and a fourth running OPTIMIZE INDEX in steps keep
+    /// every answer exact, under WAL and under MVCC: transactions and autocommit statements insert,
+    /// delete and update rows, commit or roll back, and query, their statements interleaved in a
+    /// random order with OPTIMIZE INDEX's steps. Each query's answer is the exact top ten of the rows
+    /// its snapshot holds and its transaction's own writes; a transaction that only inserts commits;
+    /// and once every transaction has ended, one more OPTIMIZE INDEX leaves no work due.
+    /// IVF_RQ_WORKLOAD_SEEDS (default 2) sets how many seeds each mode runs.
+    #[test]
+    fn a_random_workload_keeps_every_answer_exact() {
+        const DIMS: usize = 8;
+        let seeds: u64 = std::env::var("IVF_RQ_WORKLOAD_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        for mvcc in [false, true] {
+            for seed in 0..seeds {
+                let case = format!("mvcc={mvcc}, seed={seed}");
+                let (db, conn) = database(&format!("ivf-rq-random-{mvcc}-{seed}.db"), mvcc);
+                if let Some(store) = db.get_mv_store().as_ref() {
+                    // A commit then never waits on another's in flight, so each ends in its turn.
+                    store.set_group_commit_enabled(false);
+                }
+                let mut state = 241 + seed;
+                let centres: Vec<Vec<f32>> = (0..6).map(|_| random(&mut state, DIMS).iter().map(|x| 3.0 * x).collect()).collect();
+                let rows: Vec<(i64, Vec<f32>)> = (1..=1500i64).map(|id| (id, near(&mut state, &centres, 0.3))).collect();
+                insert_all(&conn, &rows);
+                conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+                let mut committed: Arc<HashMap<i64, Vec<f32>>> = Arc::new(rows.into_iter().collect());
+                let mut sessions: Vec<Session> = (0..3)
+                    .map(|_| Session { connection: db.connect(crate::ConnectOpts::new()).unwrap(), open: false, snapshot: None, pending: HashMap::new(), changed: false })
+                    .collect();
+                let maintainer = db.connect(crate::ConnectOpts::new()).unwrap();
+                let mut optimizing: Option<Interleaved> = None;
+                let (mut next, mut queries) = (100_000i64, 0usize);
+                let pick = |state: &mut u64, n: usize| ((random(state, 1)[0] + 0.5) * n as f32) as usize % n;
+                for _ in 0..600 {
+                    let roll = pick(&mut state, 100);
+                    if roll < 15 {
+                        let optimize = optimizing.get_or_insert_with(|| Interleaved::new(&maintainer, &["OPTIMIZE INDEX v_ivf".to_string()]));
+                        if optimize.turn(&db) {
+                            optimizing = None;
+                        }
+                        continue;
+                    }
+                    let s = pick(&mut state, sessions.len());
+                    let session = &mut sessions[s];
+                    let in_transaction = session.open;
+                    let begin = if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" };
+                    let first = session.snapshot.is_none();
+                    let view = session.view(&committed);
+                    let ids: Vec<i64> = view.keys().copied().collect();
+                    let (sql, writes): (String, Vec<(i64, Option<Vec<f32>>)>) = match roll {
+                        15..30 if !in_transaction => (begin.to_string(), Vec::new()),
+                        30..45 if in_transaction => ("COMMIT".to_string(), Vec::new()),
+                        45..50 if in_transaction => ("ROLLBACK".to_string(), Vec::new()),
+                        50..70 => {
+                            let rows: Vec<(i64, Vec<f32>)> = (0..1 + pick(&mut state, 6))
+                                .map(|_| {
+                                    next += 1;
+                                    (next, near(&mut state, &centres, 0.3))
+                                })
+                                .collect();
+                            let values: Vec<String> = rows.iter().map(|(id, v)| format!("({id}, {})", literal(v))).collect();
+                            (format!("INSERT INTO v VALUES {}", values.join(",")), rows.into_iter().map(|(id, v)| (id, Some(v))).collect())
+                        }
+                        70..80 if !ids.is_empty() => {
+                            let id = ids[pick(&mut state, ids.len())];
+                            (format!("DELETE FROM v WHERE id = {id}"), vec![(id, None)])
+                        }
+                        80..88 if !ids.is_empty() => {
+                            let (id, v) = (ids[pick(&mut state, ids.len())], near(&mut state, &centres, 0.3));
+                            (format!("UPDATE v SET e = {} WHERE id = {id}", literal(&v)), vec![(id, Some(v))])
+                        }
+                        _ => {
+                            let q = near(&mut state, &centres, 0.3);
+                            let got = top_ten(&session.connection, &q);
+                            assert_eq!(got, exact_top_ten(&view, &q), "{case}: a query's answer");
+                            queries += 1;
+                            if !in_transaction {
+                                session.end();
+                            }
+                            continue;
+                        }
+                    };
+                    let only_inserts = sql.starts_with("COMMIT") && !session.changed;
+                    match session.connection.execute(&sql) {
+                        Ok(()) => {
+                            if sql == begin {
+                                session.open = true;
+                                session.snapshot = None;
+                                continue;
+                            }
+                            if !sql.starts_with("INSERT") && !writes.is_empty() {
+                                session.changed = true;
+                            }
+                            session.pending.extend(writes);
+                            if sql == "ROLLBACK" {
+                                session.end();
+                            } else if sql == "COMMIT" || !in_transaction {
+                                let after = Arc::make_mut(&mut committed);
+                                for (id, row) in session.pending.drain() {
+                                    match row {
+                                        Some(v) => after.insert(id, v),
+                                        None => after.remove(&id),
+                                    };
+                                }
+                                session.end();
+                            }
+                        }
+                        // Under WAL another transaction holds the write lock: nothing happened, and a
+                        // transaction's first statement took no snapshot.
+                        Err(LimboError::Busy) if session.connection.get_auto_commit() == !session.open => {
+                            if !in_transaction {
+                                session.end();
+                            } else if first {
+                                session.snapshot = None;
+                            }
+                        }
+                        // A write lost to another transaction's, or under WAL found its snapshot
+                        // stale: the transaction is over, rolled back by the engine or here.
+                        Err(e) => {
+                            assert!(matches!(e, LimboError::WriteWriteConflict | LimboError::BusySnapshot | LimboError::Busy), "{case}: {sql}: {e}");
+                            assert!(!only_inserts, "{case}: a transaction that only inserted failed to commit: {e}");
+                            if !session.connection.get_auto_commit() {
+                                session.connection.execute("ROLLBACK").unwrap();
+                            }
+                            session.end();
+                        }
+                    }
+                }
+                while let Some(optimize) = optimizing.as_mut() {
+                    if optimize.turn(&db) {
+                        optimizing = None;
+                    }
+                }
+                for session in &mut sessions {
+                    if session.open {
+                        session.connection.execute("ROLLBACK").unwrap();
+                        session.end();
+                    }
+                }
+                assert!(queries > 50, "{case}: only {queries} queries");
+                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                let left = stored(&conn).pending();
+                assert!(left.is_empty(), "{case}: work left after OPTIMIZE INDEX: {left:?}");
+                for _ in 0..5 {
+                    let q = near(&mut state, &centres, 0.3);
+                    assert_eq!(top_ten(&conn, &q), exact_top_ten(&committed, &q), "{case}: after the workload");
+                }
+            }
+        }
+    }
+
     /// The rows maintenance surveys while it works off a backlog grow with the backlog, not with
     /// its square: doubling the rows one statement inserts less than triples them.
     #[test]

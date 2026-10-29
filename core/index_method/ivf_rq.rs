@@ -6103,7 +6103,9 @@ mod tests {
         conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
         let writers: Vec<Arc<crate::Connection>> = (0..WRITERS).map(|_| db.connect(crate::ConnectOpts::new()).unwrap()).collect();
         let insert = |rows: &[(i64, Vec<f32>)]| format!("INSERT INTO v VALUES {}", rows.iter().map(|(id, v)| format!("({id}, {})", literal(v))).collect::<Vec<_>>().join(","));
-        let mut open: Vec<Option<(Vec<(i64, Vec<f32>)>, Vec<i64>, Interleaved)>> = (0..WRITERS).map(|_| None).collect();
+        // Each writer's open transaction: the rows it inserted, the rows it deleted, its statements.
+        type Open = Option<(Vec<(i64, Vec<f32>)>, Vec<i64>, Interleaved)>;
+        let mut open: Vec<Open> = (0..WRITERS).map(|_| None).collect();
         let (mut next, mut committed) = (3000i64, 0usize);
         // Each transaction also deletes rows of the first 3,000, each once, so blocks gather stale
         // copies and compactions come due beside the packs.
@@ -6156,6 +6158,9 @@ mod tests {
         /// Whether its transaction has done anything but insert.
         changed: bool,
     }
+
+    /// A row a statement writes: its vector, or none for a row it deletes.
+    type Write = (i64, Option<Vec<f32>>);
 
     impl Session {
         /// The rows this connection's next statement sees: its transaction's snapshot, taken now
@@ -6228,7 +6233,7 @@ mod tests {
                     let first = session.snapshot.is_none();
                     let view = session.view(&committed);
                     let ids: Vec<i64> = view.keys().copied().collect();
-                    let (sql, writes): (String, Vec<(i64, Option<Vec<f32>>)>) = match roll {
+                    let (sql, writes): (String, Vec<Write>) = match roll {
                         15..30 if !in_transaction => (begin.to_string(), Vec::new()),
                         30..45 if in_transaction => ("COMMIT".to_string(), Vec::new()),
                         45..50 if in_transaction => ("ROLLBACK".to_string(), Vec::new()),
@@ -6288,7 +6293,7 @@ mod tests {
                         }
                         // Under WAL another transaction holds the write lock: nothing happened, and a
                         // transaction's first statement took no snapshot.
-                        Err(LimboError::Busy) if session.connection.get_auto_commit() == !session.open => {
+                        Err(LimboError::Busy) if session.connection.get_auto_commit() != session.open => {
                             if !in_transaction {
                                 session.end();
                             } else if first {

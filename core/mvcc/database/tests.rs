@@ -3194,7 +3194,7 @@ fn test_background_checkpoint_runs_off_the_commit_and_truncates_when_writes_paus
     let mvcc_store = db.get_mvcc_store();
     let probe = mvcc_store.background_checkpoint_probe();
     for i in 0..200 {
-        conn.execute(&format!("INSERT INTO t VALUES ({i}, randomblob(256))"))
+        conn.execute(format!("INSERT INTO t VALUES ({i}, randomblob(256))"))
             .unwrap();
     }
     assert!(
@@ -3221,7 +3221,7 @@ fn test_background_checkpoint_is_off_by_default() {
     let mvcc_store = db.get_mvcc_store();
     let probe = mvcc_store.background_checkpoint_probe();
     for i in 0..200 {
-        conn.execute(&format!("INSERT INTO t VALUES ({i}, randomblob(256))"))
+        conn.execute(format!("INSERT INTO t VALUES ({i}, randomblob(256))"))
             .unwrap();
         assert!(
             mvcc_store.storage.logical_log_offset() < 8192,
@@ -3245,7 +3245,7 @@ fn test_background_checkpoint_thread_exits_with_its_database() {
         conn.execute("PRAGMA mvcc_checkpoint_threshold = 4096").unwrap();
         let probe = db.get_mvcc_store().background_checkpoint_probe();
         for i in 0..100 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, randomblob(256))"))
+            conn.execute(format!("INSERT INTO t VALUES ({i}, randomblob(256))"))
                 .unwrap();
         }
         assert!(wait_until(|| probe.checkpoints() > 0));

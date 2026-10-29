@@ -387,9 +387,9 @@ records the generation row and keeps across a schema reload the highest position
 (`FLOORS`). `concurrent_writers_maintaining_the_index_all_commit`: three `BEGIN CONCURRENT`
 writers inserting and deleting, their statements interleaved at random, all commit; with every
 job claiming its partitions a writer's COMMIT failed with WriteWriteConflict, as the writer beside
-the stepped OPTIMIZE did. Still open under MVCC: a delete or update of a vector that maintenance
-moved after the deleting transaction's snapshot fails with WriteWriteConflict, as any write to a
-row a concurrent transaction changed does; `BEGIN CONCURRENT` clients retry.
+the stepped OPTIMIZE did. A delete or update of a vector that maintenance moved after the writing
+transaction's snapshot still failed with WriteWriteConflict until 2026-10-30 (below, "A write of an
+`ivf_rq` index that meets maintenance leaves the vector to it").
 
 Held rows of a partition no open writer has written now serve other snapshots
 (`an_open_writer_keeps_from_the_held_rows_only_the_partitions_it_wrote`: a full-probe query beside
@@ -501,6 +501,70 @@ copy. Every row now fills the columns its kind does not use with zeros; readers 
 and are unchanged. `the_check_finds_the_index_consistent_after_every_kind_of_write` asserts
 `PRAGMA integrity_check`; without the fill it fails with "NULL value in
 __turso_internal_v_ivf_partitions.c1".
+
+### A write of an `ivf_rq` index that meets maintenance leaves the vector to it
+2026-10-30 `966402498`, `bbfcec22e` (the first's subject overclaims: see "Still open" below).
+`core/index_method/ivf_rq.rs`. Maintenance moves and recodes vectors' rows beside open
+transactions: each statement does the maintenance its writes made due, and OPTIMIZE INDEX runs in
+steps on a connection of its own. Under MVCC a delete or update of a vector that maintenance had
+moved after the writing transaction's snapshot, or was moving, failed with a write-write conflict,
+though no other write touched the table's row.
+`deletes_and_updates_of_vectors_maintenance_moved_after_the_snapshot_commit`: a `BEGIN CONCURRENT`
+transaction holds its snapshot while OPTIMIZE INDEX packs and moves a 1,500-row backlog, then
+deletes half the rows whose codes moved and updates the other half; before, its DELETE failed with
+WriteWriteConflict.
+
+A write of the index now reads its rowid's redo rows first, in a fourth backing table keyed by rowid
+and sequence and usually empty. With none it writes as before, keeping each row's prior state. A
+write that meets a row maintenance changed after the snapshot, or holds, undoes what it wrote and
+writes the rowid's first redo row instead: a key nothing else writes, recording its transaction's
+MVCC begin timestamp. While a rowid has redo rows, each write of it adds one more and writes nothing
+else. A query passes over any code of such a rowid and reads its vector from the table, in every
+round of a filtered query and with or without the rerank. The rowids are held across snapshots as a
+partition's rows are, so a query over held partitions still reads no page.
+
+Maintenance settles redo rows before any other job, reading a batch of them per job it may do. A
+run that may do no job, like the first step of OPTIMIZE INDEX, still reads one batch, so OPTIMIZE
+INDEX ends as soon as none is left. A settle removes the redo rows first, which claims the rowid
+from any other run settling it, then kills the code and codes the table row's vector afresh where it
+has one. A settle that meets a row another transaction holds is undone, and the run goes on without
+that rowid. A run passes over its own transaction's redo rows, whose settle could only meet what
+their writes met. A job that codes a vector afresh and finds its table row gone, or without a
+vector, kills the code when the rowid has redo rows. A rebuild leaves such rowids to their settles.
+
+Tests, each failing with its part of the change taken out (2026-10-30, nine mutations, each red and
+then restored from HEAD by hash):
+- the conflict test above;
+- `rows_left_to_maintenance_are_answered_from_their_table_rows_until_settled`: WAL and MVCC; 120
+  rows are left to maintenance, then deleted and updated while settles are held. Every answer is
+  exact and the check is consistent; OPTIMIZE INDEX then settles them all. It fails when queries
+  score these rows' codes, or do not read their vectors, or when OPTIMIZE INDEX ends with redo
+  rows left;
+- `a_filtered_query_reads_rows_left_to_maintenance_from_the_table`;
+- `a_job_finding_a_row_left_to_maintenance_gone_kills_its_code`: a split's moves kill all forty;
+- `a_rebuild_leaves_rows_with_redo_rows_to_their_settle`;
+- `held_rows_serve_later_snapshots_until_a_commit_writes_their_partition` and the other seek-count
+  tests, which failed while every query read the redo rows from pages;
+- `optimize_settles_every_row_left_to_maintenance`: 1,100 rowids, more than one step settles; it
+  fails when OPTIMIZE INDEX ends with redo rows left;
+- `optimize_with_nothing_due_ends_at_its_first_step`: under WAL, beside a transaction holding the
+  write lock. Before the first step read the redo rows, OPTIMIZE INDEX with nothing due took a
+  second step, which waits for the write lock; that hung `a_random_workload_keeps_every_answer_exact`;
+- the conflict test's one-row updates, made while their transaction has 750 rows left to maintenance,
+  read at most 2 rows by key each. Without the pass over a transaction's own redo rows, one read
+  4,162: its maintenance tried to settle them and met its own writes.
+
+Still open, from `fork/repro`'s `ivf_crash`: four writers and OPTIMIZE INDEX under MVCC, 12 kill
+rounds on seed 4242, each passing its checks. Before the fix: 700 conflicts in 11,475 commits.
+After: 533 in 11,591, with 11 writes left to maintenance. All the remaining conflicts happen at the
+COMMIT of an explicit `BEGIN CONCURRENT` transaction; none at a statement. In a 6-second traced run,
+921 of 937 were the MVCC store refusing a concurrent commit while a non-CONCURRENT write transaction
+held its exclusive lock (`CommitState::Initial`). Under MVCC an autocommit write, `BEGIN` or `BEGIN
+IMMEDIATE` begins such a transaction (`TransactionMode::Write`), and eight in ten of the harness's
+writes are autocommit. The other 16 lost first-committer validation on index rows that their own
+statements' maintenance wrote (bookkeeping rows, the generation row, vectors' rows). They include two
+transactions each inserting a row the other had inserted and not yet committed, which the store
+detects only at commit.
 
 ## Taken upstream
 

@@ -83,14 +83,22 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     let next = Arc::new(AtomicI64::new(rows(&conn, "SELECT coalesce(max(id), 0) FROM v")?[0][0].as_int().unwrap_or(0) + 1));
     let (commits, failures, optimizes) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     let conflicts = Arc::new(AtomicU64::new(0));
+    // The conflicts by what met them: an insert, update or delete statement, or a COMMIT.
+    let met: Arc<[AtomicU64; 4]> = Arc::new(Default::default());
     let begin = if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" };
     for t in 0..threads {
-        let (db, next, commits, failures, conflicts) = (db.clone(), next.clone(), commits.clone(), failures.clone(), conflicts.clone());
+        let (db, next, commits, failures, conflicts, met) = (db.clone(), next.clone(), commits.clone(), failures.clone(), conflicts.clone(), met.clone());
         std::thread::spawn(move || {
             let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_busy_timeout(Duration::from_secs(10));
             conn.execute("PRAGMA synchronous = NORMAL").unwrap();
             let mut random = Random((seed ^ (t as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)) | 1);
+            let tally = |kind: usize, done: turso_core::Result<()>| {
+                if matches!(done, Err(turso_core::LimboError::WriteWriteConflict)) {
+                    met[kind].fetch_add(1, Ordering::Relaxed);
+                }
+                done
+            };
             let one = |random: &mut Random| -> turso_core::Result<()> {
                 let top = next.load(Ordering::Relaxed) as u64;
                 match random.below(10) {
@@ -98,10 +106,10 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
                         let n = 1 + random.below(20) as i64;
                         let first = next.fetch_add(n, Ordering::Relaxed);
                         let values: Vec<String> = (0..n).map(|i| format!("({}, {})", first + i, literal(&vector(random)))).collect();
-                        conn.execute(format!("INSERT INTO v VALUES {}", values.join(",")))
+                        tally(0, conn.execute(format!("INSERT INTO v VALUES {}", values.join(","))))
                     }
-                    5..=7 => conn.execute(format!("UPDATE v SET e = {} WHERE id = {}", literal(&vector(random)), 1 + random.below(top))),
-                    _ => conn.execute(format!("DELETE FROM v WHERE id = {}", 1 + random.below(top))),
+                    5..=7 => tally(1, conn.execute(format!("UPDATE v SET e = {} WHERE id = {}", literal(&vector(random)), 1 + random.below(top)))),
+                    _ => tally(2, conn.execute(format!("DELETE FROM v WHERE id = {}", 1 + random.below(top)))),
                 }
             };
             loop {
@@ -112,7 +120,7 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
                         for _ in 0..2 + random.below(5) {
                             one(&mut random)?;
                         }
-                        conn.execute(if random.below(6) == 0 { "ROLLBACK" } else { "COMMIT" })
+                        tally(3, conn.execute(if random.below(6) == 0 { "ROLLBACK" } else { "COMMIT" }))
                     })(),
                 };
                 match done {
@@ -147,10 +155,14 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     loop {
         std::thread::sleep(Duration::from_millis(200));
         eprintln!(
-            "progress commits={} failures={} conflicts={} optimizes={} redone={}",
+            "progress commits={} failures={} conflicts={} (insert {}, update {}, delete {}, commit {}) optimizes={} redone={}",
             commits.load(Ordering::Relaxed),
             failures.load(Ordering::Relaxed),
             conflicts.load(Ordering::Relaxed),
+            met[0].load(Ordering::Relaxed),
+            met[1].load(Ordering::Relaxed),
+            met[2].load(Ordering::Relaxed),
+            met[3].load(Ordering::Relaxed),
             optimizes.load(Ordering::Relaxed),
             turso_core::index_method::ivf_rq::REDONE.load(Ordering::Relaxed)
         );

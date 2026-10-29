@@ -321,8 +321,13 @@ Under MVCC in one transaction OPTIMIZE took 10.8 s, and the `BEGIN CONCURRENT` w
 committed once, 3,975 of its commits failing against OPTIMIZE's exclusive transaction, while the
 readers ran 200 queries a second; in steps it took 7.8 s, the writer committed all 156 of its
 transactions at its pace (p99 16 ms, longest 19.5 ms, none failed) and the readers ran 2,015. Every
-commit empties the other connections' page caches, the step connection's among them whenever the
-writer commits; how much of the slower stepped run under WAL that accounts for is not measured.
+commit emptied the other connections' page caches until a read kept the pages no other connection
+wrote (below). On in-memory files (`IO=memory`), which take this host's disk out, that took stepped
+OPTIMIZE under WAL from 6.9 and 8.5 s to 5.1 and 7.7 s, and the readers beside it from 1,365 and
+1,201 queries a second to 1,898 and 1,789. The same runs show a writer waiting on the write lock
+while OPTIMIZE steps, in both builds: p99 532 ms to 1.7 s, longest 1.2 to 2.0 s, against 233 ms and
+630 ms on the file. A step's connection takes the lock again after its commit before the writer's
+busy handler wakes.
 
 A step takes the partitions no other
 transaction holds: up to 16 of those known to be moving and 16 of those left due, the latter
@@ -355,6 +360,63 @@ rolling back and querying, beside OPTIMIZE INDEX in steps, interleaved at random
 MVCC, and checks each answer against the exact top ten of its snapshot and own writes (741 queries
 over the two default seeds of each mode; IVF_RQ_WORKLOAD_SEEDS for more). With the held rows served
 whatever writer was open, it failed at once.
+
+### A read keeps the cached pages no other connection wrote
+`core/storage/wal.rs` (`FramePages`, `ReadChanges`, `WalCoordination::read_changes`,
+`WalFile::keep_unread_changes`), `core/storage/pager.rs` (`Pager::forget_changes`). A read that
+found the WAL changed since its connection's last read cleared the connection's whole page cache,
+so each commit or checkpoint of one connection cost every other connection all its cached pages.
+The in-process WAL now records the page each frame holds, for the current generation and the last
+8 that a restart retired (up to 2^18 frames), and a read evicts only the pages of the frames
+between its connection's previous snapshot and its new one. Within a generation a committed frame
+never changes and a checkpoint copies frames to the database file as they are, so those pages are
+all that changed. A read still clears the whole cache when a frame in that range was never recorded
+(frames recovered when the WAL was opened), when a generation it spans is no longer kept, when more
+than 2^16 frames or more pages than the cache holds changed, when one of the pages is dirty, locked
+or pinned, under the process-shared WAL, and after `reload_wal_after_external_restore`.
+
+A checkpoint that restarts the WAL (`restart_log`, `try_restart_log_before_write`) moves its
+connection's snapshot into the new generation without a read. MVCC's checkpoint calls the WAL's
+checkpoint directly when it has nothing of its own to write, so after another connection's
+checkpoint wrote and backfilled frames, the restarting connection's snapshot skipped frames it had
+never read. While any change cleared the whole cache, the next change cleared those pages too (on
+upstream `main` the randomized workload below passes 40 seeds in each mode); kept, they were read
+stale ("inconsistent overflow chain observed during payload read"). The connection now keeps what
+its restart skipped, and its next read drops those pages.
+
+Tests, in `core/storage/pager.rs`: `a_read_keeps_the_pages_another_connection_did_not_write`
+(a read after a one-row update kept 3 of 156 cached pages before; WAL and MVCC, within a generation
+and across a restart), `a_restart_past_frames_a_connection_never_read_drops_their_pages` (read the
+rows' old versions without the restart's changes kept), and
+`reads_beside_writes_and_checkpoints_see_every_commit`: four connections writing rows up to two
+pages long, reading in and out of transactions, rolling back and checkpointing in every mode,
+interleaved at random with 64-page caches and checked against a model of each snapshot
+(`READ_CHANGES_SEEDS`, default 2 a mode). It failed at MVCC seed 0 before the restart's changes
+were kept, and fails with a retired generation's frames skipped. `fork-repro`'s `read_changes` runs
+the same workload through the public API: 300 seeds in each mode pass.
+
+Measured with `tmp/ann/ivfrq/src/bin/page-reads.rs`: two readers looking up random rows of a
+200,000-row table (200-byte bodies, 20,000-page caches) beside a writer updating one row a
+transaction, on efficiency cores 6-8, 20 s a run, against 9c6a6b3d5 with the two alternating. On
+in-memory files (`IO=memory`), three rounds: under WAL, with the writer at 20 transactions a second
+the readers ran 878,604-1,071,885 lookups a second against 618,256-738,833 (p99 2.4-2.9 µs against
+3.9-4.7), and with the writer unthrottled 708,223-783,524 against 352,957-441,632, the writer
+committing 12-25% more (1.32-1.49 million in 20 s against 1.06-1.30 million). On a file
+(synchronous NORMAL), two rounds: 995,167 and 1,057,091 against 683,438 and 661,707 at 20 a second,
+972,745 and 977,055 against 619,041 and 570,100 unthrottled. Under MVCC a commit writes no WAL
+frames and only checkpoints change the readers' pages: 472,691 against 472,770 at 20 a second on
+the file, and with the writer unthrottled and a checkpoint every 256 KB 141,169-243,115 against
+159,846-212,798 in memory. On the file both builds now and then had reads stall 10-17 s under MVCC
+with the writer unthrottled (4 runs of 22 with the change, 1 of 22 without), with slow fsyncs
+beside them; on in-memory files neither build's longest read passed 19 ms.
+
+In `ivfrq-load optimize` on in-memory files (glove-100, 355,054 rows indexed and 118,351 more
+waiting, stepped), the readers ran 690 and 729 queries a second against 384 and 418 beside the
+writer before OPTIMIZE, 1,789 and 1,898 against 1,201 and 1,365 during it (p99 6.3-6.9 ms against
+13-14) and 3,162 and 3,304 against 2,725 and 2,859 after it under WAL; under MVCC 1,147 against 988
+during it, OPTIMIZE taking 8.9 s against 10.1. On the file (710,108 rows and 236,702 more) the
+disk decided the runs: the writer stalled 1.1 and 1.3 s in the build without the change and 17.6
+and 22.5 s in the one with it, which no in-memory run showed.
 
 ## Considered and not taken
 

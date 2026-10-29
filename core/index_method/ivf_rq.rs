@@ -1218,6 +1218,21 @@ impl Model {
         let residual = v.iter().zip(&self.centroids[p]).map(|(a, b)| a - b).collect();
         (p as i64, self.versions[p], code(rotation, rowid, residual))
     }
+
+    /// Code a vector as [`Self::encode`] does, `nearest` being its nearest live partition.
+    fn encode_near(&self, rotation: &Rotation, rowid: i64, v: &[f32], nearest: usize) -> (i64, i64, Entry) {
+        match self.centroids.is_empty() {
+            true => (0, 0, code(rotation, rowid, v.to_vec())),
+            false => self.encode_in(rotation, rowid, v, nearest),
+        }
+    }
+
+    /// Each of `vectors` coded as [`Self::encode`] codes it, their nearest partitions found
+    /// [`NEAREST_GROUP`] at a time, so each tile of centroids is read once a group.
+    fn encode_each(&self, rotation: &Rotation, rowids: &[i64], vectors: &[Vec<f32>]) -> Vec<(i64, i64, Entry)> {
+        let nearest = nearest_all_in(self, vectors);
+        rowids.iter().zip(vectors).zip(nearest).map(|((rowid, v), p)| self.encode_near(rotation, *rowid, v, p)).collect()
+    }
 }
 
 /// The RaBitQ code of a residual.
@@ -1658,13 +1673,7 @@ fn nearest_all_in(model: &Model, vectors: &[Vec<f32>]) -> Vec<usize> {
 /// Each vector coded against its nearest live partition, as [`Model::encode`] does, the vectors
 /// split over the cores when there are enough products to pay for the threads.
 fn encode_all(model: &Model, rotation: &Rotation, rowids: &[i64], vectors: &[Vec<f32>]) -> Vec<(i64, i64, Entry)> {
-    let code = |rowids: &[i64], vectors: &[Vec<f32>]| -> Vec<(i64, i64, Entry)> {
-        if model.centroids.is_empty() {
-            return rowids.iter().zip(vectors).map(|(rowid, v)| model.encode(rotation, *rowid, v)).collect();
-        }
-        let nearest = nearest_all_in(model, vectors);
-        rowids.iter().zip(vectors).zip(nearest).map(|((rowid, v), p)| model.encode_in(rotation, *rowid, v, p)).collect()
-    };
+    let code = |rowids: &[i64], vectors: &[Vec<f32>]| model.encode_each(rotation, rowids, vectors);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     if threads == 1 || vectors.len() * model.centroids.len().max(1) < PARALLEL_PRODUCTS {
         return code(rowids, vectors);
@@ -3055,16 +3064,21 @@ impl IvfRqCursor {
     /// partition.
     fn tail_steps(&mut self, rowid: i64, vector: &[f32]) -> Result<(i64, [Step; 2])> {
         let rotation = self.rotation(vector.len());
-        let (partition, version, entry) = self.model.encode(&rotation, rowid, vector);
-        let key = tail_key(partition, rowid)?;
-        Ok((
-            partition,
-            [
-                put(PARTITIONS, key, record(&[Value::from_i64(version), blob(&pack(std::slice::from_ref(&entry))?)?])?),
-                put(VECTORS, rowid, record(&[Value::from_i64(Location::Tail(key).encode())])?),
-            ],
-        ))
+        tail_writes(self.model.encode(&rotation, rowid, vector))
     }
+}
+
+/// The writes that put a coded entry, its partition and centroid version beside it, at the end of
+/// that partition's tail, and the partition.
+fn tail_writes((partition, version, entry): (i64, i64, Entry)) -> Result<(i64, [Step; 2])> {
+    let key = tail_key(partition, entry.rowid)?;
+    Ok((
+        partition,
+        [
+            put(PARTITIONS, key, record(&[Value::from_i64(version), blob(&pack(std::slice::from_ref(&entry))?)?])?),
+            put(VECTORS, entry.rowid, record(&[Value::from_i64(Location::Tail(key).encode())])?),
+        ],
+    ))
 }
 
 /// Count what a survey's walk found at `key`, a row of `kind` that is not a block, which the walk
@@ -4366,10 +4380,12 @@ impl IvfRqCursor {
             part.open = if chunk.len() < BLOCK { chunk.len() as i64 } else { 0 };
         }
         part.size += live.len() as i64;
-        for (rowid, vector) in sorted.recode.iter().zip(&vectors) {
-            let (target, written) = self.tail_steps(*rowid, vector)?;
-            steps.extend(written);
-            self.dirty.push(target);
+        if let Some(rotation) = vectors.first().map(|v| self.rotation(v.len())) {
+            for coded in self.model.encode_each(&rotation, &sorted.recode, &vectors) {
+                let (target, written) = tail_writes(coded)?;
+                steps.extend(written);
+                self.dirty.push(target);
+            }
         }
         RECODED.fetch_add(sorted.recode.len(), Ordering::Relaxed);
         PACKS.fetch_add(1, Ordering::Relaxed);
@@ -4450,9 +4466,9 @@ impl IvfRqCursor {
         let mut staying = Vec::new();
         let mut recoded = 0;
         let mut moved = 0;
-        for (entry, vector) in sorted.live.into_iter().zip(&vectors) {
-            let nearest = self.model.nearest(vector) as i64;
-            if from_block && nearest == partition && self.model.state(partition) == State::Live {
+        let nearest = nearest_all_in(&self.model, &vectors);
+        for ((entry, vector), nearest) in sorted.live.into_iter().zip(&vectors).zip(nearest) {
+            if from_block && nearest as i64 == partition && self.model.state(partition) == State::Live {
                 if sorted.version == current {
                     staying.push(entry);
                     continue;
@@ -4465,7 +4481,8 @@ impl IvfRqCursor {
                 staying.push(fresh);
                 recoded += 1;
             } else {
-                let (target, written) = self.tail_steps(entry.rowid, vector)?;
+                let rotation = rotation.as_ref().ok_or_else(|| error("a moved entry has no vector"))?;
+                let (target, written) = tail_writes(self.model.encode_near(rotation, entry.rowid, vector, nearest))?;
                 steps.extend(written);
                 self.dirty.push(target);
                 moved += 1;

@@ -1578,6 +1578,41 @@ pub struct SharedPagerState {
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
     page_size: AtomicU32,
+    /// What `PRAGMA secure_delete` last set, for every connection to the database: a checkpoint
+    /// writes the pages of other connections' deletes.
+    secure_delete: AtomicU8,
+}
+
+/// What a freed page keeps. The bytes a delete frees inside a page are zeroed whatever this says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecureDelete {
+    /// A freed page keeps its bytes.
+    Off,
+    /// A freed page is zeroed and written back, at the cost of that write.
+    On,
+    /// SQLite's FAST: deleted content is overwritten where that costs no I/O. A freed page keeps
+    /// its bytes, as under `Off`.
+    Fast,
+}
+
+impl SecureDelete {
+    /// The value `PRAGMA secure_delete` reads and takes: 0, 1 or 2.
+    pub fn code(self) -> i64 {
+        match self {
+            SecureDelete::Off => 0,
+            SecureDelete::On => 1,
+            SecureDelete::Fast => 2,
+        }
+    }
+
+    pub fn from_code(code: i64) -> Option<Self> {
+        match code {
+            0 => Some(SecureDelete::Off),
+            1 => Some(SecureDelete::On),
+            2 => Some(SecureDelete::Fast),
+            _ => None,
+        }
+    }
 }
 
 impl SharedPagerState {
@@ -1592,6 +1627,7 @@ impl SharedPagerState {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
             page_size: AtomicU32::new(page_size),
+            secure_delete: AtomicU8::new(SecureDelete::Off.code() as u8),
         }
     }
 
@@ -2696,6 +2732,18 @@ impl Pager {
 
     pub fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
         self.auto_vacuum_mode.store(mode.into(), Ordering::SeqCst);
+    }
+
+    /// What a page this database frees keeps, for every connection to it.
+    pub fn secure_delete(&self) -> SecureDelete {
+        SecureDelete::from_code(self.shared.secure_delete.load(Ordering::Acquire) as i64)
+            .expect("secure_delete holds a value set_secure_delete stored")
+    }
+
+    pub fn set_secure_delete(&self, mode: SecureDelete) {
+        self.shared
+            .secure_delete
+            .store(mode.code() as u8, Ordering::Release);
     }
 
     /// Persist the auto-vacuum mode to page 1 and keep the pager cache in sync.
@@ -5680,6 +5728,11 @@ impl Pager {
                                 + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
                             page_id as u32,
                         );
+                        if self.secure_delete() == SecureDelete::On {
+                            // A leaf is otherwise never written again: its bytes would stay.
+                            self.add_dirty(page)?;
+                            page.get_contents().as_ptr().fill(0);
+                        }
 
                         // Unpin page before finishing - it's added to freelist
                         page.unpin();
@@ -5697,6 +5750,9 @@ impl Pager {
                     let trunk_page_id = header.freelist_trunk_page.get();
 
                     let contents = page.get_contents();
+                    if self.secure_delete() == SecureDelete::On {
+                        contents.as_ptr().fill(0);
+                    }
                     // Point to previous trunk
                     contents
                         .write_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, trunk_page_id);
@@ -6032,6 +6088,10 @@ impl Pager {
                             offset_remaining_leaves_start..offset_remaining_leaves_end,
                             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR,
                         );
+                        // The slot the last pointer moved off is past the trunk's leaves.
+                        buf[offset_remaining_leaves_end - FREELIST_LEAF_PTR_SIZE
+                            ..offset_remaining_leaves_end]
+                            .fill(0);
                     }
                     // write the new leaf count
                     page_contents.write_u32_no_offset(
@@ -6331,6 +6391,9 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef
         let buffer = buffer_pool.get_page();
         let inner = page.get();
         inner.set_buffer(Arc::new(buffer));
+        // A pooled buffer holds whatever page used it last: the new page starts empty, so no
+        // byte of another page reaches the file through it.
+        inner.as_ptr().fill(0);
         page.set_loaded();
         page.clear_wal_tag();
     }

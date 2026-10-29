@@ -4889,6 +4889,9 @@ impl BTreeCursor {
                                 &child_buf[first_child_offset
                                     ..first_child_offset + header_and_pointer_size],
                             );
+                        // Between the child's pointers and its cells the parent keeps no byte
+                        // of what it held.
+                        parent_buf[parent_offset + header_and_pointer_size..child_top].fill(0);
 
                         sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
                         turso_assert_less_than!(sibling_count_new, balance_info.sibling_count);
@@ -5488,6 +5491,8 @@ impl BTreeCursor {
             PageType::TableLeaf => PageType::TableInterior,
             other => other,
         } as u8;
+        // The root keeps no copy of the cells the child holds now.
+        root_contents.as_ptr()[offset..self.usable_space()].fill(0);
         // set new page type
         root_contents.write_page_type(new_root_page_type);
         root_contents.write_rightmost_ptr(child.get().id() as u32);
@@ -9416,6 +9421,8 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
         contents.offset(),
         "offset doesn't match computed offset for page"
     );
+    // A page made empty, as a cleared root is, keeps no byte of the cells it held.
+    contents.as_ptr()[offset..usable_space].fill(0);
     let id = page_type as u8;
     contents.write_page_type(id);
     contents.write_first_freeblock(0);
@@ -9464,6 +9471,7 @@ fn edit_page(
     let end_old_cells = start_old_cells + page.cell_count() + page.overflow_cells.len();
     let end_new_cells = start_new_cells + number_new_cells;
     let mut count_cells = page.cell_count();
+    let old_count = count_cells;
     if start_old_cells < start_new_cells {
         debug_validate_cells!(page, usable_space);
         let number_to_shift = page_free_array(
@@ -9491,6 +9499,11 @@ fn edit_page(
         count_cells -= number_tail_removed;
         debug_validate_cells!(page, usable_space);
     }
+    // The pointers of the cells removed are past the array now.
+    let pointers = page.cell_pointer_array_offset();
+    page.as_ptr()
+        [pointers + count_cells * CELL_PTR_SIZE_BYTES..pointers + old_count * CELL_PTR_SIZE_BYTES]
+        .fill(0);
     // TODO: make page_free_array defragment, for now I'm lazy so this will work for now.
     let mut defragmented_page = defragment_page_for_insert(page, usable_space, 0)?;
     // TODO: add to start
@@ -9832,6 +9845,7 @@ fn free_cell_range(
         if unlikely(offset < cur_content_area) {
             return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
         }
+        page.as_ptr()[offset..end].fill(0);
         if offset == cur_content_area {
             // if the freeblock list is empty and the freed range is exactly at the beginning of the content area,
             // we are not creating a freeblock; instead we are just extending the unallocated region.
@@ -9929,6 +9943,9 @@ fn free_cell_range(
     if unlikely(offset < cur_content_area) {
         return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
     }
+    // The freed bytes, the fragments merged with them and the headers of the freeblocks they
+    // join hold nothing once freed: no byte of a deleted cell stays in its page.
+    page.as_ptr()[offset..end].fill(0);
 
     // As above, if the freed range is exactly at the beginning of the content area, we are not creating a freeblock;
     // instead we are just extending the unallocated region.
@@ -10105,6 +10122,9 @@ fn defragment_page_fast(
     // Update page header
     page.write_cell_content_area(new_cell_content_area);
     page.write_first_freeblock(0);
+    // The bytes the cells moved off are no cell's: no copy of a cell stays behind it.
+    let unallocated_start = page.unallocated_region_start();
+    page.as_ptr()[unallocated_start..new_cell_content_area].fill(0);
 
     debug_validate_cells!(page, usable_space);
 
@@ -10144,6 +10164,8 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         page.write_cell_content_area(usable_space);
         page.write_first_freeblock(0);
         page.write_fragmented_bytes_count(0);
+        let unallocated_start = page.unallocated_region_start();
+        page.as_ptr()[unallocated_start..usable_space].fill(0);
         debug_validate_cells!(page, usable_space);
         return Ok(());
     }
@@ -10223,6 +10245,8 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         page.write_cell_content_area(cbrk);
         page.write_first_freeblock(0);
         page.write_fragmented_bytes_count(0);
+        // The bytes the cells moved off are no cell's: no copy of a cell stays behind it.
+        buffer[first_cell_content_byte..cbrk].fill(0);
         Ok(())
     }
 
@@ -10865,12 +10889,17 @@ fn delete_may_need_balancing(
 fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Result<()> {
     let (cell_start, cell_len) = page.cell_get_raw_region(cell_idx, usable_space)?;
     free_cell_range(page, cell_start, cell_len, usable_space)?;
+    let last_pointer =
+        page.cell_pointer_array_offset() + (page.cell_count() - 1) * CELL_PTR_SIZE_BYTES;
     if page.cell_count() > 1 {
         shift_pointers_left(page, cell_idx);
+        page.as_ptr()[last_pointer..last_pointer + CELL_PTR_SIZE_BYTES].fill(0);
     } else {
         page.write_cell_content_area(usable_space);
         page.write_first_freeblock(0);
         page.write_fragmented_bytes_count(0);
+        // An empty page holds nothing past its header, no freeblock's header either.
+        page.as_ptr()[last_pointer..usable_space].fill(0);
     }
     page.write_cell_count(page.cell_count() as u16 - 1);
 

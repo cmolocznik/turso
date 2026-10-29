@@ -1991,6 +1991,8 @@ pub enum PragmaName {
     QueryOnly,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// Whether deleted content is overwritten with zeros (OFF | ON | FAST)
+    SecureDelete,
     /// Deprecated: control whether unaliased column names omit the table name prefix
     ShortColumnNames,
     /// Alias for `require_where` pragma, as an homage to MySQL (<https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates>)

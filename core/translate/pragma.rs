@@ -739,6 +739,42 @@ fn update_pragma(
             connection.set_sync_mode_for_database(database_id, mode)?;
             Ok(TransactionMode::None)
         }
+        PragmaName::SecureDelete => {
+            use crate::storage::pager::SecureDelete;
+            let name_bytes = match &value {
+                Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
+                Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
+                Expr::Literal(Literal::String(s)) => s.as_bytes(),
+                _ => b"",
+            };
+            let mode = if name_bytes.eq_ignore_ascii_case(b"FAST") {
+                SecureDelete::Fast
+            } else if let Expr::Literal(Literal::Numeric(n)) = &value {
+                match n.parse::<i64>().ok().and_then(SecureDelete::from_code) {
+                    Some(mode) => mode,
+                    None => bail_parse_error!("secure_delete must be 0, 1, 2, OFF, ON or FAST"),
+                }
+            } else if parse_pragma_enabled(&value) {
+                SecureDelete::On
+            } else {
+                SecureDelete::Off
+            };
+            // As in SQLite, a pragma naming no database sets every database of the connection.
+            let databases = match schema_was_explicit {
+                true => vec![database_id],
+                false => connection
+                    .list_all_databases()
+                    .into_iter()
+                    .map(|(id, _, _)| id)
+                    .collect(),
+            };
+            for id in databases {
+                connection
+                    .get_pager_from_database_index(&id)?
+                    .set_secure_delete(mode);
+            }
+            Ok(TransactionMode::None)
+        }
         PragmaName::DataSyncRetry => {
             let retry_enabled = parse_pragma_enabled(&value);
             connection.set_data_sync_retry(retry_enabled);
@@ -1730,6 +1766,16 @@ fn query_pragma(
             let mode = connection.get_sync_mode_for_database(database_id)?;
             let register = program.alloc_register();
             program.emit_int(mode as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::SecureDelete => {
+            let mode = connection
+                .get_pager_from_database_index(&database_id)?
+                .secure_delete();
+            let register = program.alloc_register();
+            program.emit_int(mode.code(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

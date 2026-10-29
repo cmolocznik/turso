@@ -270,7 +270,7 @@ avoid this window.
 | PRAGMA recursive_triggers        | ❌ No         |                                              |
 | PRAGMA reverse_unordered_selects | ❌ No         |                                              |
 | PRAGMA schema_version            | ✅ Yes        | For writes, emulate defensive mode (always noop)|
-| PRAGMA secure_delete             | ❌ No         |                                              |
+| PRAGMA secure_delete             | ✅ Yes        | Database-wide. In-page bytes are always zeroed; ON also zeroes freed pages |
 | PRAGMA short_column_names        | ✅ Yes      | deprecated in SQLite                         |
 | PRAGMA shrink_memory             | ❌ No         |                                              |
 | PRAGMA soft_heap_limit           | ❌ No         |                                              |

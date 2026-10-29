@@ -6,8 +6,8 @@ upstream: the fork keeps up with upstream and keeps its own changes.
 - `main` mirrors upstream `main`. It only fast-forwards and holds no commit of ours.
 - `workreef`, the fork's default branch, is upstream plus every change below
   (`git log --no-merges main..workreef`).
-- `workreef/sync-upstream.sh` merges `main` into `workreef` four times a day, at 05:17, 11:17,
-  17:17 and 23:17 Asia/Kuala_Lumpur (`workreef/turso-sync.timer`, a systemd user timer). It
+- `fork/sync-upstream.sh` merges `main` into `workreef` four times a day, at 05:17, 11:17,
+  17:17 and 23:17 Asia/Kuala_Lumpur (`fork/turso-sync.timer`, a systemd user timer). It
   fetches upstream, fast-forwards `main`, merges it, and commits and pushes the merge only once
   the merged tree compiles with its tests, passes the core and FTS suites and clippy, and passes
   `ivf_crash`'s kill rounds under WAL, MVCC and MVCC with four writers. A conflict or a failed
@@ -15,7 +15,7 @@ upstream: the fork keeps up with upstream and keeps its own changes.
   commits it took and the checks it passed; each run's log and verdict are in
   `/home/me/cognition-data/turso-sync`, and a `hold` file there skips runs while a timed
   measurement needs the machine.
-- `workreef/repro` holds the harnesses the entries below cite (`ivf_crash`, `mvcc_reopen`,
+- `fork/repro` holds the harnesses the entries below cite (`ivf_crash`, `mvcc_reopen`,
   `read_changes`, `wal_growth` and the rest), a crate of its own on the compiler WorkReef
   cognition builds with.
 
@@ -56,7 +56,7 @@ the bytes past it. Truncation is unchanged: it still tests the highest appended 
 Test: `mvcc::database::tests::test_passive_checkpoint_that_keeps_the_log_counts_only_uncovered_bytes`.
 Upstream `main`: "316 checkpointed bytes of a 373-byte log still counted against the threshold".
 On 0.8.3, 2 writers at a 256 KB threshold: inline writer commit p99 165-194 ms → 9.4-12.8 ms. On
-upstream `main` the same A/B shows no gain: 15 idle runs each of `workreef/repro`'s `mvcc_inline` (2
+upstream `main` the same A/B shows no gain: 15 idle runs each of `fork/repro`'s `mvcc_inline` (2
 writers, 4,000 commits, 256 KB threshold) put the writer commit p99 median at 13.5 ms without the
 fix and 14.1 ms with it.
 
@@ -66,7 +66,7 @@ fix and 14.1 ms with it.
 MVCC version advanced to the next B-tree row, and kept going while rows were shadowed. Over a
 checkpointed table whose rows were all updated, point lookups went quadratic: on upstream `main`
 (`e9a8b0d25`), 2,000, 4,000 and 8,000 lookups took 222, 920 and 3,571 ms, against 16, 31 and 66 ms
-with the fix (`workreef/repro`'s `shadow_seek`). An exact seek has at most one B-tree match, so it now
+with the fix (`fork/repro`'s `shadow_seek`). An exact seek has at most one B-tree match, so it now
 stops when that row is shadowed or the row reached is not its target; the MVCC side still supplies
 the newer version.
 Test: `mvcc::database::tests::test_exact_rowid_seek_over_shadowed_btree_rows`, which counts each
@@ -91,7 +91,7 @@ default under MVCC) empties the logical log, syncs it, and then truncates the WA
 between the two leaves an empty log beside WAL frames the checkpoint had already backfilled into
 the synced database file. Opening such a database failed with "WAL has committed frames but
 logical log header is missing" unless passive checkpoints were enabled, where the same state is
-the steady one. On upstream `main` (`6d8f8b18a`) `workreef/repro`'s `mvcc_reopen` (an MVCC table
+the steady one. On upstream `main` (`6d8f8b18a`) `fork/repro`'s `mvcc_reopen` (an MVCC table
 written by a process killed at a random 0.1 to 1.5 s, PRAGMA wal_checkpoint(TRUNCATE) every few
 commits) left a database that would not open within 3, 6 and 7 kills on three seeds. Upstream's
 passive checkpoint (`7e8aa5c58`) had made recovery accept this state; `b80c92fb9` then refused it
@@ -432,7 +432,7 @@ rows' old versions without the restart's changes kept), and
 pages long, reading in and out of transactions, rolling back and checkpointing in every mode,
 interleaved at random with 64-page caches and checked against a model of each snapshot
 (`READ_CHANGES_SEEDS`, default 2 a mode). It failed at MVCC seed 0 before the restart's changes
-were kept, and fails with a retired generation's frames skipped. `workreef/repro`'s `read_changes` runs
+were kept, and fails with a retired generation's frames skipped. `fork/repro`'s `read_changes` runs
 the same workload through the public API: 300 seeds in each mode pass.
 
 Measured with `tmp/ann/ivfrq/src/bin/page-reads.rs`: two readers looking up random rows of a
@@ -475,7 +475,7 @@ MVCC, every live code coded again and compared), `the_check_reports_each_way_the
 (seven corruptions, each reported), and the check now ends `a_random_workload_keeps_every_answer_exact`
 and `concurrent_writers_maintaining_the_index_all_commit`.
 
-`workreef/repro`'s `ivf_crash` kills a process writing an index (inserts, updates, deletes, alone and in
+`fork/repro`'s `ivf_crash` kills a process writing an index (inserts, updates, deletes, alone and in
 transactions it commits or rolls back, stepped OPTIMIZE INDEX, checkpoints; a real file, synchronous
 NORMAL) at a random 0.2-2.5 s, reopens the database, and checks it: `PRAGMA integrity_check`,
 `ivf_rq::check`, and the top ten of three queries, every candidate reranked, against a brute-force
@@ -532,7 +532,7 @@ Under WAL a commit runs the passive auto-checkpoint once more than the threshold
 not yet backfilled (`WalFile::should_checkpoint`); SQLite runs it after every commit once the WAL
 holds the threshold. A reader on an older snapshot stops a passive checkpoint short of the WAL's
 end, and the WAL restarts only after a whole backfill, so beside overlapping readers Turso's WAL
-grows without bound. `workreef/repro`'s `wal_growth` (one writer inserting a 200-byte row a
+grows without bound. `fork/repro`'s `wal_growth` (one writer inserting a 200-byte row a
 transaction, readers counting the table, 6 s, synchronous NORMAL) restarted the WAL 0-4 times and
 grew it to 74,693-253,953 frames (0.3-1.0 GB); with SQLite's trigger the same build restarted it
 9-26 times and held it to 1,068-1,102 frames. The trigger costs the writer a checkpoint and its two

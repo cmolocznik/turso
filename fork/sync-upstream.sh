@@ -5,7 +5,7 @@
 # under WAL, MVCC and MVCC with four writers. Only then is the merge committed and pushed. A
 # conflict or a failed check aborts the merge, leaving workreef as it was, and alerts on the desktop
 # and the agent bus. A checkout that is busy (another branch, uncommitted changes, a merge under
-# way, cargo running in it) or a hold file skips the run. workreef/turso-sync.timer runs it four
+# way, cargo running in it) or a hold file skips the run. fork/turso-sync.timer runs it four
 # times a day; each run writes its log under $LOGS and its verdict to $LOGS/status.
 set -u
 
@@ -140,13 +140,13 @@ run "$CARGO" clippy -p turso_core --all-targets --all-features -- -D warnings >"
     fail "clippy reports problems ($stamp.clippy.log)"
 
 echo "== ivf_crash"
-(cd "$REPO/workreef/repro" && run "$CARGO" build --release --bin ivf_crash) >"$LOGS/$stamp.repro.log" 2>&1 ||
+(cd "$REPO/fork/repro" && run "$CARGO" build --release --bin ivf_crash) >"$LOGS/$stamp.repro.log" 2>&1 ||
     fail "ivf_crash does not build ($stamp.repro.log)"
 seed=$(( $(date +%s) / 3600 ))
 # crash NAME MODE THREADS: ivf_crash's kill rounds; a failed run's database is kept beside its log.
 crash() {
     local name=$1 mode=$2 threads=$3 out="$LOGS/$stamp.crash-$1.log" dir="$TMPDIR/turso-sync-$1"
-    run env THREADS="$threads" "$REPO/workreef/repro/target/release/ivf_crash" run "$dir" "$mode" "$ROUNDS" "$seed" >"$out" 2>&1
+    run env THREADS="$threads" "$REPO/fork/repro/target/release/ivf_crash" run "$dir" "$mode" "$ROUNDS" "$seed" >"$out" 2>&1
     if ! grep -q "^$ROUNDS rounds passed" "$out"; then
         mv "$dir" "$LOGS/$stamp.crash-$name.db"
         fail "ivf_crash failed under $name: $(grep -m1 FAILED "$out" | cut -c1-200) ($stamp.crash-$name.log)"

@@ -3,7 +3,7 @@ Description=Merge upstream Turso main into workreef
 
 [Service]
 Type=oneshot
-ExecStart=/home/me/repos/cmolocznik/turso/workreef/sync-upstream.sh
+ExecStart=/home/me/repos/cmolocznik/turso/fork/sync-upstream.sh
 Environment=PATH=/home/me/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Nice=10
 TimeoutStartSec=3h

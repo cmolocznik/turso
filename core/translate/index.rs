@@ -708,26 +708,32 @@ type ReindexTarget = (NamespaceRef, Arc<BTreeTable>, Arc<Index>);
 
 /// Translates a SQLite-compatible `REINDEX` statement into bytecode.
 ///
-/// The supported scope is rowid b-tree indexes in non-MVCC mode. Target
-/// resolution accepts SQLite's all-index, collation-name, table-name, and
-/// index-name forms, then emits a destructive clear-plus-refill program for
-/// each resolved index.
+/// Target resolution accepts SQLite's all-index, collation-name, table-name, and
+/// index-name forms. A rowid b-tree index, outside MVCC, is cleared and refilled.
+/// An index method's index, under WAL or MVCC, is made afresh: its backing
+/// tables are dropped, every page they held freed, created again and filled from
+/// the table's rows, so nothing of the index it replaces outlives it.
 pub fn translate_reindex(
     name: Option<QualifiedName>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    if connection.mvcc_enabled() {
-        bail_parse_error!("REINDEX is not supported in MVCC mode");
-    }
-
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
     let targets = resolve_reindex_targets(name.as_ref(), &resolver.catalog, connection)?;
     if targets.is_empty() {
         return Ok(());
+    }
+    let made_afresh = |index: &Index| {
+        index
+            .index_method
+            .as_ref()
+            .is_some_and(|m| !m.definition().backing_btree)
+    };
+    if connection.mvcc_enabled() && targets.iter().any(|(_, _, index)| !made_afresh(index)) {
+        bail_parse_error!("REINDEX is not supported in MVCC mode");
     }
     if connection.get_query_only() {
         bail_parse_error!("Cannot execute write statement in query_only mode");
@@ -743,17 +749,32 @@ pub fn translate_reindex(
     }
 
     for (namespace, table, index) in targets {
-        if index
-            .index_method
-            .as_ref()
-            .is_some_and(|m| !m.definition().backing_btree)
-        {
-            bail_parse_error!(
-                "REINDEX is not supported for custom index methods without a backing btree"
-            );
-        }
         if !table.has_rowid {
             bail_parse_error!("REINDEX on WITHOUT ROWID tables is not supported");
+        }
+        if made_afresh(&index) {
+            // One cursor drops the index, makes it again and fills it, so the statement holds one
+            // writer of it.
+            let index_cursor_id = program.alloc_cursor_index(None, &index)?;
+            program.emit_insn(Insn::IndexMethodDestroy {
+                db: namespace.database_id,
+                cursor_id: index_cursor_id,
+            });
+            program.emit_insn(Insn::IndexMethodCreate {
+                db: namespace.database_id,
+                cursor_id: index_cursor_id,
+            });
+            emit_refill_index(
+                program,
+                resolver,
+                namespace,
+                &table,
+                &index,
+                index_cursor_id,
+                RegisterOrLiteral::Literal(0),
+                None,
+            )?;
+            continue;
         }
         let index_cursor_id = program.alloc_cursor_index(None, &index)?;
         emit_refill_index(

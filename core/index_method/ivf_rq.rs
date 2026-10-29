@@ -8623,4 +8623,74 @@ mod tests {
     /// over these 3000 vectors, rechecking 8 neighbours per split leaves 1.7%, 4 leave 5.3% and none
     /// 9.7%.
     const MISPLACED_PERCENT: usize = 3;
+
+    /// The values of every row of index `v_ivf`'s backing tables that are blobs: codes, dead rows'
+    /// blocks and centroids.
+    fn backing_blobs(conn: &Arc<crate::Connection>) -> HashSet<Vec<u8>> {
+        let mut blobs = HashSet::new();
+        for (store, columns) in [("partitions", "c0, c1, c2"), ("centroids", "value")] {
+            for row in rows(conn, &format!("SELECT {columns} FROM __turso_internal_v_ivf_{store}")) {
+                blobs.extend(row.iter().filter_map(|value| value.to_blob()).map(<[u8]>::to_vec));
+            }
+        }
+        blobs
+    }
+
+    /// REINDEX makes an ivf_rq index afresh from the table's rows: after half its vectors are
+    /// deleted and the index made again it holds the rest alone and answers exactly from them, and
+    /// under `secure_delete` none of the codes, dead rows or centroids of the index it replaced is
+    /// left in the checkpointed file, in WAL and in MVCC mode.
+    #[test]
+    fn reindex_makes_the_index_afresh_and_leaves_none_of_the_old_one_in_the_file() {
+        use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect};
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("reindex.db");
+            let db = Database::open_file_with_flags(Arc::new(PlatformIO::new().unwrap()), path.to_str().unwrap(), OpenFlags::default(), DatabaseOpts::new().with_index_method(true), None, Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            conn.execute("PRAGMA secure_delete = ON").unwrap();
+            conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e)").unwrap();
+            let mut state = 17;
+            let rows: Vec<(i64, Vec<f32>)> = (1..=3000).map(|id| (id, random(&mut state, DIMS))).collect();
+            for chunk in rows.chunks(300) {
+                insert_all(&conn, chunk);
+            }
+            for _ in 0..20 {
+                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            }
+            // Stale copies in blocks, of vectors rewritten and of vectors then deleted.
+            for (id, v) in rows.iter().filter(|(id, _)| id % 5 == 0) {
+                let w: Vec<f32> = v.iter().map(|x| -x).collect();
+                conn.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&w))).unwrap();
+            }
+            let old = backing_blobs(&conn);
+            conn.execute("DELETE FROM v WHERE id % 2 = 0").unwrap();
+            let live: HashMap<i64, Vec<f32>> = rows.iter().filter(|(id, _)| id % 2 == 1).map(|(id, v)| (*id, if id % 5 == 0 { v.iter().map(|x| -x).collect() } else { v.clone() })).collect();
+            conn.execute("REINDEX v_ivf").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.rows == live.len() as u64 && found.stale_copies == 0 && found.partitions > 4, "mvcc={mvcc}: {found:?}");
+            for _ in 0..5 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+            let new = backing_blobs(&conn);
+            drop(conn);
+            drop(db);
+            let kept = old.iter().filter(|blob| blob.len() >= 16 && new.contains(*blob)).count();
+            assert_eq!(kept, 0, "mvcc={mvcc}: the index made again holds {kept} rows of the one it replaced");
+            let gone: Vec<&Vec<u8>> = old.iter().filter(|blob| blob.len() >= 16).collect();
+            assert!(gone.len() > 100, "mvcc={mvcc}: the old index held only {} rows", gone.len());
+            let file = std::fs::read(&path).unwrap();
+            let prefixes: HashSet<&[u8]> = gone.iter().map(|blob| &blob[..16]).collect();
+            let left: HashSet<&[u8]> = file.windows(16).filter(|window| prefixes.contains(window)).collect();
+            let left: Vec<&&Vec<u8>> = gone.iter().filter(|blob| left.contains(&blob[..16]) && file.windows(blob.len()).any(|w| w == blob.as_slice())).collect();
+            assert!(left.is_empty(), "mvcc={mvcc}: {} of {} rows of the old index left in the file", left.len(), gone.len());
+        }
+    }
 }

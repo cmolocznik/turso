@@ -1120,8 +1120,15 @@ impl Model {
         self.versions.get(partition as usize).copied().unwrap_or(0)
     }
 
+    /// A partition's state. One the model holds no centroid for does not exist, retired as it were,
+    /// but for an untrained index's origin: the partitions a rolled-back split opened stay among
+    /// those later statements survey.
     fn state(&self, partition: i64) -> State {
-        self.states.get(partition as usize).copied().unwrap_or_default()
+        match self.states.get(partition as usize) {
+            Some(state) => *state,
+            None if partition == 0 && self.centroids.is_empty() => State::Live,
+            None => State::Retired,
+        }
     }
 
     /// The live partitions, at least one: an untrained index is its origin.
@@ -4839,7 +4846,7 @@ impl IvfRqCursor {
         };
         part.state = state;
         let next = generation();
-        Arc::make_mut(&mut self.model).states[partition as usize] = state;
+        *Arc::make_mut(&mut self.model).states.get_mut(partition as usize).ok_or_else(|| error("a retirement names a partition the model does not hold"))? = state;
         self.generation = Some(next);
         self.publish();
         RETIRES.fetch_add(1, Ordering::Relaxed);
@@ -6317,6 +6324,59 @@ mod tests {
             assert!(after.consistent(), "mvcc={mvcc}: {after:?}");
             assert!(before.stale_copies > 0 && after.blocks > 0 && after.codes == after.rows, "mvcc={mvcc}: before {before:?}, after {after:?}");
             assert_eq!(after.rows, 5500 - 1100, "mvcc={mvcc}");
+        }
+    }
+
+    /// One connection's inserts, updates and deletes, alone and in transactions it commits or rolls
+    /// back, as an application's, under WAL and MVCC. A split rolled back with its transaction
+    /// leaves the partition it opened among those later statements survey, and the model holds no
+    /// centroid for it: such a partition is none to retire or work on.
+    #[test]
+    fn transactions_rolled_back_over_maintenance_leave_the_index_consistent() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-rolled-back-{mvcc}.db"), mvcc);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let begin = if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" };
+            let mut state = 337u64;
+            let mut below = |state: &mut u64, n: u64| {
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                *state % n
+            };
+            let centres: Vec<Vec<f32>> = (0..8).map(|_| random(&mut state, DIMS).iter().map(|x| 6.0 * x).collect()).collect();
+            let mut next = 1i64;
+            let mut statement = |state: &mut u64, next: &mut i64| match below(state, 10) {
+                0..=4 => {
+                    let n = 1 + below(state, 20) as i64;
+                    let rows: Vec<(i64, Vec<f32>)> = (0..n).map(|i| (*next + i, near(state, &centres, 0.5))).collect();
+                    *next += n;
+                    insert_all(&conn, &rows);
+                }
+                5..=7 => conn.execute(format!("UPDATE v SET e = {} WHERE id = {}", literal(&near(state, &centres, 0.5)), 1 + below(state, *next as u64))).unwrap(),
+                _ => conn.execute(format!("DELETE FROM v WHERE id = {}", 1 + below(state, *next as u64))).unwrap(),
+            };
+            let mut rolled_back = 0;
+            for _ in 0..800 {
+                if below(&mut state, 100) < 80 {
+                    statement(&mut state, &mut next);
+                    continue;
+                }
+                conn.execute(begin).unwrap();
+                for _ in 0..2 + below(&mut state, 5) {
+                    statement(&mut state, &mut next);
+                }
+                if below(&mut state, 6) == 0 {
+                    conn.execute("ROLLBACK").unwrap();
+                    rolled_back += 1;
+                } else {
+                    conn.execute("COMMIT").unwrap();
+                }
+            }
+            assert!(rolled_back > 10, "mvcc={mvcc}: {rolled_back} transactions rolled back");
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.partitions > 8, "mvcc={mvcc}: {found:?}");
         }
     }
 

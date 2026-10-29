@@ -90,6 +90,7 @@ use crate::{
     },
     Connection, LimboError, MvStore, Result, Value, ValueRef,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 use turso_parser::ast;
 
 pub const IVF_RQ_INDEX_METHOD_NAME: &str = "ivf_rq";
@@ -1956,16 +1957,16 @@ struct PartitionCache {
     budget: usize,
     bytes: usize,
     tick: u64,
-    entries: HashMap<(i64, i64), (Arc<HeldBlocks>, u64)>,
+    entries: FxHashMap<(i64, i64), (Arc<HeldBlocks>, u64)>,
     order: BTreeMap<u64, (i64, i64)>,
     /// Whether a partition has had to give way, and how often each partition was probed lately:
     /// the counts halve whenever the probes counted reach ten times the partitions held.
     full: bool,
-    probed: HashMap<(i64, i64), u32>,
+    probed: FxHashMap<(i64, i64), u32>,
     counted: usize,
     /// Each held partition's rows but its blocks, which come and go with the blocks they were read
     /// with.
-    rows: HashMap<i64, Arc<HeldRows>>,
+    rows: FxHashMap<i64, Arc<HeldRows>>,
 }
 
 /// A partition's blocks: each one's key, centroid version and the range of its codes in `codes`.
@@ -2713,9 +2714,9 @@ struct Query {
     limit: usize,
     keep: usize,
     /// The query's product with each centroid version it has met.
-    centres: HashMap<(i64, i64), f64>,
+    centres: FxHashMap<(i64, i64), f64>,
     /// The stale copies the probed partitions' dead rows name, as rowid and block.
-    dead: HashSet<(i64, i64)>,
+    dead: FxHashSet<(i64, i64)>,
     /// The `keep` best 7-bit estimates of live entries so far, negated: the top is the bar an
     /// entry's raised 1-bit estimate must reach.
     estimates: BinaryHeap<Ordered>,
@@ -3321,8 +3322,8 @@ impl IndexMethodCursor for IvfRqCursor {
                 wanted: limit,
                 limit,
                 keep: limit,
-                centres: HashMap::new(),
-                dead: HashSet::new(),
+                centres: FxHashMap::default(),
+                dead: FxHashSet::default(),
                 estimates: BinaryHeap::new(),
                 results: BinaryHeap::new(),
                 screens: Vec::new(),
@@ -4870,8 +4871,8 @@ mod tests {
             wanted: limit,
             limit,
             keep,
-            centres: HashMap::new(),
-            dead: HashSet::new(),
+            centres: FxHashMap::default(),
+            dead: FxHashSet::default(),
             estimates: BinaryHeap::new(),
             results: BinaryHeap::new(),
             screens: Vec::new(),

@@ -155,6 +155,8 @@ pub static INIT_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static ENCODE_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static CHANGE_NANOS: AtomicUsize = AtomicUsize::new(0);
 pub static INSERTS: AtomicUsize = AtomicUsize::new(0);
+/// Nanoseconds statements spent maintaining the index before their writes were released.
+pub static STAGE_NANOS: AtomicUsize = AtomicUsize::new(0);
 
 /// The most codes one block packs.
 const BLOCK: usize = 64;
@@ -3306,6 +3308,7 @@ impl IndexMethodCursor for IvfRqCursor {
     /// the statement wrote, when statements of a hundred random rows cost about half a job a row to
     /// keep maintained, so a run ends with nothing due well before its bound.
     fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        let _timer = timer(&STAGE_NANOS);
         let staged = self.stage(context)?;
         if matches!(staged, IOResult::Done(())) {
             self.finish_statement(true);

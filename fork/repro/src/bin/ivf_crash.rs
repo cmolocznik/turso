@@ -82,9 +82,10 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     }
     let next = Arc::new(AtomicI64::new(rows(&conn, "SELECT coalesce(max(id), 0) FROM v")?[0][0].as_int().unwrap_or(0) + 1));
     let (commits, failures, optimizes) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let conflicts = Arc::new(AtomicU64::new(0));
     let begin = if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" };
     for t in 0..threads {
-        let (db, next, commits, failures) = (db.clone(), next.clone(), commits.clone(), failures.clone());
+        let (db, next, commits, failures, conflicts) = (db.clone(), next.clone(), commits.clone(), failures.clone(), conflicts.clone());
         std::thread::spawn(move || {
             let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_busy_timeout(Duration::from_secs(10));
@@ -116,9 +117,12 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
                 };
                 match done {
                     Ok(()) => commits.fetch_add(1, Ordering::Relaxed),
-                    Err(_) => {
+                    Err(e) => {
                         if !conn.get_auto_commit() {
                             let _ = conn.execute("ROLLBACK");
+                        }
+                        if matches!(e, turso_core::LimboError::WriteWriteConflict) {
+                            conflicts.fetch_add(1, Ordering::Relaxed);
                         }
                         failures.fetch_add(1, Ordering::Relaxed)
                     }
@@ -142,7 +146,14 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     }
     loop {
         std::thread::sleep(Duration::from_millis(200));
-        eprintln!("progress commits={} failures={} optimizes={}", commits.load(Ordering::Relaxed), failures.load(Ordering::Relaxed), optimizes.load(Ordering::Relaxed));
+        eprintln!(
+            "progress commits={} failures={} conflicts={} optimizes={} redone={}",
+            commits.load(Ordering::Relaxed),
+            failures.load(Ordering::Relaxed),
+            conflicts.load(Ordering::Relaxed),
+            optimizes.load(Ordering::Relaxed),
+            turso_core::index_method::ivf_rq::REDONE.load(Ordering::Relaxed)
+        );
     }
 }
 

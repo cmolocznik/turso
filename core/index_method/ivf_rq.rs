@@ -12,6 +12,19 @@
 //! rewrites the block, so the delete names the block in the vector's dead row, and a query skips
 //! that stale copy before it can raise the bar the live entries are held to.
 //!
+//! Maintenance moves and recodes vectors' rows under MVCC beside open transactions, so a write can
+//! meet a row of its vector that maintenance changed after the writing transaction's snapshot, or
+//! is changing: a write to it would fail with a write-write conflict, though no other write touched
+//! the table's row. Such a write undoes what it wrote of the index and writes a redo row for the
+//! rowid instead, a fresh key nothing else writes, and every later write of the rowid adds one more
+//! while any stands, so no write fails for maintenance. A query passes over any code of a rowid
+//! with redo rows and reads its vector from the table, and maintenance settles the rowid: kills
+//! its code, codes the table row's vector afresh where it has one, and removes its redo rows, the
+//! removals first, so a settle another run is making conflicts at once. A job that finds the
+//! table row of a code it is coding afresh gone, or without a vector, kills the code when the rowid
+//! has redo rows. A run never settles its own transaction's redo rows, which could only meet what
+//! their writes met.
+//!
 //! A query reads a partition's bookkeeping first. The blocks of the partitions queries probe are
 //! held in memory, shared by the index's cursors, each partition's under the version its
 //! bookkeeping held when they were read: a query whose snapshot holds that version scores them
@@ -55,7 +68,7 @@
 //! `WITH (rerank = 0)` answers with those best estimates and their estimated distances instead,
 //! reading no table row.
 //!
-//! Three backing tables, every key an integer so a seek compares no payload. Partitions holds each
+//! Four backing tables, every key an integer so a seek compares no payload. Partitions holds each
 //! partition's rows under one key range, `partition << 42 | kind << 40 | id`, so a query reads a
 //! partition with one seek: its bookkeeping (next block sequence, packed size, entries in the open
 //! block, the blocks still to move, state, the size a refused split waits for, and a version each
@@ -63,8 +76,9 @@
 //! the vector's code), its tail entries (rowid -> version, code) and its blocks (sequence ->
 //! version, codes). Vectors maps a rowid to the location of its code. Centroids holds
 //! `partition << 24 | version` -> centroid, and -1 -> a generation drawn afresh by each
-//! maintenance change to them, under which cursors share the loaded model. Only maintenance writes
-//! blocks, centroids and bookkeeping.
+//! maintenance change to them, under which cursors share the loaded model. Redo holds
+//! `rowid << 22 | sequence` -> the writing transaction's MVCC begin timestamp. Only maintenance
+//! writes blocks, centroids and bookkeeping.
 use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -132,6 +146,11 @@ pub static COMPACTS: AtomicUsize = AtomicUsize::new(0);
 pub static RETIRES: AtomicUsize = AtomicUsize::new(0);
 /// Jobs reverted because another transaction held a row they wrote.
 pub static CONFLICTS: AtomicUsize = AtomicUsize::new(0);
+/// Writes of the index left to maintenance, recorded in its redo rows, because maintenance had
+/// changed a row they wrote after their snapshot or was changing it; and the rowids maintenance
+/// redid.
+pub static REDONE: AtomicUsize = AtomicUsize::new(0);
+pub static SETTLED: AtomicUsize = AtomicUsize::new(0);
 /// Rebuilds of the whole index.
 pub static REBUILDS: AtomicUsize = AtomicUsize::new(0);
 pub static SPLIT_MICROS: AtomicUsize = AtomicUsize::new(0);
@@ -226,21 +245,28 @@ const GRID_SCALES: usize = 48;
 const PARTITIONS: usize = 0;
 const VECTORS: usize = 1;
 const CENTROIDS: usize = 2;
+const REDO: usize = 3;
 /// The partitions table's columns are positional: a bookkeeping row's eight fields, a dead row's
-/// blocks, a tail entry's or block's version and codes.
-const STORES: [(&str, &[(&str, Type)]); 3] = [
+/// blocks, a tail entry's or block's version and codes. A redo row holds, under MVCC, the begin
+/// timestamp of the transaction that wrote it.
+const STORES: [(&str, &[(&str, Type)]); 4] = [
     ("partitions", &[("c0", Type::Integer), ("c1", Type::Blob), ("c2", Type::Integer), ("c3", Type::Integer), ("c4", Type::Integer), ("c5", Type::Integer), ("c6", Type::Integer), ("c7", Type::Integer)]),
     ("vectors", &[("location", Type::Integer)]),
     ("centroids", &[("value", Type::Blob)]),
+    ("redo", &[("writer", Type::Integer)]),
 ];
 /// The centroids table's rowid for the generation.
 const GENERATION: i64 = -1;
 /// The key [`Writes`] records a write of the generation under, beside the partitions' keys: every
 /// split, retirement and rebuild writes it.
 const MODEL: i64 = -1;
+/// The key [`Writes`] records a write of the redo rows under.
+const REDO_ROWS: i64 = -2;
 const PARTITION_BITS: u32 = 21;
 const ROWID_BITS: u32 = 40;
 const VERSION_BITS: u32 = 24;
+/// The bits below a redo row's rowid in its key, which number the redo rows written for the rowid.
+const REDO_BITS: u32 = 22;
 /// The kinds of a partition's rows, in key order: so a query reads the dead rows before the
 /// blocks whose stale copies they name.
 const PART_ROW: i64 = 0;
@@ -315,6 +341,26 @@ fn tail_key(partition: i64, rowid: i64) -> Result<i64> {
 fn dead_key(block: i64, rowid: i64) -> Result<i64> {
     rowid_in_range(rowid)?;
     partition_key(partition_of(block), DEAD_ROW, rowid)
+}
+
+/// A redo row's key: its vector's rowid, then its place among the redo rows written for the rowid.
+fn redo_key(rowid: i64, sequence: i64) -> Result<i64> {
+    rowid_in_range(rowid)?;
+    if !(0..1 << REDO_BITS).contains(&sequence) {
+        return Err(*error("too many redo rows for one rowid"));
+    }
+    Ok(rowid << REDO_BITS | sequence)
+}
+
+/// The keys of a rowid's redo rows: the start, and the first past them.
+fn redo_rows(rowid: i64) -> Result<(i64, i64)> {
+    rowid_in_range(rowid)?;
+    Ok((rowid << REDO_BITS, (rowid + 1) << REDO_BITS))
+}
+
+/// The write of the redo row `sequence` of `rowid` by the transaction `writer` begins.
+fn redo_step(rowid: i64, sequence: i64, writer: i64) -> Result<Step> {
+    Ok(put(REDO, redo_key(rowid, sequence)?, record(&[Value::from_i64(writer)])?))
 }
 
 fn centroid_key(partition: i64, version: i64) -> Result<i64> {
@@ -1982,8 +2028,8 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
 /// What the index's cursors share: the model last loaded or written, under its generation; the
 /// partitions known to be moving, which any writer's maintenance moves along; those a run left work
 /// due in, its jobs spent, which the next statements' maintenance surveys beside its own, and the
-/// one from which the next step of OPTIMIZE INDEX takes them; the held partitions; and the index's
-/// [`Writes`], under its database's incarnation.
+/// one from which the next step of OPTIMIZE INDEX takes them; the held partitions and redo rows;
+/// and the index's [`Writes`], under its database's incarnation.
 #[derive(Default, Debug)]
 struct SharedState {
     model: Option<(i64, Arc<Model>)>,
@@ -1991,6 +2037,9 @@ struct SharedState {
     due: BTreeSet<i64>,
     step_from: i64,
     cache: PartitionCache,
+    /// The rows with redo rows, as a query read them under its snapshot, held as a partition's
+    /// rows are.
+    redo: Option<(Position, Arc<FxHashSet<i64>>)>,
     writes: Option<(u64, SharedWrites)>,
 }
 
@@ -2352,13 +2401,20 @@ enum Load {
     Parts { partition: usize, get: Get },
 }
 
-/// A delete in progress: read the vector's row, then remove it and its tail entry, or name its
-/// packed block in its dead row.
+/// A write of the index in progress. The rowid's redo rows are read first: with any, the write is
+/// maintenance's, recorded by one more. Otherwise an insert writes its tail entry and then its
+/// vector's row; a delete reads the vector's row, removes its tail entry or names its packed block
+/// in its dead row, and then removes the vector's row. A write that meets a row maintenance changed
+/// after the transaction's snapshot, or is changing, is undone, and the rowid's first redo row
+/// written instead.
 enum Change {
     Idle,
+    Pending { rowid: i64, walk: Walk, last: Option<i64>, then: Box<Change> },
     Remove { rowid: i64, get: Get },
     Bury { rowid: i64, block: i64, get: Get },
-    Apply(VecDeque<Step>),
+    Apply { rowid: i64, steps: VecDeque<Step>, undo: Vec<Step> },
+    Revert { rowid: i64, undo: Vec<Step> },
+    Redo(Step),
 }
 
 #[derive(Clone, Copy)]
@@ -2369,12 +2425,18 @@ enum Stage {
 
 enum Search {
     Init,
+    /// Read the redo rows, before the query's first round, unless rows held under another snapshot
+    /// serve the query's.
+    Pending { walk: Walk, rows: FxHashSet<i64> },
     /// Read a partition's rows in key order, up to `end`: its bookkeeping, whose version says
     /// whether its blocks are held; its dead rows, so its stale copies are known before its blocks
     /// are scored; its tail entries; and its blocks, unless they are held. Where its blocks are to
     /// be held, its other rows are kept in `rows`, to be held beside them.
     Probe { probes: VecDeque<i64>, partition: i64, walk: Walk, end: i64, blocks: Blocks, rows: Option<HeldRows> },
-    Rerank { candidates: VecDeque<i64>, rowid: Option<i64> },
+    /// Score exactly from the table the best estimates, unless the index answers with them, and
+    /// then the rows maintenance is to redo, `redo` once they are taken: a row in progress, and
+    /// whether it is one of those, whose row the table may no longer have.
+    Rerank { candidates: VecDeque<i64>, rowid: Option<(i64, bool)>, redo: Option<VecDeque<i64>> },
 }
 
 /// An entry a pack read: where it was, the centroid version it was coded against, its code.
@@ -2468,6 +2530,9 @@ enum Job {
     Retire(i64),
     /// Train the partitions afresh by k-means over a sample of every vector, and recode them all.
     Rebuild,
+    /// Settle up to [`MOVE_BATCH`] rowids' redo rows: kill each one's live code, code its table
+    /// row's vector afresh where it has one, and remove its redo rows.
+    Redo,
 }
 
 /// What a survey read of the partitions maintenance chooses from: their tails, bookkeeping and the
@@ -2538,6 +2603,28 @@ struct Run {
     /// For a step of `OPTIMIZE INDEX`, the instant past which the run starts no job once it has
     /// done one.
     until: Option<std::time::Instant>,
+    redo: RedoScan,
+}
+
+/// What a run knows of the redo rows: where its scan of them is, whether it has reached their end,
+/// and the batches it has read; the rowids it read and may settle, each with its redo rows' keys;
+/// and those it passes over, its own transaction's and those whose settle met a row another
+/// transaction holds.
+#[derive(Default)]
+struct RedoScan {
+    from: i64,
+    done: bool,
+    reads: usize,
+    batch: BTreeMap<i64, Vec<i64>>,
+    held: BTreeSet<i64>,
+}
+
+impl RedoScan {
+    /// What the run leaves of the redo rows: the rowids it read and passed over or did not get to,
+    /// and one for the rows past where its scan stopped.
+    fn left(&self) -> usize {
+        self.batch.len() + self.held.len() + usize::from(!self.done)
+    }
 }
 
 /// Maintenance: survey, choose a job, read the entries it concerns, check each against its
@@ -2548,6 +2635,9 @@ struct Run {
 enum Upkeep {
     Idle,
     Load,
+    /// Read the next [`MOVE_BATCH`] rowids' redo rows, from where the run's scan of them is: `last`
+    /// the rowid of the last row read, and `read` the rowids read.
+    Redo { walk: Walk, last: Option<i64>, read: usize },
     Survey(Surveying),
     /// Read the entries of `job`: the open block and the tail for a pack, every member for a
     /// split's sample, a block for a move or a compaction, every vector for a rebuild.
@@ -2559,12 +2649,27 @@ enum Upkeep {
     /// Read the dead row of each stale copy a rewritten block drops, to take the block off it.
     Unbury { job: Job, part: Part, sorted: Sorted, at: usize, get: Get },
     Fetch { job: Job, part: Part, sorted: Sorted, vectors: Vec<Vec<f32>> },
+    /// The table row of the next vector to fetch is gone, or holds none: see whether its rowid has
+    /// redo rows.
+    Orphan { job: Job, part: Part, sorted: Sorted, vectors: Vec<Vec<f32>>, walk: Walk },
+    /// Settle `rowids`, reading each in turn: its vector's row, its dead row where its live code is
+    /// packed, and its table row; the steps are then written, its redo rows' removals first.
+    Settle { rowids: Vec<i64>, at: usize, stage: Settling, get: Get, steps: VecDeque<Step> },
     /// Write the job's steps in order, keeping each row's prior state until the job is done.
     Apply { job: Job, steps: VecDeque<Step>, undo: Vec<Step> },
-    /// Restore the rows the abandoned job wrote, latest first.
-    Revert { undo: Vec<Step> },
+    /// Restore the rows the abandoned job wrote, latest first. A settle another transaction held
+    /// a row of `hold` for goes on without it; any other job ends the run.
+    Revert { undo: Vec<Step>, hold: Option<i64> },
     /// A rebuild, writing `steps` before it goes on to its next phase.
     Rebuild { phase: Rebuilding, steps: VecDeque<Step> },
+}
+
+/// Where a settle is in its rowid: reading its vector's row, its dead row, or its table row.
+#[derive(Clone, Copy)]
+enum Settling {
+    Vector,
+    Dead { block: i64 },
+    Row,
 }
 
 /// A rebuild: read every vector's rowid, train partitions afresh by k-means over a sample of the
@@ -2574,6 +2679,8 @@ enum Upkeep {
 /// coded against an older model still scores; packs recode it.
 enum Rebuilding {
     Rowids { walk: Walk, rowids: Vec<i64> },
+    /// Read the rowids with redo rows, which the rebuild leaves to their settles.
+    Redo { rowids: Vec<i64>, walk: Walk, pending: HashSet<i64> },
     Sample { rowids: Vec<i64>, sample: Vec<i64>, vectors: Vec<Vec<f32>>, get: Get },
     /// Collect the keys of every block, tail entry and dead row, to remove.
     Clear { rowids: Vec<i64>, model: Box<Model>, walk: Walk, keys: Vec<i64> },
@@ -2668,6 +2775,10 @@ struct Sorted {
     buried: Vec<(i64, i64)>,
     /// The writes that take those blocks off the copies' dead rows.
     unbury: Vec<Step>,
+    /// Live codes of rows with redo rows whose table rows the job found gone or without a vector,
+    /// which it leaves out of the rows it rewrites, removing their vectors' rows: a settle codes
+    /// such a row afresh from the table.
+    killed: Vec<i64>,
     /// The partitions a split marks moving, with their bookkeeping.
     neighbours: Vec<(i64, Part)>,
     /// The members of a partition being split.
@@ -2739,6 +2850,17 @@ thread_local! {
     /// and the most jobs a statement's maintenance on it does, which tests lower to leave work due.
     static STATEMENT_UPKEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static STATEMENT_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// Whether maintenance on this thread settles redo rows: off, every run passes them over as one
+    /// another transaction holds rows of, and the codes its jobs kill are counted.
+    static SETTLE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static KILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn settles() -> bool {
+    #[cfg(test)]
+    return SETTLE.with(|on| on.get());
+    #[cfg(not(test))]
+    true
 }
 
 /// The jobs one step of `OPTIMIZE INDEX` may do, and the instant past which it starts no other once
@@ -2809,6 +2931,9 @@ struct Query {
     centres: FxHashMap<(i64, i64), f64>,
     /// The stale copies the probed partitions' dead rows name, as rowid and block.
     dead: FxHashSet<(i64, i64)>,
+    /// The rows with redo rows under the query's snapshot: maintenance is to redo their codes, so
+    /// any code of theirs is passed over, and each one's vector is read from the table instead.
+    pending: Arc<FxHashSet<i64>>,
     /// The `keep` best 7-bit estimates of live entries so far, negated: the top is the bar an
     /// entry's raised 1-bit estimate must reach.
     estimates: BinaryHeap<Ordered>,
@@ -2880,6 +3005,10 @@ pub struct IvfRqCursor {
     /// Whether the cursor runs under MVCC, where a concurrent writer can code against a model older
     /// than the one its snapshot holds.
     concurrent: bool,
+    /// Under MVCC, the begin timestamp of the cursor's transaction, which the redo rows it writes
+    /// record, so its own maintenance, whose settle of them could only meet what they met, passes
+    /// over them; zero under WAL, where its own maintenance settles them.
+    writer: i64,
     /// The model and generation before a job that changes them, until the job is written.
     saved: Option<(Arc<Model>, Option<i64>)>,
     /// The partitions the job being planned changes, to survey again once it is written.
@@ -2893,6 +3022,10 @@ pub struct IvfRqCursor {
     writing: bool,
     /// The maintenance jobs this cursor has done.
     jobs: usize,
+    /// The rowids the settle being written settles, and the rowids with redo rows the last run
+    /// left unsettled.
+    settling: Vec<i64>,
+    redo_left: usize,
 }
 
 impl IvfRqCursor {
@@ -2929,6 +3062,7 @@ impl IvfRqCursor {
             inserted: 0,
             building: None,
             concurrent: false,
+            writer: 0,
             saved: None,
             dirty: Vec::new(),
             generation: None,
@@ -2936,7 +3070,16 @@ impl IvfRqCursor {
             recorded: HashSet::new(),
             writing: false,
             jobs: 0,
+            settling: Vec::new(),
+            redo_left: 0,
         }
+    }
+
+    fn note_snapshot(&mut self, context: &IndexMethodContext) {
+        (self.concurrent, self.writer) = match context.snapshot() {
+            IndexMethodSnapshotIdentity::Mvcc { begin_timestamp, .. } => (true, i64::try_from(begin_timestamp).unwrap_or(0)),
+            _ => (false, 0),
+        };
     }
 
     fn drive_pending(&mut self) -> IOResultOr<()> {
@@ -3073,11 +3216,30 @@ impl IvfRqCursor {
         }
     }
 
-    /// Drive the delete in progress to its end.
+    /// Drive the write in progress to its end.
     fn drive_change(&mut self) -> IOResultOr<()> {
         loop {
             match std::mem::replace(&mut self.change, Change::Idle) {
                 Change::Idle => return Ok(IOResult::Done(())),
+                Change::Pending { rowid, mut walk, mut last, then } => {
+                    let (start, end) = redo_rows(rowid)?;
+                    match walk_key(&mut self.stores[REDO], start, end, &mut walk)? {
+                        IOResult::IO(io) => {
+                            self.change = Change::Pending { rowid, walk, last, then };
+                            return Ok(IOResult::IO(io));
+                        }
+                        IOResult::Done(Some(key)) => {
+                            last = Some(key - start);
+                            self.change = Change::Pending { rowid, walk, last, then };
+                        }
+                        IOResult::Done(None) => {
+                            self.change = match last {
+                                Some(sequence) => Change::Redo(redo_step(rowid, sequence + 1, self.writer)?),
+                                None => *then,
+                            };
+                        }
+                    }
+                }
                 Change::Remove { rowid, mut get } => {
                     let found = match get_row(&mut self.stores[VECTORS], rowid, &mut get)? {
                         IOResult::Done(found) => found.ok_or_else(|| error("deleted vector has no row"))?,
@@ -3086,11 +3248,10 @@ impl IvfRqCursor {
                             return Ok(IOResult::IO(io));
                         }
                     };
-                    self.written += 1;
                     self.change = match Location::decode(integer(&found, 0)?) {
                         Location::Tail(key) => {
                             self.touched.insert(partition_of(key));
-                            Change::Apply(VecDeque::from([remove(VECTORS, rowid), remove(PARTITIONS, key)]))
+                            Change::Apply { rowid, steps: VecDeque::from([remove(PARTITIONS, key), remove(VECTORS, rowid)]), undo: Vec::new() }
                         }
                         Location::Block(block) => {
                             self.touched.insert(partition_of(block));
@@ -3112,23 +3273,54 @@ impl IvfRqCursor {
                         None => Vec::new(),
                     };
                     blocks.push(block);
-                    self.change = Change::Apply(VecDeque::from([remove(VECTORS, rowid), put(PARTITIONS, key, dead_record(&blocks)?)]));
+                    self.change = Change::Apply { rowid, steps: VecDeque::from([put(PARTITIONS, key, dead_record(&blocks)?), remove(VECTORS, rowid)]), undo: Vec::new() };
                 }
-                Change::Apply(mut steps) => {
+                Change::Apply { rowid, mut steps, mut undo } => {
                     let Some(step) = steps.front_mut() else {
                         return Ok(IOResult::Done(()));
                     };
                     self.record(step);
+                    match apply_step(&mut self.stores, step, Some(&mut undo)) {
+                        Ok(IOResult::Done(())) => {
+                            steps.pop_front();
+                            self.change = Change::Apply { rowid, steps, undo };
+                        }
+                        Ok(IOResult::IO(io)) => {
+                            self.change = Change::Apply { rowid, steps, undo };
+                            return Ok(IOResult::IO(io));
+                        }
+                        // Maintenance changed a row the write needs after the snapshot, or is
+                        // changing it: the write is maintenance's to redo from the table.
+                        Err(e) if conflicted(&e) => {
+                            REDONE.fetch_add(1, Ordering::Relaxed);
+                            self.change = Change::Revert { rowid, undo };
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Change::Revert { rowid, mut undo } => {
+                    let Some(step) = undo.last_mut() else {
+                        self.change = Change::Redo(redo_step(rowid, 0, self.writer)?);
+                        continue;
+                    };
+                    self.record(step);
                     match apply_step(&mut self.stores, step, None)? {
                         IOResult::Done(()) => {
-                            steps.pop_front();
-                            self.change = Change::Apply(steps);
+                            undo.pop();
+                            self.change = Change::Revert { rowid, undo };
                         }
                         IOResult::IO(io) => {
-                            self.change = Change::Apply(steps);
+                            self.change = Change::Revert { rowid, undo };
                             return Ok(IOResult::IO(io));
                         }
                     }
+                }
+                Change::Redo(mut step) => {
+                    if let IOResult::IO(io) = apply_step(&mut self.stores, &mut step, None)? {
+                        self.change = Change::Redo(step);
+                        return Ok(IOResult::IO(io));
+                    }
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
@@ -3196,6 +3388,7 @@ impl IvfRqCursor {
         let partition = match *store {
             PARTITIONS => partition_of(*rowid),
             CENTROIDS if *rowid == GENERATION => MODEL,
+            REDO => REDO_ROWS,
             _ => return,
         };
         if self.recorded.contains(&partition) {
@@ -3337,14 +3530,14 @@ impl IndexMethodCursor for IvfRqCursor {
 
     fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let _timer = timer(&OPEN_NANOS);
-        self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
+        self.note_snapshot(context);
         self.open_stores(context)?;
         self.share(context)?;
         self.load()
     }
 
     fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
-        self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
+        self.note_snapshot(context);
         self.open_stores(context)?;
         self.share(context)?;
         self.load()
@@ -3373,7 +3566,7 @@ impl IndexMethodCursor for IvfRqCursor {
             self.touched.insert(partition);
             self.written += 1;
             self.inserted += 1;
-            self.change = Change::Apply(steps.into());
+            self.change = Change::Pending { rowid, walk: Walk::Seek, last: None, then: Box::new(Change::Apply { rowid, steps: steps.into(), undo: Vec::new() }) };
         }
         let _timer = timer(&CHANGE_NANOS);
         self.drive_change()
@@ -3384,7 +3577,8 @@ impl IndexMethodCursor for IvfRqCursor {
             let vector = dense(values[0].get_value().to_blob())?;
             self.rotation(vector.len());
             let rowid = values[1].get_value().as_int().ok_or_else(|| error("rowid must be an integer"))?;
-            self.change = Change::Remove { rowid, get: Get::Seek };
+            self.written += 1;
+            self.change = Change::Pending { rowid, walk: Walk::Seek, last: None, then: Box::new(Change::Remove { rowid, get: Get::Seek }) };
         }
         self.drive_change()
     }
@@ -3421,13 +3615,20 @@ impl IndexMethodCursor for IvfRqCursor {
                 keep: limit,
                 centres: FxHashMap::default(),
                 dead: FxHashSet::default(),
+                pending: Arc::default(),
                 estimates: BinaryHeap::new(),
                 results: BinaryHeap::new(),
                 screens: Vec::new(),
                 screened: Vec::new(),
             });
             self.filter = filtered.then(|| Filter { limit, round: 0, probed_all: false, whole: false, reach: f64::INFINITY, given: HashSet::new(), accepted: BinaryHeap::new() });
-            self.search = self.round()?;
+            self.search = match self.held_redo() {
+                Some(pending) => {
+                    self.query.as_mut().ok_or_else(|| error("query state absent"))?.pending = pending;
+                    self.round()?
+                }
+                None => Search::Pending { walk: Walk::Seek, rows: FxHashSet::default() },
+            };
         }
         self.search()
     }
@@ -3505,7 +3706,7 @@ impl IndexMethodCursor for IvfRqCursor {
     /// `OPTIMIZE INDEX`: survey every partition and do every job there is, until none is left.
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         if self.run.is_none() {
-            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new(), build: None, until: None });
+            self.run = Some(Run { budget: usize::MAX, survey: Survey::default(), all: true, first: Vec::new(), build: None, until: None, redo: RedoScan::default() });
         }
         self.maintain(context)
     }
@@ -3519,7 +3720,7 @@ impl IndexMethodCursor for IvfRqCursor {
     /// left, it waits, doing none.
     fn optimize_step(&mut self, context: &IndexMethodContext, first: bool) -> IOResultOr<OptimizeProgress> {
         if self.run.is_none() {
-            self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
+            self.note_snapshot(context);
             self.open_stores(context)?;
             if self.sharing.is_none() {
                 self.share(context)?;
@@ -3541,14 +3742,14 @@ impl IndexMethodCursor for IvfRqCursor {
             }
             let (budget, until) = step_bounds();
             let budget = if first { 0 } else { budget };
-            self.run = Some(Run { budget, survey: Survey::default(), all: first, first: start, build: None, until });
+            self.run = Some(Run { budget, survey: Survey::default(), all: first, first: start, build: None, until, redo: RedoScan::default() });
             self.jobs = 0;
         }
         if let IOResult::IO(io) = self.maintain(context)? {
             return Ok(IOResult::IO(io));
         }
         let shared = self.shared.lock().expect("index state");
-        Ok(IOResult::Done(match (shared.due.is_empty() && shared.moving.is_empty(), first || self.jobs > 0) {
+        Ok(IOResult::Done(match (shared.due.is_empty() && shared.moving.is_empty() && self.redo_left == 0, first || self.jobs > 0) {
             (true, _) => OptimizeProgress::Done,
             (false, true) => OptimizeProgress::Moved,
             (false, false) => OptimizeProgress::Waiting,
@@ -3648,6 +3849,32 @@ impl IvfRqCursor {
         loop {
             match std::mem::replace(&mut self.search, Search::Init) {
                 Search::Init => return Err(error("no query is in progress")),
+                Search::Pending { mut walk, mut rows } => {
+                    let row = match walk_key(&mut self.stores[REDO], 0, i64::MAX, &mut walk)? {
+                        IOResult::Done(row) => row,
+                        IOResult::IO(io) => {
+                            self.search = Search::Pending { walk, rows };
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    match row {
+                        Some(key) => {
+                            rows.insert(key >> REDO_BITS);
+                            self.search = Search::Pending { walk, rows };
+                        }
+                        None => {
+                            let rows = Arc::new(rows);
+                            if let Some(Sharing { writes, clock, snapshot: Some(snapshot), holds: true, .. }) = &self.sharing {
+                                let mut shared = self.shared.lock().expect("index state");
+                                if writes.lock().expect("index writes").holds(REDO_ROWS, *snapshot, || clock.now()) {
+                                    shared.redo = Some((*snapshot, rows.clone()));
+                                }
+                            }
+                            self.query.as_mut().ok_or_else(|| error("query state absent"))?.pending = rows;
+                            self.search = self.round()?;
+                        }
+                    }
+                }
                 Search::Probe { probes, partition, mut walk, mut end, mut blocks, mut rows } => {
                     let reading = timer(&READ_NANOS);
                     let row = match walk_held(&mut self.stores[PARTITIONS], part_key(partition)?, end, &mut walk)? {
@@ -3754,14 +3981,14 @@ impl IvfRqCursor {
                     }
                     self.search = Search::Probe { probes, partition, walk, end, blocks, rows };
                 }
-                Search::Rerank { mut candidates, rowid } => {
+                Search::Rerank { mut candidates, rowid, mut redo } => {
                     let _timer = timer(&RERANK_NANOS);
                     let rerank = match RERANK_OVERRIDE.load(Ordering::Relaxed) {
                         0 => self.rerank,
                         n => n == 1,
                     };
                     let query = self.query.as_mut().ok_or_else(|| error("query state absent"))?;
-                    if candidates.is_empty() && rowid.is_none() && !query.estimates.is_empty() {
+                    if candidates.is_empty() && rowid.is_none() && redo.is_none() && !query.estimates.is_empty() {
                         let estimates = std::mem::take(&mut query.estimates);
                         match rerank {
                             true => candidates = estimates.into_iter().map(|o| o.1).collect(),
@@ -3776,7 +4003,11 @@ impl IvfRqCursor {
                             }
                         }
                     }
-                    let Some(current) = rowid.or_else(|| candidates.pop_front()) else {
+                    let current = match rowid.or_else(|| candidates.pop_front().map(|c| (c, false))) {
+                        Some(current) => Some(current),
+                        None => redo.get_or_insert_with(|| query.pending.iter().copied().collect()).pop_front().map(|c| (c, true)),
+                    };
+                    let Some((current, redone)) = current else {
                         let mut results: Vec<Ordered> = std::mem::take(&mut query.results).into_vec();
                         results.sort();
                         let short = results.len() < query.limit;
@@ -3804,22 +4035,33 @@ impl IvfRqCursor {
                     let main = self.main.as_mut().ok_or_else(|| error("table cursor must be open"))?;
                     match main.seek(SeekKey::TableRowId(current), SeekOp::GE { eq_only: true })? {
                         IOResult::Done(SeekResult::Found) => {}
+                        // A row maintenance is to redo that the snapshot no longer has.
+                        IOResult::Done(_) if redone => {
+                            self.search = Search::Rerank { candidates, rowid: None, redo };
+                            continue;
+                        }
                         IOResult::Done(_) => return Err(error("a vector's row names a row the table lacks")),
                         IOResult::IO(io) => {
-                            self.search = Search::Rerank { candidates, rowid: Some(current) };
+                            self.search = Search::Rerank { candidates, rowid: Some((current, redone)), redo };
                             return Ok(IOResult::IO(io));
                         }
                     }
                     let found = match main.record()? {
                         IOResult::Done(found) => found.ok_or_else(|| error("table row absent"))?,
                         IOResult::IO(io) => {
-                            self.search = Search::Rerank { candidates, rowid: Some(current) };
+                            self.search = Search::Rerank { candidates, rowid: Some((current, redone)), redo };
                             return Ok(IOResult::IO(io));
                         }
                     };
                     let column = self.configuration.columns[0].pos_in_table;
-                    let ValueRef::Blob(bytes) = found.get_value(column)? else {
-                        return Err(error("table value is not a vector"));
+                    let bytes = match found.get_value(column)? {
+                        ValueRef::Blob(bytes) => bytes,
+                        // One whose vector is gone.
+                        ValueRef::Null if redone => {
+                            self.search = Search::Rerank { candidates, rowid: None, redo };
+                            continue;
+                        }
+                        _ => return Err(error("table value is not a vector")),
                     };
                     let stored = Vector::from_slice_owned(bytes)?;
                     let distance = operations::distance_dot::vector_distance_dot(&stored, &query.asked)?;
@@ -3827,7 +4069,7 @@ impl IvfRqCursor {
                     if query.results.len() > query.limit {
                         query.results.pop();
                     }
-                    self.search = Search::Rerank { candidates, rowid: None };
+                    self.search = Search::Rerank { candidates, rowid: None, redo };
                 }
             }
         }
@@ -3852,7 +4094,19 @@ impl IvfRqCursor {
             }
             self.score_held(partition, &rows, &blocks)?;
         }
-        Ok(Search::Rerank { candidates: VecDeque::new(), rowid: None })
+        Ok(Search::Rerank { candidates: VecDeque::new(), rowid: None, redo: None })
+    }
+
+    /// The rows with redo rows held under another snapshot, when they serve this cursor's.
+    fn held_redo(&self) -> Option<Arc<FxHashSet<i64>>> {
+        let sharing = self.sharing.as_ref()?;
+        let snapshot = sharing.snapshot?;
+        let shared = self.shared.lock().expect("index state");
+        let (held, rows) = shared.redo.as_ref()?;
+        if !sharing.writes.lock().expect("index writes").serves(REDO_ROWS, *held, snapshot, || sharing.clock.now()) {
+            return None;
+        }
+        Some(rows.clone())
     }
 
     /// The rows held for `partition` and its blocks, held under their version, when the rows serve
@@ -3903,7 +4157,7 @@ impl IvfRqCursor {
         if let Some(rowids) = self.building.take().filter(|rowids| rowids.len() >= BULK_AT) {
             // A CREATE INDEX over BULK_AT rows or more: a rebuild over them clears the tail entries
             // the first wrote and codes every row into its block.
-            self.run = Some(Run { budget: rowids.len(), survey: Survey::default(), all: false, first: Vec::new(), build: Some(rowids), until: None });
+            self.run = Some(Run { budget: rowids.len(), survey: Survey::default(), all: false, first: Vec::new(), build: Some(rowids), until: None, redo: RedoScan::default() });
             self.touched.clear();
             self.written = 0;
             self.inserted = 0;
@@ -3924,7 +4178,7 @@ impl IvfRqCursor {
             // A statement that inserted many rows surveys every partition, so a rebuild is chosen
             // when its rows have outgrown the partitions.
             let all = self.inserted >= BULK_AT;
-            self.run = Some(Run { budget, survey: Survey::default(), all, first: first.into_iter().collect(), build: None, until: None });
+            self.run = Some(Run { budget, survey: Survey::default(), all, first: first.into_iter().collect(), build: None, until: None, redo: RedoScan::default() });
             self.written = 0;
             self.inserted = 0;
         }
@@ -3962,7 +4216,7 @@ impl IvfRqCursor {
         loop {
             match std::mem::replace(&mut self.upkeep, Upkeep::Idle) {
                 Upkeep::Idle => {
-                    self.concurrent = matches!(context.snapshot(), IndexMethodSnapshotIdentity::Mvcc { .. });
+                    self.note_snapshot(context);
                     self.open_stores(context)?;
                     // OPTIMIZE INDEX opens no cursor before it maintains, and its writes are
                     // recorded like any other.
@@ -3982,10 +4236,43 @@ impl IvfRqCursor {
                         self.upkeep = Upkeep::Rebuild { phase: sampling(rowids), steps: VecDeque::new() };
                         continue;
                     }
-                    self.upkeep = Upkeep::Survey(match run.all {
-                        true => Surveying::All { partition: 0, walk: Walk::Seek },
-                        false => Surveying::Some { pending: std::mem::take(&mut run.first).into(), walk: Walk::Seek },
-                    });
+                    self.upkeep = surveying(run);
+                }
+                Upkeep::Redo { mut walk, last, read } => {
+                    let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
+                    let row = match walk_row(&mut self.stores[REDO], run.redo.from, i64::MAX, &mut walk)? {
+                        IOResult::IO(io) => {
+                            self.upkeep = Upkeep::Redo { walk, last, read };
+                            return Ok(IOResult::IO(io));
+                        }
+                        IOResult::Done(row) => row,
+                    };
+                    match row {
+                        // A batch ends at a rowid's end, so each rowid it reads is read whole.
+                        Some((key, _)) if last.is_some_and(|l| l != key >> REDO_BITS) && read >= MOVE_BATCH => run.redo.from = key,
+                        Some((key, found)) => {
+                            surveyed();
+                            let rowid = key >> REDO_BITS;
+                            let read = read + usize::from(last != Some(rowid));
+                            if self.writer != 0 && integer(&found, 0)? == self.writer {
+                                run.redo.held.insert(rowid);
+                            } else if !run.redo.held.contains(&rowid) {
+                                run.redo.batch.entry(rowid).or_default().push(key);
+                            }
+                            self.upkeep = Upkeep::Redo { walk, last: Some(rowid), read };
+                            continue;
+                        }
+                        None => run.redo.done = true,
+                    }
+                    // A read that found redo rows is spent from the run's budget as a job is.
+                    run.redo.reads += 1;
+                    if read > 0 {
+                        run.budget = run.budget.saturating_sub(1);
+                    }
+                    match self.next_job()? {
+                        Some(upkeep) => self.upkeep = upkeep,
+                        None => return Ok(IOResult::Done(())),
+                    }
                 }
                 Upkeep::Survey(Surveying::All { partition, mut walk }) => {
                     if partition >= self.model.centroids.len().max(1) as i64 {
@@ -4141,6 +4428,7 @@ impl IvfRqCursor {
                             }
                         }
                         (Job::Rebuild, _) => return Err(error("a rebuild reads through its own stage")),
+                        (Job::Redo, _) => return Err(error("a settle reads through its own stage")),
                         (_, Stage::Tail) => {
                             let (start, end) = rows_of(partition, TAIL_ROW)?;
                             let full = !matches!(job, Job::Split(_)) && rows.iter().filter(|r| matches!(r.location, Location::Tail(_))).count() >= MOVE_BATCH;
@@ -4276,6 +4564,7 @@ impl IvfRqCursor {
                             Job::Compact(block) => self.plan_compact(block, part, sorted)?,
                             Job::Retire(p) => self.plan_retire(p, part)?,
                             Job::Rebuild => return Err(error("a rebuild plans through its own stage")),
+                            Job::Redo => return Err(error("a settle plans through its own stage")),
                         };
                         steps.extend(unbury);
                         self.upkeep = Upkeep::Apply { job, steps, undo: Vec::new() };
@@ -4284,7 +4573,10 @@ impl IvfRqCursor {
                     let main = self.main.as_mut().ok_or_else(|| error("table cursor must be open"))?;
                     match main.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })? {
                         IOResult::Done(SeekResult::Found) => {}
-                        IOResult::Done(_) => return Err(error("a vector's row names a row the table lacks")),
+                        IOResult::Done(_) => {
+                            self.upkeep = Upkeep::Orphan { job, part, sorted, vectors, walk: Walk::Seek };
+                            continue;
+                        }
                         IOResult::IO(io) => {
                             self.upkeep = Upkeep::Fetch { job, part, sorted, vectors };
                             return Ok(IOResult::IO(io));
@@ -4299,10 +4591,108 @@ impl IvfRqCursor {
                     };
                     let column = self.configuration.columns[0].pos_in_table;
                     let ValueRef::Blob(bytes) = found.get_value(column)? else {
-                        return Err(error("table value is not a vector"));
+                        self.upkeep = Upkeep::Orphan { job, part, sorted, vectors, walk: Walk::Seek };
+                        continue;
                     };
                     vectors.push(dense(Some(bytes))?);
                     self.upkeep = Upkeep::Fetch { job, part, sorted, vectors };
+                }
+                Upkeep::Orphan { job, part, mut sorted, vectors, mut walk } => {
+                    let at = vectors.len();
+                    let rowid = sorted.recode[at];
+                    let (start, end) = redo_rows(rowid)?;
+                    let found = match walk_key(&mut self.stores[REDO], start, end, &mut walk)? {
+                        IOResult::Done(found) => found,
+                        IOResult::IO(io) => {
+                            self.upkeep = Upkeep::Orphan { job, part, sorted, vectors, walk };
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    if found.is_none() {
+                        return Err(error("a vector's row names a row the table lacks a vector in"));
+                    }
+                    // A row maintenance is to code afresh, deleted or without a vector since: a
+                    // split's sample leaves it out, and any other job kills its code.
+                    sorted.recode.remove(at);
+                    if let Job::Move(_) = job {
+                        sorted.live.remove(at);
+                    }
+                    if !matches!(job, Job::Split(_)) {
+                        sorted.killed.push(rowid);
+                    }
+                    self.upkeep = Upkeep::Fetch { job, part, sorted, vectors };
+                }
+                Upkeep::Settle { rowids, at, stage, mut get, mut steps } => {
+                    let Some(&rowid) = rowids.get(at) else {
+                        // The redo rows' removals go first: they claim the rowids from any other
+                        // run settling them.
+                        let redo = &self.run.as_ref().ok_or_else(|| error("maintenance without a run"))?.redo;
+                        let mut claims: VecDeque<Step> = rowids.iter().flat_map(|r| redo.batch.get(r).into_iter().flatten()).map(|key| remove(REDO, *key)).collect();
+                        claims.extend(steps);
+                        self.settling = rowids;
+                        self.upkeep = Upkeep::Apply { job: Job::Redo, steps: claims, undo: Vec::new() };
+                        continue;
+                    };
+                    match stage {
+                        Settling::Vector => {
+                            let found = match get_row(&mut self.stores[VECTORS], rowid, &mut get)? {
+                                IOResult::Done(found) => found,
+                                IOResult::IO(io) => {
+                                    self.upkeep = Upkeep::Settle { rowids, at, stage, get, steps };
+                                    return Ok(IOResult::IO(io));
+                                }
+                            };
+                            let stage = match found.map(|r| integer(&r, 0)).transpose()?.map(Location::decode) {
+                                Some(Location::Tail(key)) => {
+                                    steps.extend([remove(PARTITIONS, key), remove(VECTORS, rowid)]);
+                                    self.dirty.push(partition_of(key));
+                                    Settling::Row
+                                }
+                                Some(Location::Block(block)) => Settling::Dead { block },
+                                None => Settling::Row,
+                            };
+                            self.upkeep = Upkeep::Settle { rowids, at, stage, get: Get::Seek, steps };
+                        }
+                        Settling::Dead { block } => {
+                            let key = dead_key(block, rowid)?;
+                            let found = match get_row(&mut self.stores[PARTITIONS], key, &mut get)? {
+                                IOResult::Done(found) => found,
+                                IOResult::IO(io) => {
+                                    self.upkeep = Upkeep::Settle { rowids, at, stage, get, steps };
+                                    return Ok(IOResult::IO(io));
+                                }
+                            };
+                            let mut blocks = match &found {
+                                Some(r) => dead_blocks(bytes_at(r, 0)?)?,
+                                None => Vec::new(),
+                            };
+                            blocks.push(block);
+                            steps.extend([put(PARTITIONS, key, dead_record(&blocks)?), remove(VECTORS, rowid)]);
+                            self.dirty.push(partition_of(block));
+                            self.upkeep = Upkeep::Settle { rowids, at, stage: Settling::Row, get: Get::Seek, steps };
+                        }
+                        Settling::Row => {
+                            let main = self.main.as_mut().ok_or_else(|| error("table cursor must be open"))?;
+                            let found = match get_row(main, rowid, &mut get)? {
+                                IOResult::Done(found) => found,
+                                IOResult::IO(io) => {
+                                    self.upkeep = Upkeep::Settle { rowids, at, stage, get, steps };
+                                    return Ok(IOResult::IO(io));
+                                }
+                            };
+                            let column = self.configuration.columns[0].pos_in_table;
+                            let vector = match found.as_ref().map(|r| r.get_value(column)).transpose()? {
+                                Some(ValueRef::Blob(bytes)) => Some(dense(Some(bytes))?),
+                                _ => None,
+                            };
+                            if let Some(vector) = vector {
+                                let (partition, written) = self.tail_steps(rowid, &vector)?;
+                                steps.extend(written);
+                                self.dirty.push(partition);
+                            }
+                            self.upkeep = Upkeep::Settle { rowids, at: at + 1, stage: Settling::Vector, get: Get::Seek, steps };
+                        }
+                    }
                 }
                 Upkeep::Apply { job, mut steps, mut undo } => {
                     let Some(step) = steps.front_mut() else {
@@ -4321,7 +4711,8 @@ impl IvfRqCursor {
                         }
                         Err(e) if conflicted(&e) => {
                             CONFLICTS.fetch_add(1, Ordering::Relaxed);
-                            self.upkeep = Upkeep::Revert { undo };
+                            let hold = matches!(job, Job::Redo).then(|| settled_rowid(step));
+                            self.upkeep = Upkeep::Revert { undo, hold };
                         }
                         Err(e) => return Err(e),
                     }
@@ -4350,7 +4741,25 @@ impl IvfRqCursor {
                                 rowids.push(rowid);
                                 self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Rowids { walk, rowids }, steps };
                             }
-                            IOResult::Done(None) => self.upkeep = Upkeep::Rebuild { phase: sampling(rowids), steps },
+                            IOResult::Done(None) => self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Redo { rowids, walk: Walk::Seek, pending: HashSet::new() }, steps },
+                        },
+                        Rebuilding::Redo { rowids, mut walk, mut pending } => match walk_key(&mut self.stores[REDO], 0, i64::MAX, &mut walk)? {
+                            IOResult::IO(io) => {
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Redo { rowids, walk, pending }, steps };
+                                return Ok(IOResult::IO(io));
+                            }
+                            IOResult::Done(Some(key)) => {
+                                surveyed();
+                                pending.insert(key >> REDO_BITS);
+                                self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Redo { rowids, walk, pending }, steps };
+                            }
+                            // A row with redo rows is coded afresh by its settle: its code goes with
+                            // every other, and its vector's row with it.
+                            IOResult::Done(None) => {
+                                let (left, rowids): (Vec<i64>, Vec<i64>) = rowids.into_iter().partition(|r| pending.contains(r));
+                                steps.extend(kills(&left));
+                                self.upkeep = Upkeep::Rebuild { phase: sampling(rowids), steps };
+                            }
                         },
                         Rebuilding::Sample { rowids, sample, mut vectors, mut get } => {
                             let Some(&rowid) = sample.get(vectors.len()) else {
@@ -4434,13 +4843,28 @@ impl IvfRqCursor {
                         }
                     }
                 }
-                Upkeep::Revert { mut undo } => {
+                Upkeep::Revert { mut undo, hold } => {
                     let Some(step) = undo.last_mut() else {
+                        if let Some(rowid) = hold {
+                            // Another transaction holds a row of this rowid; the next run settles
+                            // it, and this one goes on without it.
+                            self.dirty.clear();
+                            self.settling.clear();
+                            let redo = &mut self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?.redo;
+                            redo.batch.remove(&rowid);
+                            redo.held.insert(rowid);
+                            match self.next_job()? {
+                                Some(upkeep) => self.upkeep = upkeep,
+                                None => return Ok(IOResult::Done(())),
+                            }
+                            continue;
+                        }
                         // Another writer holds a row this run needs; it maintains them itself. The
                         // partitions the run read that it leaves work due in stay due.
                         let run = self.run.take();
                         self.forget_run();
                         if let Some(run) = run {
+                            self.redo_left = run.redo.left();
                             self.leave_due(&run);
                         }
                         self.loaded = true;
@@ -4450,10 +4874,10 @@ impl IvfRqCursor {
                     match apply_step(&mut self.stores, step, None)? {
                         IOResult::Done(()) => {
                             undo.pop();
-                            self.upkeep = Upkeep::Revert { undo };
+                            self.upkeep = Upkeep::Revert { undo, hold };
                         }
                         IOResult::IO(io) => {
-                            self.upkeep = Upkeep::Revert { undo };
+                            self.upkeep = Upkeep::Revert { undo, hold };
                             return Ok(IOResult::IO(io));
                         }
                     }
@@ -4511,7 +4935,16 @@ impl IvfRqCursor {
         let run = self.run.as_mut().ok_or_else(|| error("maintenance without a run"))?;
         run.budget = run.budget.saturating_sub(1);
         let mut dirty = std::mem::take(&mut self.dirty);
-        dirty.push(job_partition(job));
+        match job {
+            Job::Redo => {
+                let settled = std::mem::take(&mut self.settling);
+                SETTLED.fetch_add(settled.len(), Ordering::Relaxed);
+                for rowid in settled {
+                    run.redo.batch.remove(&rowid);
+                }
+            }
+            job => dirty.push(job_partition(job)),
+        }
         dirty.sort_unstable();
         dirty.dedup();
         if std::env::var_os("IVF_RQ_TRACE").is_some() {
@@ -4525,9 +4958,22 @@ impl IvfRqCursor {
     fn next_job(&mut self) -> Result<Option<Upkeep>> {
         let run = self.run.as_ref().ok_or_else(|| error("maintenance without a run"))?;
         let late = run.until.is_some_and(|until| self.jobs > 0 && std::time::Instant::now() >= until);
+        // The redo rows come first, a batch at a time. A run reads one batch whatever its budget,
+        // so even a run that does no job, as the first step of OPTIMIZE INDEX, knows whether any
+        // are left.
+        if !late && settles() {
+            let rowids: Vec<i64> = run.redo.batch.keys().take(MOVE_BATCH).copied().collect();
+            if !rowids.is_empty() && run.budget > 0 {
+                return Ok(Some(Upkeep::Settle { rowids, at: 0, stage: Settling::Vector, get: Get::Seek, steps: VecDeque::new() }));
+            }
+            if rowids.is_empty() && !run.redo.done && (run.budget > 0 || run.redo.reads == 0) {
+                return Ok(Some(Upkeep::Redo { walk: Walk::Seek, last: None, read: 0 }));
+            }
+        }
         let job = if run.budget == 0 || late { None } else { self.choose(&run.survey) };
         let Some(job) = job else {
             if let Some(run) = self.run.take() {
+                self.redo_left = run.redo.left();
                 self.leave_due(&run);
             }
             return Ok(None);
@@ -4670,6 +5116,7 @@ impl IvfRqCursor {
     /// claims the partition.
     fn plan_pack(&mut self, partition: i64, mut part: Part, sorted: Sorted, vectors: Vec<Vec<f32>>) -> Result<VecDeque<Step>> {
         let mut steps = removals(&sorted.removed);
+        steps.extend(kills(&sorted.killed));
         let mut live = sorted.live;
         live.sort_unstable_by_key(|e| e.rowid);
         let version = self.model.version(partition);
@@ -4800,6 +5247,7 @@ impl IvfRqCursor {
                 moved += 1;
             }
         }
+        steps.extend(kills(&sorted.killed));
         if from_block {
             let dropped = sorted.from_blocks - staying.len() as i64 - moved;
             if moved + dropped + recoded > 0 {
@@ -4832,7 +5280,8 @@ impl IvfRqCursor {
             true => remove(PARTITIONS, block),
             false => put(PARTITIONS, block, codes_record(sorted.version, &pack(&staying)?)?),
         }]);
-        part.size = (part.size - sorted.buried.len() as i64).max(0);
+        steps.extend(kills(&sorted.killed));
+        part.size = (part.size - sorted.buried.len() as i64 - sorted.killed.len() as i64).max(0);
         // The open block is the partition's last; it stays open with the entries it keeps.
         if part.open > 0 && block == block_key(partition, part.next - 1)? {
             part.open = staying.len() as i64;
@@ -4887,11 +5336,37 @@ fn removals(removed: &[Location]) -> VecDeque<Step> {
         .collect()
 }
 
+/// The survey a run starts with: every partition, or those it starts from.
+fn surveying(run: &mut Run) -> Upkeep {
+    Upkeep::Survey(match run.all {
+        true => Surveying::All { partition: 0, walk: Walk::Seek },
+        false => Surveying::Some { pending: std::mem::take(&mut run.first).into(), walk: Walk::Seek },
+    })
+}
+
+/// The rowid a settle's step writes for: its redo row's, its vector's, or its tail entry's or dead
+/// row's.
+fn settled_rowid(step: &Step) -> i64 {
+    let (Step::Put { store, rowid, .. } | Step::Remove { store, rowid, .. }) = step;
+    match *store {
+        REDO => rowid >> REDO_BITS,
+        PARTITIONS => rowid & ((1 << ROWID_BITS) - 1),
+        _ => *rowid,
+    }
+}
+
+/// The removals of the vectors' rows of the live codes a job kills.
+fn kills(killed: &[i64]) -> VecDeque<Step> {
+    #[cfg(test)]
+    KILLS.with(|count| count.set(count.get() + killed.len()));
+    killed.iter().map(|rowid| remove(VECTORS, *rowid)).collect()
+}
+
 fn job_partition(job: Job) -> i64 {
     match job {
         Job::Pack(p) | Job::Split(p) | Job::Move(p) | Job::Retire(p) => p,
         Job::Compact(block) => partition_of(block),
-        Job::Rebuild => 0,
+        Job::Rebuild | Job::Redo => 0,
     }
 }
 
@@ -5004,7 +5479,7 @@ fn refine_block(query: &mut Query, payload: &[u8], centre: f64, source: Location
             }
             tally(&CANDIDATES, 1);
             let rowid = i64_at(payload, layout.rowids() + 8 * n);
-            if screened.is_some_and(|key| query.dead.contains(&(rowid, key))) {
+            if screened.is_some_and(|key| query.dead.contains(&(rowid, key))) || !query.pending.is_empty() && query.pending.contains(&rowid) {
                 continue;
             }
             let signed = match signed {
@@ -5046,6 +5521,8 @@ pub struct Check {
     pub stale_copies: u64,
     /// The live codes coded again from their rows' vectors and compared.
     pub codes: u64,
+    /// The rows with redo rows, which the index leaves to maintenance to code afresh from the table.
+    pub pending: u64,
     pub findings: Vec<String>,
     pub findings_total: u64,
 }
@@ -5072,7 +5549,9 @@ impl Check {
 /// the vector's row in the index says, coded from the row's vector against the centroid version it
 /// names; that every other copy a block holds is on its vector's dead row, and every dead row names
 /// a block holding a copy; that each partition's bookkeeping counts its blocks, and a retired one
-/// holds none. It reads the whole index and each indexed row once, and holds a location per row.
+/// holds none. A row with redo rows is maintenance's to code afresh: whatever code it has is held as
+/// any other, and its table row is not compared with it. It reads the whole index and each indexed
+/// row once, and holds a location per row.
 pub fn check(connection: &Arc<Connection>, index: &str) -> Result<Check> {
     let own = connection.get_auto_commit();
     if own {
@@ -5113,6 +5592,8 @@ struct Checker<'c> {
     index: String,
     check: Check,
     indexed: HashMap<i64, Indexed>,
+    /// The rows with redo rows.
+    pending: HashSet<i64>,
     centroids: HashMap<(i64, i64), Vec<f32>>,
     rotation: Option<Rotation>,
     vector: crate::Statement,
@@ -5153,7 +5634,7 @@ impl<'c> Checker<'c> {
         }
         let column = column.ok_or_else(|| error("index has no column"))?;
         let vector = connection.prepare(format!("SELECT {} FROM {} WHERE rowid = ?1", quoted_name(&column), quoted_name(&table)))?;
-        Ok(Self { connection, table, column, index: index.to_string(), check: Check::default(), indexed: HashMap::new(), centroids: HashMap::new(), rotation: None, vector })
+        Ok(Self { connection, table, column, index: index.to_string(), check: Check::default(), indexed: HashMap::new(), pending: HashSet::new(), centroids: HashMap::new(), rotation: None, vector })
     }
 
     fn store(&self, suffix: &str) -> String {
@@ -5162,6 +5643,13 @@ impl<'c> Checker<'c> {
 
     fn run(mut self) -> Result<Check> {
         let connection = self.connection;
+        let mut pending = HashSet::new();
+        each_row(connection, &format!("SELECT rowid FROM {}", self.store("redo")), |row| {
+            pending.insert(integer_value(&row[0])? >> REDO_BITS);
+            Ok(())
+        })?;
+        self.check.pending = pending.len() as u64;
+        self.pending = pending;
         let mut indexed = HashMap::new();
         each_row(connection, &format!("SELECT rowid, location FROM {}", self.store("vectors")), |row| {
             indexed.insert(integer_value(&row[0])?, Indexed { location: Location::decode(integer_value(&row[1])?), in_table: false, found: false });
@@ -5171,6 +5659,7 @@ impl<'c> Checker<'c> {
         let sql = format!("SELECT rowid, {} IS NOT NULL FROM {}", quoted_name(&self.column), quoted_name(&self.table));
         each_row(connection, &sql, |row| {
             let (rowid, has) = (integer_value(&row[0])?, integer_value(&row[1])? != 0);
+            let pending = self.pending.contains(&rowid);
             match (has, self.indexed.get_mut(&rowid)) {
                 (true, Some(entry)) => {
                     entry.in_table = true;
@@ -5178,18 +5667,22 @@ impl<'c> Checker<'c> {
                 }
                 (true, None) => {
                     self.check.rows += 1;
-                    self.check.find(format!("row {rowid} has a vector and no row in the index"));
+                    if !pending {
+                        self.check.find(format!("row {rowid} has a vector and no row in the index"));
+                    }
                 }
                 (false, Some(entry)) => {
                     entry.in_table = true;
-                    entry.found = true;
-                    self.check.find(format!("row {rowid} has no vector and a row in the index"));
+                    if !pending {
+                        entry.found = true;
+                        self.check.find(format!("row {rowid} has no vector and a row in the index"));
+                    }
                 }
                 (false, None) => {}
             }
             Ok(())
         })?;
-        let mut orphans: Vec<i64> = self.indexed.iter().filter(|(_, entry)| !entry.in_table).map(|(rowid, _)| *rowid).collect();
+        let mut orphans: Vec<i64> = self.indexed.iter().filter(|(rowid, entry)| !entry.in_table && !self.pending.contains(rowid)).map(|(rowid, _)| *rowid).collect();
         orphans.sort_unstable();
         for rowid in orphans {
             self.check.find(format!("the index holds row {rowid}, which the table does not"));
@@ -5256,7 +5749,7 @@ impl<'c> Checker<'c> {
         if let Some(done) = rows.take() {
             self.partition(done);
         }
-        let mut missing: Vec<(i64, Location)> = self.indexed.iter().filter(|(_, e)| e.in_table && !e.found).map(|(rowid, e)| (*rowid, e.location)).collect();
+        let mut missing: Vec<(i64, Location)> = self.indexed.iter().filter(|(rowid, e)| (e.in_table || self.pending.contains(rowid)) && !e.found).map(|(rowid, e)| (*rowid, e.location)).collect();
         missing.sort_unstable_by_key(|(rowid, _)| *rowid);
         for (rowid, location) in missing {
             self.check.find(format!("row {rowid}'s code is not at {location:?}, where the index says it is"));
@@ -5284,6 +5777,9 @@ impl<'c> Checker<'c> {
             if dead.get(&entry.rowid).is_some_and(|blocks| blocks.contains(&block)) {
                 self.check.find(format!("row {}'s dead row names {location:?}, which holds its live code", entry.rowid));
             }
+        }
+        if self.pending.contains(&entry.rowid) {
+            return Ok(());
         }
         let centroid = match self.centroids.get(&(partition, version)) {
             Some(centroid) => Some(centroid.clone()),
@@ -5397,6 +5893,7 @@ mod tests {
             keep,
             centres: FxHashMap::default(),
             dead: FxHashSet::default(),
+            pending: Arc::default(),
             estimates: BinaryHeap::new(),
             results: BinaryHeap::new(),
             screens: Vec::new(),
@@ -5978,6 +6475,7 @@ mod tests {
         tails: HashMap<i64, usize>,
         versions: HashMap<i64, i64>,
         stale: HashMap<i64, usize>,
+        redo: usize,
     }
 
     /// The partitions table's rows of `kind`: the key, then the row's columns.
@@ -6012,7 +6510,8 @@ mod tests {
                 *stale.entry(block).or_default() += 1;
             }
         }
-        Stored { parts, tails, versions, stale }
+        let redo = backing(conn, "redo", "writer").len();
+        Stored { parts, tails, versions, stale, redo }
     }
 
     impl Stored {
@@ -6072,6 +6571,9 @@ mod tests {
                 if *count >= COMPACT_AT {
                     left.push(format!("block {block} holds {count} stale copies"));
                 }
+            }
+            if self.redo > 0 {
+                left.push(format!("{} redo rows", self.redo));
             }
             left
         }
@@ -6787,6 +7289,269 @@ mod tests {
         for _ in 0..3 {
             let q = near(&mut state, &centres[..2], 0.05);
             assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
+        }
+    }
+
+    /// Each vector's location as its vectors row records it.
+    fn locations(conn: &Arc<crate::Connection>) -> HashMap<i64, i64> {
+        backing(conn, "vectors", "location").iter().map(|r| (r[0].as_int().unwrap(), r[1].as_int().unwrap())).collect()
+    }
+
+    /// Under MVCC, a transaction deletes and updates vectors whose codes maintenance moved after its
+    /// snapshot: OPTIMIZE INDEX packs, splits and moves the backlog while a `BEGIN CONCURRENT`
+    /// transaction holds an earlier snapshot, and the transaction's writes to the moved vectors then
+    /// commit, as writes to rows no other transaction wrote do. The maintenance each of its
+    /// statements does passes over the redo rows the transaction wrote, so each one-row update reads
+    /// a bounded number of rows by key, however many its transaction left to maintenance.
+    #[test]
+    fn deletes_and_updates_of_vectors_maintenance_moved_after_the_snapshot_commit() {
+        const DIMS: usize = 16;
+        let (db, conn) = database("ivf-rq-moved-after-snapshot.db", true);
+        let mut state = 239;
+        let mut live = backlog(&conn, &mut state, DIMS);
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        assert_eq!(rows(&writer, "SELECT count(*) FROM v")[0][0].as_int(), Some(live.len() as i64));
+        let before = locations(&conn);
+        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        let after = locations(&conn);
+        let mut moved: Vec<i64> = before.iter().filter(|(id, at)| after.get(id) != Some(at)).map(|(id, _)| *id).collect();
+        moved.sort_unstable();
+        assert!(moved.len() >= 200, "OPTIMIZE INDEX moved only {} vectors", moved.len());
+        let (deleted, updated) = moved.split_at(moved.len() / 2);
+        let ids = |ids: &[i64]| ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        writer.execute(format!("DELETE FROM v WHERE id IN ({})", ids(deleted))).unwrap();
+        let before = POINT_READS.with(|count| count.get());
+        for id in updated {
+            let v = random(&mut state, DIMS);
+            writer.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&v))).unwrap();
+            live.insert(*id, v);
+        }
+        let reads = (POINT_READS.with(|count| count.get()) - before) / updated.len();
+        assert!(reads < 400, "a one-row update read {reads} rows by key");
+        writer.execute("COMMIT").unwrap();
+        for id in deleted {
+            live.remove(id);
+        }
+        let found = check(&conn, "v_ivf").unwrap();
+        assert!(found.consistent(), "{found:?}");
+        for _ in 0..5 {
+            let q = random(&mut state, DIMS);
+            assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
+        }
+        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        let found = check(&conn, "v_ivf").unwrap();
+        assert!(found.consistent(), "{found:?}");
+        let left = stored(&conn).pending();
+        assert!(left.is_empty(), "work left after OPTIMIZE INDEX: {left:?}");
+        for _ in 0..5 {
+            let q = random(&mut state, DIMS);
+            assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
+        }
+    }
+
+    /// Write the first redo row of each of `rowids` in a nested statement of its own transaction,
+    /// as a write that meets maintenance writes it, without changing the rows.
+    fn leave_to_maintenance(conn: &Arc<crate::Connection>, mvcc: bool, index: &str, rowids: &[i64]) {
+        conn.execute(if mvcc { "BEGIN CONCURRENT" } else { "BEGIN IMMEDIATE" }).unwrap();
+        conn.start_nested();
+        let values: Vec<String> = rowids.iter().map(|r| format!("({}, 0)", r << REDO_BITS)).collect();
+        let done = conn.execute(format!("INSERT INTO __turso_internal_{index}_redo(rowid, writer) VALUES {}", values.join(",")));
+        conn.end_nested();
+        done.unwrap();
+        conn.execute("COMMIT").unwrap();
+    }
+
+    /// Rows with redo rows are maintenance's to code afresh. Until a settle does, a query passes over
+    /// any code they have and reads their vectors from the table, and deletes and updates of them add
+    /// redo rows rather than writing codes; a settle then codes each from its table row. Under WAL
+    /// and MVCC, with settles held while the rows are written and through one OPTIMIZE INDEX, so the
+    /// other jobs meet them.
+    #[test]
+    fn rows_left_to_maintenance_are_answered_from_their_table_rows_until_settled() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-left-to-maintenance-{mvcc}.db"), mvcc);
+            let mut state = 241;
+            let mut live = backlog(&conn, &mut state, DIMS);
+            // Rows of the tails the backlog left and of the blocks before it.
+            let chosen: Vec<i64> = (3001..=3060).chain((1..=600).step_by(10)).collect();
+            leave_to_maintenance(&conn, mvcc, "v_ivf", &chosen);
+            SETTLE.with(|on| on.set(false));
+            let (deleted, updated) = chosen.split_at(chosen.len() / 2);
+            let ids = |ids: &[i64]| ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            // The first deleted row's old vector, at eight times its length nearer it than any other.
+            let (gone, moved) = (deleted[0], updated[0]);
+            let at_gone: Vec<f32> = live[&gone].iter().map(|x| 8.0 * x).collect();
+            conn.execute(format!("DELETE FROM v WHERE id IN ({})", ids(deleted))).unwrap();
+            for id in deleted {
+                live.remove(id);
+            }
+            for id in updated {
+                // The first updated row moves far from every other.
+                let scale = if *id == moved { 8.0 } else { 1.0 };
+                let v: Vec<f32> = random(&mut state, DIMS).iter().map(|x| scale * x).collect();
+                conn.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&v))).unwrap();
+                live.insert(*id, v);
+            }
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.pending == chosen.len() as u64, "mvcc={mvcc}: {found:?}");
+            // A delete adds one, an update one for its delete and one for its insert.
+            assert_eq!(stored(&conn).redo, chosen.len() + deleted.len() + 2 * updated.len(), "mvcc={mvcc}: the redo rows the writes added");
+            for _ in 0..5 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+            // A query at an updated row's new vector finds it first, and one at a deleted row's old
+            // vector does not find it.
+            let q = live[&moved].clone();
+            assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            assert_eq!(top_ten(&conn, &q)[0], moved, "mvcc={mvcc}");
+            assert_eq!(top_ten(&conn, &at_gone), exact_top_ten(&live, &at_gone), "mvcc={mvcc}");
+            assert!(!top_ten(&conn, &at_gone).contains(&gone), "mvcc={mvcc}");
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.pending == chosen.len() as u64, "mvcc={mvcc}: {found:?}");
+            for _ in 0..5 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+            SETTLE.with(|on| on.set(true));
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
+            let left = stored(&conn).pending();
+            assert!(left.is_empty(), "mvcc={mvcc}: work left after OPTIMIZE INDEX: {left:?}");
+            for _ in 0..5 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// A job that codes a vector afresh and finds its row deleted since, the row left to maintenance,
+    /// kills its code: the rows of one partition, forty of them deleted while left to maintenance,
+    /// grow past the split bound, and the split's moves recode its entries.
+    #[test]
+    fn a_job_finding_a_row_left_to_maintenance_gone_kills_its_code() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-orphan-{mvcc}.db"), mvcc);
+            let mut state = 257;
+            let rows: Vec<(i64, Vec<f32>)> = (1..=300i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &rows);
+            STATEMENT_UPKEEP.with(|on| on.set(false));
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
+            let chosen: Vec<i64> = (1..=40).collect();
+            leave_to_maintenance(&conn, mvcc, "v_ivf", &chosen);
+            conn.execute("DELETE FROM v WHERE id <= 40").unwrap();
+            for id in &chosen {
+                live.remove(id);
+            }
+            STATEMENT_UPKEEP.with(|on| on.set(true));
+            SETTLE.with(|on| on.set(false));
+            KILLS.with(|count| count.set(0));
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let index = stored(&conn);
+            assert!(index.live().len() > 1, "mvcc={mvcc}: the partition did not split");
+            assert_eq!(KILLS.with(|count| count.get()), chosen.len(), "mvcc={mvcc}: the codes killed");
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.pending == chosen.len() as u64, "mvcc={mvcc}: {found:?}");
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+            SETTLE.with(|on| on.set(true));
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
+        }
+    }
+
+    /// A rebuild codes every vector but those of rows with redo rows, whose codes and vectors' rows it
+    /// removes for their settle to code afresh: a statement inserting enough rows into an index of one
+    /// partition rebuilds it while forty rows, twenty since deleted, are left to maintenance.
+    #[test]
+    fn a_rebuild_leaves_rows_with_redo_rows_to_their_settle() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-rebuild-left-{mvcc}.db"), mvcc);
+            let mut state = 251;
+            let rows: Vec<(i64, Vec<f32>)> = (1..=300i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &rows);
+            // Unmaintained, the index holds every row in one partition's tail.
+            STATEMENT_UPKEEP.with(|on| on.set(false));
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            STATEMENT_UPKEEP.with(|on| on.set(true));
+            let mut live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
+            let chosen: Vec<i64> = (1..=40).collect();
+            leave_to_maintenance(&conn, mvcc, "v_ivf", &chosen);
+            SETTLE.with(|on| on.set(false));
+            KILLS.with(|count| count.set(0));
+            conn.execute("DELETE FROM v WHERE id <= 20").unwrap();
+            for id in 1..=20 {
+                live.remove(&id);
+            }
+            let partitions = stored(&conn).live().len();
+            let more: Vec<(i64, Vec<f32>)> = (301..=1500i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &more);
+            live.extend(more);
+            let rebuilt = stored(&conn).live().len();
+            assert!(partitions == 1 && rebuilt >= trained_partitions(live.len()) / 2, "mvcc={mvcc}: {partitions} partitions became {rebuilt}");
+            assert_eq!(KILLS.with(|count| count.get()), chosen.len(), "mvcc={mvcc}: the codes killed");
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.pending == chosen.len() as u64, "mvcc={mvcc}: {found:?}");
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+            SETTLE.with(|on| on.set(true));
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
+        }
+    }
+
+    /// A filtered query gives out rows left to maintenance as it gives out any other, each round
+    /// reading their vectors from the table: rows of the kept tag left to maintenance and moved near
+    /// the query lead its answer, and those deleted are not in it.
+    #[test]
+    fn a_filtered_query_reads_rows_left_to_maintenance_from_the_table() {
+        for mvcc in [false, true] {
+            let (_db, conn, mut rows) = tagged(&format!("ivf-rq-filtered-left-{mvcc}.db"), mvcc);
+            let mut state = 83;
+            let q = random(&mut state, 16);
+            let chosen: Vec<i64> = (3..=600).step_by(10).collect();
+            leave_to_maintenance(&conn, mvcc, "f_ivf", &chosen);
+            SETTLE.with(|on| on.set(false));
+            let (deleted, moved) = chosen.split_at(chosen.len() / 2);
+            for id in deleted {
+                conn.execute(format!("DELETE FROM f WHERE id = {id}")).unwrap();
+            }
+            let near: Vec<f32> = q.iter().map(|x| 2.0 * x).collect();
+            for id in moved {
+                conn.execute(format!("UPDATE f SET e = {} WHERE id = {id}", literal(&near))).unwrap();
+            }
+            rows.retain(|(id, _)| !deleted.contains(id));
+            for (id, v) in rows.iter_mut() {
+                if moved.contains(id) {
+                    *v = near.clone();
+                }
+            }
+            let sql = format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM f WHERE tag = 3 ORDER BY distance LIMIT 10", literal(&q));
+            let got = ids(&conn, &sql);
+            assert_eq!(got, exact_filtered(&rows, &q, |id| id % 10 == 3), "mvcc={mvcc}");
+            assert!(got.iter().all(|id| moved.contains(id)), "mvcc={mvcc}: {got:?}");
+            SETTLE.with(|on| on.set(true));
+            conn.execute("OPTIMIZE INDEX f_ivf").unwrap();
+            assert_eq!(ids(&conn, &sql), exact_filtered(&rows, &q, |id| id % 10 == 3), "mvcc={mvcc}");
+            let found = check(&conn, "f_ivf").unwrap();
+            assert!(found.consistent() && found.pending == 0, "mvcc={mvcc}: {found:?}");
         }
     }
 

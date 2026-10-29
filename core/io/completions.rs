@@ -60,12 +60,6 @@ impl ContextInner {
         Self { waker: None }
     }
 
-    pub fn wake(&mut self) {
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
-    }
-
     pub fn set_waker(&mut self, waker: &Waker) {
         if let Some(curr_waker) = self.waker.as_mut() {
             // only call and change waker if it would awake a different task
@@ -92,8 +86,13 @@ impl Context {
         }
     }
 
+    /// Takes the waker under the lock and wakes it once the lock is free: a waker may register
+    /// again on the same completion from its wake.
     pub fn wake(&self) {
-        self.inner.lock().wake();
+        let waker = self.inner.lock().waker.take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     pub fn set_waker(&self, waker: &Waker) {
@@ -1335,6 +1334,48 @@ mod tests {
                 );
             },
             None,
+        );
+    }
+
+    /// `set_waker` on a finished completion wakes the waker with the completion's lock free: a
+    /// waker may register again on that completion from its wake, as polling the completion
+    /// inline does.
+    #[test]
+    fn a_waker_registering_again_from_its_wake_does_not_deadlock() {
+        use std::task::Wake;
+
+        struct Again {
+            completion: Completion,
+            wakes: AtomicUsize,
+        }
+        impl Wake for Again {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                if self.wakes.fetch_add(1, Ordering::SeqCst) < 3 {
+                    self.completion.set_waker(&Waker::from(self.clone()));
+                }
+            }
+        }
+
+        let (done, waited) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let c = Completion::new_wait();
+            c.complete(0);
+            let again = Arc::new(Again {
+                completion: c.clone(),
+                wakes: AtomicUsize::new(0),
+            });
+            c.set_waker(&Waker::from(again.clone()));
+            let _ = done.send(again.wakes.load(Ordering::SeqCst));
+        });
+        let wakes = waited
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("set_waker deadlocked waking a waker that registers again");
+        assert_eq!(
+            wakes, 4,
+            "each set_waker on the finished completion wakes once"
         );
     }
 }

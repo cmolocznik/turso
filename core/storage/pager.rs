@@ -5,7 +5,7 @@ use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
-use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
+use crate::storage::wal::{CheckpointLockSource, PreparedFrames, ReadChanges};
 use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -3297,13 +3297,8 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        let changed = wal.begin_read_tx()?;
-        if changed {
-            // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
-            self.clear_page_cache(false);
-            // Invalidate cached schema cookie to force re-read on next access
-            self.set_schema_cookie(None);
-        }
+        let changes = wal.begin_read_tx()?;
+        self.forget_changes(changes);
         Ok(())
     }
 
@@ -3312,11 +3307,39 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        if wal.mvcc_refresh_if_db_changed() {
-            // Prevents stale page cache reads after MVCC checkpoints update the DB file.
-            self.clear_page_cache(false);
-            self.set_schema_cookie(None);
+        // Prevents stale page cache reads after MVCC checkpoints update the DB file.
+        self.forget_changes(wal.mvcc_refresh_if_db_changed());
+    }
+
+    /// Drop from the page cache what other connections' commits and checkpoints changed since
+    /// this connection's last read: the pages written, where the WAL knows them and none of them
+    /// is in use, else every page.
+    fn forget_changes(&self, changes: ReadChanges) {
+        match changes {
+            ReadChanges::None => return,
+            ReadChanges::Pages(pages) => {
+                self.invalidate_all_cursors();
+                if !self.evict_clean_pages(&pages) {
+                    self.clear_page_cache(false);
+                }
+            }
+            ReadChanges::All => self.clear_page_cache(false),
         }
+        // Invalidate cached schema cookie to force re-read on next access
+        self.set_schema_cookie(None);
+    }
+
+    /// Evict `pages` from the page cache, unless one of them is dirty, locked or pinned, or there
+    /// are more of them than the cache holds; returns whether it did.
+    fn evict_clean_pages(&self, pages: &[u32]) -> bool {
+        if !self.dirty_pages.read().is_empty() {
+            return false;
+        }
+        let mut cache = self.page_cache.write();
+        pages.len() <= cache.capacity()
+            && pages
+                .iter()
+                .all(|&page| cache.delete(PageCacheKey::new(page as usize)).is_ok())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -7328,6 +7351,272 @@ mod checkpoint_phase_tests {
                 db_header_crc32c_after
             ),
             "resuming after the post-sync gap must install a valid durable backfill proof"
+        );
+    }
+}
+
+/// A read drops from its connection's page cache only what other connections changed since its
+/// last read.
+#[cfg(test)]
+mod read_changes_tests {
+    use std::collections::BTreeMap;
+
+    use crate::sync::Arc;
+    use crate::util::IOExt;
+    use crate::{ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, Value};
+
+    /// Each row's version and its body's length, by id.
+    type Rows = BTreeMap<i64, (i64, usize)>;
+
+    fn database(name: &str, mvcc: bool) -> Arc<Database> {
+        let db =
+            Database::open_file(Arc::new(MemoryIO::new()), name, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, body TEXT NOT NULL)",
+        )
+        .unwrap();
+        db
+    }
+
+    fn rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+        try_rows(conn, sql).unwrap()
+    }
+
+    fn try_rows(conn: &Arc<Connection>, sql: &str) -> crate::Result<Vec<Vec<Value>>> {
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get_values().cloned().collect());
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    /// A body of `length` copies of the letter of version `v`: its first and last characters
+    /// tell a stale page, its own or an overflow page's.
+    fn body(v: i64, length: usize) -> String {
+        let letter = char::from(b'a' + (v % 26) as u8);
+        std::iter::repeat_n(letter, length).collect()
+    }
+
+    fn write(conn: &Arc<Connection>, id: i64, v: i64, length: usize) {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({id}, {v}, '{}') ON CONFLICT(id) DO UPDATE SET v = excluded.v, body = excluded.body",
+            body(v, length)
+        ))
+        .unwrap();
+    }
+
+    /// Every row as the connection reads it, checked against its body.
+    fn read(conn: &Arc<Connection>) -> Rows {
+        try_read(conn).unwrap()
+    }
+
+    fn try_read(conn: &Arc<Connection>) -> crate::Result<Rows> {
+        Ok(try_rows(conn, "SELECT id, v, length(body), substr(body, 1, 1), substr(body, -1, 1) FROM t ORDER BY id")?
+            .into_iter()
+            .map(|row| {
+                let id = row[0].as_int().unwrap();
+                let v = row[1].as_int().unwrap();
+                let length = row[2].as_int().unwrap() as usize;
+                let letter = body(v, 1);
+                for end in [&row[3], &row[4]] {
+                    assert_eq!(end.to_string(), letter, "row {id} at version {v} has a body of another version");
+                }
+                (id, (v, length))
+            })
+            .collect())
+    }
+
+    fn cached(conn: &Arc<Connection>) -> usize {
+        conn.get_pager().page_cache.read().len()
+    }
+
+    /// A reader beside a writer of one row keeps every other page it holds, whether the change
+    /// is in the WAL's generation its last read saw, or past a checkpoint that restarted the WAL.
+    #[test]
+    fn a_read_keeps_the_pages_another_connection_did_not_write() {
+        for mvcc in [false, true] {
+            let db = database(&format!("read-keeps-{mvcc}.db"), mvcc);
+            let writer = db.connect(ConnectOpts::new()).unwrap();
+            let mut expected = Rows::new();
+            for id in 1..=2000 {
+                write(&writer, id, 0, 300);
+                expected.insert(id, (0, 300));
+            }
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            let reader = db.connect(ConnectOpts::new()).unwrap();
+            assert_eq!(read(&reader), expected);
+            let warm = cached(&reader);
+            assert!(warm > 100, "a scan of the table left {warm} pages cached");
+            for (id, restart) in [(1000, false), (1500, true)] {
+                write(&writer, id, 1, 300);
+                expected.insert(id, (1, 300));
+                if restart || mvcc {
+                    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                }
+                let v = rows(&reader, &format!("SELECT v FROM t WHERE id = {id}"));
+                assert_eq!(v[0][0].as_int(), Some(1));
+                let kept = cached(&reader);
+                assert!(
+                    kept + 8 >= warm,
+                    "mvcc {mvcc}, restart {restart}: a read after a one-row update kept {kept} of {warm} pages"
+                );
+            }
+            assert_eq!(read(&reader), expected);
+        }
+    }
+
+    /// A connection that restarts the WAL in a checkpoint of its own, after another connection's
+    /// checkpoint backfilled frames it never read, drops the pages those frames held: the restart
+    /// moves its snapshot past them without a read. MVCC's checkpoint calls the WAL's checkpoint
+    /// this way when it has nothing of its own to write.
+    #[test]
+    fn a_restart_past_frames_a_connection_never_read_drops_their_pages() {
+        let db = database("restart-past-unread.db", false);
+        let a = db.connect(ConnectOpts::new()).unwrap();
+        let b = db.connect(ConnectOpts::new()).unwrap();
+        let mut expected = Rows::new();
+        for id in 1..=500 {
+            write(&a, id, 0, 300);
+            expected.insert(id, (0, 300));
+        }
+        a.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_eq!(read(&a), expected);
+        for id in (1..=500).step_by(7) {
+            write(&b, id, 1, 300);
+            expected.insert(id, (1, 300));
+        }
+        b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let pager = a.get_pager();
+        let wal = pager.wal.as_ref().unwrap();
+        let truncate = crate::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        };
+        let mut done = pager
+            .io
+            .block(|| wal.checkpoint(&pager, truncate, crate::SyncMode::Full))
+            .unwrap();
+        done.release_guard();
+        assert_eq!(read(&a), expected);
+    }
+
+    /// Connections writing, reading in and out of transactions and checkpointing in every mode,
+    /// interleaved at random with small page caches, read every commit their snapshots should.
+    /// READ_CHANGES_SEEDS sets how many seeds run in each journal mode.
+    #[test]
+    fn reads_beside_writes_and_checkpoints_see_every_commit() {
+        let seeds = std::env::var("READ_CHANGES_SEEDS")
+            .ok()
+            .and_then(|seeds| seeds.parse().ok())
+            .unwrap_or(2u64);
+        for mvcc in [false, true] {
+            for seed in 0..seeds {
+                workload(mvcc, seed);
+            }
+        }
+    }
+
+    fn workload(mvcc: bool, seed: u64) {
+        let db = database(&format!("read-changes-{mvcc}-{seed}.db"), mvcc);
+        let conns: Vec<_> = (0..4)
+            .map(|_| db.connect(ConnectOpts::new()).unwrap())
+            .collect();
+        for conn in &conns {
+            conn.execute("PRAGMA cache_size = 64").unwrap();
+        }
+        let begin = if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" };
+        let mut state = 0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let mut model = Rows::new();
+        // The rows each connection's open transaction reads.
+        let mut snapshots: Vec<Option<Rows>> = vec![None; conns.len()];
+        let mut reads = 0;
+        let mut log: Vec<String> = Vec::new();
+        for action in 0..400 {
+            let who = next(conns.len() as u64) as usize;
+            let conn = &conns[who];
+            let context = format!("mvcc {mvcc}, seed {seed}, action {action}, connection {who}");
+            match next(10) {
+                0..=3 if snapshots[who].is_none() => {
+                    let mut changed = model.clone();
+                    conn.execute(begin).unwrap();
+                    // Now and then a transaction large enough to spill past its page cache.
+                    let changes = if next(10) == 0 { 150 } else { 1 + next(4) };
+                    for _ in 0..changes {
+                        let id = 1 + next(400) as i64;
+                        if next(5) == 0 {
+                            conn.execute(format!("DELETE FROM t WHERE id = {id}"))
+                                .unwrap();
+                            changed.remove(&id);
+                        } else {
+                            let v = changed.get(&id).map_or(0, |(v, _)| v + 1);
+                            // Bodies up to twice a page long, so some rows overflow.
+                            let length = 1 + next(8000) as usize;
+                            write(conn, id, v, length);
+                            changed.insert(id, (v, length));
+                        }
+                    }
+                    if next(8) == 0 {
+                        conn.execute("ROLLBACK").unwrap();
+                        log.push(format!("{action}: {who} rolled back {changes} changes"));
+                    } else {
+                        conn.execute("COMMIT").unwrap();
+                        model = changed;
+                        log.push(format!("{action}: {who} committed {changes} changes"));
+                    }
+                }
+                4..=6 => {
+                    let expected = snapshots[who].as_ref().unwrap_or(&model);
+                    let seen = try_read(conn).unwrap_or_else(|error| {
+                        panic!(
+                            "{context}: {error}\n{}",
+                            log[log.len().saturating_sub(40)..].join("\n")
+                        )
+                    });
+                    assert_eq!(&seen, expected, "{context}");
+                    log.push(format!("{action}: {who} read"));
+                    reads += 1;
+                }
+                7 => match snapshots[who].take() {
+                    Some(_) => {
+                        conn.execute("COMMIT").unwrap();
+                        log.push(format!("{action}: {who} ended its read"));
+                    }
+                    None => {
+                        conn.execute(begin).unwrap();
+                        let seen = try_read(conn).unwrap_or_else(|error| {
+                            panic!(
+                                "{context}: {error}\n{}",
+                                log[log.len().saturating_sub(40)..].join("\n")
+                            )
+                        });
+                        assert_eq!(seen, model, "{context}");
+                        snapshots[who] = Some(model.clone());
+                        log.push(format!("{action}: {who} began a read"));
+                    }
+                },
+                8 if snapshots[who].is_none() => {
+                    let mode = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"][next(4) as usize];
+                    // A checkpoint other connections' transactions keep from finishing reports busy.
+                    let done = conn.execute(format!("PRAGMA wal_checkpoint({mode})"));
+                    log.push(format!("{action}: {who} checkpoint {mode} {done:?}"));
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            reads > 50,
+            "mvcc {mvcc}, seed {seed}: only {reads} reads were checked"
         );
     }
 }

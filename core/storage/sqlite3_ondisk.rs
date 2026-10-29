@@ -56,7 +56,9 @@ use tracing::{instrument, Level};
 
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
-use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
+use super::wal::{
+    FramePages, OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime,
+};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};
@@ -1574,6 +1576,7 @@ impl BuildSharedWal {
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
+                frame_pages: SpinLock::new(FramePages::default()),
                 file: Some(file.clone()),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),

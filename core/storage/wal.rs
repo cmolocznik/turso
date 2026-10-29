@@ -8,7 +8,7 @@ use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
 use branches::mark_unlikely;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 use strum::EnumString;
 use tracing::{instrument, Level};
@@ -528,6 +528,18 @@ trait WalCoordination: Debug + Send + Sync {
     /// Enumerate the latest visible frame per page in the requested frame range.
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
 
+    /// What changed between snapshot `from`, taken in frame record epoch `epoch`, and snapshot
+    /// `to`, and the epoch `to` was taken in. A backend that keeps no record of the page each frame
+    /// holds treats every page as changed.
+    fn read_changes(
+        &self,
+        _from: WalSnapshot,
+        _epoch: u64,
+        _to: WalSnapshot,
+    ) -> (ReadChanges, u64) {
+        (ReadChanges::All, 0)
+    }
+
     fn try_find_frame(
         &self,
         page_id: u64,
@@ -640,10 +652,11 @@ trait WalCoordination: Debug + Send + Sync {
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
-    /// Returns whether the database state has changed since the last read transaction.
-    fn begin_read_tx(&self) -> Result<bool>;
-    /// MVCC helper: check if WAL state changed without starting a read tx.
-    fn mvcc_refresh_if_db_changed(&self) -> bool;
+    /// Returns what changed in the database since the last read transaction.
+    fn begin_read_tx(&self) -> Result<ReadChanges>;
+    /// MVCC helper: take the WAL's current state without starting a read tx, and return what
+    /// changed since the last.
+    fn mvcc_refresh_if_db_changed(&self) -> ReadChanges;
 
     /// Begin a write transaction.
     ///
@@ -1022,6 +1035,13 @@ impl WalCoordination for InProcessWalCoordination {
         list
     }
 
+    fn read_changes(&self, from: WalSnapshot, epoch: u64, to: WalSnapshot) -> (ReadChanges, u64) {
+        let shared = self.shared.read();
+        let seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        let frame_pages = shared.runtime.frame_pages.lock();
+        (frame_pages.changes(seq, from, epoch, to), frame_pages.epoch)
+    }
+
     fn checkpoint_epoch(&self) -> u32 {
         self.shared.read().runtime.epoch.load(Ordering::Acquire)
     }
@@ -1388,6 +1408,7 @@ impl WalCoordination for InProcessWalCoordination {
                 frame_cache.insert(page_id, vec![frame_id]);
             }
         }
+        shared.runtime.frame_pages.lock().record(page_id, frame_id);
         shared
             .runtime
             .frame_cache_high_water
@@ -1403,6 +1424,7 @@ impl WalCoordination for InProcessWalCoordination {
             }
             !frames.is_empty()
         });
+        shared.runtime.frame_pages.lock().rollback(max_frame);
         // Keep the high-water consistent with the truncation so a subsequent
         // append at `max_frame + 1` is not misread as a rewind.
         if shared
@@ -1590,6 +1612,7 @@ impl ShmWalCoordination {
         Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
         shared.runtime.frame_cache.lock().clear();
+        shared.runtime.frame_pages.lock().forget();
         shared
             .runtime
             .frame_cache_high_water
@@ -1885,6 +1908,7 @@ impl ShmWalCoordination {
             Self::install_local_snapshot(&mut shared, restarted, true);
             shared.metadata.initialized.store(false, Ordering::Release);
             shared.runtime.frame_cache.lock().clear();
+            shared.runtime.frame_pages.lock().forget();
             shared
                 .runtime
                 .frame_cache_high_water
@@ -2879,6 +2903,13 @@ pub struct WalFile {
 
     io_ctx: RwLock<IOContext>,
 
+    /// The frame record epoch (`FramePages`) this connection's last read took its snapshot in.
+    frame_pages_epoch: AtomicU64,
+    /// What changed past this connection's snapshot when it moved on without a read, for its
+    /// next read to report: a restart of the WAL in its own checkpoint skips the frames other
+    /// connections wrote since its last read.
+    unread_changes: Mutex<ReadChanges>,
+
     /// The WAL file is dirty: frames were appended that no successful fsync
     /// has covered yet. Set whenever a frame is recorded via
     /// `complete_append_frame`, cleared when a WAL fsync completes
@@ -2989,6 +3020,8 @@ pub struct WalSharedRuntime {
     /// `find_frame` can return a frame slot that now holds a different page).
     /// Only read/written while holding the `frame_cache` lock.
     pub frame_cache_high_water: AtomicU64,
+    /// The page each frame holds, kept beside `frame_cache` and changed under its lock.
+    pub frame_pages: SpinLock<FramePages>,
     pub file: Option<Arc<dyn File>>,
     /// Read locks advertise the maximum WAL frame a reader may access.
     /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
@@ -3037,6 +3070,157 @@ impl WalSharedRuntime {
     #[cfg(test)]
     pub(crate) fn take_frames_compared_for_tests(&self) -> u64 {
         self.frames_compared.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// What a connection's read finds changed since its previous read, for its page cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadChanges {
+    /// No page the connection may hold changed.
+    None,
+    /// These pages were written, some perhaps more than once; every other page stands.
+    Pages(Vec<u32>),
+    /// Any page may have changed.
+    All,
+}
+
+impl ReadChanges {
+    /// These changes and `more`.
+    fn and(self, more: ReadChanges) -> ReadChanges {
+        match (self, more) {
+            (ReadChanges::None, changes) | (changes, ReadChanges::None) => changes,
+            (ReadChanges::Pages(mut pages), ReadChanges::Pages(more))
+                if pages.len() + more.len() <= FramePages::CHANGED_FRAMES =>
+            {
+                pages.extend(more);
+                ReadChanges::Pages(pages)
+            }
+            _ => ReadChanges::All,
+        }
+    }
+}
+
+/// The page each WAL frame holds, in frame order, for the current generation and the last few a
+/// restart retired, so that a read drops from its connection's page cache only the pages written
+/// between its previous snapshot and its new one. Within a generation a committed frame never
+/// changes and a checkpoint copies frames to the database file as they are, so those pages are all
+/// that changed. 0 is a frame whose page this record does not know (one recovered when the WAL was
+/// opened, or one past a gap); a read that needs it treats every page as changed.
+#[derive(Debug, Default)]
+pub struct FramePages {
+    /// `current[i]` is the page frame `i + 1` holds.
+    current: Vec<u32>,
+    /// Retired generations, oldest first, by checkpoint sequence, each up to its last committed
+    /// frame.
+    retired: VecDeque<(u32, Vec<u32>)>,
+    /// Advanced when the WAL is rebuilt from storage: a snapshot taken before says nothing about
+    /// what changed since.
+    epoch: u64,
+}
+
+impl FramePages {
+    /// Retired generations kept, and the frames they may hold in all.
+    const RETIRED: usize = 8;
+    const RETIRED_FRAMES: usize = 1 << 18;
+    /// The most frames whose pages a read drops one by one; past it every page is changed.
+    const CHANGED_FRAMES: usize = 1 << 16;
+
+    /// Record that frame `frame_id` holds `page_id`. A frame at or below the last recorded one
+    /// overwrites the slots from it upward, as in `cache_frame`.
+    fn record(&mut self, page_id: u64, frame_id: u64) {
+        let Some(slot) = frame_id.checked_sub(1) else {
+            return;
+        };
+        let slot = slot as usize;
+        self.current.truncate(slot);
+        self.current.resize(slot, 0);
+        self.current.push(u32::try_from(page_id).unwrap_or(0));
+    }
+
+    /// Drop the frames past `max_frame`, as `rollback_cache` does.
+    fn rollback(&mut self, max_frame: u64) {
+        self.current.truncate(max_frame as usize);
+    }
+
+    /// Retire the current generation, checkpoint sequence `seq`, whose last committed frame is
+    /// `max_frame`: the next frame starts a new generation.
+    fn restart(&mut self, seq: u32, max_frame: u64) {
+        let mut frames = std::mem::take(&mut self.current);
+        frames.truncate(max_frame as usize);
+        frames.resize(max_frame as usize, 0);
+        self.retired.push_back((seq, frames));
+        let mut kept: usize = self.retired.iter().map(|(_, frames)| frames.len()).sum();
+        while self.retired.len() > Self::RETIRED || kept > Self::RETIRED_FRAMES {
+            let Some((_, frames)) = self.retired.pop_front() else {
+                break;
+            };
+            kept -= frames.len();
+        }
+    }
+
+    /// Forget every frame, for WAL state rebuilt from storage.
+    fn forget(&mut self) {
+        *self = Self {
+            epoch: self.epoch + 1,
+            ..Self::default()
+        };
+    }
+
+    /// What changed between snapshot `from`, taken in `epoch`, and snapshot `to`, when the
+    /// current generation's checkpoint sequence is `seq`.
+    fn changes(&self, seq: u32, from: WalSnapshot, epoch: u64, to: WalSnapshot) -> ReadChanges {
+        let generations = to.checkpoint_seq.wrapping_sub(from.checkpoint_seq) as usize;
+        if epoch != self.epoch || generations > Self::RETIRED {
+            return ReadChanges::All;
+        }
+        // At the same frame of one generation the checksums agree; when they don't, `from` is not
+        // a snapshot of the WAL this record follows.
+        if generations == 0
+            && (from.max_frame > to.max_frame
+                || from.max_frame == to.max_frame && from.last_checksum != to.last_checksum)
+        {
+            return ReadChanges::All;
+        }
+        let mut pages = Vec::new();
+        for step in 0..=generations {
+            let generation = from.checkpoint_seq.wrapping_add(step as u32);
+            let frames = if generation == seq {
+                &self.current
+            } else {
+                match self
+                    .retired
+                    .iter()
+                    .find(|(retired, _)| *retired == generation)
+                {
+                    Some((_, frames)) => frames,
+                    None => return ReadChanges::All,
+                }
+            };
+            let start = if step == 0 {
+                from.max_frame as usize
+            } else {
+                0
+            };
+            let end = if step == generations {
+                to.max_frame as usize
+            } else {
+                frames.len()
+            };
+            match frames.get(start..end) {
+                Some(written)
+                    if !written.contains(&0)
+                        && pages.len() + written.len() <= Self::CHANGED_FRAMES =>
+                {
+                    pages.extend_from_slice(written)
+                }
+                _ => return ReadChanges::All,
+            }
+        }
+        if pages.is_empty() {
+            ReadChanges::None
+        } else {
+            ReadChanges::Pages(pages)
+        }
     }
 }
 
@@ -3236,8 +3420,8 @@ impl Drop for CheckpointLocks {
 
 /// Result of try_begin_read_tx - either success or a retriable condition.
 enum TryBeginReadResult {
-    /// Successfully started read transaction, returns whether DB changed
-    Ok(bool),
+    /// Successfully started read transaction, returns what changed since the last one
+    Ok(ReadChanges),
     /// Transient condition, caller should retry immediately (like SQLite's WAL_RETRY)
     Retry,
     /// Non-retriable failure while preparing the local WAL view.
@@ -3364,6 +3548,29 @@ impl WalFile {
         snapshot != local_state.snapshot
     }
 
+    /// What changed between this connection's snapshot `from` and `to`, which it is about to take.
+    fn read_changes(&self, from: WalSnapshot, to: WalSnapshot) -> ReadChanges {
+        let (changes, epoch) = self.coordination.read_changes(
+            from,
+            self.frame_pages_epoch.load(Ordering::Acquire),
+            to,
+        );
+        self.frame_pages_epoch.store(epoch, Ordering::Release);
+        changes
+    }
+
+    /// Keep for the next read what changed between this connection's snapshot and `to`, which it
+    /// takes without a read.
+    fn keep_unread_changes(&self, to: WalSnapshot) {
+        let changes = self.read_changes(self.connection_state().snapshot, to);
+        let mut unread = self.unread_changes.lock();
+        *unread = std::mem::replace(&mut *unread, ReadChanges::None).and(changes);
+    }
+
+    fn take_unread_changes(&self) -> ReadChanges {
+        std::mem::replace(&mut *self.unread_changes.lock(), ReadChanges::None)
+    }
+
     fn has_vacuum_read_lock_guard(&self) -> bool {
         self.vacuum_lock_guard
             .read()
@@ -3469,8 +3676,9 @@ impl WalFile {
         }
 
         // Check if database changed since this connection's last read transaction.
-        // If it has, the connection will invalidate its page cache.
-        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
+        // If it has, the connection drops from its page cache what changed.
+        let local_state = self.connection_state();
+        let db_changed = self.db_changed_against(shared_snapshot, local_state);
 
         tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
 
@@ -3487,6 +3695,12 @@ impl WalFile {
         let Some(read_guard) = self.coordination.try_begin_read_tx(shared_snapshot) else {
             return TryBeginReadResult::Retry;
         };
+        let unread = self.take_unread_changes();
+        let changes = if db_changed {
+            unread.and(self.read_changes(local_state.snapshot, shared_snapshot))
+        } else {
+            unread
+        };
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
         tracing::debug!(
@@ -3496,12 +3710,12 @@ impl WalFile {
             read_guard.lock_index(),
             shared_snapshot.max_frame
         );
-        TryBeginReadResult::Ok(db_changed)
+        TryBeginReadResult::Ok(changes)
     }
 }
 
 impl Wal for WalFile {
-    fn begin_read_tx(&self) -> Result<bool> {
+    fn begin_read_tx(&self) -> Result<ReadChanges> {
         // Implement progressive backoff because transient lock contention
         // should resolve quickly, but under heavy contention busy-spinning wastes
         // CPU. SQLite uses quadratic backoff after 5 retries, with total delay
@@ -3538,7 +3752,7 @@ impl Wal for WalFile {
         }
     }
 
-    fn mvcc_refresh_if_db_changed(&self) -> bool {
+    fn mvcc_refresh_if_db_changed(&self) -> ReadChanges {
         WalFile::mvcc_refresh_if_db_changed(self)
     }
 
@@ -4917,6 +5131,8 @@ impl WalFile {
             last_checksum: AtomicU64::new(pack_checksum(last_checksum)),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
+            frame_pages_epoch: AtomicU64::new(0),
+            unread_changes: Mutex::new(ReadChanges::None),
             dirty: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -5385,6 +5601,7 @@ impl WalFile {
         else {
             return Ok(());
         };
+        self.keep_unread_changes(snapshot);
         self.apply_restart_snapshot(snapshot);
         self.increment_checkpoint_epoch();
         let result = Ok(());
@@ -5395,6 +5612,9 @@ impl WalFile {
     fn restart_log(&self) -> Result<()> {
         tracing::debug!("restart_log");
         let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
+        // The checkpoint may run on a connection whose snapshot predates other connections'
+        // checkpoints, whose frames this restart retires unread.
+        self.keep_unread_changes(snapshot);
         self.apply_restart_snapshot(snapshot);
         Ok(())
     }
@@ -5558,17 +5778,19 @@ impl WalFile {
     /// passive checkpoint materialized after its snapshot, leaking later commits into it.
     /// The guard also keeps everything at-or-below the pinned view immutable, so the page
     /// cache stays valid and needs no invalidation.
-    pub fn mvcc_refresh_if_db_changed(&self) -> bool {
+    pub fn mvcc_refresh_if_db_changed(&self) -> ReadChanges {
         if self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD {
-            return false;
+            return ReadChanges::None;
         }
         let snapshot = self.load_coordination_snapshot();
         let local_state = self.connection_state();
-        let changed = self.db_changed_against(snapshot, local_state);
-        if changed {
-            self.install_connection_state(local_state.with_snapshot(snapshot));
+        let unread = self.take_unread_changes();
+        if !self.db_changed_against(snapshot, local_state) {
+            return unread;
         }
-        changed
+        let changes = self.read_changes(local_state.snapshot, snapshot);
+        self.install_connection_state(local_state.with_snapshot(snapshot));
+        unread.and(changes)
     }
 }
 
@@ -5934,6 +6156,7 @@ impl WalFileShared {
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
+                frame_pages: SpinLock::new(FramePages::default()),
                 file: Some(file),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -6012,6 +6235,7 @@ impl WalFileShared {
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
+                frame_pages: SpinLock::new(FramePages::default()),
                 file: None,
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -6056,6 +6280,7 @@ impl WalFileShared {
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
+                frame_pages: SpinLock::new(FramePages::default()),
                 file: Some(file),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -6092,6 +6317,8 @@ impl WalFileShared {
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
     fn restart_wal_header(&mut self, io: &dyn IO) {
+        let retired_seq = self.metadata.wal_header.lock().checkpoint_seq;
+        let retired_max_frame = self.metadata.max_frame.load(Ordering::Acquire);
         {
             let mut hdr = self.metadata.wal_header.lock();
             hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
@@ -6108,6 +6335,10 @@ impl WalFileShared {
         }
 
         self.runtime.frame_cache.lock().clear();
+        self.runtime
+            .frame_pages
+            .lock()
+            .restart(retired_seq, retired_max_frame);
         self.runtime
             .frame_cache_high_water
             .store(0, Ordering::Release);
@@ -6132,6 +6363,7 @@ impl WalFileShared {
     pub fn replace_after_external_restore(&mut self, restored: WalFileShared) {
         self.metadata = restored.metadata;
         self.runtime.frame_cache = restored.runtime.frame_cache;
+        self.runtime.frame_pages.lock().forget();
         self.runtime.file = restored.runtime.file;
         self.runtime.epoch.store(
             restored.runtime.epoch.load(Ordering::Acquire),
@@ -6149,9 +6381,9 @@ pub mod test {
         AuthoritySnapshotValidation, ShmWalCoordination,
     };
     use super::{
-        CheckpointLocks, InProcessWalCoordination, ReadGuardKind, RollbackTo, TryBeginReadResult,
-        Wal, WalAutoActions, WalCommitState, WalConnectionState, WalCoordination, WalFile,
-        WalSnapshot, NO_LOCK_HELD,
+        CheckpointLocks, InProcessWalCoordination, ReadChanges, ReadGuardKind, RollbackTo,
+        TryBeginReadResult, Wal, WalAutoActions, WalCommitState, WalConnectionState,
+        WalCoordination, WalFile, WalSnapshot, NO_LOCK_HELD,
     };
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
@@ -7640,7 +7872,7 @@ pub mod test {
             ReadGuardKind::ReadMark(NonZeroUsize::new(2).unwrap()),
         ));
 
-        assert!(!wal.mvcc_refresh_if_db_changed());
+        assert_eq!(wal.mvcc_refresh_if_db_changed(), ReadChanges::None);
 
         let updated = WalSnapshot {
             max_frame: 8,
@@ -7653,7 +7885,7 @@ pub mod test {
 
         // A held read guard pins this connection's WAL view; the refresh must not
         // advance it past the snapshot an active transaction captured.
-        assert!(!wal.mvcc_refresh_if_db_changed());
+        assert_eq!(wal.mvcc_refresh_if_db_changed(), ReadChanges::None);
         assert_eq!(
             wal.connection_state(),
             WalConnectionState::new(
@@ -7662,9 +7894,10 @@ pub mod test {
             )
         );
 
-        // With no read guard held the refresh picks up the new shared snapshot.
+        // With no read guard held the refresh picks up the new shared snapshot. No restart this
+        // record saw separates the two generations, so every page may have changed.
         wal.install_connection_state(WalConnectionState::new(initial, ReadGuardKind::None));
-        assert!(wal.mvcc_refresh_if_db_changed());
+        assert_eq!(wal.mvcc_refresh_if_db_changed(), ReadChanges::All);
         assert_eq!(
             wal.connection_state(),
             WalConnectionState::new(updated, ReadGuardKind::None)

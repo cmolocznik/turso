@@ -11,8 +11,9 @@
 //! checkpoints the database with TRUNCATE, and the next round's child writes on from there. Prints
 //! a line a round and stops at the first failure, keeping DIR.
 //!
-//! THREADS=n runs n writers on their own connections and threads, BEGIN CONCURRENT under MVCC,
-//! beside a thread running OPTIMIZE INDEX over and over; a statement or transaction that fails
+//! THREADS=n runs n writers on their own connections and threads, BEGIN CONCURRENT under MVCC (with
+//! CONCURRENT=1, each lone statement in a transaction of its own too), beside a thread running
+//! OPTIMIZE INDEX over and over; a statement or transaction that fails
 //! (busy, a conflict) is rolled back and counted. The child reports its commits and failures; when
 //! it has run 2 s without a commit the round saves its threads' stacks (eu-stack) to
 //! DIR/stall-ROUND.txt before the kill, and the run reports how many rounds stalled.
@@ -86,6 +87,9 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     // The conflicts by what met them: an insert, update or delete statement, or a COMMIT.
     let met: Arc<[AtomicU64; 4]> = Arc::new(Default::default());
     let begin = if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" };
+    // CONCURRENT=1 runs each lone statement in a `BEGIN CONCURRENT` transaction of its own under
+    // MVCC, as no autocommit write takes the store's exclusive lock.
+    let concurrent = mvcc && std::env::var_os("CONCURRENT").is_some();
     for t in 0..threads {
         let (db, next, commits, failures, conflicts, met) = (db.clone(), next.clone(), commits.clone(), failures.clone(), conflicts.clone(), met.clone());
         std::thread::spawn(move || {
@@ -114,6 +118,11 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
             };
             loop {
                 let done = match random.below(10) {
+                    0..=7 if concurrent => (|| {
+                        conn.execute(begin)?;
+                        one(&mut random)?;
+                        tally(3, conn.execute("COMMIT"))
+                    })(),
                     0..=7 => one(&mut random),
                     _ => (|| {
                         conn.execute(begin)?;

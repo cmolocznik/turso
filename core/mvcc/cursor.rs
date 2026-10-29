@@ -2395,6 +2395,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn is_mvcc(&self) -> bool {
         true
     }
+
+    fn insert_would_conflict(&mut self, rowid: i64) -> Result<bool> {
+        match self.mv_cursor_type {
+            MvccCursorType::Table => self
+                .db
+                .insert_would_conflict(self.tx_id, &RowID::new(self.table_id, RowKey::Int(rowid))),
+            MvccCursorType::Index(_) => Ok(false),
+        }
+    }
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock, A> {

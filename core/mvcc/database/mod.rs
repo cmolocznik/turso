@@ -5852,6 +5852,36 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Same as read() but can read from a table or an index, indicated by the `maybe_index_id` argument.
+    /// Whether `tx_id` inserting the table row `id`, which its snapshot does not see, would lose at
+    /// commit to another transaction's version of the row: one written by a transaction that is
+    /// still active, preparing or not yet finalized, or one committed after `tx_id` began. An insert
+    /// is checked only at commit (first committer wins), so a writer that can do something other
+    /// than fail asks first.
+    pub fn insert_would_conflict(&self, tx_id: TxID, id: &RowID) -> Result<bool> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        let Some(row_versions) = self.rows.get(id) else {
+            return Ok(false);
+        };
+        let row_versions = row_versions.value().read();
+        for rv in row_versions.iter() {
+            match rv.begin() {
+                Some(TxTimestampOrID::TxID(other)) if other != tx_id => {
+                    match lookup_tx_state(&self.txs, &self.finalized_tx_states, other) {
+                        Some(TransactionState::Aborted | TransactionState::Terminated) => {}
+                        _ => return Ok(true),
+                    }
+                }
+                Some(TxTimestampOrID::Timestamp(begin)) if begin > tx.begin_ts => return Ok(true),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     pub fn read_from_table_or_index(
         &self,
         tx_id: TxID,

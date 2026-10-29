@@ -6879,6 +6879,53 @@ fn test_insert_read() {
     assert_eq!(tx1_row, row);
 }
 
+/// What this test checks: `insert_would_conflict` names exactly the inserts that would lose at
+/// commit: of a row another transaction inserted and has not committed, or committed after the
+/// asking transaction began; not of a row only the asker wrote, one committed before it began, or
+/// one whose writer rolled back.
+/// Why this matters: inserts are checked only at commit, so a writer that can undo its write and do
+/// something else instead (an index method's maintenance) asks before it inserts, rather than
+/// failing its whole transaction at commit.
+#[test]
+fn test_insert_would_conflict_names_the_inserts_that_lose_at_commit() {
+    let db = MvccTestDb::new();
+    let begin = || {
+        db.mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap()
+    };
+    let row = |n: i64| RowID {
+        table_id: (-2).into(),
+        row_id: RowKey::Int(n),
+    };
+    let (tx1, tx2) = (begin(), begin());
+    assert!(!db.mvcc_store.insert_would_conflict(tx2, &row(7)).unwrap());
+    db.mvcc_store
+        .insert(tx1, generate_simple_string_row((-2).into(), 7, "first"))
+        .unwrap();
+    assert!(!db.mvcc_store.insert_would_conflict(tx1, &row(7)).unwrap());
+    assert!(db.mvcc_store.insert_would_conflict(tx2, &row(7)).unwrap());
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+    assert!(db.mvcc_store.insert_would_conflict(tx2, &row(7)).unwrap());
+    let tx3 = begin();
+    assert!(!db.mvcc_store.insert_would_conflict(tx3, &row(7)).unwrap());
+
+    let (tx4, tx5) = (begin(), begin());
+    db.mvcc_store
+        .insert(
+            tx4,
+            generate_simple_string_row((-2).into(), 8, "rolled back"),
+        )
+        .unwrap();
+    db.mvcc_store.rollback_tx(
+        tx4,
+        db.conn.pager.load().clone(),
+        &db.conn,
+        crate::MAIN_DB_ID,
+    );
+    assert!(!db.mvcc_store.insert_would_conflict(tx5, &row(8)).unwrap());
+}
+
 /// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
 /// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
 #[test]

@@ -1,0 +1,4 @@
+[toolchain]
+# The compiler WorkReef cognition builds with, so the harnesses build the engine with it too.
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]

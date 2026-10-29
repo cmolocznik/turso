@@ -1,0 +1,9 @@
+[Unit]
+Description=Merge upstream Turso main into workreef four times a day
+
+[Timer]
+OnCalendar=*-*-* 05,11,17,23:17:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

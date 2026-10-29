@@ -1,0 +1,18 @@
+[package]
+name = "fork-repro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A workspace of its own, so it builds apart from the engine's.
+[workspace]
+
+[dependencies]
+turso = { path = "../../bindings/rust", default-features = false }
+turso_core = { path = "../../core" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde_json = "1"
+
+[profile.release]
+debug = "line-tables-only"

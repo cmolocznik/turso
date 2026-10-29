@@ -5009,6 +5009,329 @@ fn refine_block(query: &mut Query, payload: &[u8], centre: f64, source: Location
     Ok(())
 }
 
+/// What [`check`] found of an index: what it holds, and each way it disagrees with its table or
+/// with itself, the first [`CHECK_FINDINGS`] of them, with how many there were in all.
+#[derive(Debug, Default, Clone)]
+pub struct Check {
+    /// The table's rows with a vector, each of which the index must hold once.
+    pub rows: u64,
+    pub partitions: u64,
+    pub blocks: u64,
+    pub tail_entries: u64,
+    /// The copies of codes blocks still hold for vectors since moved, changed or deleted.
+    pub stale_copies: u64,
+    /// The live codes coded again from their rows' vectors and compared.
+    pub codes: u64,
+    pub findings: Vec<String>,
+    pub findings_total: u64,
+}
+
+/// The findings a [`Check`] keeps word of.
+pub const CHECK_FINDINGS: usize = 64;
+
+impl Check {
+    /// Whether the index agrees with its table and with itself.
+    pub fn consistent(&self) -> bool {
+        self.findings_total == 0
+    }
+
+    fn find(&mut self, finding: String) {
+        self.findings_total += 1;
+        if self.findings.len() < CHECK_FINDINGS {
+            self.findings.push(finding);
+        }
+    }
+}
+
+/// Check the ivf_rq index `index` of the main database against its table, on `connection`, in its
+/// open transaction or else in one of its own: that each row with a vector has one live code, where
+/// the vector's row in the index says, coded from the row's vector against the centroid version it
+/// names; that every other copy a block holds is on its vector's dead row, and every dead row names
+/// a block holding a copy; that each partition's bookkeeping counts its blocks, and a retired one
+/// holds none. It reads the whole index and each indexed row once, and holds a location per row.
+pub fn check(connection: &Arc<Connection>, index: &str) -> Result<Check> {
+    let own = connection.get_auto_commit();
+    if own {
+        connection.execute(if connection.mv_store().is_some() { "BEGIN CONCURRENT" } else { "BEGIN" })?;
+    }
+    let checked = Checker::new(connection, index).and_then(Checker::run);
+    if own {
+        connection.execute("ROLLBACK")?;
+    }
+    checked
+}
+
+/// A vector's row in the index as [`check`] holds it.
+struct Indexed {
+    location: Location,
+    /// Whether the table has the row, with a vector.
+    in_table: bool,
+    /// Whether a partition holds its code where `location` says.
+    found: bool,
+}
+
+/// A partition's rows as [`check`] reads them, in key order.
+#[derive(Default)]
+struct Rows {
+    partition: i64,
+    part: Option<Part>,
+    /// Rowid -> the blocks its dead row names.
+    dead: HashMap<i64, Vec<i64>>,
+    /// Block key -> the rowids of its entries.
+    blocks: HashMap<i64, Vec<i64>>,
+    tails: usize,
+}
+
+struct Checker<'c> {
+    connection: &'c Arc<Connection>,
+    table: String,
+    column: String,
+    index: String,
+    check: Check,
+    indexed: HashMap<i64, Indexed>,
+    centroids: HashMap<(i64, i64), Vec<f32>>,
+    rotation: Option<Rotation>,
+    vector: crate::Statement,
+}
+
+fn quoted_name(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn each_row(connection: &Arc<Connection>, sql: &str, mut row: impl FnMut(&[Value]) -> Result<()>) -> Result<()> {
+    let mut statement = connection.prepare(sql)?;
+    statement.run_with_row_callback(|found| row(&found.get_values().cloned().collect::<Vec<_>>()))
+}
+
+fn integer_value(value: &Value) -> Result<i64> {
+    match value {
+        Value::Numeric(Numeric::Integer(n)) => Ok(*n),
+        _ => Err(LimboError::Corrupt(format!("ivf_rq: {value:?} where the index holds an integer"))),
+    }
+}
+
+impl<'c> Checker<'c> {
+    fn new(connection: &'c Arc<Connection>, index: &str) -> Result<Self> {
+        let mut table = None;
+        each_row(connection, &format!("SELECT tbl_name FROM sqlite_schema WHERE type = 'index' AND name = '{}'", index.replace('\'', "''")), |row| {
+            table = row.first().and_then(|v| v.to_text().map(str::to_string));
+            Ok(())
+        })?;
+        let table = table.ok_or_else(|| LimboError::InvalidArgument(format!("no index named {index}")))?;
+        let (column, method) = connection.with_schema(crate::MAIN_DB_ID, |schema| {
+            schema.get_index(crate::namespace::NamespaceId::ROOT, &table, index).map(|found| {
+                (found.columns.first().map(|c| c.name.clone()), found.index_method.as_ref().map(|m| m.definition().method_name.to_string()))
+            })
+        })
+        .ok_or_else(|| LimboError::InvalidArgument(format!("no index named {index}")))?;
+        if method.as_deref() != Some(IVF_RQ_INDEX_METHOD_NAME) {
+            return Err(LimboError::InvalidArgument(format!("{index} is not an ivf_rq index")));
+        }
+        let column = column.ok_or_else(|| error("index has no column"))?;
+        let vector = connection.prepare(format!("SELECT {} FROM {} WHERE rowid = ?1", quoted_name(&column), quoted_name(&table)))?;
+        Ok(Self { connection, table, column, index: index.to_string(), check: Check::default(), indexed: HashMap::new(), centroids: HashMap::new(), rotation: None, vector })
+    }
+
+    fn store(&self, suffix: &str) -> String {
+        quoted_name(&format!("__turso_internal_{}_{suffix}", self.index))
+    }
+
+    fn run(mut self) -> Result<Check> {
+        let connection = self.connection;
+        let mut indexed = HashMap::new();
+        each_row(connection, &format!("SELECT rowid, location FROM {}", self.store("vectors")), |row| {
+            indexed.insert(integer_value(&row[0])?, Indexed { location: Location::decode(integer_value(&row[1])?), in_table: false, found: false });
+            Ok(())
+        })?;
+        self.indexed = indexed;
+        let sql = format!("SELECT rowid, {} IS NOT NULL FROM {}", quoted_name(&self.column), quoted_name(&self.table));
+        each_row(connection, &sql, |row| {
+            let (rowid, has) = (integer_value(&row[0])?, integer_value(&row[1])? != 0);
+            match (has, self.indexed.get_mut(&rowid)) {
+                (true, Some(entry)) => {
+                    entry.in_table = true;
+                    self.check.rows += 1;
+                }
+                (true, None) => {
+                    self.check.rows += 1;
+                    self.check.find(format!("row {rowid} has a vector and no row in the index"));
+                }
+                (false, Some(entry)) => {
+                    entry.in_table = true;
+                    entry.found = true;
+                    self.check.find(format!("row {rowid} has no vector and a row in the index"));
+                }
+                (false, None) => {}
+            }
+            Ok(())
+        })?;
+        let mut orphans: Vec<i64> = self.indexed.iter().filter(|(_, entry)| !entry.in_table).map(|(rowid, _)| *rowid).collect();
+        orphans.sort_unstable();
+        for rowid in orphans {
+            self.check.find(format!("the index holds row {rowid}, which the table does not"));
+        }
+        let mut centroids = HashMap::new();
+        each_row(connection, &format!("SELECT rowid, value FROM {}", self.store("centroids")), |row| {
+            let key = integer_value(&row[0])?;
+            if key != GENERATION {
+                let bytes = row[1].to_blob().ok_or_else(|| LimboError::Corrupt(format!("ivf_rq: centroid {key} is not a blob")))?;
+                let centroid = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+                centroids.insert((key >> VERSION_BITS, key & ((1 << VERSION_BITS) - 1)), centroid);
+            }
+            Ok(())
+        })?;
+        self.centroids = centroids;
+        let mut rows: Option<Rows> = None;
+        let sql = format!("SELECT rowid, c0, c1, c2, c3, c4, c5, c6, c7 FROM {} ORDER BY rowid", self.store("partitions"));
+        each_row(connection, &sql, |row| {
+            let key = integer_value(&row[0])?;
+            let partition = partition_of(key);
+            if rows.as_ref().is_none_or(|rows| rows.partition != partition) {
+                if let Some(done) = rows.take() {
+                    self.partition(done);
+                }
+                rows = Some(Rows { partition, ..Rows::default() });
+            }
+            let rows = rows.as_mut().expect("set above");
+            let id = key & ((1 << ROWID_BITS) - 1);
+            match kind_of(key) {
+                PART_ROW => {
+                    let field = |at: usize| integer_value(&row[1 + at]);
+                    rows.part = Some(Part { next: field(0)?, size: field(1)?, open: field(2)?, move_next: field(3)?, move_end: field(4)?, state: State::decode(field(5)?)?, retry: field(6)?, version: field(7)? });
+                }
+                DEAD_ROW => {
+                    let bytes = row[1].to_blob().ok_or_else(|| LimboError::Corrupt(format!("ivf_rq: dead row {key} holds no blocks")))?;
+                    rows.dead.insert(id, dead_blocks(bytes)?);
+                }
+                kind => {
+                    let version = integer_value(&row[1])?;
+                    let codes = row[2].to_blob().ok_or_else(|| LimboError::Corrupt(format!("ivf_rq: row {key} holds no codes")))?;
+                    let entries = unpack(codes)?;
+                    let location = match kind {
+                        TAIL_ROW => {
+                            rows.tails += 1;
+                            self.check.tail_entries += 1;
+                            if entries.len() != 1 || entries[0].rowid != id {
+                                self.check.find(format!("tail entry {key} of partition {partition} holds {} codes, not rowid {id}'s alone", entries.len()));
+                            }
+                            Location::Tail(key)
+                        }
+                        _ => {
+                            self.check.blocks += 1;
+                            rows.blocks.insert(key, entries.iter().map(|e| e.rowid).collect());
+                            Location::Block(key)
+                        }
+                    };
+                    for entry in &entries {
+                        self.entry(&rows.dead, partition, version, location, entry)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if let Some(done) = rows.take() {
+            self.partition(done);
+        }
+        let mut missing: Vec<(i64, Location)> = self.indexed.iter().filter(|(_, e)| e.in_table && !e.found).map(|(rowid, e)| (*rowid, e.location)).collect();
+        missing.sort_unstable_by_key(|(rowid, _)| *rowid);
+        for (rowid, location) in missing {
+            self.check.find(format!("row {rowid}'s code is not at {location:?}, where the index says it is"));
+        }
+        Ok(self.check)
+    }
+
+    /// One code a partition's tail entry or block holds.
+    fn entry(&mut self, dead: &HashMap<i64, Vec<i64>>, partition: i64, version: i64, location: Location, entry: &Entry) -> Result<()> {
+        let live = self.indexed.get(&entry.rowid).is_some_and(|indexed| indexed.location == location);
+        if !live {
+            match location {
+                Location::Block(block) if dead.get(&entry.rowid).is_some_and(|blocks| blocks.contains(&block)) => self.check.stale_copies += 1,
+                _ => self.check.find(format!("{location:?} in partition {partition} holds a copy of row {} that is neither where the index says its code is nor on its dead row", entry.rowid)),
+            }
+            return Ok(());
+        }
+        if let Some(indexed) = self.indexed.get_mut(&entry.rowid) {
+            if indexed.found {
+                self.check.find(format!("{location:?} holds row {}'s live code twice", entry.rowid));
+            }
+            indexed.found = true;
+        }
+        if let Location::Block(block) = location {
+            if dead.get(&entry.rowid).is_some_and(|blocks| blocks.contains(&block)) {
+                self.check.find(format!("row {}'s dead row names {location:?}, which holds its live code", entry.rowid));
+            }
+        }
+        let centroid = match self.centroids.get(&(partition, version)) {
+            Some(centroid) => Some(centroid.clone()),
+            None if partition == 0 && version == 0 => None,
+            None => {
+                self.check.find(format!("row {}'s code in partition {partition} names centroid version {version}, which the index does not hold", entry.rowid));
+                return Ok(());
+            }
+        };
+        self.vector.reset()?;
+        self.vector.bind_at(std::num::NonZero::new(1).expect("one"), Value::from_i64(entry.rowid))?;
+        let mut vector = None;
+        self.vector.run_with_row_callback(|row| {
+            vector = Some(dense(row.get_values().next().and_then(|v| v.to_blob())));
+            Ok(())
+        })?;
+        let vector = match vector {
+            Some(vector) => vector?,
+            None => return Ok(()),
+        };
+        let rotation = self.rotation.get_or_insert_with(|| Rotation::new(vector.len()));
+        if Rotation::padded(vector.len()) != rotation.padded {
+            self.check.find(format!("row {}'s vector has {} dimensions, which the index's others do not", entry.rowid, vector.len()));
+            return Ok(());
+        }
+        let residual = match &centroid {
+            Some(centroid) => vector.iter().zip(centroid).map(|(a, b)| a - b).collect(),
+            None => vector,
+        };
+        let expected = code(rotation, entry.rowid, residual);
+        self.check.codes += 1;
+        let close = |a: f32, b: f32| (a - b).abs() <= 1e-5 * b.abs().max(1.0);
+        if expected.bits != entry.bits || expected.ex != entry.ex || !close(entry.gain, expected.gain) || !close(entry.slack, expected.slack) || !close(entry.scale, expected.scale) {
+            self.check.find(format!("row {}'s code at {location:?} is not its vector's against centroid version {version} of partition {partition}", entry.rowid));
+        }
+        Ok(())
+    }
+
+    /// A partition's bookkeeping against its rows, once they are all read.
+    fn partition(&mut self, rows: Rows) {
+        self.check.partitions += 1;
+        let p = rows.partition;
+        let part = rows.part.unwrap_or_default();
+        let packed: i64 = rows.blocks.values().map(|entries| entries.len() as i64).sum();
+        if packed != part.size {
+            self.check.find(format!("partition {p}'s bookkeeping counts {} packed codes and its blocks hold {packed}", part.size));
+        }
+        for block in rows.blocks.keys() {
+            let sequence = block & ((1 << ROWID_BITS) - 1);
+            if sequence >= part.next {
+                self.check.find(format!("partition {p} holds block {sequence}, past its next sequence {}", part.next));
+            }
+        }
+        if !(part.move_next <= part.move_end && part.move_end <= part.next) {
+            self.check.find(format!("partition {p} moves blocks {}..{}, outside its {}", part.move_next, part.move_end, part.next));
+        }
+        if part.state == State::Retired && (rows.tails > 0 || !rows.blocks.is_empty()) {
+            self.check.find(format!("retired partition {p} holds {} tail entries and {} blocks", rows.tails, rows.blocks.len()));
+        }
+        let mut dead: Vec<(&i64, &Vec<i64>)> = rows.dead.iter().collect();
+        dead.sort_unstable_by_key(|(rowid, _)| **rowid);
+        for (rowid, blocks) in dead {
+            for block in blocks {
+                let held = partition_of(*block) == p && rows.blocks.get(block).is_some_and(|entries| entries.contains(rowid));
+                if !held {
+                    self.check.find(format!("row {rowid}'s dead row in partition {p} names block {block}, which holds no copy of it"));
+                }
+            }
+        }
+    }
+}
+
 /// Self-checks of the codes and the scan, run by the layout bench (the vendored crate has no test build).
 #[doc(hidden)]
 #[cfg(test)]
@@ -5965,6 +6288,121 @@ mod tests {
         }
     }
 
+    /// The index after inserts, updates, deletes, splits, packs, moves, compactions and OPTIMIZE
+    /// INDEX, under WAL and MVCC: every row with a vector has its live code where the index says,
+    /// coded from its vector, and the rest is accounted for.
+    #[test]
+    fn the_check_finds_the_index_consistent_after_every_kind_of_write() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-check-{mvcc}.db"), mvcc);
+            let mut state = 311;
+            let centres: Vec<Vec<f32>> = (0..6).map(|_| random(&mut state, DIMS).iter().map(|x| 3.0 * x).collect()).collect();
+            let rows: Vec<(i64, Vec<f32>)> = (1..=4000i64).map(|id| (id, near(&mut state, &centres, 0.5))).collect();
+            insert_all(&conn, &rows);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            for id in 4001..=5500i64 {
+                conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&near(&mut state, &centres, 0.5)))).unwrap();
+            }
+            for id in (1..=5500i64).step_by(7) {
+                conn.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&near(&mut state, &centres, 0.5)))).unwrap();
+            }
+            for id in (1..=5500i64).step_by(5) {
+                conn.execute(format!("DELETE FROM v WHERE id = {id}")).unwrap();
+            }
+            let before = check(&conn, "v_ivf").unwrap();
+            assert!(before.consistent(), "mvcc={mvcc}: {before:?}");
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            let after = check(&conn, "v_ivf").unwrap();
+            assert!(after.consistent(), "mvcc={mvcc}: {after:?}");
+            assert!(before.stale_copies > 0 && after.blocks > 0 && after.codes == after.rows, "mvcc={mvcc}: before {before:?}, after {after:?}");
+            assert_eq!(after.rows, 5500 - 1100, "mvcc={mvcc}");
+        }
+    }
+
+    /// Each way an index can disagree with its table or with itself is one the check reports: a
+    /// vector's row in the index gone, a tail entry gone, a code changed, bookkeeping miscounting
+    /// its blocks, a dead row gone, a centroid version gone, and a row the table does not have.
+    #[test]
+    fn the_check_reports_each_way_the_index_can_disagree_with_its_table() {
+        const DIMS: usize = 16;
+        let setup = |name: &str| {
+            let (db, conn) = database(name, false);
+            let mut state = 317;
+            let rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &rows);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            for id in 3001..=3020i64 {
+                conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&random(&mut state, DIMS)))).unwrap();
+            }
+            for id in (1..=3000i64).step_by(9) {
+                conn.execute(format!("UPDATE v SET e = {} WHERE id = {id}", literal(&random(&mut state, DIMS)))).unwrap();
+            }
+            let fine = check(&conn, "v_ivf").unwrap();
+            assert!(fine.consistent() && fine.tail_entries > 0 && fine.stale_copies > 0, "{fine:?}");
+            (db, conn)
+        };
+        let one = |conn: &Arc<crate::Connection>, sql: &str| rows(conn, sql).first().map(|row| row.clone()).unwrap_or_else(|| panic!("{sql} found nothing"));
+        // A nested statement may write the index's tables; it commits with the write transaction
+        // around it.
+        let corrupt = |conn: &Arc<crate::Connection>, sql: String| {
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            conn.start_nested();
+            let done = conn.execute(&sql);
+            conn.end_nested();
+            done.unwrap();
+            conn.execute("COMMIT").unwrap();
+        };
+        let findings = |conn: &Arc<crate::Connection>| {
+            let found = check(conn, "v_ivf").unwrap();
+            assert!(!found.consistent(), "the check found nothing wrong: {found:?}");
+            found.findings.join("\n")
+        };
+        let (vectors, partitions, centroids) = ("__turso_internal_v_ivf_vectors", "__turso_internal_v_ivf_partitions", "__turso_internal_v_ivf_centroids");
+
+        let (_db, conn) = setup("ivf-rq-check-vector-row.db");
+        let rowid = one(&conn, &format!("SELECT rowid FROM {vectors} WHERE location >= 0 LIMIT 1"))[0].as_int().unwrap();
+        corrupt(&conn, format!("DELETE FROM {vectors} WHERE rowid = {rowid}"));
+        assert!(findings(&conn).contains(&format!("row {rowid} has a vector and no row in the index")));
+
+        let (_db, conn) = setup("ivf-rq-check-tail.db");
+        let found = one(&conn, &format!("SELECT rowid, location FROM {vectors} WHERE location < 0 LIMIT 1"));
+        let (rowid, key) = (found[0].as_int().unwrap(), -1 - found[1].as_int().unwrap());
+        corrupt(&conn, format!("DELETE FROM {partitions} WHERE rowid = {key}"));
+        assert!(findings(&conn).contains(&format!("row {rowid}'s code is not at Tail({key})")));
+
+        let (_db, conn) = setup("ivf-rq-check-code.db");
+        let found = one(&conn, &format!("SELECT rowid, c1 FROM {partitions} WHERE (rowid >> {ROWID_BITS}) & 3 = {BLOCK_ROW} LIMIT 1"));
+        let (key, mut bytes) = (found[0].as_int().unwrap(), found[1].to_blob().unwrap().to_vec());
+        let gains = Layout::new(block_count(&bytes).unwrap(), block_code_bytes(&bytes).unwrap()).gains();
+        bytes[gains + 3] ^= 0x40;
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        corrupt(&conn, format!("UPDATE {partitions} SET c1 = X'{hex}' WHERE rowid = {key}"));
+        assert!(findings(&conn).contains(&format!("code at Block({key}) is not its vector's")));
+
+        let (_db, conn) = setup("ivf-rq-check-bookkeeping.db");
+        let partition = one(&conn, &format!("SELECT rowid >> 42 FROM {partitions} WHERE (rowid >> {ROWID_BITS}) & 3 = {BLOCK_ROW} LIMIT 1"))[0].as_int().unwrap();
+        corrupt(&conn, format!("UPDATE {partitions} SET c1 = c1 + 1 WHERE rowid = {}", part_key(partition).unwrap()));
+        assert!(findings(&conn).contains(&format!("partition {partition}'s bookkeeping counts")));
+
+        let (_db, conn) = setup("ivf-rq-check-dead-row.db");
+        let found = one(&conn, &format!("SELECT rowid FROM {partitions} WHERE (rowid >> {ROWID_BITS}) & 3 = {DEAD_ROW} LIMIT 1"));
+        let rowid = found[0].as_int().unwrap() & ((1 << ROWID_BITS) - 1);
+        corrupt(&conn, format!("DELETE FROM {partitions} WHERE rowid = {}", found[0].as_int().unwrap()));
+        assert!(findings(&conn).contains(&format!("holds a copy of row {rowid} that is neither")));
+
+        let (_db, conn) = setup("ivf-rq-check-centroid.db");
+        let found = one(&conn, &format!("SELECT rowid >> 42, c0 FROM {partitions} WHERE (rowid >> {ROWID_BITS}) & 3 = {BLOCK_ROW} LIMIT 1"));
+        let (partition, version) = (found[0].as_int().unwrap(), found[1].as_int().unwrap());
+        corrupt(&conn, format!("DELETE FROM {centroids} WHERE rowid = {}", centroid_key(partition, version).unwrap()));
+        assert!(findings(&conn).contains(&format!("names centroid version {version}, which the index does not hold")));
+
+        let (_db, conn) = setup("ivf-rq-check-orphan.db");
+        let location = one(&conn, &format!("SELECT location FROM {vectors} WHERE location >= 0 LIMIT 1"))[0].as_int().unwrap();
+        corrupt(&conn, format!("INSERT INTO {vectors} (rowid, location) VALUES (999999, {location})"));
+        assert!(findings(&conn).contains("the index holds row 999999, which the table does not"));
+    }
+
     /// Step `statement` until it yields between steps of its work, true, or ends, false, sleeping
     /// out the waits its busy handler asks for.
     fn step_waiting(db: &crate::Database, statement: &mut crate::Statement) -> bool {
@@ -6262,6 +6700,8 @@ mod tests {
                 committed += 1;
             }
         }
+        let found = check(&conn, "v_ivf").unwrap();
+        assert!(found.consistent(), "{found:?}");
         conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
         let left = stored(&conn).pending();
         assert!(left.is_empty(), "work left after OPTIMIZE INDEX: {left:?}");
@@ -6448,7 +6888,11 @@ mod tests {
                     }
                 }
                 assert!(queries > 50, "{case}: only {queries} queries");
+                let found = check(&conn, "v_ivf").unwrap();
+                assert!(found.consistent() && found.rows as usize == committed.len(), "{case}: before OPTIMIZE INDEX: {found:?}");
                 conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                let found = check(&conn, "v_ivf").unwrap();
+                assert!(found.consistent() && found.codes == found.rows, "{case}: after OPTIMIZE INDEX: {found:?}");
                 let left = stored(&conn).pending();
                 assert!(left.is_empty(), "{case}: work left after OPTIMIZE INDEX: {left:?}");
                 for _ in 0..5 {

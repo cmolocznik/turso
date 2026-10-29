@@ -632,6 +632,11 @@ impl Statement {
             self.busy = true;
         }
 
+        // A lock the statement waited for is no longer in its way: its next wait is a new one.
+        if std::mem::take(&mut self.state.lock_wait_over) {
+            self.busy_handler_state = None;
+        }
+
         // Handle busy result by invoking the busy handler
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.current_time_monotonic();

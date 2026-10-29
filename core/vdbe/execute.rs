@@ -14849,7 +14849,11 @@ pub fn op_index_method_optimize_steps(
             *db, index,
         ))
     });
-    match steps.step(&program.connection) {
+    let stepped = steps.step(&program.connection);
+    if steps.take_lock_wait_over() {
+        state.lock_wait_over = true;
+    }
+    match stepped {
         Ok(IOResult::Done(())) => {
             state.optimize_steps = None;
             state.pc += 1;

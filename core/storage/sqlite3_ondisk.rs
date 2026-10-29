@@ -1577,6 +1577,8 @@ impl BuildSharedWal {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 frame_pages: SpinLock::new(FramePages::default()),
+                write_grants: AtomicU64::new(0),
+                write_refusals: AtomicU64::new(0),
                 file: Some(file.clone()),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),

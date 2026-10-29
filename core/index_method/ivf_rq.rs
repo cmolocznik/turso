@@ -5965,6 +5965,130 @@ mod tests {
         }
     }
 
+    /// Step `statement` until it yields between steps of its work, true, or ends, false, sleeping
+    /// out the waits its busy handler asks for.
+    fn step_waiting(db: &crate::Database, statement: &mut crate::Statement) -> bool {
+        loop {
+            match statement.step().unwrap() {
+                crate::StepResult::Yield => return true,
+                crate::StepResult::Done => return false,
+                crate::StepResult::IO => db.io.step().unwrap(),
+                crate::StepResult::Sleep { duration } => std::thread::sleep(duration),
+                other => panic!("the statement stepped to {other:?}"),
+            }
+        }
+    }
+
+    /// Under WAL a stepped OPTIMIZE INDEX that finds the write lock held at many of its steps
+    /// waits for each holder within its connection's busy timeout: the timeout bounds each wait,
+    /// not their sum over the run.
+    #[test]
+    fn a_stepped_optimize_waits_for_each_writer_within_its_busy_timeout() {
+        use std::time::{Duration, Instant};
+        const DIMS: usize = 16;
+        let (db, conn) = database("ivf-rq-optimize-busy-each.db", false);
+        let mut state = 229;
+        backlog(&conn, &mut state, DIMS);
+        STATEMENT_UPKEEP.with(|on| on.set(false));
+        for statement in 0..20i64 {
+            let more: Vec<(i64, Vec<f32>)> = (1..=100).map(|i| (10_000 + statement * 100 + i, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &more);
+        }
+        STATEMENT_UPKEEP.with(|on| on.set(true));
+        conn.set_busy_timeout(Duration::from_millis(100));
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        let mut optimize = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
+        // The first step only finds the work.
+        assert!(step_waiting(&db, &mut optimize));
+        let mut holds = 0;
+        while holds < 8 {
+            // A writer holds the write lock for 30 ms while OPTIMIZE INDEX waits for it.
+            writer.execute("BEGIN IMMEDIATE").unwrap();
+            let until = Instant::now() + Duration::from_millis(30);
+            while let Some(left) = until.checked_duration_since(Instant::now()) {
+                match optimize.step().unwrap() {
+                    crate::StepResult::IO => db.io.step().unwrap(),
+                    crate::StepResult::Sleep { duration } => std::thread::sleep(duration.min(left)),
+                    crate::StepResult::Busy => {
+                        panic!("OPTIMIZE INDEX gave up on the write lock after {holds} waits of 30 ms, each within its busy timeout of 100 ms")
+                    }
+                    other => panic!("OPTIMIZE INDEX stepped to {other:?} while a writer held the write lock"),
+                }
+            }
+            writer.execute("COMMIT").unwrap();
+            holds += 1;
+            assert!(step_waiting(&db, &mut optimize), "OPTIMIZE INDEX ended after waiting for a writer {holds} times");
+        }
+        while step_waiting(&db, &mut optimize) {}
+        let left = stored(&conn).pending();
+        assert!(left.is_empty(), "work left after OPTIMIZE INDEX: {left:?}");
+    }
+
+    /// Under WAL a writer refused the write lock while a step of OPTIMIZE INDEX held it takes the
+    /// lock before later steps do: the step that refused it waits for it, as long as a busy
+    /// handler sleeps at most, before taking the lock again. A writer on its own thread inserts
+    /// beside OPTIMIZE INDEX on another and counts the steps that took the lock while it waited.
+    #[test]
+    fn a_writer_refused_during_a_step_of_optimize_takes_the_lock_before_the_next_steps() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        const DIMS: usize = 16;
+        let (db, conn) = database("ivf-rq-optimize-turns.db", false);
+        let mut state = 239;
+        backlog(&conn, &mut state, DIMS);
+        // Work for many steps, and inserts on this thread that leave theirs due too.
+        STATEMENT_UPKEEP.with(|on| on.set(false));
+        for statement in 0..30i64 {
+            let more: Vec<(i64, Vec<f32>)> = (1..=100).map(|i| (10_000 + statement * 100 + i, random(&mut state, DIMS))).collect();
+            insert_all(&conn, &more);
+        }
+        conn.set_busy_timeout(Duration::from_secs(60));
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer.set_busy_timeout(Duration::from_secs(60));
+        let grants = |connection: &Arc<crate::Connection>| connection.get_pager().wal.as_ref().unwrap().write_lock_turns().0;
+        let rows: Vec<Vec<f32>> = (0..20_000).map(|_| random(&mut state, DIMS)).collect();
+        let done = AtomicBool::new(false);
+        let ahead: Vec<u64> = std::thread::scope(|scope| {
+            let optimizing = scope.spawn(|| {
+                let optimized = conn.execute("OPTIMIZE INDEX v_ivf");
+                done.store(true, Ordering::Release);
+                optimized
+            });
+            let mut ahead = Vec::new();
+            for (i, row) in rows.iter().enumerate() {
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                let mut insert = writer.prepare(format!("INSERT INTO v VALUES ({}, {})", 300_000 + i, literal(row))).unwrap();
+                let mut refused_at = None;
+                loop {
+                    match insert.step().unwrap() {
+                        crate::StepResult::Done => break,
+                        crate::StepResult::IO => db.io.step().unwrap(),
+                        crate::StepResult::Sleep { duration } => {
+                            refused_at.get_or_insert_with(|| grants(&writer));
+                            std::thread::sleep(duration);
+                        }
+                        other => panic!("the writer's insert stepped to {other:?}"),
+                    }
+                }
+                // Its own is the last grant counted, give or take one step taken right after it.
+                if let Some(from) = refused_at {
+                    ahead.push(grants(&writer) - from - 1);
+                }
+                // A writer that leaves the lock free between its transactions, as one at a steady
+                // rate does.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            optimizing.join().unwrap().unwrap();
+            ahead
+        });
+        STATEMENT_UPKEEP.with(|on| on.set(true));
+        let most = ahead.iter().copied().max().unwrap_or(0);
+        assert!(most <= 2, "a refused writer waited while {most} steps took the write lock: {ahead:?}");
+        assert!(ahead.len() >= 5, "the writer was refused the write lock {} times", ahead.len());
+    }
+
     /// Under MVCC a step of OPTIMIZE INDEX takes work no other transaction holds: with a writer's
     /// transaction open over the sixteen lowest-numbered partitions with work due, OPTIMIZE INDEX
     /// packs every tail outside them, and after the writer commits the next does the rest. Steps

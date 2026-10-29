@@ -679,6 +679,10 @@ pub trait Wal: Debug + Send + Sync {
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool;
 
+    /// How many write transactions this process's connections began on the WAL, and how many
+    /// times one was refused the write lock because another connection held it.
+    fn write_lock_turns(&self) -> (u64, u64);
+
     /// Whether shutdown checkpointing is valid when this process closes its last connection.
     fn should_checkpoint_on_close(&self) -> bool;
 
@@ -3022,6 +3026,10 @@ pub struct WalSharedRuntime {
     pub frame_cache_high_water: AtomicU64,
     /// The page each frame holds, kept beside `frame_cache` and changed under its lock.
     pub frame_pages: SpinLock<FramePages>,
+    /// How many times a connection of this process took the write lock, and how many times one
+    /// was refused it because another held it.
+    pub write_grants: AtomicU64,
+    pub write_refusals: AtomicU64,
     pub file: Option<Arc<dyn File>>,
     /// Read locks advertise the maximum WAL frame a reader may access.
     /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
@@ -3756,6 +3764,15 @@ impl Wal for WalFile {
         WalFile::mvcc_refresh_if_db_changed(self)
     }
 
+    fn write_lock_turns(&self) -> (u64, u64) {
+        self.with_shared(|shared| {
+            (
+                shared.runtime.write_grants.load(Ordering::Acquire),
+                shared.runtime.write_refusals.load(Ordering::Acquire),
+            )
+        })
+    }
+
     /// End a read transaction.
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -3797,6 +3814,9 @@ impl Wal for WalFile {
                 "write lock already held by this connection"
             );
             if !self.coordination.try_begin_write_tx() {
+                self.with_shared(|shared| {
+                    shared.runtime.write_refusals.fetch_add(1, Ordering::AcqRel)
+                });
                 return Err(LimboError::Busy);
             }
             let db_changed =
@@ -3818,6 +3838,7 @@ impl Wal for WalFile {
             Ok(())
         };
         begin_write_result?;
+        self.with_shared(|shared| shared.runtime.write_grants.fetch_add(1, Ordering::AcqRel));
         if self
             .write_lock_held
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -6157,6 +6178,8 @@ impl WalFileShared {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 frame_pages: SpinLock::new(FramePages::default()),
+                write_grants: AtomicU64::new(0),
+                write_refusals: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -6236,6 +6259,8 @@ impl WalFileShared {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 frame_pages: SpinLock::new(FramePages::default()),
+                write_grants: AtomicU64::new(0),
+                write_refusals: AtomicU64::new(0),
                 file: None,
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -6281,6 +6306,8 @@ impl WalFileShared {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
                 frame_pages: SpinLock::new(FramePages::default()),
+                write_grants: AtomicU64::new(0),
+                write_refusals: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),

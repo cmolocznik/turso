@@ -1124,6 +1124,10 @@ pub struct ProgramState {
     pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
     /// Where an `Insn::IndexMethodOptimizeSteps` is, re-entrant across its steps and waits.
     pub(crate) optimize_steps: Option<Box<crate::index_method::optimize_steps::OptimizeSteps>>,
+    /// Set by an instruction once a lock it waited for busy is no longer in its way, so that the
+    /// statement's next wait starts its busy handler afresh: an instruction that takes a lock many
+    /// times, as `Insn::IndexMethodOptimizeSteps` does, waits for each within the busy timeout.
+    pub(crate) lock_wait_over: bool,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -1271,6 +1275,7 @@ impl ProgramState {
             view_delta_state: ViewDeltaApplyState::NotStarted,
             populate_matviews_state: None,
             optimize_steps: None,
+            lock_wait_over: false,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -1437,6 +1442,7 @@ impl ProgramState {
         self.view_delta_state = ViewDeltaApplyState::NotStarted;
         self.populate_matviews_state = None;
         self.optimize_steps = None;
+        self.lock_wait_over = false;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         self.fk_immediate_violation = None;

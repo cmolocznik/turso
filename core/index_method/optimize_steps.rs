@@ -5,17 +5,21 @@
 //! under WAL, and yields between steps. Readers never wait for it and it pins no snapshot while it
 //! runs; a writer waits for one step at most. A step that finds the write lock held reports busy,
 //! and the statement's busy handler decides whether it waits; a step whose commit loses to a
-//! concurrent transaction is done again. Dropping the statement drops the step connection, which
-//! rolls back a step in flight. Inside a transaction the statement runs one `OPTIMIZE INDEX` there
-//! instead, which does all the work in that transaction.
+//! concurrent transaction is done again. Under WAL a step that refused another connection the write
+//! lock while it held it lets that connection take the lock before the next step does. Each wait
+//! for the lock is one for the statement's busy handler, its timeout bounding each wait rather than
+//! their sum over the run. Dropping the statement drops the step connection, which rolls back a step
+//! in flight. Inside a transaction the statement runs one `OPTIMIZE INDEX` there instead, which
+//! does all the work in that transaction.
 
 use super::OptimizeProgress;
 use crate::{
     io::Completion,
     sync::{atomic::Ordering, Arc},
     types::{IOCompletions, IOResult, IOResultOr},
-    Connection, LimboError, Result, Statement, StepResult,
+    Connection, LimboError, MonotonicInstant, Result, Statement, StepResult,
 };
+use std::time::Duration;
 
 /// What an `OPTIMIZE INDEX` on a step connection asks of its index method, as the connection holds
 /// it in [`Connection::index_method_optimize_step`].
@@ -82,6 +86,11 @@ fn recorded_progress(connection: &Connection) -> OptimizeProgress {
 const LOST_IN_A_ROW: usize = 16;
 const WAITING_IN_A_ROW: usize = 64;
 
+/// The longest a step that refused a writer the write lock waits for it to take the lock before
+/// the next step takes it: the default busy handler's longest sleep, within which a writer
+/// refused during the step tries again.
+const GIVE_WAY: Duration = Duration::from_millis(100);
+
 /// An `OPTIMIZE INDEX` of one index in steps, and where it is.
 pub(crate) struct OptimizeSteps {
     /// The index's database on the statement's connection.
@@ -95,6 +104,10 @@ pub(crate) struct OptimizeSteps {
     left: OptimizeProgress,
     lost: usize,
     waiting: usize,
+    /// The WAL's count of write-lock refusals when the step in flight took the write lock.
+    refusals: u64,
+    /// Whether a lock the statement waited for is no longer in its way, for its busy handler.
+    lock_wait_over: bool,
 }
 
 enum Phase {
@@ -107,6 +120,13 @@ enum Phase {
     /// Roll a failed step back, then report its error, or begin the next attempt when its commit
     /// lost to a concurrent transaction.
     Rollback(Option<Statement>, Option<Box<LimboError>>),
+    /// Leave the write lock to a connection the last step refused it, until one takes it or
+    /// `GIVE_WAY` has passed since `since`: `grants` is the WAL's count of write locks taken when
+    /// the step committed.
+    GiveWay {
+        since: MonotonicInstant,
+        grants: u64,
+    },
 }
 
 /// Whether a failed commit lost to a concurrent transaction, so the step can be done again.
@@ -117,6 +137,16 @@ fn lost(error: &LimboError) -> bool {
             | LimboError::CommitDependencyAborted
             | LimboError::SchemaConflict
     )
+}
+
+/// The WAL's counts of write locks taken and refused, on `connection`'s main database, if it has
+/// a WAL.
+fn write_lock_turns(connection: &Connection) -> Option<(u64, u64)> {
+    connection
+        .get_pager()
+        .wal
+        .as_ref()
+        .map(|wal| wal.write_lock_turns())
 }
 
 /// A name as an identifier in SQL.
@@ -154,7 +184,14 @@ impl OptimizeSteps {
             left: OptimizeProgress::Done,
             lost: 0,
             waiting: 0,
+            refusals: 0,
+            lock_wait_over: false,
         }
+    }
+
+    /// Whether a lock the statement waited for has stopped being in its way since last asked.
+    pub(crate) fn take_lock_wait_over(&mut self) -> bool {
+        std::mem::take(&mut self.lock_wait_over)
     }
 
     fn steps(&self) -> Result<&Arc<Connection>> {
@@ -212,7 +249,13 @@ impl OptimizeSteps {
                             self.phase = Phase::Begin(Some(begin));
                             return Ok(IOResult::IO(io));
                         }
-                        Ok(IOResult::Done(())) => self.phase = Phase::Step(None),
+                        Ok(IOResult::Done(())) => {
+                            self.lock_wait_over = true;
+                            if let Some((_, refusals)) = write_lock_turns(&steps) {
+                                self.refusals = refusals;
+                            }
+                            self.phase = Phase::Step(None);
+                        }
                         Err(error) => {
                             // Nothing has begun: the next attempt begins afresh.
                             self.phase = Phase::Begin(None);
@@ -259,6 +302,9 @@ impl OptimizeSteps {
                             return Ok(IOResult::IO(io));
                         }
                         Ok(IOResult::Done(())) => {
+                            self.lock_wait_over = true;
+                            // Under WAL every step but the first held the write lock.
+                            let held = steps.mv_store().is_none() && !self.first;
                             self.first = false;
                             self.lost = 0;
                             match self.left {
@@ -271,7 +317,15 @@ impl OptimizeSteps {
                                     }
                                 }
                             }
-                            self.phase = Phase::Begin(None);
+                            self.phase = match write_lock_turns(&steps) {
+                                Some((grants, refusals)) if held && refusals > self.refusals => {
+                                    Phase::GiveWay {
+                                        since: steps.get_pager().io.current_time_monotonic(),
+                                        grants,
+                                    }
+                                }
+                                _ => Phase::Begin(None),
+                            };
                             return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
                         }
                         Err(error) if matches!(*error, LimboError::Busy) => {
@@ -304,6 +358,21 @@ impl OptimizeSteps {
                         return Err(error);
                     }
                     self.phase = Phase::Begin(None);
+                    return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+                }
+                Phase::GiveWay { since, grants } => {
+                    let steps = self.steps()?.clone();
+                    let taken = write_lock_turns(&steps).is_none_or(|(now, _)| now > grants);
+                    let waited = steps
+                        .get_pager()
+                        .io
+                        .current_time_monotonic()
+                        .duration_since(since);
+                    if taken || waited >= GIVE_WAY {
+                        self.phase = Phase::Begin(None);
+                        continue;
+                    }
+                    self.phase = Phase::GiveWay { since, grants };
                     return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
                 }
             }

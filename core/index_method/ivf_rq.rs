@@ -2036,6 +2036,10 @@ struct SharedState {
     moving: BTreeSet<i64>,
     due: BTreeSet<i64>,
     step_from: i64,
+    /// Whether a survey of every partition found the index holding four times the vectors its
+    /// partitions were trained for: the next step of OPTIMIZE INDEX surveys them all again and
+    /// rebuilds.
+    rebuild_due: bool,
     cache: PartitionCache,
     /// The rows with redo rows, as a query read them under its snapshot, held as a partition's
     /// rows are.
@@ -2869,6 +2873,8 @@ thread_local! {
     /// another transaction holds rows of, and the codes its jobs kill are counted.
     static SETTLE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static KILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The rebuilds done on this thread.
+    static REBUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn settles() -> bool {
@@ -3766,14 +3772,15 @@ impl IndexMethodCursor for IvfRqCursor {
             }
             let (budget, until) = step_bounds();
             let budget = if first { 0 } else { budget };
-            self.run = Some(Run { budget, survey: Survey::default(), all: first, first: start, build: None, until, redo: RedoScan::default() });
+            let all = first || self.shared.lock().expect("index state").rebuild_due;
+            self.run = Some(Run { budget, survey: Survey::default(), all, first: start, build: None, until, redo: RedoScan::default() });
             self.jobs = 0;
         }
         if let IOResult::IO(io) = self.maintain(context)? {
             return Ok(IOResult::IO(io));
         }
         let shared = self.shared.lock().expect("index state");
-        Ok(IOResult::Done(match (shared.due.is_empty() && shared.moving.is_empty() && self.redo_left == 0, first || self.jobs > 0) {
+        Ok(IOResult::Done(match (shared.due.is_empty() && shared.moving.is_empty() && !shared.rebuild_due && self.redo_left == 0, first || self.jobs > 0) {
             (true, _) => OptimizeProgress::Done,
             (false, true) => OptimizeProgress::Moved,
             (false, false) => OptimizeProgress::Waiting,
@@ -4855,8 +4862,11 @@ impl IvfRqCursor {
                             let mut shared = self.shared.lock().expect("index state");
                             shared.moving.clear();
                             shared.due.clear();
+                            shared.rebuild_due = false;
                             drop(shared);
                             REBUILDS.fetch_add(1, Ordering::Relaxed);
+                            #[cfg(test)]
+                            REBUILT.with(|count| count.set(count.get() + 1));
                             JOBS.fetch_add(1, Ordering::Relaxed);
                             self.jobs += 1;
                             self.saved = None;
@@ -5010,12 +5020,23 @@ impl IvfRqCursor {
         Ok(Some(Upkeep::Read { job, part, stage: Stage::Blocks, walk: Walk::Seek, get: Get::Seek, rows: Vec::new() }))
     }
 
+    /// Whether a survey of every partition found the index holding four times the vectors its
+    /// partitions were trained for, at least [`BULK_AT`].
+    fn rebuild_due(&self, survey: &Survey) -> bool {
+        survey.vectors.is_some_and(|vectors| vectors as usize >= BULK_AT && 4 * self.model.live() < trained_partitions(vectors as usize))
+    }
+
     /// The partitions `run` read that it leaves work due in, its jobs spent, are the next
-    /// statements' to survey; those it leaves none in no longer are.
+    /// statements' to survey; those it leaves none in no longer are. A run that surveyed every
+    /// partition says whether a rebuild is due.
     fn leave_due(&self, run: &Run) {
         let settled = self.settled(&run.survey);
         let read: Vec<(i64, bool)> = run.survey.read.iter().map(|p| (*p, self.choose_among(&run.survey, &BTreeSet::from([*p]), settled).is_some())).collect();
+        let rebuild = run.survey.vectors.is_some().then(|| self.rebuild_due(&run.survey));
         let mut shared = self.shared.lock().expect("index state");
+        if let Some(rebuild) = rebuild {
+            shared.rebuild_due = rebuild;
+        }
         for (p, due) in read {
             match due {
                 true => shared.due.insert(p),
@@ -5030,10 +5051,8 @@ impl IvfRqCursor {
     /// [`COMPACT_AT`], the retirement of a partition too small to keep, a split of the largest
     /// partition past the bound.
     fn choose(&self, survey: &Survey) -> Option<Job> {
-        if let Some(vectors) = survey.vectors {
-            if vectors as usize >= BULK_AT && 4 * self.model.live() < trained_partitions(vectors as usize) && self.claimable(&self.claims(Job::Rebuild)) {
-                return Some(Job::Rebuild);
-            }
+        if self.rebuild_due(survey) && self.claimable(&self.claims(Job::Rebuild)) {
+            return Some(Job::Rebuild);
         }
         let settled = self.settled(survey);
         if !self.concurrent {
@@ -7657,6 +7676,37 @@ mod tests {
         for _ in 0..3 {
             let q = random(&mut state, DIMS);
             assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
+        }
+    }
+
+    /// OPTIMIZE INDEX in steps rebuilds an index holding four times the vectors its partitions were
+    /// trained for: its first step's survey of every partition finds the rebuild due, and the next
+    /// step makes it, under WAL and MVCC.
+    #[test]
+    fn optimize_in_steps_rebuilds_an_index_its_rows_outgrew() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (_db, conn) = database(&format!("ivf-rq-steps-rebuild-{mvcc}.db"), mvcc);
+            let mut state = 277;
+            let rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, DIMS))).collect();
+            // Unmaintained, the index holds every row in one partition's tail.
+            STATEMENT_UPKEEP.with(|on| on.set(false));
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            insert_all(&conn, &rows);
+            STATEMENT_UPKEEP.with(|on| on.set(true));
+            assert_eq!(stored(&conn).live().len(), 1, "mvcc={mvcc}");
+            REBUILT.with(|count| count.set(0));
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            assert_eq!(REBUILT.with(|count| count.get()), 1, "mvcc={mvcc}: the rebuilds OPTIMIZE INDEX made");
+            let index = stored(&conn);
+            assert!(index.live().len() >= trained_partitions(3000) / 2 && index.pending().is_empty(), "mvcc={mvcc}: {} partitions, {:?}", index.live().len(), index.pending());
+            let live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
+            for _ in 0..3 {
+                let q = random(&mut state, DIMS);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+            }
         }
     }
 

@@ -2059,14 +2059,19 @@ impl PartitionCache {
         *count
     }
 
-    /// The blocks held for `partition` under `version`, now the most recently probed.
+    /// The blocks held for `partition` under `version`, now among the most recently probed: one
+    /// moved to the front within the last quarter of the held partitions' moves keeps its place,
+    /// being far from giving way, so most probes reorder nothing.
     fn get(&mut self, partition: i64, version: i64) -> Option<Arc<HeldBlocks>> {
         self.probe(partition, version);
+        let recent = self.tick.saturating_sub(self.entries.len() as u64 / 4);
         let (blocks, tick) = self.entries.get_mut(&(partition, version))?;
-        self.order.remove(tick);
-        self.tick += 1;
-        *tick = self.tick;
-        self.order.insert(self.tick, (partition, version));
+        if *tick <= recent {
+            self.order.remove(tick);
+            self.tick += 1;
+            *tick = self.tick;
+            self.order.insert(self.tick, (partition, version));
+        }
         Some(blocks.clone())
     }
 
@@ -6081,6 +6086,30 @@ mod tests {
         cache.get(6, 7);
         assert!(cache.admits(6, 7), "a partition probed most is not held");
         assert!(!PartitionCache::default().admits(0, 0), "an empty budget holds a partition");
+    }
+
+    /// A held partition probed again while it is among the most recently moved quarter keeps its
+    /// place, so the order moves only for partitions nearer giving way.
+    #[test]
+    fn a_held_partition_probed_among_the_recent_quarter_keeps_its_place() {
+        let held = |bytes: usize| {
+            let mut blocks = HeldBlocks::default();
+            blocks.push(0, 0, &vec![0u8; bytes]);
+            blocks
+        };
+        let mut cache = PartitionCache { budget: 800, ..PartitionCache::default() };
+        for partition in 0..8 {
+            cache.insert(partition, 7, held(100));
+        }
+        let ticks = cache.tick;
+        // 7 and 6 are the most recently moved quarter of the eight.
+        assert!(cache.get(7, 7).is_some() && cache.get(6, 7).is_some());
+        assert_eq!(cache.tick, ticks, "a partition among the recent quarter moved");
+        // 0, the least recent, moves to the front, so 1 gives way first.
+        assert!(cache.get(0, 7).is_some());
+        assert_eq!(cache.tick, ticks + 1, "the least recent partition kept its place");
+        cache.insert(8, 7, held(100));
+        assert!(cache.get(1, 7).is_none() && cache.get(0, 7).is_some() && cache.get(8, 7).is_some());
     }
 
     /// A query reads each partition it probes with one seek: its bookkeeping, dead rows, tail and

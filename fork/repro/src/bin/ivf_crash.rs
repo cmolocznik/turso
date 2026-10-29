@@ -290,6 +290,22 @@ fn verify(dir: &str, random: &mut Random) -> Result<String, String> {
 
 /// Top-ten recall of `queries` random queries over DIR's database, as the index is created and with
 /// more candidates reranked: a miss that more candidates mend is the estimates' cut, not a lost row.
+/// OPTIMIZE INDEX on a round's database alone, after the check: its shape before and after, and the
+/// time it took.
+fn optimize(dir: &str) -> turso_core::Result<()> {
+    let (_db, conn) = open(&format!("{dir}/crash.db"))?;
+    let shape = |conn: &Arc<Connection>| -> turso_core::Result<String> {
+        let found = ivf_rq::check(conn, "v_ivf")?;
+        Ok(format!("{} rows, {} partitions, {} blocks, {} tail entries, {} stale copies, {} pending, consistent {}", found.rows, found.partitions, found.blocks, found.tail_entries, found.stale_copies, found.pending, found.consistent()))
+    };
+    println!("before: {}", shape(&conn)?);
+    let started = Instant::now();
+    conn.execute("OPTIMIZE INDEX v_ivf")?;
+    println!("OPTIMIZE INDEX took {:.1} s", started.elapsed().as_secs_f64());
+    println!("after: {}", shape(&conn)?);
+    Ok(())
+}
+
 fn diagnose(dir: &str, queries: usize) {
     let (_db, conn) = open(&format!("{dir}/crash.db")).unwrap();
     let table: Vec<(i64, Vec<f32>)> = rows(&conn, "SELECT id, e FROM v")
@@ -327,6 +343,10 @@ fn main() {
         }
         Some("diagnose") => {
             diagnose(&args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(50));
+            return;
+        }
+        Some("optimize") => {
+            optimize(&args[2]).unwrap();
             return;
         }
         Some("run") => {}

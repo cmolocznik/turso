@@ -564,7 +564,67 @@ IMMEDIATE` begins such a transaction (`TransactionMode::Write`), and eight in te
 writes are autocommit. The other 16 lost first-committer validation on index rows that their own
 statements' maintenance wrote (bookkeeping rows, the generation row, vectors' rows). They include two
 transactions each inserting a row the other had inserted and not yet committed, which the store
-detects only at commit.
+detects only at commit. The next entry closes that class.
+
+### ivf_rq's writes refuse rows other transactions wrote unseen, and its jobs wait only on jobs
+2026-10-30 `c01598a1e` (a first check, apart from the write, replaced), `957f67921`, `858f2d542`.
+`core/mvcc/database/mod.rs`, `core/mvcc/cursor.rs`, `core/storage/btree.rs`,
+`core/index_method/ivf_rq.rs`. Under MVCC, the store checks an insert, a version over a row only the
+B-tree holds, and a delete of such a row only at commit. A write of an index row inside a writer's
+transaction could therefore lose there, failing the whole transaction, though a maintenance job
+could have been undone or the writer's change left to maintenance. Two writers in `BEGIN
+CONCURRENT` transactions beside OPTIMIZE INDEX lost 14 commits in 10 s this way. A cursor can now
+ask for refusing writes (`CursorTrait::refuse_unseen_writes`): its inserts, versions over B-tree
+rows, and deletes of table rows check, under the row's lock, for a write the transaction's snapshot
+does not include (`chain_has_unseen_write`), and fail at once with WriteWriteConflict, writing
+nothing (`MvStore::insert_row`, `insert_btree_resident_row`, `delete_row`). ivf_rq asks it of its
+backing tables' cursors. Other tables keep their optimistic writes.
+`test_refusing_writes_fail_at_the_write_over_unseen_writes` fails with the check disabled. The
+first version of the check ran apart from the insert, so another thread could insert between the
+two.
+
+A job left for later every partition an open transaction had written. So under MVCC, writers that
+kept transactions open on the same partitions kept maintenance off them for good: four writers in
+`BEGIN CONCURRENT` transactions left an index of one partition and 425,658 tail entries after 12
+rounds of `ivf_crash`. Writes of table rows write fresh index rows, plus the rows of a vector a job
+moves, which the refusing writes now catch. The index's record of its writers therefore keeps apart
+the partitions maintenance jobs wrote. A job now leaves for later only a partition another
+transaction's job holds, or one where a job committed past its snapshot.
+`maintenance_works_the_partitions_an_open_writer_wrote` (OPTIMIZE INDEX beside a writer whose open
+transaction inserted 1,000 rows across the backlog's partitions) fails under the old rule. A redo
+row's write is now entered in that record like any other. Without it, the conflict test's query
+served redo rows held from before the writes and failed with "a vector's row names a row the table
+lacks".
+
+Measured with `ivf_crash` on `858f2d542`, 12 kill rounds each on seed 4242, every round passing its
+checks:
+
+| writers | commits | conflicts | left to maintenance | index at the end |
+|---|---|---|---|---|
+| 2, every write `BEGIN CONCURRENT` | 5,512 | 0 | 16 | 43,128 rows, 438 partitions |
+| 4, every write `BEGIN CONCURRENT` | 19,790 | 1, an update statement | 70 | 150,278 rows, 29 partitions |
+| 4, eight in ten autocommit | 13,432 | 712, 711 at COMMIT | 16 | 90,993 rows, 921 partitions |
+
+Still open:
+- **The exclusive lock.** The 711 commit conflicts are the MVCC store refusing a concurrent commit
+  while an exclusive transaction holds its lock. An exclusive transaction skips conflict
+  validation, so the store cannot let a concurrent commit land beside it. The rule for writers
+  under MVCC is that every write runs in `BEGIN CONCURRENT`; `ivf_crash` takes `CONCURRENT=1` for
+  that.
+- **Splits starve under four contending writers: 29 partitions for 150,278 rows.** Every split
+  writes the model's generation row, so splits serialize across the index, and a transaction whose
+  snapshot predates the latest split cannot split at all. Over 8 traced seconds:
+  - 19,344 splits were refused at their claims, 5,199 of them on the model alone;
+  - 1,337 of the 1,390 started were undone at a write, on the generation and centroid rows and
+    bookkeeping rows;
+  - 51 finished.
+
+  Two writers keep up.
+- **Stepped OPTIMIZE INDEX never rebuilds.** Run alone on that four-writer database, OPTIMIZE INDEX
+  split its 29 partitions into 1,259 one at a time, in 206 s, and left it consistent. It made no
+  rebuild, though the index held far more vectors than its partitions were trained for. A rebuild
+  is chosen only after a survey of every partition, and only the first step, which does no job,
+  surveys them all.
 
 ## Taken upstream
 

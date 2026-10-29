@@ -698,10 +698,12 @@ pub fn translate_insert(
             // the user-supplied rowid so the next auto-generated rowid is
             // strictly greater. The helper is a no-op when the explicit
             // rowid is already <= current watermark.
-            let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+            let seq_name = crate::schema::autoincrement_sequence_name(
+                &resolver.mangle_name(ctx.namespace, &ctx.table.name),
+            );
             let seq = resolver
                 .with_schema(ctx.namespace.database_id, |s| {
-                    s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                    s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
                 })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
@@ -712,7 +714,7 @@ pub fn translate_insert(
             crate::translate::sequence::emit_disk_advance_past(
                 program,
                 resolver,
-                ctx.namespace,
+                NamespaceRef::root_of(ctx.namespace.database_id),
                 &seq_name,
                 &seq,
                 insertion.key_register(),
@@ -1176,6 +1178,7 @@ pub fn translate_insert(
         let has_upsert_do_update = upsert_actions
             .iter()
             .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }));
+        let has_returning = !result_columns.is_empty();
         set_insert_stmt_journal_flags(
             program,
             resolver,
@@ -1185,6 +1188,7 @@ pub fn translate_insert(
             ctx.on_conflict,
             inserting_multiple_rows,
             has_triggers,
+            has_returning,
             has_fks,
             has_upsert,
             has_upsert_do_update,
@@ -1556,10 +1560,12 @@ fn emit_rowid_generation(
     is_mvcc: bool,
 ) -> Result<()> {
     if ctx.table.has_autoincrement && is_mvcc {
-        let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+        let seq_name = crate::schema::autoincrement_sequence_name(
+            &resolver.mangle_name(ctx.namespace, &ctx.table.name),
+        );
         let seq = resolver
             .with_schema(ctx.namespace.database_id, |s| {
-                s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
             })
             .ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
@@ -1570,7 +1576,7 @@ fn emit_rowid_generation(
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
-            ctx.namespace,
+            NamespaceRef::root_of(ctx.namespace.database_id),
             &seq_name,
             &seq,
             insertion.key_register(),
@@ -1769,7 +1775,8 @@ fn open_autoincrement_state(
         db: ctx.namespace.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    let table_name_reg =
+        program.emit_string8_new_reg(resolver.mangle_name(ctx.namespace, &ctx.table.name));
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -2954,7 +2961,7 @@ fn translate_column(
         };
         let has_custom_encode = resolved
             .as_ref()
-            .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+            .is_some_and(|r| r.chain.iter().any(|td| td.has_encode_or_coerce()));
         if has_custom_encode {
             translate_expr_no_constant_opt(
                 program,

@@ -2720,6 +2720,10 @@ struct Query {
     /// entry's raised 1-bit estimate must reach.
     estimates: BinaryHeap<Ordered>,
     results: BinaryHeap<Ordered>,
+    /// The screens of the blocks a held partition's probe screened, and each block's centre and
+    /// the end of its screens, kept to be reused from probe to probe.
+    screens: Vec<Screen>,
+    screened: Vec<(f64, usize)>,
 }
 
 impl Query {
@@ -2728,6 +2732,12 @@ impl Query {
             Some(worst) if self.estimates.len() >= self.keep => -worst.0,
             _ => f64::NEG_INFINITY,
         }
+    }
+
+    /// The bound a block's members are tested against, for a block whose centroid's product with
+    /// the query is `centre`, at the bar as it stands.
+    fn bound(&self, centre: f64) -> Bound {
+        Bound { centre, step: self.scan.step, base: self.scan.base, error: self.scan.error, sum: self.sum, spread: self.spread, bar: self.bar() }
     }
 
     fn centre(&mut self, model: &Model, partition: i64, version: i64) -> Result<f64> {
@@ -3315,6 +3325,8 @@ impl IndexMethodCursor for IvfRqCursor {
                 dead: HashSet::new(),
                 estimates: BinaryHeap::new(),
                 results: BinaryHeap::new(),
+                screens: Vec::new(),
+                screened: Vec::new(),
             });
             self.filter = filtered.then(|| Filter { limit, round: 0, probed_all: false, whole: false, reach: f64::INFINITY, given: HashSet::new(), accepted: BinaryHeap::new() });
             self.search = self.round()?;
@@ -3721,11 +3733,24 @@ impl IvfRqCursor {
         query.dead.extend(rows.dead.iter().copied());
         let tail = rows.tail.iter().map(|(key, version, codes)| (Location::Tail(*key), *version, &rows.codes[codes.clone()]));
         let packed = blocks.blocks.iter().map(|(key, version, codes)| (Location::Block(*key), *version, &blocks.codes[codes.clone()]));
-        for (source, version, codes) in tail.chain(packed) {
+        // Every block is screened before any is refined, so the codes of the members refining
+        // reaches are on their way from memory while the rest of the partition is screened.
+        let (mut screens, mut screened) = (std::mem::take(&mut query.screens), std::mem::take(&mut query.screened));
+        screens.clear();
+        screened.clear();
+        for (_, version, codes) in tail.clone().chain(packed.clone()) {
             let centre = query.centre(&self.model, partition, version)?;
             let _scoring = timer(&SCORE_NANOS);
-            score_block(query, codes, centre, source)?;
+            screen_block(query, codes, centre, &mut screens)?;
+            screened.push((centre, screens.len()));
         }
+        let _scoring = timer(&SCORE_NANOS);
+        let mut start = 0;
+        for ((source, _, codes), (centre, end)) in tail.chain(packed).zip(&screened) {
+            refine_block(query, codes, *centre, source, &screens[start..*end])?;
+            start = *end;
+        }
+        (query.screens, query.screened) = (screens, screened);
         Ok(())
     }
 
@@ -4668,49 +4693,81 @@ fn job_partition(job: Job) -> i64 {
     }
 }
 
+/// A group's screen: its members' fast-scan sums, gains and slacks, whether it was fast-scanned,
+/// and the members whose raised 1-bit estimates reached the bar it was screened against.
+struct Screen {
+    sums: [u32; GROUP],
+    gains: [f32; GROUP],
+    slacks: [f32; GROUP],
+    left: u32,
+    scanned: bool,
+}
+
 /// Estimate a block's entries from their 1-bit codes, each group in one fast-scan pass (a sparse
 /// group, a tail entry above all, summed exactly), and score from its 7-bit code, where the block
 /// lies, each entry whose estimate raised by its error bound reaches the bar of the `keep` best
 /// 7-bit estimates so far. A stale copy the partition's dead rows name is skipped before it can
 /// raise the bar.
 fn score_block(query: &mut Query, payload: &[u8], centre: f64, source: Location) -> Result<()> {
-    let dims = query.rotated.len();
+    let mut screens = std::mem::take(&mut query.screens);
+    screens.clear();
+    let scored = screen_block(query, payload, centre, &mut screens).and_then(|()| refine_block(query, payload, centre, source, &screens));
+    query.screens = screens;
+    scored
+}
+
+/// [`score_block`]'s first half: each group of the block screened against the bar as it stands,
+/// its screen pushed to `screens`, and the rowids and 7-bit codes of the members that reach the
+/// bar started on their way to the cache.
+fn screen_block(query: &Query, payload: &[u8], centre: f64, screens: &mut Vec<Screen>) -> Result<()> {
     let count = block_count(payload)?;
-    let layout = Layout::new(count, dims / 8);
+    let layout = Layout::new(count, query.rotated.len() / 8);
     if payload.len() != layout.len() {
         return Err(*error("block length differs from its count"));
     }
-    let screened = match source {
-        Location::Block(key) if !query.dead.is_empty() => Some(key),
-        _ => None,
-    };
-    let mut bound = Bound { centre, step: query.scan.step, base: query.scan.base, error: query.scan.error, sum: query.sum, spread: query.spread, bar: query.bar() };
-    let (mut sums, mut gains, mut slacks) = ([0u32; GROUP], [0f32; GROUP], [0f32; GROUP]);
+    let bound = query.bound(centre);
     for group in 0..layout.groups() {
         let first = group * GROUP;
-        let codes = &payload[layout.scan() + group * layout.group_bytes()..][..layout.group_bytes()];
         let members = GROUP.min(count - first);
         tally(&SCANNED, members);
         let scanned = members >= SCAN_MEMBERS;
+        let mut screen = Screen { sums: [0; GROUP], gains: [0.0; GROUP], slacks: [0.0; GROUP], left: u32::MAX >> (GROUP - members), scanned };
         for slot in 0..members {
-            gains[slot] = f32_at(payload, layout.gains() + 4 * (first + slot));
-            slacks[slot] = f32_at(payload, layout.slacks() + 4 * (first + slot));
+            screen.gains[slot] = f32_at(payload, layout.gains() + 4 * (first + slot));
+            screen.slacks[slot] = f32_at(payload, layout.slacks() + 4 * (first + slot));
         }
-        let present = u32::MAX >> (GROUP - members);
-        // A scanned group's members are tested together against the bar the group starts with;
-        // those that reach it are tested again against the bar as it rises.
-        let mut left = present;
+        // A scanned group's members are tested together against the bar as it stands; those that
+        // reach it are tested again against the bar as it stands when they are refined.
         if scanned {
-            scan_group(codes, &query.scan.bytes, &mut sums);
-            left &= reaching(&sums, &gains, &slacks, &bound);
+            scan_group(&payload[layout.scan() + group * layout.group_bytes()..][..layout.group_bytes()], &query.scan.bytes, &mut screen.sums);
+            screen.left &= reaching(&screen.sums, &screen.gains, &screen.slacks, &bound);
         }
-        let mut ahead = left;
+        let mut ahead = screen.left;
         while ahead != 0 {
             let n = first + ahead.trailing_zeros() as usize;
             ahead &= ahead - 1;
             prefetch(&payload[layout.rowids() + 8 * n..][..8]);
             prefetch(&payload[layout.extras() + n * layout.extra_bytes()..][..layout.extra_bytes()]);
         }
+        screens.push(screen);
+    }
+    Ok(())
+}
+
+/// [`score_block`]'s second half: each member the block's `screens` kept, tested again against the
+/// bar as it stands, and scored from its 7-bit code when it still reaches it.
+fn refine_block(query: &mut Query, payload: &[u8], centre: f64, source: Location, screens: &[Screen]) -> Result<()> {
+    let layout = Layout::new(block_count(payload)?, query.rotated.len() / 8);
+    let screened = match source {
+        Location::Block(key) if !query.dead.is_empty() => Some(key),
+        _ => None,
+    };
+    let mut bound = query.bound(centre);
+    for (group, screen) in screens.iter().enumerate() {
+        let first = group * GROUP;
+        let codes = &payload[layout.scan() + group * layout.group_bytes()..][..layout.group_bytes()];
+        let (sums, gains, slacks, scanned) = (&screen.sums, &screen.gains, &screen.slacks, screen.scanned);
+        let mut left = screen.left;
         let exact = |slot: usize| {
             #[cfg(test)]
             EXACT_SUMS.with(|count| count.set(count.get() + 1));
@@ -4817,6 +4874,8 @@ mod tests {
             dead: HashSet::new(),
             estimates: BinaryHeap::new(),
             results: BinaryHeap::new(),
+            screens: Vec::new(),
+            screened: Vec::new(),
         }
     }
 

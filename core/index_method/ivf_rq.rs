@@ -1131,6 +1131,7 @@ impl Model {
         Err(*error("an entry names a centroid version the index does not hold"))
     }
 
+    #[cfg(test)]
     fn nearest(&self, v: &[f32]) -> usize {
         self.nearest_of(&[v])[0]
     }
@@ -1254,8 +1255,13 @@ impl Model {
     }
 
     /// What ranks partition `p` for `q`, exactly, as [`Self::ranked`] gives it approximately.
+    #[cfg(test)]
     fn rank(&self, q: &[f32], p: usize, by_product: bool) -> f32 {
-        let product = dot32(&self.centroids[p], q);
+        self.rank_of(dot32(&self.centroids[p], q), p, by_product)
+    }
+
+    /// What ranks partition `p` for a query whose product with its centroid is `product`.
+    fn rank_of(&self, product: f32, p: usize, by_product: bool) -> f32 {
         if by_product {
             -product
         } else {
@@ -1266,8 +1272,9 @@ impl Model {
     /// The `take` partitions not retired that rank nearest `q`, nearest first, so a query's bar
     /// rises soonest: every partition is ranked over the int8 centroids, and the best quarter again
     /// as many as are taken, and thirty-two, again exactly, so the rounding, a few thousandths,
-    /// moves none across the cut.
-    fn probes(&self, q: &[f32], take: usize, by_product: bool) -> Vec<(f32, i64)> {
+    /// moves none across the cut. Each exact product is kept in `products`, when given, under the
+    /// partition and its centroid's version, as [`Query::centre`] takes it.
+    fn probes(&self, q: &[f32], take: usize, by_product: bool, mut products: Option<&mut FxHashMap<(i64, i64), f64>>) -> Vec<(f32, i64)> {
         let mut ranked = self.ranked(q, by_product);
         let order = |a: &(f32, i64), b: &(f32, i64)| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1));
         if take >= ranked.len() {
@@ -1278,7 +1285,12 @@ impl Model {
         ranked.select_nth_unstable_by(near - 1, order);
         ranked.truncate(near);
         for entry in &mut ranked {
-            entry.0 = self.rank(q, entry.1 as usize, by_product);
+            let p = entry.1 as usize;
+            let product = dot32(&self.centroids[p], q);
+            entry.0 = self.rank_of(product, p, by_product);
+            if let Some(products) = products.as_deref_mut() {
+                products.insert((entry.1, self.versions[p]), product as f64);
+            }
         }
         if take > 0 {
             ranked.select_nth_unstable_by(take - 1, order);
@@ -3484,7 +3496,7 @@ impl IvfRqCursor {
                 _ => nprobes.saturating_mul(widen).min(probeable),
             };
             probed_all = take == probeable;
-            let ranked = self.model.probes(&query.vector, take, PROBE_BY_PRODUCT.load(Ordering::Relaxed) != 0);
+            let ranked = self.model.probes(&query.vector, take, PROBE_BY_PRODUCT.load(Ordering::Relaxed) != 0, Some(&mut query.centres));
             // A retired partition holds no block, but under MVCC a writer coding against a
             // model older than its retirement can still have left a tail entry there, which
             // maintenance moves out; until it does, the query reads it. A WAL writer codes
@@ -5109,7 +5121,7 @@ mod tests {
             let mut exact: Vec<(f32, i64)> = (0..1000).filter(|i| model.states[*i] != State::Retired).map(|i| (model.rank(&q, i, false), i as i64)).collect();
             exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             for take in [1, 10, 64] {
-                let probes = model.probes(&q, take, false);
+                let probes = model.probes(&q, take, false, None);
                 assert!(probes.windows(2).all(|w| w[0].0 <= w[1].0), "take {take}: not nearest first");
                 let mut probed: Vec<i64> = probes.into_iter().map(|(_, p)| p).collect();
                 let mut nearest: Vec<i64> = exact[..take].iter().map(|(_, p)| *p).collect();

@@ -75,10 +75,14 @@
 //! rewrite of its blocks draws afresh), its dead rows (rowid -> the blocks holding a stale copy of
 //! the vector's code), its tail entries (rowid -> version, code) and its blocks (sequence ->
 //! version, codes). Vectors maps a rowid to the location of its code. Centroids holds
-//! `partition << 24 | version` -> centroid, and -1 -> a generation drawn afresh by each
-//! maintenance change to them, under which cursors share the loaded model. Redo holds
-//! `rowid << 22 | sequence` -> the writing transaction's MVCC begin timestamp. Only maintenance
-//! writes blocks, centroids and bookkeeping.
+//! `partition << 24 | version` -> centroid, and `-2 - partition` -> the partition's directory
+//! row: its current version, its state, and a tag drawn afresh by each change to either. Cursors
+//! share the model a partition at a time, each part under its tag, and a process's writers record
+//! which partitions' parts they change, so a cursor reads the directory rows of those alone, and of
+//! every partition where other processes write: splits of different partitions write no row in
+//! common, and each claims the slot it opens. Redo holds `rowid << 22 | sequence` -> the writing
+//! transaction's MVCC begin timestamp. Only maintenance writes blocks, centroids, directory rows
+//! and bookkeeping.
 use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -255,11 +259,9 @@ const STORES: [(&str, &[(&str, Type)]); 4] = [
     ("centroids", &[("value", Type::Blob)]),
     ("redo", &[("writer", Type::Integer)]),
 ];
-/// The centroids table's rowid for the generation.
-const GENERATION: i64 = -1;
-/// The key [`Writes`] records a write of the generation under, beside the partitions' keys: every
-/// split, retirement and rebuild writes it.
-const MODEL: i64 = -1;
+/// The centroids table's rowid under which the earlier format kept one generation for the whole
+/// model: an index that holds it is refused, with a hint to REINDEX it.
+const LEGACY_GENERATION: i64 = -1;
 /// The key [`Writes`] records a write of the redo rows under.
 const REDO_ROWS: i64 = -2;
 const PARTITION_BITS: u32 = 21;
@@ -369,6 +371,13 @@ fn centroid_key(partition: i64, version: i64) -> Result<i64> {
         return Err(*error("centroid version out of range"));
     }
     Ok(partition << VERSION_BITS | version)
+}
+
+/// A partition's directory row's key in the centroids table, below every centroid's and the
+/// earlier format's generation.
+fn directory_key(partition: i64) -> Result<i64> {
+    partition_in_range(partition)?;
+    Ok(-2 - partition)
 }
 
 /// Where a vector's code lives, as its row records it: a packed block's key, or a tail key negated
@@ -1116,7 +1125,8 @@ impl ScanTable {
 ///
 /// Each partition has a current centroid version; earlier versions are kept for entries coded
 /// against them. Partition 0 at version 0 with no stored centroid is the untrained origin. Only a
-/// live partition is assigned vectors.
+/// live partition is assigned vectors. A slot no split holds, as the one a rolled-back split
+/// opened, is retired, with a zero centroid and no tag.
 #[derive(Debug, Clone, Default)]
 struct Model {
     centroids: Vec<Vec<f32>>,
@@ -1126,8 +1136,11 @@ struct Model {
     versions: Vec<i64>,
     /// Superseded centroids, by partition and version.
     older: HashMap<(i64, i64), Vec<f32>>,
-    /// Each partition's state, from its bookkeeping.
+    /// Each partition's state, from its directory row.
     states: Vec<State>,
+    /// Each partition's tag, from its directory row: zero for one without, the untrained origin
+    /// and a slot no split holds.
+    tags: Vec<i64>,
     eta: f32,
     /// The current centroids again, in tiles: every change to `centroids` changes them.
     tiles: Tiles,
@@ -1138,15 +1151,20 @@ impl Model {
         let squares = centroids.iter().map(|c| dot32(c, c)).collect();
         let versions = vec![0; centroids.len()];
         let states = vec![State::Live; centroids.len()];
+        let tags = vec![0; centroids.len()];
         let mut tiles = Tiles::default();
         for (p, c) in centroids.iter().enumerate() {
             tiles.set(p, c);
         }
-        Self { centroids, squares, versions, older: HashMap::new(), states, eta, tiles }
+        Self { centroids, squares, versions, older: HashMap::new(), states, tags, eta, tiles }
     }
 
-    /// Set a partition's centroid at a version, keeping the one it supersedes.
+    /// Set a partition's centroid at a version, keeping the one it supersedes, if it had one. The
+    /// slots between the last partition and this one are left vacant.
     fn place(&mut self, partition: usize, version: i64, c: Vec<f32>) {
+        while self.centroids.len() < partition {
+            self.vacate(c.len());
+        }
         let square = dot32(&c, &c);
         self.tiles.set(partition, &c);
         if partition == self.centroids.len() {
@@ -1154,16 +1172,67 @@ impl Model {
             self.squares.push(square);
             self.versions.push(version);
             self.states.push(State::Live);
+            self.tags.push(0);
             return;
         }
         let previous = std::mem::replace(&mut self.centroids[partition], c);
-        self.older.insert((partition as i64, self.versions[partition]), previous);
+        if self.tags[partition] != 0 {
+            self.older.insert((partition as i64, self.versions[partition]), previous);
+        }
         self.squares[partition] = square;
         self.versions[partition] = version;
     }
 
+    /// Add a vacant slot past the last partition: retired, with a zero centroid and no tag.
+    fn vacate(&mut self, dims: usize) {
+        let zero = vec![0.0; dims];
+        self.tiles.set(self.centroids.len(), &zero);
+        self.centroids.push(zero);
+        self.squares.push(0.0);
+        self.versions.push(0);
+        self.states.push(State::Retired);
+        self.tags.push(0);
+    }
+
+    /// Set partition `p` as its directory row and its centroid rows hold it: the current centroid
+    /// at the row's version, the ones it superseded, its state and its tag. One with no directory
+    /// row is a vacant slot.
+    fn set(&mut self, p: usize, directory: Option<Directory>, centroids: Vec<(i64, Vec<f32>)>) -> Result<()> {
+        self.older.retain(|(q, _), _| *q != p as i64);
+        let Some(directory) = directory else {
+            if p < self.centroids.len() {
+                let zero = vec![0.0; self.centroids[p].len()];
+                self.tiles.set(p, &zero);
+                (self.centroids[p], self.squares[p], self.versions[p], self.states[p], self.tags[p]) = (zero, 0.0, 0, State::Retired, 0);
+            }
+            return Ok(());
+        };
+        let versions: Vec<i64> = centroids.iter().map(|(version, _)| *version).collect();
+        let mut current = None;
+        for (version, c) in centroids {
+            match version == directory.version {
+                true => current = Some(c),
+                false => {
+                    self.older.insert((p as i64, version), c);
+                }
+            }
+        }
+        let current = current.ok_or_else(|| LimboError::Corrupt(format!("ivf_rq: partition {p}'s directory row names centroid version {}, and it holds {versions:?}", directory.version)))?;
+        while self.centroids.len() <= p {
+            self.vacate(current.len());
+        }
+        self.squares[p] = dot32(&current, &current);
+        self.tiles.set(p, &current);
+        (self.centroids[p], self.versions[p], self.states[p], self.tags[p]) = (current, directory.version, directory.state, directory.tag);
+        Ok(())
+    }
+
     fn version(&self, partition: i64) -> i64 {
         self.versions.get(partition as usize).copied().unwrap_or(0)
+    }
+
+    fn tag(&self, partition: i64) -> i64 {
+        self.tags.get(partition as usize).copied().unwrap_or(0)
     }
 
     /// A partition's state. One the model holds no centroid for does not exist, retired as it were,
@@ -1489,6 +1558,42 @@ fn generation() -> i64 {
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
     hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     hasher.finish() as i64
+}
+
+/// What a partition's directory row says of it: its current centroid version, its state, and a tag
+/// drawn afresh by each change to either. Cursors share the model a partition at a time, each
+/// partition's part under the tag it was read with, so splits of different partitions write no row
+/// in common.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Directory {
+    version: i64,
+    state: State,
+    tag: i64,
+}
+
+impl Directory {
+    fn record(&self) -> Result<ImmutableRecord> {
+        let bytes: Vec<u8> = [self.version, self.state.code(), self.tag].iter().flat_map(|field| field.to_le_bytes()).collect();
+        record(&[blob(&bytes)?])
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 24 {
+            return Err(LimboError::Corrupt("ivf_rq: a directory row is not a version, a state and a tag".into()));
+        }
+        let field = |at: usize| i64::from_le_bytes(bytes[8 * at..8 * at + 8].try_into().expect("eight bytes"));
+        Ok(Directory { version: field(0), state: State::decode(field(1))?, tag: field(2) })
+    }
+
+    fn parse(found: &ImmutableRecord) -> Result<Self> {
+        Self::from_bytes(bytes_at(found, 0)?)
+    }
+}
+
+/// The write of a partition's directory row for `version` and `state`, and the fresh tag it draws.
+fn directory_step(partition: i64, version: i64, state: State) -> Result<(Step, i64)> {
+    let tag = generation();
+    Ok((put(CENTROIDS, directory_key(partition)?, Directory { version, state, tag }.record()?), tag))
 }
 
 fn centroid_record(c: &[f32]) -> Result<ImmutableRecord> {
@@ -2025,14 +2130,14 @@ fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
     BackingSchema::new(tables, Vec::new())
 }
 
-/// What the index's cursors share: the model last loaded or written, under its generation; the
-/// partitions known to be moving, which any writer's maintenance moves along; those a run left work
+/// What the index's cursors share: the model last read, with the snapshot it was read under where
+/// that names a position; the partitions known to be moving, which any writer's maintenance moves along; those a run left work
 /// due in, its jobs spent, which the next statements' maintenance surveys beside its own, and the
 /// one from which the next step of OPTIMIZE INDEX takes them; the held partitions and redo rows;
 /// and the index's [`Writes`], under its database's incarnation.
 #[derive(Default, Debug)]
 struct SharedState {
-    model: Option<(i64, Arc<Model>)>,
+    model: Option<(Option<Position>, Arc<Model>)>,
     moving: BTreeSet<i64>,
     due: BTreeSet<i64>,
     step_from: i64,
@@ -2276,6 +2381,11 @@ struct Writes {
     /// writes and with writes of the vectors it moves, which the engine refuses at the write, so a
     /// job leaves for later only a partition another job holds or wrote past its snapshot.
     jobs_changed: HashMap<i64, Position>,
+    /// The same, for the partitions whose part of the model jobs changed, their directory rows and
+    /// centroids, and the highest of them: a model held under one snapshot serves another but for
+    /// the partitions an open writer has changed or one changed past either.
+    models: HashMap<i64, Position>,
+    model_high: Position,
     /// A position at or past every commit the record did not see, standing for every partition not
     /// in `changed`: the highest one the index's last record knew, or the commit position when the
     /// record began, for the index's first.
@@ -2287,7 +2397,7 @@ impl Drop for Writes {
     /// commit it recorded, as the floor of the index's next record: no commit writes the index
     /// meanwhile, as every cursor that writes it holds a record.
     fn drop(&mut self) {
-        let high = self.changed.values().copied().fold(self.floor, Position::max);
+        let high = self.changed.values().chain(self.models.values()).copied().fold(self.floor, Position::max);
         if let Ok(mut floors) = FLOORS.lock() {
             floors.insert(std::mem::take(&mut self.key), high);
         }
@@ -2295,15 +2405,24 @@ impl Drop for Writes {
 }
 
 /// A transaction writing the index, entered under its connection: the partitions it wrote, those
-/// its maintenance jobs wrote, its statements writing the index now, and whether one of them staged
-/// its writes.
+/// its maintenance jobs wrote or claimed, those whose part of the model they changed, whether it
+/// drops the index's tables, changing every partition, its statements writing the index now, and
+/// whether one of them staged its writes.
 #[derive(Debug)]
 struct Writer {
     connection: std::sync::Weak<Connection>,
     partitions: HashSet<i64>,
     jobs: HashSet<i64>,
+    models: HashSet<i64>,
+    whole: bool,
     statements: usize,
     staged: bool,
+}
+
+impl Writer {
+    fn new(connection: std::sync::Weak<Connection>) -> Self {
+        Writer { connection, partitions: HashSet::new(), jobs: HashSet::new(), models: HashSet::new(), whole: false, statements: 0, staged: false }
+    }
 }
 
 impl Writes {
@@ -2315,8 +2434,18 @@ impl Writes {
         self.jobs_changed.get(&partition).copied().unwrap_or(self.floor)
     }
 
-    /// Raise the partitions an ended writer wrote, and those its jobs wrote, to `to`.
+    /// Raise the partitions an ended writer wrote, those its jobs wrote and those whose part of the
+    /// model they changed, to `to`.
     fn raise(&mut self, writer: Writer, to: Position) {
+        if writer.whole {
+            // Every partition changed at `to`: each record of one is past.
+            self.changed.clear();
+            self.jobs_changed.clear();
+            self.models.clear();
+            self.floor = self.floor.max(to);
+            self.model_high = self.model_high.max(self.floor);
+            return;
+        }
         for partition in writer.partitions {
             let changed = self.changed(partition).max(to);
             self.changed.insert(partition, changed);
@@ -2325,6 +2454,27 @@ impl Writes {
             let changed = self.job_changed(partition).max(to);
             self.jobs_changed.insert(partition, changed);
         }
+        for partition in writer.models {
+            let changed = self.models.get(&partition).copied().unwrap_or(self.floor).max(to);
+            self.models.insert(partition, changed);
+            self.model_high = self.model_high.max(changed);
+        }
+    }
+
+    /// The partitions whose part of a model read under `held` a snapshot at `snapshot` may see
+    /// otherwise: those an open writer has changed, and those changed past the earlier of the two.
+    /// None when the record began past it, so that every partition is in doubt.
+    fn doubt(&mut self, held: Position, snapshot: Position, now: impl FnOnce() -> Position) -> Option<Vec<i64>> {
+        self.settle(now);
+        let since = held.min(snapshot);
+        if self.floor > since || self.open.values().any(|writer| writer.whole) {
+            return None;
+        }
+        let mut doubt: BTreeSet<i64> = self.open.values().flat_map(|writer| writer.models.iter().copied()).collect();
+        if self.model_high > since {
+            doubt.extend(self.models.iter().filter(|(_, changed)| **changed > since).map(|(partition, _)| *partition));
+        }
+        Some(doubt.into_iter().collect())
     }
 
     /// Take off the writers whose connection is gone, their transaction ended unheard: their
@@ -2342,9 +2492,15 @@ impl Writes {
         }
     }
 
+    /// Whether a job of the writer `me` under `snapshot` may claim `partition`: no other writer's
+    /// job holds it, and no job committed a write to it past the snapshot.
+    fn free(&self, partition: i64, snapshot: Position, me: usize) -> bool {
+        self.job_changed(partition) <= snapshot && self.open.iter().all(|(key, writer)| *key == me || !writer.whole && !writer.jobs.contains(&partition))
+    }
+
     /// Whether an open writer has written `partition`.
     fn written(&self, partition: i64) -> bool {
-        self.open.values().any(|writer| writer.partitions.contains(&partition))
+        self.open.values().any(|writer| writer.whole || writer.partitions.contains(&partition))
     }
 
     /// Whether rows of `partition` held under `held` serve a probe under `snapshot`.
@@ -2412,12 +2568,22 @@ impl Sharing {
     }
 }
 
+/// A read of the model in progress: the one held in memory serves where this process's writers of
+/// the index leave none of its partitions in doubt; otherwise the directory rows of the partitions
+/// in doubt, or of every partition where the writers are not recorded here, are read, and those
+/// that differ from the held model's read afresh.
 enum Load {
-    /// Read the generation: a model cached under it is the stored model, so nothing else is read.
-    Generation(Get),
-    /// Read the centroids, then each partition's state.
-    Walk(Walk),
-    Parts { partition: usize, get: Get },
+    Check,
+    /// Read the directory rows of `doubt`, gathering the partitions whose rows differ from the
+    /// model's.
+    Doubt { doubt: Vec<i64>, at: usize, get: Get, changed: Vec<(i64, Option<Directory>)> },
+    /// Walk every directory row, gathering the same, and the partitions the model holds that the
+    /// directory no longer has.
+    Directory { walk: Walk, seen: HashSet<i64>, changed: Vec<(i64, Option<Directory>)> },
+    /// Look for the earlier format's generation, which an index with no directory row may hold.
+    Legacy { get: Get, changed: Vec<(i64, Option<Directory>)> },
+    /// Read each changed partition's centroid rows into the model.
+    Centroids { changed: Vec<(i64, Option<Directory>)>, at: usize, walk: Walk, rows: Vec<(i64, Vec<f32>)> },
 }
 
 /// A write of the index in progress. The rowid's redo rows are read first: with any, the write is
@@ -2694,7 +2860,7 @@ enum Settling {
 /// A rebuild: read every vector's rowid, train partitions afresh by k-means over a sample of the
 /// vectors, remove every block, tail entry and dead row, recode every vector into the trained
 /// partitions, writing each partition's blocks as they fill, and write the bookkeeping, the
-/// centroids and the generation. Centroid rows are never removed, so an entry a concurrent writer
+/// centroids and the directory rows. Centroid rows are never removed, so an entry a concurrent writer
 /// coded against an older model still scores; packs recode it.
 enum Rebuilding {
     Rowids { walk: Walk, rowids: Vec<i64> },
@@ -2706,8 +2872,8 @@ enum Rebuilding {
     /// Read the vectors from `at` on a batch at a time, code each batch over the cores, and write
     /// each partition's blocks as they fill.
     Code { rowids: Vec<i64>, model: Box<Model>, at: usize, get: Get, stream: Stream, batch: Vec<Vec<f32>> },
-    /// Every write is made: the model under its new generation is the index's.
-    Done { model: Box<Model>, generation: i64 },
+    /// Every write is made: the model is the index's.
+    Done { model: Box<Model> },
 }
 
 /// A rebuild's first phase over `rowids`, every vector of the index: reading the vectors of every
@@ -3030,16 +3196,19 @@ pub struct IvfRqCursor {
     /// record, so its own maintenance, whose settle of them could only meet what they met, passes
     /// over them; zero under WAL, where its own maintenance settles them.
     writer: i64,
-    /// The model and generation before a job that changes them, until the job is written.
-    saved: Option<(Arc<Model>, Option<i64>)>,
+    /// The model before a job that changes it, until the job is written.
+    saved: Option<Arc<Model>>,
     /// The partitions the job being planned changes, to survey again once it is written.
     dirty: Vec<i64>,
-    generation: Option<i64>,
+    /// The slot the split chosen opens, claimed with its other rows.
+    opening: std::cell::Cell<Option<i64>>,
     /// How this statement's queries use and hold partitions' rows across snapshots, none where they
     /// don't; the partitions its writes entered in [`Writes`] for its transaction; and whether its
     /// statement is entered there as writing the index.
     sharing: Option<Sharing>,
     recorded: HashSet<(i64, bool)>,
+    /// The partitions whose part of the model this statement's writes entered as changed.
+    recorded_models: HashSet<i64>,
     writing: bool,
     /// The maintenance jobs this cursor has done.
     jobs: usize,
@@ -3070,7 +3239,7 @@ impl IvfRqCursor {
             shared,
             rotation: None,
             loaded: false,
-            load: Load::Generation(Get::Seek),
+            load: Load::Check,
             change: Change::Idle,
             search: Search::Init,
             query: None,
@@ -3086,9 +3255,10 @@ impl IvfRqCursor {
             writer: 0,
             saved: None,
             dirty: Vec::new(),
-            generation: None,
+            opening: std::cell::Cell::new(None),
             sharing: None,
             recorded: HashSet::new(),
+            recorded_models: HashSet::new(),
             writing: false,
             jobs: 0,
             settling: Vec::new(),
@@ -3153,9 +3323,24 @@ impl IvfRqCursor {
         (dims as f32 - 1.0) * t * t / (1.0 - t * t)
     }
 
+    /// Hold the model for the index's other cursors, as read under this cursor's snapshot: one read
+    /// under a later snapshot replaces one read under an earlier. A WAL writer's model is not held,
+    /// as rows it reads are not: its snapshot counts the frames it has written, which a rollback
+    /// hands to later commits. Where writers are not recorded, the model is held with no snapshot,
+    /// and every cursor checks it against the whole directory.
     fn publish(&self) {
-        if let Some(g) = self.generation {
-            self.shared.lock().expect("index state").model = Some((g, self.model.clone()));
+        let at = match &self.sharing {
+            Some(sharing) if sharing.holds => sharing.snapshot,
+            Some(_) => return,
+            None => None,
+        };
+        let mut shared = self.shared.lock().expect("index state");
+        let later = match (&shared.model, at) {
+            (Some((Some(held), _)), Some(at)) => at >= *held,
+            _ => true,
+        };
+        if later {
+            shared.model = Some((at, self.model.clone()));
         }
     }
 
@@ -3164,79 +3349,116 @@ impl IvfRqCursor {
         split_bound(self.model.live())
     }
 
-    /// Read the centroids into the model, unless the model cached under the stored generation is
-    /// the one this snapshot holds.
+    /// Read the model as this cursor's snapshot holds it ([`Load`]).
     fn load(&mut self) -> IOResultOr<()> {
         if self.loaded {
             return Ok(IOResult::Done(()));
         }
         loop {
-            let meta = &mut self.stores[CENTROIDS];
-            match self.load {
-                Load::Generation(mut get) => {
-                    let found = match get_row(meta, GENERATION, &mut get)? {
-                        IOResult::Done(found) => found,
-                        IOResult::IO(io) => {
-                            self.load = Load::Generation(get);
-                            return Ok(IOResult::IO(io));
-                        }
-                    };
-                    let stored = found.as_ref().map(|r| integer(r, 0)).transpose()?;
-                    let cached = self.shared.lock().expect("index state").model.as_ref().filter(|(g, _)| Some(*g) == stored).map(|(_, m)| m.clone());
-                    if let Some(model) = cached {
-                        self.load = Load::Generation(Get::Seek);
-                        self.model = model;
-                        self.generation = stored;
-                        self.loaded = true;
-                        return Ok(IOResult::Done(()));
-                    }
-                    self.model = Arc::new(Model::default());
-                    self.generation = stored;
-                    self.load = Load::Walk(Walk::Seek);
-                }
-                Load::Walk(mut walk) => {
-                    let row = match walk_row(meta, 0, i64::MAX, &mut walk)? {
-                        IOResult::Done(row) => row,
-                        IOResult::IO(io) => {
-                            self.load = Load::Walk(walk);
-                            return Ok(IOResult::IO(io));
-                        }
-                    };
-                    self.load = Load::Walk(walk);
-                    let Some((key, found)) = row else {
-                        self.load = Load::Parts { partition: 0, get: Get::Seek };
+            match std::mem::replace(&mut self.load, Load::Check) {
+                Load::Check => {
+                    let held = self.shared.lock().expect("index state").model.clone();
+                    let Some((at, model)) = held else {
+                        self.model = Arc::new(Model::default());
+                        self.load = Load::Directory { walk: Walk::Seek, seen: HashSet::new(), changed: Vec::new() };
                         continue;
                     };
-                    let (partition, version) = (key >> VERSION_BITS, key & ((1 << VERSION_BITS) - 1));
-                    let centroid = dense(Some(bytes_at(&found, 0)?))?;
-                    let model = Arc::make_mut(&mut self.model);
-                    if partition as usize > model.centroids.len() {
-                        return Err(LimboError::Corrupt("ivf_rq: centroid partitions are not dense".into()).into());
-                    }
-                    model.place(partition as usize, version, centroid);
+                    self.model = model;
+                    let shared = self.sharing.as_ref().and_then(|sharing| sharing.snapshot.map(|snapshot| (sharing, snapshot)));
+                    let doubt = match (at, shared) {
+                        (Some(at), Some((sharing, snapshot))) => sharing.writes.lock().expect("index writes").doubt(at, snapshot, || sharing.clock.now()),
+                        _ => None,
+                    };
+                    self.load = match doubt {
+                        Some(doubt) if doubt.is_empty() => {
+                            self.loaded = true;
+                            return Ok(IOResult::Done(()));
+                        }
+                        Some(doubt) => Load::Doubt { doubt, at: 0, get: Get::Seek, changed: Vec::new() },
+                        None => Load::Directory { walk: Walk::Seek, seen: HashSet::new(), changed: Vec::new() },
+                    };
                 }
-                Load::Parts { partition, mut get } => {
-                    if partition >= self.model.centroids.len() {
-                        self.load = Load::Generation(Get::Seek);
-                        self.loaded = true;
+                Load::Doubt { doubt, at, mut get, mut changed } => {
+                    let Some(&partition) = doubt.get(at) else {
+                        self.load = Load::Centroids { changed, at: 0, walk: Walk::Seek, rows: Vec::new() };
+                        continue;
+                    };
+                    let found = match get_row(&mut self.stores[CENTROIDS], directory_key(partition)?, &mut get)? {
+                        IOResult::Done(found) => found,
+                        IOResult::IO(io) => {
+                            self.load = Load::Doubt { doubt, at, get, changed };
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    let directory = found.as_ref().map(Directory::parse).transpose()?;
+                    if directory.map_or(0, |d| d.tag) != self.model.tag(partition) {
+                        changed.push((partition, directory));
+                    }
+                    self.load = Load::Doubt { doubt, at: at + 1, get: Get::Seek, changed };
+                }
+                Load::Directory { mut walk, mut seen, mut changed } => {
+                    let row = match walk_row(&mut self.stores[CENTROIDS], i64::MIN, LEGACY_GENERATION, &mut walk)? {
+                        IOResult::Done(row) => row,
+                        IOResult::IO(io) => {
+                            self.load = Load::Directory { walk, seen, changed };
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    let Some((key, found)) = row else {
+                        changed.extend((0..self.model.tags.len() as i64).filter(|p| self.model.tag(*p) != 0 && !seen.contains(p)).map(|p| (p, None)));
+                        self.load = match seen.is_empty() {
+                            true => Load::Legacy { get: Get::Seek, changed },
+                            false => Load::Centroids { changed, at: 0, walk: Walk::Seek, rows: Vec::new() },
+                        };
+                        continue;
+                    };
+                    let (partition, directory) = (-2 - key, Directory::parse(&found)?);
+                    seen.insert(partition);
+                    if directory.tag != self.model.tag(partition) {
+                        changed.push((partition, Some(directory)));
+                    }
+                    self.load = Load::Directory { walk, seen, changed };
+                }
+                Load::Legacy { mut get, changed } => {
+                    let found = match get_row(&mut self.stores[CENTROIDS], LEGACY_GENERATION, &mut get)? {
+                        IOResult::Done(found) => found,
+                        IOResult::IO(io) => {
+                            self.load = Load::Legacy { get, changed };
+                            return Ok(IOResult::IO(io));
+                        }
+                    };
+                    if found.is_some() {
+                        let name = &self.configuration.index_name;
+                        return Err(LimboError::InvalidArgument(format!("ivf_rq index {name} was built in an earlier format of its model; rebuild it with `REINDEX {name}`")).into());
+                    }
+                    self.load = Load::Centroids { changed, at: 0, walk: Walk::Seek, rows: Vec::new() };
+                }
+                Load::Centroids { changed, at, mut walk, mut rows } => {
+                    let Some(&(partition, directory)) = changed.get(at) else {
                         if let Some(dims) = self.model.centroids.first().map(Vec::len) {
                             let eta = self.eta(dims);
                             Arc::make_mut(&mut self.model).eta = eta;
                         }
+                        self.loaded = true;
                         self.publish();
                         return Ok(IOResult::Done(()));
-                    }
-                    let found = match get_row(&mut self.stores[PARTITIONS], part_key(partition as i64)?, &mut get)? {
-                        IOResult::Done(found) => found,
-                        IOResult::IO(io) => {
-                            self.load = Load::Parts { partition, get };
-                            return Ok(IOResult::IO(io));
-                        }
                     };
-                    if let Some(found) = found {
-                        Arc::make_mut(&mut self.model).states[partition] = Part::parse(&found)?.state;
+                    if directory.is_some() {
+                        let row = match walk_row(&mut self.stores[CENTROIDS], centroid_key(partition, 0)?, (partition + 1) << VERSION_BITS, &mut walk)? {
+                            IOResult::Done(row) => row,
+                            IOResult::IO(io) => {
+                                self.load = Load::Centroids { changed, at, walk, rows };
+                                return Ok(IOResult::IO(io));
+                            }
+                        };
+                        if let Some((key, found)) = row {
+                            rows.push((key & ((1 << VERSION_BITS) - 1), dense(Some(bytes_at(&found, 0)?))?));
+                            self.load = Load::Centroids { changed, at, walk, rows };
+                            continue;
+                        }
                     }
-                    self.load = Load::Parts { partition: partition + 1, get: Get::Seek };
+                    Arc::make_mut(&mut self.model).set(partition as usize, directory, std::mem::take(&mut rows))?;
+                    self.load = Load::Centroids { changed, at: at + 1, walk: Walk::Seek, rows };
                 }
             }
         }
@@ -3359,6 +3581,7 @@ impl IvfRqCursor {
     fn share(&mut self, context: &IndexMethodContext) -> Result<()> {
         self.sharing = None;
         self.recorded.clear();
+        self.recorded_models.clear();
         self.writing = false;
         if context.database().id != crate::MAIN_DB_ID {
             return Ok(());
@@ -3399,7 +3622,7 @@ impl IvfRqCursor {
             Some(writes) => writes,
             None => {
                 let floor = FLOORS.lock().expect("index floors").remove(&key).unwrap_or_else(|| clock.now());
-                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), floor }));
+                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), models: HashMap::new(), model_high: floor, floor }));
                 registry.insert(key, std::sync::Arc::downgrade(&writes));
                 writes
             }
@@ -3409,33 +3632,64 @@ impl IvfRqCursor {
     }
 
     /// Enter, before a step on the partitions table reaches a page, that this cursor's transaction
-    /// writes the partition the step changes, and whether a maintenance job does.
+    /// writes the partition the step changes, and whether a maintenance job does; before one on
+    /// the centroids table does, that it changes the partition's part of the model.
     fn record(&mut self, step: &Step, job: bool) {
         let (Step::Put { store, rowid, .. } | Step::Remove { store, rowid, .. }) = step;
-        let partition = match *store {
-            PARTITIONS => partition_of(*rowid),
-            CENTROIDS if *rowid == GENERATION => MODEL,
-            REDO => REDO_ROWS,
+        let (partition, model) = match *store {
+            PARTITIONS => (partition_of(*rowid), false),
+            CENTROIDS if *rowid < LEGACY_GENERATION => (-2 - *rowid, true),
+            CENTROIDS => (*rowid >> VERSION_BITS, true),
+            REDO => (REDO_ROWS, false),
             _ => return,
         };
-        if self.recorded.contains(&(partition, job)) {
+        let recorded = match model {
+            true => self.recorded_models.contains(&partition),
+            false => self.recorded.contains(&(partition, job)),
+        };
+        if recorded {
             return;
         }
         let Some(sharing) = &self.sharing else {
             return;
         };
         let mut writes = sharing.writes.lock().expect("index writes");
-        let writer = writes.open.entry(sharing.key()).or_insert_with(|| Writer { connection: sharing.connection.clone(), partitions: HashSet::new(), jobs: HashSet::new(), statements: 0, staged: false });
+        let writer = writes.open.entry(sharing.key()).or_insert_with(|| Writer::new(sharing.connection.clone()));
         if !self.writing {
             writer.statements += 1;
             self.writing = true;
         }
-        writer.partitions.insert(partition);
-        if job {
-            writer.jobs.insert(partition);
+        match model {
+            true => {
+                writer.models.insert(partition);
+            }
+            false => {
+                writer.partitions.insert(partition);
+                if job {
+                    writer.jobs.insert(partition);
+                }
+            }
         }
         drop(writes);
-        self.recorded.insert((partition, job));
+        match model {
+            true => self.recorded_models.insert(partition),
+            false => self.recorded.insert((partition, job)),
+        };
+    }
+
+    /// Enter, before the index's tables are dropped, that this cursor's transaction changes every
+    /// partition of it.
+    fn record_whole(&mut self) {
+        let Some(sharing) = &self.sharing else {
+            return;
+        };
+        let mut writes = sharing.writes.lock().expect("index writes");
+        let writer = writes.open.entry(sharing.key()).or_insert_with(|| Writer::new(sharing.connection.clone()));
+        if !self.writing {
+            writer.statements += 1;
+            self.writing = true;
+        }
+        writer.whole = true;
     }
 
     /// This cursor's statement staged its writes, or undid them: it no longer writes the index. A
@@ -3443,6 +3697,7 @@ impl IvfRqCursor {
     /// nothing to commit there, and comes off the open writers.
     fn finish_statement(&mut self, staged: bool) {
         self.recorded.clear();
+        self.recorded_models.clear();
         if !std::mem::take(&mut self.writing) {
             return;
         }
@@ -3466,6 +3721,7 @@ impl IvfRqCursor {
     /// dropped.
     fn end_transaction(&mut self) {
         self.recorded.clear();
+        self.recorded_models.clear();
         self.writing = false;
         let Some(sharing) = &self.sharing else {
             return;
@@ -3553,6 +3809,11 @@ impl IndexMethodCursor for IvfRqCursor {
 
     fn destroy(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         if self.pending.is_empty() {
+            // Nothing read of the tables outlives them: past this transaction, which drops them or
+            // makes them again, every cursor reads the index afresh.
+            self.share(context)?;
+            self.record_whole();
+            self.shared.lock().expect("index state").model = None;
             self.pending.push_back(context.drop_backing_schema(&self.schema)?);
         }
         self.drive_pending()
@@ -4222,17 +4483,16 @@ impl IvfRqCursor {
         self.run = None;
         self.upkeep = Upkeep::Idle;
         self.dirty.clear();
-        if let Some((model, generation)) = self.saved.take() {
+        if let Some(model) = self.saved.take() {
             self.model = model;
-            self.generation = generation;
         }
         self.loaded = false;
     }
 
-    /// Keep the model and generation a job is about to change, to restore if the job is reverted.
+    /// Keep the model a job is about to change, to restore if the job is reverted.
     fn save_model(&mut self) {
         if self.saved.is_none() {
-            self.saved = Some((self.model.clone(), self.generation));
+            self.saved = Some(self.model.clone());
         }
     }
 
@@ -4848,17 +5108,22 @@ impl IvfRqCursor {
                                 continue;
                             }
                             stream.finish(&model, &mut steps)?;
-                            for p in (0..model.centroids.len()).filter(|p| model.states[*p] == State::Live) {
-                                steps.push_back(put(CENTROIDS, centroid_key(p as i64, model.versions[p])?, centroid_record(&model.centroids[p])?));
+                            let mut model = model;
+                            // Every partition the rebuild trains and every slot it retires gets its
+                            // directory row; a vacant slot keeps none.
+                            let directed: Vec<usize> = (0..model.centroids.len()).filter(|p| model.states[*p] == State::Live || model.tags[*p] != 0).collect();
+                            for p in directed {
+                                if model.states[p] == State::Live {
+                                    steps.push_back(put(CENTROIDS, centroid_key(p as i64, model.versions[p])?, centroid_record(&model.centroids[p])?));
+                                }
+                                let (entry, tag) = directory_step(p as i64, model.versions[p], model.states[p])?;
+                                steps.push_back(entry);
+                                model.tags[p] = tag;
                             }
-                            let next = generation();
-                            steps.push_back(put(CENTROIDS, GENERATION, record(&[Value::from_i64(next)])?));
-                            self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Done { model, generation: next }, steps };
+                            self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Done { model }, steps };
                         }
-                        Rebuilding::Done { model, generation } => {
+                        Rebuilding::Done { model } => {
                             self.model = Arc::new(*model);
-                            self.generation = Some(generation);
-                            self.publish();
                             let mut shared = self.shared.lock().expect("index state");
                             shared.moving.clear();
                             shared.due.clear();
@@ -4936,7 +5201,8 @@ impl IvfRqCursor {
     /// The model a rebuild trains for `vectors` vectors: k-means over `sample` for the partitions
     /// [`trained_partitions`] gives them, balanced, each at a version past any it had, partition 0
     /// past the untrained origin's. Every centroid the model held stays readable for entries coded
-    /// against it, and slots past the trained ones are retired.
+    /// against it, and slots past the trained ones are retired, keeping their tags until the
+    /// rebuild writes their directory rows: a vacant slot has none to write.
     fn rebuilt(&self, sample: &[Vec<f32>], vectors: usize) -> Model {
         let old = &self.model;
         let eta = sample.first().map_or(0.0, |v| self.eta(v.len()));
@@ -4947,15 +5213,16 @@ impl IvfRqCursor {
             model.older.insert((p as i64, old.versions[p]), c.clone());
         }
         for p in 0..trained.max(old.centroids.len()) {
-            let (centroid, version, state) = match centroids.get(p) {
-                Some(c) => (c.clone(), if p < old.centroids.len() || p == 0 { old.version(p as i64) + 1 } else { 0 }, State::Live),
-                None => (old.centroids[p].clone(), old.versions[p], State::Retired),
+            let (centroid, version, state, tag) = match centroids.get(p) {
+                Some(c) => (c.clone(), if p < old.centroids.len() || p == 0 { old.version(p as i64) + 1 } else { 0 }, State::Live, 0),
+                None => (old.centroids[p].clone(), old.versions[p], State::Retired, old.tags[p]),
             };
             model.squares.push(dot32(&centroid, &centroid));
             model.tiles.set(p, &centroid);
             model.centroids.push(centroid);
             model.versions.push(version);
             model.states.push(state);
+            model.tags.push(tag);
         }
         model
     }
@@ -5051,58 +5318,78 @@ impl IvfRqCursor {
     /// [`COMPACT_AT`], the retirement of a partition too small to keep, a split of the largest
     /// partition past the bound.
     fn choose(&self, survey: &Survey) -> Option<Job> {
-        if self.rebuild_due(survey) && self.claimable(&self.claims(Job::Rebuild)) {
+        if self.rebuild_due(survey) && self.claim(Job::Rebuild) {
             return Some(Job::Rebuild);
         }
         let settled = self.settled(survey);
-        if !self.concurrent {
-            return self.choose_among(survey, &survey.read, settled);
-        }
         // Under MVCC a job another transaction's write would beat at commit is left for later.
         let mut read = survey.read.clone();
         loop {
             let job = self.choose_among(survey, &read, settled)?;
-            if self.claimable(&self.claims(job)) {
+            if self.claim(job) {
                 return Some(job);
             }
             read.remove(&job_partition(job));
         }
     }
 
-    /// The rows a job writes that another transaction's maintenance may write too, by the key
-    /// [`Writes`] records them under: its partition's; for a split also the partition it opens,
-    /// the neighbours it marks moving and the generation; for a retirement the generation; and for
-    /// a rebuild every partition and the generation.
+    /// The partitions whose rows a job writes that another transaction's maintenance may write
+    /// too, by the key [`Writes`] records them under: its partition's; for a split also the
+    /// neighbours it marks moving, beside the slot it opens; and for a rebuild every partition.
     fn claims(&self, job: Job) -> Vec<i64> {
-        let count = self.model.centroids.len() as i64;
         match job {
-            Job::Split(p) => {
-                let opened = (0..count).find(|q| self.model.states[*q as usize] == State::Retired).unwrap_or_else(|| count.max(1));
-                [p, opened, MODEL].into_iter().chain(self.neighbours(p)).collect()
-            }
-            Job::Retire(p) => vec![p, MODEL],
-            Job::Rebuild => (0..count.max(1)).chain([MODEL]).collect(),
+            Job::Split(p) => [p].into_iter().chain(self.neighbours(p)).collect(),
+            Job::Rebuild => (0..(self.model.centroids.len() as i64).max(1)).collect(),
             job => vec![job_partition(job)],
         }
     }
 
-    /// Whether a job may write the rows of `claims`: under MVCC, no other transaction's job holds
-    /// one, and no job committed a write to one that this cursor's snapshot does not see, where this
-    /// job's first write would meet it. Writes of the table's rows are no bar: they write fresh
-    /// rows, and the rows of a vector a job moves, which the engine refuses at the write, so the job
-    /// is undone and the writer's change left to maintenance. The record is this process's; under
-    /// WAL the one writer holds every row.
-    fn claimable(&self, claims: &[i64]) -> bool {
-        let Some(sharing) = self.sharing.as_ref().filter(|_| self.concurrent) else {
-            return true;
-        };
-        let Some(snapshot) = sharing.snapshot else {
+    /// Whether a job may write the rows of its claims, claiming them if so: under MVCC, no other
+    /// transaction's job holds one, and no job committed a write to one that this cursor's
+    /// snapshot does not see, where this job's first write would meet it. The check and the claim
+    /// are made under one lock, so no two transactions' jobs both find a partition free. A split
+    /// also claims the slot it opens: the first retired or vacant slot, or past the last partition,
+    /// that is free as its other rows are, so concurrent splits open different slots. Writes of
+    /// the table's rows are no bar: they write fresh rows, and the rows of a vector a job moves,
+    /// which the engine refuses at the write, so the job is undone and the writer's change left to
+    /// maintenance. The record is this process's; under WAL the one writer holds every row.
+    fn claim(&self, job: Job) -> bool {
+        let claims = self.claims(job);
+        let count = self.model.centroids.len() as i64;
+        let mut slots = (0..count).filter(|q| self.model.state(*q) == State::Retired).chain(count.max(1)..1 << PARTITION_BITS);
+        let shared = self.sharing.as_ref().filter(|_| self.concurrent).and_then(|sharing| sharing.snapshot.map(|snapshot| (sharing, snapshot)));
+        let Some((sharing, snapshot)) = shared else {
+            if let Job::Split(_) = job {
+                self.opening.set(slots.next());
+            }
             return true;
         };
         let me = sharing.key();
         let mut writes = sharing.writes.lock().expect("index writes");
         writes.settle(|| sharing.clock.now());
-        claims.iter().all(|p| writes.job_changed(*p) <= snapshot && writes.open.iter().all(|(key, writer)| *key == me || !writer.jobs.contains(p)))
+        if !claims.iter().all(|p| writes.free(*p, snapshot, me)) {
+            return false;
+        }
+        let mut claimed = claims;
+        if let Job::Split(_) = job {
+            let Some(slot) = slots.find(|q| writes.free(*q, snapshot, me)) else {
+                return false;
+            };
+            self.opening.set(Some(slot));
+            claimed.push(slot);
+        }
+        writes.open.entry(me).or_insert_with(|| Writer::new(sharing.connection.clone())).jobs.extend(claimed);
+        true
+    }
+
+    /// Whether a job of this cursor could claim the partitions `claims` now, claiming nothing.
+    fn claimable(&self, claims: &[i64]) -> bool {
+        let Some((sharing, snapshot)) = self.sharing.as_ref().filter(|_| self.concurrent).and_then(|sharing| sharing.snapshot.map(|snapshot| (sharing, snapshot))) else {
+            return true;
+        };
+        let mut writes = sharing.writes.lock().expect("index writes");
+        writes.settle(|| sharing.clock.now());
+        claims.iter().all(|p| writes.free(*p, snapshot, sharing.key()))
     }
 
     /// Whether no partition is moving: none the survey read, and none a run has found moving.
@@ -5198,11 +5485,11 @@ impl IvfRqCursor {
     }
 
     /// The first half of a split: 2-means over a sample of the partition's members gives it a new
-    /// centroid version and opens a partition in the first retired slot, or past the last. Only
-    /// centroids and bookkeeping are written: the partition and its nearest live neighbours are
-    /// marked moving, and moves recode their entries block by block. A split whose smaller half
+    /// centroid version and opens a partition in the slot its claim took. Only centroids,
+    /// directory rows and bookkeeping are written: the partition and its nearest live neighbours
+    /// are marked moving, and moves recode their entries block by block. A split whose smaller half
     /// would take under a sixteenth of the sample is not made; the partition is tried again once
-    /// it has doubled. The generation is written first: it claims the model.
+    /// it has doubled. The partition's bookkeeping is written first: it claims the partition.
     fn plan_split(&mut self, partition: i64, mut part: Part, sorted: Sorted, vectors: &[Vec<f32>]) -> Result<VecDeque<Step>> {
         let started = std::time::Instant::now();
         let eta = vectors.first().map_or(0.0, |v| self.eta(v.len()));
@@ -5213,22 +5500,27 @@ impl IvfRqCursor {
         self.save_model();
         // The untrained origin is partition 0's version 0, so its first centroid is version 1.
         let version = self.model.version(partition) + 1;
-        let reused = (0..self.model.centroids.len()).find(|p| self.model.states[*p] == State::Retired);
-        let opened = reused.unwrap_or_else(|| self.model.centroids.len().max(1)) as i64;
-        let opened_version = reused.map_or(0, |p| self.model.versions[p] + 1);
-        let next = generation();
+        let opened = self.opening.take().ok_or_else(|| error("a split chosen without the slot it opens"))?;
+        // A retired slot's next centroid is past its last; a slot no split has held starts at 0.
+        let opened_version = match self.model.tag(opened) {
+            0 => 0,
+            _ => self.model.version(opened) + 1,
+        };
         part.move_next = 0;
         part.move_end = part.next;
         part.open = 0;
         part.retry = 0;
+        let (kept_row, kept_tag) = directory_step(partition, version, State::Live)?;
+        let (opened_row, opened_tag) = directory_step(opened, opened_version, State::Live)?;
         let mut steps = VecDeque::from([
-            put(CENTROIDS, GENERATION, record(&[Value::from_i64(next)])?),
-            put(CENTROIDS, centroid_key(partition, version)?, centroid_record(&kept)?),
-            put(CENTROIDS, centroid_key(opened, opened_version)?, centroid_record(&split)?),
             part_step(partition, part)?,
+            kept_row,
+            put(CENTROIDS, centroid_key(partition, version)?, centroid_record(&kept)?),
+            // A retired slot holds no block: its retirement moved every entry out and removed them.
+            part_step(opened, Part::default())?,
+            opened_row,
+            put(CENTROIDS, centroid_key(opened, opened_version)?, centroid_record(&split)?),
         ]);
-        // A retired slot holds no block: its retirement moved every entry out and removed them.
-        steps.push_back(part_step(opened, Part::default())?);
         for (neighbour, mut near) in sorted.neighbours {
             if neighbour == opened {
                 continue;
@@ -5243,8 +5535,8 @@ impl IvfRqCursor {
         model.place(partition as usize, version, kept);
         model.place(opened as usize, opened_version, split);
         model.states[opened as usize] = State::Live;
-        self.generation = Some(next);
-        self.publish();
+        model.tags[partition as usize] = kept_tag;
+        model.tags[opened as usize] = opened_tag;
         self.dirty.push(opened);
         let micros = started.elapsed().as_micros() as usize;
         SPLITS.fetch_add(1, Ordering::Relaxed);
@@ -5339,8 +5631,8 @@ impl IvfRqCursor {
     /// Start retiring a live partition: no entry is coded into it any longer, and its blocks are
     /// marked moving, so moves recode its entries into the live partitions nearest them while
     /// queries still probe it. A retiring partition whose moves are done is retired: emptied, never
-    /// probed, its slot free for the next split. The generation is written first: it claims the
-    /// model, which every cursor reloads to learn the partition's state.
+    /// probed, its slot free for the next split. Its bookkeeping is written first, claiming it,
+    /// then its directory row, from which every cursor learns its state.
     fn plan_retire(&mut self, partition: i64, mut part: Part) -> Result<VecDeque<Step>> {
         self.save_model();
         let state = match part.state {
@@ -5356,12 +5648,12 @@ impl IvfRqCursor {
             }
         };
         part.state = state;
-        let next = generation();
-        *Arc::make_mut(&mut self.model).states.get_mut(partition as usize).ok_or_else(|| error("a retirement names a partition the model does not hold"))? = state;
-        self.generation = Some(next);
-        self.publish();
+        let model = Arc::make_mut(&mut self.model);
+        *model.states.get_mut(partition as usize).ok_or_else(|| error("a retirement names a partition the model does not hold"))? = state;
+        let (directory_row, tag) = directory_step(partition, model.version(partition), state)?;
+        model.tags[partition as usize] = tag;
         RETIRES.fetch_add(1, Ordering::Relaxed);
-        Ok(VecDeque::from([put(CENTROIDS, GENERATION, record(&[Value::from_i64(next)])?), part_step(partition, part)?]))
+        Ok(VecDeque::from([part_step(partition, part)?, directory_row]))
     }
 }
 
@@ -5640,6 +5932,8 @@ struct Checker<'c> {
     /// The rows with redo rows.
     pending: HashSet<i64>,
     centroids: HashMap<(i64, i64), Vec<f32>>,
+    /// Each partition's directory row, taken off as its rows are checked.
+    directory: HashMap<i64, Directory>,
     rotation: Option<Rotation>,
     vector: crate::Statement,
 }
@@ -5679,7 +5973,7 @@ impl<'c> Checker<'c> {
         }
         let column = column.ok_or_else(|| error("index has no column"))?;
         let vector = connection.prepare(format!("SELECT {} FROM {} WHERE rowid = ?1", quoted_name(&column), quoted_name(&table)))?;
-        Ok(Self { connection, table, column, index: index.to_string(), check: Check::default(), indexed: HashMap::new(), pending: HashSet::new(), centroids: HashMap::new(), rotation: None, vector })
+        Ok(Self { connection, table, column, index: index.to_string(), check: Check::default(), indexed: HashMap::new(), pending: HashSet::new(), centroids: HashMap::new(), directory: HashMap::new(), rotation: None, vector })
     }
 
     fn store(&self, suffix: &str) -> String {
@@ -5733,16 +6027,28 @@ impl<'c> Checker<'c> {
             self.check.find(format!("the index holds row {rowid}, which the table does not"));
         }
         let mut centroids = HashMap::new();
+        let mut directory = HashMap::new();
+        let mut legacy = false;
         each_row(connection, &format!("SELECT rowid, value FROM {}", self.store("centroids")), |row| {
             let key = integer_value(&row[0])?;
-            if key != GENERATION {
-                let bytes = row[1].to_blob().ok_or_else(|| LimboError::Corrupt(format!("ivf_rq: centroid {key} is not a blob")))?;
-                let centroid = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-                centroids.insert((key >> VERSION_BITS, key & ((1 << VERSION_BITS) - 1)), centroid);
+            let bytes = row[1].to_blob().ok_or_else(|| LimboError::Corrupt(format!("ivf_rq: centroids row {key} is not a blob")))?;
+            match key {
+                LEGACY_GENERATION => legacy = true,
+                key if key < LEGACY_GENERATION => {
+                    directory.insert(-2 - key, Directory::from_bytes(bytes)?);
+                }
+                key => {
+                    let centroid = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+                    centroids.insert((key >> VERSION_BITS, key & ((1 << VERSION_BITS) - 1)), centroid);
+                }
             }
             Ok(())
         })?;
+        if legacy {
+            self.check.find("the index holds the earlier format's generation of its model".to_string());
+        }
         self.centroids = centroids;
+        self.directory = directory;
         let mut rows: Option<Rows> = None;
         let sql = format!("SELECT rowid, c0, c1, c2, c3, c4, c5, c6, c7 FROM {} ORDER BY rowid", self.store("partitions"));
         each_row(connection, &sql, |row| {
@@ -5793,6 +6099,11 @@ impl<'c> Checker<'c> {
         })?;
         if let Some(done) = rows.take() {
             self.partition(done);
+        }
+        let mut stray: Vec<i64> = self.directory.keys().copied().collect();
+        stray.sort_unstable();
+        for p in stray {
+            self.check.find(format!("partition {p} has a directory row and no bookkeeping"));
         }
         let mut missing: Vec<(i64, Location)> = self.indexed.iter().filter(|(rowid, e)| (e.in_table || self.pending.contains(rowid)) && !e.found).map(|(rowid, e)| (*rowid, e.location)).collect();
         missing.sort_unstable_by_key(|(rowid, _)| *rowid);
@@ -5868,6 +6179,21 @@ impl<'c> Checker<'c> {
         self.check.partitions += 1;
         let p = rows.partition;
         let part = rows.part.unwrap_or_default();
+        // Its directory row names its state and its current centroid, the latest it holds. The
+        // untrained origin is partition 0 with no centroid at all.
+        match self.directory.remove(&p) {
+            None if !(p == 0 && self.centroids.is_empty()) => self.check.find(format!("partition {p} has no directory row")),
+            None => {}
+            Some(directory) => {
+                if directory.state != part.state {
+                    self.check.find(format!("partition {p}'s directory row says it is {:?} and its bookkeeping {:?}", directory.state, part.state));
+                }
+                let latest = self.centroids.keys().filter(|(q, _)| *q == p).map(|(_, version)| *version).max();
+                if latest != Some(directory.version) {
+                    self.check.find(format!("partition {p}'s directory row names centroid version {}, and its latest is {latest:?}", directory.version));
+                }
+            }
+        }
         let packed: i64 = rows.blocks.values().map(|entries| entries.len() as i64).sum();
         if packed != part.size {
             self.check.find(format!("partition {p}'s bookkeeping counts {} packed codes and its blocks hold {packed}", part.size));
@@ -5957,9 +6283,9 @@ mod tests {
         }
     }
 
-    /// A query scores entries' 7-bit codes from the blocks and tail entries it read: past the
-    /// model's generation it makes no point read, however many entries it refines, in a packed
-    /// index with a tail and stale copies, and its answer is the exact top ten.
+    /// A query scores entries' 7-bit codes from the blocks and tail entries it read: with the model
+    /// held from an earlier query it makes no point read, however many entries it refines, in a
+    /// packed index with a tail and stale copies, and its answer is the exact top ten.
     #[test]
     fn a_query_refines_its_candidates_without_a_point_read() {
         use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect};
@@ -6000,6 +6326,8 @@ mod tests {
                 conn.execute(format!("DELETE FROM v WHERE id = {id}")).unwrap();
                 live.remove(&id);
             }
+            // The first query after the writes reads the directory rows of the partitions they split.
+            ids(&conn, &format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT 10", literal(&random(&mut state, DIMS))));
             for _ in 0..3 {
                 let q = random(&mut state, DIMS);
                 let sql = format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT 10", literal(&q));
@@ -6008,7 +6336,7 @@ mod tests {
                 let reads = POINT_READS.with(|c| c.get()) - reads;
                 let refines = QUERY_REFINES.with(|c| c.get()) - refines;
                 assert!(refines > 0, "mvcc={mvcc}: the query refined no candidate, so its reads measure nothing");
-                assert!(reads <= 1, "mvcc={mvcc}: refining {refines} candidates made {reads} point reads past the generation's");
+                assert_eq!(reads, 0, "mvcc={mvcc}: refining {refines} candidates made {reads} point reads");
                 let mut exact: Vec<(f64, i64)> = live.iter().map(|(id, v)| (dot(&q, v), *id)).collect();
                 exact.sort_by(|a, b| b.0.total_cmp(&a.0));
                 assert_eq!(got, exact[..10].iter().map(|(_, id)| *id).collect::<Vec<_>>(), "mvcc={mvcc}");
@@ -7027,6 +7355,41 @@ mod tests {
         let location = one(&conn, &format!("SELECT location FROM {vectors} WHERE location >= 0 LIMIT 1"))[0].as_int().unwrap();
         corrupt(&conn, format!("INSERT INTO {vectors} (rowid, location) VALUES (999999, {location})"));
         assert!(findings(&conn).contains("the index holds row 999999, which the table does not"));
+
+        let (_db, conn) = setup("ivf-rq-check-directory.db");
+        let partition = one(&conn, &format!("SELECT rowid >> 42 FROM {partitions} WHERE (rowid >> {ROWID_BITS}) & 3 = {BLOCK_ROW} LIMIT 1"))[0].as_int().unwrap();
+        corrupt(&conn, format!("DELETE FROM {centroids} WHERE rowid = {}", directory_key(partition).unwrap()));
+        assert!(findings(&conn).contains(&format!("partition {partition} has no directory row")));
+
+        let (_db, conn) = setup("ivf-rq-check-directory-state.db");
+        let partition = one(&conn, &format!("SELECT rowid >> 42 FROM {partitions} WHERE (rowid >> {ROWID_BITS}) & 3 = {BLOCK_ROW} LIMIT 1"))[0].as_int().unwrap();
+        let held = directory(&conn)[&partition];
+        let hex: String = Directory { state: State::Retiring, ..held }.record().unwrap().get_value(0).unwrap().to_blob().unwrap().iter().map(|b| format!("{b:02x}")).collect();
+        corrupt(&conn, format!("UPDATE {centroids} SET value = X'{hex}' WHERE rowid = {}", directory_key(partition).unwrap()));
+        assert!(findings(&conn).contains(&format!("partition {partition}'s directory row says it is Retiring and its bookkeeping Live")));
+    }
+
+    /// An index built in the earlier format, whose model's one generation row stands where no
+    /// directory row does, is refused with a hint, and REINDEX makes it afresh.
+    #[test]
+    fn an_index_of_the_earlier_format_is_refused_until_reindexed() {
+        let (_db, conn) = database("ivf-rq-earlier-format.db", false);
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e)").unwrap();
+        let mut state = 3u64;
+        insert_all(&conn, &(1..=50).map(|id| (id, random(&mut state, 8))).collect::<Vec<_>>());
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        conn.start_nested();
+        let done = conn.execute("INSERT INTO __turso_internal_v_ivf_centroids (rowid, value) VALUES (-1, X'01')");
+        conn.end_nested();
+        done.unwrap();
+        conn.execute("COMMIT").unwrap();
+        let q = random(&mut state, 8);
+        let sql = format!("SELECT id, vector_distance_dot(e, {}) AS distance FROM v ORDER BY distance LIMIT 10", literal(&q));
+        let refused = conn.prepare(&sql).and_then(|mut statement| statement.run_collect_rows()).unwrap_err();
+        assert!(refused.to_string().contains("REINDEX v_ivf"), "{refused}");
+        conn.execute("REINDEX v_ivf").unwrap();
+        assert_eq!(rows(&conn, &sql).len(), 10);
+        assert!(check(&conn, "v_ivf").unwrap().consistent());
     }
 
     /// Step `statement` until it yields between steps of its work, true, or ends, false, sleeping
@@ -8623,6 +8986,147 @@ mod tests {
     /// over these 3000 vectors, rechecking 8 neighbours per split leaves 1.7%, 4 leave 5.3% and none
     /// 9.7%.
     const MISPLACED_PERCENT: usize = 3;
+
+    /// Two clusters far apart, each trained into partitions of its own, so a split of one
+    /// cluster's partition marks none of the other's moving: the rows, and a connection to the
+    /// index with every partition probed, on which a query has read the model.
+    fn two_clusters(name: &str) -> (Arc<crate::Database>, Arc<crate::Connection>, HashMap<i64, Vec<f32>>, [Vec<f32>; 2]) {
+        const DIMS: usize = 16;
+        let (db, conn) = database(name, true);
+        let mut state = 913u64;
+        let centres = [vec![8.0f32; DIMS], vec![-8.0f32; DIMS]];
+        let rows: Vec<(i64, Vec<f32>)> = (1..=4000).map(|id| (id, near(&mut state, &centres, 1.0))).collect();
+        for chunk in rows.chunks(500) {
+            insert_all(&conn, chunk);
+        }
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 8)").unwrap();
+        let live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
+        assert_eq!(top_ten(&conn, &centres[0]), exact_top_ten(&live, &centres[0]));
+        (db, conn, live, centres)
+    }
+
+    /// `n` rows from `first` on, all but at `centre`, so they grow the one partition nearest it.
+    fn crowd(first: i64, n: i64, centre: &[f32]) -> Vec<(i64, Vec<f32>)> {
+        (first..first + n).map(|id| (id, centre.iter().enumerate().map(|(d, x)| x + 1e-3 * ((id as usize * 31 + d * 7) % 13) as f32).collect())).collect()
+    }
+
+    /// Two transactions under MVCC, open at once, each grow a partition of a different cluster past
+    /// the split bound: both splits are made, opening different slots, and both commit, where the
+    /// model's one generation row let one split at a time. A query on another connection, its model
+    /// read before, then answers exactly, from the partitions the splits opened too.
+    #[test]
+    fn splits_of_partitions_apart_in_open_transactions_both_commit() {
+        let (db, conn, mut live, centres) = two_clusters("ivf-rq-concurrent-splits.db");
+        let before = check(&conn, "v_ivf").unwrap();
+        let (first, second) = (db.connect(crate::ConnectOpts::new()).unwrap(), db.connect(crate::ConnectOpts::new()).unwrap());
+        first.execute("BEGIN CONCURRENT").unwrap();
+        second.execute("BEGIN CONCURRENT").unwrap();
+        for (writer, (from, centre)) in [(&first, (10_000, &centres[0])), (&second, (20_000, &centres[1]))] {
+            let rows = crowd(from, 300, centre);
+            insert_all(writer, &rows);
+            live.extend(rows);
+        }
+        first.execute("COMMIT").unwrap();
+        second.execute("COMMIT").unwrap();
+        let after = check(&conn, "v_ivf").unwrap();
+        assert!(after.consistent(), "{after:?}");
+        assert_eq!(after.partitions, before.partitions + 2, "both splits made: {before:?} then {after:?}");
+        for _ in 0..10 {
+            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        }
+        let mut state = 5u64;
+        for q in centres.iter().cloned().chain((0..4).map(|_| random(&mut state, 16).iter().map(|x| 16.0 * x).collect())) {
+            assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
+        }
+    }
+
+    /// The index's directory rows: each partition's version, state and tag.
+    fn directory(conn: &Arc<crate::Connection>) -> HashMap<i64, Directory> {
+        rows(conn, "SELECT rowid, value FROM __turso_internal_v_ivf_centroids WHERE rowid < -1").iter().map(|row| (-2 - row[0].as_int().unwrap(), Directory::from_bytes(row[1].to_blob().unwrap()).unwrap())).collect()
+    }
+
+    /// A split rolled back with its transaction leaves the slot it opened vacant beside one a
+    /// committed split opened past it: the model is read with the gap, the index answers exactly
+    /// and checks consistent, and splits take retired and vacant slots alike, lowest first, until
+    /// the vacant one is taken.
+    #[test]
+    fn a_rolled_back_split_leaves_a_vacant_slot_a_later_split_takes() {
+        let (db, conn, mut live, centres) = two_clusters("ivf-rq-vacant-slot.db");
+        let before = check(&conn, "v_ivf").unwrap();
+        let (first, second) = (db.connect(crate::ConnectOpts::new()).unwrap(), db.connect(crate::ConnectOpts::new()).unwrap());
+        first.execute("BEGIN CONCURRENT").unwrap();
+        second.execute("BEGIN CONCURRENT").unwrap();
+        insert_all(&first, &crowd(10_000, 300, &centres[0]));
+        let grown = crowd(20_000, 300, &centres[1]);
+        insert_all(&second, &grown);
+        live.extend(grown);
+        first.execute("ROLLBACK").unwrap();
+        second.execute("COMMIT").unwrap();
+        let held = directory(&conn);
+        let last = *held.keys().max().unwrap();
+        let vacant = last - 1;
+        assert!(!held.contains_key(&vacant), "slot {vacant} was not left vacant: {:?}", held.keys().collect::<BTreeSet<_>>());
+        let reader = db.connect(crate::ConnectOpts::new()).unwrap();
+        for q in &centres {
+            assert_eq!(top_ten(&reader, q), exact_top_ten(&live, q));
+        }
+        let middle = check(&conn, "v_ivf").unwrap();
+        assert!(middle.consistent() && middle.partitions == before.partitions + 1, "{before:?} then {middle:?}");
+        // Each split takes the lowest slot retired or vacant: the retired ones below the vacant
+        // slot first.
+        let retired = held.iter().filter(|(p, d)| **p < vacant && d.state == State::Retired).count();
+        let mut state = 29u64;
+        let mut taken = BTreeSet::new();
+        for round in 0..=retired as i64 {
+            let point: Vec<f32> = centres[0].iter().zip(random(&mut state, 16)).map(|(c, n)| c + 2.0 * n).collect();
+            let grown = crowd(30_000 + 1_000 * round, 300, &point);
+            insert_all(&conn, &grown);
+            live.extend(grown);
+            let now = directory(&conn);
+            taken.extend(now.iter().filter(|(p, d)| d.state == State::Live && held.get(p).is_none_or(|was| was.state != State::Live)).map(|(p, _)| *p));
+        }
+        assert!(taken.contains(&vacant), "splits took {taken:?}, not the vacant slot {vacant}, past {retired} retired below it");
+        let after = check(&conn, "v_ivf").unwrap();
+        assert!(after.consistent(), "{after:?}");
+        for q in &centres {
+            assert_eq!(top_ten(&reader, q), exact_top_ten(&live, q));
+        }
+    }
+
+    /// Where the index's writers are not recorded, as where other processes may write it, a
+    /// cursor checks the model it holds against every directory row: a query on one connection
+    /// answers exactly from the partitions a split on another opened since its last query.
+    #[test]
+    fn where_writers_are_not_recorded_a_query_reads_the_whole_directory() {
+        use crate::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect};
+        const DIMS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("directory.db");
+        let db = Database::open_file_with_flags(Arc::new(PlatformIO::new().unwrap()), path.to_str().unwrap(), OpenFlags::default(), DatabaseOpts::new().with_index_method(true).with_multiprocess_wal(true), None, Arc::new(SqliteDialect)).unwrap();
+        let (writer, reader) = (db.connect(ConnectOpts::new()).unwrap(), db.connect(ConnectOpts::new()).unwrap());
+        writer.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
+        let mut state = 77u64;
+        let centres = [vec![8.0f32; DIMS], vec![-8.0f32; DIMS]];
+        let rows: Vec<(i64, Vec<f32>)> = (1..=3000).map(|id| (id, near(&mut state, &centres, 1.0))).collect();
+        for chunk in rows.chunks(500) {
+            insert_all(&writer, chunk);
+        }
+        writer.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 8)").unwrap();
+        let mut live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
+        assert_eq!(top_ten(&reader, &centres[0]), exact_top_ten(&live, &centres[0]));
+        let before = check(&writer, "v_ivf").unwrap();
+        let rows = crowd(10_000, 300, &centres[0]);
+        insert_all(&writer, &rows);
+        live.extend(rows);
+        for _ in 0..10 {
+            writer.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        }
+        let after = check(&writer, "v_ivf").unwrap();
+        assert!(after.consistent() && after.partitions > before.partitions, "{before:?} then {after:?}");
+        for q in &centres {
+            assert_eq!(top_ten(&reader, q), exact_top_ten(&live, q));
+        }
+    }
 
     /// The values of every row of index `v_ivf`'s backing tables that are blobs: codes, dead rows'
     /// blocks and centroids.

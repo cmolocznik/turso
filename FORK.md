@@ -620,8 +620,8 @@ Still open:
   - 51 finished.
 
   Two writers keep up. The generation row is gone ("ivf_rq splits of different partitions commit
-  side by side" below); what still starves is a split of a partition every writer fills, as that
-  entry says.
+  side by side" below), and a split of a partition every writer fills no longer starves ("An ivf_rq
+  split marks its neighbours instead of claiming them").
 
 ### OPTIMIZE INDEX in steps rebuilds an `ivf_rq` index its rows outgrew
 2026-10-30 `41f8dd865`. `core/index_method/ivf_rq.rs`. A rebuild was chosen only after a survey of
@@ -772,17 +772,17 @@ ended at 85: a run whose first splits get through keeps splitting, and one whose
 few partitions. With one writer, 30 rounds on seed 2, the index ended at 184,573 rows in 1,442
 partitions before and 165,085 rows in 1,364 after, in 66 s and 63 s.
 
-Still open: **a split of a partition every writer fills starves.** A split claims its partition,
-its eight nearest neighbours and a slot. In an index of a few partitions that is every partition,
-while each writer's statement packs the tails it wrote. A trace of an after-run counted, per round
-of 0.5 to 2.3 s:
+A split of a partition every writer fills still starved. It claimed its partition, its eight
+nearest neighbours and a slot. In an index of a few partitions that is every partition, while each
+writer's statement packs the tails it wrote. A trace of an after-run counted, per round of 0.5 to
+2.3 s:
 - split claims refused 12 to 3,571 times against 0 to 2 made, none for want of a slot and none
   undone at a write;
 - pack claims made 74 to 621 times and refused 851 to 25,344 times.
 
-OPTIMIZE INDEX tries the rebuild such an index is due, and its claim was refused 18 to 869 times a
+OPTIMIZE INDEX tried the rebuild such an index is due, and its claim was refused 18 to 869 times a
 round. The three rebuilds it claimed in one round each failed at a write, which ended the
-statement, and a stepped OPTIMIZE INDEX does not end while a rebuild is due.
+statement. The next two entries close both.
 
 ### Waits sleep instead of spinning
 2026-10-30 `8059358cb`, `c595227a6`, `aa59e4aa3`, `00a233dce`. `core/statement.rs`,
@@ -816,6 +816,135 @@ fails there with the yielding wait. Fail-first: putting back each of the six wai
 
 Not covered: a caller of the C API in async mode passes no waker, so it still steps again when it
 chooses; the other language bindings' own step loops are as upstream left them.
+
+### An ivf_rq split marks its neighbours instead of claiming them
+2026-10-30 `38846b4f2`. `core/index_method/ivf_rq.rs`. A split claimed its partition, its eight
+nearest neighbours and the slot it opens, which in an index of a few partitions is every partition,
+so under four writers a split of a partition every writer filled starved ("ivf_rq splits of
+different partitions commit side by side" above).
+
+A split now claims its partition and the slot it opens alone. On each neighbour it writes a mark: a
+row of the partitions table of the bookkeeping kind, numbered past the bookkeeping by one plus the
+slot it opened. A mark is entered as a write of the index and as no job's claim, and no other job
+writes it, so it holds the neighbour against no other transaction's job. The neighbour's next job
+of any kind takes its marks up:
+- a live partition checks all its blocks again from the first, as the split's write of its
+  bookkeeping used to make it;
+- one with no block goes straight to the job's plan;
+- the job's writes remove the marks.
+
+Surveys, `settled()`, the due list OPTIMIZE INDEX steps over, the rebuild's clear, the query probe
+and `check()` tell a mark from bookkeeping, and `check()` counts them.
+
+Tests:
+- `a_split_beside_a_neighbour_another_transaction_holds_is_made_and_marks_it` (MVCC): one
+  transaction holds a pack of the partition nearest one that another transaction grows past the
+  split bound. The split commits, and the grower takes up every mark but the held neighbour's. The
+  holder then packs the neighbour again, and OPTIMIZE INDEX leaves no mark. The grown partition is
+  found by inserting the grower's rows in a probe transaction that rolls back, as the index ranks
+  partitions by its loss, not by distance.
+- `a_query_of_a_marked_partition_scores_the_blocks_held_for_it`: a query whose answer is twelve rows
+  packed in one partition, around a mark planted beside a row coded into the partition's tail.
+- `optimize_in_steps_rebuilds_an_index_its_rows_outgrew` plants a mark on a slot the rebuild leaves
+  vacant and finds it gone.
+
+Fail-first, one mutation at a time over the module's tests, 7 of 7:
+- a split claiming its neighbours again: the held-neighbour test;
+- a job taking up a mark without checking the partition's blocks again: 4 tests,
+  `vectors_live_in_their_nearest_partition` among them;
+- marks left by the job that took them up: OPTIMIZE INDEX never settled, and 18 tests had failed
+  when the run reached its 900 s bound;
+- a survey reading a mark as bookkeeping: 17 tests;
+- a rebuild keeping the marks: the rebuild test;
+- a mark entered as a job's claim on the neighbour: the held-neighbour test, the holder's pack
+  refused;
+- a query reading a mark as bookkeeping: the marked-partition query test. Two weaker forms of it had
+  passed under this mutation. Ranked by dot product, the top ten at a partition's members need not
+  lie in that partition. And a mark planted through SQL is no write the index's record sees, so the
+  query's held rows of the partition went on serving it, and it never read the mark.
+
+Measured with `ivf_crash` (`THREADS=4 CONCURRENT=1`, MVCC, 12 kill rounds on seed 4242), three
+builds alternating on the same eight cores, every round passing its checks: the build before this
+entry (`4cff6126d`), this commit's, and the next entry's (`01435fa75`).
+
+| build | index at the end | commits | failures (conflicts) | OPTIMIZE INDEX runs finished |
+|---|---|---|---|---|
+| before, run 1 | 137,217 rows, 49 partitions | 18,024 | 10 (3) | 8 |
+| before, run 2 | 92,490 rows, 33 partitions | 12,155 | 9 (4) | 7 |
+| before, run 3 | 98,426 rows, 29 partitions | 12,813 | 6 (3) | 8 |
+| marks, run 1 | 131,403 rows, 1,167 partitions | 17,030 | 6 (2) | 44 |
+| marks, run 2 | 135,181 rows, 1,188 partitions | 17,816 | 7 (3) | 55 |
+| marks, run 3 | 81,853 rows, 822 partitions | 10,843 | 3 (2) | 48 |
+| marks and the rebuild entry, run 1 | 135,407 rows, 1,186 partitions | 17,251 | 0 (0) | 94 |
+| marks and the rebuild entry, run 2 | 183,442 rows, 1,376 partitions | 23,728 | 0 (0) | 133 |
+| marks and the rebuild entry, run 3 | 228,732 rows, 1,532 partitions | 28,866 | 1 (1) | 169 |
+
+The partitions trained for those row counts are about 1,140 to 1,910. The failures past the
+conflicts are OPTIMIZE INDEX statements failing, its rebuilds at a write, which the next entry
+closes. With one writer, 30 rounds on seed 2, the index ended at 152,542 rows in 1,296 partitions
+before and at 134,689 rows in 1,232 partitions with both entries, in 66 s and 64 s.
+
+### An ivf_rq rebuild under MVCC claims only where no other write is unseen
+2026-10-30 `a6bcf1e1b`, `01435fa75`. `core/index_method/ivf_rq.rs`,
+`core/index_method/optimize_steps.rs`, `core/index_method/mod.rs`, `fork/repro`. A rebuild rewrites
+every row of the index with no undo, so under MVCC it failed at the first row another transaction
+had written, open or committed past its snapshot. That failed OPTIMIZE INDEX, and a statement
+inserting `BULK_AT` rows or more, whose own maintenance can choose the rebuild, failed with it.
+Under four writers every rebuild claimed met such a write (the entry before last).
+
+A rebuild is now claimed only where no other transaction has written the index unseen, redo rows
+aside (`Writes::quiet`): none open has written another row of it or holds a job, and none that ended
+wrote one past the rebuild's snapshot. The claim marks its writer rebuilding in the same lock. Until
+the rebuild is made, every other write of the index is left to redo, as one that meets a job is,
+and no other maintenance starts.
+- **OPTIMIZE INDEX** announces a rebuild due that it cannot claim. The announcement holds the other
+  writes to redo too, and the next steps, each under a fresh snapshot, wait for the transactions
+  that wrote the index to end. A waiting step does nothing else, reports
+  `OptimizeProgress::Draining`, sleeps 1 ms before the next, and counts among the 64 steps that may
+  wait in a row. The rebuild comes before the redo rows, which keep coming.
+- **An announcement lapses** when its connection is gone or when the steps have not renewed it
+  within `REBUILD_LEASE` (1 s), so an OPTIMIZE INDEX left unstepped holds no writer longer.
+- **A statement's maintenance** leaves a rebuild it cannot claim to OPTIMIZE INDEX.
+
+Tests, all under MVCC:
+- `a_rebuild_beside_an_open_write_waits_for_it_and_is_made`: OPTIMIZE INDEX, stepped beside an open
+  transaction that rewrote a row, announces the rebuild and sleeps between steps. A write made
+  meanwhile is left to redo. A writer of twenty rows left open starts no maintenance, and once the
+  first transaction commits the rebuild is made beside it.
+- `optimize_waiting_on_an_open_write_ends_with_the_rebuild_due`: past the steps waiting in a row
+  OPTIMIZE INDEX ends, and writes are coded again.
+- `an_announced_rebuild_left_unstepped_lapses`: past its lease, and once its statement is dropped.
+- `a_statement_beside_an_open_write_leaves_its_rebuild_to_optimize`: an INSERT of 2,000 rows into
+  an outgrown index beside an open write commits and leaves the rebuild to OPTIMIZE INDEX. In a
+  quiet index it makes the rebuild, and a write after it is coded while its transaction is open.
+
+Fail-first, one mutation at a time over the `index_method` tests, 10 of 10:
+- the claim taking no account of others' unseen writes, the rebuild as it was: all four, with
+  `WriteWriteConflict` from OPTIMIZE INDEX and from the INSERT;
+- writes beside an announced rebuild made, not left to redo: 2 tests;
+- other transactions' maintenance going on beside it: the open writer's settle of another's redo
+  row kept the rebuild from being claimed;
+- a rebuild made holding writes to redo until its transaction ends: the statement test's quiet
+  case;
+- an announcement that never lapses: the lapse test;
+- one that outlives its connection: 2 tests;
+- OPTIMIZE INDEX announcing none: 2 tests;
+- waiting steps not counted among those waiting in a row: OPTIMIZE INDEX never ended;
+- waiting steps not sleeping: 3 tests;
+- the redo rows before a rebuild due: a waiting step settled a redo row.
+
+Still open: **a statement that opens no transaction of its own strands the implicit MVCC
+transaction a sibling opens beside it.** The first test steps OPTIMIZE INDEX on a connection of its
+own for this. On the reading connection, a read made while that connection's OPTIMIZE INDEX ran
+opened the shared transaction. After both had ended, and until the OPTIMIZE INDEX statement was
+dropped, the connection's reads still saw that read's snapshot, without the rebuild. Only the
+statement that opened the transaction may end it, and it was not the last to finish.
+
+Measured in the table of the entry before (`ivf_crash` now reports `optimize_failures` and
+`rebuilds`): in each of the three four-writer runs with both entries, no OPTIMIZE INDEX failed and
+the one rebuild due was made in the first round, when the index first held about 20,000 rows. In
+that round 1,298 to 1,572 writes were left to redo while the rebuild waited and was made, against 0
+to 9 in each later round.
 
 ## Taken upstream
 

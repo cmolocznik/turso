@@ -21,7 +21,7 @@ All hooks are behind `cfg(any(test, injected_yields))`; `injected_yields` means 
 
 ## Core Model
 
-`YieldPoint { ordinal, point_count }` identifies one hook in one point family. Families are `#[repr(u8)]` enums implementing `YieldPointMarker`; `ordinal` is source-order `self as u8`, and `point_count` comes from `EnumCount`.
+`YieldPoint { domain, ordinal, point_count }` identifies one hook in one point family. Families are `#[repr(u8)]` enums implementing `YieldPointMarker`; `domain` is the family's `YieldDomain` (`YieldPointMarker::DOMAIN`), `ordinal` is source-order `self as u8`, and `point_count` comes from `EnumCount`. Two families can share an ordinal and a count (`CommitYieldPoint` and `CursorYieldPoint` both have 9), so a point is told apart only with its domain.
 
 Do not reorder existing yield-point variants. Simulator plans store raw ordinals, not names.
 

@@ -4397,6 +4397,8 @@ pub(crate) enum TransactionYieldPoint {
 
 #[cfg(any(test, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for TransactionYieldPoint {
+    const DOMAIN: crate::mvcc::yield_points::YieldDomain =
+        crate::mvcc::yield_points::YieldDomain::Transaction;
     const POINT_COUNT: u8 = 2;
 
     fn ordinal(self) -> u8 {

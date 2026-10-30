@@ -238,6 +238,8 @@ pub(crate) enum CheckpointYieldPoint {
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for CheckpointYieldPoint {
+    const DOMAIN: crate::mvcc::yield_points::YieldDomain =
+        crate::mvcc::yield_points::YieldDomain::Checkpoint;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
     fn ordinal(self) -> u8 {

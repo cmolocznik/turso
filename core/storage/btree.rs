@@ -392,6 +392,8 @@ pub(crate) const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for BTreeWriteYieldPoint {
+    const DOMAIN: crate::mvcc::yield_points::YieldDomain =
+        crate::mvcc::yield_points::YieldDomain::BTreeWrite;
     const POINT_COUNT: u8 = 1;
 
     fn ordinal(self) -> u8 {

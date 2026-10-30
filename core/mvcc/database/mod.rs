@@ -1595,6 +1595,8 @@ pub(crate) enum ExclusiveTxYieldPoint {
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for ExclusiveTxYieldPoint {
+    const DOMAIN: crate::mvcc::yield_points::YieldDomain =
+        crate::mvcc::yield_points::YieldDomain::ExclusiveTx;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
     fn ordinal(self) -> u8 {
@@ -1604,6 +1606,8 @@ impl YieldPointMarker for ExclusiveTxYieldPoint {
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for CommitYieldPoint {
+    const DOMAIN: crate::mvcc::yield_points::YieldDomain =
+        crate::mvcc::yield_points::YieldDomain::Commit;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
     fn ordinal(self) -> u8 {

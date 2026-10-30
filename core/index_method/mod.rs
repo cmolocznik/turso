@@ -229,6 +229,8 @@ pub(crate) enum IndexMethodYieldPoint {
 
 #[cfg(any(test, injected_yields))]
 impl crate::mvcc::yield_hooks::YieldPointMarker for IndexMethodYieldPoint {
+    const DOMAIN: crate::mvcc::yield_points::YieldDomain =
+        crate::mvcc::yield_points::YieldDomain::IndexMethod;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
     fn ordinal(self) -> u8 {

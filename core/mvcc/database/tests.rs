@@ -9847,10 +9847,10 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     rows
 }
 
-/// Any ddl specially CREATE INDEX must cause SchemaUpdated errors on ongoing INSERTS because
-/// we shouldn't commit an insert without inserting rows to this new index that is being created.
-/// Here we test that case by injecting in the middle of CREATE INDEX's commit and then doing a
-/// regular concurrent insert that will not take into account new index.
+/// A CREATE INDEX whose commit has taken its timestamp but not yet published the new schema
+/// refuses every transaction that would begin under the old schema: an INSERT beginning then is
+/// refused Busy, so no insert can commit without writing to the index. Once the CREATE INDEX has
+/// landed, the INSERT goes in with its index entry.
 #[test]
 fn test_insert_in_middle_commit_of_create_index_returns_err() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -9890,37 +9890,83 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
         yielded,
         "CREATE INDEX should yield at CommitYieldPoint::LogRecordPrepared"
     );
+    conn_a.set_yield_injector(None);
 
-    // T2 (conn_b): start a new tx now — its begin_ts will be > T1's end_ts,
-    // but the global schema view still doesn't know about the new index `i`.
-    // The INSERT compiles its bytecode against the stale schema and emits
-    // IdxInsert ops only for the indexes the stale schema knows about.
+    // T2 (conn_b): an INSERT beginning now would compile against the schema
+    // without the index `i` and write no entry to it.
     conn_b.execute("BEGIN CONCURRENT").unwrap();
-    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let refused = conn_b.execute("INSERT INTO t VALUES (2, 20)");
+    assert!(
+        matches!(refused, Err(LimboError::Busy)),
+        "an INSERT beginning under the unpublished schema is refused, got {refused:?}"
+    );
 
-    // T1 finishes finalizing the CREATE INDEX. After this point, the global
-    // header carries the new schema_cookie and `last_committed_schema_change_ts`
-    // is bumped to T1's `end_ts`.
     create_idx.run_ignore_rows().unwrap();
     drop(create_idx);
 
-    // T2 commits. The schema-conflict check at `CommitState::Initial` compares
-    // `last_committed_schema_change_ts (= T1.end_ts) > tx_b.begin_ts (> T1.end_ts)`
-    // which is FALSE — so no conflict is raised and T2 commits cleanly, even
-    // though its writes never touched the new index.
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn_b.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn_b, "SELECT id FROM t INDEXED BY i WHERE c = 20");
+    assert_eq!(rows.len(), 1, "the INSERT wrote its index entry");
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+    assert_integrity_ok(&conn_b);
+}
+
+/// An INSERT that begins while a CREATE INDEX is still building compiles against the schema
+/// without the index, so its COMMIT after the CREATE INDEX lands is refused: it would leave the
+/// index short the row it wrote.
+#[test]
+fn test_insert_begun_during_create_index_build_is_refused_at_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let setup = db.connect();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)")
+            .unwrap();
+        setup.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        setup.close().unwrap();
+    }
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    // T1 (conn_a): CREATE INDEX, yielding at its scan's first seek, before its commit begins.
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::SeekStart.point()
+    ])));
+    let mut create_idx = conn_a.prepare("CREATE INDEX i ON t(c)").unwrap();
+    let mut yielded = false;
+    for _ in 0..200 {
+        match create_idx.step().unwrap() {
+            StepResult::Yield => {
+                yielded = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded,
+        "CREATE INDEX should yield at its scan's first seek"
+    );
+    conn_a.set_yield_injector(None);
+
+    // T2 (conn_b) begins under the schema without `i`, and its INSERT writes no entry to it.
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    create_idx.run_ignore_rows().unwrap();
+    drop(create_idx);
 
     let commit_result = conn_b.execute("COMMIT");
-
     assert!(
         matches!(
             commit_result,
             Err(LimboError::SchemaConflict | LimboError::SchemaUpdated)
         ),
-        "BUG: tx_b's COMMIT returned {commit_result:?} but should have been \
-         aborted with SchemaConflict/SchemaUpdated. tx_b began with a stale \
-         schema (missing index `i`), so its INSERT silently skipped writing \
-         to that index. Allowing the commit leaves `i` permanently short the \
-         row tx_b wrote."
+        "tx_b's COMMIT returned {commit_result:?}: tx_b began with a schema missing index `i`, so \
+         committing it would leave `i` permanently short the row tx_b wrote"
     );
 }
 

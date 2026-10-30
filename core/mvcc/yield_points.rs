@@ -5,8 +5,23 @@ use crate::LimboError;
 /// YieldPoint is a descriptor for one safe yield boundary in a state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct YieldPoint {
+    /// The state machine the boundary belongs to. Boundaries of different machines can share an
+    /// ordinal and a count, so they are told apart by this.
+    pub domain: YieldDomain,
     pub ordinal: u8,
     pub point_count: u8,
+}
+
+/// The state machines that offer yield points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YieldDomain {
+    Commit,
+    ExclusiveTx,
+    Checkpoint,
+    Cursor,
+    BTreeWrite,
+    IndexMethod,
+    Transaction,
 }
 
 /// External hook consulted at safe state machine boundaries to decide whether to synthesize a yield.

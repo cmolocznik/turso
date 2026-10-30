@@ -145,6 +145,8 @@ pub(crate) enum CursorYieldPoint {
 
 #[cfg(any(test, injected_yields))]
 impl YieldPointMarker for CursorYieldPoint {
+    const DOMAIN: crate::mvcc::yield_points::YieldDomain =
+        crate::mvcc::yield_points::YieldDomain::Cursor;
     const POINT_COUNT: u8 = Self::COUNT as u8;
 
     fn ordinal(self) -> u8 {

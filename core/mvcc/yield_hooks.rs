@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
+use crate::mvcc::yield_points::{FailureInjector, YieldDomain, YieldInjector, YieldPoint};
 use crate::state_machine::TransitionResult;
 use crate::sync::Arc;
 use crate::types::IOCompletions;
@@ -9,18 +9,20 @@ use crate::Completion;
 use crate::LimboError;
 
 pub(crate) trait YieldPointMarker: Copy + Debug {
+    const DOMAIN: YieldDomain;
     const POINT_COUNT: u8;
 
     fn ordinal(self) -> u8;
 
     fn point(self) -> YieldPoint {
-        YieldPoint::new(self.ordinal(), Self::POINT_COUNT)
+        YieldPoint::new(Self::DOMAIN, self.ordinal(), Self::POINT_COUNT)
     }
 }
 
 impl YieldPoint {
-    pub(crate) fn new(ordinal: u8, point_count: u8) -> Self {
+    pub(crate) fn new(domain: YieldDomain, ordinal: u8, point_count: u8) -> Self {
         Self {
+            domain,
             ordinal,
             point_count,
         }

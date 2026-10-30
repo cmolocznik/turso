@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex, Once, RwLock, Weak,
     },
     task::Waker,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -1335,6 +1335,7 @@ impl TursoConnection {
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
+            asleep: None,
         }))
     }
 
@@ -1363,6 +1364,7 @@ impl TursoConnection {
                     handle,
                     stmt_id,
                     stmts: self.stmts.clone(),
+                    asleep: None,
                 }));
             }
         }
@@ -1393,6 +1395,7 @@ impl TursoConnection {
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
+            asleep: None,
         }))
     }
 
@@ -1422,6 +1425,7 @@ impl TursoConnection {
                         handle,
                         stmt_id,
                         stmts: self.stmts.clone(),
+                        asleep: None,
                     }),
                     position,
                 )))
@@ -1516,7 +1520,16 @@ fn step_inner(
     stmt: &mut Statement,
     async_io: bool,
     waker: Option<&Waker>,
+    asleep: &mut Option<Instant>,
 ) -> Result<TursoStatusCode, TursoError> {
+    // A step before a busy wait's delay ends waits without reaching the engine, which would only
+    // ask for the wait again and wake the caller at once.
+    if let Some(until) = *asleep {
+        if Instant::now() < until {
+            return Ok(TursoStatusCode::Io);
+        }
+        *asleep = None;
+    }
     loop {
         let result = if let Some(waker) = waker {
             stmt.step_with_waker(waker)
@@ -1528,7 +1541,17 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+            StepResult::Sleep { duration } => {
+                if async_io {
+                    wait_out(duration, waker, asleep);
+                    Ok(TursoStatusCode::Io)
+                } else {
+                    // Stepping the IO would spin until the busy timeout passed.
+                    stmt._io().sleep(duration);
+                    continue;
+                }
+            }
+            StepResult::IO | StepResult::Yield => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
@@ -1540,6 +1563,20 @@ fn step_inner(
     }
 }
 
+/// Arms the wake of an asynchronous step that must wait out a busy handler's `duration`: the
+/// engine has woken the caller to step again at once, and the steps before the delay ends wait
+/// without reaching it. A caller that passes no waker steps again when it chooses.
+fn wait_out(duration: Duration, waker: Option<&Waker>, asleep: &mut Option<Instant>) {
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(waker) = waker {
+        let until = Instant::now() + duration;
+        *asleep = Some(until);
+        crate::timer::wake_at(until, waker.clone());
+    }
+    #[cfg(target_family = "wasm")]
+    let _ = (duration, waker, asleep);
+}
+
 pub struct TursoStatement {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
@@ -1547,6 +1584,9 @@ pub struct TursoStatement {
     pub(crate) handle: StatementHandle,
     stmt_id: usize,
     stmts: StmtRegistry,
+    /// The instant before which a step waits out a busy handler's delay without reaching the
+    /// engine.
+    asleep: Option<Instant>,
 }
 
 impl Drop for TursoStatement {
@@ -1654,7 +1694,7 @@ impl TursoStatement {
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
-        step_inner(stmt, self.async_io, waker)
+        step_inner(stmt, self.async_io, waker, &mut self.asleep)
             .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
 
@@ -1673,7 +1713,7 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = step_inner(stmt, self.async_io, waker)
+            let status = step_inner(stmt, self.async_io, waker, &mut self.asleep)
                 .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
             if status == TursoStatusCode::Row {
                 continue;
@@ -1780,7 +1820,7 @@ impl TursoStatement {
         let mut handle = self.handle.lock().unwrap();
         if let Some(stmt) = handle.as_mut() {
             while stmt.execution_state().is_running() {
-                let status = step_inner(stmt, self.async_io, waker)?;
+                let status = step_inner(stmt, self.async_io, waker, &mut self.asleep)?;
                 if status == TursoStatusCode::Io {
                     return Ok(status);
                 }
@@ -1798,6 +1838,7 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         stmt.reset()?;
         stmt.clear_bindings();
+        self.asleep = None;
         Ok(())
     }
 
@@ -2967,5 +3008,94 @@ mod tests {
         assert_eq!(stmt.n_change(), 0);
         assert_eq!(stmt.column_count(), 0);
         assert_eq!(stmt.parameters_count(), 0);
+    }
+
+    /// Counts the steps and sleeps asked of a memory IO.
+    #[derive(Default)]
+    struct WaitCountingIo {
+        inner: turso_core::MemoryIO,
+        steps: std::sync::atomic::AtomicUsize,
+        sleeps: std::sync::atomic::AtomicUsize,
+    }
+
+    impl turso_core::Clock for WaitCountingIo {
+        fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl turso_core::IO for WaitCountingIo {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: turso_core::OpenFlags,
+            direct: bool,
+        ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+            self.inner.open_file(path, flags, direct)
+        }
+        fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+            self.inner.file_id(path)
+        }
+        fn supports_shared_wal_coordination(&self) -> bool {
+            self.inner.supports_shared_wal_coordination()
+        }
+        fn step(&self) -> turso_core::Result<()> {
+            self.steps
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.step()
+        }
+        fn sleep(&self, duration: std::time::Duration) {
+            self.sleeps
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.sleep(duration)
+        }
+    }
+
+    /// In sync mode a statement refused the write lock until its busy timeout ends sleeps out each
+    /// delay its busy handler asks for. It used to step the IO in a loop instead, which spun a core
+    /// until the timeout passed.
+    #[test]
+    pub fn sync_steps_sleep_out_a_busy_wait() {
+        use std::sync::atomic::Ordering;
+        let io = Arc::new(WaitCountingIo::default());
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: "busy-sync.db".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: Some(io.clone()),
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        assert!(!db.open().unwrap().is_io());
+        let holder = db.connect().unwrap();
+        for sql in ["CREATE TABLE t (x)", "BEGIN IMMEDIATE"] {
+            holder.prepare_single(sql).unwrap().execute(None).unwrap();
+        }
+        let waiter = db.connect().unwrap();
+        waiter.set_busy_timeout(std::time::Duration::from_millis(60));
+        io.steps.store(0, Ordering::Relaxed);
+        let mut insert = waiter.prepare_single("INSERT INTO t VALUES (1)").unwrap();
+        let error = insert.execute(None).unwrap_err();
+        assert!(matches!(error, TursoError::Busy(_)), "{error:?}");
+        let steps = io.steps.load(Ordering::Relaxed);
+        let sleeps = io.sleeps.load(Ordering::Relaxed);
+        assert!(
+            sleeps > 0 && steps < 32,
+            "the insert stepped the IO {steps} times and slept {sleeps} times"
+        );
+        holder
+            .prepare_single("ROLLBACK")
+            .unwrap()
+            .execute(None)
+            .unwrap();
     }
 }

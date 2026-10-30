@@ -935,4 +935,54 @@ mod tests {
 
         Ok(())
     }
+
+    /// Counts the polls of the future it wraps.
+    struct Polled<F> {
+        future: std::pin::Pin<Box<F>>,
+        polls: usize,
+    }
+
+    impl<F: std::future::Future> std::future::Future for Polled<F> {
+        type Output = (F::Output, usize);
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            self.polls += 1;
+            match self.future.as_mut().poll(cx) {
+                Poll::Ready(output) => Poll::Ready((output, self.polls)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    /// A statement refused the write lock waits out each delay its busy handler asks for on a
+    /// timer: it is polled again when the delay ends, where the engine's own wake had it polled
+    /// again at once until the busy timeout passed.
+    #[tokio::test]
+    async fn a_busy_wait_is_polled_again_when_each_delay_ends() -> Result<()> {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("busy.db");
+        let db = Builder::new_local(db_path.to_str().unwrap())
+            .build()
+            .await?;
+        let holder = db.connect()?;
+        holder.execute("CREATE TABLE t (x)", ()).await?;
+        holder.execute("BEGIN IMMEDIATE", ()).await?;
+        let waiter = db.connect()?;
+        waiter.busy_timeout(std::time::Duration::from_millis(60))?;
+        let insert = Polled {
+            future: Box::pin(waiter.execute("INSERT INTO t VALUES (1)", ())),
+            polls: 0,
+        };
+        let (inserted, polls) = insert.await;
+        assert!(matches!(inserted, Err(Error::Busy(_))), "{inserted:?}");
+        assert!(
+            polls < 64,
+            "the insert was polled {polls} times over its 60 ms busy wait"
+        );
+        holder.execute("ROLLBACK", ()).await?;
+        Ok(())
+    }
 }

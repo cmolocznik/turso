@@ -766,13 +766,15 @@ impl Statement {
         result
     }
 
+    /// Runs the statement to completion, discarding rows. A busy wait sleeps out each delay the
+    /// busy handler asks for: stepping the IO instead would spin until the timeout passed, on any
+    /// backend whose step returns at once with nothing pending.
     pub fn run_ignore_rows(&mut self) -> Result<()> {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
@@ -781,14 +783,15 @@ impl Statement {
         }
     }
 
+    /// Runs the statement to completion, collecting its rows; a busy wait sleeps as in
+    /// [`Self::run_ignore_rows`].
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
         let mut values = Vec::new();
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -800,7 +803,8 @@ impl Statement {
         }
     }
 
-    /// Blocks execution, advances IO, and runs to completion of the statement
+    /// Blocks execution, advances IO, and runs to completion of the statement; a busy wait sleeps
+    /// as in [`Self::run_ignore_rows`].
     pub fn run_with_row_callback(
         &mut self,
         mut func: impl FnMut(&Row) -> Result<()>,
@@ -808,9 +812,8 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -881,7 +884,8 @@ impl Statement {
     }
 
     /// Blocks execution, advances IO, and stops at any StepResult except IO
-    /// You can optionally pass a handler to run after IO is advanced
+    /// You can optionally pass a handler to run after IO is advanced. A busy
+    /// wait sleeps as in [`Self::run_ignore_rows`], between the same handlers.
     pub fn run_one_step_blocking(
         &mut self,
         mut pre_io_func: impl FnMut() -> Result<()>,
@@ -890,9 +894,14 @@ impl Statement {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
                     self.pager.io.step()?;
+                    post_io_func()?;
+                }
+                vdbe::StepResult::Sleep { duration } => {
+                    pre_io_func()?;
+                    self.pager.io.sleep(duration);
                     post_io_func()?;
                 }
                 vdbe::StepResult::Row => break Some(self.row().expect("row should be present")),
@@ -2279,5 +2288,120 @@ mod tests {
             6,
             "cumulative metrics should include root and trigger writes"
         );
+    }
+
+    /// Counts the steps and sleeps asked of a memory IO.
+    #[derive(Default)]
+    struct WaitCountingIO {
+        inner: MemoryIO,
+        steps: crate::sync::atomic::AtomicUsize,
+        sleeps: crate::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::Clock for WaitCountingIO {
+        fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for WaitCountingIO {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: OpenFlags,
+            direct: bool,
+        ) -> crate::Result<Arc<dyn crate::File>> {
+            self.inner.open_file(path, flags, direct)
+        }
+        fn remove_file(&self, path: &str) -> crate::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
+            self.inner.file_id(path)
+        }
+        fn supports_shared_wal_coordination(&self) -> bool {
+            self.inner.supports_shared_wal_coordination()
+        }
+        fn step(&self) -> crate::Result<()> {
+            self.steps
+                .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+            self.inner.step()
+        }
+        fn sleep(&self, duration: std::time::Duration) {
+            self.sleeps
+                .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+            self.inner.sleep(duration)
+        }
+    }
+
+    /// A blocking runner refused the write lock until its busy timeout ends sleeps out each delay
+    /// the busy handler asks for. It used to step the IO in a loop instead, which on a backend
+    /// whose step returns at once spun a core until the timeout passed.
+    #[test]
+    fn blocking_runners_sleep_out_a_busy_wait() {
+        use crate::sync::atomic::Ordering;
+        let io = Arc::new(WaitCountingIO::default());
+        let db = Database::open_file(io.clone(), "busy-wait-sleeps.db", Arc::new(SqliteDialect))
+            .unwrap();
+        let holder = db.connect(ConnectOpts::new()).unwrap();
+        holder.execute("CREATE TABLE t (x)").unwrap();
+        holder.execute("BEGIN IMMEDIATE").unwrap();
+        let waiter = db.connect(ConnectOpts::new()).unwrap();
+        waiter.set_busy_timeout(std::time::Duration::from_millis(60));
+        let runners: [(&str, fn(&mut Statement) -> crate::Result<()>); 4] = [
+            ("run_ignore_rows", |stmt| stmt.run_ignore_rows()),
+            ("run_collect_rows", |stmt| stmt.run_collect_rows().map(drop)),
+            ("run_with_row_callback", |stmt| {
+                stmt.run_with_row_callback(|_| Ok(()))
+            }),
+            ("run_one_step_blocking", |stmt| {
+                stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map(drop)
+            }),
+        ];
+        for (name, run) in runners {
+            io.steps.store(0, Ordering::Relaxed);
+            io.sleeps.store(0, Ordering::Relaxed);
+            let mut stmt = waiter.prepare("INSERT INTO t VALUES (1)").unwrap();
+            let error = run(&mut stmt).unwrap_err();
+            assert!(matches!(error, LimboError::Busy), "{name}: {error:?}");
+            let steps = io.steps.load(Ordering::Relaxed);
+            let sleeps = io.sleeps.load(Ordering::Relaxed);
+            assert!(
+                sleeps > 0 && steps < 32,
+                "{name} stepped the IO {steps} times and slept {sleeps} times"
+            );
+        }
+        holder.execute("ROLLBACK").unwrap();
+    }
+
+    /// Opening a blob for writing while another connection holds the write lock sleeps out each
+    /// delay of its busy handler, as the blocking runners do.
+    #[test]
+    fn blob_open_sleeps_out_a_busy_wait() {
+        use crate::sync::atomic::Ordering;
+        let io = Arc::new(WaitCountingIO::default());
+        let db = Database::open_file(io.clone(), "blob-busy-sleeps.db", Arc::new(SqliteDialect))
+            .unwrap();
+        let holder = db.connect(ConnectOpts::new()).unwrap();
+        holder.execute("CREATE TABLE t (x)").unwrap();
+        holder.execute("INSERT INTO t VALUES (x'00')").unwrap();
+        holder.execute("BEGIN IMMEDIATE").unwrap();
+        let waiter = db.connect(ConnectOpts::new()).unwrap();
+        waiter.set_busy_timeout(std::time::Duration::from_millis(60));
+        io.steps.store(0, Ordering::Relaxed);
+        let Err(error) = waiter.blob_open("t", "x", 1, true) else {
+            panic!("the blob opened for writing beside a held write lock");
+        };
+        assert!(matches!(error, LimboError::Busy), "{error:?}");
+        let steps = io.steps.load(Ordering::Relaxed);
+        let sleeps = io.sleeps.load(Ordering::Relaxed);
+        assert!(
+            sleeps > 0 && steps < 32,
+            "blob_open stepped the IO {steps} times and slept {sleeps} times"
+        );
+        holder.execute("ROLLBACK").unwrap();
     }
 }

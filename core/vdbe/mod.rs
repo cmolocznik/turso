@@ -369,6 +369,8 @@ pub(crate) enum ProgramStep {
     Interrupt,
     Busy,
     Yield,
+    /// An instruction yielded and asked its caller to sleep this long before stepping again.
+    Sleep(std::time::Duration),
     Error(Box<LimboError>),
 }
 
@@ -381,6 +383,7 @@ impl From<ProgramStep> for Result<StepResult, Box<LimboError>> {
             ProgramStep::Interrupt => Ok(StepResult::Interrupt),
             ProgramStep::Busy => Ok(StepResult::Busy),
             ProgramStep::Yield => Ok(StepResult::Yield),
+            ProgramStep::Sleep(duration) => Ok(StepResult::Sleep { duration }),
             ProgramStep::Error(err) => Err(err),
         }
     }
@@ -1168,6 +1171,10 @@ pub struct ProgramState {
     /// statement's next wait starts its busy handler afresh: an instruction that takes a lock many
     /// times, as `Insn::IndexMethodOptimizeSteps` does, waits for each within the busy timeout.
     pub(crate) lock_wait_over: bool,
+    /// Set by an instruction that yields and asks to sleep before it runs again, as
+    /// `Insn::IndexMethodOptimizeSteps` does while it gives way to a writer: the statement reports
+    /// the sleep, so that its caller waits it out instead of stepping again at once.
+    pub(crate) sleep_for: Option<std::time::Duration>,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -1320,6 +1327,7 @@ impl ProgramState {
             populate_matviews_state: None,
             optimize_steps: None,
             lock_wait_over: false,
+            sleep_for: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -1488,6 +1496,7 @@ impl ProgramState {
         self.populate_matviews_state = None;
         self.optimize_steps = None;
         self.lock_wait_over = false;
+        self.sleep_for = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         self.fk_immediate_violation = None;
@@ -2594,7 +2603,10 @@ impl Program {
             }
             _ => {}
         }
-        if !matches!(result, ProgramStep::IO | ProgramStep::Yield) {
+        if !matches!(
+            result,
+            ProgramStep::IO | ProgramStep::Yield | ProgramStep::Sleep(_)
+        ) {
             state.current_time = None;
         }
         return result;
@@ -2954,6 +2966,9 @@ impl Program {
             // contended lock). Don't store in io_completions —
             // yields aren't pending I/O, so the instruction will
             // simply re-execute on the next step.
+            if let Some(duration) = state.sleep_for.take() {
+                return Some(ProgramStep::Sleep(duration));
+            }
             return Some(ProgramStep::Yield);
         }
         let finished = io.finished();

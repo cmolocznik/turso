@@ -14862,13 +14862,17 @@ pub fn op_index_method_optimize_steps(
     if steps.take_lock_wait_over() {
         state.lock_wait_over = true;
     }
+    let wait = steps.take_wait();
     match stepped {
         Ok(IOResult::Done(())) => {
             state.optimize_steps = None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(IOResult::IO(io)) => Ok(state.suspend_on_io(io)),
+        Ok(IOResult::IO(io)) => {
+            state.sleep_for = wait;
+            Ok(state.suspend_on_io(io))
+        }
         // A busy step goes on from where it is when the statement is stepped again.
         Err(error) if matches!(*error, LimboError::Busy) => Err(error),
         Err(error) => {

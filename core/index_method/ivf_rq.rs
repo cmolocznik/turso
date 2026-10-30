@@ -6317,7 +6317,7 @@ mod tests {
                 live.insert(id, v);
             }
             for _ in 0..30 {
-                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                optimize(&conn, "v_ivf");
             }
             // Stale copies in packed blocks, and fresh entries in the tails.
             for id in (3..=600i64).step_by(3) {
@@ -6626,7 +6626,7 @@ mod tests {
                 live.remove(&id);
             }
             for _ in 0..20 {
-                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                optimize(&conn, "v_ivf");
             }
             for _ in 0..5 {
                 let q = random(&mut state, DIMS);
@@ -6708,7 +6708,7 @@ mod tests {
                 live.insert(id, v);
             }
             for _ in 0..50 {
-                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                optimize(&conn, "v_ivf");
             }
             for id in 201..=216i64 {
                 let v = random(&mut state, DIMS);
@@ -6767,7 +6767,7 @@ mod tests {
             }
             for round in 0..4 {
                 for _ in 0..30 {
-                    conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                    optimize(&conn, "v_ivf");
                 }
                 // Three rounds revise the vectors near the query again; the last moves them away.
                 for id in 281..=300i64 {
@@ -6779,7 +6779,7 @@ mod tests {
                 assert_eq!(got, exact_top(&live), "mvcc={mvcc} round {round}");
             }
             for _ in 0..100 {
-                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                optimize(&conn, "v_ivf");
             }
             let got: Vec<i64> = rows(&conn, &sql).iter().map(|row| row[0].as_int().unwrap()).collect();
             assert_eq!(got, exact_top(&live), "mvcc={mvcc} after maintenance");
@@ -7062,7 +7062,7 @@ mod tests {
             let live = backlog(&conn, &mut state, DIMS);
             let backlog = stored(&conn).pending();
             assert!(backlog.len() > 1, "mvcc={mvcc}: the writes left {backlog:?} to finish");
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let left = stored(&conn).pending();
             assert!(left.is_empty(), "mvcc={mvcc}: work left after one OPTIMIZE: {left:?}");
             for _ in 0..3 {
@@ -7088,14 +7088,38 @@ mod tests {
         rows.into_iter().collect()
     }
 
-    /// Step `statement` until it yields between steps of its work, true, or ends, false.
+    /// Step `statement` until it yields between steps of its work, or sleeps out a wait it asks
+    /// for, true, or ends, false.
     fn step_to_yield(db: &crate::Database, statement: &mut crate::Statement) -> bool {
         loop {
             match statement.step().unwrap() {
                 crate::StepResult::Yield => return true,
                 crate::StepResult::Done => return false,
                 crate::StepResult::IO => db.io.step().unwrap(),
+                crate::StepResult::Sleep { duration } => {
+                    std::thread::sleep(duration);
+                    return true;
+                }
                 other => panic!("the statement stepped to {other:?}"),
+            }
+        }
+    }
+
+    /// OPTIMIZE INDEX of `index` run to its end on `conn`, failing past ten thousand steps instead of
+    /// running on: on a model held stale it did not end.
+    fn optimize(conn: &Arc<crate::Connection>, index: &str) {
+        let mut optimize = conn.prepare(format!("OPTIMIZE INDEX {index}")).unwrap();
+        let mut yields = 0usize;
+        loop {
+            match optimize.step().unwrap() {
+                crate::StepResult::Done => return,
+                crate::StepResult::Yield => {
+                    yields += 1;
+                    assert!(yields < 10_000, "OPTIMIZE INDEX yielded ten thousand times, leaving {:?}", stored(conn).pending());
+                }
+                crate::StepResult::IO => optimize._io().step().unwrap(),
+                crate::StepResult::Sleep { duration } => std::thread::sleep(duration),
+                other => panic!("OPTIMIZE INDEX stepped to {other:?}"),
             }
         }
     }
@@ -7214,7 +7238,7 @@ mod tests {
             }
             let before = check(&conn, "v_ivf").unwrap();
             assert!(before.consistent(), "mvcc={mvcc}: {before:?}");
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let after = check(&conn, "v_ivf").unwrap();
             assert!(after.consistent(), "mvcc={mvcc}: {after:?}");
             let integrity = rows(&conn, "PRAGMA integrity_check");
@@ -7449,15 +7473,21 @@ mod tests {
             holds += 1;
             assert!(step_waiting(&db, &mut optimize), "OPTIMIZE INDEX ended after waiting for a writer {holds} times");
         }
-        while step_waiting(&db, &mut optimize) {}
+        let mut yields = 1 + holds;
+        while step_waiting(&db, &mut optimize) {
+            yields += 1;
+            assert!(yields < 10_000, "OPTIMIZE INDEX yielded ten thousand times, leaving {:?}", stored(&conn).pending());
+        }
         let left = stored(&conn).pending();
         assert!(left.is_empty(), "work left after OPTIMIZE INDEX: {left:?}");
     }
 
     /// Under WAL a writer refused the write lock while a step of OPTIMIZE INDEX held it takes the
-    /// lock before later steps do: the step that refused it waits for it, as long as a busy
-    /// handler sleeps at most, before taking the lock again. A writer on its own thread inserts
-    /// beside OPTIMIZE INDEX on another and counts the steps that took the lock while it waited.
+    /// lock before later steps do: the step that refused it waits for it, asleep, as long as a
+    /// busy handler sleeps at most, before taking the lock again. A writer on its own thread
+    /// inserts beside OPTIMIZE INDEX on another and counts the steps that took the lock while it
+    /// waited. A wait stepped through at once instead of slept yielded 760,514 times here, past
+    /// the bound of [`optimize`].
     #[test]
     fn a_writer_refused_during_a_step_of_optimize_takes_the_lock_before_the_next_steps() {
         use std::sync::atomic::AtomicBool;
@@ -7480,9 +7510,8 @@ mod tests {
         let done = AtomicBool::new(false);
         let ahead: Vec<u64> = std::thread::scope(|scope| {
             let optimizing = scope.spawn(|| {
-                let optimized = conn.execute("OPTIMIZE INDEX v_ivf");
+                optimize(&conn, "v_ivf");
                 done.store(true, Ordering::Release);
-                optimized
             });
             let mut ahead = Vec::new();
             for (i, row) in rows.iter().enumerate() {
@@ -7510,7 +7539,7 @@ mod tests {
                 // rate does.
                 std::thread::sleep(Duration::from_millis(2));
             }
-            optimizing.join().unwrap().unwrap();
+            optimizing.join().unwrap();
             ahead
         });
         STATEMENT_UPKEEP.with(|on| on.set(true));
@@ -7561,13 +7590,13 @@ mod tests {
         STATEMENT_UPKEEP.with(|on| on.set(false));
         insert_all(&writer, &rows);
         STATEMENT_UPKEEP.with(|on| on.set(true));
-        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&conn, "v_ivf");
         let index = stored(&conn);
         let unpacked: Vec<(i64, usize)> = index.live().into_iter().filter(|p| !held.contains(p) && index.tail(*p) >= PACK_AT).map(|p| (p, index.tail(p))).collect();
         assert!(unpacked.is_empty(), "tails left unpacked outside the held partitions: {unpacked:?}");
         writer.execute("COMMIT").unwrap();
         live.extend(rows);
-        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&conn, "v_ivf");
         let left = stored(&conn).pending();
         assert!(left.is_empty(), "work left after the writer committed: {left:?}");
         for _ in 0..3 {
@@ -7591,8 +7620,8 @@ mod tests {
                 let early = prepared_before.then(|| conn.prepare("OPTIMIZE INDEX v_ivf").unwrap());
                 conn.execute(if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" }).unwrap();
                 match early {
-                    Some(mut optimize) => optimize.run_ignore_rows().unwrap(),
-                    None => conn.execute("OPTIMIZE INDEX v_ivf").unwrap(),
+                    Some(mut statement) => statement.run_ignore_rows().unwrap(),
+                    None => optimize(&conn, "v_ivf"),
                 }
                 let case = format!("mvcc={mvcc}, prepared before the transaction={prepared_before}");
                 assert!(!conn.get_auto_commit(), "{case}: OPTIMIZE INDEX ended the transaction");
@@ -7620,15 +7649,15 @@ mod tests {
             let (db, conn) = database(&format!("ivf-rq-optimize-dropped-{mvcc}.db"), mvcc);
             let mut state = 229;
             let mut live = backlog(&conn, &mut state, DIMS);
-            let mut optimize = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
-            assert!(step_to_yield(&db, &mut optimize), "mvcc={mvcc}: OPTIMIZE INDEX did all its work in one step");
-            drop(optimize);
+            let mut first = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
+            assert!(step_to_yield(&db, &mut first), "mvcc={mvcc}: OPTIMIZE INDEX did all its work in one step");
+            drop(first);
             assert!(conn.get_auto_commit(), "mvcc={mvcc}: the dropped OPTIMIZE INDEX left its connection in a transaction");
             let writer = db.connect(crate::ConnectOpts::new()).unwrap();
             let row = (100_001, random(&mut state, DIMS));
             insert_all(&writer, std::slice::from_ref(&row));
             live.insert(row.0, row.1);
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let left = stored(&conn).pending();
             assert!(left.is_empty(), "mvcc={mvcc}: work left after the next OPTIMIZE INDEX: {left:?}");
             for _ in 0..3 {
@@ -7694,7 +7723,7 @@ mod tests {
         }
         let found = check(&conn, "v_ivf").unwrap();
         assert!(found.consistent(), "{found:?}");
-        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&conn, "v_ivf");
         let left = stored(&conn).pending();
         assert!(left.is_empty(), "work left after OPTIMIZE INDEX: {left:?}");
         for _ in 0..3 {
@@ -7725,7 +7754,7 @@ mod tests {
         writer.execute("BEGIN CONCURRENT").unwrap();
         assert_eq!(rows(&writer, "SELECT count(*) FROM v")[0][0].as_int(), Some(live.len() as i64));
         let before = locations(&conn);
-        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&conn, "v_ivf");
         // A query holds the redo rows, none yet, under a snapshot past OPTIMIZE INDEX's: the writes
         // below must keep them from serving any later snapshot.
         let q = random(&mut state, DIMS);
@@ -7755,7 +7784,7 @@ mod tests {
             let q = random(&mut state, DIMS);
             assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
         }
-        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&conn, "v_ivf");
         let found = check(&conn, "v_ivf").unwrap();
         assert!(found.consistent(), "{found:?}");
         let left = stored(&conn).pending();
@@ -7825,7 +7854,7 @@ mod tests {
             assert_eq!(top_ten(&conn, &q)[0], moved, "mvcc={mvcc}");
             assert_eq!(top_ten(&conn, &at_gone), exact_top_ten(&live, &at_gone), "mvcc={mvcc}");
             assert!(!top_ten(&conn, &at_gone).contains(&gone), "mvcc={mvcc}");
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let found = check(&conn, "v_ivf").unwrap();
             assert!(found.consistent() && found.pending == chosen.len() as u64, "mvcc={mvcc}: {found:?}");
             for _ in 0..5 {
@@ -7833,7 +7862,7 @@ mod tests {
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
             }
             SETTLE.with(|on| on.set(true));
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let found = check(&conn, "v_ivf").unwrap();
             assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
             let left = stored(&conn).pending();
@@ -7868,7 +7897,7 @@ mod tests {
             STATEMENT_UPKEEP.with(|on| on.set(true));
             SETTLE.with(|on| on.set(false));
             KILLS.with(|count| count.set(0));
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let index = stored(&conn);
             assert!(index.live().len() > 1, "mvcc={mvcc}: the partition did not split");
             assert_eq!(KILLS.with(|count| count.get()), chosen.len(), "mvcc={mvcc}: the codes killed");
@@ -7879,7 +7908,7 @@ mod tests {
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
             }
             SETTLE.with(|on| on.set(true));
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let found = check(&conn, "v_ivf").unwrap();
             assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
         }
@@ -7896,12 +7925,12 @@ mod tests {
             let rows: Vec<(i64, Vec<f32>)> = (1..=1500i64).map(|id| (id, random(&mut state, DIMS))).collect();
             insert_all(&conn, &rows);
             conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
             let chosen: Vec<i64> = (1..=1100).collect();
             leave_to_maintenance(&conn, mvcc, "v_ivf", &chosen);
             assert_eq!(check(&conn, "v_ivf").unwrap().pending, chosen.len() as u64, "mvcc={mvcc}");
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let found = check(&conn, "v_ivf").unwrap();
             assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
             for _ in 0..3 {
@@ -7921,7 +7950,7 @@ mod tests {
         let rows: Vec<(i64, Vec<f32>)> = (1..=300i64).map(|id| (id, random(&mut state, DIMS))).collect();
         insert_all(&conn, &rows);
         conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
-        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&conn, "v_ivf");
         let writer = db.connect(crate::ConnectOpts::new()).unwrap();
         writer.execute("BEGIN IMMEDIATE").unwrap();
         let mut optimize = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
@@ -7967,7 +7996,7 @@ mod tests {
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
             }
             SETTLE.with(|on| on.set(true));
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let found = check(&conn, "v_ivf").unwrap();
             assert!(found.consistent() && found.pending == 0 && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
             for _ in 0..3 {
@@ -8008,7 +8037,7 @@ mod tests {
             assert_eq!(got, exact_filtered(&rows, &q, |id| id % 10 == 3), "mvcc={mvcc}");
             assert!(got.iter().all(|id| moved.contains(id)), "mvcc={mvcc}: {got:?}");
             SETTLE.with(|on| on.set(true));
-            conn.execute("OPTIMIZE INDEX f_ivf").unwrap();
+            optimize(&conn, "f_ivf");
             assert_eq!(ids(&conn, &sql), exact_filtered(&rows, &q, |id| id % 10 == 3), "mvcc={mvcc}");
             let found = check(&conn, "f_ivf").unwrap();
             assert!(found.consistent() && found.pending == 0, "mvcc={mvcc}: {found:?}");
@@ -8031,14 +8060,14 @@ mod tests {
         insert_all(&writer, &rows);
         STATEMENT_UPKEEP.with(|on| on.set(true));
         assert!(!stored(&conn).pending().is_empty(), "the backlog left no work due");
-        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&conn, "v_ivf");
         let left = stored(&conn).pending();
         assert!(left.is_empty(), "work left beside the open writer: {left:?}");
         writer.execute("COMMIT").unwrap();
         live.extend(rows);
         let found = check(&conn, "v_ivf").unwrap();
         assert!(found.consistent() && found.rows as usize == live.len(), "{found:?}");
-        conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&conn, "v_ivf");
         for _ in 0..3 {
             let q = random(&mut state, DIMS);
             assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
@@ -8062,7 +8091,7 @@ mod tests {
             STATEMENT_UPKEEP.with(|on| on.set(true));
             assert_eq!(stored(&conn).live().len(), 1, "mvcc={mvcc}");
             REBUILT.with(|count| count.set(0));
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             assert_eq!(REBUILT.with(|count| count.get()), 1, "mvcc={mvcc}: the rebuilds OPTIMIZE INDEX made");
             let index = stored(&conn);
             assert!(index.live().len() >= trained_partitions(3000) / 2 && index.pending().is_empty(), "mvcc={mvcc}: {} partitions, {:?}", index.live().len(), index.pending());
@@ -8149,8 +8178,8 @@ mod tests {
                 for _ in 0..600 {
                     let roll = pick(&mut state, 100);
                     if roll < 15 {
-                        let optimize = optimizing.get_or_insert_with(|| Interleaved::new(&maintainer, &["OPTIMIZE INDEX v_ivf".to_string()]));
-                        if optimize.turn(&db) {
+                        let running = optimizing.get_or_insert_with(|| Interleaved::new(&maintainer, &["OPTIMIZE INDEX v_ivf".to_string()]));
+                        if running.turn(&db) {
                             optimizing = None;
                         }
                         continue;
@@ -8255,7 +8284,7 @@ mod tests {
                 assert!(queries > 50, "{case}: only {queries} queries");
                 let found = check(&conn, "v_ivf").unwrap();
                 assert!(found.consistent() && found.rows as usize == committed.len(), "{case}: before OPTIMIZE INDEX: {found:?}");
-                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                optimize(&conn, "v_ivf");
                 let found = check(&conn, "v_ivf").unwrap();
                 assert!(found.consistent() && found.codes == found.rows, "{case}: after OPTIMIZE INDEX: {found:?}");
                 let left = stored(&conn).pending();
@@ -8281,7 +8310,7 @@ mod tests {
             let rows: Vec<(i64, Vec<f32>)> = (1..=count).map(|id| (id, random(&mut state, DIMS))).collect();
             let before = SURVEYED.with(|c| c.get());
             insert_all(&conn, &rows);
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             reads.push(SURVEYED.with(|c| c.get()) - before);
             assert!(stored(&conn).pending().is_empty());
         }
@@ -8303,7 +8332,7 @@ mod tests {
                 let v = near(&mut state, &centres, 0.3);
                 conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&v))).unwrap();
             }
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let index = stored(&conn);
             assert!(index.pending().is_empty(), "mvcc={mvcc}: {:?}", index.pending());
             assert!(index.live().len() > 4, "mvcc={mvcc}: the index split into {} partitions", index.live().len());
@@ -8335,11 +8364,11 @@ mod tests {
                 insert_all(&conn, &rows);
                 live.extend(rows);
             }
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let before = stored(&conn).live().len();
             conn.execute("DELETE FROM v WHERE id <= 1200").unwrap();
             live.retain(|id, _| *id > 1200);
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let index = stored(&conn);
             assert!(index.pending().is_empty(), "mvcc={mvcc}: {:?}", index.pending());
             let retired = index.parts.values().filter(|part| part.state == State::Retired).count();
@@ -8451,7 +8480,7 @@ mod tests {
             // Rows near the query land in the partitions it probes; their packs rewrite blocks there.
             let near: Vec<(i64, Vec<f32>)> = (3001..=3100i64).map(|id| (id, q.iter().zip(random(&mut state, DIMS)).map(|(a, n)| a + 0.05 * n).collect())).collect();
             insert_all(&conn, &near);
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             live.extend(near);
             assert!(reads(&conn, &live) > 0, "mvcc={mvcc}: the query after the packs read no block");
             assert_eq!(reads(&conn, &live), 0, "mvcc={mvcc}: the query after that read blocks again");
@@ -8478,7 +8507,7 @@ mod tests {
         assert_eq!(top_ten(&reader, &q), before);
         let near: Vec<(i64, Vec<f32>)> = (3001..=3100i64).map(|id| (id, q.iter().zip(random(&mut state, DIMS)).map(|(a, n)| a + 0.05 * n).collect())).collect();
         insert_all(&writer, &near);
-        writer.execute("OPTIMIZE INDEX v_ivf").unwrap();
+        optimize(&writer, "v_ivf");
         live.extend(near);
         let after = exact_top_ten(&live, &q);
         assert_ne!(before, after, "the rows near the query do not change its top ten");
@@ -8554,7 +8583,7 @@ mod tests {
             STATEMENT_UPKEEP.with(|on| on.set(true));
             seeks(&live);
             assert_eq!(seeks(&live), 0, "mvcc={mvcc}: the partitions read after the inserts were not held");
-            writer.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&writer, "v_ivf");
             assert!(seeks(&live) > 0, "mvcc={mvcc}: the query after OPTIMIZE INDEX read no page");
             assert_eq!(seeks(&live), 0, "mvcc={mvcc}: the partitions read after OPTIMIZE INDEX were not held");
 
@@ -8826,7 +8855,7 @@ mod tests {
                 conn.execute(format!("INSERT INTO v VALUES ({id}, {})", literal(&v))).unwrap();
                 live.insert(id, v);
             }
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
             let (wrong, total) = misplaced(&conn, &live);
             eprintln!("mvcc={mvcc}: {wrong} of {total} vectors outside their nearest partition, {} partitions", stored(&conn).live().len());
             assert!(wrong * 100 < total * MISPLACED_PERCENT, "mvcc={mvcc}: {wrong} of {total} vectors outside their nearest partition");
@@ -9051,7 +9080,7 @@ mod tests {
         assert!(after.consistent(), "{after:?}");
         assert_eq!(after.partitions, before.partitions + 2, "both splits made: {before:?} then {after:?}");
         for _ in 0..10 {
-            conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&conn, "v_ivf");
         }
         let mut state = 5u64;
         for q in centres.iter().cloned().chain((0..4).map(|_| random(&mut state, 16).iter().map(|x| 16.0 * x).collect())) {
@@ -9138,7 +9167,7 @@ mod tests {
         insert_all(&writer, &rows);
         live.extend(rows);
         for _ in 0..10 {
-            writer.execute("OPTIMIZE INDEX v_ivf").unwrap();
+            optimize(&writer, "v_ivf");
         }
         let after = check(&writer, "v_ivf").unwrap();
         assert!(after.consistent() && after.partitions > before.partitions, "{before:?} then {after:?}");
@@ -9184,7 +9213,7 @@ mod tests {
                 insert_all(&conn, chunk);
             }
             for _ in 0..20 {
-                conn.execute("OPTIMIZE INDEX v_ivf").unwrap();
+                optimize(&conn, "v_ivf");
             }
             // Stale copies in blocks, of vectors rewritten and of vectors then deleted.
             for (id, v) in rows.iter().filter(|(id, _)| id % 5 == 0) {

@@ -91,6 +91,9 @@ const WAITING_IN_A_ROW: usize = 64;
 /// refused during the step tries again.
 const GIVE_WAY: Duration = Duration::from_millis(100);
 
+/// How long a step that gives way sleeps between looks at whether the writer has taken the lock.
+const GIVE_WAY_POLL: Duration = Duration::from_millis(1);
+
 /// An `OPTIMIZE INDEX` of one index in steps, and where it is.
 pub(crate) struct OptimizeSteps {
     /// The index's database on the statement's connection.
@@ -108,6 +111,8 @@ pub(crate) struct OptimizeSteps {
     refusals: u64,
     /// Whether a lock the statement waited for is no longer in its way, for its busy handler.
     lock_wait_over: bool,
+    /// The sleep the statement asks of its caller before it is stepped again, while it gives way.
+    wait: Option<Duration>,
 }
 
 enum Phase {
@@ -121,8 +126,8 @@ enum Phase {
     /// lost to a concurrent transaction.
     Rollback(Option<Statement>, Option<Box<LimboError>>),
     /// Leave the write lock to a connection the last step refused it, until one takes it or
-    /// `GIVE_WAY` has passed since `since`: `grants` is the WAL's count of write locks taken when
-    /// the step committed.
+    /// `GIVE_WAY` has passed since `since`, sleeping `GIVE_WAY_POLL` between looks: `grants` is
+    /// the WAL's count of write locks taken when the step committed.
     GiveWay {
         since: MonotonicInstant,
         grants: u64,
@@ -186,6 +191,7 @@ impl OptimizeSteps {
             waiting: 0,
             refusals: 0,
             lock_wait_over: false,
+            wait: None,
         }
     }
 
@@ -194,14 +200,21 @@ impl OptimizeSteps {
         std::mem::take(&mut self.lock_wait_over)
     }
 
+    /// The sleep the statement asks of its caller before it is stepped again, if any, since last
+    /// asked.
+    pub(crate) fn take_wait(&mut self) -> Option<Duration> {
+        self.wait.take()
+    }
+
     fn steps(&self) -> Result<&Arc<Connection>> {
         self.steps.as_ref().ok_or_else(|| {
             LimboError::InternalError("OPTIMIZE INDEX step without its connection".into())
         })
     }
 
-    /// Run the statement on from where it is: `Done` once the work is done, `IO` to wait on I/O or
-    /// to yield between steps. On busy it stays where it is, to go on when stepped again.
+    /// Run the statement on from where it is: `Done` once the work is done, `IO` to wait on I/O,
+    /// to yield between steps, or, with [`Self::take_wait`] set, to sleep while it gives way. On
+    /// busy it stays where it is, to go on when stepped again.
     pub(crate) fn step(&mut self, connection: &Arc<Connection>) -> IOResultOr<()> {
         loop {
             match std::mem::replace(&mut self.phase, Phase::Start) {
@@ -373,6 +386,9 @@ impl OptimizeSteps {
                         continue;
                     }
                     self.phase = Phase::GiveWay { since, grants };
+                    // Sleep between looks: stepped again at once, the statement spun a core for as
+                    // long as the writer took to come back for the lock.
+                    self.wait = Some(GIVE_WAY_POLL.min(GIVE_WAY - waited));
                     return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
                 }
             }

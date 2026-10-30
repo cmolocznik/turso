@@ -619,7 +619,9 @@ Still open:
     bookkeeping rows;
   - 51 finished.
 
-  Two writers keep up.
+  Two writers keep up. The generation row is gone ("ivf_rq splits of different partitions commit
+  side by side" below); what still starves is a split of a partition every writer fills, as that
+  entry says.
 
 ### OPTIMIZE INDEX in steps rebuilds an `ivf_rq` index its rows outgrew
 2026-10-30 `41f8dd865`. `core/index_method/ivf_rq.rs`. A rebuild was chosen only after a survey of
@@ -699,6 +701,121 @@ What the files hold is all this covers:
 - memory, the page cache and MVCC's row versions until their garbage collection, holds a deleted
   row until it is reused;
 - a file system or device that keeps freed blocks may keep what a truncation released.
+
+### ivf_rq splits of different partitions commit side by side
+2026-10-30 `5cf12df1a`, `78caecfae`, `28726660e`, `00a233dce`. `core/index_method/ivf_rq.rs`. Every
+split, retirement and rebuild wrote the model's one generation row and claimed the whole model. So
+splits ran one at a time across the index, and a transaction whose snapshot predated the last split
+could not split at all.
+
+Each partition now has a directory row in the centroids table, at key `-2 - p`: its current centroid
+version, its state, and a tag drawn afresh by each change to either.
+- **Sharing the model.** This process's writers record which partitions' parts of the model they
+  change, with the commit position, kept in position order. A cursor whose snapshot no change
+  separates from the model it holds reads nothing. Otherwise it reads the directory rows of the
+  partitions in doubt alone and compares their tags. Where writers are not recorded here, another
+  process or a whole-index change, it reads every directory row.
+- **Claims.** A split claims its partition, its neighbours and the slot it opens, the lowest
+  retired or vacant slot no other job holds, in one locked check. Concurrent splits of partitions
+  apart therefore open different slots and write no row in common. A split rolled back leaves its
+  slot vacant for the next.
+- **WAL writers.** A WAL writer's model is never held, as rows it reads are not: its snapshot
+  position counts its own frames, which a rollback reuses. REINDEX and DROP INDEX mark every
+  partition changed, so a cursor holding the model they replace reads the whole directory.
+- **Format.** An index of the earlier format is refused, with a hint to REINDEX it. `check()`
+  verifies every directory row against its partition's bookkeeping and centroids.
+
+Tests:
+- `splits_of_partitions_apart_in_open_transactions_both_commit`: MVCC, two clusters, two open
+  transactions each growing a partition of its own past the split bound. 62 partitions become 64;
+  on the old code 63, the second split refused at its claim.
+- `a_rolled_back_split_leaves_a_vacant_slot_a_later_split_takes`,
+  `where_writers_are_not_recorded_a_query_reads_the_whole_directory` (multiprocess WAL),
+  `an_index_of_the_earlier_format_is_refused_until_reindexed`,
+  `a_held_model_doubts_the_partitions_changed_past_its_snapshot_and_no_others`, and `check()` cases
+  for a deleted directory row and a wrong state.
+- `a_query_refines_its_candidates_without_a_point_read` reads no directory row after a warm-up
+  query.
+- `a_model_read_while_a_reindex_ran_is_not_used_after_it` (WAL and MVCC): a reader reads the model
+  while a REINDEX that leaves fewer partitions runs, then inserts 200 rows after it commits; the
+  index checks consistent and a fresh connection finds the exact top ten.
+
+Fail-first, one mutation at a time over the module's 69 tests. Each fails a test, 9 of 9:
+- doubting none of the partitions changed past the snapshot: 28 tests, the held-model test among
+  them;
+- doubting none an open writer of this process changed: `concurrent_writers_maintaining_the_index_all_commit`
+  and `transactions_rolled_back_over_maintenance_leave_the_index_consistent`;
+- holding a WAL writer's model: `an_index_of_the_earlier_format_is_refused_until_reindexed` and the
+  rollback test;
+- a REINDEX that does not mark every partition changed: the REINDEX reader test, with 149 check
+  findings, such as a directory row naming a centroid version the index does not hold;
+- a split taking a slot another job holds: `a_rolled_back_split_leaves_a_vacant_slot_a_later_split_takes`
+  and `splits_of_partitions_apart_in_open_transactions_both_commit`;
+- a held model keeping a partition whose directory row is gone: the rollback test;
+- a REINDEX keeping the shared model: `reindex_makes_the_index_afresh_and_leaves_none_of_the_old_one_in_the_file`;
+- a partition changed again keeping its earlier place in the order, or the boundary taking changes
+  at the snapshot itself: the held-model test.
+
+Measured with `ivf_crash` on seed 4242, 12 kill rounds under four writers whose every write is
+`BEGIN CONCURRENT`. The build before these commits (`b21b5637c`) and the build after them ran
+alternately on the same eight cores, every round passing its checks:
+
+| build | commits | OPTIMIZE INDEX runs finished | index at the end |
+|---|---|---|---|
+| before, first run | 19,210 | 3 | 147,193 rows, 5 partitions |
+| after, first run | 14,810 | 31 | 111,756 rows, 2 partitions |
+| before, second run | 17,234 | 8 | 135,199 rows, 4 partitions |
+| after, second run | 15,035 | 29 | 114,477 rows, 1 partition |
+
+The same run ended at 29 partitions on `858f2d542`, and an after-run not alternated with a before
+ended at 85: a run whose first splits get through keeps splitting, and one whose don't stays at a
+few partitions. With one writer, 30 rounds on seed 2, the index ended at 184,573 rows in 1,442
+partitions before and 165,085 rows in 1,364 after, in 66 s and 63 s.
+
+Still open: **a split of a partition every writer fills starves.** A split claims its partition,
+its eight nearest neighbours and a slot. In an index of a few partitions that is every partition,
+while each writer's statement packs the tails it wrote. A trace of an after-run counted, per round
+of 0.5 to 2.3 s:
+- split claims refused 12 to 3,571 times against 0 to 2 made, none for want of a slot and none
+  undone at a write;
+- pack claims made 74 to 621 times and refused 851 to 25,344 times.
+
+OPTIMIZE INDEX tries the rebuild such an index is due, and its claim was refused 18 to 869 times a
+round. The three rebuilds it claimed in one round each failed at a write, which ended the
+statement, and a stepped OPTIMIZE INDEX does not end while a rebuild is due.
+
+### Waits sleep instead of spinning
+2026-10-30 `8059358cb`, `c595227a6`, `aa59e4aa3`, `00a233dce`. `core/statement.rs`,
+`core/incremental_blob.rs`, `core/vdbe/mod.rs`, `core/vdbe/execute.rs`,
+`core/index_method/optimize_steps.rs`, `sdk-kit/src/rsapi.rs`, `sdk-kit/src/timer.rs`. Three waits
+each spun a core for as long as they lasted:
+- **Busy waits in blocking runners.** A statement waiting on a lock returns `StepResult::Sleep` with
+  its busy handler's next delay. `run_ignore_rows`, `run_collect_rows`, `run_with_row_callback`,
+  `run_one_step_blocking`, the incremental blob's step and the SDK kit in sync mode answered it by
+  stepping the IO, which returns at once on a backend with nothing pending. The JDBC driver steps
+  through `run_one_step_blocking`. Against a held write lock and a 60 ms busy timeout,
+  `run_ignore_rows` stepped the IO 1,244,558 times. They now sleep the delay through `IO::sleep`.
+  Every backend's monotonic clock is real time, simulators included.
+- **Busy waits in async mode.** The engine wakes the caller as it returns Sleep, so the `turso`
+  crate's statement was polled again at once: 28,337 polls over a 60 ms wait. The SDK kit now
+  records when the delay ends, has one timer thread wake the waker then, and answers steps before
+  that with IO without reaching the engine. A caller that passes no waker still steps again when it
+  chooses.
+- **OPTIMIZE INDEX giving way.** Under WAL a step that refused a writer the write lock leaves the
+  lock to it until the writer takes it or 100 ms pass. The step waited by yielding: beside a writer
+  inserting at a steady rate it yielded 760,514 times in 5 s. It now asks for a 1 ms sleep between
+  looks, which the statement reports as Sleep (`ProgramStep::Sleep`).
+
+Tests: `blocking_runners_sleep_out_a_busy_wait`, `blob_open_sleeps_out_a_busy_wait`, the SDK kit's
+`sync_steps_sleep_out_a_busy_wait` and the `turso` crate's
+`a_busy_wait_is_polled_again_when_each_delay_ends` each bound the steps or polls of a 60 ms busy
+wait. Every OPTIMIZE INDEX in the ivf_rq tests runs through a helper that fails past ten thousand
+yields, and `a_writer_refused_during_a_step_of_optimize_takes_the_lock_before_the_next_steps`
+fails there with the yielding wait. Fail-first: putting back each of the six waits fails its test,
+6 of 6 (the counts above, and 888,173 steps in the SDK kit's sync mode).
+
+Not covered: a caller of the C API in async mode passes no waker, so it still steps again when it
+chooses; the other language bindings' own step loops are as upstream left them.
 
 ## Taken upstream
 

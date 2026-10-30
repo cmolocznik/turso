@@ -2066,9 +2066,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     }
 
     /// What follows a landed commit: its checkpoint, handed to the store's pool or run inline, or
-    /// none. While the log is `far_behind`, the commit hands nothing to the pool: it waits for a
-    /// checkpoint running on its database to end, then checkpoints inline if the log is still
-    /// behind, so writers cannot outrun checkpoints for long.
+    /// none. While the log is `far_behind`, the commit waits for a checkpoint running on its
+    /// database on another thread to end, then checkpoints inline if the log is still behind, so
+    /// writers cannot outrun checkpoints for long. A checkpoint stepped on the commit's own thread
+    /// goes on only once the commit returns, so the commit does not wait for it.
     fn checkpoint_after_commit(
         &mut self,
         mvcc_store: &Arc<MvStore<Clock, A>>,
@@ -2080,34 +2081,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             && self.successor.is_none()
             && mvcc_store.storage.should_checkpoint();
         if checkpoints {
-            let running = if background_checkpoint::far_behind(mvcc_store.storage.as_ref()) {
-                mvcc_store.wait_for_running_checkpoint()
+            let inline = if background_checkpoint::far_behind(mvcc_store.storage.as_ref()) {
+                match mvcc_store.wait_for_running_checkpoint() {
+                    RunningCheckpoint::Elsewhere(wait) => {
+                        self.state = CommitState::AwaitCheckpoint { end_ts };
+                        return Ok(TransitionResult::Io(IOCompletions(wait)));
+                    }
+                    RunningCheckpoint::None => {
+                        mvcc_store.background_checkpoint.count_assist();
+                        true
+                    }
+                    // It goes on only once this commit returns.
+                    RunningCheckpoint::OnThisThread => !self.hand_off_checkpoint(mvcc_store),
+                }
             } else {
-                RunningCheckpoint::OnThisThread
-            };
-            let inline = match running {
-                RunningCheckpoint::Elsewhere(wait) => {
-                    self.state = CommitState::AwaitCheckpoint { end_ts };
-                    return Ok(TransitionResult::Io(IOCompletions(wait)));
-                }
-                RunningCheckpoint::None => {
-                    mvcc_store.background_checkpoint.count_assist();
-                    true
-                }
-                // With the background checkpoint on, the checkpoint runs on the store's pool, so
-                // this commit returns now.
-                RunningCheckpoint::OnThisThread => {
-                    !mvcc_store
-                        .background_checkpoint
-                        .request(&mvcc_store.storage, || match self.db_id {
-                            crate::MAIN_DB_ID => Some(self.connection.db.clone()),
-                            db_id => self
-                                .connection
-                                .attached_databases()
-                                .read()
-                                .get_database_by_index(db_id),
-                        })
-                }
+                !self.hand_off_checkpoint(mvcc_store)
             };
             if inline {
                 let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
@@ -2146,6 +2134,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, end_ts);
         self.finalize(mvcc_store)?;
         Ok(TransitionResult::Done(()))
+    }
+
+    /// Hands this commit's checkpoint to the store's pool, which runs it while the commit returns;
+    /// false when the pool does not take it.
+    fn hand_off_checkpoint(&self, mvcc_store: &Arc<MvStore<Clock, A>>) -> bool {
+        mvcc_store
+            .background_checkpoint
+            .request(&mvcc_store.storage, || match self.db_id {
+                crate::MAIN_DB_ID => Some(self.connection.db.clone()),
+                db_id => self
+                    .connection
+                    .attached_databases()
+                    .read()
+                    .get_database_by_index(db_id),
+            })
     }
 
     fn step_await_group_commit(

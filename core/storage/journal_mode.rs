@@ -56,10 +56,14 @@ impl From<Version> for JournalMode {
     }
 }
 
+/// Whether the database has a logical log holding anything, in any of the files it rolls through.
 pub fn logical_log_exists(db_path: impl AsRef<std::path::Path>) -> bool {
-    let db_path = db_path.as_ref();
-    let log_path = db_path.with_extension("db-log");
-    std::path::Path::exists(log_path.as_path()) && log_path.as_path().metadata().unwrap().len() > 0
+    use crate::mvcc::persistent_storage::logical_log::{segment_path, LOG_SEGMENT_FILES};
+    let log_path = db_path.as_ref().with_extension("db-log");
+    let base = log_path.to_string_lossy();
+    (0..LOG_SEGMENT_FILES).any(|slot| {
+        std::fs::metadata(segment_path(&base, slot)).is_ok_and(|metadata| metadata.len() > 0)
+    })
 }
 
 pub fn open_mv_store(
@@ -93,11 +97,13 @@ pub fn open_mv_store(
                 .to_str()
                 .expect("path should be valid string");
             let file = io.open_file(string_path, flags, false)?;
-            Arc::new(mvcc::persistent_storage::Storage::new(
+            Arc::new(mvcc::persistent_storage::Storage::new_rolling(
                 file,
                 io,
                 encryption_ctx,
-            ))
+                string_path.to_string(),
+                flags,
+            )?)
         };
 
     Ok(Arc::new(MvStore::new_in(

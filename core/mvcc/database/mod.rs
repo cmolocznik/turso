@@ -79,8 +79,8 @@ use super::persistent_storage::logical_log::{
     parse_ops_from_plaintext, LogSerializer, LOG_RECORD_PREFIX_SIZE,
 };
 use super::persistent_storage::logical_log::{
-    HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
-    LOG_HDR_SIZE,
+    HeaderReadResult, IndexOpKind, LogChainReader, ParsedOp, StreamingLogicalLogReader,
+    StreamingResult, LOG_HDR_SIZE,
 };
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
@@ -90,6 +90,8 @@ use super::portable_logical::{
 
 #[cfg(test)]
 pub mod hermitage_tests;
+#[cfg(test)]
+mod rolling_log_tests;
 #[cfg(test)]
 pub mod tests;
 
@@ -4225,10 +4227,8 @@ pub enum MetadataIoStep {
 pub enum CompleteCheckpointState {
     #[default]
     Start,
-    /// Reading the log header via the streaming reader.
-    ReadingHeader {
-        reader: Box<StreamingLogicalLogReader>,
-    },
+    /// Reading the log's headers, of each of its segments in a log that rolls.
+    ReadingHeader { reader: Box<LogChainReader> },
     /// `wal_max_frame == 0` branch: driving the early `wal.truncate_wal`.
     /// `checkpoint_result` must persist across IO yields because
     /// `truncate_wal`/`truncate_log` tracks its truncate/sync progress through
@@ -4236,6 +4236,8 @@ pub enum CompleteCheckpointState {
     /// re-entry would re-issue the truncate forever.
     DriveEarlyTruncate {
         header_result: HeaderReadResult,
+        /// The slot of the log's newest segment, whose header `header_result` is.
+        newest_slot: usize,
         checkpoint_result: CheckpointResult,
     },
     /// Main path: driving `wal.checkpoint(Truncate)`. Reached from a Valid header (reused
@@ -4309,22 +4311,22 @@ pub enum RecoverLogicalLogState {
     #[default]
     Start,
     ReadHeader {
-        reader: Box<StreamingLogicalLogReader>,
+        reader: Box<LogChainReader>,
         preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
     },
     ReadTxTs {
-        reader: Box<StreamingLogicalLogReader>,
+        reader: Box<LogChainReader>,
         preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
         header_present: bool,
         txts_st: ReadPersistentTxTsMaxState,
     },
     ReadCookie {
-        reader: Box<StreamingLogicalLogReader>,
+        reader: Box<LogChainReader>,
         preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
         persistent_tx_ts_max: u64,
     },
     QuerySchema {
-        reader: Box<StreamingLogicalLogReader>,
+        reader: Box<LogChainReader>,
         preserved_tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
         persistent_tx_ts_max: u64,
         cookie: u32,
@@ -4340,7 +4342,7 @@ pub enum RecoverLogicalLogState {
 /// Accumulated state of the logical-log replay loop, persisted across
 /// `next_frame` IO yields. See [`MvStore::maybe_recover_logical_log`].
 pub struct RecoverCtx {
-    reader: Box<StreamingLogicalLogReader>,
+    reader: Box<LogChainReader>,
     preserved_table_valued_functions: Vec<Arc<crate::vtab::VirtualTable>>,
     /// Fallback schema cookie (pre-read) used by `recover_build_schema` only
     /// when `global_header` is unset.
@@ -5074,7 +5076,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// VACUUM copies the physical DB image, so any MVCC logical-log bytes must
     /// be checkpointed first.
     pub(crate) fn has_uncheckpointed_log(&self) -> Result<bool> {
-        Ok(self.get_logical_log_file().size()? != 0)
+        Ok(self.storage.logical_log_size()? != 0)
     }
 
     /// Rebuild MVCC's physical root-page metadata after in-place VACUUM
@@ -8409,7 +8411,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             lwm: self.compute_lwm(),
             durable_txid_max: self.durable_txid_max.load(Ordering::SeqCst),
             logical_log_offset: self.logical_log_offset(),
-            logical_log_size: self.get_logical_log_file().size().unwrap_or(0),
+            logical_log_size: self.storage.logical_log_size().unwrap_or(0),
             active_txs: self.txs.len(),
             min_reader_mark: self.compute_min_reader_mark(),
             backfill_floor: *self.backfill_floor.read(),
@@ -9557,14 +9559,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     if wal.holds_read_lock() {
                         wal.end_read_tx();
                     }
-                    let file = self.get_logical_log_file();
-                    // Header is never encrypted; no EncryptionContext needed.
+                    // Headers are never encrypted; no EncryptionContext needed.
                     *st = CompleteCheckpointState::ReadingHeader {
-                        reader: Box::new(StreamingLogicalLogReader::new(file, None)),
+                        reader: Box::new(LogChainReader::new(self.storage.log_files(), None)),
                     };
                 }
                 CompleteCheckpointState::ReadingHeader { reader } => {
                     let header_result = return_if_io!(reader.try_read_header_nonblock());
+                    let newest_slot = reader.newest_slot();
                     let wal_max_frame = wal.get_max_frame_in_wal();
                     let is_readonly = connection.db.is_readonly();
                     if wal_max_frame == 0 {
@@ -9575,6 +9577,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         }
                         *st = CompleteCheckpointState::DriveEarlyTruncate {
                             header_result,
+                            newest_slot,
                             checkpoint_result: CheckpointResult::new(0, 0, 0),
                         };
                         continue;
@@ -9590,8 +9593,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         HeaderReadResult::Valid(header) => {
                             // Interrupted checkpoint with the logical log still
                             // present: reuse its header so the fresh-header write in
-                            // RetryHeader keeps the existing salt chain.
-                            self.storage.set_header(header);
+                            // RetryHeader keeps the existing salt chain, in the file of
+                            // the log's newest segment.
+                            self.storage.set_active_segment(newest_slot, header);
                         }
                         HeaderReadResult::NoLog => {
                             // A checkpoint empties the logical log only once every operation
@@ -9624,11 +9628,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
                 CompleteCheckpointState::DriveEarlyTruncate {
                     header_result,
+                    newest_slot,
                     checkpoint_result,
                 } => {
                     return_if_io!(wal.truncate_wal(checkpoint_result, pager.get_sync_type()));
+                    // With no checkpoint to complete, recovery picks the segment to write in, once
+                    // it knows a log in another slot is this database's own.
                     if let HeaderReadResult::Valid(header) = header_result {
-                        self.storage.set_header(header.clone());
+                        if *newest_slot == 0 {
+                            self.storage.set_header(header.clone());
+                        }
                     }
                     *st = CompleteCheckpointState::Start;
                     return Ok(IOResult::Done(()));
@@ -9973,9 +9982,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         loop {
             match st {
                 RecoverLogicalLogState::Start => {
-                    let file = self.get_logical_log_file();
                     let enc_ctx = self.storage.encryption_ctx();
-                    let reader = Box::new(StreamingLogicalLogReader::new(file, enc_ctx));
+                    let reader = Box::new(LogChainReader::new(self.storage.log_files(), enc_ctx));
                     let preserved_tvfs =
                         Self::capture_table_valued_functions(&connection.schema.read());
                     *st = RecoverLogicalLogState::ReadHeader {
@@ -9995,9 +10003,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             .into());
                         }
                     };
-                    if let Some(header) = &header {
-                        self.storage.set_header(header.clone());
-                    }
                     let header_present = header.is_some();
                     let RecoverLogicalLogState::ReadHeader {
                         reader,
@@ -10014,6 +10019,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     };
                 }
                 RecoverLogicalLogState::ReadTxTs {
+                    reader,
                     header_present,
                     txts_st,
                     ..
@@ -10039,8 +10045,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         .store(persistent_tx_ts_max, Ordering::SeqCst);
                     self.clock.reset(persistent_tx_ts_max + 1);
 
-                    if !header_present || self.get_logical_log_file().size()? <= LOG_HDR_SIZE as u64
-                    {
+                    reader.plan(persistent_tx_ts_max)?;
+                    if !header_present || !reader.has_frames()? {
+                        self.storage.restore_after_recovery(reader.recovered())?;
                         *st = RecoverLogicalLogState::Done;
                         return Ok(IOResult::Done(false));
                     }
@@ -10134,12 +10141,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     turso_assert_reachable!("MVCC recovery (replaying a frame)");
                     loop {
                         let Some(frame) = return_if_io!(ctx.reader.next_frame()) else {
-                            let recovered_offset = ctx.reader.last_valid_offset() as u64;
-                            let recovered_running_crc = ctx.reader.running_crc();
-                            self.storage.restore_logical_log_state_after_recovery(
-                                recovered_offset,
-                                recovered_running_crc,
-                            );
+                            self.storage
+                                .restore_after_recovery(ctx.reader.recovered())?;
                             break;
                         };
                         self.recover_process_frame(connection, ctx, frame)?;

@@ -9,6 +9,11 @@
 //! - commits append transaction frames to `.db-log`;
 //! - checkpoint copies data into the DB file, then truncates `.db-log` to 0.
 //!
+//! A passive checkpoint can truncate only when no commit landed after its snapshot, which under
+//! constant writes never happens. A log opened over its files rolls instead (see "Rolling" below):
+//! the checkpoint seals the segment being written and the log goes on in another file, which the
+//! next checkpoint frees once it has covered every commit sealed in it.
+//!
 //! ## File layout
 //!
 //! A logical log file has:
@@ -63,10 +68,11 @@
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
 //! - `version: u8` (`LOG_VERSION`)
-//! - `flags: u8` (bits 1..7 must be zero; bit 0 is currently reserved/ignored)
+//! - `flags: u8` (bits 1..7 must be zero; bit 0 marks a segment header)
 //! - `hdr_len: u16` (`>= 56`)
 //! - `salt: u64` (random salt, regenerated on each log truncation)
-//! - `reserved: [u8; 36]` (must be zero for current format)
+//! - `reserved: [u8; 36]` (zero, but in a segment header: `seq: u64 | prev_seq: u64 |
+//!   start: u64 | prior_max_ts: u64 | seed_crc: u32`; see "Rolling")
 //! - `hdr_crc32c: u32` (CRC32C of the header with this field zeroed)
 //!
 //! ### TX Header (`TX_HEADER_SIZE = 24`, `TX_EXT_HEADER_SIZE = 40`)
@@ -140,6 +146,29 @@
 //! - applies only validated frames whose `commit_ts > persistent_tx_ts_max`;
 //! - sets clock to `max(persistent_tx_ts_max, max_replayed_commit_ts) + 1`;
 //! - restores writer offset to `last_valid_offset` so torn-tail bytes are overwritten.
+//!
+//! ## Rolling
+//!
+//! A log that rolls is a chain of segments spread over a few files, `.db-log`, `.db-log.1` up to
+//! `LOG_SEGMENT_FILES - 1`, each segment a whole log file of its own. When a checkpoint has to keep
+//! frames, it seals the segment being written at a frame boundary and the next frame goes to a free
+//! file, whose header holds where the segment sits in the chain:
+//! - `seq`: the segment's number, higher than any the log's files have held before;
+//! - `prev_seq`: the number of the segment it follows (a reset follows none);
+//! - `start`: the log offset of its first frame, where that segment ended;
+//! - `seed_crc`: the running CRC that segment ended with, which its first frame chains from;
+//! - `prior_max_ts`: the newest commit in every segment before it.
+//!
+//! A later checkpoint that covers every commit of a sealed segment truncates its file, which a
+//! later roll reuses. Once every commit is covered the log resets into a numbered segment of its
+//! own, so a file freed before, whose truncate was not durable, can never outrank it.
+//!
+//! Recovery begins at the newest segment, by `seq`, and goes back through `prev_seq` while a
+//! segment's `prior_max_ts` is a commit no checkpoint has covered; a predecessor it needs that is
+//! missing fails it. It replays those segments as one log. A segment whose predecessor did not
+//! validate up to its `start` and `seed_crc` was written past a torn tail: it and the ones after it
+//! are not replayed, as a single file's frames past a torn one are not, and the next segment takes
+//! a number past theirs.
 //!
 //! ## Durability and checkpoint ordering
 //!
@@ -252,6 +281,7 @@ use crate::{
 
 use crate::storage::encryption::EncryptionContext;
 use crate::File;
+use std::collections::VecDeque;
 
 mod serializer;
 use serializer::EncryptedPayload;
@@ -302,6 +332,11 @@ const LOG_HDR_SALT_SIZE: usize = 8;
 const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
 const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
+/// Header flag: the reserved bytes hold the [`LogSegment`] the file holds, in a log that rolls.
+const LOG_HDR_FLAG_SEGMENT: u8 = 1 << 0;
+/// The files a log that rolls writes through: the segment being written, the ones sealed behind it
+/// until a checkpoint covers them, and one freed for the next roll.
+pub(crate) const LOG_SEGMENT_FILES: usize = 4;
 pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
 pub(crate) const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
@@ -455,6 +490,8 @@ pub struct LogHeader {
     pub(crate) salt: u64,
     hdr_crc32c: u32,
     reserved: [u8; LOG_HDR_RESERVED_SIZE],
+    /// The segment the file holds, in a log that has rolled.
+    pub(crate) segment: Option<LogSegment>,
 }
 
 impl LogHeader {
@@ -474,6 +511,7 @@ impl LogHeader {
             salt: io.generate_random_number() as u64,
             hdr_crc32c: 0,
             reserved: [0; LOG_HDR_RESERVED_SIZE],
+            segment: None,
         }
     }
 
@@ -481,11 +519,17 @@ impl LogHeader {
         let mut buf = [0u8; LOG_HDR_SIZE];
         buf[0..4].copy_from_slice(&LOG_MAGIC.to_le_bytes());
         buf[4] = self.version;
-        buf[5] = self.flags;
+        buf[5] = match self.segment {
+            Some(_) => self.flags | LOG_HDR_FLAG_SEGMENT,
+            None => self.flags,
+        };
         buf[6..8].copy_from_slice(&self.hdr_len.to_le_bytes());
         buf[LOG_HDR_SALT_START..LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE]
             .copy_from_slice(&self.salt.to_le_bytes());
         buf[LOG_HDR_RESERVED_START..LOG_HDR_CRC_START].copy_from_slice(&self.reserved);
+        if let Some(segment) = &self.segment {
+            segment.encode(&mut buf[LOG_HDR_RESERVED_START..LOG_HDR_CRC_START]);
+        }
 
         let crc = crc32c::crc32c(&buf);
         buf[LOG_HDR_CRC_START..LOG_HDR_SIZE].copy_from_slice(&crc.to_le_bytes());
@@ -554,20 +598,96 @@ impl LogHeader {
 
         let mut reserved = [0u8; LOG_HDR_RESERVED_SIZE];
         reserved.copy_from_slice(&buf[LOG_HDR_RESERVED_START..LOG_HDR_CRC_START]);
-        if reserved.iter().any(|b| *b != 0) {
+        let segment = if reserved.iter().all(|b| *b == 0) {
+            None
+        } else if flags & LOG_HDR_FLAG_SEGMENT != 0 {
+            Some(LogSegment::decode(&reserved)?)
+        } else {
             return Err(LimboError::Corrupt(
                 "Logical log header reserved bytes must be zero".to_string(),
             ));
-        }
+        };
 
         Ok(Self {
             version,
-            flags,
+            flags: flags & !LOG_HDR_FLAG_SEGMENT,
             hdr_len,
             salt,
             hdr_crc32c,
-            reserved,
+            reserved: [0; LOG_HDR_RESERVED_SIZE],
+            segment,
         })
+    }
+
+    /// The running CRC the first frame after this header chains from.
+    pub(crate) fn chain_seed(&self) -> u32 {
+        self.segment
+            .map_or_else(|| derive_initial_crc(self.salt), |segment| segment.seed_crc)
+    }
+}
+
+/// Where a segment sits in a log that rolls, held in its header's reserved bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LogSegment {
+    /// The segment's number, higher than any the log's files held before it.
+    pub(crate) seq: u64,
+    /// The number of the segment it follows; a reset of the log follows none.
+    pub(crate) prev_seq: u64,
+    /// The log offset of the segment's first frame: where its predecessor ended.
+    pub(crate) start: u64,
+    /// The running CRC its first frame chains from: the one its predecessor ended with.
+    pub(crate) seed_crc: u32,
+    /// The newest commit in the segments before it. Recovery may begin at this segment only when a
+    /// checkpoint has covered that commit.
+    pub(crate) prior_max_ts: u64,
+}
+
+impl LogSegment {
+    fn encode(&self, reserved: &mut [u8]) {
+        reserved[0..8].copy_from_slice(&self.seq.to_le_bytes());
+        reserved[8..16].copy_from_slice(&self.prev_seq.to_le_bytes());
+        reserved[16..24].copy_from_slice(&self.start.to_le_bytes());
+        reserved[24..32].copy_from_slice(&self.prior_max_ts.to_le_bytes());
+        reserved[32..36].copy_from_slice(&self.seed_crc.to_le_bytes());
+    }
+
+    fn decode(reserved: &[u8]) -> Result<Self> {
+        let u64_at = |at: usize| {
+            u64::from_le_bytes(
+                reserved[at..at + 8]
+                    .try_into()
+                    .expect("the reserved bytes hold eight bytes here"),
+            )
+        };
+        let segment = Self {
+            seq: u64_at(0),
+            prev_seq: u64_at(8),
+            start: u64_at(16),
+            prior_max_ts: u64_at(24),
+            seed_crc: u32::from_le_bytes(
+                reserved[32..36]
+                    .try_into()
+                    .expect("the reserved bytes hold four bytes here"),
+            ),
+        };
+        if segment.seq == 0 || segment.prev_seq >= segment.seq {
+            return Err(LimboError::Corrupt(
+                "Invalid logical log segment header".to_string(),
+            ));
+        }
+        Ok(segment)
+    }
+
+    /// The segment numbered `seq` a reset of the log begins: at offset zero, chaining from
+    /// `salt`, with every commit before it covered.
+    fn reset(seq: u64, salt: u64, prior_max_ts: u64) -> Self {
+        Self {
+            seq,
+            prev_seq: 0,
+            start: 0,
+            seed_crc: derive_initial_crc(salt),
+            prior_max_ts,
+        }
     }
 }
 
@@ -599,6 +719,140 @@ pub struct LogicalLog {
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
     max_appended_commit_ts: u64,
+    /// The files a log opened over them rolls through; `None` for a log of one file.
+    ring: Option<Box<LogRing>>,
+}
+
+/// The path of slot `slot` of the log whose first file is `base`.
+pub(crate) fn segment_path(base: &str, slot: usize) -> String {
+    if slot == 0 {
+        base.to_string()
+    } else {
+        format!("{base}.{slot}")
+    }
+}
+
+/// The files a log rolls through, and the segments sealed behind the one being written.
+struct LogRing {
+    /// The path of slot 0, `.db-log`; slot `n` is `.db-log.n`.
+    base: String,
+    flags: crate::OpenFlags,
+    slots: [Slot; LOG_SEGMENT_FILES],
+    /// The slot being written.
+    active: usize,
+    /// The segments sealed behind it, oldest first.
+    sealed: VecDeque<SealedSegment>,
+    /// A checkpoint asked for a roll while a frame was being written; the write's end rolls.
+    roll_pending: bool,
+    /// The number of the next segment, past every number the log's files have held: a segment
+    /// left by a recovery that ended before it can never share its number with a later one.
+    next_seq: u64,
+}
+
+enum Slot {
+    Missing,
+    /// A file found when the log was opened, which recovery places.
+    Found(Arc<dyn File>),
+    /// Holds the segment being written, or one sealed behind it.
+    InUse(Arc<dyn File>),
+    /// Holds nothing a reader needs once `ready`, its truncate or a new file's first fsync, has
+    /// completed.
+    Free {
+        file: Arc<dyn File>,
+        ready: Completion,
+    },
+}
+
+struct SealedSegment {
+    slot: usize,
+    /// The log offset the segment ends at.
+    end: u64,
+    /// The newest commit in it: a checkpoint that covers it frees the segment.
+    max_commit_ts: u64,
+    /// Whether it may hold frames no fsync has covered yet.
+    unsynced: Arc<crate::sync::atomic::AtomicBool>,
+}
+
+impl LogRing {
+    fn file(&self, slot: usize) -> &Arc<dyn File> {
+        match &self.slots[slot] {
+            Slot::Found(file) | Slot::InUse(file) | Slot::Free { file, .. } => file,
+            Slot::Missing => panic!("logical log slot {slot} has no file"),
+        }
+    }
+
+    /// A slot ready to take the next segment.
+    fn ready_slot(&self) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| matches!(slot, Slot::Free { ready, .. } if ready.succeeded()))
+    }
+
+    /// Truncates `slot`'s file, which then holds nothing a reader needs.
+    fn free(&mut self, slot: usize, group: Option<&mut CompletionGroup>) -> Result<()> {
+        let file = self.file(slot).clone();
+        let c = Completion::new_trunc(|result| {
+            if let Err(err) = result {
+                tracing::error!("logical log segment truncate failed: {err}");
+            }
+        });
+        if let Some(group) = group {
+            group.add(&c);
+        }
+        let ready = file.truncate(0, c)?;
+        self.slots[slot] = Slot::Free { file, ready };
+        Ok(())
+    }
+
+    /// Readies a slot for a later roll when none is: empties a file found when the log was opened,
+    /// or creates the next missing one. A new file is fsynced before it takes a frame, which makes
+    /// its name durable.
+    fn prepare(&mut self, io: &Arc<dyn crate::IO>, group: &mut CompletionGroup) -> Result<()> {
+        if let Some(slot) = self
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, Slot::Found(_)))
+        {
+            return self.free(slot, Some(group));
+        }
+        let Some(slot) = self
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, Slot::Missing))
+        else {
+            return Ok(());
+        };
+        let file = io.open_file(
+            &segment_path(&self.base, slot),
+            self.flags | crate::OpenFlags::Create,
+            false,
+        )?;
+        let c = Completion::new_sync(|_| {});
+        group.add(&c);
+        let ready = file.sync(c, FileSyncType::Fsync)?;
+        self.slots[slot] = Slot::Free { file, ready };
+        Ok(())
+    }
+}
+
+/// What recovery read of one segment of the log.
+#[derive(Clone, Debug)]
+pub struct RecoveredSegment {
+    pub(crate) slot: usize,
+    pub(crate) header: LogHeader,
+    /// The file offset just past the segment's last valid frame.
+    pub(crate) end: u64,
+    /// The running CRC after that frame.
+    pub(crate) end_crc: u32,
+    pub(crate) max_commit_ts: u64,
+}
+
+/// The segments recovery replayed, oldest first: the log goes on writing in the last of them.
+#[derive(Clone, Debug, Default)]
+pub struct RecoveredLog {
+    pub(crate) segments: Vec<RecoveredSegment>,
+    /// The highest segment number among the log's files, replayed or not.
+    pub(crate) max_seq: u64,
 }
 
 #[cfg(feature = "aristo-instr")]
@@ -630,6 +884,7 @@ impl LogicalLog {
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
+            ring: None,
         }
     }
 
@@ -639,6 +894,226 @@ impl LogicalLog {
         encryption_ctx: Option<EncryptionContext>,
     ) -> Self {
         Self::new_internal(file, io, encryption_ctx, ENCRYPTED_PAYLOAD_CHUNK_SIZE)
+    }
+
+    /// A log that rolls through the files `base`, `base.1` and on, `file` being `base`'s. It opens
+    /// those that exist, for recovery to read; `flags` are the ones `file` was opened with.
+    pub fn new_rolling(
+        file: Arc<dyn File>,
+        io: Arc<dyn crate::IO>,
+        encryption_ctx: Option<EncryptionContext>,
+        base: String,
+        flags: crate::OpenFlags,
+    ) -> Result<Self> {
+        let mut slots: [Slot; LOG_SEGMENT_FILES] = std::array::from_fn(|_| Slot::Missing);
+        slots[0] = Slot::InUse(file.clone());
+        for (slot, found) in slots.iter_mut().enumerate().skip(1) {
+            match io.open_file(
+                &segment_path(&base, slot),
+                flags & !crate::OpenFlags::Create,
+                false,
+            ) {
+                Ok(file) => *found = Slot::Found(file),
+                Err(LimboError::CompletionError(CompletionError::IOError(
+                    std::io::ErrorKind::NotFound,
+                    _,
+                ))) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let mut log = Self::new(file, io, encryption_ctx);
+        log.ring = Some(Box::new(LogRing {
+            base,
+            flags,
+            slots,
+            active: 0,
+            sealed: VecDeque::new(),
+            roll_pending: false,
+            next_seq: 1,
+        }));
+        Ok(log)
+    }
+
+    /// The log's files, by slot, for recovery to read: a freed one holds nothing to read.
+    pub(crate) fn files(&self) -> Vec<(usize, Arc<dyn File>)> {
+        match &self.ring {
+            None => vec![(0, self.file.clone())],
+            Some(ring) => ring
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| matches!(slot, Slot::Found(_) | Slot::InUse(_)))
+                .map(|(slot, _)| (slot, ring.file(slot).clone()))
+                .collect(),
+        }
+    }
+
+    /// The bytes held by the files of the segments still needed.
+    pub(crate) fn size(&self) -> Result<u64> {
+        let mut size = self.file.size()?;
+        if let Some(ring) = &self.ring {
+            for sealed in &ring.sealed {
+                size += ring.file(sealed.slot).size()?;
+            }
+        }
+        Ok(size)
+    }
+
+    /// How many segments the log is spread over: the one being written and those sealed behind it.
+    pub(crate) fn segments(&self) -> usize {
+        1 + self.ring.as_ref().map_or(0, |ring| ring.sealed.len())
+    }
+
+    /// Takes up writing where recovery left the log: in the last segment it replayed, after its
+    /// last valid frame. The segments before it stay sealed until a checkpoint covers them, and
+    /// every other file is freed.
+    pub(crate) fn restore(&mut self, recovered: RecoveredLog) -> Result<()> {
+        if let Some(ring) = self.ring.as_deref_mut() {
+            ring.next_seq = ring.next_seq.max(recovered.max_seq + 1);
+        }
+        let Some(active) = recovered.segments.last() else {
+            if let Some(ring) = self.ring.as_deref_mut() {
+                for slot in 1..LOG_SEGMENT_FILES {
+                    if matches!(ring.slots[slot], Slot::Found(_)) {
+                        ring.free(slot, None)?;
+                    }
+                }
+            }
+            return Ok(());
+        };
+        self.discard_pending_header_upgrade();
+        if let Some(ring) = self.ring.as_deref_mut() {
+            let mut in_use = [false; LOG_SEGMENT_FILES];
+            for segment in &recovered.segments {
+                in_use[segment.slot] = true;
+                let file = ring.file(segment.slot).clone();
+                ring.slots[segment.slot] = Slot::InUse(file);
+            }
+            for (slot, used) in in_use.iter().enumerate() {
+                if !used && !matches!(ring.slots[slot], Slot::Missing) {
+                    ring.free(slot, None)?;
+                }
+            }
+            ring.sealed = recovered.segments[..recovered.segments.len() - 1]
+                .iter()
+                .map(|segment| SealedSegment {
+                    slot: segment.slot,
+                    end: segment.header.segment.map_or(0, |s| s.start) + segment.end,
+                    max_commit_ts: segment.max_commit_ts,
+                    // What was read back may not have reached the disk before a crash.
+                    unsynced: Arc::new(crate::sync::atomic::AtomicBool::new(true)),
+                })
+                .collect();
+            ring.active = active.slot;
+            self.file = ring.file(active.slot).clone();
+        }
+        self.header = Some(active.header.clone());
+        self.offset = active.end;
+        self.running_crc = active.end_crc;
+        self.pending_running_crc = None;
+        self.max_appended_commit_ts = active.max_commit_ts;
+        Ok(())
+    }
+
+    /// Goes on writing in the segment of `slot`, the log's newest, whose header is `header`.
+    pub(crate) fn set_active_segment(&mut self, slot: usize, header: LogHeader) {
+        if let Some(ring) = self.ring.as_deref_mut() {
+            if slot != ring.active {
+                let file = ring.file(slot).clone();
+                ring.slots[slot] = Slot::InUse(file.clone());
+                ring.active = slot;
+                self.file = file;
+            }
+        }
+        self.set_header(header);
+    }
+
+    /// The log offset of the active segment's first frame.
+    pub(crate) fn segment_start(&self) -> u64 {
+        self.header
+            .as_ref()
+            .and_then(|header| header.segment)
+            .map_or(0, |segment| segment.start)
+    }
+
+    /// Whether this log rolls: it was opened over files it can roll through, and its frames carry
+    /// no portable changes, whose readers follow a single file.
+    fn rolls(&self) -> bool {
+        self.ring.is_some()
+            && self.pending_header_upgrade.is_none()
+            && self
+                .header
+                .as_ref()
+                .is_some_and(|header| header.version == LOG_VERSION_V2)
+    }
+
+    /// Seals the segment being written and goes on in `slot`'s file, at a frame boundary.
+    fn roll_to(&mut self, slot: usize) {
+        let header = self
+            .header
+            .clone()
+            .expect("a segment with frames has a header");
+        let segment = segment_of(&header);
+        let end = segment.start + self.offset;
+        let ring = self
+            .ring
+            .as_deref_mut()
+            .expect("only a log that rolls rolls");
+        let seq = ring.next_seq;
+        ring.next_seq += 1;
+        let Slot::Free { file, .. } = std::mem::replace(&mut ring.slots[slot], Slot::Missing)
+        else {
+            panic!("logical log rolled into slot {slot}, which is not free");
+        };
+        ring.slots[slot] = Slot::InUse(file.clone());
+        ring.sealed.push_back(SealedSegment {
+            slot: ring.active,
+            end,
+            max_commit_ts: self.max_appended_commit_ts,
+            unsynced: Arc::new(crate::sync::atomic::AtomicBool::new(true)),
+        });
+        ring.active = slot;
+        ring.roll_pending = false;
+        let mut next = LogHeader::new_with_version(&self.io, header.version);
+        next.segment = Some(LogSegment {
+            seq,
+            prev_seq: segment.seq,
+            start: end,
+            seed_crc: self.running_crc,
+            prior_max_ts: segment.prior_max_ts.max(self.max_appended_commit_ts),
+        });
+        self.file = file;
+        self.header = Some(next);
+        // The header goes to disk with the segment's first frame, which chains from `running_crc`.
+        self.offset = 0;
+        self.max_appended_commit_ts = 0;
+    }
+
+    /// Takes the next segment number; only a log that rolls writes segment headers.
+    fn take_seq(&mut self) -> u64 {
+        let ring = self
+            .ring
+            .as_deref_mut()
+            .expect("only a log that rolls numbers segments");
+        let seq = ring.next_seq;
+        ring.next_seq += 1;
+        seq
+    }
+
+    /// Rolls as a checkpoint asked once no frame is being written.
+    fn roll_if_pending(&mut self) {
+        let pending = self.ring.as_ref().is_some_and(|ring| ring.roll_pending);
+        if !pending || self.pending_running_crc.is_some() {
+            return;
+        }
+        match self.ring.as_ref().and_then(|ring| ring.ready_slot()) {
+            Some(slot) if self.rolls() && self.offset > 0 => self.roll_to(slot),
+            _ => {
+                if let Some(ring) = self.ring.as_deref_mut() {
+                    ring.roll_pending = false;
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -653,7 +1128,7 @@ impl LogicalLog {
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
         self.discard_pending_header_upgrade();
-        self.running_crc = derive_initial_crc(header.salt);
+        self.running_crc = header.chain_seed();
         self.header = Some(header);
     }
 
@@ -969,6 +1444,7 @@ impl LogicalLog {
             .pending_running_crc
             .take()
             .expect("advance_offset_after_success called without pending deferred write");
+        self.roll_if_pending();
     }
 
     /// Discard the pending running CRC staged by a deferred write whose
@@ -978,14 +1454,35 @@ impl LogicalLog {
     /// running CRC from a value staged for a write that never confirmed.
     pub fn discard_pending_write(&mut self) {
         self.pending_running_crc = None;
+        self.roll_if_pending();
     }
 
+    /// Fsyncs the segment being written, and the sealed ones that may hold frames no fsync has
+    /// covered: a frame written before a roll is in its sealed segment's file.
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
+        let mut group = CompletionGroup::new(|_| {});
+        if let Some(ring) = self.ring.as_deref() {
+            for sealed in ring
+                .sealed
+                .iter()
+                .filter(|sealed| sealed.unsynced.load(crate::sync::atomic::Ordering::Acquire))
+            {
+                let unsynced = sealed.unsynced.clone();
+                let c = Completion::new_sync(move |result| {
+                    if result.is_ok() {
+                        unsynced.store(false, crate::sync::atomic::Ordering::Release);
+                    }
+                });
+                group.add(&c);
+                let _sealed_c = ring.file(sealed.slot).sync(c, sync_type)?;
+            }
+        }
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("logical_log_sync finish");
         });
-        let c = self.file.sync(completion, sync_type)?;
-        Ok(c)
+        group.add(&completion);
+        let _active_c = self.file.sync(completion, sync_type)?;
+        Ok(group.build())
     }
 
     fn current_or_new_header(&self) -> Result<LogHeader> {
@@ -1046,13 +1543,21 @@ impl LogicalLog {
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
-    fn truncate_to_zero(&mut self) -> Result<Completion> {
+    fn truncate_to_zero(&mut self, group: &mut CompletionGroup) -> Result<()> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
         self.pending_header_upgrade = None;
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
-        self.running_crc = derive_initial_crc(header.salt);
+        if let Some(segment) = header.segment {
+            let prior_max_ts = segment.prior_max_ts.max(self.max_appended_commit_ts);
+            header.segment = Some(LogSegment::reset(
+                self.take_seq(),
+                header.salt,
+                prior_max_ts,
+            ));
+        }
+        self.running_crc = header.chain_seed();
         self.pending_running_crc = None;
         self.header = Some(header);
 
@@ -1061,28 +1566,63 @@ impl LogicalLog {
                 tracing::error!("logical_log_truncate failed: {}", err);
             }
         });
-        let c = self.file.truncate(0, completion)?;
+        group.add(&completion);
+        let _truncate_c = self.file.truncate(0, completion)?;
         self.offset = 0;
         self.max_appended_commit_ts = 0;
-        Ok(c)
+        Ok(())
     }
 
-    /// Truncate when `max_appended_commit_ts <= boundary`. Checkpoints that collected
-    /// without the blocking lock pass `durable_txid_max_new` so later commits survive;
-    /// the blocking TRUNCATE path passes `u64::MAX` (always empty after checkpoint).
+    /// Drops what a checkpoint covering every commit through `checkpointed_through_ts` made
+    /// unneeded. Checkpoints that collected without the blocking lock pass `durable_txid_max_new`
+    /// so later commits survive; the blocking TRUNCATE path passes `u64::MAX`.
+    ///
+    /// Each sealed segment the checkpoint covered is freed. Once none is left and the segment being
+    /// written holds no later commit either, the log is truncated. Otherwise a log that rolls seals
+    /// the segment being written, at once or when the frame being written lands, and goes on in a
+    /// free file, which the next checkpoint frees in turn; with no free file it readies one for the
+    /// next checkpoint.
     pub fn truncate(
         &mut self,
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
         use super::LogicalLogTruncateOutcome;
-        if self.max_appended_commit_ts > checkpointed_through_ts {
-            // Uncheckpointed frames remain — skip truncation.
-            let c = Completion::new_trunc(|_| {});
-            c.complete(0);
-            return Ok((c, LogicalLogTruncateOutcome::Retained));
+        let mut group = CompletionGroup::new(|_| {});
+        if let Some(ring) = self.ring.as_deref_mut() {
+            while ring
+                .sealed
+                .front()
+                .is_some_and(|sealed| sealed.max_commit_ts <= checkpointed_through_ts)
+            {
+                let sealed = ring.sealed.pop_front().expect("checked above");
+                ring.free(sealed.slot, Some(&mut group))?;
+            }
         }
-        let c = self.truncate_to_zero()?;
-        Ok((c, LogicalLogTruncateOutcome::Truncated))
+        let sealed = self
+            .ring
+            .as_ref()
+            .is_some_and(|ring| !ring.sealed.is_empty());
+        if !sealed && self.max_appended_commit_ts <= checkpointed_through_ts {
+            self.truncate_to_zero(&mut group)?;
+            return Ok((group.build(), LogicalLogTruncateOutcome::Truncated));
+        }
+        if self.offset > 0 && self.rolls() {
+            match self.ring.as_ref().and_then(|ring| ring.ready_slot()) {
+                Some(slot) if self.pending_running_crc.is_none() => self.roll_to(slot),
+                Some(_) => {
+                    if let Some(ring) = self.ring.as_deref_mut() {
+                        ring.roll_pending = true;
+                    }
+                }
+                None => {
+                    let io = self.io.clone();
+                    if let Some(ring) = self.ring.as_deref_mut() {
+                        ring.prepare(&io, &mut group)?;
+                    }
+                }
+            }
+        }
+        Ok((group.build(), LogicalLogTruncateOutcome::Retained))
     }
 
     /// Reset the log to a header-only file and return one completion for the
@@ -1096,12 +1636,22 @@ impl LogicalLog {
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
         self.discard_pending_header_upgrade();
+        let mut group = CompletionGroup::new(|_| {});
+        if let Some(ring) = self.ring.as_deref_mut() {
+            // Every sealed segment goes with the rest of the log.
+            while let Some(sealed) = ring.sealed.pop_front() {
+                ring.free(sealed.slot, Some(&mut group))?;
+            }
+            ring.roll_pending = false;
+        }
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
-        self.running_crc = derive_initial_crc(header.salt);
+        if header.segment.is_some() {
+            header.segment = Some(LogSegment::reset(self.take_seq(), header.salt, 0));
+        }
+        self.running_crc = header.chain_seed();
         self.pending_running_crc = None;
 
-        let mut group = CompletionGroup::new(|_| {});
         let (header, _header_c) = self.write_header(header, Some(&mut group))?;
         self.header = Some(header);
         let c = Completion::new_trunc(move |result| {
@@ -1810,7 +2360,7 @@ impl StreamingLogicalLogReader {
 
         match LogHeader::decode(&header_bytes) {
             Ok(header) => {
-                self.running_crc = derive_initial_crc(header.salt);
+                self.running_crc = header.chain_seed();
                 self.header = Some(header.clone());
                 self.offset = hdr_len;
                 self.buffer.write().clear();
@@ -3774,6 +4324,263 @@ pub(crate) enum ParsedOp {
         header: DatabaseHeader,
         commit_ts: u64,
     },
+}
+
+impl ParsedOp {
+    pub(crate) fn commit_ts(&self) -> u64 {
+        match self {
+            ParsedOp::UpsertTable { commit_ts, .. }
+            | ParsedOp::DeleteTable { commit_ts, .. }
+            | ParsedOp::UpsertIndex { commit_ts, .. }
+            | ParsedOp::DeleteIndex { commit_ts, .. }
+            | ParsedOp::UpdateHeader { commit_ts, .. } => *commit_ts,
+        }
+    }
+}
+
+/// Reads a log that may have rolled as one log: its segments in order, each from its own file.
+pub struct LogChainReader {
+    /// A reader for each of the log's files, with the file's slot.
+    readers: Vec<(usize, StreamingLogicalLogReader)>,
+    /// How many files' headers have been read.
+    headers_read: usize,
+    /// The reader of the newest segment.
+    newest: Option<usize>,
+    /// The segments to replay, oldest first, as indexes into `readers`.
+    chain: Vec<usize>,
+    /// The segment being replayed.
+    at: usize,
+    /// The newest commit read in it.
+    max_commit_ts: u64,
+    /// What was read of each segment replayed.
+    read: Vec<RecoveredSegment>,
+    /// The log ended at a segment that did not follow its predecessor.
+    broken: bool,
+}
+
+/// A segment's number and place, for ordering the log's files: a file of a log that never rolled
+/// is segment 0, at offset 0, after nothing.
+fn segment_of(header: &LogHeader) -> LogSegment {
+    header.segment.unwrap_or_else(|| LogSegment {
+        seq: 0,
+        prev_seq: 0,
+        start: 0,
+        seed_crc: header.chain_seed(),
+        prior_max_ts: 0,
+    })
+}
+
+impl LogChainReader {
+    pub(crate) fn new(
+        files: Vec<(usize, Arc<dyn File>)>,
+        encryption_ctx: Option<EncryptionContext>,
+    ) -> Self {
+        let readers = files
+            .into_iter()
+            .map(|(slot, file)| {
+                (
+                    slot,
+                    StreamingLogicalLogReader::new(file, encryption_ctx.clone()),
+                )
+            })
+            .collect();
+        Self {
+            readers,
+            headers_read: 0,
+            newest: None,
+            chain: Vec::new(),
+            at: 0,
+            max_commit_ts: 0,
+            read: Vec::new(),
+            broken: false,
+        }
+    }
+
+    fn segment(&self, index: usize) -> LogSegment {
+        segment_of(
+            self.readers[index]
+                .1
+                .header()
+                .expect("a segment has a header"),
+        )
+    }
+
+    /// The indexes of the files holding a segment.
+    fn segments(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.readers.len()).filter(|&index| self.readers[index].1.header().is_some())
+    }
+
+    /// Reads every file's header. `Valid` carries the newest segment's header, the one with the
+    /// highest number: numbers are never reused.
+    pub(crate) fn try_read_header_nonblock(&mut self) -> IOResultOr<HeaderReadResult> {
+        while self.headers_read < self.readers.len() {
+            let reader = &mut self.readers[self.headers_read].1;
+            if let HeaderReadResult::Invalid = return_if_io!(reader.try_read_header_nonblock()) {
+                return Ok(IOResult::Done(HeaderReadResult::Invalid));
+            }
+            self.headers_read += 1;
+        }
+        let mut seqs: Vec<u64> = self
+            .segments()
+            .map(|index| self.segment(index).seq)
+            .collect();
+        seqs.sort_unstable();
+        if seqs.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(LimboError::Corrupt(
+                "Two logical log segments have the same number".to_string(),
+            )
+            .into());
+        }
+        self.newest = self.segments().max_by_key(|&index| self.segment(index).seq);
+        Ok(IOResult::Done(match self.newest {
+            Some(index) => HeaderReadResult::Valid(
+                self.readers[index]
+                    .1
+                    .header()
+                    .cloned()
+                    .expect("a segment has a header"),
+            ),
+            None => HeaderReadResult::NoLog,
+        }))
+    }
+
+    /// The slot of the newest segment; that of the first file when no header was valid.
+    pub(crate) fn newest_slot(&self) -> usize {
+        match self.newest {
+            Some(index) => self.readers[index].0,
+            None => self.readers.first().map_or(0, |(slot, _)| *slot),
+        }
+    }
+
+    /// The highest segment number of the log's files, so that a later segment's is higher.
+    pub(crate) fn max_seq(&self) -> u64 {
+        self.newest.map_or(0, |index| self.segment(index).seq)
+    }
+
+    /// Picks the segments to replay, `persistent_tx_ts_max` being the newest commit a checkpoint
+    /// has covered: from the newest segment back through the segments each names as its
+    /// predecessor, while a commit before it is one no checkpoint covered. A segment that begins
+    /// at offset zero follows none. A predecessor needed that is missing fails the recovery.
+    pub(crate) fn plan(&mut self, persistent_tx_ts_max: u64) -> Result<()> {
+        let Some(newest) = self.newest else {
+            return Ok(());
+        };
+        let mut chain = vec![newest];
+        loop {
+            let last = self.segment(*chain.last().expect("the chain is not empty"));
+            if last.prior_max_ts <= persistent_tx_ts_max || last.start == 0 {
+                break;
+            }
+            let predecessor = self
+                .segments()
+                .find(|&index| self.segment(index).seq == last.prev_seq);
+            match predecessor {
+                Some(index) => chain.push(index),
+                None => {
+                    return Err(LimboError::Corrupt(format!(
+                        "Logical log segment before {} is missing",
+                        last.seq
+                    )))
+                }
+            }
+        }
+        chain.reverse();
+        self.chain = chain;
+        Ok(())
+    }
+
+    /// Whether a segment to replay holds a frame.
+    pub(crate) fn has_frames(&self) -> Result<bool> {
+        for &index in &self.chain {
+            if self.readers[index].1.file.size()? > LOG_HDR_SIZE as u64 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The log's next frame, segment after segment. A segment that does not begin where its
+    /// predecessor ended, with the CRC it ended with, follows a torn tail: the log ends there.
+    pub(crate) fn next_frame(&mut self) -> IOResultOr<Option<Vec<ParsedOp>>> {
+        loop {
+            if self.broken || self.at >= self.chain.len() {
+                return Ok(IOResult::Done(None));
+            }
+            let index = self.chain[self.at];
+            let (slot, reader) = &mut self.readers[index];
+            if let Some(frame) = return_if_io!(reader.next_frame()) {
+                if let Some(op) = frame.first() {
+                    self.max_commit_ts = self.max_commit_ts.max(op.commit_ts());
+                }
+                return Ok(IOResult::Done(Some(frame)));
+            }
+            let header = reader
+                .header()
+                .cloned()
+                .expect("a segment to replay has a header");
+            let start = segment_of(&header).start;
+            let end = reader.last_valid_offset() as u64;
+            let end_crc = reader.running_crc();
+            self.read.push(RecoveredSegment {
+                slot: *slot,
+                header,
+                end,
+                end_crc,
+                max_commit_ts: self.max_commit_ts,
+            });
+            self.max_commit_ts = 0;
+            self.at += 1;
+            if let Some(&next) = self.chain.get(self.at) {
+                let next = self.segment(next);
+                self.broken = next.start != start + end || next.seed_crc != end_crc;
+            }
+        }
+    }
+
+    /// Turns a replayed op into the row or index change it makes; see
+    /// [`StreamingLogicalLogReader::parsed_op_to_streaming_in`].
+    pub(crate) fn parsed_op_to_streaming_in<A: ConcurrentAllocator>(
+        &self,
+        parsed_op: ParsedOp,
+        get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
+        alloc: A,
+    ) -> Result<StreamingResult> {
+        self.readers
+            .first()
+            .expect("a log being replayed has a file")
+            .1
+            .parsed_op_to_streaming_in(parsed_op, get_index_info, alloc)
+    }
+
+    /// What recovery read of the log's segments, the one to go on writing in last. When no frame
+    /// was replayed, the segments to replay as they stand.
+    pub(crate) fn recovered(&self) -> RecoveredLog {
+        let segments = if !self.read.is_empty() {
+            self.read.clone()
+        } else {
+            self.chain
+                .iter()
+                .map(|&index| {
+                    let (slot, reader) = &self.readers[index];
+                    let header = reader
+                        .header()
+                        .cloned()
+                        .expect("a segment to replay has a header");
+                    RecoveredSegment {
+                        slot: *slot,
+                        end: reader.last_valid_offset() as u64,
+                        end_crc: header.chain_seed(),
+                        header,
+                        max_commit_ts: 0,
+                    }
+                })
+                .collect()
+        };
+        RecoveredLog {
+            segments,
+            max_seq: self.max_seq(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

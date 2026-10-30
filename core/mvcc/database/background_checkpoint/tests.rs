@@ -1,6 +1,7 @@
 use super::*;
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::tests::MvccTestDbNoConn;
+use crate::mvcc::persistent_storage::logical_log::LOG_SEGMENT_FILES;
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
 use crate::{Connection, DatabaseOpts, LimboError, MvStore};
@@ -439,6 +440,65 @@ fn test_a_database_past_its_threshold_after_a_slice_gives_way_to_another() {
         || !hot.probe.scheduled() && !other.probe.scheduled()
     ));
     hot.assert_intact();
+}
+
+/// Under writes that never pause, every checkpoint the pool runs sees a commit land after its
+/// snapshot and cannot truncate the log. The log rolls instead: however many checkpoints run, it
+/// keeps to a few segments, the pool empties it once the writes stop, and a restart finds every
+/// row.
+#[test]
+fn test_the_pool_keeps_the_log_bounded_under_writes_that_never_pause() {
+    let pool = pool(1);
+    let db = TestDb::open(&pool);
+    let writer = Arc::new(WriteDuringCheckpoint {
+        conn: db.db.connect(),
+        on: AtomicBool::new(true),
+    });
+    db.probe.set_injector(Some(writer.clone()));
+    db.fill();
+    let mut most = 0;
+    let mut segments = 0;
+    let ran = wait_until(|| {
+        most = most.max(db.store.storage.logical_log_size().unwrap());
+        segments = segments.max(db.store.storage.logical_log_segments());
+        db.probe.checkpoints() >= 50
+    });
+    writer.on.store(false, Ordering::Release);
+    assert!(ran, "{:?}", pool.stats());
+    assert!(
+        (2..=LOG_SEGMENT_FILES).contains(&segments),
+        "the log was spread over {segments} segments"
+    );
+    // Unrolled, the log would hold every commit, 50 of them 8 KB each.
+    assert!(
+        most < 64 * 1024,
+        "the log grew to {most} bytes over 50 checkpoints"
+    );
+    assert!(
+        wait_until(|| !db.probe.scheduled() && db.log() == 0),
+        "the log kept {} bytes once the writes stopped",
+        db.log()
+    );
+    let rows = db.rows();
+    let TestDb {
+        db: mut restarted,
+        conn,
+        store,
+        probe,
+    } = db;
+    store.set_background_checkpoint(false);
+    assert!(!probe.scheduled());
+    drop((conn, store, writer));
+    restarted.restart();
+    let conn = restarted.connect();
+    let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+    let mut recovered = None;
+    stmt.run_with_row_callback(|row| {
+        recovered = row.get_values().next().and_then(|value| value.as_int());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(recovered, Some(rows));
 }
 
 /// A store moved to another pool leaves the first: the first drops its retries of the store's

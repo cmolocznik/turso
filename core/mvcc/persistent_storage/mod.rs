@@ -10,9 +10,12 @@ use std::fmt::Debug;
 #[cfg(test)]
 mod discard_pending_tests;
 pub mod logical_log;
+#[cfg(test)]
+mod rolling_tests;
 use crate::mvcc::database::{LogRecord, RowID, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    LogSerializer, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    LogSerializer, LogicalLog, OnSerializationComplete, RecoveredLog,
+    DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
 
@@ -122,6 +125,36 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// Called during recovery to seed the CRC state from the header's salt.
     fn set_header(&self, header: logical_log::LogHeader);
 
+    /// The log's files for recovery to read, by slot: a log that rolls has one per segment file.
+    fn log_files(&self) -> Vec<(usize, Arc<dyn File>)> {
+        vec![(0, self.get_logical_log_file())]
+    }
+
+    /// Takes up writing where recovery left the log: after the last valid frame of the last
+    /// segment it replayed.
+    fn restore_after_recovery(&self, recovered: RecoveredLog) -> Result<()> {
+        if let Some(active) = recovered.segments.last() {
+            self.set_header(active.header.clone());
+            self.restore_logical_log_state_after_recovery(active.end, active.end_crc);
+        }
+        Ok(())
+    }
+
+    /// The bytes the log's files hold, every segment still needed counted.
+    fn logical_log_size(&self) -> Result<u64> {
+        self.get_logical_log_file().size()
+    }
+
+    /// How many segments the log is spread over: the one being written and those sealed behind it.
+    fn logical_log_segments(&self) -> usize {
+        1
+    }
+
+    /// Goes on writing in the segment of `slot`, the log's newest, whose header is `header`.
+    fn set_active_segment(&self, _slot: usize, header: logical_log::LogHeader) {
+        self.set_header(header);
+    }
+
     /// Called when a checkpoint begins, before any rows are written to the B-tree.
     fn on_checkpoint_start(&self) -> Result<()> {
         Ok(())
@@ -164,13 +197,36 @@ pub fn logical_log_sync_stats() -> (u64, u64, u64) {
 }
 
 impl Storage {
+    /// A log of one file, `file`.
     pub fn new(
         file: Arc<dyn File>,
         io: Arc<dyn crate::IO>,
         encryption_ctx: Option<EncryptionContext>,
     ) -> Self {
+        Self::with_log(LogicalLog::new(file, io, encryption_ctx))
+    }
+
+    /// A log that rolls through the files `base`, `base.1` and on, `file` being `base`'s, opened
+    /// with `flags`; see [`LogicalLog::new_rolling`].
+    pub fn new_rolling(
+        file: Arc<dyn File>,
+        io: Arc<dyn crate::IO>,
+        encryption_ctx: Option<EncryptionContext>,
+        base: String,
+        flags: crate::OpenFlags,
+    ) -> Result<Self> {
+        Ok(Self::with_log(LogicalLog::new_rolling(
+            file,
+            io,
+            encryption_ctx,
+            base,
+            flags,
+        )?))
+    }
+
+    fn with_log(log: LogicalLog) -> Self {
         Self {
-            logical_log: RwLock::new(LogicalLog::new(file, io, encryption_ctx)),
+            logical_log: RwLock::new(log),
             log_offset: AtomicU64::new(0),
             checkpoint_floor: AtomicU64::new(0),
             checkpoint_threshold: AtomicI64::new(DEFAULT_LOG_CHECKPOINT_THRESHOLD),
@@ -266,9 +322,9 @@ impl DurableStorage for Storage {
         let mut log = self.logical_log.write();
         let (c, outcome) = log.truncate(checkpointed_through_ts)?;
         // Shadow the log's actual offset: 0 if it truncated, unchanged if it
-        // skipped (uncheckpointed frames remain), so should_checkpoint() stays
-        // accurate.
-        let new_offset = log.offset;
+        // skipped (uncheckpointed frames remain) or rolled, so should_checkpoint()
+        // stays accurate.
+        let new_offset = log.segment_start() + log.offset;
         drop(log);
         self.shadow_offset_store(new_offset);
         Ok((c, outcome))
@@ -334,11 +390,38 @@ impl DurableStorage for Storage {
         let mut log = self.logical_log.write();
         log.offset = offset;
         log.running_crc = running_crc;
-        self.shadow_offset_store(offset);
+        let end = log.segment_start() + offset;
+        drop(log);
+        self.shadow_offset_store(end);
     }
 
     fn set_header(&self, header: logical_log::LogHeader) {
         self.logical_log.write().set_header(header);
+    }
+
+    fn log_files(&self) -> Vec<(usize, Arc<dyn File>)> {
+        self.logical_log.read().files()
+    }
+
+    fn restore_after_recovery(&self, recovered: RecoveredLog) -> Result<()> {
+        let mut log = self.logical_log.write();
+        log.restore(recovered)?;
+        let end = log.segment_start() + log.offset;
+        drop(log);
+        self.shadow_offset_store(end);
+        Ok(())
+    }
+
+    fn logical_log_size(&self) -> Result<u64> {
+        self.logical_log.read().size()
+    }
+
+    fn logical_log_segments(&self) -> usize {
+        self.logical_log.read().segments()
+    }
+
+    fn set_active_segment(&self, slot: usize, header: logical_log::LogHeader) {
+        self.logical_log.write().set_active_segment(slot, header);
     }
 }
 

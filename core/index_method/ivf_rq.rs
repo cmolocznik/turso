@@ -42,14 +42,14 @@
 //! steps on a connection of its own, each committed as it ends, so readers never wait for it and a
 //! writer waits for one step at most ([`super::optimize_steps`]). Maintenance conflicts only with a
 //! write to a row it changes: on a conflict it undoes its job and leaves the rows to the writer
-//! holding them, and under MVCC it leaves for later a partition another open transaction has
-//! written or one committed past its snapshot, where its own write would lose at commit. Its jobs: pack a partition's tail into blocks of [`BLOCK`]; rewrite
+//! holding them, and under MVCC it leaves for later a partition another transaction's job holds or
+//! one a job committed past its snapshot, where its own write would lose at commit. Its jobs: pack a partition's tail into blocks of [`BLOCK`]; rewrite
 //! a block holding [`COMPACT_AT`] stale copies without them; split a partition grown past an
 //! eighth of the partition count, and two blocks, by 2-means over its members' vectors read back
 //! from the table, so partitions stay near four times the square root of the row count, marking
-//! it and its [`NEIGHBOURS`] nearest partitions moving, so moves recheck every entry there, move
-//! each to its nearest partition and recode those that stay against their partition's new
-//! centroid; retire a partition left with under a sixteenth of the split bound, moving its entries
+//! it moving and leaving its [`NEIGHBOURS`] nearest partitions marks their next jobs take up,
+//! marking them moving, so moves recheck every entry there, move each to its nearest partition and
+//! recode those that stay against their partition's new centroid; retire a partition left with under a sixteenth of the split bound, moving its entries
 //! to their nearest partitions; and rebuild, training partitions afresh by k-means over a sample
 //! of every vector, when a statement inserting [`BULK_AT`] rows or more finds the index trained
 //! for under a quarter of the partitions its rows call for. CREATE INDEX over [`BULK_AT`] rows or
@@ -337,6 +337,19 @@ fn block_key(partition: i64, sequence: i64) -> Result<i64> {
 fn tail_key(partition: i64, rowid: i64) -> Result<i64> {
     rowid_in_range(rowid)?;
     partition_key(partition, TAIL_ROW, rowid)
+}
+
+/// The key of the mark a split that opened the slot `opened` leaves on `partition`, a live
+/// partition near it, whose blocks are to be checked again: marks follow a partition's
+/// bookkeeping, numbered past its own.
+fn mark_key(partition: i64, opened: i64) -> Result<i64> {
+    partition_in_range(opened)?;
+    partition_key(partition, PART_ROW, 1 + opened)
+}
+
+/// Whether a row of the partitions table is a mark.
+fn is_mark(key: i64) -> bool {
+    kind_of(key) == PART_ROW && key & ((1 << ROWID_BITS) - 1) != 0
 }
 
 /// A dead row's key: the partition of the block holding the stale copy, then the vector's rowid.
@@ -2637,8 +2650,9 @@ struct Tailed {
 /// What maintenance knows of a partition's blocks: the next sequence, the packed entries, how many
 /// the last block holds when it is not full (zero when it is), the blocks still to check for
 /// entries now nearer another partition (sequences `move_next..move_end`, set by a split of this
-/// partition or of a neighbour, and by a retirement), the partition's [`State`], and the size at
-/// which a split refused as lopsided is tried again (zero when none was).
+/// partition, by the first job that takes up a neighbour's split's mark, and by a retirement), the
+/// partition's [`State`], and the size at which a split refused as lopsided is tried again (zero
+/// when none was).
 #[derive(Clone, Copy, Default, Debug)]
 struct Part {
     next: i64,
@@ -2706,8 +2720,8 @@ type Parts = HashMap<i64, Part>;
 enum Job {
     /// Merge up to [`MOVE_BATCH`] tail entries into the partition's open block.
     Pack(i64),
-    /// Choose the partition's two new centroids from a sample of its members and write them; its
-    /// entries and those of the partitions nearest it move later, block by block.
+    /// Choose the partition's two new centroids from a sample of its members and write them, and
+    /// mark the partitions nearest it; its entries and theirs move later, block by block.
     Split(i64),
     /// Check a block of a partition marked moving: an entry now nearer another live partition
     /// moves there, and the rest are recoded against the partition's current centroid.
@@ -2736,12 +2750,15 @@ struct Survey {
     read: BTreeSet<i64>,
     /// The vectors the index holds, when the survey read them all.
     vectors: Option<i64>,
+    /// The keys of the marks splits left on each partition.
+    marks: HashMap<i64, Vec<i64>>,
 }
 
 impl Survey {
     fn forget(&mut self, partition: i64) {
         self.tails.remove(&partition);
         self.parts.remove(&partition);
+        self.marks.remove(&partition);
         let blocks: Vec<i64> = self.stale_in(partition).map(|(block, _)| block).collect();
         for block in blocks {
             self.stale.remove(&block);
@@ -2760,6 +2777,11 @@ impl Survey {
 
     fn tail(&self, partition: i64) -> usize {
         self.tails.get(&partition).copied().unwrap_or(0)
+    }
+
+    /// Whether a partition has blocks to check, or a mark that has the next job check them all.
+    fn moving(&self, partition: i64) -> bool {
+        self.part(partition).moving() || self.marks.contains_key(&partition)
     }
 
     /// The entries a partition holds that are live: packed and tail entries, less stale copies.
@@ -2830,9 +2852,6 @@ enum Upkeep {
     /// Read the entries of `job`: the open block and the tail for a pack, every member for a
     /// split's sample, a block for a move or a compaction, every vector for a rebuild.
     Read { job: Job, part: Part, stage: Stage, walk: Walk, get: Get, rows: Vec<Tailed> },
-    /// Read the bookkeeping of the live partitions nearest one being split, which the split marks
-    /// moving, so their entries now nearer a new centroid move to it.
-    Neighbours { job: Job, part: Part, rows: Vec<Tailed>, members: i64, neighbours: Vec<i64>, at: usize, get: Get, parts: Vec<(i64, Part)> },
     Check { job: Job, part: Part, rows: Vec<Tailed>, at: usize, get: Get, sorted: Sorted },
     /// Read the dead row of each stale copy a rewritten block drops, to take the block off it.
     Unbury { job: Job, part: Part, sorted: Sorted, at: usize, get: Get },
@@ -2967,8 +2986,6 @@ struct Sorted {
     /// which it leaves out of the rows it rewrites, removing their vectors' rows: a settle codes
     /// such a row afresh from the table.
     killed: Vec<i64>,
-    /// The partitions a split marks moving, with their bookkeeping.
-    neighbours: Vec<(i64, Part)>,
     /// The members of a partition being split.
     members: i64,
 }
@@ -3205,6 +3222,8 @@ pub struct IvfRqCursor {
     dirty: Vec<i64>,
     /// The slot the split chosen opens, claimed with its other rows.
     opening: std::cell::Cell<Option<i64>>,
+    /// The marks on the partition of the job being planned, which its writes remove.
+    marks: Vec<i64>,
     /// How this statement's queries use and hold partitions' rows across snapshots, none where they
     /// don't; the partitions its writes entered in [`Writes`] for its transaction; and whether its
     /// statement is entered there as writing the index.
@@ -3259,6 +3278,7 @@ impl IvfRqCursor {
             saved: None,
             dirty: Vec::new(),
             opening: std::cell::Cell::new(None),
+            marks: Vec::new(),
             sharing: None,
             recorded: HashSet::new(),
             recorded_models: HashSet::new(),
@@ -3761,6 +3781,7 @@ fn tail_writes((partition, version, entry): (i64, i64, Entry)) -> Result<(i64, [
 fn surveyed_row(survey: &mut Survey, cursor: &mut Box<dyn CursorTrait>, key: i64, kind: i64) -> Result<()> {
     let partition = partition_of(key);
     match kind {
+        PART_ROW if is_mark(key) => survey.marks.entry(partition).or_default().push(key),
         PART_ROW => {
             survey.parts.insert(partition, Part::parse(held_record(cursor)?)?);
         }
@@ -4211,6 +4232,8 @@ impl IvfRqCursor {
                     // is to be held.
                     let record = ImmutableRecordRef::from_bin_record(held_payload(&mut self.stores[PARTITIONS])?);
                     match kind_of(key) {
+                        // A mark is no bookkeeping: its zeros are no version to hold blocks under.
+                        PART_ROW if is_mark(key) => {}
                         PART_ROW => {
                             if let Some(ValueRef::Numeric(Numeric::Integer(version))) = record.get_value_opt(7) {
                                 let mut shared = self.shared.lock().expect("index state");
@@ -4633,7 +4656,7 @@ impl IvfRqCursor {
                             run.survey.read.insert(partition);
                             let part = run.survey.part(partition);
                             let mut shared = self.shared.lock().expect("index state");
-                            match part.moving() || part.state != State::Live && run.survey.tail(partition) > 0 {
+                            match run.survey.moving(partition) || part.state != State::Live && run.survey.tail(partition) > 0 {
                                 true => shared.moving.insert(partition),
                                 false => shared.moving.remove(&partition),
                             };
@@ -4684,6 +4707,11 @@ impl IvfRqCursor {
                                 rows.extend(unpack(bytes_at(&found, 1)?)?.into_iter().map(|entry| Tailed { location: Location::Block(key), version, entry }));
                             }
                             self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted };
+                        }
+                        // A live partition only marked, with no block to check, has nothing to
+                        // read: its job takes up the marks.
+                        (Job::Move(_), Stage::Blocks) if self.model.state(partition) == State::Live => {
+                            self.upkeep = Upkeep::Fetch { job, part, sorted: Sorted::default(), vectors: Vec::new() };
                         }
                         (Job::Move(_), Stage::Blocks) => self.upkeep = Upkeep::Read { job, part, stage: Stage::Tail, walk: Walk::Seek, get: Get::Seek, rows },
                         (Job::Compact(key), Stage::Blocks) => {
@@ -4748,8 +4776,7 @@ impl IvfRqCursor {
                                         let members = rows.len() as i64;
                                         let step = (rows.len() / SPLIT_SAMPLE).max(1);
                                         rows = rows.into_iter().step_by(step).collect();
-                                        let neighbours = self.neighbours(partition);
-                                        self.upkeep = Upkeep::Neighbours { job, part, rows, members, neighbours, at: 0, get: Get::Seek, parts: Vec::new() };
+                                        self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted: Sorted { members, ..Sorted::default() } };
                                         continue;
                                     }
                                     self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted: Sorted::default() };
@@ -4757,22 +4784,6 @@ impl IvfRqCursor {
                             }
                         }
                     }
-                }
-                Upkeep::Neighbours { job, part, rows, members, neighbours, at, mut get, mut parts } => {
-                    let Some(&neighbour) = neighbours.get(at) else {
-                        let sorted = Sorted { neighbours: parts, members, ..Sorted::default() };
-                        self.upkeep = Upkeep::Check { job, part, rows, at: 0, get: Get::Seek, sorted };
-                        continue;
-                    };
-                    let found = match get_row(&mut self.stores[PARTITIONS], part_key(neighbour)?, &mut get)? {
-                        IOResult::IO(io) => {
-                            self.upkeep = Upkeep::Neighbours { job, part, rows, members, neighbours, at, get, parts };
-                            return Ok(IOResult::IO(io));
-                        }
-                        IOResult::Done(found) => found,
-                    };
-                    parts.push((neighbour, found.as_ref().map(Part::parse).transpose()?.unwrap_or_default()));
-                    self.upkeep = Upkeep::Neighbours { job, part, rows, members, neighbours, at: at + 1, get: Get::Seek, parts };
                 }
                 Upkeep::Check { job, part, rows, at, mut get, mut sorted } => {
                     let Some(row) = rows.get(at) else {
@@ -4861,6 +4872,7 @@ impl IvfRqCursor {
                             Job::Redo => return Err(error("a settle plans through its own stage")),
                         };
                         steps.extend(unbury);
+                        steps.extend(std::mem::take(&mut self.marks).into_iter().map(|key| remove(PARTITIONS, key)));
                         self.upkeep = Upkeep::Apply { job, steps, undo: Vec::new() };
                         continue;
                     };
@@ -4993,7 +5005,7 @@ impl IvfRqCursor {
                         self.finish_job(job)?;
                         continue;
                     };
-                    self.record(step, true);
+                    self.record(step, !writes_mark(step));
                     match apply_step(&mut self.stores, step, Some(&mut undo)) {
                         Ok(IOResult::Done(())) => {
                             steps.pop_front();
@@ -5077,7 +5089,7 @@ impl IvfRqCursor {
                             }
                             IOResult::Done(Some(key)) => {
                                 surveyed();
-                                if kind_of(key) != PART_ROW {
+                                if kind_of(key) != PART_ROW || is_mark(key) {
                                     keys.push(key);
                                 }
                                 self.upkeep = Upkeep::Rebuild { phase: Rebuilding::Clear { rowids, model, walk, keys }, steps };
@@ -5286,7 +5298,16 @@ impl IvfRqCursor {
             self.save_model();
             return Ok(Some(Upkeep::Rebuild { phase: Rebuilding::Rowids { walk: Walk::Seek, rowids: Vec::new() }, steps: VecDeque::new() }));
         }
-        let part = run.survey.part(job_partition(job));
+        let partition = job_partition(job);
+        let mut part = run.survey.part(partition);
+        // The job takes up the marks splits left on its partition: a live one checks every block
+        // again, from its first, and the job's writes remove the marks.
+        let marks = run.survey.marks.get(&partition).cloned().unwrap_or_default();
+        if !marks.is_empty() && part.state == State::Live {
+            part.move_next = 0;
+            part.move_end = part.next;
+        }
+        self.marks = marks;
         Ok(Some(Upkeep::Read { job, part, stage: Stage::Blocks, walk: Walk::Seek, get: Get::Seek, rows: Vec::new() }))
     }
 
@@ -5337,11 +5358,11 @@ impl IvfRqCursor {
     }
 
     /// The partitions whose rows a job writes that another transaction's maintenance may write
-    /// too, by the key [`Writes`] records them under: its partition's; for a split also the
-    /// neighbours it marks moving, beside the slot it opens; and for a rebuild every partition.
+    /// too, by the key [`Writes`] records them under: its partition's, beside the slot a split
+    /// opens, and for a rebuild every partition. The marks a split leaves its neighbours are rows
+    /// no other job writes, so it claims none of them.
     fn claims(&self, job: Job) -> Vec<i64> {
         match job {
-            Job::Split(p) => [p].into_iter().chain(self.neighbours(p)).collect(),
             Job::Rebuild => (0..(self.model.centroids.len() as i64).max(1)).collect(),
             job => vec![job_partition(job)],
         }
@@ -5397,7 +5418,7 @@ impl IvfRqCursor {
 
     /// Whether no partition is moving: none the survey read, and none a run has found moving.
     fn settled(&self, survey: &Survey) -> bool {
-        survey.parts.values().all(|part| !part.moving()) && self.shared.lock().expect("index state").moving.is_empty()
+        survey.parts.values().all(|part| !part.moving()) && survey.marks.is_empty() && self.shared.lock().expect("index state").moving.is_empty()
     }
 
     /// The job [`Self::choose`] picks among `partitions`, which the survey read: a partition too
@@ -5410,7 +5431,7 @@ impl IvfRqCursor {
         if let Some(p) = read().filter(|p| live(*p) && survey.tail(*p) >= SURVEYED_TAIL).max_by_key(|p| (survey.tail(*p), -*p)) {
             return Some(Job::Pack(p));
         }
-        if let Some(p) = read().find(|p| survey.part(*p).moving() || survey.part(*p).state != State::Live && survey.tail(*p) > 0) {
+        if let Some(p) = read().find(|p| survey.moving(*p) || survey.part(*p).state != State::Live && survey.tail(*p) > 0) {
             return Some(Job::Move(p));
         }
         if let Some(p) = read().find(|p| survey.part(*p).state == State::Retiring) {
@@ -5489,10 +5510,11 @@ impl IvfRqCursor {
 
     /// The first half of a split: 2-means over a sample of the partition's members gives it a new
     /// centroid version and opens a partition in the slot its claim took. Only centroids,
-    /// directory rows and bookkeeping are written: the partition and its nearest live neighbours
-    /// are marked moving, and moves recode their entries block by block. A split whose smaller half
-    /// would take under a sixteenth of the sample is not made; the partition is tried again once
-    /// it has doubled. The partition's bookkeeping is written first: it claims the partition.
+    /// directory rows, bookkeeping and marks are written: the partition is marked moving and each
+    /// of its nearest live neighbours gets a mark, which the neighbour's next job takes up, and
+    /// moves recode their entries block by block. A split whose smaller half would take under a
+    /// sixteenth of the sample is not made; the partition is tried again once it has doubled. The
+    /// partition's bookkeeping is written first: it claims the partition.
     fn plan_split(&mut self, partition: i64, mut part: Part, sorted: Sorted, vectors: &[Vec<f32>]) -> Result<VecDeque<Step>> {
         let started = std::time::Instant::now();
         let eta = vectors.first().map_or(0.0, |v| self.eta(v.len()));
@@ -5500,6 +5522,7 @@ impl IvfRqCursor {
             part.retry = 2 * sorted.members.max(self.split_bound());
             return Ok(VecDeque::from([part_step(partition, part)?]));
         };
+        let neighbours = self.neighbours(partition);
         self.save_model();
         // The untrained origin is partition 0's version 0, so its first centroid is version 1.
         let version = self.model.version(partition) + 1;
@@ -5524,13 +5547,11 @@ impl IvfRqCursor {
             opened_row,
             put(CENTROIDS, centroid_key(opened, opened_version)?, centroid_record(&split)?),
         ]);
-        for (neighbour, mut near) in sorted.neighbours {
+        for neighbour in neighbours {
             if neighbour == opened {
                 continue;
             }
-            near.move_next = 0;
-            near.move_end = near.next;
-            steps.push_back(part_step(neighbour, near)?);
+            steps.push_back(put(PARTITIONS, mark_key(neighbour, opened)?, partition_record([Value::from_i64(partition)])?));
             self.dirty.push(neighbour);
         }
         let model = Arc::make_mut(&mut self.model);
@@ -5658,6 +5679,11 @@ impl IvfRqCursor {
         RETIRES.fetch_add(1, Ordering::Relaxed);
         Ok(VecDeque::from([part_step(partition, part)?, directory_row]))
     }
+}
+
+/// Whether a step writes a mark, which no job but its partition's next touches.
+fn writes_mark(step: &Step) -> bool {
+    matches!(step, Step::Put { store: PARTITIONS, rowid, .. } if is_mark(*rowid))
 }
 
 /// The write of a partition's bookkeeping, under a fresh version.
@@ -5863,6 +5889,8 @@ pub struct Check {
     pub codes: u64,
     /// The rows with redo rows, which the index leaves to maintenance to code afresh from the table.
     pub pending: u64,
+    /// The marks splits left on partitions whose blocks their next jobs are to check again.
+    pub marks: u64,
     pub findings: Vec<String>,
     pub findings_total: u64,
 }
@@ -6066,6 +6094,7 @@ impl<'c> Checker<'c> {
             let rows = rows.as_mut().expect("set above");
             let id = key & ((1 << ROWID_BITS) - 1);
             match kind_of(key) {
+                PART_ROW if is_mark(key) => self.check.marks += 1,
                 PART_ROW => {
                     let field = |at: usize| integer_value(&row[1 + at]);
                     rows.part = Some(Part { next: field(0)?, size: field(1)?, open: field(2)?, move_next: field(3)?, move_end: field(4)?, state: State::decode(field(5)?)?, retry: field(6)?, version: field(7)? });
@@ -6844,11 +6873,12 @@ mod tests {
         rows(conn, &format!("SELECT rowid, {columns} FROM __turso_internal_v_ivf_{store}"))
     }
 
-    /// The index as its backing tables hold it: each partition's bookkeeping, tail length and current
-    /// centroid version, and the stale copies per block.
+    /// The index as its backing tables hold it: each partition's bookkeeping, tail length, marks and
+    /// current centroid version, and the stale copies per block.
     struct Stored {
         parts: HashMap<i64, Part>,
         tails: HashMap<i64, usize>,
+        marks: HashMap<i64, usize>,
         versions: HashMap<i64, i64>,
         stale: HashMap<i64, usize>,
         redo: usize,
@@ -6862,6 +6892,7 @@ mod tests {
     fn stored(conn: &Arc<crate::Connection>) -> Stored {
         let parts = partition_rows(conn, PART_ROW)
             .iter()
+            .filter(|r| !is_mark(r[0].as_int().unwrap()))
             .map(|r| {
                 let f = |i: usize| r[i].as_int().unwrap();
                 let part = Part { next: f(1), size: f(2), open: f(3), move_next: f(4), move_end: f(5), state: State::decode(f(6)).unwrap(), retry: f(7), version: f(8) };
@@ -6871,6 +6902,10 @@ mod tests {
         let mut tails = HashMap::new();
         for r in partition_rows(conn, TAIL_ROW) {
             *tails.entry(partition_of(r[0].as_int().unwrap())).or_default() += 1;
+        }
+        let mut marks = HashMap::new();
+        for r in partition_rows(conn, PART_ROW).iter().filter(|r| is_mark(r[0].as_int().unwrap())) {
+            *marks.entry(partition_of(r[0].as_int().unwrap())).or_default() += 1;
         }
         let mut versions: HashMap<i64, i64> = HashMap::new();
         for r in backing(conn, "centroids", "value") {
@@ -6887,7 +6922,7 @@ mod tests {
             }
         }
         let redo = backing(conn, "redo", "writer").len();
-        Stored { parts, tails, versions, stale, redo }
+        Stored { parts, tails, marks, versions, stale, redo }
     }
 
     impl Stored {
@@ -6900,7 +6935,7 @@ mod tests {
         }
 
         fn partitions(&self) -> Vec<i64> {
-            let last = self.versions.keys().chain(self.parts.keys()).chain(self.tails.keys()).copied().max().unwrap_or(0);
+            let last = self.versions.keys().chain(self.parts.keys()).chain(self.tails.keys()).chain(self.marks.keys()).copied().max().unwrap_or(0);
             (0..=last).collect()
         }
 
@@ -6922,6 +6957,9 @@ mod tests {
                 let part = self.part(p);
                 if part.moving() {
                     left.push(format!("partition {p} is moving"));
+                }
+                if let Some(n) = self.marks.get(&p) {
+                    left.push(format!("partition {p} has {n} marks to take up"));
                 }
                 if part.state != State::Live {
                     if self.tail(p) > 0 {
@@ -8076,7 +8114,7 @@ mod tests {
 
     /// OPTIMIZE INDEX in steps rebuilds an index holding four times the vectors its partitions were
     /// trained for: its first step's survey of every partition finds the rebuild due, and the next
-    /// step makes it, under WAL and MVCC.
+    /// step makes it, under WAL and MVCC, removing a mark on a slot the rebuild leaves vacant.
     #[test]
     fn optimize_in_steps_rebuilds_an_index_its_rows_outgrew() {
         const DIMS: usize = 16;
@@ -8090,6 +8128,13 @@ mod tests {
             insert_all(&conn, &rows);
             STATEMENT_UPKEEP.with(|on| on.set(true));
             assert_eq!(stored(&conn).live().len(), 1, "mvcc={mvcc}");
+            conn.execute(if mvcc { "BEGIN CONCURRENT" } else { "BEGIN IMMEDIATE" }).unwrap();
+            conn.start_nested();
+            let planted = conn.execute(format!("INSERT INTO __turso_internal_v_ivf_partitions (rowid, c0, c1, c2, c3, c4, c5, c6, c7) VALUES ({}, 0, 0, 0, 0, 0, 0, 0, 0)", mark_key(900, 901).unwrap()));
+            conn.end_nested();
+            planted.unwrap();
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(check(&conn, "v_ivf").unwrap().marks, 1, "mvcc={mvcc}");
             REBUILT.with(|count| count.set(0));
             optimize(&conn, "v_ivf");
             assert_eq!(REBUILT.with(|count| count.get()), 1, "mvcc={mvcc}: the rebuilds OPTIMIZE INDEX made");
@@ -8097,7 +8142,7 @@ mod tests {
             assert!(index.live().len() >= trained_partitions(3000) / 2 && index.pending().is_empty(), "mvcc={mvcc}: {} partitions, {:?}", index.live().len(), index.pending());
             let live: HashMap<i64, Vec<f32>> = rows.into_iter().collect();
             let found = check(&conn, "v_ivf").unwrap();
-            assert!(found.consistent() && found.codes as usize == live.len(), "mvcc={mvcc}: {found:?}");
+            assert!(found.consistent() && found.codes as usize == live.len() && found.marks == 0, "mvcc={mvcc}: {found:?}");
             for _ in 0..3 {
                 let q = random(&mut state, DIMS);
                 assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
@@ -8814,10 +8859,10 @@ mod tests {
         }
     }
 
-    /// Live vectors whose partition is not the live partition nearest them, of all live vectors.
-    fn misplaced(conn: &Arc<crate::Connection>, live: &HashMap<i64, Vec<f32>>) -> (usize, usize) {
+    /// Each live partition's current centroid.
+    fn live_centroids(conn: &Arc<crate::Connection>) -> Vec<(i64, Vec<f32>)> {
         let index = stored(conn);
-        let mut centroids: Vec<(i64, Vec<f32>)> = Vec::new();
+        let mut centroids = Vec::new();
         for r in backing(conn, "centroids", "value") {
             let key = r[0].as_int().unwrap();
             let p = key >> VERSION_BITS;
@@ -8826,6 +8871,12 @@ mod tests {
             }
             centroids.push((p, dense(r[1].to_blob()).unwrap()));
         }
+        centroids
+    }
+
+    /// Live vectors whose partition is not the live partition nearest them, of all live vectors.
+    fn misplaced(conn: &Arc<crate::Connection>, live: &HashMap<i64, Vec<f32>>) -> (usize, usize) {
+        let centroids = live_centroids(conn);
         let mut wrong = 0;
         for r in backing(conn, "vectors", "location") {
             let rowid = r[0].as_int().unwrap();
@@ -9287,5 +9338,128 @@ mod tests {
                 assert_eq!(top_ten(&fresh, centre), exact_top_ten(&live, centre), "mvcc={mvcc}");
             }
         }
+    }
+
+    /// A split claims its partition and the slot it opens alone. Under MVCC, beside another open
+    /// transaction whose job holds the partition nearest the one split, the split is made and
+    /// leaves that neighbour a mark, which a job takes up once the other transaction has ended; the
+    /// mark is no claim, so the other transaction's next job of the neighbour is made too. A split
+    /// that claimed its neighbours too was refused by a job of any open transaction near it.
+    #[test]
+    fn a_split_beside_a_neighbour_another_transaction_holds_is_made_and_marks_it() {
+        let (db, conn, mut live, centres) = two_clusters("ivf-rq-split-held-neighbour.db");
+        optimize(&conn, "v_ivf");
+        let before = check(&conn, "v_ivf").unwrap();
+        let centroids = live_centroids(&conn);
+        let nearest = |to: &[f32], but: Option<i64>| centroids.iter().filter(|(p, _)| Some(*p) != but).min_by(|a, b| l2(&a.1, to).total_cmp(&l2(&b.1, to))).map(|(p, c)| (*p, c.clone())).unwrap();
+        // The rows that grow a partition past the split bound, and the partition the index codes
+        // them into by the loss it ranks partitions with: a probe inserts them, its maintenance
+        // off, and rolls back.
+        let grown = crowd(20_000, 300, &centres[0]);
+        let probe = db.connect(crate::ConnectOpts::new()).unwrap();
+        probe.execute("BEGIN CONCURRENT").unwrap();
+        STATEMENT_UPKEEP.with(|on| on.set(false));
+        insert_all(&probe, &grown);
+        STATEMENT_UPKEEP.with(|on| on.set(true));
+        let coded: HashSet<i64> = backing(&probe, "vectors", "location")
+            .iter()
+            .filter(|r| r[0].as_int().unwrap() >= 20_000)
+            .map(|r| match Location::decode(r[1].as_int().unwrap()) {
+                Location::Block(key) | Location::Tail(key) => partition_of(key),
+            })
+            .collect();
+        probe.execute("ROLLBACK").unwrap();
+        assert_eq!(coded.len(), 1, "the rows are coded into partitions {coded:?}");
+        let split = coded.into_iter().next().unwrap();
+        let centre = centroids.iter().find(|(p, _)| *p == split).map(|(_, c)| c.clone()).unwrap();
+        let (neighbour, beside) = nearest(&centre, Some(split));
+        let (holder, splitter) = (db.connect(crate::ConnectOpts::new()).unwrap(), db.connect(crate::ConnectOpts::new()).unwrap());
+        holder.execute("BEGIN CONCURRENT").unwrap();
+        // One job, a pack of the neighbour's tail, whose claim the holder keeps until it ends.
+        STATEMENT_BUDGET.with(|budget| budget.set(1));
+        let held = crowd(10_000, 2 * PACK_AT as i64, &beside);
+        insert_all(&holder, &held);
+        STATEMENT_BUDGET.with(|budget| budget.set(usize::MAX));
+        splitter.execute("BEGIN CONCURRENT").unwrap();
+        insert_all(&splitter, &grown);
+        splitter.execute("COMMIT").unwrap();
+        live.extend(grown);
+        let middle = check(&conn, "v_ivf").unwrap();
+        assert!(middle.consistent() && middle.partitions == before.partitions + 1, "partition {split}, beside {neighbour}: {before:?} then {middle:?}");
+        assert!(stored(&conn).marks.contains_key(&neighbour), "the held neighbour {neighbour} has no mark: {middle:?}");
+        // A query beside the mark answers exactly.
+        assert_eq!(top_ten(&conn, &beside), exact_top_ten(&live, &beside));
+        // A mark is no job's write of the neighbour, so the holder's next job packs it again.
+        STATEMENT_BUDGET.with(|budget| budget.set(1));
+        let more = crowd(11_000, 2 * PACK_AT as i64, &beside);
+        insert_all(&holder, &more);
+        STATEMENT_BUDGET.with(|budget| budget.set(usize::MAX));
+        let tail = stored(&holder).tails.get(&neighbour).copied().unwrap_or(0);
+        assert!(tail < 2 * PACK_AT, "the holder's job left {tail} entries in the tail of the neighbour {neighbour}");
+        holder.execute("COMMIT").unwrap();
+        live.extend(held);
+        live.extend(more);
+        // The pack rewrote the neighbour's blocks while its mark stood: a query beside it answers
+        // exactly.
+        assert_eq!(top_ten(&conn, &beside), exact_top_ten(&live, &beside));
+        optimize(&conn, "v_ivf");
+        let after = check(&conn, "v_ivf").unwrap();
+        assert!(after.consistent() && after.marks == 0, "{after:?}");
+        for q in &centres {
+            assert_eq!(top_ten(&conn, q), exact_top_ten(&live, q));
+        }
+    }
+
+    /// A mark is no bookkeeping: a query of a marked partition scores the blocks held for it under
+    /// the version its bookkeeping row holds, read just before the mark. Read as bookkeeping, the
+    /// mark's zeros put the held blocks aside and held none in their place, so none of the
+    /// partition's packed codes was scored. The query's answer is twelve rows far out along the
+    /// first cluster's centre, packed in one partition; the mark is planted beside a row coded into
+    /// the partition's tail, a write of the partition, which a split's mark is too, so the query
+    /// reads the partition's rows again, the mark among them.
+    #[test]
+    fn a_query_of_a_marked_partition_scores_the_blocks_held_for_it() {
+        let (_db, conn, mut live, centres) = two_clusters("ivf-rq-marked-query.db");
+        let far: Vec<f32> = centres[0].iter().map(|x| 3.0 * x).collect();
+        let outliers = crowd(20_000, 12, &far);
+        insert_all(&conn, &outliers);
+        live.extend(outliers);
+        optimize(&conn, "v_ivf");
+        let packed: HashSet<i64> = backing(&conn, "vectors", "location")
+            .iter()
+            .filter(|r| r[0].as_int().unwrap() >= 20_000)
+            .map(|r| match Location::decode(r[1].as_int().unwrap()) {
+                Location::Block(key) => partition_of(key),
+                Location::Tail(key) => panic!("an outlier's code is in the tail of partition {}", partition_of(key)),
+            })
+            .collect();
+        assert_eq!(packed.len(), 1, "the outliers are packed in partitions {packed:?}");
+        let partition = *packed.iter().next().unwrap();
+        let q = &centres[0];
+        let exact = exact_top_ten(&live, q);
+        assert!(exact.iter().all(|id| *id >= 20_000), "{exact:?}");
+        // The query reads the partition's blocks and holds them.
+        assert_eq!(top_ten(&conn, q), exact);
+        let centroid = live_centroids(&conn).into_iter().find(|(p, _)| *p == partition).map(|(_, c)| c).unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.start_nested();
+        let planted = conn.execute(format!("INSERT INTO __turso_internal_v_ivf_partitions (rowid, c0, c1, c2, c3, c4, c5, c6, c7) VALUES ({}, 0, 0, 0, 0, 0, 0, 0, 0)", mark_key(partition, 0).unwrap()));
+        conn.end_nested();
+        planted.unwrap();
+        STATEMENT_UPKEEP.with(|on| on.set(false));
+        insert_all(&conn, &[(30_000, centroid.clone())]);
+        STATEMENT_UPKEEP.with(|on| on.set(true));
+        conn.execute("COMMIT").unwrap();
+        live.insert(30_000, centroid);
+        let tail = backing(&conn, "vectors", "location").iter().find(|r| r[0].as_int() == Some(30_000)).map(|r| Location::decode(r[1].as_int().unwrap()));
+        assert!(matches!(tail, Some(Location::Tail(key)) if partition_of(key) == partition), "{tail:?}");
+        assert_eq!(check(&conn, "v_ivf").unwrap().marks, 1);
+        let exact = exact_top_ten(&live, q);
+        for round in 0..2 {
+            assert_eq!(top_ten(&conn, q), exact, "partition {partition} marked, round {round}");
+        }
+        optimize(&conn, "v_ivf");
+        let found = check(&conn, "v_ivf").unwrap();
+        assert!(found.consistent() && found.marks == 0, "{found:?}");
     }
 }

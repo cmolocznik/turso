@@ -1,16 +1,16 @@
 //! Does an MVCC database whose logical log rolls under writes that never pause still open, whole,
 //! after the process writing it is killed?
 //!
-//!     mvcc_rolling DIR ROUNDS [SEED] [LONGEST_MS]
+//!     [THRESHOLD=bytes] mvcc_rolling DIR ROUNDS [SEED] [LONGEST_MS]
 //!
 //! Each round starts a child that opens DIR/roll.db under MVCC with passive checkpoints and the
-//! background checkpoint on, at a 64 KB threshold, and runs four writers that commit without
-//! pausing: inserts of 300-byte rows and an update, each writer in its own range of ids. Every
-//! checkpoint sees commits land after its snapshot, so the log rolls. After a random 0.2 s to
-//! LONGEST_MS (3,000 unless given) the round kills the child with SIGKILL and opens the database:
-//! it must open, pass PRAGMA integrity_check and hold every row of each writer's range up to the
-//! last one the writer reported committed. Each round prints the most the log's files held while
-//! the child ran. Stops at the first failure, keeping DIR.
+//! background checkpoint on, at a 64 KB threshold unless THRESHOLD says another, and runs four
+//! writers that commit without pausing: inserts of 300-byte rows and an update, each writer in its
+//! own range of ids. Every checkpoint sees commits land after its snapshot, so the log rolls.
+//! After a random 0.2 s to LONGEST_MS (3,000 unless given) the round kills the child with SIGKILL
+//! and opens the database: it must open, pass PRAGMA integrity_check and hold every row of each
+//! writer's range up to the last one the writer reported committed. Each round prints the most the
+//! log's files held while the child ran. Stops at the first failure, keeping DIR.
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -91,7 +91,8 @@ fn child(dir: &str, seed: u64) -> turso_core::Result<()> {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, body BLOB NOT NULL)")?;
     }
     conn.execute("PRAGMA mvcc_background_checkpoint = 1")?;
-    conn.execute("PRAGMA mvcc_checkpoint_threshold = 65536")?;
+    let threshold = std::env::var("THRESHOLD").map_or(65536, |value| value.parse::<i64>().expect("THRESHOLD is a byte count"));
+    conn.execute(format!("PRAGMA mvcc_checkpoint_threshold = {threshold}"))?;
     let writers: Vec<_> = (0..WRITERS)
         .map(|number| {
             let db = db.clone();

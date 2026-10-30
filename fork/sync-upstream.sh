@@ -119,17 +119,19 @@ run "$CARGO" check -p turso_core --tests --features fts >"$LOGS/$stamp.check.log
     fail "does not compile ($stamp.check.log)"
 
 # suite NAME [ARGS]: the core library's tests; every result line must report no failure, and the
-# ivf_rq tests must be among those that ran.
+# ivf_rq tests must be among those that ran. Tests that start processes of the test binary print
+# those processes' result lines too, so the count is the suite's own line, which filters nothing.
 suite() {
-    local name=$1 out="$LOGS/$stamp.$1.log" rc passed failed lines ivf
+    local name=$1 out="$LOGS/$stamp.$1.log" rc own passed failed ivf
     shift
     echo "== suite $name"
     run "$CARGO" test -p turso_core --lib --no-fail-fast "$@" >"$out" 2>&1
     rc=$?
-    read -r passed failed lines < <(grep -E '^test result' "$out" | awk '{p += $4; f += $6} END {print p + 0, f + 0, NR}')
+    read -r own passed failed < <(grep -E '^test result' "$out" |
+        awk '/ 0 filtered out;/ {own++; p = $4} {f += $6} END {print own + 0, p + 0, f + 0}')
     ivf=$(grep -cE '^test index_method::ivf_rq::.* \.\.\. ok$' "$out")
-    if [ "$rc" -ne 0 ] || [ "$failed" -ne 0 ] || [ "$lines" -eq 0 ] || [ "$ivf" -eq 0 ]; then
-        fail "the $name suite did not pass: rc $rc, $passed passed, $failed failed, $ivf ivf_rq tests ran ($stamp.$name.log)"
+    if [ "$rc" -ne 0 ] || [ "$own" -ne 1 ] || [ "$failed" -ne 0 ] || [ "$ivf" -eq 0 ]; then
+        fail "the $name suite did not pass: rc $rc, $own result lines of its own, $passed passed, $failed failed, $ivf ivf_rq tests ran ($stamp.$name.log)"
     fi
     eval "${name}_passed=$passed"
 }

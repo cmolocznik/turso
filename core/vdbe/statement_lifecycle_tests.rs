@@ -1837,7 +1837,7 @@ fn test_commit_dropped_mid_commit_beside_a_reader_leaves_it_both_views() {
 }
 
 /// Under MVCC, keys 10, 20 and 30 in the main database, with an in-memory database attached as
-/// `mem`: a WAL database, since an in-memory attachment does not run MVCC.
+/// `mem`. It runs MVCC too: beside an MVCC main a fresh attachment is made MVCC.
 fn main_keys_and_memory_attachment(
     name: &str,
 ) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
@@ -1863,10 +1863,10 @@ fn prepare_reader_looking_ahead_in_mem(conn: &Arc<Connection>) -> crate::Stateme
         .unwrap()
 }
 
-/// A writer of an attached WAL database beside a reader of it commits at its own halt, and leaves
-/// the read transaction to the reader, which reads on and finds the writer's row.
+/// A writer of an attached in-memory database beside a reader of it commits at its own halt, and
+/// the reader reads on and finds the writer's row.
 #[test]
-fn test_reader_reads_on_in_an_attached_wal_database_beside_a_committed_writer() {
+fn test_reader_reads_on_in_an_attached_memory_database_beside_a_committed_writer() {
     let (_dir, _db, conn) = main_keys_and_memory_attachment("memory-attachment-reader-reads-on");
     let mut reader = prepare_reader_looking_ahead_in_mem(&conn);
     assert_eq!(next_ahead(&mut reader), Some((10, None)));
@@ -1882,10 +1882,10 @@ fn test_reader_reads_on_in_an_attached_wal_database_beside_a_committed_writer() 
     assert_eq!(ids_from_query(&conn, "SELECT id FROM mem.rows"), vec![25]);
 }
 
-/// A writer of an attached WAL database that fails beside a reader of it rolls back its own write
-/// alone: the reader keeps its read transaction and reads on.
+/// A writer of an attached in-memory database that fails beside a reader of it rolls back its own
+/// write alone, and the reader reads on.
 #[test]
-fn test_reader_reads_on_in_an_attached_wal_database_beside_a_failed_writer() {
+fn test_reader_reads_on_in_an_attached_memory_database_beside_a_failed_writer() {
     let (_dir, _db, conn) = main_keys_and_memory_attachment("memory-attachment-failed-writer");
     conn.execute("INSERT INTO mem.rows VALUES (25, 'twentyfive')")
         .unwrap();
@@ -1910,6 +1910,99 @@ fn test_reader_reads_on_in_an_attached_wal_database_beside_a_failed_writer() {
     assert_eq!(next_ahead(&mut reader), None);
     assert_eq!(
         ids_from_query(&conn, "SELECT id FROM mem.rows"),
+        vec![25],
+        "the failed writer's row 26 rolled back"
+    );
+}
+
+/// Under MVCC, keys 10, 20 and 30 in the main database, and a table `rows` in TEMP, the one
+/// database beside an MVCC main that uses WAL.
+fn main_keys_and_temp_rows(name: &str) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let main_path = dir.path().join(format!("{name}.db"));
+    let db = open_mvcc_database_with_opts(main_path.to_str().unwrap(), DatabaseOpts::new());
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE keys(k INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO keys VALUES (10), (20), (30)")
+        .unwrap();
+    conn.execute("CREATE TEMP TABLE rows(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    assert!(conn.mv_store_for_db(crate::TEMP_DB_ID).is_none());
+    (dir, db, conn)
+}
+
+fn prepare_reader_looking_ahead_in_temp(conn: &Arc<Connection>) -> crate::Statement {
+    conn.prepare("SELECT k, (SELECT v FROM temp.rows WHERE id = k + 5) FROM keys ORDER BY k")
+        .unwrap()
+}
+
+fn temp_holds_read_tx(conn: &Arc<Connection>) -> bool {
+    conn.with_all_attached_pagers_with_index(|pagers| {
+        pagers
+            .iter()
+            .any(|(db_id, pager)| *db_id == crate::TEMP_DB_ID && pager.holds_read_lock())
+    })
+}
+
+/// A writer of TEMP beside a reader of it commits at its own halt and leaves TEMP's read
+/// transaction to the reader, which reads on and finds the writer's row; the read transaction
+/// ends with the reader.
+#[test]
+fn test_reader_keeps_its_temp_read_transaction_beside_a_committed_writer() {
+    let (_dir, _db, conn) = main_keys_and_temp_rows("temp-committed-writer");
+    let mut reader = prepare_reader_looking_ahead_in_temp(&conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    conn.execute("INSERT INTO temp.rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    assert!(
+        temp_holds_read_tx(&conn),
+        "the commit ended the reader's read transaction of TEMP"
+    );
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string())))
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    assert!(!temp_holds_read_tx(&conn));
+    assert_eq!(conn.get_mv_tx(), None);
+    assert_eq!(ids_from_query(&conn, "SELECT id FROM temp.rows"), vec![25]);
+}
+
+/// A writer of TEMP that fails beside a reader of it rolls back its own write alone and leaves
+/// TEMP's read transaction to the reader, which reads on.
+#[test]
+fn test_reader_keeps_its_temp_read_transaction_beside_a_failed_writer() {
+    let (_dir, _db, conn) = main_keys_and_temp_rows("temp-failed-writer");
+    conn.execute("INSERT INTO temp.rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    conn.execute("CREATE TEMP TABLE src(id INTEGER, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO temp.src VALUES (26, 'twentysix'), (25, 'duplicate')")
+        .unwrap();
+    let mut reader = prepare_reader_looking_ahead_in_temp(&conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    let err = conn
+        .execute("INSERT INTO temp.rows SELECT id, v FROM temp.src")
+        .expect_err("the insert meets the duplicate id 25");
+    assert!(
+        matches!(err, LimboError::Constraint(_)),
+        "expected duplicate-key constraint error, got {err:?}"
+    );
+    assert!(
+        temp_holds_read_tx(&conn),
+        "the rollback ended the reader's read transaction of TEMP"
+    );
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string())))
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    assert!(!temp_holds_read_tx(&conn));
+    assert_eq!(
+        ids_from_query(&conn, "SELECT id FROM temp.rows"),
         vec![25],
         "the failed writer's row 26 rolled back"
     );

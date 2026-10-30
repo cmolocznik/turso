@@ -4790,8 +4790,8 @@ impl Connection {
     /// statements still read the transaction. On each MVCC database they go on in a successor
     /// that sees what the transaction saw before the writer wrote
     /// (`MvStore::rollback_tx_continued`), or in the transaction as it is where the writer wrote
-    /// nothing there. An attached WAL database's write transaction is rolled back and its read
-    /// transaction left to them.
+    /// nothing there. TEMP, the one database beside an MVCC main that uses WAL, has its write
+    /// transaction rolled back and its read transaction left to them.
     pub(crate) fn rollback_writes_continued(&self) {
         let mut txs: SmallVec<[(usize, u64); 4]> = SmallVec::new();
         if let Some(tx_id) = self.get_mv_tx_id() {

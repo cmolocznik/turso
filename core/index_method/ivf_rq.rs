@@ -9245,4 +9245,44 @@ mod tests {
             assert!(left.is_empty(), "mvcc={mvcc}: {} of {} rows of the old index left in the file", left.len(), gone.len());
         }
     }
+
+    /// A REINDEX marks every partition changed. A reader that read the model it replaces while it
+    /// ran, under an earlier snapshot, held that model on: once a REINDEX that leaves fewer
+    /// partitions commits, the reader's next statement reads the whole directory, so the rows it
+    /// inserts go to partitions the index has, the index checks consistent and a fresh connection
+    /// finds them, in WAL and in MVCC mode.
+    #[test]
+    fn a_model_read_while_a_reindex_ran_is_not_used_after_it() {
+        const DIMS: usize = 16;
+        for mvcc in [false, true] {
+            let (db, conn) = database(&format!("ivf-rq-reindex-reader-{mvcc}.db"), mvcc);
+            let mut state = 919u64;
+            let centres = [vec![8.0f32; DIMS], vec![-8.0f32; DIMS]];
+            let rows: Vec<(i64, Vec<f32>)> = (1..=4000).map(|id| (id, near(&mut state, &centres, 1.0))).collect();
+            for chunk in rows.chunks(500) {
+                insert_all(&conn, chunk);
+            }
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 8)").unwrap();
+            conn.execute("DELETE FROM v WHERE id > 300").unwrap();
+            let mut live: HashMap<i64, Vec<f32>> = rows.into_iter().filter(|(id, _)| *id <= 300).collect();
+            let before = check(&conn, "v_ivf").unwrap().partitions;
+            let reader = db.connect(crate::ConnectOpts::new()).unwrap();
+            conn.execute("BEGIN").unwrap();
+            conn.execute("REINDEX v_ivf").unwrap();
+            // The reader's snapshot precedes the REINDEX, so it reads the model being replaced.
+            assert_eq!(top_ten(&reader, &centres[0]), exact_top_ten(&live, &centres[0]), "mvcc={mvcc}");
+            conn.execute("COMMIT").unwrap();
+            let after = check(&conn, "v_ivf").unwrap().partitions;
+            assert!(after < before, "mvcc={mvcc}: the REINDEX left {after} partitions of {before}");
+            let more: Vec<(i64, Vec<f32>)> = (10_001..=10_200).map(|id| (id, near(&mut state, &centres, 1.0))).collect();
+            insert_all(&reader, &more);
+            live.extend(more);
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.rows == live.len() as u64, "mvcc={mvcc}: {found:?}");
+            let fresh = db.connect(crate::ConnectOpts::new()).unwrap();
+            for centre in &centres {
+                assert_eq!(top_ten(&fresh, centre), exact_top_ten(&live, centre), "mvcc={mvcc}");
+            }
+        }
+    }
 }

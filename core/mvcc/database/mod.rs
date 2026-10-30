@@ -68,8 +68,8 @@ pub use checkpoint_state_machine::{
 };
 
 mod background_checkpoint;
-pub use background_checkpoint::background_checkpoint_stats;
 use background_checkpoint::BackgroundCheckpoint;
+pub use background_checkpoint::{background_checkpoint_stats, CheckpointPool, CheckpointPoolStats};
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
@@ -3783,15 +3783,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
                 self.land();
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-                // With the background checkpoint on, the main database's checkpoint runs on its
-                // thread, so this commit returns now. A successor's statements hold a blocking
-                // checkpoint off until they end, so a commit that leaves one checkpoints nothing.
+                // With the background checkpoint on, the checkpoint runs on the store's pool, so
+                // this commit returns now. A successor's statements hold a blocking checkpoint off
+                // until they end, so a commit that leaves one checkpoints nothing.
                 let checkpoints = appended_to_log
                     && successor.is_none()
                     && mvcc_store.storage.should_checkpoint();
                 let handed_off = checkpoints
-                    && self.db_id == crate::MAIN_DB_ID
-                    && mvcc_store.background_checkpoint.request(&self.connection);
+                    && mvcc_store.background_checkpoint.request(
+                        &mvcc_store.storage,
+                        || mvcc_store.checkpoint_in_progress(),
+                        || match self.db_id {
+                            crate::MAIN_DB_ID => Some(self.connection.db.clone()),
+                            db_id => self
+                                .connection
+                                .attached_databases()
+                                .read()
+                                .get_database_by_index(db_id),
+                        },
+                    );
                 if !handed_off && checkpoints {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
@@ -4794,17 +4804,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
-    /// Whether commits hand the auto checkpoint to the background thread.
+    /// Whether commits hand the auto checkpoint to the store's checkpoint pool.
     pub fn background_checkpoint_enabled(&self) -> bool {
         self.background_checkpoint.enabled()
     }
 
-    /// On, a commit that crosses the threshold hands the checkpoint to a background thread;
-    /// off, it checkpoints inline. It stays off without passive checkpoints, the only ones that
-    /// can run beside commits.
+    /// On, a commit that crosses the threshold hands the checkpoint to the store's checkpoint
+    /// pool; off, it checkpoints inline. It stays off without passive checkpoints, the only ones
+    /// that can run beside commits.
     pub fn set_background_checkpoint(&self, enabled: bool) {
         self.background_checkpoint
             .set_enabled(enabled && self.experimental_mvcc_passive_checkpoint);
+    }
+
+    /// The pool that runs the store's background checkpoints: the process's shared pool unless
+    /// the store was given another.
+    pub fn checkpoint_pool(&self) -> CheckpointPool {
+        self.background_checkpoint.pool()
+    }
+
+    /// Runs the store's background checkpoints on `pool` from now on.
+    pub fn set_checkpoint_pool(&self, pool: &CheckpointPool) {
+        self.background_checkpoint.set_pool(pool.clone());
+    }
+
+    /// Whether a checkpoint is running on the store.
+    pub(crate) fn checkpoint_in_progress(&self) -> bool {
+        self.checkpoint_in_progress.load(Ordering::Acquire)
     }
 
     #[cfg(test)]

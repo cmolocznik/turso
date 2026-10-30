@@ -3604,6 +3604,13 @@ impl Database {
         self.opts.enable_experimental_mvcc_passive_checkpoint
     }
 
+    /// Whether a connection needs key material its opener holds: an encryption key or an external
+    /// page codec.
+    pub(crate) fn needs_key_material(&self) -> bool {
+        !matches!(self.encryption_cipher_mode.get(), CipherMode::None)
+            || self.page_codec_id.is_some()
+    }
+
     pub fn experimental_attach_enabled(&self) -> bool {
         self.opts.enable_attach
     }

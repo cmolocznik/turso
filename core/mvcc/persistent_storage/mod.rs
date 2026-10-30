@@ -96,6 +96,10 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn logical_log_offset(&self) -> u64;
     /// Whether the log holds at least the threshold of bytes no checkpoint has covered yet.
     fn should_checkpoint(&self) -> bool;
+    /// The log's bytes no checkpoint has covered yet.
+    fn uncheckpointed_bytes(&self) -> u64 {
+        self.logical_log_offset()
+    }
     /// Records that a checkpoint covered the log up to `offset`, so the threshold counts only the
     /// bytes after it. A log a passive checkpoint cannot truncate keeps its size, and a trigger on
     /// size alone would ask for a checkpoint at every commit.
@@ -291,14 +295,13 @@ impl DurableStorage for Storage {
     /// Lock-free: reads shadowed atomics only.
     fn should_checkpoint(&self) -> bool {
         let threshold = self.checkpoint_threshold.load(Ordering::Relaxed);
-        if threshold < 0 {
-            return false;
-        }
-        let uncovered = self
-            .log_offset
+        threshold >= 0 && self.uncheckpointed_bytes() >= threshold as u64
+    }
+
+    fn uncheckpointed_bytes(&self) -> u64 {
+        self.log_offset
             .load(Ordering::Relaxed)
-            .saturating_sub(self.checkpoint_floor.load(Ordering::Relaxed));
-        uncovered >= threshold as u64
+            .saturating_sub(self.checkpoint_floor.load(Ordering::Relaxed))
     }
 
     fn set_checkpoint_floor(&self, offset: u64) {

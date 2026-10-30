@@ -2616,6 +2616,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             CheckpointState::CollectTableRows => {
                 inject_transition_yield!(self, CheckpointYieldPoint::BeforeCollectTableRows);
+                inject_transition_failure!(self, CheckpointYieldPoint::BeforeCollectTableRows);
                 if let Some(io) = self.collect_table_rows()? {
                     return Ok(TransitionResult::Io(io));
                 }

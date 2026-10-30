@@ -5,12 +5,13 @@
 //! under WAL, and yields between steps. Readers never wait for it and it pins no snapshot while it
 //! runs; a writer waits for one step at most. A step that finds the write lock held reports busy,
 //! and the statement's busy handler decides whether it waits; a step whose commit loses to a
-//! concurrent transaction is done again. Under WAL a step that refused another connection the write
-//! lock while it held it lets that connection take the lock before the next step does. Each wait
-//! for the lock is one for the statement's busy handler, its timeout bounding each wait rather than
-//! their sum over the run. Dropping the statement drops the step connection, which rolls back a step
-//! in flight. Inside a transaction the statement runs one `OPTIMIZE INDEX` there instead, which
-//! does all the work in that transaction.
+//! concurrent transaction is done again, and one waiting for other transactions to end sleeps
+//! before the next. Under WAL a step that refused another connection the write lock while it held
+//! it lets that connection take the lock before the next step does. Each wait for the lock is one
+//! for the statement's busy handler, its timeout bounding each wait rather than their sum over the
+//! run. Dropping the statement drops the step connection, which rolls back a step in flight. Inside
+//! a transaction the statement runs one `OPTIMIZE INDEX` there instead, which does all the work in
+//! that transaction.
 
 use super::OptimizeProgress;
 use crate::{
@@ -63,6 +64,7 @@ pub(crate) fn record_progress(connection: &Connection, progress: OptimizeProgres
         OptimizeProgress::Done => 0,
         OptimizeProgress::Moved => 1,
         OptimizeProgress::Waiting => 2,
+        OptimizeProgress::Draining => 3,
     };
     connection
         .index_method_optimize_progress
@@ -76,13 +78,14 @@ fn recorded_progress(connection: &Connection) -> OptimizeProgress {
     {
         1 => OptimizeProgress::Moved,
         2 => OptimizeProgress::Waiting,
+        3 => OptimizeProgress::Draining,
         _ => OptimizeProgress::Done,
     }
 }
 
 /// Steps in a row whose commit may lose to a concurrent transaction, or that may find all the work
-/// left held by other transactions, before the statement ends its run, leaving the work due for
-/// the writers' own maintenance and the next `OPTIMIZE INDEX`.
+/// left held by other transactions or wait for them to end, before the statement ends its run,
+/// leaving the work due for the writers' own maintenance and the next `OPTIMIZE INDEX`.
 const LOST_IN_A_ROW: usize = 16;
 const WAITING_IN_A_ROW: usize = 64;
 
@@ -323,12 +326,17 @@ impl OptimizeSteps {
                             match self.left {
                                 OptimizeProgress::Done => return Ok(IOResult::Done(())),
                                 OptimizeProgress::Moved => self.waiting = 0,
-                                OptimizeProgress::Waiting => {
+                                OptimizeProgress::Waiting | OptimizeProgress::Draining => {
                                     self.waiting += 1;
                                     if self.waiting >= WAITING_IN_A_ROW {
                                         return Ok(IOResult::Done(()));
                                     }
                                 }
+                            }
+                            // A step waiting for other transactions to end sleeps before the next,
+                            // which would otherwise spin beside them.
+                            if self.left == OptimizeProgress::Draining {
+                                self.wait = Some(GIVE_WAY_POLL);
                             }
                             self.phase = match write_lock_turns(&steps) {
                                 Some((grants, refusals)) if held && refusals > self.refusals => {

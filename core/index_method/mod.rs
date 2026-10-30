@@ -174,6 +174,9 @@ pub enum OptimizeProgress {
     /// It did none, other transactions holding all the work there is: a further step may find
     /// some of it free.
     Waiting,
+    /// It did none, waiting for transactions that wrote the index to end before it does work they
+    /// must not meet: a further step, after a pause, may do it.
+    Draining,
 }
 
 /// Transaction mode exposed to index methods.

@@ -25,6 +25,14 @@
 //! has redo rows. A run never settles its own transaction's redo rows, which could only meet what
 //! their writes met.
 //!
+//! A rebuild writes every row of the index, so under MVCC it is claimed only where no other
+//! transaction has written a row of it that the rebuild's snapshot does not see, redo rows aside,
+//! and from the claim until it is made every other write of the index is left to redo and no other
+//! maintenance starts, so none meets it ([`Writes::quiet`]). A step of OPTIMIZE INDEX that finds a
+//! rebuild due and cannot claim it announces it, which holds the other writes to redo as well, and
+//! its next steps, each under a fresh snapshot, wait for the transactions that wrote the index to
+//! end; a statement's maintenance leaves such a rebuild to OPTIMIZE INDEX.
+//!
 //! A query reads a partition's bookkeeping first. The blocks of the partitions queries probe are
 //! held in memory, shared by the index's cursors, each partition's under the version its
 //! bookkeeping held when they were read: a query whose snapshot holds that version scores them
@@ -2405,6 +2413,8 @@ struct Writes {
     /// in `changed`: the highest one the index's last record knew, or the commit position when the
     /// record began, for the index's first.
     floor: Position,
+    /// A rebuild a step of OPTIMIZE INDEX announced and has not claimed.
+    rebuild: Option<Announced>,
 }
 
 impl Drop for Writes {
@@ -2419,10 +2429,22 @@ impl Drop for Writes {
     }
 }
 
+/// A rebuild a step of OPTIMIZE INDEX on the connection keyed `owner` found due and could not
+/// claim, other transactions having written the index unseen: it holds their writes to redo, as
+/// the rebuild once claimed does, so the transactions that wrote the index end and a later step's
+/// snapshot sees every row the rebuild writes. It stands while the connection is open and the steps
+/// renew it within [`REBUILD_LEASE`].
+#[derive(Debug)]
+struct Announced {
+    owner: usize,
+    connection: std::sync::Weak<Connection>,
+    renewed: std::time::Instant,
+}
+
 /// A transaction writing the index, entered under its connection: the partitions it wrote, those
 /// its maintenance jobs wrote or claimed, those whose part of the model they changed, whether it
-/// drops the index's tables, changing every partition, its statements writing the index now, and
-/// whether one of them staged its writes.
+/// drops the index's tables, changing every partition, whether it is making a rebuild it claimed,
+/// its statements writing the index now, and whether one of them staged its writes.
 #[derive(Debug)]
 struct Writer {
     connection: std::sync::Weak<Connection>,
@@ -2430,13 +2452,14 @@ struct Writer {
     jobs: HashSet<i64>,
     models: HashSet<i64>,
     whole: bool,
+    rebuilding: bool,
     statements: usize,
     staged: bool,
 }
 
 impl Writer {
     fn new(connection: std::sync::Weak<Connection>) -> Self {
-        Writer { connection, partitions: HashSet::new(), jobs: HashSet::new(), models: HashSet::new(), whole: false, statements: 0, staged: false }
+        Writer { connection, partitions: HashSet::new(), jobs: HashSet::new(), models: HashSet::new(), whole: false, rebuilding: false, statements: 0, staged: false }
     }
 }
 
@@ -2506,6 +2529,26 @@ impl Writes {
                 self.raise(writer, now);
             }
         }
+    }
+
+    /// Whether a rebuild of another connection than `me`'s holds writes of the index to redo: one
+    /// an open transaction claimed and is making, or one announced and standing.
+    fn rebuild_elsewhere(&self, me: usize) -> bool {
+        self.open.iter().any(|(key, writer)| *key != me && writer.rebuilding)
+            || self.rebuild.as_ref().is_some_and(|rebuild| rebuild.owner != me && rebuild.connection.strong_count() > 0 && rebuild.renewed.elapsed() < rebuild_lease())
+    }
+
+    /// Whether no transaction but `me` has written the index where a snapshot at `snapshot` does
+    /// not see it, redo rows aside, which a rebuild leaves to their settles: none open has written
+    /// another row of it, holds a job or changes every partition, and none that ended wrote one, or
+    /// a partition's part of the model, past the snapshot.
+    fn quiet(&self, snapshot: Position, me: usize) -> bool {
+        self.floor <= snapshot
+            && self.changed.iter().all(|(partition, at)| *partition == REDO_ROWS || *at <= snapshot)
+            && self.jobs_changed.values().chain(self.models.values()).all(|at| *at <= snapshot)
+            && self.open.iter().all(|(key, writer)| {
+                *key == me || !writer.whole && writer.jobs.is_empty() && writer.models.is_empty() && writer.partitions.iter().all(|partition| *partition == REDO_ROWS)
+            })
     }
 
     /// Whether a job of the writer `me` under `snapshot` may claim `partition`: no other writer's
@@ -2607,7 +2650,7 @@ enum Load {
 /// vector's row; a delete reads the vector's row, removes its tail entry or names its packed block
 /// in its dead row, and then removes the vector's row. A write that meets a row maintenance changed
 /// after the transaction's snapshot, or is changing, is undone, and the rowid's first redo row
-/// written instead.
+/// written instead, as is one made while another connection's rebuild holds writes to redo.
 enum Change {
     Idle,
     Pending { rowid: i64, walk: Walk, last: Option<i64>, then: Box<Change> },
@@ -3003,6 +3046,10 @@ const SURVEYED_TAIL: usize = 2 * MOVE_BATCH;
 /// The vectors at which an index trained for under a quarter of the partitions it holds vectors for
 /// is rebuilt, and the rows a statement inserts that make its maintenance check for it.
 const BULK_AT: usize = 1024;
+/// How long a rebuild announced and not yet claimed stands without its owner renewing it: the steps
+/// of the OPTIMIZE INDEX waiting to claim it renew it, so one left unstepped holds other
+/// transactions' writes to redo no longer than this.
+const REBUILD_LEASE: std::time::Duration = std::time::Duration::from_secs(1);
 /// The most jobs one step of `OPTIMIZE INDEX` does, and the time past which it starts no other,
 /// before its transaction commits and the statement gives way.
 const STEP_JOBS: usize = 16;
@@ -3061,6 +3108,15 @@ thread_local! {
     static KILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The rebuilds done on this thread.
     static REBUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The lease of a rebuild announced and not yet claimed, which tests shorten.
+    static LEASE: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(REBUILD_LEASE) };
+}
+
+fn rebuild_lease() -> std::time::Duration {
+    #[cfg(test)]
+    return LEASE.with(|lease| lease.get());
+    #[cfg(not(test))]
+    REBUILD_LEASE
 }
 
 fn settles() -> bool {
@@ -3222,6 +3278,10 @@ pub struct IvfRqCursor {
     dirty: Vec<i64>,
     /// The slot the split chosen opens, claimed with its other rows.
     opening: std::cell::Cell<Option<i64>>,
+    /// Whether the statement is a step of OPTIMIZE INDEX, which announces a rebuild it cannot claim,
+    /// and whether its rebuild so waits for the writes before it to end.
+    stepped: bool,
+    draining: std::cell::Cell<bool>,
     /// The marks on the partition of the job being planned, which its writes remove.
     marks: Vec<i64>,
     /// How this statement's queries use and hold partitions' rows across snapshots, none where they
@@ -3278,6 +3338,8 @@ impl IvfRqCursor {
             saved: None,
             dirty: Vec::new(),
             opening: std::cell::Cell::new(None),
+            stepped: false,
+            draining: std::cell::Cell::new(false),
             marks: Vec::new(),
             sharing: None,
             recorded: HashSet::new(),
@@ -3550,7 +3612,13 @@ impl IvfRqCursor {
                     let Some(step) = steps.front_mut() else {
                         return Ok(IOResult::Done(()));
                     };
-                    self.record(step, false);
+                    // Beside another connection's rebuild, which writes every row of the index, the
+                    // write is maintenance's to redo, as one that meets a job is.
+                    if !self.record_write(step) {
+                        REDONE.fetch_add(1, Ordering::Relaxed);
+                        self.change = Change::Revert { rowid, undo };
+                        continue;
+                    }
                     match apply_step(&mut self.stores, step, Some(&mut undo)) {
                         Ok(IOResult::Done(())) => {
                             steps.pop_front();
@@ -3645,7 +3713,7 @@ impl IvfRqCursor {
             Some(writes) => writes,
             None => {
                 let floor = FLOORS.lock().expect("index floors").remove(&key).unwrap_or_else(|| clock.now());
-                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), models: HashMap::new(), models_by_change: BTreeSet::new(), floor }));
+                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), models: HashMap::new(), models_by_change: BTreeSet::new(), floor, rebuild: None }));
                 registry.insert(key, std::sync::Arc::downgrade(&writes));
                 writes
             }
@@ -3658,25 +3726,40 @@ impl IvfRqCursor {
     /// writes the partition the step changes, and whether a maintenance job does; before one on
     /// the centroids table does, that it changes the partition's part of the model.
     fn record(&mut self, step: &Step, job: bool) {
+        self.enter(step, job, false);
+    }
+
+    /// [`Self::record`] for a write of a table row's rows of the index, refused, recording nothing,
+    /// while another connection's rebuild holds writes to redo ([`Writes::rebuild_elsewhere`]).
+    fn record_write(&mut self, step: &Step) -> bool {
+        self.enter(step, false, true)
+    }
+
+    /// [`Self::record`], refusing a `write` beside another connection's rebuild in the lock a
+    /// rebuild is claimed in: whether the step may be written.
+    fn enter(&mut self, step: &Step, job: bool, write: bool) -> bool {
         let (Step::Put { store, rowid, .. } | Step::Remove { store, rowid, .. }) = step;
         let (partition, model) = match *store {
             PARTITIONS => (partition_of(*rowid), false),
             CENTROIDS if *rowid < LEGACY_GENERATION => (-2 - *rowid, true),
             CENTROIDS => (*rowid >> VERSION_BITS, true),
             REDO => (REDO_ROWS, false),
-            _ => return,
+            _ => return true,
         };
         let recorded = match model {
             true => self.recorded_models.contains(&partition),
             false => self.recorded.contains(&(partition, job)),
         };
         if recorded {
-            return;
+            return true;
         }
         let Some(sharing) = &self.sharing else {
-            return;
+            return true;
         };
         let mut writes = sharing.writes.lock().expect("index writes");
+        if write && writes.rebuild_elsewhere(sharing.key()) {
+            return false;
+        }
         let writer = writes.open.entry(sharing.key()).or_insert_with(|| Writer::new(sharing.connection.clone()));
         if !self.writing {
             writer.statements += 1;
@@ -3698,6 +3781,7 @@ impl IvfRqCursor {
             true => self.recorded_models.insert(partition),
             false => self.recorded.insert((partition, job)),
         };
+        true
     }
 
     /// Enter, before the index's tables are dropped, that this cursor's transaction changes every
@@ -4032,7 +4116,9 @@ impl IndexMethodCursor for IvfRqCursor {
     /// in, these from where the last step stopped, passing over those another transaction holds or
     /// committed past this step's snapshot, and does up to [`STEP_JOBS`] jobs among them, starting
     /// none past [`STEP_TIME`] once it has done one. While other transactions hold all the work
-    /// left, it waits, doing none.
+    /// left, it waits, doing none. Under MVCC a rebuild due that other transactions' writes keep it
+    /// from claiming is announced, and the steps wait for those transactions to end, doing nothing
+    /// else, until one claims it.
     fn optimize_step(&mut self, context: &IndexMethodContext, first: bool) -> IOResultOr<OptimizeProgress> {
         if self.run.is_none() {
             self.note_snapshot(context);
@@ -4060,9 +4146,14 @@ impl IndexMethodCursor for IvfRqCursor {
             let all = first || self.shared.lock().expect("index state").rebuild_due;
             self.run = Some(Run { budget, survey: Survey::default(), all, first: start, build: None, until, redo: RedoScan::default() });
             self.jobs = 0;
+            self.stepped = true;
+            self.draining.set(false);
         }
         if let IOResult::IO(io) = self.maintain(context)? {
             return Ok(IOResult::IO(io));
+        }
+        if self.draining.get() {
+            return Ok(IOResult::Done(OptimizeProgress::Draining));
         }
         let shared = self.shared.lock().expect("index state");
         Ok(IOResult::Done(match (shared.due.is_empty() && shared.moving.is_empty() && !shared.rebuild_due && self.redo_left == 0, first || self.jobs > 0) {
@@ -5139,6 +5230,13 @@ impl IvfRqCursor {
                         }
                         Rebuilding::Done { model } => {
                             self.model = Arc::new(*model);
+                            // Made: other transactions write the index again, and meet the rows the
+                            // rebuild wrote as they meet a job's.
+                            if let Some(sharing) = &self.sharing {
+                                if let Some(writer) = sharing.writes.lock().expect("index writes").open.get_mut(&sharing.key()) {
+                                    writer.rebuilding = false;
+                                }
+                            }
                             let mut shared = self.shared.lock().expect("index state");
                             shared.moving.clear();
                             shared.due.clear();
@@ -5272,11 +5370,28 @@ impl IvfRqCursor {
 
     /// The next job of the run, or none, ending the run, when its budget is spent or nothing is due.
     fn next_job(&mut self) -> Result<Option<Upkeep>> {
+        // Another connection's rebuild writes every row of the index: maintenance starts nothing
+        // beside it, so the transactions that wrote the index end.
+        if self.rebuild_elsewhere() {
+            return Ok(self.end_run());
+        }
         let run = self.run.as_ref().ok_or_else(|| error("maintenance without a run"))?;
         let late = run.until.is_some_and(|until| self.jobs > 0 && std::time::Instant::now() >= until);
-        // The redo rows come first, a batch at a time. A run reads one batch whatever its budget,
-        // so even a run that does no job, as the first step of OPTIMIZE INDEX, knows whether any
-        // are left.
+        // A rebuild due comes first, leaving every rowid with redo rows to its settle. A step of
+        // OPTIMIZE INDEX that announced one it cannot claim does nothing else: the writes left to
+        // redo meanwhile keep coming, and the rebuild makes every job again.
+        if run.budget > 0 && !late && self.rebuild_due(&run.survey) {
+            if self.claim(Job::Rebuild) {
+                self.save_model();
+                return Ok(Some(Upkeep::Rebuild { phase: Rebuilding::Rowids { walk: Walk::Seek, rowids: Vec::new() }, steps: VecDeque::new() }));
+            }
+            if self.draining.get() {
+                return Ok(self.end_run());
+            }
+        }
+        let run = self.run.as_ref().ok_or_else(|| error("maintenance without a run"))?;
+        // Then the redo rows, a batch at a time. A run reads one batch whatever its budget, so even
+        // a run that does no job, as the first step of OPTIMIZE INDEX, knows whether any are left.
         if !late && settles() {
             let rowids: Vec<i64> = run.redo.batch.keys().take(MOVE_BATCH).copied().collect();
             if !rowids.is_empty() && run.budget > 0 {
@@ -5288,16 +5403,8 @@ impl IvfRqCursor {
         }
         let job = if run.budget == 0 || late { None } else { self.choose(&run.survey) };
         let Some(job) = job else {
-            if let Some(run) = self.run.take() {
-                self.redo_left = run.redo.left();
-                self.leave_due(&run);
-            }
-            return Ok(None);
+            return Ok(self.end_run());
         };
-        if let Job::Rebuild = job {
-            self.save_model();
-            return Ok(Some(Upkeep::Rebuild { phase: Rebuilding::Rowids { walk: Walk::Seek, rowids: Vec::new() }, steps: VecDeque::new() }));
-        }
         let partition = job_partition(job);
         let mut part = run.survey.part(partition);
         // The job takes up the marks splits left on its partition: a live one checks every block
@@ -5309,6 +5416,15 @@ impl IvfRqCursor {
         }
         self.marks = marks;
         Ok(Some(Upkeep::Read { job, part, stage: Stage::Blocks, walk: Walk::Seek, get: Get::Seek, rows: Vec::new() }))
+    }
+
+    /// End the run: the partitions it leaves work due in are the next statements' to survey.
+    fn end_run(&mut self) -> Option<Upkeep> {
+        if let Some(run) = self.run.take() {
+            self.redo_left = run.redo.left();
+            self.leave_due(&run);
+        }
+        None
     }
 
     /// Whether a survey of every partition found the index holding four times the vectors its
@@ -5342,9 +5458,6 @@ impl IvfRqCursor {
     /// [`COMPACT_AT`], the retirement of a partition too small to keep, a split of the largest
     /// partition past the bound.
     fn choose(&self, survey: &Survey) -> Option<Job> {
-        if self.rebuild_due(survey) && self.claim(Job::Rebuild) {
-            return Some(Job::Rebuild);
-        }
         let settled = self.settled(survey);
         // Under MVCC a job another transaction's write would beat at commit is left for later.
         let mut read = survey.read.clone();
@@ -5376,7 +5489,9 @@ impl IvfRqCursor {
     /// that is free as its other rows are, so concurrent splits open different slots. Writes of
     /// the table's rows are no bar: they write fresh rows, and the rows of a vector a job moves,
     /// which the engine refuses at the write, so the job is undone and the writer's change left to
-    /// maintenance. The record is this process's; under WAL the one writer holds every row.
+    /// maintenance. The record is this process's; under WAL the one writer holds every row. A
+    /// rebuild is claimed only where no other transaction has written the index unseen
+    /// ([`Writes::quiet`]); a step of OPTIMIZE INDEX that cannot claim it announces it.
     fn claim(&self, job: Job) -> bool {
         let claims = self.claims(job);
         let count = self.model.centroids.len() as i64;
@@ -5391,7 +5506,21 @@ impl IvfRqCursor {
         let me = sharing.key();
         let mut writes = sharing.writes.lock().expect("index writes");
         writes.settle(|| sharing.clock.now());
-        if !claims.iter().all(|p| writes.free(*p, snapshot, me)) {
+        let free = claims.iter().all(|p| writes.free(*p, snapshot, me));
+        if let Job::Rebuild = job {
+            // Every row the rebuild writes is as the last writer left it, seen, and none is written
+            // after the claim, which marks the writer rebuilding in the same lock.
+            if !free || !writes.quiet(snapshot, me) {
+                if self.stepped {
+                    writes.rebuild = Some(Announced { owner: me, connection: sharing.connection.clone(), renewed: std::time::Instant::now() });
+                }
+                self.draining.set(self.stepped);
+                return false;
+            }
+            if writes.rebuild.as_ref().is_some_and(|rebuild| rebuild.owner == me) {
+                writes.rebuild = None;
+            }
+        } else if !free {
             return false;
         }
         let mut claimed = claims;
@@ -5402,8 +5531,16 @@ impl IvfRqCursor {
             self.opening.set(Some(slot));
             claimed.push(slot);
         }
-        writes.open.entry(me).or_insert_with(|| Writer::new(sharing.connection.clone())).jobs.extend(claimed);
+        let writer = writes.open.entry(me).or_insert_with(|| Writer::new(sharing.connection.clone()));
+        writer.jobs.extend(claimed);
+        writer.rebuilding |= matches!(job, Job::Rebuild);
         true
+    }
+
+    /// Whether another connection's rebuild holds writes of the index to redo (see
+    /// [`Writes::rebuild_elsewhere`]).
+    fn rebuild_elsewhere(&self) -> bool {
+        self.sharing.as_ref().filter(|_| self.concurrent).is_some_and(|sharing| sharing.writes.lock().expect("index writes").rebuild_elsewhere(sharing.key()))
     }
 
     /// Whether a job of this cursor could claim the partitions `claims` now, claiming nothing.
@@ -7126,21 +7263,34 @@ mod tests {
         rows.into_iter().collect()
     }
 
-    /// Step `statement` until it yields between steps of its work, or sleeps out a wait it asks
-    /// for, true, or ends, false.
-    fn step_to_yield(db: &crate::Database, statement: &mut crate::Statement) -> bool {
+    /// Where a statement stepped on to: it yielded between steps of its work, slept out a wait it
+    /// asked for, or ended.
+    #[derive(Debug, PartialEq)]
+    enum Paused {
+        Yielded,
+        Slept,
+        Ended,
+    }
+
+    fn step_to_pause(db: &crate::Database, statement: &mut crate::Statement) -> Paused {
         loop {
             match statement.step().unwrap() {
-                crate::StepResult::Yield => return true,
-                crate::StepResult::Done => return false,
+                crate::StepResult::Yield => return Paused::Yielded,
+                crate::StepResult::Done => return Paused::Ended,
                 crate::StepResult::IO => db.io.step().unwrap(),
                 crate::StepResult::Sleep { duration } => {
                     std::thread::sleep(duration);
-                    return true;
+                    return Paused::Slept;
                 }
                 other => panic!("the statement stepped to {other:?}"),
             }
         }
+    }
+
+    /// Step `statement` until it yields between steps of its work, or sleeps out a wait it asks
+    /// for, true, or ends, false.
+    fn step_to_yield(db: &crate::Database, statement: &mut crate::Statement) -> bool {
+        step_to_pause(db, statement) != Paused::Ended
     }
 
     /// OPTIMIZE INDEX of `index` run to its end on `conn`, failing past ten thousand steps instead of
@@ -9070,7 +9220,7 @@ mod tests {
     /// once in the order, at its latest change.
     #[test]
     fn a_held_model_doubts_the_partitions_changed_past_its_snapshot_and_no_others() {
-        let mut writes = Writes { key: (u64::MAX, "doubt".into()), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), models: HashMap::new(), models_by_change: BTreeSet::new(), floor: (0, 0) };
+        let mut writes = Writes { key: (u64::MAX, "doubt".into()), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), models: HashMap::new(), models_by_change: BTreeSet::new(), floor: (0, 0), rebuild: None };
         let changing = |models: &[i64]| Writer { models: models.iter().copied().collect(), ..Writer::new(std::sync::Weak::new()) };
         writes.raise(changing(&[1, 2]), (0, 5));
         writes.raise(changing(&[2, 3]), (0, 9));
@@ -9461,5 +9611,200 @@ mod tests {
         optimize(&conn, "v_ivf");
         let found = check(&conn, "v_ivf").unwrap();
         assert!(found.consistent() && found.marks == 0, "{found:?}");
+    }
+
+    /// A database, a connection to it, the rows of its table by id, and a row a transaction still
+    /// open rewrote with its new vector.
+    type Outgrown = (Arc<crate::Database>, Arc<crate::Connection>, Arc<crate::Connection>, HashMap<i64, Vec<f32>>, (i64, Vec<f32>));
+
+    /// An MVCC index holding 3,000 rows in one partition's tail, unmaintained, so a rebuild is due,
+    /// beside a transaction kept open that rewrote one of the rows, its maintenance off: a write
+    /// of a row every rebuild rewrites.
+    fn outgrown_beside_a_holder(name: &str) -> Outgrown {
+        let (db, conn) = database(name, true);
+        let mut state = 281;
+        let rows: Vec<(i64, Vec<f32>)> = (1..=3000i64).map(|id| (id, random(&mut state, 16))).collect();
+        STATEMENT_UPKEEP.with(|on| on.set(false));
+        conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+        insert_all(&conn, &rows);
+        let holder = db.connect(crate::ConnectOpts::new()).unwrap();
+        holder.execute("BEGIN CONCURRENT").unwrap();
+        let moved = (7, random(&mut state, 16));
+        holder.execute(format!("UPDATE v SET e = {} WHERE id = {}", literal(&moved.1), moved.0)).unwrap();
+        STATEMENT_UPKEEP.with(|on| on.set(true));
+        (db, conn, holder, rows.into_iter().collect(), moved)
+    }
+
+    /// The redo rows of `rowid` `conn` sees.
+    fn redo_rows_of(conn: &Arc<crate::Connection>, rowid: i64) -> usize {
+        backing(conn, "redo", "writer").iter().filter(|r| r[0].as_int().unwrap() >> REDO_BITS == rowid).count()
+    }
+
+    /// Insert `rows` in one statement of a transaction of their own, `open` leaving it open: how many
+    /// of them it left to redo, as its transaction sees them, and the open transaction's connection.
+    fn insert_left_to_redo(db: &Arc<crate::Database>, rows: &[(i64, Vec<f32>)], open: bool) -> (usize, Option<Arc<crate::Connection>>) {
+        let writer = db.connect(crate::ConnectOpts::new()).unwrap();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        insert_all(&writer, rows);
+        let left = rows.iter().filter(|(rowid, _)| redo_rows_of(&writer, *rowid) > 0).count();
+        if open {
+            return (left, Some(writer));
+        }
+        writer.execute("COMMIT").unwrap();
+        (left, None)
+    }
+
+    /// Under MVCC a rebuild writes every row of the index, so OPTIMIZE INDEX beside another
+    /// transaction's open write of a row it rewrites announces the rebuild and waits, each step
+    /// sleeping before the next and doing nothing else: it settles no redo row, and a write another
+    /// transaction makes meanwhile is left to redo, starting no maintenance. Once the open
+    /// transaction commits a step makes the rebuild, beside a writer still open whose writes are
+    /// redo rows alone. The rebuild met the open write before, failing OPTIMIZE INDEX.
+    #[test]
+    fn a_rebuild_beside_an_open_write_waits_for_it_and_is_made() {
+        let (db, conn, holder, mut live, moved) = outgrown_beside_a_holder("ivf-rq-rebuild-beside-a-write.db");
+        let mut state = 283;
+        REBUILT.with(|count| count.set(0));
+        let mut stepped = db.connect(crate::ConnectOpts::new()).unwrap().prepare("OPTIMIZE INDEX v_ivf").unwrap();
+        // The first step surveys; the next announces the rebuild, the holder's write in its way.
+        assert_eq!(step_to_pause(&db, &mut stepped), Paused::Yielded);
+        assert_eq!(step_to_pause(&db, &mut stepped), Paused::Slept);
+        let first = vec![(5_000, random(&mut state, 16))];
+        let (left, _) = insert_left_to_redo(&db, &first, false);
+        assert_eq!(left, 1, "a write beside the announced rebuild");
+        // The writer of twenty more stays open. Its maintenance, a job for each row, starts none
+        // beside the rebuild: it would settle the first writer's row, a write the rebuild meets.
+        let more: Vec<(i64, Vec<f32>)> = (5_001..5_021).map(|id| (id, random(&mut state, 16))).collect();
+        let (left, writer) = insert_left_to_redo(&db, &more, true);
+        assert_eq!(left, more.len(), "writes beside the announced rebuild");
+        assert_eq!(step_to_pause(&db, &mut stepped), Paused::Slept);
+        assert_eq!(redo_rows_of(&conn, 5_000), 1, "a step waiting for its rebuild settled a redo row");
+        assert_eq!(REBUILT.with(|count| count.get()), 0);
+        holder.execute("COMMIT").unwrap();
+        live.insert(moved.0, moved.1);
+        let mut paused = 0;
+        while step_to_pause(&db, &mut stepped) != Paused::Ended {
+            paused += 1;
+            assert!(paused < 10_000, "OPTIMIZE INDEX did not end");
+        }
+        assert_eq!(REBUILT.with(|count| count.get()), 1, "the rebuild once the holder committed");
+        writer.unwrap().execute("COMMIT").unwrap();
+        live.extend(first);
+        live.extend(more);
+        optimize(&conn, "v_ivf");
+        let found = check(&conn, "v_ivf").unwrap();
+        assert!(found.consistent() && found.codes as usize == live.len() && found.pending == 0, "{found:?}");
+        for _ in 0..3 {
+            let q = random(&mut state, 16);
+            assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q));
+        }
+    }
+
+    /// OPTIMIZE INDEX waits for the writes before an announced rebuild no longer than its steps
+    /// waiting in a row: past them it ends, the rebuild still due, and once it has ended another
+    /// transaction's write is coded again, not left to redo.
+    #[test]
+    fn optimize_waiting_on_an_open_write_ends_with_the_rebuild_due() {
+        let (db, conn, holder, mut live, moved) = outgrown_beside_a_holder("ivf-rq-rebuild-waits-out.db");
+        let mut state = 287;
+        REBUILT.with(|count| count.set(0));
+        let mut stepped = db.connect(crate::ConnectOpts::new()).unwrap().prepare("OPTIMIZE INDEX v_ivf").unwrap();
+        let mut slept = 0;
+        loop {
+            match step_to_pause(&db, &mut stepped) {
+                Paused::Ended => break,
+                Paused::Slept => slept += 1,
+                Paused::Yielded => {}
+            }
+            assert!(slept < 1_000, "OPTIMIZE INDEX waited on and on");
+        }
+        assert!(slept > 0 && REBUILT.with(|count| count.get()) == 0, "slept {slept} steps");
+        let fresh = vec![(5_000, random(&mut state, 16))];
+        let (left, _) = insert_left_to_redo(&db, &fresh, false);
+        assert_eq!(left, 0, "a write once OPTIMIZE INDEX ended");
+        holder.execute("COMMIT").unwrap();
+        live.insert(moved.0, moved.1);
+        live.extend(fresh);
+        optimize(&conn, "v_ivf");
+        assert_eq!(REBUILT.with(|count| count.get()), 1);
+        let found = check(&conn, "v_ivf").unwrap();
+        assert!(found.consistent() && found.codes as usize == live.len() && found.pending == 0, "{found:?}");
+    }
+
+    /// A rebuild announced and left unstepped holds writes to redo until its lease runs out, and no
+    /// longer than its statement lives.
+    #[test]
+    fn an_announced_rebuild_left_unstepped_lapses() {
+        let (db, conn, holder, mut live, moved) = outgrown_beside_a_holder("ivf-rq-rebuild-lapses.db");
+        let mut state = 289;
+        let mut stepped = db.connect(crate::ConnectOpts::new()).unwrap().prepare("OPTIMIZE INDEX v_ivf").unwrap();
+        assert_eq!(step_to_pause(&db, &mut stepped), Paused::Yielded);
+        assert_eq!(step_to_pause(&db, &mut stepped), Paused::Slept);
+        let rows: Vec<(i64, Vec<f32>)> = (5_000..5_004).map(|id| (id, random(&mut state, 16))).collect();
+        assert_eq!(insert_left_to_redo(&db, &rows[0..1], false).0, 1, "within the lease");
+        LEASE.with(|lease| lease.set(std::time::Duration::ZERO));
+        assert_eq!(insert_left_to_redo(&db, &rows[1..2], false).0, 0, "past the lease");
+        LEASE.with(|lease| lease.set(REBUILD_LEASE));
+        assert_eq!(insert_left_to_redo(&db, &rows[2..3], false).0, 1, "within the lease");
+        drop(stepped);
+        assert_eq!(insert_left_to_redo(&db, &rows[3..4], false).0, 0, "once the statement is dropped");
+        holder.execute("COMMIT").unwrap();
+        live.insert(moved.0, moved.1);
+        live.extend(rows);
+        optimize(&conn, "v_ivf");
+        let found = check(&conn, "v_ivf").unwrap();
+        assert!(found.consistent() && found.codes as usize == live.len() && found.pending == 0, "{found:?}");
+    }
+
+    /// A statement that inserts rows enough to outgrow the index makes the rebuild they call for
+    /// itself only where no other transaction has written the index unseen: beside another's open
+    /// write of a row it rewrites, it leaves the rebuild to OPTIMIZE INDEX and commits, where its
+    /// rebuild met that write before, failing the statement. In a quiet index it makes the rebuild,
+    /// and another transaction's write after it, its own transaction still open, is coded, not left
+    /// to redo.
+    #[test]
+    fn a_statement_beside_an_open_write_leaves_its_rebuild_to_optimize() {
+        for quiet in [false, true] {
+            let (db, conn) = database(&format!("ivf-rq-statement-rebuild-{quiet}.db"), true);
+            conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
+            let mut state = 293;
+            let first: Vec<(i64, Vec<f32>)> = (1..=100i64).map(|id| (id, random(&mut state, 16))).collect();
+            insert_all(&conn, &first);
+            let mut live: HashMap<i64, Vec<f32>> = first.into_iter().collect();
+            let holder = db.connect(crate::ConnectOpts::new()).unwrap();
+            let moved = random(&mut state, 16);
+            if !quiet {
+                holder.execute("BEGIN CONCURRENT").unwrap();
+                STATEMENT_UPKEEP.with(|on| on.set(false));
+                holder.execute(format!("UPDATE v SET e = {} WHERE id = 7", literal(&moved))).unwrap();
+                STATEMENT_UPKEEP.with(|on| on.set(true));
+            }
+            // Rows enough to outgrow the index's one partition, in one statement doing one job.
+            let bulk: Vec<(i64, Vec<f32>)> = (1_000..3_000i64).map(|id| (id, random(&mut state, 16))).collect();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            STATEMENT_BUDGET.with(|budget| budget.set(1));
+            REBUILT.with(|count| count.set(0));
+            insert_all(&conn, &bulk);
+            STATEMENT_BUDGET.with(|budget| budget.set(usize::MAX));
+            assert_eq!(REBUILT.with(|count| count.get()), quiet as usize, "quiet={quiet}: the rebuilds the statement made");
+            live.extend(bulk);
+            let fresh = vec![(5_000, random(&mut state, 16))];
+            let (left, _) = insert_left_to_redo(&db, &fresh, false);
+            assert_eq!(left, 0, "quiet={quiet}: a write beside the statement's open transaction");
+            live.extend(fresh);
+            conn.execute("COMMIT").unwrap();
+            if !quiet {
+                holder.execute("COMMIT").unwrap();
+                live.insert(7, moved);
+            }
+            optimize(&conn, "v_ivf");
+            assert_eq!(REBUILT.with(|count| count.get()), 1, "quiet={quiet}: the rebuilds made");
+            let found = check(&conn, "v_ivf").unwrap();
+            assert!(found.consistent() && found.codes as usize == live.len() && found.pending == 0, "quiet={quiet}: {found:?}");
+            for _ in 0..3 {
+                let q = random(&mut state, 16);
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "quiet={quiet}");
+            }
+        }
     }
 }

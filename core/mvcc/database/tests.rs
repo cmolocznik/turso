@@ -3249,6 +3249,75 @@ fn test_passive_checkpoint_that_keeps_the_log_counts_only_uncovered_bytes() {
     assert!(mvcc_store.storage.should_checkpoint());
 }
 
+/// The WAL position a connection's checkpoints leave: the checkpoint sequence, which each restart
+/// advances, the WAL's last frame, and the last frame backfilled into the database file.
+fn wal_state(conn: &Arc<Connection>) -> (u32, u64, u64) {
+    let pager = conn.pager.load();
+    let wal = pager.wal.as_ref().unwrap();
+    (
+        wal.get_checkpoint_seq(),
+        wal.get_max_frame_in_wal(),
+        wal.backfill_frame(),
+    )
+}
+
+/// A passive checkpoint that commits beside a reader of the database file cannot backfill its
+/// frames: they would land in the file under the reader. The next checkpoint backfills them
+/// first, once the reader has ended, so that its own write restarts the WAL instead of appending
+/// to it.
+#[test]
+fn test_a_passive_checkpoint_backfills_what_the_last_one_left_and_restarts_the_wal() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+        .unwrap();
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let insert = |rows: usize| {
+        for _ in 0..rows {
+            conn.execute("INSERT INTO t(v) VALUES (randomblob(512))")
+                .unwrap();
+        }
+    };
+    insert(20);
+    conn.checkpoint(passive).unwrap();
+    let (_, first_max, first_backfilled) = wal_state(&conn);
+    assert!(first_max > 0 && first_backfilled == first_max);
+
+    let reader = db.connect();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t")[0][0],
+        Value::from_i64(20)
+    );
+    insert(20);
+    conn.checkpoint(passive).unwrap();
+    let (seq, max, backfilled) = wal_state(&conn);
+    assert!(
+        backfilled < max,
+        "the reader of the database file kept the checkpoint from backfilling"
+    );
+    reader.execute("COMMIT").unwrap();
+
+    insert(20);
+    conn.checkpoint(passive).unwrap();
+    let (next_seq, next_max, next_backfilled) = wal_state(&conn);
+    assert_eq!(
+        next_seq,
+        seq + 1,
+        "the checkpoint after the reader ended appended to the WAL, from frame {max} to frame \
+         {next_max}, instead of restarting it"
+    );
+    assert_eq!(next_backfilled, next_max);
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM t")[0][0],
+        Value::from_i64(60)
+    );
+}
+
 /// What this test checks: Checkpoint accepts sqlite_schema index-row updates for already-checkpointed indexes
 /// (e.g. column rename), without requiring create/destroy special writes.
 /// Why this matters: RENAME COLUMN on indexed tables rewrites sqlite_schema index SQL text while preserving rootpage.

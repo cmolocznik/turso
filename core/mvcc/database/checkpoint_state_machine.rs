@@ -167,6 +167,13 @@ fn last_key_of_first_table<V, A: SkiplistAllocator>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     PrepareCheckpoint,
+    /// Passive: backfill the frames an earlier checkpoint committed but could not backfill beside
+    /// readers of the database file. Those readers have ended by now, and readers that began since
+    /// read frames, which do not stop a backfill. With the WAL whole in the database file when this
+    /// checkpoint begins its write, the write restarts the WAL instead of appending to it.
+    BackfillEarlierFrames,
+    /// Fsync the database file after that backfill, before publishing it.
+    SyncEarlierBackfill,
     AcquireLock,
     BuildLocalSchemaView,
     CollectTableRows,
@@ -333,6 +340,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     index_id_to_index: HashMap<MVTableId, Arc<Index>>,
     /// Result of the checkpoint
     checkpoint_result: Option<CheckpointResult>,
+    /// Result of `BackfillEarlierFrames`, held until `SyncEarlierBackfill` publishes it.
+    earlier_backfill: Option<CheckpointResult>,
     /// Update connection's transaction state on checkpoint. If checkpoint was called as automatic
     /// process in a transaction we don't want to change the state as we assume we are already on a
     /// write transaction and any failure will be cleared on vdbe error handling.
@@ -970,6 +979,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             index_write_set: crate::alloc::vec![],
             index_id_to_index,
             checkpoint_result: None,
+            earlier_backfill: None,
             update_transaction_state,
             sync_mode,
             mode,
@@ -1069,6 +1079,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
         // MVCC checkpointing drives WAL checkpoint directly; on errors we must
         // explicitly reset both pager and WAL checkpoint states.
+        self.earlier_backfill = None;
         self.pager.clear_checkpoint_state();
         if let Some(wal) = self.pager.wal.as_ref() {
             wal.abort_checkpoint();
@@ -1959,6 +1970,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
+    /// Takes a passive checkpoint's snapshot.
+    fn sample_passive_snapshot(&mut self) {
+        // The offset first: every frame before it is a commit the snapshot covers or one
+        // still in flight, which the next checkpoint takes.
+        self.snapshot_log_offset = self.mvstore.storage.logical_log_offset();
+        self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
+        self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
+        // Checkpoint state machines can be created before they are run.
+        // Resample after serializing so already-durable index deletes are not replayed.
+        self.refresh_checkpoint_bounds();
+    }
+
     /// Publish `nbackfills` after Passive backfill + DB sync. Skip Truncate/Restart.
     /// Drop exclusive `read_locks[0]` first so `BEGIN CONCURRENT` is not forced
     /// onto slot 0 while the checkpointer still holds it.
@@ -2504,18 +2527,70 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
 
                 if passive {
-                    // The offset first: every frame before it is a commit the snapshot covers or one
-                    // still in flight, which the next checkpoint takes.
-                    self.snapshot_log_offset = self.mvstore.storage.logical_log_offset();
-                    self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
-                    self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
-                    // Checkpoint state machines can be created before they are run.
-                    // Resample after serializing so already-durable index deletes are not replayed.
-                    self.refresh_checkpoint_bounds();
-                    self.state = CheckpointState::BuildLocalSchemaView;
+                    // A TRUNCATE or RESTART checkpoint backfills the whole WAL itself.
+                    let unbackfilled =
+                        matches!(self.mode, CheckpointMode::Passive { .. })
+                            && self.pager.wal.as_ref().is_some_and(|wal| {
+                                wal.get_max_frame_in_wal() > wal.backfill_frame()
+                            });
+                    if unbackfilled {
+                        self.state = CheckpointState::BackfillEarlierFrames;
+                    } else {
+                        self.sample_passive_snapshot();
+                        self.state = CheckpointState::BuildLocalSchemaView;
+                    }
                 } else {
                     self.state = CheckpointState::AcquireLock;
                 }
+                Ok(TransitionResult::Continue)
+            }
+            CheckpointState::BackfillEarlierFrames => match self.checkpoint_wal() {
+                Ok(IOResult::Done(result)) => {
+                    self.earlier_backfill = Some(result);
+                    self.state = CheckpointState::SyncEarlierBackfill;
+                    Ok(TransitionResult::Continue)
+                }
+                Ok(IOResult::IO(io)) => Ok(TransitionResult::Io(io)),
+                // A reader of the database file still stands: go on without the backfill.
+                Err(err) if matches!(*err, crate::LimboError::Busy) => {
+                    self.sample_passive_snapshot();
+                    self.state = CheckpointState::BuildLocalSchemaView;
+                    Ok(TransitionResult::Continue)
+                }
+                Err(err) => Err(*err),
+            },
+            CheckpointState::SyncEarlierBackfill => {
+                let result = self
+                    .earlier_backfill
+                    .as_mut()
+                    .expect("BackfillEarlierFrames sets the result");
+                if result.wal_checkpoint_backfilled > 0
+                    && self.sync_mode != SyncMode::Off
+                    && !result.db_sync_sent
+                {
+                    let c = self
+                        .pager
+                        .db_file
+                        .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
+                    result.db_sync_sent = true;
+                    return Ok(TransitionResult::Io(IOCompletions(c)));
+                }
+                let mut result = self
+                    .earlier_backfill
+                    .take()
+                    .expect("BackfillEarlierFrames sets the result");
+                // The guard holds read mark 0 exclusively; readers may take it again once the
+                // backfill is published.
+                result.release_guard();
+                if result.wal_checkpoint_backfilled > 0 {
+                    self.pager
+                        .wal
+                        .as_ref()
+                        .expect("a backfill has a WAL")
+                        .publish_backfill(result.wal_total_backfilled);
+                }
+                self.sample_passive_snapshot();
+                self.state = CheckpointState::BuildLocalSchemaView;
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::AcquireLock => {

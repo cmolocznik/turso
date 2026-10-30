@@ -603,7 +603,8 @@ trait WalCoordination: Debug + Send + Sync {
     /// Release any restart-only coordination state held by `begin_restart`.
     fn end_restart(&self);
 
-    /// Attempt the restart path used by a writer holding read-mark 0.
+    /// Attempt the restart path used by a writer holding read-mark 0. The other readers of read
+    /// mark 0 read the database file alone, so they do not stop it; a reader of a frame does.
     fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>>;
 
     /// Mark the WAL uninitialized before truncation and return the WAL file handle.
@@ -946,10 +947,12 @@ impl InProcessWalCoordination {
         self.shared.read().runtime.read_locks[slot].set_value_exclusive(value);
     }
 
+    #[cfg(test)]
     fn try_upgrade_read_mark(&self, slot: usize) -> bool {
         self.shared.read().runtime.read_locks[slot].upgrade()
     }
 
+    #[cfg(test)]
     fn downgrade_read_mark(&self, slot: usize) {
         self.shared.read().runtime.read_locks[slot].downgrade();
     }
@@ -1287,18 +1290,9 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>> {
-        if !self.try_upgrade_read_mark(0) {
-            return Ok(None);
-        }
-        let result = self.begin_restart(io);
-        self.downgrade_read_mark(0);
-        match result {
-            Ok(snapshot) => {
-                self.end_restart();
-                Ok(Some(snapshot))
-            }
-            Err(err) => Err(err),
-        }
+        let snapshot = self.begin_restart(io)?;
+        self.end_restart();
+        Ok(Some(snapshot))
     }
 
     fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
@@ -1918,7 +1912,10 @@ impl ShmWalCoordination {
                 .frame_cache_high_water
                 .store(0, Ordering::Release);
             shared.runtime.overflow_fallback_coverage.lock().clear();
-            shared.runtime.read_locks[0].set_value_exclusive(0);
+            turso_assert!(
+                shared.runtime.read_locks[0].get_value() == 0,
+                "read mark 0 is the database file's"
+            );
             shared.runtime.read_locks[1].set_value_exclusive(0);
             for lock in &shared.runtime.read_locks[2..] {
                 lock.set_value_exclusive(READMARK_NOT_USED);
@@ -2410,18 +2407,9 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>> {
-        if !self.fallback.try_upgrade_read_mark(0) {
-            return Ok(None);
-        }
-        let result = self.begin_restart(io);
-        self.fallback.downgrade_read_mark(0);
-        match result {
-            Ok(snapshot) => {
-                self.end_restart();
-                Ok(Some(snapshot))
-            }
-            Err(err) => Err(err),
-        }
+        let snapshot = self.begin_restart(io)?;
+        self.end_restart();
+        Ok(Some(snapshot))
     }
 
     fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
@@ -6369,8 +6357,13 @@ impl WalFileShared {
         self.runtime
             .frame_cache_high_water
             .store(0, Ordering::Release);
-        // read-marks
-        self.runtime.read_locks[0].set_value_exclusive(0);
+        // Read marks 1 to 4, which the restarting writer holds. Read mark 0 is the database
+        // file's and stays 0: its readers read through the restart, as in SQLite's
+        // `walRestartHdr`.
+        turso_assert!(
+            self.runtime.read_locks[0].get_value() == 0,
+            "read mark 0 is the database file's"
+        );
         self.runtime.read_locks[1].set_value_exclusive(0);
         for lock in &self.runtime.read_locks[2..] {
             lock.set_value_exclusive(READMARK_NOT_USED);
@@ -10778,6 +10771,82 @@ pub mod test {
                 }
             }
         }
+    }
+
+    /// A reader of a fully backfilled WAL reads the database file alone, under read mark 0, so a
+    /// writer of another connection restarts the WAL beside it, as beside a reader in another
+    /// process (`subprocess_db_file_reader_allows_wal_restart_but_stops_backfill`). The reader
+    /// keeps its snapshot, and no frame of the restarted WAL reaches the database file while it
+    /// reads.
+    #[test]
+    fn test_db_file_reader_of_another_connection_allows_wal_restart_but_stops_backfill() {
+        let (db, _path) = get_database();
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        writer
+            .execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&writer, 10, 5);
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        let backfilled = run_checkpoint_until_done(&writer.pager.load(), passive);
+        assert!(backfilled.everything_backfilled());
+
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        reader.execute("begin").unwrap();
+        assert_eq!(count_test_table(&reader), 50);
+        assert!(
+            check_read_lock_slot(&reader, 0),
+            "the reader reads the database file"
+        );
+
+        writer.execute("update test set value = 'new'").unwrap();
+        let max_frame = writer
+            .pager
+            .load()
+            .wal
+            .as_ref()
+            .unwrap()
+            .get_max_frame_in_wal();
+        assert!(
+            max_frame < backfilled.wal_max_frame,
+            "a database file reader of another connection must not stop the WAL restart, \
+             but the write appended at frame {max_frame} after frame {}",
+            backfilled.wal_max_frame
+        );
+        let pager = writer.pager.load();
+        let blocked = pager
+            .io
+            .block(|| pager.checkpoint(passive, SyncMode::Full, true));
+        assert!(
+            matches!(blocked, Err(LimboError::Busy)),
+            "no frame of the restarted WAL may reach the database file while the reader reads: \
+             {blocked:?}"
+        );
+        let mut stmt = reader
+            .prepare("select count(*) from test where value = 'new'")
+            .unwrap();
+        let mut updated: i64 = -1;
+        stmt.run_with_row_callback(|row| {
+            updated = row.get(0).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(updated, 0, "the reader's snapshot must not see the update");
+        drop(stmt);
+        reader.execute("commit").unwrap();
+
+        let checkpoint = run_checkpoint_until_done(&writer.pager.load(), passive);
+        assert!(checkpoint.everything_backfilled());
+        let mut stmt = writer
+            .prepare("select count(*) from test where value = 'new'")
+            .unwrap();
+        stmt.run_with_row_callback(|row| {
+            updated = row.get(0).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(updated, 50);
     }
 
     #[test]

@@ -9,9 +9,10 @@ upstream: the fork keeps up with upstream and keeps its own changes.
 - `fork/sync-upstream.sh` merges `main` into `workreef` four times a day, at 05:17, 11:17,
   17:17 and 23:17 Asia/Kuala_Lumpur (`fork/turso-sync.timer`, a systemd user timer). It
   fetches upstream, fast-forwards `main`, merges it, and commits and pushes the merge only once
-  the merged tree compiles with its tests, passes the core and FTS suites and clippy, and passes
-  `ivf_crash`'s kill rounds under WAL, MVCC and MVCC with four writers. A conflict or a failed
-  check leaves `workreef` as it was and alerts. Each merge's commit message names the upstream
+  the merged tree compiles with its tests, passes the core and FTS suites and clippy, passes
+  `ivf_crash`'s kill rounds under WAL, MVCC and MVCC with four writers, and passes `mvcc_rolling`'s
+  over a logical log that rolls. A conflict or a failed check leaves `workreef` as it was and
+  alerts. Each merge's commit message names the upstream
   commits it took and the checks it passed; each run's log and verdict are in
   `/home/me/cognition-data/turso-sync`, and a `hold` file there skips runs while a timed
   measurement needs the machine.
@@ -26,7 +27,8 @@ fixes the same thing its own way, the entry moves to "Taken upstream".
 ## Fixes
 
 ### Lost wakeup in `Completion::set_waker`
-2026-10-28 `c07ac5ffc`, 2026-10-29 `c2e1ee261`; upstream PR #10948 holds the first alone.
+2026-10-28 `c07ac5ffc`, 2026-10-29 `c2e1ee261`, 2026-10-30 `0829e6128` and `9046b8b59`; upstream PR
+#10948 holds the same change as `a571f0ed3`, `480f7230d` and `74e3aa403`.
 `core/io/completions.rs`. `set_waker` tested `finished()` and then stored the waker under the
 context lock, so a completion finished on another thread between the two woke no one, and the task
 that registered was never polled again: a hang that happens now and then. The waker is now stored
@@ -43,6 +45,19 @@ deadlocked. The waker is now taken under the lock and woken once the lock is fre
 Test: `io::completions::tests::a_waker_registering_again_from_its_wake_does_not_deadlock` (a
 finished completion's waker registers again from its wake three times; under the lock, it
 deadlocked).
+A completion held one waker, and a second task's waker replaced it. The replaced one was woken so
+that its task could register again, which replaced the other: two tasks waiting on one completion,
+as two statements of one connection do on the pager's in-flight spill write, woke each other until
+it finished. Polled from their wakes they overflowed the stack; on upstream `main`, which wakes the
+replaced waker under the context lock, they deadlock. The PR's automated review found it.
+`0829e6128` woke the replaced waker once the lock was free, and `9046b8b59` replaced that: the
+context keeps a waker for each task waiting on the completion, one per task by `Waker::will_wake`,
+the first held inline so that a single waiter costs what it did. Registering wakes no task, and
+every wake of the completion takes all its wakers and wakes them once the lock is free. A task that
+stops waiting leaves its waker until that wake.
+Tests: `io::completions::tests::two_tasks_waiting_on_one_completion_are_each_woken_once_when_it_finishes`
+(on `0829e6128` the second registration wakes the first task; on upstream `main` it deadlocks) and
+`a_completion_lets_its_wakers_go_when_it_wakes`.
 
 ### The checkpoint trigger counts only uncheckpointed log bytes
 2026-10-28 `3776ed6be`.
@@ -61,7 +76,8 @@ writers, 4,000 commits, 256 KB threshold) put the writer commit p99 median at 13
 fix and 14.1 ms with it.
 
 ### An exact rowid seek walked every shadowed B-tree row after its target
-2026-10-28 `6387b9142`; upstream PR #10949.
+2026-10-28 `6387b9142`, 2026-10-30 `9060c9eca`; upstream PR #10949 holds both, as `d94a7d320` and
+`4813f6096`.
 `core/mvcc/cursor.rs`. An eq-only `TableRowId` seek that reached a B-tree row shadowed by a newer
 MVCC version advanced to the next B-tree row, and kept going while rows were shadowed. Over a
 checkpointed table whose rows were all updated, point lookups went quadratic: on upstream `main`
@@ -72,6 +88,9 @@ the newer version.
 Test: `mvcc::database::tests::test_exact_rowid_seek_over_shadowed_btree_rows`, which counts each
 exact seek's B-tree steps through the cursor's yield hook: the seek for row 1 takes 155 on upstream
 `main` and 2 with the fix.
+The PR's automated review found a visible target checked twice, once by the rule and again by the
+seek's match; `9060c9eca` folds the rule into that match, so a row is checked once. With a
+shadowed target left to advance again, the seek for row 1 takes 306 steps.
 
 ### An overflow chain was copied into its payload a byte at a time
 2026-10-28 `5b3da8244`.
@@ -101,30 +120,389 @@ Test: `mvcc::database::tests::test_reopen_after_crash_between_logical_log_and_wa
 stops a checkpoint once the log is empty and the WAL file still holds its frames, and reopens.
 Found by the ivf_rq kill harness below.
 
+### Under MVCC a statement that reads no database stranded its connection's transaction
+2026-10-30 `763113a6a`.
+`core/vdbe/mod.rs` (`ProgramState::can_autocommit_now`), `core/vdbe/execute.rs`,
+`core/connection.rs`, `core/statement.rs`. Under MVCC a connection's statements share one implicit
+transaction, which in autocommit mode the last of them to finish ends. Every root statement counted
+toward that, and only the statements that had run a Transaction instruction could end it, so a
+statement that reads no database held the transaction open for the others and could not end it
+itself: `SELECT 1`, or an OPTIMIZE INDEX stepped on a connection of its own. When it finished last,
+the transaction stayed open, the connection's later reads kept that transaction's snapshot, and a
+write deferred to it was never committed. While such a statement ran, every read on its connection
+shared one snapshot and every write on it waited for the statement to finish.
+
+A statement now takes part in the transaction from its first Transaction instruction until it
+finishes (`Connection::take_txn_part`, `ProgramState::txn_part`), and only the statements taking
+part are counted (`Connection::n_active_txn_statements`). A COMMIT or ROLLBACK takes part while it
+ends the transaction, so a COMMIT waiting mid-commit keeps another statement from ending the
+transaction under it.
+
+Tests, in `core/vdbe/statement_lifecycle_tests.rs`, all under MVCC:
+- `test_writer_beside_a_statement_reading_no_table_commits_at_its_halt`
+- `test_reads_beside_a_statement_reading_no_table_see_commits_made_between_them`
+- `test_reader_ends_the_transaction_beside_a_statement_reading_no_table`
+- `test_writer_after_a_finished_read_commits_at_its_halt`
+- `test_read_of_a_pragma_function_ends_the_transaction_it_began`: the helper statement a
+  table-valued pragma runs takes no part
+- `test_reader_dropped_while_commit_waits_leaves_the_transaction_to_it`
+
+`a_rebuild_beside_an_open_write_waits_for_it_and_is_made` (ivf_rq, the entry "An ivf_rq rebuild
+under MVCC claims only where no other write is unseen") again steps OPTIMIZE INDEX on the connection
+it reads from, where it found this.
+
+Fail-first, one mutation at a time over the core lib tests at `763113a6a`, 6 of 6 red:
+- every root statement counting, as before: the first three tests and the ivf_rq test;
+- a Transaction instruction taking no part: 4 tests, upstream's sibling-reader test among them;
+- COMMIT taking no part: the COMMIT test;
+- a statement that finished keeping its part until reset: 6 tests;
+- a helper statement taking a part: the pragma test;
+- a part never uncounted: most of the MVCC suite.
+A seventh, a reset releasing the part, changed no test: every road that resets a running
+statement has released it already, and a statement that restarts rightly keeps it. That line is not
+in the fix.
+
+### Under MVCC a writer beside a reader deferred its commit, and a rollback could take it back
+2026-10-30 `40bdb6de4`, `95635eeab`.
+`core/mvcc/database/mod.rs`, `core/mvcc/cursor.rs`, `core/vdbe/mod.rs`, `core/vdbe/execute.rs`,
+`core/connection.rs`, `core/statement.rs`, `core/storage/pager.rs`. A writer that finished while
+other statements of its connection read the shared implicit MVCC transaction deferred its commit to
+the last of them. Its caller saw success before the write was durable or visible to other
+connections, and if the transaction then ended in a rollback the write was lost: a reader dropped
+mid-scan, or a later writer failing without a statement savepoint. Upstream pinned both losses in
+tests (`test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned`,
+`..._when_joining_writer_errors`) and described this fix in a FIXME in `halt`. The transaction also
+held the exclusive transaction as long as any statement read it, so every other connection's writer
+waited for the reader to finish.
+
+A writer now commits at its own halt, as SQLite's does. If other statements still take part in the
+transaction when the commit lands, it goes on for them in a successor
+(`MvStore::begin_successor_tx`). The successor's begin timestamp is drawn while the writer still
+holds the exclusive transaction, and nothing has committed since the readers' snapshot (the
+exclusive transaction refuses a stale one), so the successor sees exactly what they saw, the
+writer's rows included. It reads through the same WAL read mark and takes over the
+blocking-checkpoint read lock. Each MVCC cursor reads through its transaction's lineage
+(`MvccTxnLineage`) and moves to the successor before its next read. A write asserts that its
+transaction has not gone on: while a statement writes, another writer of its connection is busy and
+a COMMIT or ROLLBACK is refused.
+- **A writer that wrote nothing** gives up the exclusive transaction, and the readers keep the
+  transaction as it was.
+- **A writer's rollback** beside readers undoes its own writes alone, and they go on in a successor
+  with the view they had before it wrote (`Connection::rollback_writes_continued`). ROLLBACK, and an
+  `OR ROLLBACK` conflict, still end the whole transaction, and a statement still reading fails at its
+  next step, as SQLite's do.
+- **A commit dropped mid-way** beside readers hands them a successor too, and only the writer's other
+  writes are undone: the readers keep their read transactions in every database, where the abandoned
+  commit's cleanup used to end them (`CommitState::cleanup_abandoned_mvcc_commit`).
+- **The decision** is taken when the commit lands or is dropped, from the statements taking part
+  then, and a commit step that yields and runs again draws no second successor. A transaction kept
+  for readers who left while the commit waited is ended with it.
+- **While a commit is in flight**, until it has ended or handed on its transaction, the connection's
+  other root statements yield (`Statement::wait_for_sibling_commit`). A sequence's inner commit is its
+  own statement's.
+- **Attached databases**: an attached database's transaction goes on in a successor of its own,
+  walked in database order. Beside an MVCC main every attached database runs MVCC (ATTACH makes a
+  fresh one MVCC), and TEMP, the one database that uses WAL, keeps its read transaction for the
+  readers.
+
+Tests, under MVCC, in `core/vdbe/statement_lifecycle_tests.rs` but the last two:
+- `test_completed_writer_commits_beside_a_sibling_mvcc_reader` (upstream's deferral test, turned);
+- `test_mvcc_completed_writer_changes_survive_an_abandoned_reader` and
+  `test_mvcc_completed_writer_changes_survive_a_failing_joined_writer` (the two pinned losses);
+- `test_reader_keeps_its_view_beside_a_committed_writer`: through a cursor it opens at each key and
+  through one open since its start, the reader finds the writer's row and not a row another
+  connection commits after it;
+- `test_a_resumed_commit_draws_one_successor`, `test_reader_waits_while_a_sibling_commit_is_in_flight`,
+  `test_reader_dropped_while_a_writer_commits_leaves_no_successor`;
+- `test_writer_dropped_mid_write_beside_a_reader_rolls_back_only_its_rows`,
+  `test_writer_writing_nothing_beside_a_reader_gives_up_the_exclusive_transaction`;
+- `test_writer_dropped_mid_commit_beside_a_reader_leaves_it_its_transaction`,
+  `test_commit_dropped_mid_commit_beside_a_reader_leaves_it_both_views`: a commit dropped while it
+  waits mid-way;
+- `test_successor_holds_a_blocking_checkpoint_off_until_its_reader_ends`: the successor holds MVCC's
+  stop-the-world gate until its reader ends;
+- `test_reader_keeps_its_attached_view_beside_a_committed_writer` (both cursors),
+  `test_a_transaction_kept_for_a_reader_gone_during_the_commit_ends_with_it`,
+  `test_reader_reads_on_in_an_attached_memory_database_beside_a_committed_writer`,
+  `..._beside_a_failed_writer`, `test_reader_from_before_begin_reads_on_after_commit`;
+- `test_reader_keeps_its_temp_read_transaction_beside_a_committed_writer` and
+  `..._beside_a_failed_writer`: TEMP's read transaction stays with the reader and ends with it;
+- `fts_writes_commit_with_a_writer_beside_a_reader` (FTS);
+- in `core/mvcc/database/tests.rs`,
+  `test_continued_commit_landing_after_the_other_left_leaves_no_successor` and
+  `test_continued_commit_dropped_after_the_other_left_leaves_no_successor`: a commit that lands, or
+  is dropped, after the statement it would have gone on for has left.
+Fail-first, one mutation at a time over the core lib tests at `d36a04607`, 19 of 19 red:
+- a writer deferring its commit to the readers beside it, as before: 15 tests;
+- the commit leaving no successor, so the transaction ends under the readers: 9 tests;
+- cursors reading on in the transaction they opened in: the two view tests;
+- the successor not taking over the blocking-checkpoint read lock: the checkpoint test;
+- a writer that wrote nothing keeping the exclusive transaction: its test;
+- a writer's rollback ending the transaction under the readers: 2 tests;
+- statements not waiting while a sibling commit is in flight: its test;
+- a successor drawn whether or not a statement still reads: the two `test_continued_commit_*` tests;
+- a commit step run again drawing a second successor: its test;
+- the end of the commit leaving a transaction kept for readers who left: its test;
+- an attached database's commit leaving no successor: the two attached tests;
+- the attached commits taken by first entry instead of in database order: the two attached tests
+  hang;
+- a commit counting as in flight until its state machine is dropped: upstream's
+  `test_auto_checkpoint_refreshes_index_metadata_after_schema_change` hangs;
+- a sequence's inner commit holding its own statement off: the two sequence tests hang;
+- ROLLBACK leaving the readers a successor: its test;
+- the abandoned commit's cleanup tearing the transaction down whatever the commit handed on: 2 tests;
+- a commit handed on leaving the abandoned writer's other writes in place: 3 tests;
+- a commit, or a rollback, ending TEMP's read transaction under the readers: one TEMP test each.
+  At first these two changed no test: the tests named for an attached WAL database attached an
+  in-memory database, and that runs MVCC. `95635eeab` added the TEMP tests, which fail under them,
+  and named the in-memory tests for what they test.
+
+### A yield point of one state machine was a point of another's too
+2026-10-30 `f96c8fea8`. `core/mvcc/yield_points.rs`, `core/mvcc/yield_hooks.rs` and each family of
+yield points. A `YieldPoint` was its ordinal and its family's point count, so two families with the
+same count shared every point. `CommitYieldPoint` and `CursorYieldPoint` both have nine:
+`LogRecordPrepared` was `SeekStart` and `BeforeFinishCommittedTx` was `ExistsBtreeFallback`.
+Without `fts`, `IndexMethodYieldPoint`'s two points were `TransactionYieldPoint`'s. A test's
+`FixedYieldInjector` matches points alone, so a test asking a commit to yield mid-way yielded at the
+first cursor point of the same number, an INSERT's existence check, before the commit began. Every
+such test of a commit in flight held a statement mid-write instead. Each family now names its state
+machine (`YieldPointMarker::DOMAIN`, `YieldDomain`), and a point is its domain, ordinal and count.
+The concurrent simulator's plans read the ordinal and the count as before.
+
+Found by the fail-first of the entry before: a resumed commit that drew a second successor past the
+exclusive transaction changed no test, because no test's commit ever resumed there.
+
+Tests, in `core/mvcc/database/tests.rs`:
+- `test_insert_in_middle_commit_of_create_index_returns_err` (upstream's) yields where it says, mid
+  commit of the CREATE INDEX, where an INSERT beginning is refused Busy;
+- `test_insert_begun_during_create_index_build_is_refused_at_commit` keeps the case the test reached
+  before, at the cursor point it yielded at: an INSERT begun while the index builds is refused at
+  its COMMIT.
+Fail-first at `95635eeab`: with every family's points taking the commit's domain again, so that
+points of different machines collide, upstream's test fails, 1 of the core lib suite's 2,673.
+
+### Under writes that never pause, neither log stayed bounded
+2026-10-31 `e3736211a`, `06477fa5b`, `7db9477d9`, `2ea9a3362`.
+`core/storage/wal.rs`, `core/mvcc/database/checkpoint_state_machine.rs`,
+`core/mvcc/database/mod.rs`, `core/mvcc/database/background_checkpoint.rs`. In a two-minute round
+of `fork/repro`'s `mvcc_rolling` (four writers committing without pause under synchronous NORMAL, a
+64 KB threshold, the background checkpoint on), the rolled logical log grew to 1.96 GB and the WAL
+to 4.66 GB, both about linearly. Three causes, each fixed:
+- **A WAL restart waited for every reader of the database file.** A writer restarted the WAL only
+  while no other connection of its process read the database file under read mark 0:
+  `try_restart_log_for_write` upgraded the writer's own lock on read mark 0. Those readers read the
+  database file alone, and a backfill still needs read mark 0 exclusively, so a restart cannot
+  change what they read. Beside transactions that overlap without pause, as an MVCC database's do,
+  some reader always held read mark 0 once the WAL was fully backfilled. A reader in another
+  process never stopped the restart (upstream's `restart_ignores_db_file_readers`), and now one in
+  the same process does not either, as in SQLite's `walRestartLog`. Test:
+  `storage::wal::test::test_db_file_reader_of_another_connection_allows_wal_restart_but_stops_backfill`
+  (before: the write appended at frame 13 after frame 12).
+- **A checkpoint's frames waited for a backfill that never came.** A passive checkpoint backfills
+  its frames right after its commit, and readers of the database file refuse that while they read.
+  The next checkpoint then began on a WAL not fully backfilled and appended to it. A passive
+  checkpoint now first backfills what an earlier one left, then takes its snapshot, so that its
+  write restarts the WAL. Test:
+  `mvcc::database::tests::test_a_passive_checkpoint_backfills_what_the_last_one_left_and_restarts_the_wal`
+  (before: from frame 7 to frame 14, with no restart).
+- **Commits outran the checkpoint.** A commit with the log `BEHIND` thresholds behind checkpointed
+  inline only when no checkpoint ran, and under writes that never pause one nearly always does. It
+  now waits for the checkpoint running on its database to end, parked as a group-commit waiter is,
+  unless that checkpoint is stepped on its own thread. It then checkpoints inline if the log is
+  still behind. Test:
+  `mvcc::database::background_checkpoint::tests::test_a_commit_far_behind_waits_for_the_checkpoint_running_on_its_database`
+  (with the wait taken out, 1,000 commits returned while the pool's checkpoint was held, ending
+  306,063 bytes behind at a 4 KB threshold).
+Measured on mt1 (cores 0-9 of a Xeon E5-2640 v4), in rounds of about 60 s with `mvcc_rolling`'s
+`THRESHOLD` (`26b125fde`), alternating before and after, each round begun at a load under 12 of the
+40 CPUs. At the 64 KB threshold, two rounds each: before, the log reached 20.6 and 22.5 MB, the WAL
+572 and 814 MB, at 25.2k and 31.2k rows a second; after, 0.4 MB, 1.2 and 0.7 MB, at 37.8k and 38.3k.
+At the default threshold (4,120,000 bytes), four rounds each: before, the log reached 30.8-43.9 MB
+and the WAL 488 MB-1.28 GB; after, 19.6-23.4 MB and 15.8-22.5 MB. The rows a second were level,
+33.7k, 38.3k and 39.0k before against 38.0k, 39.8k and 41.5k after, with one round each way at
+about 25k while another job raised the load past 20. On this laptop, whose disk stalls fsyncs for
+seconds under load (33 s once during the round), the writers now wait the stalls out: in a
+two-minute round, 5.4k rows a second against 81k, with the log at most 0.5 MB and the WAL 45 MB
+against 1.96 GB and 4.66 GB.
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)
-2026-10-28 `b207b3dec`.
+2026-10-28 `b207b3dec`; 2026-10-30 `1c934b336`, one pool for many databases.
 `core/mvcc/database/background_checkpoint.rs`, wired in `core/mvcc/database/mod.rs`; the pragma
 in `sqlite/parser/src/ast.rs`, `core/pragma.rs`, `core/translate/pragma.rs`, `core/connection.rs`.
-On, the commit that crosses the MVCC checkpoint threshold hands the checkpoint to a per-store
-thread and returns, so no writer pays for one. The thread holds the database by a weak reference,
-opens a connection per checkpoint, runs the same passive checkpoint, and stops when its store is
-dropped. After a checkpoint that had to keep the log, it checkpoints again once the log has stayed
-the same size for 100 ms, and that one truncates it.
-Off by default, since the thread steps the IO backend beside the host's own threads. Encrypted
-databases and ones read through an external page codec keep their inline checkpoint, so key
-material stays on the connections given it. Under writes that never pause the log still grows;
-bounding that needs log rotation.
-Tests: `test_background_checkpoint_runs_off_the_commit_and_truncates_when_writes_pause`,
-`test_background_checkpoint_is_off_by_default`, `test_background_checkpoint_thread_exits_with_its_database`.
-mt1, this fork, the bench's `mvcc_control` (2 writers, a maintainer rewriting 64-row batches, a
-reader; 256 KB threshold), 20 runs each way, all passing: writer commit p99 19.9 ms inline → 5.3
-ms with the thread (medians of the runs; worst run 25.3 → 6.9 ms), worst commit 28.7 → 9.1 ms
+On, the commit that crosses the MVCC checkpoint threshold hands the checkpoint to its store's
+checkpoint pool and returns, so no writer pays for one. Off by default, since the pool's threads
+step the IO backend beside the host's own. Encrypted databases and ones read through an external
+page codec keep their inline checkpoint, so key material stays on the connections given it.
+
+A pool (`CheckpointPool`) runs the checkpoints of any number of databases on a bounded number of
+threads. Every store starts on the process's shared pool, which runs a quarter of the available
+parallelism at a time, at least one checkpoint and at most eight; a store can be given another
+(`MvStore::set_checkpoint_pool`), one per storage device for instance. Threads start as work comes
+in and stop after ten idle seconds. A database waits in the queue at most once and is checkpointed
+by one thread at a time; a commit asking while it is queued or checkpointed sets a bit and takes no
+lock. The queue is served in turn: a database still past its threshold after 50 ms of checkpoints
+goes back to the end of it while another waits. The pool holds a database by a weak reference and
+opens a connection for each turn, without the connect-time statistics query, so it neither keeps a
+closed database alive nor counts as one of its connections between turns. An attached database
+hands its checkpoints to its store's pool too.
+
+What a thread used to sleep for is a timer, and an idle thread keeps them all, so the pool waits on
+one timer whatever the number of databases; timers due within 10 ms fire together. After a turn
+that left a log a checkpoint could not truncate, the pool looks at the log 100 ms later and, once it
+has stayed the same size, checkpoints to empty it. A turn that fails, or finds another checkpoint
+running on its database, is retried 10 ms later, the delay doubling up to a second, holding no
+thread. Once a database's uncheckpointed log reaches four thresholds, whether the pool fell behind
+or its turns fail, its commits hand nothing to the pool. Each waits for a checkpoint running on the
+database on another thread to end, then checkpoints inline if the log is still that far behind
+(`7db9477d9`, "Under writes that never pause, neither log stayed bounded"). A turn that panics is
+caught: the pool counts it, turns that database's background checkpoint off, and goes on serving
+the others. A pool whose thread limit is zero lets go of its databases and their commits checkpoint
+inline. `CheckpointPool::stats` reports the threads, the queue, the timers, and the checkpoints,
+failures, deferrals, inline checkpoints and panics, with the time spent checkpointing and waiting in
+the queue.
+
+Two defects of the thread per store are gone. At `mvcc_checkpoint_threshold = 0` an empty log counts
+as past the threshold, so the thread checkpointed it forever; the pool stops once the log is covered.
+And its test failed 2 times in 160 runs: after a checkpoint that emptied the log, commits under the
+threshold leave a small log that no request follows, by design, and the test waited for an empty
+log. The test now holds the pool's checkpoint after its snapshot and commits behind it, which makes
+the checkpoint keep the log, and waits for the pool to empty it once the writes pause.
+
+Tests, in `core/mvcc/database/background_checkpoint/tests.rs`, each on a pool of its own:
+- `test_background_checkpoint_runs_off_the_commit_and_truncates_when_writes_pause`,
+  `test_a_kept_log_waits_for_its_writes_to_pause`, `test_background_checkpoint_is_off_by_default`;
+- `test_one_pool_checkpoints_many_databases_on_its_threads`: 24 databases on two threads;
+- `test_databases_wait_in_the_queue_while_every_thread_is_busy`: three databases ask while the one
+  thread is held in a turn: they wait in the queue, no second thread starts, and one dropped while
+  it waits leaves the queue at once;
+- `test_a_database_dropped_with_a_timer_armed_leaves_the_timers`;
+- `test_a_database_past_its_threshold_after_a_slice_gives_way_to_another`;
+- `test_a_failing_checkpoint_is_retried_later_and_holds_no_thread`, through a failure point at
+  `CheckpointYieldPoint::BeforeCollectTableRows`;
+- `test_commits_checkpoint_inline_while_the_pool_is_far_behind_on_their_database`,
+  `test_a_turn_beside_another_checkpoint_waits_for_it`,
+  `test_at_a_threshold_of_zero_the_pool_stops_once_the_log_is_covered`;
+- `test_a_dropped_database_leaves_its_pool_and_the_idle_threads_stop`,
+  `test_a_store_moved_to_another_pool_leaves_the_first`, `test_a_turn_that_panics_is_contained`,
+  `test_a_pool_without_threads_leaves_checkpoints_to_the_commits`,
+  `test_an_attached_database_checkpoints_on_its_pool`.
+A flake hunt runs every test whose path names rolling or background_checkpoint, 8 runs side by side,
+25 times each. The first found `test_a_failing_checkpoint_is_retried_later_and_holds_no_thread`
+failing 2 times in 200: it let the pool's turns succeed before the commits it expected to
+checkpoint inline, so a turn could checkpoint first and no commit had to. Its turns now fail until
+those commits are done. On mt1 at `26b125fde`, 200 of 200 runs passed. On this laptop the hunt fails
+whole batches at once, every process at the same instant, during its disk's fsync stalls (one
+checkpoint took 23.9 s), so a hunt there does not measure the tests: 600 of 600 runs passed in one
+hour at `95635eeab`, and 176 of 200 and 151 of 200 in others.
+Fail-first, one mutation at a time over the pool's and the rolling log's tests at `f5a429b2e`,
+12 of 12 red:
+- a database past its threshold keeps the thread whoever waits: the slice test;
+- a failed or deferred turn is retried at once, without backing off: the retry test and the kept
+  log's;
+- commits never checkpoint inline however far behind the pool is: the retry test and the inline
+  one;
+- a turn checkpoints beside another checkpoint: its test;
+- threads start past the limit: the queue test;
+- at a threshold of zero an empty log is past it: the zero-threshold test;
+- a kept log is never looked at again: 4 tests;
+- a dropped or moved store stays in the pool: the timer test and the queue test;
+- a pool without threads still takes requests: its test;
+- only the main database hands its checkpoints off: the attached database's test;
+- a turn that panics takes its thread down: its test;
+- a kept log is checkpointed at each look, whether or not writes went on: the kept log's test.
+
+mt1, the bench's `mvcc_control` with the thread per store (2 writers, a maintainer rewriting 64-row
+batches, a reader; 256 KB threshold), 20 runs each way, all passing: writer commit p99 19.9 ms inline
+→ 5.3 ms with the thread (medians of the runs; worst run 25.3 → 6.9 ms), worst commit 28.7 → 9.1 ms
 (medians), and the log 0 bytes after writes pause in all 20 runs against 160 KB left inline. Every
 commit over 100 ms is matched by an fsync of about its length in the same run. `ivf_mvcc`
 (8 writers × 4,000 vectors of 128 dimensions under maintenance) passed its 520 checks in all 7
 runs, 97-110 s each with the thread against 137-211 s inline.
+
+### The logical log rolls under writes that never pause
+2026-10-30 `fdcdb1259`, `dd5a85501`; `fork/repro`'s `mvcc_rolling`, `f5a429b2e`.
+`core/mvcc/persistent_storage/logical_log.rs`, `core/mvcc/persistent_storage/mod.rs`, recovery and
+the completion of an interrupted checkpoint in `core/mvcc/database/mod.rs`,
+`core/storage/journal_mode.rs`. A passive checkpoint truncates the logical log only when no commit
+landed after its snapshot, which under writes that never pause never happens: the log kept every
+frame it was ever given, so it grew without bound, and recovery replayed all of it. In three
+rounds of up to 30 s of `fork/repro`'s `mvcc_rolling` at `95635eeab` (four writers committing
+without pause, a 64 KB threshold), the log reached 850 MB with the roll taken out and 377 MB with
+it: the roll alone keeps the log in few files, not in small ones. "Under writes that never pause,
+neither log stayed bounded" bounds their size.
+
+The log of every MVCC database's default storage (`Storage::new_rolling`) now rolls through four
+files, `.db-log` and `.db-log.1` to `.db-log.3`. A checkpoint that has to keep frames seals the
+segment being written, at once or, while a frame is being written, as soon as it lands, and the
+next frame goes to a free file. That segment's header holds where it sits in the log
+(`LogSegment`, in the header's reserved bytes, under flag bit 0): its number, which no file has
+held before; its predecessor's number; the log offset and running CRC its predecessor ended with,
+which it starts at and chains from; and the newest commit before it. A later checkpoint that
+covers every commit of a sealed segment truncates its file, which a later roll reuses; once every
+commit is covered the log resets as before, into a numbered segment. The fsync of a commit also
+covers the frames written before a roll, which are in the sealed segment's file. The first roll
+readies a file, creating and fsyncing it, and the next rolls into it. A log whose frames carry
+portable changes does not roll, as their readers follow a single file. Offsets the checkpoint
+threshold counts run across segments.
+
+Recovery reads every file's header and begins at the newest segment, going back through the
+predecessors while a segment's prior commits include one no checkpoint covered; a needed
+predecessor that is missing fails the open. It replays those segments as one log. A segment that
+does not begin where its predecessor ended, with the CRC it ended with, was written past a torn
+tail: it is not replayed, its file is freed, and the next segment takes a number past it. Completing
+an interrupted checkpoint at open rewrites the newest segment's header, in its own file. As a
+leftover `.db-log` already does, a log file in any slot keeps a WAL-mode database from opening.
+
+Tests:
+- `core/mvcc/persistent_storage/rolling_tests.rs`, over a log of its own:
+  `a_log_that_has_to_keep_frames_rolls_and_the_next_checkpoint_frees_it` (200 checkpoints that each
+  keep a commit: two segments, under 2 KB), `recovery_replays_every_segment_and_writing_goes_on_in_the_newest`,
+  `a_sealed_segment_torn_before_its_successor_ends_the_log`,
+  `recovery_refuses_a_log_whose_needed_older_segment_is_missing`,
+  `recovery_begins_after_the_segments_a_checkpoint_covered`,
+  `a_recovery_follows_the_chain_past_a_successor_left_by_a_torn_segment`,
+  `a_roll_asked_while_a_frame_is_written_happens_once_it_lands`,
+  `a_reset_after_rolling_outranks_a_segment_freed_before_it`, and
+  `a_sync_after_a_roll_makes_the_sealed_segment_durable`, on files that lose at a power loss what
+  no sync covered; `an_encrypted_log_rolls_and_recovery_decrypts_every_segment`, whose segments
+  each have a salt of their own;
+- `core/mvcc/database/rolling_log_tests.rs`, through passive checkpoints that each see a commit land
+  after their snapshot: `test_a_log_every_checkpoint_has_to_keep_rolls_and_stays_bounded` (60
+  checkpoints, then a restart), `test_recovery_replays_a_log_rolled_over_segments`,
+  `test_a_restart_after_the_first_file_was_freed_keeps_the_newer_segments`,
+  `test_a_database_beside_log_files_left_by_another_refuses_to_open`,
+  `test_a_rolled_log_reopened_without_passive_checkpoints_is_cleared_by_a_blocking_one`;
+- `test_the_pool_keeps_the_log_bounded_under_writes_that_never_pause`, in the background
+  checkpoint's tests: 50 pool checkpoints that each keep an 8 KB commit, then a restart.
+Fail-first, one mutation at a time over the pool's and the rolling log's tests at `f5a429b2e`,
+16 of 16 red:
+- the log never rolls: 14 tests;
+- recovery reads the first file alone: 9 tests;
+- completing an interrupted checkpoint rewrites the newest header into the first file: 2 tests;
+- a segment's predecessor is the latest segment that begins before it: the torn-successor test;
+- a segment written past a torn tail is replayed: 2 tests;
+- a missing predecessor recovery needs is passed over: the missing-segment test;
+- numbering starts over after a recovery: 3 tests;
+- a sync covers only the segment being written: the sync test;
+- the log rolls under a frame being written, or a roll asked then never happens: the
+  frame-in-flight test, under each;
+- sealed segments are never freed: 7 tests;
+- a reset after rolling writes an unnumbered header: the reset test;
+- a rolled segment does not carry the newest commit before it: 7 tests;
+- a segment at offset zero is followed back like any other: 3 tests;
+- the open counts the first log file alone: the test of a database beside another's log files;
+- recovery leaves the files it does not replay as they are: 2 tests.
+`dd5a85501`'s two tests, at `d36a04607`, 4 of 4 red: the readers of the segments after the first
+decrypting nothing, and a rolled segment taking its predecessor's salt, fail the encrypted test; a
+checkpoint that clears the whole log keeping the sealed segments fails the blocking-checkpoint
+test; recovery forgetting the sealed segments before the one it goes on writing in fails it and a
+recovery test.
+Killed mid-write by `fork/repro`'s `mvcc_rolling` at `26b125fde`, 30 rounds of up to 3 s and 3 of
+up to 30 s all reopened with `PRAGMA integrity_check` ok and every reported commit held, the log's
+files at most 534 KB; with the roll taken out, 3 rounds of up to 30 s held up to 49 MB. The upstream
+sync runs the short rounds (`d36a04607`).
 
 ### Logical-log fsync stats
 2026-10-28 `dde381edb`.
@@ -933,12 +1311,12 @@ Fail-first, one mutation at a time over the `index_method` tests, 10 of 10:
 - waiting steps not sleeping: 3 tests;
 - the redo rows before a rebuild due: a waiting step settled a redo row.
 
-Still open: **a statement that opens no transaction of its own strands the implicit MVCC
-transaction a sibling opens beside it.** The first test steps OPTIMIZE INDEX on a connection of its
-own for this. On the reading connection, a read made while that connection's OPTIMIZE INDEX ran
-opened the shared transaction. After both had ended, and until the OPTIMIZE INDEX statement was
-dropped, the connection's reads still saw that read's snapshot, without the rebuild. Only the
-statement that opened the transaction may end it, and it was not the last to finish.
+The first test found that a statement reading no database stranded the implicit MVCC transaction
+a sibling opened beside it: a read made on the test's connection while that connection's OPTIMIZE
+INDEX ran opened the transaction, and after both had ended the connection's reads still saw that
+read's snapshot, without the rebuild. It stepped OPTIMIZE INDEX on a connection of its own until
+`763113a6a` fixed that ("Under MVCC a statement that reads no database stranded its connection's
+transaction", under Fixes).
 
 Measured in the table of the entry before (`ivf_crash` now reports `optimize_failures` and
 `rebuilds`): in each of the three four-writer runs with both entries, no OPTIMIZE INDEX failed and

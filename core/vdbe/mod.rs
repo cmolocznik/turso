@@ -1178,6 +1178,10 @@ pub struct ProgramState {
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
+    /// This statement's part in its connection's MVCC transaction, from its first Transaction
+    /// instruction (or its COMMIT or ROLLBACK) until it finishes. A statement that restarts, to
+    /// reprepare or after a busy wait, keeps it.
+    pub(crate) txn_part: Option<crate::connection::TxnPart>,
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
@@ -1329,6 +1333,7 @@ impl ProgramState {
             lock_wait_over: false,
             sleep_for: None,
             auto_txn_cleanup: TxnCleanup::None,
+            txn_part: None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             fk_immediate_violation: None,
@@ -1554,7 +1559,9 @@ impl ProgramState {
     /// reset or dropped — then every counted statement is a *sibling*, and
     /// treating the count as "just me" would make teardown finish or roll
     /// back a transaction a suspended sibling is still using (e.g. a COMMIT
-    /// parked inside its post-commit auto-checkpoint).
+    /// parked inside its post-commit auto-checkpoint). Under MVCC the
+    /// statement's own `txn_part` says the same of
+    /// `Connection::n_active_txn_statements`.
     pub(crate) fn can_autocommit_now(
         &mut self,
         connection: &Connection,
@@ -1576,11 +1583,14 @@ impl ProgramState {
             );
         }
         if self.mv_store(connection).is_some() {
-            // MVCC keeps one tx id on the connection. A writer waits for
-            // sibling readers, and a reader waits for sibling readers/writers.
+            // MVCC keeps one tx id on the connection, shared by the
+            // statements that take part in it (`Connection::take_txn_part`).
+            // A writer waits for the readers among them, and a reader waits
+            // for readers and writers. A statement that reads no database
+            // takes no part: nobody waits for it, and it ends nothing.
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-                && connection.n_active_root_statements.load(Ordering::SeqCst)
-                    == i32::from(self_counted)
+                && connection.n_active_txn_statements.load(Ordering::SeqCst)
+                    == i32::from(self.txn_part.is_some())
                 && (self.is_active_write || active_writers == 0);
         }
         if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {

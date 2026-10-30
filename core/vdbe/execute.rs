@@ -5310,6 +5310,12 @@ pub fn op_transaction_inner(
                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
                 }
+                if is_top_level_statement
+                    && state.txn_part.is_none()
+                    && state.mv_store(&program.connection).is_some()
+                {
+                    state.txn_part = Some(program.connection.take_txn_part());
+                }
                 state.pc += 1;
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
@@ -5438,6 +5444,15 @@ pub fn op_auto_commit(
                 TxOp::Begin => unreachable!("guard only matches Commit | Rollback"),
             })
             .into());
+        }
+        if matches!(tx_op, TxOp::Commit | TxOp::Rollback)
+            && mv_store.is_some()
+            && state.txn_part.is_none()
+            && !conn.is_nested_stmt()
+        {
+            // A COMMIT can wait mid-commit, and the statements taking part in
+            // the transaction must not end it under it.
+            state.txn_part = Some(conn.take_txn_part());
         }
 
         match tx_op {

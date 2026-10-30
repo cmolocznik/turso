@@ -375,6 +375,20 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+/// A statement's part in its connection's MVCC transaction, counted in
+/// `Connection::n_active_txn_statements` while it is held.
+pub(crate) struct TxnPart(Arc<AtomicI32>);
+
+impl Drop for TxnPart {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(
+            previous > 0,
+            "a statement left a transaction no statement took part in"
+        );
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -547,6 +561,10 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    /// How many of `n_active_root_statements` take part in the connection's MVCC transaction (see
+    /// `Connection::take_txn_part`). They share it, and in autocommit mode the last of them to
+    /// finish ends it; a statement that reads no database neither holds it open nor ends it.
+    pub(crate) n_active_txn_statements: Arc<AtomicI32>,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -4561,6 +4579,14 @@ impl Connection {
         if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
             self.interrupt_requested.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// A part in the connection's MVCC transaction for a root statement: taken by each statement
+    /// that runs a Transaction instruction, which begins or joins the transaction, and by a COMMIT
+    /// or ROLLBACK, which ends it and may wait mid-commit; held until the statement finishes.
+    pub(crate) fn take_txn_part(&self) -> TxnPart {
+        self.n_active_txn_statements.fetch_add(1, Ordering::SeqCst);
+        TxnPart(self.n_active_txn_statements.clone())
     }
 
     pub(crate) fn start_root_statement(&self) -> Result<()> {

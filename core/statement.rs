@@ -417,6 +417,8 @@ impl Statement {
     }
 
     fn release_active_root_if_counted(&mut self, statement_failed: bool) {
+        // A statement that has ended takes no more part in its connection's transaction.
+        self.state.txn_part = None;
         if self.counted_as_active_root {
             let conn = &self.program.connection;
             if let Some(hooks) = conn.hooks() {

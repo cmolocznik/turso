@@ -1369,6 +1369,194 @@ fn test_suspended_read_does_not_finish_sibling_read_transaction() {
     );
 }
 
+/// Step a statement that reads no table to its first row. It runs no Transaction instruction, so
+/// it takes no part in the connection's transaction.
+fn prepare_reading_no_table(conn: &Arc<Connection>) -> crate::Statement {
+    let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
+    match stmt.step().unwrap() {
+        crate::StepResult::Row => stmt,
+        other => panic!("expected the first row, got {other:?}"),
+    }
+}
+
+fn finish_rows(stmt: &mut crate::Statement) {
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Done => return,
+            crate::StepResult::Row => {}
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            other => panic!("expected the statement to finish, got {other:?}"),
+        }
+    }
+}
+
+/// Under MVCC the statements of a connection share one implicit transaction, which the last of
+/// them to finish ends. A statement that reads no table takes no part in it: a writer beside one
+/// commits at its own halt, and nothing is left for that statement to end.
+#[test]
+fn test_writer_beside_a_statement_reading_no_table_commits_at_its_halt() {
+    let env = SameConnectionMvcc::new(":memory:writer-beside-statement-reading-no-table");
+    env.setup_rows_table();
+    let mut idle = prepare_reading_no_table(&env.conn);
+    assert_eq!(
+        env.conn.get_mv_tx(),
+        None,
+        "a statement reading no table opens no transaction"
+    );
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    assert_eq!(
+        env.observer_ids(),
+        vec![1],
+        "the writer commits at its own halt"
+    );
+    assert_eq!(env.conn.get_mv_tx(), None);
+    finish_rows(&mut idle);
+    assert_eq!(env.conn.get_mv_tx(), None);
+    assert_eq!(env.observer_ids(), vec![1]);
+}
+
+/// Each read beside a statement that reads no table ends the transaction it began, so the next
+/// read on the connection sees what another connection committed in between, while that
+/// statement still runs and after it has finished.
+#[test]
+fn test_reads_beside_a_statement_reading_no_table_see_commits_made_between_them() {
+    let env = SameConnectionMvcc::new(":memory:reads-beside-statement-reading-no-table");
+    env.setup_rows_table();
+    let mut idle = prepare_reading_no_table(&env.conn);
+    assert_eq!(
+        ids_from_query(&env.conn, "SELECT id FROM rows"),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        env.conn.get_mv_tx(),
+        None,
+        "the read ends the transaction it began"
+    );
+    env.observer
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    assert_eq!(ids_from_query(&env.conn, "SELECT id FROM rows"), vec![1]);
+    finish_rows(&mut idle);
+    env.observer
+        .execute("INSERT INTO rows VALUES (2, 'two')")
+        .unwrap();
+    assert_eq!(
+        ids_from_query(&env.conn, "SELECT id FROM rows ORDER BY id"),
+        vec![1, 2]
+    );
+    assert_eq!(env.conn.get_mv_tx(), None);
+}
+
+/// A statement takes no part in the transaction once it has finished, reset or not: a writer after
+/// a finished read commits at its own halt.
+#[test]
+fn test_writer_after_a_finished_read_commits_at_its_halt() {
+    let env = SameConnectionMvcc::new(":memory:writer-after-finished-read");
+    env.setup_rows_table();
+    let mut read = env.conn.prepare("SELECT id FROM rows").unwrap();
+    finish_without_rows(&mut read);
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    assert_eq!(
+        env.observer_ids(),
+        vec![1],
+        "the finished read holds no transaction open"
+    );
+    drop(read);
+    assert_eq!(env.observer_ids(), vec![1]);
+}
+
+/// A helper statement the engine runs inside a statement, here a table-valued pragma's, takes no
+/// part in the transaction: the statement ends the transaction it began, and a later read sees a
+/// commit made meanwhile.
+#[test]
+fn test_read_of_a_pragma_function_ends_the_transaction_it_began() {
+    let env = SameConnectionMvcc::new(":memory:read-of-a-pragma-function");
+    env.setup_rows_table();
+    assert_eq!(
+        scalar_i64(&env.conn, "SELECT count(*) FROM pragma_table_info('rows')"),
+        2
+    );
+    assert_eq!(
+        env.conn.get_mv_tx(),
+        None,
+        "the read ends the transaction it began"
+    );
+    env.observer
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    assert_eq!(ids_from_query(&env.conn, "SELECT id FROM rows"), vec![1]);
+}
+
+/// A writer beside a reader defers its commit to the reader, and the reader commits it at its own
+/// halt though a statement reading no table still runs.
+#[test]
+fn test_reader_commits_a_deferred_writer_beside_a_statement_reading_no_table() {
+    let env = SameConnectionMvcc::new(":memory:reader-commits-beside-statement-reading-no-table");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'existing')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut idle = prepare_reading_no_table(&env.conn);
+    let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 10);
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    assert_eq!(
+        env.observer_ids(),
+        vec![10],
+        "the writer defers its commit to the reader"
+    );
+    finish_without_rows(&mut reader);
+    assert_eq!(
+        env.observer_ids(),
+        vec![1, 10],
+        "the reader commits the writer's row"
+    );
+    assert_eq!(env.conn.get_mv_tx(), None);
+    finish_rows(&mut idle);
+    assert_eq!(env.observer_ids(), vec![1, 10]);
+}
+
+/// COMMIT takes part in the transaction it commits. A read that began the transaction before
+/// BEGIN, dropped while COMMIT waits mid-commit, leaves that transaction to COMMIT.
+#[test]
+fn test_reader_dropped_while_commit_waits_leaves_the_transaction_to_it() {
+    let env = SameConnectionMvcc::new(":memory:reader-dropped-while-commit-waits");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'existing')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(step_returning_id(&mut reader), 10);
+    env.conn.execute("BEGIN").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (1, 'one')")
+        .unwrap();
+    env.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut commit = env.conn.prepare("COMMIT").unwrap();
+    expect_injected_yield(&mut commit, "COMMIT");
+    env.conn.set_yield_injector(None);
+    drop(reader);
+    finish_without_rows(&mut commit);
+    assert_eq!(env.observer_ids(), vec![1, 10]);
+    assert_eq!(env.conn.get_mv_tx(), None);
+    assert_eq!(
+        env.conn.get_tx_state(),
+        crate::connection::TransactionState::None
+    );
+}
+
 #[test]
 fn test_wal_returning_writer_can_commit_while_sibling_reader_is_active() {
     let env = SameConnectionWal::new(":memory:wal-reader-active-writer-commit");

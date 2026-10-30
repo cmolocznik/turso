@@ -9659,13 +9659,15 @@ mod tests {
     /// sleeping before the next and doing nothing else: it settles no redo row, and a write another
     /// transaction makes meanwhile is left to redo, starting no maintenance. Once the open
     /// transaction commits a step makes the rebuild, beside a writer still open whose writes are
-    /// redo rows alone. The rebuild met the open write before, failing OPTIMIZE INDEX.
+    /// redo rows alone. The rebuild met the open write before, failing OPTIMIZE INDEX. It is stepped
+    /// on the connection the test reads from, whose transaction it takes no part in: the reads
+    /// made meanwhile each end their own, and see the rebuild once it is made.
     #[test]
     fn a_rebuild_beside_an_open_write_waits_for_it_and_is_made() {
         let (db, conn, holder, mut live, moved) = outgrown_beside_a_holder("ivf-rq-rebuild-beside-a-write.db");
         let mut state = 283;
         REBUILT.with(|count| count.set(0));
-        let mut stepped = db.connect(crate::ConnectOpts::new()).unwrap().prepare("OPTIMIZE INDEX v_ivf").unwrap();
+        let mut stepped = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
         // The first step surveys; the next announces the rebuild, the holder's write in its way.
         assert_eq!(step_to_pause(&db, &mut stepped), Paused::Yielded);
         assert_eq!(step_to_pause(&db, &mut stepped), Paused::Slept);

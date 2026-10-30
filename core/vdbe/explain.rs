@@ -1400,7 +1400,6 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
-                comparator: _,
             } => (
                 "AggInverse",
                 0,
@@ -1492,8 +1491,8 @@ pub fn insn_to_row(
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        let coll_str = match collation {
-                            CollationSeq::Binary => format!("{sign}B"),
+                        let coll_str = match *collation {
+                            CollationSeq::BINARY => format!("{sign}B"),
                             coll => format!("{sign}{coll}"),
                         };
                         match nulls {
@@ -2363,6 +2362,7 @@ pub fn insn_to_row(
                 auto_commit,
                 rollback,
                 concurrent,
+                read_only: _,
             } => (
                 "AutoCommit",
                 *auto_commit as i64,

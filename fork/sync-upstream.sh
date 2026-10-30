@@ -1,8 +1,9 @@
 #!/bin/bash
 # Merge upstream Turso into workreef. Fetches upstream, fast-forwards main (a mirror of upstream
 # main), merges main into workreef, and checks the merged tree before committing it: it compiles
-# with its tests, the core and FTS suites pass, clippy is clean, and ivf_crash's kill rounds pass
-# under WAL, MVCC and MVCC with four writers. Only then is the merge committed and pushed. A
+# with its tests, the core and FTS suites pass, clippy is clean, ivf_crash's kill rounds pass
+# under WAL, MVCC and MVCC with four writers, and mvcc_rolling's pass over a logical log that rolls
+# under writes that never pause. Only then is the merge committed and pushed. A
 # conflict or a failed check aborts the merge, leaving workreef as it was, and alerts on the desktop
 # and the agent bus. A checkout that is busy (another branch, uncommitted changes, a merge under
 # way, cargo running in it) or a hold file skips the run. fork/turso-sync.timer runs it four
@@ -139,9 +140,9 @@ echo "== clippy"
 run "$CARGO" clippy -p turso_core --all-targets --all-features -- -D warnings >"$LOGS/$stamp.clippy.log" 2>&1 ||
     fail "clippy reports problems ($stamp.clippy.log)"
 
-echo "== ivf_crash"
-(cd "$REPO/fork/repro" && run "$CARGO" build --release --bin ivf_crash) >"$LOGS/$stamp.repro.log" 2>&1 ||
-    fail "ivf_crash does not build ($stamp.repro.log)"
+echo "== ivf_crash and mvcc_rolling"
+(cd "$REPO/fork/repro" && run "$CARGO" build --release --bin ivf_crash --bin mvcc_rolling) >"$LOGS/$stamp.repro.log" 2>&1 ||
+    fail "ivf_crash or mvcc_rolling does not build ($stamp.repro.log)"
 seed=$(( $(date +%s) / 3600 ))
 # crash NAME MODE THREADS: ivf_crash's kill rounds; a failed run's database is kept beside its log.
 crash() {
@@ -156,14 +157,24 @@ crash() {
 crash wal wal 1
 crash mvcc mvcc 1
 crash mvcc-4-writers mvcc 4
+# mvcc_rolling's kill rounds over a log that rolls; a failed run's database is kept beside its log.
+out="$LOGS/$stamp.rolling.log"
+dir="$TMPDIR/turso-sync-rolling"
+run "$REPO/fork/repro/target/release/mvcc_rolling" "$dir" "$ROUNDS" "$seed" >"$out" 2>&1
+if ! grep -q "^$ROUNDS rounds passed" "$out"; then
+    mv "$dir" "$LOGS/$stamp.rolling.db"
+    fail "mvcc_rolling failed: $(grep -m1 FAILED "$out" | cut -c1-200) ($stamp.rolling.log)"
+fi
+rm -rf "$dir"
 
 git commit -q -F - <<EOF || fail "the merge commit failed"
 Merge upstream main $new into workreef
 
 $took upstream commits ($old..$new), merged without conflicts. The merged tree compiled with its
 tests; the core suite passed $core_passed tests and the FTS suite $fts_passed; clippy was clean;
-ivf_crash passed $ROUNDS kill rounds each under WAL, MVCC and MVCC with four writers (seed $seed).
+ivf_crash passed $ROUNDS kill rounds each under WAL, MVCC and MVCC with four writers, and
+mvcc_rolling $ROUNDS over a log that rolls (seed $seed).
 EOF
 trap - EXIT
 git push -q origin workreef || { verdict ERROR "pushing workreef failed; the merge is committed locally"; exit 1; }
-verdict MERGED "upstream $new ($took commits): core $core_passed, FTS $fts_passed, clippy clean, ivf_crash 3 x $ROUNDS rounds"
+verdict MERGED "upstream $new ($took commits): core $core_passed, FTS $fts_passed, clippy clean, ivf_crash 3 x $ROUNDS rounds, mvcc_rolling $ROUNDS rounds"

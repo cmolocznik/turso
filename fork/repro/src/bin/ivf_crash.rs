@@ -14,7 +14,8 @@
 //! THREADS=n runs n writers on their own connections and threads, BEGIN CONCURRENT under MVCC (with
 //! CONCURRENT=1, each lone statement in a transaction of its own too), beside a thread running
 //! OPTIMIZE INDEX over and over; a statement or transaction that fails
-//! (busy, a conflict) is rolled back and counted. The child reports its commits and failures; when
+//! (busy, a conflict) is rolled back and counted. The child reports its commits and failures, the
+//! OPTIMIZE INDEX statements among them that failed, and the rebuilds the index made; when
 //! it has run 2 s without a commit the round saves its threads' stacks (eu-stack) to
 //! DIR/stall-ROUND.txt before the kill, and the run reports how many rounds stalled.
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -84,6 +85,7 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     let next = Arc::new(AtomicI64::new(rows(&conn, "SELECT coalesce(max(id), 0) FROM v")?[0][0].as_int().unwrap_or(0) + 1));
     let (commits, failures, optimizes) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     let conflicts = Arc::new(AtomicU64::new(0));
+    let optimize_failures = Arc::new(AtomicU64::new(0));
     // The conflicts by what met them: an insert, update or delete statement, or a COMMIT.
     let met: Arc<[AtomicU64; 4]> = Arc::new(Default::default());
     let begin = if mvcc { "BEGIN CONCURRENT" } else { "BEGIN" };
@@ -148,14 +150,17 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
         });
     }
     {
-        let (db, optimizes, failures) = (db.clone(), optimizes.clone(), failures.clone());
+        let (db, optimizes, failures, optimize_failures) = (db.clone(), optimizes.clone(), failures.clone(), optimize_failures.clone());
         std::thread::spawn(move || {
             let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_busy_timeout(Duration::from_secs(10));
             loop {
                 match conn.execute("OPTIMIZE INDEX v_ivf") {
                     Ok(()) => optimizes.fetch_add(1, Ordering::Relaxed),
-                    Err(_) => failures.fetch_add(1, Ordering::Relaxed),
+                    Err(_) => {
+                        optimize_failures.fetch_add(1, Ordering::Relaxed);
+                        failures.fetch_add(1, Ordering::Relaxed)
+                    }
                 };
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -164,7 +169,7 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
     loop {
         std::thread::sleep(Duration::from_millis(200));
         eprintln!(
-            "progress commits={} failures={} conflicts={} (insert {}, update {}, delete {}, commit {}) optimizes={} redone={}",
+            "progress commits={} failures={} conflicts={} (insert {}, update {}, delete {}, commit {}) optimizes={} redone={} optimize_failures={} rebuilds={}",
             commits.load(Ordering::Relaxed),
             failures.load(Ordering::Relaxed),
             conflicts.load(Ordering::Relaxed),
@@ -173,7 +178,9 @@ fn threaded(dir: &str, mvcc: bool, seed: u64, threads: usize) -> turso_core::Res
             met[2].load(Ordering::Relaxed),
             met[3].load(Ordering::Relaxed),
             optimizes.load(Ordering::Relaxed),
-            turso_core::index_method::ivf_rq::REDONE.load(Ordering::Relaxed)
+            turso_core::index_method::ivf_rq::REDONE.load(Ordering::Relaxed),
+            optimize_failures.load(Ordering::Relaxed),
+            turso_core::index_method::ivf_rq::REBUILDS.load(Ordering::Relaxed)
         );
     }
 }

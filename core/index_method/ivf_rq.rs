@@ -9035,10 +9035,13 @@ mod tests {
     /// 9.7%.
     const MISPLACED_PERCENT: usize = 3;
 
+    /// A database, a connection to it, its rows by id, and the centres of its two clusters.
+    type Clustered = (Arc<crate::Database>, Arc<crate::Connection>, HashMap<i64, Vec<f32>>, [Vec<f32>; 2]);
+
     /// Two clusters far apart, each trained into partitions of its own, so a split of one
     /// cluster's partition marks none of the other's moving: the rows, and a connection to the
     /// index with every partition probed, on which a query has read the model.
-    fn two_clusters(name: &str) -> (Arc<crate::Database>, Arc<crate::Connection>, HashMap<i64, Vec<f32>>, [Vec<f32>; 2]) {
+    fn two_clusters(name: &str) -> Clustered {
         const DIMS: usize = 16;
         let (db, conn) = database(name, true);
         let mut state = 913u64;

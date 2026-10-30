@@ -2351,7 +2351,8 @@ mod tests {
         holder.execute("BEGIN IMMEDIATE").unwrap();
         let waiter = db.connect(ConnectOpts::new()).unwrap();
         waiter.set_busy_timeout(std::time::Duration::from_millis(60));
-        let runners: [(&str, fn(&mut Statement) -> crate::Result<()>); 4] = [
+        type Runner = fn(&mut Statement) -> crate::Result<()>;
+        let runners: [(&str, Runner); 4] = [
             ("run_ignore_rows", |stmt| stmt.run_ignore_rows()),
             ("run_collect_rows", |stmt| stmt.run_collect_rows().map(drop)),
             ("run_with_row_callback", |stmt| {

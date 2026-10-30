@@ -632,6 +632,74 @@ such database (`ivf_crash optimize`), 10 partitions holding 87,891 rows became 1
 consistent and with no work left. `optimize_in_steps_rebuilds_an_index_its_rows_outgrew` (WAL and
 MVCC, 3,000 rows in one partition's tail) fails without the change.
 
+### No byte of a deleted row stays in the database's files
+2026-10-30 `f29ba6995`, `39fc410c2`, `d99dec0ce`. `core/storage/btree.rs`, `core/storage/pager.rs`,
+`core/translate/pragma.rs`, `core/translate/index.rs`. A deleted row's bytes used to stay in the
+database file:
+- in the freed range of its page, of which only the first four bytes became a freeblock header;
+- in the gaps that defragmentation, a root split and a rebalance's trim left behind;
+- on freed pages, which went to the freelist as they were;
+- on new pages, which took a pooled buffer's old bytes to disk.
+
+Erasure now holds at three levels:
+- **Inside a page, always.** A b-tree page zeroes every byte a delete frees, fragments and
+  freeblock headers included, every byte defragmentation or a root split moves a cell off, and the
+  pointers a rebalance trims. A page made empty is zeroed whole, and a new page starts from zeroed
+  memory. This costs a memset per freed cell, and every b-tree test exercises it: core 2,603 and
+  FTS 2,643 pass.
+- **Freed pages, under `PRAGMA secure_delete = ON`.** Each page the database frees is also zeroed
+  and written back, as in SQLite. `FAST` and `OFF` leave freed pages as they were. The setting holds
+  for every connection to the database, because a checkpoint writes the pages of other
+  connections' deletes. It resets to `OFF` at open.
+- **Index methods, through `REINDEX idx`.** It makes an `ivf_rq` or FTS index afresh, under WAL and
+  MVCC: the backing tables are dropped with every page they held, created again and filled from the
+  table's rows.
+  - ivf_rq trains its centroids from the rows left. A centroid is a mean of the vectors it was
+    trained over, and ivf_rq never removes centroid rows.
+  - FTS indexes only the documents left.
+  - Without REINDEX, a deleted vector's code stays in its block until compaction, as a deleted
+    document stays in its segment until a merge.
+
+`PRAGMA wal_checkpoint(TRUNCATE)` copies the WAL into the database file and truncates it to 0
+bytes; under MVCC it first checkpoints the logical log into the b-trees and truncates the log to 0.
+So erasing rows takes:
+
+```sql
+PRAGMA secure_delete = ON;          -- once per open of the database
+DELETE FROM memories WHERE ...;
+REINDEX memories_embedding;         -- each ivf_rq and FTS index of the table
+PRAGMA wal_checkpoint(TRUNCATE);
+```
+
+`core/storage/erasure_tests.rs` reads the checkpointed files back. Its checker walks every b-tree,
+overflow chain and freelist page of the database file and reports every nonzero byte that none of
+them holds. The tests:
+- `deleted_rows_leave_no_byte_in_the_files_after_a_truncating_checkpoint`: rows are inserted,
+  rewritten and deleted, many checkpointed into the file before they go, and every value carries
+  markers, one at a blob's end on an overflow page. Under WAL and MVCC the file holds no stray byte,
+  the WAL and the log are empty, no dead marker is in any file and every live one is found.
+- `freed_pages_keep_their_bytes_unless_secure_delete_is_on`: the same under `OFF` leaves dead
+  markers and stray bytes on the freed pages and nowhere else, so the checker and the scan are seen
+  to find them.
+- `dropped_and_cleared_tables_leave_no_byte_in_the_file`,
+  `pages_taken_off_the_freelist_leave_no_pointer_behind`, and the page test
+  `defragmentation_keeps_no_copy_of_a_cell_it_moved` on the full and the fast path.
+- `ivf_rq` and FTS `reindex_makes_the_index_afresh_and_leaves_none_of_the_old_one_in_the_file`:
+  half the rows are deleted and the index made again. The new index shares no row with the old
+  one and answers exactly from the rows left, and none of the old codes, dead rows, centroids or
+  segment files is found in the file.
+
+Fail-first: removing each zeroing in turn fails a test, 12 of 12, and so does a REINDEX that
+refills without dropping. Two zeroings no test could fail turned out redundant, an emptied page
+and a parent taking its child's cells being zero already, and went.
+
+What the files hold is all this covers:
+- the pending-byte page, past 1 GiB, and pointer-map pages rely on a new page starting zeroed,
+  which no test reaches;
+- memory, the page cache and MVCC's row versions until their garbage collection, holds a deleted
+  row until it is reused;
+- a file system or device that keeps freed blocks may keep what a truncation released.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

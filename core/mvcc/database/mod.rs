@@ -1493,6 +1493,11 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
         // the mutex
         state_machine: Box<Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>>,
     },
+    /// The commit has landed with its database's log `far_behind` while a checkpoint runs on the
+    /// database: it waits for that checkpoint to end, then decides on its own checkpoint again.
+    AwaitCheckpoint {
+        end_ts: u64,
+    },
     MarkDirtyKeys {
         end_ts: u64,
         cursor: usize,
@@ -1901,7 +1906,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     tracing::error!("failed to discard pending MVCC logical-log write: {err}");
                 }
             }
-            if !matches!(self.state, CommitState::Checkpoint { .. }) {
+            if !matches!(
+                self.state,
+                CommitState::Checkpoint { .. } | CommitState::AwaitCheckpoint { .. }
+            ) {
                 let continues = self.continues_beside_others();
                 self.mvcc_store.cleanup_dropped_commit(
                     self.tx_id,
@@ -2055,6 +2063,89 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             pending_header,
         });
         Ok(())
+    }
+
+    /// What follows a landed commit: its checkpoint, handed to the store's pool or run inline, or
+    /// none. While the log is `far_behind`, the commit hands nothing to the pool: it waits for a
+    /// checkpoint running on its database to end, then checkpoints inline if the log is still
+    /// behind, so writers cannot outrun checkpoints for long.
+    fn checkpoint_after_commit(
+        &mut self,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
+        end_ts: u64,
+    ) -> Result<TransitionResult<()>> {
+        // A successor's statements hold a blocking checkpoint off until they end, so a commit that
+        // leaves one checkpoints nothing.
+        let checkpoints = self.wrote_logical_log
+            && self.successor.is_none()
+            && mvcc_store.storage.should_checkpoint();
+        if checkpoints {
+            let running = if background_checkpoint::far_behind(mvcc_store.storage.as_ref()) {
+                mvcc_store.wait_for_running_checkpoint()
+            } else {
+                RunningCheckpoint::OnThisThread
+            };
+            let inline = match running {
+                RunningCheckpoint::Elsewhere(wait) => {
+                    self.state = CommitState::AwaitCheckpoint { end_ts };
+                    return Ok(TransitionResult::Io(IOCompletions(wait)));
+                }
+                RunningCheckpoint::None => {
+                    mvcc_store.background_checkpoint.count_assist();
+                    true
+                }
+                // With the background checkpoint on, the checkpoint runs on the store's pool, so
+                // this commit returns now.
+                RunningCheckpoint::OnThisThread => {
+                    !mvcc_store
+                        .background_checkpoint
+                        .request(&mvcc_store.storage, || match self.db_id {
+                            crate::MAIN_DB_ID => Some(self.connection.db.clone()),
+                            db_id => self
+                                .connection
+                                .attached_databases()
+                                .read()
+                                .get_database_by_index(db_id),
+                        })
+                }
+            };
+            if inline {
+                let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
+                    crate::storage::wal::CheckpointMode::Passive {
+                        upper_bound_inclusive: None,
+                    }
+                } else {
+                    crate::storage::wal::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    }
+                };
+                let state_machine = StateMachine::new(CheckpointStateMachine::new(
+                    self.pager.clone(),
+                    mvcc_store.clone(),
+                    self.connection.clone(),
+                    false,
+                    self.sync_mode,
+                    self.db_id,
+                    auto_checkpoint_mode,
+                ));
+                let state_machine = Box::new(Mutex::new(state_machine));
+                self.state = CommitState::Checkpoint { state_machine };
+                return Ok(TransitionResult::Continue);
+            }
+        }
+        // Not checkpointing this commit. Reclaim invisible versions
+        // inline with a bounded, non-blocking GC pass so steady-state
+        // memory stays flat between checkpoints (which only fire on
+        // logical-log byte growth, not version accumulation). The pass
+        // does no I/O and is capped at MAX_CHAINS_PER_GC chains, so it
+        // doesn't meaningfully slow this committing connection. See
+        // `gc_incremental`.
+        if mvcc_store.should_gc() {
+            mvcc_store.gc_incremental(MvStore::<Clock>::MAX_CHAINS_PER_GC);
+        }
+        tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, end_ts);
+        self.finalize(mvcc_store)?;
+        Ok(TransitionResult::Done(()))
     }
 
     fn step_await_group_commit(
@@ -3730,7 +3821,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // IOW since this txn committed, let's signal waiting transactions.
                 mvcc_store.notify_committed_dependents(tx_unlocked);
 
-                let appended_to_log = self.wrote_logical_log;
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
@@ -3785,61 +3875,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
                 self.land();
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-                // With the background checkpoint on, the checkpoint runs on the store's pool, so
-                // this commit returns now. A successor's statements hold a blocking checkpoint off
-                // until they end, so a commit that leaves one checkpoints nothing.
-                let checkpoints = appended_to_log
-                    && successor.is_none()
-                    && mvcc_store.storage.should_checkpoint();
-                let handed_off = checkpoints
-                    && mvcc_store.background_checkpoint.request(
-                        &mvcc_store.storage,
-                        || mvcc_store.checkpoint_in_progress(),
-                        || match self.db_id {
-                            crate::MAIN_DB_ID => Some(self.connection.db.clone()),
-                            db_id => self
-                                .connection
-                                .attached_databases()
-                                .read()
-                                .get_database_by_index(db_id),
-                        },
-                    );
-                if !handed_off && checkpoints {
-                    let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
-                        crate::storage::wal::CheckpointMode::Passive {
-                            upper_bound_inclusive: None,
-                        }
-                    } else {
-                        crate::storage::wal::CheckpointMode::Truncate {
-                            upper_bound_inclusive: None,
-                        }
-                    };
-                    let state_machine = StateMachine::new(CheckpointStateMachine::new(
-                        self.pager.clone(),
-                        mvcc_store.clone(),
-                        self.connection.clone(),
-                        false,
-                        self.sync_mode,
-                        self.db_id,
-                        auto_checkpoint_mode,
-                    ));
-                    let state_machine = Box::new(Mutex::new(state_machine));
-                    self.state = CommitState::Checkpoint { state_machine };
-                    return Ok(TransitionResult::Continue);
-                }
-                // Not checkpointing this commit. Reclaim invisible versions
-                // inline with a bounded, non-blocking GC pass so steady-state
-                // memory stays flat between checkpoints (which only fire on
-                // logical-log byte growth, not version accumulation). The pass
-                // does no I/O and is capped at MAX_CHAINS_PER_GC chains, so it
-                // doesn't meaningfully slow this committing connection. See
-                // `gc_incremental`.
-                if mvcc_store.should_gc() {
-                    mvcc_store.gc_incremental(MvStore::<Clock>::MAX_CHAINS_PER_GC);
-                }
-                tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
-                self.finalize(mvcc_store)?;
-                Ok(TransitionResult::Done(()))
+                let end_ts = *end_ts;
+                self.checkpoint_after_commit(mvcc_store, end_ts)
+            }
+            CommitState::AwaitCheckpoint { end_ts } => {
+                let end_ts = *end_ts;
+                self.checkpoint_after_commit(mvcc_store, end_ts)
             }
             CommitState::Checkpoint { state_machine } => {
                 let step_result = {
@@ -4356,6 +4397,24 @@ pub struct RecoverCtx {
     index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
 }
 
+/// A checkpoint running on a store, as a commit `far_behind` finds it.
+pub(crate) enum RunningCheckpoint {
+    None,
+    /// Stepped on the thread asking: it goes on only once the asker returns.
+    OnThisThread,
+    /// Stepped on another thread; the completion finishes when it ends.
+    Elsewhere(Completion),
+}
+
+/// A token for the current thread, to tell a checkpoint stepped on it from one stepped elsewhere.
+fn thread_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    thread_local! {
+        static TOKEN: u64 = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    TOKEN.with(|token| *token)
+}
+
 /// WAL position `(checkpoint_seq, frame)`. Ordered lexicographically for physical reachability.
 /// Each row version stores one, so the fields are packed into 12 bytes instead of the 16 bytes
 /// that the alignment of `frame` gives.
@@ -4576,6 +4635,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// contend on it; only one wins. Needed because the lock no longer guards the start
     /// of the checkpoint (it's acquired after the pager-write phase, not before).
     checkpoint_in_progress: AtomicBool,
+    /// Commits waiting for the running checkpoint to end (`wait_for_running_checkpoint`).
+    checkpoint_waiters: Mutex<Vec<Completion>>,
+    /// The `thread_token` of the thread that last stepped the running checkpoint.
+    checkpoint_driver: AtomicU64,
     pub checkpoint_dirty_table_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
     pub checkpoint_dirty_index_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
     checkpoint_full_scan_generation: AtomicU64,
@@ -4785,6 +4848,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             checkpoint_publish_in_progress: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
+            checkpoint_waiters: Mutex::new(Vec::new()),
+            checkpoint_driver: AtomicU64::new(0),
             checkpoint_full_scan_generation: AtomicU64::new(1),
             checkpoint_full_scan_min_snapshot_ts: AtomicU64::new(0),
             durable_txid_max: AtomicU64::new(0),
@@ -4833,6 +4898,44 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Whether a checkpoint is running on the store.
     pub(crate) fn checkpoint_in_progress(&self) -> bool {
         self.checkpoint_in_progress.load(Ordering::Acquire)
+    }
+
+    /// Records that the running checkpoint is stepped on this thread.
+    pub(crate) fn note_checkpoint_driver(&self) {
+        self.checkpoint_driver
+            .store(thread_token(), Ordering::Release);
+    }
+
+    /// The checkpoint running on this store, and for one stepped on another thread, a completion
+    /// that finishes when it ends. A checkpoint stepped on this thread only goes on once its caller
+    /// regains the thread, so waiting for it would stop it. The test and the registration take
+    /// the lock `end_checkpoint_in_progress` takes after it clears the flag, so a waiter misses no
+    /// end.
+    pub(crate) fn wait_for_running_checkpoint(&self) -> RunningCheckpoint {
+        let mut waiters = self.checkpoint_waiters.lock();
+        if !self.checkpoint_in_progress.load(Ordering::Acquire) {
+            return RunningCheckpoint::None;
+        }
+        if self.checkpoint_driver.load(Ordering::Acquire) == thread_token() {
+            return RunningCheckpoint::OnThisThread;
+        }
+        let wait = Completion::new_wait();
+        waiters.push(wait.clone());
+        RunningCheckpoint::Elsewhere(wait)
+    }
+
+    /// Ends the running checkpoint and wakes the commits waiting for it.
+    pub(crate) fn end_checkpoint_in_progress(&self) {
+        self.checkpoint_in_progress.store(false, Ordering::Release);
+        let waiters = std::mem::take(&mut *self.checkpoint_waiters.lock());
+        for wait in waiters {
+            wait.complete(0);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_waiters(&self) -> usize {
+        self.checkpoint_waiters.lock().len()
     }
 
     #[cfg(test)]
@@ -11710,6 +11813,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
                 .field("end_ts", end_ts)
                 .finish(),
             Self::Checkpoint { state_machine: _ } => f.debug_struct("Checkpoint").finish(),
+            Self::AwaitCheckpoint { end_ts } => f
+                .debug_struct("AwaitCheckpoint")
+                .field("end_ts", end_ts)
+                .finish(),
             Self::CommitEnd { end_ts } => {
                 f.debug_struct("CommitEnd").field("end_ts", end_ts).finish()
             }

@@ -1041,9 +1041,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             self.lock_states.blocking_checkpoint_lock_held = false;
         }
         if self.owns_checkpoint_in_progress {
-            self.mvstore
-                .checkpoint_in_progress
-                .store(false, Ordering::Release);
+            self.mvstore.end_checkpoint_in_progress();
             self.owns_checkpoint_in_progress = false;
         }
     }
@@ -2524,6 +2522,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         return Ok(TransitionResult::Done(CheckpointResult::default()));
                     }
                     self.owns_checkpoint_in_progress = true;
+                    self.mvstore.note_checkpoint_driver();
                 }
 
                 if passive {
@@ -3747,6 +3746,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
     type SMResult = CheckpointResult;
 
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+        if self.owns_checkpoint_in_progress {
+            self.mvstore.note_checkpoint_driver();
+        }
         let res = self.step_inner(&());
         match res {
             Err(ref err) => {

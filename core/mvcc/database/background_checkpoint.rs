@@ -16,8 +16,10 @@
 //! checkpoints again, and that one truncates it. A turn that fails, or that finds another
 //! checkpoint running on its database, is retried after a delay that doubles each time, on a timer,
 //! so it holds no thread. Should a pool fall so far behind that a database's uncheckpointed log
-//! reaches `BEHIND` thresholds, or its turns keep failing, that database's commits checkpoint
-//! inline until it is back under, so the log stays bounded whatever the pool's state.
+//! reaches `BEHIND` thresholds (`far_behind`), or its turns keep failing, that database's commits
+//! checkpoint inline until it is back under, each first waiting for a checkpoint already running
+//! on the database to end, so the log stays bounded whatever the pool's state and however long a
+//! checkpoint takes.
 //!
 //! Every store starts on the process's shared pool (`CheckpointPool::shared`) and can be given
 //! another: one per storage device, say.
@@ -55,6 +57,13 @@ const RETRY_LONGEST: Duration = Duration::from_secs(1);
 /// The uncheckpointed log, in checkpoint thresholds, at which a database's commits checkpoint
 /// inline again.
 const BEHIND: u64 = 4;
+
+/// Whether `storage`'s uncheckpointed log has reached `BEHIND` thresholds, past which its commits
+/// no longer leave the checkpoint to anyone else.
+pub(crate) fn far_behind(storage: &dyn DurableStorage) -> bool {
+    let threshold = storage.checkpoint_threshold();
+    threshold > 0 && storage.uncheckpointed_bytes() >= BEHIND.saturating_mul(threshold as u64)
+}
 
 /// How long an idle thread waits for work before it stops.
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
@@ -858,13 +867,11 @@ impl BackgroundCheckpoint {
     }
 
     /// Hands a commit's checkpoint to the pool. False when the background checkpoint is off, the
-    /// database keeps its inline checkpoint, the pool cannot take it, or the pool has fallen so far
-    /// behind on the database that the commit checkpoints inline; `checkpointing` tells whether a
-    /// checkpoint is running on the database, and `database` finds it on the first request.
+    /// database keeps its inline checkpoint, or the pool cannot take it; `database` finds it on the
+    /// first request.
     pub(crate) fn request(
         &self,
         storage: &Arc<dyn DurableStorage>,
-        checkpointing: impl FnOnce() -> bool,
         database: impl FnOnce() -> Option<Arc<Database>>,
     ) -> bool {
         let binding = self.binding.load();
@@ -872,17 +879,16 @@ impl BackgroundCheckpoint {
         if !member.enabled.load(Ordering::Acquire) || !member.register(storage, database) {
             return false;
         }
-        let pool = &binding.pool.pool;
-        let threshold = storage.checkpoint_threshold();
-        if threshold > 0
-            && storage.uncheckpointed_bytes() >= BEHIND.saturating_mul(threshold as u64)
-            && !checkpointing()
-        {
-            member.assists.fetch_add(1, Ordering::Relaxed);
-            pool.assists.fetch_add(1, Ordering::Relaxed);
-            return false;
+        binding.pool.pool.request(member)
+    }
+
+    /// Counts a commit that checkpointed inline because the pool had fallen `BEHIND`.
+    pub(crate) fn count_assist(&self) {
+        let binding = self.binding.load();
+        if binding.member.enabled.load(Ordering::Acquire) {
+            binding.member.assists.fetch_add(1, Ordering::Relaxed);
+            binding.pool.pool.assists.fetch_add(1, Ordering::Relaxed);
         }
-        pool.request(member)
     }
 
     #[cfg(test)]

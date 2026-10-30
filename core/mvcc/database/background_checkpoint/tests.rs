@@ -4,7 +4,7 @@ use crate::mvcc::database::tests::MvccTestDbNoConn;
 use crate::mvcc::persistent_storage::logical_log::LOG_SEGMENT_FILES;
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
-use crate::{Connection, DatabaseOpts, LimboError, MvStore};
+use crate::{Connection, DatabaseOpts, LimboError, MvStore, StepResult};
 use parking_lot::{Condvar, Mutex};
 
 /// Waits up to ten seconds for `done`.
@@ -653,6 +653,68 @@ fn test_a_failing_checkpoint_is_retried_later_and_holds_no_thread() {
     );
     assert!(wait_until(|| !failing.probe.scheduled()));
     failing.assert_intact();
+}
+
+/// Steps `stmt` until it is done, false, or waits for a checkpoint running on its database, true.
+fn step_until_parked_or_done(db: &TestDb, stmt: &mut crate::Statement) -> bool {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO if db.store.checkpoint_waiters() > 0 => return true,
+            StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            StepResult::Done => return false,
+            other => panic!("expected the insert to commit, got {other:?}"),
+        }
+    }
+}
+
+/// While a checkpoint runs on a database, a commit that leaves the log `BEHIND` thresholds past
+/// waits for that checkpoint to end before it decides on its own, so writers cannot outrun a
+/// checkpoint that takes long: here the pool's own checkpoint of the database, held after its
+/// snapshot.
+#[test]
+fn test_a_commit_far_behind_waits_for_the_checkpoint_running_on_its_database() {
+    let pool = pool(1);
+    let db = TestDb::open(&pool);
+    let hold = Arc::new(HoldAfterSnapshot::default());
+    db.probe.set_injector(Some(hold.clone()));
+    db.fill();
+    assert!(
+        hold.wait_held(),
+        "the pool's checkpoint did not reach its snapshot"
+    );
+    // Commits leave the checkpoint to the pool until one takes the log four thresholds behind.
+    let mut parked = None;
+    for _ in 0..1_000 {
+        let mut stmt = db
+            .conn
+            .prepare("INSERT INTO t(v) VALUES (randomblob(256))")
+            .unwrap();
+        if step_until_parked_or_done(&db, &mut stmt) {
+            parked = Some(stmt);
+            break;
+        }
+    }
+    let behind = db.store.storage.uncheckpointed_bytes();
+    let mut stmt = parked.unwrap_or_else(|| {
+        panic!("1000 commits returned while the pool's checkpoint ran, {behind} bytes behind")
+    });
+    let threshold = db.store.storage.checkpoint_threshold() as u64;
+    assert!(
+        far_behind(db.store.storage.as_ref()) && behind < (BEHIND + 1) * threshold,
+        "the commit waited {behind} bytes behind, at a {threshold}-byte threshold"
+    );
+    hold.release();
+    while step_until_parked_or_done(&db, &mut stmt) {
+        std::thread::yield_now();
+    }
+    assert_eq!(db.store.checkpoint_waiters(), 0);
+    assert!(
+        wait_until(|| !far_behind(db.store.storage.as_ref())),
+        "{} uncheckpointed bytes after the commit went on, {:?}",
+        db.store.storage.uncheckpointed_bytes(),
+        pool.stats()
+    );
+    db.assert_intact();
 }
 
 /// When the pool has fallen so far behind on a database that its uncheckpointed log reaches four

@@ -2382,10 +2382,12 @@ struct Writes {
     /// job leaves for later only a partition another job holds or wrote past its snapshot.
     jobs_changed: HashMap<i64, Position>,
     /// The same, for the partitions whose part of the model jobs changed, their directory rows and
-    /// centroids, and the highest of them: a model held under one snapshot serves another but for
-    /// the partitions an open writer has changed or one changed past either.
+    /// centroids: a model held under one snapshot serves another but for the partitions an open
+    /// writer has changed or one changed past either.
     models: HashMap<i64, Position>,
-    model_high: Position,
+    /// `models` ordered by position, one entry per partition, so a snapshot finds the partitions
+    /// changed past it without reading the rest.
+    models_by_change: BTreeSet<(Position, i64)>,
     /// A position at or past every commit the record did not see, standing for every partition not
     /// in `changed`: the highest one the index's last record knew, or the commit position when the
     /// record began, for the index's first.
@@ -2442,8 +2444,8 @@ impl Writes {
             self.changed.clear();
             self.jobs_changed.clear();
             self.models.clear();
+            self.models_by_change.clear();
             self.floor = self.floor.max(to);
-            self.model_high = self.model_high.max(self.floor);
             return;
         }
         for partition in writer.partitions {
@@ -2456,8 +2458,10 @@ impl Writes {
         }
         for partition in writer.models {
             let changed = self.models.get(&partition).copied().unwrap_or(self.floor).max(to);
-            self.models.insert(partition, changed);
-            self.model_high = self.model_high.max(changed);
+            if let Some(was) = self.models.insert(partition, changed) {
+                self.models_by_change.remove(&(was, partition));
+            }
+            self.models_by_change.insert((changed, partition));
         }
     }
 
@@ -2471,9 +2475,8 @@ impl Writes {
             return None;
         }
         let mut doubt: BTreeSet<i64> = self.open.values().flat_map(|writer| writer.models.iter().copied()).collect();
-        if self.model_high > since {
-            doubt.extend(self.models.iter().filter(|(_, changed)| **changed > since).map(|(partition, _)| *partition));
-        }
+        let past = (std::ops::Bound::Excluded((since, i64::MAX)), std::ops::Bound::Unbounded);
+        doubt.extend(self.models_by_change.range(past).map(|(_, partition)| *partition));
         Some(doubt.into_iter().collect())
     }
 
@@ -3622,7 +3625,7 @@ impl IvfRqCursor {
             Some(writes) => writes,
             None => {
                 let floor = FLOORS.lock().expect("index floors").remove(&key).unwrap_or_else(|| clock.now());
-                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), models: HashMap::new(), model_high: floor, floor }));
+                let writes = std::sync::Arc::new(std::sync::Mutex::new(Writes { key: key.clone(), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), models: HashMap::new(), models_by_change: BTreeSet::new(), floor }));
                 registry.insert(key, std::sync::Arc::downgrade(&writes));
                 writes
             }
@@ -8980,6 +8983,22 @@ mod tests {
             exact.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
             assert_eq!(ids(&conn, &every), exact.iter().map(|(_, id)| *id).collect::<Vec<_>>(), "mvcc={mvcc}");
         }
+    }
+
+    /// A model held under one snapshot doubts, for another, the partitions changed past the earlier
+    /// of the two and no others: one changed at it is not in doubt. A partition changed again stands
+    /// once in the order, at its latest change.
+    #[test]
+    fn a_held_model_doubts_the_partitions_changed_past_its_snapshot_and_no_others() {
+        let mut writes = Writes { key: (u64::MAX, "doubt".into()), open: HashMap::new(), changed: HashMap::new(), jobs_changed: HashMap::new(), models: HashMap::new(), models_by_change: BTreeSet::new(), floor: (0, 0) };
+        let changing = |models: &[i64]| Writer { models: models.iter().copied().collect(), ..Writer::new(std::sync::Weak::new()) };
+        writes.raise(changing(&[1, 2]), (0, 5));
+        writes.raise(changing(&[2, 3]), (0, 9));
+        let unread = || -> Position { unreachable!("no writer is open") };
+        assert_eq!(writes.doubt((0, 5), (0, 7), unread), Some(vec![2, 3]));
+        assert_eq!(writes.doubt((0, 9), (0, 4), unread), Some(vec![1, 2, 3]));
+        assert_eq!(writes.doubt((0, 9), (0, 12), unread), Some(vec![]));
+        assert_eq!(writes.models_by_change.iter().copied().collect::<Vec<_>>(), vec![((0, 5), 1), ((0, 9), 2), ((0, 9), 3)]);
     }
 
     /// The share of live vectors outside their nearest partition the nearest-partition test allows:

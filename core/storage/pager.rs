@@ -3647,23 +3647,34 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        let is_write = wal.holds_write_lock();
-        if is_write {
-            self.clear_savepoints()
-                .expect("clear_savepoints should not fail for attached DB");
-            // Clear dirty pages and page cache before releasing the write lock
-            self.clear_page_cache(true);
-            self.dirty_pages.write().clear();
-            self.reset_internal_states();
-            self.set_schema_cookie(None);
-            wal.rollback(None);
-            wal.end_write_tx();
+        if wal.holds_write_lock() {
+            self.rollback_attached_write();
         } else {
             self.cleanup_read_tx();
         }
         if wal.holds_read_lock() {
             wal.end_read_tx();
         }
+    }
+
+    /// Rolls back an attached database's write transaction and leaves its read transaction,
+    /// for statements still reading it, at the snapshot it began with.
+    pub fn rollback_attached_write(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        if !wal.holds_write_lock() {
+            return;
+        }
+        self.clear_savepoints()
+            .expect("clear_savepoints should not fail for attached DB");
+        // Clear dirty pages and page cache before releasing the write lock
+        self.clear_page_cache(true);
+        self.dirty_pages.write().clear();
+        self.reset_internal_states();
+        self.set_schema_cookie(None);
+        wal.rollback(None);
+        wal.end_write_tx();
     }
 
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache

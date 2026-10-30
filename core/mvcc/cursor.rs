@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, MvccTxnLineage, Row, RowID, RowKey,
+    RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -555,6 +555,12 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     table_id: MVTableId,
     tx_id: u64,
     snapshot: MvccReadSnapshot,
+    /// The lineage of the connection transaction this cursor reads, when a statement began it:
+    /// when that transaction ends beside the cursor's statement, the cursor moves to its
+    /// successor, which has the same view (`MvccTxnLineage`).
+    lineage: Option<Arc<MvccTxnLineage>>,
+    /// The lineage's generation `tx_id` and `snapshot` were taken at.
+    lineage_generation: u64,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
     /// Eq-only table seek copies the occupying payload under the version lock.
@@ -625,6 +631,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         } else {
             db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
         };
+        let lineage = connection.mv_lineage_of(tx_id);
+        let lineage_generation = lineage.as_ref().map_or(0, |lineage| lineage.generation());
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
@@ -633,6 +641,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             connection: Arc::downgrade(connection),
             tx_id,
             snapshot,
+            lineage,
+            lineage_generation,
             table_iterator: None,
             index_iterator: None,
             mv_cursor_type,
@@ -653,6 +663,41 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             index_shadow_scan: IndexShadowScan::default(),
             index_peek_epoch: 0,
         })
+    }
+
+    /// Moves the cursor to the transaction its lineage went on to since its last read, if it did.
+    #[inline(always)]
+    fn follow_lineage(&mut self) {
+        if let Some(lineage) = &self.lineage {
+            let generation = lineage.generation();
+            if generation != self.lineage_generation {
+                self.snapshot = lineage.snapshot();
+                self.tx_id = self.snapshot.tx_id;
+                self.lineage_generation = generation;
+            }
+        }
+    }
+
+    /// A write never finds its transaction gone on: the connection's transaction goes on in a
+    /// successor only at a commit or rollback beside the writer's statement, and while a statement
+    /// writes, another writer of its connection is busy and a COMMIT or ROLLBACK is refused.
+    #[inline(always)]
+    fn assert_lineage_unmoved(&self) {
+        if let Some(lineage) = &self.lineage {
+            turso_assert!(
+                lineage.generation() == self.lineage_generation,
+                "a write found its transaction gone on to a successor",
+                { "tx_id": self.tx_id }
+            );
+        }
+    }
+
+    /// The snapshot the cursor reads at, its lineage's successor's if it went on to one.
+    fn current_snapshot(&self) -> MvccReadSnapshot {
+        match &self.lineage {
+            Some(lineage) if lineage.generation() != self.lineage_generation => lineage.snapshot(),
+            _ => self.snapshot,
+        }
     }
 
     /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
@@ -681,6 +726,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Returns the current row as an immutable record.
     pub fn current_row(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
+        self.follow_lineage();
         if self.db.tx_should_abort(self.tx_id) {
             return Err(LimboError::CommitDependencyAborted.into());
         }
@@ -756,19 +802,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             } if !in_btree => (row_id, versions),
             _ => panic!("invalid position to read current mvcc row"),
         };
+        let snapshot = self.current_snapshot();
         // Scan path: the range iterator already resolved this row's version
         // chain, so read it directly instead of a second skiplist lookup.
         if let Some(versions) = versions {
             return self
                 .db
-                .read_visible_from_versions(self.snapshot, row_id, versions);
+                .read_visible_from_versions(snapshot, row_id, versions);
         }
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
         self.db
-            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
+            .read_from_table_or_index(snapshot.tx_id, row_id, maybe_index_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -1369,6 +1416,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     for MvccLazyCursor<Clock, A>
 {
     fn last(&mut self) -> IOResultOr<()> {
+        self.follow_lineage();
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -1444,6 +1492,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> IOResultOr<()> {
+        self.follow_lineage();
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             if matches!(self.current_pos, CursorPosition::BeforeFirst) {
@@ -1540,6 +1589,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
+        self.follow_lineage();
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             if matches!(self.current_pos, CursorPosition::End) {
@@ -1627,6 +1677,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
+        self.follow_lineage();
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -1672,6 +1723,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        self.follow_lineage();
         // gt -> lower_bound bound excluded, we want first row after row_id
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
@@ -1919,6 +1971,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Insert a row into the table or index.
     /// Sets the cursor to the inserted row.
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
+        self.assert_lineage_unmoved();
         let row_id = match key {
             BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
             BTreeKey::IndexKey(record) => {
@@ -2022,6 +2075,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn delete(&mut self) -> IOResultOr<()> {
+        self.assert_lineage_unmoved();
         let (rowid, in_btree) = match self.get_current_pos() {
             CursorPosition::Loaded {
                 row_id, in_btree, ..
@@ -2074,6 +2128,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
+        self.follow_lineage();
         if self.state.is_none() {
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
@@ -2219,6 +2274,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn count(&mut self) -> IOResultOr<usize> {
+        self.follow_lineage();
         loop {
             let state = self.count_state;
             match state {
@@ -2274,6 +2330,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn rewind(&mut self) -> IOResultOr<()> {
+        self.follow_lineage();
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -2358,6 +2415,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
+        self.follow_lineage();
         if self.is_btree_allocated() {
             // Defer to btree cursor's seek_end implementation
             self.btree_cursor.seek_end()
@@ -2369,6 +2427,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek_to_last(&mut self) -> IOResultOr<()> {
+        self.follow_lineage();
         match self.seek(SeekKey::TableRowId(i64::MAX), SeekOp::LE { eq_only: false })? {
             IOResult::Done(_) => Ok(IOResult::Done(())),
             IOResult::IO(iocompletions) => Ok(IOResult::IO(iocompletions)),

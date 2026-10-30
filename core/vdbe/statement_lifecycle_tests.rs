@@ -1310,9 +1310,12 @@ fn test_suspended_read_does_not_finish_joined_returning_writer() {
     assert_eq!(env.observer_ids(), vec![1, 10]);
 }
 
+/// A writer that finishes beside a reader of the shared MVCC transaction commits at its own halt,
+/// as SQLite's does: another connection sees its row at once, and the reader goes on in the
+/// transaction's successor, which has the same view, to the end of its scan.
 #[test]
-fn test_completed_writer_waits_for_sibling_mvcc_reader_to_commit() {
-    let env = SameConnectionMvcc::new(":memory:completed-writer-waits-for-reader");
+fn test_completed_writer_commits_beside_a_sibling_mvcc_reader() {
+    let env = SameConnectionMvcc::new(":memory:completed-writer-commits-beside-reader");
     env.setup_rows_table();
     env.conn
         .execute("INSERT INTO rows VALUES (10, 'existing')")
@@ -1329,16 +1332,612 @@ fn test_completed_writer_waits_for_sibling_mvcc_reader_to_commit() {
 
     assert_eq!(
         env.observer_ids(),
-        vec![10],
-        "completed writer must not commit while the reader still holds the shared MVCC transaction"
+        vec![1, 10],
+        "the completed writer commits at its own halt"
     );
+    let (successor, mode) = env
+        .conn
+        .get_mv_tx()
+        .expect("the reader goes on in the transaction's successor");
+    assert_eq!(mode, crate::TransactionMode::Read);
 
     finish_without_rows(&mut reader);
     assert_eq!(
-        env.observer_ids(),
-        vec![1, 10],
-        "the last sibling statement should commit the completed writer's changes"
+        env.conn.get_mv_tx(),
+        None,
+        "the reader ends the successor {successor}"
     );
+    assert_eq!(env.observer_ids(), vec![1, 10]);
+}
+
+/// Steps `stmt` past I/O to its next row id, or None at its end.
+fn next_id(stmt: &mut crate::Statement) -> Option<i64> {
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Row => return Some(stmt.row().unwrap().get::<i64>(0).unwrap()),
+            crate::StepResult::Done => return None,
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            other => panic!("expected a row or the end, got {other:?}"),
+        }
+    }
+}
+
+fn rows_10_and_20(path: &str) -> SameConnectionMvcc {
+    let env = SameConnectionMvcc::new(path);
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'ten'), (20, 'twenty')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    env
+}
+
+/// Keys 10, 20 and 30 in a table of their own, and an empty `rows` table.
+fn keys_10_20_30(path: &str) -> SameConnectionMvcc {
+    let env = SameConnectionMvcc::new(path);
+    env.setup_rows_table();
+    env.conn
+        .execute("CREATE TABLE keys(k INTEGER PRIMARY KEY)")
+        .unwrap();
+    env.conn
+        .execute("INSERT INTO keys VALUES (10), (20), (30)")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    env
+}
+
+/// A reader of the keys that looks up, at each key, the row five ids on: a fresh seek at each
+/// key, which reads at the reader's view then.
+fn prepare_reader_looking_ahead(conn: &Arc<Connection>) -> crate::Statement {
+    conn.prepare("SELECT k, (SELECT v FROM rows WHERE id = k + 5) FROM keys ORDER BY k")
+        .unwrap()
+}
+
+/// The reader's next key and the value it found five ids on, or None at its end.
+fn next_ahead(stmt: &mut crate::Statement) -> Option<(i64, Option<String>)> {
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let value = match row.get_value(1) {
+                    Value::Null => None,
+                    value => Some(value.to_string()),
+                };
+                return Some((row.get::<i64>(0).unwrap(), value));
+            }
+            crate::StepResult::Done => return None,
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            other => panic!("expected a row or the end, got {other:?}"),
+        }
+    }
+}
+
+/// A reader of the keys that looks up, at each key, the row five ids on in `table` twice: through
+/// a subquery, which opens its cursor at each key, and through a join, whose cursor stays open from
+/// the reader's start.
+fn prepare_reader_looking_ahead_twice(conn: &Arc<Connection>, table: &str) -> crate::Statement {
+    conn.prepare(format!(
+        "SELECT k, (SELECT v FROM {table} WHERE id = k + 5), r.v FROM keys \
+         LEFT JOIN {table} AS r ON r.id = k + 5 ORDER BY k"
+    ))
+    .unwrap()
+}
+
+/// The reader's next key and the value it found five ids on through each cursor, or None at its
+/// end.
+fn next_ahead_twice(stmt: &mut crate::Statement) -> Option<(i64, Option<String>, Option<String>)> {
+    let text = |value: &Value| match value {
+        Value::Null => None,
+        value => Some(value.to_string()),
+    };
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                return Some((
+                    row.get::<i64>(0).unwrap(),
+                    text(row.get_value(1)),
+                    text(row.get_value(2)),
+                ));
+            }
+            crate::StepResult::Done => return None,
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            other => panic!("expected a row or the end, got {other:?}"),
+        }
+    }
+}
+
+fn twentyfive_twice(k: i64) -> Option<(i64, Option<String>, Option<String>)> {
+    Some((
+        k,
+        Some("twentyfive".to_string()),
+        Some("twentyfive".to_string()),
+    ))
+}
+
+/// The successor of a writer's commit has the view of the reader beside it, through a cursor the
+/// reader opens after the commit and through one it opened before: the reader finds the writer's
+/// row, and does not find a row another connection commits afterwards.
+#[test]
+fn test_reader_keeps_its_view_beside_a_committed_writer() {
+    let env = keys_10_20_30(":memory:reader-keeps-view-beside-committed-writer");
+    let mut reader = prepare_reader_looking_ahead_twice(&env.conn, "rows");
+    assert_eq!(next_ahead_twice(&mut reader), Some((10, None, None)));
+    env.conn
+        .execute("INSERT INTO rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    env.observer
+        .execute("INSERT INTO rows VALUES (35, 'thirtyfive')")
+        .unwrap();
+    assert_eq!(
+        next_ahead_twice(&mut reader),
+        twentyfive_twice(20),
+        "the reader sees its connection's committed row"
+    );
+    assert_eq!(
+        next_ahead_twice(&mut reader),
+        Some((30, None, None)),
+        "and no row another connection committed after it"
+    );
+    assert_eq!(next_ahead_twice(&mut reader), None);
+    assert_eq!(
+        ids_from_query(&env.conn, "SELECT id FROM rows ORDER BY id"),
+        vec![25, 35]
+    );
+}
+
+/// A writer's commit that yields after drawing the successor and giving up the exclusive
+/// transaction runs its last step again on resume. It draws no second successor: the reader reads
+/// on in the one it drew, and once the reader ends no transaction is left holding a checkpoint off.
+#[test]
+fn test_a_resumed_commit_draws_one_successor() {
+    let env = keys_10_20_30(":memory:resumed-commit-draws-one-successor");
+    let mut reader = prepare_reader_looking_ahead(&env.conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    let mut writer = env
+        .conn
+        .prepare("INSERT INTO rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    env.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        crate::mvcc::database::CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    expect_injected_yield(
+        &mut writer,
+        "INSERT's commit, past the exclusive transaction",
+    );
+    env.conn.set_yield_injector(None);
+    finish_without_rows(&mut writer);
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string())))
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    assert_eq!(env.conn.get_mv_tx(), None);
+    env.observer
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+}
+
+/// While a writer's commit is in flight its transaction cannot be read: a reader beside it
+/// yields, and once the commit lands it reads on in the successor.
+#[test]
+fn test_reader_waits_while_a_sibling_commit_is_in_flight() {
+    let env = keys_10_20_30(":memory:reader-waits-for-sibling-commit");
+    let mut reader = prepare_reader_looking_ahead(&env.conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    let mut writer = env
+        .conn
+        .prepare("INSERT INTO rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    env.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    expect_injected_yield(&mut writer, "INSERT's commit");
+    env.conn.set_yield_injector(None);
+    assert!(
+        matches!(reader.step().unwrap(), crate::StepResult::Yield),
+        "the reader waits for the commit of its transaction"
+    );
+    finish_without_rows(&mut writer);
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string())))
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    assert_eq!(env.conn.get_mv_tx(), None);
+}
+
+/// A reader dropped while the writer beside it commits leaves no statement reading the
+/// transaction when the commit lands, so the commit ends it and leaves no successor.
+#[test]
+fn test_reader_dropped_while_a_writer_commits_leaves_no_successor() {
+    let env = rows_10_and_20(":memory:reader-dropped-while-writer-commits");
+    let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(next_id(&mut reader), Some(10));
+    let mut writer = env
+        .conn
+        .prepare("INSERT INTO rows VALUES (15, 'fifteen')")
+        .unwrap();
+    env.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    expect_injected_yield(&mut writer, "INSERT's commit");
+    env.conn.set_yield_injector(None);
+    drop(reader);
+    finish_without_rows(&mut writer);
+    assert_eq!(env.conn.get_mv_tx(), None);
+    assert_eq!(
+        env.conn.get_tx_state(),
+        crate::connection::TransactionState::None
+    );
+    assert_eq!(env.observer_ids(), vec![10, 15, 20]);
+}
+
+/// A writer dropped mid-write beside a reader rolls back its own rows alone: the earlier commit
+/// stands, and the reader reads on with the view it had before the writer wrote.
+#[test]
+fn test_writer_dropped_mid_write_beside_a_reader_rolls_back_only_its_rows() {
+    let env = keys_10_20_30(":memory:writer-dropped-mid-write-beside-reader");
+    let mut reader = prepare_reader_looking_ahead(&env.conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    env.conn
+        .execute("INSERT INTO rows VALUES (25, 'twentyfive'), (26, 'twentysix')")
+        .unwrap();
+    let update = prepare_yielding_update_all_rows(&env.conn, "changed");
+    assert_eq!(
+        scalar_text(&env.conn, "SELECT v FROM rows WHERE id = 25"),
+        "changed",
+        "the writer wrote before it was dropped"
+    );
+    drop(update);
+    assert_eq!(env.observer_value_for_id(25), "twentyfive");
+    assert_eq!(env.observer_value_for_id(26), "twentysix");
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string()))),
+        "the reader reads on with the committed row, not the dropped writer's"
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    assert_eq!(env.conn.get_mv_tx(), None);
+}
+
+/// A writer dropped mid-commit beside a reader rolls its row back, and the reader keeps its read
+/// transaction and reads on in the successor with the view it had.
+#[test]
+fn test_writer_dropped_mid_commit_beside_a_reader_leaves_it_its_transaction() {
+    let env = keys_10_20_30(":memory:writer-dropped-mid-commit-beside-reader");
+    let mut reader = prepare_reader_looking_ahead_twice(&env.conn, "rows");
+    assert_eq!(next_ahead_twice(&mut reader), Some((10, None, None)));
+    let mut writer = env
+        .conn
+        .prepare("INSERT INTO rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    env.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    expect_injected_yield(&mut writer, "INSERT's commit");
+    env.conn.set_yield_injector(None);
+    drop(writer);
+    assert_eq!(
+        env.conn.get_tx_state(),
+        crate::connection::TransactionState::Read,
+        "the reader keeps its transaction"
+    );
+    assert!(env.conn.pager.load().holds_read_lock(), "and its read lock");
+    assert_eq!(env.observer_ids(), Vec::<i64>::new());
+    assert_eq!(next_ahead_twice(&mut reader), Some((20, None, None)));
+    assert_eq!(next_ahead_twice(&mut reader), Some((30, None, None)));
+    assert_eq!(next_ahead_twice(&mut reader), None);
+    assert_eq!(env.conn.get_mv_tx(), None);
+}
+
+/// A writer that wrote nothing beside a reader gives up the exclusive transaction at its halt:
+/// the reader keeps its transaction as it was, and another connection may write at once.
+#[test]
+fn test_writer_writing_nothing_beside_a_reader_gives_up_the_exclusive_transaction() {
+    let env = rows_10_and_20(":memory:writer-writing-nothing-beside-reader");
+    let mut reader = env.conn.prepare("SELECT id FROM rows ORDER BY id").unwrap();
+    assert_eq!(next_id(&mut reader), Some(10));
+    let (tx_id, _) = env.conn.get_mv_tx().unwrap();
+    env.conn
+        .execute("UPDATE rows SET v = 'none' WHERE id = 99")
+        .unwrap();
+    assert_eq!(
+        env.conn.get_mv_tx(),
+        Some((tx_id, crate::TransactionMode::Read)),
+        "the reader keeps the transaction it read"
+    );
+    env.observer
+        .execute("INSERT INTO rows VALUES (30, 'thirty')")
+        .unwrap();
+    assert_eq!(next_id(&mut reader), Some(20));
+    assert_eq!(next_id(&mut reader), None);
+    assert_eq!(env.observer_ids(), vec![10, 20, 30]);
+}
+
+/// The successor takes over the blocking-checkpoint read lock of the transaction it goes on
+/// from, MVCC's stop-the-world gate, which every MVCC transaction holds for its whole life: a
+/// truncate checkpoint waits for the reader beside a committed writer, and runs once the reader
+/// has ended.
+#[test]
+fn test_successor_holds_a_blocking_checkpoint_off_until_its_reader_ends() {
+    let env = keys_10_20_30(":memory:successor-holds-checkpoint-off");
+    let mv_store = env
+        .conn
+        .mv_store_for_db(crate::MAIN_DB_ID)
+        .expect("an MVCC database");
+    let mut reader = prepare_reader_looking_ahead(&env.conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    env.conn
+        .execute("INSERT INTO rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    assert!(
+        matches!(mv_store.try_begin_vacuum_gate(), Err(LimboError::Busy)),
+        "the reader's successor holds the gate"
+    );
+    let blocked = env.observer.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(
+        matches!(blocked, Err(LimboError::Busy)),
+        "the reader's successor holds the checkpoint off, got {blocked:?}"
+    );
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string())))
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    mv_store
+        .try_begin_vacuum_gate()
+        .expect("the reader's end releases the gate");
+    mv_store.release_vacuum_gate();
+    env.observer
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    assert_eq!(
+        ids_from_query(&env.observer, "SELECT id FROM rows"),
+        vec![25]
+    );
+}
+
+/// Under MVCC, keys 10, 20 and 30 in the main database and an empty `rows` table in the
+/// attached database `aux`, with a second connection.
+fn main_keys_and_attached_rows(
+    name: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<Database>,
+    Arc<Connection>,
+    Arc<Connection>,
+) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let main_path = dir.path().join(format!("{name}.db"));
+    let db = open_mvcc_database_with_opts(
+        main_path.to_str().unwrap(),
+        DatabaseOpts::new().with_attach(true),
+    );
+    let aux_path = dir.path().join(format!("{name}-aux.db"));
+    let aux_path = aux_path.to_str().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    drive_attach(&conn, aux_path, "aux");
+    conn.execute("CREATE TABLE keys(k INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO keys VALUES (10), (20), (30)")
+        .unwrap();
+    conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let observer = db.connect(ConnectOpts::new()).unwrap();
+    drive_attach(&observer, aux_path, "aux");
+    (dir, db, conn, observer)
+}
+
+fn prepare_reader_looking_ahead_in_aux(conn: &Arc<Connection>) -> crate::Statement {
+    conn.prepare("SELECT k, (SELECT v FROM aux.rows WHERE id = k + 5) FROM keys ORDER BY k")
+        .unwrap()
+}
+
+/// A writer of the attached database beside a reader of both commits at its own halt, and the
+/// reader goes on in the attached transaction's successor, through a cursor it opens after the
+/// commit and through one it opened before: it finds the writer's row, and not a row another
+/// connection commits afterwards.
+#[test]
+fn test_reader_keeps_its_attached_view_beside_a_committed_writer() {
+    let (_dir, _db, conn, observer) = main_keys_and_attached_rows("attached-reader-keeps-view");
+    let mut reader = prepare_reader_looking_ahead_twice(&conn, "aux.rows");
+    assert_eq!(next_ahead_twice(&mut reader), Some((10, None, None)));
+    conn.execute("INSERT INTO aux.rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    assert_eq!(
+        ids_from_query(&observer, "SELECT id FROM aux.rows"),
+        vec![25],
+        "the writer commits the attached row at its own halt"
+    );
+    observer
+        .execute("INSERT INTO aux.rows VALUES (35, 'thirtyfive')")
+        .unwrap();
+    assert_eq!(next_ahead_twice(&mut reader), twentyfive_twice(20));
+    assert_eq!(next_ahead_twice(&mut reader), Some((30, None, None)));
+    assert_eq!(next_ahead_twice(&mut reader), None);
+    assert_eq!(conn.get_mv_tx(), None);
+    assert_eq!(conn.next_attached_mv_tx(), None);
+}
+
+/// The reader of both databases is dropped while the writer's attached commit waits. The main
+/// transaction, kept for the reader since the writer wrote nothing there, has nobody left to end
+/// it once the commit lands, so the commit ends it.
+#[test]
+fn test_a_transaction_kept_for_a_reader_gone_during_the_commit_ends_with_it() {
+    let (_dir, _db, conn, observer) = main_keys_and_attached_rows("kept-for-reader-gone");
+    let mut reader = prepare_reader_looking_ahead_in_aux(&conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    let mut writer = conn
+        .prepare("INSERT INTO aux.rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    expect_injected_yield(&mut writer, "INSERT's attached commit");
+    conn.set_yield_injector(None);
+    assert!(
+        conn.get_mv_tx().is_some(),
+        "the main transaction is kept for the reader"
+    );
+    drop(reader);
+    finish_without_rows(&mut writer);
+    assert_eq!(conn.get_mv_tx(), None);
+    assert_eq!(conn.next_attached_mv_tx(), None);
+    assert_eq!(
+        conn.get_tx_state(),
+        crate::connection::TransactionState::None
+    );
+    assert_eq!(
+        ids_from_query(&observer, "SELECT id FROM aux.rows"),
+        vec![25]
+    );
+}
+
+/// A COMMIT dropped mid-commit beside a reader from before its BEGIN rolls the transaction's writes
+/// back in both databases, and the reader keeps its transaction in each and reads on with the
+/// views it had.
+#[test]
+fn test_commit_dropped_mid_commit_beside_a_reader_leaves_it_both_views() {
+    let (_dir, _db, conn, observer) = main_keys_and_attached_rows("commit-dropped-beside-reader");
+    let mut reader = prepare_reader_looking_ahead_twice(&conn, "aux.rows");
+    assert_eq!(next_ahead_twice(&mut reader), Some((10, None, None)));
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO keys VALUES (40)").unwrap();
+    conn.execute("INSERT INTO aux.rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        crate::mvcc::database::CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    expect_injected_yield(&mut commit, "COMMIT");
+    conn.set_yield_injector(None);
+    drop(commit);
+    assert!(
+        conn.next_attached_mv_tx().is_some(),
+        "the reader keeps its attached transaction"
+    );
+    assert_eq!(next_ahead_twice(&mut reader), Some((20, None, None)));
+    assert_eq!(next_ahead_twice(&mut reader), Some((30, None, None)));
+    assert_eq!(next_ahead_twice(&mut reader), None);
+    assert_eq!(conn.get_mv_tx(), None);
+    assert_eq!(conn.next_attached_mv_tx(), None);
+    assert_eq!(
+        ids_from_query(&observer, "SELECT k FROM keys ORDER BY k"),
+        vec![10, 20, 30]
+    );
+    assert_eq!(
+        ids_from_query(&observer, "SELECT id FROM aux.rows"),
+        Vec::<i64>::new()
+    );
+}
+
+/// Under MVCC, keys 10, 20 and 30 in the main database, with an in-memory database attached as
+/// `mem`: a WAL database, since an in-memory attachment does not run MVCC.
+fn main_keys_and_memory_attachment(
+    name: &str,
+) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let main_path = dir.path().join(format!("{name}.db"));
+    let db = open_mvcc_database_with_opts(
+        main_path.to_str().unwrap(),
+        DatabaseOpts::new().with_attach(true),
+    );
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    drive_attach(&conn, ":memory:", "mem");
+    conn.execute("CREATE TABLE keys(k INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO keys VALUES (10), (20), (30)")
+        .unwrap();
+    conn.execute("CREATE TABLE mem.rows(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    (dir, db, conn)
+}
+
+fn prepare_reader_looking_ahead_in_mem(conn: &Arc<Connection>) -> crate::Statement {
+    conn.prepare("SELECT k, (SELECT v FROM mem.rows WHERE id = k + 5) FROM keys ORDER BY k")
+        .unwrap()
+}
+
+/// A writer of an attached WAL database beside a reader of it commits at its own halt, and leaves
+/// the read transaction to the reader, which reads on and finds the writer's row.
+#[test]
+fn test_reader_reads_on_in_an_attached_wal_database_beside_a_committed_writer() {
+    let (_dir, _db, conn) = main_keys_and_memory_attachment("memory-attachment-reader-reads-on");
+    let mut reader = prepare_reader_looking_ahead_in_mem(&conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    conn.execute("INSERT INTO mem.rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string())))
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    assert_eq!(conn.get_mv_tx(), None);
+    assert_eq!(ids_from_query(&conn, "SELECT id FROM mem.rows"), vec![25]);
+}
+
+/// A writer of an attached WAL database that fails beside a reader of it rolls back its own write
+/// alone: the reader keeps its read transaction and reads on.
+#[test]
+fn test_reader_reads_on_in_an_attached_wal_database_beside_a_failed_writer() {
+    let (_dir, _db, conn) = main_keys_and_memory_attachment("memory-attachment-failed-writer");
+    conn.execute("INSERT INTO mem.rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    conn.execute("CREATE TABLE mem.src(id INTEGER, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO mem.src VALUES (26, 'twentysix'), (25, 'duplicate')")
+        .unwrap();
+    let mut reader = prepare_reader_looking_ahead_in_mem(&conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    let err = conn
+        .execute("INSERT INTO mem.rows SELECT id, v FROM mem.src")
+        .expect_err("the insert meets the duplicate id 25");
+    assert!(
+        matches!(err, LimboError::Constraint(_)),
+        "expected duplicate-key constraint error, got {err:?}"
+    );
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string())))
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    assert_eq!(
+        ids_from_query(&conn, "SELECT id FROM mem.rows"),
+        vec![25],
+        "the failed writer's row 26 rolled back"
+    );
+}
+
+/// COMMIT of a transaction begun under a read still running commits at once, and the read goes
+/// on in the successor with the transaction's view.
+#[test]
+fn test_reader_from_before_begin_reads_on_after_commit() {
+    let env = keys_10_20_30(":memory:reader-from-before-begin-reads-on");
+    let mut reader = prepare_reader_looking_ahead(&env.conn);
+    assert_eq!(next_ahead(&mut reader), Some((10, None)));
+    env.conn.execute("BEGIN").unwrap();
+    env.conn
+        .execute("INSERT INTO rows VALUES (25, 'twentyfive')")
+        .unwrap();
+    env.conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        ids_from_query(&env.observer, "SELECT id FROM rows"),
+        vec![25]
+    );
+    assert_eq!(
+        next_ahead(&mut reader),
+        Some((20, Some("twentyfive".to_string())))
+    );
+    assert_eq!(next_ahead(&mut reader), Some((30, None)));
+    assert_eq!(next_ahead(&mut reader), None);
+    assert_eq!(env.conn.get_mv_tx(), None);
 }
 
 #[test]
@@ -1491,11 +2090,11 @@ fn test_read_of_a_pragma_function_ends_the_transaction_it_began() {
     assert_eq!(ids_from_query(&env.conn, "SELECT id FROM rows"), vec![1]);
 }
 
-/// A writer beside a reader defers its commit to the reader, and the reader commits it at its own
-/// halt though a statement reading no table still runs.
+/// A writer beside a reader commits at its own halt, and the reader, the last statement taking
+/// part in the transaction, ends it though a statement reading no table still runs.
 #[test]
-fn test_reader_commits_a_deferred_writer_beside_a_statement_reading_no_table() {
-    let env = SameConnectionMvcc::new(":memory:reader-commits-beside-statement-reading-no-table");
+fn test_reader_ends_the_transaction_beside_a_statement_reading_no_table() {
+    let env = SameConnectionMvcc::new(":memory:reader-ends-beside-statement-reading-no-table");
     env.setup_rows_table();
     env.conn
         .execute("INSERT INTO rows VALUES (10, 'existing')")
@@ -1510,16 +2109,19 @@ fn test_reader_commits_a_deferred_writer_beside_a_statement_reading_no_table() {
         .unwrap();
     assert_eq!(
         env.observer_ids(),
-        vec![10],
-        "the writer defers its commit to the reader"
+        vec![1, 10],
+        "the writer commits at its own halt"
+    );
+    assert!(
+        env.conn.get_mv_tx().is_some(),
+        "the reader goes on in the transaction's successor"
     );
     finish_without_rows(&mut reader);
     assert_eq!(
-        env.observer_ids(),
-        vec![1, 10],
-        "the reader commits the writer's row"
+        env.conn.get_mv_tx(),
+        None,
+        "the reader, the last statement taking part, ends the transaction"
     );
-    assert_eq!(env.conn.get_mv_tx(), None);
     finish_rows(&mut idle);
     assert_eq!(env.observer_ids(), vec![1, 10]);
 }
@@ -2303,17 +2905,14 @@ fn test_second_writer_busy_does_not_invoke_busy_handler() {
     assert_eq!(env.observer_ids(), vec![1]);
 }
 
-// The two tests below pin known data-loss gaps in the MVCC deferred-commit
-// model; they document current behavior, not desired behavior. A writer that
-// finishes while a sibling statement holds the shared implicit MVCC
-// transaction open defers its commit to the last sibling, so any path that
-// ends that transaction in a rollback silently discards changes whose caller
-// already observed success. The durable fix is committing at the writer's own
-// halt; see the FIXME in `halt` (core/vdbe/execute.rs).
+// A writer that finishes while another statement reads the shared implicit MVCC transaction
+// commits at its own halt, so no later end of that transaction takes its rows back.
 
+/// The reader, abandoned mid-scan, ends only the successor of the writer's commit: the writer's
+/// row stays committed.
 #[test]
-fn test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned() {
-    let env = SameConnectionMvcc::new(":memory:completed-writer-lost-reader-abandoned");
+fn test_mvcc_completed_writer_changes_survive_an_abandoned_reader() {
+    let env = SameConnectionMvcc::new(":memory:completed-writer-survives-abandoned-reader");
     env.setup_rows_table();
     env.conn
         .execute("INSERT INTO rows VALUES (10, 'existing')")
@@ -2328,22 +2927,21 @@ fn test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned() {
     finish_without_rows(&mut returning);
     drop(returning);
 
-    // The reader is abandoned mid-scan instead of finishing, so the shared
-    // transaction ends through the rollback path and the completed writer's
-    // row is lost. Compare test_completed_writer_waits_for_sibling_mvcc_reader_to_commit,
-    // where the reader finishes normally and the writer's row commits.
     drop(reader);
-
     assert_eq!(
         env.observer_ids(),
-        vec![10],
-        "pins the deferred-commit gap: an abandoned last reader discards the completed writer's row"
+        vec![1, 10],
+        "an abandoned reader takes back no committed row"
     );
+    assert_eq!(env.conn.get_mv_tx(), None);
 }
 
+/// A writer joining the transaction beside a reader writes a row and then fails without a
+/// statement savepoint: its own row rolls back, the earlier writer's committed row stays, and the
+/// reader reads on.
 #[test]
-fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
-    let env = SameConnectionMvcc::new(":memory:completed-writer-lost-joining-writer-error");
+fn test_mvcc_completed_writer_changes_survive_a_failing_joined_writer() {
+    let env = SameConnectionMvcc::new(":memory:completed-writer-survives-failing-joined-writer");
     env.setup_rows_table();
     env.conn
         .execute("CREATE TABLE src(id INTEGER, v TEXT)")
@@ -2359,10 +2957,9 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
     env.conn
         .execute("INSERT INTO rows VALUES (1, 'one')")
         .unwrap();
+    assert_eq!(env.observer_ids(), vec![1]);
 
-    // The joining writer changes a row (id 2) before hitting the duplicate,
-    // and has no local rollback boundary, so the whole shared transaction is
-    // rolled back — including the earlier INSERT that already reported success.
+    // The joining writer inserts id 2 before it meets the duplicate id 1.
     let err = env
         .conn
         .execute("INSERT INTO rows SELECT id, v FROM src")
@@ -2371,13 +2968,21 @@ fn test_mvcc_completed_writer_changes_lost_when_joining_writer_errors() {
         matches!(err, LimboError::Constraint(_)),
         "expected duplicate-key constraint error, got {err:?}"
     );
-
-    drop(reader);
     assert_eq!(
         env.observer_ids(),
-        Vec::<i64>::new(),
-        "pins the deferred-commit gap: a failing joined writer discards the completed writer's row"
+        vec![1],
+        "the failed writer's row rolled back, the committed one stayed"
     );
+
+    assert_eq!(
+        step_returning_id(&mut reader),
+        2,
+        "the reader reads on in the transaction's successor"
+    );
+    finish_without_rows(&mut reader);
+    assert_eq!(env.conn.get_mv_tx(), None);
+    assert_eq!(env.observer_ids(), vec![1]);
+    assert_eq!(ids_from_query(&env.conn, "SELECT id FROM rows"), vec![1]);
 }
 
 #[cfg(feature = "fts")]
@@ -2398,18 +3003,15 @@ fn open_fts_mvcc_db(path: &str) -> (Arc<Database>, Arc<Connection>, Arc<Connecti
     (db, conn, observer)
 }
 
-/// A writer that finishes while a sibling statement holds the shared implicit
-/// MVCC transaction open defers its commit to the last sibling (see
-/// test_completed_writer_waits_for_sibling_mvcc_reader_to_commit). Its FTS
-/// writes must be deferred with it: once the base row commits, the document
-/// must be searchable. The deferred halt path must stage the writer's
-/// index-method work or hand its cursor to the connection — otherwise the
-/// pending documents die with the statement and the base row commits without
-/// its index entries.
+/// A writer that finishes while a sibling statement reads the shared implicit
+/// MVCC transaction commits at its own halt (see
+/// test_completed_writer_commits_beside_a_sibling_mvcc_reader), and its FTS
+/// writes commit with it: the document is searchable from another connection
+/// while the reader still reads.
 #[cfg(feature = "fts")]
 #[test]
-fn fts_writes_survive_deferred_shared_autocommit() {
-    let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-deferred-shared-autocommit");
+fn fts_writes_commit_with_a_writer_beside_a_reader() {
+    let (_db, conn, observer) = open_fts_mvcc_db(":memory:fts-writer-beside-reader");
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
     conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
@@ -2422,19 +3024,16 @@ fn fts_writes_survive_deferred_shared_autocommit() {
     assert_eq!(step_returning_id(&mut reader), 10);
 
     let mut writer = conn
-        .prepare("INSERT INTO docs VALUES (1, 'deferred needle') RETURNING id")
+        .prepare("INSERT INTO docs VALUES (1, 'committed needle') RETURNING id")
         .unwrap();
     assert_eq!(step_returning_id(&mut writer), 1);
     finish_without_rows(&mut writer);
     drop(writer);
 
-    finish_without_rows(&mut reader);
-    drop(reader);
-
     assert_eq!(
         ids_from_query(&observer, "SELECT id FROM docs ORDER BY id"),
         vec![1, 10],
-        "the last sibling statement commits the completed writer's base row"
+        "the writer commits its base row at its own halt"
     );
     assert_eq!(
         ids_from_query(
@@ -2442,7 +3041,17 @@ fn fts_writes_survive_deferred_shared_autocommit() {
             "SELECT id FROM docs WHERE fts_match(body, 'needle')"
         ),
         vec![1],
-        "the FTS document must commit together with its base row"
+        "the FTS document commits together with its base row"
+    );
+
+    finish_without_rows(&mut reader);
+    drop(reader);
+    assert_eq!(
+        ids_from_query(
+            &observer,
+            "SELECT id FROM docs WHERE fts_match(body, 'needle')"
+        ),
+        vec![1]
     );
 }
 

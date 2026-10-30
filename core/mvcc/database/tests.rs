@@ -21475,6 +21475,79 @@ fn dropped_exclusive_commit_releases_locks() {
     assert_eq!(rows[0][0].as_int().unwrap(), 2);
 }
 
+/// A writer's transaction, on a connection where one other statement takes part beside the
+/// writer's, ready for `commit_tx_continued`.
+fn continued_commit_beside_another_statement(
+    db: &MvccTestDb,
+) -> (crate::connection::TxnPart, crate::connection::TxnPart, TxID) {
+    let own = db.conn.take_txn_part();
+    let other = db.conn.take_txn_part();
+    let tx_id = db
+        .mvcc_store
+        .begin_exclusive_tx(db.conn.pager.load().clone(), None, &db.conn, None)
+        .unwrap();
+    db.conn.set_mv_tx(Some((tx_id, TransactionMode::Write)));
+    db.mvcc_store
+        .insert(tx_id, generate_simple_string_row((-2).into(), 1, "a"))
+        .unwrap();
+    (own, other, tx_id)
+}
+
+/// What this test checks: a commit for a statement that took part beside another
+/// (`commit_tx_continued`) lands after the other has left, and leaves no successor: the
+/// transaction ends with the commit.
+/// Why this matters: a successor nobody reads would hold the connection's transaction open, and
+/// the connection's next statement would read under its snapshot.
+#[test]
+fn test_continued_commit_landing_after_the_other_left_leaves_no_successor() {
+    let db = MvccTestDb::new();
+    let (own, other, tx_id) = continued_commit_beside_another_statement(&db);
+    let mut sm = db
+        .mvcc_store
+        .commit_tx_continued(tx_id, &db.conn, crate::MAIN_DB_ID, 1)
+        .unwrap();
+    drop(other);
+    while let IOResult::IO(io) = sm.step(&db.mvcc_store).unwrap() {
+        io.wait(db.conn.db.io.as_ref()).unwrap();
+    }
+    assert_eq!(db.conn.get_mv_tx(), None);
+    assert!(db.mvcc_store.txs.is_empty(), "no successor was drawn");
+    drop(own);
+}
+
+/// What this test checks: the same commit, dropped mid-way after the other statement has left,
+/// rolls the transaction back and leaves no successor.
+/// Why this matters: a statement whose commit fails busy keeps the transaction state its dropped
+/// commit left, so a successor here would hold the connection's transaction open.
+#[test]
+fn test_continued_commit_dropped_after_the_other_left_leaves_no_successor() {
+    let db = MvccTestDb::new();
+    let (own, other, tx_id) = continued_commit_beside_another_statement(&db);
+    db.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    let mut sm = db
+        .mvcc_store
+        .commit_tx_continued(tx_id, &db.conn, crate::MAIN_DB_ID, 1)
+        .unwrap();
+    loop {
+        match sm.step(&db.mvcc_store).unwrap() {
+            IOResult::IO(io) if io.is_explicit_yield() => break,
+            IOResult::IO(io) => io.wait(db.conn.db.io.as_ref()).unwrap(),
+            IOResult::Done(()) => panic!("the commit landed before its injected yield"),
+        }
+    }
+    db.conn.set_yield_injector(None);
+    drop(other);
+    drop(sm);
+    assert_eq!(db.conn.get_mv_tx(), None);
+    assert!(
+        db.mvcc_store.txs.is_empty(),
+        "the transaction is rolled back and no successor was drawn"
+    );
+    drop(own);
+}
+
 /// Regression for abandoned COMMIT cleanup with attached MVCC databases.
 /// Dropping the COMMIT while the main-db CommitStateMachine is paused must
 /// also roll back attached MVCC txs opened by the same SQL transaction.

@@ -9,7 +9,8 @@ use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
 use crate::sync::{
     atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
+        Ordering,
     },
     Arc, Mutex, RwLock,
 };
@@ -496,6 +497,10 @@ pub struct Connection {
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
+    /// Per database, the lineage the cursors of the connection's MVCC transaction read through
+    /// (`crate::mvcc::database::MvccTxnLineage`), replaced each time a statement begins the
+    /// transaction afresh.
+    pub(crate) mv_lineages: RwLock<HashMap<usize, Arc<crate::mvcc::database::MvccTxnLineage>>>,
     #[cfg(any(test, injected_yields))]
     pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
     #[cfg(any(test, injected_yields))]
@@ -565,6 +570,11 @@ pub struct Connection {
     /// `Connection::take_txn_part`). They share it, and in autocommit mode the last of them to
     /// finish ends it; a statement that reads no database neither holds it open nor ends it.
     pub(crate) n_active_txn_statements: Arc<AtomicI32>,
+    /// MVCC commits of this connection's transactions in flight, each from its commit state
+    /// machine's start until the transaction has ended or gone on in a successor, or the machine
+    /// is dropped. While one is, that transaction cannot be read, and the connection's other root
+    /// statements wait (`Statement::wait_for_sibling_commit`).
+    pub(crate) mv_commits_in_flight: AtomicUsize,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -4725,6 +4735,113 @@ impl Connection {
         }
     }
 
+    /// Starts the lineage the cursors of transaction `snapshot.tx_id` on database `db` read
+    /// through. Called when a statement begins the connection's transaction afresh.
+    pub(crate) fn start_mv_lineage(
+        &self,
+        db: usize,
+        snapshot: crate::mvcc::database::MvccReadSnapshot,
+    ) {
+        self.mv_lineages.write().insert(
+            db,
+            Arc::new(crate::mvcc::database::MvccTxnLineage::new(snapshot)),
+        );
+    }
+
+    /// The lineage the cursors of transaction `tx_id` read through, if a statement of this
+    /// connection began it.
+    pub(crate) fn mv_lineage_of(
+        &self,
+        tx_id: crate::mvcc::database::TxID,
+    ) -> Option<Arc<crate::mvcc::database::MvccTxnLineage>> {
+        self.mv_lineages
+            .read()
+            .values()
+            .find(|lineage| lineage.tx_id() == tx_id)
+            .cloned()
+    }
+
+    /// Hands database `db`'s MVCC transaction, which committed or rolled back while other
+    /// statements still read it, on to its successor (`MvStore::begin_successor_tx`): a read
+    /// transaction until one of those statements writes, which the cursors reading through the
+    /// transaction's lineage move to before their next read.
+    pub(crate) fn continue_mv_tx_for_db(
+        &self,
+        db: usize,
+        successor: crate::mvcc::database::MvccReadSnapshot,
+    ) {
+        self.set_mv_tx_for_db(db, Some((successor.tx_id, TransactionMode::Read)));
+        if db == crate::MAIN_DB_ID {
+            self.set_tx_state(TransactionState::Read);
+        }
+        let mut lineages = self.mv_lineages.write();
+        match lineages.get(&db) {
+            Some(lineage) => lineage.advance(successor),
+            None => {
+                lineages.insert(
+                    db,
+                    Arc::new(crate::mvcc::database::MvccTxnLineage::new(successor)),
+                );
+            }
+        }
+    }
+
+    /// Rolls back the writes of the connection's transaction for its writer, while other
+    /// statements still read the transaction. On each MVCC database they go on in a successor
+    /// that sees what the transaction saw before the writer wrote
+    /// (`MvStore::rollback_tx_continued`), or in the transaction as it is where the writer wrote
+    /// nothing there. An attached WAL database's write transaction is rolled back and its read
+    /// transaction left to them.
+    pub(crate) fn rollback_writes_continued(&self) {
+        let mut txs: SmallVec<[(usize, u64); 4]> = SmallVec::new();
+        if let Some(tx_id) = self.get_mv_tx_id() {
+            txs.push((crate::MAIN_DB_ID, tx_id));
+        }
+        txs.extend(
+            self.attached_mv_txs
+                .read()
+                .iter()
+                .map(|(&db_id, &(tx_id, _))| (db_id, tx_id)),
+        );
+        for (db_id, tx_id) in txs {
+            let Some(mv_store) = self.mv_store_for_db(db_id) else {
+                continue;
+            };
+            if mv_store.tx_has_writes(tx_id) {
+                mv_store.rollback_tx_continued(tx_id, self, db_id);
+            } else {
+                mv_store.release_exclusive_hold(tx_id);
+                self.keep_mv_tx_for_readers(db_id);
+            }
+        }
+        self.with_all_attached_pagers_with_index(|pagers| {
+            let mut rolled_back_any = false;
+            for (db_id, attached_pager) in pagers {
+                if self.mv_store_for_db(*db_id).is_none() && attached_pager.holds_write_lock() {
+                    self.database_schemas().write().remove(db_id);
+                    attached_pager.rollback_attached_write();
+                    rolled_back_any = true;
+                }
+            }
+            if rolled_back_any {
+                self.bump_prepare_context_generation();
+            }
+        });
+        // The writer's view changes die with its writes.
+        self.transaction_changes.clear();
+    }
+
+    /// Keeps database `db`'s MVCC transaction, which wrote nothing, as a read transaction for the
+    /// statements still reading it (`MvStore::release_exclusive_hold`).
+    pub(crate) fn keep_mv_tx_for_readers(&self, db: usize) {
+        if let Some((tx_id, _)) = self.get_mv_tx_for_db(db) {
+            self.set_mv_tx_for_db(db, Some((tx_id, TransactionMode::Read)));
+        }
+        if db == crate::MAIN_DB_ID {
+            self.set_tx_state(TransactionState::Read);
+        }
+    }
+
     /// Rollback MVCC transactions on all attached databases and clear the
     /// attached transaction list.  When `clear_schemas` is true the
     /// connection-local schema cache for each attached DB is also removed so
@@ -5035,6 +5152,19 @@ impl Connection {
         for (&db_id, &(tx_id, _)) in txs.iter() {
             f(db_id, tx_id);
         }
+    }
+
+    /// The attached MVCC transaction of the smallest database index past `after`.
+    pub(crate) fn next_attached_mv_tx_after(
+        &self,
+        after: Option<usize>,
+    ) -> Option<(usize, u64, TransactionMode)> {
+        self.attached_mv_txs
+            .read()
+            .iter()
+            .filter(|(&db_id, _)| after.is_none_or(|after| db_id > after))
+            .min_by_key(|(&db_id, _)| db_id)
+            .map(|(&db_id, &(tx_id, mode))| (db_id, tx_id, mode))
     }
 
     /// Get the next attached MVCC transaction.

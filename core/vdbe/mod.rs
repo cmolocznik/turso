@@ -457,11 +457,23 @@ impl CommitState {
         // (Hekaton §2.7 speculative read) deadlocks in WaitForDependencies.
         // The locks/exclusive slot the SM acquired are released by the same
         // cleanup path on drop.
+        let committing = connection.get_mv_tx_id_for_db(db_id);
         *self = CommitState::Ready;
-        connection.end_abandoned_mvcc_commit(db_id);
-
-        connection.rollback_attached_mvcc_txs(true);
-        connection.rollback_attached_wal_txns();
+        // A commit dropped beside statements still reading its transaction hands it on to them in
+        // a successor (`MvStore::cleanup_dropped_commit`): they keep their read transactions, and
+        // only the abandoned writer's other writes are undone. Otherwise the drop ended it.
+        let successor = connection.get_mv_tx_id_for_db(db_id);
+        turso_assert!(
+            successor.is_none() || successor != committing,
+            "a dropped commit left its transaction {committing:?} on the connection"
+        );
+        if successor.is_some() {
+            connection.rollback_writes_continued();
+        } else {
+            connection.end_abandoned_mvcc_commit(db_id);
+            connection.rollback_attached_mvcc_txs(true);
+            connection.rollback_attached_wal_txns();
+        }
         connection.rollback_temp_schema();
         connection.index_methods_on_transaction_rolled_back();
     }
@@ -1182,6 +1194,10 @@ pub struct ProgramState {
     /// instruction (or its COMMIT or ROLLBACK) until it finishes. A statement that restarts, to
     /// reprepare or after a busy wait, keeps it.
     pub(crate) txn_part: Option<crate::connection::TxnPart>,
+    /// Set when this statement's commit left its transaction to go on for statements still
+    /// reading it (`ProgramState::txn_continues`): the statement's writes are committed though
+    /// the connection still holds a transaction.
+    pub(crate) txn_continued: bool,
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
@@ -1334,6 +1350,7 @@ impl ProgramState {
             sleep_for: None,
             auto_txn_cleanup: TxnCleanup::None,
             txn_part: None,
+            txn_continued: false,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             fk_immediate_violation: None,
@@ -1503,6 +1520,7 @@ impl ProgramState {
         self.lock_wait_over = false;
         self.sleep_for = None;
         self.auto_txn_cleanup = TxnCleanup::None;
+        self.txn_continued = false;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         self.fk_immediate_violation = None;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
@@ -1585,13 +1603,19 @@ impl ProgramState {
         if self.mv_store(connection).is_some() {
             // MVCC keeps one tx id on the connection, shared by the
             // statements that take part in it (`Connection::take_txn_part`).
-            // A writer waits for the readers among them, and a reader waits
-            // for readers and writers. A statement that reads no database
-            // takes no part: nobody waits for it, and it ends nothing.
+            // A writer ends it at its own halt, as SQLite's writer commits at
+            // its own: the others go on in a successor with the same view
+            // (`ProgramState::txn_continues`). A reader ends it as the last
+            // statement taking part, with no writer active. A statement that
+            // reads no database takes no part: nobody waits for it, and it
+            // ends nothing.
+            if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
+                return true;
+            }
             return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && connection.n_active_txn_statements.load(Ordering::SeqCst)
                     == i32::from(self.txn_part.is_some())
-                && (self.is_active_write || active_writers == 0);
+                && active_writers == 0;
         }
         if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
             // Pager/WAL writers can finish while sibling readers remain
@@ -1628,6 +1652,20 @@ impl ProgramState {
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
             || (connection.get_auto_commit() && attached_txn_open())
+    }
+
+    /// Whether this statement's commit is under way: a commit state machine it started, its own
+    /// or a sequence's autonomous inner transaction's, has not landed yet.
+    pub(crate) fn is_committing(&self) -> bool {
+        !matches!(self.commit_state, CommitState::Ready) || self.sequence_inner_commit.is_some()
+    }
+
+    /// Whether other statements take part in the connection's MVCC transaction beside this one,
+    /// so that when this statement commits or rolls the transaction back they go on in a
+    /// successor with the same view (`MvStore::begin_successor_tx`).
+    pub(crate) fn txn_continues(&self, connection: &Connection) -> bool {
+        connection.n_active_txn_statements.load(Ordering::SeqCst)
+            > i32::from(self.txn_part.is_some())
     }
 
     /// The MvStore this statement runs against: the same answer as
@@ -3140,8 +3178,11 @@ impl Program {
                 self.connection
                     .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
             }
+            // A commit whose transaction goes on for statements still reading
+            // (`ProgramState::txn_continued`) has finished this statement's part of it.
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
-                && self.connection.get_tx_state() == TransactionState::None;
+                && (self.connection.get_tx_state() == TransactionState::None
+                    || program_state.txn_continued);
             if transaction_finished {
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
@@ -3189,7 +3230,7 @@ impl Program {
             self.step_end_write_txn(&pager, &connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
-            match self.end_attached_write_txns(&connection, rollback)? {
+            match self.end_attached_write_txns(&connection, rollback, false)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
                     if pager.holds_read_lock() {
@@ -3211,7 +3252,7 @@ impl Program {
                     // independently of the main connection's transaction state.
                     // (e.g., UPDATE aux0.t SET ... only needs Read on main DB
                     // but holds a write lock on the attached pager.)
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    match self.end_attached_write_txns(&connection, rollback, false)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
@@ -3224,7 +3265,7 @@ impl Program {
                 }
                 TransactionState::None | TransactionState::Pending { .. } => {
                     connection.set_tx_state(TransactionState::None);
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    match self.end_attached_write_txns(&connection, rollback, false)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
@@ -3267,12 +3308,29 @@ impl Program {
         if !auto_commit {
             return Ok(IOResult::Done(()));
         }
+        // The parts this statement holds in the transaction: a statement still reading beside it
+        // is a part beyond these (`ProgramState::txn_continues`).
+        let own_parts = i32::from(program_state.txn_part.is_some());
 
         // Phase 1: Commit main DB MVCC transaction
         if matches!(program_state.commit_state, CommitState::Ready) {
+            program_state.txn_continued = false;
             if let Some(tx_id) = conn.get_mv_tx_id() {
-                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
-                program_state.commit_state = CommitState::CommittingMvcc { state_machine };
+                let continues = program_state.txn_continues(&conn);
+                if continues && !mv_store.tx_has_writes(tx_id) {
+                    // Nothing to commit: the transaction goes on as it is for the statements
+                    // still reading it.
+                    mv_store.release_exclusive_hold(tx_id);
+                    conn.keep_mv_tx_for_readers(crate::MAIN_DB_ID);
+                    program_state.txn_continued = true;
+                } else {
+                    let state_machine = if continues && mv_store.is_exclusive_tx(&tx_id) {
+                        mv_store.commit_tx_continued(tx_id, &conn, crate::MAIN_DB_ID, own_parts)?
+                    } else {
+                        mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?
+                    };
+                    program_state.commit_state = CommitState::CommittingMvcc { state_machine };
+                }
             } else {
                 conn.set_tx_state(TransactionState::None);
             }
@@ -3289,7 +3347,12 @@ impl Program {
             match self.step_end_mvcc_txn(state_machine, mv_store)? {
                 IOResult::Done(_) => {
                     assert!(state_machine.is_finalized());
-                    conn.end_committed_main_mvcc_tx(&pager);
+                    if conn.get_mv_tx().is_some() {
+                        // A successor took over for the statements still reading.
+                        program_state.txn_continued = true;
+                    } else {
+                        conn.end_committed_main_mvcc_tx(&pager);
+                    }
                     program_state.commit_state = CommitState::Ready;
                     // Fall through to attached phase
                 }
@@ -3297,7 +3360,9 @@ impl Program {
             }
         }
 
-        // Phase 2: Commit MVCC transactions on attached databases
+        // Phase 2: Commit MVCC transactions on attached databases, in database order: a
+        // transaction that goes on for statements still reading stays in its slot.
+        let mut committed_through = None;
         // Resume an in-progress attached MVCC commit
         if matches!(
             program_state.commit_state,
@@ -3316,12 +3381,9 @@ impl Program {
             };
             match step_result {
                 IOResult::Done(_) => {
-                    let attached_pager = conn
-                        .get_pager_from_database_index(&db_id)
-                        .expect("attached MVCC transaction should always have a pager");
-                    conn.publish_database_schema(db_id);
-                    conn.set_mv_tx_for_db(db_id, None);
-                    attached_pager.end_read_tx();
+                    program_state.commit_state = CommitState::Ready;
+                    self.end_committed_attached_mvcc_tx(program_state, db_id);
+                    committed_through = Some(db_id);
                     // Fall through to look for more
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -3329,15 +3391,25 @@ impl Program {
         }
 
         // Start/continue committing remaining attached MVCC transactions
-        loop {
-            let Some((db_id, tx_id, _mode)) = conn.next_attached_mv_tx() else {
-                break;
-            };
+        while let Some((db_id, tx_id, _mode)) = conn.next_attached_mv_tx_after(committed_through) {
+            committed_through = Some(db_id);
             let Some(attached_mv_store) = conn.mv_store_for_db(db_id) else {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
-            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
+            let continues = program_state.txn_continues(&conn);
+            if continues && !attached_mv_store.tx_has_writes(tx_id) {
+                attached_mv_store.release_exclusive_hold(tx_id);
+                conn.keep_mv_tx_for_readers(db_id);
+                program_state.txn_continued = true;
+                continue;
+            }
+            let state_machine = if continues && attached_mv_store.is_exclusive_tx(&tx_id) {
+                attached_mv_store.commit_tx_continued(tx_id, &conn, db_id, own_parts)
+            } else {
+                attached_mv_store.commit_tx(tx_id, &conn, db_id)
+            };
+            let mut state_machine = match state_machine {
                 Ok(sm) => sm,
                 Err(e) => {
                     tracing::error!(
@@ -3353,12 +3425,7 @@ impl Program {
             };
             match state_machine.step(&attached_mv_store)? {
                 IOResult::Done(_) => {
-                    let attached_pager = conn
-                        .get_pager_from_database_index(&db_id)
-                        .expect("attached MVCC transaction should always have a pager");
-                    conn.publish_database_schema(db_id);
-                    conn.set_mv_tx_for_db(db_id, None);
-                    attached_pager.end_read_tx();
+                    self.end_committed_attached_mvcc_tx(program_state, db_id);
                     continue;
                 }
                 IOResult::IO(io) => {
@@ -3375,29 +3442,70 @@ impl Program {
         // Phase 3: Commit WAL transactions on attached databases that don't use MVCC.
         // When the main DB uses MVCC, we route through commit_txn_mvcc, but attached
         // DBs may use WAL mode and need their dirty pages committed via the WAL path.
+        let keep_read = program_state.txn_continues(&conn);
         if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached WAL pager commit.
-            match self.end_attached_write_txns(&conn, rollback)? {
+            match self.end_attached_write_txns(&conn, rollback, keep_read)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
-                    self.end_attached_read_txns(&conn);
+                    self.end_attached_txns_after_mvcc_commit(program_state, &pager);
                     return Ok(IOResult::Done(()));
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
 
-        match self.end_attached_write_txns(&conn, rollback)? {
+        match self.end_attached_write_txns(&conn, rollback, keep_read)? {
             IOResult::Done(_) => {}
             IOResult::IO(io) => {
                 program_state.commit_state = CommitState::CommittingAttached;
                 return Ok(IOResult::IO(io));
             }
         }
-        self.end_attached_read_txns(&conn);
+        self.end_attached_txns_after_mvcc_commit(program_state, &pager);
 
         program_state.commit_state = CommitState::Ready;
         Ok(IOResult::Done(()))
+    }
+
+    /// After an attached database's MVCC commit: publish its schema, and release its read
+    /// transaction unless a successor took over for the statements still reading.
+    fn end_committed_attached_mvcc_tx(&self, program_state: &mut ProgramState, db_id: usize) {
+        let attached_pager = self
+            .connection
+            .get_pager_from_database_index(&db_id)
+            .expect("attached MVCC transaction should always have a pager");
+        self.connection.publish_database_schema(db_id);
+        if self.connection.get_mv_tx_for_db(db_id).is_some() {
+            program_state.txn_continued = true;
+        } else {
+            attached_pager.end_read_tx();
+        }
+    }
+
+    /// The end of an MVCC commit: the attached read transactions end with it, unless the
+    /// transaction goes on for statements still reading. A transaction left to go on is ended
+    /// here after all if those statements finished while the commit waited: it wrote nothing,
+    /// and no statement is left to end it.
+    fn end_attached_txns_after_mvcc_commit(
+        &self,
+        program_state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) {
+        let conn = &self.connection;
+        if program_state.txn_continues(conn) {
+            return;
+        }
+        if program_state.txn_continued {
+            let mv_store = conn.mv_store();
+            if let (Some(mv_store), Some(tx_id)) = (mv_store.as_ref(), conn.get_mv_tx_id()) {
+                mv_store.rollback_tx(tx_id, pager.clone(), conn, crate::MAIN_DB_ID);
+                pager.end_read_tx();
+            }
+            conn.set_tx_state(TransactionState::None);
+            conn.rollback_attached_mvcc_txs(false);
+        }
+        self.end_attached_read_txns(conn);
     }
 
     #[instrument(skip(self, pager, connection, program_state), level = Level::DEBUG)]
@@ -3411,7 +3519,7 @@ impl Program {
         let commit_state = &mut program_state.commit_state;
         if matches!(commit_state, CommitState::CommittingAttached) {
             // Resume committing attached pagers after IO yield.
-            match self.end_attached_write_txns(connection, rollback)? {
+            match self.end_attached_write_txns(connection, rollback, false)? {
                 IOResult::Done(_) => {
                     *commit_state = CommitState::Ready;
                 }
@@ -3434,7 +3542,7 @@ impl Program {
         match txn_finish_result? {
             IOResult::Done(_) => {
                 // Main pager commit done, now commit attached database pagers
-                match self.end_attached_write_txns(connection, rollback)? {
+                match self.end_attached_write_txns(connection, rollback, false)? {
                     IOResult::Done(_) => {
                         *commit_state = CommitState::Ready;
                     }
@@ -3461,7 +3569,14 @@ impl Program {
     /// because in explicit transactions, the COMMIT statement's program may differ
     /// from the statement that acquired the attached write lock.
     /// On IO yield, already-committed pagers are skipped on re-entry via holds_write_lock().
-    fn end_attached_write_txns(&self, connection: &Connection, rollback: bool) -> IOResultOr<()> {
+    /// `keep_read`: statements still read the attached databases, so a committed write
+    /// transaction leaves its read transaction to them, as SQLite's writer does.
+    fn end_attached_write_txns(
+        &self,
+        connection: &Connection,
+        rollback: bool,
+        keep_read: bool,
+    ) -> IOResultOr<()> {
         connection.with_all_attached_pagers_with_index(|pagers| {
             for (db_id, attached_pager) in pagers {
                 let db_id = *db_id;
@@ -3495,7 +3610,9 @@ impl Program {
                     // changes to the shared Database so other connections can see them.
                     connection.publish_database_schema(db_id);
                     attached_pager.end_write_tx();
-                    attached_pager.end_read_tx();
+                    if !keep_read {
+                        attached_pager.end_read_tx();
+                    }
                     attached_pager.commit_wal_end();
                 } else {
                     // Discard any local schema changes on rollback
@@ -3747,20 +3864,13 @@ impl Program {
 
             let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
             let is_mvcc = state.mv_store(&self.connection).is_some();
-            let changed_shared_mvcc_auto_txn = !can_autocommit_now
-                && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
-                && state.n_change.load(Ordering::SeqCst) > 0;
-            if changed_shared_mvcc_auto_txn {
-                turso_assert!(
-                    is_mvcc,
-                    "shared autocommit transaction needed full rollback outside MVCC"
-                );
-                // A writer changed rows in an MVCC autocommit transaction, but
-                // a sibling reader is still holding that transaction open. The
-                // writer had no statement savepoint, so the only safe cleanup
-                // is rolling back the whole MVCC transaction.
-            }
-            let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
+            // Other statements still read the MVCC autocommit transaction: a rollback here undoes
+            // this statement's writes alone, and they go on in a successor with the view they
+            // had before it wrote (`Connection::rollback_writes_continued`).
+            let continues = is_mvcc
+                && self.connection.get_auto_commit()
+                && state.txn_continues(&self.connection);
+            let must_rollback_tx_if_needed = can_autocommit_now;
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -3816,7 +3926,7 @@ impl Program {
                             "Failed to rollback saved outer transaction after sequence conflict",
                         );
                     }
-                    self.rollback_current_txn(pager);
+                    self.rollback_current_txn_for(continues, pager);
                     self.connection.set_changes(0);
                 }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
@@ -3824,7 +3934,7 @@ impl Program {
                 // rollback transaction in autocommit mode.
                 Some(error) if error.is_foreign_key_constraint() => {
                     if must_rollback_tx_if_needed {
-                        self.rollback_current_txn(pager);
+                        self.rollback_current_txn_for(continues, pager);
                     }
                     self.connection.set_changes(0);
                 }
@@ -3843,6 +3953,9 @@ impl Program {
                     };
                     match effective_resolve {
                         ResolveType::Rollback => {
+                            // ROLLBACK ends the whole transaction, and a statement still
+                            // reading it fails at its next step, as SQLite's reads do with
+                            // SQLITE_ABORT_ROLLBACK. Writers that already halted committed.
                             self.rollback_current_txn(pager);
                             // All deferred FK violations are undone by the full rollback.
                             self.connection.clear_deferred_foreign_key_violations();
@@ -3934,7 +4047,7 @@ impl Program {
                         }
                         _ => {
                             if must_rollback_tx_if_needed {
-                                self.rollback_current_txn(pager);
+                                self.rollback_current_txn_for(continues, pager);
                             }
                         }
                     }
@@ -3956,7 +4069,7 @@ impl Program {
                 _ => match state.auto_txn_cleanup {
                     TxnCleanup::RollbackTxn => {
                         if must_rollback_tx_if_needed {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn_for(continues, pager);
                         }
                     }
                     TxnCleanup::RollbackSavepoint => {
@@ -3967,7 +4080,7 @@ impl Program {
                         // SQLite on SQLITE_IOERR.
                         let io_error = matches!(err, Some(LimboError::CompletionError(_)));
                         if can_autocommit_now || io_error {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn_for(continues, pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
                                 &self.connection,
@@ -4027,7 +4140,7 @@ impl Program {
                             );
                         }
                         if can_autocommit_now || forces_rollback || wrote_without_savepoint {
-                            self.rollback_current_txn(pager);
+                            self.rollback_current_txn_for(continues, pager);
                         }
                     }
                 },
@@ -4059,6 +4172,17 @@ impl Program {
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
         self.connection.rollback_current_txn_state(pager, true);
         self.connection.set_cdc_transaction_id(-1);
+    }
+
+    /// `continues`: other statements still read the MVCC autocommit transaction, which goes on
+    /// for them without this statement's writes (`Connection::rollback_writes_continued`).
+    fn rollback_current_txn_for(&self, continues: bool, pager: &Arc<Pager>) {
+        if continues {
+            self.connection.rollback_writes_continued();
+            self.connection.set_cdc_transaction_id(-1);
+        } else {
+            self.rollback_current_txn(pager);
+        }
     }
 
     /// MVCC sequence operations run in a separate inner tx, which temporarily

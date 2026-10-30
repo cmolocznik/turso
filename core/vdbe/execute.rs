@@ -3971,29 +3971,13 @@ pub fn halt(
             // index-method writes must still be staged before the statement
             // savepoint is released, and its cursors handed to the connection
             // so the sibling that eventually commits (or rolls back) the
-            // shared transaction delivers their outcome.
+            // shared transaction delivers their outcome. Under MVCC only a
+            // reader comes here: a writer commits at its own halt, as SQLite's
+            // does, and the readers beside it go on in a successor with the same
+            // view (`ProgramState::txn_continues`).
             return_if_io!(state, index_method_stage_statement_all(state));
             state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
             index_method_register_transaction_all(state, &program.connection)?;
-            //
-            // FIXME: when this statement is a writer in MVCC mode, deferring
-            // its commit to the last sibling statement means the writer's
-            // caller observes success before the changes are durable. If the
-            // shared transaction then ends in a rollback — the last sibling
-            // reader is reset or dropped mid-scan, or a later joining writer
-            // errors or is abandoned after changing rows — the finished
-            // writer's changes are silently discarded
-            // (see test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned).
-            // SQLite never has this window: it commits at the writer's own
-            // halt and downgrades the transaction to read-only for the
-            // remaining statements (btreeEndTransaction). The MVCC equivalent
-            // is to commit here, allocating a successor read-only
-            // transaction's begin timestamp inside the same
-            // `get_commit_timestamp` critical section as this commit's end
-            // timestamp, swapping `mv_tx` to that successor so remaining
-            // readers keep an identical snapshot. That also attributes commit
-            // errors (e.g. WriteWriteConflict) to the writer's own step
-            // instead of whichever sibling happens to finish last.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
@@ -4883,6 +4867,7 @@ pub fn op_transaction_inner(
                             ) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
+                                    conn.start_mv_lineage(*db, mv_store.read_snapshot(tx_id)?);
                                     started_secondary_tx = true;
                                     if conn.get_auto_commit() && !conn.is_nested_stmt() {
                                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
@@ -4983,6 +4968,9 @@ pub fn op_transaction_inner(
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, fresh_mode)));
+                                    program
+                                        .connection
+                                        .start_mv_lineage(*db, mv_store.read_snapshot(tx_id)?);
                                     if started_read_tx && conn.get_auto_commit() {
                                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                                     }

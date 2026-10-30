@@ -2782,6 +2782,8 @@ impl Database {
             n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
             n_active_txn_statements: Arc::new(AtomicI32::new(0)),
+            mv_lineages: RwLock::new(HashMap::default()),
+            mv_commits_in_flight: AtomicUsize::new(0),
             statement_activity: Arc::new(Mutex::new(
                 crate::connection::StatementActivity::default(),
             )),

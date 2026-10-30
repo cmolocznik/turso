@@ -1661,6 +1661,17 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     wrote_logical_log: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    /// For a statement's commit (`MvStore::commit_tx_continued`), the parts the statement holds
+    /// in its connection's transaction (`Connection::take_txn_part`). If other statements still
+    /// take part when the commit lands, a successor with the transaction's view goes on for them
+    /// (`MvStore::begin_successor_tx`).
+    continue_beside: Option<i32>,
+    /// The successor drawn for the statements still reading, once drawn: a step that yields
+    /// re-runs from its start, and draws none again.
+    successor: Option<TxID>,
+    /// Counted in `Connection::mv_commits_in_flight` until the commit has ended its transaction
+    /// (`CommitStateMachine::land`).
+    in_flight: AtomicBool,
     _phantom: PhantomData<Clock>,
 }
 
@@ -1676,6 +1687,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitStateMachine<C
 impl<Clock: LogicalClock, A: ConcurrentAllocator> Drop for CommitStateMachine<Clock, A> {
     fn drop(&mut self) {
         self.cleanup_unfinished_commit();
+        self.land();
     }
 }
 
@@ -1718,6 +1730,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
     }
 
+    /// The commit has ended its transaction, or handed it on to a successor: the connection's
+    /// other statements may read again.
+    fn land(&self) {
+        if self.in_flight.swap(false, Ordering::AcqRel) {
+            self.connection
+                .mv_commits_in_flight
+                .fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether other statements of the connection take part in the transaction beside the
+    /// committing one, so that it goes on for them in a successor once it commits.
+    fn continues_beside_others(&self) -> bool {
+        self.continue_beside.is_some_and(|own| {
+            self.connection
+                .n_active_txn_statements
+                .load(Ordering::SeqCst)
+                > own
+        })
+    }
+
     fn new(
         state: CommitState<Clock, A>,
         tx_id: TxID,
@@ -1757,6 +1790,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         let tx_entry = mvcc_store.txs.get(&tx_id).map(|entry| unsafe {
             std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry)
         });
+        connection
+            .mv_commits_in_flight
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             state,
             is_finalized: false,
@@ -1775,6 +1811,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             group_batch: None,
             wrote_logical_log: false,
             sync_mode,
+            continue_beside: None,
+            successor: None,
+            in_flight: AtomicBool::new(true),
             _phantom: PhantomData,
         })
     }
@@ -1857,10 +1896,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 }
             }
             if !matches!(self.state, CommitState::Checkpoint { .. }) {
+                let continues = self.continues_beside_others();
                 self.mvcc_store.cleanup_dropped_commit(
                     self.tx_id,
                     self.connection.as_ref(),
                     self.db_id,
+                    continues,
+                    self.successor,
                 );
             }
         }
@@ -3275,6 +3317,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // Header-only writes must not take this fast path; they need durable log records.
                 if read_only {
                     turso_assert!(
+                        self.continue_beside.is_none(),
+                        "a transaction that wrote nothing goes on without a commit"
+                    );
+                    turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read only transaction should not have commit dependencies on other txns"
                     );
@@ -3304,6 +3350,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                    self.land();
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3369,6 +3416,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // causing spurious Busy errors from acquire_exclusive_tx.
                 if tx.write_set.lock().is_empty() && !tx.header_dirty.load(Ordering::Acquire) {
                     turso_assert!(
+                        self.continue_beside.is_none(),
+                        "a transaction that wrote nothing goes on without a commit"
+                    );
+                    turso_assert!(
                         tx.commit_dep_set.lock().is_empty(),
                         "MVCC read-only transaction should not have other transactions depending on it"
                     );
@@ -3378,6 +3429,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         self.commit_coordinator.unlock_pager_commit_lock();
                     }
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                    self.land();
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3706,6 +3758,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // an IO yield + abandon during the upcoming checkpoint cannot
                 // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
                 //
+                // The successor draws its begin timestamp while this transaction still holds
+                // the exclusive transaction, so no other commit lands between the two.
+                if self.successor.is_none() && self.continues_beside_others() {
+                    self.successor = Some(mvcc_store.begin_successor_tx(tx_unlocked));
+                }
+                let successor = self.successor;
                 // Release `exclusive_tx` BEFORE `finish_committed_tx` /
                 // `inject_transition_failure!` so an Err at `AfterRemoveTx`
                 // cannot strand the atomic — matches the ordering at the
@@ -3715,14 +3773,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                if let Some(successor) = successor {
+                    let snapshot = mvcc_store.read_snapshot(successor)?;
+                    self.connection.continue_mv_tx_for_db(self.db_id, snapshot);
+                }
+                self.land();
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 // With the background checkpoint on, the main database's checkpoint runs on its
-                // thread, so this commit returns now.
-                let handed_off = appended_to_log
+                // thread, so this commit returns now. A successor's statements hold a blocking
+                // checkpoint off until they end, so a commit that leaves one checkpoints nothing.
+                let checkpoints = appended_to_log
+                    && successor.is_none()
+                    && mvcc_store.storage.should_checkpoint();
+                let handed_off = checkpoints
                     && self.db_id == crate::MAIN_DB_ID
-                    && mvcc_store.storage.should_checkpoint()
                     && mvcc_store.background_checkpoint.request(&self.connection);
-                if !handed_off && appended_to_log && mvcc_store.storage.should_checkpoint() {
+                if !handed_off && checkpoints {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
                             upper_bound_inclusive: None,
@@ -4298,6 +4364,45 @@ impl<A: RowVersionAllocator> From<&Transaction<A>> for MvccReadSnapshot {
             begin_ts: tx.begin_ts,
             read_mark: tx.read_mark,
         }
+    }
+}
+
+/// The transaction a connection's cursors read through while the connection's statements share
+/// it. When it ends beside statements still reading it, at a writer's commit or rollback, a
+/// successor with the same view takes over (`MvStore::begin_successor_tx`), and every cursor
+/// reading through the lineage moves to the successor before its next read.
+#[derive(Debug)]
+pub(crate) struct MvccTxnLineage {
+    /// Advanced each time the lineage moves to a successor.
+    generation: AtomicU64,
+    snapshot: Mutex<MvccReadSnapshot>,
+}
+
+impl MvccTxnLineage {
+    pub(crate) fn new(snapshot: MvccReadSnapshot) -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            snapshot: Mutex::new(snapshot),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn snapshot(&self) -> MvccReadSnapshot {
+        *self.snapshot.lock()
+    }
+
+    pub(crate) fn tx_id(&self) -> TxID {
+        self.snapshot.lock().tx_id
+    }
+
+    /// Moves the lineage to `successor`, the transaction that goes on from the one it read.
+    pub(crate) fn advance(&self, successor: MvccReadSnapshot) {
+        *self.snapshot.lock() = successor;
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -7214,6 +7319,118 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.rollback_tx_inner(tx_id, Some(connection), db);
     }
 
+    /// Commits `tx_id` for a statement of `connection` holding `own_parts` parts in it
+    /// (`Connection::take_txn_part`): if other statements still take part when the commit lands,
+    /// they go on in a successor with its view, `tx_id`'s writes included (`begin_successor_tx`).
+    /// The transaction must hold the exclusive transaction and have written (`tx_has_writes`).
+    pub fn commit_tx_continued(
+        self: &Arc<Self>,
+        tx_id: TxID,
+        connection: &Arc<Connection>,
+        db_id: usize,
+        own_parts: i32,
+    ) -> Result<StateMachine<Box<CommitStateMachine<Clock, A>>>> {
+        turso_assert!(
+            self.is_exclusive_tx(&tx_id),
+            "only an exclusive transaction leaves a successor with its view"
+        );
+        let mut state_machine = self.commit_tx(tx_id, connection, db_id)?;
+        state_machine.inner_mut().continue_beside = Some(own_parts);
+        Ok(state_machine)
+    }
+
+    /// Rolls back `tx_id` while other statements of `connection` still read it: they go on in a
+    /// successor that sees what `tx_id` saw before it wrote (`begin_successor_tx`). The
+    /// transaction must hold the exclusive transaction.
+    pub(crate) fn rollback_tx_continued(&self, tx_id: TxID, connection: &Connection, db: usize) {
+        let successor = {
+            let tx = self
+                .txs
+                .get(&tx_id)
+                .expect("transaction should exist in txs map");
+            self.begin_successor_tx(tx.value())
+        };
+        self.rollback_tx_inner(tx_id, Some(connection), db);
+        let snapshot = self
+            .read_snapshot(successor)
+            .expect("a successor is active until its connection ends it");
+        connection.continue_mv_tx_for_db(db, snapshot);
+    }
+
+    /// Begins the transaction that goes on from `tx`, which commits or rolls back while other
+    /// statements of its connection still read it. `tx` holds the exclusive transaction: no other
+    /// transaction committed since `tx`'s snapshot began, and none can commit before the
+    /// successor's begin timestamp is drawn, so the successor sees what `tx` saw, `tx`'s own
+    /// writes too once they commit. It reads through `tx`'s WAL read mark, and takes over the
+    /// blocking-checkpoint read lock `tx` holds.
+    pub(crate) fn begin_successor_tx(&self, tx: &Transaction<A>) -> TxID {
+        turso_assert!(
+            self.is_exclusive_tx(&tx.tx_id),
+            "only an exclusive transaction leaves a successor with its view"
+        );
+        let tx_id = self.get_tx_id();
+        let begin_ts = self.clock.get_timestamp(|ts| {
+            let header = self
+                .global_header
+                .read()
+                .expect("global_header is initialized while a transaction runs");
+            self.txs.insert(
+                tx_id,
+                Transaction::new(
+                    tx_id,
+                    ts,
+                    header,
+                    tx.read_mark,
+                    self.schema_generation(),
+                    tx.portable_logical_changes,
+                ),
+            );
+        });
+        if tx
+            .holds_blocking_checkpoint_read
+            .swap(false, Ordering::AcqRel)
+        {
+            self.txs
+                .get(&tx_id)
+                .expect("the successor was published above")
+                .value()
+                .holds_blocking_checkpoint_read
+                .store(true, Ordering::Release);
+        }
+        tracing::trace!(
+            "begin_successor_tx(of={}, tx_id={tx_id}, begin_ts={begin_ts})",
+            tx.tx_id
+        );
+        tx_id
+    }
+
+    /// Whether transaction `tx_id` holds a write its commit would make durable: a row version or
+    /// a change to its database header.
+    pub(crate) fn tx_has_writes(&self, tx_id: TxID) -> bool {
+        self.txs.get(&tx_id).is_some_and(|tx| {
+            let tx = tx.value();
+            !tx.write_set.lock().is_empty() || tx.header_dirty.load(Ordering::Acquire)
+        })
+    }
+
+    /// Gives up the exclusive transaction `tx_id` holds without having written, for other
+    /// statements of its connection still reading it: it goes on as a read transaction under its
+    /// snapshot, and a write in it later takes the exclusive transaction anew.
+    pub(crate) fn release_exclusive_hold(&self, tx_id: TxID) {
+        let Some(tx) = self.txs.get(&tx_id) else {
+            return;
+        };
+        let tx = tx.value();
+        turso_assert!(
+            tx.write_set.lock().is_empty() && !tx.header_dirty.load(Ordering::Acquire),
+            "a transaction that wrote keeps the exclusive transaction until it ends"
+        );
+        self.unlock_commit_lock_if_held(tx);
+        if self.is_exclusive_tx(&tx_id) {
+            self.release_exclusive_tx(&tx_id);
+        }
+    }
+
     #[aristo::intent(
         "Rollback freezes the transaction before transferring its complete write set; every \
          recorded row-version chain is then visited from the transferred storage without cloning \
@@ -7369,7 +7586,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             )
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+    /// `continues`: other statements of the connection still read the transaction, and go on in a
+    /// successor with its view (`begin_successor_tx`) whether the dropped commit completes or
+    /// rolls back. `drawn`: the successor the commit drew before it was dropped, if it did.
+    fn cleanup_dropped_commit(
+        &self,
+        tx_id: TxID,
+        connection: &Connection,
+        db_id: usize,
+        continues: bool,
+        drawn: Option<TxID>,
+    ) {
         let tx_state = self.txs.get(&tx_id).map(|tx| {
             let tx = tx.value();
             match tx.state.load() {
@@ -7380,8 +7607,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 state => state,
             }
         });
+        let successor = || {
+            if !self.is_exclusive_tx(&tx_id) {
+                return None;
+            }
+            self.txs
+                .get(&tx_id)
+                .map(|tx| self.begin_successor_tx(tx.value()))
+        };
         match tx_state {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
+                if continues {
+                    // A commit record already issued to a group-commit leader commits when the
+                    // leader's write lands: the successor reads the transaction's versions
+                    // speculatively and depends on that commit.
+                    let successor = successor();
+                    if self.commit_coordinator.abandon_if_issued(tx_id) {
+                        if let Some(successor) = successor {
+                            if let Ok(snapshot) = self.read_snapshot(successor) {
+                                connection.continue_mv_tx_for_db(db_id, snapshot);
+                            }
+                        }
+                        return;
+                    }
+                    self.rollback_tx_inner(tx_id, Some(connection), db_id);
+                    if let Some(successor) = successor {
+                        if let Ok(snapshot) = self.read_snapshot(successor) {
+                            connection.continue_mv_tx_for_db(db_id, snapshot);
+                        }
+                    }
+                    return;
+                }
                 if self.commit_coordinator.abandon_if_issued(tx_id) {
                     if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
                         connection.set_mv_tx_for_db(db_id, None);
@@ -7402,12 +7658,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.notify_committed_dependents(tx.value());
                     self.unlock_commit_lock_if_held(tx.value());
                 }
+                let successor = match drawn {
+                    Some(successor) => Some(successor),
+                    None if continues => successor(),
+                    None => None,
+                };
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
                 crate::without_allocation_faults!(
                     self.finish_committed_tx(tx_id, connection, db_id)
                 );
+                match successor {
+                    Some(successor) if continues => {
+                        if let Ok(snapshot) = self.read_snapshot(successor) {
+                            connection.continue_mv_tx_for_db(db_id, snapshot);
+                        }
+                    }
+                    // The statements that read it ended while the commit was dropped: the
+                    // successor wrote nothing and no statement is left to end it.
+                    Some(successor) => self.rollback_tx_inner(successor, None, db_id),
+                    None => {}
+                }
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {

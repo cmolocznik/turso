@@ -465,6 +465,17 @@ impl Statement {
                 return Ok(result);
             }
         }
+        if self
+            .program
+            .connection
+            .mv_commits_in_flight
+            .load(Ordering::Acquire)
+            > 0
+        {
+            if let Some(result) = self.wait_for_sibling_commit(waker) {
+                return Ok(result);
+            }
+        }
         let res = match self.query_mode {
             QueryMode::Normal => {
                 match self
@@ -514,6 +525,24 @@ impl Statement {
         self.analyze_refresh = None;
         self.busy = false;
         Ok(StepResult::Done)
+    }
+
+    /// Another statement's MVCC commit of the connection's transaction is in flight: the
+    /// transaction this statement reads ends or goes on to a successor when the commit lands,
+    /// and until then it is not readable. A root statement steps again once it lands; the
+    /// committing statement, and the helpers it runs, go on.
+    #[inline(never)]
+    fn wait_for_sibling_commit(&mut self, waker: Option<&Waker>) -> Option<StepResult> {
+        if self.state.is_committing()
+            || !matches!(self.origin, StatementOrigin::Root)
+            || self.program.connection.is_nested_stmt()
+        {
+            return None;
+        }
+        if let Some(waker) = waker {
+            waker.wake_by_ref();
+        }
+        Some(StepResult::Yield)
     }
 
     /// First-call and busy-wait work of [`Self::_step`]. Returns the result to

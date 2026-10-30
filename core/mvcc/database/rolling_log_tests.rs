@@ -260,3 +260,58 @@ fn test_a_restart_after_the_first_file_was_freed_keeps_the_newer_segments() {
     db.restart();
     assert_eq!(count(&db.connect()), rows + 1);
 }
+
+/// A log rolled under passive checkpoints, its process gone, is reopened without them: recovery
+/// replays every segment, and a blocking checkpoint, which clears the whole log, frees every
+/// segment and empties every file the log rolled through, and the rows stay.
+#[test]
+fn test_a_rolled_log_reopened_without_passive_checkpoints_is_cleared_by_a_blocking_one() {
+    let rolled = TestDb::open();
+    rolled.insert();
+    rolled.checkpoint_beside_a_commit();
+    rolled.checkpoint_beside_a_commit();
+    assert_eq!(rolled.segments(), 2);
+    rolled.insert();
+    let slots: Vec<String> = (0..LOG_SEGMENT_FILES)
+        .map(|slot| rolled.slot_path(slot))
+        .collect();
+    let TestDb {
+        mut db,
+        checkpointer,
+        writer,
+    } = rolled;
+    drop((checkpointer, writer));
+    let path = db.get_db().path.clone();
+    drop(db.db.take());
+    let reopen = || {
+        crate::database::remove_file_from_database_registry(&path);
+        crate::Database::open_file_with_flags(
+            Arc::new(crate::PlatformIO::new().unwrap()),
+            &path,
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+            None,
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap()
+    };
+    let blocking = reopen();
+    let conn = blocking.connect(crate::ConnectOpts::new()).unwrap();
+    assert_eq!(count(&conn), 4);
+    conn.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+    let store = blocking.get_mv_store().as_ref().cloned().unwrap();
+    assert_eq!(store.storage.logical_log_segments(), 1);
+    assert_eq!(store.storage.logical_log_size().unwrap(), 0);
+    for slot in &slots {
+        let len = std::fs::metadata(slot).map_or(0, |metadata| metadata.len());
+        assert_eq!(len, 0, "{slot} kept {len} bytes");
+    }
+    drop((conn, store, blocking));
+    let reopened = reopen();
+    let conn = reopened.connect(crate::ConnectOpts::new()).unwrap();
+    assert_eq!(count(&conn), 4);
+    assert_integrity_ok(&conn);
+}

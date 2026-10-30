@@ -10,6 +10,7 @@ use crate::mvcc::persistent_storage::logical_log::{
     segment_path, HeaderReadResult, LogChainReader, LogicalLog, RecoveredLog, LOG_SEGMENT_FILES,
 };
 use crate::mvcc::persistent_storage::LogicalLogTruncateOutcome;
+use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 use crate::sync::{Arc, Mutex};
 use crate::util::IOExt as _;
 use crate::{Buffer, Clock, Completion, File, MonotonicInstant, OpenFlags, WallClockInstant};
@@ -464,4 +465,71 @@ fn a_sync_after_a_roll_makes_the_sealed_segment_durable() {
     power.power_loss();
     let (commits, _, _) = recover(&io);
     assert_eq!(commits, [1, 2, 3, 4]);
+}
+
+fn encryption(key: u8) -> EncryptionContext {
+    EncryptionContext::new(
+        CipherMode::Aes128Gcm,
+        &EncryptionKey::Key128([key; 16]),
+        4096,
+    )
+    .unwrap()
+}
+
+/// An encrypted log rolls as a plain one does. Each segment's header has a salt of its own, which
+/// the segment's frames are sealed under, and recovery decrypts each segment under its own; under
+/// another key it replays nothing.
+#[test]
+fn an_encrypted_log_rolls_and_recovery_decrypts_every_segment() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let open_with = |key: u8| {
+        let file = io.open_file(BASE, OpenFlags::Create, false).unwrap();
+        LogicalLog::new_rolling(
+            file,
+            io.clone(),
+            Some(encryption(key)),
+            BASE.to_string(),
+            OpenFlags::Create,
+        )
+        .unwrap()
+    };
+    let mut log = open_with(0x42);
+    for ts in 1..=2 {
+        append(&io, &mut log, ts);
+    }
+    assert_eq!(
+        checkpoint(&io, &mut log, 0),
+        LogicalLogTruncateOutcome::Retained
+    );
+    for ts in 3..=4 {
+        append(&io, &mut log, ts);
+    }
+    assert_eq!(
+        checkpoint(&io, &mut log, 0),
+        LogicalLogTruncateOutcome::Retained
+    );
+    assert_eq!(log.segments(), 2);
+    for ts in 5..=6 {
+        append(&io, &mut log, ts);
+    }
+    drop(log);
+    let salt = |slot| {
+        let header = read_all(&io, &slot_file(&io, slot));
+        u64::from_le_bytes(header[8..16].try_into().unwrap())
+    };
+    assert_ne!(salt(0), salt(1), "the two segments share a salt");
+    let replay = |key: u8| {
+        let log = open_with(key);
+        let mut reader = LogChainReader::new(log.files(), Some(encryption(key)));
+        let header = io.block(|| reader.try_read_header_nonblock()).unwrap();
+        assert!(matches!(header, HeaderReadResult::Valid(_)));
+        reader.plan(0).unwrap();
+        let mut commits = Vec::new();
+        while let Some(frame) = io.block(|| reader.next_frame()).unwrap() {
+            commits.push(frame[0].commit_ts());
+        }
+        commits
+    };
+    assert_eq!(replay(0x42), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(replay(0x24), Vec::<u64>::new());
 }

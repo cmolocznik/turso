@@ -279,6 +279,16 @@ impl Log {
     }
 
     /// Everything before this is durable.
+    /// The most an operation may be admitted for at once ([`LogConfig::buffer_bytes`]).
+    pub fn buffer_bytes(&self) -> u64 {
+        self.config.buffer_bytes
+    }
+
+    /// The ring's chunk size: a record longer than it holds a flush back by more than a chunk.
+    pub fn chunk_bytes(&self) -> u64 {
+        self.config.chunk_bytes
+    }
+
     pub fn durable(&self) -> Lsn {
         self.durable.load(Ordering::Acquire)
     }

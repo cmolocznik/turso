@@ -17,6 +17,9 @@ pub const RESIDENT: u8 = 2;
 pub const WRITING: u8 = 1;
 /// Evict the page once its writeback lands, unless it changed meanwhile.
 pub const EVICT_AFTER: u8 = 2;
+/// The page was unlinked from what referred to it and is about to be freed: hints to it are not
+/// followed.
+pub const ABANDONED: u8 = 4;
 
 /// `pid` of a frame holding no page; no page id has every bit set.
 pub const NO_PAGE: u64 = u64::MAX;

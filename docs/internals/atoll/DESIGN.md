@@ -182,6 +182,16 @@ After a crash, frees logged after the point where the log restarted wait for a c
   any earlier replayed free of the same slots: they were erased before they were taken again. Slots
   of intents no remap matched are given back and erased, so a crash leaves no copy that nothing
   refers to.
+- **Provisional pages.** A new page is provisional until a record adopts it: the record, or group
+  of records (section 7.6), that makes it reachable, such as a split's new node or a value's blob
+  pages. A page being dropped is abandoned the same way, in the group that unlinks it, and freed
+  afterwards.
+  - Recovery frees every page still provisional, so a crash between allocating a page and linking
+    it in, or between unlinking it and freeing it, leaves no page that nothing refers to.
+  - The redo point never passes the record that made a page provisional while it is. A page counts
+    as settled once the record adopting or freeing it is durable.
+  - An operation dropped with provisional pages in hand gives them to the page store, and the
+    checkpointer frees them.
 
 ### 6.4 Temporary pages (step 7)
 
@@ -197,7 +207,7 @@ that bound how much of it must be replayed.
 ### 7.1 Records
 
 ```text
-len: u32 | kind: u8 | flags: u8 | reserved: u16 | txn: u64 | prev: u64 | payload | crc32c: u32 | padding to 8
+len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | payload | crc32c: u32 | padding to 16
 ```
 
 - **Alignment and CRC.** Records start at multiples of 16 bytes. The CRC covers the record's
@@ -216,8 +226,9 @@ len: u32 | kind: u8 | flags: u8 | reserved: u16 | txn: u64 | prev: u64 | payload
     per TPC-C transaction).
 - **Transaction records:** Begin, Commit (with its timestamp), End, and compensation (the redo of one
   undo step, naming the next record to undo).
-- **Structure changes** (split, merge, new root) are system operations. They are redo-only, logged
-  atomically as one record, and never undone by a user transaction's rollback.
+- **Structure changes** (split, merge, the root growing or shrinking) are system operations. They
+  are redo-only, logged atomically as one group (section 7.6), and never undone by a user
+  transaction's rollback.
 
 ### 7.2 Filling the log in parallel
 
@@ -274,6 +285,22 @@ len: u32 | kind: u8 | flags: u8 | reserved: u16 | txn: u64 | prev: u64 | payload
 
 Any failed log write or sync makes the log refuse further appends and fails every waiter. The
 database accepts no writes until it restarts and recovers.
+
+### 7.6 Groups
+
+A change spanning several pages appends its records as one group, which recovery replays whole or
+not at all. Built in `log/mod.rs` (`Log::append_group`) and `log/reader.rs`.
+
+- **Contiguous.** A group takes one reservation, so no other record lands inside it, and padding
+  never does either.
+- **Placed.** Each record carries its index in the group and the group's size, in the header's two
+  former reserved bytes.
+- **Read whole.** A reader returns a group's records only once it has read all of them. Where the
+  log ends inside a group, or the record where the group's next one belongs does not continue it,
+  the log ends at the group's start. A record that does continue a group must have the next index
+  and the same size, so records appended after a restart past part of a group never complete it.
+- **Where to read from.** Every record reports where its group starts, the position a reader must
+  begin at to replay it. Redo points are always outside groups.
 
 ## 8. Commit latency
 
@@ -551,7 +578,8 @@ otherwise.
    written back as memory runs short, as in normal running. At most four windows are held, so
    recovery needs memory beyond the pool of four passes' shares of the budget, 1.25% of the pool
    by default.
-4. **Erase** the slots of intents that got no remap.
+4. **Free** the pages left provisional (section 6.3), and **erase** the slots of intents that got no
+   remap.
 5. **Undo** every transaction with no Commit or End, from its records, following `prev` back from
    its last one. Compensation records are logged, and steps already compensated are skipped.
    (Step 7.)
@@ -570,19 +598,39 @@ the undo of open transactions. Haubenschild et al. replay 100 GB of log in 38 s 
 
 ## 13. B+-trees
 
-- **Nodes** are slotted (LeanStore 2023 §4):
-  - fence keys, fixed at split and merge;
+Built in `core/storage/atoll/btree`, except key encoding for SQL records, which comes with the cursor
+(step 8).
+
+- **Nodes** are slotted (LeanStore, BTW 2023 §4; `btree/node.rs`):
+  - fence keys: the lower exclusive, the upper inclusive, a missing one infinite;
   - the fences' common prefix stripped from every key;
-  - a 4-byte head of each key stored as an integer in its slot;
-  - a hint array.
-- **Node size.** 4 KiB unless the tree chose a larger class.
-  - Values larger than a quarter of a node go out of line, into a blob page of the smallest class
-    that holds them.
-  - Values beyond the largest class go into a tree of blob pages.
-- **Child entries** hold the child's page id and a frame hint (section 9.2).
-- **Neighbour hints.** A leaf may also hold its right neighbour's page id as a hint, which scans
-  check against the neighbour's lower fence. Since hints are never trusted, splits and merges need
-  not keep them right.
+  - a 4-byte head of each key in its slot, so a search compares integers until heads tie;
+  - a hint array of 16 heads sampled over the slots, one cache line, narrowing the binary search.
+
+  ```text
+  slot: off: u16 | key_len: u16 | value_len: u16 (top bit: out of line) | head: u32
+  ```
+
+  A node names its tree by its root's page id, and holds its level, its right neighbour (a leaf) or
+  rightmost child (an inner node), with a frame hint beside it.
+- **Node size.** 4 KiB unless the tree chose a larger class, up to 64 KiB, the most 16-bit slots
+  address.
+  - Every entry, slot included, takes at most a quarter of the node, so any two entries fit beside
+    the fences and a split always makes room. Keys are at most that less a slot and a value
+    reference: 957 bytes in a 4 KiB node.
+  - **Values out of line** (`btree/value.rs`). A value whose entry would pass a quarter goes into a
+    blob page of the smallest class that holds it. Beyond the largest class it is cut into 8 MiB
+    chunks under a directory page; a billion bytes, SQLite's limit, takes 120 chunks. Every page
+    of a value carries a random id, so a reader that followed a reference before the value was
+    replaced finds out and reads the leaf again. Its pages are written provisional, in log records
+    of at most one log chunk, and adopted by the record that puts the reference in the leaf.
+- **Child entries** hold the child's page id and a frame hint (section 9.2). A descent that finds a
+  hint stale refreshes it if it can latch the parent at once, keeping the latch's version, since no
+  reader trusts a hint.
+- **Neighbour hints.** A leaf holds its right neighbour's page id and frame hint. A scan follows it
+  only if that frame still holds the neighbour, of the same tree, a leaf, whose lower fence is this
+  leaf's upper, and not marked abandoned by a merge; otherwise it descends with the fence. Splits
+  and merges need not keep the hints right.
 - **Keys** are byte strings compared with `memcmp`.
   - **Rowid tables:** 8 bytes, big-endian with the sign bit flipped.
   - **Indexes and WITHOUT ROWID tables:** the index columns encoded so that byte order is SQLite's
@@ -595,9 +643,30 @@ the undo of open transactions. Haubenschild et al. replay 100 GB of log in 38 s 
     distinction.
   - **Proof:** a property test compares the encoding's order with `compare_immutable` on random
     records.
-- **Latching:** optimistic lock coupling. A writer latches only its leaf, and a split restarts from
-  the root and latches the nodes it changes (LeanStore 2018 §IV-F).
-- **Later:** contention splits and merging of sparse neighbours.
+- **Latching:** optimistic lock coupling (LeanStore, ICDE 2018 §IV-F).
+  - A descent fixes each node without a lock and validates the parent after finding the child, so
+    readers take no latch. A child freed meanwhile fails the parent's validation, never the read.
+  - A writer latches its leaf alone and checks under the latch that the leaf covers its key.
+  - A structure change is its own step: it descends again and latches exactly the nodes it changes,
+    then the operation that needed it starts over. A busy latch is a cooperative yield, and no
+    latch is held across a returned `IOResult`.
+- **Structure changes**, each one log group (section 7.6) with the adoption or abandonment of its
+  page (section 6.3):
+  - **Split:** the new right node's image, the left's truncation to its first entries and a new
+    upper fence, and the parent's new separator, with the old pointer moved to the new node. A
+    parent without room is split first. Separators are the shortest key between the halves.
+    Appending at the right edge of the tree, the left keeps everything, so keys inserted in order
+    fill nodes.
+  - **The root never moves**, so its page names the tree. When it splits, its contents move to a new
+    child and it becomes an inner node over that child, which then splits like any other; when it
+    has one child left, the child's contents move up.
+  - **Merge:** a node used less than a quarter after a removal merges with a neighbour, the right
+    one first, if the two fit in three quarters of a node, which leaves room for the largest entry.
+    The left goes into the right, and the parent loses the separator between them; a parent left
+    underfull merges next, and a parent with one child merges at its own level.
+- **Records** (`btree/record.rs`): init (a node's image), insert, remove, update, split and branch.
+  Each changes one node and is applied by the same code when made and when replayed.
+- **Later:** contention splits.
 
 ## 14. Object storage
 
@@ -741,12 +810,14 @@ submission or later from `IO::step`. Therefore:
    parallel redo, opening a database, and blob writes, the first page record. Done
    (`checkpoint.rs`, `buffer/pass.rs`, `recovery.rs`, `redo.rs`, `blob.rs`, `db.rs`). Undo and
    the clock move to step 7.
-6. **B+-trees.**
+6. **B+-trees.** Nodes, values out of line, optimistic lock coupling, splits, merges and root
+   changes, cursors, and the log groups and provisional pages they need. Done (`btree/`,
+   `log/`, `store.rs`). Key encoding moves to step 8, with the cursor that encodes.
 7. **Transactions.** Slots, clock, commit logs, version headers, version index, graveyard, conflicts
    and waits, rollback, undo in recovery, garbage collection.
 8. **Turso integration.**
    - the storage-mode interface;
-   - `AtollCursor`;
+   - `AtollCursor`, and the key encoding for SQL records (section 13);
    - the catalog;
    - header rows;
    - the PostgreSQL frontend switch.

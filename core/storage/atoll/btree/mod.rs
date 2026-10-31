@@ -1,0 +1,1505 @@
+//! B+-trees (DESIGN.md §13).
+//!
+//! - [`node`]: the slotted node layout.
+//! - [`record`]: the log records of node changes, applied the same way when made and replayed.
+//! - [`value`]: values too large for a node, in blob pages.
+//!
+//! **Latching** is optimistic lock coupling (LeanStore, ICDE 2018 §IV-F). A descent fixes each
+//! node without a lock and checks afterwards that the parent did not change while the child was
+//! found, so a reader takes no latch at all. A writer latches only its leaf, and checks under the
+//! latch that the leaf still covers its key. A structure change (a split, a merge, the root growing
+//! or shrinking) is its own step: it descends again and latches exactly the nodes it changes, after
+//! which the operation that needed it starts over. A latch that cannot be taken at once is a
+//! cooperative yield, like everywhere in Turso, and no latch is held across a returned `IOResult`.
+//!
+//! **Hints.** A child entry keeps the frame its child was last found in; a descent that finds the
+//! hint stale refreshes it if it can latch the parent at once, writing nothing a reader trusts. A
+//! leaf keeps its right neighbour the same way, and a scan follows that hint only when the frame
+//! it names still holds the neighbour, checked by the neighbour's tree, level and lower fence.
+//!
+//! **Atomicity.** A structure change is one log group: the new node's image, the split node's
+//! truncation, the parent's new entry, and the adoption of the new page, or the merged node's
+//! image, the parent's removed entry and the abandonment of the emptied node. A crash keeps all of
+//! it or none ([`super::log::Log::append_group`]); a page allocated for a change the crash undid
+//! is freed by recovery ([`super::store`]'s provisional pages).
+//!
+//! **The root** never moves, so the root page names the tree. When it splits, its contents move to
+//! a new child and the root becomes an inner node over it, which then splits like any child. When
+//! it is left with one child, the child's contents move up.
+//!
+//! **Merging.** A node used less than a quarter after a removal merges with a neighbour if the two
+//! fit in three quarters of a node: the merged node then has room for the largest entry, so the
+//! next insert never splits it again at once.
+
+pub mod node;
+pub mod record;
+pub mod value;
+
+#[cfg(test)]
+mod tests;
+
+use super::buffer::{BufferPool, Exclusive, Optimistic};
+use super::log::{framed_len, Admitted, Header, Log, Lsn};
+use super::page::{PageId, SizeClass};
+use super::store::{PageStore, StoreRecord};
+use crate::io::{Completion, IO};
+use crate::sync::atomic::{AtomicU32, Ordering};
+use crate::sync::Arc;
+use crate::types::{IOCompletions, IOResult};
+use crate::{LimboError, Result};
+use node::{Entry, Layout, Limits, View};
+use record::{Change, Record};
+use value::{Read, ValueRead, ValueRef, ValueWrite};
+
+fn yield_now<T>() -> Result<IOResult<T>> {
+    Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
+}
+
+/// What a descent came to.
+enum Found<'p> {
+    /// The node at the level asked for that covers the key, and its parent with the position
+    /// routing to it, unless it is the root.
+    Node {
+        node: Optimistic<'p>,
+        parent: Option<(Optimistic<'p>, usize)>,
+    },
+    /// Something changed under the descent.
+    Restart,
+    /// The tree has no level that high: it shrank since the caller looked.
+    Shorter,
+    Io(IOCompletions),
+}
+
+macro_rules! found {
+    ($e:expr) => {
+        match $e? {
+            Found::Node { node, parent } => (node, parent),
+            Found::Restart | Found::Shorter => return yield_now(),
+            Found::Io(io) => return Ok(IOResult::IO(io)),
+        }
+    };
+}
+
+macro_rules! done {
+    ($e:expr) => {
+        match $e? {
+            IOResult::Done(v) => v,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        }
+    };
+}
+
+/// How a descent routes at inner nodes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// To the child covering the key.
+    At,
+    /// To the child covering the keys just above it.
+    Above,
+}
+
+pub struct Tree {
+    io: Arc<dyn IO>,
+    pool: Arc<BufferPool>,
+    store: Arc<PageStore>,
+    root: PageId,
+    root_hint: AtomicU32,
+    limits: Limits,
+}
+
+/// What a put should do, and what it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Only if the key is absent.
+    Insert,
+    /// Only if the key is present.
+    Update,
+    Upsert,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Inserted,
+    Updated,
+    /// An insert found the key present, or an update found it absent; nothing changed.
+    Unchanged,
+}
+
+impl Tree {
+    /// A new, empty tree whose nodes are of `class`: its root page, which names it.
+    pub fn create(
+        io: &Arc<dyn IO>,
+        pool: &Arc<BufferPool>,
+        store: &Arc<PageStore>,
+        class: SizeClass,
+    ) -> Result<IOResult<PageId>> {
+        let limits = Limits::of(class);
+        let log = store.log();
+        let adopt_len = framed_len(2 + 8);
+        let init_len = framed_len(8 + 4 + class.size());
+        check_budget(log, class, limits)?;
+        let mut admitted = done!(log.admit(init_len + adopt_len));
+        let mut page = done!(pool.allocate(class));
+        let pid = page.pid();
+        node::build(
+            page.page_mut(),
+            &Layout {
+                root: pid,
+                level: 0,
+                lower: None,
+                upper: None,
+                next: (PageId::from_raw(0), 0),
+            },
+            [],
+        );
+        let image = node::image(page.page());
+        let tree = Self::open(io.clone(), pool.clone(), store.clone(), pid);
+        let lsns = tree.log_batch(
+            &mut admitted,
+            &[Record {
+                pid,
+                change: Change::Init { image: &image },
+            }],
+            &[StoreRecord::Adopt { pids: vec![pid] }],
+        );
+        page.changed(lsns[0]);
+        Ok(IOResult::Done(pid))
+    }
+
+    /// The tree whose root is `root`.
+    pub fn open(
+        io: Arc<dyn IO>,
+        pool: Arc<BufferPool>,
+        store: Arc<PageStore>,
+        root: PageId,
+    ) -> Self {
+        Self {
+            io,
+            pool,
+            store,
+            root,
+            root_hint: AtomicU32::new(0),
+            limits: Limits::of(root.class()),
+        }
+    }
+
+    pub fn root(&self) -> PageId {
+        self.root
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    fn log(&self) -> &Arc<Log> {
+        self.store.log()
+    }
+
+    fn class(&self) -> SizeClass {
+        self.root.class()
+    }
+
+    /// Bytes of log a structure change takes at most: two node images, two records carrying a
+    /// key, and the adoption or abandonment of one page.
+    fn smo_len(&self) -> u64 {
+        smo_len(self.class(), self.limits)
+    }
+
+    /// Appends the records of one change: alone, or as a group when there are several. Returns
+    /// the LSNs of the node records, in order.
+    fn log_batch(
+        &self,
+        admitted: &mut Admitted,
+        nodes: &[Record<'_>],
+        store: &[StoreRecord],
+    ) -> Vec<Lsn> {
+        let mut payloads: Vec<(Header, Vec<u8>)> = nodes
+            .iter()
+            .map(|r| {
+                (
+                    Header {
+                        kind: r.kind(),
+                        flags: 0,
+                        txn: 0,
+                        prev: 0,
+                    },
+                    r.encode(),
+                )
+            })
+            .collect();
+        payloads.extend(store.iter().map(PageStore::group_record));
+        let pieces: Vec<[&[u8]; 1]> = payloads.iter().map(|(_, p)| [p.as_slice()]).collect();
+        let records: Vec<(Header, &[&[u8]])> = payloads
+            .iter()
+            .zip(&pieces)
+            .map(|((h, _), p)| (*h, &p[..]))
+            .collect();
+        let log = self.log();
+        let (start, lsns) = if records.len() == 1 {
+            let lsn = log.append(admitted, &records[0].0, records[0].1);
+            (lsn - framed_len(payloads[0].1.len()), vec![lsn])
+        } else {
+            log.append_group(admitted, &records)
+        };
+        for (s, &lsn) in store.iter().zip(&lsns[nodes.len()..]) {
+            self.store.grouped(s, start, lsn);
+        }
+        lsns[..nodes.len()].to_vec()
+    }
+
+    // ---------------------------------------------------------------- descending
+
+    /// Descends optimistically to the node at `level` covering `key`.
+    fn descend(&self, key: &[u8], level: u8, route: Route) -> Result<Found<'_>> {
+        let mut node = match self.pool.fix_optimistic(self.root, Some(&self.root_hint))? {
+            IOResult::Done(n) => n,
+            IOResult::IO(io) => return Ok(Found::Io(io)),
+        };
+        let mut parent = None;
+        loop {
+            let read = node.read(|p| {
+                let v = View::new(p);
+                if !v.is_node() || v.root() != self.root {
+                    return None;
+                }
+                let at = v.level();
+                if at <= level {
+                    return Some((at, None));
+                }
+                let pos = match route {
+                    Route::At => v.route(key)?,
+                    Route::Above => v.search_above(key)?,
+                };
+                Some((at, Some((pos, v.child(pos)?))))
+            });
+            let Some(read) = read else {
+                return Ok(Found::Restart);
+            };
+            let Some((at, down)) = read else {
+                return Err(LimboError::Corrupt(format!(
+                    "{:?} is not a node of the B-tree rooted at {:?}",
+                    node.pid(),
+                    self.root
+                )));
+            };
+            let Some((pos, (child, hint))) = down else {
+                return Ok(if at == level {
+                    Found::Node { node, parent }
+                } else {
+                    Found::Shorter
+                });
+            };
+            let cell = AtomicU32::new(hint);
+            let fixed = match self.pool.fix_optimistic(child, Some(&cell)) {
+                Ok(IOResult::Done(c)) => c,
+                Ok(IOResult::IO(io)) => return Ok(Found::Io(io)),
+                // The child was freed since its entry was read.
+                Err(LimboError::Corrupt(_)) if !node.validate() => return Ok(Found::Restart),
+                Err(e) => return Err(e),
+            };
+            if !node.validate() {
+                return Ok(Found::Restart);
+            }
+            let found = cell.load(Ordering::Relaxed);
+            if found != hint {
+                if let Some(mut ex) = node.clone().upgrade() {
+                    node::set_child_hint(ex.page_mut(), pos, found);
+                    node = ex.release_unchanged();
+                }
+            }
+            parent = Some((node, pos));
+            node = fixed;
+        }
+    }
+
+    // ---------------------------------------------------------------- reading
+
+    /// The value of `key`, if present. Step it until done.
+    pub fn lookup(&self, op: &mut Lookup) -> Result<IOResult<Option<Vec<u8>>>> {
+        loop {
+            if let Some(read) = &mut op.read {
+                match done!(read.step(&self.pool)) {
+                    Read::Value(v) => {
+                        op.read = None;
+                        op.failed = None;
+                        return Ok(IOResult::Done(Some(v)));
+                    }
+                    Read::Changed => op.failed = op.read.take().map(|r| r.reference()),
+                }
+            }
+            let (leaf, _) = found!(self.descend(&op.key, 0, Route::At));
+            let Some(found) = leaf.read(|p| {
+                let v = View::new(p);
+                let (pos, exact) = v.search(&op.key)?;
+                if !exact {
+                    return Some(None);
+                }
+                let (value, out) = v.value(pos)?;
+                Some(Some((value.to_vec(), out)))
+            }) else {
+                continue;
+            };
+            match found.ok_or_else(|| corrupt_node(leaf.pid()))? {
+                None => return Ok(IOResult::Done(None)),
+                Some((value, false)) => return Ok(IOResult::Done(Some(value))),
+                Some((reference, true)) => {
+                    let reference =
+                        ValueRef::decode(&reference).ok_or_else(|| corrupt_node(leaf.pid()))?;
+                    if op.failed == Some(reference) {
+                        return Err(corrupt_value(reference));
+                    }
+                    op.read = Some(ValueRead::new(reference));
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- writing
+
+    /// Puts the value of a key. Step it until done.
+    pub fn put(&self, op: &mut Put) -> Result<IOResult<Outcome>> {
+        loop {
+            // Whether the key is there, and what an out-of-line value it holds takes: learned
+            // before writing anything, and checked again under the leaf's latch.
+            let (leaf, _) = found!(self.descend(&op.key, 0, Route::At));
+            let Some(seen) = leaf.read(|p| look(View::new(p), &op.key)) else {
+                continue;
+            };
+            let Some(present) = seen.ok_or_else(|| corrupt_node(leaf.pid()))? else {
+                // The leaf split since the descent read its parent.
+                continue;
+            };
+            match (op.mode, &present) {
+                (Mode::Insert, Some(_)) | (Mode::Update, None) => {
+                    return Ok(IOResult::Done(Outcome::Unchanged))
+                }
+                _ => {}
+            }
+            if !done!(op.old_pages(&self.pool, present.as_ref())) {
+                continue;
+            }
+            let out_of_line = !self.limits.inline(op.key.len(), op.value_len);
+            if out_of_line {
+                let write = op.write.get_or_insert_with(|| {
+                    ValueWrite::new(
+                        std::mem::take(&mut op.value),
+                        self.io.generate_random_number() as u64,
+                        self.store.clone(),
+                    )
+                });
+                done!(write.step(&self.pool, self.log()));
+            }
+            let stored: Vec<u8> = match &op.write {
+                Some(w) => w.reference().encode().to_vec(),
+                None => op.value.clone(),
+            };
+            let adopt = op.write.as_ref().map(|w| w.pages()).unwrap_or_default();
+            let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
+            let len = framed_len(8 + 3 + op.key.len() + stored.len())
+                + store_len(&adopt)
+                + store_len(&abandon);
+            if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
+                op.admitted = None;
+                op.admitted = Some((done!(self.log().admit(len)), len));
+            }
+            let Some(mut ex) = leaf.upgrade() else {
+                return yield_now();
+            };
+            let v = View::new(ex.page());
+            if v.covers(&op.key) != Some(true) {
+                drop(ex);
+                continue;
+            }
+            let (pos, exact) = v.search(&op.key).ok_or_else(|| corrupt_node(ex.pid()))?;
+            let now = exact
+                .then(|| v.value(pos).map(|(b, o)| (b.to_vec(), o)))
+                .flatten();
+            if now != present {
+                // Changed since the look: look again.
+                drop(ex);
+                continue;
+            }
+            let need = match &now {
+                None => v.entry_size(&op.key, stored.len()),
+                Some((old, _)) => Some(stored.len().saturating_sub(old.len())),
+            }
+            .ok_or_else(|| corrupt_node(ex.pid()))?;
+            if v.free().ok_or_else(|| corrupt_node(ex.pid()))? < need {
+                drop(ex);
+                // A split admits its own log space; holding this meanwhile could leave too
+                // little of the log buffer for it.
+                op.admitted = None;
+                done!(self.make_room(&op.key, 0, need));
+                continue;
+            }
+            let pid = ex.pid();
+            let change = if exact {
+                Change::Update {
+                    key: &op.key,
+                    value: &stored,
+                    out_of_line,
+                }
+            } else {
+                Change::Insert {
+                    key: &op.key,
+                    value: &stored,
+                    out_of_line,
+                }
+            };
+            let record = Record { pid, change };
+            record.apply(ex.page_mut())?;
+            let mut store = Vec::new();
+            if !adopt.is_empty() {
+                store.push(StoreRecord::Adopt { pids: adopt });
+            }
+            if !abandon.is_empty() {
+                store.push(StoreRecord::Abandon { pids: abandon });
+            }
+            let (mut admitted, _) = op.admitted.take().expect("admitted");
+            let lsns = self.log_batch(&mut admitted, &[record], &store);
+            ex.changed(lsns[0]);
+            op.lsn = lsns[0];
+            drop(ex);
+            if let Some(w) = op.write.as_mut() {
+                w.adopted();
+            }
+            if let Some((_, old)) = op.old.take() {
+                self.free_abandoned(old)?;
+            }
+            op.write = None;
+            return Ok(IOResult::Done(if exact {
+                Outcome::Updated
+            } else {
+                Outcome::Inserted
+            }));
+        }
+    }
+
+    /// Removes `key`; whether it was there. Step it until done.
+    pub fn remove(&self, op: &mut Remove) -> Result<IOResult<bool>> {
+        loop {
+            if let Some(level) = op.merging {
+                done!(self.merge(&op.key, level, &mut op.merging));
+                if op.merging.is_none() {
+                    return Ok(IOResult::Done(true));
+                }
+                continue;
+            }
+            let (leaf, _) = found!(self.descend(&op.key, 0, Route::At));
+            let Some(seen) = leaf.read(|p| look(View::new(p), &op.key)) else {
+                continue;
+            };
+            let Some(present) = seen.ok_or_else(|| corrupt_node(leaf.pid()))? else {
+                continue;
+            };
+            let Some(present) = present else {
+                return Ok(IOResult::Done(false));
+            };
+            if !done!(op.old_pages(&self.pool, &present)) {
+                continue;
+            }
+            let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
+            let len = framed_len(8 + op.key.len()) + store_len(&abandon);
+            if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
+                op.admitted = None;
+                op.admitted = Some((done!(self.log().admit(len)), len));
+            }
+            let Some(mut ex) = leaf.upgrade() else {
+                return yield_now();
+            };
+            let v = View::new(ex.page());
+            let (pos, exact) = v.search(&op.key).ok_or_else(|| corrupt_node(ex.pid()))?;
+            let now = exact
+                .then(|| v.value(pos).map(|(b, o)| (b.to_vec(), o)))
+                .flatten();
+            if v.covers(&op.key) != Some(true) || now.as_ref() != Some(&present) {
+                drop(ex);
+                continue;
+            }
+            let record = Record {
+                pid: ex.pid(),
+                change: Change::Remove { key: &op.key },
+            };
+            record.apply(ex.page_mut())?;
+            let store = if abandon.is_empty() {
+                Vec::new()
+            } else {
+                vec![StoreRecord::Abandon { pids: abandon }]
+            };
+            let (mut admitted, _) = op.admitted.take().expect("admitted");
+            let lsns = self.log_batch(&mut admitted, &[record], &store);
+            ex.changed(lsns[0]);
+            op.lsn = lsns[0];
+            let underfull = self.underfull(&View::new(ex.page()));
+            drop(ex);
+            if let Some((_, old)) = op.old.take() {
+                self.free_abandoned(old)?;
+            }
+            if !underfull {
+                return Ok(IOResult::Done(true));
+            }
+            op.merging = Some(0);
+        }
+    }
+
+    /// Frees pages just abandoned, handing what cannot be freed at once to the checkpointer.
+    fn free_abandoned(&self, pids: Vec<PageId>) -> Result<()> {
+        let mut pids = pids.into_iter();
+        while let Some(pid) = pids.next() {
+            if let IOResult::IO(_) = self.pool.free_unreferenced(pid)? {
+                self.store.orphaned(pid);
+                pids.for_each(|p| self.store.orphaned(p));
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn underfull(&self, v: &View<'_>) -> bool {
+        let used = v.page().len() - v.free().unwrap_or(0) - node::SLOTS;
+        used < self.limits.capacity / 4
+    }
+
+    // ---------------------------------------------------------------- structure changes
+
+    /// Splits the node at `level` covering `key` until it has `need` bytes free, splitting its
+    /// ancestors first where they lack room for the separator.
+    fn make_room(&self, key: &[u8], level: u8, need: usize) -> Result<IOResult<()>> {
+        loop {
+            match done!(self.split(key, level, need)) {
+                Split::Done => return Ok(IOResult::Done(())),
+                Split::Again => {}
+                Split::ParentFull(need) => done!(self.make_room(key, level + 1, need)),
+            }
+        }
+    }
+
+    /// One split of the node at `level` covering `key`, if it lacks `need` bytes.
+    fn split(&self, key: &[u8], level: u8, need: usize) -> Result<IOResult<Split>> {
+        let mut admitted = done!(self.log().admit(self.smo_len()));
+        let (node, parent) = match self.descend(key, level, Route::At)? {
+            Found::Node { node, parent } => (node, parent),
+            // The node to split merged away: the caller looks again.
+            Found::Shorter => return Ok(IOResult::Done(Split::Done)),
+            Found::Restart => return yield_now(),
+            Found::Io(io) => return Ok(IOResult::IO(io)),
+        };
+        let Some((parent, pos)) = parent else {
+            return self.grow(node, need, &mut admitted);
+        };
+        let Some(mut p) = parent.upgrade() else {
+            return yield_now();
+        };
+        let Some(mut n) = node.upgrade() else {
+            return yield_now();
+        };
+        let pv = View::new(p.page());
+        let nv = View::new(n.page());
+        let untouched = |p: Exclusive<'_>, n: Exclusive<'_>, outcome| {
+            p.release_unchanged();
+            n.release_unchanged();
+            Ok(IOResult::Done(outcome))
+        };
+        if pv.child(pos).map(|c| c.0) != Some(n.pid()) || nv.covers(key) != Some(true) {
+            return untouched(p, n, Split::Again);
+        }
+        if nv.free().ok_or_else(|| corrupt_node(n.pid()))? >= need {
+            return untouched(p, n, Split::Done);
+        }
+        let entries = nv.entries().ok_or_else(|| corrupt_node(n.pid()))?;
+        let node::Shape {
+            root,
+            level,
+            upper,
+            next,
+            ..
+        } = node::shape(n.page());
+        let at = nv.search(key).ok_or_else(|| corrupt_node(n.pid()))?.0;
+        let (keep, sep) = split_point(&entries, level, at, upper.is_none(), key);
+        let sep_need = pv
+            .entry_size(&sep, node::CHILD)
+            .ok_or_else(|| corrupt_node(p.pid()))?;
+        if pv.free().ok_or_else(|| corrupt_node(p.pid()))? < sep_need {
+            return untouched(p, n, Split::ParentFull(sep_need));
+        }
+        let mut r = done!(self.pool.allocate(self.class()));
+        let right_entries = if level == 0 {
+            &entries[keep..]
+        } else {
+            &entries[keep + 1..]
+        };
+        node::build(
+            r.page_mut(),
+            &Layout {
+                root,
+                level,
+                lower: Some(&sep),
+                upper: upper.as_deref(),
+                next,
+            },
+            right_entries,
+        );
+        let image = node::image(r.page());
+        let split = Record {
+            pid: n.pid(),
+            change: Change::Split {
+                right: r.pid(),
+                keep,
+                sep: &sep,
+            },
+        };
+        split.apply(n.page_mut())?;
+        let branch = Record {
+            pid: p.pid(),
+            change: Change::Branch {
+                left: n.pid(),
+                right: r.pid(),
+                sep: &sep,
+            },
+        };
+        branch.apply(p.page_mut())?;
+        let init = Record {
+            pid: r.pid(),
+            change: Change::Init { image: &image },
+        };
+        let lsns = self.log_batch(
+            &mut admitted,
+            &[init, split, branch],
+            &[StoreRecord::Adopt {
+                pids: vec![r.pid()],
+            }],
+        );
+        r.changed(lsns[0]);
+        n.changed(lsns[1]);
+        p.changed(lsns[2]);
+        // Hints the records leave at 0.
+        if level == 0 {
+            node::set_next_hint(n.page_mut(), r.hint());
+        }
+        let at = View::new(p.page()).search(&sep).unwrap().0;
+        node::set_child_hint(p.page_mut(), at, n.hint());
+        node::set_child_hint(p.page_mut(), at + 1, r.hint());
+        Ok(IOResult::Done(Split::Done))
+    }
+
+    /// Makes room in the root, which cannot move: its contents go to a new child, and it becomes
+    /// an inner node over that child alone, which the next split splits like any other.
+    fn grow(
+        &self,
+        root: Optimistic<'_>,
+        need: usize,
+        admitted: &mut Admitted,
+    ) -> Result<IOResult<Split>> {
+        let Some(mut root) = root.upgrade() else {
+            return yield_now();
+        };
+        let v = View::new(root.page());
+        if v.free().ok_or_else(|| corrupt_node(root.pid()))? >= need {
+            root.release_unchanged();
+            return Ok(IOResult::Done(Split::Done));
+        }
+        let level = v.level();
+        let mut child = done!(self.pool.allocate(self.class()));
+        let image = node::image(root.page());
+        node::apply_image(child.page_mut(), &image).ok_or_else(|| corrupt_node(root.pid()))?;
+        node::build(
+            root.page_mut(),
+            &Layout {
+                root: self.root,
+                level: level + 1,
+                lower: None,
+                upper: None,
+                next: (child.pid(), child.hint()),
+            },
+            [],
+        );
+        let root_image = node::image(root.page());
+        let lsns = self.log_batch(
+            admitted,
+            &[
+                Record {
+                    pid: child.pid(),
+                    change: Change::Init { image: &image },
+                },
+                Record {
+                    pid: self.root,
+                    change: Change::Init { image: &root_image },
+                },
+            ],
+            &[StoreRecord::Adopt {
+                pids: vec![child.pid()],
+            }],
+        );
+        child.changed(lsns[0]);
+        root.changed(lsns[1]);
+        Ok(IOResult::Done(Split::Again))
+    }
+
+    /// Merges the node at `level` covering `key` with a neighbour if it is underfull and the two
+    /// fit; then its parent, if that is left underfull, and the root, if left with one child.
+    /// `merging` holds the level still to look at, `None` once done.
+    fn merge(&self, key: &[u8], level: u8, merging: &mut Option<u8>) -> Result<IOResult<()>> {
+        let mut admitted = done!(self.log().admit(self.smo_len()));
+        let (node, parent) = match self.descend(key, level, Route::At)? {
+            Found::Node {
+                node,
+                parent: Some(parent),
+            } => (node, parent),
+            // The root, or a level the tree no longer has: nothing to merge.
+            Found::Node { parent: None, .. } | Found::Shorter => {
+                *merging = None;
+                return Ok(IOResult::Done(()));
+            }
+            Found::Restart => return yield_now(),
+            Found::Io(io) => return Ok(IOResult::IO(io)),
+        };
+        let (parent, pos) = parent;
+        let Some(look) = parent.read(|p| {
+            let v = View::new(p);
+            let count = v.count()?;
+            // Pairs by their left position: with the right neighbour first, then the left. The
+            // left of a pair goes into the right, which keeps its place in the parent.
+            let pairs: Vec<Pair> = [pos, pos.wrapping_sub(1)]
+                .into_iter()
+                .filter(|&l| l < count)
+                .map(|l| Some((l, v.child(l)?, v.child(l + 1)?)))
+                .collect::<Option<_>>()?;
+            Some(pairs)
+        }) else {
+            return yield_now();
+        };
+        let pairs = look.ok_or_else(|| corrupt_node(parent.pid()))?;
+        if pairs.is_empty() {
+            // The parent has this child alone: the root then shrinks, and any other parent
+            // merges at its own level.
+            if parent.pid() == self.root {
+                return self.shrink(parent, node, merging, &mut admitted);
+            }
+            *merging = Some(level + 1);
+            return Ok(IOResult::Done(()));
+        }
+        for (left_pos, (left, left_hint), (right, right_hint)) in pairs {
+            match done!(self.merge_pair(
+                &parent,
+                &node,
+                pos,
+                level,
+                (left_pos, left, left_hint, right, right_hint),
+                &mut admitted
+            )) {
+                Some(next) => {
+                    *merging = next;
+                    return Ok(IOResult::Done(()));
+                }
+                None => continue,
+            }
+        }
+        *merging = None;
+        Ok(IOResult::Done(()))
+    }
+
+    /// Merges one pair of children of `parent`, the left into the right, if the node at `pos`
+    /// is underfull and the two fit. `None` if they do not; else the level to look at next.
+    #[allow(clippy::too_many_arguments)]
+    fn merge_pair(
+        &self,
+        parent: &Optimistic<'_>,
+        node: &Optimistic<'_>,
+        pos: usize,
+        level: u8,
+        (left_pos, left, left_hint, right, right_hint): (usize, PageId, u32, PageId, u32),
+        admitted: &mut Admitted,
+    ) -> Result<IOResult<Option<Option<u8>>>> {
+        let fix = |pid: PageId, hint: u32| -> Result<IOResult<Optimistic<'_>>> {
+            if pid == node.pid() {
+                return Ok(IOResult::Done(node.clone()));
+            }
+            let cell = AtomicU32::new(hint);
+            match self.pool.fix_optimistic(pid, Some(&cell)) {
+                Err(LimboError::Corrupt(_)) if !parent.validate() => yield_now(),
+                r => r,
+            }
+        };
+        let l = done!(fix(left, left_hint));
+        let r = done!(fix(right, right_hint));
+        let (Some(mut p), Some(l), Some(mut r)) =
+            (parent.clone().upgrade(), l.upgrade(), r.upgrade())
+        else {
+            return yield_now();
+        };
+        let (pv, lv, rv) = (
+            View::new(p.page()),
+            View::new(l.page()),
+            View::new(r.page()),
+        );
+        let related = pv.child(left_pos).map(|c| c.0) == Some(l.pid())
+            && pv.child(left_pos + 1).map(|c| c.0) == Some(r.pid())
+            && lv.level() == level
+            && rv.level() == level;
+        // Nothing changed: the parent stays at its version for the other pair.
+        let untouched = |p: Exclusive<'_>, l: Exclusive<'_>, r: Exclusive<'_>| {
+            p.release_unchanged();
+            l.release_unchanged();
+            r.release_unchanged();
+        };
+        if !related {
+            untouched(p, l, r);
+            return yield_now();
+        }
+        if !self.underfull(if pos == left_pos { &lv } else { &rv }) {
+            untouched(p, l, r);
+            return Ok(IOResult::Done(Some(None)));
+        }
+        let sep = pv.key(left_pos).ok_or_else(|| corrupt_node(p.pid()))?;
+        let mut entries = lv.entries().ok_or_else(|| corrupt_node(l.pid()))?;
+        if level > 0 {
+            let (child, hint) = lv.next();
+            entries.push(Entry::child(sep.clone(), child, hint));
+        }
+        entries.extend(rv.entries().ok_or_else(|| corrupt_node(r.pid()))?);
+        let (left_shape, right_shape) = (node::shape(l.page()), node::shape(r.page()));
+        let (root, lower) = (left_shape.root, left_shape.lower);
+        let (upper, next) = (right_shape.upper, right_shape.next);
+        let layout = Layout {
+            root,
+            level,
+            lower: lower.as_deref(),
+            upper: upper.as_deref(),
+            next,
+        };
+        if layout.size(&entries) > self.limits.capacity * 3 / 4 {
+            untouched(p, l, r);
+            return Ok(IOResult::Done(None));
+        }
+        node::build(r.page_mut(), &layout, &entries);
+        let image = node::image(r.page());
+        let remove = Record {
+            pid: p.pid(),
+            change: Change::Remove { key: &sep },
+        };
+        remove.apply(p.page_mut())?;
+        let lsns = self.log_batch(
+            admitted,
+            &[
+                Record {
+                    pid: r.pid(),
+                    change: Change::Init { image: &image },
+                },
+                remove,
+            ],
+            &[StoreRecord::Abandon {
+                pids: vec![l.pid()],
+            }],
+        );
+        r.changed(lsns[0]);
+        p.changed(lsns[1]);
+        let at = View::new(p.page()).search(&sep).unwrap().0;
+        node::set_child_hint(p.page_mut(), at, r.hint());
+        let pv = View::new(p.page());
+        // A root left with one child shrinks, which a merge at this level finds; any other
+        // parent left underfull merges at its own level.
+        let next = if p.pid() == self.root && pv.count() == Some(0) {
+            Some(level)
+        } else if p.pid() != self.root && self.underfull(&pv) {
+            Some(level + 1)
+        } else {
+            None
+        };
+        l.abandon();
+        drop((p, r));
+        let freed = l.pid();
+        if let IOResult::IO(_) = self.pool.free(l)? {
+            self.store.orphaned(freed);
+        }
+        Ok(IOResult::Done(Some(next)))
+    }
+
+    /// The root has one child left: the child's contents move up into it.
+    fn shrink(
+        &self,
+        parent: Optimistic<'_>,
+        child: Optimistic<'_>,
+        merging: &mut Option<u8>,
+        admitted: &mut Admitted,
+    ) -> Result<IOResult<()>> {
+        if parent.pid() != self.root {
+            *merging = None;
+            return Ok(IOResult::Done(()));
+        }
+        let (Some(mut root), Some(child)) = (parent.upgrade(), child.upgrade()) else {
+            return yield_now();
+        };
+        let rv = View::new(root.page());
+        if rv.count() != Some(0) || rv.next().0 != child.pid() {
+            return yield_now();
+        }
+        let image = node::image(child.page());
+        node::apply_image(root.page_mut(), &image).ok_or_else(|| corrupt_node(child.pid()))?;
+        let lsns = self.log_batch(
+            admitted,
+            &[Record {
+                pid: self.root,
+                change: Change::Init { image: &image },
+            }],
+            &[StoreRecord::Abandon {
+                pids: vec![child.pid()],
+            }],
+        );
+        root.changed(lsns[0]);
+        child.abandon();
+        drop(root);
+        let freed = child.pid();
+        if let IOResult::IO(_) = self.pool.free(child)? {
+            self.store.orphaned(freed);
+        }
+        *merging = None;
+        Ok(IOResult::Done(()))
+    }
+
+    // ---------------------------------------------------------------- scanning
+
+    /// Moves `cursor` as `seek` says. Step it until done; then whether it found an entry.
+    pub fn seek(&self, cursor: &mut Cursor, key: &[u8], seek: Seek) -> Result<IOResult<bool>> {
+        if cursor.pending.is_none() {
+            cursor.pending = Some((seek, key.to_vec()));
+            cursor.leaf = None;
+        }
+        self.run(cursor)
+    }
+
+    /// The entry after the cursor's. Step it until done.
+    pub fn next(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
+        if cursor.pending.is_none() {
+            let Some((key, _)) = &cursor.entry else {
+                return Ok(IOResult::Done(false));
+            };
+            cursor.pending = Some((Seek::Gt, key.clone()));
+        }
+        self.run(cursor)
+    }
+
+    /// The entry before the cursor's. Step it until done.
+    pub fn prev(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
+        if cursor.pending.is_none() {
+            let Some((key, _)) = &cursor.entry else {
+                return Ok(IOResult::Done(false));
+            };
+            cursor.pending = Some((Seek::Lt, key.clone()));
+        }
+        self.run(cursor)
+    }
+
+    fn run(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
+        loop {
+            if let Some((key, read)) = &mut cursor.reading {
+                match done!(read.step(&self.pool)) {
+                    Read::Value(v) => {
+                        cursor.entry = Some((std::mem::take(key), v));
+                        cursor.reading = None;
+                        cursor.pending = None;
+                        cursor.failed = None;
+                        return Ok(IOResult::Done(true));
+                    }
+                    Read::Changed => {
+                        let failed = read.reference();
+                        cursor.reading = None;
+                        if cursor.failed == Some(failed) {
+                            return Err(corrupt_value(failed));
+                        }
+                        cursor.failed = Some(failed);
+                    }
+                }
+            }
+            let (seek, target) = cursor.pending.clone().expect("a seek pending");
+            let cached = cursor.leaf.and_then(|(pid, hint, version)| {
+                self.pool
+                    .fix_optimistic_at(pid, hint)
+                    .filter(|l| l.version() == version)
+            });
+            let leaf = match &cached {
+                // The leaf of the last entry is as it was: no descent.
+                Some(leaf) => leaf.clone(),
+                None => {
+                    let route = if seek == Seek::Gt {
+                        Route::Above
+                    } else {
+                        Route::At
+                    };
+                    found!(self.descend(&target, 0, route)).0
+                }
+            };
+            let Some(step) =
+                leaf.read(|p| scan_leaf(View::new(p), seek, &target, cached.is_some()))
+            else {
+                cursor.leaf = None;
+                continue;
+            };
+            match step.ok_or_else(|| corrupt_node(leaf.pid()))? {
+                Scan::Entry(key, value, out_of_line) => {
+                    cursor.leaf = Some((leaf.pid(), leaf.hint(), leaf.version()));
+                    if !out_of_line {
+                        cursor.entry = Some((key, value));
+                        cursor.pending = None;
+                        return Ok(IOResult::Done(true));
+                    }
+                    let reference =
+                        ValueRef::decode(&value).ok_or_else(|| corrupt_node(leaf.pid()))?;
+                    cursor.reading = Some((key, ValueRead::new(reference)));
+                }
+                Scan::End => {
+                    cursor.entry = None;
+                    cursor.pending = None;
+                    cursor.leaf = None;
+                    return Ok(IOResult::Done(false));
+                }
+                Scan::Stale => cursor.leaf = None,
+                Scan::Beyond(pid, hint, fence) => {
+                    cursor.leaf = None;
+                    // The next leaf by its hint, if its frame still holds it; else a descent.
+                    if let Some(n) = self.pool.fix_optimistic_at(pid, hint) {
+                        let neighbour = n.read(|p| {
+                            let v = View::new(p);
+                            v.is_node()
+                                && v.root() == self.root
+                                && v.is_leaf()
+                                && v.lower() == Some(Some(&fence[..]))
+                        });
+                        if neighbour == Some(true) {
+                            cursor.leaf = Some((pid, hint, n.version()));
+                        }
+                    }
+                    cursor.pending = Some((Seek::Gt, fence));
+                }
+                Scan::Before(fence) => {
+                    cursor.leaf = None;
+                    cursor.pending = Some((Seek::Le, fence));
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- checking
+
+    /// Checks the whole tree: every node's structure, the fences of each child against its
+    /// parent's entries, levels, and the root's. Step it until done.
+    pub fn check(&self, op: &mut Check) -> Result<IOResult<Stats>> {
+        if op.stack.is_empty() && op.stats.nodes == 0 {
+            op.stack.push(Expected {
+                pid: self.root,
+                lower: None,
+                upper: None,
+                level: None,
+            });
+        }
+        while let Some(Expected {
+            pid,
+            lower,
+            upper,
+            level,
+        }) = op.stack.last().cloned()
+        {
+            let page = done!(self.pool.fix_shared(pid, None));
+            op.stack.pop();
+            let v = View::new(page.page());
+            let fail = |what: String| {
+                LimboError::Corrupt(format!("B-tree {:?}, {pid:?}: {what}", self.root))
+            };
+            node::check(page.page()).map_err(fail)?;
+            if v.root() != self.root {
+                return Err(fail("belongs to another tree".into()));
+            }
+            if level.is_some_and(|l| l != v.level()) {
+                return Err(fail(format!(
+                    "at level {} under a parent expecting {level:?}",
+                    v.level()
+                )));
+            }
+            if v.lower().unwrap().map(<[u8]>::to_vec) != lower
+                || v.upper().unwrap().map(<[u8]>::to_vec) != upper
+            {
+                return Err(fail("fences differ from the parent's".into()));
+            }
+            op.stats.nodes += 1;
+            op.stats.pages.push(pid);
+            let count = v.count().unwrap();
+            if v.is_leaf() {
+                op.stats.entries += count;
+                for i in 0..count {
+                    let (value, out) = v.value(i).unwrap();
+                    if out {
+                        op.stats.values.push(
+                            ValueRef::decode(value)
+                                .ok_or_else(|| fail(format!("entry {i}: a bad reference")))?,
+                        );
+                    }
+                }
+                continue;
+            }
+            // Children in reverse, so the leftmost is checked first.
+            let mut bound = upper.clone();
+            for i in (0..=count).rev() {
+                let child = v.child(i).unwrap().0;
+                let lo = if i == 0 { lower.clone() } else { v.key(i - 1) };
+                op.stack.push(Expected {
+                    pid: child,
+                    lower: lo.clone(),
+                    upper: bound.clone(),
+                    level: Some(v.level() - 1),
+                });
+                bound = lo;
+            }
+        }
+        Ok(IOResult::Done(std::mem::take(&mut op.stats)))
+    }
+}
+
+/// What the look at a leaf found: `None` if it no longer covers the key; else the key's value
+/// and whether it is out of line, if present.
+type Look = Option<Option<(Vec<u8>, bool)>>;
+
+fn look(v: View<'_>, key: &[u8]) -> Option<Look> {
+    if !v.covers(key)? {
+        return Some(None);
+    }
+    let (pos, exact) = v.search(key)?;
+    if !exact {
+        return Some(Some(None));
+    }
+    let (value, out) = v.value(pos)?;
+    Some(Some(Some((value.to_vec(), out))))
+}
+
+fn store_len(pids: &[PageId]) -> u64 {
+    if pids.is_empty() {
+        0
+    } else {
+        framed_len(2 + 8 * pids.len())
+    }
+}
+
+fn smo_len(class: SizeClass, limits: Limits) -> u64 {
+    2 * framed_len(8 + 4 + class.size())
+        + 2 * framed_len(8 + 16 + limits.max_key)
+        + store_len(&[PageId::from_raw(0)])
+}
+
+fn check_budget(log: &Log, class: SizeClass, limits: Limits) -> Result<()> {
+    let need = smo_len(class, limits);
+    if need > log.buffer_bytes() {
+        return Err(LimboError::InternalError(format!(
+            "B-tree nodes of {} bytes need {need} bytes of log per split, more than the {} byte log buffer",
+            class.size(),
+            log.buffer_bytes()
+        )));
+    }
+    Ok(())
+}
+
+/// Where to split a node of `entries` at `level` whose upper fence is infinite if `rightmost`,
+/// for an insert at `at` of `key`: the entries the left keeps, and the separator. Appending at
+/// the right edge of the tree, the left keeps everything, so keys inserted in order fill nodes;
+/// otherwise the entries split in half by bytes.
+fn split_point(
+    entries: &[Entry],
+    level: u8,
+    at: usize,
+    rightmost: bool,
+    key: &[u8],
+) -> (usize, Vec<u8>) {
+    let n = entries.len();
+    if level == 0 {
+        let appending = at == n && entries[n - 1].key.as_slice() < key;
+        if appending && (rightmost || n == 1) {
+            return (n, node::separator(&entries[n - 1].key, key));
+        }
+        if n == 1 {
+            // The new key goes before the one entry, into a node of its own.
+            return (0, node::separator(key, &entries[0].key));
+        }
+        let keep = half(entries).clamp(1, n - 1);
+        return (
+            keep,
+            node::separator(&entries[keep - 1].key, &entries[keep].key),
+        );
+    }
+    // An inner node: entry `keep` moves up as the separator.
+    let keep = if rightmost && at == n {
+        n - 1
+    } else {
+        half(entries).min(n - 1)
+    };
+    (keep, entries[keep].key.clone())
+}
+
+/// The first entry past half the bytes of `entries`.
+fn half(entries: &[Entry]) -> usize {
+    let total: usize = entries.iter().map(|e| e.key.len() + e.value.len()).sum();
+    let mut acc = 0;
+    for (i, e) in entries.iter().enumerate() {
+        acc += e.key.len() + e.value.len();
+        if 2 * acc >= total {
+            return i + 1;
+        }
+    }
+    entries.len()
+}
+
+fn corrupt_node(pid: PageId) -> LimboError {
+    LimboError::Corrupt(format!("B-tree node {pid:?} does not read back"))
+}
+
+fn corrupt_value(r: ValueRef) -> LimboError {
+    LimboError::Corrupt(format!(
+        "the value at {:?} (id {:x}) does not read back",
+        r.pid, r.id
+    ))
+}
+
+/// What one split came to.
+enum Split {
+    Done,
+    /// The tree changed: look again.
+    Again,
+    /// The parent has no room for the separator, which takes this many bytes.
+    ParentFull(usize),
+}
+
+/// A point lookup.
+pub struct Lookup {
+    key: Vec<u8>,
+    read: Option<ValueRead>,
+    /// A reference whose value read back as changed: reading it again the same is corruption.
+    failed: Option<ValueRef>,
+}
+
+impl Lookup {
+    pub fn new(key: &[u8]) -> Self {
+        Self {
+            key: key.to_vec(),
+            read: None,
+            failed: None,
+        }
+    }
+}
+
+/// A put of one key's value.
+pub struct Put {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    value_len: usize,
+    mode: Mode,
+    write: Option<ValueWrite>,
+    /// The out-of-line value being replaced: its reference and pages.
+    old: Option<(Vec<u8>, Vec<PageId>)>,
+    admitted: Option<(Admitted, u64)>,
+    lsn: Lsn,
+}
+
+impl Put {
+    pub fn new(key: &[u8], value: Vec<u8>, mode: Mode) -> Self {
+        Self {
+            key: key.to_vec(),
+            value_len: value.len(),
+            value,
+            mode,
+            write: None,
+            old: None,
+            admitted: None,
+            lsn: 0,
+        }
+    }
+
+    /// Where the change's record ends, once made; 0 if nothing changed. The change is durable
+    /// once the log is durable up to here.
+    pub fn lsn(&self) -> Lsn {
+        self.lsn
+    }
+
+    /// Learns the pages of the out-of-line value `present` holds, if it holds one; false if they
+    /// no longer belong to it, so the key must be looked at again.
+    fn old_pages(
+        &mut self,
+        pool: &Arc<BufferPool>,
+        present: Option<&(Vec<u8>, bool)>,
+    ) -> Result<IOResult<bool>> {
+        old_pages(&mut self.old, pool, present)
+    }
+}
+
+fn old_pages(
+    old: &mut Option<(Vec<u8>, Vec<PageId>)>,
+    pool: &Arc<BufferPool>,
+    present: Option<&(Vec<u8>, bool)>,
+) -> Result<IOResult<bool>> {
+    let Some((reference, true)) = present else {
+        *old = None;
+        return Ok(IOResult::Done(true));
+    };
+    if old.as_ref().is_some_and(|(r, _)| r == reference) {
+        return Ok(IOResult::Done(true));
+    }
+    let parsed = ValueRef::decode(reference)
+        .ok_or_else(|| LimboError::Corrupt("a bad value reference".into()))?;
+    Ok(match value::pages(pool, parsed)? {
+        IOResult::Done(Some(pages)) => {
+            *old = Some((reference.clone(), pages));
+            IOResult::Done(true)
+        }
+        IOResult::Done(None) => IOResult::Done(false),
+        IOResult::IO(io) => IOResult::IO(io),
+    })
+}
+
+/// A removal of one key.
+pub struct Remove {
+    key: Vec<u8>,
+    old: Option<(Vec<u8>, Vec<PageId>)>,
+    admitted: Option<(Admitted, u64)>,
+    /// The level of a merge still to try after the removal.
+    merging: Option<u8>,
+    lsn: Lsn,
+}
+
+impl Remove {
+    pub fn new(key: &[u8]) -> Self {
+        Self {
+            key: key.to_vec(),
+            old: None,
+            admitted: None,
+            merging: None,
+            lsn: 0,
+        }
+    }
+
+    /// Where the removal's record ends, once made; 0 if the key was absent.
+    pub fn lsn(&self) -> Lsn {
+        self.lsn
+    }
+
+    fn old_pages(
+        &mut self,
+        pool: &Arc<BufferPool>,
+        present: &(Vec<u8>, bool),
+    ) -> Result<IOResult<bool>> {
+        old_pages(&mut self.old, pool, Some(present))
+    }
+}
+
+/// Where a seek lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seek {
+    /// The first key at or above.
+    Ge,
+    /// The first key above.
+    Gt,
+    /// The last key at or below.
+    Le,
+    /// The last key below.
+    Lt,
+}
+
+/// A position in a tree: an entry, copied out. It holds no latch; moving it finds the leaf again
+/// by its frame hint, without a descent while the leaf is unchanged.
+#[derive(Default)]
+pub struct Cursor {
+    entry: Option<(Vec<u8>, Vec<u8>)>,
+    pending: Option<(Seek, Vec<u8>)>,
+    /// The leaf of the entry: page, frame hint, and the version it was read at.
+    leaf: Option<(PageId, u32, u64)>,
+    reading: Option<(Vec<u8>, ValueRead)>,
+    failed: Option<ValueRef>,
+}
+
+impl Cursor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn key(&self) -> Option<&[u8]> {
+        self.entry.as_ref().map(|(k, _)| k.as_slice())
+    }
+
+    pub fn value(&self) -> Option<&[u8]> {
+        self.entry.as_ref().map(|(_, v)| v.as_slice())
+    }
+}
+
+/// What a scan of one leaf found.
+enum Scan {
+    /// The entry: its key, its value or reference, and whether the value is out of line.
+    Entry(Vec<u8>, Vec<u8>, bool),
+    /// Nothing more in this direction.
+    End,
+    /// Past the leaf's upper end: the next leaf's hint and the fence to seek above.
+    Beyond(PageId, u32, Vec<u8>),
+    /// A leaf found by its hint no longer answers this seek.
+    Stale,
+    /// Before the leaf's lower end: the fence to seek at or below.
+    Before(Vec<u8>),
+}
+
+/// The entry `seek` from `target` lands on in the leaf `v`. A leaf found by its hint (`cached`)
+/// must hold where the seek lands: cover the target, or, seeking above it, start right there.
+fn scan_leaf(v: View<'_>, seek: Seek, target: &[u8], cached: bool) -> Option<Scan> {
+    if !v.is_leaf() {
+        return None;
+    }
+    if cached && !(v.covers(target)? || seek == Seek::Gt && v.lower()? == Some(target)) {
+        return Some(Scan::Stale);
+    }
+    let count = v.count()?;
+    let (pos, exact) = v.search(target)?;
+    let pos = match seek {
+        Seek::Ge => Some(pos),
+        Seek::Gt => Some(pos + exact as usize),
+        Seek::Le => (pos + exact as usize).checked_sub(1),
+        Seek::Lt => pos.checked_sub(1),
+    };
+    match pos {
+        Some(p) if p < count => {
+            let (value, out) = v.value(p)?;
+            Some(Scan::Entry(v.key(p)?, value.to_vec(), out))
+        }
+        Some(_) => Some(match v.upper()? {
+            None => Scan::End,
+            Some(u) => {
+                let (pid, hint) = v.next();
+                Scan::Beyond(pid, hint, u.to_vec())
+            }
+        }),
+        None => Some(match v.lower()? {
+            None => Scan::End,
+            Some(l) => Scan::Before(l.to_vec()),
+        }),
+    }
+}
+
+/// A check of a whole tree in progress.
+#[derive(Default)]
+pub struct Check {
+    stack: Vec<Expected>,
+    stats: Stats,
+}
+
+/// A node a check is still to look at, and what its parent says it must be.
+#[derive(Clone)]
+struct Expected {
+    pid: PageId,
+    lower: Option<Vec<u8>>,
+    upper: Option<Vec<u8>>,
+    level: Option<u8>,
+}
+
+/// A pair of neighbouring children by the left's position, with each one's page and frame hint.
+type Pair = (usize, (PageId, u32), (PageId, u32));
+
+/// What a check counted.
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub nodes: usize,
+    pub entries: usize,
+    /// Every node's page.
+    pub pages: Vec<PageId>,
+    /// Every out-of-line value's reference.
+    pub values: Vec<ValueRef>,
+}

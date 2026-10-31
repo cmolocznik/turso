@@ -4,7 +4,9 @@
 //! - [`db`]: a database: created new, or recovered from what a crash left ([`recovery`]).
 //! - [`log`]: the one ordered log of the database: parallel appends, group commit, segments.
 //! - [`checkpoint`]: continuous checkpoints, which bound the log recovery replays.
-//! - [`redo`]: how each log record replays on the page it changes; [`blob`] pages so far.
+//! - [`btree`]: B+-trees: slotted nodes, optimistic lock coupling, values out of line.
+//! - [`redo`]: how each log record replays on the page it changes: [`btree`] nodes and [`blob`]
+//!   pages.
 //! - [`buffer`]: the buffer manager: frames, the hash table and frame hints, WATT, writeback.
 //! - [`store`]: the page store: pages written out of place through the page table.
 //! - [`meta`] and [`radix`]: the page table and free space as radix trees of metadata pages.
@@ -18,6 +20,7 @@
 
 pub mod aligned;
 pub mod blob;
+pub mod btree;
 pub mod buffer;
 pub mod checkpoint;
 pub mod control;

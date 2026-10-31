@@ -45,7 +45,7 @@ use super::log::Lsn;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::store::PageStore;
 use clean::Writeback;
-use frame::{FrameHeader, EVICT_AFTER, FREE, LOADING, NO_PAGE, RESIDENT, WRITING};
+use frame::{FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, RESIDENT, WRITING};
 use memory::{Memory, Zeroed};
 use pass::Shard;
 use table::Table;
@@ -514,12 +514,61 @@ impl BufferPool {
     }
 
     /// Frees `pid`, which nothing refers to any more: a provisional page left over by an
-    /// operation that gave up on it, or by a crash. It is read in first if it is not in memory,
-    /// so a fix racing with the free finds either the page or its number free, never both.
+    /// operation that gave up on it, or by a crash. A page not in memory is not read in: a frame
+    /// is taken for it unread and held exclusively, so no fix can read it in while its number is
+    /// freed.
     pub fn free_unreferenced(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
-        match self.fix_exclusive(pid, None)? {
-            IOResult::Done(page) => self.free(page),
-            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        loop {
+            if self.table.find(&self.headers, pid.raw()).is_some() {
+                return match self.fix_exclusive(pid, None)? {
+                    IOResult::Done(page) => self.free(page),
+                    IOResult::IO(io) => Ok(IOResult::IO(io)),
+                };
+            }
+            let class = pid.class();
+            let frame = match self.claim(class)? {
+                IOResult::Done(f) => f,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            let h = self.header(frame);
+            self.take_free_latch(frame);
+            // Whatever the frame held before must not read as this page if the free waits.
+            // SAFETY: latched exclusively.
+            let bytes = unsafe { self.bytes_mut(frame, class) };
+            bytes[..page::HEADER_SIZE].fill(0);
+            h.pid.store(pid.raw(), Ordering::Release);
+            h.flags.store(0, Ordering::Release);
+            h.page_lsn.store(0, Ordering::Release);
+            h.written_lsn.store(0, Ordering::Release);
+            h.tracker.clear();
+            h.status.store(RESIDENT, Ordering::Release);
+            if self.table.insert(&self.headers, pid.raw(), frame).is_err() {
+                // Read in meanwhile: free it where it is.
+                self.free_frame(class, frame);
+                continue;
+            }
+            return self.free(Exclusive {
+                pool: self,
+                frame,
+                pid,
+            });
+        }
+    }
+
+    /// Fixes `pid` without a lock if the frame `hint` names holds it, looking nowhere else: a
+    /// hint that may be stale is followed at no cost when it is.
+    pub fn fix_optimistic_at(self: &Arc<Self>, pid: PageId, hint: u32) -> Option<Optimistic<'_>> {
+        if hint == 0 || hint > self.memory.grains() || self.header(hint - 1).has(ABANDONED) {
+            return None;
+        }
+        match self.probe(hint - 1, pid, Mode::Optimistic) {
+            Probe::Hit(version) => Some(Optimistic {
+                pool: self,
+                frame: hint - 1,
+                pid,
+                version,
+            }),
+            _ => None,
         }
     }
 
@@ -916,6 +965,7 @@ impl BufferPool {
 // -------------------------------------------------------------------- guards
 
 /// A page fixed without a lock. Nothing read is valid until [`validate`](Self::validate) says so.
+#[derive(Clone)]
 pub struct Optimistic<'a> {
     pool: &'a BufferPool,
     frame: u32,
@@ -932,6 +982,11 @@ impl<'a> Optimistic<'a> {
         // SAFETY: validated below; see the contract above.
         let out = read(unsafe { self.pool.bytes(self.frame, self.pid.class()) });
         self.validate().then_some(out)
+    }
+
+    /// The latch version the fix saw: equal versions of one frame and page mean no change between.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Whether the page is unchanged since it was fixed.
@@ -1008,7 +1063,7 @@ pub struct Exclusive<'a> {
     pid: PageId,
 }
 
-impl Exclusive<'_> {
+impl<'a> Exclusive<'a> {
     pub fn page(&self) -> &[u8] {
         // SAFETY: latched exclusively.
         unsafe { self.pool.bytes(self.frame, self.pid.class()) }
@@ -1041,6 +1096,33 @@ impl Exclusive<'_> {
 
     pub fn hint(&self) -> u32 {
         self.frame + 1
+    }
+
+    /// Marks the page as unlinked from everything that refers to it, until it is freed: a hint
+    /// to it is not followed ([`BufferPool::fix_optimistic_at`]), since what it holds no longer
+    /// counts.
+    pub fn abandon(&self) {
+        self.pool
+            .header(self.frame)
+            .flags
+            .fetch_or(ABANDONED, Ordering::AcqRel);
+    }
+
+    /// Releases the latch keeping the version, for a write nothing depends on: a frame hint,
+    /// which every reader checks before use. Optimistic readers are not sent back for it, and
+    /// the page stays held optimistically at that version.
+    pub fn release_unchanged(self) -> Optimistic<'a> {
+        let (pool, frame, pid) = (self.pool, self.frame, self.pid);
+        std::mem::forget(self);
+        let latch = &pool.header(frame).latch;
+        let version = latch.version_held();
+        latch.unlock_exclusive_unchanged();
+        Optimistic {
+            pool,
+            frame,
+            pid,
+            version,
+        }
     }
 }
 

@@ -96,6 +96,14 @@ impl VersionedLatch {
             .is_ok()
     }
 
+    /// The version, read by the exclusive holder: what it stays at after
+    /// [`unlock_exclusive_unchanged`](Self::unlock_exclusive_unchanged).
+    pub fn version_held(&self) -> u64 {
+        let word = self.0.load(Ordering::Relaxed);
+        debug_assert_eq!(state(word), EXCLUSIVE);
+        version(word)
+    }
+
     /// Releases an exclusive hold under which nothing was written, keeping the version, so
     /// optimistic readers are not sent back for nothing.
     pub fn unlock_exclusive_unchanged(&self) {

@@ -170,6 +170,23 @@ impl Recovery {
 
     /// Recovers alongside every other thread calling this; returns once recovery is done.
     pub(super) fn work(&self) -> Result<()> {
+        // A thread that panics with work in hand fails recovery for every thread, which would
+        // otherwise wait for that work forever.
+        struct Unwinding<'r>(&'r Recovery);
+        impl Drop for Unwinding<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    let mut state = self.0.state.lock();
+                    state.phase = Phase::Failed;
+                    state
+                        .failure
+                        .get_or_insert_with(|| "a recovering thread panicked".to_string());
+                    drop(state);
+                    self.0.signal();
+                }
+            }
+        }
+        let _unwinding = Unwinding(self);
         loop {
             // Waiting starts before the look, so a change in between is not missed.
             let changed = self.changed_wait();
@@ -395,7 +412,7 @@ impl Recovery {
                     continue;
                 }
                 let record = PageRecord::decode(r.header.kind, &r.payload)?.expect("a page record");
-                record.redo(page.page_mut());
+                record.redo(page.page_mut())?;
                 page.changed(r.lsn);
             }
         }

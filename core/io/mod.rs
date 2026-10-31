@@ -858,12 +858,45 @@ pub enum Buffer {
         start: usize,
     },
     Pooled(ArenaBuffer),
+    Region(RegionBuffer),
+}
+
+/// Bytes in memory someone else owns, such as an aligned block for direct IO. The owner is kept
+/// alive while the buffer exists.
+pub struct RegionBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    _owner: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+// SAFETY: the bytes are reached only through the buffer, and `RegionBuffer::new`'s caller
+// promises they stay valid while the owner lives.
+unsafe impl Send for RegionBuffer {}
+unsafe impl Sync for RegionBuffer {}
+
+impl RegionBuffer {
+    /// # Safety
+    ///
+    /// `ptr..ptr + len` must stay valid for as long as `owner` lives, and nothing else may write
+    /// those bytes while an IO holding the buffer is in flight.
+    pub unsafe fn new(
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+        ptr: NonNull<u8>,
+        len: usize,
+    ) -> Self {
+        Self {
+            ptr,
+            len,
+            _owner: owner,
+        }
+    }
 }
 
 impl Debug for Buffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pooled(p) => write!(f, "Pooled(len={})", p.logical_len()),
+            Self::Region(r) => write!(f, "Region(len={})", r.len),
             Self::Heap(buf) => write!(f, "{buf:?}: {}", buf.len()),
             Self::Shared(buf) => write!(f, "Shared(len={})", buf.len()),
             Self::HeapView { data, start } => {
@@ -890,7 +923,7 @@ impl Drop for Buffer {
                     cache.return_buffer(buffer, underlying_len);
                 });
             }
-            Self::Pooled(_) | Self::Shared(_) => {}
+            Self::Pooled(_) | Self::Shared(_) | Self::Region(_) => {}
         }
     }
 }
@@ -930,13 +963,17 @@ impl Buffer {
     /// io_uring. Only for use with `UringIO` backend.
     pub fn fixed_id(&self) -> Option<u32> {
         match self {
-            Self::Heap(..) | Self::HeapView { .. } | Self::Shared(..) => None,
+            Self::Heap(..) | Self::HeapView { .. } | Self::Shared(..) | Self::Region(..) => None,
             Self::Pooled(buf) => buf.fixed_id(),
         }
     }
 
     pub fn new_pooled(buf: ArenaBuffer) -> Self {
         Self::Pooled(buf)
+    }
+
+    pub fn new_region(region: RegionBuffer) -> Self {
+        Self::Region(region)
     }
 
     pub fn new_temporary(size: usize) -> Self {
@@ -955,6 +992,7 @@ impl Buffer {
             Self::Shared(buf) => buf.len(),
             Self::HeapView { data, start } => data.len() - *start,
             Self::Pooled(buf) => buf.logical_len(),
+            Self::Region(r) => r.len,
         }
     }
 
@@ -977,6 +1015,8 @@ impl Buffer {
                 }
             }
             Self::Pooled(buf) => buf,
+            // SAFETY: valid while the owner lives, which the buffer keeps alive.
+            Self::Region(r) => unsafe { std::slice::from_raw_parts(r.ptr.as_ptr(), r.len) },
         }
     }
 
@@ -991,6 +1031,7 @@ impl Buffer {
             Self::Shared(buf) => buf.as_ptr(),
             Self::HeapView { data, start } => unsafe { data.as_ptr().add(*start) },
             Self::Pooled(buf) => buf.as_ptr(),
+            Self::Region(r) => r.ptr.as_ptr(),
         }
     }
     #[inline]
@@ -1000,6 +1041,7 @@ impl Buffer {
             Self::Shared(_) => panic!("Buffer::Shared is immutable"),
             Self::HeapView { data, start } => unsafe { (data.as_ptr() as *mut u8).add(*start) },
             Self::Pooled(buf) => buf.as_ptr() as *mut u8,
+            Self::Region(r) => r.ptr.as_ptr(),
         }
     }
 

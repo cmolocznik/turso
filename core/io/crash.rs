@@ -53,6 +53,9 @@ struct State {
     faults: Faults,
     capacity: Option<u64>,
     next_seq: u64,
+    durable_writes: bool,
+    /// Every write completed, per path: where and how long, in completion order.
+    writes: BTreeMap<String, Vec<(u64, usize)>>,
 }
 
 struct Entry {
@@ -101,6 +104,7 @@ enum OpKind {
 }
 
 struct Op {
+    path: String,
     file: Arc<Mutex<FileData>>,
     kind: OpKind,
     completion: Completion,
@@ -145,6 +149,8 @@ impl CrashIO {
                 faults: Faults::default(),
                 capacity: None,
                 next_seq: 0,
+                durable_writes: true,
+                writes: BTreeMap::new(),
             })),
         }
     }
@@ -156,6 +162,21 @@ impl CrashIO {
     /// Total bytes the files may hold; writes past it fail with no space.
     pub fn set_capacity(&self, bytes: Option<u64>) {
         self.state.lock().capacity = bytes;
+    }
+
+    /// Whether files offer [`File::pwrite_durable`]; without it callers must sync.
+    pub fn set_durable_writes(&self, supported: bool) {
+        self.state.lock().durable_writes = supported;
+    }
+
+    /// Every write completed to `path` so far: where and how long, in completion order.
+    pub fn writes_to(&self, path: &str) -> Vec<(u64, usize)> {
+        self.state
+            .lock()
+            .writes
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Operations submitted and not completed yet.
@@ -198,7 +219,9 @@ impl CrashIO {
                 },
             );
         }
-        CrashIO::with_paths(paths, rng.next())
+        let crashed = CrashIO::with_paths(paths, rng.next());
+        crashed.state.lock().durable_writes = state.durable_writes;
+        crashed
     }
 
     /// Completes one operation in flight, chosen at random. Callbacks run with no lock held.
@@ -222,6 +245,7 @@ impl CrashIO {
 
     fn submit(
         &self,
+        path: &str,
         file: &Arc<Mutex<FileData>>,
         kind: OpKind,
         completion: Completion,
@@ -234,6 +258,7 @@ impl CrashIO {
             kind => kind,
         };
         state.in_flight.push(Op {
+            path: path.to_string(),
             file: file.clone(),
             kind,
             completion: completion.clone(),
@@ -289,6 +314,10 @@ impl State {
                     }
                 }
                 let seq = self.seq();
+                self.writes
+                    .entry(op.path.clone())
+                    .or_default()
+                    .push((*pos, bytes.len()));
                 let mut data = op.file.lock();
                 write_at(&mut data.volatile, *pos, bytes);
                 if *durable {
@@ -489,6 +518,7 @@ impl IO for CrashIO {
             io: CrashIO {
                 state: self.state.clone(),
             },
+            path: path.to_string(),
             data,
             direct: flags.contains(OpenFlags::Direct),
         }))
@@ -532,6 +562,7 @@ impl IO for CrashIO {
 
 pub struct CrashFile {
     io: CrashIO,
+    path: String,
     data: Arc<Mutex<FileData>>,
     direct: bool,
 }
@@ -564,7 +595,9 @@ impl File for CrashFile {
 
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         self.check_aligned(pos, c.as_read().buf())?;
-        Ok(self.io.submit(&self.data, OpKind::Read { pos }, c))
+        Ok(self
+            .io
+            .submit(&self.path, &self.data, OpKind::Read { pos }, c))
     }
 
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
@@ -574,15 +607,17 @@ impl File for CrashFile {
             buffer,
             durable: false,
         };
-        Ok(self.io.submit(&self.data, kind, c))
+        Ok(self.io.submit(&self.path, &self.data, kind, c))
     }
 
     fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
-        Ok(self.io.submit(&self.data, OpKind::Sync { covers: 0 }, c))
+        Ok(self
+            .io
+            .submit(&self.path, &self.data, OpKind::Sync { covers: 0 }, c))
     }
 
     fn supports_durable_writes(&self) -> bool {
-        true
+        self.io.state.lock().durable_writes
     }
 
     fn pwrite_durable(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
@@ -592,7 +627,7 @@ impl File for CrashFile {
             buffer,
             durable: true,
         };
-        Ok(self.io.submit(&self.data, kind, c))
+        Ok(self.io.submit(&self.path, &self.data, kind, c))
     }
 
     fn allocate(&self, pos: u64, len: u64) -> Result<()> {
@@ -615,7 +650,9 @@ impl File for CrashFile {
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
-        Ok(self.io.submit(&self.data, OpKind::Truncate { len }, c))
+        Ok(self
+            .io
+            .submit(&self.path, &self.data, OpKind::Truncate { len }, c))
     }
 
     /// A punched range reads back as zeros; so does one written with zeros.

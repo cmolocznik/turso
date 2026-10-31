@@ -14,9 +14,11 @@
 //! Every IO goes through Turso's [`crate::io::IO`] and returns its completion, so this runs under
 //! the VDBE's `IOResult` stepping on every backend: io_uring, the syscall backend and memory.
 
+pub mod aligned;
 pub mod buffer;
 pub mod checkpoint;
 pub mod latch;
+pub mod log;
 pub mod page;
 pub mod store;
 pub mod wal;

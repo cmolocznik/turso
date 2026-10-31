@@ -93,7 +93,7 @@ Durability is chosen per database:
 {db}               control file: two 4 KiB superblocks, written in turn
 {db}-data/c{k}.{n} data file n of size class k, each at most a fixed size
 {db}-temp/c{k}     temporary pages of size class k, deleted at every open
-{db}-log/{n}       log segments by number, and prepared spares
+{db}.log.{n}       log segments by number, and the next one prepared
 ```
 
 - **Data files** are split into files of a fixed size (a creation parameter), so none exceeds what a
@@ -163,8 +163,10 @@ least one batch, preallocated with `fallocate`.
 2. **Write.** Each copy is durable when its write completes: a write with `RWF_DSYNC`, or the batch
    followed by one `fdatasync`.
 3. **Remap.** `Remap { pid, new, old }` is logged, the map entry points at `new`, and its bit is set.
-4. **Free.** Once the log is durable past that remap, `old` is erased (a hole punched, or zeros
-   written) and its bit cleared.
+4. **Free.** Once a checkpoint whose redo point is past that remap is durable, `old` is erased
+   (a hole punched, or zeros written) and its bit cleared. Waiting for the checkpoint rather than
+   for the remap alone matters after a crash: the log restarted there is not readable from an
+   older redo point (section 7.4).
 
 A copy may hold changes whose log records are not durable yet. Its remap is appended after it lands,
 behind every record it holds, so a remap that survives a crash names a copy whose records survived
@@ -187,8 +189,9 @@ that bound how much of it must be replayed.
 len: u32 | kind: u8 | flags: u8 | reserved: u16 | txn: u64 | prev: u64 | payload | crc32c: u32 | padding to 8
 ```
 
-- **Alignment and CRC.** Records are 8-byte aligned. The CRC covers the record's position, its
-  header and its payload, so bytes left in a recycled segment never read as a valid record.
+- **Alignment and CRC.** Records start at multiples of 16 bytes. The CRC covers the record's
+  position, its header and its payload, so a record read at another position, a torn record, or
+  bytes a crash left behind never read as valid.
 - **LSN.** A record's LSN is the position just past its end.
 - **Chaining.** `prev` is the previous record of the same transaction, so a transaction's records
   are found from its last one.
@@ -227,20 +230,27 @@ len: u32 | kind: u8 | flags: u8 | reserved: u16 | txn: u64 | prev: u64 | payload
   sync in flight.
 - **Triggers.** A flush starts when a commit waits on it, when the buffer fills, or when the page
   cleaner needs durability. There are no timers.
-- **Padding.** Every flush ends on a 4 KiB boundary, and the gap is a padding record. Durable bytes
-  are never rewritten, so a torn write cannot take committed records with it.
+- **Padding.** Every flush ends on a 4 KiB boundary. When a waited-on record sits in a partial
+  block, the block is padded to its end; padding has no CRC and is checked by its own position
+  instead. Durable bytes are never rewritten, so a torn write cannot take committed records with
+  it.
 
 ### 7.4 Segments
 
 - **Layout.** The log is a sequence of segment files of S bytes. S is a creation parameter,
   256 MiB by default: at the 1 GB/s log rate Umbra measured (VLDB 2022 §4), that is a quarter of a
   second. LSN `l` lives in segment `l / S`, and records may span segments.
-- **Preparation.** Segments are written full of zeros before use, so later writes change no file
-  metadata. Background work keeps a spare ready.
-- **Recycling.** A segment may be zero-filled and reused once:
+- **Preparation.** Segments are created, written full of zeros and synced, with their directory,
+  before any record goes in, so later writes change no file metadata. Background work keeps the
+  next one ready.
+- **Removal.** A segment is deleted, which also erases it, once:
   - it is wholly below the redo point;
   - and below the first record of the oldest transaction still writing, whose undo may need it;
   - and, with object storage, it has been uploaded.
+- **Reopening after a crash.** Appending resumes at the block boundary after the log's end. The
+  rest of that segment is zeroed and later segments removed, so nothing a crash left beyond the
+  end is ever read as log. Bytes between the end and that boundary stay unreadable, so nothing
+  appended is acknowledged until a checkpoint past it is durable.
 - **Readers.** Recovery, replicas, app servers and the archiver read segments by position. A segment
   no longer local is fetched from object storage.
 
@@ -600,6 +610,7 @@ submission or later from `IO::step`. Therefore:
 1. **IO.** Direct IO, `fdatasync`, durable writes, preallocation, directory sync, and the crash IO.
    Done.
 2. **Log.** Records, parallel fill, flushing, segments, failure, and readers by position.
+   Done (`core/storage/atoll/log`).
 3. **Page store.**
    - page kinds;
    - the page table and free space as logged pages;

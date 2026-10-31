@@ -2685,6 +2685,9 @@ impl Insn {
     /// Returns true if this opcode cannot directly modify persistent database
     /// contents. This is used to compute PreparedProgram::readonly, mirroring
     /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
+    /// Row writes such as Insert and Delete are not listed: writing a table
+    /// needs a write Transaction, and the same opcodes also fill ephemeral
+    /// tables, as in a recursive CTE.
     pub fn is_readonly(&self) -> bool {
         match self {
             Self::Checkpoint { .. }
@@ -2696,10 +2699,6 @@ impl Insn {
                 tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
                 ..
             }
-            | Self::Insert { .. }
-            | Self::Delete { .. }
-            | Self::IdxDelete { .. }
-            | Self::OpenWrite { .. }
             | Self::CreateBtree { .. }
             | Self::IndexMethodCreate { .. }
             | Self::IndexMethodDestroy { .. }

@@ -347,6 +347,62 @@ returned success. The pool's `test_a_turn_beside_another_checkpoint_waits_for_it
 running checkpoint at its gate. Both mutations are red, one at a time: the gate's empty result
 restored fails both tests, and a pool turn that counts Busy as a failure fails the pool's.
 
+### Beside writers, a TRUNCATE left what came before it in the logical log
+2026-10-31 `eeeeedc1e`. `core/mvcc/database/checkpoint_state_machine.rs`,
+`core/mvcc/persistent_storage/logical_log.rs`, `core/mvcc/persistent_storage/mod.rs`,
+`core/vdbe/execute.rs`. Under passive checkpoints writers commit while a checkpoint runs. When a
+commit landed after a TRUNCATE's snapshot, the TRUNCATE kept the log segment holding it, and with it
+every frame from before the TRUNCATE, and still reported success. A deletion checkpointed that way
+left the deleted rows' values in the log's files until some later checkpoint freed the segment, and
+nothing told the caller when that happened. WorkReef cognition's erasure check found it beside a
+writer committing every 10 ms: 20 runs of 20 left the erased values in the log.
+
+Now an explicit TRUNCATE runs checkpoint passes until the log holds no segment of the generation it
+began beside, or an older one:
+- The first pass empties the WAL and seals that segment, or readies a file to roll into, and a later
+  pass frees it. The TRUNCATE returns once nothing committed before it began is left in the WAL or
+  the log.
+- The later passes write only what was committed after the first one's snapshot, so they run as
+  passive passes: a reader of the WAL, which a TRUNCATE must wait out, does not hold them back. A
+  first version ran every pass as a TRUNCATE. Beside a writer committing every millisecond,
+  WorkReef's check then stayed Busy for 30 s, where a single pass had got through.
+- It holds `checkpoint_in_progress` from its first pass to its last, so no other checkpoint runs in
+  between.
+- A pass that leaves the log as it found it can free no more, as when a commit made before the
+  TRUNCATE has not finished. The TRUNCATE then reports Busy, never a success that leaves those frames
+  in the files. Stepped again after Busy, the same `PRAGMA wal_checkpoint` goes on toward its first
+  attempt's goal, so commits made since it began do not hold it back. A new call of
+  `Connection::checkpoint` starts afresh.
+
+The log counts the segments it begins, a roll or a truncate beginning the next
+(`LogicalLog::generation`), and reports which it holds (`DurableStorage::logical_log_hold`). A
+storage that does not count them reads as one segment. A commit's own checkpoint and the pool's are
+passive, and unchanged.
+
+Tests:
+- `storage::erasure_tests::a_truncating_checkpoint_beside_a_writer_leaves_no_deleted_value_in_any_file`:
+  rows are inserted, half of them checkpointed into the file, and deleted, and a TRUNCATE runs beside
+  a writer that commits once each of its passes has taken its snapshot. No deleted value is left in
+  the database file, the WAL or any of the log's files, and every live value and every row
+  committed beside it is found. On the code before, 200 deleted values were left in the log.
+- `mvcc::database::rolling_log_tests::test_a_truncate_that_cannot_free_what_came_before_it_reports_busy`:
+  a commit still being made, below every other, keeps any snapshot from covering them. The TRUNCATE
+  rolls the log, can free no more and reports Busy, its frames kept; once the commit is made, the
+  next TRUNCATE empties the log. On the code before, it reported success.
+- `mvcc::database::rolling_log_tests::test_a_truncates_later_passes_run_beside_a_reader_of_the_wal`:
+  a reader begins on another connection once a later pass has written the WAL, and the TRUNCATE
+  completes beside it. With every pass a TRUNCATE, it reported Busy.
+- `mvcc::database::rolling_log_tests::test_a_busy_truncate_stepped_again_goes_on_toward_its_first_goal`:
+  a TRUNCATE statement that reported Busy is stepped again after more commits and finishes in one
+  pass. Started afresh, it took more.
+- Upstream's `test_passive_truncate_keeps_log_frames_committed_after_snapshot` now checks that the
+  first pass keeps the commit that landed after its snapshot and that the next pass checkpoints it,
+  leaving the log empty. With upstream's bug (#8076) restored, it still fails.
+
+Each mutation is red, one at a time: no goal; the goal one generation short; success where a pass
+moved nothing; the gate taken again for each pass; the later passes run as TRUNCATEs; a busy retry
+that forgets its goal; later passes that do not look at the log; and upstream's #8076 bug.
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)
@@ -1063,8 +1119,9 @@ Erasure now holds at three levels:
     document stays in its segment until a merge.
 
 `PRAGMA wal_checkpoint(TRUNCATE)` copies the WAL into the database file and truncates it to 0
-bytes; under MVCC it first checkpoints the logical log into the b-trees and truncates the log to 0.
-So erasing rows takes:
+bytes; under MVCC it first checkpoints the logical log into the b-trees and takes from the log every
+frame committed before it began. Under passive checkpoints beside writers, the log keeps only the
+commits that came after. So erasing rows takes:
 
 ```sql
 PRAGMA secure_delete = ON;          -- once per open of the database
@@ -1072,6 +1129,11 @@ DELETE FROM memories WHERE ...;
 REINDEX memories_embedding;         -- each ivf_rq and FTS index of the table
 PRAGMA wal_checkpoint(TRUNCATE);
 ```
+
+Under passive checkpoints the TRUNCATE reports Busy while another checkpoint runs, while a reader
+of the WAL keeps its first pass from emptying it, or while a commit made before it keeps it from
+freeing what came before it. Set a busy timeout: the statement then retries itself and keeps its
+goal, where a new statement starts afresh.
 
 `core/storage/erasure_tests.rs` reads the checkpointed files back. Its checker walks every b-tree,
 overflow chain and freelist page of the database file and reports every nonzero byte that none of

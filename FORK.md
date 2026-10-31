@@ -1493,15 +1493,18 @@ that round 1,298 to 1,572 writes were left to redo while the rebuild waited and 
 to 9 in each later round.
 
 ### Atoll, a storage mode after LeanStore
-2026-10-31, on branch `atoll` (not yet on `workreef`): `7599d09ef`, `b1accccee`, `5fb136184`,
-`9923c8f79`, `c7b471c72`, `a2e41d461` and the design in `docs/internals/atoll/DESIGN.md`.
+2026-10-31 to 2026-11-01, on branch `atoll` (not yet on `workreef`): `7599d09ef`, `b1accccee`,
+`5fb136184`, `9923c8f79`, `c7b471c72`, `a2e41d461`, `6e30640dc`, `5d3907c1c`, `05ae1ad56`,
+`7533b17b1`, `a0380004f`, `409e158b9` and the design in `docs/internals/atoll/DESIGN.md`.
 `core/storage/atoll`. A storage engine beside the pager and MVCC, with LeanStore 2024 as its
 baseline: one ordered log filled in parallel, pages written out of place through a page table of
-logged metadata pages, a buffer manager with a hash table and frame hints, and (to come) OSIC MVCC
-and B+-trees under Turso's cursors. Built so far: the log, the page store, the control file, the
-buffer manager, continuous checkpoints and parallel recovery (`Atoll::open`, or `Opening` with
-threads the embedder lends). `CompletionError::CorruptPage` reports a page copy that fails its
-checksum.
+logged metadata pages, a buffer manager with a hash table and frame hints, B+-trees with optimistic
+lock coupling, and (to come) OSIC MVCC under Turso's cursors. Built so far: the log with atomic
+groups of records, the page store with provisional pages, the control file, the buffer manager,
+continuous checkpoints, parallel recovery (`Atoll::open`, or `Opening` with threads the embedder
+lends), and B+-trees (`btree::Tree`: lookups, puts, removes, cursors, values out of line of any
+length SQLite allows, splits, merges and root changes, each structure change one log group).
+`CompletionError::CorruptPage` reports a page copy that fails its checksum.
 `core/io`: `OpenFlags::Direct` (O_DIRECT; the old `direct` argument keeps being ignored, since the
 pager's IO is not aligned), `File::sync_data`, `File::pwrite_durable` (RWF_DSYNC),
 `File::allocate`, `IO::sync_directory`, `Buffer::Region` over memory someone else owns, and

@@ -52,6 +52,8 @@ cfg_block! {
     }
 }
 
+#[cfg(any(test, feature = "io_crash"))]
+pub mod crash;
 mod memory;
 #[cfg(feature = "io_memory_yield")]
 mod memory_yield;
@@ -157,6 +159,34 @@ pub trait File: Send + Sync {
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
     /// Sync file data&metadata to disk.
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
+    /// Makes the data written so far durable, and the metadata only as far as reading that data
+    /// back needs it (`fdatasync`). Backends without it sync everything.
+    fn sync_data(&self, c: Completion) -> Result<Completion> {
+        self.sync(c, FileSyncType::Fsync)
+    }
+    /// Whether [`pwrite_durable`](Self::pwrite_durable) is supported.
+    fn supports_durable_writes(&self) -> bool {
+        false
+    }
+    /// Writes `buffer` at `pos` and completes `c` only once the data is durable, with no separate
+    /// sync (`RWF_DSYNC`: a FUA write where the device has one).
+    fn pwrite_durable(
+        &self,
+        _pos: u64,
+        _buffer: Arc<Buffer>,
+        _c: Completion,
+    ) -> Result<Completion> {
+        Err(crate::LimboError::InternalError(
+            "durable writes are not supported for the given IO implementation".into(),
+        ))
+    }
+    /// Reserves disk blocks for `[pos, pos + len)`, growing the file to cover it, so writes there
+    /// cannot fail for want of space.
+    fn allocate(&self, _pos: u64, _len: u64) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "allocate is not supported for the given IO implementation".into(),
+        ))
+    }
     fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use crate::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
@@ -555,8 +585,15 @@ bitflags! {
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
         const NoLock = 0b0000100;
+        /// Bypasses the OS page cache (`O_DIRECT`). Every read and write on the file must then
+        /// use a buffer address, an offset and a length that are multiples of
+        /// [`DIRECT_IO_ALIGNMENT`].
+        const Direct = 0b0001000;
     }
 }
+
+/// The alignment `O_DIRECT` IO needs: the logical block size of 4Kn devices, the largest in use.
+pub const DIRECT_IO_ALIGNMENT: usize = 4096;
 
 impl Default for OpenFlags {
     fn default() -> Self {
@@ -573,6 +610,12 @@ pub trait IO: Clock + Send + Sync {
 
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
+
+    /// Makes the files created in or removed from the directory `path` so far durable. Backends
+    /// with no directories to sync do nothing.
+    fn sync_directory(&self, _path: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Whether this IO backend can back host-filesystem shared WAL coordination.
     fn supports_shared_wal_coordination(&self) -> bool {

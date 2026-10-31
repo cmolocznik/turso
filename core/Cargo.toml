@@ -47,6 +47,8 @@ simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
 allocation_metric = []
 # Test only: exposed to testing/stress and the simulator, never to regular library users.
 io_memory_yield = []
+# Test only: the crash-simulating IO in core/io/crash.rs.
+io_crash = []
 serde = ["dep:serde"]
 series = []
 encryption = []

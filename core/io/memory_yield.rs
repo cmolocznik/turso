@@ -173,6 +173,15 @@ impl File for MemoryYieldFile {
         Ok(c)
     }
 
+    /// Memory has no durability to wait for: every write is as durable as any other.
+    fn supports_durable_writes(&self) -> bool {
+        true
+    }
+
+    fn pwrite_durable(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        self.pwrite(pos, buffer, c)
+    }
+
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         tracing::debug!("truncate(path={}): len={} [deferred]", self.path, len);
         self.store.truncate(len);

@@ -49,15 +49,7 @@ impl IO for UnixIO {
 
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
-        let mut file = std::fs::File::options();
-        file.read(true);
-
-        if !flags.contains(OpenFlags::ReadOnly) {
-            file.write(true);
-            file.create(flags.contains(OpenFlags::Create));
-        }
-
-        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
+        let file = common::open_unix(path, flags)?;
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
@@ -75,6 +67,10 @@ impl IO for UnixIO {
     fn remove_file(&self, path: &str) -> Result<()> {
         std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
+    }
+
+    fn sync_directory(&self, path: &str) -> Result<()> {
+        common::sync_directory(path)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -488,6 +484,63 @@ impl File for UnixFile {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn sync_data(&self, c: Completion) -> Result<Completion> {
+        // SAFETY: a plain fdatasync on a descriptor we own.
+        if unsafe { libc::fdatasync(self.file.as_raw_fd()) } == -1 {
+            return Err(io_error(std::io::Error::last_os_error(), "fdatasync"));
+        }
+        trace!("fdatasync");
+        c.complete(0);
+        Ok(c)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supports_durable_writes(&self) -> bool {
+        true
+    }
+
+    /// `pwritev2` with `RWF_DSYNC`: each call returns once what it wrote is durable.
+    #[cfg(target_os = "linux")]
+    fn pwrite_durable(
+        &self,
+        pos: u64,
+        buffer: Arc<crate::Buffer>,
+        c: Completion,
+    ) -> Result<Completion> {
+        use rustix::io::{pwritev2, ReadWriteFlags};
+        let bytes = buffer.as_slice();
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let rest = &bytes[written..];
+            let chunk = &rest[..rest.len().min(MAX_PWRITE_LEN)];
+            match pwritev2(
+                &self.file,
+                &[std::io::IoSlice::new(chunk)],
+                pos + written as u64,
+                ReadWriteFlags::DSYNC,
+            ) {
+                Ok(0) => {
+                    return Err(LimboError::CompletionError(CompletionError::IOError(
+                        ErrorKind::UnexpectedEof,
+                        "pwritev2",
+                    )))
+                }
+                Ok(n) => written += n,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(io_error(e.into(), "pwritev2")),
+            }
+        }
+        trace!("pwrite_durable complete: wrote {written} bytes");
+        c.complete(written as i32);
+        Ok(c)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn allocate(&self, pos: u64, len: u64) -> Result<()> {
+        common::allocate(&self.file, pos, len)
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn size(&self) -> Result<u64> {
         Ok(self
@@ -633,6 +686,9 @@ mod tests {
         assert_eq!(mapped.len(), 81920);
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
-        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
+        assert_eq!(
+            &slice[mapped.len() - 128..],
+            &bytes[4096 + 81920 - 128..4096 + 81920]
+        );
     }
 }

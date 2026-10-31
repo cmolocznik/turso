@@ -233,9 +233,9 @@ fn explain_setup_failure(e: std::io::Error) -> LimboError {
             "io_uring_setup: not supported (host kernel version {})",
             read_kernel_setting("osrelease").unwrap_or_else(|| "unknown".to_string())
         )),
-        ErrorKind::PermissionDenied => LimboError::IoBackendUnavailable(
-            permission_denied_message(read_kernel_setting("io_uring_disabled").as_deref()),
-        ),
+        ErrorKind::PermissionDenied => LimboError::IoBackendUnavailable(permission_denied_message(
+            read_kernel_setting("io_uring_disabled").as_deref(),
+        )),
         _ => io_error(e, "io_uring_setup"),
     }
 }
@@ -459,15 +459,7 @@ impl IO for UringIO {
 
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
-        let mut file = std::fs::File::options();
-        file.read(true);
-
-        if !flags.contains(OpenFlags::ReadOnly) {
-            file.write(true);
-            file.create(flags.contains(OpenFlags::Create));
-        }
-
-        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
+        let file = common::open_unix(path, flags)?;
         let uring_file = Arc::new(UringFile {
             ring: self.ring.clone(),
             state: self.state.clone(),
@@ -485,6 +477,10 @@ impl IO for UringIO {
     fn remove_file(&self, path: &str) -> Result<()> {
         std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
+    }
+
+    fn sync_directory(&self, path: &str) -> Result<()> {
+        common::sync_directory(path)
     }
 
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
@@ -820,6 +816,66 @@ impl File for UringFile {
         // SAFETY: holding `state` Mutex.
         unsafe { state.submit_entry(&self.ring, &sync)? };
         Ok(c)
+    }
+
+    fn sync_data(&self, c: Completion) -> Result<Completion> {
+        trace!("sync_data()");
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let sync = io_uring::opcode::Fsync::new(fd)
+            .flags(io_uring::types::FsyncFlags::DATASYNC)
+            .build()
+            .user_data(get_key(c.clone()));
+        let mut state = self.state.lock();
+        // SAFETY: holding `state` Mutex.
+        unsafe { state.submit_entry(&self.ring, &sync)? };
+        Ok(c)
+    }
+
+    fn supports_durable_writes(&self) -> bool {
+        true
+    }
+
+    /// A write with `RWF_DSYNC`: it completes once what it wrote is durable.
+    fn pwrite_durable(
+        &self,
+        pos: u64,
+        buffer: Arc<crate::Buffer>,
+        c: Completion,
+    ) -> Result<Completion> {
+        let write = {
+            let ptr = buffer.as_ptr();
+            let len = buffer.len();
+            let fd = io_uring::types::Fd(self.file.as_raw_fd());
+            let dsync = libc::RWF_DSYNC as io_uring::types::RwFlags;
+            trace!("pwrite_durable(pos = {}, length = {})", pos, len);
+            if let Some(idx) = buffer.fixed_id() {
+                #[cfg(debug_assertions)]
+                {
+                    self.state.lock().debug_check_fixed(idx, ptr, len);
+                }
+                io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
+                    .offset(pos)
+                    .rw_flags(dsync)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            } else {
+                io_uring::opcode::Write::new(fd, ptr, len as u32)
+                    .offset(pos)
+                    .rw_flags(dsync)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            }
+        };
+        // The SQE holds a raw pointer into the buffer until the completion is processed.
+        c.keep_write_buffer_alive(buffer);
+        let mut state = self.state.lock();
+        // SAFETY: holding `state` Mutex.
+        unsafe { state.submit_entry(&self.ring, &write)? };
+        Ok(c)
+    }
+
+    fn allocate(&self, pos: u64, len: u64) -> Result<()> {
+        common::allocate(&self.file, pos, len)
     }
 
     fn pwritev(

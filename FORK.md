@@ -477,6 +477,16 @@ keeps its locks; a park on a connection with a busy handler of its own; a pass t
 reporting Busy, as before; a transaction's end that wakes nothing; and a wait that does not count
 the commits still preparing.
 
+### io_uring runs completion callbacks without the ring's lock
+2026-10-31 `5fb136184`, on branch `atoll` (not yet on `workreef`).
+`core/io/io_uring.rs`. `drain_cq` ran every completion's callback while holding the ring state's
+mutex, so a callback that submits more IO, which takes that mutex, waited on itself forever. The
+CQEs are now taken under the lock and their callbacks run once it is released; a writev's partial
+completion is still resubmitted under the lock, and its final outcome is reported after it.
+Test: `storage::atoll::store::tests::copies_are_read_back_from_their_newest_slot_and_superseded_slots_are_erased_on_every_backend`
+deadlocked on io_uring (Atoll's log chains a segment's zero-fill writes from completions) and
+passes with the change; `io::io_uring` tests pass.
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)
@@ -1481,6 +1491,20 @@ Measured in the table of the entry before (`ivf_crash` now reports `optimize_fai
 the one rebuild due was made in the first round, when the index first held about 20,000 rows. In
 that round 1,298 to 1,572 writes were left to redo while the rebuild waited and was made, against 0
 to 9 in each later round.
+
+### Atoll, a storage mode after LeanStore
+2026-10-31, on branch `atoll` (not yet on `workreef`): `7599d09ef`, `b1accccee`, `5fb136184` and
+the design in `docs/internals/atoll/DESIGN.md`.
+`core/storage/atoll`. A storage engine beside the pager and MVCC, with LeanStore 2024 as its
+baseline: one ordered log filled in parallel, pages written out of place through a page table of
+logged metadata pages, and (to come) a hash-table buffer manager with frame hints, OSIC MVCC and
+B+-trees under Turso's cursors. Built so far: the log, the page store and the control file.
+`core/io`: `OpenFlags::Direct` (O_DIRECT; the old `direct` argument keeps being ignored, since the
+pager's IO is not aligned), `File::sync_data`, `File::pwrite_durable` (RWF_DSYNC),
+`File::allocate`, `IO::sync_directory`, `Buffer::Region` over memory someone else owns, and
+`io::crash::CrashIO` (tests and the `io_crash` feature), which produces what a crash at any moment
+could leave.
+Tests: `storage::atoll`, `io::crash`.
 
 ## Taken upstream
 

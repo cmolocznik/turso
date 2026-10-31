@@ -403,6 +403,79 @@ Each mutation is red, one at a time: no goal; the goal one generation short; suc
 moved nothing; the gate taken again for each pass; the later passes run as TRUNCATEs; a busy retry
 that forgets its goal; later passes that do not look at the log; and upstream's #8076 bug.
 
+### A TRUNCATE needed a moment with no reader at all
+2026-10-31 `14aa899e1`. `core/storage/wal.rs`, `core/mvcc/database/checkpoint_state_machine.rs`,
+`core/mvcc/database/mod.rs`, `core/mvcc/database/background_checkpoint.rs`, `core/vdbe/execute.rs`,
+`core/vdbe/mod.rs`, `core/statement.rs`, `core/timer.rs`. A TRUNCATE checkpoint took read mark 0 and
+the write lock when it started and kept read mark 0 to its end, so every reader that began meanwhile
+pinned a WAL read mark, and resetting the WAL needed read marks 1 to 4 free. It finished only at a
+moment with no reader of either kind, and otherwise reported Busy, which a busy timeout turned into
+sleeps and retries. Beside a writer committing every millisecond, WorkReef cognition's erasure
+check, retrying it on Busy, completed 17 TRUNCATEs of 20. The slowest took 41.6 s, and 3 did not
+finish in 45 s. And with the background checkpoint on, a long capture kept the pool checkpointing
+back to back, taking the database's checkpoint again between one and the next: its smoke's TRUNCATE
+stayed Busy for its whole 30 s busy timeout.
+
+Now a TRUNCATE under passive checkpoints, stepped with a waker on a connection with a busy timeout,
+follows SQLite's rule, and waits for what holds it parked, not asleep:
+- It copies the WAL as FULL does and publishes the backfill, which lets read mark 0 go. It then
+  restarts and truncates the WAL beside readers of the database file (`Wal::restart_and_truncate`).
+  Readers that begin after the backfill read the database file and never hold it; only readers of
+  frames it copied can, and they end.
+- Where something holds it, it parks: the checkpoint or write lock, a reader of the database file
+  while it copies, a reader pinned below a frame it copies, a reader on a read mark when it
+  restarts, another checkpoint running on another thread, or a commit still in flight that its
+  pass could not cover, so that the pass freed nothing (`MvStore::park_until_commits_end`, woken as
+  each transaction leaves in `remove_tx`). The statement suspends on a completion that the release
+  or the end ending that wait completes (`WalCoordination::park_until`, which judges the wait from
+  the locks' words without taking one), and goes on where it stopped once woken. Nothing polls.
+- It parks for at most its busy timeout, counted from its first park. A timer then ends the park
+  (`core/timer.rs`, which the SDK kit's busy waits now use too, in place of their own), and the
+  statement reports Busy with every lock let go and no busy-handler retry, as the wait it would
+  sleep through is spent. Without a busy timeout it reports Busy at once, as SQLite does; with a
+  busy handler of the caller's own, it reports Busy to that handler.
+- The checkpoint pool gives way to an explicit checkpoint waiting for the one running: before each
+  of its checkpoints it looks, and defers its turn while one waits
+  (`MvStore::explicit_checkpoint_waits`).
+- Stepped without a waker, a caller that cannot suspend gets Busy at once, as before, and its busy
+  handler decides: a blocked thread could not be woken by a reader on that same thread.
+- Reset or dropped, a parked statement lets its locks go.
+
+Beside the same 1 ms writer, stepped as an async host steps it with a 30 s busy timeout, 20
+TRUNCATEs of 20 completed: median 58 ms, slowest 102 ms. Each parked two to four times, for 2 to
+7 ms in all, and none reported Busy or slept.
+
+Tests, each stepping `PRAGMA wal_checkpoint(TRUNCATE)` with a waker that counts its wakes:
+- `mvcc::database::rolling_log_tests::test_a_truncate_parks_on_a_reader_of_the_wal_until_that_reader_ends`:
+  a reader of the frames the TRUNCATE copies keeps it parked, and stepped again it stays parked.
+  Nothing wakes it while that reader reads, not even a reader that begins meanwhile on the
+  database file. The first reader's end wakes it, and it ends while the later reader still reads.
+- `..._parks_on_a_reader_of_the_database_file_until_it_ends` and
+  `..._parks_on_a_reader_pinned_below_its_frames_until_it_ends`: the two waits before its copy.
+- `..._parks_on_a_checkpoint_running_on_another_thread`: it waits for that checkpoint to end.
+- `..._parks_on_a_commit_its_pass_cannot_cover_until_that_commit_ends`: the commit's state alone
+  does not wake it; its end does, and the TRUNCATE then frees the log.
+- `test_a_parked_truncate_reports_busy_at_its_busy_timeout_and_lets_its_locks_go`: woken at its
+  busy timeout while its reader still reads, it reports Busy and holds nothing; run again once the
+  reader ends, it ends.
+- `test_a_truncate_without_a_busy_timeout_reports_busy_beside_a_reader` and
+  `test_a_truncate_with_a_busy_handler_of_its_own_asks_it_rather_than_park`.
+- `test_a_parked_truncate_reset_lets_its_locks_go`: after a reset, the next checkpoint runs.
+- `background_checkpoint::tests::test_the_pool_gives_way_to_an_explicit_checkpoint_waiting_for_it`:
+  a TRUNCATE parked on the pool's checkpoint, which owes another, is woken by its end and runs
+  before the pool's next one, which defers.
+- `test_a_truncate_stepped_without_a_waker_reports_busy_beside_a_reader`.
+
+Each mutation is caught, one at a time: no wake; never parking; waking every waiter on every
+release; no park for the starting locks, for a pinned reader or for the restart; a restart that
+holds read mark 0, which hangs beside a reader of the database file; parking without a waker,
+which hangs a blocking caller beside its own reader; a pool that never gives way, or a waiting
+checkpoint never counted, either of which parks the TRUNCATE again behind the pool's next turn; a
+park with no deadline, or with no timer at it; a spent park that the busy handler retries, or that
+keeps its locks; a park on a connection with a busy handler of its own; a pass that freed nothing
+reporting Busy, as before; a transaction's end that wakes nothing; and a wait that does not count
+the commits still preparing.
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)
@@ -1130,10 +1203,10 @@ REINDEX memories_embedding;         -- each ivf_rq and FTS index of the table
 PRAGMA wal_checkpoint(TRUNCATE);
 ```
 
-Under passive checkpoints the TRUNCATE reports Busy while another checkpoint runs, while a reader
-of the WAL keeps its first pass from emptying it, or while a commit made before it keeps it from
-freeing what came before it. Set a busy timeout: the statement then retries itself and keeps its
-goal, where a new statement starts afresh.
+Set a busy timeout. Under passive checkpoints, a TRUNCATE stepped with a waker, as an async caller
+steps it, then waits for what holds it, parked until the release that ends the wait, for at most
+that timeout. A blocking caller gets Busy instead, and with the busy timeout the statement retries
+itself and keeps its goal, where a new statement starts afresh.
 
 `core/storage/erasure_tests.rs` reads the checkpointed files back. Its checker walks every b-tree,
 overflow chain and freelist page of the database file and reports every nonzero byte that none of

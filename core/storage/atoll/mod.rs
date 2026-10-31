@@ -2,6 +2,7 @@
 //! `docs/internals/atoll/DESIGN.md`, whose last section says which parts are built.
 //!
 //! - [`log`]: the one ordered log of the database: parallel appends, group commit, segments.
+//! - [`buffer`]: the buffer manager: frames, the hash table and frame hints, WATT, writeback.
 //! - [`store`]: the page store: pages written out of place through the page table.
 //! - [`meta`] and [`radix`]: the page table and free space as radix trees of metadata pages.
 //! - [`control`]: the control file and its two superblocks.
@@ -13,6 +14,7 @@
 //! the VDBE's `IOResult` stepping on every backend: io_uring, the syscall backend and memory.
 
 pub mod aligned;
+pub mod buffer;
 pub mod control;
 pub mod latch;
 pub mod log;

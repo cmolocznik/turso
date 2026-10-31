@@ -72,6 +72,38 @@ impl VersionedLatch {
                 .is_ok()
     }
 
+    /// Turns the caller's shared hold into an exclusive one, if no one else holds the latch.
+    pub fn try_upgrade(&self) -> bool {
+        let word = self.0.load(Ordering::Relaxed);
+        state(word) == 1
+            && self
+                .0
+                .compare_exchange(
+                    word,
+                    word - 1 + EXCLUSIVE,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+    }
+
+    /// Takes the latch exclusively if it is free and nothing was written since `seen`, so an
+    /// optimistic reader can go on to change what it read.
+    pub fn try_lock_exclusive_at(&self, seen: u64) -> bool {
+        let word = seen << STATE_BITS;
+        self.0
+            .compare_exchange(word, word | EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Releases an exclusive hold under which nothing was written, keeping the version, so
+    /// optimistic readers are not sent back for nothing.
+    pub fn unlock_exclusive_unchanged(&self) {
+        let word = self.0.load(Ordering::Relaxed);
+        debug_assert_eq!(state(word), EXCLUSIVE);
+        self.0.store(word & !STATE_MASK, Ordering::Release);
+    }
+
     pub fn unlock_exclusive(&self) {
         let word = self.0.load(Ordering::Relaxed);
         debug_assert_eq!(state(word), EXCLUSIVE);
@@ -118,6 +150,39 @@ mod tests {
         assert!(!latch.try_lock_exclusive());
         latch.unlock_exclusive();
         assert!(latch.try_lock_shared());
+    }
+
+    #[test]
+    fn upgrades_succeed_only_for_a_sole_holder_or_an_unchanged_version() {
+        let latch = VersionedLatch::default();
+        assert!(latch.try_lock_shared() && latch.try_lock_shared());
+        assert!(
+            !latch.try_upgrade(),
+            "upgraded beside another shared holder"
+        );
+        latch.unlock_shared();
+        assert!(latch.try_upgrade());
+        latch.unlock_exclusive();
+        let seen = latch.optimistic().unwrap();
+        assert!(latch.try_lock_exclusive_at(seen));
+        latch.unlock_exclusive();
+        assert!(
+            !latch.try_lock_exclusive_at(seen),
+            "an optimistic reader upgraded across a write"
+        );
+        let now = latch.optimistic().unwrap();
+        assert!(latch.try_lock_shared());
+        assert!(
+            !latch.try_lock_exclusive_at(now),
+            "upgraded beside a shared holder"
+        );
+        latch.unlock_shared();
+        assert!(latch.try_lock_exclusive());
+        latch.unlock_exclusive_unchanged();
+        assert!(
+            latch.validate(now),
+            "an unchanged release invalidated a reader"
+        );
     }
 
     #[test]

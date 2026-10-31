@@ -327,6 +327,8 @@ pub enum CompletionError {
     PageCodecError { page_idx: usize },
     #[error("I/O error: partial write")]
     ShortWrite,
+    #[error("Corrupt page {page:#x}: its copy on disk is not whole")]
+    CorruptPage { page: u64 },
     #[error("I/O error: short read on page {page_idx}: expected {expected} bytes, got {actual}")]
     ShortRead {
         page_idx: usize,

@@ -5,16 +5,7 @@ described in Leis, "LeanStore: A High-Performance Storage Engine for NVMe SSDs" 
 Its buffer manager, its page writes and its log depart from LeanStore where the requirements below
 force them to; section 2 lists each departure and why.
 
-The code in `core/storage/atoll` is a prototype of parts of this design:
-
-- size classes and the page header;
-- the versioned latch;
-- an out-of-place page store whose page table is held whole in memory;
-- a buffer manager with swizzling;
-- a redo-only log;
-- checkpoints of that page table.
-
-Section 20 says in what order each piece is replaced.
+The code is in `core/storage/atoll`. Section 20 says which parts are built.
 
 ## 1. What it has to do
 
@@ -286,71 +277,130 @@ round to a majority under Raft. Page writeback goes to other files and never wai
 
 ## 9. The buffer manager
 
+Built in `core/storage/atoll/buffer`.
+
 ### 9.1 Frames
 
-- **Memory.** Each size class has an anonymous memory region carved into frames. The regions share
-  one budget and are backed by 2 MiB huge pages where the OS allows. This is possible because a
-  frame's memory is never unmapped on eviction: a freed frame is reused as it is. Memory moves
-  between classes in 2 MiB batches.
-- **Headers.** Frame headers live in a separate array that is never unmapped:
-  - a state word (the versioned latch, plus states for free, loading and resident; its version rises
-    on every exclusive release and every eviction);
-  - the page id;
-  - the LSN of the first unwritten change;
-  - WATT's access timestamps;
-  - one IO slot.
+- **One region.** The pool is one anonymous region of the configured size, mapped without
+  reserving memory and backed by 2 MiB huge pages where the OS allows. It is carved into 2 MiB
+  batches, and each batch is lent to one size class at a time: 512 frames of 4 KiB, down to one of
+  2 MiB. A 4 MiB or 8 MiB frame takes an aligned run of 2 or 4 batches from a buddy allocator.
+- **Frame ids.** A frame is named by the 4 KiB grain it starts at, as a `u32`, so one pool holds
+  at most 16 TiB. The id names the same memory whichever class holds it.
+- **Never unmapped.** A freed frame is reused as it is. Memory moves between classes a whole batch
+  at a time, so no huge page is ever split.
+- **Moving memory.** A batch moves once every frame in it is free. A batch to be moved is marked
+  draining, which keeps new frames out of it. Its pages then move to free frames of the same class
+  elsewhere (a copy, the hash entry repointed, the old frame's version bumped), or are evicted, or
+  are written back first.
+- **Headers.** Frame headers sit in their own array, one per 4 KiB, which is never unmapped, so a
+  hint however stale always reads a header. Each header holds:
+  - the versioned latch, whose version also rises on eviction;
+  - the page id and the frame's state (free, loading, resident);
+  - the page's LSN and the LSN of its newest copy written back. The page is dirty while the first
+    is past the second. Checkpoints need no first-unwritten LSN per page, because their passes
+    record the log's end before writing a shard (section 10);
+  - writeback flags;
+  - the link to the next frame in its hash chain;
+  - WATT's timestamps.
+
+  That is 104 bytes per 4 KiB frame, 2.5%.
+- **Cost of memory.** Untouched memory costs nothing: the region, the headers and the hash table
+  take physical memory only when used.
+- **Minimum.** A pool is at least 10 MiB: one 8 MiB frame and one batch beside it.
 
 ### 9.2 Finding a page
 
-1. **The table.** One concurrent hash table maps page id to frame, for resident pages only: about
-   16 bytes per frame. It is the only translation.
-2. **Hints.** A reference to a page (a B-tree child entry, a version pointer) carries a frame hint
-   beside the page id. A hint is never trusted. Following it reads the frame's state word and checks
-   that the frame holds that page id. If it does, the access is a hit with no hash lookup, touching
-   the same cache line swizzling would.
+1. **The table.** One hash table maps page id to frame, for pages resident or loading, and is the
+   only translation. A bucket holds the first frame of its chain and a lock bit; each header links
+   the next frame. That is 8 bytes per 4 KiB frame.
+   - Inserts and removals lock the bucket, for a few instructions.
+   - Lookups take no lock. A frame can change chains under a lookup, so what it returns is checked
+     against the frame's latch and page id, and an absence is checked again under the lock by
+     whoever acts on it.
+2. **Hints.** A reference to a page carries a frame hint beside the page id: the frame plus one,
+   with 0 for none. A hint is never trusted. Following it latches the frame and checks that it
+   holds the page. If it does, the access is a hit with no hash lookup.
 3. **Stale hints.** A stale or missing hint costs one hash lookup, and the hint is then refreshed
    with an atomic store. Hints are never cleaned up, so eviction knows nothing of who refers to a
    page, and any number of references may point at one page.
 
 ### 9.3 Fixing a page
 
-- **Optimistic:** read the version, read the page, validate the version. Used for B-tree descent.
-- **Shared** and **exclusive**, with upgrade.
-- **No waiting on a latch.** A busy latch is a cooperative yield; a full pool is a wait on the next
-  eviction.
+- **Optimistic:** read the version, read the page, validate the version. What is read may be
+  mid-change, so code reading optimistically checks every offset before use and never panics on
+  garbage. An optimistic fix upgrades to exclusive if the version is unchanged.
+- **Shared** and **exclusive.** A sole shared holder may upgrade.
+- **No waiting on a latch.** A busy latch is a cooperative yield. A page being loaded is a wait on
+  its read. A full pool is a wait on the next frame freed.
 - **No guard is held across a VDBE yield.** A cursor keeps the frame, the version it saw, its
   position and its key. On resuming it validates the version, and if the page changed it seeks again
   by key.
+- **Changes.** Every change is logged before the latch is released and reported with the end of
+  its record, which becomes the page's LSN and makes the page dirty.
+- **A miss** asks the page source to locate the page, which may wait on IO with nothing claimed.
+  It then claims a frame, links it as loading, and reads the page into it. A reader that finds the
+  page loading waits on that read.
+- **Prefetch** starts reads for pages not in memory and never waits: a page whose location needs a
+  read first, or for which no frame is free at once, is skipped.
 
 ### 9.4 Replacement
 
-WATT (LeanStore 2024 §2.2):
+WATT (Vöhringer and Leis, PVLDB 2023; LeanStore 2024 §2.2), with the paper's tuned defaults:
 
-- each frame records its last few read and write timestamps;
-- eviction samples candidates and evicts those of lowest value;
-- a dirty page's value is weighted by the cost of writing it.
+- each frame records the epochs of its last 8 accesses and its last 4 changes;
+- a page's value is its best subfrequency (accesses over the time since the oldest of them), with
+  the most recent access alone damped by 0.1. Changes count again, weighted by 4;
+- the epoch advances each time a quarter of the pool is evicted;
+- eviction takes the least value among 8 sampled frames as its threshold, then looks at 64 more:
+  clean ones at or below it are evicted, and dirty ones are written back, then evicted if still
+  clean.
+
+The paper divides by `now - t`, which is zero within the current epoch. Here elapsed time counts
+the current epoch as one, so pages used this epoch still rank by how often.
+
+**Between size classes.** When a class has no free frame and no free batch is left, each class's
+threshold is divided by its page size. If another class's value per byte is lower, the requesting
+class takes that class's emptiest batch; otherwise it evicts its own pages. Value per byte is
+GreedyDual-Size's rule with every miss costing the same (Cao and Irani, 1997). A class of 4 or
+8 MiB pages reserves an aligned run, and the batches in it drain into it as they empty. One drain is
+in progress at a time.
 
 Eviction removes the page from the hash table and bumps the frame's version, so every hint to the
 frame goes stale.
 
-### 9.5 Page sources
+### 9.5 Writing back
 
-A miss asks a page source for page P no older than log position X. The answer is:
+- A writeback takes dirty frames of one class and marks them writing, so they are neither evicted
+  nor dropped meanwhile. The page store takes fresh slots for them under a logged intent (section
+  6.3).
+- Each page is copied under a shared latch, held only for the copy, and the copy is written. A page
+  changed while its copy is in flight stays dirty.
+- No log flush comes first. A copy's remap is logged after the copy lands, so a remap that
+  survives a crash names a copy whose records survived too.
+- A writeback is stepped by whoever needs frames, or by a clean pass over a range of frames, which
+  is what checkpoints run (section 10).
+- A failed page write, like a failed log write, stops the pool until the database is reopened.
 
-- the bytes;
-- the page's LSN;
-- the source's own log position;
-- for remote readers, the versions a reader at X needs (section 15).
+### 9.6 Page sources
 
-The sources are:
+A miss asks a page source for page P in two steps:
 
-- **the page store**, on a database node;
-- **a database node**, for app servers and replicas. It answers with the bytes, or with where the
-  current copy is in object storage;
-- **object storage**, for immutable copies.
+1. **Locate:** whatever lookup the read needs first, which may wait on IO. Nothing is claimed yet.
+2. **Read** into the claimed frame. What locate found must still hold. For the local store, the
+   page-table leaf stays pinned in between, so every change to the page's entry reaches it. Once
+   the pool has claimed the page, nothing can change its entry until the read is done.
 
-Misses are batched, and scans prefetch upcoming leaves, because a network fetch costs about
-100 µs–1 ms against about 50 µs for NVMe.
+The local store's source reads the slot the page table names, verifies its checksum and page id,
+and gives a page with no copy yet as zeros. A copy that fails verification is corruption, never
+retried.
+
+Still to come, for app servers and replicas (section 15):
+
+- a read for page P no older than log position X;
+- answers carrying the source's log position, and the versions a reader at X needs;
+- sources that are a database node, or object storage;
+- batched misses, because a network fetch costs about 100 µs–1 ms against about 50 µs for NVMe.
 
 ## 10. Checkpoints
 
@@ -634,13 +684,9 @@ submission or later from `IO::step`. Therefore:
 3. **Page store.** Page kinds; the page table and free space as logged metadata pages; write
    intents and erasure; the control file. Done (`store.rs`, `meta.rs`, `radix.rs`, `control.rs`).
    Temporary pages move to step 7, which first needs them.
-4. **Buffer manager.**
-   - frames on huge pages;
-   - the hash table and frame hints;
-   - WATT replacement;
-   - fixes and prefetch;
-   - the page source for the local store;
-   - the page cleaner.
+4. **Buffer manager.** Frames on huge pages, lent to size classes in batches; the hash table and
+   frame hints; WATT replacement; fixes and prefetch; the page source for the local store;
+   writeback and clean passes. Done (`buffer/`).
 5. **Checkpoints and recovery** over the new pieces.
 6. **B+-trees.**
 7. **Transactions.** Slots, clock, commit logs, version headers, version index, graveyard, conflicts

@@ -257,6 +257,24 @@ impl MetaCache {
         }
     }
 
+    /// The page `id`, once it is in memory, pinned: it stays in the cache, and so receives every
+    /// change made to the page, until [`MetaFrame::unpin`].
+    pub fn get_pinned(self: &Arc<Self>, id: MetaId) -> Result<IOResult<Arc<MetaFrame>>> {
+        loop {
+            let frame = match self.get(id)? {
+                IOResult::Done(f) => f,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            // Eviction takes the map's lock, so a frame still in the map while it is held is the
+            // one every change goes to.
+            let frames = self.frames.lock();
+            if frames.get(&id).is_some_and(|f| Arc::ptr_eq(f, &frame)) {
+                frame.pin();
+                return Ok(IOResult::Done(frame));
+            }
+        }
+    }
+
     /// Every page in `ids`, once all are in memory.
     pub fn get_all(self: &Arc<Self>, ids: &[MetaId]) -> Result<IOResult<Vec<Arc<MetaFrame>>>> {
         let mut out = Vec::with_capacity(ids.len());

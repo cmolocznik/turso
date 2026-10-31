@@ -355,18 +355,53 @@ impl PageStore {
         })
     }
 
+    /// The page-table leaf holding `pid`'s entry, pinned in the metadata cache until the caller
+    /// unpins it, so every change to the entry reaches this frame; `None` if the page table does
+    /// not reach `pid`, whose entry is then [`FREE`].
+    pub fn pinned_leaf(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Option<Arc<MetaFrame>>>> {
+        let class = pid.class();
+        if pid.number() >= radix::capacity(Tree::Map, self.height(Tree::Map, class)) {
+            return Ok(IOResult::Done(None));
+        }
+        let leaf = radix::path(Tree::Map, class, 1, pid.number())[0];
+        Ok(match self.meta.get_pinned(leaf)? {
+            IOResult::Done(f) => IOResult::Done(Some(f)),
+            IOResult::IO(io) => IOResult::IO(io),
+        })
+    }
+
     /// Reads `slot` as a copy of `pid`; `done` gets the copy, `Invalid`, or the IO error.
     pub fn read_slot<F>(&self, pid: PageId, slot: u64, done: F) -> Result<Completion>
     where
         F: FnOnce(PageRead) + Send + 'static,
     {
+        let size = pid.class().size();
+        let block = Arc::new(AlignedBlock::zeroed(size));
+        self.read_slot_into(pid, slot, block.region(0, size), done)
+    }
+
+    /// Reads `slot` as a copy of `pid` into `into`, which is exactly the page's size and aligned
+    /// for direct IO; `done` gets `into` once it holds a whole copy, `Invalid`, or the IO error.
+    pub fn read_slot_into<F>(
+        &self,
+        pid: PageId,
+        slot: u64,
+        into: Arc<Buffer>,
+        done: F,
+    ) -> Result<Completion>
+    where
+        F: FnOnce(PageRead) + Send + 'static,
+    {
         let class = pid.class();
+        assert_eq!(
+            into.len(),
+            class.size(),
+            "a read into a buffer not the page's size"
+        );
         let (file, at) = self.data_file(class, slot)?;
-        let block = Arc::new(AlignedBlock::zeroed(class.size()));
-        let buffer = block.region(0, class.size());
         let done = Mutex::new(Some(done));
-        let keep = buffer.clone();
-        let c = Completion::new_read(buffer, move |res| {
+        let keep = into.clone();
+        let c = Completion::new_read(into, move |res| {
             let done = done.lock().take()?;
             match res {
                 Ok((_, n)) => {
@@ -1094,8 +1129,26 @@ impl WritePlan {
     }
 
     /// Writes the `i`th page's copy, sealed as `pids[i]`, and remaps the page once it is durable.
-    /// `done` gets the slot, or the error, after which the slot is given back.
+    /// `done` gets the slot, or the error, after which the slot is given back. If the write
+    /// cannot be submitted, the slot is given back at once, `done` never runs, and the error is
+    /// returned.
     pub fn write<F>(
+        this: &Arc<Mutex<Self>>,
+        i: usize,
+        copy: Arc<Buffer>,
+        done: F,
+    ) -> Result<Completion>
+    where
+        F: FnOnce(std::result::Result<u64, CompletionError>) + Send + 'static,
+    {
+        let submitted = Self::submit(this, i, copy, done);
+        if submitted.is_err() {
+            this.lock().give_back(i);
+        }
+        submitted
+    }
+
+    fn submit<F>(
         this: &Arc<Mutex<Self>>,
         i: usize,
         copy: Arc<Buffer>,

@@ -91,9 +91,11 @@ Durability is chosen per database:
 
 ```text
 {db}               control file: two 4 KiB superblocks, written in turn
-{db}-data/c{k}.{n} data file n of size class k, each at most a fixed size
-{db}-temp/c{k}     temporary pages of size class k, deleted at every open
+{db}.c{k}.{n}      data file n of size class k, each at most a fixed size
+{db}.map{k}.{l}    page-table pages of size class k at level l
+{db}.free{k}.{l}   free-space pages of size class k at level l
 {db}.log.{n}       log segments by number, and the next one prepared
+{db}.temp{k}       temporary pages of size class k, deleted at every open
 ```
 
 - **Data files** are split into files of a fixed size (a creation parameter), so none exceeds what a
@@ -134,45 +136,63 @@ Durability is chosen per database:
 A page id is `class: 8 bits | number: 56 bits`. A slot is a place in a class's data files. Every
 writeback goes to a fresh slot, so a page's id never changes and its slot does.
 
-The page table maps each page number to:
+The page table maps each page number to a `u64`: free (the number is unused), allocated (no copy
+yet), or the slot of its copy. That is 8 bytes, 0.2% of a 4 KiB page. A free entry is a free
+number, so the page table also allocates page numbers, lowest first, which keeps it dense after
+churn. Where pages live in object storage, a second table beside it says where (section 14).
 
-- **free** — the number is unused;
-- **allocated** — no copy yet;
-- **a local slot**, a remote place (an object and an offset), or both.
+### 6.2 Metadata pages
 
-An entry is 16 bytes, 0.4% of a 4 KiB page. Because a free entry is a free number, the page table
-also allocates page numbers, lowest first, which keeps it dense after churn.
+The page table and free space are radix trees of 4 KiB metadata pages, one of each per class
+(`core/storage/atoll/radix.rs`, `meta.rs`).
 
-The table is a radix tree of pages per class: a root, directory pages, and map pages. A directory
-entry records a map page's slot and how many free entries it has, so a free number is found without
-reading map pages that have none. Page-table pages are found through their parent's entry, and the
-roots through the superblock. The table is consulted only on a buffer miss, and its map pages are
-almost always in memory.
-
-### 6.2 Free space
-
-Per class, a radix tree of bitmap pages (one bit per slot), under directory pages that record each
-bitmap's free count. Allocation takes free slots near a cursor, and adjacent slots for a batch, so
-the batch goes out as one write. A full class grows geometrically, by an eighth of its size and at
-least one batch, preallocated with `fallocate`.
+- **Leaves.** In the page table, 509 entries per page. In free space, a bit per slot, 32,576 per
+  page.
+- **Above the leaves,** a `u64` per child: how many units below it are in use. A free number or
+  slot is found without reading pages that have none. A page of zeros is all free, which is how
+  every page starts.
+- **Lookups** go straight to the leaf a page number falls in; only allocation descends.
+- **Growing.** A tree grows a level at the top, the old root becoming child 0 of the new one. A
+  page's place in its file is fixed by its level and index.
+- **Two places per page.** A metadata page has two places side by side. It is always written to
+  the place that does not hold its newest durable copy, so a torn write leaves that copy whole, and
+  a read takes both places and keeps the newest whole copy. This costs twice the space of the
+  metadata, 0.4% of the data, and needs no free space, no parent pointers and no cascade of writes
+  up the tree.
+- **A cache of their own.** Metadata pages live outside the buffer pool, because a buffer miss
+  needs the page table.
+- **Logged first.** Every change is logged first, under the latches of the pages it changes, so
+  changes reach a page in log order. A page is written only once the log is durable up to its LSN.
 
 ### 6.3 The life of a slot
 
-1. **Intent.** A writeback batch takes free slots and logs a write intent naming them. The intent is
-   durable before any of those writes starts.
-2. **Write.** Each copy is durable when its write completes: a write with `RWF_DSYNC`, or the batch
-   followed by one `fdatasync`.
-3. **Remap.** `Remap { pid, new, old }` is logged, the map entry points at `new`, and its bit is set.
-4. **Free.** Once a checkpoint whose redo point is past that remap is durable, `old` is erased
-   (a hole punched, or zeros written) and its bit cleared. Waiting for the checkpoint rather than
-   for the remap alone matters after a crash: the log restarted there is not readable from an
-   older redo point (section 7.4).
+1. **Intent.** A writeback batch takes free slots, marked in use, and logs an intent naming them.
+   The intent is durable before any of those writes starts.
+2. **Write.** Each copy is durable when its write completes: a write with `RWF_DSYNC`, or a write
+   followed by `fdatasync`.
+3. **Remap.** `Remap { pid, new, old }` is logged. The entry points at `new`, and `old` is freed in
+   the same change.
+4. **Erase.** Once the record that freed `old` is durable, `old` is erased (a hole punched, or
+   zeros written). Only then may it be taken again.
 
-A copy may hold changes whose log records are not durable yet. Its remap is appended after it lands,
-behind every record it holds, so a remap that survives a crash names a copy whose records survived
-too. If a crash leaves an intent with no remap, recovery erases its slots.
+After a crash, frees logged after the point where the log restarted wait for a checkpoint past it
+(section 7.4), since a recovery from before that checkpoint cannot read them.
 
-### 6.4 Temporary pages
+- **Copies ahead of the log.** A copy may hold changes whose log records are not durable yet. Its
+  remap is appended after it lands, behind every record it holds, so a remap that survives a crash
+  names a copy whose records survived too.
+- **What the redo point waits for.** A checkpoint's redo point never passes:
+  - a metadata change not yet written;
+  - a free not yet erased;
+  - an intent with slots not yet remapped or given back.
+
+  So recovery always replays what it must finish.
+- **What recovery finishes.** It erases what replayed records freed. A replayed intent first cancels
+  any earlier replayed free of the same slots: they were erased before they were taken again. Slots
+  of intents no remap matched are given back and erased, so a crash leaves no copy that nothing
+  refers to.
+
+### 6.4 Temporary pages (step 7)
 
 Version index and graveyard pages (section 11), and the spill of large sorts, live only as long as
 the process does. They are never logged. When evicted they go to the temporary files, which are
@@ -611,12 +631,9 @@ submission or later from `IO::step`. Therefore:
    Done.
 2. **Log.** Records, parallel fill, flushing, segments, failure, and readers by position.
    Done (`core/storage/atoll/log`).
-3. **Page store.**
-   - page kinds;
-   - the page table and free space as logged pages;
-   - write intents and erasure;
-   - temporary pages;
-   - the control file.
+3. **Page store.** Page kinds; the page table and free space as logged metadata pages; write
+   intents and erasure; the control file. Done (`store.rs`, `meta.rs`, `radix.rs`, `control.rs`).
+   Temporary pages move to step 7, which first needs them.
 4. **Buffer manager.**
    - frames on huge pages;
    - the hash table and frame hints;

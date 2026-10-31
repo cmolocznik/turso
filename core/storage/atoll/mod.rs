@@ -15,13 +15,13 @@
 //! the VDBE's `IOResult` stepping on every backend: io_uring, the syscall backend and memory.
 
 pub mod aligned;
-pub mod buffer;
-pub mod checkpoint;
+pub mod control;
 pub mod latch;
 pub mod log;
+pub mod meta;
 pub mod page;
+pub mod radix;
 pub mod store;
-pub mod wal;
 
 #[cfg(test)]
 mod testing;

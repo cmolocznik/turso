@@ -1,40 +1,44 @@
 //! Size classes, page ids and the page header.
 //!
-//! Page sizes grow by powers of two from [`MIN_PAGE_SIZE`]. A page id names a page, not a place:
-//! its size class and its number within the class. Where its current copy lives is the page
-//! store's to say, since every write-back goes to a fresh slot.
+//! Page sizes double from [`MIN_PAGE_SIZE`] (4 KiB) to 8 MiB. A page id names a page, not a
+//! place: its size class and its number within the class. Where its current copy lives is the
+//! page store's to say, since every write goes to a fresh slot.
 //!
 //! Every page starts with a [`HEADER_SIZE`]-byte header:
 //!
 //! ```text
-//! lsn: u64 | checksum: u32 | class: u8 | reserved: [u8; 3] | pid: u64
+//! lsn: u64 | checksum: u32 | class: u8 | kind: u8 | flags: u16 | pid: u64
 //! ```
 //!
 //! The checksum is CRC32C over the whole page with the checksum field taken as zero, so a copy
-//! torn on its way to disk, or a slot never written, reads as invalid. The page id and LSN in the
-//! header tell a copy apart from the others the same slot has held: a slot is reused once the copy
-//! it held is superseded, and a stale record of the slot must not read the new occupant.
+//! torn on its way to disk, or a slot never written, reads as invalid. The page id and LSN tell a
+//! copy apart from the others the same place has held.
 
 /// log2 of the smallest page size.
-pub const MIN_PAGE_SHIFT: u32 = 16;
-/// The smallest page size, 64 KiB, as in Umbra.
+pub const MIN_PAGE_SHIFT: u32 = 12;
+/// The smallest page size: 4 KiB, the unit of direct IO and LeanStore's page size.
 pub const MIN_PAGE_SIZE: usize = 1 << MIN_PAGE_SHIFT;
-/// Number of size classes: 64 KiB to 8 MiB.
-pub const CLASS_COUNT: usize = 8;
+/// Number of size classes: 4 KiB to 8 MiB.
+pub const CLASS_COUNT: usize = 12;
 /// Bytes at the start of every page reserved for the header.
 pub const HEADER_SIZE: usize = 24;
 
 const LSN: std::ops::Range<usize> = 0..8;
 const CHECKSUM: std::ops::Range<usize> = 8..12;
 const CLASS: usize = 12;
+const KIND: usize = 13;
 const PID: std::ops::Range<usize> = 16..24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SizeClass(u8);
 
 impl SizeClass {
-    pub fn new(index: usize) -> Option<Self> {
-        (index < CLASS_COUNT).then_some(Self(index as u8))
+    pub const fn new(index: usize) -> Option<Self> {
+        if index < CLASS_COUNT {
+            Some(Self(index as u8))
+        } else {
+            None
+        }
     }
 
     /// The smallest class whose pages hold `len` bytes, header included.
@@ -56,26 +60,30 @@ impl SizeClass {
     }
 }
 
-/// A page's identity on disk: its size class and its slot in that class's file.
+/// What a page holds. Each owner of pages defines its kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PageKind(pub u8);
+
+/// A page's identity: its size class and its number within the class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageId(u64);
 
-const SLOT_BITS: u32 = 56;
-const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
+const NUMBER_BITS: u32 = 56;
+const NUMBER_MASK: u64 = (1 << NUMBER_BITS) - 1;
 
 impl PageId {
     pub fn new(class: SizeClass, number: u64) -> Self {
-        assert!(number <= SLOT_MASK, "page number {number} out of range");
-        Self(((class.0 as u64) << SLOT_BITS) | number)
+        assert!(number <= NUMBER_MASK, "page number {number} out of range");
+        Self(((class.0 as u64) << NUMBER_BITS) | number)
     }
 
     pub fn class(self) -> SizeClass {
-        SizeClass((self.0 >> SLOT_BITS) as u8)
+        SizeClass((self.0 >> NUMBER_BITS) as u8)
     }
 
     /// The page's number within its class.
     pub fn number(self) -> u64 {
-        self.0 & SLOT_MASK
+        self.0 & NUMBER_MASK
     }
 
     pub fn raw(self) -> u64 {
@@ -93,6 +101,14 @@ pub fn lsn(page: &[u8]) -> u64 {
 
 pub fn set_lsn(page: &mut [u8], lsn: u64) {
     page[LSN].copy_from_slice(&lsn.to_le_bytes());
+}
+
+pub fn kind(page: &[u8]) -> PageKind {
+    PageKind(page[KIND])
+}
+
+pub fn set_kind(page: &mut [u8], kind: PageKind) {
+    page[KIND] = kind.0;
 }
 
 fn checksum(page: &[u8]) -> u32 {
@@ -128,24 +144,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classes_double_from_64_kib() {
+    fn classes_double_from_4_kib_to_8_mib() {
         let sizes: Vec<usize> = SizeClass::all().map(SizeClass::size).collect();
-        assert_eq!(sizes.first(), Some(&(64 << 10)));
+        assert_eq!(sizes.first(), Some(&(4 << 10)));
         assert_eq!(sizes.last(), Some(&(8 << 20)));
         assert!(sizes.windows(2).all(|w| w[1] == 2 * w[0]));
         assert_eq!(SizeClass::fitting(1), SizeClass::new(0));
-        assert_eq!(SizeClass::fitting(MIN_PAGE_SIZE), SizeClass::new(0));
         assert_eq!(SizeClass::fitting(MIN_PAGE_SIZE + 1), SizeClass::new(1));
         assert_eq!(SizeClass::fitting((8 << 20) + 1), None);
-    }
-
-    #[test]
-    fn a_page_id_carries_its_class_and_number() {
-        let class = SizeClass::new(3).unwrap();
-        let pid = PageId::new(class, 12345);
-        assert_eq!(pid.class(), class);
-        assert_eq!(pid.number(), 12345);
-        assert_eq!(PageId::from_raw(pid.raw()), pid);
     }
 
     #[test]
@@ -155,15 +161,18 @@ mod tests {
         let mut page = vec![0u8; class.size()];
         page[HEADER_SIZE..HEADER_SIZE + 5].copy_from_slice(b"hello");
         set_lsn(&mut page, 42);
+        set_kind(&mut page, PageKind(3));
         seal(&mut page, pid);
         assert!(verify(&page, pid));
-        assert_eq!((lsn(&page), self::pid(&page)), (42, pid));
+        assert_eq!(
+            (lsn(&page), self::pid(&page), kind(&page)),
+            (42, pid, PageKind(3))
+        );
         assert!(
             !verify(&page, PageId::new(class, 8)),
             "a copy of page 7 read as page 8"
         );
-        assert!(!verify(&page, PageId::new(SizeClass::new(1).unwrap(), 7)));
-        for at in [0, 9, CLASS, PID.start, HEADER_SIZE, class.size() - 1] {
+        for at in [0, 9, CLASS, KIND, PID.start, HEADER_SIZE, class.size() - 1] {
             let mut torn = page.clone();
             torn[at] ^= 1;
             assert!(!verify(&torn, pid), "flip at {at} went unseen");

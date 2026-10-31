@@ -1573,7 +1573,8 @@ fn wait_out(duration: Duration, waker: Option<&Waker>, asleep: &mut Option<Insta
     if let Some(waker) = waker {
         let until = Instant::now() + duration;
         *asleep = Some(until);
-        crate::timer::wake_at(until, waker.clone());
+        let armed = turso_core::timer::wake_at(until, waker.clone());
+        assert!(armed, "the busy-wait timer's thread failed to start");
     }
     #[cfg(target_family = "wasm")]
     let _ = (duration, waker, asleep);

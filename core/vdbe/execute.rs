@@ -105,6 +105,7 @@ use std::{
     cell::Cell,
     num::NonZero,
     sync::{atomic::Ordering, Arc},
+    time::{Duration, Instant},
 };
 use turso_macros::turso_debug_assert;
 
@@ -533,6 +534,20 @@ pub fn op_bit_not(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// How long an explicit checkpoint may park for what is in its way: the connection's busy timeout,
+/// where the timer can end the park at it. `None`: it reports Busy instead, and the busy handler
+/// decides.
+fn checkpoint_park_timeout(connection: &Connection) -> Option<Duration> {
+    match &*connection.get_busy_handler() {
+        crate::busy::BusyHandler::Timeout(timeout)
+            if !timeout.is_zero() && crate::timer::runs() =>
+        {
+            Some(*timeout)
+        }
+        _ => None,
+    }
+}
+
 pub fn op_checkpoint(
     program: &Program,
     state: &mut ProgramState,
@@ -609,20 +624,34 @@ pub fn op_checkpoint(
     let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
         use crate::state_machine::{StateTransition, TransitionResult};
-        // MVCC honors the requested checkpoint mode: Truncate/Restart reset the WAL
-        // file, Passive/Full backfill and leave it (relying on restart-on-write).
-        let mut ckpt_sm = CheckpointStateMachine::new(
-            pager.clone(),
-            mv_store.clone(),
-            program.connection.clone(),
-            true,
-            sync_mode,
-            *database,
-            *checkpoint_mode,
-        );
-        // A busy retry runs this instruction again: a TRUNCATE goes on toward its first attempt's
-        // goal.
-        ckpt_sm.resume_truncate_goal(state.explicit_checkpoint_goal.take());
+        // A checkpoint parked on a lock, a reader or another checkpoint goes on where it stopped.
+        let mut ckpt_sm = match state.parked_checkpoint.take() {
+            Some(parked) => parked,
+            None => {
+                // MVCC honors the requested checkpoint mode: Truncate/Restart reset the WAL
+                // file, Passive/Full backfill and leave it (relying on restart-on-write).
+                let mut ckpt_sm = CheckpointStateMachine::new(
+                    pager.clone(),
+                    mv_store.clone(),
+                    program.connection.clone(),
+                    true,
+                    sync_mode,
+                    *database,
+                    *checkpoint_mode,
+                );
+                // A busy retry runs this instruction again: a TRUNCATE goes on toward its first
+                // attempt's goal.
+                ckpt_sm.resume_truncate_goal(state.explicit_checkpoint_goal.take());
+                // Stepped with a waker, the statement can suspend on a completion another
+                // connection finishes: the checkpoint waits for what is in its way, for as long as
+                // its busy timeout.
+                if state.steps_with_waker && checkpoint_park_timeout(&program.connection).is_some()
+                {
+                    ckpt_sm.park_on_contention();
+                }
+                Box::new(ckpt_sm)
+            }
+        };
         let CheckpointResult {
             wal_max_frame,
             wal_total_backfilled,
@@ -632,6 +661,29 @@ pub fn op_checkpoint(
                 Ok(TransitionResult::Continue) => {}
                 Ok(TransitionResult::Done(result)) => break result,
                 Ok(TransitionResult::Io(iocompletions)) => {
+                    if iocompletions.0.is_wait() {
+                        // Parked: the release it waits for wakes the statement, or else its busy
+                        // timeout, counted from its first park, does.
+                        let now = Instant::now();
+                        let deadline =
+                            checkpoint_park_timeout(&program.connection).map(|timeout| {
+                                *state.checkpoint_park_deadline.get_or_insert(now + timeout)
+                            });
+                        if let Some(deadline) = deadline.filter(|deadline| now < *deadline) {
+                            if crate::timer::complete_at(deadline, iocompletions.0.clone()) {
+                                state.parked_checkpoint = Some(ckpt_sm);
+                                return Ok(state.suspend_on_io(iocompletions));
+                            }
+                        }
+                        // The busy timeout passed: the checkpoint lets everything go and reports
+                        // Busy. Its completion is finished, so no list keeps it.
+                        iocompletions.0.complete(0);
+                        state.checkpoint_park_deadline = None;
+                        state.checkpoint_wait_spent = true;
+                        state.explicit_checkpoint_goal = ckpt_sm.truncate_goal();
+                        ckpt_sm.cleanup_after_external_io_error(LimboError::Busy)?;
+                        return Err(LimboError::Busy.into());
+                    }
                     if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
                         ckpt_sm.cleanup_after_external_io_error(err.clone())?;
                         return Err(err.into());

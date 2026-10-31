@@ -78,6 +78,8 @@ pub struct CheckpointResult {
     pub wal_truncate_sent: bool,
     /// Whether WAL sync I/O has been submitted after truncation
     pub wal_sync_sent: bool,
+    /// Whether `Wal::restart_and_truncate` has restarted the WAL, which it truncates next.
+    pub(crate) wal_restarted: bool,
 }
 
 impl Drop for CheckpointResult {
@@ -97,6 +99,7 @@ impl CheckpointResult {
             wal_total_backfilled,
             wal_checkpoint_backfilled,
             maybe_guard: None,
+            wal_restarted: false,
             db_sync_sent: false,
             db_truncate_sent: false,
             wal_truncate_sent: false,
@@ -445,6 +448,12 @@ impl TursoRwLock {
     }
 
     #[inline]
+    /// Whether a reader or a writer holds the lock now. Lock-free single load.
+    pub fn is_held(&self) -> bool {
+        self.0.load(Ordering::Acquire) & !Self::VALUE_MASK != 0
+    }
+
+    #[inline]
     /// Set the embedded value while holding the write lock.
     pub fn set_value_exclusive(&self, v: u32) {
         // Must be called only while WRITER bit is set
@@ -484,6 +493,54 @@ struct WalCommitState {
 enum CoordinationCheckpointGuardKind {
     Read0,
     Writer,
+    /// The checkpoint lock and the write lock, without read mark 0: what a restart of a WAL whose
+    /// every frame is backfilled takes, beside readers of the database file.
+    Restart,
+}
+
+/// What a parked checkpoint waits for. A release completes it only once this is over, which it
+/// judges from the locks' words without taking one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReleaseWait {
+    /// The locks a checkpoint in this mode takes when it starts: the checkpoint lock, read mark 0
+    /// and, but in PASSIVE, the write lock.
+    Guard(CheckpointMode),
+    /// No reader on a read mark below this frame, which the checkpoint has to copy.
+    Readers(u64),
+    /// The checkpoint lock, the write lock and no reader on a read mark but 0: a restart.
+    Restart,
+}
+
+impl ReleaseWait {
+    fn is_over(self, runtime: &WalSharedRuntime) -> bool {
+        match self {
+            ReleaseWait::Guard(mode) => {
+                !(runtime.checkpoint_lock.is_held()
+                    || runtime.read_locks[0].is_held()
+                    || (!matches!(mode, CheckpointMode::Passive { .. })
+                        && runtime.write_lock.is_held()))
+            }
+            ReleaseWait::Readers(frame) => runtime.read_locks[1..].iter().all(|lock| {
+                lock.held_value()
+                    .is_none_or(|mark| mark == READMARK_NOT_USED || u64::from(mark) >= frame)
+            }),
+            ReleaseWait::Restart => {
+                !(runtime.checkpoint_lock.is_held()
+                    || runtime.write_lock.is_held()
+                    || runtime.read_locks[1..].iter().any(TursoRwLock::is_held))
+            }
+        }
+    }
+}
+
+/// A checkpoint's parking, see `WalCoordination::park_until`.
+pub(crate) enum Park {
+    /// What it waits for is already over: look again now.
+    Over,
+    /// Parked: the release that ends what it waits for completes this.
+    Until(Completion),
+    /// A release cannot wake it here, as across processes: report Busy.
+    Unavailable,
 }
 
 /// Coordination operations that back the WAL's authoritative state.
@@ -590,6 +647,19 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// Release the checkpoint-related locks previously acquired for `guard`.
     fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind);
+
+    /// Parks a checkpoint until `what` is over: the release of a read mark, the write lock or the
+    /// checkpoint lock that ends it completes the returned completion. A checkpoint lets its own
+    /// locks go before it parks.
+    fn park_until(&self, _what: ReleaseWait) -> Park {
+        Park::Unavailable
+    }
+
+    /// Acquire the locks a restart of a WAL whose every frame is backfilled takes: the checkpoint
+    /// lock and the write lock, without read mark 0, whose readers read only the database file.
+    fn acquire_restart_guard(&self) -> Result<CoordinationCheckpointGuardKind> {
+        Err(LimboError::Busy)
+    }
 
     /// Compute the highest frame a checkpoint may safely backfill and refresh read marks.
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64;
@@ -788,6 +858,26 @@ pub trait Wal: Debug + Send + Sync {
         mode: CheckpointMode,
         sync_mode: SyncMode,
     ) -> IOResultOr<CheckpointResult>;
+    /// `checkpoint`, which waits for the locks and the readers in its way instead of reporting
+    /// Busy: parked on the next release of one, it looks again when woken. Where a release cannot
+    /// wake it, as across processes, it reports Busy.
+    fn checkpoint_parking(
+        &self,
+        pager: &Pager,
+        mode: CheckpointMode,
+        sync_mode: SyncMode,
+    ) -> IOResultOr<CheckpointResult>;
+    /// Restarts a WAL whose every frame is backfilled and truncates its file, as TRUNCATE does
+    /// after its backfill, but beside readers of the database file: it takes the checkpoint lock
+    /// and the write lock and needs no reader on a read mark but 0. When `parks`, it waits for
+    /// them, parked on the next release, instead of reporting Busy. `result` keeps its progress
+    /// across IO.
+    fn restart_and_truncate(
+        &self,
+        result: &mut CheckpointResult,
+        sync_type: FileSyncType,
+        parks: bool,
+    ) -> IOResultOr<()>;
     fn install_durable_backfill_proof(
         &self,
         max_frame: u64,
@@ -912,6 +1002,7 @@ impl InProcessWalCoordination {
 
     fn unlock_read_mark(&self, slot: usize) {
         self.shared.read().runtime.read_locks[slot].unlock();
+        self.wake_released();
     }
 
     fn read_mark_value(&self, slot: usize) -> u32 {
@@ -965,6 +1056,7 @@ impl InProcessWalCoordination {
 
     fn unlock_write_lock(&self) {
         self.shared.read().runtime.write_lock.unlock();
+        self.wake_released();
     }
 
     fn try_checkpoint_lock(&self) -> bool {
@@ -973,6 +1065,41 @@ impl InProcessWalCoordination {
 
     fn unlock_checkpoint_lock(&self) {
         self.shared.read().runtime.checkpoint_lock.unlock();
+        self.wake_released();
+    }
+
+    /// After a release, completes each parked checkpoint whose wait it ends. Its fence pairs with
+    /// the one in `park_until`: either the waiter's look after it parked sees this release, or
+    /// this sees the waiter.
+    fn wake_released(&self) {
+        crate::sync::atomic::fence(Ordering::SeqCst);
+        let ended: Vec<Completion> = {
+            let shared = self.shared.read();
+            let runtime = &shared.runtime;
+            if runtime.release_waiter_count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            let mut waiters = runtime.release_waiters.lock();
+            let mut ended = Vec::new();
+            waiters.retain(|(what, wait)| {
+                // A finished one gave up at its busy timeout.
+                if wait.finished() {
+                    return false;
+                }
+                let over = what.is_over(runtime);
+                if over {
+                    ended.push(wait.clone());
+                }
+                !over
+            });
+            runtime
+                .release_waiter_count
+                .store(waiters.len(), Ordering::SeqCst);
+            ended
+        };
+        for wait in ended {
+            wait.complete(0);
+        }
     }
 }
 
@@ -1230,7 +1357,48 @@ impl WalCoordination for InProcessWalCoordination {
                 self.unlock_read_mark(0);
                 self.unlock_checkpoint_lock();
             }
+            CoordinationCheckpointGuardKind::Restart => {
+                self.unlock_write_lock();
+                self.unlock_checkpoint_lock();
+            }
         }
+    }
+
+    fn park_until(&self, what: ReleaseWait) -> Park {
+        let wait = Completion::new_wait();
+        let shared = self.shared.read();
+        let runtime = &shared.runtime;
+        {
+            let mut waiters = runtime.release_waiters.lock();
+            // Those that gave up at their busy timeout go, with no release to end them.
+            waiters.retain(|(_, parked)| !parked.finished());
+            waiters.push((what, wait.clone()));
+            runtime
+                .release_waiter_count
+                .store(waiters.len(), Ordering::SeqCst);
+        }
+        crate::sync::atomic::fence(Ordering::SeqCst);
+        if !what.is_over(runtime) {
+            return Park::Until(wait);
+        }
+        // Over already: a release came between the failed attempt and the parking.
+        let mut waiters = runtime.release_waiters.lock();
+        waiters.retain(|(_, parked)| !parked.ptr_eq(&wait));
+        runtime
+            .release_waiter_count
+            .store(waiters.len(), Ordering::SeqCst);
+        Park::Over
+    }
+
+    fn acquire_restart_guard(&self) -> Result<CoordinationCheckpointGuardKind> {
+        if !self.try_checkpoint_lock() {
+            return Err(LimboError::Busy);
+        }
+        if !self.try_write_lock() {
+            self.unlock_checkpoint_lock();
+            return Err(LimboError::Busy);
+        }
+        Ok(CoordinationCheckpointGuardKind::Restart)
     }
 
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64 {
@@ -2313,6 +2481,12 @@ impl WalCoordination for ShmWalCoordination {
                 self.fallback.unlock_checkpoint_lock();
                 self.authority.release_checkpoint(self.owner);
             }
+            CoordinationCheckpointGuardKind::Restart => {
+                self.fallback.unlock_write_lock();
+                self.fallback.unlock_checkpoint_lock();
+                self.authority.release_writer(self.owner);
+                self.authority.release_checkpoint(self.owner);
+            }
         }
     }
 
@@ -3040,6 +3214,11 @@ pub struct WalSharedRuntime {
 
     /// Serialises checkpointer threads, only one checkpoint can be in flight at any time. Blocking and exclusive only
     pub checkpoint_lock: TursoRwLock,
+    /// Checkpoints parked until what they wait for is over: a release of a read mark, the write
+    /// lock or the checkpoint lock completes each one whose wait it ends.
+    pub(crate) release_waiters: SpinLock<Vec<(ReleaseWait, Completion)>>,
+    /// How many wait in `release_waiters`; each release reads it before it takes the list.
+    pub(crate) release_waiter_count: AtomicUsize,
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
@@ -3361,6 +3540,11 @@ enum CheckpointLocks {
     Read0 {
         coordination: Arc<dyn WalCoordination>,
     },
+    /// The locks of a restart beside readers of the database file; see
+    /// `CoordinationCheckpointGuardKind::Restart`.
+    Restart {
+        coordination: Arc<dyn WalCoordination>,
+    },
 }
 
 /// CheckpointLockSource says whether the checkpoint state machine should acquire checkpoint_lock
@@ -3386,6 +3570,7 @@ impl CheckpointLocks {
         Ok(match guard {
             CoordinationCheckpointGuardKind::Read0 => Self::Read0 { coordination },
             CoordinationCheckpointGuardKind::Writer => Self::Writer { coordination },
+            CoordinationCheckpointGuardKind::Restart => Self::Restart { coordination },
         })
     }
 
@@ -3399,7 +3584,14 @@ impl CheckpointLocks {
         Ok(match guard {
             CoordinationCheckpointGuardKind::Read0 => Self::Read0 { coordination },
             CoordinationCheckpointGuardKind::Writer => Self::Writer { coordination },
+            CoordinationCheckpointGuardKind::Restart => Self::Restart { coordination },
         })
+    }
+
+    /// The locks of a restart of a WAL whose every frame is backfilled.
+    fn for_restart(coordination: Arc<dyn WalCoordination>) -> Result<Self> {
+        coordination.acquire_restart_guard()?;
+        Ok(Self::Restart { coordination })
     }
 }
 
@@ -3411,6 +3603,9 @@ impl Drop for CheckpointLocks {
             }
             CheckpointLocks::Read0 { coordination } => {
                 coordination.release_checkpoint_guard(CoordinationCheckpointGuardKind::Read0);
+            }
+            CheckpointLocks::Restart { coordination } => {
+                coordination.release_checkpoint_guard(CoordinationCheckpointGuardKind::Restart);
             }
         }
     }
@@ -4395,12 +4590,88 @@ impl Wal for WalFile {
         mode: CheckpointMode,
         sync_mode: SyncMode,
     ) -> IOResultOr<CheckpointResult> {
-        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire, sync_mode)
+        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire, sync_mode, false)
             .inspect_err(|e| {
                 tracing::debug!("WAL checkpoint failed: {e}");
                 let _ = self.checkpoint_guard.write().take();
                 self.ongoing_checkpoint.write().state = CheckpointState::Start;
             })
+    }
+
+    fn checkpoint_parking(
+        &self,
+        pager: &Pager,
+        mode: CheckpointMode,
+        sync_mode: SyncMode,
+    ) -> IOResultOr<CheckpointResult> {
+        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire, sync_mode, true)
+            .inspect_err(|e| {
+                tracing::debug!("WAL checkpoint failed: {e}");
+                let _ = self.checkpoint_guard.write().take();
+                self.ongoing_checkpoint.write().state = CheckpointState::Start;
+            })
+    }
+
+    fn restart_and_truncate(
+        &self,
+        result: &mut CheckpointResult,
+        sync_type: FileSyncType,
+        parks: bool,
+    ) -> IOResultOr<()> {
+        while !result.wal_restarted {
+            if result.maybe_guard.is_none() {
+                match CheckpointLocks::for_restart(self.coordination.clone()) {
+                    Ok(guard) => result.maybe_guard = Some(guard),
+                    Err(err) => {
+                        if parks {
+                            match self.coordination.park_until(ReleaseWait::Restart) {
+                                Park::Until(wait) => {
+                                    io_yield_one!(wait);
+                                }
+                                Park::Over => continue,
+                                Park::Unavailable => {}
+                            }
+                        }
+                        return Err(err.into());
+                    }
+                }
+            }
+            let snapshot = self.load_coordination_snapshot();
+            if snapshot.max_frame != snapshot.nbackfills {
+                // A frame came after the backfill, which a TRUNCATE has to copy first.
+                let _ = result.maybe_guard.take();
+                return Err(LimboError::Busy.into());
+            }
+            match self.coordination.begin_restart(self.io.as_ref()) {
+                Ok(restarted) => {
+                    self.keep_unread_changes(restarted);
+                    self.apply_restart_snapshot(restarted);
+                    self.coordination.end_restart();
+                    self.increment_checkpoint_epoch();
+                    result.wal_restarted = true;
+                }
+                Err(err) => {
+                    // A reader holds a frame: let the locks go before parking, as a wake of this
+                    // checkpoint's own release would not wait.
+                    let _ = result.maybe_guard.take();
+                    if parks {
+                        match self.coordination.park_until(ReleaseWait::Restart) {
+                            Park::Until(wait) => {
+                                io_yield_one!(wait);
+                            }
+                            Park::Over => continue,
+                            Park::Unavailable => {}
+                        }
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+        if let IOResult::IO(io) = self.truncate_log(result, sync_type)? {
+            return Ok(IOResult::IO(io));
+        }
+        let _ = result.maybe_guard.take();
+        Ok(IOResult::Done(()))
     }
 
     fn vacuum_checkpoint_with_held_lock(
@@ -4415,6 +4686,7 @@ impl Wal for WalFile {
             },
             CheckpointLockSource::HeldByCaller,
             sync_mode,
+            false,
         )
         .inspect_err(|e| {
             tracing::debug!("WAL checkpoint failed: {e}");
@@ -5217,12 +5489,15 @@ impl WalFile {
     }
 
     #[aristo::intent("Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames", id = "aristos:wal_checkpoint_backfill_crash_atomic", verify = "full", parent = "wal_protocol_correctness")]
+    /// `parks`: wait for the locks and the readers in the way, parked on the next release of one,
+    /// instead of reporting Busy; see `Wal::checkpoint_parking`.
     fn checkpoint_inner(
         &self,
         pager: &Pager,
         mode: CheckpointMode,
         lock_source: CheckpointLockSource,
         sync_mode: SyncMode,
+        parks: bool,
     ) -> IOResultOr<CheckpointResult> {
         loop {
             let state = self.ongoing_checkpoint.read().state.clone();
@@ -5252,8 +5527,34 @@ impl WalFile {
                         )));
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
-                    self.acquire_proper_checkpoint_guard(mode, lock_source)?;
+                    if let Err(err) = self.acquire_proper_checkpoint_guard(mode, lock_source) {
+                        if parks {
+                            match self.coordination.park_until(ReleaseWait::Guard(mode)) {
+                                Park::Until(wait) => {
+                                    io_yield_one!(wait);
+                                }
+                                Park::Over => continue,
+                                Park::Unavailable => {}
+                            }
+                        }
+                        return Err(err.into());
+                    }
                     let mut max_frame = self.determine_max_safe_checkpoint_frame();
+                    if parks && mode.require_all_backfilled() && max_frame < snapshot.max_frame {
+                        // A reader holds frames this checkpoint has to copy: let the locks go
+                        // before parking, as a wake of this checkpoint's own release would not wait.
+                        let _ = self.checkpoint_guard.write().take();
+                        match self
+                            .coordination
+                            .park_until(ReleaseWait::Readers(snapshot.max_frame))
+                        {
+                            Park::Until(wait) => {
+                                io_yield_one!(wait);
+                            }
+                            Park::Over => continue,
+                            Park::Unavailable => return Err(LimboError::Busy.into()),
+                        }
+                    }
                     let nbackfills = self.load_coordination_snapshot().nbackfills;
 
                     if let CheckpointMode::Truncate {
@@ -6179,6 +6480,8 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                release_waiters: SpinLock::new(Vec::new()),
+                release_waiter_count: AtomicUsize::new(0),
                 epoch: AtomicU32::new(snapshot.checkpoint_epoch),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
@@ -6260,6 +6563,8 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                release_waiters: SpinLock::new(Vec::new()),
+                release_waiter_count: AtomicUsize::new(0),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
@@ -6307,6 +6612,8 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                release_waiters: SpinLock::new(Vec::new()),
+                release_waiter_count: AtomicUsize::new(0),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),

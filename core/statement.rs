@@ -672,8 +672,12 @@ impl Statement {
             self.busy_handler_state = None;
         }
 
-        // Handle busy result by invoking the busy handler
-        if matches!(res, Ok(StepResult::Busy)) {
+        // A checkpoint that parked until its busy timeout has waited the time the busy handler
+        // would have slept: the Busy goes to the caller.
+        if std::mem::take(&mut self.state.checkpoint_wait_spent) {
+            self.busy_handler_state = None;
+        } else if matches!(res, Ok(StepResult::Busy)) {
+            // Handle busy result by invoking the busy handler
             let now = self.pager.io.current_time_monotonic();
             let handler = self.program.connection.get_busy_handler();
 
@@ -763,6 +767,12 @@ impl Statement {
     #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
         self._step(None).map_err(|error| self.format_error(error))
+    }
+
+    /// Whether the statement is parked in an explicit checkpoint, waiting for a release.
+    #[cfg(test)]
+    pub(crate) fn parked_checkpoint(&self) -> bool {
+        self.state.parked_checkpoint.is_some()
     }
 
     #[inline]

@@ -7,8 +7,6 @@ use crate::rsapi::TursoError;
 
 pub mod capi;
 pub mod rsapi;
-#[cfg(not(target_family = "wasm"))]
-mod timer;
 
 #[macro_export]
 macro_rules! assert_send {

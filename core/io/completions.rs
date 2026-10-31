@@ -365,6 +365,14 @@ impl Completion {
         Self::new(CompletionType::Yield)
     }
 
+    /// Whether `other` is this same completion, not merely an equal one.
+    pub(crate) fn ptr_eq(&self, other: &Completion) -> bool {
+        match (&self.inner, &other.inner) {
+            (Some(this), Some(that)) => Arc::ptr_eq(this, that),
+            _ => false,
+        }
+    }
+
     pub fn is_wait(&self) -> bool {
         self.inner
             .as_ref()

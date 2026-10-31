@@ -1584,6 +1584,8 @@ impl BuildSharedWal {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                release_waiters: SpinLock::new(Vec::new()),
+                release_waiter_count: AtomicUsize::new(0),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),

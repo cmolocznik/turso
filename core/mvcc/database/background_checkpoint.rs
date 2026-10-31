@@ -657,6 +657,10 @@ impl Pool {
         member.hooks.lock().install(&conn);
         let began = Instant::now();
         loop {
+            // An explicit checkpoint waits for the database: it gets it next.
+            if store.explicit_checkpoint_waiting() {
+                return self.defer(member);
+            }
             let started = Instant::now();
             let result = conn.checkpoint(CheckpointMode::Passive {
                 upper_bound_inclusive: None,

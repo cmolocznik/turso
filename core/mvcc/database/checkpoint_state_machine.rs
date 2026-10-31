@@ -8,7 +8,9 @@ use crate::mvcc::database::{
     TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
     MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
-use crate::mvcc::database::{IndexRowsEntry, RowVersions};
+use crate::mvcc::database::{
+    ExplicitCheckpointWait, IndexRowsEntry, RowVersions, RunningCheckpoint,
+};
 use crate::mvcc::persistent_storage::LogicalLogHold;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -402,6 +404,14 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index` in PASSIVE mode.
     local_schema: Option<Arc<Schema>>,
     owns_checkpoint_in_progress: bool,
+    /// Waits for the locks, readers and checkpoints in its way instead of reporting Busy, parked
+    /// on a completion their release completes; set by a caller that can suspend on it.
+    parks: bool,
+    /// Counted among the explicit checkpoints waiting for the one running, while it waits.
+    waits_for_gate: Option<ExplicitCheckpointWait>,
+    /// A TRUNCATE pass freed nothing while no commit was in flight to wait for: the next pass
+    /// that frees nothing reports Busy.
+    freed_nothing_unprompted: bool,
     /// Roots allocated this checkpoint; published with `visible_from = durable_txid_max_new`.
     staged_roots: Vec<MVTableId>,
     /// Positive roots materialized this pass whose schema version was already ended
@@ -1024,6 +1034,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             build_local_schema_began_read_tx: false,
             local_schema: None,
             owns_checkpoint_in_progress: false,
+            parks: false,
+            waits_for_gate: None,
+            freed_nothing_unprompted: false,
             staged_roots: crate::alloc::vec![],
             ended_created_roots: HashSet::default(),
             freed_root_pages: HashSet::default(),
@@ -1115,6 +1128,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         );
         next.owns_checkpoint_in_progress = std::mem::take(&mut self.owns_checkpoint_in_progress);
         next.truncate_goal = self.truncate_goal;
+        next.parks = self.parks;
+        next.freed_nothing_unprompted = self.freed_nothing_unprompted;
         *self = next;
     }
 
@@ -1127,6 +1142,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// The goal this TRUNCATE works toward, for a busy retry to go on with.
     pub(crate) fn truncate_goal(&self) -> Option<u64> {
         self.truncate_goal
+    }
+
+    /// Waits for the locks, readers and checkpoints in its way, parked on a completion their
+    /// release completes, instead of reporting Busy: for a caller that suspends on that completion
+    /// and steps the checkpoint again once it is woken.
+    pub(crate) fn park_on_contention(&mut self) {
+        self.parks = true;
+    }
+
+    /// A parking TRUNCATE under passive checkpoints copies the WAL as FULL does, and then restarts
+    /// and truncates it beside readers of the database file (`Wal::restart_and_truncate`): it never
+    /// needs a moment with no reader at all, only the readers of frames it copied to end.
+    fn restarts_after_backfill(&self) -> bool {
+        self.parks && self.mode.should_restart_log() && self.mvstore.uses_passive_checkpoint()
+    }
+
+    /// The mode the WAL is checkpointed in.
+    fn wal_mode(&self) -> CheckpointMode {
+        if self.restarts_after_backfill() {
+            CheckpointMode::Full
+        } else {
+            self.mode
+        }
     }
 
     /// Cleanup path for I/O errors that happen while waiting on completions outside
@@ -2046,7 +2084,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let Some(wal) = &self.pager.wal else {
             panic!("No WAL to checkpoint");
         };
-        match wal.checkpoint(&self.pager, self.mode, self.sync_mode)? {
+        let result = if self.parks {
+            wal.checkpoint_parking(&self.pager, self.wal_mode(), self.sync_mode)?
+        } else {
+            wal.checkpoint(&self.pager, self.wal_mode(), self.sync_mode)?
+        };
+        match result {
             IOResult::Done(result) => Ok(IOResult::Done(result)),
             IOResult::IO(io) => Ok(IOResult::IO(io)),
         }
@@ -2075,7 +2118,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// Drop exclusive `read_locks[0]` first so `BEGIN CONCURRENT` is not forced
     /// onto slot 0 while the checkpointer still holds it.
     fn publish_wal_backfill_if_needed(&mut self) {
-        if self.mode.should_restart_log() {
+        if self.wal_mode().should_restart_log() {
             return;
         }
         let (max_frame, backfilled) = {
@@ -2610,14 +2653,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     {
                         // Another checkpoint is already running. A commit's own checkpoint
                         // leaves the work to it; any other reports Busy, as the blocking lock
-                        // does, never a false success that leaves the log as it was.
+                        // does, never a false success that leaves the log as it was, or, when it
+                        // parks, waits for one running on another thread to end.
                         if self.update_transaction_state {
+                            if self.parks {
+                                match self.mvstore.wait_for_running_checkpoint() {
+                                    RunningCheckpoint::Elsewhere(wait) => {
+                                        if self.waits_for_gate.is_none() {
+                                            self.waits_for_gate =
+                                                Some(self.mvstore.explicit_checkpoint_waits());
+                                        }
+                                        return Ok(TransitionResult::Io(IOCompletions(wait)));
+                                    }
+                                    RunningCheckpoint::None => {
+                                        return Ok(TransitionResult::Continue)
+                                    }
+                                    RunningCheckpoint::OnThisThread => {}
+                                }
+                            }
                             return Err(crate::LimboError::Busy);
                         }
                         self.state = CheckpointState::Finalize;
                         return Ok(TransitionResult::Done(CheckpointResult::default()));
                     }
                     self.owns_checkpoint_in_progress = true;
+                    self.waits_for_gate = None;
                     self.mvstore.note_checkpoint_driver();
                 }
 
@@ -3647,13 +3707,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     let Some(wal) = &self.pager.wal else {
                         panic!("No WAL to truncate");
                     };
+                    let restarts_after_backfill = self.restarts_after_backfill();
                     let checkpoint_result = self
                         .checkpoint_result
                         .as_mut()
                         .expect("checkpoint_result should be set");
-                    if let IOResult::IO(io) =
+                    let truncated = if restarts_after_backfill {
+                        wal.restart_and_truncate(
+                            checkpoint_result,
+                            self.pager.get_sync_type(),
+                            true,
+                        )?
+                    } else {
                         wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())?
-                    {
+                    };
+                    if let IOResult::IO(io) = truncated {
                         return Ok(TransitionResult::Io(io));
                     }
                 }
@@ -3859,10 +3927,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
                 if end.is_ok() {
                     match self.owes_another_pass() {
                         Ok(true) => {
+                            self.freed_nothing_unprompted = false;
                             self.begin_next_pass();
                             return Ok(TransitionResult::Continue);
                         }
                         Ok(false) => {}
+                        Err(crate::LimboError::Busy) if self.parks => {
+                            // The pass freed nothing: its snapshot could not cover a commit still
+                            // in flight. The next pass runs once the commits in flight now have
+                            // ended, or at once if none is, as one ended since the snapshot.
+                            match self.mvstore.park_until_commits_end() {
+                                Some(wait) => {
+                                    self.freed_nothing_unprompted = false;
+                                    self.begin_next_pass();
+                                    return Ok(TransitionResult::Io(IOCompletions(wait)));
+                                }
+                                None if !self.freed_nothing_unprompted => {
+                                    self.freed_nothing_unprompted = true;
+                                    self.begin_next_pass();
+                                    return Ok(TransitionResult::Continue);
+                                }
+                                None => {
+                                    self.release_checkpoint_locks_if_needed();
+                                    return Err(crate::LimboError::Busy);
+                                }
+                            }
+                        }
                         Err(err) => {
                             self.release_checkpoint_locks_if_needed();
                             return Err(err);

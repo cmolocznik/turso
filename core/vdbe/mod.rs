@@ -1086,6 +1086,13 @@ impl WriteBaseline {
     }
 }
 
+/// The explicit MVCC checkpoint a statement parks in.
+pub(crate) type ParkedCheckpoint =
+    crate::mvcc::database::checkpoint_state_machine::CheckpointStateMachine<
+        crate::mvcc::MvccClock,
+        crate::alloc::DynAllocator,
+    >;
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -1138,6 +1145,18 @@ pub struct ProgramState {
     /// The goal of an explicit TRUNCATE that reported Busy, for its retry at the same PC to go
     /// on with.
     pub(crate) explicit_checkpoint_goal: Option<u64>,
+    /// The explicit MVCC checkpoint this statement is parked in, waiting for a lock, a reader or
+    /// another checkpoint to be let go; it goes on where it stopped once woken.
+    pub(crate) parked_checkpoint: Option<Box<ParkedCheckpoint>>,
+    /// Whether the current step has a waker, so an instruction may park on a completion another
+    /// connection finishes instead of reporting Busy.
+    pub(crate) steps_with_waker: bool,
+    /// When the explicit checkpoint this statement parks in gives up: its busy timeout after it
+    /// first parked.
+    pub(crate) checkpoint_park_deadline: Option<std::time::Instant>,
+    /// The parked checkpoint reached its busy timeout: the statement reports Busy and its busy
+    /// handler does not retry, as the wait it would have slept through is spent.
+    pub(crate) checkpoint_wait_spent: bool,
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
@@ -1340,6 +1359,10 @@ impl ProgramState {
             query_deadline: None,
             explicit_checkpoint_guard: None,
             explicit_checkpoint_goal: None,
+            parked_checkpoint: None,
+            steps_with_waker: false,
+            checkpoint_park_deadline: None,
+            checkpoint_wait_spent: false,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
@@ -1505,6 +1528,9 @@ impl ProgramState {
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
+        self.release_parked_checkpoint();
+        self.checkpoint_park_deadline = None;
+        self.checkpoint_wait_spent = false;
         self.explicit_checkpoint_guard = None;
         self.explicit_checkpoint_goal = None;
         self.current_time = None;
@@ -1715,6 +1741,16 @@ impl ProgramState {
     #[inline]
     pub fn record_rows_written(&mut self, count: u64) {
         self.metrics.rows_written = self.metrics.rows_written.wrapping_add(count);
+    }
+
+    /// Lets a parked checkpoint go: its locks, the database's checkpoint and the WAL's are
+    /// released, as after a failed checkpoint.
+    pub(crate) fn release_parked_checkpoint(&mut self) {
+        if let Some(mut checkpoint) = self.parked_checkpoint.take() {
+            if let Err(err) = checkpoint.cleanup_after_external_io_error(LimboError::Busy) {
+                tracing::debug!("releasing a parked checkpoint: {err}");
+            }
+        }
     }
 
     /// Parks the completion an instruction waits for and answers the result
@@ -2643,6 +2679,7 @@ impl Program {
         waker: Option<&Waker>,
     ) -> ProgramStep {
         state.execution_state = ProgramExecutionState::Running;
+        state.steps_with_waker = waker.is_some();
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
         let result = if enable_tracing || vdbe_trace {
@@ -3725,6 +3762,9 @@ impl Program {
         }
         state.extension_state = crate::native_ext::ExtensionState::None;
         crate::native_ext::abort_aggregates(&mut state.registers);
+        state.release_parked_checkpoint();
+        state.checkpoint_park_deadline = None;
+        state.checkpoint_wait_spent = false;
         state.explicit_checkpoint_guard = None;
         state.explicit_checkpoint_goal = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather

@@ -869,3 +869,66 @@ fn test_an_attached_database_checkpoints_on_its_pool() {
     );
     assert_eq!(pool.stats().assists, 0);
 }
+
+/// The pool checkpoints back to back while the log owes a checkpoint, letting the database's
+/// checkpoint go between one and the next. An explicit checkpoint waiting for it gets it next: the
+/// pool gives way, and the checkpoint's end wakes the explicit one.
+#[test]
+fn test_the_pool_gives_way_to_an_explicit_checkpoint_waiting_for_it() {
+    struct Wakes(AtomicUsize);
+    impl std::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let pool = pool(1);
+    let db = TestDb::open(&pool);
+    let hold = Arc::new(HoldAfterSnapshot::default());
+    db.probe.set_injector(Some(hold.clone()));
+    db.fill();
+    assert!(
+        hold.wait_held(),
+        "the pool's checkpoint did not reach its snapshot"
+    );
+    // Twice the threshold past that checkpoint's snapshot: the pool owes another once it ends.
+    for _ in 0..32 {
+        db.insert(256);
+    }
+    let conn = db.db.connect();
+    // Longer than the test waits: the TRUNCATE parks until the pool's checkpoint ends.
+    conn.set_busy_timeout(Duration::from_secs(60));
+    let io = conn.pager.load().io.clone();
+    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut truncate = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    loop {
+        match truncate.step_with_waker(&waker).unwrap() {
+            StepResult::IO | StepResult::Yield if truncate.parked_checkpoint() => break,
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("the TRUNCATE did not park beside the pool's checkpoint: {other:?}"),
+        }
+    }
+    let deferrals = pool.stats().deferrals;
+    let parked_at = wakes.0.load(Ordering::SeqCst);
+    hold.release();
+    assert!(
+        wait_until(|| wakes.0.load(Ordering::SeqCst) > parked_at),
+        "the end of the pool's checkpoint did not wake the TRUNCATE"
+    );
+    loop {
+        match truncate.step_with_waker(&waker).unwrap() {
+            StepResult::Done => break,
+            StepResult::Row => {}
+            StepResult::IO | StepResult::Yield if truncate.parked_checkpoint() => {
+                panic!("the TRUNCATE parked again: the pool did not give way")
+            }
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("the TRUNCATE ended in {other:?}"),
+        }
+    }
+    assert!(
+        pool.stats().deferrals > deferrals,
+        "the pool did not give way to the waiting TRUNCATE: {:?}",
+        pool.stats()
+    );
+}

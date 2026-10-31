@@ -4400,6 +4400,16 @@ pub struct RecoverCtx {
     index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
 }
 
+/// An explicit checkpoint counted among those waiting for the running one, until it is dropped.
+#[derive(Debug)]
+pub(crate) struct ExplicitCheckpointWait(Arc<AtomicUsize>);
+
+impl Drop for ExplicitCheckpointWait {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A checkpoint running on a store, as a commit `far_behind` finds it.
 pub(crate) enum RunningCheckpoint {
     None,
@@ -4645,6 +4655,13 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     checkpoint_in_progress: AtomicBool,
     /// Commits waiting for the running checkpoint to end (`wait_for_running_checkpoint`).
     checkpoint_waiters: Mutex<Vec<Completion>>,
+    /// How many explicit checkpoints wait for the running one (`ExplicitCheckpointWait`).
+    explicit_checkpoints_waiting: Arc<AtomicUsize>,
+    /// Checkpoints parked until the transactions committing when they parked have ended, each
+    /// with those still committing (`park_until_commits_end`).
+    commit_end_waiters: Mutex<Vec<(Vec<TxID>, Completion)>>,
+    /// How many wait in `commit_end_waiters`; `remove_tx` reads it before it takes the list.
+    commit_end_waiter_count: AtomicUsize,
     /// The `thread_token` of the thread that last stepped the running checkpoint.
     checkpoint_driver: AtomicU64,
     pub checkpoint_dirty_table_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
@@ -4858,6 +4875,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
             checkpoint_waiters: Mutex::new(Vec::new()),
+            explicit_checkpoints_waiting: Arc::new(AtomicUsize::new(0)),
+            commit_end_waiters: Mutex::new(Vec::new()),
+            commit_end_waiter_count: AtomicUsize::new(0),
             checkpoint_driver: AtomicU64::new(0),
             checkpoint_full_scan_generation: AtomicU64::new(1),
             checkpoint_full_scan_min_snapshot_ts: AtomicU64::new(0),
@@ -4932,6 +4952,95 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let wait = Completion::new_wait();
         waiters.push(wait.clone());
         RunningCheckpoint::Elsewhere(wait)
+    }
+
+    /// Counts an explicit checkpoint among those waiting for the running one, for as long as the
+    /// returned wait lives: while one waits, the checkpoint pool gives way to it.
+    pub(crate) fn explicit_checkpoint_waits(&self) -> ExplicitCheckpointWait {
+        self.explicit_checkpoints_waiting
+            .fetch_add(1, Ordering::AcqRel);
+        ExplicitCheckpointWait(self.explicit_checkpoints_waiting.clone())
+    }
+
+    /// Whether an explicit checkpoint waits for the one running on this store.
+    pub(crate) fn explicit_checkpoint_waiting(&self) -> bool {
+        self.explicit_checkpoints_waiting.load(Ordering::Acquire) > 0
+    }
+
+    /// Parks a checkpoint until every transaction committing now, preparing or committed and not
+    /// yet removed, has ended; `None` when none is. The end in `remove_tx` of the last of them
+    /// completes the returned completion. Its fence pairs with the one in `remove_tx`: either the
+    /// look here after listing the waiter finds a transaction gone, or that end sees the waiter.
+    pub(crate) fn park_until_commits_end(&self) -> Option<Completion> {
+        let committing: Vec<TxID> = self
+            .txs
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.value().state.load(),
+                    TransactionState::Preparing(_) | TransactionState::Committed(_)
+                )
+            })
+            .map(|entry| *entry.key())
+            .collect();
+        if committing.is_empty() {
+            return None;
+        }
+        let wait = Completion::new_wait();
+        {
+            let mut waiters = self.commit_end_waiters.lock();
+            // Those that gave up at their busy timeout go, with no end to complete them.
+            waiters.retain(|(_, parked)| !parked.finished());
+            waiters.push((committing, wait.clone()));
+            self.commit_end_waiter_count
+                .store(waiters.len(), Ordering::SeqCst);
+        }
+        fence(Ordering::SeqCst);
+        let mut waiters = self.commit_end_waiters.lock();
+        // Gone: an end already completed it.
+        let Some(index) = waiters.iter().position(|(_, parked)| parked.ptr_eq(&wait)) else {
+            return Some(wait);
+        };
+        let still = &mut waiters[index].0;
+        still.retain(|tx_id| self.txs.get(tx_id).is_some());
+        if !still.is_empty() {
+            return Some(wait);
+        }
+        // Over before anything waited on it.
+        let _ = waiters.swap_remove(index);
+        self.commit_end_waiter_count
+            .store(waiters.len(), Ordering::SeqCst);
+        None
+    }
+
+    /// After `tx_id` left `txs`, completes each checkpoint parked until it and the others it waits
+    /// for have ended (`park_until_commits_end`).
+    fn wake_commit_end_waiters(&self, tx_id: TxID) {
+        fence(Ordering::SeqCst);
+        if self.commit_end_waiter_count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let ended: Vec<Completion> = {
+            let mut waiters = self.commit_end_waiters.lock();
+            let mut ended = Vec::new();
+            waiters.retain_mut(|(still, wait)| {
+                if wait.finished() {
+                    return false;
+                }
+                still.retain(|id| *id != tx_id);
+                if still.is_empty() {
+                    ended.push(wait.clone());
+                    return false;
+                }
+                true
+            });
+            self.commit_end_waiter_count
+                .store(waiters.len(), Ordering::SeqCst);
+            ended
+        };
+        for wait in ended {
+            wait.complete(0);
+        }
     }
 
     /// Ends the running checkpoint and wakes the commits waiting for it.
@@ -7153,6 +7262,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     pub fn remove_tx(&self, tx_id: TxID) {
+        self.remove_tx_entry(tx_id);
+        self.wake_commit_end_waiters(tx_id);
+    }
+
+    fn remove_tx_entry(&self, tx_id: TxID) {
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();

@@ -368,6 +368,10 @@ pub struct Memory {
     taken: Zeroed<AtomicU32>,
     /// Per batch: 1 while draining. Changed under the owner's lock.
     draining: Zeroed<AtomicU8>,
+    /// Per draining batch: 1 + the class it is drained for, which it goes to once empty; 0 for
+    /// none. Without it, the class it is drained from could take it back first, and two classes
+    /// short of memory could drain each other's batches indefinitely.
+    beneficiary: Zeroed<AtomicU8>,
     classes: [Mutex<ClassBatches>; CLASS_COUNT],
     /// Locked before any class's lock.
     runs: Mutex<Runs>,
@@ -393,6 +397,7 @@ impl Memory {
             free: Zeroed::new(batches as usize * WORDS)?,
             taken: Zeroed::new(batches as usize)?,
             draining: Zeroed::new(batches as usize)?,
+            beneficiary: Zeroed::new(batches as usize)?,
             classes: Default::default(),
             runs: Mutex::new(Runs::new(batches)),
         })
@@ -449,6 +454,12 @@ impl Memory {
         let Some(batch) = runs.take(order(class)) else {
             return false;
         };
+        self.assign(class, batch);
+        true
+    }
+
+    /// Gives the free run at `batch` to `class`, with every frame free. The runs' lock is held.
+    fn assign(&self, class: SizeClass, batch: u32) {
         let mut c = self.classes[class.index()].lock();
         for b in batch + 1..batch + (1 << order(class)) {
             self.owner[b as usize].store(CONTINUED, Ordering::Release);
@@ -468,7 +479,6 @@ impl Memory {
         self.draining[batch as usize].store(0, Ordering::Relaxed);
         c.all.push(batch);
         c.partial.insert(batch);
-        true
     }
 
     /// Returns `frame` of `class`. True if that emptied a draining batch, which then left the
@@ -494,10 +504,10 @@ impl Memory {
         emptied
     }
 
-    /// Hands an emptied draining batch back to the free runs.
+    /// Hands an emptied draining batch to the class it was drained for, or back to the free runs.
     fn release(&self, class: SizeClass, batch: u32) {
         let mut runs = self.runs.lock();
-        {
+        let beneficiary = {
             let mut c = self.classes[class.index()].lock();
             if self.draining[batch as usize].load(Ordering::Relaxed) == 0
                 || self.taken[batch as usize].load(Ordering::Relaxed) != 0
@@ -512,8 +522,27 @@ impl Memory {
             for b in batch..batch + (1 << order(class)) {
                 self.owner[b as usize].store(0, Ordering::Release);
             }
+            let b = self.beneficiary[batch as usize].swap(0, Ordering::Relaxed);
+            SizeClass::new((b as usize).wrapping_sub(1)).filter(|b| order(*b) == order(class))
+        };
+        match beneficiary {
+            Some(b) => self.assign(b, batch),
+            None => runs.give(batch, order(class)),
         }
-        runs.give(batch, order(class));
+    }
+
+    /// Drains `batch` of `class` (as [`drain`](Self::drain)) for `beneficiary`, a class whose
+    /// batches are one batch long, which gets it once it is empty.
+    pub fn drain_for(&self, class: SizeClass, batch: u32, beneficiary: SizeClass) -> bool {
+        debug_assert_eq!(order(beneficiary), 0);
+        // The first class to ask keeps it.
+        let _ = self.beneficiary[batch as usize].compare_exchange(
+            0,
+            beneficiary.index() as u8 + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.drain(class, batch)
     }
 
     /// Stops new frames being taken from `batch` of `class`; it leaves the class once every frame
@@ -657,6 +686,18 @@ mod tests {
         assert_eq!(m.held()[0], BATCH);
         assert!(m.put(class(0), first));
         assert_eq!(m.held()[0], 0);
+    }
+
+    #[test]
+    fn a_batch_drained_for_a_class_goes_to_that_class_and_not_back() {
+        let m = Memory::new(8 * BATCH).unwrap();
+        assert!(m.grow(class(1)));
+        let frame = m.take(class(1)).unwrap();
+        assert!(m.drain_for(class(1), frame / GRAINS, class(0)));
+        assert!(m.put(class(1), frame), "freeing its last frame empties it");
+        assert_eq!(m.held()[1], 0);
+        assert_eq!(m.held()[0], BATCH, "the batch went back to the free runs");
+        assert!(m.take(class(0)).is_some());
     }
 
     #[test]

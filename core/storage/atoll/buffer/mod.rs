@@ -630,7 +630,7 @@ impl BufferPool {
                     return Ok(());
                 };
                 let started = if class.size() <= memory::BATCH {
-                    self.memory.drain(holder, batch)
+                    self.memory.drain_for(holder, batch, class)
                 } else {
                     self.memory.drain_run(class, batch)
                 };

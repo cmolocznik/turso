@@ -24,6 +24,8 @@
 use crate::latch::VersionedLatch;
 use crate::page::{PageId, SizeClass, CLASS_COUNT, HEADER_SIZE};
 use crate::store::{PageStore, ReadError};
+use crate::wal::Wal;
+use std::sync::Arc;
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -77,6 +79,9 @@ pub struct SwipOwner {
     latch: VersionedLatch,
     swizzle: Mutex<()>,
     children: AtomicU32,
+    /// Addresses of this page's swips that are swizzled, so copies of the page bound for disk
+    /// can carry page ids in their place.
+    swizzled: Mutex<Vec<usize>>,
 }
 
 /// The parent of a root page: one swip outside any page.
@@ -157,6 +162,29 @@ impl Frame {
         unsafe { std::slice::from_raw_parts_mut(self.data, self.class.size()) }
     }
 
+    /// The bytes in `range` as they must reach disk: every swizzled swip in it replaced by its
+    /// child's page id.
+    fn durable_bytes(&self, range: std::ops::Range<usize>) -> Vec<u8> {
+        let mut out = self.bytes()[range.clone()].to_vec();
+        for &addr in self.owner.swizzled.lock().iter() {
+            let offset = addr - self.data as usize;
+            if offset < range.start || offset + 8 > range.end {
+                continue;
+            }
+            // SAFETY: the address is a swip in this page.
+            let word = unsafe { &*(addr as *const Swip) }.load(Ordering::Acquire);
+            let word = if word & 1 == 0 {
+                // SAFETY: a swizzled swip points at one of our frames.
+                unswizzled(unsafe { &*(word as *const Frame) }.pid())
+            } else {
+                word
+            };
+            let at = offset - range.start;
+            out[at..at + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
     fn swip(&self, offset: usize) -> &Swip {
         assert!(
             offset >= HEADER_SIZE && offset % 8 == 0 && offset + 8 <= self.class.size(),
@@ -208,6 +236,7 @@ pub struct BufferManager {
     regions: Vec<Region>,
     cooling: Mutex<Cooling>,
     waiters: Box<Waiters>,
+    wal: Option<Arc<Wal>>,
     cooled: AtomicU64,
     cool_hits: AtomicU64,
     evicted: AtomicU64,
@@ -221,6 +250,16 @@ unsafe impl Sync for BufferManager {}
 impl BufferManager {
     /// A buffer manager holding at most `budget` bytes of pages in memory.
     pub fn new(store: PageStore, budget: usize) -> io::Result<Self> {
+        Self::build(store, budget, None)
+    }
+
+    /// A buffer manager that writes a dirty page back only once `wal` is durable up to the
+    /// page's LSN.
+    pub fn with_wal(store: PageStore, budget: usize, wal: Arc<Wal>) -> io::Result<Self> {
+        Self::build(store, budget, Some(wal))
+    }
+
+    fn build(store: PageStore, budget: usize, wal: Option<Arc<Wal>>) -> io::Result<Self> {
         let waiters = Box::<Waiters>::default();
         let mut regions = Vec::with_capacity(CLASS_COUNT);
         for class in SizeClass::all() {
@@ -275,6 +314,7 @@ impl BufferManager {
             regions,
             cooling: Mutex::new(Cooling::default()),
             waiters,
+            wal,
             cooled: AtomicU64::new(0),
             cool_hits: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
@@ -431,6 +471,7 @@ impl BufferManager {
         frame.parent_swip.store(ptr::from_ref(swip).cast_mut(), Ordering::Relaxed);
         frame.parent.store(ptr::from_ref(parent).cast_mut(), Ordering::Relaxed);
         parent.children.fetch_add(1, Ordering::Relaxed);
+        parent.swizzled.lock().push(ptr::from_ref(swip) as usize);
         swip.store(swizzled(frame), Ordering::Release);
     }
 
@@ -567,6 +608,9 @@ impl BufferManager {
         if done {
             swip.store(unswizzled(frame.pid()), Ordering::Release);
             parent.children.fetch_sub(1, Ordering::Relaxed);
+            let mut swizzled = parent.swizzled.lock();
+            let at = swizzled.iter().position(|&a| a == ptr::from_ref(swip) as usize);
+            swizzled.swap_remove(at.expect("a swizzled swip is listed"));
         }
         parent.latch.unlock_shared();
         done
@@ -593,7 +637,11 @@ impl BufferManager {
             cooling.bytes -= frame.class.size();
             if frame.dirty.load(Ordering::Relaxed) {
                 debug_assert_eq!(frame.owner.children.load(Ordering::Relaxed), 0);
-                if let Err(e) = self.store.write(frame.pid(), frame.bytes_mut()) {
+                let logged = match &self.wal {
+                    Some(wal) => wal.wait_durable(crate::page::lsn(frame.bytes())),
+                    None => Ok(()),
+                };
+                if let Err(e) = logged.and_then(|()| self.store.write(frame.pid(), frame.bytes_mut())) {
                     cooling.pages.insert(frame.pid(), frame);
                     cooling.bytes += frame.class.size();
                     cooling.fifo.push_front(frame);
@@ -613,6 +661,22 @@ impl BufferManager {
     fn cool_everything(&self) {
         let mut cooling = self.cooling.lock();
         self.cool(&mut cooling, usize::MAX);
+    }
+
+    /// Cools and evicts everything that can go, as memory pressure eventually would.
+    #[cfg(test)]
+    pub(crate) fn evict_everything(&self) -> Result<()> {
+        loop {
+            let mut cooling = self.cooling.lock();
+            self.cool(&mut cooling, usize::MAX);
+            let mut any = false;
+            while self.evict_one(&mut cooling)? {
+                any = true;
+            }
+            if !any {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -666,6 +730,18 @@ impl ExclusiveGuard<'_> {
 
     pub fn swip(&self, offset: usize) -> &Swip {
         self.frame.swip(offset)
+    }
+}
+
+impl ExclusiveGuard<'_> {
+    /// The bytes in `range` as they must be logged or written: page ids in every swip.
+    pub fn durable_bytes(&self, range: std::ops::Range<usize>) -> Vec<u8> {
+        self.frame.durable_bytes(range)
+    }
+
+    /// Marks the page as changed without writing to it: its swips moved.
+    pub fn mark_dirty(&self) {
+        self.frame.dirty.store(true, Ordering::Relaxed);
     }
 }
 

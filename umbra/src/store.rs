@@ -87,7 +87,12 @@ impl PageStore {
     pub fn read(&self, pid: PageId, buf: &mut [u8]) -> Result<(), ReadError> {
         let class = pid.class();
         assert_eq!(buf.len(), class.size());
-        self.class(class).file.read_exact_at(buf, pid.offset())?;
+        match self.class(class).file.read_exact_at(buf, pid.offset()) {
+            Ok(()) => {}
+            // A slot past the end of the file was allocated but never written.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(ReadError::Invalid(pid)),
+            Err(e) => return Err(e.into()),
+        }
         self.reads.fetch_add(1, Ordering::Relaxed);
         if page::verify(buf, class) {
             Ok(())

@@ -133,6 +133,9 @@ pub enum FileSyncType {
     /// Full fsync - on macOS uses F_FULLFSYNC to flush disk write cache.
     /// On other platforms, behaves the same as Fsync.
     FullFsync,
+    /// fdatasync on Linux and Android: flushes the data and only the metadata needed to read it
+    /// back, so a write within the file's size commits no journal. Elsewhere, the same as Fsync.
+    DataSync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +201,6 @@ pub trait File: Send + Sync {
     }
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
-
     /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
     /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
     ///

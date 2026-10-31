@@ -285,6 +285,8 @@ use crate::storage::encryption::EncryptionContext;
 use crate::File;
 use std::collections::VecDeque;
 
+#[cfg(test)]
+mod growth_tests;
 mod serializer;
 use serializer::EncryptedPayload;
 #[cfg(feature = "conn_raw_api")]
@@ -342,6 +344,13 @@ pub(crate) const LOG_SEGMENT_FILES: usize = 4;
 pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
 pub(crate) const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
+/// The zeros written after a frame that ends before its file does, where the next frame's magic
+/// would be: a reader takes them for the end of the log, so the bytes after them, among them the
+/// frames of a log restarted in place, are never read as frames.
+const END_GUARD: usize = FRAME_MAGIC.to_le_bytes().len();
+/// The largest step `PRAGMA mvcc_log_growth` takes: the largest power of two whose growth write,
+/// the step and up to `END_GUARD - 1` bytes of guard, one write's `i32` result can report.
+pub(crate) const MAX_LOG_GROWTH: u64 = (i32::MAX as u64 + 1) / 2;
 
 // Size of each chunk before encryption (i.e. before tag/nonce overhead is added)
 pub(crate) const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
@@ -728,6 +737,15 @@ pub struct LogicalLog {
     /// being written when it is appended, so once the oldest segment holding a frame is of a later
     /// generation than `n`, no frame appended while `n` was being written is left in the files.
     generation: u64,
+    /// The step the active file grows by when a frame runs past its end, written as zeros, so that
+    /// a frame written within the file changes no metadata and its sync commits no filesystem
+    /// journal (`PRAGMA mvcc_log_growth`). A checkpoint that covers every frame then restarts the
+    /// log in place, keeping the file's space for the frames after it. 0 grows the file by each
+    /// frame and truncates it at that checkpoint.
+    growth: u64,
+    /// The active file's size, once read: the bytes it holds past a frame's end, which an
+    /// `END_GUARD` keeps from being read as frames.
+    file_size: Option<u64>,
 }
 
 /// The path of slot `slot` of the log whose first file is `base`.
@@ -895,6 +913,8 @@ impl LogicalLog {
             max_appended_commit_ts: 0,
             ring: None,
             generation: 0,
+            growth: 0,
+            file_size: None,
         }
     }
 
@@ -1034,6 +1054,7 @@ impl LogicalLog {
             ring.active = active.slot;
             self.file = ring.file(active.slot).clone();
         }
+        self.file_size = None;
         self.header = Some(active.header.clone());
         self.offset = active.end;
         self.running_crc = active.end_crc;
@@ -1050,6 +1071,7 @@ impl LogicalLog {
                 ring.slots[slot] = Slot::InUse(file.clone());
                 ring.active = slot;
                 self.file = file;
+                self.file_size = None;
             }
         }
         self.set_header(header);
@@ -1111,6 +1133,8 @@ impl LogicalLog {
             prior_max_ts: segment.prior_max_ts.max(self.max_appended_commit_ts),
         });
         self.file = file;
+        // A free file was emptied before it was ready.
+        self.file_size = Some(0);
         self.header = Some(next);
         // The header goes to disk with the segment's first frame, which chains from `running_crc`.
         self.offset = 0;
@@ -1167,6 +1191,41 @@ impl LogicalLog {
 
     pub(crate) fn encryption_ctx(&self) -> Option<&EncryptionContext> {
         self.encryption_ctx.as_ref()
+    }
+
+    /// The step the active file grows by, 0 when it grows by each frame.
+    pub(crate) fn growth(&self) -> u64 {
+        self.growth
+    }
+
+    /// Grows the active file by `bytes` at a time from its next frame on: 0, or a power of two up
+    /// to `MAX_LOG_GROWTH`.
+    pub(crate) fn set_growth(&mut self, bytes: u64) -> Result<()> {
+        if bytes != 0 && (!bytes.is_power_of_two() || bytes > MAX_LOG_GROWTH) {
+            return Err(LimboError::InvalidArgument(format!(
+                "mvcc_log_growth must be 0 or a power of two up to {MAX_LOG_GROWTH} bytes, not {bytes}"
+            )));
+        }
+        self.growth = bytes;
+        Ok(())
+    }
+
+    /// The zeros to write after a frame ending at `end`: an `END_GUARD` where the active file holds
+    /// bytes past it, and where the log grows in steps and the guard would run past the file, the
+    /// rest of the step the file grows to. Records the file's size with them written.
+    fn zeros_after(&mut self, end: u64) -> Result<u64> {
+        let size = match self.file_size {
+            Some(size) => size,
+            None => self.file.size()?,
+        };
+        let guard_end = end + END_GUARD as u64;
+        let zeros_end = if self.growth > 0 && guard_end > size {
+            guard_end.next_multiple_of(self.growth)
+        } else {
+            guard_end.min(size).max(end)
+        };
+        self.file_size = Some(size.max(zeros_end));
+        Ok(zeros_end - end)
     }
 
     /// Wraps the pre-serialized payload (`tx.buf`) with the log/TX framing
@@ -1390,7 +1449,30 @@ impl LogicalLog {
             );
         });
 
-        let c = self.file.pwrite(self.offset, buffer, c)?;
+        // 8. The zeros after the frame, written beside it. Their range is disjoint from the
+        // frame's, and the next frame is written only once both have completed.
+        let end = self.offset + buffer_len as u64;
+        let zeros = self.zeros_after(end)?;
+        let c = if zeros == 0 {
+            self.file.pwrite(self.offset, buffer, c)?
+        } else {
+            let mut group = CompletionGroup::new(|_| {});
+            group.add(&c);
+            let _frame_c = self.file.pwrite(self.offset, buffer, c)?;
+            let zeros_c = Completion::new_write(move |res: Result<i32, CompletionError>| {
+                let Ok(bytes_written) = res else {
+                    return;
+                };
+                turso_assert!(
+                    bytes_written as u64 == zeros,
+                    "wrote({bytes_written}) zeros != expected({zeros})"
+                );
+            });
+            group.add(&zeros_c);
+            let zero_buffer = Arc::new(Buffer::new(vec![0; zeros as usize]));
+            let _zeros_c = self.file.pwrite(end, zero_buffer, zeros_c)?;
+            group.build()
+        };
         if advance_offset_immediately {
             self.offset += buffer_len as u64;
             self.running_crc = crc;
@@ -1487,8 +1569,16 @@ impl LogicalLog {
     }
 
     /// Fsyncs the segment being written, and the sealed ones that may hold frames no fsync has
-    /// covered: a frame written before a roll is in its sealed segment's file.
+    /// covered: a frame written before a roll is in its sealed segment's file. A log that grows in
+    /// steps syncs only the data and the metadata needed to read it back, which leaves the journal
+    /// alone but where a frame grew the file.
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let sync_type = if self.growth > 0 {
+            FileSyncType::DataSync
+        } else {
+            sync_type
+        };
         let mut group = CompletionGroup::new(|_| {});
         if let Some(ring) = self.ring.as_deref() {
             for sealed in ring
@@ -1571,10 +1661,9 @@ impl LogicalLog {
         Ok(c)
     }
 
-    #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
-    fn truncate_to_zero(&mut self, group: &mut CompletionGroup) -> Result<()> {
-        // Regenerate salt so stale frames (from before truncation) cannot validate
-        // against the new CRC chain.
+    /// Gives the log a fresh salt, so that no frame from before validates against its chain, and a
+    /// segment of its own in a log that rolls.
+    fn reseed(&mut self) -> Result<()> {
         self.pending_header_upgrade = None;
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
@@ -1589,7 +1678,21 @@ impl LogicalLog {
         self.running_crc = header.chain_seed();
         self.pending_running_crc = None;
         self.header = Some(header);
+        Ok(())
+    }
 
+    /// Begins the log's next generation at the start of its file.
+    fn rewind(&mut self) {
+        self.offset = 0;
+        self.max_appended_commit_ts = 0;
+        self.generation += 1;
+    }
+
+    #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
+    fn truncate_to_zero(&mut self, group: &mut CompletionGroup) -> Result<()> {
+        // Regenerate salt so stale frames (from before truncation) cannot validate
+        // against the new CRC chain.
+        self.reseed()?;
         let completion = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
@@ -1597,9 +1700,18 @@ impl LogicalLog {
         });
         group.add(&completion);
         let _truncate_c = self.file.truncate(0, completion)?;
-        self.offset = 0;
-        self.max_appended_commit_ts = 0;
-        self.generation += 1;
+        self.file_size = Some(0);
+        self.rewind();
+        Ok(())
+    }
+
+    /// Begins the log again in place: the file keeps its size and the frames a checkpoint covered,
+    /// which the fresh salt and the `END_GUARD` after every frame keep from being read. Until the
+    /// first frame of the new generation reaches the disk, recovery reads the old one, none of
+    /// whose commits it replays, and goes on after it.
+    fn restart_in_place(&mut self) -> Result<()> {
+        self.reseed()?;
+        self.rewind();
         Ok(())
     }
 
@@ -1615,6 +1727,23 @@ impl LogicalLog {
     pub fn truncate(
         &mut self,
         checkpointed_through_ts: u64,
+    ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
+        self.drop_covered(checkpointed_through_ts, false)
+    }
+
+    /// As [`Self::truncate`], except that a log that grows in steps restarts in place where it
+    /// would be truncated, keeping its file's space for the frames after it.
+    pub fn truncate_in_place(
+        &mut self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
+        self.drop_covered(checkpointed_through_ts, true)
+    }
+
+    fn drop_covered(
+        &mut self,
+        checkpointed_through_ts: u64,
+        in_place: bool,
     ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
         use super::LogicalLogTruncateOutcome;
         let mut group = CompletionGroup::new(|_| {});
@@ -1633,7 +1762,11 @@ impl LogicalLog {
             .as_ref()
             .is_some_and(|ring| !ring.sealed.is_empty());
         if !sealed && self.max_appended_commit_ts <= checkpointed_through_ts {
-            self.truncate_to_zero(&mut group)?;
+            if in_place && self.growth > 0 {
+                self.restart_in_place()?;
+            } else {
+                self.truncate_to_zero(&mut group)?;
+            }
             return Ok((group.build(), LogicalLogTruncateOutcome::Truncated));
         }
         if self.offset > 0 && self.rolls() {
@@ -1691,6 +1824,7 @@ impl LogicalLog {
         });
         group.add(&c);
         let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
+        self.file_size = Some(LOG_HDR_SIZE as u64);
         self.offset = 0;
         self.generation += 1;
         Ok(group.build())

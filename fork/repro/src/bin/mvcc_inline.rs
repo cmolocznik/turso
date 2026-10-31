@@ -6,7 +6,8 @@
 //!     mvcc_control DIR WRITERS ROWS_PER_WRITER SECONDS_BEFORE_DECLARING_A_HANG
 //!
 //! BACKGROUND_CHECKPOINT=1 hands the checkpoint the commit crossing the threshold would run to the
-//! store's checkpoint pool; otherwise that commit checkpoints inline, the engine's default.
+//! store's checkpoint pool; otherwise that commit checkpoints inline, the engine's default. IO names
+//! the IO backend, `syscall` (the default) or `io_uring`.
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -92,10 +93,12 @@ async fn main() -> anyhow::Result<()> {
     let (dir, writers, rows, patience): (&str, usize, usize, u64) = (&args[1], args[2].parse()?, args[3].parse()?, args[4].parse()?);
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
-    let database = turso::Builder::new_local(&format!("{dir}/control.db"))
-        .experimental_mvcc_passive_checkpoint(std::env::var_os("BLOCKING_CHECKPOINT").is_none())
-        .build()
-        .await?;
+    let mut builder = turso::Builder::new_local(&format!("{dir}/control.db"))
+        .experimental_mvcc_passive_checkpoint(std::env::var_os("BLOCKING_CHECKPOINT").is_none());
+    if let Ok(io) = std::env::var("IO") {
+        builder = builder.with_io(io);
+    }
+    let database = builder.build().await?;
     RUN_START.get_or_init(std::time::Instant::now);
     let setup = database.connect()?;
     {

@@ -457,15 +457,30 @@ impl File for UnixFile {
             #[cfg(target_vendor = "apple")]
             {
                 match sync_type {
-                    FileSyncType::Fsync => libc::fsync(self.file.as_raw_fd()),
+                    FileSyncType::Fsync | FileSyncType::DataSync => {
+                        libc::fsync(self.file.as_raw_fd())
+                    }
                     FileSyncType::FullFsync => {
                         libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC)
                     }
                 }
             }
-            #[cfg(not(target_vendor = "apple"))]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             {
-                // FullFsync has no effect on non-Apple platforms
+                match sync_type {
+                    FileSyncType::DataSync => libc::fdatasync(self.file.as_raw_fd()),
+                    // FullFsync has no effect on non-Apple platforms
+                    FileSyncType::Fsync | FileSyncType::FullFsync => {
+                        libc::fsync(self.file.as_raw_fd())
+                    }
+                }
+            }
+            #[cfg(not(any(
+                target_vendor = "apple",
+                target_os = "linux",
+                target_os = "android"
+            )))]
+            {
                 let _ = sync_type;
                 libc::fsync(self.file.as_raw_fd())
             }
@@ -478,9 +493,18 @@ impl File for UnixFile {
             #[cfg(target_vendor = "apple")]
             match sync_type {
                 FileSyncType::FullFsync => trace!("fcntl(F_FULLFSYNC)"),
-                FileSyncType::Fsync => trace!("fsync"),
+                FileSyncType::Fsync | FileSyncType::DataSync => trace!("fsync"),
             }
-            #[cfg(not(target_vendor = "apple"))]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            match sync_type {
+                FileSyncType::DataSync => trace!("fdatasync"),
+                FileSyncType::Fsync | FileSyncType::FullFsync => trace!("fsync"),
+            }
+            #[cfg(not(any(
+                target_vendor = "apple",
+                target_os = "linux",
+                target_os = "android"
+            )))]
             trace!("fsync");
 
             c.complete(0);
@@ -619,6 +643,9 @@ mod tests {
         assert_eq!(mapped.len(), 81920);
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
-        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
+        assert_eq!(
+            &slice[mapped.len() - 128..],
+            &bytes[4096 + 81920 - 128..4096 + 81920]
+        );
     }
 }

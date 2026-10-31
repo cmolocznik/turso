@@ -104,6 +104,34 @@ pub trait DurableStorage: Send + Sync + Debug {
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, LogicalLogTruncateOutcome)>;
 
+    /// As [`Self::truncate`], for a checkpoint that leaves the log's file its size: a log whose
+    /// file grows in steps (`PRAGMA mvcc_log_growth`) restarts in place where it would be
+    /// truncated, keeping the space for the frames after it. A TRUNCATE or RESTART checkpoint
+    /// empties the file with `truncate`.
+    fn truncate_in_place(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
+        self.truncate(checkpointed_through_ts)
+    }
+
+    /// The step the log's file grows by, 0 when it grows by each frame (`PRAGMA mvcc_log_growth`).
+    fn log_growth(&self) -> u64 {
+        0
+    }
+
+    /// Sets [`Self::log_growth`]: 0, or a power of two up to `MAX_LOG_GROWTH`. A storage that does
+    /// not grow its log in steps refuses any step.
+    fn set_log_growth(&self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        Err(LimboError::InvalidArgument(
+            "mvcc_log_growth: this database's log storage does not grow its file in steps"
+                .to_string(),
+        ))
+    }
+
     /// Reset the logical log to a fresh header-only file.
     ///
     /// Used after an external database restore so future MVCC recovery starts
@@ -116,6 +144,11 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// The log's bytes no checkpoint has covered yet.
     fn uncheckpointed_bytes(&self) -> u64 {
         self.logical_log_offset()
+    }
+    /// Every byte appended to the log since it was opened, whatever truncated or rolled it since:
+    /// the log's growth over a stretch of time is the difference of two readings.
+    fn appended_bytes(&self) -> u64 {
+        0
     }
     /// Records that a checkpoint covered the log up to `offset`, so the threshold counts only the
     /// bytes after it. A log a passive checkpoint cannot truncate keeps its size, and a trigger on
@@ -205,6 +238,8 @@ pub struct Storage {
     /// The offset the last checkpoint covered; zero once the log is truncated.
     checkpoint_floor: AtomicU64,
     checkpoint_threshold: AtomicI64,
+    /// Every byte appended to the log since it was opened (`DurableStorage::appended_bytes`).
+    appended: AtomicU64,
 }
 
 static LOG_SYNCS: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +290,7 @@ impl Storage {
             log_offset: AtomicU64::new(0),
             checkpoint_floor: AtomicU64::new(0),
             checkpoint_threshold: AtomicI64::new(DEFAULT_LOG_CHECKPOINT_THRESHOLD),
+            appended: AtomicU64::new(0),
         }
     }
 
@@ -272,6 +308,21 @@ impl Storage {
     #[inline(always)]
     fn shadow_offset_advance(&self, bytes: u64) {
         self.log_offset.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Drops what a checkpoint covered with `covered`, then shadows the log's offset: 0 if it
+    /// truncated or restarted, unchanged if it skipped (uncheckpointed frames remain) or rolled,
+    /// so `should_checkpoint()` stays accurate.
+    fn drop_covered(
+        &self,
+        covered: impl FnOnce(&mut LogicalLog) -> Result<(Completion, LogicalLogTruncateOutcome)>,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
+        let mut log = self.logical_log.write();
+        let (c, outcome) = covered(&mut log)?;
+        let new_offset = log.segment_start() + log.offset;
+        drop(log);
+        self.shadow_offset_store(new_offset);
+        Ok((c, outcome))
     }
 }
 
@@ -344,15 +395,22 @@ impl DurableStorage for Storage {
         &self,
         checkpointed_through_ts: u64,
     ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
-        let mut log = self.logical_log.write();
-        let (c, outcome) = log.truncate(checkpointed_through_ts)?;
-        // Shadow the log's actual offset: 0 if it truncated, unchanged if it
-        // skipped (uncheckpointed frames remain) or rolled, so should_checkpoint()
-        // stays accurate.
-        let new_offset = log.segment_start() + log.offset;
-        drop(log);
-        self.shadow_offset_store(new_offset);
-        Ok((c, outcome))
+        self.drop_covered(|log| log.truncate(checkpointed_through_ts))
+    }
+
+    fn truncate_in_place(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
+        self.drop_covered(|log| log.truncate_in_place(checkpointed_through_ts))
+    }
+
+    fn log_growth(&self) -> u64 {
+        self.logical_log.read().growth()
+    }
+
+    fn set_log_growth(&self, bytes: u64) -> Result<()> {
+        self.logical_log.write().set_growth(bytes)
     }
 
     fn reset_to_fresh_header(&self) -> Result<Completion> {
@@ -403,7 +461,12 @@ impl DurableStorage for Storage {
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
         self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
+        self.appended.fetch_add(bytes, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn appended_bytes(&self) -> u64 {
+        self.appended.load(Ordering::Relaxed)
     }
 
     fn discard_pending_log_write(&self) -> Result<()> {

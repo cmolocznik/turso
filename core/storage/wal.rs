@@ -2918,6 +2918,8 @@ struct OngoingCheckpoint {
     inflight_writes: Vec<InflightWriteBatch>,
     /// List of all page_id + frame_id combinations to be backfilled
     pages_to_checkpoint: Vec<(u64, u64)>,
+    /// Pages written to the database file so far.
+    written_pages: u64,
 }
 
 struct InflightWriteBatch {
@@ -2934,6 +2936,7 @@ impl OngoingCheckpoint {
         self.pending_writes.clear();
         self.inflight_reads.clear();
         self.inflight_writes.clear();
+        self.written_pages = 0;
         self.state = CheckpointState::Start;
     }
 
@@ -5406,6 +5409,7 @@ impl WalFile {
                 current_page: 0,
                 pages_to_checkpoint: Vec::new(),
                 inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
+                written_pages: 0,
             }),
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
@@ -5672,6 +5676,15 @@ impl WalFile {
                         pager.io.drain_completions(&to_cancel)?;
                         return Err(LimboError::CompletionError(e).into());
                     }
+                    // A paced checkpoint ahead of its schedule waits before it reads or writes
+                    // more, the pages it has written being the second half of its progress.
+                    if let Some(pace) = pager.checkpoint_pace() {
+                        let pages = ongoing_chkpt.pages_to_checkpoint.len().max(1) as f64;
+                        let progress = 0.5 + 0.5 * ongoing_chkpt.written_pages as f64 / pages;
+                        if let Some(wait) = pace.hold(progress) {
+                            io_yield_one!(wait);
+                        }
+                    }
                     let epoch = self.coordination.checkpoint_epoch();
                     // Issue reads until we hit limits
                     'inner: while ongoing_chkpt.should_issue_reads() {
@@ -5716,6 +5729,7 @@ impl WalFile {
                     if should_flush {
                         let batch_map = ongoing_chkpt.pending_writes.take();
                         if !batch_map.is_empty() {
+                            let pages = batch_map.len() as u64;
                             let new_write = InflightWriteBatch::new();
                             nr_completions += write_pages_vectored(
                                 pager,
@@ -5725,6 +5739,7 @@ impl WalFile {
                                 &mut group,
                             )?;
                             ongoing_chkpt.inflight_writes.push(new_write);
+                            ongoing_chkpt.written_pages += pages;
                         }
                     }
                     if nr_completions > 0 {

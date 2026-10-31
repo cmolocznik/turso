@@ -5225,6 +5225,37 @@ impl Connection {
         }
     }
 
+    pub(crate) fn set_mvcc_log_growth(&self, bytes: u64) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => mv_store.set_log_growth(bytes),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_log_growth(&self) -> Result<u64> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.log_growth()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn set_checkpoint_completion_target(&self, target: f64) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store.set_checkpoint_completion_target(target);
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn checkpoint_completion_target(&self) -> Result<f64> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.checkpoint_completion_target()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
     pub(crate) fn set_mvcc_gc_threshold(&self, threshold: i64) -> Result<()> {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => {

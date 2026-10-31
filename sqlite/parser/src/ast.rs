@@ -1953,6 +1953,9 @@ pub enum PragmaName {
     CacheSize,
     /// set the cache spill behavior
     CacheSpill,
+    /// Sets or queries the share of the time until the next checkpoint is due that a background
+    /// MVCC checkpoint's writes may take; 0 does not pace them.
+    CheckpointCompletionTarget,
     /// When ON, each INSERT, UPDATE and DELETE returns one row with the
     /// number of rows it changed.
     CountChanges,
@@ -2056,6 +2059,9 @@ pub enum PragmaName {
     /// Sets or queries whether concurrent MVCC commits batch their logical-log
     /// appends behind a single fsync.
     MvccGroupCommit,
+    /// Sets or queries the step, in bytes, the MVCC logical log's file grows by, written as zeros
+    /// so that a commit's sync within it changes no file metadata; 0 grows the file by each commit.
+    MvccLogGrowth,
     /// Sets or queries whether a commit that crosses the MVCC checkpoint threshold hands the
     /// checkpoint to a background thread instead of running it inline. Passive checkpoints only.
     MvccBackgroundCheckpoint,

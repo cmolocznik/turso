@@ -68,6 +68,7 @@ pub use checkpoint_state_machine::{
 };
 
 mod background_checkpoint;
+pub(crate) mod checkpoint_pace;
 use background_checkpoint::BackgroundCheckpoint;
 pub use background_checkpoint::{background_checkpoint_stats, CheckpointPool, CheckpointPoolStats};
 
@@ -90,6 +91,8 @@ use super::portable_logical::{
 
 #[cfg(test)]
 pub mod hermitage_tests;
+#[cfg(test)]
+mod log_growth_tests;
 #[cfg(test)]
 mod rolling_log_tests;
 #[cfg(test)]
@@ -2084,6 +2087,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             let inline = if background_checkpoint::far_behind(mvcc_store.storage.as_ref()) {
                 match mvcc_store.wait_for_running_checkpoint() {
                     RunningCheckpoint::Elsewhere(wait) => {
+                        // A paced background checkpoint finishes without waiting for its
+                        // schedule.
+                        mvcc_store.background_checkpoint.hurry();
                         self.state = CommitState::AwaitCheckpoint { end_ts };
                         return Ok(TransitionResult::Io(IOCompletions(wait)));
                     }
@@ -4657,6 +4663,9 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     checkpoint_waiters: Mutex<Vec<Completion>>,
     /// How many explicit checkpoints wait for the running one (`ExplicitCheckpointWait`).
     explicit_checkpoints_waiting: Arc<AtomicUsize>,
+    /// The share of the time until the next checkpoint is due that a background checkpoint's writes
+    /// may take, as `f64` bits (`checkpoint_pace`).
+    checkpoint_completion_target: AtomicU64,
     /// Checkpoints parked until the transactions committing when they parked have ended, each
     /// with those still committing (`park_until_commits_end`).
     commit_end_waiters: Mutex<Vec<(Vec<TxID>, Completion)>>,
@@ -4876,6 +4885,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             checkpoint_in_progress: AtomicBool::new(false),
             checkpoint_waiters: Mutex::new(Vec::new()),
             explicit_checkpoints_waiting: Arc::new(AtomicUsize::new(0)),
+            checkpoint_completion_target: AtomicU64::new(
+                checkpoint_pace::DEFAULT_CHECKPOINT_COMPLETION_TARGET.to_bits(),
+            ),
             commit_end_waiters: Mutex::new(Vec::new()),
             commit_end_waiter_count: AtomicUsize::new(0),
             checkpoint_driver: AtomicU64::new(0),
@@ -5295,10 +5307,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.blocking_checkpoint_lock.unlock();
     }
 
-    /// VACUUM copies the physical DB image, so any MVCC logical-log bytes must
-    /// be checkpointed first.
+    /// VACUUM copies the physical DB image, so any MVCC logical-log frame must
+    /// be checkpointed first. The log's frames, not its files' size: a log that
+    /// grows in steps keeps its file's space once a checkpoint covered it.
     pub(crate) fn has_uncheckpointed_log(&self) -> Result<bool> {
-        Ok(self.storage.logical_log_size()? != 0)
+        Ok(self.storage.logical_log_hold().oldest.is_some())
     }
 
     /// Rebuild MVCC's physical root-page metadata after in-place VACUUM
@@ -11152,6 +11165,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub fn checkpoint_threshold(&self) -> i64 {
         self.storage.checkpoint_threshold()
+    }
+
+    /// The step the logical log's file grows by (`PRAGMA mvcc_log_growth`); 0 grows it by each
+    /// frame.
+    pub fn log_growth(&self) -> u64 {
+        self.storage.log_growth()
+    }
+
+    pub fn set_log_growth(&self, bytes: u64) -> Result<()> {
+        self.storage.set_log_growth(bytes)
+    }
+
+    /// The share of the time until the next checkpoint is due that a background checkpoint's
+    /// writes may take (`PRAGMA checkpoint_completion_target`); 0 does not pace them.
+    pub fn checkpoint_completion_target(&self) -> f64 {
+        f64::from_bits(self.checkpoint_completion_target.load(Ordering::Relaxed))
+    }
+
+    pub fn set_checkpoint_completion_target(&self, target: f64) {
+        self.checkpoint_completion_target
+            .store(target.to_bits(), Ordering::Relaxed);
     }
 
     pub fn get_real_table_id(&self, table_id: i64) -> i64 {

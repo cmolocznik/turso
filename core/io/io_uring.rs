@@ -810,10 +810,17 @@ impl File for UringFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
+    fn sync(&self, c: Completion, sync_type: crate::io::FileSyncType) -> Result<Completion> {
         trace!("sync()");
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let flags = match sync_type {
+            crate::io::FileSyncType::DataSync => io_uring::types::FsyncFlags::DATASYNC,
+            crate::io::FileSyncType::Fsync | crate::io::FileSyncType::FullFsync => {
+                io_uring::types::FsyncFlags::empty()
+            }
+        };
         let sync = io_uring::opcode::Fsync::new(fd)
+            .flags(flags)
             .build()
             .user_data(get_key(c.clone()));
         let mut state = self.state.lock();

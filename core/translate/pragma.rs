@@ -776,6 +776,21 @@ fn update_pragma(
             connection.set_mvcc_checkpoint_threshold(threshold)?;
             Ok(TransactionMode::None)
         }
+        PragmaName::CheckpointCompletionTarget => {
+            let target = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(target)) if (0..=1).contains(&target) => {
+                    target as f64
+                }
+                Value::Numeric(Numeric::Float(target))
+                    if (0.0..=1.0).contains(&f64::from(target)) =>
+                {
+                    f64::from(target)
+                }
+                _ => bail_parse_error!("checkpoint_completion_target must be between 0 and 1"),
+            };
+            connection.set_checkpoint_completion_target(target)?;
+            Ok(TransactionMode::None)
+        }
         PragmaName::MvccGcThreshold => {
             // 0 is rejected: it would run an inline GC pass on every commit even
             // with zero new versions (`should_gc` compares growth `>= threshold`),
@@ -793,6 +808,14 @@ fn update_pragma(
         }
         PragmaName::MvccGroupCommit => {
             connection.set_mvcc_group_commit(parse_pragma_enabled(&value))?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccLogGrowth => {
+            let bytes = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(bytes)) if bytes >= 0 => bytes as u64,
+                _ => bail_parse_error!("mvcc_log_growth must be 0 or a positive integer"),
+            };
+            connection.set_mvcc_log_growth(bytes)?;
             Ok(TransactionMode::None)
         }
         PragmaName::MvccBackgroundCheckpoint => {
@@ -1783,6 +1806,17 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
+        PragmaName::CheckpointCompletionTarget => {
+            let target = connection.checkpoint_completion_target()?;
+            let register = program.alloc_register();
+            program.emit_insn(Insn::Real {
+                value: target,
+                dest: register,
+            });
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         PragmaName::MvccGcThreshold => {
             let threshold = connection.mvcc_gc_threshold()?;
             let register = program.alloc_register();
@@ -1795,6 +1829,14 @@ fn query_pragma(
             let enabled = connection.mvcc_group_commit()?;
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccLogGrowth => {
+            let bytes = connection.mvcc_log_growth()?;
+            let register = program.alloc_register();
+            program.emit_int(i64::try_from(bytes).unwrap_or(i64::MAX), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

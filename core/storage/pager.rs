@@ -1640,6 +1640,15 @@ impl SharedPagerState {
     }
 }
 
+/// What paces a checkpoint's writes, as PostgreSQL's `checkpoint_completion_target` paces its
+/// checkpointer: asked before each batch of them, it holds a checkpoint that is ahead of its
+/// schedule. Only a caller that parks a held checkpoint and steps it again later installs one.
+pub(crate) trait WritePace: Send + Sync {
+    /// The completion that stands for the wait while the checkpoint, `progress` (0 to 1) of the way
+    /// through its writes, is ahead of its schedule; `None` to go on.
+    fn hold(&self, progress: f64) -> Option<Completion>;
+}
+
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
@@ -1674,6 +1683,8 @@ pub struct Pager {
     /// itself cannot tell whether a page was dirtied in a time window,
     /// because spills shrink it.
     pages_dirtied_count: AtomicU64,
+    /// What paces the checkpoint this pager runs, when one does (`WritePace`).
+    checkpoint_pace: RwLock<Option<Arc<dyn WritePace>>>,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -1983,6 +1994,7 @@ impl Pager {
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             pages_dirtied_count: AtomicU64::new(0),
+            checkpoint_pace: RwLock::new(None),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
@@ -4020,6 +4032,15 @@ impl Pager {
             checkpoint_seq_no: wal.get_checkpoint_seq(),
             max_frame: wal.get_max_frame(),
         })
+    }
+
+    /// What paces the checkpoint this pager runs, if anything does.
+    pub(crate) fn checkpoint_pace(&self) -> Option<Arc<dyn WritePace>> {
+        self.checkpoint_pace.read().clone()
+    }
+
+    pub(crate) fn set_checkpoint_pace(&self, pace: Option<Arc<dyn WritePace>>) {
+        *self.checkpoint_pace.write() = pace;
     }
 
     /// Flush all dirty pages to disk (async/re-entrant).

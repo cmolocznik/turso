@@ -2058,7 +2058,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         } else {
             self.durable_txid_max_new
         };
-        let (c, outcome) = self.mvstore.storage.truncate(boundary)?;
+        // A TRUNCATE or RESTART, every pass of it, empties the file; any other checkpoint leaves a
+        // log that grows in steps its file's space.
+        let (c, outcome) = if self.mode.should_restart_log() || self.truncate_goal.is_some() {
+            self.mvstore.storage.truncate(boundary)?
+        } else {
+            self.mvstore.storage.truncate_in_place(boundary)?
+        };
         if self.clears_whole_logical_log() {
             turso_assert!(
                 matches!(outcome, LogicalLogTruncateOutcome::Truncated),
@@ -2663,6 +2669,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                             self.waits_for_gate =
                                                 Some(self.mvstore.explicit_checkpoint_waits());
                                         }
+                                        // A paced background checkpoint finishes without
+                                        // waiting for its schedule.
+                                        self.mvstore.background_checkpoint.hurry();
                                         return Ok(TransitionResult::Io(IOCompletions(wait)));
                                     }
                                     RunningCheckpoint::None => {
@@ -2671,6 +2680,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                     RunningCheckpoint::OnThisThread => {}
                                 }
                             }
+                            // A paced background checkpoint finishes without waiting for its
+                            // schedule, so the busy handler's retry finds the database free.
+                            self.mvstore.background_checkpoint.hurry();
                             return Err(crate::LimboError::Busy);
                         }
                         self.state = CheckpointState::Finalize;

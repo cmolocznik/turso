@@ -188,6 +188,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_checkpoint_threshold"],
         ),
+        PragmaName::CheckpointCompletionTarget => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["checkpoint_completion_target"],
+        ),
         PragmaName::MvccGcThreshold => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_gc_threshold"],
@@ -199,6 +203,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         PragmaName::MvccGroupCommit => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_group_commit"],
+        ),
+        PragmaName::MvccLogGrowth => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["mvcc_log_growth"],
         ),
         PragmaName::FtsMergeThreshold => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,

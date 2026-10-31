@@ -932,3 +932,169 @@ fn test_the_pool_gives_way_to_an_explicit_checkpoint_waiting_for_it() {
         pool.stats()
     );
 }
+
+/// A database whose checkpoints the threshold asks for are paced by a budget longer than any test,
+/// so that each parks ahead of its schedule at its first batch of pages written to the database
+/// file.
+fn paced(pool: &CheckpointPool) -> TestDb {
+    let db = TestDb::open(pool);
+    db.probe.set_budget(Some(Duration::from_secs(600)));
+    db
+}
+
+/// The completion target reads back what was set, starts at PostgreSQL's default, and refuses what
+/// it cannot be.
+#[test]
+fn test_the_completion_target_reads_back_and_refuses_what_it_cannot_be() {
+    let pool = pool(1);
+    let db = TestDb::open(&pool);
+    let read = || -> crate::Value {
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA checkpoint_completion_target")
+            .unwrap();
+        let mut value = None;
+        stmt.run_with_row_callback(|row| {
+            value = Some(row.get_value(0).clone());
+            Ok(())
+        })
+        .unwrap();
+        value.unwrap()
+    };
+    assert_eq!(read(), crate::Value::from_f64(0.9));
+    db.conn
+        .execute("PRAGMA checkpoint_completion_target = 0.5")
+        .unwrap();
+    assert_eq!(read(), crate::Value::from_f64(0.5));
+    assert!(db
+        .conn
+        .execute("PRAGMA checkpoint_completion_target = 1.5")
+        .is_err());
+    assert_eq!(read(), crate::Value::from_f64(0.5));
+}
+
+/// A paced checkpoint ahead of its schedule parks between turns and holds no thread: the pool's
+/// only thread checkpoints another database meanwhile. Once the log has grown by a threshold since
+/// it began, the next commit's request has it go on, and it ends.
+#[test]
+fn test_a_paced_checkpoint_parks_ahead_of_its_schedule_and_holds_no_thread() {
+    let pool = pool(1);
+    let paced = paced(&pool);
+    paced.fill();
+    assert!(
+        wait_until(|| paced.probe.parked()),
+        "the paced checkpoint did not park: {:?}",
+        pool.stats()
+    );
+    let other = TestDb::open(&pool);
+    other.fill();
+    assert!(
+        wait_until(|| other.probe.checkpoints() >= 1),
+        "the parked checkpoint held the pool's only thread: {:?}",
+        pool.stats()
+    );
+    assert!(
+        paced.probe.parked(),
+        "the paced checkpoint did not stay parked"
+    );
+    assert_eq!(paced.probe.checkpoints(), 0);
+    // A threshold's worth of log since it began: the next commit past it has it go on.
+    for _ in 0..32 {
+        paced.insert(256);
+    }
+    assert!(
+        wait_until(|| paced.probe.checkpoints() >= 1),
+        "the paced checkpoint did not go on once the log had grown by a threshold: {:?}",
+        pool.stats()
+    );
+    paced.assert_intact();
+}
+
+/// An explicit checkpoint that finds a paced one parked hurries it: the paced one ends without
+/// waiting for its schedule, and the explicit one, tried again, runs.
+#[test]
+fn test_an_explicit_checkpoint_hurries_a_parked_paced_one() {
+    let pool = pool(1);
+    let paced = paced(&pool);
+    let rows = paced.fill();
+    assert!(wait_until(|| paced.probe.parked()), "{:?}", pool.stats());
+    let truncate = || {
+        paced.conn.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+    };
+    assert!(matches!(truncate(), Err(LimboError::Busy)));
+    assert!(
+        wait_until(|| paced.probe.checkpoints() >= 1),
+        "the hurried checkpoint did not end: {:?}",
+        pool.stats()
+    );
+    truncate().unwrap();
+    assert_eq!(paced.log(), 0);
+    assert_eq!(paced.rows(), rows);
+    paced.assert_intact();
+}
+
+/// A store moved to another pool lets the checkpoint parked on it go, locks and all: the next
+/// checkpoint runs.
+#[test]
+fn test_a_store_moved_off_its_pool_lets_a_parked_checkpoint_go() {
+    let pool = pool(1);
+    let paced = paced(&pool);
+    paced.fill();
+    assert!(wait_until(|| paced.probe.parked()), "{:?}", pool.stats());
+    assert!(paced.store.checkpoint_in_progress());
+    paced.store.set_checkpoint_pool(&self::pool(1));
+    assert!(
+        !paced.store.checkpoint_in_progress(),
+        "the parked checkpoint kept its locks"
+    );
+    paced
+        .conn
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(paced.log(), 0);
+    paced.assert_intact();
+}
+
+/// A paced checkpoint's budget: the target's share of the time the log takes to grow by a
+/// threshold at the rate it grew; a target past 1 counts as 1, and a time no duration can hold is
+/// no budget.
+#[test]
+fn test_a_pace_budget_is_the_targets_share_of_the_time_to_grow_by_a_threshold() {
+    let second = Duration::from_secs(1);
+    assert_eq!(
+        pace_budget(second * 10, 1_000, 4_000, 0.5),
+        Some(second * 20)
+    );
+    assert_eq!(
+        pace_budget(second * 10, 4_000, 4_000, 2.0),
+        Some(second * 10)
+    );
+    assert_eq!(pace_budget(Duration::MAX, 1, u64::MAX, 1.0), None);
+}
+
+/// The log's appended bytes count every byte a commit appends, whatever truncates the log since.
+#[test]
+fn test_the_logs_appended_bytes_outlast_its_truncation() {
+    let pool = pool(1);
+    let db = TestDb::open(&pool);
+    db.conn
+        .execute("PRAGMA mvcc_background_checkpoint = 0")
+        .unwrap();
+    let start = db.store.storage.appended_bytes();
+    db.insert(256);
+    let appended = db.store.storage.appended_bytes();
+    assert!(appended > start);
+    db.conn
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(db.log(), 0);
+    assert_eq!(db.store.storage.appended_bytes(), appended);
+    db.insert(256);
+    assert!(db.store.storage.appended_bytes() > appended);
+}

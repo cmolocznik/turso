@@ -21,15 +21,27 @@
 //! on the database to end, so the log stays bounded whatever the pool's state and however long a
 //! checkpoint takes.
 //!
+//! A checkpoint a commit's threshold asks for is paced, as PostgreSQL's checkpointer is
+//! (`checkpoint_pace`): it spreads its writes over the completion target's share of the time the
+//! log took to grow by a threshold, so that the disk takes them beside the commits' syncs. Ahead of
+//! its schedule it parks between turns, holding no thread, and a timer queues it again; it finishes
+//! without waiting once the log has grown by a threshold since it began, or once an explicit
+//! checkpoint or a commit far behind waits for it (`BackgroundCheckpoint::hurry`).
+//!
 //! Every store starts on the process's shared pool (`CheckpointPool::shared`) and can be given
 //! another: one per storage device, say.
 //!
 //! An encrypted database, or one read through an external page codec, keeps its inline checkpoint:
 //! the key material lives only on the connections given it, and the pool would have to hold it for
 //! the database's lifetime.
+use crate::connection::ExplicitCheckpointGuard;
+use crate::mvcc::database::checkpoint_pace::CheckpointPace;
+use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::persistent_storage::DurableStorage;
+use crate::state_machine::{StateTransition, TransitionResult};
+use crate::storage::pager::WritePace;
 use crate::storage::wal::CheckpointMode;
-use crate::Database;
+use crate::{CheckpointResult, Connection, Database, LimboError, MAIN_DB_ID};
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::cmp::Ordering as Order;
@@ -97,6 +109,9 @@ const QUIET: u8 = 3;
 const RETRY: u8 = 4;
 /// The thread that ran a turn decides what comes next.
 const DECIDING: u8 = 5;
+/// A paced checkpoint is parked ahead of its schedule: a timer queues the database again when it is
+/// due, and so does a commit that finds the log grown by a threshold since it began.
+const PACED: u8 = 6;
 /// Set by a commit asking for a checkpoint. Being a read-modify-write, it orders the commit's log
 /// write before the look the thread deciding a turn's end takes at the log.
 const ASKED: u8 = 0x80;
@@ -226,6 +241,17 @@ struct Member {
     failures: AtomicU64,
     deferrals: AtomicU64,
     assists: AtomicU64,
+    /// The paced checkpoint parked ahead of its schedule, which the database's next turn goes on
+    /// with.
+    parked: Mutex<Option<PoolCheckpoint>>,
+    /// The log's appended bytes at which the parked checkpoint's pace ends, past which a commit's
+    /// request queues it at once; `u64::MAX` while none is parked.
+    pace_ends_at: AtomicU64,
+    /// The pace of the checkpoint running or parked on the database, for `hurry`.
+    pace: Mutex<Option<Arc<CheckpointPace>>>,
+    /// When the database's last checkpoint began, and the log's appended bytes then: the log's
+    /// growth since is the rate the next one paces by.
+    last_begin: Mutex<Option<(Instant, u64)>>,
     #[cfg(test)]
     hooks: Mutex<TestHooks>,
 }
@@ -250,6 +276,85 @@ enum Outcome {
     /// The database is gone.
     Gone,
     Panicked,
+    /// The checkpoint is parked ahead of its schedule until this instant.
+    Paced(Instant),
+}
+
+/// A checkpoint the pool steps itself, so that a paced one can park between turns.
+struct PoolCheckpoint {
+    machine: Box<CheckpointStateMachine<crate::mvcc::MvccClock, crate::alloc::DynAllocator>>,
+    pace: Option<Arc<CheckpointPace>>,
+    /// Refuses the connection's statements until the checkpoint ends, as `Connection::checkpoint`.
+    _guard: ExplicitCheckpointGuard,
+    conn: Arc<Connection>,
+    /// The time its turns spent stepping it, parked time aside.
+    stepped: Duration,
+    /// Whether it ended, its locks let go.
+    ended: bool,
+}
+
+/// How far a turn stepped a checkpoint.
+enum Stepped {
+    Ended(crate::Result<CheckpointResult>),
+    /// Ahead of its schedule, it waits until this instant.
+    Held(Instant),
+}
+
+impl PoolCheckpoint {
+    /// Steps the checkpoint until it ends, or until its pace holds it.
+    fn step(&mut self) -> Stepped {
+        let began = Instant::now();
+        let stepped = self.step_inner();
+        self.stepped += began.elapsed();
+        stepped
+    }
+
+    fn step_inner(&mut self) -> Stepped {
+        let io = self.conn.pager.load().io.clone();
+        loop {
+            match self.machine.step(&()) {
+                Ok(TransitionResult::Continue) => {}
+                Ok(TransitionResult::Done(result)) => {
+                    self.ended = true;
+                    return Stepped::Ended(Ok(result));
+                }
+                Ok(TransitionResult::Io(completions)) => {
+                    if let Some(until) = self.pace.as_ref().and_then(|pace| pace.take_hold()) {
+                        return Stepped::Held(until);
+                    }
+                    if let Err(err) = completions.wait(io.as_ref()) {
+                        self.ended = true;
+                        if let Err(cleanup) =
+                            self.machine.cleanup_after_external_io_error(err.clone())
+                        {
+                            tracing::debug!("MVCC background checkpoint cleanup failed: {cleanup}");
+                        }
+                        return Stepped::Ended(Err(err));
+                    }
+                }
+                Err(err) => {
+                    // The machine let its locks go before it returned the error.
+                    self.ended = true;
+                    return Stepped::Ended(Err(err));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PoolCheckpoint {
+    fn drop(&mut self) {
+        // One that never ended lets its locks go, as a failed one does.
+        if !self.ended {
+            if let Err(err) = self
+                .machine
+                .cleanup_after_external_io_error(LimboError::Busy)
+            {
+                tracing::debug!("MVCC background checkpoint cleanup failed: {err}");
+            }
+        }
+        self.conn.pager.load().set_checkpoint_pace(None);
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +362,8 @@ enum Outcome {
 struct TestHooks {
     injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
     failure_injector: Option<Arc<dyn crate::mvcc::yield_points::FailureInjector>>,
+    /// The budget every paced checkpoint takes, in place of the one the log's rate gives.
+    budget: Option<Duration>,
 }
 
 impl CheckpointPool {
@@ -374,10 +481,14 @@ impl std::fmt::Debug for CheckpointPool {
 }
 
 impl Pool {
-    /// Asks for a checkpoint of `member`'s database. False when the pool cannot take it.
-    fn request(self: &Arc<Self>, member: &Arc<Member>) -> bool {
+    /// Asks for a checkpoint of `member`'s database, whose log has had `appended` bytes appended.
+    /// A paced checkpoint parked on it goes on at once once the log has grown past its pace. False
+    /// when the pool cannot take it.
+    fn request(self: &Arc<Self>, member: &Arc<Member>, appended: u64) -> bool {
         let phase = member.phase.fetch_or(ASKED, Ordering::AcqRel) & !ASKED;
-        if matches!(phase, QUEUED | RUNNING | RETRY) {
+        if matches!(phase, QUEUED | RUNNING | RETRY)
+            || (phase == PACED && appended < member.pace_ends_at.load(Ordering::Acquire))
+        {
             return true;
         }
         let mut schedule = self.schedule.lock();
@@ -385,6 +496,14 @@ impl Pool {
         let phase = member.phase.load(Ordering::Acquire) & !ASKED;
         if matches!(phase, QUEUED | RUNNING | RETRY) {
             return true;
+        }
+        if phase == PACED {
+            // Parked while this request waited for the lock: the same test as without it.
+            if appended < member.pace_ends_at.load(Ordering::Acquire) {
+                return true;
+            }
+            self.cancel_timer(&mut schedule, &mut slot);
+            return self.enqueue(&mut schedule, member, &mut slot);
         }
         if member.closed.load(Ordering::Acquire) || self.thread_limit.load(Ordering::Acquire) == 0 {
             member.phase.store(IDLE, Ordering::Release);
@@ -402,22 +521,42 @@ impl Pool {
         false
     }
 
-    /// Takes `member` out of the pool for good. A turn running on it ends idle.
+    /// Takes `member` out of the pool for good. A turn running on it ends idle, and a checkpoint
+    /// parked on it lets its locks go.
     fn close(&self, member: &Arc<Member>) {
         member.closed.store(true, Ordering::Release);
+        let parked = {
+            let mut schedule = self.schedule.lock();
+            let mut slot = member.slot.lock();
+            match member.phase.load(Ordering::Acquire) & !ASKED {
+                QUEUED => {
+                    schedule.ready.retain(|queued| !Arc::ptr_eq(queued, member));
+                    self.queued.store(schedule.ready.len(), Ordering::Relaxed);
+                    member.phase.store(IDLE, Ordering::Release);
+                }
+                QUIET | RETRY | PACED => {
+                    self.cancel_timer(&mut schedule, &mut slot);
+                    member.phase.store(IDLE, Ordering::Release);
+                }
+                _ => {}
+            }
+            member.parked.lock().take()
+        };
+        drop(parked);
+    }
+
+    /// Ends the pace of the checkpoint running or parked on `member`'s database, which something
+    /// waits for: it finishes without waiting, and one parked is queued at once.
+    fn hurry(self: &Arc<Self>, member: &Arc<Member>) {
+        let Some(pace) = member.pace.lock().clone() else {
+            return;
+        };
+        pace.unpace();
         let mut schedule = self.schedule.lock();
         let mut slot = member.slot.lock();
-        match member.phase.load(Ordering::Acquire) & !ASKED {
-            QUEUED => {
-                schedule.ready.retain(|queued| !Arc::ptr_eq(queued, member));
-                self.queued.store(schedule.ready.len(), Ordering::Relaxed);
-                member.phase.store(IDLE, Ordering::Release);
-            }
-            QUIET | RETRY => {
-                self.cancel_timer(&mut schedule, &mut slot);
-                member.phase.store(IDLE, Ordering::Release);
-            }
-            _ => {}
+        if member.phase.load(Ordering::Acquire) & !ASKED == PACED {
+            self.cancel_timer(&mut schedule, &mut slot);
+            self.enqueue(&mut schedule, member, &mut slot);
         }
     }
 
@@ -547,7 +686,7 @@ impl Pool {
                 continue;
             }
             schedule.timed -= 1;
-            if member.phase.load(Ordering::Acquire) & !ASKED == RETRY {
+            if matches!(member.phase.load(Ordering::Acquire) & !ASKED, RETRY | PACED) {
                 self.enqueue(schedule, &member, &mut slot);
                 continue;
             }
@@ -634,6 +773,9 @@ impl Pool {
     /// while another database waits. Runs without the pool's lock, and drops every handle to the
     /// database before it returns.
     fn turn(&self, member: &Member) -> Outcome {
+        // A paced checkpoint parked ahead of its schedule goes on where it stopped.
+        let mut running = member.parked.lock().take();
+        member.pace_ends_at.store(u64::MAX, Ordering::Release);
         let Some(db) = member
             .database
             .get()
@@ -645,31 +787,59 @@ impl Pool {
         let Some(store) = db.get_mv_store().as_ref().cloned() else {
             return Outcome::Gone;
         };
-        let conn = match db.connect_internal(None, None) {
-            Ok(conn) => conn,
-            Err(err) => {
-                tracing::info!("MVCC background checkpoint could not connect: {err}");
-                self.count(member, None);
-                return Outcome::Failed;
-            }
+        let conn = match &running {
+            Some(parked) => parked.conn.clone(),
+            None => match db.connect_internal(None, None) {
+                Ok(conn) => {
+                    #[cfg(test)]
+                    member.hooks.lock().install(&conn);
+                    conn
+                }
+                Err(err) => {
+                    tracing::info!("MVCC background checkpoint could not connect: {err}");
+                    self.count(member, None);
+                    return Outcome::Failed;
+                }
+            },
         };
-        #[cfg(test)]
-        member.hooks.lock().install(&conn);
         let began = Instant::now();
         loop {
-            // An explicit checkpoint waits for the database: it gets it next.
-            if store.explicit_checkpoint_waiting() {
-                return self.defer(member);
+            if running.is_none() {
+                // An explicit checkpoint waits for the database: it gets it next.
+                if store.explicit_checkpoint_waiting() {
+                    return self.defer(member);
+                }
+                match Self::begin(member, &store, &conn) {
+                    Ok(checkpoint) => running = Some(checkpoint),
+                    Err(LimboError::Busy) => return self.defer(member),
+                    Err(err) => {
+                        tracing::info!("MVCC background checkpoint did not begin: {err}");
+                        self.count(member, None);
+                        return Outcome::Failed;
+                    }
+                }
             }
-            let started = Instant::now();
-            let result = conn.checkpoint(CheckpointMode::Passive {
-                upper_bound_inclusive: None,
-            });
+            let checkpoint = running.as_mut().expect("begun above");
+            let result = match checkpoint.step() {
+                Stepped::Held(until) => {
+                    let ends_at = checkpoint
+                        .pace
+                        .as_ref()
+                        .map_or(u64::MAX, |pace| pace.due_at());
+                    member.pace_ends_at.store(ends_at, Ordering::Release);
+                    *member.parked.lock() = running.take();
+                    return Outcome::Paced(until);
+                }
+                Stepped::Ended(result) => result,
+            };
+            let stepped = checkpoint.stepped;
+            running = None;
+            *member.pace.lock() = None;
             // Another checkpoint is running on the database: it gets the turn.
-            if matches!(result, Err(crate::LimboError::Busy)) {
+            if matches!(result, Err(LimboError::Busy)) {
                 return self.defer(member);
             }
-            self.count(member, Some((started.elapsed(), result.is_ok())));
+            self.count(member, Some((stepped, result.is_ok())));
             if let Err(err) = result {
                 tracing::info!("MVCC background checkpoint failed: {err}");
                 return Outcome::Failed;
@@ -680,6 +850,89 @@ impl Pool {
                 return Outcome::Done;
             }
         }
+    }
+
+    /// Begins a checkpoint of `store` on `conn`, as `Connection::checkpoint` does: passive under
+    /// passive checkpoints, and paced when the log's threshold asked for it.
+    fn begin(
+        member: &Member,
+        store: &Arc<crate::MvStore>,
+        conn: &Arc<Connection>,
+    ) -> crate::Result<PoolCheckpoint> {
+        let pager = conn.pager.load().clone();
+        let guard = conn.begin_explicit_checkpoint(pager.clone(), false)?;
+        let passive = store.uses_passive_checkpoint();
+        let pace = Self::pace(member, store, passive);
+        *member.pace.lock() = pace.clone();
+        pager.set_checkpoint_pace(pace.clone().map(|pace| pace as Arc<dyn WritePace>));
+        let mode = if passive {
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            }
+        } else {
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            }
+        };
+        let machine = CheckpointStateMachine::new(
+            pager,
+            store.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            MAIN_DB_ID,
+            mode,
+        );
+        Ok(PoolCheckpoint {
+            machine: Box::new(machine),
+            pace,
+            _guard: guard,
+            conn: conn.clone(),
+            stepped: Duration::ZERO,
+            ended: false,
+        })
+    }
+
+    /// The pace of the checkpoint beginning now on `store`: its writes may take the completion
+    /// target's share of the time the log takes to grow by a threshold, at the rate it grew since
+    /// the last checkpoint began, and pacing ends once it has. None for a passive checkpoint the
+    /// threshold did not ask for, as one that truncates a quiet log, for a blocking one, and with no
+    /// rate, threshold or target to pace by.
+    fn pace(
+        member: &Member,
+        store: &Arc<crate::MvStore>,
+        passive: bool,
+    ) -> Option<Arc<CheckpointPace>> {
+        let storage = &store.storage;
+        let appended = storage.appended_bytes();
+        let now = Instant::now();
+        let last = member.last_begin.lock().replace((now, appended));
+        let threshold = u64::try_from(storage.checkpoint_threshold())
+            .ok()
+            .filter(|threshold| *threshold > 0)?;
+        let target = store.checkpoint_completion_target();
+        if !passive || target <= 0.0 || !owes_checkpoint(storage.as_ref()) {
+            return None;
+        }
+        #[cfg(test)]
+        let fixed = member.hooks.lock().budget;
+        #[cfg(not(test))]
+        let fixed: Option<Duration> = None;
+        let budget = match fixed {
+            Some(budget) => budget,
+            None => {
+                let (then, appended_then) = last?;
+                let grown = appended
+                    .checked_sub(appended_then)
+                    .filter(|grown| *grown > 0)?;
+                pace_budget(now.duration_since(then), grown, threshold, target)?
+            }
+        };
+        Some(Arc::new(CheckpointPace::new(
+            storage.clone(),
+            budget,
+            appended.saturating_add(threshold),
+        )))
     }
 
     fn defer(&self, member: &Member) -> Outcome {
@@ -755,9 +1008,22 @@ impl Pool {
                     .min(RETRY_LONGEST);
                 self.arm(schedule, member, &mut slot, RETRY, delay);
             }
+            Outcome::Paced(until) => {
+                slot.strikes = 0;
+                let after = until.saturating_duration_since(Instant::now());
+                self.arm(schedule, member, &mut slot, PACED, after);
+            }
             Outcome::Gone | Outcome::Panicked => member.phase.store(IDLE, Ordering::Release),
         }
     }
+}
+
+/// The time a paced checkpoint's writes may take: `target` of the time the log takes to grow by
+/// `threshold` bytes, at the rate it grew `grown` bytes in `elapsed`. None when that time is no
+/// duration.
+fn pace_budget(elapsed: Duration, grown: u64, threshold: u64, target: f64) -> Option<Duration> {
+    let interval = elapsed.as_secs_f64() * threshold as f64 / grown as f64;
+    Duration::try_from_secs_f64(interval * target.min(1.0)).ok()
 }
 
 /// Whether the log holds uncheckpointed bytes past its threshold. At a threshold of zero an empty
@@ -779,6 +1045,10 @@ impl Member {
             failures: AtomicU64::new(0),
             deferrals: AtomicU64::new(0),
             assists: AtomicU64::new(0),
+            parked: Mutex::new(None),
+            pace_ends_at: AtomicU64::new(u64::MAX),
+            pace: Mutex::new(None),
+            last_begin: Mutex::new(None),
             #[cfg(test)]
             hooks: Mutex::new(TestHooks::default()),
         }
@@ -817,7 +1087,10 @@ impl Member {
 
     fn timer_is_live(&self, slot: &Slot, generation: u64) -> bool {
         slot.generation == generation
-            && matches!(self.phase.load(Ordering::Acquire) & !ASKED, QUIET | RETRY)
+            && matches!(
+                self.phase.load(Ordering::Acquire) & !ASKED,
+                QUIET | RETRY | PACED
+            )
     }
 }
 
@@ -883,7 +1156,14 @@ impl BackgroundCheckpoint {
         if !member.enabled.load(Ordering::Acquire) || !member.register(storage, database) {
             return false;
         }
-        binding.pool.pool.request(member)
+        binding.pool.pool.request(member, storage.appended_bytes())
+    }
+
+    /// Ends the pace of a background checkpoint running or parked on the database, which
+    /// something waits for: an explicit checkpoint, or a commit far behind.
+    pub(crate) fn hurry(&self) {
+        let binding = self.binding.load();
+        binding.pool.pool.hurry(&binding.member);
     }
 
     /// Counts a commit that checkpointed inline because the pool had fallen `BEHIND`.
@@ -963,6 +1243,16 @@ impl BackgroundCheckpointProbe {
         injector: Option<Arc<dyn crate::mvcc::yield_points::FailureInjector>>,
     ) {
         self.member.hooks.lock().failure_injector = injector;
+    }
+
+    /// Paces every checkpoint the threshold asks for by `budget`.
+    pub(crate) fn set_budget(&self, budget: Option<Duration>) {
+        self.member.hooks.lock().budget = budget;
+    }
+
+    /// Whether a paced checkpoint is parked ahead of its schedule.
+    pub(crate) fn parked(&self) -> bool {
+        self.member.phase.load(Ordering::Acquire) & !ASKED == PACED
     }
 }
 

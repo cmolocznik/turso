@@ -4905,6 +4905,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Whether a checkpoint is running on the store.
+    #[cfg(test)]
     pub(crate) fn checkpoint_in_progress(&self) -> bool {
         self.checkpoint_in_progress.load(Ordering::Acquire)
     }

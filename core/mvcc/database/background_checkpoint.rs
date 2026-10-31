@@ -657,14 +657,14 @@ impl Pool {
         member.hooks.lock().install(&conn);
         let began = Instant::now();
         loop {
-            // A checkpoint running on the database would make this one a no-op, again and again.
-            if store.checkpoint_in_progress() {
-                return self.defer(member);
-            }
             let started = Instant::now();
             let result = conn.checkpoint(CheckpointMode::Passive {
                 upper_bound_inclusive: None,
             });
+            // Another checkpoint is running on the database: it gets the turn.
+            if matches!(result, Err(crate::LimboError::Busy)) {
+                return self.defer(member);
+            }
             self.count(member, Some((started.elapsed(), result.is_ok())));
             if let Err(err) = result {
                 tracing::info!("MVCC background checkpoint failed: {err}");

@@ -3507,6 +3507,81 @@ fn test_flag_off_truncate_busy_when_lock_contended() {
     c1.execute("COMMIT").unwrap();
 }
 
+/// With passive checkpoints an explicit TRUNCATE that finds another checkpoint running reports
+/// `Busy`, as the flag-off path does, never a false-success no-op: one would leave in the logical
+/// log every commit the running checkpoint does not cover, its caller believing the log empty.
+#[test]
+fn test_passive_truncate_beside_a_running_checkpoint_reports_busy() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+    let mut running = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(matches!(
+        running.step(&()).unwrap(),
+        TransitionResult::Continue
+    ));
+    assert!(
+        mvcc_store.checkpoint_in_progress(),
+        "the first step takes the database"
+    );
+    let log = mvcc_store.get_logical_log_file().size().unwrap();
+    assert!(log > 0);
+
+    let other = db.connect();
+    let res = other.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert!(
+        matches!(res, Err(LimboError::Busy)),
+        "a TRUNCATE beside a running checkpoint must report Busy, got {res:?}"
+    );
+    let res = other.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    });
+    assert!(
+        matches!(res, Err(LimboError::Busy)),
+        "Connection::checkpoint beside a running checkpoint must report Busy, got {res:?}"
+    );
+    assert_eq!(
+        mvcc_store.get_logical_log_file().size().unwrap(),
+        log,
+        "a refused TRUNCATE leaves the log as it was"
+    );
+
+    loop {
+        match running.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => break,
+        }
+    }
+    conn.execute("INSERT INTO t VALUES (2, 'after')").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        mvcc_store.get_logical_log_file().size().unwrap(),
+        0,
+        "once the running checkpoint ends, a TRUNCATE empties the log"
+    );
+    let rows = get_rows(&other, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1][1].to_string(), "after");
+}
+
 /// `checkpoint_snapshot_ts` must clamp the published checkpoint boundary below any
 /// in-flight (Preparing) commit. `last_committed_tx_ts` is a fetch_max high-water mark,
 /// so a commit that assigned a LOWER end_ts and is still Preparing (commits finalize out

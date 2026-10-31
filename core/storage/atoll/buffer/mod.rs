@@ -475,8 +475,14 @@ impl BufferPool {
         h.tracker.clear();
         h.tracker.read(self.now());
         h.status.store(RESIDENT, Ordering::Release);
-        if let Err(other) = self.table.insert(&self.headers, pid.raw(), frame) {
-            panic!("new page {pid:?} is already in frame {other}");
+        // The number may have been freed while its last page was still in memory: whoever freed
+        // it holds that frame exclusively and drops it next, waiting on nothing (`free`).
+        while let Err(other) = self.table.insert(&self.headers, pid.raw(), frame) {
+            assert!(
+                self.header(other).latch.optimistic().is_none(),
+                "new page {pid:?} is already in frame {other}, which no one is freeing"
+            );
+            std::hint::spin_loop();
         }
         Ok(IOResult::Done(Exclusive {
             pool: self,

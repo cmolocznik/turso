@@ -1,0 +1,17 @@
+[package]
+name = "turso_umbra"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prototype of an Umbra-style storage layer: variable-size pages, a buffer manager with pointer swizzling, and a write-ahead log"
+publish = false
+
+[dependencies]
+crc32c = "0.6.8"
+libc = "0.2.172"
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

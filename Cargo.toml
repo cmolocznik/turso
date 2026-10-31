@@ -56,7 +56,8 @@ members = [
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/query-result-oracle",
-    "testing/sqltest"
+    "testing/sqltest",
+    "umbra"
 ]
 
 default-members = [

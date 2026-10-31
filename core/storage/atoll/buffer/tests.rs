@@ -339,3 +339,25 @@ fn a_pass_writes_again_a_page_changed_while_its_earlier_write_was_in_flight() {
     );
     model.check_all();
 }
+
+#[test]
+fn a_failed_upgrade_leaves_the_holders_latch_alone() {
+    let b = &backends()[0];
+    let (_log, pool) = open(b, MIN_BUDGET);
+    let page = drive(&b.io, || pool.allocate(class(0))).unwrap();
+    let pid = page.pid();
+    drop(page);
+    let first = drive(&b.io, || pool.fix_optimistic(pid, None)).unwrap();
+    let second = drive(&b.io, || pool.fix_optimistic(pid, None)).unwrap();
+    let held = first.upgrade().expect("the first upgrade");
+    assert!(second.upgrade().is_none(), "two upgrades from one version");
+    assert!(
+        matches!(pool.fix_shared(pid, None).unwrap(), IOResult::IO(_)),
+        "a shared fix got in while the page was held exclusively"
+    );
+    drop(held);
+    assert!(matches!(
+        pool.fix_shared(pid, None).unwrap(),
+        IOResult::Done(_)
+    ));
+}

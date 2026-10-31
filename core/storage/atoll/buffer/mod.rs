@@ -936,9 +936,10 @@ impl<'a> Optimistic<'a> {
     /// Latches the page exclusively if it is unchanged since it was fixed.
     pub fn upgrade(self) -> Option<Exclusive<'a>> {
         let latch = &self.pool.header(self.frame).latch;
+        // Built only once latched: a guard's drop releases the latch.
         latch
             .try_lock_exclusive_at(self.version)
-            .then_some(Exclusive {
+            .then(|| Exclusive {
                 pool: self.pool,
                 frame: self.frame,
                 pid: self.pid,

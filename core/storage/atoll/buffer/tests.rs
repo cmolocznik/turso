@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::umbra::testing::{backends, corrupt, drive, Backend};
+use crate::storage::atoll::testing::{backends, corrupt, drive, Backend};
 use crate::types::IOResult;
 
 const PAGE: usize = page::MIN_PAGE_SIZE;

@@ -2,11 +2,11 @@
 //! `IOResult` to the end the way the VDBE does.
 
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
-use crate::storage::umbra::buffer::{Anchor, BufferManager, ExclusiveGuard, DEFAULT_COOLING_SHARE};
-use crate::storage::umbra::checkpoint;
-use crate::storage::umbra::page::{self, PageId, SizeClass, HEADER_SIZE};
-use crate::storage::umbra::store::PageStore;
-use crate::storage::umbra::wal::{Record, Recovered, Wal};
+use crate::storage::atoll::buffer::{Anchor, BufferManager, ExclusiveGuard, DEFAULT_COOLING_SHARE};
+use crate::storage::atoll::checkpoint;
+use crate::storage::atoll::page::{self, PageId, SizeClass, HEADER_SIZE};
+use crate::storage::atoll::store::PageStore;
+use crate::storage::atoll::wal::{Record, Recovered, Wal};
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::Result;

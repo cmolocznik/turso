@@ -1,4 +1,5 @@
-//! A storage mode beside the pager, after Umbra (Neumann and Freitag, CIDR 2020).
+//! Atoll: a storage mode beside the pager, after LeanStore and Umbra. Its design is in
+//! `docs/internals/atoll/DESIGN.md`; the modules below are the prototype it replaces step by step.
 //!
 //! - [`page`]: size classes of exponentially growing page sizes, page ids and the page header.
 //! - [`store`]: the page store, one file per size class, disk space reused only by pages of the

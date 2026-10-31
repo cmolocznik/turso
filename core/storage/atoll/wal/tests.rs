@@ -1,8 +1,8 @@
 use super::*;
 use crate::io::OpenFlags;
-use crate::storage::umbra::buffer::Anchor;
-use crate::storage::umbra::page::{SizeClass, MIN_PAGE_SIZE};
-use crate::storage::umbra::testing::{
+use crate::storage::atoll::buffer::Anchor;
+use crate::storage::atoll::page::{SizeClass, MIN_PAGE_SIZE};
+use crate::storage::atoll::testing::{
     backends, bump, commit, corrupt, create, drive, settle, slot, values, Backend, World, LEAVES,
     VALUE,
 };

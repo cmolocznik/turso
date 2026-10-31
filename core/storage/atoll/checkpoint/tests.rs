@@ -1,6 +1,6 @@
 use super::*;
-use crate::storage::umbra::buffer::{Anchor, DEFAULT_COOLING_SHARE};
-use crate::storage::umbra::testing::{
+use crate::storage::atoll::buffer::{Anchor, DEFAULT_COOLING_SHARE};
+use crate::storage::atoll::testing::{
     backends, bump, create, drive, settle, slot, values, World, LEAVES,
 };
 

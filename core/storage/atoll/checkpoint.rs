@@ -34,7 +34,7 @@ use crate::{CompletionError, LimboError, Result};
 use std::collections::BTreeSet;
 
 const SUPERBLOCKS: u64 = 2;
-const SUPER_MAGIC: u64 = u64::from_le_bytes(*b"UMBRASB1");
+const SUPER_MAGIC: u64 = u64::from_le_bytes(*b"ATOLLSB1");
 const PAGE: usize = MIN_PAGE_SIZE;
 
 fn class0() -> SizeClass {

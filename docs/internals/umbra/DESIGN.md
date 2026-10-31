@@ -484,8 +484,9 @@ Later, but the format leaves room for it.
 
 Each step replaces the prototype's piece, builds and is clippy-clean, and lands with its tests.
 
-1. **IO:** honour `direct` (O_DIRECT), `fdatasync`, writes durable on completion (`RWF_DSYNC`),
-   preallocation, aligned buffers, IO priority, and the fault-injecting IO above.
+1. **IO:** direct IO (`OpenFlags::Direct`), `fdatasync`, writes durable on completion
+   (`RWF_DSYNC`), preallocation, directory sync, and the fault-injecting IO above
+   (`core/io/crash.rs`). Done.
 2. **Log:** records, parallel fill, flushing modes, segments, failure.
 3. **Page store:**
    - page kinds;
@@ -497,7 +498,8 @@ Each step replaces the prototype's piece, builds and is clippy-clean, and lands 
    - partitioned eviction;
    - page kinds' swips;
    - optimistic fixes and prefetch;
-   - the page cleaner.
+   - the page cleaner;
+   - IO priorities, kept only if measurements show the device honours them.
 5. **Checkpoints and redo** over the new pieces.
 6. **B+-trees.**
 7. **Transactions:** slots, clock, version headers, undo pages, conflicts and waits, rollback,

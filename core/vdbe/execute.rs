@@ -620,6 +620,9 @@ pub fn op_checkpoint(
             *database,
             *checkpoint_mode,
         );
+        // A busy retry runs this instruction again: a TRUNCATE goes on toward its first attempt's
+        // goal.
+        ckpt_sm.resume_truncate_goal(state.explicit_checkpoint_goal.take());
         let CheckpointResult {
             wal_max_frame,
             wal_total_backfilled,
@@ -634,7 +637,12 @@ pub fn op_checkpoint(
                         return Err(err.into());
                     }
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    if matches!(err, LimboError::Busy) {
+                        state.explicit_checkpoint_goal = ckpt_sm.truncate_goal();
+                    }
+                    return Err(err.into());
+                }
             }
         };
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint

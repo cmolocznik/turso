@@ -161,7 +161,9 @@
 //!
 //! A later checkpoint that covers every commit of a sealed segment truncates its file, which a
 //! later roll reuses. Once every commit is covered the log resets into a numbered segment of its
-//! own, so a file freed before, whose truncate was not durable, can never outrank it.
+//! own, so a file freed before, whose truncate was not durable, can never outrank it. An explicit
+//! TRUNCATE beside writers checkpoints again until the segment it began beside is freed, so no
+//! frame from before it is left in the files.
 //!
 //! Recovery begins at the newest segment, by `seq`, and goes back through `prev_seq` while a
 //! segment's `prior_max_ts` is a commit no checkpoint has covered; a predecessor it needs that is
@@ -721,6 +723,11 @@ pub struct LogicalLog {
     max_appended_commit_ts: u64,
     /// The files a log opened over them rolls through; `None` for a log of one file.
     ring: Option<Box<LogRing>>,
+    /// The generation of the segment being written, counting the segments begun since the log
+    /// opened: a roll begins the next one, and so does a truncate. A frame is of the generation
+    /// being written when it is appended, so once the oldest segment holding a frame is of a later
+    /// generation than `n`, no frame appended while `n` was being written is left in the files.
+    generation: u64,
 }
 
 /// The path of slot `slot` of the log whose first file is `base`.
@@ -771,6 +778,8 @@ struct SealedSegment {
     max_commit_ts: u64,
     /// Whether it may hold frames no fsync has covered yet.
     unsynced: Arc<crate::sync::atomic::AtomicBool>,
+    /// Its `LogicalLog::generation`.
+    generation: u64,
 }
 
 impl LogRing {
@@ -885,6 +894,7 @@ impl LogicalLog {
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
             ring: None,
+            generation: 0,
         }
     }
 
@@ -964,6 +974,20 @@ impl LogicalLog {
         1 + self.ring.as_ref().map_or(0, |ring| ring.sealed.len())
     }
 
+    /// Which frames the log holds, by generation; see [`super::LogicalLogHold`].
+    pub(crate) fn hold(&self) -> super::LogicalLogHold {
+        let ring = self.ring.as_deref();
+        super::LogicalLogHold {
+            oldest: ring
+                .and_then(|ring| ring.sealed.front())
+                .map(|sealed| sealed.generation)
+                .or_else(|| (self.offset > 0).then_some(self.generation)),
+            writing: self.generation,
+            file_ready: ring.is_some_and(|ring| ring.ready_slot().is_some()),
+            roll_pending: ring.is_some_and(|ring| ring.roll_pending),
+        }
+    }
+
     /// Takes up writing where recovery left the log: in the last segment it replayed, after its
     /// last valid frame. The segments before it stay sealed until a checkpoint covers them, and
     /// every other file is freed.
@@ -996,14 +1020,17 @@ impl LogicalLog {
             }
             ring.sealed = recovered.segments[..recovered.segments.len() - 1]
                 .iter()
-                .map(|segment| SealedSegment {
+                .zip(self.generation..)
+                .map(|(segment, generation)| SealedSegment {
                     slot: segment.slot,
                     end: segment.header.segment.map_or(0, |s| s.start) + segment.end,
                     max_commit_ts: segment.max_commit_ts,
                     // What was read back may not have reached the disk before a crash.
                     unsynced: Arc::new(crate::sync::atomic::AtomicBool::new(true)),
+                    generation,
                 })
                 .collect();
+            self.generation += ring.sealed.len() as u64;
             ring.active = active.slot;
             self.file = ring.file(active.slot).clone();
         }
@@ -1071,6 +1098,7 @@ impl LogicalLog {
             end,
             max_commit_ts: self.max_appended_commit_ts,
             unsynced: Arc::new(crate::sync::atomic::AtomicBool::new(true)),
+            generation: self.generation,
         });
         ring.active = slot;
         ring.roll_pending = false;
@@ -1087,6 +1115,7 @@ impl LogicalLog {
         // The header goes to disk with the segment's first frame, which chains from `running_crc`.
         self.offset = 0;
         self.max_appended_commit_ts = 0;
+        self.generation += 1;
     }
 
     /// Takes the next segment number; only a log that rolls writes segment headers.
@@ -1570,6 +1599,7 @@ impl LogicalLog {
         let _truncate_c = self.file.truncate(0, completion)?;
         self.offset = 0;
         self.max_appended_commit_ts = 0;
+        self.generation += 1;
         Ok(())
     }
 
@@ -1662,6 +1692,7 @@ impl LogicalLog {
         group.add(&c);
         let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
         self.offset = 0;
+        self.generation += 1;
         Ok(group.build())
     }
 

@@ -9,6 +9,7 @@ use crate::mvcc::database::{
     MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::mvcc::database::{IndexRowsEntry, RowVersions};
+use crate::mvcc::persistent_storage::LogicalLogHold;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
@@ -385,6 +386,17 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     snapshot_ts: u64,
     /// The logical log's offset when `snapshot_ts` was taken: what this checkpoint covers.
     snapshot_log_offset: u64,
+    /// An explicit TRUNCATE under passive checkpoints: the generation of the log segment being
+    /// written when its first pass took its snapshot. Writers commit while it runs, so a pass may
+    /// have to keep that segment, which it seals for a later pass to free. The TRUNCATE runs
+    /// passes until no segment of that generation or an older one is left, so that nothing
+    /// committed before it began is left in the log's files. Its first pass empties the WAL; the
+    /// later ones write only what was committed after the first one's snapshot, so they run as
+    /// passive passes, which a reader of the WAL does not hold back. A busy retry of the statement
+    /// goes on toward the goal of its first attempt (`resume_truncate_goal`).
+    truncate_goal: Option<u64>,
+    /// What the log held when this pass took its snapshot.
+    pass_began_with: Option<LogicalLogHold>,
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
     build_local_schema_began_read_tx: bool,
     /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index` in PASSIVE mode.
@@ -1006,6 +1018,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // then `u64::MAX` disables the upper-bound filter (collect everything).
             snapshot_ts: u64::MAX,
             snapshot_log_offset: 0,
+            truncate_goal: None,
+            pass_began_with: None,
             build_local_schema_sm: None,
             build_local_schema_began_read_tx: false,
             local_schema: None,
@@ -1044,6 +1058,75 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             self.mvstore.end_checkpoint_in_progress();
             self.owns_checkpoint_in_progress = false;
         }
+    }
+
+    /// An explicit TRUNCATE under passive checkpoints, which runs passes until nothing committed
+    /// before it began is left in the log (`truncate_goal`).
+    fn clears_what_came_before(&self) -> bool {
+        self.update_transaction_state
+            && matches!(
+                self.mode,
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None
+                }
+            )
+            && self.mvstore.uses_passive_checkpoint()
+    }
+
+    /// Whether a TRUNCATE owes another pass: the log still holds a segment of `truncate_goal`'s
+    /// generation or an older one. A pass that left the log as it found it can free no more of
+    /// them, and the TRUNCATE reports Busy, never a success that leaves those frames in the files.
+    fn owes_another_pass(&self) -> Result<bool> {
+        let (Some(goal), Some(began)) = (self.truncate_goal, self.pass_began_with) else {
+            return Ok(false);
+        };
+        let hold = self.mvstore.storage.logical_log_hold();
+        if hold.oldest.is_none_or(|oldest| oldest > goal) {
+            return Ok(false);
+        }
+        if hold == began {
+            return Err(LimboError::Busy);
+        }
+        Ok(true)
+    }
+
+    /// Starts a TRUNCATE's next pass afresh, as a passive pass: the WAL holds nothing from before
+    /// the first pass. It keeps `checkpoint_in_progress`, so no other checkpoint runs between its
+    /// passes.
+    fn begin_next_pass(&mut self) {
+        turso_assert!(
+            !self.lock_states.pager_read_tx && !self.lock_states.pager_write_tx,
+            "a checkpoint pass ended in a pager transaction"
+        );
+        if self.lock_states.blocking_checkpoint_lock_held {
+            self.checkpoint_lock.unlock();
+            self.lock_states.blocking_checkpoint_lock_held = false;
+        }
+        let mut next = Self::new(
+            self.pager.clone(),
+            self.mvstore.clone(),
+            self.connection.clone(),
+            self.update_transaction_state,
+            self.sync_mode,
+            self.database_id,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        next.owns_checkpoint_in_progress = std::mem::take(&mut self.owns_checkpoint_in_progress);
+        next.truncate_goal = self.truncate_goal;
+        *self = next;
+    }
+
+    /// Goes on toward the goal of an earlier attempt of the same TRUNCATE statement, which a busy
+    /// retry carries: commits made since the statement began do not hold it back.
+    pub(crate) fn resume_truncate_goal(&mut self, goal: Option<u64>) {
+        self.truncate_goal = goal;
+    }
+
+    /// The goal this TRUNCATE works toward, for a busy retry to go on with.
+    pub(crate) fn truncate_goal(&self) -> Option<u64> {
+        self.truncate_goal
     }
 
     /// Cleanup path for I/O errors that happen while waiting on completions outside
@@ -1952,7 +2035,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// every frame in the log was written to the B-tree by this checkpoint. With
     /// `experimental_mvcc_passive_checkpoint` enabled, the checkpoint collects rows before
     /// taking the lock and writers never take it, so writers can commit after the
-    /// snapshot and those frames must stay in the log.
+    /// snapshot and those frames must stay in the log. An explicit TRUNCATE then runs
+    /// more passes, until no frame from before it is left (`truncate_goal`).
     fn clears_whole_logical_log(&self) -> bool {
         self.mode.should_restart_log() && !self.mvstore.uses_passive_checkpoint()
     }
@@ -1973,6 +2057,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // The offset first: every frame before it is a commit the snapshot covers or one
         // still in flight, which the next checkpoint takes.
         self.snapshot_log_offset = self.mvstore.storage.logical_log_offset();
+        // A TRUNCATE's first pass, or a later one, which runs as a passive pass.
+        if self.clears_what_came_before() || self.truncate_goal.is_some() {
+            // Read after the offset, a roll in between can only move the goal to a later segment.
+            let hold = self.mvstore.storage.logical_log_hold();
+            self.truncate_goal = self.truncate_goal.or(Some(hold.writing));
+            self.pass_began_with = Some(hold);
+        }
         self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
         self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
         // Checkpoint state machines can be created before they are run.
@@ -2504,7 +2595,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         match &self.state {
             CheckpointState::PrepareCheckpoint => {
                 let passive = self.mvstore.uses_passive_checkpoint();
-                if passive {
+                // A TRUNCATE's later pass holds the gate already.
+                if passive && !self.owns_checkpoint_in_progress {
                     // The passive checkpoint acquires the blocking lock only after
                     // collection, so it needs an explicit single-orchestrator gate. The
                     // blocking (flag-off) path takes the lock up front and gets that
@@ -3764,6 +3856,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
             Ok(TransitionResult::Done(ref result)) => {
                 // End hook before unlock so storage cannot race the next writer/checkpoint.
                 let end = self.mvstore.storage.on_checkpoint_end(Ok(result));
+                if end.is_ok() {
+                    match self.owes_another_pass() {
+                        Ok(true) => {
+                            self.begin_next_pass();
+                            return Ok(TransitionResult::Continue);
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            self.release_checkpoint_locks_if_needed();
+                            return Err(err);
+                        }
+                    }
+                }
                 self.release_checkpoint_locks_if_needed();
                 end?;
                 res

@@ -3095,7 +3095,8 @@ fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
 /// collects rows without the blocking checkpoint lock and writers never take it, so another
 /// connection can commit after the checkpoint snapshot. That commit is not in the B-tree
 /// yet, so the checkpoint must keep it in the logical log instead of clearing the whole
-/// file.
+/// file. The TRUNCATE then runs another pass, whose snapshot covers the commit: it goes to
+/// the B-tree, and the log ends empty.
 #[test]
 fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
     let mut db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -3135,10 +3136,18 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
         .unwrap();
 
     let mut finished = false;
+    // The log's size when the first pass hands over to the next.
+    let mut kept_by_first_pass = None;
     for _ in 0..50_000 {
         match checkpoint_sm.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
-            TransitionResult::Continue => {}
+            TransitionResult::Continue => {
+                if kept_by_first_pass.is_none()
+                    && checkpoint_sm.state_for_test() == CheckpointState::PrepareCheckpoint
+                {
+                    kept_by_first_pass = Some(mvcc_store.get_logical_log_file().size().unwrap());
+                }
+            }
             TransitionResult::Done(_) => {
                 finished = true;
                 break;
@@ -3150,8 +3159,13 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
         "TRUNCATE checkpoint must complete after the sibling commit"
     );
     assert!(
-        mvcc_store.get_logical_log_file().size().unwrap() > 0,
-        "logical log must keep the commit that landed after the checkpoint snapshot"
+        kept_by_first_pass.is_some_and(|size| size > 0),
+        "logical log must keep the commit that landed after the checkpoint snapshot, got {kept_by_first_pass:?}"
+    );
+    assert_eq!(
+        mvcc_store.get_logical_log_file().size().unwrap(),
+        0,
+        "the TRUNCATE's next pass checkpoints the commit that landed after its first snapshot"
     );
 
     let rows = get_rows(&sibling, "SELECT id FROM t ORDER BY id");

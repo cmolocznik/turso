@@ -3,15 +3,16 @@
 //! written and the log goes on in another file, which a later checkpoint frees. Recovery reads the
 //! segments as one log.
 
+use super::TransactionState;
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::tests::MvccTestDbNoConn;
 use crate::mvcc::persistent_storage::logical_log::{segment_path, LOG_SEGMENT_FILES};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::storage::wal::CheckpointMode;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::sync::Arc;
-use crate::Connection;
+use crate::{Connection, StepResult};
 
 /// Commits a row on its connection once the checkpoint it is given to has taken its snapshot, so
 /// the checkpoint cannot truncate the log.
@@ -232,6 +233,188 @@ fn test_recovery_replays_a_log_rolled_over_segments() {
     }
     let (_db, recovered) = db.restart();
     assert_eq!(recovered, 6);
+}
+
+/// A commit still being made when a TRUNCATE runs keeps every checkpoint from covering what came
+/// after it, so the TRUNCATE cannot free the segment it began beside. Once its passes can free no
+/// more, it reports Busy and the log keeps its frames: never a success that leaves them in the
+/// files. Once the commit is made, the next TRUNCATE empties the log.
+#[test]
+fn test_a_truncate_that_cannot_free_what_came_before_it_reports_busy() {
+    let db = TestDb::open();
+    db.insert();
+    let store = db.db.get_mvcc_store();
+    let making = store
+        .begin_tx(db.checkpointer.pager.load().clone())
+        .unwrap();
+    let set_state = |state: TransactionState| {
+        store.txs.get(&making).unwrap().value().state.store(state);
+    };
+    // Below every commit made so far, so no snapshot covers any of them.
+    set_state(TransactionState::Preparing(1));
+    let truncate = || {
+        db.checkpointer.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+    };
+    let res = truncate();
+    assert!(
+        matches!(res, Err(crate::LimboError::Busy)),
+        "a TRUNCATE that cannot free what came before it must report Busy, got {res:?}"
+    );
+    assert_eq!(
+        db.segments(),
+        2,
+        "its passes rolled the log, then could free no more"
+    );
+    assert!(db.log_size() > 0);
+    set_state(TransactionState::Committed(1));
+    truncate().unwrap();
+    assert_eq!((db.segments(), db.log_size()), (1, 0));
+}
+
+/// Commits a row once the first pass of the checkpoint it is given to has taken its snapshot, so
+/// that pass cannot empty the log. Once a later pass has written the WAL, it begins a read on
+/// another connection and leaves it open: a reader of the WAL beside the rest of that pass.
+struct ReadBesideALaterPass {
+    writer: Arc<Connection>,
+    reader: Arc<Connection>,
+    passes: AtomicUsize,
+    reading: AtomicBool,
+}
+
+impl std::fmt::Debug for ReadBesideALaterPass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadBesideALaterPass")
+    }
+}
+
+impl YieldInjector for ReadBesideALaterPass {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CheckpointYieldPoint::AfterCollectTableRows.point()
+            && self.passes.fetch_add(1, Ordering::AcqRel) == 0
+        {
+            self.writer
+                .execute("INSERT INTO t(v) VALUES (randomblob(512))")
+                .unwrap();
+        }
+        if point == CheckpointYieldPoint::BeforePublishWindow.point()
+            && self.passes.load(Ordering::Acquire) >= 2
+            && !self.reading.swap(true, Ordering::AcqRel)
+        {
+            self.reader.execute("BEGIN").unwrap();
+            count(&self.reader);
+        }
+        false
+    }
+}
+
+/// A TRUNCATE's first pass empties the WAL, and the passes after it write only what was committed
+/// after that pass's snapshot, so they run as passive passes: a reader of the WAL beside one of
+/// them does not hold the TRUNCATE back.
+#[test]
+fn test_a_truncates_later_passes_run_beside_a_reader_of_the_wal() {
+    let db = TestDb::open();
+    db.insert();
+    let injector = Arc::new(ReadBesideALaterPass {
+        writer: db.writer.clone(),
+        reader: db.db.connect(),
+        passes: AtomicUsize::new(0),
+        reading: AtomicBool::new(false),
+    });
+    db.checkpointer.set_yield_injector(Some(injector.clone()));
+    let res = db.checkpointer.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    });
+    db.checkpointer.set_yield_injector(None);
+    assert!(
+        injector.reading.load(Ordering::Acquire),
+        "no later pass wrote the WAL"
+    );
+    assert!(
+        res.is_ok(),
+        "a reader of the WAL held back a later pass of the TRUNCATE: {res:?}"
+    );
+    injector.reader.execute("COMMIT").unwrap();
+    assert_eq!(count(&db.checkpointer), 2);
+}
+
+/// Counts the passes of the checkpoint it is given to, committing a row once each has taken its
+/// snapshot.
+struct CountPasses {
+    writer: Arc<Connection>,
+    passes: AtomicUsize,
+}
+
+impl std::fmt::Debug for CountPasses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CountPasses")
+    }
+}
+
+impl YieldInjector for CountPasses {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CheckpointYieldPoint::AfterCollectTableRows.point() {
+            self.passes.fetch_add(1, Ordering::AcqRel);
+            self.writer
+                .execute("INSERT INTO t(v) VALUES (randomblob(512))")
+                .unwrap();
+        }
+        false
+    }
+}
+
+/// A TRUNCATE statement that reported Busy, stepped again, goes on toward the goal of its first
+/// attempt: the commits made since it began do not cost it more passes.
+#[test]
+fn test_a_busy_truncate_stepped_again_goes_on_toward_its_first_goal() {
+    let db = TestDb::open();
+    db.insert();
+    let store = db.db.get_mvcc_store();
+    let io = db.checkpointer.pager.load().io.clone();
+    let making = store
+        .begin_tx(db.checkpointer.pager.load().clone())
+        .unwrap();
+    let set_state = |state: TransactionState| {
+        store.txs.get(&making).unwrap().value().state.store(state);
+    };
+    // Below every commit made so far, so no snapshot covers any of them.
+    set_state(TransactionState::Preparing(1));
+    let mut truncate = db
+        .checkpointer
+        .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    loop {
+        match truncate.step().unwrap() {
+            StepResult::Busy => break,
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("the first attempt ended in {other:?}"),
+        }
+    }
+    assert_eq!(db.segments(), 2, "the first attempt rolled the log");
+    set_state(TransactionState::Committed(1));
+    db.insert();
+    db.insert();
+    let passes = Arc::new(CountPasses {
+        writer: db.writer.clone(),
+        passes: AtomicUsize::new(0),
+    });
+    db.checkpointer.set_yield_injector(Some(passes.clone()));
+    loop {
+        match truncate.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::Row => {}
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("the retry ended in {other:?}"),
+        }
+    }
+    db.checkpointer.set_yield_injector(None);
+    assert_eq!(
+        passes.passes.load(Ordering::Acquire),
+        1,
+        "the retry freed the segment its first attempt began beside, in one pass"
+    );
+    assert_eq!(count(&db.checkpointer), 4);
 }
 
 /// Once a checkpoint has freed the log's first file and the segments after it are elsewhere, a

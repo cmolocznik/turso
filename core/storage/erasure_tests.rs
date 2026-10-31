@@ -1,10 +1,15 @@
 //! A deleted row leaves no byte in the database's files once a truncating checkpoint has run. A
 //! b-tree page never keeps a byte of a cell it no longer holds, nor a new page a byte of the
 //! buffer it was given; under `PRAGMA secure_delete = ON` a freed page is zeroed as well; and the
-//! checkpoint empties the WAL and, under MVCC, the logical log. These tests read the files back:
-//! every byte of the checkpointed database outside its live structure must be zero, and no value a
-//! row stopped holding may be found in any file.
+//! checkpoint empties the WAL and, under MVCC, takes from the logical log every frame committed
+//! before it, writers beside it or not. These tests read the files back: every byte of the
+//! checkpointed database outside its live structure must be zero, and no value a row stopped
+//! holding may be found in any file.
 
+use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
+use crate::mvcc::persistent_storage::logical_log::{segment_path, LOG_SEGMENT_FILES};
+use crate::mvcc::yield_hooks::YieldPointMarker;
+use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::{
     ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect,
 };
@@ -15,7 +20,8 @@ use rand_chacha::{
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 fn u16_at(bytes: &[u8], at: usize) -> usize {
     u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize
@@ -535,6 +541,122 @@ fn deleted_rows_leave_no_byte_in_the_files_after_a_truncating_checkpoint() {
             &left.dead_found[..left.dead_found.len().min(5)]
         );
     }
+}
+
+/// Commits a row with a marker of its own once each checkpoint pass of the connection it is given
+/// to has taken its snapshot, as a writer that never pauses would beside it.
+struct CommitAfterEverySnapshot {
+    conn: Arc<Connection>,
+    next: AtomicU64,
+    markers: Mutex<Vec<String>>,
+}
+
+impl std::fmt::Debug for CommitAfterEverySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommitAfterEverySnapshot")
+    }
+}
+
+impl YieldInjector for CommitAfterEverySnapshot {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point == CheckpointYieldPoint::AfterCollectTableRows.point() {
+            let marker = format!("erasemark{:010}", self.next.fetch_add(1, Ordering::Relaxed));
+            self.conn
+                .execute(format!("INSERT INTO t(a, b) VALUES ('{marker}', X'00')"))
+                .unwrap();
+            self.markers.lock().unwrap().push(marker);
+        }
+        false
+    }
+}
+
+/// Under passive checkpoints writers commit while a checkpoint runs, so a TRUNCATE's first pass
+/// cannot empty the log: the segment holding the rows deleted before it also holds commits that
+/// came after its snapshot. Beside a writer that commits during every pass, the TRUNCATE runs
+/// passes until no frame from before it is left: the deleted rows leave no value in any file, and
+/// every row that was live, or committed while it ran, is still found.
+#[test]
+fn a_truncating_checkpoint_beside_a_writer_leaves_no_deleted_value_in_any_file() {
+    let dir = scratch();
+    let path = dir.path().join("erase.db");
+    let db = Database::open_file_with_flags(
+        Arc::new(PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA secure_delete = ON").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b BLOB)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+    let mut workload = Workload::new(0xe7a5_e0ff);
+    for id in 0..100 {
+        workload.insert(&conn, id);
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    for id in 100..200 {
+        workload.insert(&conn, id);
+    }
+    // Half the deleted rows are in the database file, the other half only in the log.
+    workload.delete(&conn, 50..150);
+    let found = || -> HashSet<String> {
+        let mut names = vec!["erase.db".to_string(), "erase.db-wal".to_string()];
+        names.extend((0..LOG_SEGMENT_FILES).map(|slot| segment_path("erase.db-log", slot)));
+        names
+            .iter()
+            .flat_map(|name| markers_in(&file_bytes(&dir.path().join(name))))
+            .collect()
+    };
+    let before = found();
+    assert!(
+        workload.dead.iter().all(|m| before.contains(m)),
+        "the scan misses deleted values before the checkpoint"
+    );
+    let writer = Arc::new(CommitAfterEverySnapshot {
+        conn: db.connect(ConnectOpts::new()).unwrap(),
+        next: AtomicU64::new(9_000_000_000),
+        markers: Mutex::new(Vec::new()),
+    });
+    conn.set_yield_injector(Some(writer.clone()));
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.set_yield_injector(None);
+    let after = found();
+    let committed = writer.markers.lock().unwrap().clone();
+    assert!(
+        !committed.is_empty(),
+        "no row was committed beside the checkpoint"
+    );
+    let dead_left: Vec<&String> = workload
+        .dead
+        .iter()
+        .filter(|m| after.contains(*m))
+        .collect();
+    assert!(
+        dead_left.is_empty(),
+        "{} deleted values left beside {} commits, the first {:?}",
+        dead_left.len(),
+        committed.len(),
+        dead_left.first()
+    );
+    let live_missed: Vec<&String> = workload
+        .rows
+        .values()
+        .flatten()
+        .chain(&committed)
+        .filter(|m| !after.contains(*m))
+        .collect();
+    assert!(
+        live_missed.is_empty(),
+        "live values missed: {:?}",
+        &live_missed[..live_missed.len().min(5)]
+    );
 }
 
 /// The same workload under `secure_delete = OFF` leaves the pages it freed as they were: the

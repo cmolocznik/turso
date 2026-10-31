@@ -25,6 +25,20 @@ pub enum LogicalLogTruncateOutcome {
     Retained,
 }
 
+/// Which frames a logical log holds, by the generation of their segment, as far as a checkpoint
+/// can change it: a checkpoint that leaves it as it found it can free no more of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogicalLogHold {
+    /// The generation of the oldest segment holding a frame, `None` when none does.
+    pub oldest: Option<u64>,
+    /// The generation of the segment being written.
+    pub writing: u64,
+    /// Whether a file is ready for the next roll.
+    pub file_ready: bool,
+    /// Whether a roll waits on the frame being written.
+    pub roll_pending: bool,
+}
+
 pub trait DurableStorage: Send + Sync + Debug {
     /// Append one row-version op to `log_record`'s payload buffer, in the
     /// on-disk wire format used by the logical log. Updates `op_count`.
@@ -148,6 +162,17 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// How many segments the log is spread over: the one being written and those sealed behind it.
     fn logical_log_segments(&self) -> usize {
         1
+    }
+
+    /// Which frames the log holds, by generation. A log that does not count its segments reads as
+    /// one segment, which holds frames or none.
+    fn logical_log_hold(&self) -> LogicalLogHold {
+        LogicalLogHold {
+            oldest: (self.logical_log_offset() > 0).then_some(0),
+            writing: 0,
+            file_ready: false,
+            roll_pending: false,
+        }
     }
 
     /// Goes on writing in the segment of `slot`, the log's newest, whose header is `header`.
@@ -418,6 +443,10 @@ impl DurableStorage for Storage {
 
     fn logical_log_segments(&self) -> usize {
         self.logical_log.read().segments()
+    }
+
+    fn logical_log_hold(&self) -> LogicalLogHold {
+        self.logical_log.read().hold()
     }
 
     fn set_active_segment(&self, slot: usize, header: logical_log::LogHeader) {

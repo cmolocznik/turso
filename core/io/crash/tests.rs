@@ -134,31 +134,39 @@ fn a_failed_sync_loses_the_writes_it_covered() {
 }
 
 #[test]
-fn a_sync_does_not_cover_a_write_still_in_flight() {
-    let mut survived = 0;
+fn a_sync_does_not_cover_a_write_that_completes_after_it_starts() {
+    let mut write_first = 0;
     for seed in 0..64 {
         let io = CrashIO::new(seed);
         let file = durable_file(&io);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let wrote = order.clone();
         let w = file
             .pwrite(
                 0,
                 Arc::new(Buffer::new(vec![3; SECTOR])),
-                Completion::new_write(|_| {}),
+                Completion::new_write(move |_| wrote.lock().push("write")),
             )
             .unwrap();
+        let synced = order.clone();
         let s = file
-            .sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)
+            .sync(
+                Completion::new_sync(move |_| synced.lock().push("sync")),
+                FileSyncType::Fsync,
+            )
             .unwrap();
-        io.wait_for_completion(w).unwrap();
-        io.wait_for_completion(s).unwrap();
-        survived += (0..16)
-            .filter(|&c| after_crash(&io, c) == Some(vec![3; SECTOR]))
-            .count();
+        io.drain_completions(&[w, s]).unwrap();
+        if order.lock()[0] != "write" {
+            continue;
+        }
+        // The write completed first, but after the sync started: the sync does not cover it.
+        write_first += 1;
+        assert!(
+            (0..32).any(|c| after_crash(&io, c) != Some(vec![3; SECTOR])),
+            "seed {seed}: every crash kept a write no sync covered"
+        );
     }
-    assert!(
-        survived < 64 * 16,
-        "every crash kept a write no sync covered"
-    );
+    assert!(write_first > 0, "the write never completed first");
 }
 
 #[test]

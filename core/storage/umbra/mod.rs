@@ -6,12 +6,15 @@
 //! - [`latch`]: the versioned latch each buffer frame carries.
 //! - [`buffer`]: the buffer manager: one virtual memory region per size class sharing one budget,
 //!   swizzled pointers, LeanStore's cooling stage, write-back submitted as pages cool.
-//! - [`wal`]: the write-ahead log, one write-and-fsync in flight, recovery streamed in chunks.
+//! - [`wal`]: the write-ahead log, a write and an fsync in flight, recovery streamed in chunks.
+//! - [`checkpoint`]: the page table made durable in a map file, the log cut at the redo point,
+//!   and opening a database: newest checkpoint, then recovery, then a checkpoint.
 //!
 //! Every IO goes through Turso's [`crate::io::IO`] and returns its completion, so this runs under
 //! the VDBE's `IOResult` stepping on every backend: io_uring, the syscall backend and memory.
 
 pub mod buffer;
+pub mod checkpoint;
 pub mod latch;
 pub mod page;
 pub mod store;

@@ -143,6 +143,12 @@ pub struct Frame {
     dirty: AtomicBool,
     /// Bumped by every exclusive holder that changed the page.
     changes: AtomicU64,
+    /// One past where the log ended when the page was first changed after it was last clean: no
+    /// durable copy may hold a change from at or after that position (ARIES's recLSN). Zero
+    /// while clean.
+    first_change: AtomicU64,
+    /// The log's end, read when the page is first changed; null without a log.
+    log_end: *const AtomicU64,
     /// The load in flight, while `Loading`.
     loaded: Mutex<Option<Completion>>,
     failure: Mutex<Option<CompletionError>>,
@@ -221,6 +227,19 @@ impl Frame {
     fn releases(&self) -> &Releases {
         // SAFETY: owned by the manager, which outlives its frames' guards.
         unsafe { &*self.releases }
+    }
+
+    /// Notes a change about to be made, before its log record is appended: the first since the
+    /// page was clean records where the log ends now, which is at or before that record.
+    fn note_change(&self) {
+        if self.log_end.is_null() || self.first_change.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        // SAFETY: the log outlives the manager, which holds it.
+        let end = unsafe { &*self.log_end }.load(Ordering::Acquire);
+        let _ = self
+            .first_change
+            .compare_exchange(0, end + 1, Ordering::AcqRel, Ordering::Relaxed);
     }
 }
 
@@ -330,6 +349,10 @@ impl BufferManager {
                     state: AtomicU8::new(FREE),
                     dirty: AtomicBool::new(false),
                     changes: AtomicU64::new(0),
+                    first_change: AtomicU64::new(0),
+                    log_end: wal
+                        .as_ref()
+                        .map_or(ptr::null(), |w| ptr::from_ref(w.end_position())),
                     loaded: Mutex::new(None),
                     failure: Mutex::new(None),
                     writing: Mutex::new(None),
@@ -374,13 +397,25 @@ impl BufferManager {
         }
     }
 
-    /// Bytes of pages held in memory, hot or cooling.
-    pub fn used(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+    /// The oldest log position whose change some page in memory holds and no durable copy does:
+    /// a checkpoint's redo point is at or before it. `None` when every page is clean.
+    pub fn oldest_unwritten_change(&self) -> Option<u64> {
+        self.regions
+            .iter()
+            .flat_map(|r| r.frames.iter())
+            .map(|f| f.first_change.load(Ordering::Acquire))
+            .filter(|&noted| noted != 0)
+            .min()
+            .map(|noted| noted - 1)
     }
 
     pub fn store(&self) -> &Arc<PageStore> {
         &self.store
+    }
+
+    /// Bytes of pages held in memory, hot or cooling.
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
     }
 
     /// Creates a page of `class` and points `swip`, which must be empty, at it.
@@ -405,6 +440,7 @@ impl BufferManager {
             .pid
             .store(self.store.allocate(class).raw(), Ordering::Relaxed);
         frame.dirty.store(true, Ordering::Relaxed);
+        frame.note_change();
         assert!(
             frame.owner.latch.try_lock_exclusive(),
             "a free frame is unlatched"
@@ -627,6 +663,7 @@ impl BufferManager {
     }
 
     fn release(&self, frame: &Frame) {
+        frame.first_change.store(0, Ordering::Release);
         let len = frame.class.size();
         // SAFETY: the frame holds no page any more; its memory goes back to the kernel.
         unsafe { libc::madvise(frame.data.cast(), len, libc::MADV_DONTNEED) };
@@ -799,6 +836,7 @@ impl BufferManager {
             });
             if res.is_ok() && frame.changes.load(Ordering::Acquire) == changes {
                 frame.dirty.store(false, Ordering::Release);
+                frame.first_change.store(0, Ordering::Release);
             }
             if let Some(c) = frame.writing.lock().take() {
                 match res {
@@ -975,6 +1013,7 @@ impl ExclusiveGuard<'_> {
     /// Marks the page changed without writing to it: one of its swips now names a new child.
     pub fn mark_dirty(&mut self) {
         self.touched = true;
+        self.frame.note_change();
     }
 }
 
@@ -988,7 +1027,10 @@ impl Deref for ExclusiveGuard<'_> {
 
 impl DerefMut for ExclusiveGuard<'_> {
     fn deref_mut(&mut self) -> &mut [u8] {
-        self.touched = true;
+        if !self.touched {
+            self.touched = true;
+            self.frame.note_change();
+        }
         self.frame.bytes_mut()
     }
 }

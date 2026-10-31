@@ -845,6 +845,20 @@ impl File for UringFile {
             .len())
     }
 
+    /// Frees the blocks of `[pos, pos + len)`: the range reads back as zeros and keeps the file's
+    /// size.
+    #[cfg(target_os = "linux")]
+    fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+        use rustix::fs::{fallocate, FallocateFlags};
+        fallocate(
+            &self.file,
+            FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+            pos as u64,
+            len as u64,
+        )
+        .map_err(|e| crate::LimboError::CompletionError(e.into()))
+    }
+
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         if self.caps.ftruncate {

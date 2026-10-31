@@ -12,15 +12,18 @@
 //! backend may run the callback inside the submission (the syscall and memory backends) or later
 //! from `IO::step` (io_uring), so callbacks take no lock a submitter could hold.
 //!
-//! The page table and the free slots are held in memory. Recovery rebuilds them from the log's
-//! remap records; checkpoints will write them out so the log can be cut. A recycled slot still
-//! holds its old copy's bytes until it is written again: erasing them belongs with checkpoints.
+//! The page table is held in memory and persisted by checkpoints ([`super::checkpoint`]) in map
+//! pages of [`ENTRIES_PER_MAP`] entries; the store tracks which map pages changed since the last
+//! snapshot. A slot is recycled only once a checkpoint that no longer refers to its copy is
+//! durable, and its old bytes are erased first: freed with a hole where the file system allows,
+//! overwritten with zeros where it does not.
 
-use super::page::{self, PageId, SizeClass, CLASS_COUNT};
+use super::page::{self, PageId, SizeClass, CLASS_COUNT, HEADER_SIZE, MIN_PAGE_SIZE};
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::{CompletionError, Result};
+use std::collections::BTreeSet;
 
 /// What a read of a page's copy found.
 pub enum PageRead {
@@ -32,14 +35,21 @@ pub enum PageRead {
     Failed(CompletionError),
 }
 
+/// Page table entries in one map page.
+pub const ENTRIES_PER_MAP: usize = (MIN_PAGE_SIZE - HEADER_SIZE) / 8;
+
 #[derive(Default)]
 struct Space {
     /// Page number → its slot plus one; zero for a page with no copy on disk.
     table: Vec<u64>,
     next_slot: u64,
     free: Vec<u64>,
-    /// Slots of superseded copies, reusable once their successors are durable.
+    /// Slots of superseded copies since the last snapshot.
     retired: Vec<u64>,
+    /// Slots retired before the last snapshot: reusable once its checkpoint is durable.
+    recycling: Vec<u64>,
+    /// Map pages whose entries changed since the last snapshot.
+    dirty_maps: BTreeSet<u64>,
 }
 
 impl Space {
@@ -58,12 +68,13 @@ impl Space {
         })
     }
 
-    fn set(&mut self, number: u64, slot: u64) {
+    fn set(&mut self, number: u64, slot: Option<u64>) {
         let at = number as usize;
         if self.table.len() <= at {
             self.table.resize(at + 1, 0);
         }
-        self.table[at] = slot + 1;
+        self.table[at] = slot.map_or(0, |s| s + 1);
+        self.dirty_maps.insert(number / ENTRIES_PER_MAP as u64);
     }
 
     /// Points `number` at `slot`, retiring the slot it held.
@@ -71,7 +82,7 @@ impl Space {
         if let Some(old) = self.slot(number) {
             self.retired.push(old);
         }
-        self.set(number, slot);
+        self.set(number, Some(slot));
     }
 }
 
@@ -248,42 +259,103 @@ impl PageStore {
         let mut space = self.class(pid.class()).space.lock();
         if let Some(slot) = space.slot(pid.number()) {
             space.retired.push(slot);
-            space.table[pid.number() as usize] = 0;
+            space.set(pid.number(), None);
         }
     }
 
-    /// Makes the retired slots reusable. The caller has made every copy written so far, and the
-    /// record of where it went, durable.
-    pub fn recycle(&self) {
-        for class in &self.classes {
-            let mut space = class.space.lock();
-            let retired = std::mem::take(&mut space.retired);
-            space.free.extend(retired);
-        }
-    }
-
-    /// Installs the page table recovery found for `class`: where each page's current copy is, and
-    /// the next page number. Every other slot in the file is retired, to be reused once the
-    /// remaps of the copies recovery wrote are durable ([`recycle`](Self::recycle)).
-    pub fn restore(&self, class: SizeClass, next_page: u64, copies: &[(u64, u64)]) {
+    /// Takes what a checkpoint persists of `class`: the next page number and slot, and the
+    /// entries of every map page changed since the last snapshot. The slots retired so far become
+    /// reusable once this checkpoint is durable ([`finish_checkpoint`](Self::finish_checkpoint)).
+    pub(super) fn snapshot(&self, class: SizeClass) -> ClassSnapshot {
         let c = self.class(class);
-        c.pages.store(next_page, Ordering::Relaxed);
         let mut space = c.space.lock();
-        space.table.clear();
-        space.retired.clear();
+        let retired = std::mem::take(&mut space.retired);
+        space.recycling.extend(retired);
+        let maps = std::mem::take(&mut space.dirty_maps)
+            .into_iter()
+            .map(|index| {
+                let start = index as usize * ENTRIES_PER_MAP;
+                let mut entries = vec![0u64; ENTRIES_PER_MAP];
+                if start < space.table.len() {
+                    let end = space.table.len().min(start + ENTRIES_PER_MAP);
+                    entries[..end - start].copy_from_slice(&space.table[start..end]);
+                }
+                (index, entries)
+            })
+            .collect();
+        ClassSnapshot {
+            next_page: c.pages.load(Ordering::Relaxed),
+            next_slot: space.next_slot,
+            maps,
+        }
+    }
+
+    /// Erases the slots the durable checkpoint no longer refers to and makes them reusable.
+    /// Returns the zero-writes in flight where the file system could not punch a hole.
+    pub(super) fn finish_checkpoint(&self) -> Result<Vec<Completion>> {
+        let mut writes = Vec::new();
+        for (class, c) in SizeClass::all().zip(&self.classes) {
+            let slots = std::mem::take(&mut c.space.lock().recycling);
+            let size = class.size();
+            for &slot in &slots {
+                let at = slot * size as u64;
+                if c.file.punch_hole(at as usize, size).is_err() {
+                    let zeros = Arc::new(Buffer::new(vec![0; size]));
+                    writes.push(c.file.pwrite(at, zeros, Completion::new_write(|_| {}))?);
+                }
+            }
+            c.space.lock().free.extend(slots);
+        }
+        Ok(writes)
+    }
+
+    /// Installs page table entries from a checkpoint or recovery: `copies` gives where pages'
+    /// current copies are, and `next_page` and `next_slot` how far the class has grown. With
+    /// `changed`, the next checkpoint writes the map pages they fall in.
+    pub(super) fn install(
+        &self,
+        class: SizeClass,
+        next_page: u64,
+        next_slot: u64,
+        copies: &[(u64, u64)],
+        changed: bool,
+    ) {
+        let c = self.class(class);
+        c.pages.fetch_max(next_page, Ordering::Relaxed);
+        let mut space = c.space.lock();
+        space.next_slot = space.next_slot.max(next_slot);
         for &(number, slot) in copies {
-            space.set(number, slot);
+            space.set(number, Some(slot));
             space.next_slot = space.next_slot.max(slot + 1);
         }
-        let mut used = vec![false; space.next_slot as usize];
-        for &s in space.table.iter().filter(|&&s| s != 0) {
-            used[s as usize - 1] = true;
+        if !changed {
+            for &(number, _) in copies {
+                space.dirty_maps.remove(&(number / ENTRIES_PER_MAP as u64));
+            }
         }
-        space.free.clear();
-        space.retired = (0..space.next_slot)
-            .rev()
-            .filter(|&s| !used[s as usize])
-            .collect();
+    }
+
+    /// Marks map pages changed again after a checkpoint that took them failed.
+    pub(super) fn redirty(&self, class: SizeClass, maps: impl IntoIterator<Item = u64>) {
+        self.class(class).space.lock().dirty_maps.extend(maps);
+    }
+
+    /// Retires every slot of the file no page refers to, so the next checkpoint erases and
+    /// recycles it: what is left of copies a crash or recovery superseded.
+    pub(super) fn retire_unreferenced(&self) {
+        for c in &self.classes {
+            let mut space = c.space.lock();
+            let mut used = vec![false; space.next_slot as usize];
+            for &s in space.table.iter().filter(|&&s| s != 0) {
+                used[s as usize - 1] = true;
+            }
+            space.free.clear();
+            space.recycling.clear();
+            space.retired = (0..space.next_slot)
+                .rev()
+                .filter(|&s| !used[s as usize])
+                .collect();
+        }
     }
 
     /// Makes every write that completed before this call durable.
@@ -317,11 +389,27 @@ impl PageStore {
         self.writes.load(Ordering::Relaxed)
     }
 
-    /// Slots held by superseded copies, waiting for their successors to be durable.
+    /// Slots held by superseded copies, waiting for a checkpoint.
     pub fn retired(&self) -> usize {
         self.classes
             .iter()
-            .map(|c| c.space.lock().retired.len())
+            .map(|c| {
+                let space = c.space.lock();
+                space.retired.len() + space.recycling.len()
+            })
             .sum()
     }
+
+    /// Free slots ready for the next write.
+    pub fn free_slots(&self) -> usize {
+        self.classes.iter().map(|c| c.space.lock().free.len()).sum()
+    }
+}
+
+/// What a checkpoint persists of one class.
+pub(super) struct ClassSnapshot {
+    pub next_page: u64,
+    pub next_slot: u64,
+    /// Changed map pages: index and entries (slot plus one, zero for none).
+    pub maps: Vec<(u64, Vec<u64>)>,
 }

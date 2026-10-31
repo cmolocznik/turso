@@ -345,7 +345,7 @@ fn a_torn_page_fails_to_load_and_leaves_nothing_behind() {
         drive(&b.io, || bm.evict_everything()).unwrap();
         assert_eq!(bm.used(), 0, "{}", b.name);
         let pid = PageId::from_raw(anchor.swip().load(Ordering::Relaxed) >> 1);
-        corrupt(&b, &bm.store, pid);
+        corrupt(&b, &b.path("pages"), &bm.store, pid);
         for attempt in 0..2 {
             let err = drive(&b.io, || bm.fix_shared(anchor.owner(), anchor.swip())).err();
             assert!(

@@ -1,8 +1,11 @@
 use super::*;
 use crate::io::OpenFlags;
-use crate::storage::umbra::buffer::{Anchor, BufferManager, ExclusiveGuard, DEFAULT_COOLING_SHARE};
+use crate::storage::umbra::buffer::Anchor;
 use crate::storage::umbra::page::{SizeClass, MIN_PAGE_SIZE};
-use crate::storage::umbra::testing::{backends, corrupt, drive, Backend};
+use crate::storage::umbra::testing::{
+    backends, bump, commit, corrupt, create, drive, settle, slot, values, Backend, World, LEAVES,
+    VALUE,
+};
 
 const PAGE: usize = MIN_PAGE_SIZE;
 
@@ -82,7 +85,7 @@ fn log_bytes(b: &Backend) -> Vec<u8> {
 #[test]
 fn concurrent_commits_share_fsyncs_and_all_land_in_order() {
     for b in backends() {
-        let wal = Wal::open(&b.io, open_log(&b), 0).unwrap();
+        let wal = Wal::open(&b.io, open_log(&b), 0, 0).unwrap();
         let threads: Vec<_> = (0..8u64)
             .map(|t| {
                 let (wal, io) = (wal.clone(), b.io.clone());
@@ -128,7 +131,7 @@ fn the_next_write_goes_out_while_the_fsync_before_it_runs() {
         .into_iter()
         .filter(|b| b.name == "memory-deferred")
     {
-        let wal = Wal::open(&b.io, open_log(&b), 0).unwrap();
+        let wal = Wal::open(&b.io, open_log(&b), 0, 0).unwrap();
         let first = wal.append(&[range(0, 24, b"a")]).unwrap();
         let c1 = wal.durable_completion(first).expect("not durable yet");
         assert!(wal.tail.lock().writing);
@@ -169,7 +172,7 @@ fn threads_committing_end_durable_to_every_frame_with_writes_beside_fsyncs() {
         .into_iter()
         .filter(|b| b.name == "syscall" || b.name == "io_uring")
     {
-        let wal = Wal::open(&b.io, open_log(&b), 0).unwrap();
+        let wal = Wal::open(&b.io, open_log(&b), 0, 0).unwrap();
         let threads: Vec<_> = (0..8u64)
             .map(|t| {
                 let (wal, io) = (wal.clone(), b.io.clone());
@@ -195,109 +198,6 @@ fn threads_committing_end_durable_to_every_frame_with_writes_beside_fsyncs() {
             );
         }
     }
-}
-
-/// A tree of leaves under one root, changed through the log the way a transaction layer will.
-struct World<'a> {
-    b: &'a Backend,
-}
-
-const LEAVES: usize = 24;
-/// Offset of a leaf's counter.
-const VALUE: usize = HEADER_SIZE + 64;
-
-fn slot(i: usize) -> usize {
-    HEADER_SIZE + 8 * i
-}
-
-impl World<'_> {
-    fn open(&self, budget: usize) -> (Arc<Wal>, BufferManager, Recovered) {
-        let io = &self.b.io;
-        let store = Arc::new(PageStore::open(io, &self.b.path("pages"), false).unwrap());
-        let (wal, recovered) = Wal::open_recovered(io, open_log(self.b), &store, budget).unwrap();
-        let bm = BufferManager::new(
-            io.clone(),
-            store,
-            Some(wal.clone()),
-            budget,
-            DEFAULT_COOLING_SHARE,
-        )
-        .unwrap();
-        (wal, bm, recovered)
-    }
-}
-
-/// Logs each page's change (a new page's creation, then the ranges written), stamps the pages
-/// with the frame's LSN, lets them go and waits for durability.
-/// A page a commit changed: held exclusively, whether it is new, and the byte ranges written.
-type Changed<'a> = (ExclusiveGuard<'a>, bool, Vec<(usize, usize)>);
-
-fn commit(io: &Arc<dyn IO>, wal: &Arc<Wal>, pages: Vec<Changed<'_>>) {
-    let mut records = Vec::new();
-    for (page, created, ranges) in &pages {
-        if *created {
-            records.push(Record::New { pid: page.pid() });
-        }
-        for &(start, end) in ranges {
-            records.push(Record::Range {
-                pid: page.pid(),
-                offset: start as u32,
-                bytes: page.durable_bytes(start..end),
-            });
-        }
-    }
-    let lsn = wal.append(&records).unwrap();
-    for (mut page, _, _) in pages {
-        page::set_lsn(&mut page, lsn);
-    }
-    drive(io, || wal.wait_durable(lsn)).unwrap();
-}
-
-/// Makes everything appended durable, as the next commit would.
-fn settle(io: &Arc<dyn IO>, wal: &Arc<Wal>) {
-    let end = wal.tail.lock().end;
-    drive(io, || wal.wait_durable(end)).unwrap();
-}
-
-fn create(io: &Arc<dyn IO>, wal: &Arc<Wal>, bm: &BufferManager, anchor: &Anchor) -> PageId {
-    let root = drive(io, || bm.allocate(anchor.owner(), anchor.swip(), class(0))).unwrap();
-    let root_pid = root.pid();
-    let mut pages = Vec::new();
-    for i in 0..LEAVES {
-        let mut leaf = drive(io, || {
-            bm.allocate(root.owner(), root.swip(slot(i)), class(0))
-        })
-        .unwrap();
-        leaf[VALUE..VALUE + 8].copy_from_slice(&0u64.to_le_bytes());
-        leaf[VALUE + 8..VALUE + 1008].fill(i as u8);
-        pages.push((leaf, true, vec![(VALUE, VALUE + 1008)]));
-    }
-    // The root's swips, which the log carries as page ids.
-    pages.insert(0, (root, true, vec![(slot(0), slot(LEAVES))]));
-    commit(io, wal, pages);
-    root_pid
-}
-
-fn bump(io: &Arc<dyn IO>, wal: &Arc<Wal>, bm: &BufferManager, anchor: &Anchor, i: usize, by: u64) {
-    let root = drive(io, || bm.fix_shared(anchor.owner(), anchor.swip())).unwrap();
-    let mut leaf = drive(io, || bm.fix_exclusive(root.owner(), root.swip(slot(i)))).unwrap();
-    let v = u64::from_le_bytes(leaf[VALUE..VALUE + 8].try_into().unwrap());
-    leaf[VALUE..VALUE + 8].copy_from_slice(&(v + by).to_le_bytes());
-    commit(io, wal, vec![(leaf, false, vec![(VALUE, VALUE + 8)])]);
-}
-
-fn values(io: &Arc<dyn IO>, bm: &BufferManager, anchor: &Anchor, name: &str) -> Vec<u64> {
-    let root = drive(io, || bm.fix_shared(anchor.owner(), anchor.swip())).unwrap();
-    (0..LEAVES)
-        .map(|i| {
-            let leaf = drive(io, || bm.fix_shared(root.owner(), root.swip(slot(i)))).unwrap();
-            assert!(
-                leaf[VALUE + 8..VALUE + 1008].iter().all(|&b| b == i as u8),
-                "{name}: leaf {i} torn"
-            );
-            u64::from_le_bytes(leaf[VALUE..VALUE + 8].try_into().unwrap())
-        })
-        .collect()
 }
 
 #[test]
@@ -387,7 +287,7 @@ fn a_torn_newest_copy_falls_back_to_the_copy_before_it() {
             assert_eq!(word & 1, 1, "{}", b.name);
             let leaf5 = PageId::from_raw(word >> 1);
             // Its newest copy was torn: the second half never reached disk.
-            corrupt(&b, bm.store(), leaf5);
+            corrupt(&b, &format!("{}.pages", world.base()), bm.store(), leaf5);
             (root_pid, leaf5)
         };
         let (_, bm, recovered) = world.open(64 * PAGE);
@@ -421,7 +321,7 @@ fn a_commit_torn_in_the_log_is_not_recovered_and_is_cut() {
             bump(io, &wal, &bm, &anchor, 1, 2);
             root_pid
         };
-        let log = open_log(&b);
+        let log = world.log();
         let len = log.size().unwrap();
         b.io.wait_for_completion(
             log.truncate(len - 3, Completion::new_trunc(|_| {}))
@@ -449,7 +349,7 @@ fn a_commit_torn_in_the_log_is_not_recovered_and_is_cut() {
 }
 
 #[test]
-fn recovery_run_twice_rewrites_nothing_the_second_time() {
+fn a_second_open_after_recovery_has_no_log_to_recover() {
     for b in backends() {
         let io = &b.io;
         let world = World { b: &b };
@@ -463,12 +363,11 @@ fn recovery_run_twice_rewrites_nothing_the_second_time() {
         }
         let first = world.open(64 * PAGE).2;
         assert_eq!(first.rewritten, LEAVES as u64 + 1, "{}: {first:?}", b.name);
-        // The first recovery logged where it wrote every page: the second starts each from that
-        // copy, which already holds every change.
+        // The first open logged where it wrote every page and checkpointed: the second finds no
+        // log to recover.
         let second = world.open(64 * PAGE).2;
+        assert_eq!(second.frames, 0, "{}: {second:?}", b.name);
         assert_eq!(second.rewritten, 0, "{}: {second:?}", b.name);
-        assert_eq!(second.stale_copies, 0, "{}: {second:?}", b.name);
-        assert!(second.skipped > 0, "{}", b.name);
     }
 }
 

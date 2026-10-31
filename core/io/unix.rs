@@ -497,6 +497,20 @@ impl File for UnixFile {
             .len())
     }
 
+    /// Frees the blocks of `[pos, pos + len)`: the range reads back as zeros and keeps the file's
+    /// size.
+    #[cfg(target_os = "linux")]
+    fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+        use rustix::fs::{fallocate, FallocateFlags};
+        fallocate(
+            &self.file,
+            FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+            pos as u64,
+            len as u64,
+        )
+        .map_err(|e| crate::LimboError::CompletionError(e.into()))
+    }
+
     #[instrument(err, skip_all, level = Level::DEBUG)]
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let result = self.file.set_len(len);

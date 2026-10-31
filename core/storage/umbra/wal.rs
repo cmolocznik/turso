@@ -218,11 +218,20 @@ pub struct Recovered {
     written: Vec<Record>,
 }
 
+impl Recovered {
+    /// The remaps of the copies recovery wrote, which must be logged before any slot they
+    /// superseded is reused.
+    pub(super) fn take_written(&mut self) -> Vec<Record> {
+        std::mem::take(&mut self.written)
+    }
+}
+
 /// Streams the frames of the log in `file`, calling `each(lsn, records)` for every valid frame,
 /// and returns where the valid frames end.
 fn stream(
     io: &Arc<dyn IO>,
     file: &Arc<dyn File>,
+    start: Lsn,
     mut each: impl FnMut(Lsn, Vec<Record>) -> Result<()>,
 ) -> Result<(u64, Lsn)> {
     let size = file.size()?;
@@ -231,8 +240,8 @@ fn stream(
     let chunk =
         page::SizeClass::all().last().expect("classes").size() + FRAME_HEADER + FRAME_TRAILER;
     let mut window = Vec::new();
-    let mut window_at = 0u64;
-    let mut at = 0u64;
+    let mut window_at = start;
+    let mut at = start;
     let mut frames = 0u64;
     'log: while at < size {
         let mut need = FRAME_HEADER;
@@ -271,20 +280,22 @@ struct Redo {
     base: Lsn,
 }
 
-/// Recovers the log in `file` into `store` (ARIES analysis then redo), holding at most `budget`
-/// bytes of pages at once. Analysis collects every page's remaps; redo starts each page the log
-/// changes from its newest copy that reads back whole as the copy its remap names, and applies the
-/// changes after it. Pages it changed are written out of place and synced; their remaps are in
-/// [`Recovered`] for [`Wal::open_recovered`] to log before any old slot is reused.
-fn recover(
+/// Recovers the log in `file` from `start`, the last checkpoint's redo point, into `store`, which
+/// holds that checkpoint's page table (ARIES analysis then redo), holding at most `budget` bytes of
+/// pages at once. Analysis collects every page's remaps; redo starts each page the log changes
+/// from its newest copy that reads back whole as the copy its remap names, else the checkpoint's
+/// copy, and applies the changes after it. Pages it changed are written out of place and synced;
+/// their remaps are in [`Recovered`] for the caller to log before any old slot is reused.
+pub(super) fn recover(
     io: &Arc<dyn IO>,
     file: &Arc<dyn File>,
+    start: Lsn,
     store: &PageStore,
     budget: usize,
 ) -> Result<Recovered> {
     let mut remaps: HashMap<PageId, Vec<(u64, Lsn)>> = HashMap::new();
     let mut changed: HashMap<PageId, ()> = HashMap::new();
-    let (frames, end) = stream(io, file, |_, records| {
+    let (frames, end) = stream(io, file, start, |_, records| {
         for r in records {
             match r {
                 Record::Remap { pid, slot, lsn } => {
@@ -307,7 +318,7 @@ fn recover(
     let mut located: HashMap<PageId, Option<(u64, Lsn)>> = HashMap::new();
     let mut pages: HashMap<PageId, Redo> = HashMap::new();
     let mut held = 0usize;
-    stream(io, file, |lsn, records| {
+    stream(io, file, start, |lsn, records| {
         for record in records {
             let pid = record.pid();
             if matches!(record, Record::Remap { .. }) {
@@ -349,33 +360,37 @@ fn recover(
     write_redone(io, store, &mut pages, &mut out.written)?;
     wait(io, store.sync()?)?;
     out.rewritten = out.written.len() as u64;
-    // Install the page table: the copies recovery wrote, else each page's newest whole copy.
-    let mut next_page = [0u64; page::CLASS_COUNT];
-    let mut copies: Vec<Vec<(u64, u64)>> = vec![Vec::new(); page::CLASS_COUNT];
-    let mut placed: HashMap<PageId, u64> = HashMap::new();
+    // The copies recovery wrote are in the table already; the newest whole copy of every other
+    // page the log remapped goes in beside them.
+    let mut rewritten = HashMap::new();
     for r in &out.written {
-        if let Record::Remap { pid, slot, .. } = r {
-            placed.insert(*pid, *slot);
+        if let Record::Remap { pid, .. } = r {
+            rewritten.insert(*pid, ());
         }
     }
+    let mut copies: Vec<Vec<(u64, u64)>> = vec![Vec::new(); page::CLASS_COUNT];
+    let mut next_page = [0u64; page::CLASS_COUNT];
     let all: Vec<PageId> = remaps.keys().chain(changed.keys()).copied().collect();
     for pid in all {
         let class = pid.class().index();
         next_page[class] = next_page[class].max(pid.number() + 1);
-        if placed.contains_key(&pid) {
+        if rewritten.contains_key(&pid) {
             continue;
         }
         if let Some((slot, _)) =
             newest_located(io, store, pid, &remaps, &mut located, &mut out.stale_copies)?
         {
-            placed.insert(pid, slot);
+            copies[class].push((pid.number(), slot));
         }
     }
-    for (pid, slot) in placed {
-        copies[pid.class().index()].push((pid.number(), slot));
-    }
     for class in page::SizeClass::all() {
-        store.restore(class, next_page[class.index()], &copies[class.index()]);
+        store.install(
+            class,
+            next_page[class.index()],
+            0,
+            &copies[class.index()],
+            true,
+        );
     }
     Ok(out)
 }
@@ -401,6 +416,14 @@ fn newest_located(
             }
         }
         *stale += 1;
+    }
+    if found.is_none() {
+        // The checkpoint's copy, made durable before the checkpoint was.
+        if let Some(slot) = store.location(pid) {
+            if let Some(buf) = read_copy(io, store, pid, slot)? {
+                found = Some((slot, page::lsn(&buf)));
+            }
+        }
     }
     located.insert(pid, found);
     Ok(found)
@@ -502,40 +525,21 @@ struct Tail {
 pub struct Wal {
     file: Arc<dyn File>,
     tail: Mutex<Tail>,
+    /// Where the appended frames end: the LSN the next frame will follow.
+    end: AtomicU64,
     durable: AtomicU64,
+    /// The log before this has been cut.
+    released: AtomicU64,
     syncs: AtomicU64,
     /// Writes started while an fsync was in flight.
     overlapped: AtomicU64,
 }
 
 impl Wal {
-    /// Recovers the log into `store`, opens it for appending, and logs where recovery wrote the
-    /// pages it rebuilt. Only once those remaps are durable may the slots of the copies they
-    /// replace be reused, so the store's free slots are installed last.
-    pub fn open_recovered(
-        io: &Arc<dyn IO>,
-        file: Arc<dyn File>,
-        store: &PageStore,
-        budget: usize,
-    ) -> Result<(Arc<Self>, Recovered)> {
-        let mut recovered = recover(io, &file, store, budget)?;
-        let wal = Self::open(io, file, recovered.end)?;
-        let written = std::mem::take(&mut recovered.written);
-        if !written.is_empty() {
-            let lsn = wal.append(&written)?;
-            let mut done = wal.wait_durable(lsn)?;
-            while let IOResult::IO(IOCompletions(c)) = done {
-                wait(io, c)?;
-                done = wal.wait_durable(lsn)?;
-            }
-        }
-        store.recycle();
-        Ok((wal, recovered))
-    }
-
     /// Opens the log for appending at `end`, where [`recover`] found its valid frames end, and
-    /// cuts whatever follows: a torn frame must not read as the start of the next one.
-    pub fn open(io: &Arc<dyn IO>, file: Arc<dyn File>, end: Lsn) -> Result<Arc<Self>> {
+    /// cuts whatever follows: a torn frame must not read as the start of the next one. The log
+    /// before `start`, the last checkpoint's redo point, is no longer needed.
+    pub fn open(io: &Arc<dyn IO>, file: Arc<dyn File>, start: Lsn, end: Lsn) -> Result<Arc<Self>> {
         if file.size()? != end {
             wait(io, file.truncate(end, Completion::new_trunc(|_| {}))?)?;
             wait(
@@ -555,7 +559,9 @@ impl Wal {
                 waiters: Vec::new(),
                 failed: None,
             }),
+            end: AtomicU64::new(end),
             durable: AtomicU64::new(end),
+            released: AtomicU64::new(start),
             syncs: AtomicU64::new(0),
             overlapped: AtomicU64::new(0),
         }))
@@ -563,6 +569,33 @@ impl Wal {
 
     pub fn durable(&self) -> Lsn {
         self.durable.load(Ordering::Acquire)
+    }
+
+    /// Where the appended frames end.
+    pub fn end(&self) -> Lsn {
+        self.end.load(Ordering::Acquire)
+    }
+
+    /// The atomic [`end`](Self::end) reads, for frames to note when they were first changed.
+    pub(super) fn end_position(&self) -> &AtomicU64 {
+        &self.end
+    }
+
+    /// Frees the log before `lsn`, which a durable checkpoint has made unneeded. The log keeps
+    /// its offsets, so LSNs stay byte positions; what is cut reads as a hole.
+    pub fn release_before(&self, lsn: Lsn) -> Result<()> {
+        // Holes are cut in whole blocks of the smallest size any backend frees.
+        const BLOCK: u64 = 4096;
+        let from = self
+            .released
+            .load(Ordering::Acquire)
+            .next_multiple_of(BLOCK);
+        let to = lsn - lsn % BLOCK;
+        if to > from {
+            self.file.punch_hole(from as usize, (to - from) as usize)?;
+            self.released.store(to, Ordering::Release);
+        }
+        Ok(())
     }
 
     pub fn syncs(&self) -> u64 {
@@ -584,6 +617,7 @@ impl Wal {
         let frame = encode_frame(tail.end, records);
         tail.end += frame.len() as u64;
         tail.pending.extend_from_slice(&frame);
+        self.end.store(tail.end, Ordering::Release);
         Ok(tail.end)
     }
 

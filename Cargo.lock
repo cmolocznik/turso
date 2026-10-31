@@ -7543,16 +7543,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "turso_umbra"
-version = "0.9.0-pre.2"
-dependencies = [
- "crc32c",
- "libc",
- "parking_lot",
- "tempfile",
-]
-
-[[package]]
 name = "turso_whopper"
 version = "0.9.0-pre.2"
 dependencies = [

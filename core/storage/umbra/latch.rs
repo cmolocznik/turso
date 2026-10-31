@@ -3,8 +3,13 @@
 //! State 0 is unlocked, 1..=30 counts shared holders, 31 is exclusive. Releasing an exclusive
 //! latch bumps the version, so an optimistic reader, which takes no lock and only remembers the
 //! version, learns afterwards whether the page changed under it.
+//!
+//! There is no blocking acquire. Under Turso's cooperative scheduling another connection holding
+//! the latch may run on this very thread, so a caller that cannot take the latch yields
+//! (`IOResult::IO` with an explicit yield) and tries again.
 
-use std::sync::atomic::{fence, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::fence;
 
 const STATE_BITS: u32 = 5;
 const STATE_MASK: u64 = (1 << STATE_BITS) - 1;
@@ -37,18 +42,19 @@ impl VersionedLatch {
     }
 
     pub fn try_lock_shared(&self) -> bool {
-        let word = self.0.load(Ordering::Relaxed);
-        state(word) < MAX_SHARED
-            && self
+        let mut word = self.0.load(Ordering::Relaxed);
+        loop {
+            if state(word) >= MAX_SHARED {
+                return false;
+            }
+            match self
                 .0
-                .compare_exchange_weak(word, word + 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-    }
-
-    pub fn lock_shared(&self) {
-        while !self.try_lock_shared() {
-            std::hint::spin_loop();
-            std::thread::yield_now();
+                .compare_exchange(word, word + 1, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                // Another shared holder came or went: try again with what it left.
+                Err(now) => word = now,
+            }
         }
     }
 
@@ -64,13 +70,6 @@ impl VersionedLatch {
                 .0
                 .compare_exchange(word, word | EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
-    }
-
-    pub fn lock_exclusive(&self) {
-        while !self.try_lock_exclusive() {
-            std::hint::spin_loop();
-            std::thread::yield_now();
-        }
     }
 
     pub fn unlock_exclusive(&self) {
@@ -89,12 +88,18 @@ mod tests {
     fn an_optimistic_read_fails_validation_after_a_write_and_only_then() {
         let latch = VersionedLatch::default();
         let seen = latch.optimistic().unwrap();
-        latch.lock_shared();
+        assert!(latch.try_lock_shared());
         latch.unlock_shared();
-        assert!(latch.validate(seen), "a shared holder invalidated an optimistic read");
-        latch.lock_exclusive();
+        assert!(
+            latch.validate(seen),
+            "a shared holder invalidated an optimistic read"
+        );
+        assert!(latch.try_lock_exclusive());
         assert_eq!(latch.optimistic(), None);
-        assert!(!latch.validate(seen), "validated while a writer held the latch");
+        assert!(
+            !latch.validate(seen),
+            "validated while a writer held the latch"
+        );
         latch.unlock_exclusive();
         assert!(!latch.validate(seen), "validated across a write");
         assert_eq!(latch.optimistic(), Some(seen + 1));

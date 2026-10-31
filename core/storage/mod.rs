@@ -33,6 +33,7 @@ pub(super) mod slot_bitmap;
 pub mod sqlite3_ondisk;
 mod state_machines;
 pub(crate) mod subjournal;
+pub mod umbra;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod wal;
 

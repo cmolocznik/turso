@@ -340,8 +340,9 @@ impl MetaCache {
 
     /// Drops clean, unpinned pages while over the budget.
     fn evict_over_budget(&self) {
-        let mut order = self.order.lock();
+        // `frames` before `order`, as `get` takes them.
         let mut frames = self.frames.lock();
+        let mut order = self.order.lock();
         let mut looked = 0;
         while frames.len() > self.budget && looked < order.len() {
             let Some(id) = order.pop_front() else { break };

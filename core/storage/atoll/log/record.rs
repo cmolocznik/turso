@@ -1,8 +1,11 @@
 //! How a record is framed in the log.
 //!
 //! ```text
-//! payload_len: u32 | kind: u8 | flags: u8 | reserved: u16 | txn: u64 | prev: u64 | payload | crc32c: u32 | zeros
+//! payload_len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | payload | crc32c: u32 | zeros
 //! ```
+//!
+//! `index` and `size` place a record in a group of records appended as one ([`Place`]): recovery
+//! replays all of a group or none of it. A record outside any group has both 0.
 //!
 //! A record starts at a multiple of [`ALIGN`] and is padded with zeros to the next one. The CRC
 //! covers the record's position, its first 24 bytes and its payload, so a record read at any other
@@ -65,17 +68,52 @@ pub struct Header {
     pub prev: Lsn,
 }
 
+/// Where a record stands in a group of records appended as one: its index, and how many records
+/// the group has. A group's records are contiguous, so its first record's start is where a reader
+/// must begin to read any of them. Outside a group, both are 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Place {
+    pub index: u8,
+    pub size: u8,
+}
+
+impl Place {
+    pub const ALONE: Self = Self { index: 0, size: 0 };
+
+    pub fn grouped(self) -> bool {
+        self.size > 0
+    }
+
+    pub fn first(self) -> bool {
+        self.index == 0
+    }
+
+    pub fn last(self) -> bool {
+        self.index + 1 == self.size
+    }
+
+    fn valid(self) -> bool {
+        if self.size == 0 {
+            self.index == 0
+        } else {
+            self.size >= 2 && self.index < self.size
+        }
+    }
+}
+
 /// Bytes a record with `payload_len` bytes of payload takes in the log.
 pub fn framed_len(payload_len: usize) -> u64 {
     ((HEADER + payload_len + TRAILER) as u64).next_multiple_of(ALIGN)
 }
 
 /// The first [`HEADER`] bytes of a record.
-pub fn header_bytes(header: &Header, payload_len: usize) -> [u8; HEADER] {
+pub fn header_bytes(header: &Header, place: Place, payload_len: usize) -> [u8; HEADER] {
     let mut out = [0u8; HEADER];
     out[0..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
     out[4] = header.kind.0;
     out[5] = header.flags;
+    out[6] = place.index;
+    out[7] = place.size;
     out[8..16].copy_from_slice(&header.txn.to_le_bytes());
     out[16..24].copy_from_slice(&header.prev.to_le_bytes());
     out
@@ -106,6 +144,7 @@ pub fn padding(start: Lsn) -> Vec<u8> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record<'a> {
     pub header: Header,
+    pub place: Place,
     pub payload: &'a [u8],
     /// Where it starts.
     pub start: Lsn,
@@ -156,10 +195,15 @@ pub fn parse(at: Lsn, bytes: &[u8]) -> Parsed<'_> {
             .try_into()
             .unwrap(),
     );
-    if stored != crc(at, &header, &[payload]) {
+    let place = Place {
+        index: header[6],
+        size: header[7],
+    };
+    if stored != crc(at, &header, &[payload]) || !place.valid() {
         return Parsed::End;
     }
     Parsed::Record(Record {
+        place,
         header: Header {
             kind: Kind(header[4]),
             flags: header[5],
@@ -174,8 +218,8 @@ pub fn parse(at: Lsn, bytes: &[u8]) -> Parsed<'_> {
 
 /// A whole record as it goes into the log.
 #[cfg(test)]
-pub fn encode(start: Lsn, header: &Header, payload: &[u8]) -> Vec<u8> {
-    let head = header_bytes(header, payload.len());
+pub fn encode(start: Lsn, header: &Header, place: Place, payload: &[u8]) -> Vec<u8> {
+    let head = header_bytes(header, place, payload.len());
     let crc = crc(start, &head, &[payload]);
     let mut out = Vec::with_capacity(framed_len(payload.len()) as usize);
     out.extend_from_slice(&head);
@@ -201,13 +245,14 @@ mod tests {
     #[test]
     fn a_record_reads_back_as_written_and_only_at_its_own_position() {
         let at = 8192 + 48;
-        let bytes = encode(at, &header(), b"payload");
+        let place = Place { index: 1, size: 3 };
+        let bytes = encode(at, &header(), place, b"payload");
         let Parsed::Record(r) = parse(at, &bytes) else {
             panic!("no record")
         };
         assert_eq!(
-            (r.header, r.payload, r.start),
-            (header(), &b"payload"[..], at)
+            (r.header, r.place, r.payload, r.start),
+            (header(), place, &b"payload"[..], at)
         );
         assert_eq!(r.lsn, at + bytes.len() as u64);
         assert_eq!(
@@ -219,7 +264,7 @@ mod tests {
 
     #[test]
     fn any_flipped_byte_ends_the_log() {
-        let bytes = encode(0, &header(), b"some payload bytes");
+        let bytes = encode(0, &header(), Place::ALONE, b"some payload bytes");
         let crc_end = HEADER + 18 + TRAILER;
         for at in 0..crc_end {
             let mut torn = bytes.clone();
@@ -233,7 +278,7 @@ mod tests {
 
     #[test]
     fn short_bytes_ask_for_more_and_zeros_end_the_log() {
-        let bytes = encode(0, &header(), &[1; 100]);
+        let bytes = encode(0, &header(), Place::ALONE, &[1; 100]);
         assert_eq!(parse(0, &bytes[..10]), Parsed::Need(ALIGN as usize));
         assert_eq!(parse(0, &bytes[..40]), Parsed::Need(bytes.len()));
         assert_eq!(parse(0, &[0u8; 64]), Parsed::End);

@@ -16,6 +16,14 @@
 //!    passes a free not yet erased, so recovery replays every free it must finish erasing. Slots of
 //!    intents that got no remap are released and erased by recovery.
 //!
+//! **Provisional pages.** A new page is provisional until a record adopts it: the record, or
+//! group of records ([`Log::append_group`]), that makes it reachable. A page being dropped is
+//! abandoned the same way, in the group that makes it unreachable, and freed afterwards. Recovery
+//! frees every page still provisional, so a crash between allocating a page and linking it in, or
+//! between unlinking it and freeing it, leaves nothing behind that nothing refers to. A
+//! checkpoint's redo point never passes the record that made a page provisional while it is, so
+//! recovery always sees it.
+//!
 //! The page table and free space are radix trees of metadata pages ([`super::radix`],
 //! [`super::meta`]), changed only by the logged records below.
 
@@ -40,16 +48,22 @@ pub mod kinds {
     pub const REMAP: Kind = Kind::new(4).unwrap();
     pub const RELEASE: Kind = Kind::new(5).unwrap();
     pub const GROW: Kind = Kind::new(6).unwrap();
+    pub const ADOPT: Kind = Kind::new(7).unwrap();
+    pub const ABANDON: Kind = Kind::new(8).unwrap();
 
     pub fn owns(kind: Kind) -> bool {
-        (1..=6).contains(&kind.get())
+        (1..=8).contains(&kind.get())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreRecord {
-    /// A page was created, with no copy yet.
+    /// A page was created, with no copy yet. It is provisional until adopted.
     New { pid: PageId },
+    /// These provisional pages are reachable now: logged in the group that links them in.
+    Adopt { pids: Vec<PageId> },
+    /// These pages are unreachable now and are freed next: logged in the group that unlinks them.
+    Abandon { pids: Vec<PageId> },
     /// A page was dropped; its copy's slot, if it had one, is freed.
     Free { pid: PageId, old: Option<u64> },
     /// These slots were taken for writes about to start.
@@ -89,6 +103,8 @@ impl StoreRecord {
             Self::Remap { .. } => kinds::REMAP,
             Self::Release { .. } => kinds::RELEASE,
             Self::Grow { .. } => kinds::GROW,
+            Self::Adopt { .. } => kinds::ADOPT,
+            Self::Abandon { .. } => kinds::ABANDON,
         }
     }
 
@@ -97,6 +113,11 @@ impl StoreRecord {
         let opt = |o: &Option<u64>| o.unwrap_or(NONE);
         match self {
             Self::New { pid } => out.extend(pid.raw().to_le_bytes()),
+            Self::Adopt { pids } | Self::Abandon { pids } => {
+                for p in pids {
+                    out.extend(p.raw().to_le_bytes());
+                }
+            }
             Self::Free { pid, old } => {
                 out.extend(pid.raw().to_le_bytes());
                 out.extend(opt(old).to_le_bytes());
@@ -135,8 +156,8 @@ impl StoreRecord {
         };
         let opt = |at: usize| word(at).map(|w| (w != NONE).then_some(w));
         let class = |at: usize| SizeClass::new(*payload.get(at)? as usize);
-        let slots = || -> Option<Vec<u64>> {
-            let rest = payload.get(1..)?;
+        let words = |from: usize| -> Option<Vec<u64>> {
+            let rest = payload.get(from..)?;
             if rest.len() % 8 != 0 {
                 return None;
             }
@@ -145,6 +166,11 @@ impl StoreRecord {
                     .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
                     .collect(),
             )
+        };
+        let slots = || words(1);
+        let pids = || -> Option<Vec<PageId>> {
+            let pids: Vec<PageId> = words(0)?.into_iter().map(PageId::from_raw).collect();
+            (!pids.is_empty()).then_some(pids)
         };
         Some(match kind {
             k if k == kinds::NEW => Self::New {
@@ -167,6 +193,8 @@ impl StoreRecord {
                 class: class(0)?,
                 slots: slots()?,
             },
+            k if k == kinds::ADOPT => Self::Adopt { pids: pids()? },
+            k if k == kinds::ABANDON => Self::Abandon { pids: pids()? },
             k if k == kinds::GROW => Self::Grow {
                 tree: if *payload.first()? == 1 {
                     Tree::Space
@@ -257,8 +285,22 @@ pub struct PageStore {
     erase_limit: AtomicU64,
     /// While recovering: slots of intents not yet matched by a remap or a release.
     pending_intents: Mutex<HashMap<(SizeClass, u64), Lsn>>,
+    /// Provisional pages: where the group that made each provisional starts, and where the
+    /// record that settled it (adopted or freed it) ends, once one did. A settled page stays
+    /// until that record is durable: a crash before then still finds it provisional.
+    provisional: Mutex<HashMap<PageId, Provisional>>,
+    /// Provisional pages their owner gave up on, waiting to be freed ([`take_orphans`]).
+    ///
+    /// [`take_orphans`]: Self::take_orphans
+    orphans: Mutex<Vec<PageId>>,
     /// The erasure in progress, if any.
     erasure: Mutex<Option<Erasure>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Provisional {
+    start: Lsn,
+    settled: Option<Lsn>,
 }
 
 /// Freed slots being erased: holes punched or zeros written, then their files synced.
@@ -315,6 +357,8 @@ impl PageStore {
             unerased: Mutex::new(HashSet::new()),
             erase_limit: AtomicU64::new(u64::MAX),
             pending_intents: Mutex::new(HashMap::new()),
+            provisional: Mutex::new(HashMap::new()),
+            orphans: Mutex::new(Vec::new()),
             erasure: Mutex::new(None),
         })
     }
@@ -458,7 +502,8 @@ impl PageStore {
 
     // ---------------------------------------------------------------- page numbers
 
-    /// A new page of `class`, logged; it has no copy until its first write.
+    /// A new page of `class`, logged; it has no copy until its first write, and is provisional
+    /// until adopted ([`adopt`](Self::adopt), or [`StoreRecord::Adopt`] in a group).
     pub fn allocate(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<PageId>> {
         let record_len = StoreRecord::New {
             pid: PageId::new(class, 0),
@@ -496,6 +541,7 @@ impl PageStore {
             let (start, lsn) = self.append(&mut admitted, &StoreRecord::New { pid }, heights);
             set_map(&mut locked, Tree::Map, number, FREE, ALLOCATED);
             locked.commit(&self.meta, start, lsn);
+            self.made_provisional(pid, start);
             return Ok(IOResult::Done(pid));
         }
     }
@@ -555,7 +601,101 @@ impl PageStore {
         if let Some(old) = old {
             self.freed((start, lsn), class, old);
         }
+        self.settled(pid, lsn);
         Ok(IOResult::Done(()))
+    }
+
+    // ---------------------------------------------------------------- provisional pages
+
+    fn made_provisional(&self, pid: PageId, start: Lsn) {
+        let mut provisional = self.provisional.lock();
+        // A page abandoned before its adoption was durable keeps the earlier start: a crash
+        // could still lose the adoption.
+        let start = provisional.get(&pid).map_or(start, |p| p.start.min(start));
+        provisional.insert(
+            pid,
+            Provisional {
+                start,
+                settled: None,
+            },
+        );
+    }
+
+    fn settled(&self, pid: PageId, lsn: Lsn) {
+        if let Some(p) = self.provisional.lock().get_mut(&pid) {
+            p.settled = Some(lsn);
+        }
+    }
+
+    /// The header and payload of an adoption or abandonment, to append in the group that links
+    /// the pages in or out; then report where it landed with [`grouped`](Self::grouped).
+    pub fn group_record(record: &StoreRecord) -> (Header, Vec<u8>) {
+        assert!(
+            matches!(
+                record,
+                StoreRecord::Adopt { .. } | StoreRecord::Abandon { .. }
+            ),
+            "only adoptions and abandonments go in another owner's group"
+        );
+        let header = Header {
+            kind: record.kind(),
+            flags: 0,
+            txn: 0,
+            prev: 0,
+        };
+        // They change no metadata page, so no levels apply.
+        (header, record.logged([0, 0]))
+    }
+
+    /// Notes an adoption or abandonment appended in a group starting at `group`, ending at `lsn`.
+    pub fn grouped(&self, record: &StoreRecord, group: Lsn, lsn: Lsn) {
+        match record {
+            StoreRecord::Adopt { pids } => pids.iter().for_each(|&p| self.settled(p, lsn)),
+            StoreRecord::Abandon { pids } => {
+                pids.iter().for_each(|&p| self.made_provisional(p, group))
+            }
+            _ => unreachable!("not a group record"),
+        }
+    }
+
+    /// Adopts provisional pages on their own, for pages reachable from outside the log's records.
+    pub fn adopt(&self, pids: &[PageId]) -> Result<IOResult<()>> {
+        let record = StoreRecord::Adopt {
+            pids: pids.to_vec(),
+        };
+        let (header, payload) = Self::group_record(&record);
+        let mut admitted = match self.log().admit(framed_len(payload.len()))? {
+            IOResult::Done(a) => a,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        let lsn = self.log().append(&mut admitted, &header, &[&payload]);
+        self.grouped(&record, lsn - framed_len(payload.len()), lsn);
+        Ok(IOResult::Done(()))
+    }
+
+    /// The pages still provisional and not settled: what recovery frees once it has replayed
+    /// the log.
+    pub fn provisional_pages(&self) -> Vec<PageId> {
+        let mut pids: Vec<PageId> = self
+            .provisional
+            .lock()
+            .iter()
+            .filter(|(_, p)| p.settled.is_none())
+            .map(|(&pid, _)| pid)
+            .collect();
+        pids.sort();
+        pids
+    }
+
+    /// Hands over a provisional page its owner gave up on: an operation dropped between
+    /// allocating the page and adopting it, or between abandoning it and freeing it.
+    pub fn orphaned(&self, pid: PageId) {
+        self.orphans.lock().push(pid);
+    }
+
+    /// The pages handed over with [`orphaned`](Self::orphaned), for whoever frees them.
+    pub fn take_orphans(&self) -> Vec<PageId> {
+        std::mem::take(&mut *self.orphans.lock())
     }
 
     /// The first free unit of `tree` at or after `from`, wrapping around, or `None` if the tree is
@@ -904,13 +1044,28 @@ impl PageStore {
         for frame in &frames {
             frame.redo(&self.meta, start, lsn, |page| apply(&r, frame.id, page));
         }
-        // What recovery must finish: erase what this record freed, and settle its intents.
+        // What recovery must finish: erase what this record freed, settle its intents, and free
+        // the pages it leaves provisional.
         let span = (start, lsn);
         match &r {
-            StoreRecord::Free {
-                pid,
-                old: Some(old),
-            } => self.freed(span, pid.class(), *old),
+            StoreRecord::New { pid } => self.made_provisional(*pid, record.group),
+            StoreRecord::Abandon { pids } => {
+                for &p in pids {
+                    self.made_provisional(p, record.group);
+                }
+            }
+            StoreRecord::Adopt { pids } => {
+                let mut provisional = self.provisional.lock();
+                for p in pids {
+                    provisional.remove(p);
+                }
+            }
+            StoreRecord::Free { pid, .. } => {
+                self.provisional.lock().remove(pid);
+                if let StoreRecord::Free { old: Some(old), .. } = &r {
+                    self.freed(span, pid.class(), *old);
+                }
+            }
             StoreRecord::Remap { pid, new, old } => {
                 self.pending_intents.lock().remove(&(pid.class(), *new));
                 if let Some(old) = old {
@@ -1006,12 +1161,20 @@ impl PageStore {
     // ---------------------------------------------------------------- checkpoints
 
     /// Where a checkpoint's redo point may be at most, as far as the page store is concerned: no
-    /// change to a metadata page not yet on disk, and no free not yet erased, is before it.
+    /// change to a metadata page not yet on disk, no free not yet erased, and nothing that made a
+    /// page provisional while it is, is before it.
     pub fn redo_bound(&self) -> Option<Lsn> {
+        let provisional = {
+            let durable = self.log().durable();
+            let mut provisional = self.provisional.lock();
+            provisional.retain(|_, p| p.settled.is_none_or(|s| s > durable));
+            provisional.values().map(|p| p.start).min()
+        };
         [
             self.meta.oldest_unwritten(),
             self.erasing.lock().keys().next().copied(),
             self.open_intents.lock().keys().next().copied(),
+            provisional,
         ]
         .into_iter()
         .flatten()
@@ -1461,6 +1624,7 @@ fn record_pages(r: &StoreRecord, [map_height, space_height]: Heights) -> Vec<Met
             height,
             ..
         } => vec![radix::root(*tree, *class, *height)],
+        StoreRecord::Adopt { .. } | StoreRecord::Abandon { .. } => Vec::new(),
     };
     ids.sort();
     ids.dedup();

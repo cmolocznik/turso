@@ -10,8 +10,8 @@
 //!    newest whose remap is durable, or from zeros if it has none; a record applies only if it is
 //!    newer than the page. Whichever thread asks for work takes the next window to read or the
 //!    next partition ready to apply, so any number of threads recover together.
-//! 3. **Finishing.** Slots of intents no remap matched are given back, and a full checkpoint
-//!    writes back every page redone. Its redo point is past where the log restarted, so nothing
+//! 3. **Finishing.** Pages left provisional are freed, slots of intents no remap matched are
+//!    given back, and a full checkpoint writes back every page redone. Its redo point is past where the log restarted, so nothing
 //!    replayed here is replayed again.
 //!
 //! Undoing open transactions and restarting the clock come with transactions (DESIGN.md §20, step
@@ -411,13 +411,18 @@ impl Recovery {
         Ok(())
     }
 
-    /// Gives back the slots of unmatched intents and checkpoints everything redone.
+    /// Frees pages left provisional, gives back the slots of unmatched intents and checkpoints
+    /// everything redone.
     fn finish(&self) -> Result<()> {
         let (pool, restart) = {
             let state = self.state.lock();
             (state.pool.clone().expect("a pool"), state.restart)
         };
         let log = self.store.log().clone();
+        // Pages allocated and never linked in, or unlinked and never freed, before the crash.
+        for pid in self.store.provisional_pages() {
+            drive(&self.io, || pool.free_unreferenced(pid))?;
+        }
         drive(&self.io, || self.store.release_orphans())?;
         self.store.end_recovery();
         let control = self.control.lock().take().expect("the control file");

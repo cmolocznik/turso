@@ -8,6 +8,11 @@
 //! ([`Log::admit`]), for at most the bytes it will append, waiting there if the unflushed log is
 //! full or the next segment is not ready.
 //!
+//! **Groups.** A change spanning several pages appends its records as one group
+//! ([`Log::append_group`]): one reservation, so the group is contiguous, and each record carries
+//! its place in it ([`Place`]). Recovery replays a group only once it has read all of it; a crash
+//! that leaves part of one ends the log at the group's start.
+//!
 //! **Flushing.** The flusher writes the complete prefix of the log in whole [`BLOCK`]s, straight
 //! from the chunks. When someone waits on a record in a block that is not full and nothing more is
 //! coming, the block is padded to its end; the next flush starts in a fresh block, so bytes
@@ -32,7 +37,7 @@ mod record;
 mod segment;
 
 pub use reader::{LogReader, OwnedRecord};
-pub use record::{framed_len, Header, Kind, Lsn, ALIGN, BLOCK, MAX_PAYLOAD};
+pub use record::{framed_len, Header, Kind, Lsn, Place, ALIGN, BLOCK, MAX_PAYLOAD};
 
 use super::aligned::AlignedBlock;
 use crate::io::{Completion, CompletionGroup, IO};
@@ -342,34 +347,83 @@ impl Log {
         header: &Header,
         payload: &[&[u8]],
     ) -> Lsn {
-        let payload_len: usize = payload.iter().map(|p| p.len()).sum();
+        let len = framed_len(payload_len(payload));
+        let start = self.reserve(admitted, len);
+        let lsn = self.write_record(start, header, Place::ALONE, payload);
+        self.count_copied(start, lsn);
+        if self.flush_wanted.load(Ordering::Acquire) {
+            self.flush();
+        }
+        lsn
+    }
+
+    /// Appends `records` as one group: contiguous in the log, and replayed by recovery all
+    /// together or not at all, so a change spanning several pages survives a crash whole or not
+    /// at all. Returns where the group starts and each record's LSN. As with
+    /// [`append`](Self::append), the caller holds the latch of every page the records change.
+    pub fn append_group(
+        self: &Arc<Self>,
+        admitted: &mut Admitted,
+        records: &[(Header, &[&[u8]])],
+    ) -> (Lsn, Vec<Lsn>) {
         assert!(
-            payload_len <= MAX_PAYLOAD,
-            "a {payload_len} byte log record"
+            (2..=u8::MAX as usize).contains(&records.len()),
+            "a group of {} records",
+            records.len()
         );
-        let len = framed_len(payload_len);
+        let total = records
+            .iter()
+            .map(|(_, payload)| framed_len(payload_len(payload)))
+            .sum();
+        // One reservation, so no other record lands inside the group.
+        let start = self.reserve(admitted, total);
+        let size = records.len() as u8;
+        let mut at = start;
+        let lsns = records
+            .iter()
+            .enumerate()
+            .map(|(i, (header, payload))| {
+                let place = Place {
+                    index: i as u8,
+                    size,
+                };
+                at = self.write_record(at, header, place, payload);
+                at
+            })
+            .collect();
+        self.count_copied(start, at);
+        if self.flush_wanted.load(Ordering::Acquire) {
+            self.flush();
+        }
+        (start, lsns)
+    }
+
+    /// Takes `len` bytes of `admitted`'s room at the log's end; returns where they start.
+    fn reserve(&self, admitted: &mut Admitted, len: u64) -> Lsn {
         assert!(
             len <= admitted.left,
-            "a {len} byte record appended with {} bytes admitted",
+            "{len} bytes of records appended with {} bytes admitted",
             admitted.left
         );
         let start = self.insert.fetch_add(len, Ordering::SeqCst);
         self.granted.fetch_sub(len, Ordering::SeqCst);
         admitted.left -= len;
-        let head = record::header_bytes(header, payload_len);
+        start
+    }
+
+    /// Copies a record into the ring at `start`; returns its LSN.
+    fn write_record(&self, start: Lsn, header: &Header, place: Place, payload: &[&[u8]]) -> Lsn {
+        let payload_len = payload_len(payload);
+        let head = record::header_bytes(header, place, payload_len);
         let crc = record::crc(start, &head, payload);
-        let mut at = start;
-        at = self.copy_in(at, &head);
+        let mut at = self.copy_in(start, &head);
         for piece in payload {
             at = self.copy_in(at, piece);
         }
         at = self.copy_in(at, &crc.to_le_bytes());
-        self.zero_to(at, start + len);
-        self.count_copied(start, start + len);
-        if self.flush_wanted.load(Ordering::Acquire) {
-            self.flush();
-        }
-        start + len
+        let end = start + framed_len(payload_len);
+        self.zero_to(at, end);
+        end
     }
 
     /// Done once everything before `lsn` is durable; until then, the completion to wait on.
@@ -826,6 +880,12 @@ impl Log {
             start,
         )
     }
+}
+
+fn payload_len(payload: &[&[u8]]) -> usize {
+    let len = payload.iter().map(|p| p.len()).sum();
+    assert!(len <= MAX_PAYLOAD, "a {len} byte log record");
+    len
 }
 
 fn io_failure(e: &LimboError) -> CompletionError {

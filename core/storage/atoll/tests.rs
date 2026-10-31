@@ -216,9 +216,10 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
                 pid = Some((page.pid(), page.hint()));
                 Ok(IOResult::Done(()))
             });
-            // The allocation's record is the last thing it appended.
-            let born = db.log().end();
             let (pid, hint) = pid.unwrap();
+            // The page lives from its adoption on: recovery frees a page it finds unadopted.
+            run(&mut || db.store().adopt(&[pid]));
+            let born = db.log().end();
             hints.borrow_mut().insert(pid, AtomicU32::new(hint));
             model.borrow_mut().entry(pid).or_default().0.push(Life {
                 born,
@@ -298,4 +299,73 @@ fn crashes_recover_every_durable_write_and_nothing_torn_with_durable_writes() {
 #[test]
 fn crashes_recover_every_durable_write_and_nothing_torn_with_writes_then_syncs() {
     crashes_recover_every_durable_write_and_nothing_torn(false);
+}
+
+#[test]
+fn recovery_frees_pages_left_provisional_and_the_redo_point_waits_for_them() {
+    use super::store::{PageStore, StoreRecord};
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let db = open(io.clone(), 1);
+    let allocate = |db: &Atoll| {
+        let page = drive(&io, || db.pool().allocate(class(0))).unwrap();
+        let pid = page.pid();
+        drop(page);
+        pid
+    };
+    let write = |db: &Atoll, pid: PageId| {
+        let mut admitted = drive(&io, || db.log().admit(blob::record_len(STAMP))).unwrap();
+        let mut page = drive(&io, || db.pool().fix_exclusive(pid, None)).unwrap();
+        let (offset, bytes) = stamp(pid, 1);
+        blob::write(db.log(), &mut admitted, &mut page, offset, &bytes);
+    };
+    let checkpoint = |db: &Atoll| {
+        let ticket = db.checkpointer().request_full();
+        drive(&io, || db.checkpointer().step_full(ticket)).unwrap();
+        db.checkpointer().superblock().redo
+    };
+    // Never adopted: as if the operation that allocated it crashed before linking it in.
+    let unlinked_at = db.log().end();
+    let unlinked = allocate(&db);
+    write(&db, unlinked);
+    let kept = allocate(&db);
+    drive(&io, || db.store().adopt(&[kept])).unwrap();
+    write(&db, kept);
+    // Adopted, then abandoned: as if it crashed between unlinking it and freeing it.
+    let dropped = allocate(&db);
+    drive(&io, || db.store().adopt(&[dropped])).unwrap();
+    let abandon = StoreRecord::Abandon {
+        pids: vec![dropped],
+    };
+    let (header, payload) = PageStore::group_record(&abandon);
+    let len = crate::storage::atoll::log::framed_len(payload.len());
+    let mut admitted = drive(&io, || db.log().admit(len)).unwrap();
+    let lsn = db.log().append(&mut admitted, &header, &[&payload]);
+    db.store().grouped(&abandon, lsn - len, lsn);
+    let redo = checkpoint(&db);
+    assert!(
+        redo <= unlinked_at,
+        "the redo point moved to {redo}, past the provisional page made at {unlinked_at}"
+    );
+    // An operation dropped with its page in hand hands it over; the checkpointer frees it.
+    let orphan = allocate(&db);
+    db.store().orphaned(orphan);
+    drive(&io, || db.checkpointer().step()).unwrap();
+    assert_eq!(drive(&io, || db.store().entry(orphan)).unwrap(), FREE);
+    drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
+    drop(db);
+    let db = open(io.clone(), 1);
+    for (pid, live) in [
+        (unlinked, false),
+        (kept, true),
+        (dropped, false),
+        (orphan, false),
+    ] {
+        let entry = drive(&io, || db.store().entry(pid)).unwrap();
+        assert_eq!(entry != FREE, live, "{pid:?}");
+    }
+    let redo = checkpoint(&db);
+    assert!(
+        redo >= db.recovered_end().unwrap(),
+        "nothing provisional is left to hold the redo point at {redo}"
+    );
 }

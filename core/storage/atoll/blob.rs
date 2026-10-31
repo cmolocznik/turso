@@ -12,7 +12,7 @@ use crate::sync::Arc;
 use crate::{LimboError, Result};
 
 /// The log record of a write.
-pub const WRITE: Kind = Kind::new(7).unwrap();
+pub const WRITE: Kind = Kind::new(9).unwrap();
 
 /// What a blob page's header says it holds.
 pub const KIND: PageKind = PageKind(1);

@@ -507,6 +507,16 @@ impl BufferPool {
         Ok(IOResult::Done(()))
     }
 
+    /// Frees `pid`, which nothing refers to any more: a provisional page left over by an
+    /// operation that gave up on it, or by a crash. It is read in first if it is not in memory,
+    /// so a fix racing with the free finds either the page or its number free, never both.
+    pub fn free_unreferenced(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        match self.fix_exclusive(pid, None)? {
+            IOResult::Done(page) => self.free(page),
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        }
+    }
+
     // ---------------------------------------------------------------- prefetching
 
     /// Starts reading those of `pids` that are not in memory, without waiting for anything:

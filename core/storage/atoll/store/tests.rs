@@ -311,6 +311,7 @@ fn copies_are_read_back_from_their_newest_slot_and_superseded_slots_are_erased_o
         let pids: Vec<PageId> = (0..5)
             .map(|_| drive(&db.io, || db.store.allocate(class(1))).unwrap())
             .collect();
+        drive(&db.io, || db.store.adopt(&pids)).unwrap();
         let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| drive(&db.io, op).unwrap();
         write_copies(&db, &pids, 1, &run);
         write_copies(&db, &pids, 2, &run);
@@ -427,6 +428,7 @@ fn a_crash_at_any_moment_recovers_a_consistent_page_store(durable_writes: bool) 
                     });
                     Ok(IOResult::Done(()))
                 });
+                run(&mut || db.store.adopt(&[pid.unwrap()]));
                 durable(&db);
                 expected
                     .borrow_mut()

@@ -4,7 +4,8 @@
 //! the next shard of frames, round robin ([`Pass`]). After a pass, the redo point moves to the
 //! lowest position of any shard, as far as the page store allows too: its metadata pages are
 //! written up to there and the slots it freed before there are erased. A superblock naming the
-//! new redo point is written, and log segments wholly before it are deleted.
+//! new redo point is written, and log segments wholly before it are deleted. In between, it frees
+//! the provisional pages operations gave up on ([`PageStore::orphaned`]).
 //!
 //! With S shards each taking 1/S of the budget, the redo point trails the log's end by about the
 //! budget, plus what is appended while a pass runs.
@@ -154,6 +155,15 @@ impl State {
                         self.next_shard = (shard + 1) % cp.pool.shard_count();
                         self.work = Work::Passes(vec![cp.pool.pass(shard)], None);
                         continue;
+                    }
+                    // Pages an operation gave up on hold the redo point back until freed.
+                    let mut orphans = cp.store.take_orphans().into_iter();
+                    while let Some(pid) = orphans.next() {
+                        if let IOResult::IO(io) = cp.pool.free_unreferenced(pid)? {
+                            cp.store.orphaned(pid);
+                            orphans.for_each(|p| cp.store.orphaned(p));
+                            return Ok(IOResult::IO(io));
+                        }
                     }
                     // Deleted data leaves the disk once its freeing is durable, not at the next
                     // checkpoint.

@@ -5,6 +5,7 @@
 //! - [`frame`]: frame headers: the latch, the page id, dirtiness and the replacement tracker.
 //! - [`watt`]: write-aware timestamp tracking, which chooses what to evict.
 //! - [`clean`]: writing dirty pages back through the page store.
+//! - [`pass`]: checkpoint passes over shards of frames, which bound the log recovery replays.
 //! - [`source`]: where a missing page comes from.
 //!
 //! **Finding a page.** A reference to a page may carry a frame hint beside the page id: the frame
@@ -28,6 +29,7 @@
 mod clean;
 mod frame;
 mod memory;
+mod pass;
 mod source;
 mod table;
 mod watt;
@@ -36,6 +38,7 @@ mod watt;
 mod tests;
 
 pub use memory::MIN_BUDGET;
+pub use pass::Pass;
 pub use source::{LocalSource, Located, PageSource, ReadDone};
 
 use super::log::Lsn;
@@ -44,6 +47,7 @@ use super::store::PageStore;
 use clean::Writeback;
 use frame::{FrameHeader, EVICT_AFTER, FREE, LOADING, NO_PAGE, RESIDENT, WRITING};
 use memory::{Memory, Zeroed};
+use pass::Shard;
 use table::Table;
 
 use crate::io::Completion;
@@ -59,6 +63,20 @@ pub struct BufferConfig {
     /// Bytes of memory for frames, at least [`MIN_BUDGET`]. Frame headers take 2% more and the
     /// hash table 0.2%, and none of it takes physical memory until used.
     pub budget: usize,
+    /// Shards of frames that checkpoint passes take in turn ([`Pass`]). Haubenschild et al.
+    /// (SIGMOD 2020, §3.4) found 128 smoother than 10: each pass writes less at once, and the
+    /// log kept for recovery strays less from its budget.
+    pub checkpoint_shards: usize,
+}
+
+impl BufferConfig {
+    /// A pool of `budget` bytes with the default shards.
+    pub fn with_budget(budget: usize) -> Self {
+        Self {
+            budget,
+            checkpoint_shards: 128,
+        }
+    }
 }
 
 /// How a page is fixed.
@@ -100,6 +118,8 @@ pub struct BufferPool {
     writebacks: Mutex<Vec<Arc<Mutex<Writeback>>>>,
     writes_in_flight: AtomicUsize,
     failure: Mutex<Option<CompletionError>>,
+    /// Checkpoint shards, each a run of frames by position.
+    shards: Box<[Shard]>,
 }
 
 fn yield_now<T>() -> Result<IOResult<T>> {
@@ -114,16 +134,24 @@ fn io_failure(e: &LimboError) -> CompletionError {
 }
 
 impl BufferPool {
-    /// A pool reading missing pages from `source` and writing dirty ones to `store`.
+    /// A pool reading missing pages from `source` and writing dirty ones to `store`. `redo` is
+    /// where a recovery would start replaying the log now: every change the pool's pages will
+    /// receive is logged at or after it.
     pub fn new(
         config: BufferConfig,
         source: Arc<dyn PageSource>,
         store: Arc<PageStore>,
+        redo: Lsn,
     ) -> Result<Arc<Self>> {
         let memory = Memory::new(config.budget)?;
         let grains = memory.grains();
-        // One shard per hardware thread, so concurrent misses rarely share a lock.
-        let shards = std::thread::available_parallelism()
+        assert!(
+            config.checkpoint_shards > 0,
+            "a pool with no checkpoint shards"
+        );
+        let shards = config.checkpoint_shards.min(grains as usize);
+        // One shard of loads per hardware thread, so concurrent misses rarely share a lock.
+        let load_shards = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .next_power_of_two();
         let epoch_bytes =
@@ -134,7 +162,9 @@ impl BufferPool {
             memory,
             source,
             store,
-            loads: (0..shards).map(|_| Mutex::new(HashMap::new())).collect(),
+            loads: (0..load_shards)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
             epoch: AtomicU32::new(watt::FIRST_EPOCH),
             evicted: AtomicU64::new(0),
             epoch_bytes,
@@ -142,6 +172,7 @@ impl BufferPool {
             writebacks: Mutex::new(Vec::new()),
             writes_in_flight: AtomicUsize::new(0),
             failure: Mutex::new(None),
+            shards: (0..shards).map(|_| Shard::new(redo)).collect(),
         }))
     }
 
@@ -715,6 +746,12 @@ impl BufferPool {
             )
         };
         let pid = src.pid();
+        if src.dirty() {
+            let (a, b) = (self.shard_of(from), self.shard_of(to));
+            if a != b {
+                self.shards[b].arrived(self.shards[a].position());
+            }
+        }
         dst.pid.store(pid, Ordering::Release);
         dst.page_lsn
             .store(src.page_lsn.load(Ordering::Acquire), Ordering::Release);
@@ -825,52 +862,38 @@ impl BufferPool {
         self.signal_released();
     }
 
-    /// Writes back every page dirty in the frames `range` of the pool (indexes of 4 KiB grains),
-    /// as a checkpoint pass over one shard does. Done once each is written.
-    pub fn clean(self: &Arc<Self>, range: Range<u32>) -> Clean {
-        let mut by_class: [Vec<u32>; CLASS_COUNT] = Default::default();
-        for frame in range.start..range.end.min(self.memory.grains()) {
-            let h = self.header(frame);
-            if h.status() != RESIDENT || !h.dirty() || h.has(WRITING) {
-                continue;
-            }
-            if !h.latch.try_lock_shared() {
-                continue;
-            }
-            // Under the latch the frame cannot be evicted or dropped: check it again.
-            if h.status() == RESIDENT
-                && h.dirty()
-                && h.flags.fetch_or(WRITING, Ordering::AcqRel) & WRITING == 0
-            {
-                by_class[PageId::from_raw(h.pid()).class().index()].push(frame);
-            }
-            h.latch.unlock_shared();
-        }
-        let finished = by_class
-            .into_iter()
-            .zip(SizeClass::all())
-            .filter_map(|(frames, class)| self.write_back(class, frames, false))
-            .collect();
-        Clean { finished }
+    // ---------------------------------------------------------------- checkpoints
+
+    /// How many checkpoint shards the frames are split into.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
     }
-}
 
-/// A pass writing back dirty pages; see [`BufferPool::clean`].
-pub struct Clean {
-    finished: Vec<Completion>,
-}
+    /// The frames of `shard`, as indexes of 4 KiB grains.
+    fn shard_frames(&self, shard: usize) -> Range<u32> {
+        let (grains, n) = (self.memory.grains() as u64, self.shards.len() as u64);
+        let at = |s: u64| (s * grains).div_ceil(n) as u32;
+        at(shard as u64)..at(shard as u64 + 1)
+    }
 
-impl Clean {
-    pub fn step(&mut self, pool: &Arc<BufferPool>) -> Result<IOResult<()>> {
-        if let Some(c) = pool.drive_writebacks()? {
-            return Ok(IOResult::IO(IOCompletions(c)));
-        }
-        self.finished.retain(|c| !c.finished());
-        pool.failed()?;
-        match self.finished.first() {
-            Some(c) => Ok(IOResult::IO(IOCompletions(c.clone()))),
-            None => Ok(IOResult::Done(())),
-        }
+    fn shard_of(&self, frame: u32) -> usize {
+        let (grains, n) = (self.memory.grains() as u64, self.shards.len() as u64);
+        (frame as u64 * n / grains) as usize
+    }
+
+    /// Starts a checkpoint pass over `shard`.
+    pub fn pass(&self, shard: usize) -> Pass {
+        Pass::new(self, shard)
+    }
+
+    /// Where a recovery could start replaying the log now, as far as the pool is concerned: the
+    /// lowest position of any shard.
+    pub fn redo_floor(&self) -> Lsn {
+        self.shards
+            .iter()
+            .map(Shard::position)
+            .min()
+            .expect("a shard")
     }
 }
 

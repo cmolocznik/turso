@@ -9,6 +9,7 @@
 //!
 //! At one bucket per 4 KiB frame the table costs 8 bytes per 4 KiB of pool, 0.2%.
 
+use super::super::page::PageId;
 use super::frame::FrameHeader;
 use super::memory::Zeroed;
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -22,14 +23,6 @@ pub struct Table {
     mask: u64,
 }
 
-/// SplitMix64's finalizer: page numbers are dense, and their low bits alone would crowd buckets.
-fn hash(pid: u64) -> u64 {
-    let mut z = pid.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
 impl Table {
     /// A table for `frames` frames: at least one bucket per frame.
     pub fn new(frames: u32) -> Result<Self> {
@@ -41,7 +34,7 @@ impl Table {
     }
 
     fn bucket(&self, pid: u64) -> &AtomicU64 {
-        &self.buckets[(hash(pid) & self.mask) as usize]
+        &self.buckets[(PageId::from_raw(pid).hash() & self.mask) as usize]
     }
 
     /// The frame holding `pid`, unchecked. May miss a page moving between frames.

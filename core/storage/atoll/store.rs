@@ -26,7 +26,7 @@ use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex, OnceLock};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -231,7 +231,9 @@ pub struct PageStore {
     io: Arc<dyn IO>,
     base: String,
     config: StoreConfig,
-    log: Arc<Log>,
+    /// Set once: at creation, or by recovery once it has replayed the page table and found where
+    /// the log ends.
+    log: OnceLock<Arc<Log>>,
     meta: Arc<MetaCache>,
     files: Mutex<HashMap<(SizeClass, u64), Arc<dyn File>>>,
     /// Levels of the page table (`[0]`) and free space (`[1]`) per class.
@@ -255,6 +257,17 @@ pub struct PageStore {
     erase_limit: AtomicU64,
     /// While recovering: slots of intents not yet matched by a remap or a release.
     pending_intents: Mutex<HashMap<(SizeClass, u64), Lsn>>,
+    /// The erasure in progress, if any.
+    erasure: Mutex<Option<Erasure>>,
+}
+
+/// Freed slots being erased: holes punched or zeros written, then their files synced.
+struct Erasure {
+    ready: Vec<(Lsn, Freed)>,
+    files: Vec<Arc<dyn File>>,
+    /// The zero writes, then the syncs.
+    pending: Vec<Completion>,
+    synced: bool,
 }
 
 impl PageStore {
@@ -267,12 +280,30 @@ impl PageStore {
         log: Arc<Log>,
         heights: [[u8; CLASS_COUNT]; 2],
     ) -> Arc<Self> {
+        let store = Self::recovering(io, base, config, heights);
+        store.end_recovery();
+        assert!(store.log.set(log).is_ok());
+        store
+    }
+
+    /// A page store to recover, its page table and free space as the superblock in charge left
+    /// them. Its records are replayed with [`redo`](Self::redo) before the log is reopened, since
+    /// only the replay finds where the log ends; then [`resume`](Self::resume) gives it the log.
+    /// Until [`end_recovery`](Self::end_recovery), a metadata page with no whole copy reads as
+    /// zeros: every change to it is in the log being replayed.
+    pub fn recovering(
+        io: Arc<dyn IO>,
+        base: &str,
+        config: StoreConfig,
+        heights: [[u8; CLASS_COUNT]; 2],
+    ) -> Arc<Self> {
         let meta = Arc::new(MetaCache::new(io.clone(), base, config.meta_pages));
+        meta.set_recovering(true);
         Arc::new(Self {
             io,
             base: base.to_string(),
             config,
-            log,
+            log: OnceLock::new(),
             meta,
             files: Mutex::new(HashMap::new()),
             heights: Mutex::new(heights.map(|h| h.map(|l| l.max(1)))),
@@ -284,6 +315,7 @@ impl PageStore {
             unerased: Mutex::new(HashSet::new()),
             erase_limit: AtomicU64::new(u64::MAX),
             pending_intents: Mutex::new(HashMap::new()),
+            erasure: Mutex::new(None),
         })
     }
 
@@ -292,7 +324,9 @@ impl PageStore {
     }
 
     pub fn log(&self) -> &Arc<Log> {
-        &self.log
+        self.log
+            .get()
+            .expect("the page store's log is given before anything is appended")
     }
 
     pub fn heights(&self) -> [[u8; CLASS_COUNT]; 2] {
@@ -430,7 +464,7 @@ impl PageStore {
             pid: PageId::new(class, 0),
         }
         .framed_len();
-        let mut admitted = match self.log.admit(record_len)? {
+        let mut admitted = match self.log().admit(record_len)? {
             IOResult::Done(a) => a,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -470,7 +504,7 @@ impl PageStore {
     pub fn free(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
         let class = pid.class();
         let record_len = StoreRecord::Free { pid, old: None }.framed_len();
-        let mut admitted = match self.log.admit(record_len)? {
+        let mut admitted = match self.log().admit(record_len)? {
             IOResult::Done(a) => a,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -614,7 +648,7 @@ impl PageStore {
             used: 0,
         }
         .framed_len();
-        let mut admitted = match self.log.admit(record_len)? {
+        let mut admitted = match self.log().admit(record_len)? {
             IOResult::Done(a) => a,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -680,7 +714,7 @@ impl PageStore {
             txn: 0,
             prev: 0,
         };
-        let lsn = self.log.append(admitted, &header, &[&payload]);
+        let lsn = self.log().append(admitted, &header, &[&payload]);
         (lsn - framed_len(payload.len()), lsn)
     }
 
@@ -722,14 +756,65 @@ impl PageStore {
         }
     }
 
-    /// Erases every freed slot whose freeing is durable, and makes it free to take again.
+    /// Erases every freed slot whose freeing is durable, and makes it free to take again. Done
+    /// once everything erasable now is erased.
     ///
     /// A punched hole, like a write, is durable only once its file is synced: until then a crash
     /// can bring the old copy back. So every slot is punched (or overwritten with zeros) first,
-    /// every file touched is synced, and only then do the slots count as erased.
-    pub fn erase_freed(&self) -> Result<()> {
+    /// every file touched is synced, and only then do the slots count as erased. A failed write or
+    /// sync leaves the slots to be erased again by the next call.
+    pub fn erase_freed(&self) -> Result<IOResult<()>> {
+        let Some(mut erasure) = self.erasure.try_lock() else {
+            // Someone else is stepping it.
+            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+        };
+        loop {
+            let Some(e) = erasure.as_mut() else {
+                match self.start_erasure()? {
+                    Some(e) => *erasure = Some(e),
+                    None => return Ok(IOResult::Done(())),
+                }
+                continue;
+            };
+            if let Some(c) = e.pending.iter().find(|c| !c.finished()) {
+                return Ok(IOResult::IO(IOCompletions(c.clone())));
+            }
+            if let Some(err) = e.pending.iter().find_map(|c| c.get_error()) {
+                *erasure = None;
+                return Err(LimboError::CompletionError(err));
+            }
+            if !e.synced {
+                e.synced = true;
+                e.pending = e
+                    .files
+                    .iter()
+                    .map(|f| f.sync_data(Completion::new_sync(|_| {})))
+                    .collect::<Result<_>>()?;
+                continue;
+            }
+            let done = erasure.take().expect("an erasure");
+            let mut erasing = self.erasing.lock();
+            let mut unerased = self.unerased.lock();
+            for (start, (_, slots)) in done.ready {
+                if let Some((_, left)) = erasing.get_mut(&start) {
+                    left.retain(|s| !slots.contains(s));
+                    if left.is_empty() {
+                        erasing.remove(&start);
+                    }
+                }
+                for slot in slots {
+                    unerased.remove(&slot);
+                }
+            }
+            return Ok(IOResult::Done(()));
+        }
+    }
+
+    /// Punches out every slot whose freeing is durable, or starts writing zeros over it where
+    /// the file cannot punch holes; `None` if there is none.
+    fn start_erasure(&self) -> Result<Option<Erasure>> {
         let durable = self
-            .log
+            .log()
             .durable()
             .min(self.erase_limit.load(Ordering::Acquire));
         let ready: Vec<(Lsn, Freed)> = {
@@ -741,42 +826,30 @@ impl PageStore {
                 .collect()
         };
         if ready.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let mut touched: BTreeMap<(SizeClass, u64), Arc<dyn File>> = BTreeMap::new();
+        let mut files: BTreeMap<(SizeClass, u64), Arc<dyn File>> = BTreeMap::new();
+        let mut pending = Vec::new();
         for (_, (_, slots)) in &ready {
             for &(class, slot) in slots {
                 let (file, at) = self.data_file(class, slot)?;
                 if file.punch_hole(at as usize, class.size()).is_err() {
                     let zeros = Arc::new(AlignedBlock::zeroed(class.size()));
-                    let c = file.pwrite(
+                    pending.push(file.pwrite(
                         at,
                         zeros.region(0, class.size()),
                         Completion::new_write(|_| {}),
-                    )?;
-                    self.io.wait_for_completion(c)?;
+                    )?);
                 }
-                touched.insert((class, slot / self.slots_per_file(class)), file);
+                files.insert((class, slot / self.slots_per_file(class)), file);
             }
         }
-        for file in touched.values() {
-            let c = file.sync_data(Completion::new_sync(|_| {}))?;
-            self.io.wait_for_completion(c)?;
-        }
-        let mut erasing = self.erasing.lock();
-        let mut unerased = self.unerased.lock();
-        for (start, (_, slots)) in ready {
-            if let Some((_, left)) = erasing.get_mut(&start) {
-                left.retain(|s| !slots.contains(s));
-                if left.is_empty() {
-                    erasing.remove(&start);
-                }
-            }
-            for slot in slots {
-                unerased.remove(&slot);
-            }
-        }
-        Ok(())
+        Ok(Some(Erasure {
+            ready,
+            files: files.into_values().collect(),
+            pending,
+            synced: false,
+        }))
     }
 
     /// Lets erasing reach everything: a checkpoint past where the log restarted after a crash is
@@ -787,16 +860,22 @@ impl PageStore {
 
     // ---------------------------------------------------------------- recovery
 
-    /// Starts recovery of a log whose valid records end at `end`: metadata pages with no whole copy
-    /// read as zeros, and nothing freed by a record after `end` is erased until
-    /// [`allow_erasing`](Self::allow_erasing).
-    pub fn begin_recovery(&self, end: Lsn) {
-        self.meta.set_recovering(true);
-        self.erase_limit.store(end, Ordering::Release);
+    /// Gives a recovering store the log, reopened where the replay found it ends. Nothing freed by
+    /// a record appended from here on is erased until [`allow_erasing`](Self::allow_erasing): a
+    /// recovery from the superblock still in charge stops where the replay did, and could still
+    /// need the copies such a record frees.
+    pub fn resume(&self, log: Arc<Log>) {
+        self.erase_limit.store(log.end(), Ordering::Release);
+        assert!(
+            self.log.set(log).is_ok(),
+            "the page store's log is given once"
+        );
     }
 
     /// Replays a page-store record during recovery, unless the pages it changes already hold it.
-    /// Safe to call again after it returned IO: pages already changed are skipped.
+    /// Safe to call again after it returned IO: pages already changed are skipped. Every record is
+    /// replayed before anything new is appended: a new record would stamp the pages it changes
+    /// with an LSN past every record still to replay, which would then be skipped.
     pub fn redo(self: &Arc<Self>, record: &OwnedRecord) -> Result<IOResult<()>> {
         let Some((r, heights)) = StoreRecord::decode_logged(record.header.kind, &record.payload)
         else {
@@ -888,7 +967,7 @@ impl PageStore {
             class,
             slots: slots.to_vec(),
         };
-        let mut admitted = match self.log.admit(record.framed_len())? {
+        let mut admitted = match self.log().admit(record.framed_len())? {
             IOResult::Done(a) => a,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -941,7 +1020,7 @@ impl PageStore {
 
     /// Writes every metadata page changed before `before`.
     pub fn write_metadata(self: &Arc<Self>, before: Lsn) -> Result<IOResult<()>> {
-        self.meta.write_dirty(&self.log, before)
+        self.meta.write_dirty(self.log(), before)
     }
 }
 
@@ -995,7 +1074,7 @@ impl WritePlan {
             };
             let bytes = intent.framed_len()
                 + self.pids.len() as u64 * remap.framed_len().max(release.framed_len());
-            self.admitted = Some(match store.log.admit(bytes)? {
+            self.admitted = Some(match store.log().admit(bytes)? {
                 IOResult::Done(a) => a,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             });
@@ -1012,7 +1091,7 @@ impl WritePlan {
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
-        match store.log.wait_durable(self.intent.expect("logged"))? {
+        match store.log().wait_durable(self.intent.expect("logged"))? {
             IOResult::Done(()) => {
                 self.ready = true;
                 Ok(IOResult::Done(()))

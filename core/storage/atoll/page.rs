@@ -93,6 +93,15 @@ impl PageId {
     pub fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
+
+    /// The id spread over 64 bits by SplitMix64's finalizer: page numbers are dense, and their
+    /// low bits alone would crowd hash buckets and partitions.
+    pub fn hash(self) -> u64 {
+        let mut z = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
 }
 
 pub fn lsn(page: &[u8]) -> u64 {

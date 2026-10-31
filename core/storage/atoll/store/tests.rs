@@ -88,18 +88,15 @@ fn write_superblock(db: &mut Db, redo: Lsn) {
 fn recover(io: Arc<dyn IO>, base: &str) -> Db {
     let (control, sb) = Control::open(io.clone(), base).unwrap();
     let sb = sb.expect("a superblock");
+    let store = PageStore::recovering(io.clone(), base, store_config(), sb.heights);
     let mut reader = Log::reader(io.clone(), base, &log_config(), sb.redo);
-    let mut records = Vec::new();
     while let Some(r) = reader.next_record().unwrap() {
-        records.push(r);
+        if kinds::owns(r.header.kind) {
+            drive(&io, || store.redo(&r)).unwrap();
+        }
     }
-    let end = reader.position();
-    let log = Log::open(io.clone(), base, log_config(), end).unwrap();
-    let store = PageStore::new(io.clone(), base, store_config(), log.clone(), sb.heights);
-    store.begin_recovery(end);
-    for r in records.iter().filter(|r| kinds::owns(r.header.kind)) {
-        drive(&io, || store.redo(r)).unwrap();
-    }
+    let log = Log::open(io.clone(), base, log_config(), reader.position()).unwrap();
+    store.resume(log.clone());
     drive(&io, || store.release_orphans()).unwrap();
     store.end_recovery();
     let mut db = Db {
@@ -118,7 +115,7 @@ fn recover(io: Arc<dyn IO>, base: &str) -> Db {
 
 fn store_erase(db: &Db) {
     drive(&db.io, || db.log.wait_durable(db.log.end())).unwrap();
-    db.store.erase_freed().unwrap();
+    drive(&db.io, || db.store.erase_freed()).unwrap();
 }
 
 /// Writes every changed metadata page, then a superblock whose redo point is as far on as the
@@ -475,7 +472,7 @@ fn a_crash_at_any_moment_recovers_a_consistent_page_store(durable_writes: bool) 
                     expected.borrow_mut().get_mut(&victim).unwrap().freed = true;
                 }
             }
-            db.store.erase_freed().unwrap();
+            run(&mut || db.store.erase_freed());
             if round % 4 == 3 {
                 let end = db.log.end();
                 run(&mut || db.store.write_metadata(end));

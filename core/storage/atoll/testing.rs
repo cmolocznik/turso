@@ -1,10 +1,9 @@
 //! Test support: every IO backend the storage runs on, and a driver that steps an operation's
 //! `IOResult` to the end the way the VDBE does.
 
+pub(super) use super::drive;
 use crate::io::IO;
 use crate::sync::Arc;
-use crate::types::{IOCompletions, IOResult};
-use crate::Result;
 
 pub(super) struct Backend {
     pub name: &'static str,
@@ -44,14 +43,4 @@ pub(super) fn backends() -> Vec<Backend> {
         Arc::new(crate::io::UringIO::new().unwrap()),
     ));
     all
-}
-
-/// Runs `op` until it is done, waiting on each completion it hands back.
-pub(super) fn drive<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
-    loop {
-        match op()? {
-            IOResult::Done(v) => return Ok(v),
-            IOResult::IO(IOCompletions(c)) => io.wait_for_completion(c)?,
-        }
-    }
 }

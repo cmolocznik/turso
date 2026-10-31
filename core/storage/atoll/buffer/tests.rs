@@ -1,4 +1,5 @@
 use super::*;
+use crate::io::crash::CrashIO;
 use crate::io::IO;
 use crate::storage::atoll::log::{framed_len, Admitted, Header, Kind, Log, LogConfig};
 use crate::storage::atoll::page::HEADER_SIZE;
@@ -15,9 +16,13 @@ fn class(i: usize) -> SizeClass {
 }
 
 fn open(b: &Backend, budget: usize) -> (Arc<Log>, Arc<BufferPool>) {
+    open_on(&b.io, &b.base, budget)
+}
+
+fn open_on(io: &Arc<dyn IO>, base: &str, budget: usize) -> (Arc<Log>, Arc<BufferPool>) {
     let log = Log::open(
-        b.io.clone(),
-        &b.base,
+        io.clone(),
+        base,
         LogConfig {
             segment_bytes: 4 << 20,
             buffer_bytes: 256 << 10,
@@ -29,8 +34,8 @@ fn open(b: &Backend, budget: usize) -> (Arc<Log>, Arc<BufferPool>) {
     )
     .unwrap();
     let store = PageStore::new(
-        b.io.clone(),
-        &b.base,
+        io.clone(),
+        base,
         StoreConfig {
             file_bytes: 1 << 30,
             meta_pages: 1 << 10,
@@ -39,9 +44,10 @@ fn open(b: &Backend, budget: usize) -> (Arc<Log>, Arc<BufferPool>) {
         [[1; CLASS_COUNT]; 2],
     );
     let pool = BufferPool::new(
-        BufferConfig { budget },
+        BufferConfig::with_budget(budget),
         Arc::new(LocalSource::new(store.clone())),
         store,
+        0,
     )
     .unwrap();
     (log, pool)
@@ -210,15 +216,18 @@ fn pages_keep_their_contents_through_eviction_writeback_and_moves_between_classe
             held[3]
         );
         model.check_all();
-        // A pass over the whole pool leaves no page dirty.
-        let mut pass = pool.clean(0..pool.memory.grains());
-        drive(&b.io, || pass.step(&pool)).unwrap();
-        // Writebacks begun by eviction may still be in flight.
-        drive(&b.io, || pool.settle_writes()).unwrap();
+        // A pass over every shard leaves no page dirty, and the pool's redo floor at the log's
+        // end when the passes began.
+        let end = log.end();
+        for shard in 0..pool.shard_count() {
+            let mut pass = pool.pass(shard);
+            drive(&b.io, || pass.step(&pool)).unwrap();
+        }
         let dirty = (0..pool.memory.grains())
             .filter(|&f| pool.header(f).status() == RESIDENT && pool.header(f).dirty())
             .count();
-        assert_eq!(dirty, 0, "{}: pages left dirty by a clean pass", b.name);
+        assert_eq!(dirty, 0, "{}: pages left dirty by passes", b.name);
+        assert_eq!(pool.redo_floor(), end, "{}", b.name);
         // Dropped pages free their frames; the rest still read back.
         let kept = model.pages.split_off(model.pages.len() / 2);
         for p in std::mem::replace(&mut model.pages, kept) {
@@ -295,4 +304,38 @@ fn concurrent_fixes_lose_no_change() {
         }
         model.check_all();
     }
+}
+
+/// A page whose write was in flight when a pass began may have changed since its copy was taken,
+/// by a change logged before the pass: the pass waits for the write, and writes the page again.
+#[test]
+fn a_pass_writes_again_a_page_changed_while_its_earlier_write_was_in_flight() {
+    // Writes complete only at a step, so one stays in flight while the page changes.
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
+    let (log, pool) = open_on(&io, "/db/pass", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        log: &log,
+        pool: &pool,
+        pages: Vec::new(),
+    };
+    model.allocate(class(0));
+    let frame = model.pages[0].hint.load(Ordering::Relaxed) - 1;
+    // Written back the way eviction does: marked, then stepped until the write is submitted.
+    pool.header(frame).flags.fetch_or(WRITING, Ordering::AcqRel);
+    let written = pool.write_back(class(0), vec![frame], false).unwrap();
+    while let Some(c) = pool.drive_writebacks().unwrap() {
+        io.wait_for_completion(c).unwrap();
+    }
+    assert!(!written.finished(), "the write is in flight");
+    let changed = log.end();
+    model.update(0);
+    let shard = pool.shard_of(frame);
+    let mut pass = pool.pass(shard);
+    drive(&io, || pass.step(&pool)).unwrap();
+    assert!(
+        !pool.header(frame).dirty() || pool.shards[shard].position() <= changed,
+        "the shard's position passed a change no written copy holds"
+    );
+    model.check_all();
 }

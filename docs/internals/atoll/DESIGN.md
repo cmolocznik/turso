@@ -245,6 +245,11 @@ len: u32 | kind: u8 | flags: u8 | reserved: u16 | txn: u64 | prev: u64 | payload
   block, the block is padded to its end; padding has no CRC and is checked by its own position
   instead. Durable bytes are never rewritten, so a torn write cannot take committed records with
   it.
+- **Padding is admitted.** Padding moves every record admitted and not yet appended along with it.
+  Admission checked that those records fit in the prepared segments from where the log stood
+  then, so padding that would push one past them waits until the next segment is prepared.
+  Otherwise the record lands in a segment whose zeros are still being written, and the zeros land
+  on it.
 
 ### 7.4 Segments
 
@@ -378,8 +383,8 @@ frame goes stale.
   changed while its copy is in flight stays dirty.
 - No log flush comes first. A copy's remap is logged after the copy lands, so a remap that
   survives a crash names a copy whose records survived too.
-- A writeback is stepped by whoever needs frames, or by a clean pass over a range of frames, which
-  is what checkpoints run (section 10).
+- A writeback is stepped by whoever needs frames, or by a checkpoint pass over a shard of frames
+  (section 10).
 - A failed page write, like a failed log write, stops the pool until the database is reopened.
 
 ### 9.6 Page sources
@@ -404,20 +409,43 @@ Still to come, for app servers and replicas (section 15):
 
 ## 10. Checkpoints
 
-Checkpoints are continuous (LeanStore 2024 §2.7, Haubenschild et al. §3.4).
+Checkpoints are continuous (LeanStore 2024 §2.7, Haubenschild et al. §3.4). Built in
+`core/storage/atoll/checkpoint.rs` and `buffer/pass.rs`.
 
-1. **Shards.** Frames are split into S shards; S is 128 by default, which Haubenschild found
-   smoother than 10.
-2. **Passes.** Each time 1/S of the log budget has been appended, the cleaner writes back every
-   dirty page of the next shard, round robin. Before it starts, it records the log's end as that
-   shard's checkpointed position.
-3. **Redo point.** The minimum checkpointed position over all shards. When it moves, a new superblock
-   is written.
-4. **Log budget.** The log budget is how much log recovery may have to replay. It is configured,
+1. **Shards.** The pool's frames are split into S shards by position; S is 128 by default, which
+   Haubenschild found smoother than 10.
+2. **Positions.** Each shard has a position: every change to a page in its frames that is not yet
+   in a written copy has its record start at or after it. Recovery may start at the lowest
+   position of any shard.
+3. **Passes.** Each time 1/S of the log budget has been appended, a pass takes the next shard,
+   round robin. It records where the log ends, then makes every change logged before that part of
+   a written copy:
+   - a page clean when looked at is done;
+   - a dirty page is written; its copy is taken under a latch granted after the end was recorded,
+     and a change's record is appended under the page's latch, so the copy holds every change
+     logged before the end;
+   - a page already being written is looked at again once its write lands, and written again if
+     it changed meanwhile.
+
+   Then the shard's position is the end the pass recorded.
+4. **Moving pages.** A dirty page can move to a frame of another shard while memory moves between
+   size classes (section 9.4). It takes its old shard's position along: the new shard's position
+   falls to it if lower, and a pass over the new shard already running keeps it too.
+5. **Redo point.** After a pass, the log is made durable up to its end, so the remaps of the
+   pass's writes are durable. Metadata pages changed before the lowest shard position are
+   written, and slots whose freeing is durable are erased. The redo point is then the lowest
+   shard position, or what the page store allows (section 6.3) if that is lower. When it moves,
+   a superblock naming it is written, and log segments wholly before it are deleted.
+6. **Log budget.** The log budget is how much log recovery may have to replay. It is configured,
    and by default scales with the pool: 0.4 times the pool, the ratio of Haubenschild's example (a
-   20 GB WAL for a 50 GB pool).
-5. **No stalls.** Writing a page latches it only long enough to copy it. A page being written may
+   20 GB WAL for a 50 GB pool). The redo point then trails the log's end by about the budget, plus
+   what is appended while a pass runs. Like PostgreSQL's `max_wal_size`, it is a target: appends
+   are never held back waiting for a pass.
+7. **No stalls.** Writing a page latches it only long enough to copy it. A page being written may
    still change, and is clean afterwards only if it did not.
+8. **Stepped like any background work.** Whoever steps the checkpointer runs what is due: a pass,
+   moving the redo point, and erasing what has become erasable. A full checkpoint passes every
+   shard at once; recovery ends with one.
 
 ## 11. Transactions and versions
 
@@ -500,23 +528,45 @@ where it stood at its snapshot.
 
 ## 12. Recovery
 
+Built in `core/storage/atoll/recovery.rs`, except undo and the clock, which come with transactions
+(step 7). Opening a database (`db.rs`) creates it if there is no superblock, and recovers it
+otherwise.
+
 1. Read the newest whole superblock.
-2. **Analysis**, from the redo point, in parallel by segment:
-   - collect remaps, write intents and transactions;
-   - find the log's end: the first record that fails its CRC at its own position.
-3. **Redo**, in parallel by page id range:
-   - each page starts from its newest copy whose remap is durable, or else the copy the checkpoint's
-     page table names;
-   - records newer than the page's LSN are applied.
+2. **Analysis**, by one reader from the redo point:
+   - replay the page store's records, so the page table and free space are as the log left them;
+   - find the log's end: the first record that does not read back whole at its own position;
+   - note the pages freed and allocated again within the replay: their records before the new
+     allocation belong to the page's earlier life.
+
+   Every page-store record is replayed before anything is appended: a new record would stamp the
+   metadata pages it changes with an LSN past every record still to replay. So the log is read
+   twice. One reader keeps up with one device: CRC32C ran at 16 GB/s on one core of a Core Ultra 9
+   285H, above the 7 GB/s a PCIe 4 NVMe drive reads sequentially.
+3. **Redo**, in parallel. The log is read again in windows of one checkpoint pass's share of the
+   budget. Each window's page records are split into partitions by page id; a partition's records
+   apply in log order, window after window. A page starts from its newest copy whose remap is
+   durable, which is what the replayed page table names, or from zeros if it has none. A record
+   applies only if it is newer than the page and not from an earlier life. Dirty pages are
+   written back as memory runs short, as in normal running. At most four windows are held, so
+   recovery needs memory beyond the pool of four passes' shares of the budget, 1.25% of the pool
+   by default.
 4. **Erase** the slots of intents that got no remap.
 5. **Undo** every transaction with no Commit or End, from its records, following `prev` back from
    its last one. Compensation records are logged, and steps already compensated are skipped.
+   (Step 7.)
 6. **Restart the clock** above every logged timestamp. Every header left in a page is then a
-   committed version.
-7. **Checkpoint.**
+   committed version. (Step 7.)
+7. **Checkpoint.** A full checkpoint writes back every page redone. Its redo point is past where
+   the log restarted, which recovery checks, so nothing replayed is replayed again and the bytes
+   between the old end and the restart are never read.
 
-Recovery reads at most the log budget, plus the undo of open transactions. Haubenschild et al.
-replay 100 GB of log in 38 s on 40 threads (§4).
+**Threads.** Turso core starts no threads. Whichever threads call `Opening::work` take the next
+work: the window to read, or the next partition ready to apply. Opening on one thread recovers on
+one thread.
+
+Recovery reads at most the log budget (plus what was appended during the last pass) twice, plus
+the undo of open transactions. Haubenschild et al. replay 100 GB of log in 38 s on 40 threads (§4).
 
 ## 13. B+-trees
 
@@ -686,8 +736,11 @@ submission or later from `IO::step`. Therefore:
    Temporary pages move to step 7, which first needs them.
 4. **Buffer manager.** Frames on huge pages, lent to size classes in batches; the hash table and
    frame hints; WATT replacement; fixes and prefetch; the page source for the local store;
-   writeback and clean passes. Done (`buffer/`).
-5. **Checkpoints and recovery** over the new pieces.
+   writeback. Done (`buffer/`).
+5. **Checkpoints and recovery** over the new pieces: shard passes, continuous checkpoints,
+   parallel redo, opening a database, and blob writes, the first page record. Done
+   (`checkpoint.rs`, `buffer/pass.rs`, `recovery.rs`, `redo.rs`, `blob.rs`, `db.rs`). Undo and
+   the clock move to step 7.
 6. **B+-trees.**
 7. **Transactions.** Slots, clock, commit logs, version headers, version index, graveyard, conflicts
    and waits, rollback, undo in recovery, garbage collection.

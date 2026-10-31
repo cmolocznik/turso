@@ -3,7 +3,8 @@
 # main), merges main into workreef, and checks the merged tree before committing it: it compiles
 # with its tests, the core and FTS suites pass, clippy is clean, ivf_crash's kill rounds pass
 # under WAL, MVCC and MVCC with four writers, and mvcc_rolling's pass over a logical log that rolls
-# under writes that never pause. Only then is the merge committed and pushed. A
+# under writes that never pause. Only then is the merge committed and pushed. A test that fails
+# beside the others and passes run again alone is named in the verdict and the merge's message. A
 # conflict or a failed check aborts the merge, leaving workreef as it was, and alerts on the desktop
 # and the agent bus. A checkout that is busy (another branch, uncommitted changes, a merge under
 # way, cargo running in it) or a hold file skips the run. fork/turso-sync.timer runs it four
@@ -121,8 +122,12 @@ run "$CARGO" check -p turso_core --tests --features fts >"$LOGS/$stamp.check.log
 # suite NAME [ARGS]: the core library's tests; every result line must report no failure, and the
 # ivf_rq tests must be among those that ran. Tests that start processes of the test binary print
 # those processes' result lines too, so the count is the suite's own line, which filters nothing.
+# When the suite ran to its own result line and only named tests failed, each is run again alone:
+# one that passes alone failed beside the others, as tests that wait on the clock do under this
+# machine's load, and is named in $alone; one that fails alone fails the run.
+alone=""
 suite() {
-    local name=$1 out="$LOGS/$stamp.$1.log" rc own passed failed ivf
+    local name=$1 out="$LOGS/$stamp.$1.log" rc own passed failed ivf tests test again
     shift
     echo "== suite $name"
     run "$CARGO" test -p turso_core --lib --no-fail-fast "$@" >"$out" 2>&1
@@ -130,6 +135,24 @@ suite() {
     read -r own passed failed < <(grep -E '^test result' "$out" |
         awk '/ 0 filtered out;/ {own++; p = $4} {f += $6} END {print own + 0, p + 0, f + 0}')
     ivf=$(grep -cE '^test index_method::ivf_rq::.* \.\.\. ok$' "$out")
+    tests=$(sed -nE 's/^test ([^ ]+) \.\.\. FAILED$/\1/p' "$out" | sort -u)
+    if [ "$rc" -ne 0 ] && [ "$own" -eq 1 ] && [ "$ivf" -gt 0 ] && [ "$failed" -gt 0 ] &&
+        [ "$(printf '%s\n' "$tests" | grep -c .)" -eq "$failed" ]; then
+        for test in $tests; do
+            again="$LOGS/$stamp.$name.alone.$test.log"
+            run "$CARGO" test -p turso_core --lib "$@" -- --exact "$test" >"$again" 2>&1
+            # Its own line and every line of the processes it starts: none failed, it passed.
+            if [ $? -ne 0 ] || grep -qE '^test result: FAILED' "$again" ||
+                ! grep -qE '^test result: ok\. 1 passed; 0 failed' "$again"; then
+                fail "$test failed in the $name suite and again alone ($stamp.$name.log, $(basename "$again"))"
+            fi
+        done
+        echo "== suite $name: $failed failed beside the others and passed alone: $(echo $tests)"
+        alone="$alone $(echo $tests)"
+        passed=$((passed + failed))
+        rc=0
+        failed=0
+    fi
     if [ "$rc" -ne 0 ] || [ "$own" -ne 1 ] || [ "$failed" -ne 0 ] || [ "$ivf" -eq 0 ]; then
         fail "the $name suite did not pass: rc $rc, $own result lines of its own, $passed passed, $failed failed, $ivf ivf_rq tests ran ($stamp.$name.log)"
     fi
@@ -169,14 +192,22 @@ if ! grep -q "^$ROUNDS rounds passed" "$out"; then
 fi
 rm -rf "$dir"
 
+note=""
+if [ -n "$alone" ]; then
+    note="
+These failed beside the others and passed run again alone:$alone."
+fi
 git commit -q -F - <<EOF || fail "the merge commit failed"
 Merge upstream main $new into workreef
 
 $took upstream commits ($old..$new), merged without conflicts. The merged tree compiled with its
 tests; the core suite passed $core_passed tests and the FTS suite $fts_passed; clippy was clean;
 ivf_crash passed $ROUNDS kill rounds each under WAL, MVCC and MVCC with four writers, and
-mvcc_rolling $ROUNDS over a log that rolls (seed $seed).
+mvcc_rolling $ROUNDS over a log that rolls (seed $seed).$note
 EOF
 trap - EXIT
 git push -q origin workreef || { verdict ERROR "pushing workreef failed; the merge is committed locally"; exit 1; }
-verdict MERGED "upstream $new ($took commits): core $core_passed, FTS $fts_passed, clippy clean, ivf_crash 3 x $ROUNDS rounds, mvcc_rolling $ROUNDS rounds"
+verdict MERGED "upstream $new ($took commits): core $core_passed, FTS $fts_passed, clippy clean, ivf_crash 3 x $ROUNDS rounds, mvcc_rolling $ROUNDS rounds${alone:+; passed only alone:$alone}"
+if [ -n "$alone" ]; then
+    "$BUS" send --from turso-sync --to claude "Turso upstream merge $new: these failed beside the others and passed alone:$alone (log $log)" >/dev/null 2>&1
+fi

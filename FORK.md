@@ -11,8 +11,9 @@ upstream: the fork keeps up with upstream and keeps its own changes.
   fetches upstream, fast-forwards `main`, merges it, and commits and pushes the merge only once
   the merged tree compiles with its tests, passes the core and FTS suites and clippy, passes
   `ivf_crash`'s kill rounds under WAL, MVCC and MVCC with four writers, and passes `mvcc_rolling`'s
-  over a logical log that rolls. A conflict or a failed check leaves `workreef` as it was and
-  alerts. Each merge's commit message names the upstream
+  over a logical log that rolls. A test that fails beside the others and passes run again alone
+  is named in the merge's message, its verdict and on the agent bus; one that fails alone fails
+  the run. A conflict or a failed check leaves `workreef` as it was and alerts. Each merge's commit message names the upstream
   commits it took and the checks it passed; each run's log and verdict are in
   `/home/me/cognition-data/turso-sync`, and a `hold` file there skips runs while a timed
   measurement needs the machine.

@@ -89,8 +89,13 @@ fn child(dir: &str, seed: u64) -> turso_core::Result<()> {
     if int(&conn, "SELECT count(*) FROM sqlite_schema WHERE name = 't'")? == 0 {
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, body BLOB NOT NULL)")?;
+        if std::env::var("INDEX").is_ok_and(|v| v == "1") {
+            conn.execute("CREATE INDEX t_n ON t(n)")?;
+        }
     }
-    conn.execute("PRAGMA mvcc_background_checkpoint = 1")?;
+    if std::env::var("BACKGROUND_CHECKPOINT").map_or(true, |v| v != "0") {
+        conn.execute("PRAGMA mvcc_background_checkpoint = 1")?;
+    }
     let threshold = std::env::var("THRESHOLD").map_or(65536, |value| value.parse::<i64>().expect("THRESHOLD is a byte count"));
     conn.execute(format!("PRAGMA mvcc_checkpoint_threshold = {threshold}"))?;
     let writers: Vec<_> = (0..WRITERS)

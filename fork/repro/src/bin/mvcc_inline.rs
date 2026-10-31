@@ -5,8 +5,8 @@
 //!
 //!     mvcc_control DIR WRITERS ROWS_PER_WRITER SECONDS_BEFORE_DECLARING_A_HANG
 //!
-//! BACKGROUND_CHECKPOINT=0 makes the commit that crosses the checkpoint threshold checkpoint
-//! inline, as stock Turso does.
+//! BACKGROUND_CHECKPOINT=1 hands the checkpoint the commit crossing the threshold would run to the
+//! store's checkpoint pool; otherwise that commit checkpoints inline, the engine's default.
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -102,8 +102,8 @@ async fn main() -> anyhow::Result<()> {
         let mut r = setup.query("PRAGMA journal_mode = 'mvcc'", ()).await?;
         while r.next().await?.is_some() {}
     }
-    if std::env::var("BACKGROUND_CHECKPOINT").is_ok_and(|v| v == "0") {
-        setup.execute("PRAGMA mvcc_background_checkpoint = 0", ()).await?;
+    if std::env::var("BACKGROUND_CHECKPOINT").is_ok_and(|v| v == "1") {
+        setup.execute("PRAGMA mvcc_background_checkpoint = 1", ()).await?;
     }
     if let Ok(bytes) = std::env::var("CHECKPOINT_BYTES") {
         let mut r = setup.query(&format!("PRAGMA mvcc_checkpoint_threshold = {bytes}"), ()).await?;
@@ -222,9 +222,16 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(3);
         }
     }
+    let write_ms = RUN_START.get().unwrap().elapsed().as_millis() as u64;
     stop.store(true, Ordering::Relaxed);
     maintainer.await??;
     reader.await??;
+    let background = {
+        let mut r = setup.query("PRAGMA mvcc_background_checkpoint", ()).await?;
+        let on = r.next().await?.map(|row| row.get::<i64>(0)).transpose()?.unwrap_or(-1);
+        while r.next().await?.is_some() {}
+        on
+    };
     // The checkpoint that truncates a log kept under load runs once writes pause.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let log_bytes = std::fs::metadata(format!("{dir}/control.db-log")).map_or(0, |m| m.len());
@@ -240,11 +247,14 @@ async fn main() -> anyhow::Result<()> {
         "{}",
         serde_json::json!({
             "hang": false,
+            "background": background,
             "writer_retries": writer_retries.load(Ordering::Relaxed),
             "upkeep_retries": upkeep_retries.load(Ordering::Relaxed),
             "writer_commits": writes.len(),
             "writer_commit_ms_p50": percentile(&writes, 0.5),
             "writer_commit_ms_p99": percentile(&writes, 0.99),
+            "writer_commit_ms_p999": percentile(&writes, 0.999),
+            "write_ms": write_ms,
             "writer_commit_ms_max": percentile(&writes, 1.0),
             "writer_commit_slowest_at_ms": slowest,
             "upkeep_commit_ms_p99": percentile(&upkeep, 0.99),

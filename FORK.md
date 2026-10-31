@@ -325,6 +325,28 @@ seconds under load (33 s once during the round), the writers now wait the stalls
 two-minute round, 5.4k rows a second against 81k, with the log at most 0.5 MB and the WAL 45 MB
 against 1.96 GB and 4.66 GB.
 
+### A checkpoint asked for beside a running one did nothing and reported success
+2026-10-31 `3bd2d58fc`. `core/mvcc/database/checkpoint_state_machine.rs`,
+`core/mvcc/database/background_checkpoint.rs`. Under passive checkpoints one checkpoint runs on a
+database at a time, and one that found another running returned at once with an empty result. That
+suits a commit's own checkpoint, whose work the running one does. But `PRAGMA wal_checkpoint`,
+`Connection::checkpoint` and the checkpoint before a journal mode change got the same result, and
+the pragma reported it as not busy: a TRUNCATE that did nothing reported success, the logical log
+left as it was. The blocking path, whose lock refuses a second checkpoint, reports Busy (upstream's
+`test_flag_off_truncate_busy_when_lock_contended`). The background checkpoint makes the overlap
+common. WorkReef cognition's erasure check found it once it turned the pool on: after TRUNCATE
+checkpoints that reported success, the planted text had not reached the database file, and the
+erased words were still in the logical log. Now only a commit's own checkpoint leaves the work to
+the running one; any other reports Busy. A pool turn that meets a running checkpoint gives way to it
+on that Busy, in place of a check before its checkpoint that left a window between the two.
+Tests: `mvcc::database::tests::test_passive_truncate_beside_a_running_checkpoint_reports_busy`. A
+passive checkpoint stopped after its first step holds the database. On another connection, PRAGMA
+wal_checkpoint(TRUNCATE) and `Connection::checkpoint` must each report Busy and leave the log as it
+was, and once the running one ends a TRUNCATE empties the log. On the code before, the pragma
+returned success. The pool's `test_a_turn_beside_another_checkpoint_waits_for_it` now meets the
+running checkpoint at its gate. Both mutations are red, one at a time: the gate's empty result
+restored fails both tests, and a pool turn that counts Busy as a failure fails the pool's.
+
 ## Additions
 
 ### Background checkpoint (`PRAGMA mvcc_background_checkpoint`)

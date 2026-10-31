@@ -123,6 +123,16 @@ pub struct Log {
     zeros: Arc<AlignedBlock>,
 }
 
+/// What padding a partial block came to.
+enum Pad {
+    /// Padded to here.
+    Padded(Lsn),
+    /// Someone reserved bytes past the block's start meanwhile.
+    Raced,
+    /// Records already admitted would be pushed past the prepared segments.
+    Unprepared,
+}
+
 /// Space an operation may append into, taken from [`Log::admit`]; what it does not use goes back
 /// when it is dropped.
 pub struct Admitted {
@@ -473,23 +483,37 @@ impl Log {
     }
 
     /// Writes padding from `at` to the end of its block, if nothing has been reserved past `at`.
-    fn pad(&self, at: Lsn) -> Option<Lsn> {
+    ///
+    /// Padding moves every record admitted and not yet appended along with it. Admission checked
+    /// that they fit before the end of the prepared segments from where the log stood then, so the
+    /// padding is admitted like a record: if it would push them past that end, it waits for the
+    /// next segment, whose preparation flushes again once done.
+    fn pad(&self, at: Lsn) -> Pad {
         let to = at.next_multiple_of(BLOCK);
-        if self
-            .insert
-            .compare_exchange(at, to, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
         {
-            return None;
+            // No one is admitted while this holds.
+            let _admission = self.admission.lock();
+            if to + self.granted.load(Ordering::SeqCst) > self.prepared_end.load(Ordering::Acquire)
+            {
+                return Pad::Unprepared;
+            }
+            if self
+                .insert
+                .compare_exchange(at, to, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Pad::Raced;
+            }
         }
         self.copy_in(at, &record::padding(at));
         self.count_copied(at, to);
-        Some(to)
+        Pad::Padded(to)
     }
 
     /// Starts writing what is complete, as far as the writes allowed in flight go.
     fn flush(self: &Arc<Self>) {
         let mut writes = Vec::new();
+        let mut unprepared = false;
         {
             let mut f = self.flush.lock();
             if f.failed.is_some() {
@@ -515,9 +539,13 @@ impl Log {
                         break;
                     }
                     match self.pad(insert) {
-                        Some(padded) => end = padded,
+                        Pad::Padded(padded) => end = padded,
                         // Someone reserved more meanwhile: look again.
-                        None => continue,
+                        Pad::Raced => continue,
+                        Pad::Unprepared => {
+                            unprepared = true;
+                            break;
+                        }
                     }
                 } else if !someone_waits && end - start < self.config.chunk_bytes {
                     // Nobody waits: let a chunk's worth gather.
@@ -533,6 +561,9 @@ impl Log {
         }
         for (start, end) in writes {
             self.submit_write(start, end);
+        }
+        if unprepared {
+            self.prepare_ahead();
         }
     }
 
@@ -750,6 +781,8 @@ impl Log {
         self.admission.lock().preparing = None;
         self.wake_admitters();
         self.prepare_ahead();
+        // A flush may be waiting to pad until this segment was ready.
+        self.flush();
     }
 
     /// Whether the bytes in flight reached the disk is unknown: nothing may follow them, and

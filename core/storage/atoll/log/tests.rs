@@ -267,3 +267,52 @@ fn a_failed_write_fails_its_waiters_and_every_later_operation() {
     assert!(log.failure().is_some());
     assert!(log.admit(64).is_err());
 }
+
+/// Padding a partial block moves every record admitted and not yet appended along with it. Here
+/// it would push one past the end of the last prepared segment: the record must wait for the next
+/// segment's zeros to be written, or they land on it.
+#[test]
+fn padding_never_pushes_an_admitted_record_into_a_segment_still_being_prepared() {
+    let config = small();
+    let segment = config.segment_bytes;
+    // Records of 1 KiB, so the log fills to a block boundary exactly.
+    let filler = vec![7u8; 996];
+    assert_eq!(framed_len(filler.len()), 1024);
+    let resume = segment - 3 * BLOCK;
+    for seed in 0..16 {
+        let crash = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
+        while log.end() < resume {
+            let mut admitted = drive(&io, || log.admit(1024)).unwrap();
+            log.append(&mut admitted, &header(0), &[&filler]);
+        }
+        drive(&io, || log.wait_durable(resume)).unwrap();
+        drop(log);
+        // Reopened there, as after a crash: the next segment is prepared only once asked for.
+        let log = Log::open(io.clone(), BASE, config.clone(), resume).unwrap();
+        let first = vec![1u8; 36];
+        let mut admitted_first = drive(&io, || log.admit(framed_len(first.len()))).unwrap();
+        // The second fits before the segment's end from where the log stands now.
+        let second = vec![2u8; (segment - resume - 64 - 64) as usize - 28];
+        let second_len = framed_len(second.len());
+        assert!(resume + framed_len(first.len()) + second_len <= segment);
+        let mut admitted_second = drive(&io, || log.admit(second_len)).unwrap();
+        let lsn = log.append(&mut admitted_first, &header(1), &[&first]);
+        // Waiting on the first pads its block, moving the second past the segment's end.
+        drive(&io, || log.wait_durable(lsn)).unwrap();
+        let lsn = log.append(&mut admitted_second, &header(2), &[&second]);
+        drive(&io, || log.wait_durable(lsn)).unwrap();
+        while crash.in_flight() > 0 {
+            io.step().unwrap();
+        }
+        let (records, _) = read_all(io, resume);
+        assert_eq!(
+            records.len(),
+            2,
+            "seed {seed}: the log holds {} records",
+            records.len()
+        );
+        assert_eq!(records[1].payload, second, "seed {seed}");
+    }
+}

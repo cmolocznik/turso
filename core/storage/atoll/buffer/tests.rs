@@ -361,3 +361,39 @@ fn a_failed_upgrade_leaves_the_holders_latch_alone() {
         IOResult::Done(_)
     ));
 }
+
+#[test]
+fn a_drain_chosen_before_its_batch_changed_class_leaves_the_new_class_alone() {
+    for b in backends() {
+        let (log, pool) = open(&b, MIN_BUDGET);
+        let mut model = Model {
+            io: &b.io,
+            log: &log,
+            pool: &pool,
+            pages: Vec::new(),
+        };
+        for _ in 0..8 {
+            model.allocate(class(2));
+        }
+        // Written back, so a wrong eviction drops them at once rather than writing them first.
+        for shard in 0..pool.shard_count() {
+            let mut pass = pool.pass(shard);
+            drive(&b.io, || pass.step(&pool)).unwrap();
+        }
+        let frame = |p: &Page| p.hint.load(Ordering::Relaxed) - 1;
+        let batch = frame(&model.pages[0]) / memory::GRAINS;
+        // A drain of the batch as class 0's, chosen before it went to class 2.
+        pool.drain(class(0), batch).unwrap();
+        for p in &model.pages {
+            assert_eq!(
+                pool.table.find(&pool.headers, p.pid.raw()),
+                Some(frame(p)),
+                "{}: {:?} left its frame",
+                b.name,
+                p.pid
+            );
+        }
+        assert_eq!(pool.memory.take(class(0)), None, "{}", b.name);
+        model.check_all();
+    }
+}

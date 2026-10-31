@@ -731,14 +731,7 @@ impl BufferPool {
         let mut dirty = Vec::new();
         for frame in candidates {
             let h = self.header(frame);
-            if h.status() != RESIDENT || h.has(WRITING) || h.tracker.value(now) > threshold {
-                continue;
-            }
-            if !h.latch.try_lock_exclusive() {
-                continue;
-            }
-            if h.status() != RESIDENT || h.has(WRITING) {
-                h.latch.unlock_exclusive();
+            if h.tracker.value(now) > threshold || !self.latch_to_evict(class, frame) {
                 continue;
             }
             if h.dirty() {
@@ -772,17 +765,10 @@ impl BufferPool {
         let mut dirty = Vec::new();
         for i in 0..memory::frames_per_batch(class) {
             let frame = memory::frame_at(class, batch, i);
-            if self.memory.is_free(class, frame) {
+            if self.memory.is_free(class, frame) || !self.latch_to_evict(class, frame) {
                 continue;
             }
             let h = self.header(frame);
-            if h.status() != RESIDENT || h.has(WRITING) || !h.latch.try_lock_exclusive() {
-                continue;
-            }
-            if h.status() != RESIDENT || h.has(WRITING) {
-                h.latch.unlock_exclusive();
-                continue;
-            }
             if let Some(to) = self.memory.take(class) {
                 self.relocate(class, frame, to);
             } else if !h.dirty() {
@@ -795,6 +781,22 @@ impl BufferPool {
         }
         self.write_back(class, dirty, true);
         Ok(())
+    }
+
+    /// Latches `frame` exclusively to move or evict its page: true if it holds a page of `class`
+    /// not being written. A frame chosen while its batch was `class`'s may by now be part of
+    /// another class's frame, holding a page of that class or none: moving or evicting that page
+    /// as `class`'s would give its memory to two pages.
+    fn latch_to_evict(&self, class: SizeClass, frame: u32) -> bool {
+        let h = self.header(frame);
+        if h.status() != RESIDENT || h.has(WRITING) || !h.latch.try_lock_exclusive() {
+            return false;
+        }
+        if h.status() != RESIDENT || h.has(WRITING) || PageId::from_raw(h.pid()).class() != class {
+            h.latch.unlock_exclusive_unchanged();
+            return false;
+        }
+        true
     }
 
     /// Moves the page in `from`, latched exclusively, to the free frame `to`. Hints to `from` go

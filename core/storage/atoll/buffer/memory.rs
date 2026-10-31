@@ -265,7 +265,8 @@ struct ClassBatches {
 struct Runs {
     free: [BTreeSet<u32>; ORDERS],
     /// A run being emptied for a class of a larger order: batches freed inside it wait here
-    /// until the whole run is free, so no other class takes them meanwhile.
+    /// until the whole run is free, and it then goes to that class, so no other class takes them
+    /// meanwhile.
     reserved: Option<Reserved>,
 }
 
@@ -273,6 +274,13 @@ struct Reserved {
     start: u32,
     order: usize,
     missing: u32,
+    class: SizeClass,
+}
+
+impl Reserved {
+    fn holds(&self, batch: u32) -> bool {
+        (self.start..self.start + (1 << self.order)).contains(&batch)
+    }
 }
 
 impl Runs {
@@ -302,18 +310,48 @@ impl Runs {
         Some(start)
     }
 
-    fn give(&mut self, mut start: u32, mut order: usize) {
+    /// Returns a run to the free lists, or to the reserved run if it lies in it or holds it.
+    /// Returns the reserved run's class and first batch once it is whole: it goes to that class,
+    /// not to the free lists.
+    fn give(&mut self, start: u32, order: usize) -> Option<(SizeClass, u32)> {
         if let Some(r) = &mut self.reserved {
-            let end = r.start + (1 << r.order);
-            if start >= r.start && start < end {
+            // Aligned runs either nest or do not meet.
+            if r.holds(start) && order <= r.order {
                 r.missing -= 1 << order;
                 if r.missing > 0 {
-                    return;
+                    return None;
                 }
-                (start, order) = (r.start, r.order);
-                self.reserved = None;
+                let r = self.reserved.take().expect("reserved");
+                return Some((r.class, r.start));
+            }
+            if order > r.order && (start..start + (1 << order)).contains(&r.start) {
+                let r = self.reserved.take().expect("reserved");
+                self.give_around(start, order, r.start, r.order);
+                return Some((r.class, r.start));
             }
         }
+        self.coalesce(start, order);
+        None
+    }
+
+    /// Frees the run at `start` of `order` but for the aligned run at `keep` of `keep_order`
+    /// inside it: the halves not holding `keep`, down to its order.
+    fn give_around(&mut self, mut start: u32, mut order: usize, keep: u32, keep_order: usize) {
+        while order > keep_order {
+            order -= 1;
+            let upper = start + (1 << order);
+            let (kept, other) = if keep >= upper {
+                (upper, start)
+            } else {
+                (start, upper)
+            };
+            // Its buddy is kept, so it merges with nothing.
+            self.free[order].insert(other);
+            start = kept;
+        }
+    }
+
+    fn coalesce(&mut self, mut start: u32, mut order: usize) {
         while order + 1 < ORDERS {
             let buddy = start ^ (1 << order);
             if !self.free[order].remove(&buddy) {
@@ -325,34 +363,41 @@ impl Runs {
         self.free[order].insert(start);
     }
 
-    /// Holds the aligned run of `order` around `batch` for whoever drains it: its free batches
-    /// leave the free lists, and the rest join it as they are freed. False while another run is
-    /// held.
-    fn reserve(&mut self, batch: u32, order: usize) -> Option<u32> {
+    /// Holds the aligned run of `class`'s order around `batch` for `class`: its free batches leave
+    /// the free lists, and the rest join it as they are freed. Returns its first batch, and
+    /// whether it is whole already; `None` while another run is held.
+    fn reserve(&mut self, batch: u32, class: SizeClass) -> Option<(u32, bool)> {
         if self.reserved.is_some() {
             return None;
         }
+        let order = order(class);
         let start = batch & !((1u32 << order) - 1);
         let end = start + (1 << order);
+        // A free run holding the whole of it.
+        for o in order..ORDERS {
+            let s = start & !((1u32 << o) - 1);
+            if self.free[o].remove(&s) {
+                self.give_around(s, o, start, order);
+                return Some((start, true));
+            }
+        }
         let mut free = 0;
-        for o in 0..ORDERS {
+        for o in 0..order {
             let inside: Vec<u32> = self.free[o].range(start..end).copied().collect();
             for s in inside {
                 self.free[o].remove(&s);
                 free += 1 << o;
             }
         }
-        let missing = (1 << order) - free;
-        if missing == 0 {
-            self.give(start, order);
-        } else {
-            self.reserved = Some(Reserved {
-                start,
-                order,
-                missing,
-            });
-        }
-        Some(start)
+        // Free runs coalesce, so a run wholly free is one run, found above.
+        debug_assert!(free < 1 << order);
+        self.reserved = Some(Reserved {
+            start,
+            order,
+            missing: (1 << order) - free,
+            class,
+        });
+        Some((start, false))
     }
 }
 
@@ -487,6 +532,7 @@ impl Memory {
         let (batch, i) = position(class, frame);
         let emptied = {
             let mut c = self.classes[class.index()].lock();
+            debug_assert!(self.owns(class, batch), "frame {frame} is not {class:?}'s");
             let word = &self.words(batch)[i as usize / 64];
             let before = word.fetch_or(1 << (i % 64), Ordering::Relaxed);
             debug_assert_eq!(before & (1 << (i % 64)), 0, "frame {frame} freed twice");
@@ -504,12 +550,21 @@ impl Memory {
         emptied
     }
 
-    /// Hands an emptied draining batch to the class it was drained for, or back to the free runs.
+    /// Whether `class` holds `batch`. Stable while the class's lock is held: a batch changes hands
+    /// only under the lock of the class giving it up, and goes to a class only when no class
+    /// holds it.
+    fn owns(&self, class: SizeClass, batch: u32) -> bool {
+        self.owner[batch as usize].load(Ordering::Acquire) == class.index() as u8 + 1
+    }
+
+    /// Hands an emptied draining batch to the run reserved around it, whatever class it was
+    /// drained for, or else to that class, or back to the free runs.
     fn release(&self, class: SizeClass, batch: u32) {
         let mut runs = self.runs.lock();
         let beneficiary = {
             let mut c = self.classes[class.index()].lock();
-            if self.draining[batch as usize].load(Ordering::Relaxed) == 0
+            if !self.owns(class, batch)
+                || self.draining[batch as usize].load(Ordering::Relaxed) == 0
                 || self.taken[batch as usize].load(Ordering::Relaxed) != 0
             {
                 return;
@@ -525,9 +580,14 @@ impl Memory {
             let b = self.beneficiary[batch as usize].swap(0, Ordering::Relaxed);
             SizeClass::new((b as usize).wrapping_sub(1)).filter(|b| order(*b) == order(class))
         };
-        match beneficiary {
+        let reserved = runs.reserved.as_ref().is_some_and(|r| r.holds(batch));
+        match beneficiary.filter(|_| !reserved) {
             Some(b) => self.assign(b, batch),
-            None => runs.give(batch, order(class)),
+            None => {
+                if let Some((to, start)) = runs.give(batch, order(class)) {
+                    self.assign(to, start);
+                }
+            }
         }
     }
 
@@ -535,21 +595,32 @@ impl Memory {
     /// batches are one batch long, which gets it once it is empty.
     pub fn drain_for(&self, class: SizeClass, batch: u32, beneficiary: SizeClass) -> bool {
         debug_assert_eq!(order(beneficiary), 0);
-        // The first class to ask keeps it.
-        let _ = self.beneficiary[batch as usize].compare_exchange(
-            0,
-            beneficiary.index() as u8 + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-        self.drain(class, batch)
+        self.start_drain(class, batch, Some(beneficiary))
     }
 
     /// Stops new frames being taken from `batch` of `class`; it leaves the class once every frame
-    /// in it is free. True if it was not draining already.
+    /// in it is free. True if it was not draining already. False, and nothing done, if `class`
+    /// no longer holds the batch: it was chosen before it left.
+    #[cfg(test)]
     pub fn drain(&self, class: SizeClass, batch: u32) -> bool {
+        self.start_drain(class, batch, None)
+    }
+
+    fn start_drain(&self, class: SizeClass, batch: u32, beneficiary: Option<SizeClass>) -> bool {
         let empty = {
             let mut c = self.classes[class.index()].lock();
+            if !self.owns(class, batch) {
+                return false;
+            }
+            if let Some(b) = beneficiary {
+                // The first class to ask keeps it.
+                let _ = self.beneficiary[batch as usize].compare_exchange(
+                    0,
+                    b.index() as u8 + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
             if self.draining[batch as usize].swap(1, Ordering::Relaxed) == 1 {
                 return false;
             }
@@ -562,19 +633,46 @@ impl Memory {
         true
     }
 
-    /// Holds the aligned run of `order(class)` batches around `batch` for `class`, and drains
-    /// every batch in it that a class holds. False while another run is held.
+    /// Holds the aligned run of `class`'s order around `batch` for `class`, and drains every
+    /// batch in it that a class holds: the run goes to `class` once it is free. False while
+    /// another run is held.
     pub fn drain_run(&self, class: SizeClass, batch: u32) -> bool {
-        let order = order(class);
-        let Some(start) = self.runs.lock().reserve(batch, order) else {
-            return false;
-        };
-        for b in start..start + (1 << order) {
-            let owner = self.owner[b as usize].load(Ordering::Acquire);
-            if owner != 0 && owner != CONTINUED {
-                let holder = SizeClass::new(owner as usize - 1).expect("a class");
-                self.drain(holder, b);
+        let mut empty = Vec::new();
+        {
+            let mut runs = self.runs.lock();
+            let Some((start, whole)) = runs.reserve(batch, class) else {
+                return false;
+            };
+            if whole {
+                self.assign(class, start);
+                return true;
             }
+            // Batches change hands only under the runs' lock, held here, so every run a class
+            // holds in the reserved one is drained, and none slips out to another class.
+            let mut heads = Vec::new();
+            for b in start..start + (1 << order(class)) {
+                let mut head = b;
+                while self.owner[head as usize].load(Ordering::Acquire) == CONTINUED {
+                    head -= 1;
+                }
+                if self.owner[head as usize].load(Ordering::Acquire) != 0 && !heads.contains(&head)
+                {
+                    heads.push(head);
+                }
+            }
+            for head in heads {
+                let owner = self.owner[head as usize].load(Ordering::Acquire);
+                let holder = SizeClass::new(owner as usize - 1).expect("a class");
+                let mut c = self.classes[holder.index()].lock();
+                self.draining[head as usize].store(1, Ordering::Relaxed);
+                c.partial.remove(&head);
+                if self.taken[head as usize].load(Ordering::Relaxed) == 0 {
+                    empty.push((holder, head));
+                }
+            }
+        }
+        for (holder, head) in empty {
+            self.release(holder, head);
         }
         true
     }
@@ -731,9 +829,77 @@ mod tests {
         );
         assert!(!m.grow(class(11)));
         m.put(class(9), frames[3]);
-        assert!(
-            m.grow(class(11)),
-            "the whole run is free once its last batch is"
+        assert_eq!(
+            m.held()[11],
+            4 * BATCH,
+            "the run goes to the class that reserved it once its last batch is free"
         );
+        assert!(m.take(class(11)).is_some());
+    }
+
+    #[test]
+    fn a_drain_of_a_batch_that_left_the_class_does_nothing() {
+        let m = Memory::new(8 * BATCH).unwrap();
+        assert!(m.grow(class(1)));
+        let frame = m.take(class(1)).unwrap();
+        let batch = frame / GRAINS;
+        // Chosen to be drained for class 2, the batch empties and goes to class 0 first.
+        assert!(m.drain_for(class(1), batch, class(0)));
+        assert!(m.put(class(1), frame));
+        assert!(
+            !m.drain_for(class(1), batch, class(2)),
+            "class 1 no longer holds the batch"
+        );
+        assert!(!m.drain(class(1), batch));
+        assert!(m.draining().is_empty());
+        for _ in 0..frames_per_batch(class(0)) {
+            assert_eq!(
+                m.take(class(0)).map(|f| f / GRAINS),
+                Some(batch),
+                "class 0 keeps every frame of it"
+            );
+        }
+        assert_eq!(m.held()[0], BATCH);
+        assert_eq!(m.held()[2], 0);
+    }
+
+    #[test]
+    fn a_reserved_run_takes_a_batch_drained_for_another_class() {
+        let m = Memory::new(5 * BATCH).unwrap();
+        let mut frames: Vec<u32> = (0..5)
+            .map(|_| {
+                assert!(m.grow(class(9)));
+                m.take(class(9)).unwrap()
+            })
+            .collect();
+        frames.sort_unstable();
+        // One batch is drained for class 0 before the run is reserved, and one after, by a
+        // drain chosen before.
+        assert!(m.drain_for(class(9), frames[0] / GRAINS, class(0)));
+        assert!(m.drain_run(class(11), frames[1] / GRAINS));
+        assert!(!m.drain_for(class(9), frames[2] / GRAINS, class(0)));
+        for &f in &frames[..4] {
+            m.put(class(9), f);
+        }
+        assert_eq!(m.held()[11], 4 * BATCH, "the reserved run is whole");
+        assert_eq!(m.held()[0], 0);
+    }
+
+    #[test]
+    fn a_run_reserved_inside_a_larger_run_gets_its_part_and_the_rest_is_free() {
+        // 5 batches: an 8 MiB frame takes the run of 4.
+        let m = Memory::new(5 * BATCH).unwrap();
+        assert!(m.grow(class(11)));
+        let big = m.take(class(11)).unwrap();
+        assert!(m.drain_run(class(10), big / GRAINS));
+        assert!(m.put(class(11), big));
+        assert_eq!(m.held()[11], 0);
+        assert_eq!(
+            m.held()[10],
+            2 * BATCH,
+            "the reserved half goes to class 10"
+        );
+        assert!(m.grow(class(10)), "the other half is free");
+        assert_eq!(m.held()[10], 4 * BATCH);
     }
 }

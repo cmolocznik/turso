@@ -304,7 +304,7 @@ Built in `core/storage/atoll/buffer`.
   - the link to the next frame in its hash chain;
   - WATT's timestamps.
 
-  That is 104 bytes per 4 KiB frame, 2.5%.
+  That is 96 bytes per 4 KiB frame, 2.3%.
 - **Cost of memory.** Untouched memory costs nothing: the region, the headers and the hash table
   take physical memory only when used.
 - **Minimum.** A pool is at least 10 MiB: one 8 MiB frame and one batch beside it.

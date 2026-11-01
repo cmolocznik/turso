@@ -495,7 +495,9 @@ impl BufferPool {
                         // landed. The write landing completes `c` and wakes the pool's waiters;
                         // a thread holding the writeback wakes them too if it leaves the write
                         // unsubmitted, waiting on its plan, and `c` then waits on nothing anyone
-                        // does. So the wait is the pool's, started before the look.
+                        // does; and a write-out whose writeback is not queued yet has none to
+                        // step, its queueing waking them. So the wait is the pool's, started
+                        // before the look.
                         let woken = self.released_wait();
                         if let Some(w) = self.drive_writebacks()? {
                             return Ok(IOResult::IO(IOCompletions(w)));
@@ -1358,7 +1360,9 @@ impl BufferPool {
         }
     }
 
-    /// Queues the writes of `outgoing`, pages of `class` leaving their frames.
+    /// Queues the writes of `outgoing`, pages of `class` leaving their frames, and wakes the
+    /// pool's waiters: a fix that found one of the pages leaving before this had no writeback to
+    /// step, and waits on the pool.
     fn write_out(&self, class: SizeClass, outgoing: Vec<Outgoing>) {
         let (temporary, logged): (Vec<Outgoing>, Vec<Outgoing>) =
             outgoing.into_iter().partition(|o| o.pid.is_temporary());
@@ -1368,6 +1372,7 @@ impl BufferPool {
                 self.writebacks.lock().push(Arc::new(Mutex::new(wb)));
             }
         }
+        self.signal_released();
     }
 
     /// Ends the write-out of `pid` from the frame `hold` holds, with the write of a copy holding

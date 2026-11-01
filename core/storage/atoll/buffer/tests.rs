@@ -999,6 +999,43 @@ fn a_class_holding_no_memory_drains_none_its_step_holds() {
     );
 }
 
+/// A fix that finds its page leaving its frame waits on the pool: only stepping the write-out's
+/// writeback submits the write. A drain marks its pages leaving before it queues their writeback,
+/// so a fix looking in between has nothing to step, and queueing the writeback wakes it.
+#[cfg(not(shuttle))]
+#[test]
+fn a_fix_that_finds_its_page_leaving_wakes_when_the_write_out_is_queued() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let (log, pool) = open_on(&io, "/db/leaving", MIN_BUDGET);
+    let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+    let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+    let (pid, frame) = (g.pid(), g.frame);
+    stamp(&mut g.page_mut(), pid, 1);
+    let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+    g.changed(lsn);
+    drop((g, admitted));
+    // As a drain does: the page marked leaving, then its writeback queued.
+    let latch = || FrameLatch {
+        frames: pool.frames.clone(),
+        frame,
+    };
+    let outgoing = pool.start_write_out(pool.latch_to_evict(class(0), frame, latch).unwrap());
+    let woken = match pool.fix_optimistic(pid, None).unwrap() {
+        IOResult::IO(IOCompletions(c)) => c,
+        IOResult::Done(_) => panic!("fixed a page leaving its frame"),
+    };
+    assert!(!woken.finished());
+    pool.write_out(class(0), vec![outgoing]);
+    assert!(
+        woken.finished(),
+        "the fix waits on a write-out queued after it looked, and nothing wakes it"
+    );
+    let g = named(&io, "fix once written out", || {
+        pool.fix_optimistic(pid, None)
+    });
+    assert_eq!(g.read(|p| stamped(p, pid)), Some(Some(1)));
+}
+
 /// A write that lands while another thread steps its writeback, after that step took the writes
 /// landed so far, is left for the next step. A waiter that found the writeback held when the
 /// write's own wakeup had already passed waits for the stepper: the stepper wakes it.

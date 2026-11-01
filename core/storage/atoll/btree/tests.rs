@@ -107,6 +107,18 @@ fn scan(tree: &Tree, run: &Runner<'_>, forward: bool) -> Vec<(Vec<u8>, Vec<u8>)>
 /// Checks the tree's structure, and that the pages allocated in the store are exactly those of
 /// its nodes and values: nothing leaked, nothing freed that is in use.
 fn check_whole(tree: &Tree, db: &Atoll, run: &Runner<'_>, label: &str) -> Stats {
+    check_reachable(tree, db, run, label, false)
+}
+
+/// [`check_whole`], but for pages handed over to be freed and not freed yet: with `handed_over`,
+/// those are allocated and unreachable, and every page allocated and unreachable is one of them.
+fn check_reachable(
+    tree: &Tree,
+    db: &Atoll,
+    run: &Runner<'_>,
+    label: &str,
+    handed_over: bool,
+) -> Stats {
     let mut check = Check::default();
     let stats = run_to(run, || tree.check(&mut check));
     let mut expected: BTreeSet<PageId> = stats.pages.iter().copied().collect();
@@ -131,6 +143,10 @@ fn check_whole(tree: &Tree, db: &Atoll, run: &Runner<'_>, label: &str) -> Stats 
             }
             number += 1;
         }
+    }
+    let orphans: BTreeSet<PageId> = db.store().orphans().into_iter().collect();
+    if handed_over {
+        expected.extend(&orphans);
     }
     let leaked: Vec<_> = allocated.difference(&expected).collect();
     let lost: Vec<_> = expected.difference(&allocated).collect();
@@ -916,7 +932,8 @@ fn concurrent_tree(seed: u64, ops: u64) {
         "the tree differs from what the writers wrote"
     );
     // A merge whose free of the node it emptied had to wait hands the node to the checkpointer,
-    // which frees it on its next step.
+    // which frees it on its next step: until then those are the only pages unreachable.
+    check_reachable(&tree, &db, &run, "schedules, before the checkpointer", true);
     run(&mut || db.checkpointer().step());
     check_whole(&tree, &db, &run, "schedules");
 }

@@ -129,6 +129,8 @@ pub enum Outcome {
     Updated,
     /// An insert found the key present, or an update found it absent; nothing changed.
     Unchanged,
+    /// The entry was not the one the put expected ([`Put::expecting`]); nothing changed.
+    Changed,
 }
 
 impl Tree {
@@ -286,18 +288,32 @@ impl Tree {
         nodes: &[Record<'_>],
         store: &[StoreRecord],
     ) -> Vec<Lsn> {
+        self.log_as(grant, None, nodes, store)
+    }
+
+    /// As [`log_batch`](Self::log_batch), with the first node record in transaction `txn`: its
+    /// id, and its previous record.
+    fn log_as(
+        &self,
+        grant: &mut Grant,
+        txn: Option<(u64, Lsn)>,
+        nodes: &[Record<'_>],
+        store: &[StoreRecord],
+    ) -> Vec<Lsn> {
         let Some(admitted) = &mut grant.0 else {
             return nodes.iter().map(|_| self.pool.temporary_lsn()).collect();
         };
         let mut payloads: Vec<(Header, Vec<u8>)> = nodes
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(i, r)| {
+                let (txn, prev) = txn.filter(|_| i == 0).unwrap_or((0, 0));
                 (
                     Header {
                         kind: r.kind(),
                         flags: 0,
-                        txn: 0,
-                        prev: 0,
+                        txn,
+                        prev,
                     },
                     r.encode(),
                 )
@@ -513,7 +529,14 @@ impl Tree {
             }
             let adopt = op.write.as_ref().map(|w| w.pages()).unwrap_or_default();
             let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
-            let len = framed_len(8 + 3 + op.key.len() + stored.len())
+            // A transaction's change names the tree, and an update of one the value's length and
+            // the value it replaces.
+            let undo = match (&op.txn, &present) {
+                (Some(_), Some((old, _))) => 8 + 4 + old.len(),
+                (Some(_), None) => 8,
+                (None, _) => 0,
+            };
+            let len = framed_len(8 + 3 + op.key.len() + stored.len() + undo)
                 + store_len(&adopt)
                 + store_len(&abandon);
             if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
@@ -551,18 +574,24 @@ impl Tree {
                 continue;
             }
             let pid = ex.pid();
-            let change = if exact {
-                Change::Update {
+            if op.expected.as_ref().is_some_and(|e| *e != now) {
+                drop(ex);
+                return Ok(IOResult::Done(Outcome::Changed));
+            }
+            let in_txn = op.txn.is_some();
+            let change = match &now {
+                Some((old, _)) => Change::Update {
                     key: &op.key,
                     value: &stored,
                     out_of_line,
-                }
-            } else {
-                Change::Insert {
+                    undo: in_txn.then_some((self.root, old.as_slice())),
+                },
+                None => Change::Insert {
                     key: &op.key,
                     value: &stored,
                     out_of_line,
-                }
+                    undo: in_txn.then_some(self.root),
+                },
             };
             let record = Record { pid, change };
             record.apply(ex.page_mut())?;
@@ -574,7 +603,7 @@ impl Tree {
                 store.push(StoreRecord::Abandon { pids: abandon });
             }
             let (mut admitted, _) = op.admitted.take().expect("admitted");
-            let lsns = self.log_batch(&mut admitted, &[record], &store);
+            let lsns = self.log_as(&mut admitted, op.txn, &[record], &store);
             ex.changed(lsns[0]);
             op.lsn = lsns[0];
             drop(ex);
@@ -1433,6 +1462,11 @@ pub struct Put {
     old: Option<(Vec<u8>, Vec<PageId>)>,
     admitted: Option<(Grant, u64)>,
     lsn: Lsn,
+    /// The entry the put expects to replace: its stored value and whether out of line, or `None`
+    /// for an absent key.
+    expected: Option<Option<(Vec<u8>, bool)>>,
+    /// The transaction the change belongs to: its id and previous record.
+    txn: Option<(u64, Lsn)>,
 }
 
 impl Put {
@@ -1452,7 +1486,25 @@ impl Put {
             old: None,
             admitted: None,
             lsn: 0,
+            expected: None,
+            txn: None,
         }
+    }
+
+    /// Changes nothing, and reports [`Outcome::Changed`], unless the entry is `stored`, as
+    /// [`Tree::stored`] read it, or absent for `None`.
+    pub fn expecting(mut self, stored: Option<&Stored>) -> Self {
+        self.expected = Some(stored.map(|s| match &s.value {
+            StoredValue::Inline(v) => ([s.head.as_slice(), v].concat(), false),
+            StoredValue::OutOfLine(r) => ([s.head.as_slice(), &r.encode()].concat(), true),
+        }));
+        self
+    }
+
+    /// Logs the change as transaction `txn`'s, after its record at `prev`, with what undoes it.
+    pub fn in_transaction(mut self, txn: u64, prev: Lsn) -> Self {
+        self.txn = Some((txn, prev));
+        self
     }
 
     /// Where the change's record ends, once made; 0 if nothing changed. The change is durable

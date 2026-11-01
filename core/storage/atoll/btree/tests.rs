@@ -716,3 +716,88 @@ fn a_log_ending_at_any_record_of_a_structure_change_recovers_a_whole_tree() {
         check_whole(&tree, &db, &run, &format!("the log cut at {at}"));
     }
 }
+
+#[test]
+fn a_put_expecting_an_entry_changes_nothing_when_the_entry_differs() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, MIN_BUDGET, 1);
+    let run = drive_runner(&io);
+    let tree = create(&io, &db, &run, false).with_head(4);
+    let put = |value: &[u8], expected: Option<&Stored>| {
+        let mut op =
+            Put::with_head(b"k", vec![1; 4], value.to_vec(), Mode::Upsert).expecting(expected);
+        run_to(&run, || tree.put(&mut op))
+    };
+    let stored = |run: &Runner<'_>| run_to(run, || tree.stored(b"k"));
+    assert_eq!(put(b"one", None), Outcome::Inserted);
+    let first = stored(&run).unwrap();
+    assert_eq!(put(b"two", None), Outcome::Changed, "expected absent");
+    assert_eq!(put(b"two", Some(&first)), Outcome::Updated);
+    assert_eq!(
+        put(b"three", Some(&first)),
+        Outcome::Changed,
+        "expected stale"
+    );
+    assert_eq!(
+        get(&tree, &run, b"k"),
+        Some([&[1u8; 4][..], b"two"].concat())
+    );
+}
+
+#[test]
+fn a_transactions_changes_name_it_and_its_tree_and_carry_what_undoes_them() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let root = {
+        let db = open(&io, MIN_BUDGET, 1);
+        let run = drive_runner(&io);
+        let tree = create(&io, &db, &run, false);
+        let mut first = Put::new(b"k", b"one".to_vec(), Mode::Insert).in_transaction(42, 7);
+        assert_eq!(run_to(&run, || tree.put(&mut first)), Outcome::Inserted);
+        let mut second =
+            Put::new(b"k", b"two".to_vec(), Mode::Update).in_transaction(42, first.lsn());
+        assert_eq!(run_to(&run, || tree.put(&mut second)), Outcome::Updated);
+        let mut plain = Put::new(b"p", b"x".to_vec(), Mode::Insert);
+        run_to(&run, || tree.put(&mut plain));
+        drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
+        let mut reader = Log::reader(io.clone(), BASE, &config(0).log, 0);
+        let mut seen = Vec::new();
+        while reader.position() < plain.lsn() {
+            let Some(r) = reader.next_record().unwrap() else {
+                break;
+            };
+            let Some(rec) = Record::decode(r.header.kind, &r.payload).unwrap() else {
+                continue;
+            };
+            match rec.change {
+                Change::Insert { key, undo, .. } if key == b"k" => {
+                    seen.push((r.header.kind, r.header.txn, r.header.prev, r.lsn));
+                    assert_eq!(undo, Some(tree.root()));
+                }
+                Change::Update { key, undo, .. } if key == b"k" => {
+                    seen.push((r.header.kind, r.header.txn, r.header.prev, r.lsn));
+                    assert_eq!(undo, Some((tree.root(), &b"one"[..])));
+                }
+                Change::Insert { key, undo, .. } if key == b"p" => {
+                    assert_eq!(
+                        (r.header.kind, r.header.txn, undo),
+                        (record::INSERT, 0, None)
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (record::TXN_INSERT, 42, 7, first.lsn()),
+                (record::TXN_UPDATE, 42, first.lsn(), second.lsn()),
+            ]
+        );
+        tree.root()
+    };
+    // Replayed like any other change.
+    let db = open(&io, MIN_BUDGET, 1);
+    let run = drive_runner(&io);
+    let tree = tree_of(&io, &db, root);
+    assert_eq!(get(&tree, &run, b"k"), Some(b"two".to_vec()));
+}

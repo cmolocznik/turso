@@ -10,7 +10,13 @@
 //!                                             up to `sep`
 //! branch: pid | left: u64 | right: u64 | sep  a parent taking a split: `sep` routes to `left`,
 //!                                             and the child after it, which was `left`, is `right`
+//! txn insert: pid | root: u64 | out: u8 | key_len: u16 | key | value
+//! txn update: pid | root: u64 | out: u8 | key_len: u16 | key | value_len: u32 | value | old
 //! ```
+//!
+//! A transaction's insert and update also name the tree, by its root, and an update carries the
+//! value it replaces: what undoes them, by tree and key, after splits and merges (DESIGN.md §7.1).
+//! Their header names the transaction and chains to its previous record.
 //!
 //! A change to several nodes is a group of these ([`super::super::log::Log::append_group`]).
 
@@ -25,9 +31,11 @@ pub const REMOVE: Kind = Kind::new(12).unwrap();
 pub const UPDATE: Kind = Kind::new(13).unwrap();
 pub const SPLIT: Kind = Kind::new(14).unwrap();
 pub const BRANCH: Kind = Kind::new(15).unwrap();
+pub const TXN_INSERT: Kind = Kind::new(17).unwrap();
+pub const TXN_UPDATE: Kind = Kind::new(18).unwrap();
 
 pub fn owns(kind: Kind) -> bool {
-    (INIT.get()..=BRANCH.get()).contains(&kind.get())
+    (INIT.get()..=BRANCH.get()).contains(&kind.get()) || kind == TXN_INSERT || kind == TXN_UPDATE
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +47,8 @@ pub enum Change<'a> {
         key: &'a [u8],
         value: &'a [u8],
         out_of_line: bool,
+        /// For a transaction's insert: the tree's root.
+        undo: Option<PageId>,
     },
     Remove {
         key: &'a [u8],
@@ -47,6 +57,8 @@ pub enum Change<'a> {
         key: &'a [u8],
         value: &'a [u8],
         out_of_line: bool,
+        /// For a transaction's update: the tree's root, and the value it replaces.
+        undo: Option<(PageId, &'a [u8])>,
     },
     Split {
         right: PageId,
@@ -74,9 +86,11 @@ impl<'a> Record<'a> {
     pub fn kind(&self) -> Kind {
         match self.change {
             Change::Init { .. } => INIT,
-            Change::Insert { .. } => INSERT,
+            Change::Insert { undo: None, .. } => INSERT,
+            Change::Insert { undo: Some(_), .. } => TXN_INSERT,
             Change::Remove { .. } => REMOVE,
-            Change::Update { .. } => UPDATE,
+            Change::Update { undo: None, .. } => UPDATE,
+            Change::Update { undo: Some(_), .. } => TXN_UPDATE,
             Change::Split { .. } => SPLIT,
             Change::Branch { .. } => BRANCH,
         }
@@ -90,16 +104,35 @@ impl<'a> Record<'a> {
                 key,
                 value,
                 out_of_line,
-            }
-            | Change::Update {
-                key,
-                value,
-                out_of_line,
+                undo,
             } => {
+                if let Some(root) = undo {
+                    out.extend(root.raw().to_le_bytes());
+                }
                 out.push(*out_of_line as u8);
                 out.extend((key.len() as u16).to_le_bytes());
                 out.extend_from_slice(key);
                 out.extend_from_slice(value);
+            }
+            Change::Update {
+                key,
+                value,
+                out_of_line,
+                undo,
+            } => {
+                if let Some((root, _)) = undo {
+                    out.extend(root.raw().to_le_bytes());
+                }
+                out.push(*out_of_line as u8);
+                out.extend((key.len() as u16).to_le_bytes());
+                out.extend_from_slice(key);
+                if let Some((_, old)) = undo {
+                    out.extend((value.len() as u32).to_le_bytes());
+                    out.extend_from_slice(value);
+                    out.extend_from_slice(old);
+                } else {
+                    out.extend_from_slice(value);
+                }
             }
             Change::Remove { key } => out.extend_from_slice(key),
             Change::Split { right, keep, sep } => {
@@ -133,7 +166,13 @@ impl<'a> Record<'a> {
             ))
         };
         let pid = PageId::from_raw(word(0)?);
-        let rest = &payload[8..];
+        let txn = kind == TXN_INSERT || kind == TXN_UPDATE;
+        let root = if txn {
+            Some(PageId::from_raw(word(8)?))
+        } else {
+            None
+        };
+        let rest = &payload[if txn { 16 } else { 8 }..];
         let keyed = || -> Result<(&'a [u8], &'a [u8], bool)> {
             let out_of_line = match rest.first() {
                 Some(0) => false,
@@ -147,12 +186,13 @@ impl<'a> Record<'a> {
         };
         let change = match kind {
             k if k == INIT => Change::Init { image: rest },
-            k if k == INSERT => {
+            k if k == INSERT || k == TXN_INSERT => {
                 let (key, value, out_of_line) = keyed()?;
                 Change::Insert {
                     key,
                     value,
                     out_of_line,
+                    undo: root,
                 }
             }
             k if k == UPDATE => {
@@ -161,6 +201,18 @@ impl<'a> Record<'a> {
                     key,
                     value,
                     out_of_line,
+                    undo: None,
+                }
+            }
+            k if k == TXN_UPDATE => {
+                let (key, rest, out_of_line) = keyed()?;
+                let len =
+                    u32::from_le_bytes(rest.get(..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
+                Change::Update {
+                    key,
+                    value: rest.get(4..4 + len).ok_or_else(bad)?,
+                    out_of_line,
+                    undo: Some((root.expect("a root"), &rest[4 + len..])),
                 }
             }
             k if k == REMOVE => Change::Remove { key: rest },
@@ -188,6 +240,7 @@ impl<'a> Record<'a> {
                 key,
                 value,
                 out_of_line,
+                ..
             } => {
                 let v = View::new(page);
                 match v.search(key) {
@@ -212,6 +265,7 @@ impl<'a> Record<'a> {
                 key,
                 value,
                 out_of_line,
+                ..
             } => match View::new(page).search(key) {
                 Some((pos, true)) if node::set_value(page, pos, value, *out_of_line) => Ok(()),
                 _ => Err(corrupt("update")),

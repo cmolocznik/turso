@@ -119,6 +119,12 @@ impl Epochs {
         self.global.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// The global epoch now: at or above the announcement of any step the calling thread is in,
+    /// the epoch only rising.
+    pub fn current(&self) -> u64 {
+        self.global.load(Ordering::SeqCst)
+    }
+
     /// The global epoch and every announcement of a thread in a step, for a test that stalled
     /// to show.
     #[cfg(test)]

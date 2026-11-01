@@ -965,6 +965,40 @@ fn a_frame_is_read_into_only_once_every_grain_it_spans_is_quiet() {
     }
 }
 
+/// A step holding a page of one class, as an operation holds the parent it reads a child through,
+/// needs memory for a class that holds none, while every batch holds pages read this epoch.
+/// Draining the held page's batch would only send that page's next fix to drain the memory back,
+/// round after round: the class takes a batch no step under way holds, and the held page stays.
+#[cfg(not(shuttle))]
+#[test]
+fn a_class_holding_no_memory_drains_none_its_step_holds() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let (_log, pool) = open_on(&io, "/db/held", MIN_BUDGET);
+    let parent = drive(&io, || pool.allocate(class(0))).unwrap().pid();
+    // Of the other four 2 MiB batches, two to a 4 MiB page and two to four 1 MiB pages, each
+    // read this epoch.
+    drop(drive(&io, || pool.allocate(class(10))).unwrap());
+    let mut small: Vec<PageId> = (0..4)
+        .map(|_| drive(&io, || pool.allocate(class(8))).unwrap().pid())
+        .collect();
+    assert!(!pool.memory.has_free_run(class(8)), "the pool is full");
+    // A free moves the epoch past the steps that read them, as frees and evictions do in a pool
+    // at work.
+    let freed = small.pop().unwrap();
+    drive(&io, || match pool.fix_exclusive(freed, None)? {
+        IOResult::Done(page) => pool.free(page),
+        IOResult::IO(io) => Ok(IOResult::IO(io)),
+    })
+    .unwrap();
+    let held = drive(&io, || pool.fix_optimistic(parent, None)).unwrap();
+    let child = drive(&io, || pool.allocate(class(9))).unwrap();
+    assert!(
+        held.validate(),
+        "the memory for {:?} came from the page its step holds",
+        child.pid()
+    );
+}
+
 /// A write that lands while another thread steps its writeback, after that step took the writes
 /// landed so far, is left for the next step. A waiter that found the writeback held when the
 /// write's own wakeup had already passed waits for the stepper: the stepper wakes it.

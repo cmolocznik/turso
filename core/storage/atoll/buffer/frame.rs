@@ -44,6 +44,9 @@ pub struct FrameHeader {
     pub status: AtomicU8,
     pub flags: AtomicU8,
     pub tracker: Tracker,
+    /// The global epoch when a step last fixed the page, the highest any did: a page marked at
+    /// or above the epochs' horizon may be held by a step under way.
+    pub held: AtomicU64,
 }
 
 // SAFETY: every field is atomics, valid as zeros: an unlocked latch at version 0, a FREE frame.
@@ -69,4 +72,4 @@ impl FrameHeader {
 
 // Shuttle's atomics are larger than the hardware's.
 #[cfg(not(shuttle))]
-const _: () = assert!(std::mem::size_of::<FrameHeader>() == 96);
+const _: () = assert!(std::mem::size_of::<FrameHeader>() == 104);

@@ -362,9 +362,10 @@ Built in `core/storage/atoll/buffer`.
     record the log's end before writing a shard (section 10);
   - writeback flags;
   - the link to the next frame in its hash chain;
-  - WATT's timestamps.
+  - WATT's timestamps;
+  - the global epoch of the last step to fix the page.
 
-  That is 96 bytes per 4 KiB frame, 2.3%.
+  That is 104 bytes per 4 KiB frame, 2.5%.
 - **Cost of memory.** Untouched memory costs nothing: the region, the headers and the hash table
   take physical memory only when used.
 - **Minimum.** A pool is at least 10 MiB: one 8 MiB frame and one batch beside it.
@@ -425,10 +426,15 @@ batch of another class: of each class with a batch that can go to it (for 4 and 
 whose aligned run lies inside the region), the emptiest such batch, valued by the pages draining it
 evicts, per byte it frees. A page read in the current epoch is in use, whatever its value: a page
 read in again starts with no history and looks the coldest, and one operation needing it and a page
-of another class would each evict the other for good. A class holding memory drains a batch only if
-no page in it is in use and it gives up less per byte than evicting its own; a class holding none
-takes the batch with the fewest pages in use, then the least value. Sampling and the choice skip
-batches already draining. Value per byte is
+of another class would each evict the other for good. So is a page a step under way may hold: a fix
+marks the page with the global epoch (CONCURRENCY.md §4), at or above its step's announcement, so a
+page marked at or above the horizon may be held. A class holding memory drains a batch only if no
+page in it is in use and it gives up less per byte than evicting its own. A class holding none must
+drain some batch, perhaps one in use: it takes the batch with the fewest pages a step may hold, then
+the fewest in use, then the least value. Draining a page the requesting step holds, the other page
+of its operation, would only send that page's next fix to drain the memory back. Steps that ended
+since the global epoch last rose look under way too, so the mark errs toward keeping a page.
+Sampling and the choice skip batches already draining. Value per byte is
 GreedyDual-Size's rule with every miss costing the same (Cao and Irani, 1997). A class of 4 or
 8 MiB pages reserves an aligned run, and the batches in it drain into it as they empty. One drain is
 in progress at a time.

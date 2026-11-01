@@ -519,6 +519,7 @@ impl BufferPool {
                     }
                 }
                 self.header(frame).tracker.read(self.now());
+                self.mark_held(frame);
                 return Ok(IOResult::Done(Some(Fixed {
                     frame,
                     version,
@@ -623,6 +624,7 @@ impl BufferPool {
         h.flags.store(0, Ordering::Release);
         h.tracker.clear();
         h.tracker.read(self.now());
+        self.mark_held(frame);
         h.status.store(LOADING, Ordering::Release);
         let loaded = Completion::new_wait();
         self.transits_of(frame).lock().insert(frame, loaded.clone());
@@ -722,6 +724,17 @@ impl BufferPool {
         self.signal_released();
     }
 
+    /// Marks the page in `frame` held by the step under way, with the global epoch now: at or above
+    /// the step's announcement, so at or above the horizon while the step lasts. The mark only
+    /// rises, so a step that entered earlier does not lower a later one's.
+    fn mark_held(&self, frame: u32) {
+        let now = self.store.epochs().current();
+        let held = &self.header(frame).held;
+        if held.load(Ordering::Relaxed) < now {
+            held.fetch_max(now, Ordering::Relaxed);
+        }
+    }
+
     /// Whether no step that could still read what `frame`'s memory held before is left, given
     /// the epochs' `horizon`: then an IO may read a page into it. A page written through the
     /// frame's writer needs no such wait, its stores being atomic.
@@ -815,6 +828,7 @@ impl BufferPool {
         h.written_lsn.store(0, Ordering::Release);
         h.tracker.clear();
         h.tracker.read(self.now());
+        self.mark_held(frame);
         h.status.store(RESIDENT, Ordering::Release);
         // A number is handed out again only once every step that could hold its last page is
         // gone (`epoch`), and the page left the table within its freer's step.
@@ -1125,7 +1139,11 @@ impl BufferPool {
         // read this epoch is in use, whatever its value says: a page read in again starts with
         // no history, so it looks the coldest, and one operation needing it and a page of another
         // class would evict each for the other forever. A class with memory of its own drains
-        // none in use; one with none takes the batch with the fewest in use, then the cheapest.
+        // none in use. One with none must drain some batch, all of them perhaps in use: it takes
+        // the batch with the fewest pages a step under way may hold, then the fewest in use, then
+        // the cheapest. Draining a page the requesting step itself holds, as its operation's
+        // other page, would only send that page's next fix to drain the memory back.
+        let horizon = self.store.epochs().horizon();
         let own = self
             .threshold(class)
             .map_or(f32::INFINITY, |t| t / class.size() as f32);
@@ -1136,12 +1154,12 @@ impl BufferPool {
             .filter(|&c| c != class)
             .filter_map(|c| {
                 let batch = self.memory.emptiest(c, class)?;
-                let (in_use, per_byte) = self.drain_cost(class, batch);
-                Some((c, batch, in_use, per_byte))
+                let (held, in_use, per_byte) = self.drain_cost(class, batch, horizon);
+                Some((c, batch, held, in_use, per_byte))
             })
-            .min_by(|a, b| a.2.cmp(&b.2).then(a.3.total_cmp(&b.3)));
+            .min_by(|a, b| a.2.cmp(&b.2).then(a.3.cmp(&b.3)).then(a.4.total_cmp(&b.4)));
         match colder {
-            Some((holder, batch, in_use, per_byte))
+            Some((holder, batch, _, in_use, per_byte))
                 if own == f32::INFINITY || (in_use == 0 && per_byte < own) =>
             {
                 let started = if class.size() <= memory::BATCH {
@@ -1160,29 +1178,37 @@ impl BufferPool {
         }
     }
 
-    /// What draining the memory around `batch` for `class` gives up: how many of its pages are
-    /// in use, read this epoch or being read in or claimed for a new page; and per byte it frees,
-    /// the value of every page in it. A page being written out is leaving anyway.
-    fn drain_cost(&self, class: SizeClass, batch: u32) -> (usize, f32) {
+    /// What draining the memory around `batch` for `class` gives up: how many of its pages a step
+    /// under way may hold, marked at or above the epochs' `horizon` or being read in or claimed
+    /// for a new page; how many are in use, those and the pages read this epoch; and per byte it
+    /// frees, the value of every page in it. A page being written out is leaving anyway.
+    fn drain_cost(&self, class: SizeClass, batch: u32, horizon: u64) -> (usize, usize, f32) {
         let count = 1u32 << memory::order(class);
         let start = batch & !(count - 1);
         let now = self.now();
-        let (mut in_use, mut value) = (0, 0.0);
+        let (mut held, mut in_use, mut value) = (0, 0, 0.0);
         for frame in self.memory.taken_in(start, count) {
             let h = self.header(frame);
             match h.status() {
                 RESIDENT => {
-                    in_use += (h.tracker.last() >= now) as usize;
+                    let marked = h.held.load(Ordering::Relaxed) >= horizon;
+                    held += marked as usize;
+                    in_use += (marked || h.tracker.last() >= now) as usize;
                     value += h.tracker.value(now);
                 }
                 OUTGOING => {}
                 _ => {
+                    held += 1;
                     in_use += 1;
                     value = f32::INFINITY;
                 }
             }
         }
-        (in_use, value / (count as usize * memory::BATCH) as f32)
+        (
+            held,
+            in_use,
+            value / (count as usize * memory::BATCH) as f32,
+        )
     }
 
     /// The least value among a sample of `class`'s frames: free frames are worth nothing.

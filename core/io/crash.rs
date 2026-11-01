@@ -54,11 +54,26 @@ struct State {
     in_flight: Vec<Op>,
     rng: Rng,
     faults: Faults,
+    /// The path faults apply to; every path if `None`.
+    faults_on: Option<String>,
     capacity: Option<u64>,
     next_seq: u64,
     durable_writes: bool,
     /// Every write completed, per path: where and how long, in completion order.
     writes: BTreeMap<String, Vec<(u64, usize)>>,
+    /// Operations completed.
+    completed: u64,
+    captures: Option<Captures>,
+}
+
+/// Crash images taken while operations complete, armed by [`CrashIO::capture`].
+struct Captures {
+    /// One just before each write to a path this accepts completes.
+    before_writes_to: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    /// And one as every `every`th operation completes.
+    every: u64,
+    seed: u64,
+    images: Vec<CrashIO>,
 }
 
 struct Entry {
@@ -150,16 +165,24 @@ impl CrashIO {
                 in_flight: Vec::new(),
                 rng: Rng(seed),
                 faults: Faults::default(),
+                faults_on: None,
                 capacity: None,
                 next_seq: 0,
                 durable_writes: true,
                 writes: BTreeMap::new(),
+                completed: 0,
+                captures: None,
             })),
         }
     }
 
     pub fn set_faults(&self, faults: Faults) {
         self.state.lock().faults = faults;
+    }
+
+    /// Makes faults apply to operations on `path` alone, or on every path with `None`.
+    pub fn set_faults_on(&self, path: Option<&str>) {
+        self.state.lock().faults_on = path.map(str::to_string);
     }
 
     /// Total bytes the files may hold; writes past it fail with no space.
@@ -187,46 +210,84 @@ impl CrashIO {
         self.state.lock().in_flight.len()
     }
 
+    /// Operations completed so far.
+    pub fn completed(&self) -> u64 {
+        self.state.lock().completed
+    }
+
+    /// From now on, takes what a crash could leave just before each write to a path
+    /// `before_writes_to` accepts completes, and as every `every`th operation completes, each
+    /// chosen by a seed drawn from `seed`: crashes in the middle of whatever runs on this IO, such
+    /// as a recovery.
+    pub fn capture(
+        &self,
+        before_writes_to: impl Fn(&str) -> bool + Send + Sync + 'static,
+        every: u64,
+        seed: u64,
+    ) {
+        self.state.lock().captures = Some(Captures {
+            before_writes_to: Box::new(before_writes_to),
+            every: every.max(1),
+            seed,
+            images: Vec::new(),
+        });
+    }
+
+    /// The images taken since [`capture`](Self::capture), which stops taking them.
+    pub fn captured(&self) -> Vec<CrashIO> {
+        self.state
+            .lock()
+            .captures
+            .take()
+            .map_or_else(Vec::new, |c| c.images)
+    }
+
     /// What a crash now could leave on disk, chosen by `seed`, as a fresh IO holding only that.
     /// This IO carries on unchanged.
     pub fn crash(&self, seed: u64) -> CrashIO {
-        let state = self.state.lock();
-        let mut rng = Rng(seed);
-        let mut paths = BTreeMap::new();
-        for (path, entry) in &state.paths {
-            let on_disk = if entry.durable {
-                // Removed since the directory was last synced: the removal may not have stuck.
-                entry.exists || rng.coin()
-            } else {
-                entry.exists && rng.coin()
-            };
-            if !on_disk {
-                continue;
-            }
-            let data = entry.data.lock();
-            let in_flight = state
-                .in_flight
-                .iter()
-                .filter(|op| Arc::ptr_eq(&op.file, &entry.data));
-            let image = survivor(&data, in_flight, &mut rng);
-            paths.insert(
-                path.clone(),
-                Entry {
-                    data: Arc::new(Mutex::new(FileData {
-                        volatile: image.clone(),
-                        durable: image,
-                        unsynced: Vec::new(),
-                    })),
-                    exists: true,
-                    durable: true,
-                },
-            );
-        }
-        let crashed = CrashIO::with_paths(paths, rng.next());
-        crashed.state.lock().durable_writes = state.durable_writes;
-        crashed
+        image(&self.state.lock(), seed)
     }
+}
 
+/// What a crash in `state` could leave on disk, chosen by `seed`.
+fn image(state: &State, seed: u64) -> CrashIO {
+    let mut rng = Rng(seed);
+    let mut paths = BTreeMap::new();
+    for (path, entry) in &state.paths {
+        let on_disk = if entry.durable {
+            // Removed since the directory was last synced: the removal may not have stuck.
+            entry.exists || rng.coin()
+        } else {
+            entry.exists && rng.coin()
+        };
+        if !on_disk {
+            continue;
+        }
+        let data = entry.data.lock();
+        let in_flight = state
+            .in_flight
+            .iter()
+            .filter(|op| Arc::ptr_eq(&op.file, &entry.data));
+        let image = survivor(&data, in_flight, &mut rng);
+        paths.insert(
+            path.clone(),
+            Entry {
+                data: Arc::new(Mutex::new(FileData {
+                    volatile: image.clone(),
+                    durable: image,
+                    unsynced: Vec::new(),
+                })),
+                exists: true,
+                durable: true,
+            },
+        );
+    }
+    let crashed = CrashIO::with_paths(paths, rng.next());
+    crashed.state.lock().durable_writes = state.durable_writes;
+    crashed
+}
+
+impl CrashIO {
     /// Completes one operation in flight, chosen at random. Callbacks run with no lock held.
     fn complete_one(&self) {
         let (op, outcome) = {
@@ -236,8 +297,24 @@ impl CrashIO {
             }
             let count = state.in_flight.len();
             let at = state.rng.below(count);
+            let before = state.captures.as_ref().is_some_and(|c| {
+                let op = &state.in_flight[at];
+                matches!(op.kind, OpKind::Write { .. }) && (c.before_writes_to)(&op.path)
+            });
+            if before {
+                state.capture();
+            }
             let op = state.in_flight.swap_remove(at);
             let outcome = state.apply(&op);
+            state.completed += 1;
+            let completed = state.completed;
+            if state
+                .captures
+                .as_ref()
+                .is_some_and(|c| completed % c.every == 0)
+            {
+                state.capture();
+            }
             (op, outcome)
         };
         match outcome {
@@ -271,6 +348,16 @@ impl CrashIO {
 }
 
 impl State {
+    /// Takes a crash image into the armed captures.
+    fn capture(&mut self) {
+        let Some(c) = &self.captures else { return };
+        let seed = c.seed ^ self.completed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let crashed = image(self, seed);
+        if let Some(c) = &mut self.captures {
+            c.images.push(crashed);
+        }
+    }
+
     fn seq(&mut self) -> u64 {
         self.next_seq += 1;
         self.next_seq - 1
@@ -286,7 +373,10 @@ impl State {
 
     /// Carries out `op`; its result is what its completion reports.
     fn apply(&mut self, op: &Op) -> std::result::Result<i32, CompletionError> {
-        let faults = self.faults;
+        let faults = match &self.faults_on {
+            Some(path) if *path != op.path => Faults::default(),
+            _ => self.faults,
+        };
         match &op.kind {
             OpKind::Read { pos } => {
                 if self.rng.chance(faults.read) {

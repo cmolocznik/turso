@@ -7,18 +7,17 @@
 //!
 //! A pass over a shard records where the log ends, then makes sure that every change logged
 //! before that is in a written copy: a page clean when looked at is done; a dirty one is written,
-//! its copy taken under a latch taken after the end was recorded; one already being written is
-//! looked at again once its write lands. A change's record is appended under the page's latch, so
-//! a change logged before the end is in the page by the time a later latch is granted. Once the
-//! pass is done, the shard's position is that end.
+//! its copy taken under a latch taken after the end was recorded; one already being written, or
+//! written out of its frame, is looked at again once its write lands. A change's record is
+//! appended under the page's latch, so a change logged before the end is in the page by the time
+//! a later latch is granted. Once the pass is done, the shard's position is that end.
 //!
-//! A dirty page can move to a frame of another shard while memory moves between size classes.
-//! It takes its old shard's position along: the new shard's position falls to it if lower, and a
-//! pass over the new shard already running keeps it too.
+//! A page never moves to another frame, and so never to another shard: memory moves between size
+//! classes only by evicting.
 
 use super::super::latch::Held;
 use super::super::log::Lsn;
-use super::frame::{RESIDENT, WRITING};
+use super::frame::{OUTGOING, RESIDENT, WRITING};
 use super::BufferPool;
 use crate::io::Completion;
 use crate::storage::atoll::page::{PageId, SizeClass, CLASS_COUNT};
@@ -30,28 +29,17 @@ use std::ops::Range;
 
 pub(super) struct Shard {
     position: AtomicU64,
-    /// The lowest position of a shard a dirty page moved here from since the pass in progress
-    /// began.
-    incoming: AtomicU64,
 }
 
 impl Shard {
     pub(super) fn new(position: Lsn) -> Self {
         Self {
             position: AtomicU64::new(position),
-            incoming: AtomicU64::new(u64::MAX),
         }
     }
 
     pub(super) fn position(&self) -> Lsn {
         self.position.load(Ordering::SeqCst)
-    }
-
-    /// A dirty page moved here from a shard at `position`.
-    pub(super) fn arrived(&self, position: Lsn) {
-        // `incoming` first: a pass ending meanwhile reads it after setting the position.
-        self.incoming.fetch_min(position, Ordering::SeqCst);
-        self.position.fetch_min(position, Ordering::SeqCst);
     }
 }
 
@@ -61,9 +49,9 @@ enum Look {
     Done,
     /// Marked writing for this pass: a page of this class.
     Write(SizeClass),
-    /// Being written by someone else: look again once the write lands.
+    /// Being written by someone else, or written out: look again once the write lands.
     Writing,
-    /// Latched exclusively for a change, a load or a move: look again shortly.
+    /// Latched exclusively for a change or a load: look again shortly.
     Busy,
 }
 
@@ -83,10 +71,6 @@ pub struct Pass {
 
 impl Pass {
     pub(super) fn new(pool: &BufferPool, shard: usize) -> Self {
-        let s = &pool.shards[shard];
-        // Before the end is read: a page moving here after this is kept by `incoming`, and one
-        // that moved before is in the shard's frames when they are looked at.
-        s.incoming.store(u64::MAX, Ordering::SeqCst);
         let end = pool.store.log().end();
         let frames = pool.shard_frames(shard);
         Self {
@@ -149,22 +133,21 @@ impl Pass {
     }
 
     fn finish(&self, pool: &BufferPool) {
-        let s = &pool.shards[self.shard];
-        s.position.store(
-            self.end.min(s.incoming.load(Ordering::SeqCst)),
-            Ordering::SeqCst,
-        );
-        // A page that arrived after `incoming` was read lowered the position before this store,
-        // and is in `incoming` now.
-        s.position
-            .fetch_min(s.incoming.load(Ordering::SeqCst), Ordering::SeqCst);
+        pool.shards[self.shard]
+            .position
+            .store(self.end, Ordering::SeqCst);
     }
 }
 
 fn look(pool: &BufferPool, frame: u32) -> Look {
     let h = pool.header(frame);
     let Some(version) = h.latch.optimistic() else {
-        return Look::Busy;
+        // A write-out holds its frame until the write lands; anything else holds it briefly.
+        return if h.status() == OUTGOING {
+            Look::Writing
+        } else {
+            Look::Busy
+        };
     };
     let (status, dirty, writing) = (h.status(), h.dirty(), h.has(WRITING));
     let temporary = PageId::from_raw(h.pid()).is_temporary();

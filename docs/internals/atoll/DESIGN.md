@@ -333,9 +333,10 @@ Built in `core/storage/atoll/buffer`.
 - **Never unmapped.** A freed frame is reused as it is. Memory moves between classes a whole batch
   at a time, so no huge page is ever split.
 - **Moving memory.** A batch moves once every frame in it is free. A batch to be moved is marked
-  draining, which keeps new frames out of it. Its pages then move to free frames of the same class
-  elsewhere (a copy, the hash entry repointed, the old frame's version bumped), or are evicted, or
-  are written back first.
+  draining, which keeps new frames out of it. Its pages are then evicted: a clean page at once, a
+  dirty one written out, its frame held until the write lands while whoever wants the page waits
+  on that write as on a read. A page that keeps changing therefore still leaves, and no page ever
+  moves to another frame (CONCURRENCY.md §6).
 - **Headers.** Frame headers sit in their own array, one per 4 KiB, which is never unmapped, so a
   hint however stale always reads a header. Each header holds:
   - the versioned latch, whose version also rises on eviction;
@@ -403,8 +404,10 @@ The paper divides by `now - t`, which is zero within the current epoch. Here ela
 the current epoch as one, so pages used this epoch still rank by how often.
 
 **Between size classes.** When a class has no free frame and no free batch is left, each class's
-threshold is divided by its page size. If another class's value per byte is lower, the requesting
-class takes that class's emptiest batch; otherwise it evicts its own pages. Value per byte is
+threshold is divided by its page size. Among the classes with a batch that can go to the
+requesting class (for 4 and 8 MiB pages, one whose aligned run lies inside the region), if one's
+value per byte is lower, the requesting class takes that class's emptiest such batch; otherwise it
+evicts its own pages. Sampling and the choice skip batches already draining. Value per byte is
 GreedyDual-Size's rule with every miss costing the same (Cao and Irani, 1997). A class of 4 or
 8 MiB pages reserves an aligned run, and the batches in it drain into it as they empty. One drain is
 in progress at a time.
@@ -466,9 +469,9 @@ Checkpoints are continuous (LeanStore 2024 §2.7, Haubenschild et al. §3.4). Bu
      it changed meanwhile.
 
    Then the shard's position is the end the pass recorded.
-4. **Moving pages.** A dirty page can move to a frame of another shard while memory moves between
-   size classes (section 9.4). It takes its old shard's position along: the new shard's position
-   falls to it if lower, and a pass over the new shard already running keeps it too.
+4. **Pages stay in their frames.** A page never moves to another frame, so it never changes
+   shard. A page being written out of a draining batch (section 9.4) is looked at again once its
+   write lands, like one being written back.
 5. **Redo point.** After a pass, the log is made durable up to its end, so the remaps of the
    pass's writes are durable. Metadata pages changed before the lowest shard position are
    written, and slots whose freeing is durable are erased. The redo point is then the lowest

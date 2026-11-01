@@ -97,7 +97,9 @@ Anything that fits none of these is a design error.
   page it came from is validated. A descent that finds a child missing validates the parent, then
   reads the child in.
 - **Size classes.** Memory moves between classes only as whole batches, and a batch is drained
-  only by evicting its pages (writing dirty ones back first); live pages are never relocated.
+  only by evicting its pages; live pages are never relocated. A dirty page is written out: its
+  frame is held until the write lands, and whoever wants the page waits on that write, so a page
+  that keeps changing still leaves.
   An emptied batch goes at once to the class it was drained for (§4).
 - **Allocation.** A page id is reused only after an epoch (section 4), so a reader still holding
   the old id can only find it free. A freed number joins the waiting numbers before it reads as

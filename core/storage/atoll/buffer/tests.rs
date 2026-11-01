@@ -342,6 +342,82 @@ fn a_pass_writes_again_a_page_changed_while_its_earlier_write_was_in_flight() {
     model.check_all();
 }
 
+/// A batch drained for another class empties even while a page in it changes faster than it can
+/// be written: the page is written out, unavailable until its write lands, rather than written
+/// back and kept because it changed meanwhile.
+#[test]
+fn a_drain_empties_its_batch_while_a_page_in_it_keeps_changing() {
+    // Writes complete only at a step, so a page can change while its write is in flight.
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(5));
+    let (log, pool) = open_on(&io, "/db/drain", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        log: &log,
+        pool: &pool,
+        pages: Vec::new(),
+    };
+    // Five 2 MiB pages fill the pool: a 4 KiB page needs one of their batches drained.
+    for _ in 0..5 {
+        model.allocate(class(9));
+    }
+    // A write lands within a few steps (the intent's flush, then the page); a drain that keeps
+    // its page because it changed never ends at all.
+    let mut allocated = None;
+    for _ in 0..1000 {
+        if let IOResult::Done(page) = pool.allocate(class(0)).unwrap() {
+            allocated = Some(page.pid());
+            break;
+        }
+        // Every 2 MiB page still resident changes, if it can at once, before the step that
+        // lands writes: the one in the batch being drained is a page that keeps changing.
+        for i in 0..model.pages.len() {
+            let p = &model.pages[i];
+            if pool.table.find(&pool.frames.headers, p.pid.raw()).is_none() {
+                continue;
+            }
+            let mut admitted = model.admit();
+            if let IOResult::Done(mut g) = pool.fix_exclusive(p.pid, Some(&p.hint)).unwrap() {
+                let version = p.version + 1;
+                let lsn = model.change(g.page_mut(), p.pid, version, &mut admitted);
+                g.changed(lsn);
+                drop(g);
+                model.pages[i].version = version;
+            }
+        }
+        io.step().unwrap();
+    }
+    assert!(
+        allocated.is_some(),
+        "the drained batch never emptied while one of its pages kept changing"
+    );
+    model.check_all();
+}
+
+/// A write-out holds its frame through the frames, never the pool, so a pool dropped with one
+/// still queued is freed rather than kept alive by its own queue.
+#[test]
+fn a_write_out_queued_when_the_pool_is_dropped_does_not_keep_it() {
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(5));
+    let (log, pool) = open_on(&io, "/db/dropped", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        log: &log,
+        pool: &pool,
+        pages: Vec::new(),
+    };
+    model.allocate(class(9));
+    let frame = model.pages[0].hint.load(Ordering::Relaxed) - 1;
+    drop(model);
+    pool.drain(class(9), frame / memory::GRAINS).unwrap();
+    assert_eq!(pool.header(frame).status(), OUTGOING, "not written out");
+    let weak = Arc::downgrade(&pool);
+    drop(pool);
+    assert!(
+        weak.upgrade().is_none(),
+        "a queued write-out kept the pool alive"
+    );
+}
+
 #[test]
 fn a_failed_upgrade_leaves_the_holders_latch_alone() {
     let b = &backends()[0];
@@ -388,7 +464,7 @@ fn a_drain_chosen_before_its_batch_changed_class_leaves_the_new_class_alone() {
         pool.drain(class(0), batch).unwrap();
         for p in &model.pages {
             assert_eq!(
-                pool.table.find(&pool.headers, p.pid.raw()),
+                pool.table.find(&pool.frames.headers, p.pid.raw()),
                 Some(frame(p)),
                 "{}: {:?} left its frame",
                 b.name,

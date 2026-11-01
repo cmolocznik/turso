@@ -98,20 +98,6 @@ impl Tracker {
         self.read_head.store(0, Ordering::Relaxed);
         self.write_head.store(0, Ordering::Relaxed);
     }
-
-    /// Takes over `from`'s history, for a page moving to another frame.
-    pub fn copy_from(&self, from: &Tracker) {
-        for (to, from) in self.reads.iter().zip(&from.reads) {
-            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-        for (to, from) in self.writes.iter().zip(&from.writes) {
-            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-        self.read_head
-            .store(from.read_head.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.write_head
-            .store(from.write_head.load(Ordering::Relaxed), Ordering::Relaxed);
-    }
 }
 
 #[cfg(test)]

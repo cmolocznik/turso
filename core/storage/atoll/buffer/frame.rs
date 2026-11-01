@@ -12,6 +12,9 @@ pub const FREE: u8 = 0;
 pub const LOADING: u8 = 1;
 /// The frame holds a page.
 pub const RESIDENT: u8 = 2;
+/// The page is being written out of the frame, which the write-out holds exclusively until the
+/// write ends.
+pub const OUTGOING: u8 = 3;
 
 /// A copy of the page is being written back.
 pub const WRITING: u8 = 1;
@@ -29,7 +32,7 @@ pub struct FrameHeader {
     /// The page's latch. Its version also rises on eviction, so a reader holding a hint learns
     /// that the frame changed hands.
     pub latch: VersionedLatch,
-    /// The page held; meaningful only with `status` RESIDENT or LOADING.
+    /// The page held; meaningful only with `status` RESIDENT, LOADING or OUTGOING.
     pub pid: AtomicU64,
     /// The LSN of the page's last change, mirrored from its header.
     pub page_lsn: AtomicU64,

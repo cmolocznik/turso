@@ -5,7 +5,8 @@
 //! else, so it is a leaf in the lock order. Lookups take nothing. A frame can leave its chain and
 //! join another while a lookup walks it, so what a lookup returns is checked by the caller against
 //! the frame's latch and page id. A walk that finds nothing may have missed a page, so whoever acts
-//! on an absence asks again under the mutex ([`Table::insert`] does).
+//! on an absence asks again under the mutex ([`Table::insert`] does). A page never moves between
+//! frames: it leaves one only by eviction.
 //!
 //! At one bucket per 4 KiB frame the table costs 8 bytes per 4 KiB of pool, 0.2%.
 
@@ -53,7 +54,7 @@ impl Table {
         &self.buckets[(PageId::from_raw(pid).hash() & self.mask) as usize]
     }
 
-    /// The frame holding `pid`, unchecked. May miss a page moving between frames.
+    /// The frame holding `pid`, unchecked. May miss it while chains change under the walk.
     pub fn find(&self, headers: &[FrameHeader], pid: u64) -> Option<u32> {
         let bucket = self.bucket(pid);
         let mut at = bucket.head.load(Ordering::Acquire);
@@ -101,26 +102,10 @@ impl Table {
 
     /// Unlinks `frame`, which holds `pid`.
     pub fn remove(&self, headers: &[FrameHeader], pid: u64, frame: u32) {
-        self.relink(headers, pid, frame, None);
-    }
-
-    /// Puts `to`, which already names `pid`, in `from`'s place.
-    pub fn replace(&self, headers: &[FrameHeader], pid: u64, from: u32, to: u32) {
-        self.relink(headers, pid, from, Some(to));
-    }
-
-    fn relink(&self, headers: &[FrameHeader], pid: u64, frame: u32, to: Option<u32>) {
         let bucket = self.bucket(pid);
         let _changing = bucket.changing.lock();
         let mut head = bucket.head.load(Ordering::Acquire);
-        let after = headers[frame as usize].next.load(Ordering::Relaxed);
-        let with = match to {
-            Some(to) => {
-                headers[to as usize].next.store(after, Ordering::Relaxed);
-                to + 1
-            }
-            None => after,
-        };
+        let with = headers[frame as usize].next.load(Ordering::Relaxed);
         if head == frame + 1 {
             head = with;
         } else {

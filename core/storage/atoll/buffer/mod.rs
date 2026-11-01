@@ -23,6 +23,11 @@
 //! WATT, starts writing back dirty ones, or takes a batch from a size class whose pages are worth
 //! less per byte. If nothing can be freed at once, the miss waits on the next frame freed.
 //!
+//! **Draining a batch** evicts every page in it. A clean page goes at once; a dirty one is
+//! written out: its frame is held until the write lands, then freed, and whoever wants the page
+//! meanwhile waits on the write as on a read. A page that keeps changing therefore still leaves,
+//! and no page ever moves to another frame (CONCURRENCY.md §6).
+//!
 //! **Failure.** A failed page write, like a failed log write (§7.5), stops the pool: every later
 //! miss fails until the database is reopened and recovered.
 
@@ -48,7 +53,9 @@ use super::log::Lsn;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::store::PageStore;
 use clean::Writeback;
-use frame::{FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, RESIDENT, WRITING};
+use frame::{
+    FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
+};
 use memory::{Memory, Zeroed};
 use pass::Shard;
 use table::Table;
@@ -64,10 +71,38 @@ use std::ops::Deref;
 /// An exclusive hold on a frame's latch, borrowed from the pool.
 type Hold<'a> = Held<&'a VersionedLatch>;
 
-/// A frame's latch, reached through the pool that keeps it: for a hold that outlives a borrow of
-/// the pool, a read in flight.
+/// The frame headers and the IO in flight for frames: what a hold on a frame reaches. Apart from
+/// the pool, so a hold the pool itself keeps (a write-out queued) does not keep the pool alive.
+struct Frames {
+    headers: Zeroed<FrameHeader>,
+    /// Per shard of frames: the IO in flight for each loading or outgoing frame.
+    transits: Box<[Mutex<HashMap<u32, Completion>>]>,
+}
+
+impl Frames {
+    fn transits_of(&self, frame: u32) -> &Mutex<HashMap<u32, Completion>> {
+        &self.transits[frame as usize & (self.transits.len() - 1)]
+    }
+
+    /// Leaves the page whose write-out did not happen in the frame `hold` holds, and sends
+    /// whoever waits on the write to look again.
+    fn kept(&self, hold: Held<FrameLatch>) {
+        let frame = hold.latch().frame;
+        let waiting = self.transits_of(frame).lock().remove(&frame);
+        self.headers[frame as usize]
+            .status
+            .store(RESIDENT, Ordering::Release);
+        drop(hold);
+        if let Some(c) = waiting {
+            c.complete(0);
+        }
+    }
+}
+
+/// A frame's latch, reached through the frames that keep it: for a hold that outlives a borrow of
+/// the pool, a read or a write-out in flight.
 struct FrameLatch {
-    pool: Arc<BufferPool>,
+    frames: Arc<Frames>,
     frame: u32,
 }
 
@@ -75,14 +110,16 @@ impl Deref for FrameLatch {
     type Target = VersionedLatch;
 
     fn deref(&self) -> &VersionedLatch {
-        &self.pool.header(self.frame).latch
+        &self.frames.headers[self.frame as usize].latch
     }
 }
 
 /// A page being read into a frame, which it holds exclusively until the read ends. Dropped
 /// before then, when the read was never started or a panic unwinds, it takes the frame out of
-/// the table and frees it, and whoever waits on the read looks again.
+/// the table and frees it, and whoever waits on the read looks again. The read's completion keeps
+/// it, never the pool.
 struct Loading {
+    pool: Arc<BufferPool>,
     pid: PageId,
     hold: Option<Held<FrameLatch>>,
 }
@@ -90,16 +127,57 @@ struct Loading {
 impl Loading {
     fn end(mut self, res: std::result::Result<(), CompletionError>) {
         let hold = self.hold.take().expect("a read ends once");
-        let pool = hold.latch().pool.clone();
-        pool.loaded(self.pid, hold, res);
+        self.pool.loaded(self.pid, hold, res);
     }
 }
 
 impl Drop for Loading {
     fn drop(&mut self) {
         if let Some(hold) = self.hold.take() {
-            let pool = hold.latch().pool.clone();
-            pool.unload(self.pid, hold, None);
+            self.pool.unload(self.pid, hold, None);
+        }
+    }
+}
+
+/// A dirty page being written out of its frame, which it holds exclusively until the write ends.
+/// Dropped before then, when the write was never submitted, the pool dropped it unwritten, or a
+/// panic unwinds, it leaves the page in the frame, still dirty, and whoever waits on the write
+/// looks again; whoever dropped it wakes the pool's waiters.
+pub(super) struct Outgoing {
+    pid: PageId,
+    hold: Option<Held<FrameLatch>>,
+}
+
+impl Outgoing {
+    pub(super) fn pid(&self) -> PageId {
+        self.pid
+    }
+
+    pub(super) fn frame(&self) -> u32 {
+        self.hold
+            .as_ref()
+            .expect("held until it ends")
+            .latch()
+            .frame
+    }
+
+    /// Ends the write-out with the write of a copy holding changes up to `lsn`.
+    pub(super) fn end(
+        mut self,
+        pool: &BufferPool,
+        lsn: Lsn,
+        res: std::result::Result<(), CompletionError>,
+    ) {
+        let hold = self.hold.take().expect("a write-out ends once");
+        pool.written_out(self.pid, hold, lsn, res);
+    }
+}
+
+impl Drop for Outgoing {
+    fn drop(&mut self) {
+        if let Some(hold) = self.hold.take() {
+            let frames = hold.latch().frames.clone();
+            frames.kept(hold);
         }
     }
 }
@@ -151,18 +229,18 @@ enum Probe<'a> {
     Busy,
     /// The page is being read into the frame.
     Loading(Completion),
+    /// The page is being written out of the frame.
+    Outgoing(Completion),
     /// The frame does not hold the page.
     Miss,
 }
 
 pub struct BufferPool {
     memory: Memory,
-    headers: Zeroed<FrameHeader>,
+    frames: Arc<Frames>,
     table: Table,
     source: Arc<dyn PageSource>,
     store: Arc<PageStore>,
-    /// Per shard of frames: the read in flight into each loading frame.
-    loads: Box<[Mutex<HashMap<u32, Completion>>]>,
     /// The current WATT epoch.
     epoch: AtomicU32,
     /// Bytes evicted since the pool opened; each quarter of the pool is an epoch.
@@ -206,20 +284,22 @@ impl BufferPool {
             "a pool with no checkpoint shards"
         );
         let shards = config.checkpoint_shards.min(grains as usize);
-        // One shard of loads per hardware thread, so concurrent misses rarely share a lock.
+        // One shard of transits per hardware thread, so concurrent misses rarely share a lock.
         let load_shards = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .next_power_of_two();
         let epoch_bytes =
             (memory.batches as u64 * memory::BATCH as u64) / watt::EPOCHS_PER_TURNOVER as u64;
         Ok(Arc::new(Self {
-            headers: Zeroed::new(grains as usize)?,
+            frames: Arc::new(Frames {
+                headers: Zeroed::new(grains as usize)?,
+                transits: (0..load_shards)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
+            }),
             table: Table::new(grains)?,
             memory,
             source,
-            loads: (0..load_shards)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
             epoch: AtomicU32::new(watt::FIRST_EPOCH),
             evicted: AtomicU64::new(0),
             epoch_bytes,
@@ -238,15 +318,15 @@ impl BufferPool {
     }
 
     fn header(&self, frame: u32) -> &FrameHeader {
-        &self.headers[frame as usize]
+        &self.frames.headers[frame as usize]
+    }
+
+    fn transits_of(&self, frame: u32) -> &Mutex<HashMap<u32, Completion>> {
+        self.frames.transits_of(frame)
     }
 
     fn now(&self) -> u32 {
         self.epoch.load(Ordering::Relaxed)
-    }
-
-    fn loads_of(&self, frame: u32) -> &Mutex<HashMap<u32, Completion>> {
-        &self.loads[frame as usize & (self.loads.len() - 1)]
     }
 
     fn failed(&self) -> Result<()> {
@@ -340,7 +420,7 @@ impl BufferPool {
                 // The table, asked only if the hint missed.
                 std::iter::from_fn(|| {
                     self.table
-                        .find(&self.headers, pid.raw())
+                        .find(&self.frames.headers, pid.raw())
                         .map(|f| (f, false))
                 })
                 .take(1),
@@ -351,6 +431,14 @@ impl BufferPool {
                     Probe::Held(hold) => (hold.version(), Some(hold)),
                     Probe::Busy => return yield_now(),
                     Probe::Loading(c) => return Ok(IOResult::IO(IOCompletions(c))),
+                    Probe::Outgoing(c) => {
+                        // Its write may not be submitted yet, and only stepping its writeback
+                        // submits it.
+                        if let Some(w) = self.drive_writebacks()? {
+                            return Ok(IOResult::IO(IOCompletions(w)));
+                        }
+                        return Ok(IOResult::IO(IOCompletions(c)));
+                    }
                     Probe::Miss => continue,
                 };
                 if !from_hint {
@@ -396,13 +484,17 @@ impl BufferPool {
     fn probe(&self, frame: u32, pid: PageId, mode: Mode) -> Probe<'_> {
         let h = self.header(frame);
         let Some(version) = h.latch.optimistic() else {
-            // Held: being read in, changed, evicted or freed.
+            // Held: being read in, written out, changed, evicted or freed.
             if h.pid() != pid.raw() {
                 return Probe::Miss;
             }
-            if h.status() == LOADING {
-                if let Some(c) = self.loads_of(frame).lock().get(&frame) {
-                    return Probe::Loading(c.clone());
+            let status = h.status();
+            if status == LOADING || status == OUTGOING {
+                if let Some(c) = self.transits_of(frame).lock().get(&frame) {
+                    return match status {
+                        LOADING => Probe::Loading(c.clone()),
+                        _ => Probe::Outgoing(c.clone()),
+                    };
                 }
             }
             return Probe::Busy;
@@ -446,7 +538,7 @@ impl BufferPool {
     ) -> Result<Option<Completion>> {
         let h = self.header(frame);
         let hold = Held::try_take(FrameLatch {
-            pool: self.clone(),
+            frames: self.frames.clone(),
             frame,
         })
         .unwrap_or_else(|| panic!("free frame {frame} is held"));
@@ -456,9 +548,13 @@ impl BufferPool {
         h.tracker.read(self.now());
         h.status.store(LOADING, Ordering::Release);
         let loaded = Completion::new_wait();
-        self.loads_of(frame).lock().insert(frame, loaded.clone());
-        if self.table.insert(&self.headers, pid.raw(), frame).is_err() {
-            self.loads_of(frame).lock().remove(&frame);
+        self.transits_of(frame).lock().insert(frame, loaded.clone());
+        if self
+            .table
+            .insert(&self.frames.headers, pid.raw(), frame)
+            .is_err()
+        {
+            self.transits_of(frame).lock().remove(&frame);
             self.free_frame(pid.class(), frame, hold);
             // A reader may have followed a hint here meanwhile: send it to the other frame.
             loaded.complete(0);
@@ -466,6 +562,7 @@ impl BufferPool {
         }
         let size = pid.class().size();
         let reading = Loading {
+            pool: self.clone(),
             pid,
             hold: Some(hold),
         };
@@ -488,7 +585,7 @@ impl BufferPool {
         let h = self.header(frame);
         match res {
             Ok(()) => {
-                let waiting = self.loads_of(frame).lock().remove(&frame);
+                let waiting = self.transits_of(frame).lock().remove(&frame);
                 // SAFETY: the frame is the load's alone until its latch is released below.
                 let lsn = page::lsn(unsafe { self.bytes(frame, pid.class()) });
                 h.page_lsn.store(lsn, Ordering::Release);
@@ -507,8 +604,8 @@ impl BufferPool {
     /// Whoever waits gets `error`, or looks again without one.
     fn unload(&self, pid: PageId, hold: Held<FrameLatch>, error: Option<CompletionError>) {
         let frame = hold.latch().frame;
-        let waiting = self.loads_of(frame).lock().remove(&frame);
-        self.table.remove(&self.headers, pid.raw(), frame);
+        let waiting = self.transits_of(frame).lock().remove(&frame);
+        self.table.remove(&self.frames.headers, pid.raw(), frame);
         self.free_frame(pid.class(), frame, hold);
         match (waiting, error) {
             (Some(c), Some(e)) => c.error(e),
@@ -625,7 +722,7 @@ impl BufferPool {
         h.status.store(RESIDENT, Ordering::Release);
         // A number is handed out again only once every step that could hold its last page is
         // gone (`epoch`), and the page left the table within its freer's step.
-        if let Err(other) = self.table.insert(&self.headers, pid.raw(), frame) {
+        if let Err(other) = self.table.insert(&self.frames.headers, pid.raw(), frame) {
             panic!("new page {pid:?} is already in frame {other}");
         }
         Exclusive {
@@ -657,7 +754,7 @@ impl BufferPool {
         }
         // Its latch is released by freeing the frame; its step ends last.
         let Exclusive { hold, step, .. } = page;
-        self.table.remove(&self.headers, pid.raw(), frame);
+        self.table.remove(&self.frames.headers, pid.raw(), frame);
         self.free_frame(pid.class(), frame, hold);
         if pid.is_temporary() {
             // Once no frame holds it, so a new page under its number finds none.
@@ -674,7 +771,7 @@ impl BufferPool {
     pub fn free_unreferenced(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
         let _step = self.store.epochs().enter();
         loop {
-            if self.table.find(&self.headers, pid.raw()).is_some() {
+            if self.table.find(&self.frames.headers, pid.raw()).is_some() {
                 return match self.fix_exclusive(pid, None)? {
                     IOResult::Done(page) => self.free(page),
                     IOResult::IO(io) => Ok(IOResult::IO(io)),
@@ -702,7 +799,11 @@ impl BufferPool {
             h.written_lsn.store(0, Ordering::Release);
             h.tracker.clear();
             h.status.store(RESIDENT, Ordering::Release);
-            if self.table.insert(&self.headers, pid.raw(), frame).is_err() {
+            if self
+                .table
+                .insert(&self.frames.headers, pid.raw(), frame)
+                .is_err()
+            {
                 // Read in meanwhile: free it where it is.
                 self.free_frame(class, frame, hold);
                 continue;
@@ -744,7 +845,7 @@ impl BufferPool {
         let _step = self.store.epochs().enter();
         self.failed()?;
         for &pid in pids {
-            if self.table.find(&self.headers, pid.raw()).is_some() {
+            if self.table.find(&self.frames.headers, pid.raw()).is_some() {
                 continue;
             }
             let located = match self.locate(pid)? {
@@ -901,7 +1002,7 @@ impl BufferPool {
             if h.tracker.value(now) > threshold {
                 continue;
             }
-            let Some(hold) = self.latch_to_evict(class, frame) else {
+            let Some(hold) = self.latch_to_evict(class, frame, || &h.latch) else {
                 continue;
             };
             if h.dirty() {
@@ -917,11 +1018,21 @@ impl BufferPool {
     }
 
     /// Evicts the clean page in `frame`, which `hold` latches.
-    fn evict(&self, class: SizeClass, frame: u32, hold: Hold<'_>) {
+    fn evict<L: Deref<Target = VersionedLatch>>(
+        &self,
+        class: SizeClass,
+        frame: u32,
+        hold: Held<L>,
+    ) {
         let h = self.header(frame);
         debug_assert!(!h.dirty() && !h.has(WRITING));
-        self.table.remove(&self.headers, h.pid(), frame);
+        self.table.remove(&self.frames.headers, h.pid(), frame);
         self.free_frame(class, frame, hold);
+        self.evicted(class);
+    }
+
+    /// Counts an eviction of a page of `class` toward the WATT epoch.
+    fn evicted(&self, class: SizeClass) {
         let size = class.size() as u64;
         let before = self.evicted.fetch_add(size, Ordering::Relaxed);
         if (before + size) / self.epoch_bytes != before / self.epoch_bytes {
@@ -929,45 +1040,50 @@ impl BufferPool {
         }
     }
 
-    /// Empties what it can of `batch`, draining out of `class`: each page moves to a free frame
-    /// of the class outside the batch, or is evicted if clean, or starts being written back.
+    /// Empties what it can of `batch`, draining out of `class`: clean pages are evicted, dirty
+    /// ones written out. A page latched or being written back is looked at again on the next
+    /// drain.
     fn drain(self: &Arc<Self>, class: SizeClass, batch: u32) -> Result<()> {
-        let mut dirty = Vec::new();
+        let mut outgoing = Vec::new();
         for i in 0..memory::frames_per_batch(class) {
             let frame = memory::frame_at(class, batch, i);
             if self.memory.is_free(class, frame) {
                 continue;
             }
-            let Some(hold) = self.latch_to_evict(class, frame) else {
+            let latch = || FrameLatch {
+                frames: self.frames.clone(),
+                frame,
+            };
+            let Some(hold) = self.latch_to_evict(class, frame, latch) else {
                 continue;
             };
-            let h = self.header(frame);
-            if let Some(to) = self.memory.take(class) {
-                self.relocate(class, frame, hold, to);
-            } else if !h.dirty() {
-                self.evict(class, frame, hold);
+            if self.header(frame).dirty() {
+                outgoing.push(self.start_write_out(hold));
             } else {
-                h.flags.fetch_or(WRITING | EVICT_AFTER, Ordering::AcqRel);
-                drop(hold);
-                dirty.push(frame);
+                self.evict(class, frame, hold);
             }
         }
-        self.write_back(class, dirty, true);
+        self.write_out(class, outgoing);
         Ok(())
     }
 
-    /// Latches `frame` exclusively to move or evict its page, if it holds a page of `class` not
-    /// being written. A frame chosen while its batch was `class`'s may by now be part of
-    /// another class's frame, holding a page of that class or none: moving or evicting that page
-    /// as `class`'s would give its memory to two pages.
-    fn latch_to_evict(&self, class: SizeClass, frame: u32) -> Option<Hold<'_>> {
+    /// Latches `frame` exclusively, through `latch`, to evict its page, if it holds a page of
+    /// `class` not being written. A frame chosen while its batch was `class`'s may by now be part
+    /// of another class's frame, holding a page of that class or none: evicting that page as
+    /// `class`'s would give its memory to two pages.
+    fn latch_to_evict<L: Deref<Target = VersionedLatch>>(
+        &self,
+        class: SizeClass,
+        frame: u32,
+        latch: impl FnOnce() -> L,
+    ) -> Option<Held<L>> {
         let h = self.header(frame);
         let version = h.latch.optimistic()?;
         let holds = h.status() == RESIDENT && PageId::from_raw(h.pid()).class() == class;
         if !holds || !h.latch.validate(version) {
             return None;
         }
-        let hold = Held::try_take_at(&h.latch, version)?;
+        let hold = Held::try_take_at(latch(), version)?;
         // WRITING is set under the latch by a pass claiming a dirty page, and cleared without it
         // when a write ends: look again later.
         if h.has(WRITING) {
@@ -977,37 +1093,71 @@ impl BufferPool {
         Some(hold)
     }
 
-    /// Moves the page in `from`, latched exclusively, to the free frame `to`. Hints to `from` go
-    /// stale like after an eviction.
-    fn relocate(&self, class: SizeClass, from: u32, hold: Hold<'_>, to: u32) {
-        let (src, dst) = (self.header(from), self.header(to));
-        let arrived = self.take_free_latch(to);
-        // SAFETY: both frames are latched exclusively, and distinct.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.memory.region.ptr(from),
-                self.memory.region.ptr(to),
-                class.size(),
-            )
-        };
-        let pid = src.pid();
-        if src.dirty() {
-            let (a, b) = (self.shard_of(from), self.shard_of(to));
-            if a != b {
-                self.shards[b].arrived(self.shards[a].position());
+    /// Marks the dirty page in the frame `hold` holds as leaving it, and returns its write-out,
+    /// for [`write_out`](Self::write_out). Whoever wants the page waits on the write from now on.
+    fn start_write_out(&self, hold: Held<FrameLatch>) -> Outgoing {
+        let frame = hold.latch().frame;
+        let h = self.header(frame);
+        let pid = PageId::from_raw(h.pid());
+        self.transits_of(frame)
+            .lock()
+            .insert(frame, Completion::new_wait());
+        h.status.store(OUTGOING, Ordering::Release);
+        Outgoing {
+            pid,
+            hold: Some(hold),
+        }
+    }
+
+    /// Queues the writes of `outgoing`, pages of `class` leaving their frames.
+    fn write_out(&self, class: SizeClass, outgoing: Vec<Outgoing>) {
+        let (temporary, logged): (Vec<Outgoing>, Vec<Outgoing>) =
+            outgoing.into_iter().partition(|o| o.pid.is_temporary());
+        for (outgoing, temporary) in [(logged, false), (temporary, true)] {
+            if !outgoing.is_empty() {
+                let wb = Writeback::out(class, outgoing, temporary);
+                self.writebacks.lock().push(Arc::new(Mutex::new(wb)));
             }
         }
-        dst.pid.store(pid, Ordering::Release);
-        dst.page_lsn
-            .store(src.page_lsn.load(Ordering::Acquire), Ordering::Release);
-        dst.written_lsn
-            .store(src.written_lsn.load(Ordering::Acquire), Ordering::Release);
-        dst.tracker.copy_from(&src.tracker);
-        dst.flags.store(0, Ordering::Release);
-        dst.status.store(RESIDENT, Ordering::Release);
-        self.table.replace(&self.headers, pid, from, to);
-        drop(arrived);
-        self.free_frame(class, from, hold);
+    }
+
+    /// Ends the write-out of `pid` from the frame `hold` holds, with the write of a copy holding
+    /// changes up to `lsn`. Written, the page leaves the frame, and whoever waits reads it again
+    /// from that copy, already in the page table; not written, the page stays, dirty.
+    fn written_out(
+        &self,
+        pid: PageId,
+        hold: Held<FrameLatch>,
+        lsn: Lsn,
+        res: std::result::Result<(), CompletionError>,
+    ) {
+        let frame = hold.latch().frame;
+        match res {
+            Ok(()) => {
+                let h = self.header(frame);
+                h.written_lsn.fetch_max(lsn, Ordering::AcqRel);
+                debug_assert!(!h.dirty(), "{pid:?} changed while held for its write-out");
+                let waiting = self.transits_of(frame).lock().remove(&frame);
+                self.table.remove(&self.frames.headers, pid.raw(), frame);
+                self.free_frame(pid.class(), frame, hold);
+                self.evicted(pid.class());
+                if let Some(c) = waiting {
+                    c.complete(0);
+                }
+            }
+            Err(e) => {
+                self.fail(e);
+                self.kept(hold);
+            }
+        }
+        self.writes_in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.signal_released();
+    }
+
+    /// Leaves the page whose write-out failed in the frame `hold` holds, and wakes whoever waits.
+    fn kept(&self, hold: Held<FrameLatch>) {
+        self.frames.kept(hold);
+        self.signal_released();
     }
 
     // ---------------------------------------------------------------- writing back
@@ -1139,6 +1289,7 @@ impl BufferPool {
         at(shard as u64)..at(shard as u64 + 1)
     }
 
+    #[cfg(test)]
     fn shard_of(&self, frame: u32) -> usize {
         let (grains, n) = (self.memory.grains() as u64, self.shards.len() as u64);
         (frame as u64 * n / grains) as usize

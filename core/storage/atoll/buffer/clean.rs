@@ -108,9 +108,10 @@ impl Writeback {
             let pending = self.pending.clone();
             let finished = self.finished.clone();
             let evict_after = self.evict_after;
+            let pid = self.pids[i];
             pool.writes_in_flight.fetch_add(1, Ordering::AcqRel);
             let done = move |res: std::result::Result<(), CompletionError>| {
-                ended.write_ended(frame, lsn, evict_after, res);
+                ended.write_ended(frame, pid, lsn, evict_after, res);
                 if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
                     finished.complete(0);
                 }
@@ -125,7 +126,7 @@ impl Writeback {
             match written {
                 Ok(()) => {}
                 Err(e) => {
-                    pool.write_ended(frame, lsn, false, Err(super::io_failure(&e)));
+                    pool.write_ended(frame, pid, lsn, false, Err(super::io_failure(&e)));
                     if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
                         self.finished.complete(0);
                     }

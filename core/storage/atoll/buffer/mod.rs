@@ -833,15 +833,18 @@ impl BufferPool {
         let own = self
             .threshold(class)
             .map_or(f32::INFINITY, |t| t / class.size() as f32);
+        // Among the classes with a batch that can go to `class`: one whose only batches lie where
+        // no run of `class`'s order fits has nothing to give it, and choosing it would leave
+        // `class` waiting on a drain that never starts.
         let colder = SizeClass::all()
             .filter(|&c| c != class)
-            .filter_map(|c| self.threshold(c).map(|t| (c, t / c.size() as f32)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
+            .filter_map(|c| {
+                let per_byte = self.threshold(c)? / c.size() as f32;
+                Some((c, self.memory.emptiest(c, class)?, per_byte))
+            })
+            .min_by(|a, b| a.2.total_cmp(&b.2));
         match colder {
-            Some((holder, per_byte)) if per_byte < own => {
-                let Some(batch) = self.memory.emptiest(holder) else {
-                    return Ok(());
-                };
+            Some((holder, batch, per_byte)) if per_byte < own => {
                 let started = if class.size() <= memory::BATCH {
                     self.memory.drain_for(holder, batch, class)
                 } else {
@@ -1078,16 +1081,21 @@ impl BufferPool {
         Ok(IOResult::Done(()))
     }
 
-    /// Ends the write of a copy of `frame`'s page holding changes up to `lsn`.
+    /// Ends the write of a copy of `pid`, in `frame`, holding changes up to `lsn`.
     fn write_ended(
         &self,
         frame: u32,
+        pid: PageId,
         lsn: Lsn,
         evict_after: bool,
         res: std::result::Result<(), CompletionError>,
     ) {
         let h = self.header(frame);
-        let ok = res.is_ok();
+        // Taken while WRITING keeps the page in the frame (nothing evicts or frees a page being
+        // written), so the hold is on this page; once the flag is clear another may be in.
+        let hold = (res.is_ok() && evict_after)
+            .then(|| Held::try_take(&h.latch))
+            .flatten();
         match res {
             Ok(()) => {
                 h.written_lsn.fetch_max(lsn, Ordering::AcqRel);
@@ -1096,11 +1104,16 @@ impl BufferPool {
         }
         h.flags
             .fetch_and(!(WRITING | EVICT_AFTER), Ordering::AcqRel);
-        if ok && evict_after {
-            if let Some(hold) = Held::try_take(&h.latch) {
-                if h.status() == RESIDENT && !h.dirty() && !h.has(WRITING) {
-                    self.evict(self.memory.class_of(frame), frame, hold);
-                }
+        if let Some(hold) = hold {
+            assert!(
+                h.status() == RESIDENT && h.pid() == pid.raw(),
+                "frame {frame} gave up {pid:?} while it was being written"
+            );
+            if h.dirty() {
+                // Changed while it was written: it stays.
+                hold.release_unchanged();
+            } else {
+                self.evict(self.memory.class_of(frame), frame, hold);
             }
         }
         self.writes_in_flight.fetch_sub(1, Ordering::AcqRel);

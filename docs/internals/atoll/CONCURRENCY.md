@@ -58,8 +58,8 @@ Anything that fits none of these is a design error.
 - **Participants.** Every connection stepping Atoll is a participant. It announces the global
   epoch when it enters a step (one call into Atoll that returns `Done` or `IO`) and clears the
   announcement when it leaves. Two atomic stores per step.
-- **Retiring.** Freeing a frame, a page id, a memory batch, a temporary page, a version index
-  entry or a retired page puts it on a limbo list stamped with the current epoch.
+- **Retiring.** Freeing a page id, a temporary page, a version index entry or a retired page
+  puts it on a limbo list stamped with the current epoch.
 - **Reclaiming.** An object retired at epoch `e` is reused once every participant's announcement
   is above `e`, or clear. The epoch advances when the limbo lists hold enough to reclaim; the
   check is one pass over the participants.
@@ -69,6 +69,13 @@ Anything that fits none of these is a design error.
   validates all three before use. A frame's version only rises, so a frame that held another page
   in between never validates. A cursor kept open for an hour pins nothing.
 - **Bounded:** a step never blocks, so a slow participant delays reclamation by at most one step.
+- **Frames and memory batches are checked, not retired.** A frame's identity is its latch
+  version, which only rises, and every use validates it. A batch is used only through its frames,
+  and every action on a frame drawn from a batch (an eviction, a drain) checks under the frame's
+  latch that the page it holds is of the class it was drawn for. A stale name acts on nothing, so
+  neither needs an epoch. Retiring batches was built and measured: the claim that empties a batch
+  cannot use it before its own step ends, and another class's claim takes it back first, so two
+  classes passed one batch back and forth forever (two single-threaded crash tests hung).
 
 ## 5. Latches
 
@@ -91,7 +98,7 @@ Anything that fits none of these is a design error.
   reads the child in.
 - **Size classes.** Memory moves between classes only as whole batches, and a batch is drained
   only by evicting its pages (writing dirty ones back first); live pages are never relocated.
-  An emptied batch is retired through an epoch before another class gets it.
+  An emptied batch goes at once to the class it was drained for (§4).
 - **Allocation.** A page id is reused only after an epoch (section 4), so a reader still holding
   the old id can only find it free. A freed number joins the waiting numbers before it reads as
   free in the page table, so no allocation takes it in between.

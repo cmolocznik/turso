@@ -256,6 +256,9 @@ impl Region {
 struct ClassBatches {
     /// Every batch (first batch of each run) the class holds.
     all: Vec<u32>,
+    /// Those not draining: what eviction samples, and what a drain chooses from. A draining
+    /// batch's freed frames are leaving, and would make the class look as if it had room.
+    live: Vec<u32>,
     /// Those with a free frame and not draining, lowest first. Taking frames from the lowest
     /// leaves the highest batches emptier, and so cheaper to drain.
     partial: BTreeSet<u32>,
@@ -523,6 +526,7 @@ impl Memory {
         self.taken[batch as usize].store(0, Ordering::Relaxed);
         self.draining[batch as usize].store(0, Ordering::Relaxed);
         c.all.push(batch);
+        c.live.push(batch);
         c.partial.insert(batch);
     }
 
@@ -574,6 +578,7 @@ impl Memory {
                 word.store(0, Ordering::Relaxed);
             }
             c.all.retain(|&b| b != batch);
+            debug_assert!(!c.live.contains(&batch));
             for b in batch..batch + (1 << order(class)) {
                 self.owner[b as usize].store(0, Ordering::Release);
             }
@@ -625,6 +630,7 @@ impl Memory {
                 return false;
             }
             c.partial.remove(&batch);
+            c.live.retain(|&b| b != batch);
             self.taken[batch as usize].load(Ordering::Relaxed) == 0
         };
         if empty {
@@ -637,6 +643,11 @@ impl Memory {
     /// batch in it that a class holds: the run goes to `class` once it is free. False while
     /// another run is held.
     pub fn drain_run(&self, class: SizeClass, batch: u32) -> bool {
+        let run = 1u32 << order(class);
+        assert!(
+            (batch & !(run - 1)) + run <= self.batches,
+            "the run of {class:?} around batch {batch} leaves the region"
+        );
         let mut empty = Vec::new();
         {
             let mut runs = self.runs.lock();
@@ -666,6 +677,7 @@ impl Memory {
                 let mut c = self.classes[holder.index()].lock();
                 self.draining[head as usize].store(1, Ordering::Relaxed);
                 c.partial.remove(&head);
+                c.live.retain(|&b| b != head);
                 if self.taken[head as usize].load(Ordering::Relaxed) == 0 {
                     empty.push((holder, head));
                 }
@@ -695,28 +707,31 @@ impl Memory {
         self.words(batch)[i as usize / 64].load(Ordering::Relaxed) & (1 << (i % 64)) != 0
     }
 
-    /// Up to `n` frames of `class` drawn at random from the batches it holds (taken or not).
+    /// Up to `n` frames of `class` drawn at random from the batches it holds and is not draining
+    /// (taken or not).
     pub fn sample(&self, class: SizeClass, n: usize, rng: &mut impl rand::Rng) -> Vec<u32> {
         let c = self.classes[class.index()].lock();
-        if c.all.is_empty() {
+        if c.live.is_empty() {
             return Vec::new();
         }
         let per = frames_per_batch(class);
         (0..n)
             .map(|_| {
-                let batch = c.all[rng.random_range(0..c.all.len())];
+                let batch = c.live[rng.random_range(0..c.live.len())];
                 frame_at(class, batch, rng.random_range(0..per))
             })
             .collect()
     }
 
-    /// The batch of `class`, not draining, with the fewest frames taken.
-    pub fn emptiest(&self, class: SizeClass) -> Option<u32> {
+    /// The batch of `class`, not draining, with the fewest frames taken, to drain for `to`: one
+    /// whose aligned run of `to`'s order lies inside the region, which a short last run may not.
+    pub fn emptiest(&self, class: SizeClass, to: SizeClass) -> Option<u32> {
+        let run = 1u32 << order(to);
         let c = self.classes[class.index()].lock();
-        c.all
+        c.live
             .iter()
             .copied()
-            .filter(|&b| self.draining[b as usize].load(Ordering::Relaxed) == 0)
+            .filter(|&b| (b & !(run - 1)) + run <= self.batches)
             .min_by_key(|&b| self.taken[b as usize].load(Ordering::Relaxed))
     }
 
@@ -901,5 +916,25 @@ mod tests {
         );
         assert!(m.grow(class(10)), "the other half is free");
         assert_eq!(m.held()[10], 4 * BATCH);
+    }
+
+    #[test]
+    fn a_batch_for_a_large_class_is_chosen_where_its_run_fits() {
+        // 5 batches: a run of 4 at 0 and one batch at 4, each given a 2 MiB frame. Batch 4 is
+        // the emptiest once its frame is back, but no aligned run of two fits around it.
+        let m = Memory::new(5 * BATCH).unwrap();
+        let frames: Vec<u32> = (0..5)
+            .map(|_| {
+                assert!(m.grow(class(9)));
+                m.take(class(9)).unwrap()
+            })
+            .collect();
+        let last = *frames.iter().find(|&&f| f / GRAINS == 4).unwrap();
+        m.put(class(9), last);
+        assert_eq!(m.emptiest(class(9), class(9)), Some(4));
+        assert!(
+            m.emptiest(class(9), class(10)).is_some_and(|b| b < 4),
+            "a drain for 4 MiB frames chose a batch with no aligned run of two"
+        );
     }
 }

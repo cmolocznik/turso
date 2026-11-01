@@ -490,18 +490,19 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
     }
 }
 
-/// Three threads allocate, change, read and free pages of 2 MiB in a pool of five frames, so
-/// nearly every step evicts and writes back. Each page reads back the version last written to it.
 /// A page and the version last written to it, if one is allocated.
 type Slot = Mutex<Option<(PageId, u64)>>;
 
+/// Three threads allocate, change, read and free pages of 1, 2 and 4 MiB, two of each, in a pool
+/// of five 2 MiB batches: they need 14 MiB, so the pool evicts and writes back, and memory moves
+/// between the classes, a 4 MiB frame taking an aligned run of two batches. Each page reads back
+/// the version last written to it.
 fn concurrent_pages(ops: usize, seed: u64) {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
     let (log, pool) = open_on(&io, "/db/schedules", MIN_BUDGET);
-    let class = class(9);
     // Pages and the versions written to them, behind one lock per page: a thread changing a page
     // holds its entry, so the version it writes is the one it records.
-    let pages: Arc<Vec<Slot>> = Arc::new((0..4).map(|_| Mutex::new(None)).collect());
+    let pages: Arc<Vec<Slot>> = Arc::new((0..6).map(|_| Mutex::new(None)).collect());
     let mut handles = Vec::new();
     for t in 0..3u64 {
         let (io, log, pool, pages) = (io.clone(), log.clone(), pool.clone(), pages.clone());
@@ -513,6 +514,7 @@ fn concurrent_pages(ops: usize, seed: u64) {
                     continue;
                 };
                 let admit = || named(&io, "admit", || log.admit(framed_len(16)));
+                let class = class(8 + i % 3);
                 match (*slot, rng.random_range(0..4)) {
                     (None, _) => {
                         let mut admitted = admit();
@@ -604,4 +606,61 @@ fn pages_survive_concurrent_fixes_evictions_and_frees_in_every_schedule() {
         || concurrent_pages(12, SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
         300,
     );
+}
+
+/// A page written back to be evicted afterwards is evicted only if it is still the page in the
+/// frame: once its write ends, another thread may evict it and put a new page in the frame,
+/// which the writer must not evict in its stead.
+fn written_page_eviction() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let (log, pool) = open_on(&io, "/db/written", MIN_BUDGET);
+    let class = class(9);
+    // Five 2 MiB frames fill the pool; four stay latched, so the page written back is the only
+    // one another thread can evict.
+    let mut held = Vec::new();
+    for v in 0..5u64 {
+        let mut admitted = named(&io, "admit", || log.admit(framed_len(16)));
+        let mut g = named(&io, "allocate", || pool.allocate(class));
+        let pid = g.pid();
+        stamp(g.page_mut(), pid, v);
+        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+        g.changed(lsn);
+        held.push(g);
+    }
+    let written = held.remove(0);
+    let frame = written.hint() - 1;
+    drop(written);
+    pool.header(frame)
+        .flags
+        .fetch_or(WRITING | EVICT_AFTER, Ordering::AcqRel);
+    drop(pool.write_back(class, vec![frame], true));
+    let writer = {
+        let (io, pool) = (io.clone(), pool.clone());
+        crate::thread::spawn(move || {
+            while let Some(c) = pool.drive_writebacks().unwrap() {
+                io.wait_for_completion(c).unwrap();
+            }
+        })
+    };
+    let allocator = {
+        let (io, pool) = (io.clone(), pool.clone());
+        crate::thread::spawn(move || drop(named(&io, "allocate", || pool.allocate(class))))
+    };
+    writer.join().unwrap();
+    allocator.join().unwrap();
+    drop(held);
+}
+
+#[cfg(not(shuttle))]
+#[test]
+fn a_written_page_is_evicted_only_while_its_write_pins_it() {
+    for _ in 0..200 {
+        written_page_eviction();
+    }
+}
+
+#[cfg(shuttle)]
+#[test]
+fn a_written_page_is_evicted_only_while_its_write_pins_it_in_every_schedule() {
+    crate::storage::atoll::testing::schedules(written_page_eviction, 300);
 }

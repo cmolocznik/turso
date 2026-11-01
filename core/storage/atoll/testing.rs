@@ -45,6 +45,15 @@ pub(super) fn backends() -> Vec<Backend> {
     all
 }
 
+/// A schedule test's workload seed, drawn from shuttle's generator, which the schedule a failure
+/// prints records: replaying that schedule replays the workload too. 32 bits, as the stress tests'
+/// seeds are small numbers the workloads scale by ten per thread.
+#[cfg(shuttle)]
+pub(super) fn workload_seed() -> u64 {
+    use shuttle::rand::RngCore;
+    shuttle::rand::thread_rng().next_u32().into()
+}
+
 /// Runs `test` under `iterations` random schedules and as many PCT schedules (depth 3), each task
 /// on a stack of 8 MiB: shuttle's default is too small for the IO completions that run inside
 /// their submission.

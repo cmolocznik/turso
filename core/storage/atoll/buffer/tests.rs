@@ -741,9 +741,8 @@ fn pages_survive_concurrent_fixes_evictions_and_frees() {
 #[cfg(shuttle)]
 #[test]
 fn pages_survive_concurrent_fixes_evictions_and_frees_in_shuttle_schedules() {
-    static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     crate::storage::atoll::testing::schedules(
-        || concurrent_pages(12, SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        || concurrent_pages(12, crate::storage::atoll::testing::workload_seed()),
         300,
     );
 }
@@ -1379,9 +1378,8 @@ fn children_read_through_their_directory_are_whole_and_in_the_life_it_names() {
 #[cfg(shuttle)]
 #[test]
 fn children_read_through_their_directory_are_whole_and_in_the_life_it_names_in_shuttle_schedules() {
-    static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     crate::storage::atoll::testing::schedules(
-        || linked_pages(12, SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        || linked_pages(12, crate::storage::atoll::testing::workload_seed()),
         300,
     );
 }

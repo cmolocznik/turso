@@ -941,9 +941,8 @@ fn concurrent_tree(seed: u64, ops: u64) {
 #[cfg(shuttle)]
 #[test]
 fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order_in_shuttle_schedules() {
-    static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     crate::storage::atoll::testing::schedules(
-        || concurrent_tree(SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed), 12),
+        || concurrent_tree(crate::storage::atoll::testing::workload_seed(), 12),
         300,
     );
 }

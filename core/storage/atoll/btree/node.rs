@@ -634,6 +634,8 @@ pub fn remove<P: BytesMut + ?Sized>(page: &mut P, pos: usize) {
 }
 
 /// Replaces the value at `pos`; false, leaving the node as it was, if the new one does not fit.
+/// The entry is rewritten in place: a value of another length moves the entry to the start of the
+/// data, its old bytes left a hole.
 pub fn set_value<P: BytesMut + ?Sized>(
     page: &mut P,
     pos: usize,
@@ -641,26 +643,46 @@ pub fn set_value<P: BytesMut + ?Sized>(
     out_of_line: bool,
 ) -> bool {
     let v = View::new(&*page);
-    let (old, old_out) = v.value(pos).unwrap();
-    if old.len() == value.len() {
-        let s = v.slot(pos).unwrap();
+    let s = v.slot(pos).unwrap();
+    let at = SLOTS + pos * SLOT;
+    let lengths = value.len() | if out_of_line { OUT_OF_LINE as usize } else { 0 };
+    if s.value_len == value.len() {
         page.write(s.off + s.key_len, value);
-        put16(
-            page,
-            SLOTS + pos * SLOT + 4,
-            value.len() | if out_of_line { OUT_OF_LINE as usize } else { 0 },
-        );
+        put16(page, at + 4, lengths);
         return true;
     }
-    let key = v.key(pos).unwrap();
-    if v.free().unwrap() + old.len() < value.len() {
+    if v.free().unwrap() + s.value_len < value.len() {
         return false;
     }
-    remove(page, pos);
-    if !insert(page, pos, &key, value, out_of_line) {
-        assert!(insert(page, pos, &key, &old, old_out));
-        return false;
-    }
+    let need = s.key_len + value.len();
+    let slots_end = SLOTS + v.count().unwrap() * SLOT;
+    let space = v.space();
+    let data = if v.data_start().unwrap() >= slots_end + need {
+        // Room before the data: the key moves there, the value after it.
+        let data = v.data_start().unwrap() - need;
+        page.copy_within(s.off..s.off + s.key_len, data);
+        data
+    } else {
+        // The room is in holes: the key held aside, the old entry compacted away.
+        KEY.with(|key| {
+            let mut key = key.borrow_mut();
+            key.resize(s.key_len, 0);
+            page.copy_to(s.off, &mut key);
+            put16(page, at + 2, 0);
+            put16(page, at + 4, 0);
+            page.put_u32(SPACE, (space - s.key_len - s.value_len) as u32);
+            compact(page);
+            let data = page.u32_at(DATA_START) as usize - need;
+            page.write(data, &key);
+            put16(page, at + 2, s.key_len);
+            data
+        })
+    };
+    page.write(data + s.key_len, value);
+    put16(page, at, data);
+    put16(page, at + 4, lengths);
+    page.put_u32(DATA_START, data as u32);
+    page.put_u32(SPACE, (space - s.value_len + value.len()) as u32);
     true
 }
 
@@ -673,6 +695,8 @@ crate::thread::thread_local! {
     static RUNS: std::cell::RefCell<Vec<(u16, u16, u16)>> = const {
         std::cell::RefCell::new(Vec::new())
     };
+    /// Scratch for [`set_value`]: a key held aside while its node compacts.
+    static KEY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Puts the node's runs of data (offset, length, which) in `runs`, in the order they pack toward

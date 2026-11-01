@@ -86,19 +86,23 @@ impl Writeback {
             let i = self.next;
             let frame = self.frames[i];
             let h = &pool.headers[frame as usize];
-            if !h.latch.try_lock_shared() {
-                // A writer holds the page for a moment: come back.
-                return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
-            }
+            // The frame keeps its page while it is being written: the copy is whole once nothing
+            // was written under the latch while it was taken.
             debug_assert_eq!(h.status(), RESIDENT);
             debug_assert_eq!(h.pid(), self.pids[i].raw());
+            let Some(version) = h.latch.optimistic() else {
+                // A writer holds the page for a moment: come back.
+                return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+            };
             let copy = Arc::new(AlignedBlock::zeroed(size));
-            // SAFETY: the shared latch keeps writers out of the frame; the copy is fresh.
+            // SAFETY: the copy is fresh; what is copied counts only once validated below.
             unsafe {
                 std::ptr::copy_nonoverlapping(pool.memory.region.ptr(frame), copy.as_ptr(), size)
             };
             let lsn = h.page_lsn.load(Ordering::Acquire);
-            h.latch.unlock_shared();
+            if !h.latch.validate(version) {
+                return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+            }
             self.next += 1;
             let ended = pool.clone();
             let pending = self.pending.clone();

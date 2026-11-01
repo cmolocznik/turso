@@ -536,3 +536,82 @@ fn records_decode_as_encoded() {
         );
     }
 }
+
+/// Frees change the page table's leaves while the checkpointer writes them back: in no schedule
+/// do they wait on each other for good. Each free changes two leaves, the number's entry and its
+/// copy's slot, so two frees and a write can each hold what another waits for unless every path
+/// takes the locks in one order (CONCURRENCY.md §8).
+#[cfg(shuttle)]
+#[test]
+fn frees_and_metadata_writes_never_wait_on_each_other_in_every_schedule() {
+    crate::storage::atoll::testing::schedules(
+        || {
+            let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+            let db = create(io.clone(), BASE);
+            let pids: Vec<PageId> = (0..4)
+                .map(|_| drive(&db.io, || db.store.allocate(class(1))).unwrap())
+                .collect();
+            drive(&db.io, || db.store.adopt(&pids)).unwrap();
+            let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| drive(&db.io, op).unwrap();
+            write_copies(&db, &pids, 1, &run);
+            let mut threads = Vec::new();
+            for pair in pids.chunks(2) {
+                let (io, store, pair) = (io.clone(), db.store.clone(), pair.to_vec());
+                threads.push(crate::thread::spawn(move || {
+                    for pid in pair {
+                        drive(&io, || store.free(pid)).unwrap();
+                    }
+                }));
+            }
+            let (io, store, log) = (io.clone(), db.store.clone(), db.log.clone());
+            threads.push(crate::thread::spawn(move || {
+                for _ in 0..2 {
+                    drive(&io, || store.write_metadata(log.end())).unwrap();
+                }
+            }));
+            for t in threads {
+                t.join().unwrap();
+            }
+        },
+        300,
+    );
+}
+
+/// A number is not handed out again while the step that freed it runs: that step may still hold
+/// the page in memory under it (CONCURRENCY.md §4, §6).
+#[cfg(shuttle)]
+#[test]
+fn a_freed_number_waits_out_its_freers_step_in_every_schedule() {
+    crate::storage::atoll::testing::schedules(
+        || {
+            let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+            let db = create(io.clone(), BASE);
+            let freed = drive(&db.io, || db.store.allocate(class(1))).unwrap();
+            drive(&db.io, || db.store.adopt(&[freed])).unwrap();
+            // Set only while the freer's step runs.
+            let freeing = Arc::new(crate::sync::atomic::AtomicBool::new(false));
+            let (fio, fstore, flag) = (io.clone(), db.store.clone(), freeing.clone());
+            let freer = crate::thread::spawn(move || {
+                let step = fstore.epochs().enter();
+                flag.store(true, crate::sync::atomic::Ordering::SeqCst);
+                drive(&fio, || fstore.free(freed)).unwrap();
+                crate::thread::yield_now();
+                flag.store(false, crate::sync::atomic::Ordering::SeqCst);
+                drop(step);
+            });
+            let (aio, astore) = (io.clone(), db.store.clone());
+            let allocator = crate::thread::spawn(move || {
+                for _ in 0..3 {
+                    let pid = drive(&aio, || astore.allocate(class(1))).unwrap();
+                    assert!(
+                        pid != freed || !freeing.load(crate::sync::atomic::Ordering::SeqCst),
+                        "{pid:?} was handed out while its freer's step ran"
+                    );
+                }
+            });
+            freer.join().unwrap();
+            allocator.join().unwrap();
+        },
+        300,
+    );
+}

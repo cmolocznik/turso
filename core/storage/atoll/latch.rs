@@ -1,126 +1,125 @@
-//! The versioned latch (Umbra §2.3): one 64-bit word, 5 bits of state and 59 of version.
+//! The versioned latch (CONCURRENCY.md §5): one 64-bit word, an exclusive bit and 63 bits of
+//! version.
 //!
-//! State 0 is unlocked, 1..=30 counts shared holders, 31 is exclusive. Releasing an exclusive
-//! latch bumps the version, so an optimistic reader, which takes no lock and only remembers the
-//! version, learns afterwards whether the page changed under it.
+//! There is one kind of hold, exclusive, for changing a page or what a frame holds. Readers take
+//! nothing: they remember the version, read, and validate that it did not change. Releasing an
+//! exclusive hold bumps the version, unless nothing was written under it.
 //!
-//! There is no blocking acquire. Under Turso's cooperative scheduling another connection holding
-//! the latch may run on this very thread, so a caller that cannot take the latch yields
-//! (`IOResult::IO` with an explicit yield) and tries again.
+//! A hold exists only as a [`Held`] guard, from the instruction that took it, so a panic while it
+//! lives releases it: no path can leave a latch held.
+//!
+//! Nothing waits for a latch. A taker that finds it held yields to its caller (`IOResult::IO` with
+//! an explicit yield) and tries again: under Turso's cooperative scheduling the holder may be
+//! another connection on the very same thread.
 
-use crate::sync::atomic::{AtomicU64, Ordering};
-use std::sync::atomic::fence;
+use crate::sync::atomic::{fence, AtomicU64, Ordering};
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 
-const STATE_BITS: u32 = 5;
-const STATE_MASK: u64 = (1 << STATE_BITS) - 1;
-const EXCLUSIVE: u64 = STATE_MASK;
-const MAX_SHARED: u64 = EXCLUSIVE - 1;
+const EXCLUSIVE: u64 = 1;
 
 #[derive(Debug, Default)]
 pub struct VersionedLatch(AtomicU64);
 
-fn state(word: u64) -> u64 {
-    word & STATE_MASK
+fn version(word: u64) -> u64 {
+    word >> 1
 }
 
-fn version(word: u64) -> u64 {
-    word >> STATE_BITS
+fn held(word: u64) -> bool {
+    word & EXCLUSIVE != 0
 }
 
 impl VersionedLatch {
     /// The version to validate against later, or `None` while a writer holds the latch.
     pub fn optimistic(&self) -> Option<u64> {
         let word = self.0.load(Ordering::Acquire);
-        (state(word) != EXCLUSIVE).then_some(version(word))
+        (!held(word)).then_some(version(word))
     }
 
     /// Whether nothing was written under the latch since [`optimistic`](Self::optimistic).
     pub fn validate(&self, seen: u64) -> bool {
         fence(Ordering::Acquire);
+        self.0.load(Ordering::Relaxed) == seen << 1
+    }
+
+    fn try_lock_exclusive(&self) -> bool {
         let word = self.0.load(Ordering::Relaxed);
-        state(word) != EXCLUSIVE && version(word) == seen
-    }
-
-    pub fn try_lock_shared(&self) -> bool {
-        let mut word = self.0.load(Ordering::Relaxed);
-        loop {
-            if state(word) >= MAX_SHARED {
-                return false;
-            }
-            match self
-                .0
-                .compare_exchange(word, word + 1, Ordering::Acquire, Ordering::Relaxed)
-            {
-                Ok(_) => return true,
-                // Another shared holder came or went: try again with what it left.
-                Err(now) => word = now,
-            }
-        }
-    }
-
-    pub fn unlock_shared(&self) {
-        let before = self.0.fetch_sub(1, Ordering::Release);
-        debug_assert!((1..=MAX_SHARED).contains(&state(before)));
-    }
-
-    pub fn try_lock_exclusive(&self) -> bool {
-        let word = self.0.load(Ordering::Relaxed);
-        state(word) == 0
+        !held(word)
             && self
                 .0
                 .compare_exchange(word, word | EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
     }
 
-    /// Turns the caller's shared hold into an exclusive one, if no one else holds the latch.
-    pub fn try_upgrade(&self) -> bool {
-        let word = self.0.load(Ordering::Relaxed);
-        state(word) == 1
-            && self
-                .0
-                .compare_exchange(
-                    word,
-                    word - 1 + EXCLUSIVE,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-    }
-
-    /// Takes the latch exclusively if it is free and nothing was written since `seen`, so an
-    /// optimistic reader can go on to change what it read.
-    pub fn try_lock_exclusive_at(&self, seen: u64) -> bool {
-        let word = seen << STATE_BITS;
+    fn try_lock_exclusive_at(&self, seen: u64) -> bool {
         self.0
-            .compare_exchange(word, word | EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                seen << 1,
+                seen << 1 | EXCLUSIVE,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
     }
 
-    /// The version, read by the exclusive holder: what it stays at after
-    /// [`unlock_exclusive_unchanged`](Self::unlock_exclusive_unchanged).
-    pub fn version_held(&self) -> u64 {
+    fn unlock_exclusive_unchanged(&self) {
         let word = self.0.load(Ordering::Relaxed);
-        debug_assert_eq!(state(word), EXCLUSIVE);
-        version(word)
+        debug_assert!(held(word));
+        self.0.store(word & !EXCLUSIVE, Ordering::Release);
     }
 
-    /// Releases an exclusive hold under which nothing was written, keeping the version, so
-    /// optimistic readers are not sent back for nothing.
-    pub fn unlock_exclusive_unchanged(&self) {
+    fn unlock_exclusive(&self) {
         let word = self.0.load(Ordering::Relaxed);
-        debug_assert_eq!(state(word), EXCLUSIVE);
-        self.0.store(word & !STATE_MASK, Ordering::Release);
-    }
-
-    pub fn unlock_exclusive(&self) {
-        let word = self.0.load(Ordering::Relaxed);
-        debug_assert_eq!(state(word), EXCLUSIVE);
-        self.0
-            .store((version(word) + 1) << STATE_BITS, Ordering::Release);
+        debug_assert!(held(word));
+        self.0.store((version(word) + 1) << 1, Ordering::Release);
     }
 }
 
-#[cfg(test)]
+/// An exclusive hold on the latch `L` reaches: `&VersionedLatch`, or an owner that keeps the
+/// latch alive, for a hold that outlives the borrow (a read in flight). Dropping it releases the
+/// latch and bumps the version.
+#[must_use = "a hold is released when dropped"]
+pub struct Held<L: Deref<Target = VersionedLatch>>(L);
+
+impl<L: Deref<Target = VersionedLatch>> Held<L> {
+    /// Takes the latch if no one holds it.
+    pub fn try_take(latch: L) -> Option<Self> {
+        latch.try_lock_exclusive().then(|| Self(latch))
+    }
+
+    /// Takes the latch if nothing was written since `seen`: the holder then changes exactly what
+    /// it read, or what it checked the frame holds.
+    pub fn try_take_at(latch: L, seen: u64) -> Option<Self> {
+        latch.try_lock_exclusive_at(seen).then(|| Self(latch))
+    }
+
+    /// What reaches the latch.
+    pub fn latch(&self) -> &L {
+        &self.0
+    }
+
+    /// The version: what it stays at after [`release_unchanged`](Self::release_unchanged).
+    pub fn version(&self) -> u64 {
+        version(self.0 .0.load(Ordering::Relaxed))
+    }
+
+    /// Releases a hold under which nothing was written, keeping the version, so readers are not
+    /// sent back for nothing.
+    pub fn release_unchanged(self) {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `this` is never used or dropped again; the latch reference is dropped here.
+        let latch = unsafe { std::ptr::read(&this.0) };
+        latch.unlock_exclusive_unchanged();
+    }
+}
+
+impl<L: Deref<Target = VersionedLatch>> Drop for Held<L> {
+    fn drop(&mut self) {
+        self.0.unlock_exclusive();
+    }
+}
+
+#[cfg(all(test, not(shuttle)))]
 mod tests {
     use super::*;
 
@@ -128,77 +127,51 @@ mod tests {
     fn an_optimistic_read_fails_validation_after_a_write_and_only_then() {
         let latch = VersionedLatch::default();
         let seen = latch.optimistic().unwrap();
-        assert!(latch.try_lock_shared());
-        latch.unlock_shared();
-        assert!(
-            latch.validate(seen),
-            "a shared holder invalidated an optimistic read"
-        );
-        assert!(latch.try_lock_exclusive());
+        let hold = Held::try_take(&latch).unwrap();
         assert_eq!(latch.optimistic(), None);
+        assert!(Held::try_take(&latch).is_none(), "two holders");
         assert!(
             !latch.validate(seen),
             "validated while a writer held the latch"
         );
-        latch.unlock_exclusive();
+        drop(hold);
         assert!(!latch.validate(seen), "validated across a write");
         assert_eq!(latch.optimistic(), Some(seen + 1));
     }
 
     #[test]
-    fn shared_holders_exclude_a_writer_and_a_writer_excludes_everyone() {
+    fn a_hold_at_a_version_is_taken_only_while_nothing_was_written() {
         let latch = VersionedLatch::default();
-        assert!(latch.try_lock_shared());
-        assert!(latch.try_lock_shared());
-        assert!(!latch.try_lock_exclusive());
-        latch.unlock_shared();
-        latch.unlock_shared();
-        assert!(latch.try_lock_exclusive());
-        assert!(!latch.try_lock_shared());
-        assert!(!latch.try_lock_exclusive());
-        latch.unlock_exclusive();
-        assert!(latch.try_lock_shared());
-    }
-
-    #[test]
-    fn upgrades_succeed_only_for_a_sole_holder_or_an_unchanged_version() {
-        let latch = VersionedLatch::default();
-        assert!(latch.try_lock_shared() && latch.try_lock_shared());
-        assert!(
-            !latch.try_upgrade(),
-            "upgraded beside another shared holder"
-        );
-        latch.unlock_shared();
-        assert!(latch.try_upgrade());
-        latch.unlock_exclusive();
         let seen = latch.optimistic().unwrap();
-        assert!(latch.try_lock_exclusive_at(seen));
-        latch.unlock_exclusive();
+        let hold = Held::try_take_at(&latch, seen).unwrap();
+        assert!(Held::try_take_at(&latch, seen).is_none(), "taken twice");
+        drop(hold);
         assert!(
-            !latch.try_lock_exclusive_at(seen),
-            "an optimistic reader upgraded across a write"
+            Held::try_take_at(&latch, seen).is_none(),
+            "taken across a write"
         );
         let now = latch.optimistic().unwrap();
-        assert!(latch.try_lock_shared());
-        assert!(
-            !latch.try_lock_exclusive_at(now),
-            "upgraded beside a shared holder"
-        );
-        latch.unlock_shared();
-        assert!(latch.try_lock_exclusive());
-        latch.unlock_exclusive_unchanged();
+        let hold = Held::try_take(&latch).unwrap();
+        assert_eq!(hold.version(), now);
+        hold.release_unchanged();
         assert!(
             latch.validate(now),
             "an unchanged release invalidated a reader"
         );
+        drop(Held::try_take_at(&latch, now).unwrap());
     }
 
     #[test]
-    fn shared_holders_stop_at_thirty() {
+    fn a_panic_while_holding_releases_the_latch() {
         let latch = VersionedLatch::default();
-        for _ in 0..MAX_SHARED {
-            assert!(latch.try_lock_shared());
-        }
-        assert!(!latch.try_lock_shared());
+        let panicked = std::panic::catch_unwind(|| {
+            let _hold = Held::try_take(&latch).unwrap();
+            panic!("a holder failed");
+        });
+        assert!(panicked.is_err());
+        assert!(
+            latch.optimistic().is_some(),
+            "the panic left the latch held"
+        );
     }
 }

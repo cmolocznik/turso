@@ -44,3 +44,27 @@ pub(super) fn backends() -> Vec<Backend> {
     ));
     all
 }
+
+/// Runs `test` under `iterations` random schedules and as many PCT schedules (depth 3), each task
+/// on a stack of 8 MiB: shuttle's default is too small for the IO completions that run inside
+/// their submission.
+#[cfg(shuttle)]
+pub(super) fn schedules(test: impl Fn() + Send + Sync + 'static, iterations: usize) {
+    let test = std::sync::Arc::new(test);
+    let config = || {
+        let mut config = shuttle::Config::new();
+        config.stack_size = 8 << 20;
+        config
+    };
+    let t = test.clone();
+    shuttle::Runner::new(
+        shuttle::scheduler::RandomScheduler::new(iterations),
+        config(),
+    )
+    .run(move || t());
+    shuttle::Runner::new(
+        shuttle::scheduler::PctScheduler::new(3, iterations),
+        config(),
+    )
+    .run(move || test());
+}

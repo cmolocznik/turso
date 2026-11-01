@@ -20,12 +20,13 @@
 //! taken by something else; the id tells it so, and it reads the leaf again.
 
 use super::super::blob;
-use super::super::buffer::BufferPool;
+use super::super::buffer::{BufferPool, Optimistic};
 use super::super::log::Log;
 use super::super::page::{self, PageId, SizeClass, CLASS_COUNT, HEADER_SIZE};
 use super::super::store::PageStore;
+use crate::io::Completion;
 use crate::sync::Arc;
-use crate::types::IOResult;
+use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
 
 /// Bytes a reference takes in a leaf.
@@ -254,6 +255,9 @@ pub enum Read {
     /// A page of it no longer belongs to it: the value was replaced or removed since its
     /// reference was read.
     Changed,
+    /// The leaf that named the value changed, or left memory, before a page of the value was
+    /// read in: read the reference again. What was read so far stays, for the same reference.
+    Unheld,
 }
 
 /// Checks that `page` is a blob page of the value `id`.
@@ -263,10 +267,23 @@ fn of_value(page: &[u8], id: u64) -> bool {
 
 /// Reads an out-of-line value, page by page, so a value larger than memory is read with every
 /// page it holds still in place: what was copied stays valid while the id matches.
+///
+/// Its pages are named by the leaf that holds its reference, which can drop the value between
+/// steps. A page is read in only after that leaf is seen unchanged in the same step: `holder`
+/// (CONCURRENCY.md §6).
 pub struct ValueRead {
     reference: ValueRef,
     out: Vec<u8>,
     chunks: Option<Vec<PageId>>,
+}
+
+/// A page of a value, fixed.
+enum Fixed<'a> {
+    Page(Optimistic<'a>),
+    /// Its number is free: the value was removed since its reference was read.
+    Freed,
+    /// Not in memory, and its holder changed.
+    Unheld,
 }
 
 impl ValueRead {
@@ -288,36 +305,51 @@ impl ValueRead {
         pool: &Arc<BufferPool>,
         pid: PageId,
         len: usize,
-    ) -> Result<IOResult<Option<()>>> {
-        let page = match fix_shared(pool, pid)? {
-            Some(IOResult::Done(p)) => p,
-            Some(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-            None => return Ok(IOResult::Done(None)),
+        holder: &dyn Fn() -> bool,
+    ) -> Result<IOResult<Option<Read>>> {
+        let page = match fix(pool, pid, holder)? {
+            IOResult::Done(Fixed::Page(p)) => p,
+            IOResult::Done(Fixed::Freed) => return Ok(IOResult::Done(Some(Read::Changed))),
+            IOResult::Done(Fixed::Unheld) => return Ok(IOResult::Done(Some(Read::Unheld))),
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        let bytes = page.page();
-        if !of_value(bytes, self.reference.id) || HEADER_SIZE + ID + len > bytes.len() {
-            return Ok(IOResult::Done(None));
-        }
-        self.out
-            .extend_from_slice(&bytes[HEADER_SIZE + ID..HEADER_SIZE + ID + len]);
-        Ok(IOResult::Done(Some(())))
+        let (id, before) = (self.reference.id, self.out.len());
+        let out = &mut self.out;
+        let copied = page.read(|bytes| {
+            if !of_value(bytes, id) || HEADER_SIZE + ID + len > bytes.len() {
+                return false;
+            }
+            out.extend_from_slice(&bytes[HEADER_SIZE + ID..HEADER_SIZE + ID + len]);
+            true
+        });
+        Ok(match copied {
+            Some(true) => IOResult::Done(None),
+            Some(false) => IOResult::Done(Some(Read::Changed)),
+            // The page moved or was evicted while copied: copy it again.
+            None => {
+                self.out.truncate(before);
+                IOResult::IO(IOCompletions(Completion::new_yield()))
+            }
+        })
     }
 
-    pub fn step(&mut self, pool: &Arc<BufferPool>) -> Result<IOResult<Read>> {
+    pub fn step(
+        &mut self,
+        pool: &Arc<BufferPool>,
+        holder: &dyn Fn() -> bool,
+    ) -> Result<IOResult<Read>> {
         let len = self.reference.len as usize;
         let Some(count) = self.reference.chunks() else {
-            return Ok(match self.copy(pool, self.reference.pid, len)? {
-                IOResult::Done(Some(())) => {
-                    IOResult::Done(Read::Value(std::mem::take(&mut self.out)))
-                }
-                IOResult::Done(None) => IOResult::Done(Read::Changed),
+            return Ok(match self.copy(pool, self.reference.pid, len, holder)? {
+                IOResult::Done(None) => IOResult::Done(Read::Value(std::mem::take(&mut self.out))),
+                IOResult::Done(Some(stop)) => IOResult::Done(stop),
                 IOResult::IO(io) => IOResult::IO(io),
             });
         };
         if self.chunks.is_none() {
-            match directory(pool, self.reference, count)? {
-                IOResult::Done(Some(chunks)) => self.chunks = Some(chunks),
-                IOResult::Done(None) => return Ok(IOResult::Done(Read::Changed)),
+            match directory(pool, self.reference, count, holder)? {
+                IOResult::Done(Ok(chunks)) => self.chunks = Some(chunks),
+                IOResult::Done(Err(stop)) => return Ok(IOResult::Done(stop)),
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
@@ -325,9 +357,9 @@ impl ValueRead {
         while self.out.len() < len {
             let i = self.out.len() / chunk();
             let n = (len - self.out.len()).min(chunk());
-            match self.copy(pool, chunks[i], n)? {
-                IOResult::Done(Some(())) => {}
-                IOResult::Done(None) => return Ok(IOResult::Done(Read::Changed)),
+            match self.copy(pool, chunks[i], n, holder)? {
+                IOResult::Done(None) => {}
+                IOResult::Done(Some(stop)) => return Ok(IOResult::Done(stop)),
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
@@ -335,53 +367,65 @@ impl ValueRead {
     }
 }
 
-/// Fixes a page of a value shared; `None` if its number is free: the value it belonged to was
-/// removed since its reference was read.
-fn fix_shared(
-    pool: &Arc<BufferPool>,
+/// Fixes a page of a value that `holder` names.
+fn fix<'a>(
+    pool: &'a Arc<BufferPool>,
     pid: PageId,
-) -> Result<Option<IOResult<super::super::buffer::Shared<'_>>>> {
-    match pool.fix_shared(pid, None) {
-        Ok(r) => Ok(Some(r)),
-        Err(LimboError::Corrupt(_)) => Ok(None),
+    holder: &dyn Fn() -> bool,
+) -> Result<IOResult<Fixed<'a>>> {
+    match pool.fix_optimistic_held(pid, None, holder) {
+        Ok(IOResult::Done(Some(p))) => Ok(IOResult::Done(Fixed::Page(p))),
+        Ok(IOResult::Done(None)) => Ok(IOResult::Done(Fixed::Unheld)),
+        Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+        Err(LimboError::Corrupt(_)) => Ok(IOResult::Done(Fixed::Freed)),
         Err(e) => Err(e),
     }
 }
 
-/// The chunks a chunked value's directory lists; `None` if it no longer belongs to the value.
+/// The chunks a chunked value's directory lists; else why they could not be read.
 fn directory(
     pool: &Arc<BufferPool>,
     reference: ValueRef,
     count: usize,
-) -> Result<IOResult<Option<Vec<PageId>>>> {
-    let page = match fix_shared(pool, reference.pid)? {
-        Some(IOResult::Done(p)) => p,
-        Some(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-        None => return Ok(IOResult::Done(None)),
+    holder: &dyn Fn() -> bool,
+) -> Result<IOResult<std::result::Result<Vec<PageId>, Read>>> {
+    let page = match fix(pool, reference.pid, holder)? {
+        IOResult::Done(Fixed::Page(p)) => p,
+        IOResult::Done(Fixed::Freed) => return Ok(IOResult::Done(Err(Read::Changed))),
+        IOResult::Done(Fixed::Unheld) => return Ok(IOResult::Done(Err(Read::Unheld))),
+        IOResult::IO(io) => return Ok(IOResult::IO(io)),
     };
-    let bytes = page.page();
     let at = HEADER_SIZE + ID;
-    if !of_value(bytes, reference.id) || at + 8 * count > bytes.len() {
-        return Ok(IOResult::Done(None));
-    }
-    Ok(IOResult::Done(Some(
-        bytes[at..at + 8 * count]
+    let read = page.read(|bytes| {
+        if !of_value(bytes, reference.id) || at + 8 * count > bytes.len() {
+            return Err(Read::Changed);
+        }
+        Ok(bytes[at..at + 8 * count]
             .chunks_exact(8)
             .map(|c| PageId::from_raw(u64::from_le_bytes(c.try_into().unwrap())))
-            .collect(),
-    )))
+            .collect())
+    });
+    Ok(match read {
+        Some(chunks) => IOResult::Done(chunks),
+        // The page moved or was evicted while read: read it again.
+        None => IOResult::IO(IOCompletions(Completion::new_yield())),
+    })
 }
 
-/// Every page a value takes; `None` if they no longer belong to it.
-pub fn pages(pool: &Arc<BufferPool>, reference: ValueRef) -> Result<IOResult<Option<Vec<PageId>>>> {
+/// Every page a value takes, which `holder` names; else why they could not be read.
+pub fn pages(
+    pool: &Arc<BufferPool>,
+    reference: ValueRef,
+    holder: &dyn Fn() -> bool,
+) -> Result<IOResult<std::result::Result<Vec<PageId>, Read>>> {
     let Some(count) = reference.chunks() else {
-        return Ok(IOResult::Done(Some(vec![reference.pid])));
+        return Ok(IOResult::Done(Ok(vec![reference.pid])));
     };
-    Ok(match directory(pool, reference, count)? {
-        IOResult::Done(Some(chunks)) => {
-            IOResult::Done(Some(std::iter::once(reference.pid).chain(chunks).collect()))
+    Ok(match directory(pool, reference, count, holder)? {
+        IOResult::Done(Ok(chunks)) => {
+            IOResult::Done(Ok(std::iter::once(reference.pid).chain(chunks).collect()))
         }
-        IOResult::Done(None) => IOResult::Done(None),
+        IOResult::Done(Err(stop)) => IOResult::Done(Err(stop)),
         IOResult::IO(io) => IOResult::IO(io),
     })
 }

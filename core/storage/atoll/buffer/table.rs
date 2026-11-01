@@ -1,25 +1,41 @@
 //! The one translation from page id to frame, for pages resident or loading.
 //!
-//! A bucket's word holds the first frame of its chain, plus one, and a lock bit; each frame header
-//! links the next frame. Inserts and removals take the bucket's lock, held for a few instructions
-//! and never across anything else. Lookups take no lock. A frame can leave its chain and join
-//! another while a lookup walks it, so what a lookup returns is checked by the caller against the
-//! frame's latch and page id. A walk that finds nothing may have missed a page, so whoever acts on
-//! an absence asks again under the lock ([`Table::insert`] does).
+//! A bucket holds the first frame of its chain, plus one; each frame header links the next frame.
+//! Inserts and removals hold the bucket's mutex, for a few instructions and never across anything
+//! else, so it is a leaf in the lock order. Lookups take nothing. A frame can leave its chain and
+//! join another while a lookup walks it, so what a lookup returns is checked by the caller against
+//! the frame's latch and page id. A walk that finds nothing may have missed a page, so whoever acts
+//! on an absence asks again under the mutex ([`Table::insert`] does).
 //!
 //! At one bucket per 4 KiB frame the table costs 8 bytes per 4 KiB of pool, 0.2%.
 
 use super::super::page::PageId;
 use super::frame::FrameHeader;
-use super::memory::Zeroed;
-use crate::sync::atomic::{AtomicU64, Ordering};
+use super::memory::{Zeroable, Zeroed};
+use crate::sync::atomic::{AtomicU32, Ordering};
+use crate::sync::Mutex;
 use crate::Result;
 
-const LOCK: u64 = 1 << 32;
-const HEAD: u64 = LOCK - 1;
+struct Bucket {
+    /// The chain's first frame, plus one; 0 for none.
+    head: AtomicU32,
+    changing: Mutex<()>,
+}
+
+impl Default for Bucket {
+    fn default() -> Self {
+        Self {
+            head: AtomicU32::new(0),
+            changing: Mutex::new(()),
+        }
+    }
+}
+
+// SAFETY: all zeros is a head of 0 and an unlocked mutex (parking_lot's state 0).
+unsafe impl Zeroable for Bucket {}
 
 pub struct Table {
-    buckets: Zeroed<AtomicU64>,
+    buckets: Zeroed<Bucket>,
     mask: u64,
 }
 
@@ -33,14 +49,14 @@ impl Table {
         })
     }
 
-    fn bucket(&self, pid: u64) -> &AtomicU64 {
+    fn bucket(&self, pid: u64) -> &Bucket {
         &self.buckets[(PageId::from_raw(pid).hash() & self.mask) as usize]
     }
 
     /// The frame holding `pid`, unchecked. May miss a page moving between frames.
     pub fn find(&self, headers: &[FrameHeader], pid: u64) -> Option<u32> {
         let bucket = self.bucket(pid);
-        let mut at = (bucket.load(Ordering::Acquire) & HEAD) as u32;
+        let mut at = bucket.head.load(Ordering::Acquire);
         // A chain is never longer than the frames; a walk that is has crossed into chains that
         // changed under it.
         for _ in 0..headers.len() {
@@ -53,10 +69,8 @@ impl Table {
             }
             at = h.next.load(Ordering::Acquire);
         }
-        let head = self.lock(bucket);
-        let found = Self::walk(headers, head, pid);
-        self.unlock(bucket, head);
-        found
+        let _changing = bucket.changing.lock();
+        Self::walk(headers, bucket.head.load(Ordering::Acquire), pid)
     }
 
     fn walk(headers: &[FrameHeader], head: u32, pid: u64) -> Option<u32> {
@@ -71,42 +85,17 @@ impl Table {
         None
     }
 
-    fn lock(&self, bucket: &AtomicU64) -> u32 {
-        let mut spins = 0u32;
-        loop {
-            let word = bucket.load(Ordering::Relaxed);
-            if word & LOCK == 0
-                && bucket
-                    .compare_exchange_weak(word, word | LOCK, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            {
-                return (word & HEAD) as u32;
-            }
-            // The holder runs a few instructions; only an OS preemption makes this wait long.
-            spins += 1;
-            if spins.is_multiple_of(64) {
-                std::thread::yield_now();
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-    }
-
-    fn unlock(&self, bucket: &AtomicU64, head: u32) {
-        bucket.store(head as u64, Ordering::Release);
-    }
-
     /// Links `frame`, which already names `pid`, unless a frame holds `pid` already: then that
     /// frame.
     pub fn insert(&self, headers: &[FrameHeader], pid: u64, frame: u32) -> Result<(), u32> {
         let bucket = self.bucket(pid);
-        let head = self.lock(bucket);
+        let _changing = bucket.changing.lock();
+        let head = bucket.head.load(Ordering::Acquire);
         if let Some(existing) = Self::walk(headers, head, pid) {
-            self.unlock(bucket, head);
             return Err(existing);
         }
         headers[frame as usize].next.store(head, Ordering::Relaxed);
-        self.unlock(bucket, frame + 1);
+        bucket.head.store(frame + 1, Ordering::Release);
         Ok(())
     }
 
@@ -122,7 +111,8 @@ impl Table {
 
     fn relink(&self, headers: &[FrameHeader], pid: u64, frame: u32, to: Option<u32>) {
         let bucket = self.bucket(pid);
-        let mut head = self.lock(bucket);
+        let _changing = bucket.changing.lock();
+        let mut head = bucket.head.load(Ordering::Acquire);
         let after = headers[frame as usize].next.load(Ordering::Relaxed);
         let with = match to {
             Some(to) => {
@@ -145,6 +135,6 @@ impl Table {
                 at = h.next.load(Ordering::Relaxed);
             }
         }
-        self.unlock(bucket, head);
+        bucket.head.store(head, Ordering::Release);
     }
 }

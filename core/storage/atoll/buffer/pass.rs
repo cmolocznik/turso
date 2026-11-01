@@ -16,6 +16,7 @@
 //! It takes its old shard's position along: the new shard's position falls to it if lower, and a
 //! pass over the new shard already running keeps it too.
 
+use super::super::latch::Held;
 use super::super::log::Lsn;
 use super::frame::{RESIDENT, WRITING};
 use super::BufferPool;
@@ -104,6 +105,7 @@ impl Pass {
     }
 
     pub fn step(&mut self, pool: &Arc<BufferPool>) -> Result<IOResult<()>> {
+        let _step = pool.store.epochs().enter();
         pool.failed()?;
         // Waiting starts before the looks, so a write landing in between is not missed.
         let landed = pool.released_wait();
@@ -176,15 +178,14 @@ fn look(pool: &BufferPool, frame: u32) -> Look {
     if writing {
         return Look::Writing;
     }
-    if !h.latch.try_lock_shared() {
+    // Held at the version seen, the frame keeps the page looked at: claim it if it is still dirty
+    // and unclaimed. Nothing in the page changes, so readers are not sent back.
+    let Some(hold) = Held::try_take_at(&h.latch, version) else {
         return Look::Busy;
-    }
-    // Under the latch the frame keeps its page: claim it if it is still dirty and unclaimed.
-    let claimed = h.status() == RESIDENT
-        && h.dirty()
-        && h.flags.fetch_or(WRITING, Ordering::AcqRel) & WRITING == 0;
+    };
+    let claimed = h.dirty() && h.flags.fetch_or(WRITING, Ordering::AcqRel) & WRITING == 0;
     let class = PageId::from_raw(h.pid()).class();
-    h.latch.unlock_shared();
+    hold.release_unchanged();
     if claimed {
         Look::Write(class)
     } else {

@@ -382,8 +382,13 @@ impl Tree {
                 });
             };
             let cell = AtomicU32::new(hint);
-            let fixed = match self.pool.fix_optimistic(child, Some(&cell)) {
-                Ok(IOResult::Done(c)) => c,
+            // Read in only while the node still names it.
+            let fixed = match self
+                .pool
+                .fix_optimistic_held(child, Some(&cell), &|| node.validate())
+            {
+                Ok(IOResult::Done(Some(c))) => c,
+                Ok(IOResult::Done(None)) => return Ok(Found::Restart),
                 Ok(IOResult::IO(io)) => return Ok(Found::Io(io)),
                 // The child was freed since its entry was read.
                 Err(LimboError::Corrupt(_)) if !node.validate() => return Ok(Found::Restart),
@@ -406,11 +411,18 @@ impl Tree {
 
     // ---------------------------------------------------------------- reading
 
+    /// Whether the leaf `pid` is still in the frame `hint` names, unchanged since `version`.
+    fn holds(&self, pid: PageId, hint: u32, version: u64) -> bool {
+        self.pool
+            .fix_optimistic_at(pid, hint)
+            .is_some_and(|l| l.version() == version)
+    }
+
     /// The value of `key`, if present. Step it until done.
     pub fn lookup(&self, op: &mut Lookup) -> Result<IOResult<Option<Vec<u8>>>> {
         loop {
-            if let Some(read) = &mut op.read {
-                match done!(read.step(&self.pool)) {
+            if let (Some(read), Some((pid, hint, version))) = (&mut op.read, op.held) {
+                match done!(read.step(&self.pool, &|| self.holds(pid, hint, version))) {
                     Read::Value(v) => {
                         op.read = None;
                         op.failed = None;
@@ -419,7 +431,9 @@ impl Tree {
                         return Ok(IOResult::Done(Some(value)));
                     }
                     Read::Changed => op.failed = op.read.take().map(|r| r.reference()),
+                    Read::Unheld => {}
                 }
+                op.held = None;
             }
             let (leaf, _) = found!(self.descend(&op.key, 0, Route::At));
             let Some(found) = leaf.read(|p| {
@@ -443,8 +457,12 @@ impl Tree {
                     if op.failed == Some(reference) {
                         return Err(corrupt_value(reference));
                     }
-                    op.head = head.to_vec();
-                    op.read = Some(ValueRead::new(reference));
+                    // The value of a read under way goes on from where it was.
+                    if op.read.as_ref().is_none_or(|r| r.reference() != reference) {
+                        op.head = head.to_vec();
+                        op.read = Some(ValueRead::new(reference));
+                    }
+                    op.held = Some((leaf.pid(), leaf.hint(), leaf.version()));
                 }
             }
         }
@@ -508,7 +526,7 @@ impl Tree {
                 _ => {}
             }
             assert_eq!(op.head.len(), self.head, "a put's head is not the tree's");
-            if !done!(op.old_pages(&self.pool, self.head, present.as_ref())) {
+            if !done!(op.old_pages(&self.pool, self.head, present.as_ref(), &|| leaf.validate())) {
                 continue;
             }
             let out_of_line = !self.limits.inline(op.key.len(), self.head + op.value_len);
@@ -642,7 +660,7 @@ impl Tree {
             let Some(present) = present else {
                 return Ok(IOResult::Done(false));
             };
-            if !done!(op.old_pages(&self.pool, self.head, &present)) {
+            if !done!(op.old_pages(&self.pool, self.head, &present, &|| leaf.validate())) {
                 continue;
             }
             let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
@@ -1138,13 +1156,16 @@ impl Tree {
 
     fn run(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
         loop {
-            if let Some((key, head, read)) = &mut cursor.reading {
-                match done!(read.step(&self.pool)) {
+            if let (Some((key, head, read)), Some((pid, hint, version))) =
+                (&mut cursor.reading, cursor.held)
+            {
+                match done!(read.step(&self.pool, &|| self.holds(pid, hint, version))) {
                     Read::Value(v) => {
                         let mut value = std::mem::take(head);
                         value.extend_from_slice(&v);
                         cursor.entry = Some((std::mem::take(key), value));
                         cursor.reading = None;
+                        cursor.held = None;
                         cursor.pending = None;
                         cursor.failed = None;
                         return Ok(IOResult::Done(true));
@@ -1157,7 +1178,9 @@ impl Tree {
                         }
                         cursor.failed = Some(failed);
                     }
+                    Read::Unheld => {}
                 }
+                cursor.held = None;
             }
             let (seek, target) = cursor.pending.clone().expect("a seek pending");
             let cached = cursor.leaf.and_then(|(pid, hint, version)| {
@@ -1185,18 +1208,29 @@ impl Tree {
             };
             match step.ok_or_else(|| corrupt_node(leaf.pid()))? {
                 Scan::Entry(key, value, out_of_line) => {
-                    cursor.leaf = Some((leaf.pid(), leaf.hint(), leaf.version()));
+                    let at = (leaf.pid(), leaf.hint(), leaf.version());
+                    cursor.leaf = Some(at);
                     if !out_of_line {
                         cursor.entry = Some((key, value));
                         cursor.pending = None;
+                        cursor.reading = None;
                         return Ok(IOResult::Done(true));
                     }
                     let (head, reference) = self
                         .split_reference(&value)
                         .ok_or_else(|| corrupt_node(leaf.pid()))?;
-                    cursor.reading = Some((key, head.to_vec(), ValueRead::new(reference)));
+                    // The value of a read under way goes on from where it was.
+                    if cursor
+                        .reading
+                        .as_ref()
+                        .is_none_or(|(k, _, r)| *k != key || r.reference() != reference)
+                    {
+                        cursor.reading = Some((key, head.to_vec(), ValueRead::new(reference)));
+                    }
+                    cursor.held = Some(at);
                 }
                 Scan::End => {
+                    cursor.reading = None;
                     cursor.entry = None;
                     cursor.pending = None;
                     cursor.leaf = None;
@@ -1248,13 +1282,17 @@ impl Tree {
             level,
         }) = op.stack.last().cloned()
         {
-            let page = done!(self.pool.fix_shared(pid, None));
+            let page = done!(self.pool.fix_optimistic(pid, None));
+            // A copy, checked once it is known whole: the page changed meanwhile otherwise.
+            let Some(bytes) = page.read(|p| p.to_vec()) else {
+                continue;
+            };
             op.stack.pop();
-            let v = View::new(page.page());
+            let v = View::new(&bytes);
             let fail = |what: String| {
                 LimboError::Corrupt(format!("B-tree {:?}, {pid:?}: {what}", self.root))
             };
-            node::check(page.page()).map_err(fail)?;
+            node::check(&bytes).map_err(fail)?;
             if v.root() != self.root {
                 return Err(fail("belongs to another tree".into()));
             }
@@ -1421,6 +1459,9 @@ pub struct Lookup {
     /// The head of the out-of-line value being read.
     head: Vec<u8>,
     read: Option<ValueRead>,
+    /// The leaf the value's reference was read from, while it is known to hold it: page, frame
+    /// hint and version.
+    held: Option<(PageId, u32, u64)>,
     /// A reference whose value read back as changed: reading it again the same is corruption.
     failed: Option<ValueRef>,
 }
@@ -1431,6 +1472,7 @@ impl Lookup {
             key: key.to_vec(),
             head: Vec::new(),
             read: None,
+            held: None,
             failed: None,
         }
     }
@@ -1520,8 +1562,9 @@ impl Put {
         pool: &Arc<BufferPool>,
         head: usize,
         present: Option<&(Vec<u8>, bool)>,
+        holder: &dyn Fn() -> bool,
     ) -> Result<IOResult<bool>> {
-        old_pages(&mut self.old, pool, head, present)
+        old_pages(&mut self.old, pool, head, present, holder)
     }
 }
 
@@ -1530,6 +1573,7 @@ fn old_pages(
     pool: &Arc<BufferPool>,
     head: usize,
     present: Option<&(Vec<u8>, bool)>,
+    holder: &dyn Fn() -> bool,
 ) -> Result<IOResult<bool>> {
     let Some((stored, true)) = present else {
         *old = None;
@@ -1541,12 +1585,12 @@ fn old_pages(
     }
     let parsed = ValueRef::decode(reference)
         .ok_or_else(|| LimboError::Corrupt("a bad value reference".into()))?;
-    Ok(match value::pages(pool, parsed)? {
-        IOResult::Done(Some(pages)) => {
+    Ok(match value::pages(pool, parsed, holder)? {
+        IOResult::Done(Ok(pages)) => {
             *old = Some((reference.clone(), pages));
             IOResult::Done(true)
         }
-        IOResult::Done(None) => IOResult::Done(false),
+        IOResult::Done(Err(_)) => IOResult::Done(false),
         IOResult::IO(io) => IOResult::IO(io),
     })
 }
@@ -1582,8 +1626,9 @@ impl Remove {
         pool: &Arc<BufferPool>,
         head: usize,
         present: &(Vec<u8>, bool),
+        holder: &dyn Fn() -> bool,
     ) -> Result<IOResult<bool>> {
-        old_pages(&mut self.old, pool, head, Some(present))
+        old_pages(&mut self.old, pool, head, Some(present), holder)
     }
 }
 
@@ -1610,6 +1655,9 @@ pub struct Cursor {
     leaf: Option<(PageId, u32, u64)>,
     /// The key, the head and the read of an out-of-line value.
     reading: Option<(Vec<u8>, Vec<u8>, ValueRead)>,
+    /// The leaf the value's reference was read from, while it is known to hold it: page, frame
+    /// hint and version.
+    held: Option<(PageId, u32, u64)>,
     failed: Option<ValueRef>,
 }
 

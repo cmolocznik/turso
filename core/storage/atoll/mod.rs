@@ -52,7 +52,20 @@ pub(crate) fn drive<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult
     loop {
         match op()? {
             IOResult::Done(v) => return Ok(v),
-            IOResult::IO(IOCompletions(c)) => io.wait_for_completion(c)?,
+            IOResult::IO(IOCompletions(c)) => {
+                // Another thread may be the one to complete it, or, for a yield, the one holding
+                // what the operation needs: give it the processor, rather than spin.
+                crate::thread::yield_now();
+                while !c.finished() {
+                    io.step()?;
+                    if !c.finished() {
+                        crate::thread::yield_now();
+                    }
+                }
+                if let Some(e) = c.get_error() {
+                    return Err(crate::LimboError::CompletionError(e));
+                }
+            }
         }
     }
 }

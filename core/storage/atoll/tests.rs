@@ -113,7 +113,12 @@ fn check(db: &Atoll, io: &Arc<dyn IO>, model: &BTreeMap<PageId, Lives>, end: Lsn
             continue;
         };
         assert_ne!(entry, FREE, "{label}: {pid:?} lost");
-        let page = drive(io, || db.pool().fix_shared(pid, None)).unwrap();
+        let page = loop {
+            let g = drive(io, || db.pool().fix_optimistic(pid, None)).unwrap();
+            if let Some(bytes) = g.read(|p| p.to_vec()) {
+                break bytes;
+            }
+        };
         for (place, version) in places.iter().enumerate() {
             let at = HEADER_SIZE + place * STAMP;
             let expected = match version {
@@ -121,7 +126,7 @@ fn check(db: &Atoll, io: &Arc<dyn IO>, model: &BTreeMap<PageId, Lives>, end: Lsn
                 None => [0; STAMP],
             };
             assert_eq!(
-                page.page()[at..at + STAMP],
+                page[at..at + STAMP],
                 expected,
                 "{label}: {pid:?} place {place} after recovery to {end}"
             );

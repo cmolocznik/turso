@@ -4,6 +4,7 @@
 //! names, and read back from there. The files are deleted at every open, and recovery never reads
 //! them.
 
+use super::super::epoch::{Epochs, Limbo};
 use super::super::page::{PageId, SizeClass, CLASS_COUNT};
 use super::source::ReadDone;
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
@@ -20,6 +21,9 @@ pub struct TempPages {
     /// The next change's LSN. Nothing is logged, so these only order a page's changes and tell
     /// its frame dirty. They start at 1: 0 is a page never changed.
     lsn: AtomicU64,
+    epochs: Arc<Epochs>,
+    /// Numbers freed and not yet reusable: a step that could hold one may still run.
+    retired: Limbo<PageId>,
 }
 
 #[derive(Default)]
@@ -37,7 +41,7 @@ fn path(base: &str, class: SizeClass) -> String {
 
 impl TempPages {
     /// Temporary pages in files beside `base`. Whatever an earlier process left there is deleted.
-    pub fn new(io: Arc<dyn IO>, base: &str) -> Result<Self> {
+    pub fn new(io: Arc<dyn IO>, base: &str, epochs: Arc<Epochs>) -> Result<Self> {
         for class in SizeClass::all() {
             let path = path(base, class);
             // Created first, so the removal finds it whether or not an earlier process left one.
@@ -50,11 +54,19 @@ impl TempPages {
             classes: Default::default(),
             files: Mutex::new(Default::default()),
             lsn: AtomicU64::new(1),
+            epochs,
+            retired: Limbo::default(),
         })
     }
 
     /// A new temporary page of `class`. It has no copy until it is first written: it is zeros.
     pub fn allocate(&self, class: SizeClass) -> PageId {
+        for pid in self.retired.reclaim(&self.epochs) {
+            self.classes[pid.class().index()]
+                .lock()
+                .free
+                .push(pid.temporary_number());
+        }
         let mut c = self.classes[class.index()].lock();
         let number = c.free.pop().unwrap_or_else(|| {
             c.next += 1;
@@ -63,21 +75,35 @@ impl TempPages {
         PageId::temporary(class, number)
     }
 
-    /// Gives `pid`'s number back. Its frame must be gone already.
+    /// Gives `pid`'s number back, once no step that could hold it is left. Its frame must be gone
+    /// already. It has no copy from here on: a stale reader reads zeros.
     pub fn free(&self, pid: PageId) {
-        let mut c = self.classes[pid.class().index()].lock();
-        let number = pid.temporary_number();
-        c.written.remove(&number);
-        c.free.push(number);
+        self.classes[pid.class().index()]
+            .lock()
+            .written
+            .remove(&pid.temporary_number());
+        self.retired.retire(&self.epochs, pid);
     }
 
     /// Every temporary page allocated and not freed.
     #[cfg(test)]
     pub fn allocated(&self) -> Vec<PageId> {
         let mut out = Vec::new();
+        let retired: HashSet<PageId> = self.retired.waiting().into_iter().collect();
         for class in SizeClass::all() {
             let c = self.classes[class.index()].lock();
-            let free: HashSet<u64> = c.free.iter().copied().collect();
+            let free: HashSet<u64> = c
+                .free
+                .iter()
+                .copied()
+                .filter(|&n| !retired.contains(&PageId::temporary(class, n)))
+                .chain(
+                    retired
+                        .iter()
+                        .filter(|p| p.class() == class)
+                        .map(|p| p.temporary_number()),
+                )
+                .collect();
             out.extend(
                 (0..c.next)
                     .filter(|n| !free.contains(n))

@@ -162,13 +162,25 @@ impl<T> Limbo<T> {
 
     /// Takes every item no step can hold any more.
     pub fn reclaim(&self, epochs: &Epochs) -> Vec<T> {
-        let horizon = epochs.horizon();
+        // The horizon after the items: each was stamped before it is read, so a step that could
+        // hold one announced before the read, at or below its stamp. A horizon read first could
+        // miss a step that began, retired an item and still runs.
         let mut items = self.items.lock();
+        let horizon = epochs.horizon();
         let mut out = Vec::new();
         while items.front().is_some_and(|(stamp, _)| *stamp < horizon) {
             out.push(items.pop_front().expect("an item").1);
         }
         out
+    }
+
+    /// What waits, for a test to count it.
+    #[cfg(test)]
+    pub fn waiting(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.items.lock().iter().map(|(_, t)| t.clone()).collect()
     }
 
     pub fn len(&self) -> usize {

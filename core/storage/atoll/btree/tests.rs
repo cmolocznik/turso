@@ -110,8 +110,9 @@ fn check_whole(tree: &Tree, db: &Atoll, run: &Runner<'_>, label: &str) -> Stats 
     let stats = run_to(run, || tree.check(&mut check));
     let mut expected: BTreeSet<PageId> = stats.pages.iter().copied().collect();
     for &v in &stats.values {
-        let pages = run_to(run, || value::pages(db.pool(), v));
-        expected.extend(pages.unwrap_or_else(|| panic!("{label}: value {v:?} lost its pages")));
+        // The tree is still: its leaves keep their references.
+        let pages = run_to(run, || value::pages(db.pool(), v, &|| true));
+        expected.extend(pages.unwrap_or_else(|_| panic!("{label}: value {v:?} lost its pages")));
     }
     let mut allocated = BTreeSet::new();
     if tree.temporary() {

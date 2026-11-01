@@ -42,6 +42,8 @@ pub use memory::MIN_BUDGET;
 pub use pass::Pass;
 pub use source::{LocalSource, Located, PageSource, ReadDone};
 
+use super::epoch::Step;
+use super::latch::{Held, VersionedLatch};
 use super::log::Lsn;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::store::PageStore;
@@ -57,6 +59,50 @@ use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
+use std::ops::Deref;
+
+/// An exclusive hold on a frame's latch, borrowed from the pool.
+type Hold<'a> = Held<&'a VersionedLatch>;
+
+/// A frame's latch, reached through the pool that keeps it: for a hold that outlives a borrow of
+/// the pool, a read in flight.
+struct FrameLatch {
+    pool: Arc<BufferPool>,
+    frame: u32,
+}
+
+impl Deref for FrameLatch {
+    type Target = VersionedLatch;
+
+    fn deref(&self) -> &VersionedLatch {
+        &self.pool.header(self.frame).latch
+    }
+}
+
+/// A page being read into a frame, which it holds exclusively until the read ends. Dropped
+/// before then, when the read was never started or a panic unwinds, it takes the frame out of
+/// the table and frees it, and whoever waits on the read looks again.
+struct Loading {
+    pid: PageId,
+    hold: Option<Held<FrameLatch>>,
+}
+
+impl Loading {
+    fn end(mut self, res: std::result::Result<(), CompletionError>) {
+        let hold = self.hold.take().expect("a read ends once");
+        let pool = hold.latch().pool.clone();
+        pool.loaded(self.pid, hold, res);
+    }
+}
+
+impl Drop for Loading {
+    fn drop(&mut self) {
+        if let Some(hold) = self.hold.take() {
+            let pool = hold.latch().pool.clone();
+            pool.unload(self.pid, hold, None);
+        }
+    }
+}
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -85,15 +131,22 @@ impl BufferConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Optimistic,
-    Shared,
     Exclusive,
 }
 
 /// What following a frame found.
-enum Probe {
-    /// The frame holds the page, latched in the mode asked for; for an optimistic fix, the
-    /// version seen.
+/// A frame found holding a page: the version an optimistic fix saw, and an exclusive fix's hold.
+struct Fixed<'a> {
+    frame: u32,
+    version: u64,
+    hold: Option<Hold<'a>>,
+}
+
+enum Probe<'a> {
+    /// The frame holds the page; the version an optimistic fix saw.
     Hit(u64),
+    /// The frame holds the page, latched exclusively.
+    Held(Hold<'a>),
     /// The frame holds the page, but its latch is held.
     Busy,
     /// The page is being read into the frame.
@@ -175,7 +228,11 @@ impl BufferPool {
             writes_in_flight: AtomicUsize::new(0),
             failure: Mutex::new(None),
             shards: (0..shards).map(|_| Shard::new(redo)).collect(),
-            temp: Arc::new(TempPages::new(store.io().clone(), store.base())?),
+            temp: Arc::new(TempPages::new(
+                store.io().clone(),
+                store.base(),
+                store.epochs().clone(),
+            )?),
             store,
         }))
     }
@@ -213,28 +270,36 @@ impl BufferPool {
         pid: PageId,
         hint: Option<&AtomicU32>,
     ) -> Result<IOResult<Optimistic<'_>>> {
-        Ok(match self.fix(pid, hint, Mode::Optimistic)? {
-            IOResult::Done((frame, version)) => IOResult::Done(Optimistic {
-                pool: self,
-                frame,
-                pid,
-                version,
-            }),
+        Ok(match self.fix_optimistic_held(pid, hint, &|| true)? {
+            IOResult::Done(page) => IOResult::Done(page.expect("held without a holder")),
             IOResult::IO(io) => IOResult::IO(io),
         })
     }
 
-    pub fn fix_shared(
+    /// Fixes `pid`, which a page `holder` names, without a lock: `None` once `holder` no longer
+    /// names it. A page number is reused only after an epoch, but a reader holds `pid` across
+    /// steps; so before reading it in, the fix checks in its own step that `holder` still names
+    /// it. A number freed after the check is not reused before that step ends, and the read
+    /// finds it free; one freed before fails the check. Either way no copy of a freed page stays
+    /// in memory, where a new page under its number would meet it (CONCURRENCY.md §6).
+    pub fn fix_optimistic_held(
         self: &Arc<Self>,
         pid: PageId,
         hint: Option<&AtomicU32>,
-    ) -> Result<IOResult<Shared<'_>>> {
-        Ok(match self.fix(pid, hint, Mode::Shared)? {
-            IOResult::Done((frame, _)) => IOResult::Done(Shared {
-                pool: self,
-                frame,
-                pid,
-            }),
+        holder: &dyn Fn() -> bool,
+    ) -> Result<IOResult<Option<Optimistic<'_>>>> {
+        let step = self.store.epochs().enter();
+        Ok(match self.fix(pid, hint, Mode::Optimistic, holder)? {
+            IOResult::Done(Some(Fixed { frame, version, .. })) => {
+                IOResult::Done(Some(Optimistic {
+                    pool: self,
+                    frame,
+                    pid,
+                    version,
+                    _step: step,
+                }))
+            }
+            IOResult::Done(None) => IOResult::Done(None),
             IOResult::IO(io) => IOResult::IO(io),
         })
     }
@@ -244,23 +309,29 @@ impl BufferPool {
         pid: PageId,
         hint: Option<&AtomicU32>,
     ) -> Result<IOResult<Exclusive<'_>>> {
-        Ok(match self.fix(pid, hint, Mode::Exclusive)? {
-            IOResult::Done((frame, _)) => IOResult::Done(Exclusive {
+        let step = self.store.epochs().enter();
+        Ok(match self.fix(pid, hint, Mode::Exclusive, &|| true)? {
+            IOResult::Done(Some(Fixed { frame, hold, .. })) => IOResult::Done(Exclusive {
                 pool: self,
                 frame,
                 pid,
+                hold: hold.expect("an exclusive fix holds the latch"),
+                step,
             }),
+            IOResult::Done(None) => unreachable!("held without a holder"),
             IOResult::IO(io) => IOResult::IO(io),
         })
     }
 
-    /// The frame holding `pid`, latched in `mode`, and the version an optimistic fix saw.
+    /// The frame holding `pid`, latched in `mode`, and the version an optimistic fix saw; `None`
+    /// if `pid` is not in memory and `holder` no longer names it.
     fn fix(
         self: &Arc<Self>,
         pid: PageId,
         hint: Option<&AtomicU32>,
         mode: Mode,
-    ) -> Result<IOResult<(u32, u64)>> {
+        holder: &dyn Fn() -> bool,
+    ) -> Result<IOResult<Option<Fixed<'_>>>> {
         loop {
             let hinted = hint
                 .map(|h| h.load(Ordering::Relaxed))
@@ -275,20 +346,28 @@ impl BufferPool {
                 .take(1),
             );
             for (frame, from_hint) in found {
-                match self.probe(frame, pid, mode) {
-                    Probe::Hit(version) => {
-                        if !from_hint {
-                            if let Some(h) = hint {
-                                h.store(frame + 1, Ordering::Relaxed);
-                            }
-                        }
-                        self.header(frame).tracker.read(self.now());
-                        return Ok(IOResult::Done((frame, version)));
-                    }
+                let (version, hold) = match self.probe(frame, pid, mode) {
+                    Probe::Hit(version) => (version, None),
+                    Probe::Held(hold) => (hold.version(), Some(hold)),
                     Probe::Busy => return yield_now(),
                     Probe::Loading(c) => return Ok(IOResult::IO(IOCompletions(c))),
-                    Probe::Miss => {}
+                    Probe::Miss => continue,
+                };
+                if !from_hint {
+                    if let Some(h) = hint {
+                        h.store(frame + 1, Ordering::Relaxed);
+                    }
                 }
+                self.header(frame).tracker.read(self.now());
+                return Ok(IOResult::Done(Some(Fixed {
+                    frame,
+                    version,
+                    hold,
+                })));
+            }
+            // In this step, before anything is read.
+            if !holder() {
+                return Ok(IOResult::Done(None));
             }
             let located = match self.locate(pid)? {
                 IOResult::Done(l) => l,
@@ -314,37 +393,36 @@ impl BufferPool {
     }
 
     /// Latches `frame` in `mode` if it holds `pid`.
-    fn probe(&self, frame: u32, pid: PageId, mode: Mode) -> Probe {
+    fn probe(&self, frame: u32, pid: PageId, mode: Mode) -> Probe<'_> {
         let h = self.header(frame);
-        let holds = |h: &FrameHeader| h.status() == RESIDENT && h.pid() == pid.raw();
-        let latched = match mode {
-            Mode::Optimistic => match h.latch.optimistic() {
-                // The version read first: an eviction after it fails validation later.
-                Some(v) => return if holds(h) { Probe::Hit(v) } else { Probe::Miss },
-                None => false,
-            },
-            Mode::Shared => h.latch.try_lock_shared(),
-            Mode::Exclusive => h.latch.try_lock_exclusive(),
+        let Some(version) = h.latch.optimistic() else {
+            // Held: being read in, changed, evicted or freed.
+            if h.pid() != pid.raw() {
+                return Probe::Miss;
+            }
+            if h.status() == LOADING {
+                if let Some(c) = self.loads_of(frame).lock().get(&frame) {
+                    return Probe::Loading(c.clone());
+                }
+            }
+            return Probe::Busy;
         };
-        if latched {
-            if holds(h) {
-                return Probe::Hit(0);
-            }
-            match mode {
-                Mode::Shared => h.latch.unlock_shared(),
-                _ => h.latch.unlock_exclusive_unchanged(),
-            }
+        let holds = h.status() == RESIDENT && h.pid() == pid.raw();
+        if !h.latch.validate(version) {
+            return Probe::Busy;
+        }
+        if !holds {
             return Probe::Miss;
         }
-        if h.pid() != pid.raw() {
-            return Probe::Miss;
+        match mode {
+            Mode::Optimistic => Probe::Hit(version),
+            // Only at the version it was seen to hold the page at: a frame that changed hands
+            // meanwhile is never held, so no one ever holds a free frame.
+            Mode::Exclusive => match Held::try_take_at(&h.latch, version) {
+                Some(hold) => Probe::Held(hold),
+                None => Probe::Busy,
+            },
         }
-        if h.status() == LOADING {
-            if let Some(c) = self.loads_of(frame).lock().get(&frame) {
-                return Probe::Loading(c.clone());
-            }
-        }
-        Probe::Busy
     }
 
     /// Gets ready to read `pid`: from the temporary files, or from the page source.
@@ -367,7 +445,11 @@ impl BufferPool {
         located: Box<dyn Located>,
     ) -> Result<Option<Completion>> {
         let h = self.header(frame);
-        self.take_free_latch(frame);
+        let hold = Held::try_take(FrameLatch {
+            pool: self.clone(),
+            frame,
+        })
+        .unwrap_or_else(|| panic!("free frame {frame} is held"));
         h.pid.store(pid.raw(), Ordering::Release);
         h.flags.store(0, Ordering::Release);
         h.tracker.clear();
@@ -377,66 +459,83 @@ impl BufferPool {
         self.loads_of(frame).lock().insert(frame, loaded.clone());
         if self.table.insert(&self.headers, pid.raw(), frame).is_err() {
             self.loads_of(frame).lock().remove(&frame);
-            self.free_frame(pid.class(), frame);
+            self.free_frame(pid.class(), frame, hold);
             // A reader may have followed a hint here meanwhile: send it to the other frame.
             loaded.complete(0);
             return Ok(None);
         }
         let size = pid.class().size();
-        let pool = self.clone();
-        let read = located.read(
+        let reading = Loading {
+            pid,
+            hold: Some(hold),
+        };
+        // On an error the read never starts, and dropping it frees the frame.
+        located.read(
             self.memory.region.buffer(frame, size),
-            Box::new(move |res| pool.loaded(pid, frame, res)),
-        );
-        if let Err(e) = read {
-            self.loaded(pid, frame, Err(io_failure(&e)));
-            return Err(e);
-        }
+            Box::new(move |res| reading.end(res)),
+        )?;
         Ok(Some(loaded))
     }
 
-    /// Ends the read of `pid` into `frame`.
-    fn loaded(&self, pid: PageId, frame: u32, res: std::result::Result<(), CompletionError>) {
+    /// Ends the read of `pid` into the frame `hold` holds.
+    fn loaded(
+        &self,
+        pid: PageId,
+        hold: Held<FrameLatch>,
+        res: std::result::Result<(), CompletionError>,
+    ) {
+        let frame = hold.latch().frame;
         let h = self.header(frame);
-        let waiting = self.loads_of(frame).lock().remove(&frame);
         match res {
             Ok(()) => {
+                let waiting = self.loads_of(frame).lock().remove(&frame);
                 // SAFETY: the frame is the load's alone until its latch is released below.
                 let lsn = page::lsn(unsafe { self.bytes(frame, pid.class()) });
                 h.page_lsn.store(lsn, Ordering::Release);
                 h.written_lsn.store(lsn, Ordering::Release);
                 h.status.store(RESIDENT, Ordering::Release);
-                h.latch.unlock_exclusive();
+                drop(hold);
                 if let Some(c) = waiting {
                     c.complete(0);
                 }
             }
-            Err(e) => {
-                self.table.remove(&self.headers, pid.raw(), frame);
-                self.free_frame(pid.class(), frame);
-                if let Some(c) = waiting {
-                    c.error(e);
-                }
-            }
+            Err(e) => self.unload(pid, hold, Some(e)),
         }
     }
 
-    /// Latches a free frame exclusively. Only a reader following a stale hint can hold it, for
-    /// the instant it takes to see the frame holds nothing.
-    fn take_free_latch(&self, frame: u32) {
-        let latch = &self.header(frame).latch;
-        while !latch.try_lock_exclusive() {
-            std::hint::spin_loop();
+    /// Gives up the read of `pid` into the frame `hold` holds: the frame is unlinked and freed.
+    /// Whoever waits gets `error`, or looks again without one.
+    fn unload(&self, pid: PageId, hold: Held<FrameLatch>, error: Option<CompletionError>) {
+        let frame = hold.latch().frame;
+        let waiting = self.loads_of(frame).lock().remove(&frame);
+        self.table.remove(&self.headers, pid.raw(), frame);
+        self.free_frame(pid.class(), frame, hold);
+        match (waiting, error) {
+            (Some(c), Some(e)) => c.error(e),
+            (Some(c), None) => c.complete(0),
+            (None, _) => {}
         }
     }
 
-    /// Returns `frame`, unlinked and latched exclusively, to the free frames.
-    fn free_frame(&self, class: SizeClass, frame: u32) {
+    /// Latches a free frame exclusively. No one else ever holds a free frame: every other hold
+    /// is taken at a version seen with the frame holding a page.
+    fn take_free_latch(&self, frame: u32) -> Hold<'_> {
+        Held::try_take(&self.header(frame).latch)
+            .unwrap_or_else(|| panic!("free frame {frame} is held"))
+    }
+
+    /// Returns `frame`, unlinked, to the free frames, releasing `hold` on it.
+    fn free_frame<L: Deref<Target = VersionedLatch>>(
+        &self,
+        class: SizeClass,
+        frame: u32,
+        hold: Held<L>,
+    ) {
         let h = self.header(frame);
         h.status.store(FREE, Ordering::Release);
         h.pid.store(NO_PAGE, Ordering::Release);
         h.flags.store(0, Ordering::Release);
-        h.latch.unlock_exclusive();
+        drop(hold);
         self.memory.put(class, frame);
         self.signal_released();
     }
@@ -462,6 +561,7 @@ impl BufferPool {
 
     /// A new page of `class`, all zeros, fixed exclusively.
     pub fn allocate(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<Exclusive<'_>>> {
+        let step = self.store.epochs().enter();
         let frame = match self.claim(class)? {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -469,17 +569,15 @@ impl BufferPool {
         let pid = match self.store.allocate(class) {
             Ok(IOResult::Done(pid)) => pid,
             Ok(IOResult::IO(io)) => {
-                self.take_free_latch(frame);
-                self.free_frame(class, frame);
+                self.free_frame(class, frame, self.take_free_latch(frame));
                 return Ok(IOResult::IO(io));
             }
             Err(e) => {
-                self.take_free_latch(frame);
-                self.free_frame(class, frame);
+                self.free_frame(class, frame, self.take_free_latch(frame));
                 return Err(e);
             }
         };
-        Ok(IOResult::Done(self.install(frame, pid)))
+        Ok(IOResult::Done(self.install(frame, pid, step)))
     }
 
     /// A new temporary page of `class` (DESIGN.md §6.4), all zeros, fixed exclusively. Its
@@ -488,13 +586,16 @@ impl BufferPool {
         self: &Arc<Self>,
         class: SizeClass,
     ) -> Result<IOResult<Exclusive<'_>>> {
+        let step = self.store.epochs().enter();
         let frame = match self.claim(class)? {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        Ok(IOResult::Done(
-            self.install(frame, self.temp.allocate(class)),
-        ))
+        Ok(IOResult::Done(self.install(
+            frame,
+            self.temp.allocate(class),
+            step,
+        )))
     }
 
     /// Every temporary page allocated and not freed.
@@ -509,10 +610,10 @@ impl BufferPool {
     }
 
     /// Puts the new page `pid`, all zeros, in the claimed `frame`, fixed exclusively.
-    fn install(self: &Arc<Self>, frame: u32, pid: PageId) -> Exclusive<'_> {
+    fn install<'a>(self: &'a Arc<Self>, frame: u32, pid: PageId, step: Step<'a>) -> Exclusive<'a> {
         let class = pid.class();
         let h = self.header(frame);
-        self.take_free_latch(frame);
+        let hold = self.take_free_latch(frame);
         // SAFETY: latched exclusively.
         unsafe { self.bytes_mut(frame, class) }.fill(0);
         h.pid.store(pid.raw(), Ordering::Release);
@@ -522,19 +623,17 @@ impl BufferPool {
         h.tracker.clear();
         h.tracker.read(self.now());
         h.status.store(RESIDENT, Ordering::Release);
-        // The number may have been freed while its last page was still in memory: whoever freed
-        // it holds that frame exclusively and drops it next, waiting on nothing (`free`).
-        while let Err(other) = self.table.insert(&self.headers, pid.raw(), frame) {
-            assert!(
-                self.header(other).latch.optimistic().is_none(),
-                "new page {pid:?} is already in frame {other}, which no one is freeing"
-            );
-            std::hint::spin_loop();
+        // A number is handed out again only once every step that could hold its last page is
+        // gone (`epoch`), and the page left the table within its freer's step.
+        if let Err(other) = self.table.insert(&self.headers, pid.raw(), frame) {
+            panic!("new page {pid:?} is already in frame {other}");
         }
         Exclusive {
             pool: self,
             frame,
             pid,
+            hold,
+            step,
         }
     }
 
@@ -556,13 +655,15 @@ impl BufferPool {
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
-        std::mem::forget(page);
+        // Its latch is released by freeing the frame; its step ends last.
+        let Exclusive { hold, step, .. } = page;
         self.table.remove(&self.headers, pid.raw(), frame);
-        self.free_frame(pid.class(), frame);
+        self.free_frame(pid.class(), frame, hold);
         if pid.is_temporary() {
             // Once no frame holds it, so a new page under its number finds none.
             self.temp.free(pid);
         }
+        drop(step);
         Ok(IOResult::Done(()))
     }
 
@@ -571,6 +672,7 @@ impl BufferPool {
     /// is taken for it unread and held exclusively, so no fix can read it in while its number is
     /// freed.
     pub fn free_unreferenced(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        let _step = self.store.epochs().enter();
         loop {
             if self.table.find(&self.headers, pid.raw()).is_some() {
                 return match self.fix_exclusive(pid, None)? {
@@ -589,7 +691,7 @@ impl BufferPool {
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
             let h = self.header(frame);
-            self.take_free_latch(frame);
+            let hold = self.take_free_latch(frame);
             // Whatever the frame held before must not read as this page if the free waits.
             // SAFETY: latched exclusively.
             let bytes = unsafe { self.bytes_mut(frame, class) };
@@ -602,13 +704,15 @@ impl BufferPool {
             h.status.store(RESIDENT, Ordering::Release);
             if self.table.insert(&self.headers, pid.raw(), frame).is_err() {
                 // Read in meanwhile: free it where it is.
-                self.free_frame(class, frame);
+                self.free_frame(class, frame, hold);
                 continue;
             }
             return self.free(Exclusive {
                 pool: self,
                 frame,
                 pid,
+                hold,
+                step: self.store.epochs().enter(),
             });
         }
     }
@@ -625,6 +729,7 @@ impl BufferPool {
                 frame: hint - 1,
                 pid,
                 version,
+                _step: self.store.epochs().enter(),
             }),
             _ => None,
         }
@@ -636,6 +741,7 @@ impl BufferPool {
     /// pages whose location needs a read first, and pages for which no frame is free at once,
     /// are skipped. A later fix finds each page resident or being read.
     pub fn prefetch(self: &Arc<Self>, pids: &[PageId]) -> Result<()> {
+        let _step = self.store.epochs().enter();
         self.failed()?;
         for &pid in pids {
             if self.table.find(&self.headers, pid.raw()).is_some() {
@@ -789,27 +895,30 @@ impl BufferPool {
         let mut dirty = Vec::new();
         for frame in candidates {
             let h = self.header(frame);
-            if h.tracker.value(now) > threshold || !self.latch_to_evict(class, frame) {
+            if h.tracker.value(now) > threshold {
                 continue;
             }
+            let Some(hold) = self.latch_to_evict(class, frame) else {
+                continue;
+            };
             if h.dirty() {
                 h.flags.fetch_or(WRITING | EVICT_AFTER, Ordering::AcqRel);
-                h.latch.unlock_exclusive();
+                drop(hold);
                 dirty.push(frame);
             } else {
-                self.evict(class, frame);
+                self.evict(class, frame, hold);
             }
         }
         self.write_back(class, dirty, true);
         Ok(())
     }
 
-    /// Evicts the clean page in `frame`, latched exclusively.
-    fn evict(&self, class: SizeClass, frame: u32) {
+    /// Evicts the clean page in `frame`, which `hold` latches.
+    fn evict(&self, class: SizeClass, frame: u32, hold: Hold<'_>) {
         let h = self.header(frame);
         debug_assert!(!h.dirty() && !h.has(WRITING));
         self.table.remove(&self.headers, h.pid(), frame);
-        self.free_frame(class, frame);
+        self.free_frame(class, frame, hold);
         let size = class.size() as u64;
         let before = self.evicted.fetch_add(size, Ordering::Relaxed);
         if (before + size) / self.epoch_bytes != before / self.epoch_bytes {
@@ -823,17 +932,20 @@ impl BufferPool {
         let mut dirty = Vec::new();
         for i in 0..memory::frames_per_batch(class) {
             let frame = memory::frame_at(class, batch, i);
-            if self.memory.is_free(class, frame) || !self.latch_to_evict(class, frame) {
+            if self.memory.is_free(class, frame) {
                 continue;
             }
+            let Some(hold) = self.latch_to_evict(class, frame) else {
+                continue;
+            };
             let h = self.header(frame);
             if let Some(to) = self.memory.take(class) {
-                self.relocate(class, frame, to);
+                self.relocate(class, frame, hold, to);
             } else if !h.dirty() {
-                self.evict(class, frame);
+                self.evict(class, frame, hold);
             } else {
                 h.flags.fetch_or(WRITING | EVICT_AFTER, Ordering::AcqRel);
-                h.latch.unlock_exclusive();
+                drop(hold);
                 dirty.push(frame);
             }
         }
@@ -841,27 +953,32 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Latches `frame` exclusively to move or evict its page: true if it holds a page of `class`
-    /// not being written. A frame chosen while its batch was `class`'s may by now be part of
+    /// Latches `frame` exclusively to move or evict its page, if it holds a page of `class` not
+    /// being written. A frame chosen while its batch was `class`'s may by now be part of
     /// another class's frame, holding a page of that class or none: moving or evicting that page
     /// as `class`'s would give its memory to two pages.
-    fn latch_to_evict(&self, class: SizeClass, frame: u32) -> bool {
+    fn latch_to_evict(&self, class: SizeClass, frame: u32) -> Option<Hold<'_>> {
         let h = self.header(frame);
-        if h.status() != RESIDENT || h.has(WRITING) || !h.latch.try_lock_exclusive() {
-            return false;
+        let version = h.latch.optimistic()?;
+        let holds = h.status() == RESIDENT && PageId::from_raw(h.pid()).class() == class;
+        if !holds || !h.latch.validate(version) {
+            return None;
         }
-        if h.status() != RESIDENT || h.has(WRITING) || PageId::from_raw(h.pid()).class() != class {
-            h.latch.unlock_exclusive_unchanged();
-            return false;
+        let hold = Held::try_take_at(&h.latch, version)?;
+        // WRITING is set under the latch by a pass claiming a dirty page, and cleared without it
+        // when a write ends: look again later.
+        if h.has(WRITING) {
+            hold.release_unchanged();
+            return None;
         }
-        true
+        Some(hold)
     }
 
     /// Moves the page in `from`, latched exclusively, to the free frame `to`. Hints to `from` go
     /// stale like after an eviction.
-    fn relocate(&self, class: SizeClass, from: u32, to: u32) {
+    fn relocate(&self, class: SizeClass, from: u32, hold: Hold<'_>, to: u32) {
         let (src, dst) = (self.header(from), self.header(to));
-        self.take_free_latch(to);
+        let arrived = self.take_free_latch(to);
         // SAFETY: both frames are latched exclusively, and distinct.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -886,8 +1003,8 @@ impl BufferPool {
         dst.flags.store(0, Ordering::Release);
         dst.status.store(RESIDENT, Ordering::Release);
         self.table.replace(&self.headers, pid, from, to);
-        dst.latch.unlock_exclusive();
-        self.free_frame(class, from);
+        drop(arrived);
+        self.free_frame(class, from, hold);
     }
 
     // ---------------------------------------------------------------- writing back
@@ -949,6 +1066,7 @@ impl BufferPool {
 
     /// Done once no writeback is queued or in flight; meanwhile, drives the queued ones.
     pub fn settle_writes(self: &Arc<Self>) -> Result<IOResult<()>> {
+        let _step = self.store.epochs().enter();
         // Waiting starts before the look, so a write ending in between is not missed.
         let wait = self.released_wait();
         if let Some(c) = self.drive_writebacks()? {
@@ -978,11 +1096,11 @@ impl BufferPool {
         }
         h.flags
             .fetch_and(!(WRITING | EVICT_AFTER), Ordering::AcqRel);
-        if ok && evict_after && h.latch.try_lock_exclusive() {
-            if h.status() == RESIDENT && !h.dirty() && !h.has(WRITING) {
-                self.evict(self.memory.class_of(frame), frame);
-            } else {
-                h.latch.unlock_exclusive();
+        if ok && evict_after {
+            if let Some(hold) = Held::try_take(&h.latch) {
+                if h.status() == RESIDENT && !h.dirty() && !h.has(WRITING) {
+                    self.evict(self.memory.class_of(frame), frame, hold);
+                }
             }
         }
         self.writes_in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -1044,12 +1162,25 @@ impl Located for TempLocated {
 // -------------------------------------------------------------------- guards
 
 /// A page fixed without a lock. Nothing read is valid until [`validate`](Self::validate) says so.
-#[derive(Clone)]
 pub struct Optimistic<'a> {
     pool: &'a BufferPool,
     frame: u32,
     pid: PageId,
     version: u64,
+    /// Nothing the guard names is reused while it lives.
+    _step: Step<'a>,
+}
+
+impl Clone for Optimistic<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool,
+            frame: self.frame,
+            pid: self.pid,
+            version: self.version,
+            _step: self.pool.store.epochs().enter(),
+        }
+    }
 }
 
 impl<'a> Optimistic<'a> {
@@ -1075,15 +1206,14 @@ impl<'a> Optimistic<'a> {
 
     /// Latches the page exclusively if it is unchanged since it was fixed.
     pub fn upgrade(self) -> Option<Exclusive<'a>> {
-        let latch = &self.pool.header(self.frame).latch;
-        // Built only once latched: a guard's drop releases the latch.
-        latch
-            .try_lock_exclusive_at(self.version)
-            .then(|| Exclusive {
-                pool: self.pool,
-                frame: self.frame,
-                pid: self.pid,
-            })
+        let (pool, frame, pid) = (self.pool, self.frame, self.pid);
+        Held::try_take_at(&pool.header(frame).latch, self.version).map(|hold| Exclusive {
+            pool,
+            frame,
+            pid,
+            hold,
+            step: self._step,
+        })
     }
 
     pub fn pid(&self) -> PageId {
@@ -1096,50 +1226,15 @@ impl<'a> Optimistic<'a> {
     }
 }
 
-/// A page latched shared.
-pub struct Shared<'a> {
-    pool: &'a BufferPool,
-    frame: u32,
-    pid: PageId,
-}
-
-impl<'a> Shared<'a> {
-    pub fn page(&self) -> &[u8] {
-        // SAFETY: latched shared.
-        unsafe { self.pool.bytes(self.frame, self.pid.class()) }
-    }
-
-    pub fn pid(&self) -> PageId {
-        self.pid
-    }
-
-    pub fn hint(&self) -> u32 {
-        self.frame + 1
-    }
-
-    /// Latches the page exclusively if no one else holds it shared.
-    pub fn upgrade(self) -> std::result::Result<Exclusive<'a>, Self> {
-        if self.pool.header(self.frame).latch.try_upgrade() {
-            let (pool, frame, pid) = (self.pool, self.frame, self.pid);
-            std::mem::forget(self);
-            Ok(Exclusive { pool, frame, pid })
-        } else {
-            Err(self)
-        }
-    }
-}
-
-impl Drop for Shared<'_> {
-    fn drop(&mut self) {
-        self.pool.header(self.frame).latch.unlock_shared();
-    }
-}
-
 /// A page latched exclusively.
 pub struct Exclusive<'a> {
     pool: &'a BufferPool,
     frame: u32,
     pid: PageId,
+    /// Released when the guard drops, before its step ends.
+    hold: Hold<'a>,
+    /// Nothing the guard names is reused while it lives.
+    step: Step<'a>,
 }
 
 impl<'a> Exclusive<'a> {
@@ -1191,22 +1286,22 @@ impl<'a> Exclusive<'a> {
     /// which every reader checks before use. Optimistic readers are not sent back for it, and
     /// the page stays held optimistically at that version.
     pub fn release_unchanged(self) -> Optimistic<'a> {
-        let (pool, frame, pid) = (self.pool, self.frame, self.pid);
-        std::mem::forget(self);
-        let latch = &pool.header(frame).latch;
-        let version = latch.version_held();
-        latch.unlock_exclusive_unchanged();
+        let Exclusive {
+            pool,
+            frame,
+            pid,
+            hold,
+            step,
+        } = self;
+        let version = hold.version();
+        hold.release_unchanged();
+        // Its step goes on in the reader's.
         Optimistic {
             pool,
             frame,
             pid,
             version,
+            _step: step,
         }
-    }
-}
-
-impl Drop for Exclusive<'_> {
-    fn drop(&mut self) {
-        self.pool.header(self.frame).latch.unlock_exclusive();
     }
 }

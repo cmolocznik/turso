@@ -64,8 +64,7 @@ fn a_retired_object_outlives_every_step_that_could_hold_it() {
 #[cfg(shuttle)]
 #[test]
 fn a_retired_object_outlives_every_step_that_could_hold_it_in_every_schedule() {
-    shuttle::check_random(|| readers_never_lose_what_they_hold(20), 2_000);
-    shuttle::check_pct(|| readers_never_lose_what_they_hold(20), 2_000, 3);
+    crate::storage::atoll::testing::schedules(|| readers_never_lose_what_they_hold(20), 2_000);
 }
 
 #[cfg(not(shuttle))]

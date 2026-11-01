@@ -313,12 +313,13 @@ impl MetaCache {
                 }
                 Err(e) => Err(e),
             };
+            // The page before its state, the order a change takes them in.
+            if let Ok((Some(bytes), _)) = &outcome {
+                target.bytes.write().copy_from_slice(bytes);
+            }
             let mut state = target.state.lock();
             match outcome {
-                Ok((bytes, side)) => {
-                    if let Some(bytes) = bytes {
-                        target.bytes.write().copy_from_slice(&bytes);
-                    }
+                Ok((_, side)) => {
                     state.durable_side = side;
                     state.status = Status::Ready;
                 }
@@ -397,6 +398,8 @@ impl MetaCache {
         log: &Arc<Log>,
     ) -> Result<Option<Completion>> {
         let (copy, changes, side) = {
+            // The page before its state, the order a change takes them in.
+            let bytes = frame.bytes.read();
             let mut state = frame.state.lock();
             if let Some(c) = &state.writing {
                 return Ok(Some(c.clone()));
@@ -404,11 +407,10 @@ impl MetaCache {
             if state.rec.is_none() {
                 return Ok(None);
             }
-            let bytes = frame.bytes.read();
             let lsn = page::lsn(&bytes);
             if log.durable() < lsn {
-                drop(bytes);
                 drop(state);
+                drop(bytes);
                 return match log.wait_durable(lsn)? {
                     IOResult::Done(()) => self.write(frame, log),
                     IOResult::IO(IOCompletions(c)) => Ok(Some(c)),

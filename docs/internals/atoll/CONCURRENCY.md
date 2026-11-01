@@ -93,8 +93,13 @@ Anything that fits none of these is a design error.
   only by evicting its pages (writing dirty ones back first); live pages are never relocated.
   An emptied batch is retired through an epoch before another class gets it.
 - **Allocation.** A page id is reused only after an epoch (section 4), so a reader still holding
-  the old id can only find it free. A new page's frame is entered in the table before its id is
-  visible to anyone.
+  the old id can only find it free. A freed number joins the waiting numbers before it reads as
+  free in the page table, so no allocation takes it in between.
+- **Ids held across steps.** A reader that keeps a page id across steps (a cursor reading a large
+  value, a lookup) reads the page in only after checking, in the same step, that the page that
+  names it still does (`fix_optimistic_held`). An id freed after the check is not reused before
+  that step ends, so the read finds it free; one freed before fails the check. No copy of a freed
+  page stays in memory to meet a new page under its number.
 - **Metadata pages** (page table, free space) follow the same discipline as tree nodes: versioned
   latch, optimistic reads. Today they sit behind a blocking reader-writer lock.
 
@@ -129,7 +134,10 @@ Anything that fits none of these is a design error.
     slots). A cycle aborts its youngest transaction. Under BEGIN CONCURRENT it fails at once.
   - Version indexes: written only by their slot's transaction, read optimistically by everyone;
     entries are removed by garbage collection through epochs.
-- **The one lock order** for the short critical sections that remain, written here once built.
+- **The one lock order** for the short critical sections that remain:
+  - Metadata pages, until they move to versioned latches: a page's bytes (several in ascending
+    page order), then its state, then the dirty list. Every path takes them in this order; a
+    checkpoint write that took the state first deadlocked with two page-table changes.
 
 ## 9. Proof
 

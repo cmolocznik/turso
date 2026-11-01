@@ -148,8 +148,10 @@ impl Model<'_> {
                 }
             }
         } else {
-            let g = drive(self.io, || self.pool.fix_shared(p.pid, Some(&p.hint))).unwrap();
-            stamped(g.page(), p.pid)
+            let g = drive(self.io, || self.pool.fix_exclusive(p.pid, Some(&p.hint))).unwrap();
+            let seen = stamped(g.page(), p.pid);
+            drop(g.release_unchanged());
+            seen
         };
         assert_eq!(seen, Some(p.version), "{:?} read back wrong", p.pid);
     }
@@ -352,12 +354,12 @@ fn a_failed_upgrade_leaves_the_holders_latch_alone() {
     let held = first.upgrade().expect("the first upgrade");
     assert!(second.upgrade().is_none(), "two upgrades from one version");
     assert!(
-        matches!(pool.fix_shared(pid, None).unwrap(), IOResult::IO(_)),
-        "a shared fix got in while the page was held exclusively"
+        matches!(pool.fix_exclusive(pid, None).unwrap(), IOResult::IO(_)),
+        "a second hold got in while the page was held"
     );
     drop(held);
     assert!(matches!(
-        pool.fix_shared(pid, None).unwrap(),
+        pool.fix_exclusive(pid, None).unwrap(),
         IOResult::Done(_)
     ));
 }
@@ -403,9 +405,11 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
     for b in backends() {
         let (log, pool) = open(&b, MIN_BUDGET);
         let end = log.end();
-        let read = |pid: PageId| {
-            let g = drive(&b.io, || pool.fix_shared(pid, None)).unwrap();
-            (stamped(g.page(), pid), g.page().iter().all(|&x| x == 0))
+        let read = |pid: PageId| loop {
+            let g = drive(&b.io, || pool.fix_optimistic(pid, None)).unwrap();
+            if let Some(seen) = g.read(|p| (stamped(p, pid), p.iter().all(|&x| x == 0))) {
+                break seen;
+            }
         };
         // 600 pages of 32 KiB, nearly twice the pool: most are written to the temporary file.
         let mut pages = Vec::new();
@@ -484,4 +488,120 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
             b.name
         );
     }
+}
+
+/// Three threads allocate, change, read and free pages of 2 MiB in a pool of five frames, so
+/// nearly every step evicts and writes back. Each page reads back the version last written to it.
+/// A page and the version last written to it, if one is allocated.
+type Slot = Mutex<Option<(PageId, u64)>>;
+
+fn concurrent_pages(ops: usize, seed: u64) {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let (log, pool) = open_on(&io, "/db/schedules", MIN_BUDGET);
+    let class = class(9);
+    // Pages and the versions written to them, behind one lock per page: a thread changing a page
+    // holds its entry, so the version it writes is the one it records.
+    let pages: Arc<Vec<Slot>> = Arc::new((0..4).map(|_| Mutex::new(None)).collect());
+    let mut handles = Vec::new();
+    for t in 0..3u64 {
+        let (io, log, pool, pages) = (io.clone(), log.clone(), pool.clone(), pages.clone());
+        handles.push(crate::thread::spawn(move || {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed * 10 + t);
+            for _ in 0..ops {
+                let i = rng.random_range(0..pages.len());
+                let Some(mut slot) = pages[i].try_lock() else {
+                    continue;
+                };
+                let admit = || named(&io, "admit", || log.admit(framed_len(16)));
+                match (*slot, rng.random_range(0..4)) {
+                    (None, _) => {
+                        let mut admitted = admit();
+                        let mut g = named(&io, "allocate", || pool.allocate(class));
+                        let pid = g.pid();
+                        stamp(g.page_mut(), pid, 1);
+                        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+                        g.changed(lsn);
+                        *slot = Some((pid, 1));
+                    }
+                    (Some((pid, version)), 0) => {
+                        let mut admitted = admit();
+                        let mut g = named(&io, "fix_exclusive", || pool.fix_exclusive(pid, None));
+                        assert_eq!(stamped(g.page(), pid), Some(version));
+                        stamp(g.page_mut(), pid, version + 1);
+                        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+                        g.changed(lsn);
+                        *slot = Some((pid, version + 1));
+                    }
+                    (Some((pid, _)), 1) => {
+                        named(&io, "free", || match pool.fix_exclusive(pid, None)? {
+                            IOResult::Done(page) => pool.free(page),
+                            IOResult::IO(io) => Ok(IOResult::IO(io)),
+                        });
+                        *slot = None;
+                    }
+                    (Some((pid, version)), _) => loop {
+                        let g = named(&io, "fix_optimistic", || pool.fix_optimistic(pid, None));
+                        if let Some(seen) = g.read(|p| stamped(p, pid)) {
+                            assert_eq!(seen, Some(version), "{pid:?} read back wrong");
+                            break;
+                        }
+                    },
+                }
+            }
+        }));
+    }
+    // The checkpointer's part: metadata pages written back while allocations and frees change
+    // them.
+    {
+        let io = io.clone();
+        handles.push(crate::thread::spawn(move || {
+            for _ in 0..ops {
+                named(&io, "write_metadata", || {
+                    pool.store.write_metadata(log.end())
+                });
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+/// Drives `op` like [`drive`], and names it in a panic once it has been tried 100,000 times: a
+/// schedule that livelocks says where.
+fn named<T>(io: &Arc<dyn IO>, name: &str, mut op: impl FnMut() -> Result<IOResult<T>>) -> T {
+    let mut tries = 0u64;
+    drive(io, || {
+        tries += 1;
+        assert!(tries < 100_000, "{name} tried {tries} times");
+        op()
+    })
+    .unwrap()
+}
+
+fn header() -> Header {
+    Header {
+        kind: CHANGE,
+        flags: 0,
+        txn: 0,
+        prev: 0,
+    }
+}
+
+#[cfg(not(shuttle))]
+#[test]
+fn pages_survive_concurrent_fixes_evictions_and_frees() {
+    for seed in 0..20 {
+        concurrent_pages(200, seed);
+    }
+}
+
+#[cfg(shuttle)]
+#[test]
+fn pages_survive_concurrent_fixes_evictions_and_frees_in_every_schedule() {
+    static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::storage::atoll::testing::schedules(
+        || concurrent_pages(12, SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        300,
+    );
 }

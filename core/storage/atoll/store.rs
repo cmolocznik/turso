@@ -28,6 +28,7 @@
 //! [`super::meta`]), changed only by the logged records below.
 
 use super::aligned::AlignedBlock;
+use super::epoch::{Epochs, Limbo};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
 use super::meta::{MetaCache, MetaFrame, MetaId, Tree};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
@@ -295,6 +296,11 @@ pub struct PageStore {
     orphans: Mutex<Vec<PageId>>,
     /// The erasure in progress, if any.
     erasure: Mutex<Option<Erasure>>,
+    epochs: Arc<Epochs>,
+    /// Page numbers freed and not yet reusable: a step that could hold one may still run.
+    retired: Limbo<PageId>,
+    /// The same numbers, which no allocation may take.
+    retiring: Mutex<HashSet<PageId>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -360,11 +366,19 @@ impl PageStore {
             provisional: Mutex::new(HashMap::new()),
             orphans: Mutex::new(Vec::new()),
             erasure: Mutex::new(None),
+            epochs: Arc::new(Epochs::new()),
+            retired: Limbo::default(),
+            retiring: Mutex::new(HashSet::new()),
         })
     }
 
     pub fn io(&self) -> &Arc<dyn IO> {
         &self.io
+    }
+
+    /// The epochs every step on this database's pages announces in.
+    pub fn epochs(&self) -> &Arc<Epochs> {
+        &self.epochs
     }
 
     /// The path every file of the database is named after.
@@ -514,6 +528,9 @@ impl PageStore {
     /// A new page of `class`, logged; it has no copy until its first write, and is provisional
     /// until adopted ([`adopt`](Self::adopt), or [`StoreRecord::Adopt`] in a group).
     pub fn allocate(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<PageId>> {
+        for pid in self.retired.reclaim(&self.epochs) {
+            self.retiring.lock().remove(&pid);
+        }
         let record_len = StoreRecord::New {
             pid: PageId::new(class, 0),
         }
@@ -546,6 +563,7 @@ impl PageStore {
             let leaf = ids[0];
             if self.height(Tree::Map, class) != height
                 || radix::map_entry(locked.page_of(leaf), number) != FREE
+                || self.retiring.lock().contains(&pid)
             {
                 // Taken, or the tree grew, since the search: look again.
                 continue;
@@ -605,6 +623,8 @@ impl PageStore {
             heights[Tree::Map as usize][class.index()],
             heights[Tree::Space as usize][class.index()],
         ];
+        // Waiting before it reads as free, so no allocation takes it in between.
+        self.retiring.lock().insert(pid);
         let (start, lsn) = self.append(&mut admitted, &StoreRecord::Free { pid, old }, logged);
         set_map(&mut locked, Tree::Map, pid.number(), entry, FREE);
         if let Some(old) = old {
@@ -615,6 +635,8 @@ impl PageStore {
             self.freed((start, lsn), class, old);
         }
         self.settled(pid, lsn);
+        // Its number waits for every step that could still hold it.
+        self.retired.retire(&self.epochs, pid);
         Ok(IOResult::Done(()))
     }
 
@@ -746,6 +768,12 @@ impl PageStore {
                             break None;
                         };
                         if skip_unerased && self.unerased.lock().contains(&(class, u)) {
+                            at = u + 1;
+                            continue;
+                        }
+                        if tree == Tree::Map
+                            && self.retiring.lock().contains(&PageId::new(class, u))
+                        {
                             at = u + 1;
                             continue;
                         }

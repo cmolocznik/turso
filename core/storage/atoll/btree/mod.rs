@@ -41,6 +41,7 @@ mod tests;
 use super::buffer::{BufferPool, Exclusive, Optimistic};
 use super::log::{framed_len, Admitted, Header, Log, Lsn};
 use super::page::{PageId, SizeClass};
+use super::shared::Bytes;
 use super::store::{PageStore, StoreRecord};
 use crate::io::{Completion, IO};
 use crate::sync::atomic::{AtomicU32, Ordering};
@@ -177,7 +178,7 @@ impl Tree {
         };
         let pid = page.pid();
         node::build(
-            page.page_mut(),
+            &mut page.page_mut(),
             &Layout {
                 root: pid,
                 level: 0,
@@ -400,7 +401,7 @@ impl Tree {
             let found = cell.load(Ordering::Relaxed);
             if found != hint {
                 if let Some(mut ex) = node.clone().upgrade() {
-                    node::set_child_hint(ex.page_mut(), pos, found);
+                    node::set_child_hint(&mut ex.page_mut(), pos, found);
                     node = ex.release_unchanged();
                 }
             }
@@ -612,7 +613,7 @@ impl Tree {
                 },
             };
             let record = Record { pid, change };
-            record.apply(ex.page_mut())?;
+            record.apply(&mut ex.page_mut())?;
             let mut store = Vec::new();
             if !adopt.is_empty() {
                 store.push(StoreRecord::Adopt { pids: adopt });
@@ -685,7 +686,7 @@ impl Tree {
                 pid: ex.pid(),
                 change: Change::Remove { key: &op.key },
             };
-            record.apply(ex.page_mut())?;
+            record.apply(&mut ex.page_mut())?;
             let store = if abandon.is_empty() {
                 Vec::new()
             } else {
@@ -720,7 +721,7 @@ impl Tree {
         Ok(())
     }
 
-    fn underfull(&self, v: &View<'_>) -> bool {
+    fn underfull<P: Bytes + ?Sized>(&self, v: &View<'_, P>) -> bool {
         let used = v.page().len() - v.free().unwrap_or(0) - node::SLOTS;
         used < self.limits.capacity / 4
     }
@@ -794,7 +795,7 @@ impl Tree {
             &entries[keep + 1..]
         };
         node::build(
-            r.page_mut(),
+            &mut r.page_mut(),
             &Layout {
                 root,
                 level,
@@ -813,7 +814,7 @@ impl Tree {
                 sep: &sep,
             },
         };
-        split.apply(n.page_mut())?;
+        split.apply(&mut n.page_mut())?;
         let branch = Record {
             pid: p.pid(),
             change: Change::Branch {
@@ -822,7 +823,7 @@ impl Tree {
                 sep: &sep,
             },
         };
-        branch.apply(p.page_mut())?;
+        branch.apply(&mut p.page_mut())?;
         let init = Record {
             pid: r.pid(),
             change: Change::Init { image: &image },
@@ -839,11 +840,11 @@ impl Tree {
         p.changed(lsns[2]);
         // Hints the records leave at 0.
         if level == 0 {
-            node::set_next_hint(n.page_mut(), r.hint());
+            node::set_next_hint(&mut n.page_mut(), r.hint());
         }
         let at = View::new(p.page()).search(&sep).unwrap().0;
-        node::set_child_hint(p.page_mut(), at, n.hint());
-        node::set_child_hint(p.page_mut(), at + 1, r.hint());
+        node::set_child_hint(&mut p.page_mut(), at, n.hint());
+        node::set_child_hint(&mut p.page_mut(), at + 1, r.hint());
         Ok(IOResult::Done(Split::Done))
     }
 
@@ -866,9 +867,9 @@ impl Tree {
         let level = v.level();
         let mut child = done!(self.allocate());
         let image = node::image(root.page());
-        node::apply_image(child.page_mut(), &image).ok_or_else(|| corrupt_node(root.pid()))?;
+        node::apply_image(&mut child.page_mut(), &image).ok_or_else(|| corrupt_node(root.pid()))?;
         node::build(
-            root.page_mut(),
+            &mut root.page_mut(),
             &Layout {
                 root: self.root,
                 level: level + 1,
@@ -1036,13 +1037,13 @@ impl Tree {
             untouched(p, l, r);
             return Ok(IOResult::Done(None));
         }
-        node::build(r.page_mut(), &layout, &entries);
+        node::build(&mut r.page_mut(), &layout, &entries);
         let image = node::image(r.page());
         let remove = Record {
             pid: p.pid(),
             change: Change::Remove { key: &sep },
         };
-        remove.apply(p.page_mut())?;
+        remove.apply(&mut p.page_mut())?;
         let lsns = self.log_batch(
             admitted,
             &[
@@ -1059,7 +1060,7 @@ impl Tree {
         r.changed(lsns[0]);
         p.changed(lsns[1]);
         let at = View::new(p.page()).search(&sep).unwrap().0;
-        node::set_child_hint(p.page_mut(), at, r.hint());
+        node::set_child_hint(&mut p.page_mut(), at, r.hint());
         let pv = View::new(p.page());
         // A root left with one child shrinks, which a merge at this level finds; any other
         // parent left underfull merges at its own level.
@@ -1099,7 +1100,7 @@ impl Tree {
             return yield_now();
         }
         let image = node::image(child.page());
-        node::apply_image(root.page_mut(), &image).ok_or_else(|| corrupt_node(child.pid()))?;
+        node::apply_image(&mut root.page_mut(), &image).ok_or_else(|| corrupt_node(child.pid()))?;
         let lsns = self.log_batch(
             admitted,
             &[Record {
@@ -1203,8 +1204,9 @@ impl Tree {
             let Some(step) =
                 leaf.read(|p| scan_leaf(View::new(p), seek, &target, cached.is_some()))
             else {
+                // Changed while read: a writer holds it for a moment.
                 cursor.leaf = None;
-                continue;
+                return yield_now();
             };
             match step.ok_or_else(|| corrupt_node(leaf.pid()))? {
                 Scan::Entry(key, value, out_of_line) => {
@@ -1238,6 +1240,19 @@ impl Tree {
                 }
                 Scan::Stale => cursor.leaf = None,
                 Scan::Beyond(pid, hint, fence) => {
+                    // A leaf holds the keys up to its upper fence. A descent above the target
+                    // goes right of a separator equal to it, so the leaf it finds ends past the
+                    // target; a descent from the target, or the leaf of the last entry, which
+                    // may end at that entry, ends at or past it, and the next step is above
+                    // that end. Each step thus moves the scan on, so it ends. A fence that does
+                    // not is a tree that does not hold together.
+                    let advances = match seek {
+                        Seek::Gt if cached.is_none() => fence > target,
+                        _ => fence >= target,
+                    };
+                    if !advances {
+                        return Err(stuck_scan(leaf.pid(), seek, &target, &fence));
+                    }
                     cursor.leaf = None;
                     // The next leaf by its hint, if its frame still holds it; else a descent.
                     if let Some(n) = self.pool.fix_optimistic_at(pid, hint) {
@@ -1246,7 +1261,7 @@ impl Tree {
                             v.is_node()
                                 && v.root() == self.root
                                 && v.is_leaf()
-                                && v.lower() == Some(Some(&fence[..]))
+                                && matches!(v.lower(), Some(Some(l)) if l == fence)
                         });
                         if neighbour == Some(true) {
                             cursor.leaf = Some((pid, hint, n.version()));
@@ -1255,6 +1270,10 @@ impl Tree {
                     cursor.pending = Some((Seek::Gt, fence));
                 }
                 Scan::Before(fence) => {
+                    // A leaf's lower fence lies below every key it covers.
+                    if fence >= target {
+                        return Err(stuck_scan(leaf.pid(), seek, &target, &fence));
+                    }
                     cursor.leaf = None;
                     cursor.pending = Some((Seek::Le, fence));
                 }
@@ -1284,7 +1303,7 @@ impl Tree {
         {
             let page = done!(self.pool.fix_optimistic(pid, None));
             // A copy, checked once it is known whole: the page changed meanwhile otherwise.
-            let Some(bytes) = page.read(|p| p.to_vec()) else {
+            let Some(bytes) = page.read(|p| p.copied(0..p.len())) else {
                 continue;
             };
             op.stack.pop();
@@ -1302,9 +1321,7 @@ impl Tree {
                     v.level()
                 )));
             }
-            if v.lower().unwrap().map(<[u8]>::to_vec) != lower
-                || v.upper().unwrap().map(<[u8]>::to_vec) != upper
-            {
+            if v.lower().unwrap() != lower || v.upper().unwrap() != upper {
                 return Err(fail("fences differ from the parent's".into()));
             }
             op.stats.nodes += 1;
@@ -1316,7 +1333,7 @@ impl Tree {
                     let (value, out) = v.value(i).unwrap();
                     if out {
                         op.stats.values.push(
-                            self.split_reference(value)
+                            self.split_reference(&value)
                                 .ok_or_else(|| fail(format!("entry {i}: a bad reference")))?
                                 .1,
                         );
@@ -1346,7 +1363,7 @@ impl Tree {
 /// and whether it is out of line, if present.
 type Look = Option<Option<(Vec<u8>, bool)>>;
 
-fn look(v: View<'_>, key: &[u8]) -> Option<Look> {
+fn look<P: Bytes + ?Sized>(v: View<'_, P>, key: &[u8]) -> Option<Look> {
     if !v.covers(key)? {
         return Some(None);
     }
@@ -1435,6 +1452,13 @@ fn half(entries: &[Entry]) -> usize {
 
 fn corrupt_node(pid: PageId) -> LimboError {
     LimboError::Corrupt(format!("B-tree node {pid:?} does not read back"))
+}
+
+/// A scan step that would not move on: the leaf's fence does not lie past where the scan stands.
+fn stuck_scan(pid: PageId, seek: Seek, target: &[u8], fence: &[u8]) -> LimboError {
+    LimboError::Corrupt(format!(
+        "a scan seeking {seek:?} from {target:?} in leaf {pid:?} was sent to fence {fence:?}"
+    ))
 }
 
 fn corrupt_value(r: ValueRef) -> LimboError {
@@ -1691,11 +1715,16 @@ enum Scan {
 
 /// The entry `seek` from `target` lands on in the leaf `v`. A leaf found by its hint (`cached`)
 /// must hold where the seek lands: cover the target, or, seeking above it, start right there.
-fn scan_leaf(v: View<'_>, seek: Seek, target: &[u8], cached: bool) -> Option<Scan> {
+fn scan_leaf<P: Bytes + ?Sized>(
+    v: View<'_, P>,
+    seek: Seek,
+    target: &[u8],
+    cached: bool,
+) -> Option<Scan> {
     if !v.is_leaf() {
         return None;
     }
-    if cached && !(v.covers(target)? || seek == Seek::Gt && v.lower()? == Some(target)) {
+    if cached && !(v.covers(target)? || seek == Seek::Gt && v.lower()?.as_deref() == Some(target)) {
         return Some(Scan::Stale);
     }
     let count = v.count()?;

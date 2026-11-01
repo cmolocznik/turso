@@ -8,6 +8,7 @@
 use super::buffer::Exclusive;
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
 use super::page::{self, PageId, PageKind, HEADER_SIZE};
+use super::shared::BytesMut;
 use crate::sync::Arc;
 use crate::{LimboError, Result};
 
@@ -49,15 +50,15 @@ pub fn write(
         prev: 0,
     };
     let lsn = log.append(admitted, &header, &[&head, bytes]);
-    apply(page.page_mut(), offset, bytes);
+    apply(&mut page.page_mut(), offset, bytes);
     page.changed(lsn);
     lsn
 }
 
 /// Puts `bytes` at `offset` in a blob page: what a write logs, and what replaying it does.
-pub fn apply(page: &mut [u8], offset: usize, bytes: &[u8]) {
+pub fn apply<P: BytesMut + ?Sized>(page: &mut P, offset: usize, bytes: &[u8]) {
     page::set_kind(page, KIND);
-    page[offset..offset + bytes.len()].copy_from_slice(bytes);
+    page.write(offset, bytes);
 }
 
 /// A write read back from the log.
@@ -86,7 +87,7 @@ impl<'a> Write<'a> {
     }
 
     /// Replays the write on the page.
-    pub fn redo(&self, page: &mut [u8]) {
+    pub fn redo<P: BytesMut + ?Sized>(&self, page: &mut P) {
         apply(page, self.offset, self.bytes);
     }
 }

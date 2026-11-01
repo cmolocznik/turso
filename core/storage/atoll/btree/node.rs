@@ -27,9 +27,11 @@
 //!
 //! [`View`] reads a node that may change underneath it (an optimistic fix): every offset is
 //! checked before use and nothing panics on garbage; what it read counts only once the fix
-//! validates. The functions taking `&mut [u8]` change a node held exclusively.
+//! validates. The functions taking [`BytesMut`] change a node held exclusively, in a frame
+//! through its writer, or in bytes of their own.
 
 use super::super::page::{self, PageId, PageKind, SizeClass, HEADER_SIZE};
+use super::super::shared::{Bytes, BytesMut};
 use std::cmp::Ordering;
 
 pub const LEAF: PageKind = PageKind(2);
@@ -101,29 +103,13 @@ impl Limits {
     }
 }
 
-fn u16_at(p: &[u8], at: usize) -> usize {
-    u16::from_le_bytes([p[at], p[at + 1]]) as usize
+fn u16_at<P: Bytes + ?Sized>(p: &P, at: usize) -> usize {
+    p.u16_at(at) as usize
 }
 
-fn u32_at(p: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(p[at..at + 4].try_into().unwrap())
-}
-
-fn u64_at(p: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(p[at..at + 8].try_into().unwrap())
-}
-
-fn put16(p: &mut [u8], at: usize, v: usize) {
+fn put16<P: BytesMut + ?Sized>(p: &mut P, at: usize, v: usize) {
     debug_assert!(v <= u16::MAX as usize);
-    p[at..at + 2].copy_from_slice(&(v as u16).to_le_bytes());
-}
-
-fn put32(p: &mut [u8], at: usize, v: u32) {
-    p[at..at + 4].copy_from_slice(&v.to_le_bytes());
-}
-
-fn put64(p: &mut [u8], at: usize, v: u64) {
-    p[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    p.put_u16(at, v as u16);
 }
 
 /// The first four bytes of a key as a big-endian integer, zero-padded: heads order like the keys,
@@ -161,20 +147,35 @@ struct Slot {
     head: u32,
 }
 
-/// A node read in place. Every method returns `None` where what it reads does not hold together,
-/// which only a concurrent change (or corruption) can cause.
-#[derive(Clone, Copy)]
-pub struct View<'a>(&'a [u8]);
+/// A run of a node's bytes: a fence, or an entry's key or value.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    off: usize,
+    len: usize,
+}
 
-/// A fence: a key, or infinite.
-pub type Fence<'a> = Option<&'a [u8]>;
+/// A node read in place: in a frame, held optimistically or latched, or in bytes of its own. Every
+/// method returns `None` where what it reads does not hold together, which only a concurrent
+/// change (or corruption) can cause; what it returns is copied out.
+pub struct View<'a, P: ?Sized>(&'a P);
 
-impl<'a> View<'a> {
-    pub fn new(page: &'a [u8]) -> Self {
+impl<P: ?Sized> Clone for View<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: ?Sized> Copy for View<'_, P> {}
+
+/// A fence read out of a node: a key, or infinite.
+pub type Fence = Option<Vec<u8>>;
+
+impl<'a, P: Bytes + ?Sized> View<'a, P> {
+    pub fn new(page: &'a P) -> Self {
         Self(page)
     }
 
-    pub fn page(&self) -> &'a [u8] {
+    pub fn page(&self) -> &'a P {
         self.0
     }
 
@@ -183,11 +184,11 @@ impl<'a> View<'a> {
     }
 
     pub fn root(&self) -> PageId {
-        PageId::from_raw(u64_at(self.0, ROOT))
+        PageId::from_raw(self.0.u64_at(ROOT))
     }
 
     pub fn level(&self) -> u8 {
-        self.0[LEVEL]
+        self.0.u8_at(LEVEL)
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -198,13 +199,13 @@ impl<'a> View<'a> {
     /// frame hint.
     pub fn next(&self) -> (PageId, u32) {
         (
-            PageId::from_raw(u64_at(self.0, NEXT)),
-            u32_at(self.0, NEXT_HINT),
+            PageId::from_raw(self.0.u64_at(NEXT)),
+            self.0.u32_at(NEXT_HINT),
         )
     }
 
     fn data_start(&self) -> Option<usize> {
-        let d = u32_at(self.0, DATA_START) as usize;
+        let d = self.0.u32_at(DATA_START) as usize;
         (d <= self.0.len()).then_some(d)
     }
 
@@ -215,7 +216,7 @@ impl<'a> View<'a> {
 
     /// Bytes of data in use: entries and fences.
     pub fn space(&self) -> usize {
-        u32_at(self.0, SPACE) as usize
+        self.0.u32_at(SPACE) as usize
     }
 
     fn slot(&self, i: usize) -> Option<Slot> {
@@ -223,7 +224,7 @@ impl<'a> View<'a> {
             return None;
         }
         let at = SLOTS + i * SLOT;
-        let b = self.0.get(at..at + SLOT)?;
+        let b: [u8; SLOT] = self.0.bytes(at);
         let value = u16::from_le_bytes([b[4], b[5]]);
         let s = Slot {
             off: u16::from_le_bytes([b[0], b[1]]) as usize,
@@ -235,51 +236,81 @@ impl<'a> View<'a> {
         (s.off + s.key_len + s.value_len <= self.0.len()).then_some(s)
     }
 
-    fn fence(&self, at: usize, infinite: u8) -> Option<Fence<'a>> {
-        if self.0[FENCES] & infinite != 0 {
+    /// A run, if it lies in the node.
+    fn run(&self, off: usize, len: usize) -> Option<Run> {
+        (off + len <= self.0.len()).then_some(Run { off, len })
+    }
+
+    fn copy(&self, run: Run) -> Vec<u8> {
+        self.0.copied(run.off..run.off + run.len)
+    }
+
+    /// How the bytes of `run` order against `key`.
+    fn order(&self, run: Run, key: &[u8]) -> Ordering {
+        let n = run.len.min(key.len());
+        self.0
+            .compare(run.off, &key[..n])
+            .then(run.len.cmp(&key.len()))
+    }
+
+    fn fence_run(&self, at: usize, infinite: u8) -> Option<Option<Run>> {
+        if self.0.u8_at(FENCES) & infinite != 0 {
             return Some(None);
         }
-        let (off, len) = (u16_at(self.0, at), u16_at(self.0, at + 2));
-        Some(Some(self.0.get(off..off + len)?))
+        Some(Some(self.run(u16_at(self.0, at), u16_at(self.0, at + 2))?))
     }
 
     /// The exclusive lower fence.
-    pub fn lower(&self) -> Option<Fence<'a>> {
-        self.fence(LOWER, LOWER_INFINITE)
+    pub fn lower(&self) -> Option<Fence> {
+        Some(self.fence_run(LOWER, LOWER_INFINITE)?.map(|r| self.copy(r)))
     }
 
     /// The inclusive upper fence.
-    pub fn upper(&self) -> Option<Fence<'a>> {
-        self.fence(UPPER, UPPER_INFINITE)
+    pub fn upper(&self) -> Option<Fence> {
+        Some(self.fence_run(UPPER, UPPER_INFINITE)?.map(|r| self.copy(r)))
     }
 
-    /// The bytes every key in the node starts with, stripped from each.
-    pub fn prefix(&self) -> Option<&'a [u8]> {
+    /// Where the bytes every key in the node starts with lie: the start of the lower fence.
+    fn prefix_run(&self) -> Option<Run> {
         let len = u16_at(self.0, PREFIX);
-        match self.lower()? {
-            Some(lower) => lower.get(..len),
-            None => (len == 0).then_some(&[][..]),
+        match self.fence_run(LOWER, LOWER_INFINITE)? {
+            Some(lower) => (len <= lower.len).then_some(Run {
+                off: lower.off,
+                len,
+            }),
+            None => (len == 0).then_some(Run { off: 0, len: 0 }),
         }
     }
 
+    /// The bytes every key in the node starts with, stripped from each.
+    pub fn prefix(&self) -> Option<Vec<u8>> {
+        Some(self.copy(self.prefix_run()?))
+    }
+
     /// Entry `i`'s key past the prefix.
-    pub fn suffix(&self, i: usize) -> Option<&'a [u8]> {
+    pub fn suffix(&self, i: usize) -> Option<Vec<u8>> {
         let s = self.slot(i)?;
-        self.0.get(s.off..s.off + s.key_len)
+        Some(self.copy(Run {
+            off: s.off,
+            len: s.key_len,
+        }))
     }
 
     /// Entry `i`'s whole key.
     pub fn key(&self, i: usize) -> Option<Vec<u8>> {
-        let mut key = self.prefix()?.to_vec();
-        key.extend_from_slice(self.suffix(i)?);
+        let mut key = self.prefix()?;
+        key.extend_from_slice(&self.suffix(i)?);
         Some(key)
     }
 
     /// Entry `i`'s value, and whether it is a reference to blob pages.
-    pub fn value(&self, i: usize) -> Option<(&'a [u8], bool)> {
+    pub fn value(&self, i: usize) -> Option<(Vec<u8>, bool)> {
         let s = self.slot(i)?;
-        let at = s.off + s.key_len;
-        Some((self.0.get(at..at + s.value_len)?, s.out_of_line))
+        let value = self.copy(Run {
+            off: s.off + s.key_len,
+            len: s.value_len,
+        });
+        Some((value, s.out_of_line))
     }
 
     /// An inner node's child `i`, the rightmost at `i == count`, and its frame hint.
@@ -287,38 +318,42 @@ impl<'a> View<'a> {
         if i == self.count()? {
             return Some(self.next());
         }
-        let (v, _) = self.value(i)?;
-        let v = v.get(..CHILD)?;
-        Some((
-            PageId::from_raw(u64::from_le_bytes(v[..8].try_into().unwrap())),
-            u32::from_le_bytes(v[8..12].try_into().unwrap()),
-        ))
+        let s = self.slot(i)?;
+        if s.value_len < CHILD {
+            return None;
+        }
+        let at = s.off + s.key_len;
+        Some((PageId::from_raw(self.0.u64_at(at)), self.0.u32_at(at + 8)))
     }
 
     /// Whether `key` lies between the fences.
     pub fn covers(&self, key: &[u8]) -> Option<bool> {
-        let above = self.lower()?.is_none_or(|l| key > l);
-        let below = self.upper()?.is_none_or(|u| key <= u);
+        let above = self
+            .fence_run(LOWER, LOWER_INFINITE)?
+            .is_none_or(|l| self.order(l, key) == Ordering::Less);
+        let below = self
+            .fence_run(UPPER, UPPER_INFINITE)?
+            .is_none_or(|u| self.order(u, key) != Ordering::Less);
         Some(above && below)
     }
 
     fn hint(&self, i: usize) -> u32 {
-        u32_at(self.0, HINTS + 4 * i)
+        self.0.u32_at(HINTS + 4 * i)
     }
 
     /// The first position whose key is at least `key`, and whether it is equal: where `key` is,
     /// or would go.
     pub fn search(&self, key: &[u8]) -> Option<(usize, bool)> {
         let count = self.count()?;
-        let prefix = self.prefix()?;
-        let n = prefix.len().min(key.len());
-        match key[..n].cmp(&prefix[..n]) {
+        let prefix = self.prefix_run()?;
+        let n = prefix.len.min(key.len());
+        match self.0.compare(prefix.off, &key[..n]).reverse() {
             Ordering::Less => return Some((0, false)),
             Ordering::Greater => return Some((count, false)),
-            Ordering::Equal if key.len() < prefix.len() => return Some((0, false)),
+            Ordering::Equal if key.len() < prefix.len => return Some((0, false)),
             Ordering::Equal => {}
         }
-        let suffix = &key[prefix.len()..];
+        let suffix = &key[prefix.len..];
         let key_head = head(suffix);
         let (mut lo, mut hi) = (0, count);
         if count > HINT_COUNT * 2 {
@@ -340,7 +375,13 @@ impl<'a> View<'a> {
             let mid = (lo + hi) / 2;
             let s = self.slot(mid)?;
             let ord = match s.head.cmp(&key_head) {
-                Ordering::Equal => self.0.get(s.off..s.off + s.key_len)?.cmp(suffix),
+                Ordering::Equal => self.order(
+                    Run {
+                        off: s.off,
+                        len: s.key_len,
+                    },
+                    suffix,
+                ),
                 o => o,
             };
             match ord {
@@ -371,7 +412,7 @@ impl<'a> View<'a> {
 
     /// Bytes `key` with a value of `value_len` takes here, its slot included.
     pub fn entry_size(&self, key: &[u8], value_len: usize) -> Option<usize> {
-        Some(SLOT + key.len().checked_sub(self.prefix()?.len())? + value_len)
+        Some(SLOT + key.len().checked_sub(self.prefix_run()?.len)? + value_len)
     }
 
     /// Every entry: whole key, value, and whether the value is out of line.
@@ -381,7 +422,7 @@ impl<'a> View<'a> {
                 let (value, out_of_line) = self.value(i)?;
                 Some(Entry {
                     key: self.key(i)?,
-                    value: value.to_vec(),
+                    value,
                     out_of_line,
                 })
             })
@@ -418,8 +459,8 @@ pub fn child_value(child: PageId, hint: u32) -> [u8; CHILD] {
 pub struct Layout<'k> {
     pub root: PageId,
     pub level: u8,
-    pub lower: Fence<'k>,
-    pub upper: Fence<'k>,
+    pub lower: Option<&'k [u8]>,
+    pub upper: Option<&'k [u8]>,
     pub next: (PageId, u32),
 }
 
@@ -444,16 +485,16 @@ impl Layout<'_> {
 }
 
 /// Builds a node whole in `page`: its layout, then `entries`, which are in key order and fit.
-pub fn build<'e>(
-    page: &mut [u8],
+pub fn build<'e, P: BytesMut + ?Sized>(
+    page: &mut P,
     layout: &Layout<'_>,
     entries: impl IntoIterator<Item = &'e Entry>,
 ) {
     let size = page.len();
-    page[HEADER_SIZE..].fill(0);
+    page.fill(HEADER_SIZE..size, 0);
     page::set_kind(page, if layout.level == 0 { LEAF } else { INNER });
-    put64(page, ROOT, layout.root.raw());
-    page[LEVEL] = layout.level;
+    page.put_u64(ROOT, layout.root.raw());
+    page.put_u8(LEVEL, layout.level);
     let mut data = size;
     let mut fences = 0;
     for (at, fence, infinite) in [
@@ -463,20 +504,20 @@ pub fn build<'e>(
         match fence {
             Some(f) => {
                 data -= f.len();
-                page[data..data + f.len()].copy_from_slice(f);
+                page.write(data, f);
                 put16(page, at, data);
                 put16(page, at + 2, f.len());
             }
             None => fences |= infinite,
         }
     }
-    page[FENCES] = fences;
+    page.put_u8(FENCES, fences);
     put16(page, PREFIX, layout.prefix_len());
-    put32(page, DATA_START, data as u32);
-    put32(page, SPACE, (size - data) as u32);
+    page.put_u32(DATA_START, data as u32);
+    page.put_u32(SPACE, (size - data) as u32);
     set_next(page, layout.next.0, layout.next.1);
     for e in entries {
-        let count = View::new(page).count().unwrap();
+        let count = View::new(&*page).count().unwrap();
         assert!(
             insert(page, count, &e.key, &e.value, e.out_of_line),
             "building a node that does not fit"
@@ -495,53 +536,58 @@ pub struct Shape {
 }
 
 /// The shape of the node in `page`.
-pub fn shape(page: &[u8]) -> Shape {
+pub fn shape<P: Bytes + ?Sized>(page: &P) -> Shape {
     let v = View::new(page);
     Shape {
         root: v.root(),
         level: v.level(),
-        lower: v.lower().unwrap().map(<[u8]>::to_vec),
-        upper: v.upper().unwrap().map(<[u8]>::to_vec),
+        lower: v.lower().unwrap(),
+        upper: v.upper().unwrap(),
         next: v.next(),
     }
 }
 
-pub fn set_next(page: &mut [u8], pid: PageId, hint: u32) {
-    put64(page, NEXT, pid.raw());
-    put32(page, NEXT_HINT, hint);
+pub fn set_next<P: BytesMut + ?Sized>(page: &mut P, pid: PageId, hint: u32) {
+    page.put_u64(NEXT, pid.raw());
+    page.put_u32(NEXT_HINT, hint);
 }
 
-pub fn set_next_hint(page: &mut [u8], hint: u32) {
-    put32(page, NEXT_HINT, hint);
+pub fn set_next_hint<P: BytesMut + ?Sized>(page: &mut P, hint: u32) {
+    page.put_u32(NEXT_HINT, hint);
 }
 
 /// Points an inner node's child `i` (the rightmost at `count`) at `child`.
-pub fn set_child(page: &mut [u8], i: usize, child: PageId, hint: u32) {
-    let v = View::new(page);
+pub fn set_child<P: BytesMut + ?Sized>(page: &mut P, i: usize, child: PageId, hint: u32) {
+    let v = View::new(&*page);
     if i == v.count().unwrap() {
         return set_next(page, child, hint);
     }
     let s = v.slot(i).unwrap();
-    let at = s.off + s.key_len;
-    page[at..at + CHILD].copy_from_slice(&child_value(child, hint));
+    page.write(s.off + s.key_len, &child_value(child, hint));
 }
 
 /// Stores the frame hint of an inner node's child `i`.
-pub fn set_child_hint(page: &mut [u8], i: usize, hint: u32) {
-    let v = View::new(page);
+pub fn set_child_hint<P: BytesMut + ?Sized>(page: &mut P, i: usize, hint: u32) {
+    let v = View::new(&*page);
     if i == v.count().unwrap() {
         return set_next_hint(page, hint);
     }
     let s = v.slot(i).unwrap();
-    put32(page, s.off + s.key_len + 8, hint);
+    page.put_u32(s.off + s.key_len + 8, hint);
 }
 
 /// Inserts an entry at `pos`, compacting first if the free bytes are scattered; false if it does
 /// not fit even then. `key` is whole and between the fences.
-pub fn insert(page: &mut [u8], pos: usize, key: &[u8], value: &[u8], out_of_line: bool) -> bool {
-    let v = View::new(page);
+pub fn insert<P: BytesMut + ?Sized>(
+    page: &mut P,
+    pos: usize,
+    key: &[u8],
+    value: &[u8],
+    out_of_line: bool,
+) -> bool {
+    let v = View::new(&*page);
     let count = v.count().unwrap();
-    let prefix = v.prefix().unwrap().len();
+    let prefix = v.prefix_run().unwrap().len;
     debug_assert!(pos <= count && key.len() >= prefix);
     let suffix = &key[prefix..];
     let need = suffix.len() + value.len();
@@ -552,11 +598,11 @@ pub fn insert(page: &mut [u8], pos: usize, key: &[u8], value: &[u8], out_of_line
     if (v.data_start().unwrap()) < slots_end + need {
         compact(page);
     }
-    let data = u32_at(page, DATA_START) as usize - need;
-    page[data..data + suffix.len()].copy_from_slice(suffix);
-    page[data + suffix.len()..data + need].copy_from_slice(value);
-    put32(page, DATA_START, data as u32);
-    put32(page, SPACE, (u32_at(page, SPACE) as usize + need) as u32);
+    let data = page.u32_at(DATA_START) as usize - need;
+    page.write(data, suffix);
+    page.write(data + suffix.len(), value);
+    page.put_u32(DATA_START, data as u32);
+    page.put_u32(SPACE, (page.u32_at(SPACE) as usize + need) as u32);
     let at = SLOTS + pos * SLOT;
     page.copy_within(at..SLOTS + count * SLOT, at + SLOT);
     put16(page, at, data);
@@ -566,21 +612,20 @@ pub fn insert(page: &mut [u8], pos: usize, key: &[u8], value: &[u8], out_of_line
         at + 4,
         value.len() | if out_of_line { OUT_OF_LINE as usize } else { 0 },
     );
-    put32(page, at + 6, head(suffix));
+    page.put_u32(at + 6, head(suffix));
     put16(page, COUNT, count + 1);
     update_hints(page);
     true
 }
 
 /// Removes the entry at `pos`.
-pub fn remove(page: &mut [u8], pos: usize) {
-    let v = View::new(page);
+pub fn remove<P: BytesMut + ?Sized>(page: &mut P, pos: usize) {
+    let v = View::new(&*page);
     let count = v.count().unwrap();
     let s = v.slot(pos).unwrap();
-    put32(
-        page,
+    page.put_u32(
         SPACE,
-        (u32_at(page, SPACE) as usize - s.key_len - s.value_len) as u32,
+        (page.u32_at(SPACE) as usize - s.key_len - s.value_len) as u32,
     );
     let at = SLOTS + pos * SLOT;
     page.copy_within(at + SLOT..SLOTS + count * SLOT, at);
@@ -589,13 +634,17 @@ pub fn remove(page: &mut [u8], pos: usize) {
 }
 
 /// Replaces the value at `pos`; false, leaving the node as it was, if the new one does not fit.
-pub fn set_value(page: &mut [u8], pos: usize, value: &[u8], out_of_line: bool) -> bool {
-    let v = View::new(page);
+pub fn set_value<P: BytesMut + ?Sized>(
+    page: &mut P,
+    pos: usize,
+    value: &[u8],
+    out_of_line: bool,
+) -> bool {
+    let v = View::new(&*page);
     let (old, old_out) = v.value(pos).unwrap();
     if old.len() == value.len() {
         let s = v.slot(pos).unwrap();
-        let at = s.off + s.key_len;
-        page[at..at + value.len()].copy_from_slice(value);
+        page.write(s.off + s.key_len, value);
         put16(
             page,
             SLOTS + pos * SLOT + 4,
@@ -603,7 +652,7 @@ pub fn set_value(page: &mut [u8], pos: usize, value: &[u8], out_of_line: bool) -
         );
         return true;
     }
-    let (old, key) = (old.to_vec(), v.key(pos).unwrap());
+    let key = v.key(pos).unwrap();
     if v.free().unwrap() + old.len() < value.len() {
         return false;
     }
@@ -616,16 +665,16 @@ pub fn set_value(page: &mut [u8], pos: usize, value: &[u8], out_of_line: bool) -
 }
 
 /// Rewrites the data area without holes.
-pub fn compact(page: &mut [u8]) {
-    let copy = page.to_vec();
-    let v = View::new(&copy);
+pub fn compact<P: BytesMut + ?Sized>(page: &mut P) {
+    let copy = page.copied(0..page.len());
+    let v = View::new(copy.as_slice());
     let count = v.count().unwrap();
     let mut data = page.len();
     for (at, infinite) in [(UPPER, UPPER_INFINITE), (LOWER, LOWER_INFINITE)] {
         if copy[FENCES] & infinite == 0 {
-            let (off, len) = (u16_at(&copy, at), u16_at(&copy, at + 2));
+            let (off, len) = (u16_at(copy.as_slice(), at), u16_at(copy.as_slice(), at + 2));
             data -= len;
-            page[data..data + len].copy_from_slice(&copy[off..off + len]);
+            page.write(data, &copy[off..off + len]);
             put16(page, at, data);
         }
     }
@@ -633,15 +682,15 @@ pub fn compact(page: &mut [u8]) {
         let s = v.slot(i).unwrap();
         let len = s.key_len + s.value_len;
         data -= len;
-        page[data..data + len].copy_from_slice(&copy[s.off..s.off + len]);
+        page.write(data, &copy[s.off..s.off + len]);
         put16(page, SLOTS + i * SLOT, data);
     }
-    put32(page, DATA_START, data as u32);
-    debug_assert_eq!(page.len() - data, View::new(page).space());
+    page.put_u32(DATA_START, data as u32);
+    debug_assert_eq!(page.len() - data, View::new(&*page).space());
 }
 
-fn update_hints(page: &mut [u8]) {
-    let v = View::new(page);
+fn update_hints<P: BytesMut + ?Sized>(page: &mut P) {
+    let v = View::new(&*page);
     let count = v.count().unwrap();
     let dist = count / (HINT_COUNT + 1);
     let heads: Vec<u32> = (0..HINT_COUNT)
@@ -654,16 +703,16 @@ fn update_hints(page: &mut [u8]) {
         })
         .collect();
     for (i, h) in heads.into_iter().enumerate() {
-        put32(page, HINTS + 4 * i, h);
+        page.put_u32(HINTS + 4 * i, h);
     }
 }
 
 /// The node in `page` as a log record's payload: its header and slots, then its data, with no
 /// holes, so that [`apply_image`] rebuilds it exactly.
-pub fn image(page: &[u8]) -> Vec<u8> {
-    let mut copy = page.to_vec();
-    compact(&mut copy);
-    let v = View::new(&copy);
+pub fn image<P: Bytes + ?Sized>(page: &P) -> Vec<u8> {
+    let mut copy = page.copied(0..page.len());
+    compact(copy.as_mut_slice());
+    let v = View::new(copy.as_slice());
     let head_end = SLOTS + v.count().unwrap() * SLOT;
     let data = v.data_start().unwrap();
     let mut out = Vec::with_capacity(4 + head_end - HEADER_SIZE + copy.len() - data);
@@ -675,7 +724,7 @@ pub fn image(page: &[u8]) -> Vec<u8> {
 
 /// Rebuilds a node from its [`image`]; `None` if the image does not describe a node of this
 /// page's size.
-pub fn apply_image(page: &mut [u8], image: &[u8]) -> Option<()> {
+pub fn apply_image<P: BytesMut + ?Sized>(page: &mut P, image: &[u8]) -> Option<()> {
     let head_len = u32::from_le_bytes(image.get(..4)?.try_into().ok()?) as usize;
     let head = image.get(4..4 + head_len)?;
     let data = &image[4 + head_len..];
@@ -686,10 +735,10 @@ pub fn apply_image(page: &mut [u8], image: &[u8]) -> Option<()> {
     {
         return None;
     }
-    page[HEADER_SIZE..].fill(0);
-    page[HEADER_SIZE..HEADER_SIZE + head_len].copy_from_slice(head);
-    page[size - data.len()..].copy_from_slice(data);
-    let v = View::new(page);
+    page.fill(HEADER_SIZE..size, 0);
+    page.write(HEADER_SIZE, head);
+    page.write(size - data.len(), data);
+    let v = View::new(&*page);
     let consistent = v.data_start() == Some(size - data.len())
         && v.space() == data.len()
         && v.count() == Some((HEADER_SIZE + head_len - SLOTS) / SLOT)
@@ -699,12 +748,12 @@ pub fn apply_image(page: &mut [u8], image: &[u8]) -> Option<()> {
     }
     let level = v.level();
     page::set_kind(page, if level == 0 { LEAF } else { INNER });
-    check(page).ok()
+    check(&*page).ok()
 }
 
 /// Checks a node's structure: fences, prefix, slots in bounds and in key order between the
 /// fences, heads and hints right, space accounted.
-pub fn check(page: &[u8]) -> Result<(), String> {
+pub fn check<P: Bytes + ?Sized>(page: &P) -> Result<(), String> {
     let v = View::new(page);
     if !v.is_node() {
         return Err(format!("kind {:?} is not a node", page::kind(page)));
@@ -714,13 +763,13 @@ pub fn check(page: &[u8]) -> Result<(), String> {
         v.lower().ok_or("lower fence out of bounds")?,
         v.upper().ok_or("upper fence out of bounds")?,
     );
-    if let (Some(l), Some(u)) = (lower, upper) {
+    if let (Some(l), Some(u)) = (&lower, &upper) {
         if l >= u {
             return Err("fences out of order".into());
         }
     }
     let prefix = v.prefix().ok_or("prefix out of bounds")?;
-    let expected = match (lower, upper) {
+    let expected = match (&lower, &upper) {
         (Some(l), Some(u)) => common_prefix(l, u),
         _ => 0,
     };
@@ -730,7 +779,7 @@ pub fn check(page: &[u8]) -> Result<(), String> {
             prefix.len()
         ));
     }
-    let mut space = lower.map_or(0, <[u8]>::len) + upper.map_or(0, <[u8]>::len);
+    let mut space = lower.as_ref().map_or(0, Vec::len) + upper.as_ref().map_or(0, Vec::len);
     let mut last: Option<Vec<u8>> = None;
     for i in 0..count {
         let s = v.slot(i).ok_or_else(|| format!("slot {i} out of bounds"))?;
@@ -789,7 +838,7 @@ mod tests {
             .collect()
     }
 
-    fn leaf<'k>(lower: Fence<'k>, upper: Fence<'k>) -> Layout<'k> {
+    fn leaf<'k>(lower: Option<&'k [u8]>, upper: Option<&'k [u8]>) -> Layout<'k> {
         Layout {
             root: PageId::new(class(0), 1),
             level: 0,

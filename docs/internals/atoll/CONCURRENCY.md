@@ -81,6 +81,13 @@ Anything that fits none of these is a design error.
   neither needs an epoch. Retiring batches was built and measured: the claim that empties a batch
   cannot use it before its own step ends, and another class's claim takes it back first, so two
   classes passed one batch back and forth forever (two single-threaded crash tests hung).
+- **A page is read into a frame only once its memory is quiet.** A frame given up stamps every
+  4 KiB grain it spans with the epoch. A new page is written through the frame's writer, whose
+  stores are atomic, so a stale reader of the memory's last page races with nothing, and any free
+  frame will do. An IO reading a page in writes the memory plainly, straight from the device, so
+  it takes only a frame whose grains were all given up before every step under way began; with
+  only stale ones free, the claim yields, and the next step finds them quiet. Memory still goes to
+  its class at once, so nothing like the batch ping-pong above can start.
 
 ## 5. Latches
 

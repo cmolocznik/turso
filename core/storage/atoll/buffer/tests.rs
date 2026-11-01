@@ -3,6 +3,7 @@ use crate::io::crash::CrashIO;
 use crate::io::{OpenFlags, IO};
 use crate::storage::atoll::log::{framed_len, Admitted, Header, Kind, Log, LogConfig};
 use crate::storage::atoll::page::HEADER_SIZE;
+use crate::storage::atoll::shared::{Bytes, BytesMut};
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::{backends, drive, Backend};
 use rand::{Rng, SeedableRng};
@@ -55,21 +56,18 @@ fn open_on(io: &Arc<dyn IO>, base: &str, budget: usize) -> (Arc<Log>, Arc<Buffer
 
 /// Writes `version` into `page` beside its id: after the header, and at its end, so a copy torn
 /// or mixed up with another page's reads wrong.
-fn stamp(page: &mut [u8], pid: PageId, version: u64) {
-    page[HEADER_SIZE..HEADER_SIZE + 8].copy_from_slice(&pid.raw().to_le_bytes());
-    page[HEADER_SIZE + 8..HEADER_SIZE + 16].copy_from_slice(&version.to_le_bytes());
+fn stamp<P: BytesMut + ?Sized>(page: &mut P, pid: PageId, version: u64) {
+    page.put_u64(HEADER_SIZE, pid.raw());
+    page.put_u64(HEADER_SIZE + 8, version);
     let end = page.len();
-    page[end - 8..].copy_from_slice(&version.to_le_bytes());
+    page.put_u64(end - 8, version);
 }
 
 /// The version stamped in `page`, if it is stamped as `pid` and whole.
-fn stamped(page: &[u8], pid: PageId) -> Option<u64> {
-    let word = |at: usize| {
-        page.get(at..at + 8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-    };
-    let version = word(HEADER_SIZE + 8)?;
-    (word(HEADER_SIZE)? == pid.raw() && word(page.len() - 8)? == version).then_some(version)
+fn stamped<P: Bytes + ?Sized>(page: &P, pid: PageId) -> Option<u64> {
+    let version = page.u64_at(HEADER_SIZE + 8);
+    (page.u64_at(HEADER_SIZE) == pid.raw() && page.u64_at(page.len() - 8) == version)
+        .then_some(version)
 }
 
 /// One page of the model: its id, the version it should hold and the hint kept beside it.
@@ -88,7 +86,13 @@ struct Model<'a> {
 
 impl Model<'_> {
     /// Logs a change to `pid` before latching it, as every change is admitted.
-    fn change(&self, page: &mut [u8], pid: PageId, version: u64, admitted: &mut Admitted) -> Lsn {
+    fn change<P: BytesMut + ?Sized>(
+        &self,
+        page: &mut P,
+        pid: PageId,
+        version: u64,
+        admitted: &mut Admitted,
+    ) -> Lsn {
         stamp(page, pid, version);
         let payload = version.to_le_bytes();
         let header = Header {
@@ -109,7 +113,7 @@ impl Model<'_> {
         let mut admitted = self.admit();
         let mut g = drive(self.io, || self.pool.allocate(class)).unwrap();
         let pid = g.pid();
-        let lsn = self.change(g.page_mut(), pid, 1, &mut admitted);
+        let lsn = self.change(&mut g.page_mut(), pid, 1, &mut admitted);
         g.changed(lsn);
         let hint = AtomicU32::new(g.hint());
         drop(g);
@@ -132,7 +136,7 @@ impl Model<'_> {
             Some(version - 1),
             "{pid:?} before an update"
         );
-        let lsn = self.change(g.page_mut(), pid, version, &mut admitted);
+        let lsn = self.change(&mut g.page_mut(), pid, version, &mut admitted);
         g.changed(lsn);
         drop(g);
         self.pages[i].version = version;
@@ -279,7 +283,7 @@ fn concurrent_fixes_lose_no_change() {
                                 })
                                 .unwrap();
                                 let n = stamped(g.page(), p.pid).expect("a whole page") + 1;
-                                let lsn = model.change(g.page_mut(), p.pid, n, &mut admitted);
+                                let lsn = model.change(&mut g.page_mut(), p.pid, n, &mut admitted);
                                 g.changed(lsn);
                                 counts[i] += 1;
                             } else {
@@ -378,7 +382,7 @@ fn a_drain_empties_its_batch_while_a_page_in_it_keeps_changing() {
             let mut admitted = model.admit();
             if let IOResult::Done(mut g) = pool.fix_exclusive(p.pid, Some(&p.hint)).unwrap() {
                 let version = p.version + 1;
-                let lsn = model.change(g.page_mut(), p.pid, version, &mut admitted);
+                let lsn = model.change(&mut g.page_mut(), p.pid, version, &mut admitted);
                 g.changed(lsn);
                 drop(g);
                 model.pages[i].version = version;
@@ -483,7 +487,12 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
         let end = log.end();
         let read = |pid: PageId| loop {
             let g = drive(&b.io, || pool.fix_optimistic(pid, None)).unwrap();
-            if let Some(seen) = g.read(|p| (stamped(p, pid), p.iter().all(|&x| x == 0))) {
+            if let Some(seen) = g.read(|p| {
+                (
+                    stamped(p, pid),
+                    p.copied(0..p.len()).iter().all(|&x| x == 0),
+                )
+            }) {
                 break seen;
             }
         };
@@ -492,7 +501,7 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
         for v in 1..=600u64 {
             let mut g = drive(&b.io, || pool.allocate_temporary(class(3))).unwrap();
             let pid = g.pid();
-            stamp(g.page_mut(), pid, v);
+            stamp(&mut g.page_mut(), pid, v);
             g.changed(pool.temporary_lsn());
             pages.push((pid, v));
         }
@@ -596,7 +605,7 @@ fn concurrent_pages(ops: usize, seed: u64) {
                         let mut admitted = admit();
                         let mut g = named(&io, "allocate", || pool.allocate(class));
                         let pid = g.pid();
-                        stamp(g.page_mut(), pid, 1);
+                        stamp(&mut g.page_mut(), pid, 1);
                         let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
                         g.changed(lsn);
                         *slot = Some((pid, 1));
@@ -605,7 +614,7 @@ fn concurrent_pages(ops: usize, seed: u64) {
                         let mut admitted = admit();
                         let mut g = named(&io, "fix_exclusive", || pool.fix_exclusive(pid, None));
                         assert_eq!(stamped(g.page(), pid), Some(version));
-                        stamp(g.page_mut(), pid, version + 1);
+                        stamp(&mut g.page_mut(), pid, version + 1);
                         let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
                         g.changed(lsn);
                         *slot = Some((pid, version + 1));
@@ -698,7 +707,7 @@ fn written_page_eviction() {
         let mut admitted = named(&io, "admit", || log.admit(framed_len(16)));
         let mut g = named(&io, "allocate", || pool.allocate(class));
         let pid = g.pid();
-        stamp(g.page_mut(), pid, v);
+        stamp(&mut g.page_mut(), pid, v);
         let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
         g.changed(lsn);
         held.push(g);
@@ -752,7 +761,7 @@ fn a_pass_waiting_on_its_writeback_wakes_when_another_thread_finishes_it() {
     let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
     let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
     let pid = g.pid();
-    stamp(g.page_mut(), pid, 1);
+    stamp(&mut g.page_mut(), pid, 1);
     let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
     g.changed(lsn);
     let frame = g.frame;

@@ -20,6 +20,7 @@
 use super::super::aligned::AlignedBlock;
 use super::super::log::Lsn;
 use super::super::page::{PageId, SizeClass};
+use super::super::shared::Bytes;
 use super::super::store::WritePlan;
 use super::frame::{EVICT_AFTER, RESIDENT, WRITING};
 use super::{BufferPool, Outgoing};
@@ -180,15 +181,9 @@ impl Writeback {
             debug_assert_eq!(h.pid(), self.pids[i].raw());
             let copy = Arc::new(AlignedBlock::zeroed(size));
             let copy_frame = || {
-                // SAFETY: the copy is fresh; the frame is held, or what is copied counts only
-                // once validated.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        pool.memory.region.ptr(frame),
-                        copy.as_ptr(),
-                        size,
-                    )
-                };
+                // SAFETY: the copy is fresh, and nothing else reaches it yet.
+                let into = unsafe { std::slice::from_raw_parts_mut(copy.as_ptr(), size) };
+                pool.bytes(frame, self.class).copy_to(0, into);
                 h.page_lsn.load(Ordering::Acquire)
             };
             let outgoing = self.outgoing[i].is_some();

@@ -15,6 +15,8 @@
 //! copy apart from the others the same place has held.
 
 /// log2 of the smallest page size.
+use super::shared::{Bytes, BytesMut};
+
 pub const MIN_PAGE_SHIFT: u32 = 12;
 /// The smallest page size: 4 KiB, the unit of direct IO and LeanStore's page size.
 pub const MIN_PAGE_SIZE: usize = 1 << MIN_PAGE_SHIFT;
@@ -126,20 +128,20 @@ impl PageId {
     }
 }
 
-pub fn lsn(page: &[u8]) -> u64 {
-    u64::from_le_bytes(page[LSN].try_into().unwrap())
+pub fn lsn<P: Bytes + ?Sized>(page: &P) -> u64 {
+    page.u64_at(LSN.start)
 }
 
-pub fn set_lsn(page: &mut [u8], lsn: u64) {
-    page[LSN].copy_from_slice(&lsn.to_le_bytes());
+pub fn set_lsn<P: BytesMut + ?Sized>(page: &mut P, lsn: u64) {
+    page.put_u64(LSN.start, lsn);
 }
 
-pub fn kind(page: &[u8]) -> PageKind {
-    PageKind(page[KIND])
+pub fn kind<P: Bytes + ?Sized>(page: &P) -> PageKind {
+    PageKind(page.u8_at(KIND))
 }
 
-pub fn set_kind(page: &mut [u8], kind: PageKind) {
-    page[KIND] = kind.0;
+pub fn set_kind<P: BytesMut + ?Sized>(page: &mut P, kind: PageKind) {
+    page.put_u8(KIND, kind.0);
 }
 
 fn checksum(page: &[u8]) -> u32 {
@@ -149,8 +151,8 @@ fn checksum(page: &[u8]) -> u32 {
 }
 
 /// The page id in a page's header.
-pub fn pid(page: &[u8]) -> PageId {
-    PageId(u64::from_le_bytes(page[PID].try_into().unwrap()))
+pub fn pid<P: Bytes + ?Sized>(page: &P) -> PageId {
+    PageId(page.u64_at(PID.start))
 }
 
 /// Stamps the page id, class and checksum, just before a copy goes to disk.

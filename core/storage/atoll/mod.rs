@@ -33,6 +33,7 @@ pub mod page;
 pub mod radix;
 mod recovery;
 pub mod redo;
+pub mod shared;
 pub mod store;
 pub mod txn;
 

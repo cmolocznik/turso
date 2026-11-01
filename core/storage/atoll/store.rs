@@ -33,6 +33,7 @@ use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
 use super::meta::{MetaCache, MetaFrame, MetaHold, MetaId, Tree};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
+use super::shared::{BytesMut, Writer};
 use super::{whole, whole_write};
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -1607,7 +1608,7 @@ impl<'a> Locked<'a> {
         })
     }
 
-    fn page_of(&mut self, id: MetaId) -> &mut [u8] {
+    fn page_of(&mut self, id: MetaId) -> &mut Writer<'a> {
         let i = self
             .ids
             .iter()
@@ -1723,8 +1724,8 @@ fn heights_of(ids: &[MetaId]) -> Heights {
 }
 
 /// What `r` does to the metadata page `id`, during recovery.
-fn apply(r: &StoreRecord, id: MetaId, page: &mut [u8]) {
-    let map = |page: &mut [u8], number: u64, from_used: bool, to: u64| {
+fn apply<P: BytesMut + ?Sized>(r: &StoreRecord, id: MetaId, page: &mut P) {
+    let map = |page: &mut P, number: u64, from_used: bool, to: u64| {
         if id.level == 0 {
             radix::set_map_entry(page, number, to);
         } else {
@@ -1734,7 +1735,7 @@ fn apply(r: &StoreRecord, id: MetaId, page: &mut [u8]) {
             }
         }
     };
-    let space = |page: &mut [u8], slot: u64, used: bool| {
+    let space = |page: &mut P, slot: u64, used: bool| {
         if id.level == 0 {
             radix::set_space_bit(page, slot, used);
         } else {

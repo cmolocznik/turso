@@ -239,11 +239,11 @@ impl Region {
         unsafe { self.map.start.as_ptr().add(at) }
     }
 
-    /// `frame`'s `len` bytes as an IO buffer that keeps the region alive.
+    /// `frame`'s `len` bytes as an IO buffer that keeps the region alive, for a read into a quiet
+    /// frame the caller holds exclusively while the read is in flight.
     pub fn buffer(self: &Arc<Self>, frame: u32, len: usize) -> Arc<Buffer> {
         assert!(frame as usize * MIN_PAGE_SIZE + len <= self.len);
-        // SAFETY: inside the region, which the buffer keeps alive. The caller holds the frame
-        // exclusively while an IO into it is in flight.
+        // SAFETY: inside the region, which the buffer keeps alive.
         let region = unsafe {
             RegionBuffer::new(self.clone(), NonNull::new_unchecked(self.ptr(frame)), len)
         };
@@ -404,6 +404,15 @@ impl Runs {
     }
 }
 
+/// What looking for a free frame found.
+pub enum Take {
+    Frame(u32),
+    /// Free frames, none of which was usable.
+    Unusable,
+    /// No free frame.
+    None,
+}
+
 /// Which frames are free, and which class holds each batch.
 pub struct Memory {
     pub region: Arc<Region>,
@@ -471,29 +480,57 @@ impl Memory {
     }
 
     /// A free frame of `class` from a batch it holds, if any.
+    #[cfg(test)]
     pub fn take(&self, class: SizeClass) -> Option<u32> {
+        match self.take_where(class, |_| true) {
+            Take::Frame(f) => Some(f),
+            Take::Unusable | Take::None => None,
+        }
+    }
+
+    /// A free frame of `class` that `usable` accepts.
+    pub fn take_where(&self, class: SizeClass, usable: impl Fn(u32) -> bool) -> Take {
         let n = frames_per_batch(class);
         let mut c = self.classes[class.index()].lock();
-        while let Some(&batch) = c.partial.first() {
+        let mut free = false;
+        let mut empty = Vec::new();
+        let mut taken = None;
+        'batches: for &batch in &c.partial {
             let words = self.words(batch);
-            let found = words.iter().enumerate().find_map(|(w, word)| {
-                let bits = word.load(Ordering::Relaxed);
-                (bits != 0).then(|| (w, bits.trailing_zeros()))
-            });
-            let Some((w, bit)) = found else {
-                c.partial.remove(&batch);
-                continue;
-            };
-            let i = w as u32 * 64 + bit;
-            debug_assert!(i < n);
-            let left = words[w].fetch_and(!(1 << bit), Ordering::Relaxed) & !(1 << bit);
-            self.taken[batch as usize].fetch_add(1, Ordering::Relaxed);
-            if left == 0 && words.iter().all(|w| w.load(Ordering::Relaxed) == 0) {
-                c.partial.remove(&batch);
+            let mut any = false;
+            for (w, word) in words.iter().enumerate() {
+                let mut bits = word.load(Ordering::Relaxed);
+                any |= bits != 0;
+                while bits != 0 {
+                    let i = w as u32 * 64 + bits.trailing_zeros();
+                    debug_assert!(i < n);
+                    let frame = frame_at(class, batch, i);
+                    if usable(frame) {
+                        taken = Some((batch, w, i % 64, frame));
+                        break 'batches;
+                    }
+                    bits &= bits - 1;
+                }
             }
-            return Some(frame_at(class, batch, i));
+            if any {
+                free = true;
+            } else {
+                empty.push(batch);
+            }
         }
-        None
+        for batch in empty {
+            c.partial.remove(&batch);
+        }
+        let Some((batch, w, bit, frame)) = taken else {
+            return if free { Take::Unusable } else { Take::None };
+        };
+        let words = self.words(batch);
+        let left = words[w].fetch_and(!(1 << bit), Ordering::Relaxed) & !(1 << bit);
+        self.taken[batch as usize].fetch_add(1, Ordering::Relaxed);
+        if left == 0 && words.iter().all(|w| w.load(Ordering::Relaxed) == 0) {
+            c.partial.remove(&batch);
+        }
+        Take::Frame(frame)
     }
 
     /// Lends a free run to `class`; false if there is none.

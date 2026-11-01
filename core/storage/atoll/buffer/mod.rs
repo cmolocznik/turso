@@ -51,12 +51,13 @@ use super::epoch::Step;
 use super::latch::{Held, VersionedLatch};
 use super::log::Lsn;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
+use super::shared::{BytesMut, Shared, Writer};
 use super::store::PageStore;
 use clean::{Progress, Writeback};
 use frame::{
     FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
 };
-use memory::{Memory, Zeroed};
+use memory::{Memory, Take, Zeroed};
 use pass::Shard;
 use table::Table;
 use temp::TempPages;
@@ -75,6 +76,10 @@ type Hold<'a> = Held<&'a VersionedLatch>;
 /// the pool, so a hold the pool itself keeps (a write-out queued) does not keep the pool alive.
 struct Frames {
     headers: Zeroed<FrameHeader>,
+    /// Per 4 KiB grain: one past the epoch stamp at which a frame over it was last given up, or 0
+    /// if none ever was. A page is read into a frame only once every step that could still read
+    /// what its memory held has ended ([`BufferPool::quiet`]).
+    given_up: Zeroed<AtomicU64>,
     /// Per shard of frames: the IO in flight for each loading or outgoing frame.
     transits: Box<[Mutex<HashMap<u32, Completion>>]>,
 }
@@ -256,6 +261,30 @@ pub struct BufferPool {
     temp: Arc<TempPages>,
 }
 
+/// What a claimed frame is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// A page read in by an IO, which writes the frame's memory plainly: only a quiet frame.
+    Read,
+    /// A new page, written through the frame's writer: any free frame.
+    New,
+}
+
+/// What looking for a free frame found.
+enum Got {
+    Frame(u32),
+    /// Free frames, none quiet yet.
+    Quieting,
+    /// No free frame.
+    None,
+}
+
+/// The grains `frame` of `class` spans.
+fn grains(frame: u32, class: SizeClass) -> std::ops::Range<usize> {
+    let start = frame as usize;
+    start..start + class.size() / page::MIN_PAGE_SIZE
+}
+
 fn yield_now<T>() -> Result<IOResult<T>> {
     Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
 }
@@ -293,6 +322,7 @@ impl BufferPool {
         Ok(Arc::new(Self {
             frames: Arc::new(Frames {
                 headers: Zeroed::new(grains as usize)?,
+                given_up: Zeroed::new(grains as usize)?,
                 transits: (0..load_shards)
                     .map(|_| Mutex::new(HashMap::new()))
                     .collect(),
@@ -470,7 +500,7 @@ impl BufferPool {
                 IOResult::Done(l) => l,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            let frame = match self.claim(pid.class())? {
+            let frame = match self.claim(pid.class(), Purpose::Read)? {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -574,7 +604,9 @@ impl BufferPool {
             loaded.complete(0);
             return Ok(IOResult::Done(None));
         }
-        let size = pid.class().size();
+        // The frame is quiet (claimed for a read) and held: nothing else reaches its memory while
+        // the IO writes it.
+        let into = self.memory.region.buffer(frame, pid.class().size());
         let reading = Loading {
             pool: self.clone(),
             pid,
@@ -582,10 +614,7 @@ impl BufferPool {
         };
         // On an error or a yield the read never starts, and dropping it frees the frame.
         Ok(
-            match located.read(
-                self.memory.region.buffer(frame, size),
-                Box::new(move |res| reading.end(res)),
-            )? {
+            match located.read(into, Box::new(move |res| reading.end(res)))? {
                 IOResult::Done(()) => IOResult::Done(Some(loaded)),
                 IOResult::IO(io) => IOResult::IO(io),
             },
@@ -604,8 +633,7 @@ impl BufferPool {
         match res {
             Ok(()) => {
                 let waiting = self.transits_of(frame).lock().remove(&frame);
-                // SAFETY: the frame is the load's alone until its latch is released below.
-                let lsn = page::lsn(unsafe { self.bytes(frame, pid.class()) });
+                let lsn = page::lsn(self.bytes(frame, pid.class()));
                 h.page_lsn.store(lsn, Ordering::Release);
                 h.written_lsn.store(lsn, Ordering::Release);
                 h.status.store(RESIDENT, Ordering::Release);
@@ -651,25 +679,41 @@ impl BufferPool {
         h.pid.store(NO_PAGE, Ordering::Release);
         h.flags.store(0, Ordering::Release);
         drop(hold);
+        // Stamped after the release: a reader that fixed the page before it entered its step
+        // before the stamp, and one that fixes the frame after finds it free.
+        let stamp = self.store.epochs().stamp() + 1;
+        for grain in &self.frames.given_up[grains(frame, class)] {
+            grain.store(stamp, Ordering::Release);
+        }
         self.memory.put(class, frame);
         self.signal_released();
     }
 
-    /// The bytes of `frame`, of `class`'s size.
-    ///
-    /// # Safety
-    ///
-    /// The caller holds the frame's latch, or reads optimistically and validates afterwards.
-    unsafe fn bytes(&self, frame: u32, class: SizeClass) -> &[u8] {
-        std::slice::from_raw_parts(self.memory.region.ptr(frame), class.size())
+    /// Whether no step that could still read what `frame`'s memory held before is left, given
+    /// the epochs' `horizon`: then an IO may read a page into it. A page written through the
+    /// frame's writer needs no such wait, its stores being atomic.
+    fn quiet(&self, frame: u32, class: SizeClass, horizon: u64) -> bool {
+        self.frames.given_up[grains(frame, class)]
+            .iter()
+            .all(|g| g.load(Ordering::Acquire) <= horizon)
     }
 
+    /// The bytes of `frame`, of `class`'s size: read under its latch, or optimistically and
+    /// validated afterwards.
+    fn bytes(&self, frame: u32, class: SizeClass) -> &Shared {
+        // SAFETY: frames are aligned to 4 KiB and sized in whole pages, and the region outlives
+        // the pool. Its bytes are reached only as `Shared`, but by an IO reading a page into a
+        // frame, which is quiet and held while it does (`Purpose::Read`).
+        unsafe { Shared::from_raw(self.memory.region.ptr(frame), class.size()) }
+    }
+
+    /// The writer of `frame`'s bytes.
+    ///
     /// # Safety
     ///
-    /// The caller holds the frame's latch exclusively.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn bytes_mut(&self, frame: u32, class: SizeClass) -> &mut [u8] {
-        std::slice::from_raw_parts_mut(self.memory.region.ptr(frame), class.size())
+    /// The caller holds the frame's latch exclusively while the writer lives.
+    unsafe fn writer(&self, frame: u32, class: SizeClass) -> Writer<'_> {
+        self.bytes(frame, class).writer()
     }
 
     // ---------------------------------------------------------------- new pages
@@ -677,7 +721,7 @@ impl BufferPool {
     /// A new page of `class`, all zeros, fixed exclusively.
     pub fn allocate(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<Exclusive<'_>>> {
         let step = self.store.epochs().enter();
-        let frame = match self.claim(class)? {
+        let frame = match self.claim(class, Purpose::New)? {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -702,7 +746,7 @@ impl BufferPool {
         class: SizeClass,
     ) -> Result<IOResult<Exclusive<'_>>> {
         let step = self.store.epochs().enter();
-        let frame = match self.claim(class)? {
+        let frame = match self.claim(class, Purpose::New)? {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -730,7 +774,7 @@ impl BufferPool {
         let h = self.header(frame);
         let hold = self.take_free_latch(frame);
         // SAFETY: latched exclusively.
-        unsafe { self.bytes_mut(frame, class) }.fill(0);
+        unsafe { self.writer(frame, class) }.fill(0..class.size(), 0);
         h.pid.store(pid.raw(), Ordering::Release);
         h.flags.store(0, Ordering::Release);
         h.page_lsn.store(0, Ordering::Release);
@@ -801,7 +845,7 @@ impl BufferPool {
                 return Ok(IOResult::Done(()));
             }
             let class = pid.class();
-            let frame = match self.claim(class)? {
+            let frame = match self.claim(class, Purpose::New)? {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -809,8 +853,7 @@ impl BufferPool {
             let hold = self.take_free_latch(frame);
             // Whatever the frame held before must not read as this page if the free waits.
             // SAFETY: latched exclusively.
-            let bytes = unsafe { self.bytes_mut(frame, class) };
-            bytes[..page::HEADER_SIZE].fill(0);
+            unsafe { self.writer(frame, class) }.fill(0..page::HEADER_SIZE, 0);
             h.pid.store(pid.raw(), Ordering::Release);
             h.flags.store(0, Ordering::Release);
             h.page_lsn.store(0, Ordering::Release);
@@ -871,13 +914,14 @@ impl BufferPool {
                 IOResult::IO(_) => continue,
             };
             let class = pid.class();
-            let frame = match self.take_or_grow(class) {
-                Some(f) => f,
-                None => {
+            let frame = match self.take_or_grow(class, Purpose::Read) {
+                Got::Frame(f) => f,
+                Got::Quieting => continue,
+                Got::None => {
                     self.evict_round(class)?;
-                    match self.take_or_grow(class) {
-                        Some(f) => f,
-                        None => return Ok(()),
+                    match self.take_or_grow(class, Purpose::Read) {
+                        Got::Frame(f) => f,
+                        Got::Quieting | Got::None => return Ok(()),
                     }
                 }
             };
@@ -888,28 +932,39 @@ impl BufferPool {
 
     // ---------------------------------------------------------------- frames
 
-    fn take_or_grow(&self, class: SizeClass) -> Option<u32> {
+    fn take_or_grow(&self, class: SizeClass, purpose: Purpose) -> Got {
+        let horizon = (purpose == Purpose::Read).then(|| self.store.epochs().horizon());
         loop {
-            if let Some(f) = self.memory.take(class) {
-                return Some(f);
-            }
-            if !self.memory.grow(class) {
-                return None;
+            let usable = |f| horizon.is_none_or(|h| self.quiet(f, class, h));
+            match self.memory.take_where(class, usable) {
+                Take::Frame(f) => return Got::Frame(f),
+                // Growing would take memory a later step does not need: once the steps under
+                // way end, these frames are quiet.
+                Take::Unusable => return Got::Quieting,
+                Take::None => {
+                    if !self.memory.grow(class) {
+                        return Got::None;
+                    }
+                }
             }
         }
     }
 
-    /// A free frame of `class`, making room if there is none.
-    fn claim(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<u32>> {
+    /// A free frame of `class` for `purpose`, making room if there is none.
+    fn claim(self: &Arc<Self>, class: SizeClass, purpose: Purpose) -> Result<IOResult<u32>> {
         self.failed()?;
-        if let Some(f) = self.take_or_grow(class) {
-            return Ok(IOResult::Done(f));
+        match self.take_or_grow(class, purpose) {
+            Got::Frame(f) => return Ok(IOResult::Done(f)),
+            Got::Quieting => return yield_now(),
+            Got::None => {}
         }
         // Waiting starts before the last look, so a frame freed in between is not missed.
         let wait = self.released_wait();
         self.make_room(class)?;
-        if let Some(f) = self.take_or_grow(class) {
-            return Ok(IOResult::Done(f));
+        match self.take_or_grow(class, purpose) {
+            Got::Frame(f) => return Ok(IOResult::Done(f)),
+            Got::Quieting => return yield_now(),
+            Got::None => {}
         }
         if let Some(c) = self.drive_writebacks()? {
             return Ok(IOResult::IO(IOCompletions(c)));
@@ -1386,9 +1441,8 @@ impl<'a> Optimistic<'a> {
     /// meanwhile, `None` if it did. `read` may see the page mid-change, so it must not trust
     /// what it reads to be consistent: offsets and lengths are checked before use, and nothing
     /// it does may panic on garbage.
-    pub fn read<R>(&self, read: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        // SAFETY: validated below; see the contract above.
-        let out = read(unsafe { self.pool.bytes(self.frame, self.pid.class()) });
+    pub fn read<R>(&self, read: impl FnOnce(&Shared) -> R) -> Option<R> {
+        let out = read(self.pool.bytes(self.frame, self.pid.class()));
         self.validate().then_some(out)
     }
 
@@ -1436,16 +1490,15 @@ pub struct Exclusive<'a> {
 }
 
 impl<'a> Exclusive<'a> {
-    pub fn page(&self) -> &[u8] {
-        // SAFETY: latched exclusively.
-        unsafe { self.pool.bytes(self.frame, self.pid.class()) }
+    pub fn page(&self) -> &Shared {
+        self.pool.bytes(self.frame, self.pid.class())
     }
 
     /// The page, to change. Every change is logged, and reported with [`changed`](Self::changed)
     /// before the latch is released; a change not reported is lost when the page is evicted.
-    pub fn page_mut(&mut self) -> &mut [u8] {
-        // SAFETY: latched exclusively.
-        unsafe { self.pool.bytes_mut(self.frame, self.pid.class()) }
+    pub fn page_mut(&mut self) -> Writer<'_> {
+        // SAFETY: latched exclusively, and the writer borrows the guard.
+        unsafe { self.pool.writer(self.frame, self.pid.class()) }
     }
 
     /// Notes a change whose log record ends at `lsn`: the page's LSN becomes `lsn`, and the page
@@ -1457,7 +1510,7 @@ impl<'a> Exclusive<'a> {
             "a change to {:?} at {lsn} is not after its last",
             self.pid
         );
-        page::set_lsn(self.page_mut(), lsn);
+        page::set_lsn(&mut self.page_mut(), lsn);
         h.page_lsn.store(lsn, Ordering::Release);
         h.tracker.write(self.pool.now());
     }

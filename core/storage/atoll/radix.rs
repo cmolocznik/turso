@@ -12,6 +12,7 @@
 
 use super::meta::{MetaId, Tree, META_PAGE};
 use super::page::{SizeClass, HEADER_SIZE};
+use super::shared::{Bytes, BytesMut};
 
 pub const FREE: u64 = 0;
 pub const ALLOCATED: u64 = 1;
@@ -68,42 +69,40 @@ pub fn child(tree: Tree, level: u8, unit: u64) -> u64 {
     (unit / span(tree, level - 1)) % FANOUT
 }
 
-pub fn map_entry(leaf: &[u8], number: u64) -> u64 {
-    let at = HEADER_SIZE + 8 * (number % MAP_ENTRIES) as usize;
-    u64::from_le_bytes(leaf[at..at + 8].try_into().unwrap())
+pub fn map_entry<P: Bytes + ?Sized>(leaf: &P, number: u64) -> u64 {
+    leaf.u64_at(HEADER_SIZE + 8 * (number % MAP_ENTRIES) as usize)
 }
 
-pub fn set_map_entry(leaf: &mut [u8], number: u64, value: u64) {
-    let at = HEADER_SIZE + 8 * (number % MAP_ENTRIES) as usize;
-    leaf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+pub fn set_map_entry<P: BytesMut + ?Sized>(leaf: &mut P, number: u64, value: u64) {
+    leaf.put_u64(HEADER_SIZE + 8 * (number % MAP_ENTRIES) as usize, value);
 }
 
-pub fn space_bit(leaf: &[u8], slot: u64) -> bool {
+pub fn space_bit<P: Bytes + ?Sized>(leaf: &P, slot: u64) -> bool {
     let bit = slot % SPACE_BITS;
-    leaf[HEADER_SIZE + (bit / 8) as usize] & (1 << (bit % 8)) != 0
+    leaf.u8_at(HEADER_SIZE + (bit / 8) as usize) & (1 << (bit % 8)) != 0
 }
 
-pub fn set_space_bit(leaf: &mut [u8], slot: u64, used: bool) {
+pub fn set_space_bit<P: BytesMut + ?Sized>(leaf: &mut P, slot: u64, used: bool) {
     let bit = slot % SPACE_BITS;
-    let byte = &mut leaf[HEADER_SIZE + (bit / 8) as usize];
-    if used {
-        *byte |= 1 << (bit % 8);
+    let at = HEADER_SIZE + (bit / 8) as usize;
+    let byte = leaf.u8_at(at);
+    let byte = if used {
+        byte | 1 << (bit % 8)
     } else {
-        *byte &= !(1 << (bit % 8));
-    }
+        byte & !(1 << (bit % 8))
+    };
+    leaf.put_u8(at, byte);
 }
 
-pub fn used_below(node: &[u8], child: u64) -> u64 {
-    let at = HEADER_SIZE + 8 * child as usize;
-    u64::from_le_bytes(node[at..at + 8].try_into().unwrap())
+pub fn used_below<P: Bytes + ?Sized>(node: &P, child: u64) -> u64 {
+    node.u64_at(HEADER_SIZE + 8 * child as usize)
 }
 
-pub fn set_used_below(node: &mut [u8], child: u64, used: u64) {
-    let at = HEADER_SIZE + 8 * child as usize;
-    node[at..at + 8].copy_from_slice(&used.to_le_bytes());
+pub fn set_used_below<P: BytesMut + ?Sized>(node: &mut P, child: u64, used: u64) {
+    node.put_u64(HEADER_SIZE + 8 * child as usize, used);
 }
 
-pub fn add_used_below(node: &mut [u8], child: u64, delta: i64) {
+pub fn add_used_below<P: BytesMut + ?Sized>(node: &mut P, child: u64, delta: i64) {
     let now = used_below(node, child)
         .checked_add_signed(delta)
         .expect("a used count below zero");
@@ -111,7 +110,7 @@ pub fn add_used_below(node: &mut [u8], child: u64, delta: i64) {
 }
 
 /// Whether `unit` is in use in its leaf.
-pub fn used(tree: Tree, leaf: &[u8], unit: u64) -> bool {
+pub fn used<P: Bytes + ?Sized>(tree: Tree, leaf: &P, unit: u64) -> bool {
     match tree {
         Tree::Map => map_entry(leaf, unit) != FREE,
         Tree::Space => space_bit(leaf, unit),
@@ -119,14 +118,24 @@ pub fn used(tree: Tree, leaf: &[u8], unit: u64) -> bool {
 }
 
 /// The first unit at or after `from` in this leaf that is free, if any.
-pub fn free_in_leaf(tree: Tree, leaf: &[u8], leaf_index: u64, from: u64) -> Option<u64> {
+pub fn free_in_leaf<P: Bytes + ?Sized>(
+    tree: Tree,
+    leaf: &P,
+    leaf_index: u64,
+    from: u64,
+) -> Option<u64> {
     let first = leaf_index * leaf_units(tree);
     let start = from.clamp(first, first + leaf_units(tree));
     (start..first + leaf_units(tree)).find(|&u| !used(tree, leaf, u))
 }
 
 /// The first child at or after `from_child` of a node at `level` with a free unit below it.
-pub fn child_with_room(tree: Tree, node: &[u8], level: u8, from_child: u64) -> Option<u64> {
+pub fn child_with_room<P: Bytes + ?Sized>(
+    tree: Tree,
+    node: &P,
+    level: u8,
+    from_child: u64,
+) -> Option<u64> {
     let room = span(tree, level - 1);
     (from_child..FANOUT).find(|&c| used_below(node, c) < room)
 }

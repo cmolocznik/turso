@@ -23,6 +23,7 @@ use super::super::blob;
 use super::super::buffer::{BufferPool, Optimistic};
 use super::super::log::Log;
 use super::super::page::{self, PageId, SizeClass, CLASS_COUNT, HEADER_SIZE};
+use super::super::shared::Bytes;
 use super::super::store::PageStore;
 use crate::io::Completion;
 use crate::sync::Arc;
@@ -230,7 +231,7 @@ impl ValueWrite {
                     blob::write(log, admitted, &mut page, HEADER_SIZE + done, &bytes);
                 }
                 _ => {
-                    blob::apply(page.page_mut(), HEADER_SIZE + done, &bytes);
+                    blob::apply(&mut page.page_mut(), HEADER_SIZE + done, &bytes);
                     page.changed(pool.temporary_lsn());
                 }
             }
@@ -261,8 +262,9 @@ pub enum Read {
 }
 
 /// Checks that `page` is a blob page of the value `id`.
-fn of_value(page: &[u8], id: u64) -> bool {
-    page::kind(page) == blob::KIND && page[HEADER_SIZE..HEADER_SIZE + ID] == id.to_le_bytes()
+fn of_value<P: Bytes + ?Sized>(page: &P, id: u64) -> bool {
+    page::kind(page) == blob::KIND
+        && page.compare(HEADER_SIZE, &id.to_le_bytes()) == std::cmp::Ordering::Equal
 }
 
 /// Reads an out-of-line value, page by page, so a value larger than memory is read with every
@@ -319,7 +321,9 @@ impl ValueRead {
             if !of_value(bytes, id) || HEADER_SIZE + ID + len > bytes.len() {
                 return false;
             }
-            out.extend_from_slice(&bytes[HEADER_SIZE + ID..HEADER_SIZE + ID + len]);
+            let start = out.len();
+            out.resize(start + len, 0);
+            bytes.copy_to(HEADER_SIZE + ID, &mut out[start..]);
             true
         });
         Ok(match copied {
@@ -400,7 +404,8 @@ fn directory(
         if !of_value(bytes, reference.id) || at + 8 * count > bytes.len() {
             return Err(Read::Changed);
         }
-        Ok(bytes[at..at + 8 * count]
+        Ok(bytes
+            .copied(at..at + 8 * count)
             .chunks_exact(8)
             .map(|c| PageId::from_raw(u64::from_le_bytes(c.try_into().unwrap())))
             .collect())

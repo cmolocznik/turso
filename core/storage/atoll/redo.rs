@@ -6,6 +6,7 @@ use super::blob;
 use super::btree::record::Record;
 use super::log::Kind;
 use super::page::PageId;
+use super::shared::BytesMut;
 use crate::Result;
 
 /// A record that changes one page in the buffer pool.
@@ -31,7 +32,7 @@ impl<'a> PageRecord<'a> {
     }
 
     /// Replays the change on `page`, which does not hold it yet.
-    pub fn redo(&self, page: &mut [u8]) -> Result<()> {
+    pub fn redo<P: BytesMut + ?Sized>(&self, page: &mut P) -> Result<()> {
         match self {
             Self::Blob(w) => {
                 w.redo(page);

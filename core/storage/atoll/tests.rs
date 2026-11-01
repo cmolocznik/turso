@@ -8,6 +8,7 @@ use super::db::{Atoll, AtollConfig, Opening};
 use super::log::{LogConfig, Lsn};
 use super::page::{PageId, SizeClass, HEADER_SIZE};
 use super::radix::FREE;
+use super::shared::Bytes;
 use super::store::StoreConfig;
 use super::testing::drive;
 use crate::io::crash::CrashIO;
@@ -115,7 +116,7 @@ fn check(db: &Atoll, io: &Arc<dyn IO>, model: &BTreeMap<PageId, Lives>, end: Lsn
         assert_ne!(entry, FREE, "{label}: {pid:?} lost");
         let page = loop {
             let g = drive(io, || db.pool().fix_optimistic(pid, None)).unwrap();
-            if let Some(bytes) = g.read(|p| p.to_vec()) {
+            if let Some(bytes) = g.read(|p| p.copied(0..p.len())) {
                 break bytes;
             }
         };

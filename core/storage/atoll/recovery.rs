@@ -429,7 +429,7 @@ impl Recovery {
                     continue;
                 }
                 let record = PageRecord::decode(r.header.kind, &r.payload)?.expect("a page record");
-                record.redo(page.page_mut())?;
+                record.redo(&mut page.page_mut())?;
                 page.changed(r.lsn);
             }
         }

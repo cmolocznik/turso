@@ -22,6 +22,7 @@
 
 use super::super::log::Kind;
 use super::super::page::PageId;
+use super::super::shared::BytesMut;
 use super::node::{self, child_value, Layout, View};
 use crate::{LimboError, Result};
 
@@ -233,7 +234,7 @@ impl<'a> Record<'a> {
 
     /// Makes the change on `page`, the node `pid` as the change found it. Frame hints it stores
     /// are 0; the caller sets them where it knows them.
-    pub fn apply(&self, page: &mut [u8]) -> Result<()> {
+    pub fn apply<P: BytesMut + ?Sized>(&self, page: &mut P) -> Result<()> {
         match &self.change {
             Change::Init { image } => node::apply_image(page, image).ok_or_else(|| corrupt("init")),
             Change::Insert {
@@ -242,7 +243,7 @@ impl<'a> Record<'a> {
                 out_of_line,
                 ..
             } => {
-                let v = View::new(page);
+                let v = View::new(&*page);
                 match v.search(key) {
                     Some((pos, false)) if v.covers(key) == Some(true) => {
                         if node::insert(page, pos, key, value, *out_of_line) {
@@ -254,7 +255,7 @@ impl<'a> Record<'a> {
                     _ => Err(corrupt("insert")),
                 }
             }
-            Change::Remove { key } => match View::new(page).search(key) {
+            Change::Remove { key } => match View::new(&*page).search(key) {
                 Some((pos, true)) => {
                     node::remove(page, pos);
                     Ok(())
@@ -266,13 +267,13 @@ impl<'a> Record<'a> {
                 value,
                 out_of_line,
                 ..
-            } => match View::new(page).search(key) {
+            } => match View::new(&*page).search(key) {
                 Some((pos, true)) if node::set_value(page, pos, value, *out_of_line) => Ok(()),
                 _ => Err(corrupt("update")),
             },
             Change::Split { right, keep, sep } => split(page, *right, *keep, sep),
             Change::Branch { left, right, sep } => {
-                let v = View::new(page);
+                let v = View::new(&*page);
                 let (pos, exact) = v.search(sep).ok_or_else(|| corrupt("branch"))?;
                 if exact
                     || v.covers(sep) != Some(true)
@@ -291,8 +292,8 @@ impl<'a> Record<'a> {
 /// Keeps the first `keep` entries of the node in `page`, up to `sep`: a leaf's right neighbour
 /// becomes `right`, and an inner node's rightmost child becomes the child of entry `keep`, whose
 /// key `sep` is.
-fn split(page: &mut [u8], right: PageId, keep: usize, sep: &[u8]) -> Result<()> {
-    let v = View::new(page);
+fn split<P: BytesMut + ?Sized>(page: &mut P, right: PageId, keep: usize, sep: &[u8]) -> Result<()> {
+    let v = View::new(&*page);
     let entries = v.entries().ok_or_else(|| corrupt("split"))?;
     let node::Shape {
         root,
@@ -300,7 +301,7 @@ fn split(page: &mut [u8], right: PageId, keep: usize, sep: &[u8]) -> Result<()> 
         lower,
         upper,
         ..
-    } = node::shape(page);
+    } = node::shape(&*page);
     let valid = keep <= entries.len()
         && upper.as_deref().is_none_or(|u| sep < u)
         && lower.as_deref().is_none_or(|l| sep > l)

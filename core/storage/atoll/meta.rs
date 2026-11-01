@@ -21,13 +21,13 @@ use super::aligned::AlignedBlock;
 use super::latch::{Held, VersionedLatch};
 use super::log::{Log, Lsn};
 use super::page::{self, PageId, SizeClass, MIN_PAGE_SIZE};
+use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
-use std::cell::UnsafeCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 pub const META_PAGE: usize = MIN_PAGE_SIZE;
@@ -116,24 +116,19 @@ pub struct MetaFrame {
     pub id: MetaId,
     latch: VersionedLatch,
     /// Written only under the latch, held exclusively; read under it, or optimistically.
-    bytes: UnsafeCell<Box<[u8]>>,
+    bytes: Box<Shared>,
     state: Mutex<FrameState>,
     loaded: Mutex<Option<Completion>>,
 }
-
-// SAFETY: the bytes are written only under the latch, held exclusively, and read either under it
-// or without it and validated against its version afterwards, as frames of the buffer pool are.
-unsafe impl Sync for MetaFrame {}
 
 impl MetaFrame {
     /// Reads the page without a lock: `None` while a change holds the latch, else what `f`
     /// returned over a version no change overlapped. `f` may see a change half made, and then runs
     /// again, so it must not trust what it reads to be consistent, nor panic on it.
-    pub fn read<R>(&self, f: impl Fn(&[u8]) -> R) -> Option<R> {
+    pub fn read<R>(&self, f: impl Fn(&Shared) -> R) -> Option<R> {
         loop {
             let version = self.latch.optimistic()?;
-            // SAFETY: what is read counts only once validated; see above.
-            let out = f(unsafe { &*self.bytes.get() });
+            let out = f(&self.bytes);
             if self.latch.validate(version) {
                 return Some(out);
             }
@@ -143,7 +138,12 @@ impl MetaFrame {
     /// Latches the page for a change, or `None` while a change holds it. The change's record is
     /// appended while the latch is held, so changes reach a page in the order of their records.
     pub fn try_lock(&self) -> Option<MetaHold<'_>> {
-        Held::try_take(&self.latch).map(|hold| MetaHold { frame: self, hold })
+        Held::try_take(&self.latch).map(|hold| MetaHold {
+            frame: self,
+            // SAFETY: the hold has the latch exclusively, and keeps it while the writer lives.
+            page: unsafe { self.bytes.writer() },
+            hold,
+        })
     }
 
     /// Notes a change, whose record starts at `start`, made under the latch, which is still held.
@@ -163,7 +163,7 @@ impl MetaFrame {
         cache: &MetaCache,
         start: Lsn,
         lsn: Lsn,
-        f: impl FnOnce(&mut [u8]),
+        f: impl FnOnce(&mut Writer<'_>),
     ) -> Option<bool> {
         let mut hold = self.try_lock()?;
         let page = hold.page();
@@ -181,13 +181,13 @@ impl MetaFrame {
 /// A metadata page latched for a change; released, with its version bumped, when dropped.
 pub struct MetaHold<'a> {
     frame: &'a MetaFrame,
+    page: Writer<'a>,
     hold: Held<&'a VersionedLatch>,
 }
 
-impl MetaHold<'_> {
-    pub fn page(&mut self) -> &mut [u8] {
-        // SAFETY: the latch is held exclusively, by this hold alone.
-        unsafe { &mut *self.frame.bytes.get() }
+impl<'a> MetaHold<'a> {
+    pub fn page(&mut self) -> &mut Writer<'a> {
+        &mut self.page
     }
 
     /// Releases the latch after a change whose record starts at `start`, noting the page dirty
@@ -264,7 +264,7 @@ impl MetaCache {
                     let frame = Arc::new(MetaFrame {
                         id,
                         latch: VersionedLatch::default(),
-                        bytes: UnsafeCell::new(vec![0u8; META_PAGE].into_boxed_slice()),
+                        bytes: Shared::zeroed(META_PAGE),
                         state: Mutex::new(FrameState {
                             status: Status::Loading,
                             rec: None,
@@ -339,7 +339,7 @@ impl MetaCache {
             // page still loading: `get` hands out none.
             if let Ok((Some(bytes), _)) = &outcome {
                 let mut hold = target.try_lock().expect("a page loading is latched");
-                hold.page().copy_from_slice(bytes);
+                hold.page().write(0, bytes);
             }
             let mut state = target.state.lock();
             match outcome {
@@ -435,15 +435,10 @@ impl MetaCache {
                 return Ok(Some(Completion::new_yield()));
             };
             let copy = Arc::new(AlignedBlock::zeroed(META_PAGE));
-            // SAFETY: a fresh block of the page's size; what is copied counts only once
-            // validated.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (*frame.bytes.get()).as_ptr(),
-                    copy.as_ptr(),
-                    META_PAGE,
-                )
-            };
+            // SAFETY: a fresh block of the page's size, which nothing else reaches yet.
+            frame.bytes.copy_to(0, unsafe {
+                std::slice::from_raw_parts_mut(copy.as_ptr(), META_PAGE)
+            });
             let mut state = frame.state.lock();
             if !frame.latch.validate(version) {
                 return Ok(Some(Completion::new_yield()));

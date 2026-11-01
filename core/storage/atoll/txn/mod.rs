@@ -88,6 +88,15 @@ struct CommitLog {
 }
 
 impl CommitLog {
+    /// Whether the slot's transaction that started at `start` committed.
+    fn committed(&self, start: Ts) -> bool {
+        start <= self.base
+            || self
+                .entries
+                .binary_search_by_key(&start, |&(s, _)| s)
+                .is_ok()
+    }
+
     /// The start of the slot's last transaction committed before `at`.
     fn last_before(&self, at: Ts) -> Ts {
         match self.entries.partition_point(|&(_, commit)| commit < at) {
@@ -101,9 +110,20 @@ pub struct Transactions {
     clock: Arc<Clock>,
     log: Arc<Log>,
     slots: Box<[Mutex<CommitLog>]>,
+    /// Per slot, the start of the transaction it runs; 0 for none.
+    running: Box<[AtomicU64]>,
     free: Mutex<Vec<u16>>,
     /// Done when a slot is next freed, if anyone waits for one.
     freed: Mutex<Option<Completion>>,
+}
+
+/// Where the writer of a version stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writer {
+    Open,
+    Committed,
+    /// Neither: it ended without committing, and its versions should be gone.
+    Gone,
 }
 
 /// A transaction, from its begin to its commit or abort.
@@ -195,6 +215,7 @@ impl Transactions {
                     })
                 })
                 .collect(),
+            running: (0..config.slots).map(|_| AtomicU64::new(0)).collect(),
             free: Mutex::new((0..config.slots).rev().map(|s| s as u16).collect()),
             freed: Mutex::new(None),
             clock,
@@ -218,6 +239,7 @@ impl Transactions {
             return Ok(IOResult::IO(IOCompletions(wait)));
         };
         let start = self.clock.next();
+        self.running[slot as usize].store(start, Ordering::Release);
         Ok(IOResult::Done(Txn {
             slot,
             start,
@@ -304,7 +326,22 @@ impl Transactions {
         self.release(txn.slot);
     }
 
+    /// Where the transaction that started at `start` in `slot` stands, for a version it wrote.
+    pub fn writer(&self, slot: u16, start: Ts) -> Writer {
+        // The slot first: a committing transaction enters its pair before it leaves the slot, so a
+        // transaction gone from the slot by this read has its pair in the log by the next.
+        let running = self.running[slot as usize].load(Ordering::Acquire);
+        if self.slots[slot as usize].lock().committed(start) {
+            Writer::Committed
+        } else if running == start {
+            Writer::Open
+        } else {
+            Writer::Gone
+        }
+    }
+
     fn release(&self, slot: u16) {
+        self.running[slot as usize].store(0, Ordering::Release);
         self.free.lock().push(slot);
         let waiting = self.freed.lock().take();
         if let Some(c) = waiting {
@@ -312,6 +349,8 @@ impl Transactions {
         }
     }
 }
+
+pub mod versioned;
 
 #[cfg(test)]
 mod tests;

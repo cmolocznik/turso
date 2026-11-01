@@ -524,8 +524,16 @@ Built in `txn/mod.rs`.
   - `flags` mark a deleted entry or a lock with no new data.
 - **Old versions.**
   - **Version index.** Each slot keeps a version index, a B-tree of temporary pages keyed
-    `slot | ts | tree | key`. An update stores its delta there, or the whole old value when the size
-    changes. Inserts go to the right edge, and garbage collection is a range delete.
+    `slot | ts | tree | key | command` by the version that replaced the stored one: the replacing
+    transaction's start, the tree's root, the key and the replacing statement. The statement is in
+    the key so that a statement changing a row an earlier statement of its transaction changed
+    keeps that earlier version, which it still reads. An update stores its delta there, or the
+    whole old value when the size changes. Inserts go to the right edge, and garbage collection is
+    a range delete. A slot has one per node class of the trees it writes, a class larger, so its
+    keys hold a tree's longest key and the 18 bytes around it.
+  - **Reading.** A reader starts from the leaf's version and follows the chain while a version is
+    not visible to it. A version flagged as the key's first ends the chain without a lookup.
+    Built in `txn/versioned.rs`, for values that fit their leaf.
   - **Fat tuples.** A tuple updated very often keeps its recent deltas inline instead (OSIC's fat
     tuples).
 - **Graveyard.** A deleted entry that no running OLTP snapshot can see, but an older snapshot still

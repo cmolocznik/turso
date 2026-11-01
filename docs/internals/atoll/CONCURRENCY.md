@@ -176,6 +176,8 @@ Anything that fits none of these is a design error.
   - None is held across IO, while a callback runs, or while a completion is completed, except
     the log's flush and a transaction slot: an append can submit log writes, whose completions
     run inside the submission on some backends. Both go with step 4.
+  - Every other mutex is taken alone, nesting nothing: the writeback buffer's ring among them,
+    taken to lease room and, from a write's completion, to give it back.
   - Every acquisition in the engine was read for this list (2026-11-01): no two mutexes are taken
     in both orders.
 
@@ -200,7 +202,12 @@ Anything that fits none of these is a design error.
 2. The buffer manager: validation before IO, epoch-deferred ids, batches checked under the latch
    (§4), no relocation, no shared reads, metadata pages latched the same way, writes settled in
    steps, page bytes read and written only through atomic accesses (§3). Schedule tests.
-3. B-trees on top: schedule tests and stress, then the scan livelock found or proved gone.
+3. B-trees on top: schedule tests and stress, then the scan livelock found or proved gone. Found:
+   a split appending past the rightmost leaf kept every entry in the left half, which then could
+   not take its new upper fence, and the writer panicked with the tree half changed; scanners
+   looped on it, and the test hung before printing the panic. A split now takes a point where both
+   halves fit; a scan step that does not move on, and a descent that lands outside its key, are
+   reported as corruption.
 4. Transactions: lock-free commit logs, waits as completions, deadlock detection, and a log flush
    that holds no mutex across its writes. Schedule tests.
 5. Then step 7 resumes from what is committed, re-proved under the new rules.

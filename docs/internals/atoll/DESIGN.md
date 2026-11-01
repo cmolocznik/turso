@@ -339,6 +339,10 @@ Built in `core/storage/atoll/buffer`.
   at most 16 TiB. The id names the same memory whichever class holds it.
 - **Never unmapped.** A freed frame is reused as it is. Memory moves between classes a whole batch
   at a time, so no huge page is ever split.
+- **Bytes as atomic words.** Optimistic readers may overlap a writer, so a frame's bytes are read
+  and written only as relaxed 64-bit atomics (`shared.rs`; CONCURRENCY.md §3). A page is read by
+  its IO straight into its frame, which needs the frame's memory quiet: no step that could still
+  read its last page under way (CONCURRENCY.md §4). Nothing is copied on the way in.
 - **Moving memory.** A batch moves once every frame in it is free. A batch to be moved is marked
   draining, which keeps new frames out of it. Its pages are then evicted: a clean page at once, a
   dirty one written out, its frame held until the write lands while whoever wants the page waits
@@ -427,9 +431,14 @@ frame goes stale.
 - A writeback takes dirty frames of one class and marks them writing, so they are neither evicted
   nor dropped meanwhile. The page store takes fresh slots for them under a logged intent (section
   6.3).
-- Each page is copied optimistically, checked against its latch, and the copy is written. A page
-  changed while its copy is in flight stays dirty. A page written out of a draining batch is held
-  for its write instead, so its copy needs no check.
+- A page written out of its frame (a draining batch, an eviction) is held by its write-out until
+  the write lands, so it is sealed in its frame and written from there: no copy.
+- A page that stays in its frame may change while it is written, so it is copied optimistically,
+  checked against its latch, and the copy is written; a page changed while its copy is in flight
+  stays dirty. Copies are made in one ring of fixed size allocated with the pool (`writeback_bytes`,
+  at least the largest page, two of it by default), leased per write and given back as it lands.
+  Its size bounds such writes in flight, and so the cleaner's share of the device; a writeback
+  finding no room submits no more until writes land.
 - A write's completion only records that it landed and wakes the pool's waiters. Its remap, which
   latches metadata pages, and the frame's new state are settled the next time the writeback is
   stepped: a latched page means a yield there, which a completion cannot do.
@@ -701,14 +710,19 @@ Built in `core/storage/atoll/btree`, except key encoding for SQL records, which 
     upper fence, and the parent's new separator, with the old pointer moved to the new node. A
     parent without room is split first. Separators are the shortest key between the halves.
     Appending at the right edge of the tree, the left keeps everything, so keys inserted in order
-    fill nodes.
+    fill nodes, unless its new upper fence would not fit beside them; a split is taken only where
+    both halves fit, else nearest the middle. Both halves' fences share at least the node's
+    prefix, so each entry moves as one run of bytes: the right half is appended straight from the
+    node, and the left is cut down in place.
   - **The root never moves**, so its page names the tree. When it splits, its contents move to a new
     child and it becomes an inner node over that child, which then splits like any other; when it
     has one child left, the child's contents move up.
   - **Merge:** a node used less than a quarter after a removal merges with a neighbour, the right
     one first, if the two fit in three quarters of a node, which leaves room for the largest entry.
     The left goes into the right, and the parent loses the separator between them; a parent left
-    underfull merges next, and a parent with one child merges at its own level.
+    underfull merges next, and a parent with one child merges at its own level. The merged fences
+    may share less, so keys grow: the node is built in a page of the thread's own from both nodes
+    and copied over the right one.
 - **Records** (`btree/record.rs`): init (a node's image), insert, remove, update, split and branch.
   Each changes one node and is applied by the same code when made and when replayed.
 - **Later:** contention splits.

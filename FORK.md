@@ -1495,7 +1495,8 @@ to 9 in each later round.
 ### Atoll, a storage mode after LeanStore
 2026-10-31 to 2026-11-01, on branch `atoll` (not yet on `workreef`): `7599d09ef`, `b1accccee`,
 `5fb136184`, `9923c8f79`, `c7b471c72`, `a2e41d461`, `6e30640dc`, `5d3907c1c`, `05ae1ad56`,
-`7533b17b1`, `a0380004f`, `409e158b9` and the design in `docs/internals/atoll/DESIGN.md`.
+`7533b17b1`, `a0380004f`, `409e158b9`, `6c07a60d9` and the design in
+`docs/internals/atoll/DESIGN.md`.
 `core/storage/atoll`. A storage engine beside the pager and MVCC, with LeanStore 2024 as its
 baseline: one ordered log filled in parallel, pages written out of place through a page table of
 logged metadata pages, a buffer manager with a hash table and frame hints, B+-trees with optimistic

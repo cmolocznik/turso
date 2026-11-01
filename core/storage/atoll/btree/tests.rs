@@ -113,6 +113,9 @@ fn check_whole(tree: &Tree, db: &Atoll, run: &Runner<'_>, label: &str) -> Stats 
         expected.extend(pages.unwrap_or_else(|| panic!("{label}: value {v:?} lost its pages")));
     }
     let mut allocated = BTreeSet::new();
+    if tree.temporary() {
+        allocated.extend(db.pool().temporary_pages());
+    }
     for c in 0..CLASS_COUNT {
         let (mut number, mut free_run) = (0, 0);
         while free_run < 512 {
@@ -182,13 +185,34 @@ fn stamped_key(value: &[u8]) -> Option<&[u8]> {
     value.get(12..12 + len)
 }
 
+/// A new tree, logged or temporary.
+fn create(io: &Arc<dyn IO>, db: &Atoll, run: &Runner<'_>, temporary: bool) -> Tree {
+    let root = run_to(run, || {
+        if temporary {
+            Tree::create_temporary(io, db.pool(), db.store(), class(0))
+        } else {
+            Tree::create(io, db.pool(), db.store(), class(0))
+        }
+    });
+    tree_of(io, db, root)
+}
+
 #[test]
 fn a_tree_holds_what_a_sorted_map_holds_through_puts_removes_merges_and_eviction() {
+    holds_what_a_sorted_map_holds(false);
+}
+
+#[test]
+fn a_temporary_tree_holds_what_a_sorted_map_holds_and_logs_nothing() {
+    holds_what_a_sorted_map_holds(true);
+}
+
+fn holds_what_a_sorted_map_holds(temporary: bool) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, MIN_BUDGET, 1);
     let run = drive_runner(&io);
-    let root = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
-    let tree = tree_of(&io, &db, root);
+    let end = db.log().end();
+    let tree = create(&io, &db, &run, temporary);
     let max = tree.limits().max_key;
     let mut rng = ChaCha8Rng::seed_from_u64(1);
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -286,15 +310,27 @@ fn a_tree_holds_what_a_sorted_map_holds_through_puts_removes_merges_and_eviction
     model.clear();
     let stats = check_whole(&tree, &db, &run, "empty");
     assert_eq!(stats.nodes, 1, "an empty tree is its root");
+    if temporary {
+        assert_eq!(db.log().end(), end, "a temporary tree logged");
+    }
 }
 
 #[test]
 fn values_longer_than_a_chunk_are_written_read_and_freed_whole() {
+    long_values(false);
+}
+
+#[test]
+fn a_temporary_trees_long_values_are_temporary_pages() {
+    long_values(true);
+}
+
+fn long_values(temporary: bool) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, 64 << 20, 1);
     let run = drive_runner(&io);
-    let root = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
-    let tree = tree_of(&io, &db, root);
+    let end = db.log().end();
+    let tree = create(&io, &db, &run, temporary);
     let chunk = value::chunk();
     let sizes = [chunk, chunk + 1, 2 * chunk + 12_345];
     for (i, &len) in sizes.iter().enumerate() {
@@ -326,6 +362,9 @@ fn values_longer_than_a_chunk_are_written_read_and_freed_whole() {
     run(&mut || db.checkpointer().step());
     let stats = check_whole(&tree, &db, &run, "removed");
     assert_eq!((stats.nodes, stats.entries), (1, 0));
+    if temporary {
+        assert_eq!(db.log().end(), end, "a temporary tree logged");
+    }
 }
 
 #[test]

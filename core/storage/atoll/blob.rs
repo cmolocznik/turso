@@ -54,7 +54,8 @@ pub fn write(
     lsn
 }
 
-fn apply(page: &mut [u8], offset: usize, bytes: &[u8]) {
+/// Puts `bytes` at `offset` in a blob page: what a write logs, and what replaying it does.
+pub fn apply(page: &mut [u8], offset: usize, bytes: &[u8]) {
     page::set_kind(page, KIND);
     page[offset..offset + bytes.len()].copy_from_slice(bytes);
 }

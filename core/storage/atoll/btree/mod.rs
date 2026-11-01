@@ -98,6 +98,9 @@ enum Route {
     Above,
 }
 
+/// Log space admitted for a change; none for a temporary tree.
+pub struct Grant(Option<Admitted>);
+
 pub struct Tree {
     io: Arc<dyn IO>,
     pool: Arc<BufferPool>,
@@ -133,13 +136,40 @@ impl Tree {
         store: &Arc<PageStore>,
         class: SizeClass,
     ) -> Result<IOResult<PageId>> {
-        let limits = Limits::of(class);
-        let log = store.log();
+        check_budget(store.log(), class, Limits::of(class))?;
+        Self::create_in(io, pool, store, class, false)
+    }
+
+    /// A new, empty temporary tree (DESIGN.md §6.4), whose nodes and values are temporary pages:
+    /// nothing it does is logged, and it does not outlive the process.
+    pub fn create_temporary(
+        io: &Arc<dyn IO>,
+        pool: &Arc<BufferPool>,
+        store: &Arc<PageStore>,
+        class: SizeClass,
+    ) -> Result<IOResult<PageId>> {
+        Self::create_in(io, pool, store, class, true)
+    }
+
+    fn create_in(
+        io: &Arc<dyn IO>,
+        pool: &Arc<BufferPool>,
+        store: &Arc<PageStore>,
+        class: SizeClass,
+        temporary: bool,
+    ) -> Result<IOResult<PageId>> {
         let adopt_len = framed_len(2 + 8);
         let init_len = framed_len(8 + 4 + class.size());
-        check_budget(log, class, limits)?;
-        let mut admitted = done!(log.admit(init_len + adopt_len));
-        let mut page = done!(pool.allocate(class));
+        let mut grant = if temporary {
+            Grant(None)
+        } else {
+            Grant(Some(done!(store.log().admit(init_len + adopt_len))))
+        };
+        let mut page = if temporary {
+            done!(pool.allocate_temporary(class))
+        } else {
+            done!(pool.allocate(class))
+        };
         let pid = page.pid();
         node::build(
             page.page_mut(),
@@ -155,7 +185,7 @@ impl Tree {
         let image = node::image(page.page());
         let tree = Self::open(io.clone(), pool.clone(), store.clone(), pid);
         let lsns = tree.log_batch(
-            &mut admitted,
+            &mut grant,
             &[Record {
                 pid,
                 change: Change::Init { image: &image },
@@ -191,8 +221,34 @@ impl Tree {
         self.limits
     }
 
-    fn log(&self) -> &Arc<Log> {
-        self.store.log()
+    /// Whether the tree is temporary: its root, and so every page of it, is a temporary page.
+    pub fn temporary(&self) -> bool {
+        self.root.is_temporary()
+    }
+
+    /// The log the tree's changes go to; `None` for a temporary tree.
+    fn journal(&self) -> Option<&Arc<Log>> {
+        (!self.temporary()).then(|| self.store.log())
+    }
+
+    /// Admits `len` bytes of log for a change; a temporary tree needs none.
+    fn admit(&self, len: u64) -> Result<IOResult<Grant>> {
+        Ok(match self.journal() {
+            Some(log) => match log.admit(len)? {
+                IOResult::Done(a) => IOResult::Done(Grant(Some(a))),
+                IOResult::IO(io) => IOResult::IO(io),
+            },
+            None => IOResult::Done(Grant(None)),
+        })
+    }
+
+    /// A new node page, of the tree's kind.
+    fn allocate(&self) -> Result<IOResult<Exclusive<'_>>> {
+        if self.temporary() {
+            self.pool.allocate_temporary(self.class())
+        } else {
+            self.pool.allocate(self.class())
+        }
     }
 
     fn class(&self) -> SizeClass {
@@ -206,13 +262,17 @@ impl Tree {
     }
 
     /// Appends the records of one change: alone, or as a group when there are several. Returns
-    /// the LSNs of the node records, in order.
+    /// the LSNs of the node records, in order. A temporary tree appends nothing: its node changes
+    /// get temporary LSNs, and its pages need no adoption.
     fn log_batch(
         &self,
-        admitted: &mut Admitted,
+        grant: &mut Grant,
         nodes: &[Record<'_>],
         store: &[StoreRecord],
     ) -> Vec<Lsn> {
+        let Some(admitted) = &mut grant.0 else {
+            return nodes.iter().map(|_| self.pool.temporary_lsn()).collect();
+        };
         let mut payloads: Vec<(Header, Vec<u8>)> = nodes
             .iter()
             .map(|r| {
@@ -234,7 +294,7 @@ impl Tree {
             .zip(&pieces)
             .map(|((h, _), p)| (*h, &p[..]))
             .collect();
-        let log = self.log();
+        let log = self.store.log();
         let (start, lsns) = if records.len() == 1 {
             let lsn = log.append(admitted, &records[0].0, records[0].1);
             (lsn - framed_len(payloads[0].1.len()), vec![lsn])
@@ -387,7 +447,7 @@ impl Tree {
                         self.store.clone(),
                     )
                 });
-                done!(write.step(&self.pool, self.log()));
+                done!(write.step(&self.pool, self.journal()));
             }
             let stored: Vec<u8> = match &op.write {
                 Some(w) => w.reference().encode().to_vec(),
@@ -400,7 +460,7 @@ impl Tree {
                 + store_len(&abandon);
             if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
                 op.admitted = None;
-                op.admitted = Some((done!(self.log().admit(len)), len));
+                op.admitted = Some((done!(self.admit(len)), len));
             }
             let Some(mut ex) = leaf.upgrade() else {
                 return yield_now();
@@ -502,7 +562,7 @@ impl Tree {
             let len = framed_len(8 + op.key.len()) + store_len(&abandon);
             if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
                 op.admitted = None;
-                op.admitted = Some((done!(self.log().admit(len)), len));
+                op.admitted = Some((done!(self.admit(len)), len));
             }
             let Some(mut ex) = leaf.upgrade() else {
                 return yield_now();
@@ -576,7 +636,7 @@ impl Tree {
 
     /// One split of the node at `level` covering `key`, if it lacks `need` bytes.
     fn split(&self, key: &[u8], level: u8, need: usize) -> Result<IOResult<Split>> {
-        let mut admitted = done!(self.log().admit(self.smo_len()));
+        let mut admitted = done!(self.admit(self.smo_len()));
         let (node, parent) = match self.descend(key, level, Route::At)? {
             Found::Node { node, parent } => (node, parent),
             // The node to split merged away: the caller looks again.
@@ -622,7 +682,7 @@ impl Tree {
         if pv.free().ok_or_else(|| corrupt_node(p.pid()))? < sep_need {
             return untouched(p, n, Split::ParentFull(sep_need));
         }
-        let mut r = done!(self.pool.allocate(self.class()));
+        let mut r = done!(self.allocate());
         let right_entries = if level == 0 {
             &entries[keep..]
         } else {
@@ -688,7 +748,7 @@ impl Tree {
         &self,
         root: Optimistic<'_>,
         need: usize,
-        admitted: &mut Admitted,
+        admitted: &mut Grant,
     ) -> Result<IOResult<Split>> {
         let Some(mut root) = root.upgrade() else {
             return yield_now();
@@ -699,7 +759,7 @@ impl Tree {
             return Ok(IOResult::Done(Split::Done));
         }
         let level = v.level();
-        let mut child = done!(self.pool.allocate(self.class()));
+        let mut child = done!(self.allocate());
         let image = node::image(root.page());
         node::apply_image(child.page_mut(), &image).ok_or_else(|| corrupt_node(root.pid()))?;
         node::build(
@@ -739,7 +799,7 @@ impl Tree {
     /// fit; then its parent, if that is left underfull, and the root, if left with one child.
     /// `merging` holds the level still to look at, `None` once done.
     fn merge(&self, key: &[u8], level: u8, merging: &mut Option<u8>) -> Result<IOResult<()>> {
-        let mut admitted = done!(self.log().admit(self.smo_len()));
+        let mut admitted = done!(self.admit(self.smo_len()));
         let (node, parent) = match self.descend(key, level, Route::At)? {
             Found::Node {
                 node,
@@ -808,7 +868,7 @@ impl Tree {
         pos: usize,
         level: u8,
         (left_pos, left, left_hint, right, right_hint): (usize, PageId, u32, PageId, u32),
-        admitted: &mut Admitted,
+        admitted: &mut Grant,
     ) -> Result<IOResult<Option<Option<u8>>>> {
         let fix = |pid: PageId, hint: u32| -> Result<IOResult<Optimistic<'_>>> {
             if pid == node.pid() {
@@ -920,7 +980,7 @@ impl Tree {
         parent: Optimistic<'_>,
         child: Optimistic<'_>,
         merging: &mut Option<u8>,
-        admitted: &mut Admitted,
+        admitted: &mut Grant,
     ) -> Result<IOResult<()>> {
         if parent.pid() != self.root {
             *merging = None;
@@ -1291,7 +1351,7 @@ pub struct Put {
     write: Option<ValueWrite>,
     /// The out-of-line value being replaced: its reference and pages.
     old: Option<(Vec<u8>, Vec<PageId>)>,
-    admitted: Option<(Admitted, u64)>,
+    admitted: Option<(Grant, u64)>,
     lsn: Lsn,
 }
 
@@ -1354,7 +1414,7 @@ fn old_pages(
 pub struct Remove {
     key: Vec<u8>,
     old: Option<(Vec<u8>, Vec<PageId>)>,
-    admitted: Option<(Admitted, u64)>,
+    admitted: Option<(Grant, u64)>,
     /// The level of a merge still to try after the removal.
     merging: Option<u8>,
     lsn: Lsn,

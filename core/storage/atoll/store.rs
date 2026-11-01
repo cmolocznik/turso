@@ -363,6 +363,15 @@ impl PageStore {
         })
     }
 
+    pub fn io(&self) -> &Arc<dyn IO> {
+        &self.io
+    }
+
+    /// The path every file of the database is named after.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     pub fn meta(&self) -> &Arc<MetaCache> {
         &self.meta
     }
@@ -529,6 +538,10 @@ impl PageStore {
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
             let pid = PageId::new(class, number);
+            debug_assert!(
+                !pid.is_temporary(),
+                "the page table reached temporary numbers"
+            );
             let mut locked = Locked::new(&frames);
             let leaf = ids[0];
             if self.height(Tree::Map, class) != height

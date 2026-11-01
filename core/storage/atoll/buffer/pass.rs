@@ -165,10 +165,12 @@ fn look(pool: &BufferPool, frame: u32) -> Look {
         return Look::Busy;
     };
     let (status, dirty, writing) = (h.status(), h.dirty(), h.has(WRITING));
+    let temporary = PageId::from_raw(h.pid()).is_temporary();
     if !h.latch.validate(version) {
         return Look::Busy;
     }
-    if status != RESIDENT || (!dirty && !writing) {
+    // A temporary page is written only when it is evicted, and holds back no redo point.
+    if status != RESIDENT || (!dirty && !writing) || temporary {
         return Look::Done;
     }
     if writing {

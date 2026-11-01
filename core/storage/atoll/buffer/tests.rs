@@ -1,6 +1,6 @@
 use super::*;
 use crate::io::crash::CrashIO;
-use crate::io::IO;
+use crate::io::{OpenFlags, IO};
 use crate::storage::atoll::log::{framed_len, Admitted, Header, Kind, Log, LogConfig};
 use crate::storage::atoll::page::HEADER_SIZE;
 use crate::storage::atoll::store::StoreConfig;
@@ -395,5 +395,93 @@ fn a_drain_chosen_before_its_batch_changed_class_leaves_the_new_class_alone() {
         }
         assert_eq!(pool.memory.take(class(0)), None, "{}", b.name);
         model.check_all();
+    }
+}
+
+#[test]
+fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
+    for b in backends() {
+        let (log, pool) = open(&b, MIN_BUDGET);
+        let end = log.end();
+        let read = |pid: PageId| {
+            let g = drive(&b.io, || pool.fix_shared(pid, None)).unwrap();
+            (stamped(g.page(), pid), g.page().iter().all(|&x| x == 0))
+        };
+        // 600 pages of 32 KiB, nearly twice the pool: most are written to the temporary file.
+        let mut pages = Vec::new();
+        for v in 1..=600u64 {
+            let mut g = drive(&b.io, || pool.allocate_temporary(class(3))).unwrap();
+            let pid = g.pid();
+            stamp(g.page_mut(), pid, v);
+            g.changed(pool.temporary_lsn());
+            pages.push((pid, v));
+        }
+        for &(pid, v) in &pages {
+            assert_eq!(read(pid).0, Some(v), "{}: {pid:?} read back wrong", b.name);
+        }
+        let overflow = 600 * class(3).size() as u64 - MIN_BUDGET as u64;
+        assert!(
+            pool.evicted.load(Ordering::Relaxed) >= overflow,
+            "{}",
+            b.name
+        );
+        assert_eq!(log.end(), end, "{}: a temporary page was logged", b.name);
+        // Passes leave them dirty, and hold the redo floor back for none of them.
+        for shard in 0..pool.shard_count() {
+            let mut pass = pool.pass(shard);
+            drive(&b.io, || pass.step(&pool)).unwrap();
+        }
+        let dirty = (0..pool.memory.grains())
+            .filter(|&f| {
+                let h = pool.header(f);
+                h.status() == RESIDENT && h.dirty() && PageId::from_raw(h.pid()).is_temporary()
+            })
+            .count();
+        assert!(dirty > 0, "{}: a pass wrote temporary pages", b.name);
+        assert_eq!(pool.redo_floor(), end, "{}", b.name);
+        // A freed number comes back as a new page, zeros, even once evicted unchanged.
+        let freed: Vec<PageId> = pages.drain(..100).map(|(pid, _)| pid).collect();
+        for &pid in &freed {
+            drive(&b.io, || match pool.fix_exclusive(pid, None)? {
+                IOResult::Done(page) => pool.free(page),
+                IOResult::IO(io) => Ok(IOResult::IO(io)),
+            })
+            .unwrap();
+        }
+        let mut again: Vec<PageId> = (0..100)
+            .map(|_| {
+                drive(&b.io, || pool.allocate_temporary(class(3)))
+                    .unwrap()
+                    .pid()
+            })
+            .collect();
+        again.sort_unstable();
+        let mut sorted = freed.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            again, sorted,
+            "{}: freed numbers were not handed out again",
+            b.name
+        );
+        for &(pid, v) in &pages {
+            assert_eq!(read(pid).0, Some(v), "{}: {pid:?}", b.name);
+        }
+        for &pid in &again {
+            assert!(read(pid).1, "{}: {pid:?} reads its earlier life", b.name);
+        }
+        assert_eq!(log.end(), end, "{}", b.name);
+        // Opening again deletes the files.
+        let path = format!("{}.t3", b.base);
+        let file = b.io.open_file(&path, OpenFlags::Create, false).unwrap();
+        assert!(file.size().unwrap() > 0, "{}: nothing was written", b.name);
+        drop((file, pool));
+        let (_log, _pool) = open(&b, MIN_BUDGET);
+        let file = b.io.open_file(&path, OpenFlags::Create, false).unwrap();
+        assert_eq!(
+            file.size().unwrap(),
+            0,
+            "{}: the temporary file survived",
+            b.name
+        );
     }
 }

@@ -32,6 +32,7 @@ mod memory;
 mod pass;
 mod source;
 mod table;
+mod temp;
 mod watt;
 
 #[cfg(test)]
@@ -49,8 +50,9 @@ use frame::{FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, RESIDEN
 use memory::{Memory, Zeroed};
 use pass::Shard;
 use table::Table;
+use temp::TempPages;
 
-use crate::io::Completion;
+use crate::io::{Buffer, Completion};
 use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
@@ -120,6 +122,7 @@ pub struct BufferPool {
     failure: Mutex<Option<CompletionError>>,
     /// Checkpoint shards, each a run of frames by position.
     shards: Box<[Shard]>,
+    temp: Arc<TempPages>,
 }
 
 fn yield_now<T>() -> Result<IOResult<T>> {
@@ -161,7 +164,6 @@ impl BufferPool {
             table: Table::new(grains)?,
             memory,
             source,
-            store,
             loads: (0..load_shards)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
@@ -173,6 +175,8 @@ impl BufferPool {
             writes_in_flight: AtomicUsize::new(0),
             failure: Mutex::new(None),
             shards: (0..shards).map(|_| Shard::new(redo)).collect(),
+            temp: Arc::new(TempPages::new(store.io().clone(), store.base())?),
+            store,
         }))
     }
 
@@ -286,7 +290,7 @@ impl BufferPool {
                     Probe::Miss => {}
                 }
             }
-            let located = match self.source.locate(pid)? {
+            let located = match self.locate(pid)? {
                 IOResult::Done(l) => l,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -341,6 +345,17 @@ impl BufferPool {
             }
         }
         Probe::Busy
+    }
+
+    /// Gets ready to read `pid`: from the temporary files, or from the page source.
+    fn locate(&self, pid: PageId) -> Result<IOResult<Box<dyn Located>>> {
+        if pid.is_temporary() {
+            return Ok(IOResult::Done(Box::new(TempLocated {
+                temp: self.temp.clone(),
+                pid,
+            })));
+        }
+        self.source.locate(pid)
     }
 
     /// Claims `frame` for `pid` and starts reading the page into it. `None` if another frame
@@ -464,6 +479,38 @@ impl BufferPool {
                 return Err(e);
             }
         };
+        Ok(IOResult::Done(self.install(frame, pid)))
+    }
+
+    /// A new temporary page of `class` (DESIGN.md §6.4), all zeros, fixed exclusively. Its
+    /// changes are never logged: stamp them with [`temporary_lsn`](Self::temporary_lsn).
+    pub fn allocate_temporary(
+        self: &Arc<Self>,
+        class: SizeClass,
+    ) -> Result<IOResult<Exclusive<'_>>> {
+        let frame = match self.claim(class)? {
+            IOResult::Done(f) => f,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        Ok(IOResult::Done(
+            self.install(frame, self.temp.allocate(class)),
+        ))
+    }
+
+    /// Every temporary page allocated and not freed.
+    #[cfg(test)]
+    pub fn temporary_pages(&self) -> Vec<PageId> {
+        self.temp.allocated()
+    }
+
+    /// The LSN to stamp the next change to a temporary page with.
+    pub fn temporary_lsn(&self) -> Lsn {
+        self.temp.next_lsn()
+    }
+
+    /// Puts the new page `pid`, all zeros, in the claimed `frame`, fixed exclusively.
+    fn install(self: &Arc<Self>, frame: u32, pid: PageId) -> Exclusive<'_> {
+        let class = pid.class();
         let h = self.header(frame);
         self.take_free_latch(frame);
         // SAFETY: latched exclusively.
@@ -484,11 +531,11 @@ impl BufferPool {
             );
             std::hint::spin_loop();
         }
-        Ok(IOResult::Done(Exclusive {
+        Exclusive {
             pool: self,
             frame,
             pid,
-        }))
+        }
     }
 
     /// Drops the page `page` holds: its number becomes free, its copy's slot is freed, and its
@@ -503,13 +550,19 @@ impl BufferPool {
                 io => io,
             });
         }
-        match self.store.free(pid)? {
-            IOResult::Done(()) => {}
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        if !pid.is_temporary() {
+            match self.store.free(pid)? {
+                IOResult::Done(()) => {}
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
         }
         std::mem::forget(page);
         self.table.remove(&self.headers, pid.raw(), frame);
         self.free_frame(pid.class(), frame);
+        if pid.is_temporary() {
+            // Once no frame holds it, so a new page under its number finds none.
+            self.temp.free(pid);
+        }
         Ok(IOResult::Done(()))
     }
 
@@ -524,6 +577,11 @@ impl BufferPool {
                     IOResult::Done(page) => self.free(page),
                     IOResult::IO(io) => Ok(IOResult::IO(io)),
                 };
+            }
+            if pid.is_temporary() {
+                // Nothing reads it in: nothing refers to it.
+                self.temp.free(pid);
+                return Ok(IOResult::Done(()));
             }
             let class = pid.class();
             let frame = match self.claim(class)? {
@@ -583,7 +641,7 @@ impl BufferPool {
             if self.table.find(&self.headers, pid.raw()).is_some() {
                 continue;
             }
-            let located = match self.source.locate(pid)? {
+            let located = match self.locate(pid)? {
                 IOResult::Done(l) => l,
                 IOResult::IO(_) => continue,
             };
@@ -841,17 +899,24 @@ impl BufferPool {
         frames: Vec<u32>,
         evict_after: bool,
     ) -> Option<Completion> {
-        if frames.is_empty() {
-            return None;
+        let (temporary, logged): (Vec<u32>, Vec<u32>) = frames
+            .into_iter()
+            .partition(|&f| PageId::from_raw(self.header(f).pid()).is_temporary());
+        let mut finished = None;
+        for (frames, temporary) in [(logged, false), (temporary, true)] {
+            if frames.is_empty() {
+                continue;
+            }
+            let pids = frames
+                .iter()
+                .map(|&f| PageId::from_raw(self.header(f).pid()))
+                .collect();
+            let wb = Writeback::new(class, frames, pids, evict_after, temporary);
+            // Passes, which wait on this, hand over no temporary pages.
+            finished.get_or_insert(wb.finished.clone());
+            self.writebacks.lock().push(Arc::new(Mutex::new(wb)));
         }
-        let pids = frames
-            .iter()
-            .map(|&f| PageId::from_raw(self.header(f).pid()))
-            .collect();
-        let wb = Writeback::new(class, frames, pids, evict_after);
-        let finished = wb.finished.clone();
-        self.writebacks.lock().push(Arc::new(Mutex::new(wb)));
-        Some(finished)
+        finished
     }
 
     /// Steps every queued writeback no one else is stepping. Returns something to wait on, if
@@ -948,7 +1013,7 @@ impl BufferPool {
         (frame as u64 * n / grains) as usize
     }
 
-    /// Starts a checkpoint pass over `shard`.
+    /// Starts a checkpoint pass over `shard`. Passes leave temporary pages alone.
     pub fn pass(&self, shard: usize) -> Pass {
         Pass::new(self, shard)
     }
@@ -961,6 +1026,18 @@ impl BufferPool {
             .map(Shard::position)
             .min()
             .expect("a shard")
+    }
+}
+
+/// A temporary page about to be read in.
+struct TempLocated {
+    temp: Arc<TempPages>,
+    pid: PageId,
+}
+
+impl Located for TempLocated {
+    fn read(self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<()> {
+        self.temp.read(self.pid, into, done)
     }
 }
 

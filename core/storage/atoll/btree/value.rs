@@ -173,10 +173,16 @@ impl ValueWrite {
         bytes
     }
 
-    pub fn step(&mut self, pool: &Arc<BufferPool>, log: &Arc<Log>) -> Result<IOResult<()>> {
+    /// Writes the value through `log`, or, for a temporary tree, into temporary pages with
+    /// nothing logged.
+    pub fn step(&mut self, pool: &Arc<BufferPool>, log: Option<&Arc<Log>>) -> Result<IOResult<()>> {
         while self.pages.len() < self.plan.len() {
             let class = self.plan[self.pages.len()];
-            let page = match pool.allocate(class)? {
+            let allocated = match log {
+                Some(_) => pool.allocate(class)?,
+                None => pool.allocate_temporary(class)?,
+            };
+            let page = match allocated {
                 IOResult::Done(p) => p,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -188,8 +194,10 @@ impl ValueWrite {
                     .collect();
             }
         }
-        // Pieces of at most a log chunk, record framing included.
-        let piece = (log.chunk_bytes() as usize).saturating_sub(64).max(1);
+        // Pieces of at most a log chunk, record framing included; unlogged, a page at once.
+        let piece = log.map_or(usize::MAX, |l| {
+            (l.chunk_bytes() as usize).saturating_sub(64).max(1)
+        });
         loop {
             let (j, done) = self.at;
             if j == self.pages.len() {
@@ -201,9 +209,12 @@ impl ValueWrite {
                 continue;
             }
             let n = (total - done).min(piece);
-            let mut admitted = match log.admit(blob::record_len(n))? {
-                IOResult::Done(a) => a,
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            let mut admitted = match log {
+                Some(log) => match log.admit(blob::record_len(n))? {
+                    IOResult::Done(a) => Some(a),
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                },
+                None => None,
             };
             let (pid, hint) = self.pages[j];
             let hint = crate::sync::atomic::AtomicU32::new(hint);
@@ -213,7 +224,15 @@ impl ValueWrite {
             };
             self.pages[j].1 = page.hint();
             let bytes = self.piece(j, done, n);
-            blob::write(log, &mut admitted, &mut page, HEADER_SIZE + done, &bytes);
+            match (log, &mut admitted) {
+                (Some(log), Some(admitted)) => {
+                    blob::write(log, admitted, &mut page, HEADER_SIZE + done, &bytes);
+                }
+                _ => {
+                    blob::apply(page.page_mut(), HEADER_SIZE + done, &bytes);
+                    page.changed(pool.temporary_lsn());
+                }
+            }
             self.at.1 += n;
         }
     }

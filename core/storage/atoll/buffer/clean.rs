@@ -18,13 +18,15 @@ use crate::io::Completion;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
-use crate::Result;
+use crate::{CompletionError, Result};
 
 pub struct Writeback {
     class: SizeClass,
     frames: Vec<u32>,
     pids: Vec<PageId>,
     evict_after: bool,
+    /// The pages are temporary: written to the temporary files, with no plan.
+    temporary: bool,
     plan: Option<Arc<Mutex<WritePlan>>>,
     /// The next frame to copy and write.
     next: usize,
@@ -36,7 +38,13 @@ pub struct Writeback {
 
 impl Writeback {
     /// Writes back `frames`, holding `pids`; they must be marked WRITING already.
-    pub fn new(class: SizeClass, frames: Vec<u32>, pids: Vec<PageId>, evict_after: bool) -> Self {
+    pub fn new(
+        class: SizeClass,
+        frames: Vec<u32>,
+        pids: Vec<PageId>,
+        evict_after: bool,
+        temporary: bool,
+    ) -> Self {
         let finished = Completion::new_wait();
         if frames.is_empty() {
             finished.complete(0);
@@ -47,6 +55,7 @@ impl Writeback {
             frames,
             pids,
             evict_after,
+            temporary,
             plan: None,
             next: 0,
             finished,
@@ -58,13 +67,20 @@ impl Writeback {
         if self.next == self.frames.len() {
             return Ok(IOResult::Done(()));
         }
-        let plan = self
-            .plan
-            .get_or_insert_with(|| Arc::new(Mutex::new(pool.store.plan_writes(self.pids.clone()))))
-            .clone();
-        if let IOResult::IO(io) = plan.lock().step()? {
-            return Ok(IOResult::IO(io));
-        }
+        let plan = if self.temporary {
+            None
+        } else {
+            let plan = self
+                .plan
+                .get_or_insert_with(|| {
+                    Arc::new(Mutex::new(pool.store.plan_writes(self.pids.clone())))
+                })
+                .clone();
+            if let IOResult::IO(io) = plan.lock().step()? {
+                return Ok(IOResult::IO(io));
+            }
+            Some(plan)
+        };
         let size = self.class.size();
         while self.next < self.frames.len() {
             let i = self.next;
@@ -89,14 +105,21 @@ impl Writeback {
             let finished = self.finished.clone();
             let evict_after = self.evict_after;
             pool.writes_in_flight.fetch_add(1, Ordering::AcqRel);
-            let written = WritePlan::write(&plan, i, copy.region(0, size), move |res| {
-                ended.write_ended(frame, lsn, evict_after, res.map(|_| ()));
+            let done = move |res: std::result::Result<(), CompletionError>| {
+                ended.write_ended(frame, lsn, evict_after, res);
                 if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
                     finished.complete(0);
                 }
-            });
+            };
+            let written = match &plan {
+                Some(plan) => WritePlan::write(plan, i, copy.region(0, size), move |res| {
+                    done(res.map(|_| ()))
+                })
+                .map(drop),
+                None => pool.temp.write(self.pids[i], copy.region(0, size), done),
+            };
             match written {
-                Ok(c) => drop(c),
+                Ok(()) => {}
                 Err(e) => {
                     pool.write_ended(frame, lsn, false, Err(super::io_failure(&e)));
                     if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {

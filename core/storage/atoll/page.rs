@@ -70,11 +70,33 @@ pub struct PageId(u64);
 
 const NUMBER_BITS: u32 = 56;
 const NUMBER_MASK: u64 = (1 << NUMBER_BITS) - 1;
+/// The number bit naming a temporary page (DESIGN.md §6.4), which the page store never sees. The
+/// store's numbers stay below it: 2^55 pages of 4 KiB is 128 EiB.
+const TEMPORARY: u64 = 1 << (NUMBER_BITS - 1);
 
 impl PageId {
     pub fn new(class: SizeClass, number: u64) -> Self {
         assert!(number <= NUMBER_MASK, "page number {number} out of range");
         Self(((class.0 as u64) << NUMBER_BITS) | number)
+    }
+
+    /// The temporary page `number` of `class`.
+    pub fn temporary(class: SizeClass, number: u64) -> Self {
+        assert!(
+            number < TEMPORARY,
+            "temporary page number {number} out of range"
+        );
+        Self::new(class, TEMPORARY | number)
+    }
+
+    pub fn is_temporary(self) -> bool {
+        self.0 & TEMPORARY != 0
+    }
+
+    /// The number of a temporary page among its class's temporary pages.
+    pub fn temporary_number(self) -> u64 {
+        debug_assert!(self.is_temporary());
+        self.number() & !TEMPORARY
     }
 
     pub fn class(self) -> SizeClass {

@@ -193,11 +193,22 @@ After a crash, frees logged after the point where the log restarted wait for a c
   - An operation dropped with provisional pages in hand gives them to the page store, and the
     checkpointer frees them.
 
-### 6.4 Temporary pages (step 7)
+### 6.4 Temporary pages
 
 Version index and graveyard pages (section 11), and the spill of large sorts, live only as long as
 the process does. They are never logged. When evicted they go to the temporary files, which are
-deleted at every open, and recovery never reads them.
+deleted at every open, and recovery never reads them. Built in `buffer/temp.rs`:
+
+- **Ids.** The top bit of a page number names a temporary page; the page store never sees one.
+- **Place.** Each class has one temporary file, and a page's copy sits at its number times its
+  size. A freed number is handed out again, and a page that was never written reads as zeros.
+- **Changes** are stamped with LSNs from a counter of their own, which only orders a page's changes
+  and tells its frame dirty.
+- **Checkpoints** pass over temporary pages: they are written only when evicted, and hold back no
+  redo point.
+- **Trees.** A B-tree whose root is a temporary page is a temporary tree
+  (`Tree::create_temporary`): its nodes and out-of-line values are temporary pages, and nothing it
+  does is logged.
 
 ## 7. The log
 
@@ -813,8 +824,9 @@ submission or later from `IO::step`. Therefore:
 6. **B+-trees.** Nodes, values out of line, optimistic lock coupling, splits, merges and root
    changes, cursors, and the log groups and provisional pages they need. Done (`btree/`,
    `log/`, `store.rs`). Key encoding moves to step 8, with the cursor that encodes.
-7. **Transactions.** Slots, clock, commit logs, version headers, version index, graveyard, conflicts
-   and waits, rollback, undo in recovery, garbage collection.
+7. **Transactions.** Temporary pages and temporary trees (done: `buffer/temp.rs`); slots, clock,
+   commit logs, version headers, version index, graveyard, conflicts and waits, rollback, undo in
+   recovery, garbage collection.
 8. **Turso integration.**
    - the storage-mode interface;
    - `AtollCursor`, and the key encoding for SQL records (section 13);

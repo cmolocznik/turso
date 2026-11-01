@@ -146,9 +146,26 @@ Anything that fits none of these is a design error.
     slots). A cycle aborts its youngest transaction. Under BEGIN CONCURRENT it fails at once.
   - Version indexes: written only by their slot's transaction, read optimistically by everyone;
     entries are removed by garbage collection through epochs.
-- **The one lock order** for the short critical sections that remain. Latches are never waited
-  for, so they are in no order; the metadata pages' rule (bytes, then state) went with their
-  reader-writer lock.
+- **The one lock order** for the short critical sections that remain.
+  - Latches are never waited for, and some mutexes are only ever tried, as ownership of a piece
+    of work (§3, class 3): a checkpointer's state, a writeback, the page store's erasure and its
+    tree growth. Neither is in any order: busy means a yield. An owner may hold its mutex across
+    IO it submits.
+  - The mutexes that are waited for nest only as follows, outer first:
+    - the memory's free runs, then a size class's batches;
+    - the metadata cache's map of pages, then its order of arrival, then a page's state, then
+      the dirty list;
+    - the page store's erasing list, then its unerased slots or its open intents;
+    - a limbo's items, then the list of threads stepping;
+    - the log's flush, then its admission;
+    - a transaction slot, then the log (step 4 replaces the slot's lock with a commit log of one
+      writer);
+    - a version root, then the page store's orphans.
+  - None is held across IO, while a callback runs, or while a completion is completed, except
+    the log's flush and a transaction slot: an append can submit log writes, whose completions
+    run inside the submission on some backends. Both go with step 4.
+  - Every acquisition in the engine was read for this list (2026-11-01): no two mutexes are taken
+    in both orders.
 
 ## 9. Proof
 
@@ -165,8 +182,10 @@ Anything that fits none of these is a design error.
 ## 10. Order of work
 
 1. Epochs, the one latch kind with guards, yields instead of spins.
-2. The buffer manager: validation before IO, epoch-deferred ids and batches, no relocation, no
-   shared reads, metadata pages latched the same way. Schedule tests.
+2. The buffer manager: validation before IO, epoch-deferred ids, batches checked under the latch
+   (§4), no relocation, no shared reads, metadata pages latched the same way, writes settled in
+   steps. Schedule tests.
 3. B-trees on top: schedule tests and stress, then the scan livelock found or proved gone.
-4. Transactions: lock-free commit logs, waits as completions, deadlock detection. Schedule tests.
+4. Transactions: lock-free commit logs, waits as completions, deadlock detection, and a log flush
+   that holds no mutex across its writes. Schedule tests.
 5. Then step 7 resumes from what is committed, re-proved under the new rules.

@@ -1234,7 +1234,9 @@ impl BufferPool {
     /// the frame's write-out, wakes and steps the writeback that settles it.
     fn write_landed(&self, frame: u32, outgoing: bool) {
         if outgoing {
-            if let Some(c) = self.transits_of(frame).lock().get(&frame) {
+            // Completed outside the lock: completing may run a waiter's callback.
+            let c = self.transits_of(frame).lock().get(&frame).cloned();
+            if let Some(c) = c {
                 c.complete(0);
             }
         }

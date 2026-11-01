@@ -267,6 +267,7 @@ pub struct PageStore {
     files: Mutex<HashMap<(SizeClass, u64), Arc<dyn File>>>,
     /// Levels of the page table (`[0]`) and free space (`[1]`) per class.
     heights: Mutex<[[u8; CLASS_COUNT]; 2]>,
+    /// Owned by the one growing a tree; another grower yields.
     growing: Mutex<()>,
     /// Where each class's next slot search starts.
     cursors: Mutex<[u64; CLASS_COUNT]>,
@@ -847,7 +848,10 @@ impl PageStore {
             IOResult::Done(a) => a,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        let _growing = self.growing.lock();
+        // Only tried, never waited for: it is ownership of the growth, held across its IO.
+        let Some(_growing) = self.growing.try_lock() else {
+            return Ok(busy());
+        };
         let height = self.height(tree, class);
         let old_root = radix::root(tree, class, height);
         let new_root = radix::root(tree, class, height + 1);
@@ -1463,7 +1467,9 @@ impl WritePlan {
                 Ok(_) => Err(CompletionError::ShortWrite),
                 Err(e) => Err(e),
             };
-            if let Some(landed) = landed.lock().take() {
+            // Taken out first: no lock is held while a callback runs.
+            let landed = landed.lock().take();
+            if let Some(landed) = landed {
                 landed(res);
             }
         });

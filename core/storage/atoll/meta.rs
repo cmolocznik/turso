@@ -243,10 +243,11 @@ impl MetaCache {
     }
 
     fn file(&self, key: FileKey) -> Result<Arc<dyn File>> {
-        let mut files = self.files.lock();
-        if let Some(f) = files.get(&key) {
+        if let Some(f) = self.files.lock().get(&key) {
             return Ok(f.clone());
         }
+        // Opened outside the lock, which is never held across IO: two first users may both open
+        // it, and the first to put it in the map is kept.
         let f = self.io.open_file(
             &path(&self.base, key),
             OpenFlags::Create | OpenFlags::Direct,
@@ -254,8 +255,7 @@ impl MetaCache {
         )?;
         // A page written here must survive a crash, so the file's creation must too.
         self.io.sync_directory(&directory(&self.base))?;
-        files.insert(key, f.clone());
-        Ok(f)
+        Ok(self.files.lock().entry(key).or_insert(f).clone())
     }
 
     /// The page `id`, once it is in memory.
@@ -373,7 +373,8 @@ impl MetaCache {
                 Err(e) => state.status = Status::Failed(e),
             }
             drop(state);
-            if let Some(c) = target.loaded.lock().take() {
+            let loaded = target.loaded.lock().take();
+            if let Some(c) = loaded {
                 c.complete(0);
             }
             None
@@ -517,7 +518,9 @@ impl MetaCache {
         };
         let done = Arc::new(Mutex::new(Some(done)));
         let finish = move |res| {
-            if let Some(done) = done.lock().take() {
+            // Taken out first: no lock is held while a callback runs.
+            let done = done.lock().take();
+            if let Some(done) = done {
                 done(res);
             }
         };
@@ -548,8 +551,8 @@ impl MetaCache {
             file.pwrite(at, buffer, c)
         };
         if let Err(e) = submitted {
-            let mut state = frame.state.lock();
-            if let Some(c) = state.writing.take() {
+            let writing = frame.state.lock().writing.take();
+            if let Some(c) = writing {
                 c.error(io_failure(&e));
             }
             return Err(e);

@@ -119,17 +119,17 @@ impl TempPages {
     }
 
     fn file(&self, class: SizeClass) -> Result<Arc<dyn File>> {
-        let mut files = self.files.lock();
-        if let Some(f) = &files[class.index()] {
+        if let Some(f) = &self.files.lock()[class.index()] {
             return Ok(f.clone());
         }
+        // Opened outside the lock, which is never held across IO: two first users may both open
+        // it, and the first to put it in the map is kept.
         let file = self.io.open_file(
             &path(&self.base, class),
             OpenFlags::Create | OpenFlags::Direct,
             false,
         )?;
-        files[class.index()] = Some(file.clone());
-        Ok(file)
+        Ok(self.files.lock()[class.index()].get_or_insert(file).clone())
     }
 
     fn at(pid: PageId) -> u64 {

@@ -31,6 +31,8 @@ use super::page::{self, PageId};
 use super::radix::FREE;
 use super::redo::PageRecord;
 use super::store::{kinds, PageStore, StoreRecord};
+use super::txn::Ts;
+use super::txn::{self, Clock};
 use crate::io::{Completion, IO};
 use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
@@ -68,6 +70,8 @@ pub(super) struct Recovered {
     pub log: Arc<Log>,
     pub pool: Arc<BufferPool>,
     pub checkpointer: Checkpointer,
+    /// Restarted above every timestamp logged (DESIGN.md §12, step 6).
+    pub clock: Arc<Clock>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -90,6 +94,8 @@ struct State {
     restart: Lsn,
     /// Pages freed and allocated again within the replay: where their last allocation ends.
     reborn: Arc<HashMap<PageId, Lsn>>,
+    /// The highest timestamp the superblock and the replayed log hold.
+    clock: Ts,
     pool: Option<Arc<BufferPool>>,
     reader: Option<LogReader>,
     read_all: bool,
@@ -156,6 +162,7 @@ impl Recovery {
                 end: 0,
                 restart: 0,
                 reborn: Arc::new(HashMap::new()),
+                clock: 0,
                 pool: None,
                 reader: None,
                 read_all: false,
@@ -295,7 +302,16 @@ impl Recovery {
         );
         let mut freed = HashSet::new();
         let mut reborn = HashMap::new();
+        let mut clock = self.superblock.clock;
         while let Some(r) = reader.next_record()? {
+            // A record's transaction is named by its start timestamp.
+            clock = clock.max(r.header.txn);
+            if txn::owns(r.header.kind) {
+                let ts = txn::commit_ts(&r.payload).ok_or_else(|| {
+                    LimboError::Corrupt(format!("a Commit record at {} does not decode", r.start))
+                })?;
+                clock = clock.max(ts);
+            }
             if !kinds::owns(r.header.kind) {
                 continue;
             }
@@ -330,6 +346,7 @@ impl Recovery {
         state.end = end;
         state.restart = restart;
         state.reborn = Arc::new(reborn);
+        state.clock = clock;
         state.pool = Some(pool);
         state.reader = Some(reader);
         state.running = false;
@@ -431,9 +448,13 @@ impl Recovery {
     /// Frees pages left provisional, gives back the slots of unmatched intents and checkpoints
     /// everything redone.
     fn finish(&self) -> Result<()> {
-        let (pool, restart) = {
+        let (pool, restart, clock) = {
             let state = self.state.lock();
-            (state.pool.clone().expect("a pool"), state.restart)
+            (
+                state.pool.clone().expect("a pool"),
+                state.restart,
+                Arc::new(Clock::after(state.clock)),
+            )
         };
         let log = self.store.log().clone();
         // Pages allocated and never linked in, or unlinked and never freed, before the crash.
@@ -449,6 +470,7 @@ impl Recovery {
             control,
             self.superblock.clone(),
             self.log_budget,
+            clock.clone(),
         );
         let ticket = checkpointer.request_full();
         drive(&self.io, || checkpointer.step_full(ticket))?;
@@ -467,6 +489,7 @@ impl Recovery {
             log,
             pool,
             checkpointer,
+            clock,
         });
         state.running = false;
         state.phase = Phase::Done;

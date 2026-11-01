@@ -491,15 +491,24 @@ The MVCC is OSIC (Alhomssi and Leis, VLDB 2023; LeanStore 2024 §2.6).
 
 ### 11.1 Slots, the clock and visibility
 
-- **Slots.** W transaction slots; W is the most transactions open at once. A transaction holds a
-  slot from begin to end, so a slot runs one transaction at a time.
-- **Clock.** One global atomic clock issues start timestamps and commit timestamps.
-- **Commit logs.** Each slot keeps a commit log: a fixed array of its recent (start, commit) pairs,
-  in order.
+Built in `txn/mod.rs`.
+
+- **Slots.** W transaction slots; W is the most transactions open at once, 100 by default,
+  PostgreSQL's default `max_connections`. A transaction holds a slot from begin to end, so a slot
+  runs one transaction at a time. A begin with every slot taken waits for one.
+- **Clock.** One global atomic clock issues start, snapshot and commit timestamps, each unique. A
+  transaction's start names it in its log records, which chain to its previous record.
+- **Commit logs.** Each slot keeps a commit log: its committed (start, commit) pairs, in order.
+  Garbage collection folds the pairs older than every snapshot into one start (section 11.5).
   - A version written by (slot s, start t) is visible to a snapshot at time T when the last
     transaction of s committed before T started at or after t.
   - A snapshot caches that answer per slot, so a check consults another slot only for versions that
     slot wrote.
+  - The commit timestamp is drawn, the Commit record appended and the pair entered under the
+    slot's lock, which a snapshot reading the slot's log takes too: a snapshot taken after the
+    commit timestamp was drawn sees the pair.
+- **Statements.** A transaction sees what its own earlier statements wrote, and not what its
+  current statement writes. Under read committed each statement takes a new snapshot.
 
 ### 11.2 Tuples and versions
 
@@ -594,8 +603,11 @@ otherwise.
 5. **Undo** every transaction with no Commit or End, from its records, following `prev` back from
    its last one. Compensation records are logged, and steps already compensated are skipped.
    (Step 7.)
-6. **Restart the clock** above every logged timestamp. Every header left in a page is then a
-   committed version. (Step 7.)
+6. **Restart the clock** above every logged timestamp: the clock the superblock recorded, which is
+   above every change logged before the redo point, and every transaction id and commit
+   timestamp replayed. Every header left in a page is then a committed version: each slot's commit
+   log starts with every transaction before the restart committed. (Built; undo, step 5, is not
+   yet.)
 7. **Checkpoint.** A full checkpoint writes back every page redone. Its redo point is past where
    the log restarted, which recovery checks, so nothing replayed is replayed again and the bytes
    between the old end and the restart are never read.
@@ -825,8 +837,8 @@ submission or later from `IO::step`. Therefore:
    changes, cursors, and the log groups and provisional pages they need. Done (`btree/`,
    `log/`, `store.rs`). Key encoding moves to step 8, with the cursor that encodes.
 7. **Transactions.** Temporary pages and temporary trees (done: `buffer/temp.rs`); slots, clock,
-   commit logs, version headers, version index, graveyard, conflicts and waits, rollback, undo in
-   recovery, garbage collection.
+   commit logs, visibility, commit and restarting the clock (done: `txn/mod.rs`); version headers,
+   version index, graveyard, conflicts and waits, rollback, undo in recovery, garbage collection.
 8. **Turso integration.**
    - the storage-mode interface;
    - `AtollCursor`, and the key encoding for SQL records (section 13);

@@ -37,6 +37,7 @@ fn config(budget: usize) -> AtollConfig {
             checkpoint_shards: 8,
         },
         log_budget: Some(512 << 10),
+        txn: Default::default(),
     }
 }
 

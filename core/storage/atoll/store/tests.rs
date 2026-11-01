@@ -79,6 +79,7 @@ fn write_superblock(db: &mut Db, redo: Lsn) {
         file_bytes: store_config().file_bytes,
         database_id: [7; 16],
         heights: db.store.heights(),
+        clock: 0,
     };
     db.control.write_and_wait(&sb).unwrap();
 }

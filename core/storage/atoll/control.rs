@@ -18,6 +18,7 @@ const MAGIC: u64 = u64::from_le_bytes(*b"ATOLLSB1");
 const VERSION: u32 = 1;
 const SIZE: usize = 4096;
 const HEIGHTS: usize = 64;
+const CLOCK: usize = HEIGHTS + 2 * CLASS_COUNT;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Superblock {
@@ -29,6 +30,9 @@ pub struct Superblock {
     pub database_id: [u8; 16],
     /// Levels of the page table (`[0]`) and free space (`[1]`) of each size class.
     pub heights: [[u8; CLASS_COUNT]; 2],
+    /// The transaction clock when the superblock was written: above every timestamp of a change
+    /// logged before the redo point.
+    pub clock: u64,
 }
 
 impl Superblock {
@@ -43,6 +47,7 @@ impl Superblock {
         out[48..64].copy_from_slice(&self.database_id);
         out[HEIGHTS..HEIGHTS + CLASS_COUNT].copy_from_slice(&self.heights[0]);
         out[HEIGHTS + CLASS_COUNT..HEIGHTS + 2 * CLASS_COUNT].copy_from_slice(&self.heights[1]);
+        out[CLOCK..CLOCK + 8].copy_from_slice(&self.clock.to_le_bytes());
         let crc = crc32c::crc32c(&out[..SIZE - 4]);
         out[SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
         out
@@ -67,6 +72,7 @@ impl Superblock {
             file_bytes: word(40),
             database_id: bytes[48..64].try_into().unwrap(),
             heights,
+            clock: word(CLOCK),
         })
     }
 }
@@ -192,10 +198,11 @@ mod tests {
             file_bytes: 1 << 40,
             database_id: [9; 16],
             heights: [[2; CLASS_COUNT], [1; CLASS_COUNT]],
+            clock: 1 << 40,
         };
         let bytes = sb.encode();
         assert_eq!(Superblock::decode(&bytes), Some(sb));
-        for at in [0, 16, 24, HEIGHTS, SIZE - 1] {
+        for at in [0, 16, 24, HEIGHTS, CLOCK, SIZE - 1] {
             let mut torn = bytes.clone();
             torn[at] ^= 1;
             assert_eq!(

@@ -8,6 +8,7 @@ use super::log::{Log, LogConfig, Lsn};
 use super::page::CLASS_COUNT;
 use super::recovery::Recovery;
 use super::store::{PageStore, StoreConfig};
+use super::txn::{Clock, Transactions, TxnConfig};
 use crate::io::IO;
 use crate::sync::Arc;
 use crate::{LimboError, Result};
@@ -21,6 +22,7 @@ pub struct AtollConfig {
     /// ratio of Haubenschild et al.'s example (SIGMOD 2020, §3.4: a 20 GB log for a 50 GB pool):
     /// the checkpoint work per byte of log then stays the same whatever the pool's size.
     pub log_budget: Option<u64>,
+    pub txn: TxnConfig,
 }
 
 impl AtollConfig {
@@ -31,6 +33,7 @@ impl AtollConfig {
             store: StoreConfig::default(),
             buffer: BufferConfig::with_budget(budget),
             log_budget: None,
+            txn: TxnConfig::default(),
         }
     }
 
@@ -48,6 +51,7 @@ pub struct Atoll {
     store: Arc<PageStore>,
     pool: Arc<BufferPool>,
     checkpointer: Checkpointer,
+    txns: Transactions,
 }
 
 impl Atoll {
@@ -82,6 +86,10 @@ impl Atoll {
     }
 
     /// Continuous checkpoints, stepped like any background work ([`Checkpointer::step`]).
+    pub fn transactions(&self) -> &Transactions {
+        &self.txns
+    }
+
     pub fn checkpointer(&self) -> &Checkpointer {
         &self.checkpointer
     }
@@ -93,11 +101,20 @@ impl Atoll {
 pub struct Opening {
     store: Arc<PageStore>,
     superblock: Superblock,
+    txn: TxnConfig,
     how: How,
 }
 
+/// A new database, ready to open.
+struct Created {
+    log: Arc<Log>,
+    pool: Arc<BufferPool>,
+    checkpointer: Checkpointer,
+    clock: Arc<Clock>,
+}
+
 enum How {
-    Created(Box<(Arc<Log>, Arc<BufferPool>, Checkpointer)>),
+    Created(Box<Created>),
     Recovering(Box<Recovery>),
 }
 
@@ -123,6 +140,7 @@ impl Opening {
         Ok(Self {
             store,
             superblock,
+            txn: config.txn,
             how: How::Recovering(Box::new(recovery)),
         })
     }
@@ -140,6 +158,7 @@ impl Opening {
             file_bytes: config.store.file_bytes,
             database_id,
             heights: [[1; CLASS_COUNT]; 2],
+            clock: 0,
         };
         let log = Log::open(io.clone(), base, config.log.clone(), 0)?;
         let store = PageStore::new(
@@ -158,17 +177,25 @@ impl Opening {
             store.clone(),
             0,
         )?;
+        let clock = Arc::new(Clock::after(0));
         let checkpointer = Checkpointer::new(
             pool.clone(),
             store.clone(),
             control,
             superblock.clone(),
             config.log_budget(),
+            clock.clone(),
         );
         Ok(Self {
             store,
             superblock,
-            how: How::Created(Box::new((log, pool, checkpointer))),
+            txn: config.txn,
+            how: How::Created(Box::new(Created {
+                log,
+                pool,
+                checkpointer,
+                clock,
+            })),
         })
     }
 
@@ -181,21 +208,33 @@ impl Opening {
     }
 
     pub fn finish(self) -> Result<Atoll> {
-        let (recovered_end, log, pool, checkpointer) = match self.how {
+        let (recovered_end, log, pool, checkpointer, clock) = match self.how {
             How::Created(created) => {
-                let (log, pool, checkpointer) = *created;
-                (None, log, pool, checkpointer)
+                let Created {
+                    log,
+                    pool,
+                    checkpointer,
+                    clock,
+                } = *created;
+                (None, log, pool, checkpointer, clock)
             }
             How::Recovering(r) => {
                 let done = r.take_recovered().ok_or_else(|| {
                     LimboError::InternalError("finishing an open before recovery is done".into())
                 })?;
-                (Some(done.end), done.log, done.pool, done.checkpointer)
+                (
+                    Some(done.end),
+                    done.log,
+                    done.pool,
+                    done.checkpointer,
+                    done.clock,
+                )
             }
         };
         Ok(Atoll {
             database_id: self.superblock.database_id,
             recovered_end,
+            txns: Transactions::new(&self.txn, clock, log.clone()),
             log,
             store: self.store,
             pool,

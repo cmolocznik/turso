@@ -14,6 +14,7 @@ use super::buffer::{BufferPool, Pass};
 use super::control::{Control, Superblock};
 use super::log::{Log, Lsn};
 use super::store::PageStore;
+use super::txn::Clock;
 use crate::io::Completion;
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
@@ -23,6 +24,7 @@ pub struct Checkpointer {
     pool: Arc<BufferPool>,
     store: Arc<PageStore>,
     control: Control,
+    clock: Arc<Clock>,
     /// Log appended between passes: the budget split among the shards.
     increment: u64,
     state: Mutex<State>,
@@ -73,6 +75,7 @@ impl Checkpointer {
         control: Control,
         superblock: Superblock,
         budget: u64,
+        clock: Arc<Clock>,
     ) -> Self {
         let last_pass = store.log().end();
         Self {
@@ -80,6 +83,7 @@ impl Checkpointer {
             pool,
             store,
             control,
+            clock,
             state: Mutex::new(State {
                 superblock,
                 next_shard: 0,
@@ -210,6 +214,8 @@ impl State {
                                 seq: self.superblock.seq + 1,
                                 redo,
                                 heights: cp.store.heights(),
+                                // Read after every change before the redo point was logged.
+                                clock: cp.clock.now(),
                                 ..self.superblock.clone()
                             };
                             a.stage = Stage::Superblock(sb, None);

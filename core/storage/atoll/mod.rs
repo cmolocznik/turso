@@ -33,6 +33,7 @@ pub mod radix;
 mod recovery;
 pub mod redo;
 pub mod store;
+pub mod txn;
 
 #[cfg(test)]
 mod testing;

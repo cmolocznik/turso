@@ -856,3 +856,78 @@ fn a_pass_writes_back_more_pages_than_the_writeback_buffer_holds() {
         assert_eq!(g.read(|p| stamped(p, pid)), Some(Some(v)));
     }
 }
+
+/// A frame read into from disk is written plainly by the IO, so it is taken only once no step
+/// that could still read its memory's last pages is left: every 4 KiB grain it spans counts, not
+/// just the first. Two 1 MiB pages share a 2 MiB batch; the first is freed before a reader's step
+/// begins, the second while the reader is in its step and has the page fixed. The batch then goes
+/// to the 2 MiB class: a new page may take its frame at once, but a read waits for the reader.
+#[cfg(not(shuttle))]
+#[test]
+fn a_frame_is_read_into_only_once_every_grain_it_spans_is_quiet() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let (_log, pool) = open_on(&io, "/db/quiet", MIN_BUDGET);
+    let (small, large) = (class(8), class(9));
+    let first = drive(&io, || pool.allocate(small)).unwrap();
+    let mut second = drive(&io, || pool.allocate(small)).unwrap();
+    let batch = first.frame / memory::GRAINS;
+    assert_eq!(
+        second.frame / memory::GRAINS,
+        batch,
+        "the pages share a batch"
+    );
+    assert!(first.frame < second.frame);
+    let (pid, held_frame) = (second.pid(), second.frame);
+    stamp(&mut second.page_mut(), pid, 1);
+    let first_pid = first.pid();
+    drop((first, second));
+    let free = |pid| {
+        drive(&io, || match pool.fix_exclusive(pid, None)? {
+            IOResult::Done(page) => pool.free(page),
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        })
+        .unwrap()
+    };
+    // Every other batch to the large class, so the small pages' batch is the only memory left
+    // for a large page.
+    let mut others = 0;
+    while let Got::Frame(_) = pool.take_or_grow(large, Purpose::New) {
+        others += 1;
+    }
+    assert!(others > 0);
+    free(first_pid);
+    let frame = memory::frame_at(large, batch, 0);
+    assert!(grains(frame, large).contains(&(held_frame as usize)));
+    std::thread::scope(|s| {
+        // Dropped if this thread panics, which lets the reader go.
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (leave, leave_rx) = std::sync::mpsc::channel::<()>();
+        let (pool, io) = (&pool, &io);
+        let reader = s.spawn(move || {
+            let _step = pool.store.epochs().enter();
+            let g = drive(&io, || pool.fix_optimistic(pid, None)).unwrap();
+            assert_eq!(g.read(|p| stamped(p, pid)), Some(Some(1)));
+            entered.send(()).unwrap();
+            let _ = leave_rx.recv();
+        });
+        entered_rx.recv().unwrap();
+        free(pid);
+        assert!(pool.memory.drain_for(small, batch, large));
+        // A new page is written through the frame's writer, whose stores race with nothing.
+        match pool.take_or_grow(large, Purpose::New) {
+            Got::Frame(f) => assert_eq!(f, frame),
+            _ => panic!("no frame for a new page in the drained batch"),
+        }
+        pool.memory.put(large, frame);
+        assert!(
+            matches!(pool.take_or_grow(large, Purpose::Read), Got::Quieting),
+            "a read took memory a reader in its step may still be reading"
+        );
+        leave.send(()).unwrap();
+        reader.join().unwrap();
+    });
+    match pool.take_or_grow(large, Purpose::Read) {
+        Got::Frame(f) => assert_eq!(f, frame),
+        _ => panic!("the frame stayed unquiet after the reader left"),
+    }
+}

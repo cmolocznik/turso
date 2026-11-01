@@ -121,7 +121,7 @@ pub fn head(key: &[u8]) -> u32 {
     u32::from_be_bytes(b)
 }
 
-fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+pub fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
@@ -290,6 +290,14 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         )
     }
 
+    /// Whether the upper fence is `key`, compared in place.
+    pub fn upper_is(&self, key: &[u8]) -> Option<bool> {
+        Some(
+            self.fence_run(UPPER, UPPER_INFINITE)?
+                .is_some_and(|u| self.order(u, key) == Ordering::Equal),
+        )
+    }
+
     /// The bytes every key in the node starts with, stripped from each.
     pub fn prefix(&self) -> Option<Vec<u8>> {
         Some(self.copy(self.prefix_run()?))
@@ -423,6 +431,60 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         Some(SLOT + key.len().checked_sub(self.prefix_run()?.len)? + value_len)
     }
 
+    /// Entry `i`'s whole key against `key`, compared in place.
+    pub fn compare_key(&self, i: usize, key: &[u8]) -> Option<Ordering> {
+        let prefix = self.prefix_run()?;
+        let s = self.slot(i)?;
+        let n = prefix.len.min(key.len());
+        let order = self.0.compare(prefix.off, &key[..n]);
+        if order != Ordering::Equal {
+            return Some(order);
+        }
+        if key.len() < prefix.len {
+            return Some(Ordering::Greater);
+        }
+        let suffix = Run {
+            off: s.off,
+            len: s.key_len,
+        };
+        Some(self.order(suffix, &key[prefix.len..]))
+    }
+
+    /// Entry `i`'s whole key and value: their length together.
+    pub fn entry_len(&self, i: usize) -> Option<usize> {
+        let s = self.slot(i)?;
+        Some(self.prefix_run()?.len + s.key_len + s.value_len)
+    }
+
+    /// How many bytes, from the start, the lower fence shares with `other`.
+    fn lower_shares(&self, other: &[u8]) -> Option<usize> {
+        let Some(lower) = self.fence_run(LOWER, LOWER_INFINITE)? else {
+            return Some(0);
+        };
+        let mut shared = 0;
+        let mut differs = false;
+        self.0
+            .pieces(lower.off..lower.off + lower.len.min(other.len()), |b| {
+                if differs {
+                    return;
+                }
+                let same = common_prefix(b, &other[shared..]);
+                shared += same;
+                differs = same < b.len();
+            });
+        Some(shared)
+    }
+
+    /// Bytes the entries in `range` take, slots included, in a node whose keys share a prefix
+    /// of `prefix` bytes.
+    pub fn entries_size(&self, range: std::ops::Range<usize>, prefix: usize) -> Option<usize> {
+        let mut size = 0;
+        for i in range {
+            size += (SLOT + self.entry_len(i)?).checked_sub(prefix)?;
+        }
+        Some(size)
+    }
+
     /// Every entry: whole key, value, and whether the value is out of line.
     pub fn entries(&self) -> Option<Vec<Entry>> {
         (0..self.count()?)
@@ -473,11 +535,17 @@ pub struct Layout<'k> {
 }
 
 impl Layout<'_> {
-    fn prefix_len(&self) -> usize {
+    /// How many bytes every key between the fences starts with.
+    pub fn prefix_len(&self) -> usize {
         match (self.lower, self.upper) {
             (Some(l), Some(u)) => common_prefix(l, u),
             _ => 0,
         }
+    }
+
+    /// Bytes the fences take.
+    pub fn fences_len(&self) -> usize {
+        self.lower.map_or(0, <[u8]>::len) + self.upper.map_or(0, <[u8]>::len)
     }
 
     /// Bytes these entries take in a node with this layout, fences included.
@@ -624,6 +692,128 @@ pub fn insert<P: BytesMut + ?Sized>(
     put16(page, COUNT, count + 1);
     update_hints(page);
     true
+}
+
+/// Appends the entries of `src` in `range` to the node in `dst`, after its own, which they lie
+/// above, between its fences. Each is copied straight from `src`, its key cut again to `dst`'s
+/// prefix: none is assembled on the way. False if one does not fit; those before it stay.
+pub fn append_from<S: Bytes + ?Sized, D: BytesMut + ?Sized>(
+    dst: &mut D,
+    src: &View<'_, S>,
+    range: std::ops::Range<usize>,
+) -> bool {
+    let (Some(from), Some(to)) = (src.prefix_run(), View::new(&*dst).prefix_run()) else {
+        return false;
+    };
+    for i in range {
+        let Some(s) = src.slot(i) else {
+            return false;
+        };
+        let Some(suffix) = (from.len + s.key_len).checked_sub(to.len) else {
+            return false;
+        };
+        let need = suffix + s.value_len;
+        let v = View::new(&*dst);
+        let count = v.count().unwrap();
+        if v.free().unwrap() < SLOT + need {
+            return false;
+        }
+        if v.data_start().unwrap() < SLOTS + (count + 1) * SLOT + need {
+            compact(dst);
+        }
+        let data = dst.u32_at(DATA_START) as usize - need;
+        let mut at = data;
+        let mut copy = |range: std::ops::Range<usize>| {
+            src.page().pieces(range, |b| {
+                dst.write(at, b);
+                at += b.len();
+            })
+        };
+        if to.len >= from.len {
+            // The key loses the bytes of `dst`'s prefix past `src`'s.
+            copy(s.off + to.len - from.len..s.off + s.key_len + s.value_len);
+        } else {
+            // The key gains the bytes of `src`'s prefix past `dst`'s.
+            copy(from.off + to.len..from.off + from.len);
+            copy(s.off..s.off + s.key_len + s.value_len);
+        }
+        let mut first = [0u8; 4];
+        let n = suffix.min(4);
+        dst.copy_to(data, &mut first[..n]);
+        let at = SLOTS + count * SLOT;
+        put16(dst, at, data);
+        put16(dst, at + 2, suffix);
+        put16(
+            dst,
+            at + 4,
+            s.value_len
+                | if s.out_of_line {
+                    OUT_OF_LINE as usize
+                } else {
+                    0
+                },
+        );
+        dst.put_u32(at + 6, head(&first[..n]));
+        put16(dst, COUNT, count + 1);
+        dst.put_u32(DATA_START, data as u32);
+        dst.put_u32(SPACE, (dst.u32_at(SPACE) as usize + need) as u32);
+    }
+    update_hints(dst);
+    true
+}
+
+/// Keeps the first `keep` entries of the node in `page`, under a new upper fence `upper`, and
+/// points it on to `next`: the left half of a split, made in place. The fences then share a
+/// prefix at least as long, so each kept key is cut again where it lies. `None`, the node as it
+/// was, if the node or `upper` do not hold for it.
+pub fn split_off<P: BytesMut + ?Sized>(
+    page: &mut P,
+    keep: usize,
+    upper: &[u8],
+    next: (PageId, u32),
+) -> Option<()> {
+    let v = View::new(&*page);
+    let count = v.count()?;
+    let old = v.prefix_run()?.len;
+    let new = match v.fence_run(LOWER, LOWER_INFINITE)? {
+        Some(_) => v.lower_shares(upper)?,
+        None => 0,
+    };
+    let cut = new.checked_sub(old)?;
+    if keep > count || (0..keep).any(|i| v.slot(i).is_none_or(|s| s.key_len < cut)) {
+        return None;
+    }
+    let kept: usize = (0..keep)
+        .map(|i| v.slot(i).map_or(0, |s| s.key_len + s.value_len))
+        .sum();
+    let lower_len = v.fence_run(LOWER, LOWER_INFINITE)?.map_or(0, |r| r.len);
+    for i in 0..keep {
+        let s = View::new(&*page).slot(i)?;
+        let at = SLOTS + i * SLOT;
+        let mut first = [0u8; 4];
+        let n = (s.key_len - cut).min(4);
+        page.copy_to(s.off + cut, &mut first[..n]);
+        put16(page, at, s.off + cut);
+        put16(page, at + 2, s.key_len - cut);
+        page.put_u32(at + 6, head(&first[..n]));
+    }
+    put16(page, COUNT, keep);
+    put16(page, PREFIX, new);
+    // The old upper fence is no longer one: compaction leaves it behind.
+    let fences = page.u8_at(FENCES);
+    page.put_u8(FENCES, fences | UPPER_INFINITE);
+    page.put_u32(SPACE, (lower_len + kept - keep * cut) as u32);
+    compact(page);
+    let data = page.u32_at(DATA_START) as usize - upper.len();
+    page.write(data, upper);
+    put16(page, UPPER, data);
+    put16(page, UPPER + 2, upper.len());
+    page.put_u8(FENCES, fences & !UPPER_INFINITE);
+    page.put_u32(DATA_START, data as u32);
+    page.put_u32(SPACE, (page.u32_at(SPACE) as usize + upper.len()) as u32);
+    set_next(page, next.0, next.1);
+    update_hints(page);
+    Some(())
 }
 
 /// Removes the entry at `pos`.

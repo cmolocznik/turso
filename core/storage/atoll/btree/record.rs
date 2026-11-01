@@ -23,8 +23,9 @@
 use super::super::log::Kind;
 use super::super::page::PageId;
 use super::super::shared::BytesMut;
-use super::node::{self, child_value, Layout, View};
+use super::node::{self, child_value, View};
 use crate::{LimboError, Result};
+use std::cmp::Ordering;
 
 pub const INIT: Kind = Kind::new(10).unwrap();
 pub const INSERT: Kind = Kind::new(11).unwrap();
@@ -291,25 +292,23 @@ impl<'a> Record<'a> {
 
 /// Keeps the first `keep` entries of the node in `page`, up to `sep`: a leaf's right neighbour
 /// becomes `right`, and an inner node's rightmost child becomes the child of entry `keep`, whose
-/// key `sep` is.
+/// key `sep` is. Checked and made in place.
 fn split<P: BytesMut + ?Sized>(page: &mut P, right: PageId, keep: usize, sep: &[u8]) -> Result<()> {
     let v = View::new(&*page);
-    let entries = v.entries().ok_or_else(|| corrupt("split"))?;
-    let node::Shape {
-        root,
-        level,
-        lower,
-        upper,
-        ..
-    } = node::shape(&*page);
-    let valid = keep <= entries.len()
-        && upper.as_deref().is_none_or(|u| sep < u)
-        && lower.as_deref().is_none_or(|l| sep > l)
-        && (keep == 0 || entries[keep - 1].key.as_slice() <= sep)
+    let count = v.count().ok_or_else(|| corrupt("split"))?;
+    let at_most = |i: usize| {
+        v.compare_key(i, sep)
+            .is_some_and(|o| o != Ordering::Greater)
+    };
+    let between = v.covers(sep) == Some(true) && v.upper_is(sep) == Some(false);
+    let level = v.level();
+    let valid = keep <= count
+        && between
+        && (keep == 0 || at_most(keep - 1))
         && if level == 0 {
-            entries.get(keep).is_none_or(|e| sep < e.key.as_slice())
+            keep == count || v.compare_key(keep, sep) == Some(Ordering::Greater)
         } else {
-            entries.get(keep).is_some_and(|e| e.key == sep)
+            keep < count && v.compare_key(keep, sep) == Some(Ordering::Equal)
         };
     if !valid {
         return Err(corrupt("split"));
@@ -317,22 +316,7 @@ fn split<P: BytesMut + ?Sized>(page: &mut P, right: PageId, keep: usize, sep: &[
     let next = if level == 0 {
         (right, 0)
     } else {
-        let v = &entries[keep].value;
-        (
-            PageId::from_raw(u64::from_le_bytes(v[..8].try_into().unwrap())),
-            0,
-        )
+        (v.child(keep).ok_or_else(|| corrupt("split"))?.0, 0)
     };
-    node::build(
-        page,
-        &Layout {
-            root,
-            level,
-            lower: lower.as_deref(),
-            upper: Some(sep),
-            next,
-        },
-        &entries[..keep],
-    );
-    Ok(())
+    node::split_off(page, keep, sep, next).ok_or_else(|| corrupt("split"))
 }

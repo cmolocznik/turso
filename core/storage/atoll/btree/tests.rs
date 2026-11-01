@@ -829,3 +829,107 @@ fn a_transactions_changes_name_it_and_its_tree_and_carry_what_undoes_them() {
     let tree = tree_of(&io, &db, root);
     assert_eq!(get(&tree, &run, b"k"), Some(b"two".to_vec()));
 }
+
+/// Two writers put and remove keys, each its own and both two shared ones, while a reader scans
+/// both ways, four times. Values take most of an inline entry's room, so a node holds a few entries and
+/// splits and merges come within a few operations. Scans see keys in order, each value whole and
+/// its key's, and the tree ends holding what the writers left and checks whole.
+fn concurrent_tree(seed: u64, ops: u64) {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Arc::new(open(&io, MIN_BUDGET, 1));
+    let run = drive_runner(&io);
+    let root = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
+    let tree = Arc::new(tree_of(&io, &db, root));
+    let shared: Vec<Vec<u8>> = (0..2).map(|i| format!("hot{i}").into_bytes()).collect();
+    let max_entry = Limits::of(class(0)).max_entry;
+    // A fixed number of scans, so a schedule's length does not depend on how the scanner's
+    // turns fall against the writers'.
+    let scanner = {
+        let (io, tree) = (io.clone(), tree.clone());
+        crate::thread::spawn(move || {
+            let run = drive_runner(&io);
+            for scans in 0..4 {
+                let entries = scan(&tree, &run, scans % 2 == 0);
+                for w in entries.windows(2) {
+                    assert!(w[0].0 < w[1].0, "a scan out of order");
+                }
+                for (k, v) in &entries {
+                    assert_eq!(
+                        stamped_key(v),
+                        Some(k.as_slice()),
+                        "a scan read a torn value"
+                    );
+                }
+            }
+        })
+    };
+    let writers: Vec<_> = (0..2u64)
+        .map(|t| {
+            let (io, db, tree, shared) = (io.clone(), db.clone(), tree.clone(), shared.clone());
+            crate::thread::spawn(move || {
+                let run = drive_runner(&io);
+                let mut rng = ChaCha8Rng::seed_from_u64(seed * 10 + t);
+                let mut model = BTreeMap::new();
+                for op in 0..ops {
+                    let version = t << 32 | op;
+                    let len = rng.random_range(max_entry / 2..max_entry - 40);
+                    if rng.random_range(0..4) == 0 {
+                        let key = &shared[rng.random_range(0..shared.len())];
+                        let mut put = Put::new(key, stamp(key, version, len), Mode::Upsert);
+                        run_to(&run, || tree.put(&mut put));
+                        continue;
+                    }
+                    let key = format!("t{t}-{}", rng.random_range(0..8)).into_bytes();
+                    if rng.random_range(0..3) == 0 {
+                        let mut remove = Remove::new(&key);
+                        let removed = run_to(&run, || tree.remove(&mut remove));
+                        assert_eq!(removed, model.remove(&key).is_some());
+                    } else {
+                        let value = stamp(&key, version, len);
+                        let mut put = Put::new(&key, value.clone(), Mode::Upsert);
+                        run_to(&run, || tree.put(&mut put));
+                        model.insert(key, value);
+                    }
+                    if op == ops / 2 {
+                        run(&mut || db.checkpointer().step());
+                    }
+                }
+                model
+            })
+        })
+        .collect();
+    let models: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    scanner.join().unwrap();
+    let entries = scan(&tree, &run, true);
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = models.into_iter().flatten().collect();
+    for (k, v) in &entries {
+        if k.starts_with(b"hot") {
+            assert_eq!(stamped_key(v), Some(k.as_slice()));
+            expected.insert(k.clone(), v.clone());
+        }
+    }
+    assert!(
+        entries == expected.into_iter().collect::<Vec<_>>(),
+        "the tree differs from what the writers wrote"
+    );
+    check_whole(&tree, &db, &run, "schedules");
+}
+
+#[cfg(shuttle)]
+#[test]
+fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order_in_shuttle_schedules() {
+    static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::storage::atoll::testing::schedules(
+        || concurrent_tree(SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed), 12),
+        300,
+    );
+}
+
+/// The schedule test's workload on real threads, so it runs, and is stressed, without shuttle.
+#[cfg(not(shuttle))]
+#[test]
+fn concurrent_writers_and_scans_through_splits_and_merges() {
+    for seed in 0..20 {
+        concurrent_tree(seed, 40);
+    }
+}

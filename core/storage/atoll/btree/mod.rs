@@ -40,15 +40,15 @@ mod tests;
 
 use super::buffer::{BufferPool, Exclusive, Optimistic};
 use super::log::{framed_len, Admitted, Header, Log, Lsn};
-use super::page::{PageId, SizeClass};
-use super::shared::Bytes;
+use super::page::{self, PageId, SizeClass};
+use super::shared::{Bytes, BytesMut};
 use super::store::{PageStore, StoreRecord};
 use crate::io::{Completion, IO};
 use crate::sync::atomic::{AtomicU32, Ordering};
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
-use node::{Entry, Layout, Limits, View};
+use node::{Layout, Limits, View};
 use record::{Change, Record};
 use value::{Read, ValueRead, ValueRef, ValueWrite};
 
@@ -69,6 +69,11 @@ enum Found<'p> {
     /// The tree has no level that high: it shrank since the caller looked.
     Shorter,
     Io(IOCompletions),
+}
+
+crate::thread::thread_local! {
+    /// A page of the thread's own a merge builds its node in, kept between merges.
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 macro_rules! found {
@@ -788,7 +793,7 @@ impl Tree {
         if nv.free().ok_or_else(|| corrupt_node(n.pid()))? >= need {
             return untouched(p, n, Split::Done);
         }
-        let entries = nv.entries().ok_or_else(|| corrupt_node(n.pid()))?;
+        let count = nv.count().ok_or_else(|| corrupt_node(n.pid()))?;
         let node::Shape {
             root,
             level,
@@ -797,28 +802,31 @@ impl Tree {
             next,
         } = node::shape(n.page());
         let at = nv.search(key).ok_or_else(|| corrupt_node(n.pid()))?.0;
+        let right = |keep: usize| {
+            if level == 0 {
+                keep..count
+            } else {
+                keep + 1..count
+            }
+        };
         // Each half with its own fences, so its own prefix: what it takes, whole.
         let capacity = self.limits.capacity;
         let fits = |keep: usize, sep: &[u8]| {
-            let (left, right) = if level == 0 {
-                (&entries[..keep], &entries[keep..])
-            } else {
-                (&entries[..keep], &entries[keep + 1..])
-            };
-            let half = |lower: Option<&[u8]>, upper: Option<&[u8]>, entries: &[Entry]| {
-                Layout {
+            let half = |range, lower: Option<&[u8]>, upper: Option<&[u8]>| {
+                let layout = Layout {
                     root,
                     level,
                     lower,
                     upper,
                     next,
-                }
-                .size(entries)
-                    <= capacity
+                };
+                nv.entries_size(range, layout.prefix_len())
+                    .is_some_and(|size| layout.fences_len() + size <= capacity)
             };
-            half(lower.as_deref(), Some(sep), left) && half(Some(sep), upper.as_deref(), right)
+            half(0..keep, lower.as_deref(), Some(sep))
+                && half(right(keep), Some(sep), upper.as_deref())
         };
-        let (keep, sep) = split_point(&entries, level, at, upper.is_none(), key, fits)
+        let (keep, sep) = split_point(&nv, count, level, at, upper.is_none(), key, fits)
             .ok_or_else(|| corrupt_node(n.pid()))?;
         let sep_need = pv
             .entry_size(&sep, node::CHILD)
@@ -827,13 +835,10 @@ impl Tree {
             return untouched(p, n, Split::ParentFull(sep_need));
         }
         let mut r = done!(self.allocate());
-        let right_entries = if level == 0 {
-            &entries[keep..]
-        } else {
-            &entries[keep + 1..]
-        };
+        // The right half's entries copied straight from the node, their keys cut again.
+        let mut page = r.page_mut();
         node::build(
-            &mut r.page_mut(),
+            &mut page,
             &Layout {
                 root,
                 level,
@@ -841,8 +846,11 @@ impl Tree {
                 upper: upper.as_deref(),
                 next,
             },
-            right_entries,
+            [],
         );
+        if !node::append_from(&mut page, &nv, right(keep)) {
+            return Err(corrupt_node(n.pid()));
+        }
         let image = node::image(r.page());
         let split = Record {
             pid: n.pid(),
@@ -1055,12 +1063,6 @@ impl Tree {
             return Ok(IOResult::Done(Some(None)));
         }
         let sep = pv.key(left_pos).ok_or_else(|| corrupt_node(p.pid()))?;
-        let mut entries = lv.entries().ok_or_else(|| corrupt_node(l.pid()))?;
-        if level > 0 {
-            let (child, hint) = lv.next();
-            entries.push(Entry::child(sep.clone(), child, hint));
-        }
-        entries.extend(rv.entries().ok_or_else(|| corrupt_node(r.pid()))?);
         let (left_shape, right_shape) = (node::shape(l.page()), node::shape(r.page()));
         let (root, lower) = (left_shape.root, left_shape.lower);
         let (upper, next) = (right_shape.upper, right_shape.next);
@@ -1071,11 +1073,54 @@ impl Tree {
             upper: upper.as_deref(),
             next,
         };
-        if layout.size(&entries) > self.limits.capacity * 3 / 4 {
+        // Both nodes' entries, and an inner node's separator over the left's rightmost child,
+        // under the merged fences.
+        let prefix = layout.prefix_len();
+        let (lcount, rcount) = (
+            lv.count().ok_or_else(|| corrupt_node(l.pid()))?,
+            rv.count().ok_or_else(|| corrupt_node(r.pid()))?,
+        );
+        let separator = if level > 0 {
+            (node::SLOT + sep.len() + node::CHILD).checked_sub(prefix)
+        } else {
+            Some(0)
+        };
+        let size = lv
+            .entries_size(0..lcount, prefix)
+            .zip(rv.entries_size(0..rcount, prefix))
+            .zip(separator)
+            .map(|((l, r), s)| layout.fences_len() + l + r + s)
+            .ok_or_else(|| corrupt_node(r.pid()))?;
+        if size > self.limits.capacity * 3 / 4 {
             untouched(p, l, r);
             return Ok(IOResult::Done(None));
         }
-        node::build(&mut r.page_mut(), &layout, &entries);
+        // Built in a page of the thread's own, as the right node still holds what goes into it,
+        // then copied over it once.
+        let built = SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            scratch.resize(r.page().len(), 0);
+            let merged = scratch.as_mut_slice();
+            node::build(merged, &layout, []);
+            let (child, hint) = lv.next();
+            let whole = node::append_from(merged, &lv, 0..lcount)
+                && (level == 0 || {
+                    let count = View::new(&*merged).count().unwrap();
+                    node::insert(merged, count, &sep, &node::child_value(child, hint), false)
+                })
+                && node::append_from(merged, &rv, 0..rcount);
+            whole
+        });
+        if !built {
+            return Err(corrupt_node(r.pid()));
+        }
+        SCRATCH.with(|scratch| {
+            let merged = scratch.borrow();
+            let mut page = r.page_mut();
+            page.write(page::HEADER_SIZE, &merged[page::HEADER_SIZE..]);
+            page::set_kind(&mut page, page::kind(merged.as_slice()));
+        });
         let image = node::image(r.page());
         let remove = Record {
             pid: p.pid(),
@@ -1438,50 +1483,48 @@ fn check_budget(log: &Log, class: SizeClass, limits: Limits) -> Result<()> {
     Ok(())
 }
 
-/// Where to split a node of `entries` at `level` whose upper fence is infinite if `rightmost`,
-/// for an insert at `at` of `key`: the entries the left keeps, and the separator. Appending at
-/// the right edge of the tree, the left keeps everything, so keys inserted in order fill nodes;
-/// otherwise the entries split in half by bytes. A split is taken only where both halves `fit`,
-/// fences included: a left keeping everything gains an upper fence, which a long separator can
-/// make too much for it. Then the split nearest the middle that fits; `None` if none does.
-fn split_point(
-    entries: &[Entry],
+/// Where to split the node `v` of `count` entries at `level`, whose upper fence is infinite if
+/// `rightmost`, for an insert at `at` of `key`: the entries the left keeps, and the separator.
+/// Appending at the right edge of the tree, the left keeps everything, so keys inserted in order
+/// fill nodes; otherwise the entries split in half by bytes. A split is taken only where both
+/// halves `fit`, fences included: a left keeping everything gains an upper fence, which a long
+/// separator can make too much for it. Then the split nearest the middle that fits; `None` if
+/// none does. Only the keys a candidate's separator comes from are copied out.
+fn split_point<P: Bytes + ?Sized>(
+    v: &View<'_, P>,
+    count: usize,
     level: u8,
     at: usize,
     rightmost: bool,
     key: &[u8],
     fits: impl Fn(usize, &[u8]) -> bool,
 ) -> Option<(usize, Vec<u8>)> {
-    let n = entries.len();
+    let n = count;
     let try_at = |keep: usize, sep: Vec<u8>| fits(keep, &sep).then_some((keep, sep));
     if level == 0 {
-        let appending = at == n && entries[n - 1].key.as_slice() < key;
+        let appending = at == n && v.compare_key(n - 1, key)? == std::cmp::Ordering::Less;
         if appending && (rightmost || n == 1) {
-            if let Some(split) = try_at(n, node::separator(&entries[n - 1].key, key)) {
+            if let Some(split) = try_at(n, node::separator(&v.key(n - 1)?, key)) {
                 return Some(split);
             }
         }
         if n == 1 {
             // The new key goes before the one entry, into a node of its own.
-            return try_at(0, node::separator(key, &entries[0].key));
+            return try_at(0, node::separator(key, &v.key(0)?));
         }
         // Between two entries, from the middle out.
-        let half = half(entries).clamp(1, n - 1);
-        return outward(half, 1..n).find_map(|keep| {
-            try_at(
-                keep,
-                node::separator(&entries[keep - 1].key, &entries[keep].key),
-            )
-        });
+        let half = half(v, n)?.clamp(1, n - 1);
+        return outward(half, 1..n)
+            .find_map(|keep| try_at(keep, node::separator(&v.key(keep - 1)?, &v.key(keep)?)));
     }
     // An inner node: entry `keep` moves up as the separator.
     if rightmost && at == n {
-        if let Some(split) = try_at(n - 1, entries[n - 1].key.clone()) {
+        if let Some(split) = try_at(n - 1, v.key(n - 1)?) {
             return Some(split);
         }
     }
-    let half = half(entries).min(n - 1);
-    outward(half, 0..n).find_map(|keep| try_at(keep, entries[keep].key.clone()))
+    let half = half(v, n)?.min(n - 1);
+    outward(half, 0..n).find_map(|keep| try_at(keep, v.key(keep)?))
 }
 
 /// The positions of `range`, from `start` out, nearest first.
@@ -1493,17 +1536,20 @@ fn outward(start: usize, range: std::ops::Range<usize>) -> impl Iterator<Item = 
     })
 }
 
-/// The first entry past half the bytes of `entries`.
-fn half(entries: &[Entry]) -> usize {
-    let total: usize = entries.iter().map(|e| e.key.len() + e.value.len()).sum();
+/// The first entry past half the bytes of the `count` entries of `v`.
+fn half<P: Bytes + ?Sized>(v: &View<'_, P>, count: usize) -> Option<usize> {
+    let mut total = 0;
+    for i in 0..count {
+        total += v.entry_len(i)?;
+    }
     let mut acc = 0;
-    for (i, e) in entries.iter().enumerate() {
-        acc += e.key.len() + e.value.len();
+    for i in 0..count {
+        acc += v.entry_len(i)?;
         if 2 * acc >= total {
-            return i + 1;
+            return Some(i + 1);
         }
     }
-    entries.len()
+    Some(count)
 }
 
 fn corrupt_node(pid: PageId) -> LimboError {

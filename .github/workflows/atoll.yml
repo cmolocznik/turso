@@ -1,0 +1,68 @@
+name: Atoll
+
+# The Atoll storage engine's own gate on this fork: its suite, and its schedule tests under
+# shuttle. The upstream workflows run on main alone and on runners this fork does not have.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["workreef", "atoll"]
+  pull_request:
+    branches: ["workreef"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  # Each bound is a cold build, which upstream's shuttle-tests job bounds at 30 minutes with its
+  # own tests, plus the run measured on 4 threads of a loaded Xeon: the suite 2 minutes, the
+  # schedule tests 8.
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-atoll-suite"
+          cache-on-failure: true
+      - name: Atoll suite
+        # A filter that selects nothing passes, so the count is checked first.
+        run: |
+          n=$(cargo test -p turso_core --lib --locked storage::atoll -- --list | grep -c ': test$' || true)
+          echo "selected $n tests"
+          [ "$n" -gt 0 ] || { echo "the filter selected no tests"; exit 1; }
+          cargo test -p turso_core --lib --locked storage::atoll
+
+  schedules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 38
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-atoll-shuttle"
+          cache-on-failure: true
+      - name: Atoll schedule tests
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable --cfg shuttle"
+        # Each test samples 300 random and 300 PCT schedules. A filter that selects nothing
+        # passes, so the count is checked first.
+        run: |
+          n=$(cargo test -p turso_core --lib --locked in_shuttle_schedules -- --list | grep -c ': test$' || true)
+          echo "selected $n schedule tests"
+          [ "$n" -gt 0 ] || { echo "the filter selected no schedule tests"; exit 1; }
+          cargo test -p turso_core --lib --locked in_shuttle_schedules -- --test-threads 4

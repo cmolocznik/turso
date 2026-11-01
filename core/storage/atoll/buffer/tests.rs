@@ -1036,6 +1036,32 @@ fn a_fix_that_finds_its_page_leaving_wakes_when_the_write_out_is_queued() {
     assert_eq!(g.read(|p| stamped(p, pid)), Some(Some(1)));
 }
 
+/// A claim takes its wait on the pool before it makes room, so a drain finding every page of its
+/// batch already leaving, and queueing nothing, must wake no one: the wake would reach the claim's
+/// own wait, handing it back finished, and a caller that steps IO only while it waits would retry
+/// forever, the write it waits on never landing.
+#[cfg(not(shuttle))]
+#[test]
+fn a_drain_that_queues_no_write_out_wakes_no_one() {
+    // Writes complete only at a step.
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(5));
+    let (log, pool) = open_on(&io, "/db/nothing-queued", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        log: &log,
+        pool: &pool,
+        pages: Vec::new(),
+    };
+    // Five dirty 2 MiB pages fill the pool: a 4 KiB page waits for one of them to be written out.
+    for _ in 0..5 {
+        model.allocate(class(9));
+    }
+    drop(named_in(&io, "a 4 KiB page", Some(&pool), || {
+        pool.allocate(class(0))
+    }));
+    model.check_all();
+}
+
 /// A write that lands while another thread steps its writeback, after that step took the writes
 /// landed so far, is left for the next step. A waiter that found the writeback held when the
 /// write's own wakeup had already passed waits for the stepper: the stepper wakes it.

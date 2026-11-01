@@ -1362,8 +1362,13 @@ impl BufferPool {
 
     /// Queues the writes of `outgoing`, pages of `class` leaving their frames, and wakes the
     /// pool's waiters: a fix that found one of the pages leaving before this had no writeback to
-    /// step, and waits on the pool.
+    /// step, and waits on the pool. Queueing none wakes no one: no page was marked leaving, and a
+    /// claim draining a batch whose pages are all leaving already took its wait before the drain,
+    /// so a wake would hand it back its own wait finished, its writes never stepped.
     fn write_out(&self, class: SizeClass, outgoing: Vec<Outgoing>) {
+        if outgoing.is_empty() {
+            return;
+        }
         let (temporary, logged): (Vec<Outgoing>, Vec<Outgoing>) =
             outgoing.into_iter().partition(|o| o.pid.is_temporary());
         for (outgoing, temporary) in [(logged, false), (temporary, true)] {

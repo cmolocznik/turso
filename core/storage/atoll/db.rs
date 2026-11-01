@@ -159,6 +159,7 @@ impl Opening {
             database_id,
             heights: [[1; CLASS_COUNT]; 2],
             clock: 0,
+            continuations: Vec::new(),
         };
         let log = Log::open(io.clone(), base, config.log.clone(), 0)?;
         let store = PageStore::new(

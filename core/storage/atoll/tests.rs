@@ -4,14 +4,15 @@
 
 use super::blob;
 use super::buffer::{BufferConfig, MIN_BUDGET};
+use super::control::{self, Control, MAX_CONTINUATIONS};
 use super::db::{Atoll, AtollConfig, Opening};
-use super::log::{LogConfig, Lsn};
+use super::log::{LogConfig, Lsn, BLOCK};
 use super::page::{PageId, SizeClass, HEADER_SIZE};
 use super::radix::FREE;
 use super::shared::Bytes;
 use super::store::StoreConfig;
 use super::testing::drive;
-use crate::io::crash::CrashIO;
+use crate::io::crash::{CrashIO, Faults};
 use crate::io::IO;
 use crate::sync::atomic::AtomicU32;
 use crate::sync::Arc;
@@ -96,14 +97,28 @@ impl Lives {
 
 /// Opens the database on `threads` threads, the way an embedder lends them to recovery.
 fn open(io: Arc<dyn IO>, threads: usize) -> Atoll {
-    let opening = Opening::new(io, BASE, config()).unwrap();
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(|| opening.work().unwrap());
-        }
-        opening.work().unwrap();
+    try_open(io, threads, MIN_BUDGET).unwrap()
+}
+
+/// [`open`] with a buffer of `budget` bytes, and an error if recovery fails.
+fn try_open(io: Arc<dyn IO>, threads: usize, budget: usize) -> Result<Atoll> {
+    let mut config = config();
+    config.buffer.budget = budget;
+    let opening = Opening::new(io, BASE, config)?;
+    let worked: Vec<Result<()>> = std::thread::scope(|s| {
+        let others: Vec<_> = (1..threads).map(|_| s.spawn(|| opening.work())).collect();
+        let mut worked = vec![opening.work()];
+        worked.extend(others.into_iter().map(|h| h.join().unwrap()));
+        worked
     });
-    opening.finish().unwrap()
+    worked.into_iter().collect::<Result<Vec<()>>>()?;
+    opening.finish()
+}
+
+/// The gaps the superblock in charge records.
+fn gaps(io: &Arc<dyn IO>) -> Vec<(Lsn, Lsn)> {
+    let (_, sb) = Control::open(io.clone(), BASE).unwrap();
+    sb.expect("a superblock in charge").continuations
 }
 
 /// Checks that `db` holds what the model says the log up to `end` leaves.
@@ -137,6 +152,11 @@ fn check(db: &Atoll, io: &Arc<dyn IO>, model: &BTreeMap<PageId, Lives>, end: Lsn
 }
 
 fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
+    // Recoveries crashed in succession whose last superblock recorded two gaps or more;
+    // recoveries refused for want of room for a gap; and ones from a version 1 control file.
+    let (chained, refused, legacy) = (Cell::new(0u64), Cell::new(0u64), Cell::new(0u64));
+    // Crashes whose log ends inside a block, interrupted in recovery with a chain.
+    let gapped = Cell::new(0u64);
     for seed in 0..2u64 {
         let crash_io = Arc::new(CrashIO::new(seed));
         crash_io.set_durable_writes(durable_writes);
@@ -146,11 +166,14 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
         let acknowledged = Cell::new(0);
         let steps = Cell::new(0u64);
         let checks = Cell::new(0u64);
+        let interrupted = Cell::new(0u64);
         let crash_and_check = |crash_seed: u64| {
             let threads = 1 + (crash_seed % 3) as usize;
-            let crashed: Arc<dyn IO> = Arc::new(crash_io.crash(crash_seed));
+            let crashed_io = Arc::new(crash_io.crash(crash_seed));
+            let crashed: Arc<dyn IO> = crashed_io.clone();
             let label = format!("seed {seed}/{crash_seed}, {threads} threads");
             let recovered = open(crashed.clone(), threads);
+            let ops = crashed_io.completed();
             let end = recovered.recovered_end().expect("a recovery");
             assert!(
                 end >= acknowledged.get(),
@@ -165,6 +188,208 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
             let label = format!("{label}, reopened");
             check(&again, &crashed, &model.borrow(), end, &label);
             checks.set(checks.get() + 1);
+            drop(again);
+            // A crash in the middle of recovery recovers to the same state too. Recovery records
+            // the gap past the log's end before it appends anything, so the crashes that matter
+            // most fall while its checkpoint writes metadata and before its superblock lands: one
+            // just before each of those writes, and eight more spread over the whole recovery.
+            // Each costs a recovery, so a tenth of the crashes get them.
+            let metadata = [format!("{BASE}.map"), format!("{BASE}.free")];
+            let in_recovery = move |path: &str| {
+                path == BASE || metadata.iter().any(|m| path.starts_with(m.as_str()))
+            };
+            // Every log ending inside a block makes recovery record a gap; two such crashes a
+            // seed also start a chain of crashes in recovery.
+            let chain = end % BLOCK != 0 && gapped.get() < 2 * (seed + 1);
+            if crash_seed % 10 == 0 || chain {
+                if chain {
+                    gapped.set(gapped.get() + 1);
+                }
+                let rerun = Arc::new(crash_io.crash(crash_seed));
+                rerun.capture(in_recovery.clone(), ops / 8, crash_seed);
+                drop(open(rerun.clone(), 1));
+                // The images include one just before each superblock recovery wrote.
+                assert!(
+                    !rerun.writes_to(BASE).is_empty(),
+                    "{label}: recovery wrote no superblock"
+                );
+                let images = rerun.captured();
+                let count = images.len();
+                for (i, image) in images.into_iter().enumerate() {
+                    // One image, taken once the gap is recorded and before recovery's last
+                    // superblock, crashes again in recovery, twice, each time with another
+                    // buffer, then recovers whole.
+                    if chain
+                        && i == (1 + (crash_seed / 10) as usize % count.saturating_sub(2).max(1))
+                            .min(count - 1)
+                    {
+                        let label = format!("{label}, crashed in recovery at capture {i}");
+                        let mut image = image;
+                        for (depth, budget) in
+                            [2 * MIN_BUDGET, 4 * MIN_BUDGET].into_iter().enumerate()
+                        {
+                            let again = Arc::new(image);
+                            // Also just before each log write lands: a crash then may tear the
+                            // log's last block, and the next recovery reopens it past a gap.
+                            let log = format!("{BASE}.log.");
+                            let in_recovery = in_recovery.clone();
+                            again.capture(
+                                move |path| in_recovery(path) || path.starts_with(log.as_str()),
+                                ops / 8,
+                                crash_seed + depth as u64,
+                            );
+                            eprintln!("recovering {label}, crash {depth} again");
+                            drop(try_open(again.clone(), 1, budget).unwrap());
+                            let mut images = again.captured();
+                            if images.is_empty() {
+                                // Taken late, the image left this recovery nothing to write:
+                                // what it left recovers whole.
+                                image = again.crash(crash_seed);
+                                break;
+                            }
+                            // Past the first, taken before the gap was durable, and short of
+                            // the last, taken before the superblock that ends recovery; of
+                            // those, the first whose log ends inside a block, so the next
+                            // recovery records a gap of its own too.
+                            let first = 1
+                                + (crash_seed as usize + depth)
+                                    % images.len().saturating_sub(2).max(1);
+                            let first = first.min(images.len() - 1);
+                            let at = (0..images.len())
+                                .map(|k| (first + k) % images.len())
+                                .find(|&k| {
+                                    let copy: Arc<dyn IO> = Arc::new(images[k].crash(crash_seed));
+                                    let probe = open(copy, 1);
+                                    probe.recovered_end().expect("a recovery") % BLOCK != 0
+                                })
+                                .unwrap_or(first);
+                            image = images.swap_remove(at);
+                        }
+                        let image: Arc<dyn IO> = Arc::new(image);
+                        if gaps(&image).len() >= 2 {
+                            chained.set(chained.get() + 1);
+                        }
+                        let label = format!("{label}, crashed twice more");
+                        eprintln!("recovering {label}");
+                        let again = try_open(image.clone(), 2, 2 * MIN_BUDGET).unwrap();
+                        check(&again, &image, &model.borrow(), end, &label);
+                        drop(again);
+                        let again = open(image.clone(), 1);
+                        check(
+                            &again,
+                            &image,
+                            &model.borrow(),
+                            end,
+                            &format!("{label}, reopened"),
+                        );
+                        continue;
+                    }
+                    let image: Arc<dyn IO> = Arc::new(image);
+                    let label = format!("{label}, crashed in recovery at capture {i}");
+                    // Named before it runs: a recovery that fails does so inside `open`.
+                    eprintln!("recovering {label}");
+                    let again = open(image.clone(), 1 + i % 3);
+                    let end_again = again.recovered_end().expect("a recovery");
+                    assert!(
+                        end_again >= acknowledged.get(),
+                        "{label}: recovery ended at {end_again}, before {}, which was durable",
+                        acknowledged.get()
+                    );
+                    check(&again, &image, &model.borrow(), end, &label);
+                    interrupted.set(interrupted.get() + 1);
+                }
+            }
+            // A superblock write that lands short fails recovery before it appends past the
+            // gap; with the fault gone, the database recovers whole.
+            if crash_seed % 10 == 3 {
+                let image = Arc::new(crash_io.crash(crash_seed));
+                image.set_faults(Faults {
+                    short_write: 1.0,
+                    ..Faults::default()
+                });
+                image.set_faults_on(Some(BASE));
+                assert!(
+                    try_open(image.clone(), 1, MIN_BUDGET).is_err(),
+                    "{label}: recovery went on past a short superblock write"
+                );
+                image.set_faults(Faults::default());
+                let image: Arc<dyn IO> = image;
+                let again = open(image.clone(), 1);
+                check(
+                    &again,
+                    &image,
+                    &model.borrow(),
+                    end,
+                    &format!("{label}, after a short write"),
+                );
+            }
+            // A superblock with no room for another gap: a recovery that needs one, as every
+            // recovery of a log ending inside a block does, refuses before it changes anything,
+            // and recovers whole once there is room.
+            if end % BLOCK != 0 && refused.get() < 4 * (seed + 1) {
+                let image: Arc<dyn IO> = Arc::new(crash_io.crash(crash_seed));
+                let full = control::rewrite_in_charge(image.clone(), BASE, false, |sb| {
+                    // Gaps behind the redo point, which no reader goes past, but which count.
+                    sb.continuations = vec![(0, 0); MAX_CONTINUATIONS];
+                });
+                match try_open(image.clone(), 1, MIN_BUDGET) {
+                    Err(e) => {
+                        assert!(e.to_string().contains("gaps it holds"), "{label}: {e}");
+                        let (_, now) = Control::open(image.clone(), BASE).unwrap();
+                        assert_eq!(
+                            now,
+                            Some(full),
+                            "{label}: a refused recovery wrote a superblock"
+                        );
+                        control::rewrite_in_charge(image.clone(), BASE, false, |sb| {
+                            sb.continuations.clear()
+                        });
+                        refused.set(refused.get() + 1);
+                    }
+                    Ok(_) => panic!(
+                        "{label}: a log ending inside a block recovered with no gap recorded"
+                    ),
+                }
+                let again = open(image.clone(), 1);
+                check(
+                    &again,
+                    &image,
+                    &model.borrow(),
+                    end,
+                    &format!("{label}, after a full superblock"),
+                );
+            }
+            // A control file version 1 wrote recovers, and the upgrade to version 2 that its
+            // first superblock written makes holds through a crash just before any superblock
+            // write lands.
+            if crash_seed % 10 == 7 {
+                let image = Arc::new(crash_io.crash(crash_seed));
+                let as_io: Arc<dyn IO> = image.clone();
+                control::rewrite_in_charge(as_io, BASE, true, |sb| {
+                    assert!(
+                        sb.continuations.is_empty(),
+                        "{label}: gaps recorded at runtime"
+                    );
+                });
+                image.capture(|path| path == BASE, u64::MAX, crash_seed);
+                let as_io: Arc<dyn IO> = image.clone();
+                let upgraded = open(as_io.clone(), 1);
+                check(
+                    &upgraded,
+                    &as_io,
+                    &model.borrow(),
+                    end,
+                    &format!("{label}, from version 1"),
+                );
+                drop(upgraded);
+                for (i, image) in image.captured().into_iter().enumerate() {
+                    let image: Arc<dyn IO> = Arc::new(image);
+                    let label = format!("{label}, from version 1, crashed at superblock write {i}");
+                    let again = open(image.clone(), 1);
+                    check(&again, &image, &model.borrow(), end, &label);
+                }
+                legacy.set(legacy.get() + 1);
+            }
         };
         let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| loop {
             match op().unwrap() {
@@ -295,8 +520,22 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
             "seed {seed}: only {} crashes",
             checks.get()
         );
+        assert!(
+            interrupted.get() >= 50,
+            "seed {seed}: only {} crashes in recovery",
+            interrupted.get()
+        );
+
         crash_and_check(seed);
     }
+    assert!(
+        chained.get() >= 1 && refused.get() >= 1 && legacy.get() >= 1,
+        "{} recoveries crashed in succession with two gaps or more, {} refused for want of room, \
+         {} from version 1",
+        chained.get(),
+        refused.get(),
+        legacy.get()
+    );
 }
 
 #[test]

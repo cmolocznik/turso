@@ -3,8 +3,15 @@
 //!
 //! ```text
 //! magic: u64 | version: u32 | reserved: u32 | seq: u64 | redo: u64 | segment_bytes: u64 |
-//! file_bytes: u64 | database_id: [u8; 16] | heights: [[u8; CLASS_COUNT]; 2] | zeros | crc32c: u32
+//! file_bytes: u64 | database_id: [u8; 16] | heights: [[u8; CLASS_COUNT]; 2] | clock: u64 |
+//! continuations: u64 | (ended: u64, resumed: u64) * continuations | zeros | crc32c: u32
 //! ```
+//!
+//! **Versions.** Version 1 had no continuations; it reads as version 2 with none, and the next
+//! superblock written is version 2, in the other place, so a crash before it is whole leaves the
+//! version 1 superblock in charge. A version 1 build cannot read version 2. A superblock whole
+//! but of a version this build does not know fails the open: it is neither absent nor torn, and
+//! the superblock before it may lack what that one recorded.
 
 use super::aligned::AlignedBlock;
 use super::log::Lsn;
@@ -16,10 +23,15 @@ use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"ATOLLSB1");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+/// The format before continuations.
+const LEGACY_VERSION: u32 = 1;
 const SIZE: usize = 4096;
 const HEIGHTS: usize = 64;
 const CLOCK: usize = HEIGHTS + 2 * CLASS_COUNT;
+const CONTINUATIONS: usize = CLOCK + 8;
+/// Continuations a superblock holds: all that fit between their count and the checksum.
+pub const MAX_CONTINUATIONS: usize = (SIZE - 4 - CONTINUATIONS - 8) / 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Superblock {
@@ -34,6 +46,11 @@ pub struct Superblock {
     /// The transaction clock when the superblock was written: above every timestamp of a change
     /// logged before the redo point.
     pub clock: u64,
+    /// Where the log goes on past a gap, in order: it ended at `.0`, and goes on at `.1`. A
+    /// recovery reopens the log past where it ends, at the next block, and records the gap here,
+    /// durably, before it appends anything: a recovery that crashes and starts again from this
+    /// superblock then reads all it appended. A gap stays recorded until the redo point passes it.
+    pub continuations: Vec<(Lsn, Lsn)>,
 }
 
 impl Superblock {
@@ -49,24 +66,60 @@ impl Superblock {
         out[HEIGHTS..HEIGHTS + CLASS_COUNT].copy_from_slice(&self.heights[0]);
         out[HEIGHTS + CLASS_COUNT..HEIGHTS + 2 * CLASS_COUNT].copy_from_slice(&self.heights[1]);
         out[CLOCK..CLOCK + 8].copy_from_slice(&self.clock.to_le_bytes());
+        assert!(
+            self.continuations.len() <= MAX_CONTINUATIONS,
+            "{} continuations",
+            self.continuations.len()
+        );
+        out[CONTINUATIONS..CONTINUATIONS + 8]
+            .copy_from_slice(&(self.continuations.len() as u64).to_le_bytes());
+        for (i, &(ended, resumed)) in self.continuations.iter().enumerate() {
+            let at = CONTINUATIONS + 8 + 16 * i;
+            out[at..at + 8].copy_from_slice(&ended.to_le_bytes());
+            out[at + 8..at + 16].copy_from_slice(&resumed.to_le_bytes());
+        }
         let crc = crc32c::crc32c(&out[..SIZE - 4]);
         out[SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
         out
     }
 
-    fn decode(bytes: &[u8]) -> Option<Self> {
+    /// The superblock `bytes` hold: `None` if they are not one whole, an error if they are one
+    /// of a version this build does not read.
+    fn decode(bytes: &[u8]) -> Result<Option<Self>> {
         let crc = u32::from_le_bytes(bytes[SIZE - 4..SIZE].try_into().unwrap());
         if crc != crc32c::crc32c(&bytes[..SIZE - 4])
             || u64::from_le_bytes(bytes[0..8].try_into().unwrap()) != MAGIC
-            || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != VERSION
         {
-            return None;
+            return Ok(None);
         }
         let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let continuations = match u32::from_le_bytes(bytes[8..12].try_into().unwrap()) {
+            LEGACY_VERSION => Vec::new(),
+            VERSION => {
+                let count = word(CONTINUATIONS);
+                if count > MAX_CONTINUATIONS as u64 {
+                    return Err(LimboError::Corrupt(format!(
+                        "a superblock records {count} continuations, more than its {MAX_CONTINUATIONS}"
+                    )));
+                }
+                (0..count as usize)
+                    .map(|i| {
+                        let at = CONTINUATIONS + 8 + 16 * i;
+                        (word(at), word(at + 8))
+                    })
+                    .collect()
+            }
+            version => {
+                return Err(LimboError::Corrupt(format!(
+                    "a superblock of format version {version}, which this build does not read \
+                     (it reads {LEGACY_VERSION} and {VERSION})"
+                )))
+            }
+        };
         let mut heights = [[0u8; CLASS_COUNT]; 2];
         heights[0].copy_from_slice(&bytes[HEIGHTS..HEIGHTS + CLASS_COUNT]);
         heights[1].copy_from_slice(&bytes[HEIGHTS + CLASS_COUNT..HEIGHTS + 2 * CLASS_COUNT]);
-        Some(Self {
+        Ok(Some(Self {
             seq: word(16),
             redo: word(24),
             segment_bytes: word(32),
@@ -74,7 +127,8 @@ impl Superblock {
             database_id: bytes[48..64].try_into().unwrap(),
             heights,
             clock: word(CLOCK),
-        })
+            continuations,
+        }))
     }
 }
 
@@ -107,19 +161,28 @@ impl Control {
         let read = *got.lock();
         // SAFETY: the read filled the block, which nothing else uses.
         let bytes = unsafe { std::slice::from_raw_parts(block.as_ptr(), 2 * SIZE) };
-        let newest = (0..2)
-            .filter(|i| read >= (i + 1) * SIZE)
-            .filter_map(|i| Superblock::decode(&bytes[i * SIZE..(i + 1) * SIZE]))
-            .max_by_key(|sb| sb.seq);
+        let mut newest: Option<Superblock> = None;
+        for i in (0..2).filter(|i| read >= (i + 1) * SIZE) {
+            if let Some(sb) = Superblock::decode(&bytes[i * SIZE..(i + 1) * SIZE])? {
+                if newest.as_ref().is_none_or(|n| sb.seq > n.seq) {
+                    newest = Some(sb);
+                }
+            }
+        }
         Ok((Self { io, file }, newest))
     }
 
     /// Writes `sb` over the superblock not in charge; done once it is durable.
     pub fn write(&self, sb: &Superblock) -> Result<Completion> {
+        self.write_encoded(sb.seq, &sb.encode())
+    }
+
+    /// Writes the encoded superblock `bytes` in the place of `seq`.
+    fn write_encoded(&self, seq: u64, bytes: &[u8]) -> Result<Completion> {
         let block = Arc::new(AlignedBlock::zeroed(SIZE));
         // SAFETY: a fresh block of the superblock's size.
-        unsafe { std::ptr::copy_nonoverlapping(sb.encode().as_ptr(), block.as_ptr(), SIZE) };
-        let at = (sb.seq % 2) * SIZE as u64;
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), block.as_ptr(), SIZE) };
+        let at = (seq % 2) * SIZE as u64;
         let durable = Completion::new_wait();
         let done = durable.clone();
         if self.file.supports_durable_writes() {
@@ -187,6 +250,47 @@ fn io_failure(e: &LimboError) -> CompletionError {
 }
 
 #[cfg(test)]
+impl Superblock {
+    /// The bytes version 1 wrote: the layout without continuations.
+    fn encode_version_1(&self) -> Vec<u8> {
+        assert!(self.continuations.is_empty(), "version 1 records no gaps");
+        let mut out = self.encode();
+        out[8..12].copy_from_slice(&LEGACY_VERSION.to_le_bytes());
+        seal(&mut out);
+        out
+    }
+}
+
+#[cfg(test)]
+fn seal(bytes: &mut [u8]) {
+    let crc = crc32c::crc32c(&bytes[..SIZE - 4]);
+    bytes[SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Rewrites the superblock in charge of the database at `base` in its own place, as `change`
+/// leaves it, and in version 1 if `legacy`: a control file as an older build, or a full one,
+/// left it.
+#[cfg(test)]
+pub(crate) fn rewrite_in_charge(
+    io: Arc<dyn IO>,
+    base: &str,
+    legacy: bool,
+    change: impl FnOnce(&mut Superblock),
+) -> Superblock {
+    let (control, sb) = Control::open(io.clone(), base).unwrap();
+    let mut sb = sb.expect("a superblock in charge");
+    change(&mut sb);
+    let bytes = if legacy {
+        sb.encode_version_1()
+    } else {
+        sb.encode()
+    };
+    io.wait_for_completion(control.write_encoded(sb.seq, &bytes).unwrap())
+        .unwrap();
+    sb
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::crash::{CrashIO, Faults};
@@ -200,6 +304,7 @@ mod tests {
             database_id: [9; 16],
             heights: [[2; CLASS_COUNT], [1; CLASS_COUNT]],
             clock: 1 << 40,
+            continuations: vec![(20_000, 20_480), (40_100, 40_960)],
         }
     }
 
@@ -207,15 +312,95 @@ mod tests {
     fn a_superblock_reads_back_as_written_and_not_once_any_byte_flips() {
         let sb = superblock(7);
         let bytes = sb.encode();
-        assert_eq!(Superblock::decode(&bytes), Some(sb));
-        for at in [0, 16, 24, HEIGHTS, CLOCK, SIZE - 1] {
+        assert_eq!(Superblock::decode(&bytes).unwrap(), Some(sb));
+        for at in [
+            0,
+            16,
+            24,
+            HEIGHTS,
+            CLOCK,
+            CONTINUATIONS,
+            CONTINUATIONS + 8,
+            SIZE - 1,
+        ] {
             let mut torn = bytes.clone();
             torn[at] ^= 1;
             assert_eq!(
-                Superblock::decode(&torn),
+                Superblock::decode(&torn).unwrap(),
                 None,
                 "a flip at {at} went unseen"
             );
+        }
+    }
+
+    #[test]
+    fn a_superblock_holds_as_many_continuations_as_fit_and_refuses_a_count_past_them() {
+        let mut sb = superblock(3);
+        sb.continuations = (0..MAX_CONTINUATIONS as u64)
+            .map(|i| (i * 8192 + 100, i * 8192 + 4096))
+            .collect();
+        assert_eq!(Superblock::decode(&sb.encode()).unwrap(), Some(sb.clone()));
+        let mut bytes = sb.encode();
+        bytes[CONTINUATIONS..CONTINUATIONS + 8]
+            .copy_from_slice(&(MAX_CONTINUATIONS as u64 + 1).to_le_bytes());
+        seal(&mut bytes);
+        assert!(Superblock::decode(&bytes).is_err());
+    }
+
+    /// A version 1 control file opens, with no continuations; the next superblock written is
+    /// version 2, and a crash at any point of that write leaves one of the two in charge.
+    #[test]
+    fn a_version_1_superblock_reads_with_no_continuations_and_upgrades_through_any_crash() {
+        let crash = Arc::new(CrashIO::new(11));
+        crash.set_durable_writes(false);
+        let io: Arc<dyn IO> = crash.clone();
+        let (control, _) = Control::open(io.clone(), "/db/legacy").unwrap();
+        let old = Superblock {
+            continuations: Vec::new(),
+            ..superblock(4)
+        };
+        // Written as version 1 left it.
+        io.wait_for_completion(control.write_encoded(4, &old.encode_version_1()).unwrap())
+            .unwrap();
+        let (control, newest) = Control::open(io.clone(), "/db/legacy").unwrap();
+        assert_eq!(newest, Some(old.clone()));
+        let new = superblock(5);
+        let written = control.write(&new).unwrap();
+        let mut images = 0;
+        while !written.finished() {
+            for seed in 0..8 {
+                let crashed: Arc<dyn IO> = Arc::new(crash.crash(seed));
+                let (_, newest) = Control::open(crashed, "/db/legacy").unwrap();
+                assert!(
+                    newest == Some(old.clone()) || newest == Some(new.clone()),
+                    "a crash in the upgrade left {newest:?}"
+                );
+                images += 1;
+            }
+            io.step().unwrap();
+        }
+        assert!(images > 0);
+        let (_, newest) = Control::open(io, "/db/legacy").unwrap();
+        assert_eq!(newest, Some(new));
+    }
+
+    /// A whole superblock of a version this build does not know fails the open, whatever the
+    /// other place holds: falling back to it could lose what the unknown one recorded.
+    #[test]
+    fn a_superblock_of_an_unknown_version_fails_the_open() {
+        for unknown_seq in [6, 4] {
+            let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
+            let (control, _) = Control::open(io.clone(), "/db/unknown").unwrap();
+            control.write_and_wait(&superblock(5)).unwrap();
+            let mut bytes = superblock(unknown_seq).encode();
+            bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+            seal(&mut bytes);
+            io.wait_for_completion(control.write_encoded(unknown_seq, &bytes).unwrap())
+                .unwrap();
+            let err = Control::open(io, "/db/unknown")
+                .map(|(_, sb)| sb)
+                .unwrap_err();
+            assert!(err.to_string().contains("version 3"), "{err}");
         }
     }
 

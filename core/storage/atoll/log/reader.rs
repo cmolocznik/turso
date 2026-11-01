@@ -48,6 +48,8 @@ pub struct LogReader {
     /// No more bytes can be read: a segment is missing or ends.
     exhausted: bool,
     buffer: Arc<AlignedBlock>,
+    /// Gaps to read past, in order: where the log ended, and where it goes on.
+    continuations: std::collections::VecDeque<(Lsn, Lsn)>,
 }
 
 impl LogReader {
@@ -69,7 +71,20 @@ impl LogReader {
             window_at,
             exhausted: false,
             buffer: Arc::new(AlignedBlock::zeroed(READ)),
+            continuations: Default::default(),
         }
+    }
+
+    /// Reads past the gaps a superblock records ([`super::super::control::Superblock`]): where
+    /// the log ends at a gap's start, it goes on at the gap's end. Gaps behind the start are
+    /// passed already.
+    pub fn following(mut self, continuations: &[(Lsn, Lsn)]) -> Self {
+        self.continuations = continuations
+            .iter()
+            .copied()
+            .filter(|&(_, resumed)| resumed > self.position)
+            .collect();
+        self
     }
 
     /// Where the next record starts; once [`next_record`](Self::next_record) has returned `None`, where the log
@@ -89,19 +104,19 @@ impl LogReader {
                 return Ok(None);
             }
             let Some(r) = self.parse_next()? else {
-                return Ok(self.end());
+                return self.end();
             };
             let place = r.place;
             if !place.grouped() {
                 if !self.group.is_empty() {
-                    return Ok(self.end());
+                    return self.end();
                 }
                 self.position = r.lsn;
                 return Ok(Some(r));
             }
             if place.first() {
                 if !self.group.is_empty() {
-                    return Ok(self.end());
+                    return self.end();
                 }
             } else {
                 let continues = self.group.last().is_some_and(|last| {
@@ -116,7 +131,7 @@ impl LogReader {
                     )));
                 }
                 if !continues {
-                    return Ok(self.end());
+                    return self.end();
                 }
             }
             let group = self.group.first().map_or(r.start, |g| g.start);
@@ -128,11 +143,30 @@ impl LogReader {
     }
 
     /// Ends the log where the last whole record or group ends: a group read only in part was
-    /// never appended.
-    fn end(&mut self) -> Option<OwnedRecord> {
+    /// never appended. At a recorded gap, it goes on past it instead.
+    fn end(&mut self) -> Result<Option<OwnedRecord>> {
         self.group.clear();
-        self.ended = true;
-        None
+        match self.continuations.front().copied() {
+            Some((ended, resumed)) if ended == self.position => {
+                self.continuations.pop_front();
+                self.position = resumed;
+                self.scan = resumed;
+                self.window.clear();
+                self.window_at = resumed - resumed % BLOCK;
+                self.exhausted = false;
+                self.next_record()
+            }
+            // The log ended before a gap recorded past where it ends: records a recovery read
+            // and appended after are gone.
+            Some((ended, _)) => Err(LimboError::Corrupt(format!(
+                "the log ends at {}, before the gap recorded at {ended}",
+                self.position
+            ))),
+            None => {
+                self.ended = true;
+                Ok(None)
+            }
+        }
     }
 
     /// The next record past `scan`, skipping padding; `None` where no valid record starts.

@@ -20,10 +20,20 @@
 //! The page store's records are all replayed before anything is appended: a new record would
 //! stamp the metadata pages it changes with an LSN past every record still to replay. That is why
 //! the log is read twice.
+//!
+//! **Continuations.** The log reopens at the block after its end, and the bytes between stay as
+//! the crash left them: a reader from the superblock in charge would stop at the end, and miss
+//! whatever recovery appends past the gap. But recovery's checkpoint writes metadata pages, and
+//! data copies they name, before its superblock lands; a crash between would leave pages a later
+//! recovery cannot explain from the log it reads. So before it appends anything, recovery writes
+//! the superblock in charge again with the gap recorded ([`Superblock::continuations`]), and
+//! waits until it is durable: every later reader goes past the gap. A gap is recorded only while
+//! the superblock has room for it; with none left, recovery fails before it changes anything. The
+//! checkpoint whose redo point passes the gaps drops them.
 
 use super::buffer::{BufferConfig, BufferPool, LocalSource};
 use super::checkpoint::Checkpointer;
-use super::control::{Control, Superblock};
+use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::db::AtollConfig;
 use super::drive;
 use super::log::{Log, LogConfig, LogReader, Lsn, OwnedRecord};
@@ -52,7 +62,8 @@ pub(super) struct Recovery {
     log_config: LogConfig,
     buffer: BufferConfig,
     log_budget: u64,
-    superblock: Superblock,
+    /// The superblock in charge: as recovery found it, then with the gap it records.
+    superblock: Mutex<Superblock>,
     store: Arc<PageStore>,
     control: Mutex<Option<Control>>,
     /// Log per window: what one checkpoint pass covers.
@@ -151,7 +162,7 @@ impl Recovery {
             log_config: config.log.clone(),
             buffer: config.buffer.clone(),
             log_budget,
-            superblock,
+            superblock: Mutex::new(superblock),
             store,
             control: Mutex::new(Some(control)),
             partitions,
@@ -294,15 +305,17 @@ impl Recovery {
 
     /// Replays the page store's records and finds where the log ends.
     fn analyze(&self) -> Result<()> {
+        let superblock = self.superblock.lock().clone();
         let mut reader = Log::reader(
             self.io.clone(),
             &self.base,
             &self.log_config,
-            self.superblock.redo,
-        );
+            superblock.redo,
+        )
+        .following(&superblock.continuations);
         let mut freed = HashSet::new();
         let mut reborn = HashMap::new();
-        let mut clock = self.superblock.clock;
+        let mut clock = superblock.clock;
         while let Some(r) = reader.next_record()? {
             // A record's transaction is named by its start timestamp.
             clock = clock.max(r.header.txn);
@@ -327,21 +340,46 @@ impl Recovery {
             }
         }
         let end = reader.position();
+        // Recorded before the log reopens past the gap, and before anything is appended there.
+        let restart = Log::resumes_at(end);
+        if restart > end {
+            if superblock.continuations.len() >= MAX_CONTINUATIONS {
+                return Err(LimboError::InternalError(format!(
+                    "recovery would reopen the log at {restart}, past its end at {end}, and the \
+                     superblock already records the {MAX_CONTINUATIONS} gaps it holds: recovering \
+                     on would leave a gap no reader goes past"
+                )));
+            }
+            let mut continuations = superblock.continuations.clone();
+            continuations.push((end, restart));
+            let recorded = Superblock {
+                seq: superblock.seq + 1,
+                continuations,
+                ..superblock.clone()
+            };
+            self.control
+                .lock()
+                .as_ref()
+                .expect("the control file")
+                .write_and_wait(&recorded)?;
+            *self.superblock.lock() = recorded;
+        }
         let log = Log::open(self.io.clone(), &self.base, self.log_config.clone(), end)?;
-        let restart = log.end();
+        assert_eq!(log.end(), restart, "the log reopened elsewhere");
         self.store.resume(log);
         let pool = BufferPool::new(
             self.buffer.clone(),
             Arc::new(LocalSource::new(self.store.clone())),
             self.store.clone(),
-            self.superblock.redo,
+            superblock.redo,
         )?;
         let reader = Log::reader(
             self.io.clone(),
             &self.base,
             &self.log_config,
-            self.superblock.redo,
-        );
+            superblock.redo,
+        )
+        .following(&superblock.continuations);
         let mut state = self.state.lock();
         state.end = end;
         state.restart = restart;
@@ -468,7 +506,7 @@ impl Recovery {
             pool.clone(),
             self.store.clone(),
             control,
-            self.superblock.clone(),
+            self.superblock.lock().clone(),
             self.log_budget,
             clock.clone(),
         );

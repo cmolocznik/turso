@@ -156,6 +156,12 @@ impl Drop for Admitted {
 }
 
 impl Log {
+    /// Where [`open`](Self::open) resumes appending to a log that ends at `end`: the next block
+    /// boundary.
+    pub fn resumes_at(end: Lsn) -> Lsn {
+        end.next_multiple_of(BLOCK)
+    }
+
     /// Opens the log of the database at `base` to append from `end`, where recovery found its
     /// valid records end ([`LogReader`]). A new log has `end` 0.
     ///
@@ -178,7 +184,7 @@ impl Log {
             "a log buffer smaller than one chunk"
         );
         let segments = Segments::new(io.clone(), base, config.segment_bytes, config.direct);
-        let start = end.next_multiple_of(BLOCK);
+        let start = Self::resumes_at(end);
         let current = segments.number(start);
         let durable_writes = Self::open_segments(&io, &segments, end, start)?;
         // Room for the admitted bytes, a padded block per write in flight, and the chunk being

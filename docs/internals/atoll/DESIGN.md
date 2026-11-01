@@ -102,9 +102,14 @@ Durability is chosen per database:
   - the checkpoint number and the redo point;
   - per class, where the page-table root and the free-space root are;
   - the clock floor;
+  - the gaps the log goes on past (section 7.4), as many as fit: 249;
   - a CRC32C.
 
-  It is written with a durable write. A torn superblock leaves the other one in charge.
+  It is written with a durable write. A torn superblock leaves the other one in charge. Format
+  version 1 had no gaps; it reads as version 2 with none, and the next superblock written is
+  version 2, in the other place, so a crash during that write leaves version 1 in charge. A
+  superblock whole but of a version the build does not know fails the open rather than leave the
+  one before it in charge. Version 1 builds cannot open version 2.
 
 ## 5. Pages
 
@@ -170,8 +175,8 @@ The page table and free space are radix trees of 4 KiB metadata pages, one of ea
 4. **Erase.** Once the record that freed `old` is durable, `old` is erased (a hole punched, or
    zeros written). Only then may it be taken again.
 
-After a crash, frees logged after the point where the log restarted wait for a checkpoint past it
-(section 7.4), since a recovery from before that checkpoint cannot read them.
+After a crash, frees logged after the point where the log restarted are erased only once the
+checkpoint that ends recovery is durable (section 12).
 
 - **Copies ahead of the log.** A copy may hold changes whose log records are not durable yet. Its
   remap is appended after it lands, behind every record it holds, so a remap that survives a crash
@@ -291,8 +296,10 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
   - and, with object storage, it has been uploaded.
 - **Reopening after a crash.** Appending resumes at the block boundary after the log's end. The
   rest of that segment is zeroed and later segments removed, so nothing a crash left beyond the
-  end is ever read as log. Bytes between the end and that boundary stay unreadable, so nothing
-  appended is acknowledged until a checkpoint past it is durable.
+  end is ever read as log. Bytes between the end and that boundary stay unreadable: a reader stops
+  at the end. Before anything is appended, recovery records the gap in the superblock in charge,
+  durably, and every reader from that superblock goes past it (section 12). A gap stays recorded
+  until a checkpoint's redo point passes it.
 - **Readers.** Recovery, replicas, app servers and the archiver read segments by position. A segment
   no longer local is fetched from object storage.
 
@@ -619,7 +626,14 @@ otherwise.
 
    Every page-store record is replayed before anything is appended: a new record would stamp the
    metadata pages it changes with an LSN past every record still to replay. So the log is read
-   twice. One reader keeps up with one device: CRC32C ran at 16 GB/s on one core of a Core Ultra 9
+   twice. The reader goes past every gap the superblock records, where a recovery that crashed
+   reopened the log.
+
+   **Record the gap.** If the log reopens past its end, recovery writes the superblock in charge
+   again with that gap added, and waits until it is durable, before it appends anything. Its
+   checkpoint writes metadata pages, and the copies they name, before its own superblock lands;
+   a crash in between leaves pages a later recovery explains only from what this one appended.
+   With no room left for a gap, recovery fails before it changes anything. One reader keeps up with one device: CRC32C ran at 16 GB/s on one core of a Core Ultra 9
    285H, above the 7 GB/s a PCIe 4 NVMe drive reads sequentially.
 3. **Redo**, in parallel. The log is read again in windows of one checkpoint pass's share of the
    budget. Each window's page records are split into partitions by page id; a partition's records

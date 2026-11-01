@@ -216,6 +216,14 @@ impl State {
                                 heights: cp.store.heights(),
                                 // Read after every change before the redo point was logged.
                                 clock: cp.clock.now(),
+                                // A gap the redo point passed is read past by no one.
+                                continuations: self
+                                    .superblock
+                                    .continuations
+                                    .iter()
+                                    .copied()
+                                    .filter(|&(_, resumed)| resumed > redo)
+                                    .collect(),
                                 ..self.superblock.clone()
                             };
                             a.stage = Stage::Superblock(sb, None);

@@ -78,6 +78,7 @@ fn write_superblock(db: &mut Db, redo: Lsn) {
         database_id: [7; 16],
         heights: db.store.heights(),
         clock: 0,
+        continuations: Vec::new(),
     };
     db.control.write_and_wait(&sb).unwrap();
 }

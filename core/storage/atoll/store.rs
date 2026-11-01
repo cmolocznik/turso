@@ -1068,9 +1068,10 @@ impl PageStore {
     // ---------------------------------------------------------------- recovery
 
     /// Gives a recovering store the log, reopened where the replay found it ends. Nothing freed by
-    /// a record appended from here on is erased until [`allow_erasing`](Self::allow_erasing): a
-    /// recovery from the superblock still in charge stops where the replay did, and could still
-    /// need the copies such a record frees.
+    /// a record appended from here on is erased until [`allow_erasing`](Self::allow_erasing), once
+    /// the checkpoint that ends recovery is durable: erasing what recovery frees stays ordered
+    /// after the superblock that makes recovery's records part of the log every reader starts
+    /// from.
     pub fn resume(&self, log: Arc<Log>) {
         self.erase_limit.store(log.end(), Ordering::Release);
         assert!(

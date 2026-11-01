@@ -152,9 +152,9 @@ fn check(db: &Atoll, io: &Arc<dyn IO>, model: &BTreeMap<PageId, Lives>, end: Lsn
 }
 
 fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
-    // Recoveries crashed in succession whose last superblock recorded two gaps or more;
-    // recoveries refused for want of room for a gap; and ones from a version 1 control file.
-    let (chained, refused, legacy) = (Cell::new(0u64), Cell::new(0u64), Cell::new(0u64));
+    // Recoveries crashed in succession whose last superblock recorded two gaps or more, and
+    // recoveries refused for want of room for a gap.
+    let (chained, refused) = (Cell::new(0u64), Cell::new(0u64));
     // Crashes whose log ends inside a block, interrupted in recovery with a chain.
     let gapped = Cell::new(0u64);
     for seed in 0..2u64 {
@@ -328,7 +328,7 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
             // and recovers whole once there is room.
             if end % BLOCK != 0 && refused.get() < 4 * (seed + 1) {
                 let image: Arc<dyn IO> = Arc::new(crash_io.crash(crash_seed));
-                let full = control::rewrite_in_charge(image.clone(), BASE, false, |sb| {
+                let full = control::rewrite_in_charge(image.clone(), BASE, |sb| {
                     // Gaps behind the redo point, which no reader goes past, but which count.
                     sb.continuations = vec![(0, 0); MAX_CONTINUATIONS];
                 });
@@ -341,7 +341,7 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
                             Some(full),
                             "{label}: a refused recovery wrote a superblock"
                         );
-                        control::rewrite_in_charge(image.clone(), BASE, false, |sb| {
+                        control::rewrite_in_charge(image.clone(), BASE, |sb| {
                             sb.continuations.clear()
                         });
                         refused.set(refused.get() + 1);
@@ -358,37 +358,6 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
                     end,
                     &format!("{label}, after a full superblock"),
                 );
-            }
-            // A control file version 1 wrote recovers, and the upgrade to version 2 that its
-            // first superblock written makes holds through a crash just before any superblock
-            // write lands.
-            if crash_seed % 10 == 7 {
-                let image = Arc::new(crash_io.crash(crash_seed));
-                let as_io: Arc<dyn IO> = image.clone();
-                control::rewrite_in_charge(as_io, BASE, true, |sb| {
-                    assert!(
-                        sb.continuations.is_empty(),
-                        "{label}: gaps recorded at runtime"
-                    );
-                });
-                image.capture(|path| path == BASE, u64::MAX, crash_seed);
-                let as_io: Arc<dyn IO> = image.clone();
-                let upgraded = open(as_io.clone(), 1);
-                check(
-                    &upgraded,
-                    &as_io,
-                    &model.borrow(),
-                    end,
-                    &format!("{label}, from version 1"),
-                );
-                drop(upgraded);
-                for (i, image) in image.captured().into_iter().enumerate() {
-                    let image: Arc<dyn IO> = Arc::new(image);
-                    let label = format!("{label}, from version 1, crashed at superblock write {i}");
-                    let again = open(image.clone(), 1);
-                    check(&again, &image, &model.borrow(), end, &label);
-                }
-                legacy.set(legacy.get() + 1);
             }
         };
         let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| loop {
@@ -529,12 +498,10 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
         crash_and_check(seed);
     }
     assert!(
-        chained.get() >= 1 && refused.get() >= 1 && legacy.get() >= 1,
-        "{} recoveries crashed in succession with two gaps or more, {} refused for want of room, \
-         {} from version 1",
+        chained.get() >= 1 && refused.get() >= 1,
+        "{} recoveries crashed in succession with two gaps or more, {} refused for want of room",
         chained.get(),
-        refused.get(),
-        legacy.get()
+        refused.get()
     );
 }
 

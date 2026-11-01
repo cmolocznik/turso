@@ -7,11 +7,8 @@
 //! continuations: u64 | (ended: u64, resumed: u64) * continuations | zeros | crc32c: u32
 //! ```
 //!
-//! **Versions.** Version 1 had no continuations; it reads as version 2 with none, and the next
-//! superblock written is version 2, in the other place, so a crash before it is whole leaves the
-//! version 1 superblock in charge. A version 1 build cannot read version 2. A superblock whole
-//! but of a version this build does not know fails the open: it is neither absent nor torn, and
-//! the superblock before it may lack what that one recorded.
+//! A superblock whole but of a version this build does not know fails the open: it is neither
+//! absent nor torn, and the superblock before it may lack what that one recorded.
 
 use super::aligned::AlignedBlock;
 use super::log::Lsn;
@@ -23,9 +20,7 @@ use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"ATOLLSB1");
-const VERSION: u32 = 2;
-/// The format before continuations.
-const LEGACY_VERSION: u32 = 1;
+const VERSION: u32 = 1;
 const SIZE: usize = 4096;
 const HEIGHTS: usize = 64;
 const CLOCK: usize = HEIGHTS + 2 * CLASS_COUNT;
@@ -94,7 +89,6 @@ impl Superblock {
         }
         let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
         let continuations = match u32::from_le_bytes(bytes[8..12].try_into().unwrap()) {
-            LEGACY_VERSION => Vec::new(),
             VERSION => {
                 let count = word(CONTINUATIONS);
                 if count > MAX_CONTINUATIONS as u64 {
@@ -112,7 +106,7 @@ impl Superblock {
             version => {
                 return Err(LimboError::Corrupt(format!(
                     "a superblock of format version {version}, which this build does not read \
-                     (it reads {LEGACY_VERSION} and {VERSION})"
+                     (it reads {VERSION})"
                 )))
             }
         };
@@ -250,42 +244,23 @@ fn io_failure(e: &LimboError) -> CompletionError {
 }
 
 #[cfg(test)]
-impl Superblock {
-    /// The bytes version 1 wrote: the layout without continuations.
-    fn encode_version_1(&self) -> Vec<u8> {
-        assert!(self.continuations.is_empty(), "version 1 records no gaps");
-        let mut out = self.encode();
-        out[8..12].copy_from_slice(&LEGACY_VERSION.to_le_bytes());
-        seal(&mut out);
-        out
-    }
-}
-
-#[cfg(test)]
 fn seal(bytes: &mut [u8]) {
     let crc = crc32c::crc32c(&bytes[..SIZE - 4]);
     bytes[SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Rewrites the superblock in charge of the database at `base` in its own place, as `change`
-/// leaves it, and in version 1 if `legacy`: a control file as an older build, or a full one,
-/// left it.
+/// leaves it: a control file as a full one, say, left it.
 #[cfg(test)]
 pub(crate) fn rewrite_in_charge(
     io: Arc<dyn IO>,
     base: &str,
-    legacy: bool,
     change: impl FnOnce(&mut Superblock),
 ) -> Superblock {
     let (control, sb) = Control::open(io.clone(), base).unwrap();
     let mut sb = sb.expect("a superblock in charge");
     change(&mut sb);
-    let bytes = if legacy {
-        sb.encode_version_1()
-    } else {
-        sb.encode()
-    };
-    io.wait_for_completion(control.write_encoded(sb.seq, &bytes).unwrap())
+    io.wait_for_completion(control.write_encoded(sb.seq, &sb.encode()).unwrap())
         .unwrap();
     sb
 }
@@ -345,43 +320,6 @@ mod tests {
             .copy_from_slice(&(MAX_CONTINUATIONS as u64 + 1).to_le_bytes());
         seal(&mut bytes);
         assert!(Superblock::decode(&bytes).is_err());
-    }
-
-    /// A version 1 control file opens, with no continuations; the next superblock written is
-    /// version 2, and a crash at any point of that write leaves one of the two in charge.
-    #[test]
-    fn a_version_1_superblock_reads_with_no_continuations_and_upgrades_through_any_crash() {
-        let crash = Arc::new(CrashIO::new(11));
-        crash.set_durable_writes(false);
-        let io: Arc<dyn IO> = crash.clone();
-        let (control, _) = Control::open(io.clone(), "/db/legacy").unwrap();
-        let old = Superblock {
-            continuations: Vec::new(),
-            ..superblock(4)
-        };
-        // Written as version 1 left it.
-        io.wait_for_completion(control.write_encoded(4, &old.encode_version_1()).unwrap())
-            .unwrap();
-        let (control, newest) = Control::open(io.clone(), "/db/legacy").unwrap();
-        assert_eq!(newest, Some(old.clone()));
-        let new = superblock(5);
-        let written = control.write(&new).unwrap();
-        let mut images = 0;
-        while !written.finished() {
-            for seed in 0..8 {
-                let crashed: Arc<dyn IO> = Arc::new(crash.crash(seed));
-                let (_, newest) = Control::open(crashed, "/db/legacy").unwrap();
-                assert!(
-                    newest == Some(old.clone()) || newest == Some(new.clone()),
-                    "a crash in the upgrade left {newest:?}"
-                );
-                images += 1;
-            }
-            io.step().unwrap();
-        }
-        assert!(images > 0);
-        let (_, newest) = Control::open(io, "/db/legacy").unwrap();
-        assert_eq!(newest, Some(new));
     }
 
     /// A whole superblock of a version this build does not know fails the open, whatever the

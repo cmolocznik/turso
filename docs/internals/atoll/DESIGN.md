@@ -105,11 +105,9 @@ Durability is chosen per database:
   - the gaps the log goes on past (section 7.4), as many as fit: 249;
   - a CRC32C.
 
-  It is written with a durable write. A torn superblock leaves the other one in charge. Format
-  version 1 had no gaps; it reads as version 2 with none, and the next superblock written is
-  version 2, in the other place, so a crash during that write leaves version 1 in charge. A
+  It is written with a durable write. A torn superblock leaves the other one in charge. A
   superblock whole but of a version the build does not know fails the open rather than leave the
-  one before it in charge. Version 1 builds cannot open version 2.
+  one before it in charge.
 
 ## 5. Pages
 

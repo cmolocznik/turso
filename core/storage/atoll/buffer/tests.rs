@@ -746,7 +746,10 @@ fn written_page_eviction() {
     let writer = {
         let (io, pool) = (io.clone(), pool.clone());
         crate::thread::spawn(move || {
+            // As `drive` does: a yield gives the processor up, or a thread spinning here can keep
+            // one holding what it waits on from ever running, as a priority scheduler did.
             while let Some(c) = pool.drive_writebacks().unwrap() {
+                crate::thread::yield_now();
                 io.wait_for_completion(c).unwrap();
             }
         })

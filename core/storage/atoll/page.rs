@@ -144,10 +144,14 @@ pub fn set_kind<P: BytesMut + ?Sized>(page: &mut P, kind: PageKind) {
     page.put_u8(KIND, kind.0);
 }
 
-fn checksum(page: &[u8]) -> u32 {
-    let head = crc32c::crc32c(&page[..CHECKSUM.start]);
-    let head = crc32c::crc32c_append(head, &[0; 4]);
-    crc32c::crc32c_append(head, &page[CHECKSUM.end..])
+fn checksum<P: Bytes + ?Sized>(page: &P) -> u32 {
+    let mut crc = 0;
+    page.pieces(0..CHECKSUM.start, |b| crc = crc32c::crc32c_append(crc, b));
+    crc = crc32c::crc32c_append(crc, &[0; 4]);
+    page.pieces(CHECKSUM.end..page.len(), |b| {
+        crc = crc32c::crc32c_append(crc, b)
+    });
+    crc
 }
 
 /// The page id in a page's header.
@@ -156,25 +160,26 @@ pub fn pid<P: Bytes + ?Sized>(page: &P) -> PageId {
 }
 
 /// Stamps the page id, class and checksum, just before a copy goes to disk.
-pub fn seal(page: &mut [u8], pid: PageId) {
+pub fn seal<P: BytesMut + ?Sized>(page: &mut P, pid: PageId) {
     debug_assert_eq!(page.len(), pid.class().size());
-    page[CLASS] = pid.class().0;
-    page[PID].copy_from_slice(&pid.0.to_le_bytes());
+    page.put_u8(CLASS, pid.class().0);
+    page.put_u64(PID.start, pid.0);
     let crc = checksum(page);
-    page[CHECKSUM].copy_from_slice(&crc.to_le_bytes());
+    page.put_u32(CHECKSUM.start, crc);
 }
 
 /// Whether a copy read from disk is whole and a copy of `pid`.
-pub fn verify(page: &[u8], pid: PageId) -> bool {
+pub fn verify<P: Bytes + ?Sized>(page: &P, pid: PageId) -> bool {
     page.len() == pid.class().size()
-        && page[CLASS] == pid.class().0
+        && page.u8_at(CLASS) == pid.class().0
         && self::pid(page) == pid
-        && u32::from_le_bytes(page[CHECKSUM].try_into().unwrap()) == checksum(page)
+        && page.u32_at(CHECKSUM.start) == checksum(page)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::atoll::shared::Shared;
 
     #[test]
     fn classes_double_from_4_kib_to_8_mib() {
@@ -214,5 +219,14 @@ mod tests {
             !verify(&vec![0u8; class.size()], pid),
             "a never-written slot verified"
         );
+        // Sealed in a frame, as a write-out seals it, the page is the same bytes.
+        let mut unsealed = page.clone();
+        unsealed[CHECKSUM].fill(0);
+        let mut shared = Shared::zeroed(class.size());
+        let mut w = shared.owned();
+        w.write(0, &unsealed);
+        seal(&mut w, pid);
+        assert_eq!(w.copied(0..class.size()), page);
+        assert!(verify(w.shared(), pid));
     }
 }

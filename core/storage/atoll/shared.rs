@@ -49,6 +49,19 @@ pub trait Bytes {
         Order::Equal
     }
 
+    /// Hands the bytes in `range` to `f` in pieces, in order: plain bytes in one, shared ones
+    /// through a buffer on the stack.
+    fn pieces(&self, range: Range<usize>, mut f: impl FnMut(&[u8])) {
+        let mut piece = [0u8; 512];
+        let mut at = range.start;
+        while at < range.end {
+            let n = piece.len().min(range.end - at);
+            self.copy_to(at, &mut piece[..n]);
+            f(&piece[..n]);
+            at += n;
+        }
+    }
+
     /// The `N` bytes at `at`.
     fn bytes<const N: usize>(&self, at: usize) -> [u8; N] {
         let mut out = [0u8; N];
@@ -145,6 +158,10 @@ impl Bytes for [u8] {
     fn compare(&self, at: usize, other: &[u8]) -> Order {
         self[at..at + other.len()].cmp(other)
     }
+
+    fn pieces(&self, range: Range<usize>, mut f: impl FnMut(&[u8])) {
+        f(&self[range]);
+    }
 }
 
 impl BytesMut for [u8] {
@@ -172,6 +189,10 @@ impl Bytes for Vec<u8> {
 
     fn compare(&self, at: usize, other: &[u8]) -> Order {
         self.as_slice().compare(at, other)
+    }
+
+    fn pieces(&self, range: Range<usize>, f: impl FnMut(&[u8])) {
+        self.as_slice().pieces(range, f);
     }
 }
 

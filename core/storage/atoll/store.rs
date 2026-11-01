@@ -1444,7 +1444,8 @@ impl WritePlan {
         self.slots[i]
     }
 
-    /// Writes the `i`th page's copy, sealed as `pids[i]`, to its slot. `landed` gets how the
+    /// Writes the `i`th page's copy, which the caller sealed as `pids[i]` ([`page::seal`]), to its
+    /// slot. `landed` gets how the
     /// write ended once the copy is durable or the write failed; then [`settle`](Self::settle) it.
     /// If the write cannot be submitted, `landed` never runs and the error is returned: settle the
     /// write as failed.
@@ -1454,7 +1455,6 @@ impl WritePlan {
     {
         assert!(self.ready, "writing before the plan is ready");
         let (pid, slot) = (self.pids[i], self.slots[i]);
-        page::seal(copy.as_mut_slice(), pid);
         let (file, at) = self.store.data_file(pid.class(), slot)?;
         let len = copy.len();
         let landed = Mutex::new(Some(landed));

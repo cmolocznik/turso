@@ -19,7 +19,7 @@
 
 use super::super::aligned::AlignedBlock;
 use super::super::log::Lsn;
-use super::super::page::{PageId, SizeClass};
+use super::super::page::{self, PageId, SizeClass};
 use super::super::shared::Bytes;
 use super::super::store::WritePlan;
 use super::frame::{EVICT_AFTER, RESIDENT, WRITING};
@@ -179,30 +179,38 @@ impl Writeback {
             let frame = self.frames[i];
             let h = pool.header(frame);
             debug_assert_eq!(h.pid(), self.pids[i].raw());
-            let copy = Arc::new(AlignedBlock::zeroed(size));
-            let copy_frame = || {
-                // SAFETY: the copy is fresh, and nothing else reaches it yet.
-                let into = unsafe { std::slice::from_raw_parts_mut(copy.as_ptr(), size) };
-                pool.bytes(frame, self.class).copy_to(0, into);
-                h.page_lsn.load(Ordering::Acquire)
-            };
             let outgoing = self.outgoing[i].is_some();
-            self.lsns[i] = if outgoing {
-                // Held by its write-out: nothing changes it.
-                copy_frame()
+            let sealed = !self.temporary;
+            let buffer = if outgoing {
+                // Held by its write-out until the write ends, so nothing changes it: written
+                // straight from its frame, sealed there.
+                if sealed {
+                    // SAFETY: the write-out holds the frame exclusively.
+                    page::seal(&mut unsafe { pool.writer(frame, self.class) }, self.pids[i]);
+                }
+                self.lsns[i] = h.page_lsn.load(Ordering::Acquire);
+                pool.memory.region.buffer(frame, size)
             } else {
-                // The frame keeps its page while it is being written: the copy is whole once
-                // nothing was written under the latch while it was taken.
+                // The frame keeps its page, which may change while it is written: a copy, whole
+                // once nothing was written under the latch while it was taken.
                 debug_assert_eq!(h.status(), RESIDENT);
                 let Some(version) = h.latch.optimistic() else {
                     // A writer holds the page for a moment: come back.
                     return Some(Completion::new_yield());
                 };
-                let lsn = copy_frame();
+                let copy = Arc::new(AlignedBlock::zeroed(size));
+                // SAFETY: the copy is fresh, and nothing else reaches it yet.
+                let into = unsafe { std::slice::from_raw_parts_mut(copy.as_ptr(), size) };
+                pool.bytes(frame, self.class).copy_to(0, into);
+                let lsn = h.page_lsn.load(Ordering::Acquire);
                 if !h.latch.validate(version) {
                     return Some(Completion::new_yield());
                 }
-                lsn
+                if sealed {
+                    page::seal(into, self.pids[i]);
+                }
+                self.lsns[i] = lsn;
+                copy.region(0, size)
             };
             self.next += 1;
             self.unsettled += 1;
@@ -213,8 +221,8 @@ impl Writeback {
                 woken.write_landed(frame, outgoing);
             };
             let written = match &self.plan {
-                Some(plan) => plan.write(i, copy.region(0, size), ended).map(drop),
-                None => pool.temp.write(self.pids[i], copy.region(0, size), ended),
+                Some(plan) => plan.write(i, buffer, ended).map(drop),
+                None => pool.temp.write(self.pids[i], buffer, ended),
             };
             if let Err(e) = written {
                 // It never started: settled as failed, which fails the pool.

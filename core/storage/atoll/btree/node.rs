@@ -664,61 +664,114 @@ pub fn set_value<P: BytesMut + ?Sized>(
     true
 }
 
-/// Rewrites the data area without holes.
-pub fn compact<P: BytesMut + ?Sized>(page: &mut P) {
-    let copy = page.copied(0..page.len());
-    let v = View::new(copy.as_slice());
+/// A run of data in a node, named for its compaction: a fence, or entry `i`'s key and value.
+const UPPER_RUN: u16 = u16::MAX;
+const LOWER_RUN: u16 = u16::MAX - 1;
+
+crate::thread::thread_local! {
+    /// Scratch for [`gather_runs`], kept between calls so a compaction allocates nothing.
+    static RUNS: std::cell::RefCell<Vec<(u16, u16, u16)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Puts the node's runs of data (offset, length, which) in `runs`, in the order they pack toward
+/// its end without holes: highest offset first. Packed so, each run only moves up, onto bytes
+/// already moved or unused.
+fn gather_runs<P: Bytes + ?Sized>(page: &P, runs: &mut Vec<(u16, u16, u16)>) {
+    let v = View::new(page);
     let count = v.count().unwrap();
-    let mut data = page.len();
-    for (at, infinite) in [(UPPER, UPPER_INFINITE), (LOWER, LOWER_INFINITE)] {
-        if copy[FENCES] & infinite == 0 {
-            let (off, len) = (u16_at(copy.as_slice(), at), u16_at(copy.as_slice(), at + 2));
-            data -= len;
-            page.write(data, &copy[off..off + len]);
-            put16(page, at, data);
+    runs.clear();
+    for (at, infinite, which) in [
+        (UPPER, UPPER_INFINITE, UPPER_RUN),
+        (LOWER, LOWER_INFINITE, LOWER_RUN),
+    ] {
+        if page.u8_at(FENCES) & infinite == 0 {
+            runs.push((page.u16_at(at), page.u16_at(at + 2), which));
         }
     }
     for i in 0..count {
         let s = v.slot(i).unwrap();
-        let len = s.key_len + s.value_len;
-        data -= len;
-        page.write(data, &copy[s.off..s.off + len]);
-        put16(page, SLOTS + i * SLOT, data);
+        runs.push((s.off as u16, (s.key_len + s.value_len) as u16, i as u16));
     }
+    runs.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+}
+
+/// Where the run `which` starts.
+fn run_at(which: u16) -> usize {
+    match which {
+        UPPER_RUN => UPPER,
+        LOWER_RUN => LOWER,
+        i => SLOTS + i as usize * SLOT,
+    }
+}
+
+/// Rewrites the data area without holes, in place.
+pub fn compact<P: BytesMut + ?Sized>(page: &mut P) {
+    let size = page.len();
+    let data = RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        gather_runs(&*page, &mut runs);
+        let mut data = size;
+        for &(off, len, which) in runs.iter() {
+            data -= len as usize;
+            if off as usize != data {
+                page.copy_within(off as usize..off as usize + len as usize, data);
+                put16(page, run_at(which), data);
+            }
+        }
+        data
+    });
     page.put_u32(DATA_START, data as u32);
-    debug_assert_eq!(page.len() - data, View::new(&*page).space());
+    debug_assert_eq!(size - data, View::new(&*page).space());
 }
 
 fn update_hints<P: BytesMut + ?Sized>(page: &mut P) {
     let v = View::new(&*page);
     let count = v.count().unwrap();
     let dist = count / (HINT_COUNT + 1);
-    let heads: Vec<u32> = (0..HINT_COUNT)
-        .map(|i| {
-            if count > HINT_COUNT * 2 {
-                v.slot(dist * (i + 1)).unwrap().head
-            } else {
-                0
-            }
-        })
-        .collect();
+    let heads: [u32; HINT_COUNT] = std::array::from_fn(|i| {
+        if count > HINT_COUNT * 2 {
+            v.slot(dist * (i + 1)).unwrap().head
+        } else {
+            0
+        }
+    });
     for (i, h) in heads.into_iter().enumerate() {
         page.put_u32(HINTS + 4 * i, h);
     }
 }
 
 /// The node in `page` as a log record's payload: its header and slots, then its data, with no
-/// holes, so that [`apply_image`] rebuilds it exactly.
+/// holes, so that [`apply_image`] rebuilds it exactly. Read straight from the page, compacted as
+/// it is copied out.
 pub fn image<P: Bytes + ?Sized>(page: &P) -> Vec<u8> {
-    let mut copy = page.copied(0..page.len());
-    compact(copy.as_mut_slice());
-    let v = View::new(copy.as_slice());
-    let head_end = SLOTS + v.count().unwrap() * SLOT;
-    let data = v.data_start().unwrap();
-    let mut out = Vec::with_capacity(4 + head_end - HEADER_SIZE + copy.len() - data);
-    out.extend_from_slice(&((head_end - HEADER_SIZE) as u32).to_le_bytes());
-    out.extend_from_slice(&copy[HEADER_SIZE..head_end]);
-    out.extend_from_slice(&copy[data..]);
+    let count = View::new(page).count().unwrap();
+    let size = page.len();
+    let head_end = SLOTS + count * SLOT;
+    let space = View::new(page).space();
+    let mut out = vec![0u8; 4 + head_end - HEADER_SIZE + space];
+    out[..4].copy_from_slice(&((head_end - HEADER_SIZE) as u32).to_le_bytes());
+    let (head, data) = out[4..].split_at_mut(head_end - HEADER_SIZE);
+    page.copy_to(HEADER_SIZE, head);
+    // The head as it stands at `at` in the page.
+    let head_at = |at: usize| at - HEADER_SIZE;
+    let left = RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        gather_runs(page, &mut runs);
+        let mut left = size;
+        for &(off, len, which) in runs.iter() {
+            let len = len as usize;
+            left -= len;
+            page.copy_to(off as usize, &mut data[left - (size - space)..][..len]);
+            let at = head_at(run_at(which));
+            head[at..at + 2].copy_from_slice(&(left as u16).to_le_bytes());
+        }
+        left
+    });
+    debug_assert_eq!(left, size - space);
+    let at = head_at(DATA_START);
+    head[at..at + 4].copy_from_slice(&(left as u32).to_le_bytes());
     out
 }
 

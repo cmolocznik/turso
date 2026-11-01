@@ -239,8 +239,8 @@ impl Region {
         unsafe { self.map.start.as_ptr().add(at) }
     }
 
-    /// `frame`'s `len` bytes as an IO buffer that keeps the region alive, for a read into a quiet
-    /// frame the caller holds exclusively while the read is in flight.
+    /// `frame`'s `len` bytes as an IO buffer that keeps the region alive: for a read into a quiet
+    /// frame, or a write out of one, that the caller holds exclusively while the IO is in flight.
     pub fn buffer(self: &Arc<Self>, frame: u32, len: usize) -> Arc<Buffer> {
         assert!(frame as usize * MIN_PAGE_SIZE + len <= self.len);
         // SAFETY: inside the region, which the buffer keeps alive.

@@ -355,26 +355,47 @@ impl Tree {
                 if !v.is_node() || v.root() != self.root {
                     return None;
                 }
+                // Reached by a descent its parent validated, the node holds what the parent
+                // routed here: a split or merge that moves its fences changes the parent too.
+                let reaches = match route {
+                    Route::At => v.covers(key)?,
+                    Route::Above => v.covers(key)? || v.lower()?.as_deref() == Some(key),
+                };
+                if !reaches {
+                    return Some(Err((v.level(), v.lower()?, v.upper()?)));
+                }
                 let at = v.level();
                 if at <= level {
-                    return Some((at, None));
+                    return Some(Ok((at, None)));
                 }
                 let pos = match route {
                     Route::At => v.route(key)?,
                     Route::Above => v.search_above(key)?,
                 };
-                Some((at, Some((pos, v.child(pos)?))))
+                Some(Ok((at, Some((pos, v.child(pos)?)))))
             });
             let Some(read) = read else {
                 return Ok(Found::Restart);
             };
-            let Some((at, down)) = read else {
+            let Some(read) = read else {
                 return Err(LimboError::Corrupt(format!(
                     "{:?} is not a node of the B-tree rooted at {:?}",
                     node.pid(),
                     self.root
                 )));
             };
+            let (at, down) =
+                match read {
+                    Ok(step) => step,
+                    Err((at, lower, upper)) => {
+                        return Err(LimboError::Corrupt(format!(
+                        "a descent to {key:?} reached {:?} at level {at}, holding {lower:?} to \
+                         {upper:?}, under {:?}",
+                        node.pid(),
+                        parent.as_ref().map(|(p, pos): &(Optimistic<'_>, usize)| (p.pid(), *pos))
+                    )))
+                    }
+                };
             let Some((pos, (child, hint))) = down else {
                 return Ok(if at == level {
                     Found::Node { node, parent }

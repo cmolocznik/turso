@@ -137,7 +137,9 @@ fn write_copies(db: &Db, pids: &[PageId], version: u8, run: &Runner<'_>) {
         .iter()
         .enumerate()
         .map(|(i, pid)| {
-            plan.write(i, copy(pid.class(), version), |res| {
+            let copy = copy(pid.class(), version);
+            page::seal(copy.as_mut_slice(), *pid);
+            plan.write(i, copy, |res| {
                 res.expect("a write failed");
             })
             .unwrap()
@@ -644,7 +646,9 @@ fn a_latched_metadata_page_makes_its_users_yield_and_none_wait() {
     // A write of `first`, landed and not yet settled.
     let mut plan = db.store.plan_writes(vec![first]);
     drive(&io, || plan.step()).unwrap();
-    let written = plan.write(0, copy(class, 2), |res| res.unwrap()).unwrap();
+    let copy = copy(class, 2);
+    page::seal(copy.as_mut_slice(), first);
+    let written = plan.write(0, copy, |res| res.unwrap()).unwrap();
     drive(&io, || {
         Ok(match written.finished() {
             true => IOResult::Done(()),

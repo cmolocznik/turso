@@ -702,8 +702,9 @@ impl BufferPool {
     /// validated afterwards.
     fn bytes(&self, frame: u32, class: SizeClass) -> &Shared {
         // SAFETY: frames are aligned to 4 KiB and sized in whole pages, and the region outlives
-        // the pool. Its bytes are reached only as `Shared`, but by an IO reading a page into a
-        // frame, which is quiet and held while it does (`Purpose::Read`).
+        // the pool. Its bytes are reached only as `Shared`, but by an IO: a read into a frame,
+        // quiet and held while it runs (`Purpose::Read`), and a write out of a frame its write-out
+        // holds, which only reads it, as readers do.
         unsafe { Shared::from_raw(self.memory.region.ptr(frame), class.size()) }
     }
 

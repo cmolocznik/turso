@@ -36,6 +36,7 @@ mod frame;
 mod memory;
 mod pass;
 mod source;
+mod staging;
 mod table;
 mod temp;
 mod watt;
@@ -198,14 +199,23 @@ pub struct BufferConfig {
     /// (SIGMOD 2020, §3.4) found 128 smoother than 10: each pass writes less at once, and the
     /// log kept for recovery strays less from its budget.
     pub checkpoint_shards: usize,
+    /// Bytes of the writeback buffer ([`staging`]): what copies of pages written back while they
+    /// stay in their frames are made in, and so a bound on such writes in flight. At least the
+    /// largest page.
+    pub writeback_bytes: usize,
 }
 
+/// The default writeback buffer: two of the largest page, so a write of one never waits behind
+/// another, which is far more than the 32 to 128 small writes in flight that keep a device busy.
+pub const WRITEBACK_BYTES: usize = 2 * page::MAX_PAGE_SIZE;
+
 impl BufferConfig {
-    /// A pool of `budget` bytes with the default shards.
+    /// A pool of `budget` bytes with the default shards and writeback buffer.
     pub fn with_budget(budget: usize) -> Self {
         Self {
             budget,
             checkpoint_shards: 128,
+            writeback_bytes: WRITEBACK_BYTES,
         }
     }
 }
@@ -254,6 +264,8 @@ pub struct BufferPool {
     /// Done when a frame is next freed, if anyone waits for that.
     released: Mutex<Option<Completion>>,
     writebacks: Mutex<Vec<Arc<Mutex<Writeback>>>>,
+    /// Where copies of pages written back while they stay in their frames are made.
+    staging: Arc<staging::Staging>,
     writes_in_flight: AtomicUsize,
     failure: Mutex<Option<CompletionError>>,
     /// Checkpoint shards, each a run of frames by position.
@@ -307,6 +319,16 @@ impl BufferPool {
         redo: Lsn,
     ) -> Result<Arc<Self>> {
         let memory = Memory::new(config.budget)?;
+        if config.writeback_bytes < page::MAX_PAGE_SIZE
+            || !config.writeback_bytes.is_multiple_of(page::MIN_PAGE_SIZE)
+        {
+            return Err(LimboError::InternalError(format!(
+                "a writeback buffer of {} bytes holds no copy of the largest page, {} bytes, or is \
+                 not in whole 4 KiB",
+                config.writeback_bytes,
+                page::MAX_PAGE_SIZE
+            )));
+        }
         let grains = memory.grains();
         assert!(
             config.checkpoint_shards > 0,
@@ -335,6 +357,7 @@ impl BufferPool {
             epoch_bytes,
             released: Mutex::new(None),
             writebacks: Mutex::new(Vec::new()),
+            staging: Arc::new(staging::Staging::new(config.writeback_bytes)),
             writes_in_flight: AtomicUsize::new(0),
             failure: Mutex::new(None),
             shards: (0..shards).map(|_| Shard::new(redo)).collect(),

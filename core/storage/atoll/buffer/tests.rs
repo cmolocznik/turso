@@ -21,6 +21,10 @@ fn open(b: &Backend, budget: usize) -> (Arc<Log>, Arc<BufferPool>) {
 }
 
 fn open_on(io: &Arc<dyn IO>, base: &str, budget: usize) -> (Arc<Log>, Arc<BufferPool>) {
+    open_with(io, base, BufferConfig::with_budget(budget))
+}
+
+fn open_with(io: &Arc<dyn IO>, base: &str, config: BufferConfig) -> (Arc<Log>, Arc<BufferPool>) {
     let log = Log::open(
         io.clone(),
         base,
@@ -44,13 +48,8 @@ fn open_on(io: &Arc<dyn IO>, base: &str, budget: usize) -> (Arc<Log>, Arc<Buffer
         log.clone(),
         [[1; CLASS_COUNT]; 2],
     );
-    let pool = BufferPool::new(
-        BufferConfig::with_budget(budget),
-        Arc::new(LocalSource::new(store.clone())),
-        store,
-        0,
-    )
-    .unwrap();
+    let pool =
+        BufferPool::new(config, Arc::new(LocalSource::new(store.clone())), store, 0).unwrap();
     (log, pool)
 }
 
@@ -806,4 +805,43 @@ fn a_pass_waiting_on_its_writeback_wakes_when_another_thread_finishes_it() {
         waited.finished(),
         "the pass waits on a wakeup no one sends once its writeback has finished"
     );
+}
+
+/// A pass writing back more pages than the writeback buffer holds copies of writes what fits,
+/// takes room again as writes land, and writes every page: none is left dirty, and each reads
+/// back as written. The writes stay in flight until the IO steps, so the buffer fills.
+#[test]
+fn a_pass_writes_back_more_pages_than_the_writeback_buffer_holds() {
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
+    let (log, pool) = open_with(
+        &io,
+        "/db/room",
+        BufferConfig {
+            budget: MIN_BUDGET,
+            checkpoint_shards: 1,
+            writeback_bytes: page::MAX_PAGE_SIZE,
+        },
+    );
+    let room = page::MAX_PAGE_SIZE / class(0).size();
+    let mut pids = Vec::new();
+    for v in 0..(room + room / 8) as u64 {
+        let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+        let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+        let pid = g.pid();
+        stamp(&mut g.page_mut(), pid, v);
+        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+        g.changed(lsn);
+        pids.push((pid, v));
+    }
+    assert!(pids.len() > room, "the pages fit the buffer");
+    let mut pass = pool.pass(0);
+    drive(&io, || pass.step(&pool)).unwrap();
+    let dirty = (0..pool.memory.grains())
+        .filter(|&f| pool.header(f).status() == RESIDENT && pool.header(f).dirty())
+        .count();
+    assert_eq!(dirty, 0, "pages left dirty");
+    for (pid, v) in pids {
+        let g = drive(&io, || pool.fix_optimistic(pid, None)).unwrap();
+        assert_eq!(g.read(|p| stamped(p, pid)), Some(Some(v)));
+    }
 }

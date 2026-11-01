@@ -22,6 +22,8 @@ pub const MIN_PAGE_SHIFT: u32 = 12;
 pub const MIN_PAGE_SIZE: usize = 1 << MIN_PAGE_SHIFT;
 /// Number of size classes: 4 KiB to 8 MiB.
 pub const CLASS_COUNT: usize = 12;
+/// The largest page: the last class's.
+pub const MAX_PAGE_SIZE: usize = MIN_PAGE_SIZE << (CLASS_COUNT - 1);
 /// Bytes at the start of every page reserved for the header.
 pub const HEADER_SIZE: usize = 24;
 

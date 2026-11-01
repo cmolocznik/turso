@@ -43,6 +43,7 @@ fn config() -> AtollConfig {
         buffer: BufferConfig {
             budget: MIN_BUDGET,
             checkpoint_shards: 8,
+            writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
         },
         log_budget: Some(96 << 10),
         txn: Default::default(),

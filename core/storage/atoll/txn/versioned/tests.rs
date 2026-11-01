@@ -33,6 +33,7 @@ fn open() -> Db {
         buffer: BufferConfig {
             budget: MIN_BUDGET,
             checkpoint_shards: 8,
+            writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
         txn: TxnConfig { slots: 4 },

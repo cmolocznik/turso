@@ -17,7 +17,6 @@
 //! No log flush comes first: a copy's remap is logged after the copy lands, so a remap that
 //! survives a crash names a copy whose records survived too (DESIGN.md §6.3).
 
-use super::super::aligned::AlignedBlock;
 use super::super::log::Lsn;
 use super::super::page::{self, PageId, SizeClass};
 use super::super::shared::Bytes;
@@ -181,6 +180,8 @@ impl Writeback {
             debug_assert_eq!(h.pid(), self.pids[i].raw());
             let outgoing = self.outgoing[i].is_some();
             let sealed = !self.temporary;
+            // The buffer's room, given back when the write lands, or if it never starts.
+            let mut held = None;
             let buffer = if outgoing {
                 // Held by its write-out until the write ends, so nothing changes it: written
                 // straight from its frame, sealed there.
@@ -194,29 +195,34 @@ impl Writeback {
                 // The frame keeps its page, which may change while it is written: a copy, whole
                 // once nothing was written under the latch while it was taken.
                 debug_assert_eq!(h.status(), RESIDENT);
+                // Room in the writeback buffer, which only writes in flight hold: each gives its
+                // room back as it lands, and wakes the pool. Until then the rest wait unsubmitted.
+                let Some(mut copy) = pool.staging.lease(size) else {
+                    return None;
+                };
                 let Some(version) = h.latch.optimistic() else {
                     // A writer holds the page for a moment: come back.
                     return Some(Completion::new_yield());
                 };
-                let copy = Arc::new(AlignedBlock::zeroed(size));
-                // SAFETY: the copy is fresh, and nothing else reaches it yet.
-                let into = unsafe { std::slice::from_raw_parts_mut(copy.as_ptr(), size) };
-                pool.bytes(frame, self.class).copy_to(0, into);
+                pool.bytes(frame, self.class).copy_to(0, copy.bytes());
                 let lsn = h.page_lsn.load(Ordering::Acquire);
                 if !h.latch.validate(version) {
                     return Some(Completion::new_yield());
                 }
                 if sealed {
-                    page::seal(into, self.pids[i]);
+                    page::seal(copy.bytes(), self.pids[i]);
                 }
                 self.lsns[i] = lsn;
-                copy.region(0, size)
+                held = Some(copy);
+                held.as_ref().map(|c| c.buffer()).expect("just leased")
             };
             self.next += 1;
             self.unsettled += 1;
             pool.writes_in_flight.fetch_add(1, Ordering::AcqRel);
             let (landed, woken) = (self.landed.clone(), pool.clone());
             let ended = move |res: std::result::Result<(), CompletionError>| {
+                // Before the wake, so a waiter woken for room finds it.
+                drop(held);
                 landed.lock().push((i, res));
                 woken.write_landed(frame, outgoing);
             };

@@ -492,12 +492,16 @@ impl BufferPool {
                     Probe::Loading(c) => return Ok(IOResult::IO(IOCompletions(c))),
                     Probe::Outgoing(c) => {
                         // Only stepping its writeback submits its write, and settles it once it
-                        // landed, which completes `c`.
+                        // landed. The write landing completes `c` and wakes the pool's waiters;
+                        // a thread holding the writeback wakes them too if it leaves the write
+                        // unsubmitted, waiting on its plan, and `c` then waits on nothing anyone
+                        // does. So the wait is the pool's, started before the look.
+                        let woken = self.released_wait();
                         if let Some(w) = self.drive_writebacks()? {
                             return Ok(IOResult::IO(IOCompletions(w)));
                         }
                         if !c.finished() {
-                            return Ok(IOResult::IO(IOCompletions(c)));
+                            return Ok(IOResult::IO(IOCompletions(woken)));
                         }
                         let h = self.header(frame);
                         if h.status() == OUTGOING && h.pid() == pid.raw() {
@@ -1387,8 +1391,12 @@ impl BufferPool {
     /// Steps `wb`, unless another thread is stepping it; the only way a writeback is stepped. A
     /// waiter that found it held saw it neither finished nor left for another to step, so once
     /// released after either, the pool's waiters are woken: nothing else would wake that one.
+    /// Nor would anything wake it for a write that landed during the step, after the step took
+    /// the writes landed so far: that write's wakeup came while the writeback was held, and only
+    /// a later step settles it.
     fn step_writeback(self: &Arc<Self>, wb: &Arc<Mutex<Writeback>>) -> Option<Progress> {
         let mut w = wb.try_lock()?;
+        let landings = w.landings();
         let progress = w.step(self);
         #[cfg(test)]
         {
@@ -1403,7 +1411,13 @@ impl BufferPool {
         }
         drop(w);
         match progress {
-            Progress::InFlight => {}
+            // Checked once released: a write landing after this wakes the waiters itself, with
+            // the writeback free to step.
+            Progress::InFlight => {
+                if !landings.lock().is_empty() {
+                    self.signal_released();
+                }
+            }
             Progress::Done => {
                 self.writebacks.lock().retain(|q| !Arc::ptr_eq(q, wb));
                 self.signal_released();

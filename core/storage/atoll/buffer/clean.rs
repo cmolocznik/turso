@@ -30,7 +30,7 @@ use crate::types::{IOCompletions, IOResult};
 use crate::CompletionError;
 
 /// Writes that ended and are not yet settled, by position, with how each ended.
-type Landed = Arc<Mutex<Vec<(usize, std::result::Result<(), CompletionError>)>>>;
+pub(super) type Landed = Arc<Mutex<Vec<(usize, std::result::Result<(), CompletionError>)>>>;
 
 /// What stepping a writeback came to.
 pub enum Progress {
@@ -64,6 +64,12 @@ pub struct Writeback {
     /// Run just before the writeback finishes, while its stepper holds it.
     #[cfg(test)]
     pub before_finish: Option<Box<dyn FnOnce() + Send>>,
+    /// Run once a step has taken the writes landed so far, while its stepper holds it.
+    #[cfg(test)]
+    pub after_taking_landed: Option<Box<dyn FnOnce() + Send>>,
+    /// Run as a step begins, while its stepper holds it.
+    #[cfg(test)]
+    pub before_step: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Writeback {
@@ -94,7 +100,16 @@ impl Writeback {
             finished,
             #[cfg(test)]
             before_finish: None,
+            #[cfg(test)]
+            after_taking_landed: None,
+            #[cfg(test)]
+            before_step: None,
         }
+    }
+
+    /// The writes landed and not yet settled, shared with their completions.
+    pub fn landings(&self) -> Landed {
+        self.landed.clone()
     }
 
     /// Where it stands, for a test that stalled to show.
@@ -130,10 +145,18 @@ impl Writeback {
         if self.finished.finished() {
             return Progress::Done;
         }
+        #[cfg(test)]
+        if let Some(hook) = self.before_step.take() {
+            hook();
+        }
         if let Some(c) = self.submit(pool) {
             return Progress::Waiting(c);
         }
         let landed = std::mem::take(&mut *self.landed.lock());
+        #[cfg(test)]
+        if let Some(hook) = self.after_taking_landed.take() {
+            hook();
+        }
         let mut landed = landed.into_iter();
         while let Some((i, res)) = landed.next() {
             if let Some(plan) = &mut self.plan {

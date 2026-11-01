@@ -931,3 +931,122 @@ fn a_frame_is_read_into_only_once_every_grain_it_spans_is_quiet() {
         _ => panic!("the frame stayed unquiet after the reader left"),
     }
 }
+
+/// A write that lands while another thread steps its writeback, after that step took the writes
+/// landed so far, is left for the next step. A waiter that found the writeback held when the
+/// write's own wakeup had already passed waits for the stepper: the stepper wakes it.
+#[test]
+fn a_write_landing_during_another_threads_step_wakes_whoever_waits_on_the_writeback() {
+    // Writes stay in flight until the IO steps, which completes them in an order its seed picks:
+    // a seed whose write is still in flight once the pass submitted it builds the case.
+    let mut built = 0;
+    for seed in 0..32 {
+        let crash = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let (log, pool) = open_on(&io, "/db/landed", MIN_BUDGET);
+        let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+        let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+        let pid = g.pid();
+        stamp(&mut g.page_mut(), pid, 1);
+        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+        g.changed(lsn);
+        let frame = g.frame;
+        drop(g);
+        drop(admitted);
+        // Stepped until it submits the write, and no further: its wait ends only once it lands.
+        let mut pass = pool.pass(pool.shard_of(frame));
+        loop {
+            match pass.step(&pool).unwrap() {
+                IOResult::IO(IOCompletions(_))
+                    if pool.writes_in_flight.load(Ordering::Acquire) > 0 =>
+                {
+                    break
+                }
+                IOResult::IO(IOCompletions(c)) => io.wait_for_completion(c).unwrap(),
+                IOResult::Done(()) => panic!("the pass wrote nothing"),
+            }
+        }
+        let wb = pool.writebacks.lock()[0].clone();
+        let landings = wb.lock().landings();
+        if !landings.lock().is_empty() || crash.in_flight() == 0 {
+            continue;
+        }
+        built += 1;
+        // Inside the step, once it took the landed writes (none): the write lands, its wakeup
+        // passes, and a waiter finds the writeback held.
+        let waited: Arc<Mutex<Option<Completion>>> = Arc::new(Mutex::new(None));
+        wb.lock().after_taking_landed = Some({
+            let (pool, waited, crash, io) =
+                (pool.clone(), waited.clone(), crash.clone(), io.clone());
+            Box::new(move || {
+                while crash.in_flight() > 0 {
+                    io.step().unwrap();
+                }
+                assert!(!landings.lock().is_empty(), "the write did not land");
+                match pool.settle_writes().unwrap() {
+                    IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
+                    IOResult::Done(()) => panic!("settled with the write unsettled"),
+                }
+            })
+        });
+        assert!(pool.drive_writebacks().unwrap().is_none());
+        let waited = waited.lock().take().expect("the waiter looked");
+        assert!(
+            waited.finished(),
+            "seed {seed}: the waiter waits on a wakeup no one sends, with its write landed and \
+             unsettled"
+        );
+    }
+    assert!(built > 0, "no seed left the write in flight");
+}
+
+/// A page leaving its frame, wanted while another thread steps its write-out, which waits on
+/// its write plan before it submits the write: the reader waits for that thread, and is woken by
+/// it, not by the write, which nothing submits until someone steps the write-out again.
+#[test]
+fn a_reader_of_a_page_written_out_wakes_when_its_write_out_waits_before_submitting() {
+    // Reads stay in flight until the IO steps, so the write plan's metadata page waits.
+    let crash = Arc::new(CrashIO::new(3));
+    let io: Arc<dyn IO> = crash.clone();
+    let (log, pool) = open_on(&io, "/db/outgoing", MIN_BUDGET);
+    let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+    let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+    let pid = g.pid();
+    stamp(&mut g.page_mut(), pid, 1);
+    let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+    g.changed(lsn);
+    let frame = g.frame;
+    drop(g);
+    drop(admitted);
+    // The page leaves its frame, as a drain makes it.
+    let hold = pool
+        .latch_to_evict(class(0), frame, || FrameLatch {
+            frames: pool.frames.clone(),
+            frame,
+        })
+        .expect("the page is held by no one");
+    let out = pool.start_write_out(hold);
+    pool.write_out(class(0), vec![out]);
+    let waited: Arc<Mutex<Option<Completion>>> = Arc::new(Mutex::new(None));
+    let wb = pool.writebacks.lock()[0].clone();
+    wb.lock().before_step = Some({
+        let (pool, waited) = (pool.clone(), waited.clone());
+        Box::new(move || match pool.fix_optimistic(pid, None).unwrap() {
+            IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
+            IOResult::Done(_) => panic!("the page read as resident while it is written out"),
+        })
+    });
+    match pool.drive_writebacks().unwrap() {
+        Some(c) if !c.finished() => {}
+        other => panic!(
+            "the write-out did not wait before submitting: {:?}",
+            other.map(|c| c.finished())
+        ),
+    }
+    assert_eq!(pool.writes_in_flight.load(Ordering::Acquire), 0);
+    let waited = waited.lock().take().expect("the reader looked");
+    assert!(
+        waited.finished(),
+        "the reader waits for a write no one submits while the write-out waits on its plan"
+    );
+}

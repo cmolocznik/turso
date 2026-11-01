@@ -287,6 +287,15 @@ impl Reserved {
 }
 
 impl Runs {
+    #[cfg(test)]
+    fn describe(&self) -> String {
+        let reserved = self
+            .reserved
+            .as_ref()
+            .map(|r| (r.start, r.order, r.missing, r.class));
+        format!("{:?} reserved {reserved:?}", self.free)
+    }
+
     fn new(batches: u32) -> Self {
         let mut free: [BTreeSet<u32>; ORDERS] = Default::default();
         let mut start = 0;
@@ -788,6 +797,32 @@ impl Memory {
     }
 
     /// Bytes of the region each class holds.
+    /// Each class's batches: (batch, frames taken, draining), for a test to show.
+    #[cfg(test)]
+    pub fn describe(&self) -> String {
+        let mut out = String::new();
+        for class in SizeClass::all() {
+            let c = self.classes[class.index()].lock();
+            if c.all.is_empty() {
+                continue;
+            }
+            let batches: Vec<_> = c
+                .all
+                .iter()
+                .map(|&b| {
+                    (
+                        b,
+                        self.taken[b as usize].load(Ordering::Relaxed),
+                        self.draining[b as usize].load(Ordering::Relaxed) == 1,
+                    )
+                })
+                .collect();
+            out.push_str(&format!("{class:?}: {batches:?} partial {:?}\n", c.partial));
+        }
+        out.push_str(&format!("free runs: {:?}\n", self.runs.lock().describe()));
+        out
+    }
+
     pub fn held(&self) -> [usize; CLASS_COUNT] {
         let mut out = [0; CLASS_COUNT];
         for class in SizeClass::all() {

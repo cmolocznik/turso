@@ -977,6 +977,19 @@ impl BufferPool {
         yield_now()
     }
 
+    /// The pool's memory and writes, for a test that stalled to show.
+    #[cfg(test)]
+    pub fn describe(&self) -> String {
+        format!(
+            "{}writebacks queued {}, writes in flight {}, draining {:?}, failure {:?}",
+            self.memory.describe(),
+            self.writebacks.lock().len(),
+            self.writes_in_flight.load(Ordering::Acquire),
+            self.memory.draining(),
+            self.failure.lock().as_ref(),
+        )
+    }
+
     fn released_wait(&self) -> Completion {
         self.released
             .lock()

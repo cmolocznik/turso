@@ -603,7 +603,7 @@ fn concurrent_pages(ops: usize, seed: u64) {
                 match (*slot, rng.random_range(0..4)) {
                     (None, _) => {
                         let mut admitted = admit();
-                        let mut g = named(&io, "allocate", || pool.allocate(class));
+                        let mut g = named_in(&io, "allocate", Some(&pool), || pool.allocate(class));
                         let pid = g.pid();
                         stamp(&mut g.page_mut(), pid, 1);
                         let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
@@ -656,11 +656,25 @@ fn concurrent_pages(ops: usize, seed: u64) {
 
 /// Drives `op` like [`drive`], and names it in a panic once it has been tried 100,000 times: a
 /// schedule that livelocks says where.
-fn named<T>(io: &Arc<dyn IO>, name: &str, mut op: impl FnMut() -> Result<IOResult<T>>) -> T {
+fn named<T>(io: &Arc<dyn IO>, name: &str, op: impl FnMut() -> Result<IOResult<T>>) -> T {
+    named_in(io, name, None, op)
+}
+
+/// [`named`], showing `pool`'s state in the panic too.
+fn named_in<T>(
+    io: &Arc<dyn IO>,
+    name: &str,
+    pool: Option<&BufferPool>,
+    mut op: impl FnMut() -> Result<IOResult<T>>,
+) -> T {
     let mut tries = 0u64;
     drive(io, || {
         tries += 1;
-        assert!(tries < 100_000, "{name} tried {tries} times");
+        assert!(
+            tries < 100_000,
+            "{name} tried {tries} times\n{}",
+            pool.map_or(String::new(), BufferPool::describe)
+        );
         op()
     })
     .unwrap()

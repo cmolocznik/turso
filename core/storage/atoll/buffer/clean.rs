@@ -97,6 +97,23 @@ impl Writeback {
         }
     }
 
+    /// Where it stands, for a test that stalled to show.
+    #[cfg(test)]
+    pub fn describe(&self) -> String {
+        format!(
+            "{:?} frames {:?} next {} unsettled {} landed {} outgoing {} plan {}",
+            self.class,
+            self.frames,
+            self.next,
+            self.unsettled,
+            self.landed.lock().len(),
+            self.outgoing.iter().filter(|o| o.is_some()).count(),
+            self.plan
+                .as_ref()
+                .map_or_else(|| "none".to_string(), WritePlan::describe),
+        )
+    }
+
     /// Writes out `outgoing`, pages leaving their frames.
     pub fn out(class: SizeClass, outgoing: Vec<Outgoing>, temporary: bool) -> Self {
         let frames = outgoing.iter().map(Outgoing::frame).collect();

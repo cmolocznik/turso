@@ -1280,6 +1280,20 @@ pub struct WritePlan {
 }
 
 impl WritePlan {
+    /// Where it stands, for a test that stalled to show.
+    #[cfg(test)]
+    pub fn describe(&self) -> String {
+        format!(
+            "admitted {} intent {:?} slots {} held {}/{} ready {}",
+            self.admitted.is_some(),
+            self.intent,
+            self.slots.len(),
+            self.frames.len(),
+            self.pids.len(),
+            self.ready
+        )
+    }
+
     pub fn step(&mut self) -> Result<IOResult<()>> {
         if self.ready {
             return Ok(IOResult::Done(()));

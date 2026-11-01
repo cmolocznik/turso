@@ -1003,10 +1003,40 @@ impl BufferPool {
     /// The pool's memory and writes, for a test that stalled to show.
     #[cfg(test)]
     pub fn describe(&self) -> String {
+        let queued: Vec<String> = self
+            .writebacks
+            .lock()
+            .iter()
+            .map(|wb| match wb.try_lock() {
+                Some(w) => w.describe(),
+                None => "held by its stepper".to_string(),
+            })
+            .collect();
+        // What is left in each draining batch.
+        let left: Vec<_> = self
+            .memory
+            .draining()
+            .into_iter()
+            .flat_map(|(class, batch)| {
+                (0..memory::frames_per_batch(class))
+                    .map(move |i| memory::frame_at(class, batch, i))
+                    .filter(move |&f| !self.memory.is_free(class, f))
+                    .map(|f| {
+                        let h = self.header(f);
+                        (
+                            f,
+                            h.status(),
+                            h.flags.load(Ordering::Acquire),
+                            h.latch.optimistic().is_none(),
+                            h.dirty(),
+                        )
+                    })
+            })
+            .collect();
         format!(
-            "{}writebacks queued {}, writes in flight {}, draining {:?}, failure {:?}",
+            "{}writebacks {queued:?}, writes in flight {}, draining {:?}, left in them (frame, \
+             status, flags, latched, dirty) {left:?}, failure {:?}",
             self.memory.describe(),
-            self.writebacks.lock().len(),
             self.writes_in_flight.load(Ordering::Acquire),
             self.memory.draining(),
             self.failure.lock().as_ref(),

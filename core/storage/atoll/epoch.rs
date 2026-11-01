@@ -92,7 +92,10 @@ impl Epochs {
             }
             entry.depth.set(entry.depth.get() + 1);
         });
-        Step { epochs: self }
+        Step {
+            epochs: self,
+            _thread: std::marker::PhantomData,
+        }
     }
 
     fn leave(&self) {
@@ -144,9 +147,11 @@ impl Epochs {
     }
 }
 
-/// A step in progress.
+/// A step in progress. It ends on the thread that entered it: its announcement and nesting are
+/// that thread's, so it cannot be sent to another, nor can any guard holding one.
 pub struct Step<'e> {
     epochs: &'e Epochs,
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for Step<'_> {

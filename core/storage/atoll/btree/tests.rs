@@ -136,7 +136,9 @@ fn check_whole(tree: &Tree, db: &Atoll, run: &Runner<'_>, label: &str) -> Stats 
     let lost: Vec<_> = expected.difference(&allocated).collect();
     assert!(
         leaked.is_empty() && lost.is_empty(),
-        "{label}: pages allocated and unreachable {leaked:?}; reachable and free {lost:?}"
+        "{label}: pages allocated and unreachable {leaked:?}; reachable and free {lost:?}; \
+         handed over to be freed {:?}",
+        db.store().orphans()
     );
     stats
 }
@@ -913,6 +915,9 @@ fn concurrent_tree(seed: u64, ops: u64) {
         entries == expected.into_iter().collect::<Vec<_>>(),
         "the tree differs from what the writers wrote"
     );
+    // A merge whose free of the node it emptied had to wait hands the node to the checkpointer,
+    // which frees it on its next step.
+    run(&mut || db.checkpointer().step());
     check_whole(&tree, &db, &run, "schedules");
 }
 

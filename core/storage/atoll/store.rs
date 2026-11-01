@@ -738,6 +738,12 @@ impl PageStore {
         self.orphans.lock().push(pid);
     }
 
+    /// The pages handed over and not yet taken to be freed.
+    #[cfg(test)]
+    pub fn orphans(&self) -> Vec<PageId> {
+        self.orphans.lock().clone()
+    }
+
     /// The pages handed over with [`orphaned`](Self::orphaned), for whoever frees them.
     pub fn take_orphans(&self) -> Vec<PageId> {
         std::mem::take(&mut *self.orphans.lock())

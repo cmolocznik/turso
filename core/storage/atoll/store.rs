@@ -33,6 +33,7 @@ use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
 use super::meta::{MetaCache, MetaFrame, MetaHold, MetaId, Tree};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
+use super::{whole, whole_write};
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex, OnceLock};
@@ -460,16 +461,16 @@ impl PageStore {
         })
     }
 
-    /// The page-table leaf holding `pid`'s entry, pinned in the metadata cache until the caller
-    /// unpins it, so every change to the entry reaches this frame; `None` if the page table does
-    /// not reach `pid`, whose entry is then [`FREE`].
-    pub fn pinned_leaf(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Option<Arc<MetaFrame>>>> {
+    /// The page-table leaf holding `pid`'s entry, which stays in the metadata cache while held, so
+    /// every change to the entry reaches it; `None` if the page table does not reach `pid`, whose
+    /// entry is then [`FREE`].
+    pub fn leaf(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Option<Arc<MetaFrame>>>> {
         let class = pid.class();
         if pid.number() >= radix::capacity(Tree::Map, self.height(Tree::Map, class)) {
             return Ok(IOResult::Done(None));
         }
         let leaf = radix::path(Tree::Map, class, 1, pid.number())[0];
-        Ok(match self.meta.get_pinned(leaf)? {
+        Ok(match self.meta.get(leaf)? {
             IOResult::Done(f) => IOResult::Done(Some(f)),
             IOResult::IO(io) => IOResult::IO(io),
         })
@@ -1036,11 +1037,9 @@ impl PageStore {
                 let (file, at) = self.data_file(class, slot)?;
                 if file.punch_hole(at as usize, class.size()).is_err() {
                     let zeros = Arc::new(AlignedBlock::zeroed(class.size()));
-                    pending.push(file.pwrite(
-                        at,
-                        zeros.region(0, class.size()),
-                        Completion::new_write(|_| {}),
-                    )?);
+                    let (write, zeroed) = whole_write(class.size());
+                    drop(file.pwrite(at, zeros.region(0, class.size()), write)?);
+                    pending.push(zeroed);
                 }
                 files.insert((class, slot / self.slots_per_file(class)), file);
             }
@@ -1399,7 +1398,7 @@ impl WritePlan {
         }
     }
 
-    /// Loads and pins, for each page, the page-table pages of its entry and the free-space pages
+    /// Loads and holds, for each page, the page-table pages of its entry and the free-space pages
     /// of the slots its remap frees and its release would give back.
     fn hold_remap_pages(
         &mut self,
@@ -1434,9 +1433,6 @@ impl WritePlan {
             if self.frames.is_empty() {
                 store.plans.lock()[class.index()] += 1;
             }
-            for f in &frames {
-                f.pin();
-            }
             self.frames.push(frames);
         }
         Ok(IOResult::Done(()))
@@ -1462,11 +1458,7 @@ impl WritePlan {
         let len = copy.len();
         let landed = Mutex::new(Some(landed));
         let c = Completion::new_write(move |res| {
-            let res = match res {
-                Ok(n) if n as usize == len => Ok(()),
-                Ok(_) => Err(CompletionError::ShortWrite),
-                Err(e) => Err(e),
-            };
+            let res = whole(len, res);
             // Taken out first: no lock is held while a callback runs.
             let landed = landed.lock().take();
             if let Some(landed) = landed {
@@ -1570,11 +1562,6 @@ impl WritePlan {
 
 impl Drop for WritePlan {
     fn drop(&mut self) {
-        for frames in &self.frames {
-            for f in frames {
-                f.unpin();
-            }
-        }
         if let Some(pid) = self.pids.first() {
             if !self.frames.is_empty() {
                 self.store.plans.lock()[pid.class().index()] -= 1;
@@ -1631,14 +1618,11 @@ impl<'a> Locked<'a> {
 
     /// Stamps every page with the change's LSN and marks it dirty.
     fn commit(self, cache: &MetaCache, start: Lsn, lsn: Lsn) {
-        let Self { holds, frames, .. } = self;
-        for (mut hold, frame) in holds.into_iter().zip(frames) {
+        for mut hold in self.holds {
             let page = hold.page();
             let current = page::lsn(page);
             page::set_lsn(page, lsn.max(current));
-            // The page before its state, the order every change takes them in.
-            drop(hold);
-            frame.changed(cache, start);
+            hold.commit(cache, start);
         }
     }
 }

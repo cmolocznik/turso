@@ -9,6 +9,7 @@
 use super::aligned::AlignedBlock;
 use super::log::Lsn;
 use super::page::CLASS_COUNT;
+use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
@@ -122,12 +123,12 @@ impl Control {
         let durable = Completion::new_wait();
         let done = durable.clone();
         if self.file.supports_durable_writes() {
-            let c = Completion::new_write(move |res| finish(&done, res.map(|_| ())));
+            let c = Completion::new_write(move |res| finish(&done, whole(SIZE, res)));
             drop(self.file.pwrite_durable(at, block.region(0, SIZE), c)?);
         } else {
             let file = self.file.clone();
-            let c = Completion::new_write(move |res| match res {
-                Ok(_) => {
+            let c = Completion::new_write(move |res| match whole(SIZE, res) {
+                Ok(()) => {
                     let after = done.clone();
                     let synced = Completion::new_sync(move |r| finish(&after, r.map(|_| ())));
                     if let Err(e) = file.sync_data(synced) {
@@ -188,18 +189,23 @@ fn io_failure(e: &LimboError) -> CompletionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::crash::{CrashIO, Faults};
 
-    #[test]
-    fn a_superblock_reads_back_as_written_and_not_once_any_byte_flips() {
-        let sb = Superblock {
-            seq: 7,
+    fn superblock(seq: u64) -> Superblock {
+        Superblock {
+            seq,
             redo: 12_288,
             segment_bytes: 1 << 28,
             file_bytes: 1 << 40,
             database_id: [9; 16],
             heights: [[2; CLASS_COUNT], [1; CLASS_COUNT]],
             clock: 1 << 40,
-        };
+        }
+    }
+
+    #[test]
+    fn a_superblock_reads_back_as_written_and_not_once_any_byte_flips() {
+        let sb = superblock(7);
         let bytes = sb.encode();
         assert_eq!(Superblock::decode(&bytes), Some(sb));
         for at in [0, 16, 24, HEIGHTS, CLOCK, SIZE - 1] {
@@ -210,6 +216,31 @@ mod tests {
                 None,
                 "a flip at {at} went unseen"
             );
+        }
+    }
+
+    /// A superblock write that lands short has failed, with or without durable writes: counted as
+    /// durable, a checkpoint would release the log before the superblock that needs it is whole.
+    #[test]
+    fn a_short_superblock_write_fails_and_leaves_the_one_before_in_charge() {
+        for durable_writes in [true, false] {
+            let crash = Arc::new(CrashIO::new(5));
+            crash.set_durable_writes(durable_writes);
+            let io: Arc<dyn IO> = crash.clone();
+            let (control, newest) = Control::open(io.clone(), "/db/short").unwrap();
+            assert_eq!(newest, None);
+            control.write_and_wait(&superblock(1)).unwrap();
+            crash.set_faults(Faults {
+                short_write: 1.0,
+                ..Faults::default()
+            });
+            assert!(
+                control.write_and_wait(&superblock(2)).is_err(),
+                "a short write counted as durable (durable writes: {durable_writes})"
+            );
+            crash.set_faults(Faults::default());
+            let (_, newest) = Control::open(io, "/db/short").unwrap();
+            assert_eq!(newest, Some(superblock(1)));
         }
     }
 }

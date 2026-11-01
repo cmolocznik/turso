@@ -49,16 +49,14 @@ struct Db {
 }
 
 fn create(io: Arc<dyn IO>, base: &str) -> Db {
+    create_with(io, base, store_config())
+}
+
+fn create_with(io: Arc<dyn IO>, base: &str, config: StoreConfig) -> Db {
     let (control, sb) = Control::open(io.clone(), base).unwrap();
     assert!(sb.is_none());
     let log = Log::open(io.clone(), base, log_config(), 0).unwrap();
-    let store = PageStore::new(
-        io.clone(),
-        base,
-        store_config(),
-        log.clone(),
-        [[1; CLASS_COUNT]; 2],
-    );
+    let store = PageStore::new(io.clone(), base, config, log.clone(), [[1; CLASS_COUNT]; 2]);
     let mut db = Db {
         io,
         log,
@@ -551,7 +549,7 @@ fn records_decode_as_encoded() {
 /// takes the locks in one order (CONCURRENCY.md §8).
 #[cfg(shuttle)]
 #[test]
-fn frees_and_metadata_writes_never_wait_on_each_other_in_every_schedule() {
+fn frees_and_metadata_writes_never_wait_on_each_other_in_shuttle_schedules() {
     crate::storage::atoll::testing::schedules(
         || {
             let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
@@ -589,7 +587,7 @@ fn frees_and_metadata_writes_never_wait_on_each_other_in_every_schedule() {
 /// the page in memory under it (CONCURRENCY.md §4, §6).
 #[cfg(shuttle)]
 #[test]
-fn a_freed_number_waits_out_its_freers_step_in_every_schedule() {
+fn a_freed_number_waits_out_its_freers_step_in_shuttle_schedules() {
     crate::storage::atoll::testing::schedules(
         || {
             let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
@@ -669,4 +667,90 @@ fn a_latched_metadata_page_makes_its_users_yield_and_none_wait() {
     drive(&io, || db.store.allocate(class)).unwrap();
     drive(&io, || db.store.free(pid)).unwrap();
     checkpoint(&mut db);
+}
+
+/// Two changes to one metadata page, each committed by its own thread: the page's oldest unwritten
+/// change is the first one's, whichever thread notes its change first. A page noted at the later
+/// change's record would let a checkpoint's redo point pass the earlier one, still unwritten.
+#[cfg(shuttle)]
+#[test]
+fn a_metadata_page_keeps_its_oldest_change_whatever_order_commits_finish_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || {
+            let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+            let mut db = create(io.clone(), BASE);
+            drive(&db.io, || db.store.allocate(class(1))).unwrap();
+            checkpoint(&mut db);
+            assert_eq!(db.store.meta.oldest_unwritten(), None);
+            // Where the first change's record starts: both allocations change the same leaf.
+            let first = db.log.end();
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let (io, store) = (io.clone(), db.store.clone());
+                    crate::thread::spawn(move || {
+                        drive(&io, || store.allocate(class(1))).unwrap();
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            assert_eq!(db.store.meta.oldest_unwritten(), Some(first));
+        },
+        300,
+    );
+}
+
+/// A metadata page stays in the cache while anyone holds it, however small the cache: here two
+/// allocations in different classes and a checkpointer share a cache of one page. A page dropped
+/// while an allocation held it would lose the allocation's change, and its number would be handed
+/// out again.
+#[cfg(shuttle)]
+#[test]
+fn a_metadata_page_in_use_stays_in_a_cache_too_small_for_it_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || {
+            let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+            let config = StoreConfig {
+                meta_pages: 1,
+                ..store_config()
+            };
+            let db = create_with(io.clone(), BASE, config);
+            let allocators: Vec<_> = (0..2)
+                .map(|c| {
+                    let (io, store) = (io.clone(), db.store.clone());
+                    crate::thread::spawn(move || {
+                        (0..3)
+                            .map(|_| drive(&io, || store.allocate(class(c))).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let (cio, cstore, clog) = (io.clone(), db.store.clone(), db.log.clone());
+            let checkpointer = crate::thread::spawn(move || {
+                for _ in 0..3 {
+                    drive(&cio, || cstore.write_metadata(clog.end())).unwrap();
+                }
+            });
+            let pids: Vec<PageId> = allocators
+                .into_iter()
+                .flat_map(|t| t.join().unwrap())
+                .collect();
+            checkpointer.join().unwrap();
+            let distinct: BTreeSet<PageId> = pids.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                pids.len(),
+                "a number was handed out twice: {pids:?}"
+            );
+            for pid in pids {
+                assert_ne!(
+                    drive(&io, || db.store.entry(pid)).unwrap(),
+                    FREE,
+                    "{pid:?} lost"
+                );
+            }
+        },
+        300,
+    );
 }

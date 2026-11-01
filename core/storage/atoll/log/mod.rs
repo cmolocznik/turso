@@ -40,6 +40,7 @@ pub use reader::{LogReader, OwnedRecord};
 pub use record::{framed_len, Header, Kind, Lsn, Place, ALIGN, BLOCK, MAX_PAYLOAD};
 
 use super::aligned::AlignedBlock;
+use super::{whole, whole_write};
 use crate::io::{Completion, CompletionGroup, IO};
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -243,12 +244,9 @@ impl Log {
         let mut at = from;
         while at < segments.size {
             let len = (segments.size - at).min(zeros.len() as u64);
-            let c = file.pwrite(
-                at,
-                zeros.region(0, len as usize),
-                Completion::new_write(|_| {}),
-            )?;
-            io.wait_for_completion(c)?;
+            let (write, zeroed) = whole_write(len as usize);
+            drop(file.pwrite(at, zeros.region(0, len as usize), write)?);
+            io.wait_for_completion(zeroed)?;
             at += len;
         }
         io.wait_for_completion(file.sync_data(Completion::new_sync(|_| {}))?)?;
@@ -639,12 +637,7 @@ impl Log {
         let me = self.clone();
         let len = end - start;
         let c = Completion::new_write(move |res| {
-            let res = match res {
-                Ok(n) if n as u64 == len => Ok(()),
-                Ok(_) => Err(CompletionError::ShortWrite),
-                Err(e) => Err(e),
-            };
-            me.written(start, end, segment, res);
+            me.written(start, end, segment, whole(len as usize, res));
         });
         let at = start - self.segments.start(segment);
         let submitted = if self.durable_writes {
@@ -826,9 +819,8 @@ impl Log {
         }
         let len = (self.segments.size - at).min(self.zeros.len() as u64);
         let me = self.clone();
-        let c = Completion::new_write(move |res| match res {
-            Ok(n) if n as u64 == len => me.zero_fill(number, at + len),
-            Ok(_) => me.fail(CompletionError::ShortWrite),
+        let c = Completion::new_write(move |res| match whole(len as usize, res) {
+            Ok(()) => me.zero_fill(number, at + len),
             Err(e) => me.fail(e),
         });
         if let Err(e) = file.pwrite(at, self.zeros.region(0, len as usize), c) {

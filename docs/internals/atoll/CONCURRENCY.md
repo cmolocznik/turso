@@ -1,8 +1,8 @@
 # Atoll concurrency, from first principles
 
-A proposal replacing every concurrency mechanism in Atoll. Nothing here is built yet. Once
-approved, it replaces DESIGN.md §9.2-§9.4 (latching and replacement), the latching part of §13,
-§18, and the waits of §11.3.
+How Atoll runs concurrently. It replaces every earlier mechanism: DESIGN.md §9.2-§9.4 (latching
+and replacement), the latching part of §13, §18, and the waits of §11.3. Step 1 of the order of
+work (§10) is built; step 2 is not finished, and steps 3 to 5 are not started.
 
 ## 1. What must hold
 
@@ -43,7 +43,10 @@ Each object belongs to exactly one of four classes, named in its type's document
    through epochs (section 4).
 2. **One writer, optimistic readers.** B-tree nodes, page table and free-space pages, frame
    headers. A writer holds the object's exclusive latch; readers read without a latch and
-   validate its version afterwards. There is no shared latch mode at all.
+   validate its version afterwards. There is no shared latch mode at all. A reader may overlap a
+   writer, so both touch the object's bytes only through atomic accesses, relaxed loads and
+   stores: a plain read overlapping a write is a data race, undefined behaviour even when
+   validation then throws its result away.
 3. **Owned by one context at a time.** A transaction's state, an operation in progress, a
    writeback, a recovery partition, a slot's version index while its transaction writes. Handed
    over explicitly; no synchronization while owned.
@@ -169,11 +172,14 @@ Anything that fits none of these is a design error.
 
 ## 9. Proof
 
-- **Deterministic interleavings.** Turso's sync layer runs on `shuttle` under `cfg(shuttle)`, and
-  Atoll uses it. Each module gets schedule tests over its invariants: the buffer manager (pages
-  keep their bytes through eviction, class moves and frees), B-trees (a sorted-map model through
-  concurrent puts, removes, splits, merges and scans), transactions (snapshots see exactly the
-  commits before them; no lost update; deadlocks always broken), recovery.
+- **Shuttle schedules.** Turso's sync layer runs on `shuttle` under `cfg(shuttle)`, and Atoll uses
+  it. Each module gets schedule tests over its invariants: the buffer manager (pages keep their
+  bytes through eviction, class moves and frees), B-trees (a sorted-map model through concurrent
+  puts, removes, splits, merges and scans), transactions (snapshots see exactly the commits
+  before them; no lost update; deadlocks always broken), recovery. A schedule test runs 300
+  random and 300 PCT schedules: a sample of the interleavings, not all of them. Its name ends in
+  `_in_shuttle_schedules`, so `make test-shuttle` runs it, and a workload that keeps some
+  operations apart says which races it leaves out.
 - **Contention stress.** Every concurrent test also runs 12 copies at once on the 16-core host,
   with a run count sized to the failure rate being ruled out.
 - **Done** means both are clean, with the counts reported. A component that has only passed
@@ -181,10 +187,10 @@ Anything that fits none of these is a design error.
 
 ## 10. Order of work
 
-1. Epochs, the one latch kind with guards, yields instead of spins.
+1. Epochs, the one latch kind with guards, yields instead of spins. Built.
 2. The buffer manager: validation before IO, epoch-deferred ids, batches checked under the latch
    (§4), no relocation, no shared reads, metadata pages latched the same way, writes settled in
-   steps. Schedule tests.
+   steps, page bytes read and written only through atomic accesses (§3). Schedule tests.
 3. B-trees on top: schedule tests and stress, then the scan livelock found or proved gone.
 4. Transactions: lock-free commit logs, waits as completions, deadlock detection, and a log flush
    that holds no mutex across its writes. Schedule tests.

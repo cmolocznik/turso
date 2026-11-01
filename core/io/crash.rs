@@ -33,12 +33,15 @@ use std::sync::Arc;
 /// The unit a crash tears a write at.
 pub const SECTOR: usize = 512;
 
-/// Chances, from 0 to 1, that an operation fails with an IO error.
+/// Chances, from 0 to 1, that an operation fails with an IO error, or, for `short_write`, that a
+/// write lands only a prefix of its bytes and says so in its count, as a full device or a signal
+/// can leave one.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Faults {
     pub read: f64,
     pub write: f64,
     pub sync: f64,
+    pub short_write: f64,
 }
 
 pub struct CrashIO {
@@ -305,7 +308,10 @@ impl State {
                 if self.rng.chance(faults.write) {
                     return Err(injected("write"));
                 }
-                let bytes = buffer.as_slice();
+                let mut bytes = buffer.as_slice();
+                if !bytes.is_empty() && self.rng.chance(faults.short_write) {
+                    bytes = &bytes[..self.rng.below(bytes.len())];
+                }
                 let end = *pos + bytes.len() as u64;
                 let grows = end.saturating_sub(op.file.lock().volatile.len() as u64);
                 if let Some(capacity) = self.capacity {

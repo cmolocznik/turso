@@ -676,7 +676,7 @@ fn pages_survive_concurrent_fixes_evictions_and_frees() {
 
 #[cfg(shuttle)]
 #[test]
-fn pages_survive_concurrent_fixes_evictions_and_frees_in_every_schedule() {
+fn pages_survive_concurrent_fixes_evictions_and_frees_in_shuttle_schedules() {
     static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     crate::storage::atoll::testing::schedules(
         || concurrent_pages(12, SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
@@ -737,6 +737,6 @@ fn a_written_page_is_evicted_only_while_its_write_pins_it() {
 
 #[cfg(shuttle)]
 #[test]
-fn a_written_page_is_evicted_only_while_its_write_pins_it_in_every_schedule() {
+fn a_written_page_is_evicted_only_while_its_write_pins_it_in_shuttle_schedules() {
     crate::storage::atoll::testing::schedules(written_page_eviction, 300);
 }

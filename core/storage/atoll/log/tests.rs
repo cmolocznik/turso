@@ -269,6 +269,19 @@ fn a_failed_write_fails_its_waiters_and_every_later_operation() {
     assert!(log.admit(64).is_err());
 }
 
+/// A segment is zeroed whole before the log uses it: a zero write that lands short fails the open,
+/// for the segment's end is not yet in the file.
+#[test]
+fn a_short_write_while_opening_a_log_fails_the_open() {
+    let crash_io = Arc::new(CrashIO::new(3));
+    crash_io.set_faults(Faults {
+        short_write: 1.0,
+        ..Faults::default()
+    });
+    let io: Arc<dyn IO> = crash_io;
+    assert!(Log::open(io, BASE, small(), 0).is_err());
+}
+
 /// Padding a partial block moves every record admitted and not yet appended along with it. Here
 /// it would push one past the end of the last prepared segment: the record must wait for the next
 /// segment's zeros to be written, or they land on it.

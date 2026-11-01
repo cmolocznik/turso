@@ -21,6 +21,7 @@ use super::aligned::AlignedBlock;
 use super::latch::{Held, VersionedLatch};
 use super::log::{Log, Lsn};
 use super::page::{self, PageId, SizeClass, MIN_PAGE_SIZE};
+use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -109,7 +110,6 @@ struct FrameState {
     writing: Option<Completion>,
     /// The place holding the newest durable copy; `None` if the page has none.
     durable_side: Option<u8>,
-    pins: u32,
 }
 
 pub struct MetaFrame {
@@ -146,8 +146,8 @@ impl MetaFrame {
         Held::try_take(&self.latch).map(|hold| MetaHold { frame: self, hold })
     }
 
-    /// Notes a change, whose record starts at `start`, made under [`lock`](Self::lock).
-    pub fn changed(&self, cache: &MetaCache, start: Lsn) {
+    /// Notes a change, whose record starts at `start`, made under the latch, which is still held.
+    fn changed(&self, cache: &MetaCache, start: Lsn) {
         let mut state = self.state.lock();
         state.changes += 1;
         if state.rec.is_none() {
@@ -173,20 +173,8 @@ impl MetaFrame {
         }
         f(page);
         page::set_lsn(page, lsn);
-        drop(hold);
-        self.changed(cache, start);
+        hold.commit(cache, start);
         Some(true)
-    }
-
-    /// Keeps the page in the cache until [`unpin`](Self::unpin).
-    pub fn pin(&self) {
-        self.state.lock().pins += 1;
-    }
-
-    pub fn unpin(&self) {
-        let mut state = self.state.lock();
-        debug_assert!(state.pins > 0);
-        state.pins -= 1;
     }
 }
 
@@ -202,6 +190,13 @@ impl MetaHold<'_> {
         unsafe { &mut *self.frame.bytes.get() }
     }
 
+    /// Releases the latch after a change whose record starts at `start`, noting the page dirty
+    /// first. Noted after the release, a later change could be noted before it and stand as the
+    /// page's oldest, and a checkpoint's redo point would pass this one unwritten.
+    pub fn commit(self, cache: &MetaCache, start: Lsn) {
+        self.frame.changed(cache, start);
+    }
+
     /// Releases the latch keeping the version, for a hold under which nothing was written.
     pub fn release_unchanged(self) {
         self.hold.release_unchanged();
@@ -211,7 +206,7 @@ impl MetaHold<'_> {
 pub struct MetaCache {
     io: Arc<dyn IO>,
     base: String,
-    /// Pages held before clean, unpinned ones are dropped.
+    /// Pages kept before clean ones no one holds are dropped.
     budget: usize,
     frames: Mutex<HashMap<MetaId, Arc<MetaFrame>>>,
     /// Pages in the order they came in, for eviction.
@@ -258,7 +253,8 @@ impl MetaCache {
         Ok(self.files.lock().entry(key).or_insert(f).clone())
     }
 
-    /// The page `id`, once it is in memory.
+    /// The page `id`, once it is in memory. It stays in the cache while the frame returned, or a
+    /// clone of it, is held, so every change to the page reaches that frame.
     pub fn get(self: &Arc<Self>, id: MetaId) -> Result<IOResult<Arc<MetaFrame>>> {
         let frame = {
             let mut frames = self.frames.lock();
@@ -275,7 +271,6 @@ impl MetaCache {
                             changes: 0,
                             writing: None,
                             durable_side: None,
-                            pins: 0,
                         }),
                         loaded: Mutex::new(None),
                     });
@@ -299,24 +294,6 @@ impl MetaCache {
                 Some(c) => Ok(IOResult::IO(IOCompletions(c))),
                 None => Ok(IOResult::IO(IOCompletions(Completion::new_yield()))),
             },
-        }
-    }
-
-    /// The page `id`, once it is in memory, pinned: it stays in the cache, and so receives every
-    /// change made to the page, until [`MetaFrame::unpin`].
-    pub fn get_pinned(self: &Arc<Self>, id: MetaId) -> Result<IOResult<Arc<MetaFrame>>> {
-        loop {
-            let frame = match self.get(id)? {
-                IOResult::Done(f) => f,
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
-            };
-            // Eviction takes the map's lock, so a frame still in the map while it is held is the
-            // one every change goes to.
-            let frames = self.frames.lock();
-            if frames.get(&id).is_some_and(|f| Arc::ptr_eq(f, &frame)) {
-                frame.pin();
-                return Ok(IOResult::Done(frame));
-            }
         }
     }
 
@@ -387,7 +364,9 @@ impl MetaCache {
         Ok(())
     }
 
-    /// Drops clean, unpinned pages while over the budget.
+    /// Drops clean pages no one holds while over the budget. Every frame handed out is cloned
+    /// from the map under its lock, which this holds: a frame the map alone holds stays unheld
+    /// until it is dropped.
     fn evict_over_budget(&self) {
         // `frames` before `order`, as `get` takes them.
         let mut frames = self.frames.lock();
@@ -398,7 +377,10 @@ impl MetaCache {
             looked += 1;
             let evictable = frames.get(&id).is_some_and(|f| {
                 let s = f.state.lock();
-                s.status == Status::Ready && s.rec.is_none() && s.writing.is_none() && s.pins == 0
+                Arc::strong_count(f) == 1
+                    && s.status == Status::Ready
+                    && s.rec.is_none()
+                    && s.writing.is_none()
             });
             if evictable {
                 frames.remove(&id);
@@ -446,9 +428,9 @@ impl MetaCache {
         log: &Arc<Log>,
     ) -> Result<Option<Completion>> {
         let (copy, changes, side) = {
-            // Copied without the latch, then checked under the state's mutex: a change is made
-            // under the latch and counted in the state after, so one this copy misses either
-            // fails the check or is counted after `changes` is read, and the page stays dirty.
+            // Copied without the latch, then checked under the state's mutex: a change is counted
+            // in the state before its latch is released, so one this copy misses either fails the
+            // check or is counted after `changes` is read, and the page stays dirty.
             let Some(version) = frame.latch.optimistic() else {
                 return Ok(Some(Completion::new_yield()));
             };
@@ -525,11 +507,7 @@ impl MetaCache {
             }
         };
         let c = Completion::new_write(move |res| {
-            let res = match res {
-                Ok(n) if n as usize == META_PAGE => Ok(()),
-                Ok(_) => Err(CompletionError::ShortWrite),
-                Err(e) => Err(e),
-            };
+            let res = whole(META_PAGE, res);
             match res {
                 Ok(()) if !durable => {
                     // Durable only once synced: until then the other place keeps the newest

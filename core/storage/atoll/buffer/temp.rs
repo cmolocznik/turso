@@ -6,6 +6,7 @@
 
 use super::super::epoch::{Epochs, Limbo};
 use super::super::page::{PageId, SizeClass, CLASS_COUNT};
+use super::super::whole;
 use super::source::ReadDone;
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -188,11 +189,7 @@ impl TempPages {
             let Some(done) = done.lock().take() else {
                 return;
             };
-            let res = match res {
-                Ok(n) if n as usize == len => Ok(()),
-                Ok(_) => Err(CompletionError::ShortWrite),
-                Err(e) => Err(e),
-            };
+            let res = whole(len, res);
             if res.is_ok() {
                 // Before `done`, which may evict the page: a read after that finds the copy.
                 me.classes[pid.class().index()]

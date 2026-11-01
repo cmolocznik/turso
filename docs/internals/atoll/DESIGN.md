@@ -438,7 +438,7 @@ A miss asks a page source for page P in two steps:
 
 1. **Locate:** whatever lookup the read needs first, which may wait on IO. Nothing is claimed yet.
 2. **Read** into the claimed frame. What locate found must still hold. For the local store, the
-   page-table leaf stays pinned in between, so every change to the page's entry reaches it. Once
+   page-table leaf stays held in between, so every change to the page's entry reaches it. Once
    the pool has claimed the page, nothing can change its entry until the read is done.
 
 The local store's source reads the slot the page table names, verifies its checksum and page id,
@@ -833,6 +833,9 @@ submission or later from `IO::step`. Therefore:
   - B-tree lookups with 100%, 50% and 5% of pages in memory, frame hints against hash lookups.
 
 ## 20. Order of work
+
+CONCURRENCY.md rebuilds the concurrency of steps 4 to 6 before step 7 goes on; its own order of
+work says which parts are done.
 
 1. **IO.** Direct IO, `fdatasync`, durable writes, preallocation, directory sync, and the crash IO.
    Done.

@@ -41,10 +41,35 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
-use crate::io::IO;
+use crate::io::{Completion, IO};
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
-use crate::Result;
+use crate::{CompletionError, Result};
+
+/// How a write of `len` bytes ended: one that landed short failed. A write's completion counts a
+/// short write as done, so every write checks its count with this.
+pub(crate) fn whole(
+    len: usize,
+    res: std::result::Result<i32, CompletionError>,
+) -> std::result::Result<(), CompletionError> {
+    match res {
+        Ok(n) if usize::try_from(n) == Ok(len) => Ok(()),
+        Ok(_) => Err(CompletionError::ShortWrite),
+        Err(e) => Err(e),
+    }
+}
+
+/// A completion to hand a write of `len` bytes, and one to wait on: it ends when the write does,
+/// failed if the write failed or landed short.
+pub(crate) fn whole_write(len: usize) -> (Completion, Completion) {
+    let ended = Completion::new_wait();
+    let done = ended.clone();
+    let write = Completion::new_write(move |res| match whole(len, res) {
+        Ok(()) => done.complete(0),
+        Err(e) => done.error(e),
+    });
+    (write, ended)
+}
 
 /// Runs `op` until it is done, waiting on each completion it hands back: for opening a database,
 /// whose caller waits for it anyway.

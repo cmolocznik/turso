@@ -110,7 +110,10 @@ Anything that fits none of these is a design error.
   that step ends, so the read finds it free; one freed before fails the check. No copy of a freed
   page stays in memory to meet a new page under its number.
 - **Metadata pages** (page table, free space) follow the same discipline as tree nodes: versioned
-  latch, optimistic reads. Today they sit behind a blocking reader-writer lock.
+  latch, optimistic reads. A change takes the latches of every page it changes, in id order,
+  without waiting, or none of them, and yields. A page write's completion only records that it
+  landed: the remap that follows latches metadata pages, so the writeback does it when next
+  stepped, and a writeback stays queued until every write it submitted is settled.
 
 ## 7. B-trees
 
@@ -143,10 +146,9 @@ Anything that fits none of these is a design error.
     slots). A cycle aborts its youngest transaction. Under BEGIN CONCURRENT it fails at once.
   - Version indexes: written only by their slot's transaction, read optimistically by everyone;
     entries are removed by garbage collection through epochs.
-- **The one lock order** for the short critical sections that remain:
-  - Metadata pages, until they move to versioned latches: a page's bytes (several in ascending
-    page order), then its state, then the dirty list. Every path takes them in this order; a
-    checkpoint write that took the state first deadlocked with two page-table changes.
+- **The one lock order** for the short critical sections that remain. Latches are never waited
+  for, so they are in no order; the metadata pages' rule (bytes, then state) went with their
+  reader-writer lock.
 
 ## 9. Proof
 

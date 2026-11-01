@@ -119,10 +119,9 @@ impl Pass {
         }
         self.ours.retain(|c| !c.finished());
         pool.failed()?;
-        if let Some(c) = self.ours.first() {
-            return Ok(IOResult::IO(IOCompletions(c.clone())));
-        }
-        if writing {
+        // Not on our writebacks' own completions: a write that lands wakes the pool's waiters,
+        // and only the next step settles it.
+        if !self.ours.is_empty() || writing {
             return Ok(IOResult::IO(IOCompletions(landed)));
         }
         if !self.again.is_empty() {

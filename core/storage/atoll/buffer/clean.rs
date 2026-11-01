@@ -6,21 +6,41 @@
 //! against its latch, and writes the copy. A page changed while its copy is in flight stays dirty.
 //!
 //! A write-out ([`Outgoing`]) is a writeback of a page leaving its frame for good: the frame is
-//! held until the write lands, so the copy needs no check, and the write's end frees the frame.
+//! held until the write lands, so the copy needs no check, and settling the write frees the frame.
+//!
+//! **Settling.** A write's completion only records that it landed and wakes the pool's waiters:
+//! what follows (the remap, which latches metadata pages; the frame's state) is done when the
+//! writeback is next stepped, where a latched page means a yield rather than a wait. So a
+//! writeback stays queued until every write it submitted is settled, and whoever waits for a
+//! write steps the queue when it wakes.
 //!
 //! No log flush comes first: a copy's remap is logged after the copy lands, so a remap that
 //! survives a crash names a copy whose records survived too (DESIGN.md §6.3).
 
 use super::super::aligned::AlignedBlock;
+use super::super::log::Lsn;
 use super::super::page::{PageId, SizeClass};
 use super::super::store::WritePlan;
-use super::frame::RESIDENT;
+use super::frame::{EVICT_AFTER, RESIDENT, WRITING};
 use super::{BufferPool, Outgoing};
 use crate::io::Completion;
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::atomic::Ordering;
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
-use crate::{CompletionError, Result};
+use crate::CompletionError;
+
+/// Writes that ended and are not yet settled, by position, with how each ended.
+type Landed = Arc<Mutex<Vec<(usize, std::result::Result<(), CompletionError>)>>>;
+
+/// What stepping a writeback came to.
+pub enum Progress {
+    /// Waiting on this before it can go on: IO before its writes are submitted, or a yield.
+    Waiting(Completion),
+    /// Its writes are in flight; each wakes the pool's waiters as it lands.
+    InFlight,
+    /// Every write is settled.
+    Done,
+}
 
 pub struct Writeback {
     class: SizeClass,
@@ -31,12 +51,15 @@ pub struct Writeback {
     evict_after: bool,
     /// The pages are temporary: written to the temporary files, with no plan.
     temporary: bool,
-    plan: Option<Arc<Mutex<WritePlan>>>,
+    plan: Option<WritePlan>,
     /// The next frame to copy and write.
     next: usize,
-    /// Writes not yet ended.
-    pending: Arc<AtomicUsize>,
-    /// Done once every write has ended.
+    /// Per frame, the LSN its copy holds changes up to, once taken.
+    lsns: Vec<Lsn>,
+    landed: Landed,
+    /// Writes submitted and not yet settled.
+    unsettled: usize,
+    /// Done once every write is settled.
     pub finished: Completion,
 }
 
@@ -55,14 +78,16 @@ impl Writeback {
         }
         Self {
             class,
-            pending: Arc::new(AtomicUsize::new(frames.len())),
             outgoing: frames.iter().map(|_| None).collect(),
+            lsns: vec![0; frames.len()],
             frames,
             pids,
             evict_after,
             temporary,
             plan: None,
             next: 0,
+            landed: Arc::new(Mutex::new(Vec::new())),
+            unsettled: 0,
             finished,
         }
     }
@@ -76,30 +101,69 @@ impl Writeback {
         wb
     }
 
-    /// Done once every write is submitted; [`finished`](Self::finished) says when they end.
-    pub fn step(&mut self, pool: &Arc<BufferPool>) -> Result<IOResult<()>> {
-        if self.next == self.frames.len() {
-            return Ok(IOResult::Done(()));
+    /// Submits what it can, then settles what landed. It never fails: a failed write fails the
+    /// pool, and the frames it has not written are given up.
+    pub fn step(&mut self, pool: &Arc<BufferPool>) -> Progress {
+        if let Some(c) = self.submit(pool) {
+            return Progress::Waiting(c);
         }
-        let plan = if self.temporary {
-            None
-        } else {
+        let landed = std::mem::take(&mut *self.landed.lock());
+        let mut landed = landed.into_iter();
+        while let Some((i, res)) = landed.next() {
+            if let Some(plan) = &mut self.plan {
+                if let IOResult::IO(IOCompletions(c)) = plan.settle(i, &res) {
+                    let mut back = self.landed.lock();
+                    back.push((i, res));
+                    back.extend(landed);
+                    return Progress::Waiting(c);
+                }
+            }
+            match self.outgoing[i].take() {
+                Some(out) => out.end(pool, self.lsns[i], res),
+                None => pool.write_ended(
+                    self.frames[i],
+                    self.pids[i],
+                    self.lsns[i],
+                    self.evict_after,
+                    res,
+                ),
+            }
+            self.unsettled -= 1;
+        }
+        if self.next < self.frames.len() || self.unsettled > 0 {
+            return Progress::InFlight;
+        }
+        // The plan held the metadata pages its remaps changed until now.
+        self.plan = None;
+        self.finished.complete(0);
+        Progress::Done
+    }
+
+    /// Copies and writes every frame not yet written. Something to wait on if it cannot go on
+    /// before then.
+    fn submit(&mut self, pool: &Arc<BufferPool>) -> Option<Completion> {
+        if self.next == self.frames.len() {
+            return None;
+        }
+        if !self.temporary {
             let plan = self
                 .plan
-                .get_or_insert_with(|| {
-                    Arc::new(Mutex::new(pool.store.plan_writes(self.pids.clone())))
-                })
-                .clone();
-            if let IOResult::IO(io) = plan.lock().step()? {
-                return Ok(IOResult::IO(io));
+                .get_or_insert_with(|| pool.store.plan_writes(self.pids.clone()));
+            match plan.step() {
+                Ok(IOResult::Done(())) => {}
+                Ok(IOResult::IO(IOCompletions(c))) => return Some(c),
+                Err(e) => {
+                    pool.fail(super::io_failure(&e));
+                    self.abandon(pool);
+                    return None;
+                }
             }
-            Some(plan)
-        };
+        }
         let size = self.class.size();
         while self.next < self.frames.len() {
             let i = self.next;
             let frame = self.frames[i];
-            let h = &pool.frames.headers[frame as usize];
+            let h = pool.header(frame);
             debug_assert_eq!(h.pid(), self.pids[i].raw());
             let copy = Arc::new(AlignedBlock::zeroed(size));
             let copy_frame = || {
@@ -114,8 +178,8 @@ impl Writeback {
                 };
                 h.page_lsn.load(Ordering::Acquire)
             };
-            let out = self.outgoing[i].take();
-            let lsn = if out.is_some() {
+            let outgoing = self.outgoing[i].is_some();
+            self.lsns[i] = if outgoing {
                 // Held by its write-out: nothing changes it.
                 copy_frame()
             } else {
@@ -124,74 +188,50 @@ impl Writeback {
                 debug_assert_eq!(h.status(), RESIDENT);
                 let Some(version) = h.latch.optimistic() else {
                     // A writer holds the page for a moment: come back.
-                    return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+                    return Some(Completion::new_yield());
                 };
                 let lsn = copy_frame();
                 if !h.latch.validate(version) {
-                    return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+                    return Some(Completion::new_yield());
                 }
                 lsn
             };
             self.next += 1;
-            let ended = pool.clone();
-            let pending = self.pending.clone();
-            let finished = self.finished.clone();
-            let evict_after = self.evict_after;
-            let pid = self.pids[i];
+            self.unsettled += 1;
             pool.writes_in_flight.fetch_add(1, Ordering::AcqRel);
-            let done = move |res: std::result::Result<(), CompletionError>| {
-                match out {
-                    Some(out) => out.end(&ended, lsn, res),
-                    None => ended.write_ended(frame, pid, lsn, evict_after, res),
-                }
-                if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    finished.complete(0);
-                }
+            let (landed, woken) = (self.landed.clone(), pool.clone());
+            let ended = move |res: std::result::Result<(), CompletionError>| {
+                landed.lock().push((i, res));
+                woken.write_landed(frame, outgoing);
             };
-            let written = match &plan {
-                Some(plan) => WritePlan::write(plan, i, copy.region(0, size), move |res| {
-                    done(res.map(|_| ()))
-                })
-                .map(drop),
-                None => pool.temp.write(self.pids[i], copy.region(0, size), done),
+            let written = match &self.plan {
+                Some(plan) => plan.write(i, copy.region(0, size), ended).map(drop),
+                None => pool.temp.write(self.pids[i], copy.region(0, size), ended),
             };
-            match written {
-                Ok(()) => {}
-                Err(e) => {
-                    // A write-out's frame was given back when its `done` was dropped unrun.
-                    pool.write_ended(frame, pid, lsn, false, Err(super::io_failure(&e)));
-                    if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-                        self.finished.complete(0);
-                    }
-                    return Err(e);
-                }
+            if let Err(e) = written {
+                // It never started: settled as failed, which fails the pool.
+                self.landed.lock().push((i, Err(super::io_failure(&e))));
+                self.abandon(pool);
+                return None;
             }
         }
-        // The writes in flight hold the plan until they end.
-        self.plan = None;
-        Ok(IOResult::Done(()))
+        None
     }
 
     /// Gives up every frame not yet written: they stay dirty, and pages being written out stay
     /// in their frames.
-    pub fn abandon(&mut self, pool: &BufferPool) {
+    fn abandon(&mut self, pool: &BufferPool) {
         for (&frame, out) in self.frames[self.next..]
             .iter()
             .zip(&mut self.outgoing[self.next..])
         {
             if out.take().is_none() {
-                pool.frames.headers[frame as usize].flags.fetch_and(
-                    !(super::frame::WRITING | super::frame::EVICT_AFTER),
-                    Ordering::AcqRel,
-                );
+                pool.header(frame)
+                    .flags
+                    .fetch_and(!(WRITING | EVICT_AFTER), Ordering::AcqRel);
             }
         }
-        let left = self.frames.len() - self.next;
         self.next = self.frames.len();
-        self.plan = None;
-        if left > 0 && self.pending.fetch_sub(left, Ordering::AcqRel) == left {
-            self.finished.complete(0);
-        }
         pool.signal_released();
     }
 }

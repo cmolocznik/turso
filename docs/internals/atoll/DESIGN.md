@@ -420,8 +420,12 @@ frame goes stale.
 - A writeback takes dirty frames of one class and marks them writing, so they are neither evicted
   nor dropped meanwhile. The page store takes fresh slots for them under a logged intent (section
   6.3).
-- Each page is copied under a shared latch, held only for the copy, and the copy is written. A page
-  changed while its copy is in flight stays dirty.
+- Each page is copied optimistically, checked against its latch, and the copy is written. A page
+  changed while its copy is in flight stays dirty. A page written out of a draining batch is held
+  for its write instead, so its copy needs no check.
+- A write's completion only records that it landed and wakes the pool's waiters. Its remap, which
+  latches metadata pages, and the frame's new state are settled the next time the writeback is
+  stepped: a latched page means a yield there, which a completion cannot do.
 - No log flush comes first. A copy's remap is logged after the copy lands, so a remap that
   survives a crash names a copy whose records survived too.
 - A writeback is stepped by whoever needs frames, or by a checkpoint pass over a shard of frames

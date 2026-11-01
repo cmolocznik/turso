@@ -133,23 +133,26 @@ type Runner<'a> = dyn Fn(&mut dyn FnMut() -> Result<IOResult<()>>) + 'a;
 
 /// Writes a copy of each of `pids` (all of one class) holding `version`.
 fn write_copies(db: &Db, pids: &[PageId], version: u8, run: &Runner<'_>) {
-    let plan = Arc::new(Mutex::new(db.store.plan_writes(pids.to_vec())));
-    run(&mut || plan.lock().step());
+    let mut plan = db.store.plan_writes(pids.to_vec());
+    run(&mut || plan.step());
     let writes: Vec<Completion> = pids
         .iter()
         .enumerate()
         .map(|(i, pid)| {
-            WritePlan::write(&plan, i, copy(pid.class(), version), |res| {
+            plan.write(i, copy(pid.class(), version), |res| {
                 res.expect("a write failed");
             })
             .unwrap()
         })
         .collect();
-    // A write's completion runs its remap, so once every one is finished every page is remapped.
     run(&mut || match writes.iter().find(|c| !c.finished()) {
         Some(c) => Ok(IOResult::IO(IOCompletions(c.clone()))),
         None => Ok(IOResult::Done(())),
     });
+    // Every write landed: settling remaps each page.
+    for i in 0..pids.len() {
+        run(&mut || Ok(plan.settle(i, &Ok(()))));
+    }
 }
 
 /// What every page reads as now: its entry and, if it has a copy, the version the copy holds.
@@ -210,13 +213,14 @@ fn check_consistent(db: &Db, class: SizeClass, numbers: u64) {
             index: leaf,
         };
         let frame = drive(&db.io, || db.store.meta.get(id)).unwrap();
-        frame.read(|b| {
-            for s in leaf * radix::SPACE_BITS..(leaf + 1) * radix::SPACE_BITS {
-                if radix::space_bit(b, s) {
-                    used.insert(s);
-                }
-            }
-        });
+        let bits = frame
+            .read(|b| {
+                (leaf * radix::SPACE_BITS..(leaf + 1) * radix::SPACE_BITS)
+                    .filter(|&s| radix::space_bit(b, s))
+                    .collect::<Vec<u64>>()
+            })
+            .expect("a still store's page is latched by no one");
+        used.extend(bits);
     }
     assert_eq!(
         referenced, used,
@@ -239,17 +243,21 @@ fn check_counts(db: &Db, tree: Tree, class: SizeClass, level: u8, index: u64) ->
     let frame = drive(&db.io, || db.store.meta.get(id)).unwrap();
     if level == 0 {
         let first = index * radix::leaf_units(tree);
-        return frame.read(|b| {
-            (first..first + radix::leaf_units(tree))
-                .filter(|&u| radix::used(tree, b, u))
-                .count() as u64
-        });
+        return frame
+            .read(|b| {
+                (first..first + radix::leaf_units(tree))
+                    .filter(|&u| radix::used(tree, b, u))
+                    .count() as u64
+            })
+            .expect("a still store's page is latched by no one");
     }
-    let counts: Vec<u64> = frame.read(|b| {
-        (0..radix::FANOUT)
-            .map(|c| radix::used_below(b, c))
-            .collect()
-    });
+    let counts: Vec<u64> = frame
+        .read(|b| {
+            (0..radix::FANOUT)
+                .map(|c| radix::used_below(b, c))
+                .collect()
+        })
+        .expect("a still store's page is latched by no one");
     let mut total = 0;
     for (c, &count) in counts.iter().enumerate() {
         if count == 0 {
@@ -614,4 +622,51 @@ fn a_freed_number_waits_out_its_freers_step_in_every_schedule() {
         },
         300,
     );
+}
+
+/// What every user of a metadata page does while a change holds its latch: yields, and finishes
+/// once the latch is released. None waits for it, so a holder on the same thread, under Turso's
+/// cooperative scheduling, never leaves another connection stuck.
+#[test]
+fn a_latched_metadata_page_makes_its_users_yield_and_none_wait() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let mut db = create(io.clone(), "/db/latched");
+    let class = class(0);
+    let pid = drive(&io, || db.store.allocate(class)).unwrap();
+    drive(&io, || db.store.adopt(&[pid])).unwrap();
+    let first = drive(&io, || db.store.allocate(class)).unwrap();
+    drive(&io, || db.store.adopt(&[first])).unwrap();
+    write_copies(&db, &[first], 1, &|op| drive(&io, op).unwrap());
+    let leaf = radix::path(Tree::Map, class, 1, pid.number())[0];
+    let frame = drive(&io, || db.store.meta.get(leaf)).unwrap();
+    let yields = |res: Result<IOResult<()>>, what: &str| match res.unwrap() {
+        IOResult::IO(IOCompletions(c)) => assert!(c.is_explicit_yield(), "{what} waited"),
+        IOResult::Done(()) => panic!("{what} went on under a held latch"),
+    };
+    // A write of `first`, landed and not yet settled.
+    let mut plan = db.store.plan_writes(vec![first]);
+    drive(&io, || plan.step()).unwrap();
+    let written = plan.write(0, copy(class, 2), |res| res.unwrap()).unwrap();
+    drive(&io, || {
+        Ok(match written.finished() {
+            true => IOResult::Done(()),
+            false => IOResult::IO(IOCompletions(written.clone())),
+        })
+    })
+    .unwrap();
+    let hold = frame.try_lock().expect("the leaf is free");
+    yields(db.store.entry(pid).map(|r| r.map(drop)), "a reader");
+    yields(
+        db.store.allocate(class).map(|r| r.map(drop)),
+        "an allocation",
+    );
+    yields(db.store.free(pid), "a free");
+    yields(db.store.write_metadata(db.log.end()), "a metadata write");
+    yields(Ok(plan.settle(0, &Ok(()))), "a remap");
+    drop(hold);
+    drive(&io, || Ok(plan.settle(0, &Ok(())))).unwrap();
+    assert_ne!(drive(&io, || db.store.entry(pid)).unwrap(), FREE);
+    drive(&io, || db.store.allocate(class)).unwrap();
+    drive(&io, || db.store.free(pid)).unwrap();
+    checkpoint(&mut db);
 }

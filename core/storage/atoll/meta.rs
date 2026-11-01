@@ -11,15 +11,22 @@
 //! **Logged first.** Every change is logged before it is made, and a page is written only once the
 //! log is durable up to its LSN. A page with no whole copy has never had a change before the last
 //! checkpoint's redo point, so recovery starts it from zeros and replays its changes.
+//!
+//! **Latching** is the buffer pool's (CONCURRENCY.md §5): a change holds the page's versioned
+//! latch, taken without waiting, and a reader takes nothing and validates the version after it
+//! read. A taker that finds the latch held yields. A page's state (dirtiness, its write in flight)
+//! sits behind a short mutex, taken after the latch.
 
 use super::aligned::AlignedBlock;
+use super::latch::{Held, VersionedLatch};
 use super::log::{Log, Lsn};
 use super::page::{self, PageId, SizeClass, MIN_PAGE_SIZE};
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicBool, Ordering};
-use crate::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
+use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
+use std::cell::UnsafeCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 pub const META_PAGE: usize = MIN_PAGE_SIZE;
@@ -107,26 +114,36 @@ struct FrameState {
 
 pub struct MetaFrame {
     pub id: MetaId,
-    bytes: RwLock<Box<[u8]>>,
+    latch: VersionedLatch,
+    /// Written only under the latch, held exclusively; read under it, or optimistically.
+    bytes: UnsafeCell<Box<[u8]>>,
     state: Mutex<FrameState>,
     loaded: Mutex<Option<Completion>>,
 }
 
+// SAFETY: the bytes are written only under the latch, held exclusively, and read either under it
+// or without it and validated against its version afterwards, as frames of the buffer pool are.
+unsafe impl Sync for MetaFrame {}
+
 impl MetaFrame {
-    /// Reads the page.
-    pub fn read<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        f(&self.bytes.read())
+    /// Reads the page without a lock: `None` while a change holds the latch, else what `f`
+    /// returned over a version no change overlapped. `f` may see a change half made, and then runs
+    /// again, so it must not trust what it reads to be consistent, nor panic on it.
+    pub fn read<R>(&self, f: impl Fn(&[u8]) -> R) -> Option<R> {
+        loop {
+            let version = self.latch.optimistic()?;
+            // SAFETY: what is read counts only once validated; see above.
+            let out = f(unsafe { &*self.bytes.get() });
+            if self.latch.validate(version) {
+                return Some(out);
+            }
+        }
     }
 
-    /// The LSN of the last change applied.
-    pub fn lsn(&self) -> Lsn {
-        page::lsn(&self.bytes.read())
-    }
-
-    /// Latches the page for a change. The change's record is appended while the latch is held, so
-    /// changes reach a page in the order of their records.
-    pub fn lock(&self) -> RwLockWriteGuard<'_, Box<[u8]>> {
-        self.bytes.write()
+    /// Latches the page for a change, or `None` while a change holds it. The change's record is
+    /// appended while the latch is held, so changes reach a page in the order of their records.
+    pub fn try_lock(&self) -> Option<MetaHold<'_>> {
+        Held::try_take(&self.latch).map(|hold| MetaHold { frame: self, hold })
     }
 
     /// Notes a change, whose record starts at `start`, made under [`lock`](Self::lock).
@@ -139,17 +156,26 @@ impl MetaFrame {
         }
     }
 
-    /// Applies a logged change during recovery unless the page already holds it.
-    pub fn redo(&self, cache: &MetaCache, start: Lsn, lsn: Lsn, f: impl FnOnce(&mut [u8])) -> bool {
-        let mut bytes = self.lock();
-        if page::lsn(&bytes) >= lsn {
-            return false;
+    /// Applies a logged change during recovery unless the page already holds it: whether it was
+    /// applied, or `None` while a change holds the latch.
+    pub fn redo(
+        &self,
+        cache: &MetaCache,
+        start: Lsn,
+        lsn: Lsn,
+        f: impl FnOnce(&mut [u8]),
+    ) -> Option<bool> {
+        let mut hold = self.try_lock()?;
+        let page = hold.page();
+        if page::lsn(page) >= lsn {
+            hold.release_unchanged();
+            return Some(false);
         }
-        f(&mut bytes);
-        page::set_lsn(&mut bytes, lsn);
-        drop(bytes);
+        f(page);
+        page::set_lsn(page, lsn);
+        drop(hold);
         self.changed(cache, start);
-        true
+        Some(true)
     }
 
     /// Keeps the page in the cache until [`unpin`](Self::unpin).
@@ -161,6 +187,24 @@ impl MetaFrame {
         let mut state = self.state.lock();
         debug_assert!(state.pins > 0);
         state.pins -= 1;
+    }
+}
+
+/// A metadata page latched for a change; released, with its version bumped, when dropped.
+pub struct MetaHold<'a> {
+    frame: &'a MetaFrame,
+    hold: Held<&'a VersionedLatch>,
+}
+
+impl MetaHold<'_> {
+    pub fn page(&mut self) -> &mut [u8] {
+        // SAFETY: the latch is held exclusively, by this hold alone.
+        unsafe { &mut *self.frame.bytes.get() }
+    }
+
+    /// Releases the latch keeping the version, for a hold under which nothing was written.
+    pub fn release_unchanged(self) {
+        self.hold.release_unchanged();
     }
 }
 
@@ -223,7 +267,8 @@ impl MetaCache {
                 None => {
                     let frame = Arc::new(MetaFrame {
                         id,
-                        bytes: RwLock::new(vec![0u8; META_PAGE].into_boxed_slice()),
+                        latch: VersionedLatch::default(),
+                        bytes: UnsafeCell::new(vec![0u8; META_PAGE].into_boxed_slice()),
                         state: Mutex::new(FrameState {
                             status: Status::Loading,
                             rec: None,
@@ -313,9 +358,11 @@ impl MetaCache {
                 }
                 Err(e) => Err(e),
             };
-            // The page before its state, the order a change takes them in.
+            // The page before its state, the order a change takes them in. Nothing else holds a
+            // page still loading: `get` hands out none.
             if let Ok((Some(bytes), _)) = &outcome {
-                target.bytes.write().copy_from_slice(bytes);
+                let mut hold = target.try_lock().expect("a page loading is latched");
+                hold.page().copy_from_slice(bytes);
             }
             let mut state = target.state.lock();
             match outcome {
@@ -398,27 +445,41 @@ impl MetaCache {
         log: &Arc<Log>,
     ) -> Result<Option<Completion>> {
         let (copy, changes, side) = {
-            // The page before its state, the order a change takes them in.
-            let bytes = frame.bytes.read();
+            // Copied without the latch, then checked under the state's mutex: a change is made
+            // under the latch and counted in the state after, so one this copy misses either
+            // fails the check or is counted after `changes` is read, and the page stays dirty.
+            let Some(version) = frame.latch.optimistic() else {
+                return Ok(Some(Completion::new_yield()));
+            };
+            let copy = Arc::new(AlignedBlock::zeroed(META_PAGE));
+            // SAFETY: a fresh block of the page's size; what is copied counts only once
+            // validated.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (*frame.bytes.get()).as_ptr(),
+                    copy.as_ptr(),
+                    META_PAGE,
+                )
+            };
             let mut state = frame.state.lock();
+            if !frame.latch.validate(version) {
+                return Ok(Some(Completion::new_yield()));
+            }
             if let Some(c) = &state.writing {
                 return Ok(Some(c.clone()));
             }
             if state.rec.is_none() {
                 return Ok(None);
             }
-            let lsn = page::lsn(&bytes);
+            // SAFETY: the copy is ours alone.
+            let lsn = page::lsn(unsafe { std::slice::from_raw_parts(copy.as_ptr(), META_PAGE) });
             if log.durable() < lsn {
                 drop(state);
-                drop(bytes);
                 return match log.wait_durable(lsn)? {
                     IOResult::Done(()) => self.write(frame, log),
                     IOResult::IO(IOCompletions(c)) => Ok(Some(c)),
                 };
             }
-            let copy = Arc::new(AlignedBlock::zeroed(META_PAGE));
-            // SAFETY: a fresh block of the page's size.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), copy.as_ptr(), META_PAGE) };
             let side = match state.durable_side {
                 Some(s) => 1 - s,
                 None => 0,

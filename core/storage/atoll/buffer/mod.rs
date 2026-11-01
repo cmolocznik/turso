@@ -52,7 +52,7 @@ use super::latch::{Held, VersionedLatch};
 use super::log::Lsn;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::store::PageStore;
-use clean::Writeback;
+use clean::{Progress, Writeback};
 use frame::{
     FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
 };
@@ -432,12 +432,21 @@ impl BufferPool {
                     Probe::Busy => return yield_now(),
                     Probe::Loading(c) => return Ok(IOResult::IO(IOCompletions(c))),
                     Probe::Outgoing(c) => {
-                        // Its write may not be submitted yet, and only stepping its writeback
-                        // submits it.
+                        // Only stepping its writeback submits its write, and settles it once it
+                        // landed, which completes `c`.
                         if let Some(w) = self.drive_writebacks()? {
                             return Ok(IOResult::IO(IOCompletions(w)));
                         }
-                        return Ok(IOResult::IO(IOCompletions(c)));
+                        if !c.finished() {
+                            return Ok(IOResult::IO(IOCompletions(c)));
+                        }
+                        let h = self.header(frame);
+                        if h.status() == OUTGOING && h.pid() == pid.raw() {
+                            // Landed, and its settle met a latched page or is someone else's.
+                            return yield_now();
+                        }
+                        // Settled: the page left, so look for it anew.
+                        continue;
                     }
                     Probe::Miss => continue,
                 };
@@ -465,7 +474,11 @@ impl BufferPool {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            if let Some(loaded) = self.load(pid, frame, located)? {
+            let loaded = match self.load(pid, frame, located)? {
+                IOResult::Done(loaded) => loaded,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            if let Some(loaded) = loaded {
                 if let Some(h) = hint {
                     h.store(frame + 1, Ordering::Relaxed);
                 }
@@ -529,13 +542,14 @@ impl BufferPool {
     }
 
     /// Claims `frame` for `pid` and starts reading the page into it. `None` if another frame
-    /// holds `pid` already. Otherwise the read's completion, done when the page is resident.
+    /// holds `pid` already. Otherwise the read's completion, done when the page is resident. A
+    /// yield, with the frame given back, if the read could not start for a moment.
     fn load(
         self: &Arc<Self>,
         pid: PageId,
         frame: u32,
         located: Box<dyn Located>,
-    ) -> Result<Option<Completion>> {
+    ) -> Result<IOResult<Option<Completion>>> {
         let h = self.header(frame);
         let hold = Held::try_take(FrameLatch {
             frames: self.frames.clone(),
@@ -558,7 +572,7 @@ impl BufferPool {
             self.free_frame(pid.class(), frame, hold);
             // A reader may have followed a hint here meanwhile: send it to the other frame.
             loaded.complete(0);
-            return Ok(None);
+            return Ok(IOResult::Done(None));
         }
         let size = pid.class().size();
         let reading = Loading {
@@ -566,12 +580,16 @@ impl BufferPool {
             pid,
             hold: Some(hold),
         };
-        // On an error the read never starts, and dropping it frees the frame.
-        located.read(
-            self.memory.region.buffer(frame, size),
-            Box::new(move |res| reading.end(res)),
-        )?;
-        Ok(Some(loaded))
+        // On an error or a yield the read never starts, and dropping it frees the frame.
+        Ok(
+            match located.read(
+                self.memory.region.buffer(frame, size),
+                Box::new(move |res| reading.end(res)),
+            )? {
+                IOResult::Done(()) => IOResult::Done(Some(loaded)),
+                IOResult::IO(io) => IOResult::IO(io),
+            },
+        )
     }
 
     /// Ends the read of `pid` into the frame `hold` holds.
@@ -1198,23 +1216,29 @@ impl BufferPool {
             let Some(mut w) = wb.try_lock() else {
                 continue;
             };
-            let stepped = w.step(self);
-            match stepped {
-                Ok(IOResult::IO(IOCompletions(c))) => {
+            match w.step(self) {
+                Progress::Waiting(c) => {
                     wait.get_or_insert(c);
-                    continue;
                 }
-                Ok(IOResult::Done(())) => {}
-                Err(ref e) => {
-                    self.fail(io_failure(e));
-                    w.abandon(self);
+                Progress::InFlight => {}
+                Progress::Done => {
+                    drop(w);
+                    self.writebacks.lock().retain(|q| !Arc::ptr_eq(q, &wb));
                 }
             }
-            drop(w);
-            self.writebacks.lock().retain(|q| !Arc::ptr_eq(q, &wb));
-            stepped.map(drop)?;
         }
         Ok(wait)
+    }
+
+    /// Notes that a write of `frame` landed, from its completion: whoever waits on the pool, or on
+    /// the frame's write-out, wakes and steps the writeback that settles it.
+    fn write_landed(&self, frame: u32, outgoing: bool) {
+        if outgoing {
+            if let Some(c) = self.transits_of(frame).lock().get(&frame) {
+                c.complete(0);
+            }
+        }
+        self.signal_released();
     }
 
     /// Done once no writeback is queued or in flight; meanwhile, drives the queued ones.
@@ -1318,8 +1342,9 @@ struct TempLocated {
 }
 
 impl Located for TempLocated {
-    fn read(self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<()> {
-        self.temp.read(self.pid, into, done)
+    fn read(self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<IOResult<()>> {
+        self.temp.read(self.pid, into, done)?;
+        Ok(IOResult::Done(()))
     }
 }
 

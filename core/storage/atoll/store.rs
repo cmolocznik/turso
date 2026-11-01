@@ -30,7 +30,7 @@
 use super::aligned::AlignedBlock;
 use super::epoch::{Epochs, Limbo};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
-use super::meta::{MetaCache, MetaFrame, MetaId, Tree};
+use super::meta::{MetaCache, MetaFrame, MetaHold, MetaId, Tree};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
@@ -443,7 +443,10 @@ impl PageStore {
         }
         let leaf = radix::path(Tree::Map, class, 1, pid.number())[0];
         Ok(match self.meta.get(leaf)? {
-            IOResult::Done(f) => IOResult::Done(f.read(|b| radix::map_entry(b, pid.number()))),
+            IOResult::Done(f) => match f.read(|b| radix::map_entry(b, pid.number())) {
+                Some(entry) => IOResult::Done(entry),
+                None => busy(),
+            },
             IOResult::IO(io) => IOResult::IO(io),
         })
     }
@@ -559,7 +562,9 @@ impl PageStore {
                 !pid.is_temporary(),
                 "the page table reached temporary numbers"
             );
-            let mut locked = Locked::new(&frames);
+            let Some(mut locked) = Locked::new(&frames) else {
+                return Ok(busy());
+            };
             let leaf = ids[0];
             if self.height(Tree::Map, class) != height
                 || radix::map_entry(locked.page_of(leaf), number) != FREE
@@ -610,7 +615,9 @@ impl PageStore {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        let mut locked = Locked::new(&frames);
+        let Some(mut locked) = Locked::new(&frames) else {
+            return Ok(busy());
+        };
         if self.heights() != heights {
             // A tree grew since the paths were taken.
             drop(locked);
@@ -763,8 +770,11 @@ impl PageStore {
                 if level == 0 {
                     let mut at = from.max(node_first);
                     let found = loop {
-                        let Some(u) = frame.read(|b| radix::free_in_leaf(tree, b, index, at))
+                        let Some(free) = frame.read(|b| radix::free_in_leaf(tree, b, index, at))
                         else {
+                            return Ok(busy());
+                        };
+                        let Some(u) = free else {
                             break None;
                         };
                         if skip_unerased && self.unerased.lock().contains(&(class, u)) {
@@ -800,7 +810,11 @@ impl PageStore {
                 } else {
                     0
                 };
-                match frame.read(|b| radix::child_with_room(tree, b, level, from_child)) {
+                let Some(room) = frame.read(|b| radix::child_with_room(tree, b, level, from_child))
+                else {
+                    return Ok(busy());
+                };
+                match room {
                     Some(c) => {
                         index = index * radix::FANOUT + c;
                         level -= 1;
@@ -841,7 +855,9 @@ impl PageStore {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        let mut locked = Locked::new(&frames);
+        let Some(mut locked) = Locked::new(&frames) else {
+            return Ok(busy());
+        };
         if self.height(tree, class) != height {
             return Ok(IOResult::Done(()));
         }
@@ -1083,7 +1099,13 @@ impl PageStore {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
         for frame in &frames {
-            frame.redo(&self.meta, start, lsn, |page| apply(&r, frame.id, page));
+            // A busy page is redone on the next step; one redone already is skipped by its LSN.
+            if frame
+                .redo(&self.meta, start, lsn, |page| apply(&r, frame.id, page))
+                .is_none()
+            {
+                return Ok(busy());
+            }
         }
         // What recovery must finish: erase what this record freed, settle its intents, and free
         // the pages it leaves provisional.
@@ -1172,18 +1194,24 @@ impl PageStore {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        self.release_locked(&frames, &mut admitted, class, slots);
+        if !self.release_locked(&frames, &mut admitted, class, slots) {
+            return Ok(busy());
+        }
         Ok(IOResult::Done(()))
     }
 
+    /// Gives back `slots` under the latches of `frames`; false, with nothing done, while one is
+    /// held.
     fn release_locked(
         &self,
         frames: &[Arc<MetaFrame>],
         admitted: &mut Admitted,
         class: SizeClass,
         slots: &[u64],
-    ) {
-        let mut locked = Locked::new(frames);
+    ) -> bool {
+        let Some(mut locked) = Locked::new(frames) else {
+            return false;
+        };
         let record = StoreRecord::Release {
             class,
             slots: slots.to_vec(),
@@ -1197,6 +1225,7 @@ impl PageStore {
         for &s in slots {
             self.freed((start, lsn), class, s);
         }
+        true
     }
 
     // ---------------------------------------------------------------- checkpoints
@@ -1228,12 +1257,13 @@ impl PageStore {
     }
 }
 
-/// The writeback of a copy of each of a set of pages. Step it until it is ready, then write each
-/// copy with [`write`](Self::write).
+/// The writeback of a copy of each of a set of pages. Step it until it is ready, write each copy
+/// with [`write`](Self::write), and [`settle`](Self::settle) each write once it lands.
 ///
 /// Stepping admits log space for the intent and every remap, takes fresh slots for the copies and
-/// logs the intent, holds in memory every metadata page the remaps will change (so a remap never
-/// waits on IO inside a write's completion), and waits until the intent is durable.
+/// logs the intent, holds in memory every metadata page the remaps will change (so a settle never
+/// waits on IO), and waits until the intent is durable. A write's completion only reports that it
+/// landed: the remap takes latches, which a completion may not wait for, so it is done in a step.
 pub struct WritePlan {
     store: Arc<PageStore>,
     pids: Vec<PageId>,
@@ -1335,7 +1365,9 @@ impl WritePlan {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            let mut locked = Locked::new(&frames);
+            let Some(mut locked) = Locked::new(&frames) else {
+                return Ok(busy());
+            };
             if store.height(Tree::Space, class) != space_height {
                 continue;
             }
@@ -1411,73 +1443,42 @@ impl WritePlan {
         self.slots[i]
     }
 
-    /// Writes the `i`th page's copy, sealed as `pids[i]`, and remaps the page once it is durable.
-    /// `done` gets the slot, or the error, after which the slot is given back. If the write
-    /// cannot be submitted, the slot is given back at once, `done` never runs, and the error is
-    /// returned.
-    pub fn write<F>(
-        this: &Arc<Mutex<Self>>,
-        i: usize,
-        copy: Arc<Buffer>,
-        done: F,
-    ) -> Result<Completion>
+    /// Writes the `i`th page's copy, sealed as `pids[i]`, to its slot. `landed` gets how the
+    /// write ended once the copy is durable or the write failed; then [`settle`](Self::settle) it.
+    /// If the write cannot be submitted, `landed` never runs and the error is returned: settle the
+    /// write as failed.
+    pub fn write<F>(&self, i: usize, copy: Arc<Buffer>, landed: F) -> Result<Completion>
     where
-        F: FnOnce(std::result::Result<u64, CompletionError>) + Send + 'static,
+        F: FnOnce(std::result::Result<(), CompletionError>) + Send + 'static,
     {
-        let submitted = Self::submit(this, i, copy, done);
-        if submitted.is_err() {
-            this.lock().give_back(i);
-        }
-        submitted
-    }
-
-    fn submit<F>(
-        this: &Arc<Mutex<Self>>,
-        i: usize,
-        copy: Arc<Buffer>,
-        done: F,
-    ) -> Result<Completion>
-    where
-        F: FnOnce(std::result::Result<u64, CompletionError>) + Send + 'static,
-    {
-        let (store, pid, slot) = {
-            let plan = this.lock();
-            assert!(plan.ready, "writing before the plan is ready");
-            (plan.store.clone(), plan.pids[i], plan.slots[i])
-        };
+        assert!(self.ready, "writing before the plan is ready");
+        let (pid, slot) = (self.pids[i], self.slots[i]);
         page::seal(copy.as_mut_slice(), pid);
-        let (file, at) = store.data_file(pid.class(), slot)?;
+        let (file, at) = self.store.data_file(pid.class(), slot)?;
         let len = copy.len();
-        let plan = this.clone();
-        let done = Mutex::new(Some(done));
+        let landed = Mutex::new(Some(landed));
         let c = Completion::new_write(move |res| {
             let res = match res {
                 Ok(n) if n as usize == len => Ok(()),
                 Ok(_) => Err(CompletionError::ShortWrite),
                 Err(e) => Err(e),
             };
-            let mut plan = plan.lock();
-            let res = res.map(|()| plan.remap(i));
-            if res.is_err() {
-                plan.give_back(i);
-            }
-            if let Some(done) = done.lock().take() {
-                done(res.map(|()| slot));
+            if let Some(landed) = landed.lock().take() {
+                landed(res);
             }
         });
         if file.supports_durable_writes() {
             return file.pwrite_durable(at, copy, c);
         }
-        // Durable only once synced: the remap waits for the sync, and the caller waits for the
-        // remap.
+        // Durable only once synced: the write lands with the sync.
         let synced = c.clone();
         let sync_file = file.clone();
         let wrote = Completion::new_write(move |res| match res {
             Ok(n) => {
-                let remap = synced.clone();
+                let landed = synced.clone();
                 let after = Completion::new_sync(move |r| match r {
-                    Ok(_) => remap.complete(n),
-                    Err(e) => remap.error(e),
+                    Ok(_) => landed.complete(n),
+                    Err(e) => landed.error(e),
                 });
                 if let Err(e) = sync_file.sync_data(after) {
                     synced.error(io_failure(&e));
@@ -1489,13 +1490,35 @@ impl WritePlan {
         Ok(c)
     }
 
-    /// Points the page table at the `i`th copy and frees the slot it replaces.
-    fn remap(&mut self, i: usize) {
+    /// Settles the `i`th write, which ended with `res`. Written, the page table points at its
+    /// copy and the slot it replaces is freed; failed, its slot is given back. A yield while a
+    /// metadata page it changes is latched: settle it again.
+    pub fn settle(
+        &mut self,
+        i: usize,
+        res: &std::result::Result<(), CompletionError>,
+    ) -> IOResult<()> {
+        let settled = match res {
+            Ok(()) => self.remap(i),
+            Err(_) => self.give_back(i),
+        };
+        if settled {
+            IOResult::Done(())
+        } else {
+            busy()
+        }
+    }
+
+    /// Points the page table at the `i`th copy and frees the slot it replaces; false, with
+    /// nothing done, while a page it changes is latched.
+    fn remap(&mut self, i: usize) -> bool {
         let store = self.store.clone();
         let pid = self.pids[i];
         let class = pid.class();
         let frames = &self.frames[i];
-        let mut locked = Locked::new(frames);
+        let Some(mut locked) = Locked::new(frames) else {
+            return false;
+        };
         let leaf = radix::path(Tree::Map, class, 1, pid.number())[0];
         let entry = radix::map_entry(locked.page_of(leaf), pid.number());
         let old = entry.checked_sub(SLOT_BASE);
@@ -1522,15 +1545,20 @@ impl WritePlan {
             store.freed((start, lsn), class, old);
         }
         store.intent_settled(self.intent_start);
+        true
     }
 
-    /// Gives the `i`th slot back after its write failed.
-    fn give_back(&mut self, i: usize) {
+    /// Gives the `i`th slot back after its write failed; false, with nothing done, while a page
+    /// it changes is latched.
+    fn give_back(&mut self, i: usize) -> bool {
         let store = self.store.clone();
         let class = self.pids[i].class();
         let admitted = self.admitted.as_mut().expect("admitted");
-        store.release_locked(&self.frames[i], admitted, class, &[self.slots[i]]);
+        if !store.release_locked(&self.frames[i], admitted, class, &[self.slots[i]]) {
+            return false;
+        }
         store.intent_settled(self.intent_start);
+        true
     }
 }
 
@@ -1549,24 +1577,41 @@ impl Drop for WritePlan {
     }
 }
 
-/// Metadata pages latched together, in a fixed order so two changes never wait on each other.
+/// What a step that met a latched metadata page returns: try again shortly.
+fn busy<T>() -> IOResult<T> {
+    IOResult::IO(IOCompletions(Completion::new_yield()))
+}
+
+/// Metadata pages latched together, in the order of their ids, or none of them.
 struct Locked<'a> {
     ids: Vec<MetaId>,
-    guards: Vec<crate::sync::RwLockWriteGuard<'a, Box<[u8]>>>,
+    holds: Vec<MetaHold<'a>>,
     frames: Vec<&'a Arc<MetaFrame>>,
 }
 
 impl<'a> Locked<'a> {
-    fn new(frames: &'a [Arc<MetaFrame>]) -> Self {
+    /// Latches every page of `frames`, or `None`, holding nothing, if one is held: the caller
+    /// yields and tries again.
+    fn new(frames: &'a [Arc<MetaFrame>]) -> Option<Self> {
         let mut order: Vec<&Arc<MetaFrame>> = frames.iter().collect();
         order.sort_by_key(|f| f.id);
         order.dedup_by_key(|f| f.id);
-        let guards = order.iter().map(|f| f.lock()).collect();
-        Self {
-            ids: order.iter().map(|f| f.id).collect(),
-            guards,
-            frames: order,
+        let mut holds = Vec::with_capacity(order.len());
+        for f in &order {
+            match f.try_lock() {
+                Some(hold) => holds.push(hold),
+                None => {
+                    // Nothing was written: readers are not sent back.
+                    holds.into_iter().for_each(MetaHold::release_unchanged);
+                    return None;
+                }
+            }
         }
+        Some(Self {
+            ids: order.iter().map(|f| f.id).collect(),
+            holds,
+            frames: order,
+        })
     }
 
     fn page_of(&mut self, id: MetaId) -> &mut [u8] {
@@ -1575,16 +1620,18 @@ impl<'a> Locked<'a> {
             .iter()
             .position(|&x| x == id)
             .unwrap_or_else(|| panic!("{id:?} is not latched"));
-        &mut self.guards[i]
+        self.holds[i].page()
     }
 
     /// Stamps every page with the change's LSN and marks it dirty.
     fn commit(self, cache: &MetaCache, start: Lsn, lsn: Lsn) {
-        let Self { guards, frames, .. } = self;
-        for (mut guard, frame) in guards.into_iter().zip(frames) {
-            let current = page::lsn(&guard);
-            page::set_lsn(&mut guard, lsn.max(current));
-            drop(guard);
+        let Self { holds, frames, .. } = self;
+        for (mut hold, frame) in holds.into_iter().zip(frames) {
+            let page = hold.page();
+            let current = page::lsn(page);
+            page::set_lsn(page, lsn.max(current));
+            // The page before its state, the order every change takes them in.
+            drop(hold);
             frame.changed(cache, start);
         }
     }

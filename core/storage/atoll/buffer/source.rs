@@ -5,15 +5,16 @@
 //! and [`Located::read`] reads the page into it. What `locate` found must still hold when `read`
 //! runs: for the local store, the page-table leaf is pinned in between, so every change to the
 //! page's entry reaches the copy `read` looks at, and once the pool has claimed the page nothing
-//! can change it until the read is done.
+//! can change it until the read is done. `read` reads the entry without a lock, and yields if a
+//! change to the leaf holds its latch at that moment.
 
 use super::super::meta::MetaFrame;
 use super::super::page::PageId;
 use super::super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
 use super::super::store::{PageRead, PageStore};
-use crate::io::Buffer;
+use crate::io::{Buffer, Completion};
 use crate::sync::Arc;
-use crate::types::IOResult;
+use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 
 /// Called once a read ends: `Ok` once the buffer holds a whole copy of the page.
@@ -26,8 +27,9 @@ pub trait PageSource: Send + Sync {
 
 pub trait Located: Send {
     /// Reads the page into `into`, exactly its size. `done` runs once, inside this call or later,
-    /// unless this returns an error, in which case it never runs.
-    fn read(self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<()>;
+    /// unless this returns an error or a yield, in which case it never runs: a yield while what
+    /// the read needs is latched for a moment.
+    fn read(self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<IOResult<()>>;
 }
 
 /// Pages of the local page store.
@@ -70,13 +72,16 @@ impl Drop for LocalLocated {
 }
 
 impl Located for LocalLocated {
-    fn read(mut self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<()> {
+    fn read(mut self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<IOResult<()>> {
         let pid = self.pid;
         let entry = match self.leaf.take() {
             Some(leaf) => {
                 let entry = leaf.read(|b| radix::map_entry(b, pid.number()));
                 leaf.unpin();
-                entry
+                match entry {
+                    Some(entry) => entry,
+                    None => return Ok(IOResult::IO(IOCompletions(Completion::new_yield()))),
+                }
             }
             None => FREE,
         };
@@ -88,7 +93,7 @@ impl Located for LocalLocated {
                 // A page with no copy yet has never been written back: it is all zeros.
                 into.as_mut_slice().fill(0);
                 done(Ok(()));
-                Ok(())
+                Ok(IOResult::Done(()))
             }
             entry => {
                 let c = self
@@ -103,7 +108,7 @@ impl Located for LocalLocated {
                         })
                     })?;
                 drop(c);
-                Ok(())
+                Ok(IOResult::Done(()))
             }
         }
     }

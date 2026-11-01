@@ -108,6 +108,9 @@ pub struct Tree {
     root: PageId,
     root_hint: AtomicU32,
     limits: Limits,
+    /// Bytes at the start of every value kept in the leaf even when the rest goes out of line:
+    /// a version header the leaf must show without reading the value.
+    head: usize,
 }
 
 /// What a put should do, and what it did.
@@ -210,7 +213,20 @@ impl Tree {
             root,
             root_hint: AtomicU32::new(0),
             limits: Limits::of(root.class()),
+            head: 0,
         }
+    }
+
+    /// The tree with every value starting with `head` bytes kept in the leaf. Keys are shorter by
+    /// as much.
+    pub fn with_head(mut self, head: usize) -> Self {
+        self.head = head;
+        self.limits = self.limits.with_head(head);
+        self
+    }
+
+    pub fn head(&self) -> usize {
+        self.head
     }
 
     pub fn root(&self) -> PageId {
@@ -382,7 +398,9 @@ impl Tree {
                     Read::Value(v) => {
                         op.read = None;
                         op.failed = None;
-                        return Ok(IOResult::Done(Some(v)));
+                        let mut value = std::mem::take(&mut op.head);
+                        value.extend_from_slice(&v);
+                        return Ok(IOResult::Done(Some(value)));
                     }
                     Read::Changed => op.failed = op.read.take().map(|r| r.reference()),
                 }
@@ -402,16 +420,54 @@ impl Tree {
             match found.ok_or_else(|| corrupt_node(leaf.pid()))? {
                 None => return Ok(IOResult::Done(None)),
                 Some((value, false)) => return Ok(IOResult::Done(Some(value))),
-                Some((reference, true)) => {
-                    let reference =
-                        ValueRef::decode(&reference).ok_or_else(|| corrupt_node(leaf.pid()))?;
+                Some((stored, true)) => {
+                    let (head, reference) = self
+                        .split_reference(&stored)
+                        .ok_or_else(|| corrupt_node(leaf.pid()))?;
                     if op.failed == Some(reference) {
                         return Err(corrupt_value(reference));
                     }
+                    op.head = head.to_vec();
                     op.read = Some(ValueRead::new(reference));
                 }
             }
         }
+    }
+
+    /// `key`'s entry as the leaf holds it, with nothing read out of line: its head, and the rest
+    /// of its value or the reference to it. Step it until done.
+    pub fn stored(&self, key: &[u8]) -> Result<IOResult<Option<Stored>>> {
+        loop {
+            let (leaf, _) = found!(self.descend(key, 0, Route::At));
+            let Some(found) = leaf.read(|p| look(View::new(p), key)) else {
+                continue;
+            };
+            let Some(found) = found.ok_or_else(|| corrupt_node(leaf.pid()))? else {
+                continue;
+            };
+            return Ok(IOResult::Done(match found {
+                None => None,
+                Some((stored, false)) => Some(Stored {
+                    head: stored[..self.head.min(stored.len())].to_vec(),
+                    value: StoredValue::Inline(stored[self.head.min(stored.len())..].to_vec()),
+                }),
+                Some((stored, true)) => {
+                    let (head, reference) = self
+                        .split_reference(&stored)
+                        .ok_or_else(|| corrupt_node(leaf.pid()))?;
+                    Some(Stored {
+                        head: head.to_vec(),
+                        value: StoredValue::OutOfLine(reference),
+                    })
+                }
+            }));
+        }
+    }
+
+    /// An out-of-line value as the leaf stores it: its head, and the reference to the rest.
+    fn split_reference<'v>(&self, stored: &'v [u8]) -> Option<(&'v [u8], ValueRef)> {
+        let head = stored.get(..self.head)?;
+        Some((head, ValueRef::decode(&stored[self.head..])?))
     }
 
     // ---------------------------------------------------------------- writing
@@ -435,10 +491,11 @@ impl Tree {
                 }
                 _ => {}
             }
-            if !done!(op.old_pages(&self.pool, present.as_ref())) {
+            assert_eq!(op.head.len(), self.head, "a put's head is not the tree's");
+            if !done!(op.old_pages(&self.pool, self.head, present.as_ref())) {
                 continue;
             }
-            let out_of_line = !self.limits.inline(op.key.len(), op.value_len);
+            let out_of_line = !self.limits.inline(op.key.len(), self.head + op.value_len);
             if out_of_line {
                 let write = op.write.get_or_insert_with(|| {
                     ValueWrite::new(
@@ -449,10 +506,11 @@ impl Tree {
                 });
                 done!(write.step(&self.pool, self.journal()));
             }
-            let stored: Vec<u8> = match &op.write {
-                Some(w) => w.reference().encode().to_vec(),
-                None => op.value.clone(),
-            };
+            let mut stored = op.head.clone();
+            match &op.write {
+                Some(w) => stored.extend_from_slice(&w.reference().encode()),
+                None => stored.extend_from_slice(&op.value),
+            }
             let adopt = op.write.as_ref().map(|w| w.pages()).unwrap_or_default();
             let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
             let len = framed_len(8 + 3 + op.key.len() + stored.len())
@@ -555,7 +613,7 @@ impl Tree {
             let Some(present) = present else {
                 return Ok(IOResult::Done(false));
             };
-            if !done!(op.old_pages(&self.pool, &present)) {
+            if !done!(op.old_pages(&self.pool, self.head, &present)) {
                 continue;
             }
             let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
@@ -1051,10 +1109,12 @@ impl Tree {
 
     fn run(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
         loop {
-            if let Some((key, read)) = &mut cursor.reading {
+            if let Some((key, head, read)) = &mut cursor.reading {
                 match done!(read.step(&self.pool)) {
                     Read::Value(v) => {
-                        cursor.entry = Some((std::mem::take(key), v));
+                        let mut value = std::mem::take(head);
+                        value.extend_from_slice(&v);
+                        cursor.entry = Some((std::mem::take(key), value));
                         cursor.reading = None;
                         cursor.pending = None;
                         cursor.failed = None;
@@ -1102,9 +1162,10 @@ impl Tree {
                         cursor.pending = None;
                         return Ok(IOResult::Done(true));
                     }
-                    let reference =
-                        ValueRef::decode(&value).ok_or_else(|| corrupt_node(leaf.pid()))?;
-                    cursor.reading = Some((key, ValueRead::new(reference)));
+                    let (head, reference) = self
+                        .split_reference(&value)
+                        .ok_or_else(|| corrupt_node(leaf.pid()))?;
+                    cursor.reading = Some((key, head.to_vec(), ValueRead::new(reference)));
                 }
                 Scan::End => {
                     cursor.entry = None;
@@ -1188,8 +1249,9 @@ impl Tree {
                     let (value, out) = v.value(i).unwrap();
                     if out {
                         op.stats.values.push(
-                            ValueRef::decode(value)
-                                .ok_or_else(|| fail(format!("entry {i}: a bad reference")))?,
+                            self.split_reference(value)
+                                .ok_or_else(|| fail(format!("entry {i}: a bad reference")))?
+                                .1,
                         );
                     }
                 }
@@ -1327,6 +1389,8 @@ enum Split {
 /// A point lookup.
 pub struct Lookup {
     key: Vec<u8>,
+    /// The head of the out-of-line value being read.
+    head: Vec<u8>,
     read: Option<ValueRead>,
     /// A reference whose value read back as changed: reading it again the same is corruption.
     failed: Option<ValueRef>,
@@ -1336,15 +1400,31 @@ impl Lookup {
     pub fn new(key: &[u8]) -> Self {
         Self {
             key: key.to_vec(),
+            head: Vec::new(),
             read: None,
             failed: None,
         }
     }
 }
 
+/// An entry as its leaf holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    pub head: Vec<u8>,
+    pub value: StoredValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredValue {
+    Inline(Vec<u8>),
+    OutOfLine(ValueRef),
+}
+
 /// A put of one key's value.
 pub struct Put {
     key: Vec<u8>,
+    /// Kept in the leaf whatever the value's length: the tree's head.
+    head: Vec<u8>,
     value: Vec<u8>,
     value_len: usize,
     mode: Mode,
@@ -1357,8 +1437,14 @@ pub struct Put {
 
 impl Put {
     pub fn new(key: &[u8], value: Vec<u8>, mode: Mode) -> Self {
+        Self::with_head(key, Vec::new(), value, mode)
+    }
+
+    /// A put into a tree whose values start with a head of `head`'s length.
+    pub fn with_head(key: &[u8], head: Vec<u8>, value: Vec<u8>, mode: Mode) -> Self {
         Self {
             key: key.to_vec(),
+            head,
             value_len: value.len(),
             value,
             mode,
@@ -1380,21 +1466,24 @@ impl Put {
     fn old_pages(
         &mut self,
         pool: &Arc<BufferPool>,
+        head: usize,
         present: Option<&(Vec<u8>, bool)>,
     ) -> Result<IOResult<bool>> {
-        old_pages(&mut self.old, pool, present)
+        old_pages(&mut self.old, pool, head, present)
     }
 }
 
 fn old_pages(
     old: &mut Option<(Vec<u8>, Vec<PageId>)>,
     pool: &Arc<BufferPool>,
+    head: usize,
     present: Option<&(Vec<u8>, bool)>,
 ) -> Result<IOResult<bool>> {
-    let Some((reference, true)) = present else {
+    let Some((stored, true)) = present else {
         *old = None;
         return Ok(IOResult::Done(true));
     };
+    let reference = &stored[head.min(stored.len())..].to_vec();
     if old.as_ref().is_some_and(|(r, _)| r == reference) {
         return Ok(IOResult::Done(true));
     }
@@ -1439,9 +1528,10 @@ impl Remove {
     fn old_pages(
         &mut self,
         pool: &Arc<BufferPool>,
+        head: usize,
         present: &(Vec<u8>, bool),
     ) -> Result<IOResult<bool>> {
-        old_pages(&mut self.old, pool, Some(present))
+        old_pages(&mut self.old, pool, head, Some(present))
     }
 }
 
@@ -1466,7 +1556,8 @@ pub struct Cursor {
     pending: Option<(Seek, Vec<u8>)>,
     /// The leaf of the entry: page, frame hint, and the version it was read at.
     leaf: Option<(PageId, u32, u64)>,
-    reading: Option<(Vec<u8>, ValueRead)>,
+    /// The key, the head and the read of an out-of-line value.
+    reading: Option<(Vec<u8>, Vec<u8>, ValueRead)>,
     failed: Option<ValueRef>,
 }
 

@@ -322,6 +322,43 @@ fn values_longer_than_a_chunk_are_written_read_and_freed_whole() {
 }
 
 #[test]
+fn a_head_stays_in_the_leaf_when_the_rest_of_its_value_goes_out_of_line() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 64 << 20, 1);
+    let run = drive_runner(&io);
+    let plain = create(&io, &db, &run, false);
+    let tree = tree_of(&io, &db, plain.root()).with_head(16);
+    assert_eq!(tree.limits().max_key, plain.limits().max_key - 16);
+    for (i, len) in [10usize, 900, 5000, value::chunk() + 7]
+        .into_iter()
+        .enumerate()
+    {
+        let key = format!("k{i}").into_bytes();
+        let head = vec![i as u8 + 1; 16];
+        let value = stamp(&key, i as u64, len);
+        let mut op = Put::with_head(&key, head.clone(), value.clone(), Mode::Insert);
+        assert_eq!(run_to(&run, || tree.put(&mut op)), Outcome::Inserted);
+        let whole: Vec<u8> = head.iter().chain(&value).copied().collect();
+        assert!(
+            get(&tree, &run, &key) == Some(whole.clone()),
+            "{len}: read back"
+        );
+        let stored = run_to(&run, || tree.stored(&key)).expect("stored");
+        assert_eq!(stored.head, head, "{len}: the head");
+        match stored.value {
+            StoredValue::Inline(v) => assert!(v == value && len < 1000, "{len}: inline"),
+            StoredValue::OutOfLine(r) => {
+                assert!(len >= 1000, "{len}: out of line");
+                assert_eq!(r.len as usize, len);
+            }
+        }
+        let scanned = scan(&tree, &run, true);
+        assert!(scanned.iter().any(|(k, v)| *k == key && *v == whole));
+    }
+    check_whole(&tree, &db, &run, "with heads");
+}
+
+#[test]
 fn a_temporary_trees_long_values_are_temporary_pages() {
     long_values(true);
 }

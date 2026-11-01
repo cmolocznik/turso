@@ -88,6 +88,12 @@ impl Limits {
         }
     }
 
+    /// The limits of a tree whose values keep `head` bytes in the leaf even out of line.
+    pub fn with_head(mut self, head: usize) -> Self {
+        self.max_key -= head;
+        self
+    }
+
     /// Whether a value goes inline beside `key_len` bytes of key: the entry fits `max_entry` with
     /// the whole key, so the choice does not depend on the node's prefix.
     pub fn inline(&self, key_len: usize, value_len: usize) -> bool {

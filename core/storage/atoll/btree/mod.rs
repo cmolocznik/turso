@@ -792,12 +792,34 @@ impl Tree {
         let node::Shape {
             root,
             level,
+            lower,
             upper,
             next,
-            ..
         } = node::shape(n.page());
         let at = nv.search(key).ok_or_else(|| corrupt_node(n.pid()))?.0;
-        let (keep, sep) = split_point(&entries, level, at, upper.is_none(), key);
+        // Each half with its own fences, so its own prefix: what it takes, whole.
+        let capacity = self.limits.capacity;
+        let fits = |keep: usize, sep: &[u8]| {
+            let (left, right) = if level == 0 {
+                (&entries[..keep], &entries[keep..])
+            } else {
+                (&entries[..keep], &entries[keep + 1..])
+            };
+            let half = |lower: Option<&[u8]>, upper: Option<&[u8]>, entries: &[Entry]| {
+                Layout {
+                    root,
+                    level,
+                    lower,
+                    upper,
+                    next,
+                }
+                .size(entries)
+                    <= capacity
+            };
+            half(lower.as_deref(), Some(sep), left) && half(Some(sep), upper.as_deref(), right)
+        };
+        let (keep, sep) = split_point(&entries, level, at, upper.is_none(), key, fits)
+            .ok_or_else(|| corrupt_node(n.pid()))?;
         let sep_need = pv
             .entry_size(&sep, node::CHILD)
             .ok_or_else(|| corrupt_node(p.pid()))?;
@@ -1419,37 +1441,56 @@ fn check_budget(log: &Log, class: SizeClass, limits: Limits) -> Result<()> {
 /// Where to split a node of `entries` at `level` whose upper fence is infinite if `rightmost`,
 /// for an insert at `at` of `key`: the entries the left keeps, and the separator. Appending at
 /// the right edge of the tree, the left keeps everything, so keys inserted in order fill nodes;
-/// otherwise the entries split in half by bytes.
+/// otherwise the entries split in half by bytes. A split is taken only where both halves `fit`,
+/// fences included: a left keeping everything gains an upper fence, which a long separator can
+/// make too much for it. Then the split nearest the middle that fits; `None` if none does.
 fn split_point(
     entries: &[Entry],
     level: u8,
     at: usize,
     rightmost: bool,
     key: &[u8],
-) -> (usize, Vec<u8>) {
+    fits: impl Fn(usize, &[u8]) -> bool,
+) -> Option<(usize, Vec<u8>)> {
     let n = entries.len();
+    let try_at = |keep: usize, sep: Vec<u8>| fits(keep, &sep).then_some((keep, sep));
     if level == 0 {
         let appending = at == n && entries[n - 1].key.as_slice() < key;
         if appending && (rightmost || n == 1) {
-            return (n, node::separator(&entries[n - 1].key, key));
+            if let Some(split) = try_at(n, node::separator(&entries[n - 1].key, key)) {
+                return Some(split);
+            }
         }
         if n == 1 {
             // The new key goes before the one entry, into a node of its own.
-            return (0, node::separator(key, &entries[0].key));
+            return try_at(0, node::separator(key, &entries[0].key));
         }
-        let keep = half(entries).clamp(1, n - 1);
-        return (
-            keep,
-            node::separator(&entries[keep - 1].key, &entries[keep].key),
-        );
+        // Between two entries, from the middle out.
+        let half = half(entries).clamp(1, n - 1);
+        return outward(half, 1..n).find_map(|keep| {
+            try_at(
+                keep,
+                node::separator(&entries[keep - 1].key, &entries[keep].key),
+            )
+        });
     }
     // An inner node: entry `keep` moves up as the separator.
-    let keep = if rightmost && at == n {
-        n - 1
-    } else {
-        half(entries).min(n - 1)
-    };
-    (keep, entries[keep].key.clone())
+    if rightmost && at == n {
+        if let Some(split) = try_at(n - 1, entries[n - 1].key.clone()) {
+            return Some(split);
+        }
+    }
+    let half = half(entries).min(n - 1);
+    outward(half, 0..n).find_map(|keep| try_at(keep, entries[keep].key.clone()))
+}
+
+/// The positions of `range`, from `start` out, nearest first.
+fn outward(start: usize, range: std::ops::Range<usize>) -> impl Iterator<Item = usize> {
+    (0..range.len()).flat_map(move |d| {
+        let below = start.checked_sub(d).filter(|p| range.contains(p));
+        let above = (d > 0).then_some(start + d).filter(|p| range.contains(p));
+        below.into_iter().chain(above)
+    })
 }
 
 /// The first entry past half the bytes of `entries`.

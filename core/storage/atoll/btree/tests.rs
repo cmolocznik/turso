@@ -317,6 +317,33 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
     }
 }
 
+/// Keys appended in order past the rightmost leaf split it keeping every entry, under a new upper
+/// fence: the separator, which keys sharing a long start make long. A leaf too full to take that
+/// fence splits in half instead.
+#[test]
+fn keys_appended_with_long_shared_starts_split_leaves_that_fit() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 64 << 20, 1);
+    let run = drive_runner(&io);
+    let root = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
+    let tree = tree_of(&io, &db, root);
+    let start = "x".repeat(300);
+    let keys: Vec<Vec<u8>> = (0..400)
+        .map(|i| format!("{start}{i:05}").into_bytes())
+        .collect();
+    for key in &keys {
+        let mut put = Put::new(key, key.clone(), Mode::Upsert);
+        run_to(&run, || tree.put(&mut put));
+    }
+    let entries = scan(&tree, &run, true);
+    assert_eq!(entries.len(), keys.len());
+    assert!(entries
+        .iter()
+        .zip(&keys)
+        .all(|((k, v), key)| k == key && v == key));
+    check_whole(&tree, &db, &run, "appended");
+}
+
 #[test]
 fn values_longer_than_a_chunk_are_written_read_and_freed_whole() {
     long_values(false);

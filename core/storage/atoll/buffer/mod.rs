@@ -271,6 +271,10 @@ pub struct BufferPool {
     /// Checkpoint shards, each a run of frames by position.
     shards: Box<[Shard]>,
     temp: Arc<TempPages>,
+    /// Each queued writeback's state after its last step, by address, for a test that stalled to
+    /// show while another thread steps it.
+    #[cfg(test)]
+    stepped: Mutex<HashMap<usize, String>>,
 }
 
 /// What a claimed frame is for.
@@ -367,6 +371,8 @@ impl BufferPool {
                 store.epochs().clone(),
             )?),
             store,
+            #[cfg(test)]
+            stepped: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -1009,7 +1015,13 @@ impl BufferPool {
             .iter()
             .map(|wb| match wb.try_lock() {
                 Some(w) => w.describe(),
-                None => "held by its stepper".to_string(),
+                None => format!(
+                    "held by its stepper, last stepped: {}",
+                    self.stepped
+                        .lock()
+                        .get(&(Arc::as_ptr(wb) as usize))
+                        .map_or("never", String::as_str)
+                ),
             })
             .collect();
         // What is left in each draining batch.
@@ -1033,10 +1045,40 @@ impl BufferPool {
                     })
             })
             .collect();
+        // Every frame marked as being written, whichever writeback holds it, or none.
+        let writing: Vec<_> = (0..self.frames.headers.len() as u32)
+            .filter(|&f| self.header(f).has(WRITING))
+            .map(|f| {
+                let h = self.header(f);
+                (
+                    f,
+                    PageId::from_raw(h.pid()),
+                    h.status(),
+                    h.flags.load(Ordering::Acquire),
+                    h.latch.optimistic().is_none(),
+                    h.dirty(),
+                )
+            })
+            .collect();
+        // Per class, its free frames and how many of them a read may take now.
+        let horizon = self.store.epochs().horizon();
+        let free: Vec<_> = SizeClass::all()
+            .filter_map(|c| {
+                let frames = self.memory.free_frames(c);
+                let quiet = frames
+                    .iter()
+                    .filter(|&&f| self.quiet(f, c, horizon))
+                    .count();
+                (!frames.is_empty()).then_some((c.index(), frames.len(), quiet))
+            })
+            .collect();
         format!(
-            "{}writebacks {queued:?}, writes in flight {}, draining {:?}, left in them (frame, \
-             status, flags, latched, dirty) {left:?}, failure {:?}",
+            "{}{}, horizon {horizon}; free frames (class, free, quiet) {free:?}\nwritebacks \
+             {queued:?}, writes in flight {}, draining {:?}, left in them (frame, status, flags, \
+             latched, dirty) {left:?}, marked writing (frame, page, status, flags, latched, \
+             dirty) {writing:?}, failure {:?}",
             self.memory.describe(),
+            self.store.epochs().describe(),
             self.writes_in_flight.load(Ordering::Acquire),
             self.memory.draining(),
             self.failure.lock().as_ref(),
@@ -1346,7 +1388,20 @@ impl BufferPool {
     /// waiter that found it held saw it neither finished nor left for another to step, so once
     /// released after either, the pool's waiters are woken: nothing else would wake that one.
     fn step_writeback(self: &Arc<Self>, wb: &Arc<Mutex<Writeback>>) -> Option<Progress> {
-        let progress = wb.try_lock()?.step(self);
+        let mut w = wb.try_lock()?;
+        let progress = w.step(self);
+        #[cfg(test)]
+        {
+            let came_to = match &progress {
+                Progress::Waiting(c) if c.finished() => "yielded",
+                Progress::Waiting(_) => "waiting",
+                Progress::InFlight => "in flight",
+                Progress::Done => "done",
+            };
+            let state = format!("{} -> {came_to}", w.describe());
+            self.stepped.lock().insert(Arc::as_ptr(wb) as usize, state);
+        }
+        drop(w);
         match progress {
             Progress::InFlight => {}
             Progress::Done => {

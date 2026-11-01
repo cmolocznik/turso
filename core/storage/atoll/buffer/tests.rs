@@ -611,7 +611,9 @@ fn concurrent_pages(ops: usize, seed: u64) {
                     }
                     (Some((pid, version)), 0) => {
                         let mut admitted = admit();
-                        let mut g = named(&io, "fix_exclusive", || pool.fix_exclusive(pid, None));
+                        let mut g = named_in(&io, "fix_exclusive", Some(&pool), || {
+                            pool.fix_exclusive(pid, None)
+                        });
                         assert_eq!(stamped(g.page(), pid), Some(version));
                         stamp(&mut g.page_mut(), pid, version + 1);
                         let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
@@ -619,14 +621,18 @@ fn concurrent_pages(ops: usize, seed: u64) {
                         *slot = Some((pid, version + 1));
                     }
                     (Some((pid, _)), 1) => {
-                        named(&io, "free", || match pool.fix_exclusive(pid, None)? {
-                            IOResult::Done(page) => pool.free(page),
-                            IOResult::IO(io) => Ok(IOResult::IO(io)),
+                        named_in(&io, "free", Some(&pool), || {
+                            match pool.fix_exclusive(pid, None)? {
+                                IOResult::Done(page) => pool.free(page),
+                                IOResult::IO(io) => Ok(IOResult::IO(io)),
+                            }
                         });
                         *slot = None;
                     }
                     (Some((pid, version)), _) => loop {
-                        let g = named(&io, "fix_optimistic", || pool.fix_optimistic(pid, None));
+                        let g = named_in(&io, "fix_optimistic", Some(&pool), || {
+                            pool.fix_optimistic(pid, None)
+                        });
                         if let Some(seen) = g.read(|p| stamped(p, pid)) {
                             assert_eq!(seen, Some(version), "{pid:?} read back wrong");
                             break;
@@ -642,7 +648,7 @@ fn concurrent_pages(ops: usize, seed: u64) {
         let io = io.clone();
         handles.push(crate::thread::spawn(move || {
             for _ in 0..ops {
-                named(&io, "write_metadata", || {
+                named_in(&io, "write_metadata", Some(&pool), || {
                     pool.store.write_metadata(log.end())
                 });
             }
@@ -666,15 +672,20 @@ fn named_in<T>(
     pool: Option<&BufferPool>,
     mut op: impl FnMut() -> Result<IOResult<T>>,
 ) -> T {
-    let mut tries = 0u64;
+    // Tries handed back something already done (a yield), and something to wait on.
+    let (mut tries, mut ready) = (0u64, 0u64);
     drive(io, || {
         tries += 1;
         assert!(
             tries < 100_000,
-            "{name} tried {tries} times\n{}",
+            "{name} tried {tries} times, {ready} handed back a yield\n{}",
             pool.map_or(String::new(), BufferPool::describe)
         );
-        op()
+        let r = op();
+        if let Ok(IOResult::IO(IOCompletions(c))) = &r {
+            ready += c.finished() as u64;
+        }
+        r
     })
     .unwrap()
 }

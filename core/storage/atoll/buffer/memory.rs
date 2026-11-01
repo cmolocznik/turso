@@ -796,7 +796,20 @@ impl Memory {
         out
     }
 
-    /// Bytes of the region each class holds.
+    /// Every free frame of `class`, for a test to show.
+    #[cfg(test)]
+    pub fn free_frames(&self, class: SizeClass) -> Vec<u32> {
+        let c = self.classes[class.index()].lock();
+        c.all
+            .iter()
+            .flat_map(|&b| (0..frames_per_batch(class)).map(move |i| frame_at(class, b, i)))
+            .filter(|&f| {
+                let (batch, i) = position(class, f);
+                self.words(batch)[i as usize / 64].load(Ordering::Relaxed) & (1 << (i % 64)) != 0
+            })
+            .collect()
+    }
+
     /// Each class's batches: (batch, frames taken, draining), for a test to show.
     #[cfg(test)]
     pub fn describe(&self) -> String {

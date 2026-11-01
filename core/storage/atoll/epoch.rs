@@ -116,6 +116,23 @@ impl Epochs {
         self.global.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// The global epoch and every announcement of a thread in a step, for a test that stalled
+    /// to show.
+    #[cfg(test)]
+    pub fn describe(&self) -> String {
+        let announced: Vec<u64> = self
+            .threads
+            .lock()
+            .iter()
+            .map(|a| a.epoch.load(Ordering::SeqCst))
+            .filter(|&e| e != IDLE)
+            .collect();
+        format!(
+            "epoch {}, threads in a step announced {announced:?}",
+            self.global.load(Ordering::SeqCst)
+        )
+    }
+
     /// The lowest epoch any thread in a step announced; objects stamped below it may be reused.
     pub fn horizon(&self) -> u64 {
         self.threads

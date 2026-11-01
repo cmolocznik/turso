@@ -64,4 +64,6 @@ impl FrameHeader {
     }
 }
 
+// Shuttle's atomics are larger than the hardware's.
+#[cfg(not(shuttle))]
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 96);

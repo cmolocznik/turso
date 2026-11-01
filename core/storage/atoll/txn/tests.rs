@@ -140,8 +140,8 @@ fn a_snapshot_sees_exactly_the_transactions_committed_before_it() {
             });
         }
     });
-    let committed = committed.into_inner();
-    let seen = seen.into_inner();
+    let committed = std::mem::take(&mut *committed.lock());
+    let seen = std::mem::take(&mut *seen.lock());
     // Both answers come up: visible, and committed only after the snapshot.
     let after = seen
         .iter()

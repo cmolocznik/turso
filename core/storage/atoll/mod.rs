@@ -25,6 +25,7 @@ pub mod buffer;
 pub mod checkpoint;
 pub mod control;
 pub mod db;
+pub mod epoch;
 pub mod latch;
 pub mod log;
 pub mod meta;

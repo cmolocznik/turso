@@ -419,11 +419,16 @@ WATT (Vöhringer and Leis, PVLDB 2023; LeanStore 2024 §2.2), with the paper's t
 The paper divides by `now - t`, which is zero within the current epoch. Here elapsed time counts
 the current epoch as one, so pages used this epoch still rank by how often.
 
-**Between size classes.** When a class has no free frame and no free batch is left, each class's
-threshold is divided by its page size. Among the classes with a batch that can go to the
-requesting class (for 4 and 8 MiB pages, one whose aligned run lies inside the region), if one's
-value per byte is lower, the requesting class takes that class's emptiest such batch; otherwise it
-evicts its own pages. Sampling and the choice skip batches already draining. Value per byte is
+**Between size classes.** When a class has no free frame and no free batch is left, it weighs
+evicting its own least valuable page, its threshold divided by its page size, against draining a
+batch of another class: of each class with a batch that can go to it (for 4 and 8 MiB pages, one
+whose aligned run lies inside the region), the emptiest such batch, valued by the pages draining it
+evicts, per byte it frees. A page read in the current epoch is in use, whatever its value: a page
+read in again starts with no history and looks the coldest, and one operation needing it and a page
+of another class would each evict the other for good. A class holding memory drains a batch only if
+no page in it is in use and it gives up less per byte than evicting its own; a class holding none
+takes the batch with the fewest pages in use, then the least value. Sampling and the choice skip
+batches already draining. Value per byte is
 GreedyDual-Size's rule with every miss costing the same (Cao and Irani, 1997). A class of 4 or
 8 MiB pages reserves an aligned run, and the batches in it drain into it as they empty. One drain is
 in progress at a time.

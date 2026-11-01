@@ -41,7 +41,7 @@ const CONTINUED: u8 = u8::MAX;
 pub const MIN_BUDGET: usize = (1 << (ORDERS - 1)) * BATCH + BATCH;
 
 /// The order of the runs a class's frames take: 0 for one batch, up to `ORDERS - 1`.
-fn order(class: SizeClass) -> usize {
+pub(super) fn order(class: SizeClass) -> usize {
     class.index().saturating_sub(BATCH_CLASS)
 }
 
@@ -767,6 +767,35 @@ impl Memory {
                 frame_at(class, batch, rng.random_range(0..per))
             })
             .collect()
+    }
+
+    /// The frames taken in the `count` batches from `start`, whichever classes hold them; a frame
+    /// begun before `start` that reaches into it counts too. Read without the classes' locks, so
+    /// it may be stale by the time it is used: it estimates what draining the batches would evict.
+    pub fn taken_in(&self, start: u32, count: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut b = start;
+        while b > 0 && self.owner[b as usize].load(Ordering::Acquire) == CONTINUED {
+            b -= 1;
+        }
+        while b < start + count {
+            let owner = self.owner[b as usize].load(Ordering::Acquire);
+            let Some(class) = (owner != CONTINUED)
+                .then(|| SizeClass::new((owner as usize).wrapping_sub(1)))
+                .flatten()
+            else {
+                b += 1;
+                continue;
+            };
+            for i in 0..frames_per_batch(class) {
+                let frame = frame_at(class, b, i);
+                if !self.is_free(class, frame) {
+                    out.push(frame);
+                }
+            }
+            b += 1 << order(class);
+        }
+        out
     }
 
     /// The batch of `class`, not draining, with the fewest frames taken, to drain for `to`: one

@@ -8,6 +8,7 @@ use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::{backends, drive, Backend};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::collections::BTreeMap;
 
 /// The kind of the records logging test changes; the page store owns kinds 1 to 6.
 const CHANGE: Kind = Kind::new(100).unwrap();
@@ -665,6 +666,27 @@ fn named<T>(io: &Arc<dyn IO>, name: &str, op: impl FnMut() -> Result<IOResult<T>
     named_in(io, name, None, op)
 }
 
+/// Tries after which an operation that has not finished is reported as livelocked.
+const TRIES: u64 = 100_000;
+
+/// Reports an operation that has tried [`TRIES`] times: by default it fails the test. With
+/// ATOLL_PARK_ON_LIVELOCK set, the thread stops here instead, so a stall catcher can take every
+/// thread's stack while the livelock stands. With ATOLL_SLOW_GOES_ON, it says so and goes on: a
+/// run that then ends was slow, not stuck.
+fn too_many_tries(state: String) {
+    if std::env::var_os("ATOLL_PARK_ON_LIVELOCK").is_some() {
+        eprintln!("{state}\nparked");
+        loop {
+            std::thread::park();
+        }
+    }
+    if std::env::var_os("ATOLL_SLOW_GOES_ON").is_some() {
+        eprintln!("{state}\ngoing on");
+    } else {
+        panic!("{state}");
+    }
+}
+
 /// [`named`], showing `pool`'s state in the panic too.
 fn named_in<T>(
     io: &Arc<dyn IO>,
@@ -676,12 +698,21 @@ fn named_in<T>(
     let (mut tries, mut ready) = (0u64, 0u64);
     drive(io, || {
         tries += 1;
-        assert!(
-            tries < 100_000,
-            "{name} tried {tries} times, {ready} handed back a yield\n{}",
-            pool.map_or(String::new(), BufferPool::describe)
-        );
+        if tries == TRIES {
+            too_many_tries(format!(
+                "{name} tried {tries} times, {ready} handed back a yield\n{}",
+                pool.map_or(String::new(), BufferPool::describe)
+            ));
+        }
         let r = op();
+        // A slow operation that ends says so, with the steps under way then: the one it waited
+        // on has left.
+        if tries >= TRIES && matches!(r, Ok(IOResult::Done(_))) {
+            eprintln!(
+                "{name} done after {tries} tries; {}",
+                pool.map_or(String::new(), |p| p.store.epochs().describe())
+            );
+        }
         if let Ok(IOResult::IO(IOCompletions(c))) = &r {
             ready += c.finished() as u64;
         }
@@ -1051,5 +1082,306 @@ fn a_reader_of_a_page_written_out_wakes_when_its_write_out_waits_before_submitti
     assert!(
         waited.finished(),
         "the reader waits for a write no one submits while the write-out waits on its plan"
+    );
+}
+
+/// Slots of the directory page in [`linked_pages`]: each names a child and the life it is in.
+const SLOTS: usize = 6;
+
+fn slot_at(i: usize) -> usize {
+    HEADER_SIZE + 16 * i
+}
+
+/// Waits for `c` as [`drive`] does between tries.
+fn wait_for(io: &Arc<dyn IO>, c: Completion) {
+    crate::thread::yield_now();
+    while !c.finished() {
+        io.step().unwrap();
+        if !c.finished() {
+            crate::thread::yield_now();
+        }
+    }
+    assert!(c.get_error().is_none(), "{:?}", c.get_error());
+}
+
+/// What one try of an operation through the directory came to; a retry says where it came from.
+enum Try<T> {
+    Done(T),
+    /// Wait for this, holding nothing, then try again.
+    Wait(Completion, &'static str),
+    Again(&'static str),
+}
+
+/// Runs `op` until it is done, waiting between tries with nothing held, as an operation that
+/// returns IO drops its guards.
+fn through<T>(
+    io: &Arc<dyn IO>,
+    pool: &BufferPool,
+    name: &str,
+    mut op: impl FnMut() -> Try<T>,
+) -> T {
+    let mut retries: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for tries in 1u64.. {
+        if tries == TRIES {
+            too_many_tries(format!(
+                "{name} tried {tries} times, retried {retries:?}\n{}",
+                pool.describe()
+            ));
+        }
+        match op() {
+            Try::Done(v) => {
+                if tries >= TRIES {
+                    eprintln!(
+                        "{name} done after {tries} tries; {}",
+                        pool.store.epochs().describe()
+                    );
+                }
+                return v;
+            }
+            Try::Wait(c, why) => {
+                *retries.entry(why).or_default() += 1;
+                wait_for(io, c)
+            }
+            Try::Again(why) => {
+                *retries.entry(why).or_default() += 1;
+                crate::thread::yield_now()
+            }
+        }
+    }
+    unreachable!("tries run out")
+}
+
+/// One try of a fix, for [`through`]: a fix of a number the directory no longer names may find
+/// it freed, which is only an error while the directory still names it.
+fn fixed<T>(r: Result<IOResult<T>>, directory: &Optimistic<'_>, class: SizeClass) -> Try<T> {
+    match r {
+        Ok(IOResult::Done(v)) => Try::Done(v),
+        Ok(IOResult::IO(IOCompletions(c))) => {
+            let why = match (c.finished(), class.index()) {
+                (true, 8) => "child fix yielded, 1 MiB",
+                (true, 9) => "child fix yielded, 2 MiB",
+                (true, _) => "child fix yielded, 4 MiB",
+                (false, _) => "child fix waited",
+            };
+            Try::Wait(c, why)
+        }
+        Err(LimboError::Corrupt(_)) if !directory.validate() => Try::Again("child freed"),
+        Err(e) => panic!("a fix through a valid directory failed: {e}"),
+    }
+}
+
+/// Children linked from one directory page, as tree nodes are from their parent. Three threads
+/// read children through the directory, change them, unlink and free them, and allocate and
+/// link new ones, with no lock of the test's own: whatever excludes them is the pool's latches
+/// and the directory's. The children are 1, 2 and 4 MiB in a pool of 10 MiB, so they are evicted,
+/// written back and moved between classes meanwhile, and their numbers freed and reused. A
+/// thread that finds the directory unchanged after it read a child read that child whole, as the
+/// page and in the life the directory names: never a freed number's next page.
+fn linked_pages(ops: usize, seed: u64) {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let (log, pool) = open_on(&io, "/db/linked", MIN_BUDGET);
+    let admit = |log: &Arc<Log>| named(&io, "admit", || log.admit(framed_len(16)));
+    let dir = {
+        let mut admitted = admit(&log);
+        let mut g = named_in(&io, "allocate", Some(&pool), || pool.allocate(class(0)));
+        let lsn = log.append(&mut admitted, &header(), &[&g.pid().raw().to_le_bytes()]);
+        g.changed(lsn);
+        g.pid()
+    };
+    let lives = Arc::new(AtomicU64::new(1));
+    let mut handles = Vec::new();
+    for t in 0..3u64 {
+        let (io, log, pool, lives) = (io.clone(), log.clone(), pool.clone(), lives.clone());
+        handles.push(crate::thread::spawn(move || {
+            let admit = || named(&io, "admit", || log.admit(framed_len(16)));
+            let free = |pid: PageId| {
+                named_in(&io, "free", Some(&pool), || {
+                    match pool.fix_exclusive(pid, None)? {
+                        IOResult::Done(page) => pool.free(page),
+                        IOResult::IO(io) => Ok(IOResult::IO(io)),
+                    }
+                })
+            };
+            let mut rng = ChaCha8Rng::seed_from_u64(seed * 10 + t);
+            for _ in 0..ops {
+                let i = rng.random_range(0..SLOTS);
+                match rng.random_range(0..8) {
+                    // Allocate a child and link it, if the slot is still empty then.
+                    0 => {
+                        let life = lives.fetch_add(1, Ordering::Relaxed);
+                        let mut admitted = admit();
+                        let mut g = named_in(&io, "allocate", Some(&pool), || {
+                            pool.allocate(class(8 + i % 3))
+                        });
+                        let pid = g.pid();
+                        stamp(&mut g.page_mut(), pid, life << 32);
+                        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+                        g.changed(lsn);
+                        drop(g);
+                        let mut admitted = admit();
+                        let linked = through(&io, &pool, "link", || {
+                            let mut d = match pool.fix_exclusive(dir, None).unwrap() {
+                                IOResult::Done(d) => d,
+                                IOResult::IO(IOCompletions(c)) => {
+                                    return Try::Wait(c, "directory fix for a link")
+                                }
+                            };
+                            if d.page().u64_at(slot_at(i)) != 0 {
+                                d.release_unchanged();
+                                return Try::Done(false);
+                            }
+                            d.page_mut().put_u64(slot_at(i), pid.raw());
+                            d.page_mut().put_u64(slot_at(i) + 8, life);
+                            let lsn =
+                                log.append(&mut admitted, &header(), &[&dir.raw().to_le_bytes()]);
+                            d.changed(lsn);
+                            Try::Done(true)
+                        });
+                        if !linked {
+                            free(pid);
+                        }
+                    }
+                    // Unlink a child, then free it.
+                    1 => {
+                        let mut admitted = admit();
+                        let unlinked = through(&io, &pool, "unlink", || {
+                            let mut d = match pool.fix_exclusive(dir, None).unwrap() {
+                                IOResult::Done(d) => d,
+                                IOResult::IO(IOCompletions(c)) => {
+                                    return Try::Wait(c, "directory fix for an unlink")
+                                }
+                            };
+                            let raw = d.page().u64_at(slot_at(i));
+                            if raw == 0 {
+                                d.release_unchanged();
+                                return Try::Done(None);
+                            }
+                            d.page_mut().put_u64(slot_at(i), 0);
+                            d.page_mut().put_u64(slot_at(i) + 8, 0);
+                            let lsn =
+                                log.append(&mut admitted, &header(), &[&dir.raw().to_le_bytes()]);
+                            d.changed(lsn);
+                            Try::Done(Some(PageId::from_raw(raw)))
+                        });
+                        if let Some(pid) = unlinked {
+                            free(pid);
+                        }
+                    }
+                    // Change a child, reached through the directory.
+                    2..4 => {
+                        let mut admitted = admit();
+                        through(&io, &pool, "change", || {
+                            let d = match pool.fix_optimistic(dir, None).unwrap() {
+                                IOResult::Done(d) => d,
+                                IOResult::IO(IOCompletions(c)) => {
+                                    return Try::Wait(c, "directory fix for a change")
+                                }
+                            };
+                            let Some((raw, life)) =
+                                d.read(|p| (p.u64_at(slot_at(i)), p.u64_at(slot_at(i) + 8)))
+                            else {
+                                return Try::Again("directory changed while read");
+                            };
+                            if raw == 0 {
+                                return Try::Done(());
+                            }
+                            let pid = PageId::from_raw(raw);
+                            let mut g = match fixed(pool.fix_exclusive(pid, None), &d, pid.class())
+                            {
+                                Try::Done(g) => g,
+                                Try::Wait(c, why) => return Try::Wait(c, why),
+                                Try::Again(why) => return Try::Again(why),
+                            };
+                            if !d.validate() {
+                                g.release_unchanged();
+                                return Try::Again("directory changed under the child");
+                            }
+                            let v = stamped(g.page(), pid).unwrap_or_else(|| {
+                                panic!("{pid:?} changed torn or as another page")
+                            });
+                            assert_eq!(v >> 32, life, "{pid:?} changed in another life");
+                            stamp(&mut g.page_mut(), pid, v + 1);
+                            let lsn = log.append(&mut admitted, &header(), &[&raw.to_le_bytes()]);
+                            g.changed(lsn);
+                            Try::Done(())
+                        });
+                    }
+                    // Read a child through the directory.
+                    _ => through(&io, &pool, "read", || {
+                        let d = match pool.fix_optimistic(dir, None).unwrap() {
+                            IOResult::Done(d) => d,
+                            IOResult::IO(IOCompletions(c)) => {
+                                return Try::Wait(c, "directory fix for a read")
+                            }
+                        };
+                        let Some((raw, life)) =
+                            d.read(|p| (p.u64_at(slot_at(i)), p.u64_at(slot_at(i) + 8)))
+                        else {
+                            return Try::Again("directory changed while read");
+                        };
+                        if raw == 0 {
+                            return Try::Done(());
+                        }
+                        let pid = PageId::from_raw(raw);
+                        let holder = || d.validate();
+                        let child = match fixed(
+                            pool.fix_optimistic_held(pid, None, &holder),
+                            &d,
+                            pid.class(),
+                        ) {
+                            Try::Done(Some(c)) => c,
+                            Try::Done(None) => {
+                                return Try::Again("directory changed before the load")
+                            }
+                            Try::Again(why) => return Try::Again(why),
+                            Try::Wait(c, why) => return Try::Wait(c, why),
+                        };
+                        let Some(seen) = child.read(|p| stamped(p, pid)) else {
+                            return Try::Again("child changed while read");
+                        };
+                        if !d.validate() {
+                            return Try::Again("directory changed under the child");
+                        }
+                        let v =
+                            seen.unwrap_or_else(|| panic!("{pid:?} read torn or as another page"));
+                        assert_eq!(v >> 32, life, "{pid:?} read in another life");
+                        Try::Done(())
+                    }),
+                }
+            }
+        }));
+    }
+    // The checkpointer's part: metadata pages written back while allocations and frees change
+    // them.
+    {
+        let (io, pool) = (io.clone(), pool.clone());
+        handles.push(crate::thread::spawn(move || {
+            for _ in 0..ops {
+                named_in(&io, "write_metadata", Some(&pool), || {
+                    pool.store.write_metadata(log.end())
+                });
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+#[cfg(not(shuttle))]
+#[test]
+fn children_read_through_their_directory_are_whole_and_in_the_life_it_names() {
+    for seed in 0..20 {
+        linked_pages(200, seed);
+    }
+}
+
+#[cfg(shuttle)]
+#[test]
+fn children_read_through_their_directory_are_whole_and_in_the_life_it_names_in_shuttle_schedules() {
+    static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::storage::atoll::testing::schedules(
+        || linked_pages(12, SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        300,
     );
 }

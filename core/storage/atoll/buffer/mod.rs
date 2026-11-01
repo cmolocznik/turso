@@ -1117,6 +1117,15 @@ impl BufferPool {
             }
             return Ok(());
         }
+        // What evicting the class's own least valuable page gives up per byte, against what
+        // draining memory from another class gives up: the value of the pages that drain evicts,
+        // per byte it frees. A batch's free frames are worth nothing, but its pages are worth
+        // what they are: drained for their free frames, a batch holding one hot page would lose
+        // it, and the page's next reader would drain memory back, round after round. And a page
+        // read this epoch is in use, whatever its value says: a page read in again starts with
+        // no history, so it looks the coldest, and one operation needing it and a page of another
+        // class would evict each for the other forever. A class with memory of its own drains
+        // none in use; one with none takes the batch with the fewest in use, then the cheapest.
         let own = self
             .threshold(class)
             .map_or(f32::INFINITY, |t| t / class.size() as f32);
@@ -1126,12 +1135,15 @@ impl BufferPool {
         let colder = SizeClass::all()
             .filter(|&c| c != class)
             .filter_map(|c| {
-                let per_byte = self.threshold(c)? / c.size() as f32;
-                Some((c, self.memory.emptiest(c, class)?, per_byte))
+                let batch = self.memory.emptiest(c, class)?;
+                let (in_use, per_byte) = self.drain_cost(class, batch);
+                Some((c, batch, in_use, per_byte))
             })
-            .min_by(|a, b| a.2.total_cmp(&b.2));
+            .min_by(|a, b| a.2.cmp(&b.2).then(a.3.total_cmp(&b.3)));
         match colder {
-            Some((holder, batch, per_byte)) if per_byte < own => {
+            Some((holder, batch, in_use, per_byte))
+                if own == f32::INFINITY || (in_use == 0 && per_byte < own) =>
+            {
                 let started = if class.size() <= memory::BATCH {
                     self.memory.drain_for(holder, batch, class)
                 } else {
@@ -1146,6 +1158,31 @@ impl BufferPool {
             }
             _ => self.evict_round(class),
         }
+    }
+
+    /// What draining the memory around `batch` for `class` gives up: how many of its pages are
+    /// in use, read this epoch or being read in or claimed for a new page; and per byte it frees,
+    /// the value of every page in it. A page being written out is leaving anyway.
+    fn drain_cost(&self, class: SizeClass, batch: u32) -> (usize, f32) {
+        let count = 1u32 << memory::order(class);
+        let start = batch & !(count - 1);
+        let now = self.now();
+        let (mut in_use, mut value) = (0, 0.0);
+        for frame in self.memory.taken_in(start, count) {
+            let h = self.header(frame);
+            match h.status() {
+                RESIDENT => {
+                    in_use += (h.tracker.last() >= now) as usize;
+                    value += h.tracker.value(now);
+                }
+                OUTGOING => {}
+                _ => {
+                    in_use += 1;
+                    value = f32::INFINITY;
+                }
+            }
+        }
+        (in_use, value / (count as usize * memory::BATCH) as f32)
     }
 
     /// The least value among a sample of `class`'s frames: free frames are worth nothing.

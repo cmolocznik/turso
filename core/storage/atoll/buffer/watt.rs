@@ -84,6 +84,11 @@ impl Tracker {
         record(&self.writes, &self.write_head, now);
     }
 
+    /// The epoch of the latest access, 0 for none.
+    pub fn last(&self) -> u32 {
+        self.reads[self.read_head.load(Ordering::Relaxed) as usize % READS].load(Ordering::Relaxed)
+    }
+
     /// The page's value in epoch `now`: higher is worth keeping more.
     pub fn value(&self, now: u32) -> f32 {
         frequency(&self.reads, &self.read_head, now)

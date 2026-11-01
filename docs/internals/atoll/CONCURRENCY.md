@@ -71,7 +71,9 @@ Anything that fits none of these is a design error.
 - **Across steps,** a participant holds only names with versions (page id, frame, version), and
   validates all three before use. A frame's version only rises, so a frame that held another page
   in between never validates. A cursor kept open for an hour pins nothing.
-- **Bounded:** a step never blocks, so a slow participant delays reclamation by at most one step.
+- **Bounded in steps:** a step never blocks, so a participant delays reclamation by at most the
+  step it is in. That is a bound in steps, not in time or memory: a thread descheduled mid-step,
+  or a step that runs long, holds reclamation back for as long, and limbo lists grow meanwhile.
 - **Frames and memory batches are checked, not retired.** A frame's identity is its latch
   version, which only rises, and every use validates it. A batch is used only through its frames,
   and every action on a frame drawn from a batch (an eviction, a drain) checks under the frame's

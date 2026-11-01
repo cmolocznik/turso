@@ -28,14 +28,18 @@ The code is in `core/storage/atoll`. Section 20 says which parts are built.
   - read committed and snapshot isolation, with serializable later;
   - long-running reads, and transactions larger than memory;
   - crash safety;
-  - commit latency that checkpoints and page writeback do not move.
+  - commit latency that checkpoints and page writeback do not wait in front of (section 8).
 - **Turso's SQL layer:** everything keeps working:
   - rowid and WITHOUT ROWID tables;
   - every index and index method;
   - the SQLite and PostgreSQL frontends.
 - **Torn writes.** Any write can tear, at any size. Nothing depends on the OS or the device writing
   atomically.
-- **Erasure.** Deleted data leaves the disk promptly.
+- **Erasure.** Deleted data leaves the files promptly (section 6.3). That is the file system's view:
+  an SSD remaps writes, so the physical blocks can keep old data until the device reuses them, and
+  the log, temporary files and replicas keep copies until they are removed themselves. Data that
+  must not be recoverable from the device needs encryption with per-subject keys destroyed on
+  deletion, which is not designed yet.
 - **No SQLite file compatibility.**
 
 ## 2. Baseline and departures
@@ -316,7 +320,10 @@ not at all. Built in `log/mod.rs` (`Log::append_group`) and `log/reader.rs`.
 ## 8. Commit latency
 
 A commit appends its record and waits for durability: one device write in the local modes, one
-round to a majority under Raft. Page writeback goes to other files and never waits on the log path.
+round to a majority under Raft. Page writeback goes to other files and never waits on the log path,
+so a commit waits on no page write. Both still share the device's queues and bandwidth, the file
+system and the CPU, so writeback can lengthen a commit's write; section 19 measures commit latency
+percentiles while the cleaner runs, rather than assuming it.
 
 ## 9. The buffer manager
 

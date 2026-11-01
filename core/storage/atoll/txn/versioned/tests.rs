@@ -88,32 +88,25 @@ impl Db {
         txn
     }
 
+    fn read(&self, txn: &mut Txn, key: &str) -> Option<Vec<u8>> {
+        let mut op = Get::new(key.as_bytes());
+        run(&self.io, || self.tree.get(self.txns(), &self.versions, txn, &mut op))
+    }
+
     fn get(&self, txn: &mut Txn, key: &str) -> Option<String> {
-        run(&self.io, || {
-            self.tree
-                .get(self.txns(), &self.versions, txn, key.as_bytes())
-        })
-        .map(|v| String::from_utf8(v).unwrap())
+        self.read(txn, key).map(|v| String::from_utf8(v).unwrap())
+    }
+
+    fn write(&self, txn: &mut Txn, mut op: WriteOp) -> Write {
+        run(&self.io, || self.tree.write(self.txns(), &self.versions, txn, &mut op))
     }
 
     fn put(&self, txn: &mut Txn, key: &str, value: &str, mode: Mode) -> Write {
-        run(&self.io, || {
-            self.tree.put(
-                self.txns(),
-                &self.versions,
-                txn,
-                key.as_bytes(),
-                value.as_bytes(),
-                mode,
-            )
-        })
+        self.write(txn, WriteOp::put(key.as_bytes(), value.as_bytes().to_vec(), mode))
     }
 
     fn delete(&self, txn: &mut Txn, key: &str) -> Write {
-        run(&self.io, || {
-            self.tree
-                .delete(self.txns(), &self.versions, txn, key.as_bytes())
-        })
+        self.write(txn, WriteOp::delete(key.as_bytes()))
     }
 
     fn commit(&self, txn: Txn) {

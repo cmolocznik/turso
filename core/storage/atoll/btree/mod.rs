@@ -508,7 +508,9 @@ impl Tree {
                 _ => {}
             }
             assert_eq!(op.head.len(), self.head, "a put's head is not the tree's");
-            if !done!(op.old_pages(&self.pool, self.head, present.as_ref())) {
+            if op.keep {
+                op.old = None;
+            } else if !done!(op.old_pages(&self.pool, self.head, present.as_ref())) {
                 continue;
             }
             let out_of_line = !self.limits.inline(op.key.len(), self.head + op.value_len);
@@ -1137,7 +1139,19 @@ impl Tree {
     }
 
     fn run(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
+        let mut spins = 0u64; // TEMPORARY DIAGNOSIS
         loop {
+            spins += 1;
+            if spins == 1_000_000 {
+                let (seek, target) = cursor.pending.clone().unwrap_or((Seek::Ge, Vec::new()));
+                let mut leaf_desc = String::new();
+                if let Ok(Found::Node { node: n, parent }) = self.descend(&target, 0, Route::At) {
+                    let d = n.read(|p| { let v = View::new(p); format!("pid {:?} level {} count {:?} lower {:?} upper {:?}", n.pid(), v.level(), v.count(), v.lower().map(|l| l.map(|x| x.to_vec())), v.upper().map(|u| u.map(|x| x.to_vec()))) });
+                    let pd = parent.map(|(p, pos)| p.read(|b| { let v = View::new(b); format!("parent {:?} pos {pos} count {:?} key(pos-1) {:?} key(pos) {:?}", p.pid(), v.count(), pos.checked_sub(1).and_then(|q| v.key(q)), v.key(pos)) }));
+                    leaf_desc = format!("{d:?} {pd:?}");
+                }
+                panic!("TEMPORARY DIAGNOSIS: cursor stuck: seek {seek:?} target {target:?} cached {:?} failed {:?}; descent lands on {leaf_desc}", cursor.leaf, cursor.failed);
+            }
             if let Some((key, head, read)) = &mut cursor.reading {
                 match done!(read.step(&self.pool)) {
                     Read::Value(v) => {
@@ -1467,6 +1481,8 @@ pub struct Put {
     expected: Option<Option<(Vec<u8>, bool)>>,
     /// The transaction the change belongs to: its id and previous record.
     txn: Option<(u64, Lsn)>,
+    /// The pages of an out-of-line value replaced stay: someone else frees them.
+    keep: bool,
 }
 
 impl Put {
@@ -1488,7 +1504,15 @@ impl Put {
             lsn: 0,
             expected: None,
             txn: None,
+            keep: false,
         }
+    }
+
+    /// Leaves the pages of an out-of-line value it replaces in place, for whoever still reads them;
+    /// their owner frees them.
+    pub fn keeping_replaced(mut self) -> Self {
+        self.keep = true;
+        self
     }
 
     /// Changes nothing, and reports [`Outcome::Changed`], unless the entry is `stored`, as

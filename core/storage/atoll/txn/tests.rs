@@ -212,6 +212,8 @@ fn a_transaction_sees_its_own_writes_from_its_next_statement_and_others_once_com
 fn a_commit_logs_its_timestamp_and_a_read_only_one_logs_nothing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, 4);
+    // Durable first, so the commit has no padding to flush.
+    drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
     let end = db.log().end();
     let reader = begin(&io, &db, Isolation::Snapshot);
     assert_eq!(commit(&io, &db, reader), None);

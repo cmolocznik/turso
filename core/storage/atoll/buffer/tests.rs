@@ -485,3 +485,37 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
         );
     }
 }
+
+#[test]
+fn a_new_page_read_in_by_a_stale_reader_before_its_frame_is_installed_is_replaced() {
+    for b in backends() {
+        let (_log, pool) = open(&b, MIN_BUDGET);
+        let class = class(0);
+        // A page lives and is freed.
+        let page = drive(&b.io, || pool.allocate(class)).unwrap();
+        let pid = page.pid();
+        drop(page);
+        drive(&b.io, || match pool.fix_exclusive(pid, None)? {
+            IOResult::Done(page) => pool.free(page),
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        })
+        .unwrap();
+        // An allocation claims its frame and gets the number back from the store; before it
+        // installs its frame, a reader of the page's earlier life reads the number in.
+        let frame = drive(&b.io, || pool.claim(class)).unwrap();
+        let again = drive(&b.io, || pool.store.allocate(class)).unwrap();
+        assert_eq!(again, pid, "{}: the store hands out the freed number", b.name);
+        let stale = drive(&b.io, || pool.fix_shared(pid, None)).unwrap();
+        assert!(stale.page().iter().all(|&x| x == 0), "{}", b.name);
+        let read_in = stale.frame;
+        drop(stale);
+        let mut page = pool.install(frame, pid);
+        assert_eq!(page.frame, frame, "{}", b.name);
+        page.page_mut()[HEADER_SIZE] = 7;
+        drop(page);
+        assert_eq!(pool.table.find(&pool.headers, pid.raw()), Some(frame), "{}", b.name);
+        assert_ne!(pool.header(read_in).pid(), pid.raw(), "{}", b.name);
+        let page = drive(&b.io, || pool.fix_shared(pid, None)).unwrap();
+        assert_eq!(page.page()[HEADER_SIZE], 7, "{}", b.name);
+    }
+}

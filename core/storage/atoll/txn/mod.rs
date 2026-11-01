@@ -141,6 +141,8 @@ pub struct Txn {
     last: Lsn,
     /// Where the log stood at the snapshot: what a read-only commit waits to be durable.
     log_at: Lsn,
+    /// Entries the transaction put in the list of retired pages.
+    retired: u32,
 }
 
 impl Txn {
@@ -249,6 +251,7 @@ impl Transactions {
             seen: vec![None; self.slots.len()],
             last: 0,
             log_at: self.log.end(),
+            retired: 0,
         }))
     }
 
@@ -350,6 +353,7 @@ impl Transactions {
     }
 }
 
+pub mod retired;
 pub mod versioned;
 
 #[cfg(test)]

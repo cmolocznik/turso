@@ -41,6 +41,21 @@ pub struct FrameHeader {
     pub status: AtomicU8,
     pub flags: AtomicU8,
     pub tracker: Tracker,
+    /// TEMPORARY DIAGNOSIS: the site and thread that last took the latch exclusively.
+    pub owner: AtomicU64,
+}
+
+thread_local!(static THREAD: u64 = {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+});
+
+impl FrameHeader {
+    /// TEMPORARY DIAGNOSIS
+    pub fn owned(&self, site: u64) {
+        let t = THREAD.with(|t| *t);
+        self.owner.store(site << 32 | t, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 // SAFETY: every field is atomics, valid as zeros: an unlocked latch at version 0, a FREE frame.
@@ -64,4 +79,4 @@ impl FrameHeader {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<FrameHeader>() == 96);
+const _: () = assert!(std::mem::size_of::<FrameHeader>() == 104); // TEMPORARY DIAGNOSIS: 96 without owner

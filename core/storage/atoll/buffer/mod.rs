@@ -324,7 +324,13 @@ impl BufferPool {
                 None => false,
             },
             Mode::Shared => h.latch.try_lock_shared(),
-            Mode::Exclusive => h.latch.try_lock_exclusive(),
+            Mode::Exclusive => {
+                let l = h.latch.try_lock_exclusive();
+                if l {
+                    h.owned(1);
+                }
+                l
+            }
         };
         if latched {
             if holds(h) {
@@ -428,6 +434,7 @@ impl BufferPool {
         while !latch.try_lock_exclusive() {
             std::hint::spin_loop();
         }
+        self.header(frame).owned(2);
     }
 
     /// Returns `frame`, unlinked and latched exclusively, to the free frames.
@@ -522,13 +529,25 @@ impl BufferPool {
         h.tracker.clear();
         h.tracker.read(self.now());
         h.status.store(RESIDENT, Ordering::Release);
-        // The number may have been freed while its last page was still in memory: whoever freed
-        // it holds that frame exclusively and drops it next, waiting on nothing (`free`).
+        // Another frame may hold the number already. Either its last page was still in memory
+        // when it was freed: whoever freed it holds that frame exclusively and drops it next,
+        // waiting on nothing (`free`). Or a reader following a reference to the page's earlier
+        // life read it in after the store handed the number out and before this insert: that
+        // frame holds what the store holds for a page with no copy, zeros, and goes, unwritten.
+        // The reader's reference is stale and fails its validation.
         while let Err(other) = self.table.insert(&self.headers, pid.raw(), frame) {
-            assert!(
-                self.header(other).latch.optimistic().is_none(),
-                "new page {pid:?} is already in frame {other}, which no one is freeing"
-            );
+            let o = self.header(other);
+            if o.latch.try_lock_exclusive() {
+                assert!(
+                    o.status() == RESIDENT
+                        && o.pid() == pid.raw()
+                        && o.page_lsn.load(Ordering::Acquire) == 0
+                        && !o.dirty()
+                        && !o.has(WRITING),
+                    "new page {pid:?} is already in frame {other}, which holds more than it read in"
+                );
+                self.evict(class, other);
+            }
             std::hint::spin_loop();
         }
         Exclusive {
@@ -850,6 +869,7 @@ impl BufferPool {
         if h.status() != RESIDENT || h.has(WRITING) || !h.latch.try_lock_exclusive() {
             return false;
         }
+        h.owned(3);
         if h.status() != RESIDENT || h.has(WRITING) || PageId::from_raw(h.pid()).class() != class {
             h.latch.unlock_exclusive_unchanged();
             return false;
@@ -978,7 +998,7 @@ impl BufferPool {
         }
         h.flags
             .fetch_and(!(WRITING | EVICT_AFTER), Ordering::AcqRel);
-        if ok && evict_after && h.latch.try_lock_exclusive() {
+        if ok && evict_after && h.latch.try_lock_exclusive() && { h.owned(4); true } {
             if h.status() == RESIDENT && !h.dirty() && !h.has(WRITING) {
                 self.evict(self.memory.class_of(frame), frame);
             } else {
@@ -1079,11 +1099,11 @@ impl<'a> Optimistic<'a> {
         // Built only once latched: a guard's drop releases the latch.
         latch
             .try_lock_exclusive_at(self.version)
-            .then(|| Exclusive {
+            .then(|| { self.pool.header(self.frame).owned(5); Exclusive {
                 pool: self.pool,
                 frame: self.frame,
                 pid: self.pid,
-            })
+            }})
     }
 
     pub fn pid(&self) -> PageId {
@@ -1120,6 +1140,7 @@ impl<'a> Shared<'a> {
     /// Latches the page exclusively if no one else holds it shared.
     pub fn upgrade(self) -> std::result::Result<Exclusive<'a>, Self> {
         if self.pool.header(self.frame).latch.try_upgrade() {
+            self.pool.header(self.frame).owned(6);
             let (pool, frame, pid) = (self.pool, self.frame, self.pid);
             std::mem::forget(self);
             Ok(Exclusive { pool, frame, pid })

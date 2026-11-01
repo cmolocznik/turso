@@ -231,6 +231,9 @@ impl Opening {
                 )
             }
         };
+        // The list of retired pages exists from the first open on (txn::retired).
+        let io = self.store.io().clone();
+        super::drive(&io, || super::txn::retired::ensure(&io, &pool, &self.store))?;
         Ok(Atoll {
             database_id: self.superblock.database_id,
             recovered_end,

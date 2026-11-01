@@ -109,6 +109,16 @@ fn check_whole(tree: &Tree, db: &Atoll, run: &Runner<'_>, label: &str) -> Stats 
     let mut check = Check::default();
     let stats = run_to(run, || tree.check(&mut check));
     let mut expected: BTreeSet<PageId> = stats.pages.iter().copied().collect();
+    // Every database has the list of retired pages.
+    let retired = crate::storage::atoll::txn::retired::open(
+        tree.io.clone(),
+        db.pool().clone(),
+        db.store().clone(),
+    );
+    if retired.root() != tree.root() {
+        let mut check = Check::default();
+        expected.extend(run_to(run, || retired.check(&mut check)).pages);
+    }
     for &v in &stats.values {
         let pages = run_to(run, || value::pages(db.pool(), v));
         expected.extend(pages.unwrap_or_else(|| panic!("{label}: value {v:?} lost its pages")));

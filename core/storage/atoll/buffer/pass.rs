@@ -78,6 +78,8 @@ pub struct Pass {
     again: Vec<u32>,
     /// The writebacks this pass started.
     ours: Vec<Completion>,
+    /// TEMPORARY DIAGNOSIS: steps taken.
+    steps: u64,
 }
 
 impl Pass {
@@ -95,6 +97,7 @@ impl Pass {
             frames,
             again: Vec::new(),
             ours: Vec::new(),
+            steps: 0,
         }
     }
 
@@ -105,6 +108,33 @@ impl Pass {
 
     pub fn step(&mut self, pool: &Arc<BufferPool>) -> Result<IOResult<()>> {
         pool.failed()?;
+        self.steps += 1;
+        if self.steps == 2_000_000 {
+            let mut out = String::new();
+            for &f in &self.again {
+                let h = pool.header(f);
+                out.push_str(&format!(
+                    "frame {f}: owner site {} thread {} pid {:?} status {} flags {:#x} dirty {} latch {:?} page_lsn {} written {}\n",
+                    h.owner.load(Ordering::Relaxed) >> 32,
+                    h.owner.load(Ordering::Relaxed) & 0xffff_ffff,
+                    PageId::from_raw(h.pid()),
+                    h.status(),
+                    h.flags.load(Ordering::Acquire),
+                    h.dirty(),
+                    h.latch.optimistic(),
+                    h.page_lsn.load(Ordering::Acquire),
+                    h.written_lsn.load(Ordering::Acquire),
+                ));
+            }
+            panic!(
+                "TEMPORARY DIAGNOSIS: pass over shard {} stuck; again {:?}\n{out}ours {:?}; writebacks {}; in flight {}",
+                self.shard,
+                self.again,
+                self.ours.iter().map(|c| c.finished()).collect::<Vec<_>>(),
+                pool.writebacks.lock().len(),
+                pool.writes_in_flight.load(Ordering::Acquire)
+            );
+        }
         // Waiting starts before the looks, so a write landing in between is not missed.
         let landed = pool.released_wait();
         let mut start: [Vec<u32>; CLASS_COUNT] = Default::default();

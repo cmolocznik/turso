@@ -61,6 +61,9 @@ pub struct Writeback {
     unsettled: usize,
     /// Done once every write is settled.
     pub finished: Completion,
+    /// Run just before the writeback finishes, while its stepper holds it.
+    #[cfg(test)]
+    pub before_finish: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Writeback {
@@ -89,6 +92,8 @@ impl Writeback {
             landed: Arc::new(Mutex::new(Vec::new())),
             unsettled: 0,
             finished,
+            #[cfg(test)]
+            before_finish: None,
         }
     }
 
@@ -104,6 +109,10 @@ impl Writeback {
     /// Submits what it can, then settles what landed. It never fails: a failed write fails the
     /// pool, and the frames it has not written are given up.
     pub fn step(&mut self, pool: &Arc<BufferPool>) -> Progress {
+        // Stepped again by a thread that found it queued just before it was taken off.
+        if self.finished.finished() {
+            return Progress::Done;
+        }
         if let Some(c) = self.submit(pool) {
             return Progress::Waiting(c);
         }
@@ -135,6 +144,10 @@ impl Writeback {
         }
         // The plan held the metadata pages its remaps changed until now.
         self.plan = None;
+        #[cfg(test)]
+        if let Some(hook) = self.before_finish.take() {
+            hook();
+        }
         self.finished.complete(0);
         Progress::Done
     }

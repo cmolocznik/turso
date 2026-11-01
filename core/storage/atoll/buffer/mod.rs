@@ -1213,21 +1213,27 @@ impl BufferPool {
         let queued: Vec<_> = self.writebacks.lock().clone();
         let mut wait = None;
         for wb in queued {
-            let Some(mut w) = wb.try_lock() else {
-                continue;
-            };
-            match w.step(self) {
-                Progress::Waiting(c) => {
-                    wait.get_or_insert(c);
-                }
-                Progress::InFlight => {}
-                Progress::Done => {
-                    drop(w);
-                    self.writebacks.lock().retain(|q| !Arc::ptr_eq(q, &wb));
-                }
+            if let Some(Progress::Waiting(c)) = self.step_writeback(&wb) {
+                wait.get_or_insert(c);
             }
         }
         Ok(wait)
+    }
+
+    /// Steps `wb`, unless another thread is stepping it; the only way a writeback is stepped. A
+    /// waiter that found it held saw it neither finished nor left for another to step, so once
+    /// released after either, the pool's waiters are woken: nothing else would wake that one.
+    fn step_writeback(self: &Arc<Self>, wb: &Arc<Mutex<Writeback>>) -> Option<Progress> {
+        let progress = wb.try_lock()?.step(self);
+        match progress {
+            Progress::InFlight => {}
+            Progress::Done => {
+                self.writebacks.lock().retain(|q| !Arc::ptr_eq(q, wb));
+                self.signal_released();
+            }
+            Progress::Waiting(_) => self.signal_released(),
+        }
+        Some(progress)
     }
 
     /// Notes that a write of `frame` landed, from its completion: whoever waits on the pool, or on
@@ -1251,7 +1257,8 @@ impl BufferPool {
         if let Some(c) = self.drive_writebacks()? {
             return Ok(IOResult::IO(IOCompletions(c)));
         }
-        if self.writes_in_flight.load(Ordering::Acquire) > 0 {
+        // One queued and held by another thread may not have submitted its writes yet.
+        if self.writes_in_flight.load(Ordering::Acquire) > 0 || !self.writebacks.lock().is_empty() {
             return Ok(IOResult::IO(IOCompletions(wait)));
         }
         Ok(IOResult::Done(()))

@@ -740,3 +740,47 @@ fn a_written_page_is_evicted_only_while_its_write_pins_it() {
 fn a_written_page_is_evicted_only_while_its_write_pins_it_in_shuttle_schedules() {
     crate::storage::atoll::testing::schedules(written_page_eviction, 300);
 }
+
+/// A pass waiting for its own writeback wakes when another thread finishes it. A writeback
+/// finishes after its last write settles, so a pass that looks in between, while the other thread
+/// holds the writeback, waits on the pool: only the finish can wake it.
+#[test]
+fn a_pass_waiting_on_its_writeback_wakes_when_another_thread_finishes_it() {
+    // Writes stay in flight until the IO steps, so the pass cannot settle its own on submitting.
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(1));
+    let (log, pool) = open_on(&io, "/db/woken", MIN_BUDGET);
+    let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+    let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+    let pid = g.pid();
+    stamp(g.page_mut(), pid, 1);
+    let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
+    g.changed(lsn);
+    let frame = g.frame;
+    drop(g);
+    drop(admitted);
+    // The pass claims the page and submits its write, which stays in flight until the IO steps.
+    let mut pass = pool.pass(pool.shard_of(frame));
+    while pool.writes_in_flight.load(Ordering::Acquire) == 0 {
+        match pass.step(&pool).unwrap() {
+            IOResult::IO(IOCompletions(c)) => io.wait_for_completion(c).unwrap(),
+            IOResult::Done(()) => panic!("the pass wrote nothing"),
+        }
+    }
+    // Another thread settles the write; the pass steps once its last write has settled and before
+    // the writeback finishes, and finds the writeback held.
+    let waited: Arc<Mutex<Option<Completion>>> = Arc::new(Mutex::new(None));
+    let wb = pool.writebacks.lock()[0].clone();
+    wb.lock().before_finish = Some({
+        let (pool, waited) = (pool.clone(), waited.clone());
+        Box::new(move || match pass.step(&pool).unwrap() {
+            IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
+            IOResult::Done(()) => panic!("the pass finished before its writeback"),
+        })
+    });
+    drive(&io, || pool.settle_writes()).unwrap();
+    let waited = waited.lock().take().expect("the pass stepped");
+    assert!(
+        waited.finished(),
+        "the pass waits on a wakeup no one sends once its writeback has finished"
+    );
+}

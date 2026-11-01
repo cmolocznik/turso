@@ -282,6 +282,14 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         }
     }
 
+    /// Whether the lower fence is `key`, compared in place.
+    pub fn lower_is(&self, key: &[u8]) -> Option<bool> {
+        Some(
+            self.fence_run(LOWER, LOWER_INFINITE)?
+                .is_some_and(|l| self.order(l, key) == Ordering::Equal),
+        )
+    }
+
     /// The bytes every key in the node starts with, stripped from each.
     pub fn prefix(&self) -> Option<Vec<u8>> {
         Some(self.copy(self.prefix_run()?))

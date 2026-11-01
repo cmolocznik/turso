@@ -359,7 +359,7 @@ impl Tree {
                 // routed here: a split or merge that moves its fences changes the parent too.
                 let reaches = match route {
                     Route::At => v.covers(key)?,
-                    Route::Above => v.covers(key)? || v.lower()?.as_deref() == Some(key),
+                    Route::Above => v.covers(key)? || v.lower_is(key)?,
                 };
                 if !reaches {
                     return Some(Err((v.level(), v.lower()?, v.upper()?)));
@@ -464,8 +464,7 @@ impl Tree {
                 if !exact {
                     return Some(None);
                 }
-                let (value, out) = v.value(pos)?;
-                Some(Some((value.to_vec(), out)))
+                Some(Some(v.value(pos)?))
             }) else {
                 continue;
             };
@@ -592,9 +591,7 @@ impl Tree {
                 continue;
             }
             let (pos, exact) = v.search(&op.key).ok_or_else(|| corrupt_node(ex.pid()))?;
-            let now = exact
-                .then(|| v.value(pos).map(|(b, o)| (b.to_vec(), o)))
-                .flatten();
+            let now = exact.then(|| v.value(pos)).flatten();
             if now != present {
                 // Changed since the look: look again.
                 drop(ex);
@@ -696,9 +693,7 @@ impl Tree {
             };
             let v = View::new(ex.page());
             let (pos, exact) = v.search(&op.key).ok_or_else(|| corrupt_node(ex.pid()))?;
-            let now = exact
-                .then(|| v.value(pos).map(|(b, o)| (b.to_vec(), o)))
-                .flatten();
+            let now = exact.then(|| v.value(pos)).flatten();
             if v.covers(&op.key) != Some(true) || now.as_ref() != Some(&present) {
                 drop(ex);
                 continue;
@@ -1282,7 +1277,7 @@ impl Tree {
                             v.is_node()
                                 && v.root() == self.root
                                 && v.is_leaf()
-                                && matches!(v.lower(), Some(Some(l)) if l == fence)
+                                && v.lower_is(&fence) == Some(true)
                         });
                         if neighbour == Some(true) {
                             cursor.leaf = Some((pid, hint, n.version()));
@@ -1392,8 +1387,7 @@ fn look<P: Bytes + ?Sized>(v: View<'_, P>, key: &[u8]) -> Option<Look> {
     if !exact {
         return Some(Some(None));
     }
-    let (value, out) = v.value(pos)?;
-    Some(Some(Some((value.to_vec(), out))))
+    Some(Some(Some(v.value(pos)?)))
 }
 
 fn store_len(pids: &[PageId]) -> u64 {
@@ -1624,7 +1618,7 @@ fn old_pages(
         *old = None;
         return Ok(IOResult::Done(true));
     };
-    let reference = &stored[head.min(stored.len())..].to_vec();
+    let reference = &stored[head.min(stored.len())..];
     if old.as_ref().is_some_and(|(r, _)| r == reference) {
         return Ok(IOResult::Done(true));
     }
@@ -1632,7 +1626,7 @@ fn old_pages(
         .ok_or_else(|| LimboError::Corrupt("a bad value reference".into()))?;
     Ok(match value::pages(pool, parsed, holder)? {
         IOResult::Done(Ok(pages)) => {
-            *old = Some((reference.clone(), pages));
+            *old = Some((reference.to_vec(), pages));
             IOResult::Done(true)
         }
         IOResult::Done(Err(_)) => IOResult::Done(false),
@@ -1745,7 +1739,7 @@ fn scan_leaf<P: Bytes + ?Sized>(
     if !v.is_leaf() {
         return None;
     }
-    if cached && !(v.covers(target)? || seek == Seek::Gt && v.lower()?.as_deref() == Some(target)) {
+    if cached && !(v.covers(target)? || seek == Seek::Gt && v.lower_is(target)?) {
         return Some(Scan::Stale);
     }
     let count = v.count()?;
@@ -1759,18 +1753,18 @@ fn scan_leaf<P: Bytes + ?Sized>(
     match pos {
         Some(p) if p < count => {
             let (value, out) = v.value(p)?;
-            Some(Scan::Entry(v.key(p)?, value.to_vec(), out))
+            Some(Scan::Entry(v.key(p)?, value, out))
         }
         Some(_) => Some(match v.upper()? {
             None => Scan::End,
             Some(u) => {
                 let (pid, hint) = v.next();
-                Scan::Beyond(pid, hint, u.to_vec())
+                Scan::Beyond(pid, hint, u)
             }
         }),
         None => Some(match v.lower()? {
             None => Scan::End,
-            Some(l) => Scan::Before(l.to_vec()),
+            Some(l) => Scan::Before(l),
         }),
     }
 }

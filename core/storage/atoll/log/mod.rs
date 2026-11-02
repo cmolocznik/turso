@@ -330,7 +330,11 @@ impl Log {
     }
 
     /// Whether anyone waits to be admitted or for the log to be durable: an append then flushes.
+    /// Across a fence from the copy the append just counted, pairing with the one a waiter passes
+    /// between pushing its wait and flushing: either this finds the wait, or the waiter's flush
+    /// finds the copy. Without it each can miss the other, and nobody flushes.
     fn flush_wanted(&self) -> bool {
+        fence(Ordering::SeqCst);
         !self.durable_waits.is_empty() || !self.admitters.is_empty()
     }
 

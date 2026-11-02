@@ -19,6 +19,7 @@
 //! the VDBE's `IOResult` stepping on every backend: io_uring, the syscall backend and memory.
 
 pub mod aligned;
+pub mod arc_cell;
 pub mod bits;
 pub mod blob;
 pub mod btree;

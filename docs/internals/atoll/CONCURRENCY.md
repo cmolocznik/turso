@@ -273,9 +273,21 @@ in the last point.
   again. Those waiting to be durable or admitted wait on take-all stacks, looking again across a
   fence once on them, so a waker finds them or they see what it did. The first failure is set
   once.
-- **Checkpoints and writeback** own their work while stepping it and hold nothing across IO.
-- **Recovery.** Each window is immutable once read; each partition is owned by the one thread
-  applying it.
+- **Checkpoints and writeback** own their work while stepping it and hold nothing across IO. A
+  full checkpoint is asked for with one atomic add, and the superblock in charge is published in
+  a cell (`arc_cell.rs`) anyone reads in a step.
+- **The log's segment files** are cells by segment number, put by compare-and-swap, read in a
+  step and let go through the epochs once removed.
+- **Recovery takes no lock** (`recovery.rs`). Its phase moves on by compare-and-swap, the
+  analysis and the finish each taken by the one thread whose exchange moves them to running.
+  What the analysis finds is set once. The redo's log reader, and the control file, are batons
+  one thread holds at a time (`once.rs`). The windows read are a ring: each partition's part of a
+  window is one word naming the window, so a part is taken by compare-and-swap and never from a
+  window its slot held before or holds after, and a slot is read into again only once the window
+  it held is wholly applied. A partition moves past a window once its part is done or the window
+  wholly applied. Threads with nothing to do wait on a take-all stack, looking for work again
+  once on it, and every change wakes them. Each window is immutable once read; each part is
+  owned by the one thread applying it. The intents it has yet to match are a bitmap per class.
 - **Transactions.**
   - A slot is owned by its transaction.
   - Its commit log has one writer, the slot's transaction, which appends and then publishes the
@@ -375,8 +387,9 @@ in the last point.
 6. Lock-free throughout (2026-11-02), one part at a time, each with its design here, loom, Miri
    where it holds pointers, shuttle, stress and mutants before it is done: the epochs; then the
    buffer pool (its page table, allocator, IO in flight, wake, first error, writeback queue,
-   landed writes, ring and temporary pages done); the page store (done but for the intents
-   recovery tracks while it replays alone); the metadata cache (done); the log's admission and
-   flush (done but for its segment files' map); transactions (done: commit logs, the published
-   horizon, slots and the version indexes' roots); the cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and
-   stay.
+   landed writes, ring and temporary pages done); the page store (done); the metadata cache
+   (done); the log's admission and
+   flush (done); transactions (done: commit logs, the published horizon, slots and the version
+   indexes' roots); the cold paths (done: recovery, the checkpointer's requests and superblock,
+   the control file's and the log reader's reads). Mutexes only ever tried (§8) are ownership,
+   not locks, and stay.

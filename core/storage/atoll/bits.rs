@@ -37,6 +37,19 @@ impl GrowBits {
             == 0
     }
 
+    /// The bits set, in order: a bit set or cleared during the scan may or may not be among them.
+    pub fn ones(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.words.each(|i, word| {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                out.push(i * 64 + bits.trailing_zeros() as u64);
+                bits &= bits - 1;
+            }
+        });
+        out
+    }
+
     /// Clears bit `n`; true if it was set.
     pub fn clear(&self, n: u64) -> bool {
         let bit = 1 << (n % 64);

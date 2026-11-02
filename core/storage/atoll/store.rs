@@ -297,8 +297,8 @@ pub struct PageStore {
     /// log restarted, until a checkpoint past the restart is durable: a recovery from before that
     /// checkpoint cannot read what was appended since, and could still need the copies it freed.
     erase_limit: AtomicU64,
-    /// While recovering: slots of intents not yet matched by a remap or a release.
-    pending_intents: Mutex<HashMap<(SizeClass, u64), Lsn>>,
+    /// While recovering, per class: slots of intents not yet matched by a remap or a release.
+    pending_intents: [GrowBits; CLASS_COUNT],
     /// Provisional pages: where the group that made each provisional starts, and where the
     /// record that settled it (adopted or freed it) ends, once one did. A settled page stays
     /// until that record is durable: a crash before then still finds it provisional.
@@ -411,7 +411,7 @@ impl PageStore {
             plans: Default::default(),
             unerased: Default::default(),
             erase_limit: AtomicU64::new(u64::MAX),
-            pending_intents: Mutex::new(HashMap::new()),
+            pending_intents: Default::default(),
             provisional: Provisionals::new(epochs.clone()),
             orphans: Stack::default(),
             erasure: Mutex::new(Eraser::default()),
@@ -1170,7 +1170,7 @@ impl PageStore {
                 }
             }
             StoreRecord::Remap { pid, new, old } => {
-                self.pending_intents.lock().remove(&(pid.class(), *new));
+                self.pending_intents[pid.class().index()].clear(*new);
                 if let Some(old) = old {
                     self.freed(span, pid.class(), *old);
                 }
@@ -1178,12 +1178,12 @@ impl PageStore {
             StoreRecord::Intent { class, slots } => {
                 for &s in slots {
                     self.retaken(*class, s);
-                    self.pending_intents.lock().insert((*class, s), start);
+                    self.pending_intents[class.index()].set(s);
                 }
             }
             StoreRecord::Release { class, slots } => {
                 for &s in slots {
-                    self.pending_intents.lock().remove(&(*class, s));
+                    self.pending_intents[class.index()].clear(s);
                     self.freed(span, *class, s);
                 }
             }
@@ -1195,17 +1195,16 @@ impl PageStore {
     /// Releases the slots of intents no remap matched, so recovery leaves no copy behind that
     /// nothing refers to. Called once every record has been replayed.
     pub fn release_orphans(self: &Arc<Self>) -> Result<IOResult<()>> {
-        let mut by_class: BTreeMap<SizeClass, Vec<u64>> = BTreeMap::new();
-        for &(class, slot) in self.pending_intents.lock().keys() {
-            by_class.entry(class).or_default().push(slot);
-        }
-        for (class, mut slots) in by_class {
-            slots.sort_unstable();
+        for class in SizeClass::all() {
+            let pending = &self.pending_intents[class.index()];
+            let slots = pending.ones();
+            if slots.is_empty() {
+                continue;
+            }
             match self.release(class, &slots)? {
                 IOResult::Done(()) => {
-                    let mut pending = self.pending_intents.lock();
-                    for s in &slots {
-                        pending.remove(&(class, *s));
+                    for &s in &slots {
+                        pending.clear(s);
                     }
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),

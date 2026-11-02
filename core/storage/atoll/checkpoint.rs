@@ -10,12 +10,15 @@
 //! With S shards each taking 1/S of the budget, the redo point trails the log's end by about the
 //! budget, plus what is appended while a pass runs.
 
+use super::arc_cell::{ArcCell, Releasing};
 use super::buffer::{BufferPool, Pass};
 use super::control::{Control, Superblock};
+use super::epoch::Epochs;
 use super::log::{Log, Lsn};
 use super::store::PageStore;
 use super::txn::Clock;
 use crate::io::Completion;
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
 use crate::Result;
@@ -27,6 +30,12 @@ pub struct Checkpointer {
     clock: Arc<Clock>,
     /// Log appended between passes: the budget split among the shards.
     increment: u64,
+    /// Full checkpoints asked for so far.
+    full_wanted: AtomicU64,
+    /// The superblock in charge, as the checkpoint stepping it last wrote it, for anyone to read.
+    published: ArcCell<Superblock>,
+    releasing: Releasing<Superblock>,
+    /// Owned by whoever steps the checkpoints, and only ever tried.
     state: Mutex<State>,
 }
 
@@ -37,8 +46,7 @@ struct State {
     /// Where the log ended when the last pass began.
     last_pass: Lsn,
     work: Work,
-    /// Full checkpoints asked for so far, and how many of them are done.
-    full_wanted: u64,
+    /// Full checkpoints done.
     full_done: u64,
 }
 
@@ -84,12 +92,14 @@ impl Checkpointer {
             store,
             control,
             clock,
+            full_wanted: AtomicU64::new(0),
+            published: ArcCell::new(Arc::new(superblock.clone())),
+            releasing: Releasing::new(Arc::new(Epochs::new())),
             state: Mutex::new(State {
                 superblock,
                 next_shard: 0,
                 last_pass,
                 work: Work::Idle,
-                full_wanted: 0,
                 full_done: 0,
             }),
         }
@@ -101,7 +111,8 @@ impl Checkpointer {
 
     /// The superblock in charge.
     pub fn superblock(&self) -> Superblock {
-        self.state.lock().superblock.clone()
+        let step = self.releasing.epochs().enter();
+        (*self.published.get(&step).expect("a superblock in charge")).clone()
     }
 
     /// Does whatever is due: a pass once its share of the log has been appended, moving the redo
@@ -117,9 +128,7 @@ impl Checkpointer {
     /// Asks for a full checkpoint: every shard passed, then the redo point moved as far as it
     /// goes. Step it with [`step_full`](Self::step_full).
     pub fn request_full(&self) -> u64 {
-        let mut state = self.state.lock();
-        state.full_wanted += 1;
-        state.full_wanted
+        self.full_wanted.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Done once the full checkpoint `ticket` names is done.
@@ -145,11 +154,12 @@ impl State {
         loop {
             match &mut self.work {
                 Work::Idle => {
-                    if self.full_done < self.full_wanted {
+                    let wanted = cp.full_wanted.load(Ordering::Acquire);
+                    if self.full_done < wanted {
                         let passes = (0..cp.pool.shard_count())
                             .map(|s| cp.pool.pass(s))
                             .collect();
-                        self.work = Work::Passes(passes, Some(self.full_wanted));
+                        self.work = Work::Passes(passes, Some(wanted));
                         continue;
                     }
                     let end = cp.log().end();
@@ -233,6 +243,8 @@ impl State {
                     Stage::Superblock(sb, written) => match cp.control.step_write(sb, written)? {
                         IOResult::Done(()) => {
                             self.superblock = sb.clone();
+                            cp.published
+                                .replace(Some(Arc::new(sb.clone())), &cp.releasing);
                             let full = a.full;
                             cp.log().release_before(self.superblock.redo)?;
                             self.finish(full);

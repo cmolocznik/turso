@@ -56,6 +56,21 @@ impl<T: Default> Segmented<T> {
         (!p.is_null()).then(|| unsafe { &*p.add(at) })
     }
 
+    /// Every item of the segments made so far, with its index, in order.
+    pub fn each(&self, mut f: impl FnMut(u64, &T)) {
+        for (k, segment) in self.segments.iter().enumerate() {
+            let p = segment.load(Ordering::Acquire);
+            if p.is_null() {
+                continue;
+            }
+            let first = ((1u64 << k) - 1) << FIRST_SHIFT;
+            for at in 0..len(k) {
+                // SAFETY: as in `get`.
+                f(first + at as u64, unsafe { &*p.add(at) });
+            }
+        }
+    }
+
     /// Item `i`, its segment made if it was not.
     pub fn get_or_make(&self, i: u64) -> &T {
         let (k, at) = locate(i);

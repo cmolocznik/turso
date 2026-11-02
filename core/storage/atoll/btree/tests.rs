@@ -938,6 +938,72 @@ fn concurrent_tree(seed: u64, ops: u64) {
     check_whole(&tree, &db, &run, "schedules");
 }
 
+/// A tree's puts, durable, its database then dropped without a checkpoint past them and recovered
+/// on `threads` threads at once: every key reads back, and the tree is whole. The recovering
+/// threads take the analysis, the windows to read and the partitions to apply from one another.
+fn a_tree_recovered_on_threads_at_once_reads_back_whole(threads: usize, keys: u64) {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let value = |k: u64| stamp(&k.to_be_bytes(), k, 40 + (k % 7) as usize * 30);
+    let root = {
+        let db = open(&io, MIN_BUDGET, 1);
+        let run = drive_runner(&io);
+        let tree = create(&io, &db, &run, false);
+        for k in 0..keys {
+            let mut op = Put::new(&k.to_be_bytes(), value(k), Mode::Upsert);
+            run_to(&run, || tree.put(&mut op));
+        }
+        drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
+        tree.root()
+    };
+    // A budget small enough that recovery reads the log in windows several times its ring's.
+    let mut small = config(MIN_BUDGET);
+    small.log_budget = Some(64 << 10);
+    let opening = Arc::new(Opening::new(io.clone(), BASE, small).unwrap());
+    let others: Vec<_> = (1..threads)
+        .map(|_| {
+            let opening = opening.clone();
+            crate::thread::spawn(move || opening.work().unwrap())
+        })
+        .collect();
+    opening.work().unwrap();
+    for t in others {
+        t.join().unwrap();
+    }
+    let db = Arc::into_inner(opening)
+        .expect("the opening, every thread done")
+        .finish()
+        .unwrap();
+    assert!(db.recovered_end().is_some(), "the open did not recover");
+    let run = drive_runner(&io);
+    let tree = tree_of(&io, &db, root);
+    for k in 0..keys {
+        assert_eq!(
+            get(&tree, &run, &k.to_be_bytes()),
+            Some(value(k)),
+            "key {k}"
+        );
+    }
+    let stats = check_whole(&tree, &db, &run, "recovered");
+    assert_eq!(stats.entries, keys as usize);
+}
+
+#[cfg(not(shuttle))]
+#[test]
+fn a_tree_recovered_on_threads_at_once_reads_back_whole_on_threads() {
+    for threads in [1, 3, 12] {
+        a_tree_recovered_on_threads_at_once_reads_back_whole(threads, 3_000);
+    }
+}
+
+#[cfg(shuttle)]
+#[test]
+fn a_tree_recovered_on_threads_at_once_reads_back_whole_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || a_tree_recovered_on_threads_at_once_reads_back_whole(2, 300),
+        100,
+    );
+}
+
 #[cfg(shuttle)]
 #[test]
 fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order_in_shuttle_schedules() {

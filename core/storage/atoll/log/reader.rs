@@ -12,7 +12,8 @@ use super::record::{self, Header, Lsn, Parsed, Place, BLOCK};
 use super::segment::Segments;
 use crate::io::{Completion, IO};
 use crate::storage::atoll::aligned::AlignedBlock;
-use crate::sync::{Arc, Mutex};
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::Arc;
 use crate::{LimboError, Result};
 
 /// The largest read the reader makes at once.
@@ -234,18 +235,19 @@ impl LogReader {
             let segment_end = self.segments.start(number + 1);
             let len = ((segment_end - at) as usize).min(READ);
             let into = self.buffer.region(0, len);
-            let got = Arc::new(Mutex::new(None));
+            // The bytes read, set once the read lands.
+            let got = Arc::new(AtomicU64::new(0));
             let out = got.clone();
             let c = Completion::new_read(into, move |res| match res {
                 Ok((_, n)) => {
-                    *out.lock() = Some(n.max(0) as usize);
+                    out.store(n.max(0) as u64, Ordering::Release);
                     None
                 }
                 Err(e) => Some(e),
             });
             let c = file.pread(at - self.segments.start(number), c)?;
             self.io.wait_for_completion(c)?;
-            let n = got.lock().take().unwrap_or(0);
+            let n = got.load(Ordering::Acquire) as usize;
             // SAFETY: the read filled the first `n` bytes of the buffer, and nothing else uses it.
             let bytes = unsafe { std::slice::from_raw_parts(self.buffer.as_ptr(), n) };
             self.window.extend_from_slice(bytes);

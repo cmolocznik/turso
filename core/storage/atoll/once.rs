@@ -1,28 +1,58 @@
-//! Values set or taken once, by compare-and-swap: a set-once cell read with one load, and a
-//! one-shot value taken by whichever thread swaps it out first.
+//! Values set or taken by compare-and-swap: a set-once cell read with one load, a value held by
+//! one thread at a time, taken by swapping it out and put back by its taker, and a one-shot value
+//! taken by whichever thread swaps it out first.
 
 use crate::sync::atomic::{AtomicPtr, Ordering};
 use std::ptr;
 
-/// A value taken once, by whichever thread swaps it out first: a one-shot callback a completion
-/// that may run more than once calls at most once.
-pub struct TakeOnce<T>(AtomicPtr<T>);
+/// A value held by one thread at a time: whoever swaps it out holds it, and puts it back, or on,
+/// when done.
+pub struct Baton<T>(AtomicPtr<T>);
 
-impl<T> TakeOnce<T> {
-    pub fn new(value: T) -> Self {
-        Self(AtomicPtr::new(Box::into_raw(Box::new(value))))
+// SAFETY: the value moves between threads only through the pointer's swaps.
+unsafe impl<T: Send> Send for Baton<T> {}
+unsafe impl<T: Send> Sync for Baton<T> {}
+
+impl<T> Baton<T> {
+    pub fn new(value: Option<T>) -> Self {
+        Self(AtomicPtr::new(
+            value.map_or(ptr::null_mut(), |v| Box::into_raw(Box::new(v))),
+        ))
     }
 
+    /// The value, if no one holds it.
     pub fn take(&self) -> Option<T> {
         let p = self.0.swap(ptr::null_mut(), Ordering::AcqRel);
-        // SAFETY: from `new`'s box, and the swap made this thread its only holder.
+        // SAFETY: from a box put here, and the swap made this thread its only holder.
         (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
+    }
+
+    /// Puts the value held back, for the next to take: by its holder, or whoever it hands it to.
+    pub fn put(&self, value: T) {
+        let old = self
+            .0
+            .swap(Box::into_raw(Box::new(value)), Ordering::AcqRel);
+        assert!(old.is_null(), "a value put back while another was there");
     }
 }
 
-impl<T> Drop for TakeOnce<T> {
+impl<T> Drop for Baton<T> {
     fn drop(&mut self) {
         drop(self.take());
+    }
+}
+
+/// A value taken once, by whichever thread swaps it out first: a one-shot callback a completion
+/// that may run more than once calls at most once.
+pub struct TakeOnce<T>(Baton<T>);
+
+impl<T> TakeOnce<T> {
+    pub fn new(value: T) -> Self {
+        Self(Baton::new(Some(value)))
+    }
+
+    pub fn take(&self) -> Option<T> {
+        self.0.take()
     }
 }
 
@@ -33,6 +63,15 @@ pub struct SetOnce<T>(AtomicPtr<T>);
 impl<T> Default for SetOnce<T> {
     fn default() -> Self {
         Self(AtomicPtr::new(ptr::null_mut()))
+    }
+}
+
+impl<T> SetOnce<T> {
+    /// The value set, if any, for as long as the cell lives.
+    pub fn get_ref(&self) -> Option<&T> {
+        let p = self.0.load(Ordering::Acquire);
+        // SAFETY: set once from a box, freed only with the cell.
+        (!p.is_null()).then(|| unsafe { &*p })
     }
 }
 

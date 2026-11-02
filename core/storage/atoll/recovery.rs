@@ -37,16 +37,20 @@ use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::db::AtollConfig;
 use super::drive;
 use super::log::{Log, LogConfig, LogReader, Lsn, OwnedRecord};
+use super::once::{Baton, SetOnce};
 use super::page::{self, PageId};
 use super::radix::FREE;
 use super::redo::PageRecord;
+use super::stack::Stack;
 use super::store::{kinds, PageStore, StoreRecord};
 use super::txn::Ts;
 use super::txn::{self, Clock};
 use crate::io::{Completion, IO};
-use crate::sync::{Arc, Mutex};
+use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::sync::Arc;
 use crate::{LimboError, Result};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cell::UnsafeCell;
+use std::collections::{HashMap, HashSet};
 
 /// Windows read and not yet wholly applied, at most: one being read while the others apply, and
 /// room for partitions to run up to two windows ahead of the slowest.
@@ -56,22 +60,65 @@ const WINDOWS: usize = 4;
 /// another ready while one holding a hot page runs long.
 const PARTITIONS_PER_THREAD: usize = 4;
 
+/// The phases, each moved on by compare-and-swap; the analysis and the finish are taken by the one
+/// thread whose exchange moves them on to running.
+const ANALYSIS: u8 = 0;
+const ANALYZING: u8 = 1;
+const REDO: u8 = 2;
+const FINISH: u8 = 3;
+const FINISHING: u8 = 4;
+const DONE: u8 = 5;
+const FAILED: u8 = 6;
+
+/// A part's state, beside the index of the window it is part of.
+const READY: u64 = 1;
+const TAKEN: u64 = 2;
+const PART_DONE: u64 = 3;
+
+fn part_state(window: u64, state: u64) -> u64 {
+    window << 2 | state
+}
+
+/// Recovery without a lock. Its phase moves on by compare-and-swap. What the analysis finds is set
+/// once. The log reader is a baton the thread reading a window holds, and the windows read are a
+/// ring: a partition's part of a window is one word naming the window, taken by compare-and-swap,
+/// so a part is never taken from a window its slot held before or holds after; a window's slot is
+/// read into again only once every part of the window it held is done. Threads with nothing to do
+/// wait on a take-all stack, looking for work again once on it, and every change wakes them.
 pub(super) struct Recovery {
     io: Arc<dyn IO>,
     base: String,
     log_config: LogConfig,
     buffer: BufferConfig,
     log_budget: u64,
-    /// The superblock in charge: as recovery found it, then with the gap it records.
-    superblock: Mutex<Superblock>,
+    /// The superblock in charge as recovery found it.
+    superblock: Superblock,
+    /// The superblock in charge once the analysis recorded the gap it leaves, if it leaves one.
+    recorded: SetOnce<Superblock>,
     store: Arc<PageStore>,
-    control: Mutex<Option<Control>>,
+    /// The control file: the analysis's to write, then the finish's to hand on.
+    control: Baton<Control>,
     /// Log per window: what one checkpoint pass covers.
     window_bytes: u64,
     partitions: usize,
-    state: Mutex<State>,
-    /// Done when the state next changes, for threads waiting for work.
-    changed: Mutex<Option<Completion>>,
+    phase: AtomicU8,
+    failure: SetOnce<String>,
+    analyzed: SetOnce<Arc<Analyzed>>,
+    /// The redo's reader, held by the thread reading a window.
+    reader: Baton<LogReader>,
+    /// Windows read so far: written by the thread holding the reader.
+    read: AtomicU64,
+    /// Set once the last window is read, after `read`.
+    read_all: AtomicBool,
+    /// The oldest window not wholly applied.
+    first: AtomicU64,
+    /// The windows read and not wholly applied, by index modulo [`WINDOWS`].
+    windows: Box<[Window]>,
+    /// Per partition, the index of the next window whose part it applies.
+    next: Box<[AtomicU64]>,
+    /// Threads waiting for work.
+    waits: Stack<Completion>,
+    recovered: Baton<Recovered>,
 }
 
 /// What recovery leaves behind.
@@ -85,50 +132,39 @@ pub(super) struct Recovered {
     pub clock: Arc<Clock>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Analysis,
-    Redo,
-    Finish,
-    Done,
-    Failed,
-}
-
-struct State {
-    phase: Phase,
-    /// A thread is running the analysis or the finish, which take one thread each.
-    running: bool,
-    failure: Option<String>,
+/// What the analysis found.
+struct Analyzed {
     /// Where the valid log ends.
     end: Lsn,
     /// Where the log resumed appending: the end, up to the next block boundary.
     restart: Lsn,
     /// Pages freed and allocated again within the replay: where their last allocation ends.
-    reborn: Arc<HashMap<PageId, Lsn>>,
+    reborn: HashMap<PageId, Lsn>,
     /// The highest timestamp the superblock and the replayed log hold.
     clock: Ts,
-    pool: Option<Arc<BufferPool>>,
-    reader: Option<LogReader>,
-    read_all: bool,
-    /// Windows not yet wholly applied, oldest first; `first` is the index of the oldest.
-    windows: VecDeque<Window>,
-    first: u64,
-    /// Per partition, the index of the next window whose part it applies.
-    next: Vec<u64>,
-    recovered: Option<Recovered>,
+    pool: Arc<BufferPool>,
 }
 
+/// A window's slot in the ring.
 struct Window {
-    parts: Vec<Part>,
-    /// Parts not yet done.
-    left: usize,
+    /// The window it holds, plus one; 0 before its first.
+    index: AtomicU64,
+    /// Its parts not yet done.
+    left: AtomicUsize,
+    parts: Box<[Part]>,
 }
 
-enum Part {
-    Ready(Vec<(PageId, OwnedRecord)>),
-    Taken,
-    Done,
+/// A partition's records of a window.
+struct Part {
+    /// [`part_state`]: 0 before its first window.
+    state: AtomicU64,
+    /// Written by the reader before the part is ready, taken by the thread whose exchange takes
+    /// the part.
+    records: UnsafeCell<Vec<(PageId, OwnedRecord)>>,
 }
+
+// SAFETY: the records are written and taken only by the thread their part's state hands them to.
+unsafe impl Sync for Part {}
 
 /// What a thread asking for work gets.
 enum Next {
@@ -162,27 +198,33 @@ impl Recovery {
             log_config: config.log.clone(),
             buffer: config.buffer.clone(),
             log_budget,
-            superblock: Mutex::new(superblock),
+            superblock,
+            recorded: SetOnce::default(),
             store,
-            control: Mutex::new(Some(control)),
+            control: Baton::new(Some(control)),
             partitions,
-            state: Mutex::new(State {
-                phase: Phase::Analysis,
-                running: false,
-                failure: None,
-                end: 0,
-                restart: 0,
-                reborn: Arc::new(HashMap::new()),
-                clock: 0,
-                pool: None,
-                reader: None,
-                read_all: false,
-                windows: VecDeque::new(),
-                first: 0,
-                next: vec![0; partitions],
-                recovered: None,
-            }),
-            changed: Mutex::new(None),
+            phase: AtomicU8::new(ANALYSIS),
+            failure: SetOnce::default(),
+            analyzed: SetOnce::default(),
+            reader: Baton::new(None),
+            read: AtomicU64::new(0),
+            read_all: AtomicBool::new(false),
+            first: AtomicU64::new(0),
+            windows: (0..WINDOWS)
+                .map(|_| Window {
+                    index: AtomicU64::new(0),
+                    left: AtomicUsize::new(0),
+                    parts: (0..partitions)
+                        .map(|_| Part {
+                            state: AtomicU64::new(0),
+                            records: UnsafeCell::new(Vec::new()),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            next: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            waits: Stack::default(),
+            recovered: Baton::new(None),
         }
     }
 
@@ -194,29 +236,25 @@ impl Recovery {
         impl Drop for Unwinding<'_> {
             fn drop(&mut self) {
                 if std::thread::panicking() {
-                    let mut state = self.0.state.lock();
-                    state.phase = Phase::Failed;
-                    state
-                        .failure
-                        .get_or_insert_with(|| "a recovering thread panicked".to_string());
-                    drop(state);
-                    self.0.signal();
+                    self.0.fail("a recovering thread panicked".to_string());
                 }
             }
         }
         let _unwinding = Unwinding(self);
         loop {
-            // Waiting starts before the look, so a change in between is not missed.
-            let changed = self.changed_wait();
-            let next = self.next(&mut self.state.lock())?;
-            let done = match next {
+            // Waiting starts before the look: either a change after the look wakes it, or the
+            // look sees the change.
+            let changed = Completion::new_wait();
+            self.waits.push(changed.clone());
+            fence(Ordering::SeqCst);
+            let done = match self.next()? {
                 Next::Analysis => self.analyze(),
                 Next::Read(reader) => self.read(reader),
                 Next::Apply(window, partition, records) => self.apply(window, partition, records),
                 Next::Finish => self.finish(),
                 Next::Wait => {
-                    // Another thread holds the work: the analysis, the finish, or every
-                    // partition ready. Step the IO, which may be what it waits on.
+                    // Another thread holds the work: the analysis, the finish, the reader, or
+                    // every partition ready. Step the IO, which may be what it waits on.
                     while !changed.finished() {
                         self.io.step()?;
                         std::thread::yield_now();
@@ -226,11 +264,7 @@ impl Recovery {
                 Next::Done => return Ok(()),
             };
             if let Err(e) = done {
-                let mut state = self.state.lock();
-                state.phase = Phase::Failed;
-                state.failure.get_or_insert_with(|| e.to_string());
-                drop(state);
-                self.signal();
+                self.fail(e.to_string());
                 return Err(e);
             }
         }
@@ -238,74 +272,97 @@ impl Recovery {
 
     /// What recovery left behind, once it is done.
     pub(super) fn take_recovered(&self) -> Option<Recovered> {
-        self.state.lock().recovered.take()
+        self.recovered.take()
     }
 
-    fn changed_wait(&self) -> Completion {
-        self.changed
-            .lock()
-            .get_or_insert_with(Completion::new_wait)
-            .clone()
-    }
-
+    /// Wakes every thread waiting for work, to look again.
     fn signal(&self) {
-        let waiting = self.changed.lock().take();
-        if let Some(c) = waiting {
+        fence(Ordering::SeqCst);
+        for c in self.waits.take_all() {
             c.complete(0);
         }
     }
 
+    fn fail(&self, why: String) {
+        self.failure.set(why);
+        self.phase.store(FAILED, Ordering::Release);
+        self.signal();
+    }
+
+    /// Moves the phase on from `from` to `to`, if it is still at `from`.
+    fn move_on(&self, from: u8, to: u8) -> bool {
+        self.phase
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn analyzed(&self) -> &Arc<Analyzed> {
+        self.analyzed.get_ref().expect("the analysis done")
+    }
+
     /// The next work for a thread asking.
-    fn next(&self, state: &mut State) -> Result<Next> {
-        Ok(match state.phase {
-            Phase::Failed => {
-                return Err(LimboError::InternalError(format!(
-                    "recovery failed: {}",
-                    state.failure.as_deref().unwrap_or("")
-                )))
-            }
-            Phase::Done => Next::Done,
-            Phase::Analysis | Phase::Finish if state.running => Next::Wait,
-            Phase::Analysis => {
-                state.running = true;
-                Next::Analysis
-            }
-            Phase::Finish => {
-                state.running = true;
-                Next::Finish
-            }
-            Phase::Redo => {
-                for p in 0..self.partitions {
-                    let k = state.next[p];
-                    let Some(window) = state.windows.get_mut((k - state.first) as usize) else {
+    fn next(&self) -> Result<Next> {
+        loop {
+            return Ok(match self.phase.load(Ordering::Acquire) {
+                FAILED => {
+                    return Err(LimboError::InternalError(format!(
+                        "recovery failed: {}",
+                        self.failure.get().unwrap_or_default()
+                    )))
+                }
+                DONE => Next::Done,
+                ANALYZING | FINISHING => Next::Wait,
+                ANALYSIS => match self.move_on(ANALYSIS, ANALYZING) {
+                    true => Next::Analysis,
+                    false => continue,
+                },
+                FINISH => match self.move_on(FINISH, FINISHING) {
+                    true => Next::Finish,
+                    false => continue,
+                },
+                _ => {
+                    for p in 0..self.partitions {
+                        let k = self.next[p].load(Ordering::Acquire);
+                        let part = &self.windows[k as usize % WINDOWS].parts[p];
+                        if part
+                            .state
+                            .compare_exchange(
+                                part_state(k, READY),
+                                part_state(k, TAKEN),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            // SAFETY: the exchange handed this thread the part's records.
+                            let records = std::mem::take(unsafe { &mut *part.records.get() });
+                            return Ok(Next::Apply(k, p, records));
+                        }
+                    }
+                    if !self.read_all.load(Ordering::Acquire) {
+                        let room = self.read.load(Ordering::Acquire)
+                            < self.first.load(Ordering::Acquire) + WINDOWS as u64;
+                        if room {
+                            if let Some(reader) = self.reader.take() {
+                                return Ok(Next::Read(reader));
+                            }
+                        }
+                    } else if self.first.load(Ordering::Acquire)
+                        == self.read.load(Ordering::Acquire)
+                    {
+                        // Every window read is applied.
+                        self.move_on(REDO, FINISH);
                         continue;
-                    };
-                    if let Part::Ready(_) = window.parts[p] {
-                        let Part::Ready(records) =
-                            std::mem::replace(&mut window.parts[p], Part::Taken)
-                        else {
-                            unreachable!("the part was ready");
-                        };
-                        return Ok(Next::Apply(k, p, records));
                     }
+                    Next::Wait
                 }
-                if !state.read_all && state.windows.len() < WINDOWS {
-                    if let Some(reader) = state.reader.take() {
-                        return Ok(Next::Read(reader));
-                    }
-                }
-                if state.read_all && state.windows.is_empty() {
-                    state.phase = Phase::Finish;
-                    return self.next(state);
-                }
-                Next::Wait
-            }
-        })
+            });
+        }
     }
 
     /// Replays the page store's records and finds where the log ends.
     fn analyze(&self) -> Result<()> {
-        let superblock = self.superblock.lock().clone();
+        let superblock = &self.superblock;
         let mut reader = Log::reader(
             self.io.clone(),
             &self.base,
@@ -361,12 +418,11 @@ impl Recovery {
                 continuations,
                 ..superblock.clone()
             };
-            self.control
-                .lock()
-                .as_ref()
-                .expect("the control file")
-                .write_and_wait(&recorded)?;
-            *self.superblock.lock() = recorded;
+            let control = self.control.take().expect("the control file");
+            let written = control.write_and_wait(&recorded);
+            self.control.put(control);
+            written?;
+            self.recorded.set(recorded);
         }
         self.store.resume(log);
         let pool = BufferPool::new(
@@ -382,23 +438,30 @@ impl Recovery {
             superblock.redo,
         )
         .following(&superblock.continuations);
-        let mut state = self.state.lock();
-        state.end = end;
-        state.restart = restart;
-        state.reborn = Arc::new(reborn);
-        state.clock = clock;
-        state.pool = Some(pool);
-        state.reader = Some(reader);
-        state.running = false;
-        state.phase = Phase::Redo;
-        drop(state);
+        self.analyzed.set(Arc::new(Analyzed {
+            end,
+            restart,
+            reborn,
+            clock,
+            pool,
+        }));
+        self.reader.put(reader);
+        self.phase.store(REDO, Ordering::Release);
         self.signal();
         Ok(())
     }
 
-    /// Reads the next window of page records.
+    /// Reads the next window of page records, if the ring has room for it.
     fn read(&self, mut reader: LogReader) -> Result<()> {
-        let end = self.state.lock().end;
+        let k = self.read.load(Ordering::Relaxed);
+        // Its slot's last window, WINDOWS before it, wholly applied.
+        if k >= self.first.load(Ordering::Acquire) + WINDOWS as u64 {
+            self.reader.put(reader);
+            // A window applied meanwhile woke no one for the reader it held.
+            self.signal();
+            return Ok(());
+        }
+        let end = self.analyzed().end;
         let mut parts: Vec<Vec<(PageId, OwnedRecord)>> = vec![Vec::new(); self.partitions];
         let from = reader.position();
         let mut read_all = true;
@@ -415,30 +478,31 @@ impl Recovery {
             };
             parts[(pid.hash() % self.partitions as u64) as usize].push((pid, r));
         }
-        let mut state = self.state.lock();
-        let left = parts.iter().filter(|p| !p.is_empty()).count();
-        state.windows.push_back(Window {
-            parts: parts
-                .into_iter()
-                .map(|p| {
-                    if p.is_empty() {
-                        Part::Done
-                    } else {
-                        Part::Ready(p)
-                    }
-                })
-                .collect(),
-            left,
-        });
-        state.read_all = read_all;
-        if !read_all {
-            state.reader = Some(reader);
+        let slot = &self.windows[k as usize % WINDOWS];
+        // The count before the window, the window before its parts: a part done counts down a
+        // count already set, and a window found by its index has its count.
+        slot.left.store(
+            parts.iter().filter(|p| !p.is_empty()).count(),
+            Ordering::Relaxed,
+        );
+        slot.index.store(k + 1, Ordering::Release);
+        for (part, records) in slot.parts.iter().zip(parts) {
+            let state = if records.is_empty() { PART_DONE } else { READY };
+            // SAFETY: the part's last window is done, and its records taken: no one reaches
+            // them until the state below hands them on.
+            unsafe { *part.records.get() = records };
+            part.state.store(part_state(k, state), Ordering::Release);
+        }
+        self.read.store(k + 1, Ordering::Release);
+        if read_all {
+            self.read_all.store(true, Ordering::Release);
+        } else {
+            self.reader.put(reader);
         }
         for p in 0..self.partitions {
-            advance(&mut state, p);
+            self.advance(p);
         }
-        pop_done(&mut state);
-        drop(state);
+        self.pop_done();
         self.signal();
         Ok(())
     }
@@ -450,10 +514,7 @@ impl Recovery {
         partition: usize,
         mut records: Vec<(PageId, OwnedRecord)>,
     ) -> Result<()> {
-        let (pool, reborn) = {
-            let state = self.state.lock();
-            (state.pool.clone().expect("a pool"), state.reborn.clone())
-        };
+        let analyzed = self.analyzed();
         // A stable sort keeps a page's records in log order; grouping them fixes each page once.
         records.sort_by_key(|(pid, _)| *pid);
         for group in records.chunk_by(|a, b| a.0 == b.0) {
@@ -462,8 +523,8 @@ impl Recovery {
             if drive(&self.io, || self.store.entry(pid))? == FREE {
                 continue;
             }
-            let born = reborn.get(&pid).copied().unwrap_or(0);
-            let mut page = drive(&self.io, || pool.fix_exclusive(pid, None))?;
+            let born = analyzed.reborn.get(&pid).copied().unwrap_or(0);
+            let mut page = drive(&self.io, || analyzed.pool.fix_exclusive(pid, None))?;
             for (_, r) in group {
                 if r.lsn <= born || r.lsn <= page::lsn(page.page()) {
                     continue;
@@ -473,29 +534,55 @@ impl Recovery {
                 page.changed(r.lsn);
             }
         }
-        let mut state = self.state.lock();
-        let i = (window - state.first) as usize;
-        let w = &mut state.windows[i];
-        w.parts[partition] = Part::Done;
-        w.left -= 1;
-        advance(&mut state, partition);
-        pop_done(&mut state);
-        drop(state);
+        let slot = &self.windows[window as usize % WINDOWS];
+        slot.parts[partition]
+            .state
+            .store(part_state(window, PART_DONE), Ordering::Release);
+        slot.left.fetch_sub(1, Ordering::AcqRel);
+        self.advance(partition);
+        self.pop_done();
         self.signal();
         Ok(())
+    }
+
+    /// Moves `partition` past the windows whose part it has done, or that are wholly applied.
+    fn advance(&self, partition: usize) {
+        let next = &self.next[partition];
+        loop {
+            let k = next.load(Ordering::Acquire);
+            let done = k < self.first.load(Ordering::Acquire)
+                || self.windows[k as usize % WINDOWS].parts[partition]
+                    .state
+                    .load(Ordering::Acquire)
+                    == part_state(k, PART_DONE);
+            if !done {
+                return;
+            }
+            let _ = next.compare_exchange(k, k + 1, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    /// Moves past the oldest windows once every part of them is done.
+    fn pop_done(&self) {
+        loop {
+            let f = self.first.load(Ordering::Acquire);
+            let slot = &self.windows[f as usize % WINDOWS];
+            if slot.index.load(Ordering::Acquire) != f + 1 || slot.left.load(Ordering::Acquire) != 0
+            {
+                return;
+            }
+            let _ = self
+                .first
+                .compare_exchange(f, f + 1, Ordering::AcqRel, Ordering::Acquire);
+        }
     }
 
     /// Frees pages left provisional, gives back the slots of unmatched intents and checkpoints
     /// everything redone.
     fn finish(&self) -> Result<()> {
-        let (pool, restart, clock) = {
-            let state = self.state.lock();
-            (
-                state.pool.clone().expect("a pool"),
-                state.restart,
-                Arc::new(Clock::after(state.clock)),
-            )
-        };
+        let analyzed = self.analyzed();
+        let (pool, restart) = (analyzed.pool.clone(), analyzed.restart);
+        let clock = Arc::new(Clock::after(analyzed.clock));
         let log = self.store.log().clone();
         // Pages allocated and never linked in, or unlinked and never freed, before the crash.
         for pid in self.store.provisional_pages() {
@@ -503,12 +590,16 @@ impl Recovery {
         }
         drive(&self.io, || self.store.release_orphans())?;
         self.store.end_recovery();
-        let control = self.control.lock().take().expect("the control file");
+        let control = self.control.take().expect("the control file");
+        let superblock = self
+            .recorded
+            .get()
+            .unwrap_or_else(|| self.superblock.clone());
         let checkpointer = Checkpointer::new(
             pool.clone(),
             self.store.clone(),
             control,
-            self.superblock.lock().clone(),
+            superblock,
             self.log_budget,
             clock.clone(),
         );
@@ -522,41 +613,15 @@ impl Recovery {
         }
         self.store.allow_erasing();
         drive(&self.io, || self.store.erase_freed())?;
-        let mut state = self.state.lock();
-        let end = state.end;
-        state.recovered = Some(Recovered {
-            end,
+        self.recovered.put(Recovered {
+            end: analyzed.end,
             log,
             pool,
             checkpointer,
             clock,
         });
-        state.running = false;
-        state.phase = Phase::Done;
-        drop(state);
+        self.phase.store(DONE, Ordering::Release);
         self.signal();
         Ok(())
-    }
-}
-
-/// Moves `partition` past the windows whose part it has done.
-fn advance(state: &mut State, partition: usize) {
-    loop {
-        let k = state.next[partition];
-        let Some(i) = k.checked_sub(state.first) else {
-            return;
-        };
-        match state.windows.get(i as usize) {
-            Some(w) if matches!(w.parts[partition], Part::Done) => state.next[partition] += 1,
-            _ => return,
-        }
-    }
-}
-
-/// Drops the oldest windows once every part of them is done.
-fn pop_done(state: &mut State) {
-    while state.windows.front().is_some_and(|w| w.left == 0) {
-        state.windows.pop_front();
-        state.first += 1;
     }
 }

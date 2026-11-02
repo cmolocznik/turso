@@ -15,7 +15,8 @@ use super::log::Lsn;
 use super::page::CLASS_COUNT;
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
-use crate::sync::{Arc, Mutex};
+use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 
@@ -142,17 +143,18 @@ impl Control {
             .unwrap_or_else(|| ".".to_string());
         io.sync_directory(&dir)?;
         let block = Arc::new(AlignedBlock::zeroed(2 * SIZE));
-        let got = Arc::new(Mutex::new(0usize));
+        // The bytes read, set once the read lands.
+        let got = Arc::new(AtomicUsize::new(0));
         let out = got.clone();
         let c = Completion::new_read(block.region(0, 2 * SIZE), move |res| match res {
             Ok((_, n)) => {
-                *out.lock() = n.max(0) as usize;
+                out.store(n.max(0) as usize, Ordering::Release);
                 None
             }
             Err(e) => Some(e),
         });
         io.wait_for_completion(file.pread(0, c)?)?;
-        let read = *got.lock();
+        let read = got.load(Ordering::Acquire);
         // SAFETY: the read filled the block, which nothing else uses.
         let bytes = unsafe { std::slice::from_raw_parts(block.as_ptr(), 2 * SIZE) };
         let mut newest: Option<Superblock> = None;

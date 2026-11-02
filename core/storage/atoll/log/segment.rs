@@ -1,9 +1,15 @@
 //! Log segment files: `{base}.log.{n}` holds the log's bytes from `n·size` to `(n+1)·size`.
+//!
+//! The files open are cells by segment number, in an array that grows to the highest number
+//! reached: a cell each, of one word, per segment the log has ever had. A file is put in its cell
+//! by compare-and-swap, read in a step, and let go through the epochs once removed.
 
+use super::super::arc_cell::{ArcCell, Releasing};
+use super::super::epoch::Epochs;
+use super::super::segmented::Segmented;
 use crate::io::{File, OpenFlags, IO};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::{CompletionError, LimboError, Result};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 pub(super) struct Segments {
@@ -11,7 +17,8 @@ pub(super) struct Segments {
     base: String,
     pub size: u64,
     direct: bool,
-    files: Mutex<BTreeMap<u64, Arc<dyn File>>>,
+    files: Segmented<ArcCell<Arc<dyn File>>>,
+    releasing: Releasing<Arc<dyn File>>,
 }
 
 impl Segments {
@@ -21,7 +28,8 @@ impl Segments {
             base: base.to_string(),
             size,
             direct,
-            files: Mutex::new(BTreeMap::new()),
+            files: Segmented::default(),
+            releasing: Releasing::new(Arc::new(Epochs::new())),
         }
     }
 
@@ -53,15 +61,27 @@ impl Segments {
             .unwrap_or_else(|| ".".to_string())
     }
 
+    /// The open file of segment `number`, if it is open.
+    fn get(&self, number: u64) -> Option<Arc<dyn File>> {
+        let cell = self.files.get(number)?;
+        let step = self.releasing.epochs().enter();
+        cell.get(&step).map(|file| (*file).clone())
+    }
+
     /// Segment `number`, or `None` if it does not exist.
     pub fn open(&self, number: u64) -> Result<Option<Arc<dyn File>>> {
-        if let Some(file) = self.files.lock().get(&number) {
-            return Ok(Some(file.clone()));
+        if let Some(file) = self.get(number) {
+            return Ok(Some(file));
         }
         match self.io.open_file(&self.path(number), self.flags(), false) {
             Ok(file) => {
-                self.files.lock().insert(number, file.clone());
-                Ok(Some(file))
+                // Opened by two at once, the first kept.
+                let step = self.releasing.epochs().enter();
+                let kept = self
+                    .files
+                    .get_or_make(number)
+                    .put_if_empty(Arc::new(file), &step);
+                Ok(Some((*kept).clone()))
             }
             Err(LimboError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::NotFound,
@@ -76,21 +96,22 @@ impl Segments {
         let file =
             self.io
                 .open_file(&self.path(number), self.flags() | OpenFlags::Create, false)?;
-        self.files.lock().insert(number, file.clone());
+        self.files
+            .get_or_make(number)
+            .replace(Some(Arc::new(file.clone())), &self.releasing);
         Ok(file)
     }
 
     /// The open file of segment `number`, which must have been opened or created.
     pub fn file(&self, number: u64) -> Arc<dyn File> {
-        self.files
-            .lock()
-            .get(&number)
-            .cloned()
+        self.get(number)
             .unwrap_or_else(|| panic!("log segment {number} is not open"))
     }
 
     pub fn remove(&self, number: u64) -> Result<()> {
-        self.files.lock().remove(&number);
+        if let Some(cell) = self.files.get(number) {
+            cell.replace(None, &self.releasing);
+        }
         self.io.remove_file(&self.path(number))
     }
 }

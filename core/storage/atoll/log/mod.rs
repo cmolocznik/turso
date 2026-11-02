@@ -55,7 +55,7 @@ use super::stack::Stack;
 use super::{whole, whole_write};
 use crate::io::{Completion, CompletionGroup, IO};
 use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use crate::sync::Arc;
+use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use room::{Pad, Room};
@@ -614,15 +614,25 @@ impl Log {
         (writes, unprepared)
     }
 
+    /// The hold a completion keeps on the log, weak: the completion waits in the log's own IO, so
+    /// a strong hold would keep a dropped log, its ring and its files alive while it is in flight,
+    /// and for good once nothing steps that IO. A write that lands after the log is gone leaves
+    /// what a crash then would.
+    fn held(self: &Arc<Self>) -> Weak<Self> {
+        Arc::downgrade(self)
+    }
+
     fn submit_write(self: &Arc<Self>, start: Lsn, end: Lsn) {
         let segment = self.segments.number(start);
         let file = self.segments.file(segment);
         let (slot, offset) = self.slot(start);
         let buffer = slot.block.region(offset, (end - start) as usize);
-        let me = self.clone();
+        let me = self.held();
         let len = end - start;
         let c = Completion::new_write(move |res| {
-            me.written(start, end, whole(len as usize, res));
+            if let Some(me) = me.upgrade() {
+                me.written(start, end, whole(len as usize, res));
+            }
         });
         let at = start - self.segments.start(segment);
         let submitted = if self.durable_writes {
@@ -674,9 +684,11 @@ impl Log {
 
     /// Syncs the segments the writes from `from` to `covers` went to.
     fn submit_sync(self: &Arc<Self>, from: Lsn, covers: Lsn) {
-        let me = self.clone();
+        let me = self.held();
         let mut group = CompletionGroup::new(move |res| {
-            me.synced(covers, res);
+            if let Some(me) = me.upgrade() {
+                me.synced(covers, res);
+            }
         });
         let segments: Vec<u64> =
             (self.segments.number(from)..=self.segments.number(covers - 1)).collect();
@@ -754,10 +766,13 @@ impl Log {
     fn zero_fill(self: &Arc<Self>, number: u64, at: u64) {
         let file = self.segments.file(number);
         if at == self.segments.size {
-            let me = self.clone();
-            let c = Completion::new_sync(move |res| match res {
-                Ok(_) => me.prepared(number),
-                Err(e) => me.fail(e),
+            let me = self.held();
+            let c = Completion::new_sync(move |res| {
+                let Some(me) = me.upgrade() else { return };
+                match res {
+                    Ok(_) => me.prepared(number),
+                    Err(e) => me.fail(e),
+                }
             });
             if let Err(e) = file.sync_data(c) {
                 self.fail(io_failure(&e));
@@ -765,10 +780,13 @@ impl Log {
             return;
         }
         let len = (self.segments.size - at).min(self.zeros.len() as u64);
-        let me = self.clone();
-        let c = Completion::new_write(move |res| match whole(len as usize, res) {
-            Ok(()) => me.zero_fill(number, at + len),
-            Err(e) => me.fail(e),
+        let me = self.held();
+        let c = Completion::new_write(move |res| {
+            let Some(me) = me.upgrade() else { return };
+            match whole(len as usize, res) {
+                Ok(()) => me.zero_fill(number, at + len),
+                Err(e) => me.fail(e),
+            }
         });
         if let Err(e) = file.pwrite(at, self.zeros.region(0, len as usize), c) {
             self.fail(io_failure(&e));

@@ -129,6 +129,30 @@ fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order_
     );
 }
 
+/// A log dropped while its writes are in flight is freed at once: they wait in the log's own IO,
+/// so a completion that held the log would keep it, its ring and its files alive until the IO
+/// next steps, and for good once nothing does.
+#[cfg(not(shuttle))]
+#[test]
+fn a_log_dropped_with_writes_in_flight_is_freed() {
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
+    let p = payload(0, 0);
+    let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+    let lsn = log.append(&mut admitted, &header(0), &[&p]);
+    drop(admitted);
+    // Asks for the flush, and nothing steps the IO from here: its write stays in flight.
+    let waiting = matches!(log.wait_durable(lsn).unwrap(), IOResult::IO(_));
+    assert!(waiting && crash.in_flight() > 0, "no write left in flight");
+    let held = Arc::downgrade(&log);
+    drop(log);
+    assert!(
+        held.upgrade().is_none(),
+        "a write in flight kept the dropped log alive"
+    );
+}
+
 /// Appends records one after another, some waited on as commits are, and after every few IO
 /// steps checks what a crash then would leave: an unbroken prefix of what was appended that
 /// holds every record waited on. Then reopens one such crash and appends past it.

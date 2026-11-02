@@ -20,6 +20,7 @@
 use super::aligned::AlignedBlock;
 use super::latch::{Held, VersionedLatch};
 use super::log::{Log, Lsn};
+use super::once::TakeOnce;
 use super::page::{self, PageId, SizeClass, MIN_PAGE_SIZE};
 use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::whole;
@@ -493,11 +494,9 @@ impl MetaCache {
                 }
             }
         };
-        let done = Arc::new(Mutex::new(Some(done)));
+        let done = Arc::new(TakeOnce::new(done));
         let finish = move |res| {
-            // Taken out first: no lock is held while a callback runs.
-            let done = done.lock().take();
-            if let Some(done) = done {
+            if let Some(done) = done.take() {
                 done(res);
             }
         };

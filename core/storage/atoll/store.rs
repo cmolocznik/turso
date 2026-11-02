@@ -31,6 +31,7 @@ use super::aligned::AlignedBlock;
 use super::epoch::{Epochs, Retired};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
 use super::meta::{MetaCache, MetaFrame, MetaHold, MetaId, Tree};
+use super::once::TakeOnce;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
 use super::shared::{BytesMut, Writer};
@@ -506,10 +507,10 @@ impl PageStore {
             "a read into a buffer not the page's size"
         );
         let (file, at) = self.data_file(class, slot)?;
-        let done = Mutex::new(Some(done));
+        let done = TakeOnce::new(done);
         let keep = into.clone();
         let c = Completion::new_read(into, move |res| {
-            let done = done.lock().take()?;
+            let done = done.take()?;
             match res {
                 Ok((_, n)) => {
                     let whole = n as usize == class.size() && page::verify(keep.as_slice(), pid);
@@ -1478,12 +1479,10 @@ impl WritePlan {
         let (pid, slot) = (self.pids[i], self.slots[i]);
         let (file, at) = self.store.data_file(pid.class(), slot)?;
         let len = copy.len();
-        let landed = Mutex::new(Some(landed));
+        let landed = TakeOnce::new(landed);
         let c = Completion::new_write(move |res| {
             let res = whole(len, res);
-            // Taken out first: no lock is held while a callback runs.
-            let landed = landed.lock().take();
-            if let Some(landed) = landed {
+            if let Some(landed) = landed.take() {
                 landed(res);
             }
         });

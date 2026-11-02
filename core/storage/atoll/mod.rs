@@ -19,6 +19,7 @@
 //! the VDBE's `IOResult` stepping on every backend: io_uring, the syscall backend and memory.
 
 pub mod aligned;
+pub mod bits;
 pub mod blob;
 pub mod btree;
 pub mod buffer;
@@ -29,11 +30,13 @@ pub mod epoch;
 pub mod latch;
 pub mod log;
 pub mod meta;
+pub mod once;
 pub mod page;
 pub mod radix;
 mod recovery;
 pub mod redo;
 pub mod shared;
+pub mod stack;
 pub mod store;
 pub mod txn;
 

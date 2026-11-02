@@ -31,6 +31,7 @@
 //! **Failure.** A failed page write, like a failed log write (§7.5), stops the pool: every later
 //! miss fails until the database is reopened and recovered.
 
+mod cell;
 mod clean;
 mod frame;
 mod memory;
@@ -51,9 +52,12 @@ pub use source::{LocalSource, Located, PageSource, ReadDone};
 use super::epoch::Step;
 use super::latch::{Held, VersionedLatch};
 use super::log::Lsn;
+use super::once::SetOnce;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::shared::{BytesMut, Shared, Writer};
+use super::stack::Stack;
 use super::store::PageStore;
+use cell::{CompletionCell, Retiring};
 use clean::{Progress, Writeback};
 use frame::{
     FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
@@ -65,7 +69,9 @@ use temp::TempPages;
 
 use crate::io::{Buffer, Completion};
 use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
+#[cfg(test)]
+use crate::sync::Mutex;
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::ops::Deref;
@@ -81,20 +87,24 @@ struct Frames {
     /// if none ever was. A page is read into a frame only once every step that could still read
     /// what its memory held has ended ([`BufferPool::quiet_at`]).
     given_up: Zeroed<AtomicU64>,
-    /// Per shard of frames: the IO in flight for each loading or outgoing frame.
-    transits: Box<[Mutex<HashMap<u32, Completion>>]>,
+    /// Per 4 KiB grain: the IO in flight for a loading or outgoing frame that begins there. Put
+    /// and taken by whoever holds the frame, read by anyone in a step.
+    transits: Zeroed<CompletionCell>,
+    /// Completions taken out of the transits, and out of the pool's released cell.
+    retiring: Retiring,
 }
 
 impl Frames {
-    fn transits_of(&self, frame: u32) -> &Mutex<HashMap<u32, Completion>> {
-        &self.transits[frame as usize & (self.transits.len() - 1)]
+    /// Takes the IO in flight for `frame` out of its cell: for the frame's holder.
+    fn end_transit(&self, frame: u32) -> Option<Completion> {
+        self.transits[frame as usize].take(&self.retiring)
     }
 
     /// Leaves the page whose write-out did not happen in the frame `hold` holds, and sends
     /// whoever waits on the write to look again.
     fn kept(&self, hold: Held<FrameLatch>) {
         let frame = hold.latch().frame;
-        let waiting = self.transits_of(frame).lock().remove(&frame);
+        let waiting = self.end_transit(frame);
         self.headers[frame as usize]
             .status
             .store(RESIDENT, Ordering::Release);
@@ -187,6 +197,7 @@ impl Drop for Outgoing {
         }
     }
 }
+#[cfg(test)]
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -262,19 +273,23 @@ pub struct BufferPool {
     evicted: AtomicU64,
     epoch_bytes: u64,
     /// Done when a frame is next freed, if anyone waits for that.
-    released: Mutex<Option<Completion>>,
-    writebacks: Mutex<Vec<Arc<Mutex<Writeback>>>>,
+    released: CompletionCell,
+    /// Writebacks queued and not stepped to their end: a stepping thread takes them all and puts
+    /// back each one not done.
+    writebacks: Stack<Writeback>,
+    /// Writebacks queued and not done, those a stepping thread holds included.
+    queued: AtomicUsize,
     /// Where copies of pages written back while they stay in their frames are made.
     staging: Arc<staging::Staging>,
     writes_in_flight: AtomicUsize,
-    failure: Mutex<Option<CompletionError>>,
+    failure: SetOnce<CompletionError>,
     /// Checkpoint shards, each a run of frames by position.
     shards: Box<[Shard]>,
     temp: Arc<TempPages>,
     /// Each queued writeback's state after its last step, by address, for a test that stalled to
     /// show while another thread steps it.
     #[cfg(test)]
-    stepped: Mutex<HashMap<usize, String>>,
+    stepped: Mutex<HashMap<u64, String>>,
 }
 
 /// What a claimed frame is for.
@@ -339,19 +354,14 @@ impl BufferPool {
             "a pool with no checkpoint shards"
         );
         let shards = config.checkpoint_shards.min(grains as usize);
-        // One shard of transits per hardware thread, so concurrent misses rarely share a lock.
-        let load_shards = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .next_power_of_two();
         let epoch_bytes =
             (memory.batches as u64 * memory::BATCH as u64) / watt::EPOCHS_PER_TURNOVER as u64;
         Ok(Arc::new(Self {
             frames: Arc::new(Frames {
                 headers: Zeroed::new(grains as usize)?,
                 given_up: Zeroed::new(grains as usize)?,
-                transits: (0..load_shards)
-                    .map(|_| Mutex::new(HashMap::new()))
-                    .collect(),
+                transits: Zeroed::new(grains as usize)?,
+                retiring: Retiring::new(store.epochs().clone()),
             }),
             table: Table::new(grains)?,
             memory,
@@ -359,11 +369,12 @@ impl BufferPool {
             epoch: AtomicU32::new(watt::FIRST_EPOCH),
             evicted: AtomicU64::new(0),
             epoch_bytes,
-            released: Mutex::new(None),
-            writebacks: Mutex::new(Vec::new()),
+            released: CompletionCell::default(),
+            writebacks: Stack::default(),
+            queued: AtomicUsize::new(0),
             staging: Arc::new(staging::Staging::new(config.writeback_bytes)),
             writes_in_flight: AtomicUsize::new(0),
-            failure: Mutex::new(None),
+            failure: SetOnce::default(),
             shards: (0..shards).map(|_| Shard::new(redo)).collect(),
             temp: Arc::new(TempPages::new(
                 store.io().clone(),
@@ -380,8 +391,8 @@ impl BufferPool {
         &self.frames.headers[frame as usize]
     }
 
-    fn transits_of(&self, frame: u32) -> &Mutex<HashMap<u32, Completion>> {
-        self.frames.transits_of(frame)
+    fn transit(&self, frame: u32) -> &CompletionCell {
+        &self.frames.transits[frame as usize]
     }
 
     fn now(&self) -> u32 {
@@ -389,7 +400,7 @@ impl BufferPool {
     }
 
     fn failed(&self) -> Result<()> {
-        match *self.failure.lock() {
+        match self.failure.get() {
             Some(e) => Err(LimboError::CompletionError(e)),
             None => Ok(()),
         }
@@ -569,10 +580,10 @@ impl BufferPool {
             }
             let status = h.status();
             if status == LOADING || status == OUTGOING {
-                if let Some(c) = self.transits_of(frame).lock().get(&frame) {
+                if let Some(c) = self.transit(frame).get(&self.store.epochs().enter()) {
                     return match status {
-                        LOADING => Probe::Loading(c.clone()),
-                        _ => Probe::Outgoing(c.clone()),
+                        LOADING => Probe::Loading(c),
+                        _ => Probe::Outgoing(c),
                     };
                 }
             }
@@ -629,13 +640,13 @@ impl BufferPool {
         self.mark_held(frame);
         h.status.store(LOADING, Ordering::Release);
         let loaded = Completion::new_wait();
-        self.transits_of(frame).lock().insert(frame, loaded.clone());
+        self.transit(frame).put(loaded.clone());
         if self
             .table
             .insert(&self.frames.headers, pid.raw(), frame)
             .is_err()
         {
-            self.transits_of(frame).lock().remove(&frame);
+            self.frames.end_transit(frame);
             self.free_frame(pid.class(), frame, hold);
             // A reader may have followed a hint here meanwhile: send it to the other frame.
             loaded.complete(0);
@@ -669,7 +680,7 @@ impl BufferPool {
         let h = self.header(frame);
         match res {
             Ok(()) => {
-                let waiting = self.transits_of(frame).lock().remove(&frame);
+                let waiting = self.frames.end_transit(frame);
                 let lsn = page::lsn(self.bytes(frame, pid.class()));
                 h.page_lsn.store(lsn, Ordering::Release);
                 h.written_lsn.store(lsn, Ordering::Release);
@@ -687,7 +698,7 @@ impl BufferPool {
     /// Whoever waits gets `error`, or looks again without one.
     fn unload(&self, pid: PageId, hold: Held<FrameLatch>, error: Option<CompletionError>) {
         let frame = hold.latch().frame;
-        let waiting = self.transits_of(frame).lock().remove(&frame);
+        let waiting = self.frames.end_transit(frame);
         self.table.remove(&self.frames.headers, pid.raw(), frame);
         self.free_frame(pid.class(), frame, hold);
         match (waiting, error) {
@@ -1076,21 +1087,19 @@ impl BufferPool {
     /// The pool's memory and writes, for a test that stalled to show.
     #[cfg(test)]
     pub fn describe(&self) -> String {
-        let queued: Vec<String> = self
-            .writebacks
-            .lock()
-            .iter()
-            .map(|wb| match wb.try_lock() {
-                Some(w) => w.describe(),
-                None => format!(
-                    "held by its stepper, last stepped: {}",
-                    self.stepped
-                        .lock()
-                        .get(&(Arc::as_ptr(wb) as usize))
-                        .map_or("never", String::as_str)
-                ),
-            })
-            .collect();
+        // Taken and put back: a stepping thread may hold some meanwhile, and shows in `stepped`.
+        let taken = self.writebacks.take_all();
+        let mut queued: Vec<String> = taken.iter().map(Writeback::describe).collect();
+        for wb in taken {
+            self.writebacks.push(wb);
+        }
+        let stepped = self.stepped.lock();
+        queued.extend(
+            stepped
+                .iter()
+                .map(|(id, state)| format!("{id} last stepped: {state}")),
+        );
+        drop(stepped);
         // What is left in each draining batch.
         let left: Vec<_> = self
             .memory
@@ -1148,7 +1157,7 @@ impl BufferPool {
             self.store.epochs().describe(),
             self.writes_in_flight.load(Ordering::Acquire),
             self.memory.draining(),
-            self.failure.lock().as_ref(),
+            self.failure.get(),
         )
     }
 
@@ -1156,16 +1165,12 @@ impl BufferPool {
     /// also registered for, is replaced: handed out finished, it would send every claim round
     /// again at once.
     fn released_wait(&self) -> Completion {
-        let mut released = self.released.lock();
-        if released.as_ref().is_some_and(Completion::finished) {
-            *released = None;
-        }
-        released.get_or_insert_with(Completion::new_wait).clone()
+        self.released
+            .current(&self.store.epochs().enter(), &self.frames.retiring)
     }
 
     fn signal_released(&self) {
-        let waiting = self.released.lock().take();
-        if let Some(c) = waiting {
+        if let Some(c) = self.released.take(&self.frames.retiring) {
             c.complete(0);
         }
     }
@@ -1401,9 +1406,7 @@ impl BufferPool {
         let frame = hold.latch().frame;
         let h = self.header(frame);
         let pid = PageId::from_raw(h.pid());
-        self.transits_of(frame)
-            .lock()
-            .insert(frame, Completion::new_wait());
+        self.transit(frame).put(Completion::new_wait());
         h.status.store(OUTGOING, Ordering::Release);
         Outgoing {
             pid,
@@ -1424,8 +1427,7 @@ impl BufferPool {
             outgoing.into_iter().partition(|o| o.pid.is_temporary());
         for (outgoing, temporary) in [(logged, false), (temporary, true)] {
             if !outgoing.is_empty() {
-                let wb = Writeback::out(class, outgoing, temporary);
-                self.writebacks.lock().push(Arc::new(Mutex::new(wb)));
+                self.queue(Writeback::out(class, outgoing, temporary));
             }
         }
         self.signal_released();
@@ -1447,7 +1449,7 @@ impl BufferPool {
                 let h = self.header(frame);
                 h.written_lsn.fetch_max(lsn, Ordering::AcqRel);
                 debug_assert!(!h.dirty(), "{pid:?} changed while held for its write-out");
-                let waiting = self.transits_of(frame).lock().remove(&frame);
+                let waiting = self.frames.end_transit(frame);
                 self.table.remove(&self.frames.headers, pid.raw(), frame);
                 self.free_frame(pid.class(), frame, hold);
                 self.evicted(pid.class());
@@ -1494,34 +1496,39 @@ impl BufferPool {
             let wb = Writeback::new(class, frames, pids, evict_after, temporary);
             // Passes, which wait on this, hand over no temporary pages.
             finished.get_or_insert(wb.finished.clone());
-            self.writebacks.lock().push(Arc::new(Mutex::new(wb)));
+            self.queue(wb);
         }
         finished
     }
 
-    /// Steps every queued writeback no one else is stepping. Returns something to wait on, if
-    /// one is waiting on IO before its writes are submitted.
+    /// Queues `wb` for stepping.
+    fn queue(&self, wb: Writeback) {
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        self.writebacks.push(wb);
+    }
+
+    /// Takes every queued writeback and steps each, putting back those not done: a thread that
+    /// finds them taken has none to step, and the thread that took them steps them all. Returns
+    /// something to wait on, if one is waiting on IO before its writes are submitted.
     fn drive_writebacks(self: &Arc<Self>) -> Result<Option<Completion>> {
-        let queued: Vec<_> = self.writebacks.lock().clone();
         let mut wait = None;
-        for wb in queued {
-            if let Some(Progress::Waiting(c)) = self.step_writeback(&wb) {
+        for wb in self.writebacks.take_all() {
+            if let Progress::Waiting(c) = self.step_writeback(wb) {
                 wait.get_or_insert(c);
             }
         }
         Ok(wait)
     }
 
-    /// Steps `wb`, unless another thread is stepping it; the only way a writeback is stepped. A
-    /// waiter that found it held saw it neither finished nor left for another to step, so once
-    /// released after either, the pool's waiters are woken: nothing else would wake that one.
-    /// Nor would anything wake it for a write that landed during the step, after the step took
-    /// the writes landed so far: that write's wakeup came while the writeback was held, and only
-    /// a later step settles it.
-    fn step_writeback(self: &Arc<Self>, wb: &Arc<Mutex<Writeback>>) -> Option<Progress> {
-        let mut w = wb.try_lock()?;
-        let landings = w.landings();
-        let progress = w.step(self);
+    /// Steps `wb`, which this thread took from the queue: the only way a writeback is stepped. A
+    /// waiter that found it taken saw it neither finished nor put back for another to step, so
+    /// once it is put back or done, the pool's waiters are woken: nothing else would wake that
+    /// one. Nor would anything wake it for a write that landed during the step, after the step
+    /// took the writes landed so far: that write's wakeup came while the writeback was taken, and
+    /// only a later step settles it.
+    fn step_writeback(self: &Arc<Self>, mut wb: Writeback) -> Progress {
+        let landings = wb.landings();
+        let progress = wb.step(self);
         #[cfg(test)]
         {
             let came_to = match &progress {
@@ -1530,33 +1537,45 @@ impl BufferPool {
                 Progress::InFlight => "in flight",
                 Progress::Done => "done",
             };
-            let state = format!("{} -> {came_to}", w.describe());
-            self.stepped.lock().insert(Arc::as_ptr(wb) as usize, state);
+            let state = format!("{} -> {came_to}", wb.describe());
+            self.stepped.lock().insert(wb.id, state);
         }
-        drop(w);
-        match progress {
-            // Checked once released: a write landing after this wakes the waiters itself, with
-            // the writeback free to step.
+        match &progress {
+            // Checked once put back: a write landing after this wakes the waiters itself, with
+            // the writeback there to step.
             Progress::InFlight => {
-                if !landings.lock().is_empty() {
+                self.writebacks.push(wb);
+                if !landings.is_empty() {
                     self.signal_released();
                 }
             }
             Progress::Done => {
-                self.writebacks.lock().retain(|q| !Arc::ptr_eq(q, wb));
+                self.queued.fetch_sub(1, Ordering::AcqRel);
                 self.signal_released();
             }
-            Progress::Waiting(_) => self.signal_released(),
+            Progress::Waiting(_) => {
+                self.writebacks.push(wb);
+                self.signal_released();
+            }
         }
-        Some(progress)
+        progress
+    }
+
+    /// Runs `f` on the oldest queued writeback, for a test to set its hooks.
+    #[cfg(test)]
+    fn with_queued(&self, f: impl FnOnce(&mut Writeback)) {
+        let mut queued = self.writebacks.take_all();
+        f(queued.first_mut().expect("a writeback queued"));
+        for wb in queued {
+            self.writebacks.push(wb);
+        }
     }
 
     /// Notes that a write of `frame` landed, from its completion: whoever waits on the pool, or on
     /// the frame's write-out, wakes and steps the writeback that settles it.
     fn write_landed(&self, frame: u32, outgoing: bool) {
         if outgoing {
-            // Completed outside the lock: completing may run a waiter's callback.
-            let c = self.transits_of(frame).lock().get(&frame).cloned();
+            let c = self.transit(frame).get(&self.store.epochs().enter());
             if let Some(c) = c {
                 c.complete(0);
             }
@@ -1573,7 +1592,9 @@ impl BufferPool {
             return Ok(IOResult::IO(IOCompletions(c)));
         }
         // One queued and held by another thread may not have submitted its writes yet.
-        if self.writes_in_flight.load(Ordering::Acquire) > 0 || !self.writebacks.lock().is_empty() {
+        if self.writes_in_flight.load(Ordering::Acquire) > 0
+            || self.queued.load(Ordering::Acquire) > 0
+        {
             return Ok(IOResult::IO(IOCompletions(wait)));
         }
         Ok(IOResult::Done(()))
@@ -1619,7 +1640,7 @@ impl BufferPool {
     }
 
     fn fail(&self, e: CompletionError) {
-        self.failure.lock().get_or_insert(e);
+        self.failure.set(e);
         self.signal_released();
     }
 

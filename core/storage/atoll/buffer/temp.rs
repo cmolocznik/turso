@@ -4,21 +4,27 @@
 //! names, and read back from there. The files are deleted at every open, and recovery never reads
 //! them.
 
+use super::super::bits::GrowBits;
 use super::super::epoch::{Epochs, Retired};
+use super::super::once::{SetOnce, TakeOnce};
 use super::super::page::{PageId, SizeClass, CLASS_COUNT};
+use super::super::stack::FreeList;
 use super::super::whole;
 use super::source::ReadDone;
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::{CompletionError, Result};
+#[cfg(test)]
 use std::collections::HashSet;
 
+/// Lock-free: a class's numbers are a counter and a free list, the copies written a bitmap, and
+/// each file is set once, the first opened kept.
 pub struct TempPages {
     io: Arc<dyn IO>,
     base: String,
-    classes: [Mutex<Class>; CLASS_COUNT],
-    files: Mutex<[Option<Arc<dyn File>>; CLASS_COUNT]>,
+    classes: [Class; CLASS_COUNT],
+    files: [SetOnce<Arc<dyn File>>; CLASS_COUNT],
     /// The next change's LSN. Nothing is logged, so these only order a page's changes and tell
     /// its frame dirty. They start at 1: 0 is a page never changed.
     lsn: AtomicU64,
@@ -30,10 +36,11 @@ pub struct TempPages {
 #[derive(Default)]
 struct Class {
     /// Numbers from here on were never handed out.
-    next: u64,
-    free: Vec<u64>,
+    next: AtomicU64,
+    /// Numbers given back and reusable.
+    free: FreeList<u64>,
     /// Numbers whose page has a copy in the file.
-    written: HashSet<u64>,
+    written: GrowBits,
 }
 
 fn path(base: &str, class: SizeClass) -> String {
@@ -53,7 +60,7 @@ impl TempPages {
             io,
             base: base.to_string(),
             classes: Default::default(),
-            files: Mutex::new(Default::default()),
+            files: Default::default(),
             lsn: AtomicU64::new(1),
             epochs,
             retired: Retired::default(),
@@ -64,15 +71,15 @@ impl TempPages {
     pub fn allocate(&self, class: SizeClass) -> PageId {
         for pid in self.retired.reclaim(&self.epochs) {
             self.classes[pid.class().index()]
-                .lock()
                 .free
                 .push(pid.temporary_number());
         }
-        let mut c = self.classes[class.index()].lock();
-        let number = c.free.pop().unwrap_or_else(|| {
-            c.next += 1;
-            c.next - 1
-        });
+        let c = &self.classes[class.index()];
+        let step = self.epochs.enter();
+        let number = c
+            .free
+            .pop(&self.epochs, &step)
+            .unwrap_or_else(|| c.next.fetch_add(1, Ordering::Relaxed));
         PageId::temporary(class, number)
     }
 
@@ -80,9 +87,8 @@ impl TempPages {
     /// already. It has no copy from here on: a stale reader reads zeros.
     pub fn free(&self, pid: PageId) {
         self.classes[pid.class().index()]
-            .lock()
             .written
-            .remove(&pid.temporary_number());
+            .clear(pid.temporary_number());
         self.retired.retire(&self.epochs, pid);
     }
 
@@ -92,11 +98,11 @@ impl TempPages {
         let mut out = Vec::new();
         let retired: HashSet<PageId> = self.retired.waiting().into_iter().collect();
         for class in SizeClass::all() {
-            let c = self.classes[class.index()].lock();
+            let c = &self.classes[class.index()];
             let free: HashSet<u64> = c
                 .free
-                .iter()
-                .copied()
+                .items()
+                .into_iter()
                 .filter(|&n| !retired.contains(&PageId::temporary(class, n)))
                 .chain(
                     retired
@@ -106,7 +112,7 @@ impl TempPages {
                 )
                 .collect();
             out.extend(
-                (0..c.next)
+                (0..c.next.load(Ordering::Acquire))
                     .filter(|n| !free.contains(n))
                     .map(|n| PageId::temporary(class, n)),
             );
@@ -120,17 +126,17 @@ impl TempPages {
     }
 
     fn file(&self, class: SizeClass) -> Result<Arc<dyn File>> {
-        if let Some(f) = &self.files.lock()[class.index()] {
-            return Ok(f.clone());
+        let cell = &self.files[class.index()];
+        if let Some(f) = cell.get() {
+            return Ok(f);
         }
-        // Opened outside the lock, which is never held across IO: two first users may both open
-        // it, and the first to put it in the map is kept.
+        // Two first users may both open it; the first to set it is kept.
         let file = self.io.open_file(
             &path(&self.base, class),
             OpenFlags::Create | OpenFlags::Direct,
             false,
         )?;
-        Ok(self.files.lock()[class.index()].get_or_insert(file).clone())
+        Ok(cell.set(file))
     }
 
     fn at(pid: PageId) -> u64 {
@@ -141,18 +147,17 @@ impl TempPages {
     pub fn read(&self, pid: PageId, into: Arc<Buffer>, done: ReadDone) -> Result<()> {
         let class = pid.class();
         if !self.classes[class.index()]
-            .lock()
             .written
-            .contains(&pid.temporary_number())
+            .get(pid.temporary_number())
         {
             into.as_mut_slice().fill(0);
             done(Ok(()));
             return Ok(());
         }
         let size = class.size();
-        let done = Mutex::new(Some(done));
+        let done = TakeOnce::new(done);
         let c = Completion::new_read(into, move |res| {
-            let done = done.lock().take()?;
+            let done = done.take()?;
             match res {
                 Ok((_, n)) if n as usize == size => {
                     done(Ok(()));
@@ -184,18 +189,17 @@ impl TempPages {
     {
         let len = copy.len();
         let me = self.clone();
-        let done = Mutex::new(Some(done));
+        let done = TakeOnce::new(done);
         let c = Completion::new_write(move |res| {
-            let Some(done) = done.lock().take() else {
+            let Some(done) = done.take() else {
                 return;
             };
             let res = whole(len, res);
             if res.is_ok() {
                 // Before `done`, which may evict the page: a read after that finds the copy.
                 me.classes[pid.class().index()]
-                    .lock()
                     .written
-                    .insert(pid.temporary_number());
+                    .set(pid.temporary_number());
             }
             done(res);
         });

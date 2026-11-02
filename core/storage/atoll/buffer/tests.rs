@@ -835,12 +835,13 @@ fn a_pass_waiting_on_its_writeback_wakes_when_another_thread_finishes_it() {
     // Another thread settles the write; the pass steps once its last write has settled and before
     // the writeback finishes, and finds the writeback held.
     let waited: Arc<Mutex<Option<Completion>>> = Arc::new(Mutex::new(None));
-    let wb = pool.writebacks.lock()[0].clone();
-    wb.lock().before_finish = Some({
-        let (pool, waited) = (pool.clone(), waited.clone());
-        Box::new(move || match pass.step(&pool).unwrap() {
-            IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
-            IOResult::Done(()) => panic!("the pass finished before its writeback"),
+    pool.with_queued(|wb| {
+        wb.before_finish = Some({
+            let (pool, waited) = (pool.clone(), waited.clone());
+            Box::new(move || match pass.step(&pool).unwrap() {
+                IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
+                IOResult::Done(()) => panic!("the pass finished before its writeback"),
+            })
         })
     });
     drive(&io, || pool.settle_writes()).unwrap();
@@ -1146,27 +1147,30 @@ fn a_write_landing_during_another_threads_step_wakes_whoever_waits_on_the_writeb
                 IOResult::Done(()) => panic!("the pass wrote nothing"),
             }
         }
-        let wb = pool.writebacks.lock()[0].clone();
-        let landings = wb.lock().landings();
-        if !landings.lock().is_empty() || crash.in_flight() == 0 {
+        let mut landings = None;
+        pool.with_queued(|wb| landings = Some(wb.landings()));
+        let landings = landings.expect("a writeback queued");
+        if !landings.is_empty() || crash.in_flight() == 0 {
             continue;
         }
         built += 1;
         // Inside the step, once it took the landed writes (none): the write lands, its wakeup
         // passes, and a waiter finds the writeback held.
         let waited: Arc<Mutex<Option<Completion>>> = Arc::new(Mutex::new(None));
-        wb.lock().after_taking_landed = Some({
-            let (pool, waited, crash, io) =
-                (pool.clone(), waited.clone(), crash.clone(), io.clone());
-            Box::new(move || {
-                while crash.in_flight() > 0 {
-                    io.step().unwrap();
-                }
-                assert!(!landings.lock().is_empty(), "the write did not land");
-                match pool.settle_writes().unwrap() {
-                    IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
-                    IOResult::Done(()) => panic!("settled with the write unsettled"),
-                }
+        pool.with_queued(|wb| {
+            wb.after_taking_landed = Some({
+                let (pool, waited, crash, io) =
+                    (pool.clone(), waited.clone(), crash.clone(), io.clone());
+                Box::new(move || {
+                    while crash.in_flight() > 0 {
+                        io.step().unwrap();
+                    }
+                    assert!(!landings.is_empty(), "the write did not land");
+                    match pool.settle_writes().unwrap() {
+                        IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
+                        IOResult::Done(()) => panic!("settled with the write unsettled"),
+                    }
+                })
             })
         });
         assert!(pool.drive_writebacks().unwrap().is_none());
@@ -1208,12 +1212,13 @@ fn a_reader_of_a_page_written_out_wakes_when_its_write_out_waits_before_submitti
     let out = pool.start_write_out(hold);
     pool.write_out(class(0), vec![out]);
     let waited: Arc<Mutex<Option<Completion>>> = Arc::new(Mutex::new(None));
-    let wb = pool.writebacks.lock()[0].clone();
-    wb.lock().before_step = Some({
-        let (pool, waited) = (pool.clone(), waited.clone());
-        Box::new(move || match pool.fix_optimistic(pid, None).unwrap() {
-            IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
-            IOResult::Done(_) => panic!("the page read as resident while it is written out"),
+    pool.with_queued(|wb| {
+        wb.before_step = Some({
+            let (pool, waited) = (pool.clone(), waited.clone());
+            Box::new(move || match pool.fix_optimistic(pid, None).unwrap() {
+                IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
+                IOResult::Done(_) => panic!("the page read as resident while it is written out"),
+            })
         })
     });
     match pool.drive_writebacks().unwrap() {

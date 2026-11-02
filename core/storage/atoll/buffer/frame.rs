@@ -4,7 +4,7 @@
 use super::super::latch::VersionedLatch;
 use super::memory::Zeroable;
 use super::watt::Tracker;
-use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use crate::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// The frame holds no page.
 pub const FREE: u8 = 0;
@@ -39,8 +39,8 @@ pub struct FrameHeader {
     /// The LSN of the newest copy written back, or loaded: the page is dirty while `page_lsn` is
     /// past it.
     pub written_lsn: AtomicU64,
-    /// The next frame, plus one, in this frame's hash chain.
-    pub next: AtomicU32,
+    /// This frame's link in its hash chain: the next frame, a mark and a tag ([`super::table`]).
+    pub next: super::table::Link,
     pub status: AtomicU8,
     pub flags: AtomicU8,
     pub tracker: Tracker,
@@ -70,6 +70,6 @@ impl FrameHeader {
     }
 }
 
-// Shuttle's atomics are larger than the hardware's.
-#[cfg(not(shuttle))]
+// Shuttle's and loom's atomics are larger than the hardware's.
+#[cfg(not(any(shuttle, atoll_loom)))]
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 104);

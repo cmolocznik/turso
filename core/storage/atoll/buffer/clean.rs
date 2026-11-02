@@ -20,17 +20,18 @@
 use super::super::log::Lsn;
 use super::super::page::{self, PageId, SizeClass};
 use super::super::shared::Bytes;
+use super::super::stack::Stack;
 use super::super::store::WritePlan;
 use super::frame::{EVICT_AFTER, RESIDENT, WRITING};
 use super::{BufferPool, Outgoing};
 use crate::io::Completion;
 use crate::sync::atomic::Ordering;
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::CompletionError;
 
 /// Writes that ended and are not yet settled, by position, with how each ended.
-pub(super) type Landed = Arc<Mutex<Vec<(usize, std::result::Result<(), CompletionError>)>>>;
+pub(super) type Landed = Arc<Stack<(usize, std::result::Result<(), CompletionError>)>>;
 
 /// What stepping a writeback came to.
 pub enum Progress {
@@ -70,6 +71,9 @@ pub struct Writeback {
     /// Run as a step begins, while its stepper holds it.
     #[cfg(test)]
     pub before_step: Option<Box<dyn FnOnce() + Send>>,
+    /// Which writeback, for a test that stalled to show.
+    #[cfg(test)]
+    pub id: u64,
 }
 
 impl Writeback {
@@ -95,7 +99,7 @@ impl Writeback {
             temporary,
             plan: None,
             next: 0,
-            landed: Arc::new(Mutex::new(Vec::new())),
+            landed: Arc::new(Stack::default()),
             unsettled: 0,
             finished,
             #[cfg(test)]
@@ -104,6 +108,11 @@ impl Writeback {
             after_taking_landed: None,
             #[cfg(test)]
             before_step: None,
+            #[cfg(test)]
+            id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         }
     }
 
@@ -121,7 +130,11 @@ impl Writeback {
             self.frames,
             self.next,
             self.unsettled,
-            self.landed.lock().len(),
+            if self.landed.is_empty() {
+                "none"
+            } else {
+                "some"
+            },
             self.outgoing.iter().filter(|o| o.is_some()).count(),
             self.plan
                 .as_ref()
@@ -152,7 +165,7 @@ impl Writeback {
         if let Some(c) = self.submit(pool) {
             return Progress::Waiting(c);
         }
-        let landed = std::mem::take(&mut *self.landed.lock());
+        let landed = self.landed.take_all();
         #[cfg(test)]
         if let Some(hook) = self.after_taking_landed.take() {
             hook();
@@ -161,9 +174,10 @@ impl Writeback {
         while let Some((i, res)) = landed.next() {
             if let Some(plan) = &mut self.plan {
                 if let IOResult::IO(IOCompletions(c)) = plan.settle(i, &res) {
-                    let mut back = self.landed.lock();
-                    back.push((i, res));
-                    back.extend(landed);
+                    self.landed.push((i, res));
+                    for rest in landed {
+                        self.landed.push(rest);
+                    }
                     return Progress::Waiting(c);
                 }
             }
@@ -263,7 +277,7 @@ impl Writeback {
             let ended = move |res: std::result::Result<(), CompletionError>| {
                 // Before the wake, so a waiter woken for room finds it.
                 drop(held);
-                landed.lock().push((i, res));
+                landed.push((i, res));
                 woken.write_landed(frame, outgoing);
             };
             let written = match &self.plan {
@@ -272,7 +286,7 @@ impl Writeback {
             };
             if let Err(e) = written {
                 // It never started: settled as failed, which fails the pool.
-                self.landed.lock().push((i, Err(super::io_failure(&e))));
+                self.landed.push((i, Err(super::io_failure(&e))));
                 self.abandon(pool);
                 return None;
             }

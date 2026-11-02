@@ -365,6 +365,40 @@ impl Completion {
         Self::new(CompletionType::Yield)
     }
 
+    /// This completion as a raw pointer holding its reference, for a lock-free cell that hands
+    /// it to other threads; null for a yield.
+    pub(crate) fn into_raw(self) -> *const () {
+        self.inner
+            .map_or(std::ptr::null(), |inner| Arc::into_raw(inner).cast())
+    }
+
+    /// The completion behind `raw`, with the reference it held.
+    ///
+    /// # Safety
+    ///
+    /// `raw` came from [`into_raw`](Self::into_raw), and its reference is handed back here once.
+    pub(crate) unsafe fn from_raw(raw: *const ()) -> Self {
+        Self {
+            // SAFETY: as the caller promises.
+            inner: (!raw.is_null())
+                .then(|| unsafe { Arc::from_raw(raw.cast::<CompletionInner>()) }),
+        }
+    }
+
+    /// A new reference to the completion behind `raw`, which keeps its own.
+    ///
+    /// # Safety
+    ///
+    /// `raw` came from [`into_raw`](Self::into_raw), and its reference is still held.
+    pub(crate) unsafe fn clone_raw(raw: *const ()) -> Self {
+        if !raw.is_null() {
+            // SAFETY: as the caller promises, the reference `raw` holds keeps it alive.
+            unsafe { Arc::increment_strong_count(raw.cast::<CompletionInner>()) };
+        }
+        // SAFETY: the reference just taken.
+        unsafe { Self::from_raw(raw) }
+    }
+
     /// Whether `other` is this same completion, not merely an equal one.
     pub(crate) fn ptr_eq(&self, other: &Completion) -> bool {
         match (&self.inner, &other.inner) {

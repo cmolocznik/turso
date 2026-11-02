@@ -162,7 +162,14 @@ in the last point.
 ## 6. The buffer manager
 
 - **Translation.** The hash table maps page ids to frames; frame hints are checked by page id and
-  version on use. Unchanged.
+  version on use. It takes no lock: each bucket's chain is Michael's list (2002) linked through
+  the frame headers, a link holding the next frame, a mark and a tag. Removing a frame marks its
+  own link, so nothing is linked in after it, and a walk unlinks every marked frame it meets.
+  Every write to a link raises its tag, and a walk reads a frame's link and page, then reads
+  again the word that led it there, starting over if it changed: so it never follows a frame
+  that left for another chain, and never misses a page that stays. A page goes in at its chain's
+  head by compare-and-swap against the head its walk of the whole chain began from, so it is in
+  one frame at most. A removal returns once nothing links the frame.
 - **Validate before IO.** A miss on a page reached through another page starts IO only after the
   page it came from is validated. A descent that finds a child missing validates the parent, then
   reads the child in.
@@ -171,6 +178,37 @@ in the last point.
   frame is held until the write lands, and whoever wants the page waits on that write, so a page
   that keeps changing still leaves.
   An emptied batch goes at once to the class it was drained for (§4).
+- **The allocator takes no lock.** Every change to a batch is a compare-and-swap of one word:
+  the class holding it, whether it drains, whether a release owns it, the frames taken, and the
+  class it is drained for. A take first counts a frame in that word, only while its class holds
+  the batch and it does not drain, then claims a free bit; the free bits never fall below the
+  frames counted and not yet claimed, so one is there. The free that empties a draining batch,
+  or the drain that finds it empty, is the one exchange that marks it released, so one thread
+  hands it on. Per class, bitmaps say which batches it holds, which are live and which may have a
+  free frame: hints its word confirms. A hint whose loss would hide memory is never lost: a free
+  marks its batch after counting the frame back, and a take that clears the mark rechecks the
+  count, the mark's setting and clearing being acquire-release exchanges of one word, so one sees
+  the other; and a batch lent while its run is being reserved is drained either by the reserving
+  drain or by the lending, across paired fences. Free batches are a bitmap in which aligned runs of up
+  to four lie in one word, so a run is taken with one compare-and-swap, from the smallest free
+  run that holds it as a buddy allocator would, and coalesces as its bits are set. The run held
+  for a large class is one word too, counting down the batches it still misses; every holder of
+  a batch in it is drained until it is whole, the class itself included.
+- **IO in flight and the pool's wake** are completion cells: one pointer each, put and taken by
+  the frame's holder or anyone finishing the wake, read by anyone in a step for a reference of
+  their own. A completion taken out is dropped through the epochs, once no step that could have
+  read the pointer is left. The pool's first error is set once by compare-and-swap.
+- **The writeback queue and each writeback's landed writes** are stacks whose items are taken
+  all at once (`stack.rs`): a push is a compare-and-swap of the head, a take one swap of it, so no
+  thread reads a node another may free and no epoch is needed. A thread stepping writebacks takes
+  them all, steps each and puts back those not done; another finds none to step, as it found
+  them held before. A count of those queued, held ones included, says whether any is left.
+- **The writeback buffer's ring** takes no lock (`staging.rs`). Its head and tail are positions
+  that only rise, a lap apart at most; a lease is a compare-and-swap of the head, and a wrap a
+  lease of the end's remainder given back at once. A lease given back records its end at the
+  unit it starts in, and its giver moves the tail past every lease back at it, the record and
+  the tail each written and the other read across paired fences, so room given back is never
+  left behind the tail.
 - **Allocation.** A page id is reused only after an epoch (section 4), so a reader still holding
   the old id can only find it free. A freed number joins the waiting numbers before it reads as
   free in the page table, so no allocation takes it in between.
@@ -222,7 +260,6 @@ in the last point.
     tree growth, a reclaim of retired objects. Neither is in any order: busy means a yield, or for
     a reclaim, nothing reclaimed this time. An owner may hold its mutex across IO it submits.
   - The mutexes that are waited for nest only as follows, outer first:
-    - the memory's free runs, then a size class's batches;
     - the metadata cache's map of pages, then its order of arrival, then a page's state, then
       the dirty list;
     - the page store's erasing list, then its unerased slots or its open intents;
@@ -233,8 +270,7 @@ in the last point.
   - None is held across IO, while a callback runs, or while a completion is completed, except
     the log's flush and a transaction slot: an append can submit log writes, whose completions
     run inside the submission on some backends. Both go with step 4.
-  - Every other mutex is taken alone, nesting nothing: the writeback buffer's ring among them,
-    taken to lease room and, from a write's completion, to give it back.
+  - Every other mutex is taken alone, nesting nothing.
   - Every acquisition in the engine was read for this list (2026-11-01): no two mutexes are taken
     in both orders.
 
@@ -254,26 +290,37 @@ in the last point.
   a loom-checked cell under loom, so a read not ordered after its write fails. loom models
   `fence(SeqCst)` and treats sequentially consistent accesses as acquire-release, which errs
   toward false alarms. It hands a read-modify-write the latest write in its run, so it cannot
-  show that one needs an acquire to see another thread's earlier write. Its exploration is not
-  exhaustive either, so no part rests on loom alone for its interleavings.
+  show that one needs an acquire to see another thread's earlier write. And it let through one
+  interleaving shuttle caught at once (the page table's walk without its re-read), which smaller
+  probes did not reproduce, so no part rests on loom alone for its interleavings.
 - **Miri** (`cargo +nightly-2025-10-01 miri test`, `-Zmiri-many-seeds`) runs threaded tests,
   checking every access for undefined behaviour, a use after free among them, and data races, at
   the interleavings its scheduler draws. In eight seeds it caught none of six weakened
   publications that loom's checked cells catch, the tests' own synchronization ordering the
   accesses in the schedules it drew; it is the instrument for pointers and reference counts.
+  cargo-miri's test binary is a stub that records the tree it was built in and compiles that
+  tree's sources when it runs, so a Miri run gets a tree and a target of its own, never copied,
+  and a mutant is applied in that tree.
 - **Contention stress.** Every concurrent test also runs 12 copies at once on the 16-core host,
   with a run count sized to the failure rate being ruled out.
 - **Fail-first by mutation.** Every ordering, fence and check a lock-free part relies on is
   weakened or removed in turn, and the suite must fail. A mutant nothing catches is either an
   ordering or check something else already supplies, which then goes or is named as kept, or a
-  blind spot named here with the argument that covers it. The blind spots, each an acquire on a
-  read-modify-write that loom cannot show is needed:
+  blind spot named here with the argument that covers it. The blind spots, orderings C11 needs
+  that no instrument here could show are needed:
   - A step's end swaps its word acquire-release. The flag it reads was set after the wait was
     pushed; only the acquire orders the wake's taking of the list after that push, so the wake
     finds the wait.
   - A wait is pushed acquire-release. Put back after a wake took the list, it reads the swap of a
     step's end that found the list empty; only the acquire orders the recheck that follows after
     that step's end, so the recheck sees the step gone and finishes the wait.
+  - A batch lent while its run is being reserved: the reserving drain writes the reservation and
+    reads the batch's state, the lending writes the state and reads the reservation, and only a
+    sequentially consistent fence on each side forbids both reading the old value. loom let the
+    removal of either fence through.
+  Orderings found redundant and kept, each saying what supplies it: a frame's claim is acquire,
+  though the batch word's acquire-release chain already orders the freer before the next taker;
+  and a tag is raised on both kinds of write to a link.
 - **Done** means all of them are clean, with the counts reported. A component that has only
   passed alone is not done.
 
@@ -294,7 +341,7 @@ in the last point.
 5. Then step 7 resumes from what is committed, re-proved under the new rules.
 6. Lock-free throughout (2026-11-02), one part at a time, each with its design here, loom, Miri
    where it holds pointers, shuttle, stress and mutants before it is done: the epochs; then the
-   buffer pool (its page table, its allocator, the IO in flight, the wake, the first error, the
-   writeback queue and the staging ring); the page store's sets and maps; the
+   buffer pool (its page table, allocator, IO in flight, wake, first error, writeback queue,
+   landed writes and ring done; its temporary pages next); the page store's sets and maps; the
    metadata cache; the log's admission and flush; writeback's landed list; transactions; the
    cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and stay.

@@ -7,37 +7,56 @@
 //! leases given back in the order they were taken, so a write landing early holds its room until
 //! the older ones land. A lease that does not fit waits for room: the size of the block bounds the
 //! writes in flight, and so the share of the device the cleaner takes, and its memory.
+//!
+//! Lock-free. The head and the tail are positions that only rise, a lap of the ring apart at most:
+//! a lease is one compare-and-swap of the head, a wrap a lease of the end's remainder given back
+//! at once. A lease given back records its end at the unit it starts in, and whoever gives one
+//! back then moves the tail past every lease back at it. The record and the tail are each written
+//! and then the other read across a fence, so either the giver sees the tail reach its lease or
+//! the thread that moved it sees the lease back: room given back is never left behind the tail.
 
+use self::sync::{fence, AtomicU64, Ordering};
 use super::super::aligned::AlignedBlock;
 use crate::io::Buffer;
-use crate::sync::{Arc, Mutex};
-use std::collections::VecDeque;
+use crate::sync::Arc;
 
-/// Room taken in the ring: where, how long, and whether it was given back.
-struct Taken {
-    start: usize,
-    len: usize,
-    returned: bool,
+/// The engine's atomics, or loom's.
+#[cfg(not(atoll_loom))]
+mod sync {
+    pub(super) use crate::sync::atomic::{fence, AtomicU64, Ordering};
 }
 
+#[cfg(atoll_loom)]
+mod sync {
+    pub(super) use loom::sync::atomic::{fence, AtomicU64, Ordering};
+}
+
+/// The leases of a ring of `cap` bytes, in whole units.
 struct Ring {
-    /// Where the next lease starts.
-    head: usize,
-    /// Leases in the order taken, the oldest first: the ring is in use from the first's start to
-    /// `head`, wrapping.
-    taken: VecDeque<Taken>,
+    cap: u64,
+    unit: u64,
+    /// Where the next lease starts, as a position that only rises: its offset is this modulo
+    /// `cap`.
+    head: AtomicU64,
+    /// Where the oldest lease not given back starts; everything before it is free.
+    tail: AtomicU64,
+    /// Per unit: the end of the lease given back that starts there, or an older one's.
+    ends: Box<[AtomicU64]>,
 }
 
 pub struct Staging {
     block: Arc<AlignedBlock>,
-    ring: Mutex<Ring>,
+    ring: Ring,
 }
 
 /// A run of the ring, its holder's alone until [`Staging::give_back`].
 #[derive(Debug, PartialEq, Eq)]
 struct Lease {
+    /// The run's offset in the block.
     start: usize,
     len: usize,
+    /// Its position.
+    at: u64,
 }
 
 /// A lease that gives its room back when dropped: a write that never starts, or a writeback
@@ -69,15 +88,93 @@ impl Drop for Leased {
     }
 }
 
+impl Ring {
+    fn new(cap: u64, unit: u64) -> Self {
+        Self {
+            cap,
+            unit,
+            head: AtomicU64::new(0),
+            tail: AtomicU64::new(0),
+            ends: (0..cap / unit).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn end_at(&self, at: u64) -> &AtomicU64 {
+        &self.ends[((at % self.cap) / self.unit) as usize]
+    }
+
+    /// `len` contiguous bytes, if the ring has them free; `len` is a whole number of units and at
+    /// most the ring's.
+    fn take(&self, len: u64) -> Option<Lease> {
+        debug_assert!(len <= self.cap && len % self.unit == 0);
+        loop {
+            // The tail first: the head, read after it, is at or past it.
+            let tail = self.tail.load(Ordering::Acquire);
+            let head = self.head.load(Ordering::Acquire);
+            let offset = head % self.cap;
+            // The end is too short: a lease of the rest, given back at once, wraps to the start.
+            let pad = if offset + len > self.cap {
+                self.cap - offset
+            } else {
+                0
+            };
+            // An empty ring's padding is behind the tail as soon as it is given back.
+            let used = if tail == head {
+                len
+            } else {
+                head + pad + len - tail
+            };
+            if used > self.cap {
+                return None;
+            }
+            match self.head.compare_exchange_weak(
+                head,
+                head + pad + len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if pad > 0 {
+                        self.give_back(head, pad);
+                    }
+                    return Some(Lease {
+                        start: ((head + pad) % self.cap) as usize,
+                        len: len as usize,
+                        at: head + pad,
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Gives back the run of `len` at position `at`, and moves the tail past every run given back
+    /// at it.
+    fn give_back(&self, at: u64, len: u64) {
+        // Release: whoever moves the tail past it sees the run's bytes done with.
+        self.end_at(at).store(at + len, Ordering::Release);
+        loop {
+            // Pairs with the fence of whoever moves the tail: one sees the other.
+            fence(Ordering::SeqCst);
+            let tail = self.tail.load(Ordering::Acquire);
+            // An end recorded a lap before is at or behind the tail.
+            let end = self.end_at(tail).load(Ordering::Acquire);
+            if end <= tail {
+                return;
+            }
+            let _ = self
+                .tail
+                .compare_exchange(tail, end, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
 impl Staging {
     /// A ring of `len` bytes, a multiple of the direct IO alignment.
     pub fn new(len: usize) -> Self {
         Self {
             block: Arc::new(AlignedBlock::zeroed(len)),
-            ring: Mutex::new(Ring {
-                head: 0,
-                taken: VecDeque::new(),
-            }),
+            ring: Ring::new(len as u64, crate::io::DIRECT_IO_ALIGNMENT as u64),
         }
     }
 
@@ -92,32 +189,7 @@ impl Staging {
     /// `len` contiguous bytes, if the ring has them free; `len` is a multiple of the direct IO
     /// alignment and at most the ring's.
     fn take(&self, len: usize) -> Option<Lease> {
-        let cap = self.block.len();
-        debug_assert!(len <= cap);
-        let mut ring = self.ring.lock();
-        let start = match ring.taken.front().map(|oldest| oldest.start) {
-            None => 0,
-            // In use from the tail to the head: free past the head, then before the tail.
-            Some(tail) if ring.head > tail => {
-                if cap - ring.head >= len {
-                    ring.head
-                } else if tail >= len {
-                    0
-                } else {
-                    return None;
-                }
-            }
-            // Wrapped: free between the head and the tail, none if they meet.
-            Some(tail) if tail - ring.head >= len => ring.head,
-            Some(_) => return None,
-        };
-        ring.head = start + len;
-        ring.taken.push_back(Taken {
-            start,
-            len,
-            returned: false,
-        });
-        Some(Lease { start, len })
+        self.ring.take(len as u64)
     }
 
     /// The leased bytes, to write from.
@@ -135,26 +207,124 @@ impl Staging {
 
     /// Gives `lease` back once its write has landed.
     fn give_back(&self, lease: Lease) {
-        let mut ring = self.ring.lock();
-        let taken = ring
-            .taken
-            .iter_mut()
-            .find(|t| t.start == lease.start && t.len == lease.len && !t.returned)
-            .expect("a lease given back once");
-        taken.returned = true;
-        while ring.taken.front().is_some_and(|t| t.returned) {
-            ring.taken.pop_front();
-        }
-        if ring.taken.is_empty() {
-            ring.head = 0;
-        }
+        self.ring.give_back(lease.at, lease.len as u64);
     }
 }
 
+/// Threads lease runs of a ring and give them back in whatever order they finish: no unit is
+/// leased twice at once, and once all are back the whole ring is free.
 #[cfg(test)]
+fn leases_from_threads_never_overlap_and_all_room_comes_back(threads: usize, rounds: usize) {
+    use crate::sync::atomic::AtomicBool;
+    let units = 8u64;
+    let ring = Arc::new(Ring::new(units, 1));
+    let used: Arc<Vec<AtomicBool>> = Arc::new((0..units).map(|_| AtomicBool::new(false)).collect());
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let (ring, used) = (ring.clone(), used.clone());
+            crate::thread::spawn(move || {
+                for round in 0..rounds {
+                    let len = 1 + ((t + round) as u64 % 3);
+                    let Some(lease) = ring.take(len) else {
+                        crate::thread::yield_now();
+                        continue;
+                    };
+                    for u in lease.start..lease.start + lease.len {
+                        assert!(
+                            !used[u].swap(true, Ordering::AcqRel),
+                            "unit {u} leased twice"
+                        );
+                    }
+                    crate::thread::yield_now();
+                    for u in lease.start..lease.start + lease.len {
+                        used[u].store(false, Ordering::Release);
+                    }
+                    ring.give_back(lease.at, lease.len as u64);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert!(
+        ring.take(units).is_some(),
+        "room given back was left behind the tail"
+    );
+}
+
+#[cfg(all(test, not(atoll_loom), not(shuttle)))]
+#[test]
+fn leases_from_threads_never_overlap_and_all_room_comes_back_on_threads() {
+    leases_from_threads_never_overlap_and_all_room_comes_back(3, 100_000);
+}
+
+#[cfg(all(test, shuttle))]
+#[test]
+fn leases_from_threads_never_overlap_and_all_room_comes_back_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || leases_from_threads_never_overlap_and_all_room_comes_back(2, 6),
+        2_000,
+    );
+}
+
+#[cfg(all(test, atoll_loom))]
+mod loom_tests {
+    use super::*;
+    use loom::cell::UnsafeCell;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// The ring's bytes, a unit each: loom fails a write by a lease's holder not ordered after
+    /// the last holder's.
+    struct Units(Vec<UnsafeCell<u64>>);
+
+    // SAFETY: shared to be raced on: loom checks every access.
+    unsafe impl Sync for Units {}
+
+    impl Units {
+        fn fill(&self, lease: &Lease, with: u64) {
+            for u in lease.start..lease.start + lease.len {
+                // SAFETY: loom fails this write if another holder's is not ordered with it.
+                self.0[u].with_mut(|v| unsafe { *v = with });
+            }
+        }
+    }
+
+    /// Two leases given back out of order while the other is taken: the tail passes both, so
+    /// the whole ring is free once both are back, and its next holder's writes follow theirs.
+    #[test]
+    fn room_given_back_in_any_order_all_comes_back() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(|| {
+            let ring = Arc::new(Ring::new(4, 1));
+            let units = Arc::new(Units((0..4).map(|_| UnsafeCell::new(0)).collect()));
+            let first = ring.take(2).unwrap();
+            let other = {
+                let (ring, units) = (ring.clone(), units.clone());
+                thread::spawn(move || {
+                    let lease = ring.take(2).expect("room for two");
+                    units.fill(&lease, 2);
+                    ring.give_back(lease.at, lease.len as u64);
+                })
+            };
+            units.fill(&first, 1);
+            ring.give_back(first.at, first.len as u64);
+            other.join().unwrap();
+            let whole = ring
+                .take(4)
+                .expect("room given back was left behind the tail");
+            units.fill(&whole, 3);
+        });
+    }
+}
+
+#[cfg(all(test, not(atoll_loom)))]
 mod tests {
     use super::*;
     use crate::io::DIRECT_IO_ALIGNMENT as A;
+    use std::collections::VecDeque;
 
     /// Leases never overlap, wrap when the end is short, wait while the ring is full, and free
     /// room in the order they were taken.

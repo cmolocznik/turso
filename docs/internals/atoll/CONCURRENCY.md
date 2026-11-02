@@ -154,6 +154,10 @@ in the last point.
 
 - **One kind.** A 64-bit word: version and an exclusive bit. Taken with one compare-and-swap;
   released by a guard, which exists from the instruction that took it, so a panic releases it.
+  The holder passes a release fence after taking it and before its first write, as a seqlock's
+  writer does: the exchange is an acquire, which lets a later store be seen before its own, so a
+  reader could otherwise read a write under way and still find its version, and validate a page
+  half written.
 - **Busy means yield.** A taker that finds it held returns a yield to its caller. No spin anywhere.
 - **No shared mode.** Every read is optimistic: copy, then validate. That covers B-tree nodes,
   out-of-line value pages (immutable once linked, so a failed validation means the page moved or

@@ -46,6 +46,8 @@ pub mod stack;
 pub mod store;
 pub mod txn;
 
+#[cfg(all(test, not(atoll_loom), not(shuttle), not(miri)))]
+mod bench;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]

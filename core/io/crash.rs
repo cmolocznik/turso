@@ -210,6 +210,12 @@ impl CrashIO {
         self.state.lock().in_flight.len()
     }
 
+    /// Handles on this IO's state besides this one: its files still open, and every other
+    /// handle. Whoever drops all it built on the IO finds none left unless something holds one.
+    pub fn other_handles(&self) -> usize {
+        Arc::strong_count(&self.state) - 1
+    }
+
     /// Operations completed so far.
     pub fn completed(&self) -> u64 {
         self.state.lock().completed

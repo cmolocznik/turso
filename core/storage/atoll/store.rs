@@ -1527,11 +1527,13 @@ impl WritePlan {
         if file.supports_durable_writes() {
             return file.pwrite_durable(at, copy, c);
         }
-        // Durable only once synced: the write lands with the sync.
+        // Durable only once synced: the write lands with the sync. The file weakly: it holds the
+        // IO the write waits in, so a strong hold would keep that IO alive for good once nothing
+        // steps it; a file closed before its sync leaves the write not durable.
         let synced = c.clone();
-        let sync_file = file.clone();
-        let wrote = Completion::new_write(move |res| match res {
-            Ok(n) => {
+        let sync_file = Arc::downgrade(&file);
+        let wrote = Completion::new_write(move |res| match (res, sync_file.upgrade()) {
+            (Ok(n), Some(sync_file)) => {
                 let landed = synced.clone();
                 let after = Completion::new_sync(move |r| match r {
                     Ok(_) => landed.complete(n),
@@ -1541,7 +1543,8 @@ impl WritePlan {
                     synced.error(io_failure(&e));
                 }
             }
-            Err(e) => synced.error(e),
+            (Ok(_), None) => synced.error(CompletionError::Aborted),
+            (Err(e), _) => synced.error(e),
         });
         drop(file.pwrite(at, copy, wrote)?);
         Ok(c)

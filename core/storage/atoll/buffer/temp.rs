@@ -188,14 +188,16 @@ impl TempPages {
         F: FnOnce(std::result::Result<(), CompletionError>) + Send + 'static,
     {
         let len = copy.len();
-        let me = self.clone();
+        // Weakly: the completion waits in our own IO, so a strong hold would keep pages dropped
+        // with the write in flight alive, and for good once nothing steps that IO.
+        let me = Arc::downgrade(self);
         let done = TakeOnce::new(done);
         let c = Completion::new_write(move |res| {
             let Some(done) = done.take() else {
                 return;
             };
             let res = whole(len, res);
-            if res.is_ok() {
+            if let (Ok(()), Some(me)) = (&res, me.upgrade()) {
                 // Before `done`, which may evict the page: a read after that finds the copy.
                 me.classes[pid.class().index()]
                     .written

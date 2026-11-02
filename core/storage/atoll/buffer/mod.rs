@@ -69,9 +69,9 @@ use temp::TempPages;
 
 use crate::io::{Buffer, Completion};
 use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use crate::sync::Arc;
 #[cfg(test)]
 use crate::sync::Mutex;
+use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::ops::Deref;
@@ -133,9 +133,11 @@ impl Deref for FrameLatch {
 /// A page being read into a frame, which it holds exclusively until the read ends. Dropped
 /// before then, when the read was never started or a panic unwinds, it takes the frame out of
 /// the table and frees it, and whoever waits on the read looks again. The read's completion keeps
-/// it, never the pool.
+/// it, and it keeps the pool weakly: the completion waits in the pool's own IO, so a strong hold
+/// would keep a pool dropped with the read in flight alive, and for good once nothing steps that
+/// IO. The frame's memory is the read buffer's to keep.
 struct Loading {
-    pool: Arc<BufferPool>,
+    pool: Weak<BufferPool>,
     pid: PageId,
     hold: Option<Held<FrameLatch>>,
 }
@@ -143,14 +145,16 @@ struct Loading {
 impl Loading {
     fn end(mut self, res: std::result::Result<(), CompletionError>) {
         let hold = self.hold.take().expect("a read ends once");
-        self.pool.loaded(self.pid, hold, res);
+        if let Some(pool) = self.pool.upgrade() {
+            pool.loaded(self.pid, hold, res);
+        }
     }
 }
 
 impl Drop for Loading {
     fn drop(&mut self) {
-        if let Some(hold) = self.hold.take() {
-            self.pool.unload(self.pid, hold, None);
+        if let (Some(hold), Some(pool)) = (self.hold.take(), self.pool.upgrade()) {
+            pool.unload(self.pid, hold, None);
         }
     }
 }
@@ -656,7 +660,7 @@ impl BufferPool {
         // the IO writes it.
         let into = self.memory.region.buffer(frame, pid.class().size());
         let reading = Loading {
-            pool: self.clone(),
+            pool: Arc::downgrade(self),
             pid,
             hold: Some(hold),
         };

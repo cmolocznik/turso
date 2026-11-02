@@ -185,16 +185,20 @@ impl Control {
             let c = Completion::new_write(move |res| finish(&done, whole(SIZE, res)));
             drop(self.file.pwrite_durable(at, block.region(0, SIZE), c)?);
         } else {
-            let file = self.file.clone();
-            let c = Completion::new_write(move |res| match whole(SIZE, res) {
-                Ok(()) => {
+            // The file weakly: it holds the IO the write waits in, so a strong hold would keep that
+            // IO alive for good once nothing steps it; a file closed before its sync leaves the
+            // superblock not durable.
+            let file = Arc::downgrade(&self.file);
+            let c = Completion::new_write(move |res| match (whole(SIZE, res), file.upgrade()) {
+                (Ok(()), Some(file)) => {
                     let after = done.clone();
                     let synced = Completion::new_sync(move |r| finish(&after, r.map(|_| ())));
                     if let Err(e) = file.sync_data(synced) {
                         finish(&done, Err(io_failure(&e)));
                     }
                 }
-                Err(e) => finish(&done, Err(e)),
+                (Ok(()), None) => finish(&done, Err(CompletionError::Aborted)),
+                (Err(e), _) => finish(&done, Err(e)),
             });
             drop(self.file.pwrite(at, block.region(0, SIZE), c)?);
         }

@@ -273,12 +273,16 @@ impl Writeback {
             self.next += 1;
             self.unsettled += 1;
             pool.writes_in_flight.fetch_add(1, Ordering::AcqRel);
-            let (landed, woken) = (self.landed.clone(), pool.clone());
+            // The pool weakly: the write waits in the pool's own IO, so a strong hold would keep a
+            // pool dropped with it in flight alive, and for good once nothing steps that IO.
+            let (landed, woken) = (self.landed.clone(), Arc::downgrade(pool));
             let ended = move |res: std::result::Result<(), CompletionError>| {
                 // Before the wake, so a waiter woken for room finds it.
                 drop(held);
                 landed.push((i, res));
-                woken.write_landed(frame, outgoing);
+                if let Some(pool) = woken.upgrade() {
+                    pool.write_landed(frame, outgoing);
+                }
             };
             let written = match &self.plan {
                 Some(plan) => plan.write(i, buffer, ended).map(drop),

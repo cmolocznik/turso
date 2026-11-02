@@ -10,7 +10,7 @@ use super::db::{Atoll, AtollConfig, Opening};
 use super::log::{Log, LogConfig, Lsn, BLOCK};
 use super::page::{PageId, SizeClass, HEADER_SIZE};
 use super::radix::FREE;
-use super::shared::Bytes;
+use super::shared::{Bytes, BytesMut};
 use super::store::StoreConfig;
 use super::testing::drive;
 use crate::io::crash::{CrashIO, Faults};
@@ -686,4 +686,118 @@ fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_p
         check(&db, &image, &model, end, &label);
     }
     assert!(gapped > 0, "none of {count} images holds the gap");
+}
+
+/// [`drive`] while `left` holds IO steps, each step spending one, shared across calls: `None` once
+/// they run out, with what the operation submitted still in flight. A yield spends one too, so
+/// they always run out.
+fn drive_for<T>(
+    io: &Arc<dyn IO>,
+    left: &Cell<u64>,
+    mut op: impl FnMut() -> Result<IOResult<T>>,
+) -> Option<T> {
+    loop {
+        match op().unwrap() {
+            IOResult::Done(v) => return Some(v),
+            IOResult::IO(IOCompletions(c)) => loop {
+                if left.get() == 0 {
+                    return None;
+                }
+                left.set(left.get() - 1);
+                io.step().unwrap();
+                if c.finished() {
+                    break;
+                }
+            },
+        }
+    }
+}
+
+/// Steps the IO while `left` holds IO steps until nothing is in flight: `None` if they ran out.
+fn settle(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Option<()> {
+    while crash.in_flight() > 0 {
+        if left.get() == 0 {
+            return None;
+        }
+        left.set(left.get() - 1);
+        io.step().unwrap();
+    }
+    Some(())
+}
+
+/// Every kind of IO a database submits, for as long as `left` holds IO steps: pages written and
+/// logged, a full checkpoint, the next log segment zeroed and synced, temporary pages enough to
+/// write some out, the pages fixed again, then the database dropped, reopened and the pages fixed
+/// again from disk, through their page-table pages. `None` where the steps ran out.
+fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Option<()> {
+    let pids = {
+        let db = open(io.clone(), 1);
+        let mut pids = Vec::new();
+        for v in 1..=8 {
+            let pid = drive_for(io, left, || db.pool().allocate(class(0)))?.pid();
+            drive_for(io, left, || db.store().adopt(&[pid]))?;
+            let mut admitted = drive_for(io, left, || db.log().admit(blob::record_len(STAMP)))?;
+            let mut page = drive_for(io, left, || db.pool().fix_exclusive(pid, None))?;
+            let (offset, bytes) = stamp(pid, v);
+            blob::write(db.log(), &mut admitted, &mut page, offset, &bytes);
+            pids.push(pid);
+        }
+        drive_for(io, left, || db.log().wait_durable(db.log().end()))?;
+        let ticket = db.checkpointer().request_full();
+        drive_for(io, left, || db.checkpointer().step_full(ticket))?;
+        // The next segment's zeros go one write at a time, then its sync: all of it lands.
+        settle(crash, io, left)?;
+        // Twice the pool of them: a pool's worth at least is written out, and the pages above
+        // leave memory.
+        let temp = class(5);
+        for v in 0..2 * MIN_BUDGET / temp.size() {
+            let mut page = drive_for(io, left, || db.pool().allocate_temporary(temp))?;
+            page.page_mut().put_u64(HEADER_SIZE, v as u64);
+            page.changed(db.pool().temporary_lsn());
+        }
+        for &pid in &pids {
+            drive_for(io, left, || db.pool().fix_exclusive(pid, None))?;
+        }
+        pids
+    };
+    // What the first one left in flight lands before the reopen, as it would after a crash.
+    settle(crash, io, left)?;
+    let db = open(io.clone(), 1);
+    for &pid in &pids {
+        drive_for(io, left, || db.pool().fix_exclusive(pid, None))?;
+    }
+    Some(())
+}
+
+/// A database dropped with its IO in flight leaves nothing holding the IO: every completion it
+/// hands the IO waits in it, so one that held its owner, or a file it syncs, strongly would keep
+/// the IO and all it holds alive for good once nothing steps it. Dropped after every number of IO
+/// steps through every kind of IO it submits, with and without durable writes.
+#[test]
+fn a_database_dropped_with_io_in_flight_leaves_nothing_holding_its_io() {
+    for durable_writes in [true, false] {
+        let mut dropped_in_flight = 0;
+        for steps in 0.. {
+            let crash = Arc::new(CrashIO::new(0));
+            crash.set_durable_writes(durable_writes);
+            let io: Arc<dyn IO> = crash.clone();
+            let finished = every_kind_of_io(&crash, &io, &Cell::new(steps)).is_some();
+            dropped_in_flight += usize::from(crash.in_flight() > 0);
+            drop(io);
+            assert_eq!(
+                (Arc::strong_count(&crash), crash.other_handles()),
+                (1, 0),
+                "dropped after {steps} IO steps with {} in flight (durable writes: \
+                 {durable_writes}): something it submitted holds the IO",
+                crash.in_flight()
+            );
+            if finished {
+                break;
+            }
+        }
+        assert!(
+            dropped_in_flight > 0,
+            "no drop with IO in flight (durable writes: {durable_writes})"
+        );
+    }
 }

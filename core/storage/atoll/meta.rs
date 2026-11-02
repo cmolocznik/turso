@@ -40,7 +40,7 @@ use super::stack::Stack;
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::collections::VecDeque;
@@ -398,6 +398,13 @@ impl MetaCache {
         self.recovering.store(recovering, Ordering::Release);
     }
 
+    /// The hold a completion keeps on the cache, weak: the completion waits in the cache's own
+    /// IO, so a strong hold would keep a cache dropped with it in flight alive, and for good once
+    /// nothing steps that IO.
+    fn held(self: &Arc<Self>) -> Weak<Self> {
+        Arc::downgrade(self)
+    }
+
     fn file(&self, id: MetaId) -> Result<Arc<dyn File>> {
         let slot = &self.files[id.file_index()];
         if let Some(f) = slot.file.get() {
@@ -490,10 +497,12 @@ impl MetaCache {
         let loaded = Completion::new_wait();
         frame.loaded.put(loaded.clone());
         let target = frame.clone();
-        let me = self.clone();
+        let me = self.held();
         let recovering = self.recovering.load(Ordering::Acquire);
         let held = block.clone();
         let c = Completion::new_read(block.region(0, 2 * META_PAGE), move |res| {
+            // Gone, the cache has no one left to wait on the page.
+            let me = me.upgrade()?;
             let outcome = match res {
                 Ok((_, n)) => {
                     // SAFETY: the read filled the block, which nothing else uses.
@@ -648,10 +657,14 @@ impl MetaCache {
         };
         let at = frame.id.offset() + side as u64 * META_PAGE as u64;
         let target = frame.clone();
-        let me = self.clone();
+        let me = self.held();
         let durable = file.supports_durable_writes();
-        let sync_file = file.clone();
+        // The file weakly too: it holds the IO the write waits in. A file closed before its sync
+        // leaves the copy not durable.
+        let sync_file = Arc::downgrade(&file);
         let done = move |res: std::result::Result<(), CompletionError>| {
+            // Gone, the cache has no one left to wait on the write.
+            let Some(me) = me.upgrade() else { return };
             if res.is_ok() {
                 target.durable_side.store(side + 1, Ordering::Release);
                 target.written(&me, changes, lsn);
@@ -675,6 +688,9 @@ impl MetaCache {
                 Ok(()) if !durable => {
                     // Durable only once synced: until then the other place keeps the newest
                     // durable copy, and the next write still goes here.
+                    let Some(sync_file) = sync_file.upgrade() else {
+                        return finish(Err(CompletionError::Aborted));
+                    };
                     let after = finish.clone();
                     let synced = Completion::new_sync(move |r| after(r.map(|_| ())));
                     if let Err(e) = sync_file.sync_data(synced) {

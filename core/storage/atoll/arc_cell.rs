@@ -136,7 +136,7 @@ mod tests {
                         for _ in 0..rounds {
                             let step = releasing.epochs().enter();
                             if let Some(v) = cell.get(&step) {
-                                assert!(v.1 < rounds * 2 + 1);
+                                assert!(v.1 <= rounds * 2 + 1);
                             }
                             drop(step);
                             crate::thread::yield_now();

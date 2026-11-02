@@ -225,8 +225,13 @@ fn a_thread_that_exits_gives_its_slot_back() {
 /// thread is done.
 fn waits_end_with_the_steps_holding_them_back(rounds: usize) {
     let epochs = Arc::new(Epochs::new());
-    let alive: Arc<Vec<AtomicBool>> =
-        Arc::new((0..OBJECTS).map(|i| AtomicBool::new(i == 0)).collect());
+    // A fresh object every round: a waiter destroys the object it took out, which may be the
+    // other's, and an object used again could be the current one again by the time it does.
+    let alive: Arc<Vec<AtomicBool>> = Arc::new(
+        (0..1 + 2 * rounds)
+            .map(|i| AtomicBool::new(i == 0))
+            .collect(),
+    );
     let current = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
     for _ in 0..2 {
@@ -251,7 +256,7 @@ fn waits_end_with_the_steps_holding_them_back(rounds: usize) {
         handles.push(crate::thread::spawn(move || {
             for round in 0..rounds {
                 // Each waiter its own objects, never the first: odd ones and even ones.
-                let next = 1 + waiter + 2 * (round % ((OBJECTS - 2) / 2));
+                let next = 1 + waiter + 2 * round;
                 alive[next].store(true, Ordering::SeqCst);
                 let old = current.swap(next as u64, Ordering::SeqCst) as usize;
                 let waited = Completion::new_wait();

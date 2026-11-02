@@ -437,3 +437,86 @@ fn retired_objects_cross_threads_through_the_list_alone(rounds: usize) {
 fn retired_objects_cross_threads_through_the_list_alone_on_threads() {
     retired_objects_cross_threads_through_the_list_alone(ROUNDS);
 }
+
+/// A scan that reads a thread's announcement of a later step finds its earlier steps done: a reader
+/// reads an object in one step, the object is retired, and the reader enters another step,
+/// announcing past the object's stamp, while a scan that then reads the announcement is under way
+/// and destroys the object. Miri, like loom, orders every sequentially consistent fence after the
+/// ones before it, so a scan fenced after the later announcement is ordered after the earlier step
+/// whatever the announcement: the scan has to fence first and read the reader's slot after, which
+/// a chunk's worth of slots held ahead of the reader's makes likely. Relaxed flags order none of
+/// the reader's memory, so only the announcement orders the destruction after the read.
+#[cfg(not(shuttle))]
+#[test]
+fn a_scan_reading_a_later_step_finds_the_earlier_ones_done() {
+    use crate::sync::atomic::AtomicU8;
+    use std::sync::Barrier;
+    // Every other slot of the first chunk: the reader's is the last a scan of it reads.
+    const AHEAD: usize = CHUNK_SLOTS - 1;
+    let wait = |flag: &AtomicU8, at: u8, order: Ordering| {
+        while flag.load(order) < at {
+            crate::thread::yield_now();
+        }
+    };
+    for _ in 0..if cfg!(miri) { 10 } else { 100 } {
+        let epochs = Arc::new(Epochs::new());
+        let (joined, done) = (
+            Arc::new(Barrier::new(AHEAD + 1)),
+            Arc::new(Barrier::new(AHEAD + 1)),
+        );
+        let holders: Vec<_> = (0..AHEAD)
+            .map(|_| {
+                let (epochs, joined, done) = (epochs.clone(), joined.clone(), done.clone());
+                crate::thread::spawn(move || {
+                    drop(epochs.enter());
+                    joined.wait();
+                    done.wait();
+                })
+            })
+            .collect();
+        joined.wait();
+        let object = Arc::new(AtomicPtr::new(Box::into_raw(Box::new(7u64))));
+        // From the reader, relaxed; to it, a release, so its later step announces the stamp.
+        let (to_reclaimer, to_reader) = (Arc::new(AtomicU8::new(0)), Arc::new(AtomicU8::new(0)));
+        let reader = {
+            let (epochs, object) = (epochs.clone(), object.clone());
+            let (to_reclaimer, to_reader) = (to_reclaimer.clone(), to_reader.clone());
+            crate::thread::spawn(move || {
+                {
+                    let _step = epochs.enter();
+                    // SAFETY: the object is destroyed only once no step that could read it is left.
+                    assert_eq!(unsafe { *object.load(Ordering::Acquire) }, 7);
+                }
+                to_reclaimer.store(1, Ordering::Relaxed);
+                wait(&to_reader, 1, Ordering::Acquire);
+                let _later = epochs.enter();
+                wait(&to_reader, 2, Ordering::Relaxed);
+            })
+        };
+        wait(&to_reclaimer, 1, Ordering::Relaxed);
+        // Retired as the pointer: a box would claim it whole while the reader may still read it.
+        let retired: Retired<*mut u64> = Retired::default();
+        retired.retire(&epochs, object.swap(ptr::null_mut(), Ordering::AcqRel));
+        to_reader.store(1, Ordering::Release);
+        // Scans as the reader enters its later step: one that reads its slot clear or the later
+        // step announced lets the object go.
+        let reclaimed = loop {
+            epochs.horizon();
+            let out = retired.reclaim(&epochs);
+            if !out.is_empty() {
+                break out;
+            }
+            crate::thread::yield_now();
+        };
+        // SAFETY: from `Box::into_raw`, unlinked, and past every step that could read it.
+        let mut destroyed = unsafe { Box::from_raw(reclaimed[0]) };
+        *destroyed = 0;
+        drop(destroyed);
+        to_reader.store(2, Ordering::Relaxed);
+        reader.join().unwrap();
+        done.wait();
+        for h in holders {
+            h.join().unwrap();
+        }
+    }
+}

@@ -389,10 +389,13 @@ impl Epochs {
                 // or a later one, so this step's reads see the object unlinked: the fence below
                 // makes this load an acquire.
                 let epoch = self.global.load(Ordering::Relaxed);
+                // Release: a scan that reads this announcement in place of the swap that ended
+                // the thread's last step sees every read of that step done, as reading the swap
+                // would. A relaxed store orders none: only read-modify-writes carry a release on.
                 entry
                     .slot()
                     .word
-                    .store(announcing(epoch), Ordering::Relaxed);
+                    .store(announcing(epoch), Ordering::Release);
                 // Either a scan sees this announcement, or this step's reads see everything
                 // unlinked before the scan's fence.
                 fence(Ordering::SeqCst);

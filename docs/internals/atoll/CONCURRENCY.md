@@ -75,9 +75,12 @@ in the last point.
   the next thread to join, so the registry holds as many slots as threads have stepped at once,
   not every thread that ever did.
 - **Announcing.** A thread entering a step (one call into Atoll that returns `Done` or `IO`)
-  announces the global epoch in its slot's word: an acquire load, a store and a sequentially
-  consistent fence. Leaving, it swaps the word clear, one atomic exchange, which also returns the
-  flag a wait it held back left there. Nothing shared is read or written on the way out. Steps
+  announces the global epoch in its slot's word: an acquire load, a release store and a
+  sequentially consistent fence. Leaving, it swaps the word clear, one atomic exchange, which also
+  returns the flag a wait it held back left there. The store is a release because a scan may read
+  it in place of that exchange, and must then see the last step's reads done: a relaxed store
+  continues no release, which only read-modify-writes do. crossbeam-epoch announces with a
+  compare-and-swap on x86, a release, and with a relaxed store elsewhere and under Miri. Nothing shared is read or written on the way out. Steps
   nest; only the outermost announces.
 - **Retiring.** Freeing a page id or a temporary page, or giving up a frame's memory, advances
   the global epoch by one and stamps the object with the new value: one atomic add. Retired page

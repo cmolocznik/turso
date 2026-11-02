@@ -1,7 +1,8 @@
 name: Atoll
 
-# The Atoll storage engine's own gate on this fork: its suite, and its schedule tests under
-# shuttle. The upstream workflows run on main alone and on runners this fork does not have.
+# The Atoll storage engine's own gate on this fork: its suite on x86_64 and aarch64, its schedule
+# tests under shuttle, and builds for riscv64 and loongarch64. The upstream workflows run on main
+# alone and on runners this fork does not have.
 on:
   workflow_dispatch:
   push:
@@ -66,3 +67,60 @@ jobs:
           echo "selected $n schedule tests"
           [ "$n" -gt 0 ] || { echo "the filter selected no schedule tests"; exit 1; }
           cargo test -p turso_core --lib --locked in_shuttle_schedules -- --test-threads 4
+
+  # The suite on aarch64, whose memory ordering is weaker than x86's, so its threaded tests can
+  # fail on an ordering x86 hides. Shuttle runs every access sequentially consistent, so its
+  # schedules gain nothing here. Bounded like the suite.
+  suite-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-atoll-suite-aarch64"
+          cache-on-failure: true
+      - name: Atoll suite
+        # A filter that selects nothing passes, so the count is checked first.
+        run: |
+          n=$(cargo test -p turso_core --lib --locked storage::atoll -- --list | grep -c ': test$' || true)
+          echo "selected $n tests"
+          [ "$n" -gt 0 ] || { echo "the filter selected no tests"; exit 1; }
+          cargo test -p turso_core --lib --locked storage::atoll
+
+  # riscv64 and loongarch64 have no hosted runners, and emulation does not reproduce their weak
+  # ordering, so they are built rather than run: the library with code generation, and the tests
+  # checked. simsimd's and mimalloc's build scripts compile C, and 26.04 is the first Ubuntu that
+  # packages a LoongArch cross compiler. Bounded like a cold build.
+  cross:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: riscv64gc-unknown-linux-gnu
+            gcc: gcc-riscv64-linux-gnu
+          - target: loongarch64-unknown-linux-gnu
+            gcc: gcc-loongarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cross compiler and target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.gcc }}
+          # The toolchain rust-toolchain.toml names, which the target is added to.
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-atoll-cross-${{ matrix.target }}"
+          cache-on-failure: true
+      - name: Build for ${{ matrix.target }}
+        run: |
+          cargo build -p turso_core --lib --locked --target ${{ matrix.target }}
+          cargo check -p turso_core --lib --tests --locked --target ${{ matrix.target }}

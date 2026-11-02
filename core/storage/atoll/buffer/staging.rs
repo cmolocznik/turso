@@ -10,25 +10,24 @@
 //!
 //! Lock-free. The head and the tail are positions that only rise, a lap of the ring apart at most:
 //! a lease is one compare-and-swap of the head, a wrap a lease of the end's remainder given back
-//! at once. A lease given back records its end at the unit it starts in, and whoever gives one
-//! back then moves the tail past every lease back at it. The record and the tail are each written
-//! and then the other read across a fence, so either the giver sees the tail reach its lease or
-//! the thread that moved it sees the lease back: room given back is never left behind the tail.
+//! at once, and the tail rises past the leases given back in any order ([`Prefix`]), so room given
+//! back is never left behind it.
 
-use self::sync::{fence, AtomicU64, Ordering};
+use self::sync::{AtomicU64, Ordering};
 use super::super::aligned::AlignedBlock;
+use super::super::prefix::Prefix;
 use crate::io::Buffer;
 use crate::sync::Arc;
 
 /// The engine's atomics, or loom's.
 #[cfg(not(atoll_loom))]
 mod sync {
-    pub(super) use crate::sync::atomic::{fence, AtomicU64, Ordering};
+    pub(super) use crate::sync::atomic::{AtomicU64, Ordering};
 }
 
 #[cfg(atoll_loom)]
 mod sync {
-    pub(super) use loom::sync::atomic::{fence, AtomicU64, Ordering};
+    pub(super) use loom::sync::atomic::{AtomicU64, Ordering};
 }
 
 /// The leases of a ring of `cap` bytes, in whole units.
@@ -39,9 +38,7 @@ struct Ring {
     /// `cap`.
     head: AtomicU64,
     /// Where the oldest lease not given back starts; everything before it is free.
-    tail: AtomicU64,
-    /// Per unit: the end of the lease given back that starts there, or an older one's.
-    ends: Box<[AtomicU64]>,
+    tail: Prefix,
 }
 
 pub struct Staging {
@@ -94,13 +91,8 @@ impl Ring {
             cap,
             unit,
             head: AtomicU64::new(0),
-            tail: AtomicU64::new(0),
-            ends: (0..cap / unit).map(|_| AtomicU64::new(0)).collect(),
+            tail: Prefix::new(0, cap, unit),
         }
-    }
-
-    fn end_at(&self, at: u64) -> &AtomicU64 {
-        &self.ends[((at % self.cap) / self.unit) as usize]
     }
 
     /// `len` contiguous bytes, if the ring has them free; `len` is a whole number of units and at
@@ -109,7 +101,7 @@ impl Ring {
         debug_assert!(len <= self.cap && len % self.unit == 0);
         loop {
             // The tail first: the head, read after it, is at or past it.
-            let tail = self.tail.load(Ordering::Acquire);
+            let tail = self.tail.at();
             let head = self.head.load(Ordering::Acquire);
             let offset = head % self.cap;
             // The end is too short: a lease of the rest, given back at once, wraps to the start.
@@ -149,23 +141,9 @@ impl Ring {
     }
 
     /// Gives back the run of `len` at position `at`, and moves the tail past every run given back
-    /// at it.
+    /// at it: whoever moves the tail past it sees the run's bytes done with.
     fn give_back(&self, at: u64, len: u64) {
-        // Release: whoever moves the tail past it sees the run's bytes done with.
-        self.end_at(at).store(at + len, Ordering::Release);
-        loop {
-            // Pairs with the fence of whoever moves the tail: one sees the other.
-            fence(Ordering::SeqCst);
-            let tail = self.tail.load(Ordering::Acquire);
-            // An end recorded a lap before is at or behind the tail.
-            let end = self.end_at(tail).load(Ordering::Acquire);
-            if end <= tail {
-                return;
-            }
-            let _ = self
-                .tail
-                .compare_exchange(tail, end, Ordering::AcqRel, Ordering::Acquire);
-        }
+        self.tail.complete(at, at + len);
     }
 }
 

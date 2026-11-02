@@ -21,8 +21,14 @@
 //! the contiguous prefix of completed writes. Elsewhere a write is followed by `fdatasync`, the
 //! next write overlapping the sync in flight. A flush starts when someone waits, or when a chunk's
 //! worth is complete; there are no timers. Everything is a chain of completions, so it runs the
-//! same whether the backend completes inside a submission or later from `IO::step`, and no lock is
-//! held across a submission.
+//! same whether the backend completes inside a submission or later from `IO::step`.
+//!
+//! **No lock.** Admission and padding take room by compare-and-swap of one word ([`room`]). The
+//! writes landed raise a position past them in any order ([`Prefix`]). A flush, a sync and a
+//! segment's preparation each run one at a time ([`solo`](super::solo)): whoever finds one under
+//! way leaves it the work, and it looks again before it stops, so no request goes unanswered.
+//! Those waiting to be admitted or for the log to be durable wait on take-all stacks ([`waits`]),
+//! looking again once they are on them, so a waker either finds them or they see what it did.
 //!
 //! **Segments.** The log is cut into segment files ([`segment`]). A segment is written full of
 //! zeros and synced, with its directory, before any record goes into it, so a later write changes
@@ -34,20 +40,27 @@
 
 mod reader;
 mod record;
+mod room;
 mod segment;
+mod waits;
 
 pub use reader::{LogReader, OwnedRecord};
 pub use record::{framed_len, Header, Kind, Lsn, Place, ALIGN, BLOCK, MAX_PAYLOAD};
 
 use super::aligned::AlignedBlock;
+use super::once::SetOnce;
+use super::prefix::Prefix;
+use super::solo::{Claim, Solo};
+use super::stack::Stack;
 use super::{whole, whole_write};
 use crate::io::{Completion, CompletionGroup, IO};
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
+use room::{Pad, Room};
 use segment::Segments;
-use std::collections::{BTreeMap, BTreeSet};
+use waits::Waits;
 
 #[derive(Debug, Clone)]
 pub struct LogConfig {
@@ -86,57 +99,33 @@ struct Slot {
     copied: AtomicU64,
 }
 
-#[derive(Default)]
-struct Flush {
-    /// Where the next write starts: the end of everything handed to writes.
-    submitted: Lsn,
-    /// Writes in flight or completed out of order, by start: their end and whether they are done.
-    writes: BTreeMap<Lsn, (Lsn, bool)>,
-    /// Without durable writes: where the completed writes end, the sync in flight and the
-    /// segments written since their last sync.
-    written: Lsn,
-    syncing: bool,
-    unsynced: BTreeSet<u64>,
-    waiters: Vec<(Lsn, Completion)>,
-    failed: Option<CompletionError>,
-}
-
-#[derive(Default)]
-struct Admission {
-    waiting: Vec<Completion>,
-    /// The segment being prepared.
-    preparing: Option<u64>,
-}
-
 pub struct Log {
     io: Arc<dyn IO>,
     segments: Segments,
     config: LogConfig,
     durable_writes: bool,
     ring: Box<[Slot]>,
-    insert: AtomicU64,
-    durable: AtomicU64,
-    /// Records may be written below this: every segment before it is prepared.
-    prepared_end: AtomicU64,
-    /// Someone waits on a position no flush covers yet, or to be admitted.
-    flush_wanted: AtomicBool,
-    /// Bytes admitted and not yet appended.
-    granted: AtomicU64,
-    admitters_waiting: AtomicBool,
+    room: Room,
+    /// Past every write landed, in whole blocks: durable, with durable writes.
+    landed: Prefix,
+    /// The furthest anyone has waited for the log to be durable to.
+    wanted: AtomicU64,
+    /// Where the flush taking its turn writes from next: the turn's own.
+    submitted: AtomicU64,
+    /// Writes submitted and not landed.
+    in_flight: AtomicUsize,
+    flushes: Solo,
+    /// The sync in flight, without durable writes.
+    sync: Claim,
+    /// The preparation of a segment under way.
+    preparation: Claim,
+    /// Waiting for the log to be durable to a mark.
+    durable_waits: Waits,
+    /// Waiting to be admitted, woken to try again whenever room may have been made.
+    admitters: Stack<Completion>,
     failed: AtomicBool,
-    flush: Mutex<Flush>,
-    admission: Mutex<Admission>,
+    failure: SetOnce<CompletionError>,
     zeros: Arc<AlignedBlock>,
-}
-
-/// What padding a partial block came to.
-enum Pad {
-    /// Padded to here.
-    Padded(Lsn),
-    /// Someone reserved bytes past the block's start meanwhile.
-    Raced,
-    /// Records already admitted would be pushed past the prepared segments.
-    Unprepared,
 }
 
 /// Space an operation may append into, taken from [`Log::admit`]; what it does not use goes back
@@ -149,7 +138,7 @@ pub struct Admitted {
 impl Drop for Admitted {
     fn drop(&mut self) {
         if self.left > 0 {
-            self.log.granted.fetch_sub(self.left, Ordering::SeqCst);
+            self.log.room.give_back(self.left);
             self.log.wake_admitters();
         }
     }
@@ -191,6 +180,7 @@ impl Log {
         // flushed while the next fills.
         let slack = config.writes_in_flight as u64 * BLOCK + 2 * config.chunk_bytes;
         let slots = (config.buffer_bytes + slack).div_ceil(config.chunk_bytes) as usize;
+        let span = slots as u64 * config.chunk_bytes;
         let ring = (0..slots)
             .map(|_| Slot {
                 block: Arc::new(AlignedBlock::zeroed(config.chunk_bytes as usize)),
@@ -201,19 +191,19 @@ impl Log {
             io,
             durable_writes,
             ring,
-            insert: AtomicU64::new(start),
-            durable: AtomicU64::new(start),
-            prepared_end: AtomicU64::new(segments.start(current + 1)),
-            flush_wanted: AtomicBool::new(false),
-            granted: AtomicU64::new(0),
-            admitters_waiting: AtomicBool::new(false),
+            room: Room::new(start, segments.start(current + 1), config.buffer_bytes),
+            // The writes in flight lie within the ring of the position, in whole blocks.
+            landed: Prefix::new(start, span, BLOCK),
+            wanted: AtomicU64::new(0),
+            submitted: AtomicU64::new(start),
+            in_flight: AtomicUsize::new(0),
+            flushes: Solo::default(),
+            sync: Claim::default(),
+            preparation: Claim::default(),
+            durable_waits: Waits::default(),
+            admitters: Stack::default(),
             failed: AtomicBool::new(false),
-            flush: Mutex::new(Flush {
-                submitted: start,
-                written: start,
-                ..Flush::default()
-            }),
-            admission: Mutex::new(Admission::default()),
+            failure: SetOnce::default(),
             zeros: Arc::new(AlignedBlock::zeroed(config.chunk_bytes as usize)),
             segments,
             config,
@@ -279,7 +269,7 @@ impl Log {
 
     /// Where the next record will start.
     pub fn end(&self) -> Lsn {
-        self.insert.load(Ordering::Acquire)
+        self.room.end()
     }
 
     /// Everything before this is durable.
@@ -294,7 +284,7 @@ impl Log {
     }
 
     pub fn durable(&self) -> Lsn {
-        self.durable.load(Ordering::Acquire)
+        self.room.durable()
     }
 
     pub fn durable_writes(&self) -> bool {
@@ -311,45 +301,37 @@ impl Log {
                 self.config.buffer_bytes
             )));
         }
-        let wait = {
-            let mut a = self.admission.lock();
-            if self.failed.load(Ordering::Acquire) {
-                None
-            } else {
-                // `granted` before `insert`: an append between the two reads is then counted
-                // twice rather than not at all.
-                let granted = self.granted.load(Ordering::SeqCst);
-                let insert = self.insert.load(Ordering::SeqCst);
-                let unflushed = insert - self.durable.load(Ordering::SeqCst) + granted;
-                let reach = insert + granted + bytes;
-                if unflushed + bytes <= self.config.buffer_bytes
-                    && reach <= self.prepared_end.load(Ordering::Acquire)
-                {
-                    self.granted.fetch_add(bytes, Ordering::SeqCst);
-                    None
-                } else {
-                    let c = Completion::new_wait();
-                    a.waiting.push(c.clone());
-                    self.admitters_waiting.store(true, Ordering::Release);
-                    Some(c)
-                }
-            }
-        };
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
-        self.prepare_ahead();
-        match wait {
-            None => Ok(IOResult::Done(Admitted {
-                log: self.clone(),
-                left: bytes,
-            })),
-            Some(c) => {
-                self.flush_wanted.store(true, Ordering::Release);
-                self.flush();
-                Ok(IOResult::IO(IOCompletions(c)))
-            }
+        let admitted = || Admitted {
+            log: self.clone(),
+            left: bytes,
+        };
+        if self.room.grant(bytes, true) {
+            self.prepare_ahead();
+            return Ok(IOResult::Done(admitted()));
         }
+        let c = Completion::new_wait();
+        self.admitters.push(c.clone());
+        // Pairs with the fence of whoever makes room: either it finds this waiting, or this sees
+        // the room. A completion left behind is completed by the next wake, for no one.
+        fence(Ordering::SeqCst);
+        if let Some(e) = self.failure() {
+            return Err(LimboError::CompletionError(e));
+        }
+        if self.room.grant(bytes, true) {
+            self.prepare_ahead();
+            return Ok(IOResult::Done(admitted()));
+        }
+        self.prepare_ahead();
+        self.flush();
+        Ok(IOResult::IO(IOCompletions(c)))
+    }
+
+    /// Whether anyone waits to be admitted or for the log to be durable: an append then flushes.
+    fn flush_wanted(&self) -> bool {
+        !self.durable_waits.is_empty() || !self.admitters.is_empty()
     }
 
     /// Appends one record within `admitted`'s room and returns its LSN. The caller holds the
@@ -365,7 +347,7 @@ impl Log {
         let start = self.reserve(admitted, len);
         let lsn = self.write_record(start, header, Place::ALONE, payload);
         self.count_copied(start, lsn);
-        if self.flush_wanted.load(Ordering::Acquire) {
+        if self.flush_wanted() {
             self.flush();
         }
         lsn
@@ -406,7 +388,7 @@ impl Log {
             })
             .collect();
         self.count_copied(start, at);
-        if self.flush_wanted.load(Ordering::Acquire) {
+        if self.flush_wanted() {
             self.flush();
         }
         (start, lsns)
@@ -419,8 +401,7 @@ impl Log {
             "{len} bytes of records appended with {} bytes admitted",
             admitted.left
         );
-        let start = self.insert.fetch_add(len, Ordering::SeqCst);
-        self.granted.fetch_sub(len, Ordering::SeqCst);
+        let start = self.room.reserve(len);
         admitted.left -= len;
         start
     }
@@ -445,17 +426,15 @@ impl Log {
         if self.durable() >= lsn {
             return Ok(IOResult::Done(()));
         }
-        let c = Completion::new_wait();
-        {
-            let mut f = self.flush.lock();
-            if let Some(e) = f.failed {
-                return Err(LimboError::CompletionError(e));
-            }
-            if self.durable() >= lsn {
-                return Ok(IOResult::Done(()));
-            }
-            f.waiters.push((lsn, c.clone()));
-            self.flush_wanted.store(true, Ordering::Release);
+        if let Some(e) = self.failure() {
+            return Err(LimboError::CompletionError(e));
+        }
+        self.wanted.fetch_max(lsn, Ordering::SeqCst);
+        let Some(c) = self.durable_waits.wait(lsn, || self.durable()) else {
+            return Ok(IOResult::Done(()));
+        };
+        if let Some(e) = self.failure() {
+            return Err(LimboError::CompletionError(e));
         }
         self.flush();
         if c.finished() {
@@ -550,89 +529,89 @@ impl Log {
         }
     }
 
-    /// Writes padding from `at` to the end of its block, if nothing has been reserved past `at`.
-    ///
-    /// Padding moves every record admitted and not yet appended along with it. Admission checked
-    /// that they fit before the end of the prepared segments from where the log stood then, so the
-    /// padding is admitted like a record: if it would push them past that end, it waits for the
-    /// next segment, whose preparation flushes again once done.
+    /// Pads from `at` to the end of its block, if nothing has been reserved past `at` and it
+    /// pushes no record granted past the prepared segments ([`Room::pad`]); padding waiting for a
+    /// segment flushes again once it is prepared.
     fn pad(&self, at: Lsn) -> Pad {
-        let to = at.next_multiple_of(BLOCK);
-        {
-            // No one is admitted while this holds.
-            let _admission = self.admission.lock();
-            if to + self.granted.load(Ordering::SeqCst) > self.prepared_end.load(Ordering::Acquire)
-            {
-                return Pad::Unprepared;
+        let padded = self.room.pad(at);
+        match padded {
+            Pad::To(to) => {
+                self.copy_in(at, &record::padding(at));
+                self.count_copied(at, to);
             }
-            if self
-                .insert
-                .compare_exchange(at, to, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Pad::Raced;
-            }
+            // The room it held may have turned an admission away.
+            Pad::Raced => self.wake_admitters(),
+            Pad::Unprepared => {}
         }
-        self.copy_in(at, &record::padding(at));
-        self.count_copied(at, to);
-        Pad::Padded(to)
+        padded
     }
 
-    /// Starts writing what is complete, as far as the writes allowed in flight go.
+    /// Starts writing what is complete, as far as the writes allowed in flight go: a turn at a
+    /// time ([`Solo`]).
     fn flush(self: &Arc<Self>) {
-        let mut writes = Vec::new();
-        let mut unprepared = false;
-        {
-            let mut f = self.flush.lock();
-            if f.failed.is_some() {
-                return;
+        self.flushes.ask();
+        while let Some(turn) = self.flushes.turn() {
+            let (writes, unprepared) = self.plan_writes();
+            drop(turn);
+            for (start, end) in writes {
+                self.submit_write(start, end);
             }
-            let wanted = f.waiters.iter().map(|w| w.0).max().unwrap_or(0);
-            let admitting = self.admitters_waiting.load(Ordering::Acquire);
-            let limit = if self.durable_writes {
-                self.config.writes_in_flight
-            } else {
-                1
-            };
-            while f.writes.len() < limit {
-                let start = f.submitted;
-                let insert = self.insert.load(Ordering::Acquire);
-                let complete = self.complete_from(start, insert);
-                let mut end = complete - complete % BLOCK;
-                let someone_waits = wanted > start || admitting;
-                if end <= start {
-                    // No whole block is ready. Pad the partial one if someone waits on it and
-                    // every byte reserved so far is in.
-                    if !(someone_waits && complete == insert && insert > start) {
-                        break;
-                    }
-                    match self.pad(insert) {
-                        Pad::Padded(padded) => end = padded,
-                        // Someone reserved more meanwhile: look again.
-                        Pad::Raced => continue,
-                        Pad::Unprepared => {
-                            unprepared = true;
-                            break;
-                        }
-                    }
-                } else if !someone_waits && end - start < self.config.chunk_bytes {
-                    // Nobody waits: let a chunk's worth gather.
+            if unprepared {
+                self.prepare_ahead();
+            }
+        }
+    }
+
+    /// The writes to start, from where the last ended, and whether padding waits for a segment:
+    /// for the flush under way.
+    fn plan_writes(&self) -> (Vec<(Lsn, Lsn)>, bool) {
+        let mut writes = Vec::new();
+        if self.failed.load(Ordering::Acquire) {
+            return (writes, false);
+        }
+        let wanted = self.wanted.load(Ordering::SeqCst);
+        let admitting = !self.admitters.is_empty();
+        let limit = if self.durable_writes {
+            self.config.writes_in_flight
+        } else {
+            1
+        };
+        // The turn's own, handed from turn to turn by the turns themselves.
+        let mut start = self.submitted.load(Ordering::Relaxed);
+        let mut unprepared = false;
+        while self.in_flight.load(Ordering::Acquire) < limit {
+            let insert = self.room.end();
+            let complete = self.complete_from(start, insert);
+            let mut end = complete - complete % BLOCK;
+            let someone_waits = wanted > start || admitting;
+            if end <= start {
+                // No whole block is ready. Pad the partial one if someone waits on it and every
+                // byte reserved so far is in.
+                if !(someone_waits && complete == insert && insert > start) {
                     break;
                 }
-                let chunk_end = (start / self.config.chunk_bytes + 1) * self.config.chunk_bytes;
-                let segment_end = self.segments.start(self.segments.number(start) + 1);
-                let write_end = end.min(chunk_end).min(segment_end);
-                f.writes.insert(start, (write_end, false));
-                f.submitted = write_end;
-                writes.push((start, write_end));
+                match self.pad(insert) {
+                    Pad::To(padded) => end = padded,
+                    // Someone reserved more meanwhile: look again.
+                    Pad::Raced => continue,
+                    Pad::Unprepared => {
+                        unprepared = true;
+                        break;
+                    }
+                }
+            } else if !someone_waits && end - start < self.config.chunk_bytes {
+                // Nobody waits: let a chunk's worth gather.
+                break;
             }
+            let chunk_end = (start / self.config.chunk_bytes + 1) * self.config.chunk_bytes;
+            let segment_end = self.segments.start(self.segments.number(start) + 1);
+            let write_end = end.min(chunk_end).min(segment_end);
+            self.in_flight.fetch_add(1, Ordering::AcqRel);
+            writes.push((start, write_end));
+            start = write_end;
         }
-        for (start, end) in writes {
-            self.submit_write(start, end);
-        }
-        if unprepared {
-            self.prepare_ahead();
-        }
+        self.submitted.store(start, Ordering::Relaxed);
+        (writes, unprepared)
     }
 
     fn submit_write(self: &Arc<Self>, start: Lsn, end: Lsn) {
@@ -643,7 +622,7 @@ impl Log {
         let me = self.clone();
         let len = end - start;
         let c = Completion::new_write(move |res| {
-            me.written(start, end, segment, whole(len as usize, res));
+            me.written(start, end, whole(len as usize, res));
         });
         let at = start - self.segments.start(segment);
         let submitted = if self.durable_writes {
@@ -660,85 +639,47 @@ impl Log {
         self: &Arc<Self>,
         start: Lsn,
         end: Lsn,
-        segment: u64,
         res: std::result::Result<(), CompletionError>,
     ) {
         if let Err(e) = res {
             self.fail(e);
             return;
         }
-        let (released, sync) = {
-            let mut f = self.flush.lock();
-            if f.failed.is_some() {
-                return;
-            }
-            f.writes.get_mut(&start).expect("a write in flight").1 = true;
-            debug_assert_eq!(f.writes[&start].0, end);
-            let mut reached = None;
-            while let Some((&s, &(e, done))) = f.writes.iter().next() {
-                if !done {
-                    break;
-                }
-                f.writes.remove(&s);
-                reached = Some(e);
-            }
-            if self.durable_writes {
-                match reached {
-                    Some(e) => (self.durable_to(&mut f, e), None),
-                    None => (Vec::new(), None),
-                }
-            } else {
-                f.unsynced.insert(segment);
-                if let Some(e) = reached {
-                    f.written = e;
-                }
-                (Vec::new(), self.start_sync(&mut f))
-            }
-        };
-        self.after_progress(released);
-        if let Some((covers, files)) = sync {
-            self.submit_sync(covers, files);
+        self.landed.complete(start, end);
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        if self.durable_writes {
+            self.room.raise_durable(self.landed.at());
+            self.wake();
+        } else {
+            self.start_sync();
         }
         self.flush();
     }
 
-    /// Moves the durable position to `end` and takes the waiters it releases.
-    fn durable_to(&self, f: &mut Flush, end: Lsn) -> Vec<Completion> {
-        self.durable.store(end, Ordering::Release);
-        let (done, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut f.waiters)
-            .into_iter()
-            .partition(|(lsn, _)| *lsn <= end);
-        f.waiters = waiting;
-        if f.waiters.is_empty() && !self.admitters_waiting.load(Ordering::Acquire) {
-            self.flush_wanted.store(false, Ordering::Release);
+    /// Starts syncing the writes landed and not yet durable, unless a sync is in flight, which
+    /// starts the next when it ends.
+    fn start_sync(self: &Arc<Self>) {
+        while self.sync.take() {
+            let durable = self.durable();
+            let landed = self.landed.at();
+            if landed > durable {
+                return self.submit_sync(durable, landed);
+            }
+            self.sync.release();
+            if self.landed.at() <= self.durable() {
+                return;
+            }
         }
-        done.into_iter().map(|(_, c)| c).collect()
     }
 
-    fn after_progress(&self, released: Vec<Completion>) {
-        for c in released {
-            c.complete(0);
-        }
-        self.wake_admitters();
-    }
-
-    /// The sync to start, if the completed writes are not all durable and none is in flight.
-    fn start_sync(&self, f: &mut Flush) -> Option<(Lsn, Vec<u64>)> {
-        if f.syncing || f.written <= self.durable() || f.unsynced.is_empty() {
-            return None;
-        }
-        f.syncing = true;
-        Some((
-            f.written,
-            std::mem::take(&mut f.unsynced).into_iter().collect(),
-        ))
-    }
-
-    fn submit_sync(self: &Arc<Self>, covers: Lsn, segments: Vec<u64>) {
+    /// Syncs the segments the writes from `from` to `covers` went to.
+    fn submit_sync(self: &Arc<Self>, from: Lsn, covers: Lsn) {
         let me = self.clone();
         let mut group = CompletionGroup::new(move |res| {
             me.synced(covers, res);
         });
+        let segments: Vec<u64> =
+            (self.segments.number(from)..=self.segments.number(covers - 1)).collect();
         let syncs: Vec<_> = segments
             .iter()
             .map(|_| {
@@ -762,52 +703,52 @@ impl Log {
             self.fail(e);
             return;
         }
-        let (released, next) = {
-            let mut f = self.flush.lock();
-            f.syncing = false;
-            let released = self.durable_to(&mut f, covers);
-            (released, self.start_sync(&mut f))
-        };
-        self.after_progress(released);
-        if let Some((covers, files)) = next {
-            self.submit_sync(covers, files);
-        }
+        self.room.raise_durable(covers);
+        self.sync.release();
+        self.wake();
+        self.start_sync();
         self.flush();
+    }
+
+    /// Wakes those waiting for the durable position raised, and those waiting to be admitted.
+    fn wake(&self) {
+        self.durable_waits.wake(|| self.durable());
+        self.wake_admitters();
     }
 
     /// Wakes everyone waiting to be admitted, to try again.
     fn wake_admitters(&self) {
-        let waiting = {
-            let mut a = self.admission.lock();
-            self.admitters_waiting.store(false, Ordering::Release);
-            std::mem::take(&mut a.waiting)
-        };
-        for c in waiting {
+        // Pairs with the fence of an admitter that waits: either this finds it, or it sees the
+        // room made.
+        fence(Ordering::SeqCst);
+        for c in self.admitters.take_all() {
             c.complete(0);
         }
     }
 
     /// Starts preparing the next segment when less than one is left ahead of what is admitted.
+    /// One preparation runs at a time ([`Claim`]): whoever finds one under way leaves it the work,
+    /// and it looks again when it ends.
     fn prepare_ahead(self: &Arc<Self>) {
-        let number = {
-            let mut a = self.admission.lock();
-            let prepared = self.prepared_end.load(Ordering::Acquire);
-            let reach = self.insert.load(Ordering::SeqCst) + self.granted.load(Ordering::SeqCst);
-            if a.preparing.is_some() || prepared.saturating_sub(reach) > self.segments.size {
+        let needed = |log: &Self| {
+            log.room.prepared_end().saturating_sub(log.room.reach()) <= log.segments.size
+        };
+        while self.preparation.take() {
+            if needed(self) {
+                let number = self.segments.number(self.room.prepared_end());
+                let file = match self.segments.create(number) {
+                    Ok(file) => file,
+                    Err(e) => return self.fail(io_failure(&e)),
+                };
+                let _ = file.allocate(0, self.segments.size);
+                return self.zero_fill(number, 0);
+            }
+            self.preparation.release();
+            if !needed(self) {
                 return;
             }
-            let number = self.segments.number(prepared);
-            a.preparing = Some(number);
-            number
-        };
-        let file = match self.segments.create(number) {
-            Ok(file) => file,
-            Err(e) => return self.fail(io_failure(&e)),
-        };
-        let _ = file.allocate(0, self.segments.size);
-        self.zero_fill(number, 0);
+        }
     }
-
     /// Writes zeros into segment `number` from `at`, one write after another, then syncs it and
     /// its directory.
     fn zero_fill(self: &Arc<Self>, number: u64, at: u64) {
@@ -838,9 +779,8 @@ impl Log {
         if let Err(e) = self.io.sync_directory(&self.segments.directory()) {
             return self.fail(io_failure(&e));
         }
-        self.prepared_end
-            .store(self.segments.start(number + 1), Ordering::Release);
-        self.admission.lock().preparing = None;
+        self.room.set_prepared_end(self.segments.start(number + 1));
+        self.preparation.release();
         self.wake_admitters();
         self.prepare_ahead();
         // A flush may be waiting to pad until this segment was ready.
@@ -850,34 +790,25 @@ impl Log {
     /// Whether the bytes in flight reached the disk is unknown: nothing may follow them, and
     /// everyone waiting is told.
     fn fail(&self, e: CompletionError) {
-        let waiters = {
-            let mut f = self.flush.lock();
-            if f.failed.is_none() {
-                tracing::error!("the log failed: {e}");
-                f.failed = Some(e);
-            }
-            self.failed.store(true, Ordering::Release);
-            std::mem::take(&mut f.waiters)
-        };
-        for (_, c) in waiters {
-            c.error(e);
+        // The first failure is the one kept and told.
+        let e = self.failure.set(e);
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            tracing::error!("the log failed: {e}");
         }
-        let admitting = {
-            let mut a = self.admission.lock();
-            self.admitters_waiting.store(false, Ordering::Release);
-            std::mem::take(&mut a.waiting)
-        };
-        for c in admitting {
+        self.durable_waits.fail(e);
+        // Pairs with the fence of an admitter: either this finds it, or it sees the failure.
+        fence(Ordering::SeqCst);
+        for c in self.admitters.take_all() {
             c.error(e);
         }
     }
 
     /// The error the log failed with, if it did.
     pub fn failure(&self) -> Option<CompletionError> {
-        if !self.failed.load(Ordering::Acquire) {
+        if !self.failed.load(Ordering::SeqCst) {
             return None;
         }
-        self.flush.lock().failed
+        self.failure.get()
     }
 
     /// A reader of this database's log from `start`, for recovery and followers.

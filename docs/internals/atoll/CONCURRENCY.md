@@ -260,8 +260,19 @@ in the last point.
 
 ## 8. Everything else
 
-- **The log.** Appenders reserve with one atomic add and announce their copy in a slot array
-  (unchanged; already lock-free). Admission and durability waits are completions.
+- **The log takes no lock** (phase 5, `log/`). Appenders reserve with one atomic add and count
+  their copy into its chunk. What is granted and appended is one word, the reach: admission is a
+  compare-and-swap of it, checked against the prepared segments and the buffer, and padding a
+  partial block is granted the same way before it moves the end, so a grant and a padding racing
+  are two exchanges of one word and neither can push a record past the prepared segments. The
+  writes landed raise a position past them in any order (`prefix.rs`, the writeback ring's too).
+  A flush runs a turn at a time (`solo.rs`): a request swaps a flag in and the turn swaps it
+  back, acquiring what the request was made after, and looks again before it stops. The request
+  is a swap, not a store, so it is never ordered before an earlier one a turn takes unread. A
+  sync and a segment's preparation are claims held across their IO, let go and then looked at
+  again. Those waiting to be durable or admitted wait on take-all stacks, looking again across a
+  fence once on them, so a waker finds them or they see what it did. The first failure is set
+  once.
 - **Checkpoints and writeback** own their work while stepping it and hold nothing across IO.
 - **Recovery.** Each window is immutable once read; each partition is owned by the one thread
   applying it.
@@ -283,16 +294,14 @@ in the last point.
 - **The one lock order** for the short critical sections that remain.
   - Latches are never waited for, and some mutexes are only ever tried, as ownership of a piece
     of work (§3, class 3): a checkpointer's state, a writeback, the page store's erasure and its
-    tree growth, the metadata cache's eviction, a reclaim of retired objects. Neither is in any order: busy means a yield, or for
-    a reclaim, nothing reclaimed this time. An owner may hold its mutex across IO it submits.
-  - The mutexes that are waited for nest only as follows, outer first:
-    - the log's flush, then its admission;
-    - a transaction slot, then the log (step 4 replaces the slot's lock with a commit log of one
-      writer);
-    - a version root, then the page store's orphans.
+    tree growth, the metadata cache's eviction, a reclaim of retired objects. Neither is in any
+    order: busy means a yield, or for a reclaim, nothing reclaimed this time. An owner may hold
+    its mutex across IO it submits.
+  - No mutex that is waited for nests another: the page store's orphans, which a version root's
+    mutex once nested, are a stack.
   - None is held across IO, while a callback runs, or while a completion is completed, except
-    the log's flush and a transaction slot: an append can submit log writes, whose completions
-    run inside the submission on some backends. Both go with step 4.
+    a transaction slot: an append can submit log writes, whose completions run inside the
+    submission on some backends. It goes with step 4.
   - Every other mutex is taken alone, nesting nothing.
   - Every acquisition in the engine was read for this list (2026-11-01): no two mutexes are taken
     in both orders.
@@ -370,6 +379,5 @@ in the last point.
    buffer pool (its page table, allocator, IO in flight, wake, first error, writeback queue,
    landed writes, ring and temporary pages done); the page store (done but for the intents
    recovery tracks while it replays alone); the metadata cache (done); the log's admission and
-   flush;
-   transactions; the cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and
+   flush (done but for its segment files' map); transactions; the cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and
    stay.

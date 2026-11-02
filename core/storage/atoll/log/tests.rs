@@ -46,15 +46,22 @@ fn read_all(io: Arc<dyn IO>, start: Lsn) -> (Vec<OwnedRecord>, Lsn) {
     (records, reader.position())
 }
 
-#[test]
-fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order() {
-    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+/// Writers append records at once, waiting on every seventeenth as a commit does, through a log
+/// small enough that they wait to be admitted, pad blocks and cross chunks and segments: every
+/// record reads back once, each writer's in its order. Miri sees a copy into the ring racing the
+/// write out of it, the two ordered only by the log's own publication. On memory, writes land
+/// within their submission; on the crash backend, later and in any order, durable as they land
+/// or once synced.
+fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order(
+    io: Arc<dyn IO>,
+    writers: u64,
+    each: u64,
+) {
     let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
-    let (writers, each) = (8u64, 300u64);
-    std::thread::scope(|s| {
-        for writer in 0..writers {
+    let handles: Vec<_> = (0..writers)
+        .map(|writer| {
             let (io, log) = (io.clone(), log.clone());
-            s.spawn(move || {
+            crate::thread::spawn(move || {
                 for seq in 0..each {
                     let p = payload(writer, seq);
                     let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
@@ -63,9 +70,12 @@ fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order(
                         drive(&io, || log.wait_durable(lsn)).unwrap();
                     }
                 }
-            });
-        }
-    });
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
     drive(&io, || log.wait_durable(log.end())).unwrap();
     let (records, _) = read_all(io, 0);
     assert_eq!(records.len() as u64, writers * each);
@@ -80,6 +90,43 @@ fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order(
         assert_eq!(r.payload, payload(writer, seq));
         next[writer as usize] += 1;
     }
+}
+
+/// The backends the threaded test runs on: memory, and the crash backend with and without
+/// durable writes, its writes landing in an order its seed picks.
+fn threaded_backends(seed: u64) -> Vec<Arc<dyn IO>> {
+    let durable = Arc::new(CrashIO::new(seed));
+    let synced = Arc::new(CrashIO::new(seed));
+    synced.set_durable_writes(false);
+    vec![Arc::new(MemoryIO::new()), durable, synced]
+}
+
+#[cfg(not(shuttle))]
+#[test]
+fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order_on_threads() {
+    let (writers, each) = if cfg!(miri) { (3, 40) } else { (8, 300) };
+    for io in threaded_backends(7) {
+        records_appended_from_many_threads_read_back_once_each_in_each_threads_order(
+            io, writers, each,
+        );
+    }
+}
+
+#[cfg(shuttle)]
+#[test]
+fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order_in_shuttle_schedules(
+) {
+    crate::storage::atoll::testing::schedules(
+        || {
+            let seed = crate::storage::atoll::testing::workload_seed();
+            for io in threaded_backends(seed) {
+                records_appended_from_many_threads_read_back_once_each_in_each_threads_order(
+                    io, 2, 40,
+                );
+            }
+        },
+        300,
+    );
 }
 
 /// Appends records one after another, some waited on as commits are, and after every few IO

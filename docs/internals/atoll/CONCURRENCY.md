@@ -50,30 +50,88 @@ Each object belongs to exactly one of four classes, named in its type's document
 3. **Owned by one context at a time.** A transaction's state, an operation in progress, a
    writeback, a recovery partition, a slot's version index while its transaction writes. Handed
    over explicitly; no synchronization while owned.
-4. **Short critical sections.** A mutex around a few instructions of bookkeeping (a free list, a
-   waiter list). Never held across IO, a yield, a callback or another lock, except in the one
-   global order section 8 lists. Each is named in that list.
+4. **Lock-free shared state.** A free list, a waiter list, a map or a counter shared between
+   threads changes by atomic operations, never under a lock a thread can be descheduled holding:
+   each is named with its design (§4, §6). Mutexes that remain until their part is rebuilt are
+   short critical sections, never held across IO, a yield, a callback or another lock except in
+   the one global order section 8 lists, and each is named in that list.
 
 Anything that fits none of these is a design error.
 
 ## 4. Epochs: when an identity may be reused
 
-- **Participants.** Every connection stepping Atoll is a participant. It announces the global
-  epoch when it enters a step (one call into Atoll that returns `Done` or `IO`) and clears the
-  announcement when it leaves. Two atomic stores per step.
-- **Retiring.** Freeing a page id, a temporary page, a version index entry or a retired page
-  puts it on a limbo list stamped with the current epoch.
-- **Reclaiming.** An object retired at epoch `e` is reused once every participant's announcement
-  is above `e`, or clear. The epoch advances when the limbo lists hold enough to reclaim; the
-  check is one pass over the participants.
+Read-copy update's grace periods (McKenney and Slingwine, 1998; Desnoyers et al., "User-Level
+Implementations of Read-Copy Update", IEEE TPDS 2012): exact, with the step that holds a wait back
+waking it. Lock-free throughout: no thread waits for another to enter or leave a step, scan,
+retire, reclaim or register a wait. The fences around an announcement and a scan are
+crossbeam-epoch's (0.9, `internal.rs`); its way of advancing the epoch is not used, for the reason
+in the last point.
+
+- **Participants.** Every thread stepping an instance is a participant. Its first step takes a
+  slot in the instance's registry: a free one by compare-and-swap, or the next unused one. The
+  registry is a chain of chunks of slots, each slot on a cache line of its own; a full chain gets
+  another chunk with one compare-and-swap. Chunks are freed only with the registry, so a scan
+  reads them with no lock and nothing to reclaim. When the thread exits its slot is released for
+  the next thread to join, so the registry holds as many slots as threads have stepped at once,
+  not every thread that ever did.
+- **Announcing.** A thread entering a step (one call into Atoll that returns `Done` or `IO`)
+  announces the global epoch in its slot's word: an acquire load, a store and a sequentially
+  consistent fence. Leaving, it swaps the word clear, one atomic exchange, which also returns the
+  flag a wait it held back left there. Nothing shared is read or written on the way out. Steps
+  nest; only the outermost announces.
+- **Retiring.** Freeing a page id or a temporary page, or giving up a frame's memory, advances
+  the global epoch by one and stamps the object with the new value: one atomic add. Retired page
+  ids and temporary pages are pushed onto a lock-free stack. A reclaim takes the whole stack with
+  one swap into a heap ordered by stamp and hands out what the horizon has passed. The heap
+  belongs to the reclaim under way: another finds it taken and hands out nothing this time,
+  without waiting.
+- **Reclaiming.** The horizon is the lowest announcement, or none while no step is under way. An
+  object stamped `s` is reused once the horizon is at or above `s`: every step under way entered
+  after it was retired. That is exact, so no step that has ended is ever waited for. A scan
+  fences, reads every announcement, and takes an acquire fence after. Either it sees a step's
+  announcement, or that step's reads see the object already unlinked; a step it sees clear has
+  finished every read. A step that announced `s` or above loaded the epoch from the retiring add
+  or later, so its reads see the object unlinked too.
+- **The known horizon.** Every scan raises a shared lower bound to the lower of the horizon it
+  found and the epoch it read before its fence. Everything stamped at or below it was unlinked
+  before that scan; every step under way then was seen at or above it, and every step entered
+  since either was seen by a later scan or sees those objects unlinked. So an object stamped at
+  or below it is reused with one load and no scan. A page read in takes a frame quiet by it if
+  one is free, and scans only if none is. A reclaim scans only once as many objects and reclaims
+  have come since its last scan as a scan reads slots, so a scan costs a constant per object.
+- **Waiting.** A claim that needs an object not yet reusable does not yield and retry. It
+  pushes a wait for that epoch onto a lock-free list, then flags the slot of every step announced
+  below the epoch, and returns a completion. The flag and the step's end both change the slot's
+  one word, so either the end returns the flag, and the step wakes the waits, or the flag finds
+  the slot clear and the step is not holding the wait back. A wake takes the whole list with one
+  swap, flags the holders it finds, notifies every wait no holder holds back, and pushes the rest
+  back. Having pushed them back it flags again, and goes round once more if one is reached now: a
+  flagged step that ended while they were out of the list found none to wake, and pushing back
+  after a wake's swap sees that step's end. A step no wait flagged reads nothing on the way out.
+  A claim's wait is the pool's completion for a frame freed too, so whichever comes first ends it.
+- **Grace periods.** Waiting for every step under way now to end is a retirement of nothing:
+  advance the epoch and wait for the horizon to reach it. A claim that finds every frame it could
+  take latched or held by steps under way waits for one.
+- **Bounded in steps:** a step never blocks, so a participant delays reclamation by at most the
+  step it is in. That is a bound in steps, not in time or memory: a thread descheduled mid-step,
+  or a step that runs long, holds reclamation back for as long, and retired objects pile up
+  meanwhile. Whatever needs them waits on a completion, and the stalled step's end wakes it.
+- **Not crossbeam's epoch advance.** crossbeam-epoch advances the global epoch only once every
+  pinned thread has seen it, tries every 128 pins, and frees garbage two advances after it was
+  retired. That makes the check one load, and suits garbage nobody waits for. Memory a step needs
+  back is another matter: a frame given up in a thread's last step becomes reusable only after
+  two advances, and the second waits for that thread's next step to end. With exact stamps it is
+  reusable as soon as the steps that could read it have ended, and the known horizon keeps the
+  check to one load as well.
+- **Verified by loom, Miri and shuttle** (§9). loom checks the orderings, with the objects the
+  tests read and destroy as plain memory and a retired object's stamp, a wait's epoch and a
+  chunk's slots as loom-checked cells; Miri checks the unsafe pointer code; shuttle checks the
+  interleavings.
 - **What it guarantees.** Within one step, nothing a participant read can be handed to another
   page, class or transaction. That alone rules out the drain, lost-value and new-page bugs above.
 - **Across steps,** a participant holds only names with versions (page id, frame, version), and
   validates all three before use. A frame's version only rises, so a frame that held another page
   in between never validates. A cursor kept open for an hour pins nothing.
-- **Bounded in steps:** a step never blocks, so a participant delays reclamation by at most the
-  step it is in. That is a bound in steps, not in time or memory: a thread descheduled mid-step,
-  or a step that runs long, holds reclamation back for as long, and limbo lists grow meanwhile.
 - **Frames and memory batches are checked, not retired.** A frame's identity is its latch
   version, which only rises, and every use validates it. A batch is used only through its frames,
   and every action on a frame drawn from a batch (an eviction, a drain) checks under the frame's
@@ -86,8 +144,8 @@ Anything that fits none of these is a design error.
   stores are atomic, so a stale reader of the memory's last page races with nothing, and any free
   frame will do. An IO reading a page in writes the memory plainly, straight from the device, so
   it takes only a frame whose grains were all given up before every step under way began; with
-  only stale ones free, the claim yields, and the next step finds them quiet. Memory still goes to
-  its class at once, so nothing like the batch ping-pong above can start.
+  only stale ones free, the claim waits for the earliest of them to be quiet (Waiting, above).
+  Memory still goes to its class at once, so nothing like the batch ping-pong above can start.
 
 ## 5. Latches
 
@@ -161,14 +219,13 @@ Anything that fits none of these is a design error.
 - **The one lock order** for the short critical sections that remain.
   - Latches are never waited for, and some mutexes are only ever tried, as ownership of a piece
     of work (§3, class 3): a checkpointer's state, a writeback, the page store's erasure and its
-    tree growth. Neither is in any order: busy means a yield. An owner may hold its mutex across
-    IO it submits.
+    tree growth, a reclaim of retired objects. Neither is in any order: busy means a yield, or for
+    a reclaim, nothing reclaimed this time. An owner may hold its mutex across IO it submits.
   - The mutexes that are waited for nest only as follows, outer first:
     - the memory's free runs, then a size class's batches;
     - the metadata cache's map of pages, then its order of arrival, then a page's state, then
       the dirty list;
     - the page store's erasing list, then its unerased slots or its open intents;
-    - a limbo's items, then the list of threads stepping;
     - the log's flush, then its admission;
     - a transaction slot, then the log (step 4 replaces the slot's lock with a commit log of one
       writer);
@@ -191,10 +248,34 @@ Anything that fits none of these is a design error.
   random and 300 PCT schedules: a sample of the interleavings, not all of them. Its name ends in
   `_in_shuttle_schedules`, so `make test-shuttle` runs it, and a workload that keeps some
   operations apart says which races it leaves out.
+- **loom** (`--cfg atoll_loom`) explores the C11 model's reorderings as well as interleavings, in
+  models of a few threads. Plain data one thread writes and others reach through a published
+  pointer (an object a step reads, a retired object's stamp, a wait's epoch, a chunk's slots) is
+  a loom-checked cell under loom, so a read not ordered after its write fails. loom models
+  `fence(SeqCst)` and treats sequentially consistent accesses as acquire-release, which errs
+  toward false alarms. It hands a read-modify-write the latest write in its run, so it cannot
+  show that one needs an acquire to see another thread's earlier write. Its exploration is not
+  exhaustive either, so no part rests on loom alone for its interleavings.
+- **Miri** (`cargo +nightly-2025-10-01 miri test`, `-Zmiri-many-seeds`) runs threaded tests,
+  checking every access for undefined behaviour, a use after free among them, and data races, at
+  the interleavings its scheduler draws. In eight seeds it caught none of six weakened
+  publications that loom's checked cells catch, the tests' own synchronization ordering the
+  accesses in the schedules it drew; it is the instrument for pointers and reference counts.
 - **Contention stress.** Every concurrent test also runs 12 copies at once on the 16-core host,
   with a run count sized to the failure rate being ruled out.
-- **Done** means both are clean, with the counts reported. A component that has only passed
-  alone is not done.
+- **Fail-first by mutation.** Every ordering, fence and check a lock-free part relies on is
+  weakened or removed in turn, and the suite must fail. A mutant nothing catches is either an
+  ordering or check something else already supplies, which then goes or is named as kept, or a
+  blind spot named here with the argument that covers it. The blind spots, each an acquire on a
+  read-modify-write that loom cannot show is needed:
+  - A step's end swaps its word acquire-release. The flag it reads was set after the wait was
+    pushed; only the acquire orders the wake's taking of the list after that push, so the wake
+    finds the wait.
+  - A wait is pushed acquire-release. Put back after a wake took the list, it reads the swap of a
+    step's end that found the list empty; only the acquire orders the recheck that follows after
+    that step's end, so the recheck sees the step gone and finishes the wait.
+- **Done** means all of them are clean, with the counts reported. A component that has only
+  passed alone is not done.
 
 ## 10. Order of work
 
@@ -211,3 +292,9 @@ Anything that fits none of these is a design error.
 4. Transactions: lock-free commit logs, waits as completions, deadlock detection, and a log flush
    that holds no mutex across its writes. Schedule tests.
 5. Then step 7 resumes from what is committed, re-proved under the new rules.
+6. Lock-free throughout (2026-11-02), one part at a time, each with its design here, loom, Miri
+   where it holds pointers, shuttle, stress and mutants before it is done: the epochs; then the
+   buffer pool (its page table, its allocator, the IO in flight, the wake, the first error, the
+   writeback queue and the staging ring); the page store's sets and maps; the
+   metadata cache; the log's admission and flush; writeback's landed list; transactions; the
+   cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and stay.

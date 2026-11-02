@@ -79,7 +79,7 @@ struct Frames {
     headers: Zeroed<FrameHeader>,
     /// Per 4 KiB grain: one past the epoch stamp at which a frame over it was last given up, or 0
     /// if none ever was. A page is read into a frame only once every step that could still read
-    /// what its memory held has ended ([`BufferPool::quiet`]).
+    /// what its memory held has ended ([`BufferPool::quiet_at`]).
     given_up: Zeroed<AtomicU64>,
     /// Per shard of frames: the IO in flight for each loading or outgoing frame.
     transits: Box<[Mutex<HashMap<u32, Completion>>]>,
@@ -289,8 +289,8 @@ enum Purpose {
 /// What looking for a free frame found.
 enum Got {
     Frame(u32),
-    /// Free frames, none quiet yet.
-    Quieting,
+    /// Free frames, none quiet yet; the earliest is quiet once the horizon reaches this epoch.
+    Quieting(u64),
     /// No free frame.
     None,
 }
@@ -718,7 +718,7 @@ impl BufferPool {
         drop(hold);
         // Stamped after the release: a reader that fixed the page before it entered its step
         // before the stamp, and one that fixes the frame after finds it free.
-        let stamp = self.store.epochs().stamp() + 1;
+        let stamp = self.store.epochs().stamp();
         for grain in &self.frames.given_up[grains(frame, class)] {
             grain.store(stamp, Ordering::Release);
         }
@@ -740,10 +740,19 @@ impl BufferPool {
     /// Whether no step that could still read what `frame`'s memory held before is left, given
     /// the epochs' `horizon`: then an IO may read a page into it. A page written through the
     /// frame's writer needs no such wait, its stores being atomic.
+    #[cfg(test)]
     fn quiet(&self, frame: u32, class: SizeClass, horizon: u64) -> bool {
+        self.quiet_at(frame, class) <= horizon
+    }
+
+    /// The epoch the horizon must reach for `frame`'s memory to be quiet: the latest stamp of the
+    /// grains it spans.
+    fn quiet_at(&self, frame: u32, class: SizeClass) -> u64 {
         self.frames.given_up[grains(frame, class)]
             .iter()
-            .all(|g| g.load(Ordering::Acquire) <= horizon)
+            .map(|g| g.load(Ordering::Acquire))
+            .max()
+            .unwrap_or(0)
     }
 
     /// The bytes of `frame`, of `class`'s size: read under its latch, or optimistically and
@@ -966,12 +975,12 @@ impl BufferPool {
             let class = pid.class();
             let frame = match self.take_or_grow(class, Purpose::Read) {
                 Got::Frame(f) => f,
-                Got::Quieting => continue,
+                Got::Quieting(_) => continue,
                 Got::None => {
                     self.evict_round(class)?;
                     match self.take_or_grow(class, Purpose::Read) {
                         Got::Frame(f) => f,
-                        Got::Quieting | Got::None => return Ok(()),
+                        Got::Quieting(_) | Got::None => return Ok(()),
                     }
                 }
             };
@@ -983,14 +992,35 @@ impl BufferPool {
     // ---------------------------------------------------------------- frames
 
     fn take_or_grow(&self, class: SizeClass, purpose: Purpose) -> Got {
-        let horizon = (purpose == Purpose::Read).then(|| self.store.epochs().horizon());
+        if purpose == Purpose::New {
+            return self.take_or_grow_by(class, None);
+        }
+        // Most free frames are quiet by the horizon some scan found already: no scan.
+        match self.take_or_grow_by(class, Some(self.store.epochs().known_horizon())) {
+            Got::Quieting(_) => self.take_or_grow_by(class, Some(self.store.epochs().horizon())),
+            got => got,
+        }
+    }
+
+    /// A free frame of `class` whose memory is quiet by `horizon`, any free frame with none,
+    /// growing the class if it has no free frame.
+    fn take_or_grow_by(&self, class: SizeClass, horizon: Option<u64>) -> Got {
+        // Of the frames not quiet, the epoch the earliest is quiet at.
+        let soonest = std::cell::Cell::new(u64::MAX);
         loop {
-            let usable = |f| horizon.is_none_or(|h| self.quiet(f, class, h));
+            let usable = |f| match horizon {
+                None => true,
+                Some(h) => {
+                    let at = self.quiet_at(f, class);
+                    soonest.set(soonest.get().min(at));
+                    at <= h
+                }
+            };
             match self.memory.take_where(class, usable) {
                 Take::Frame(f) => return Got::Frame(f),
                 // Growing would take memory a later step does not need: once the steps under
                 // way end, these frames are quiet.
-                Take::Unusable => return Got::Quieting,
+                Take::Unusable => return Got::Quieting(soonest.get()),
                 Take::None => {
                     if !self.memory.grow(class) {
                         return Got::None;
@@ -1003,17 +1033,28 @@ impl BufferPool {
     /// A free frame of `class` for `purpose`, making room if there is none.
     fn claim(self: &Arc<Self>, class: SizeClass, purpose: Purpose) -> Result<IOResult<u32>> {
         self.failed()?;
-        match self.take_or_grow(class, purpose) {
-            Got::Frame(f) => return Ok(IOResult::Done(f)),
-            Got::Quieting => return yield_now(),
-            Got::None => {}
+        let first = self.take_or_grow(class, purpose);
+        if let Got::Frame(f) = first {
+            return Ok(IOResult::Done(f));
         }
-        // Waiting starts before the last look, so a frame freed in between is not missed.
+        // Waiting starts before the next look, so a frame freed in between is not missed. Every
+        // wait below is this one: a frame freed finishes it, whatever else it waits for too.
         let wait = self.released_wait();
-        self.make_room(class)?;
-        match self.take_or_grow(class, purpose) {
+        let next = match first {
+            Got::Quieting(_) => self.take_or_grow(class, purpose),
+            _ => {
+                self.make_room(class)?;
+                self.take_or_grow(class, purpose)
+            }
+        };
+        match next {
             Got::Frame(f) => return Ok(IOResult::Done(f)),
-            Got::Quieting => return yield_now(),
+            // Until the steps that may still read the earliest free frame's memory have ended.
+            Got::Quieting(at) if self.store.epochs().wait_for(at, wait.clone()) => {
+                return Ok(IOResult::IO(IOCompletions(wait)));
+            }
+            // Quiet since the look: look again.
+            Got::Quieting(_) => return yield_now(),
             Got::None => {}
         }
         if let Some(c) = self.drive_writebacks()? {
@@ -1022,7 +1063,13 @@ impl BufferPool {
         if self.writes_in_flight.load(Ordering::Acquire) > 0 {
             return Ok(IOResult::IO(IOCompletions(wait)));
         }
-        // Every candidate is latched for the moment, and nothing in flight will free a frame.
+        // Every candidate is latched, or held by a writeback being stepped, by a step under way,
+        // and nothing in flight will free a frame: until those steps have ended, or a frame is
+        // freed first. A step held open while its thread waits for this claim, as a test holding
+        // pages does, ends only after it: the freed frame is what ends the wait then.
+        if self.store.epochs().grace_period(wait.clone()) {
+            return Ok(IOResult::IO(IOCompletions(wait)));
+        }
         yield_now()
     }
 
@@ -1105,11 +1152,15 @@ impl BufferPool {
         )
     }
 
+    /// The completion a frame freed finishes. One finished otherwise, by an epoch's wait it was
+    /// also registered for, is replaced: handed out finished, it would send every claim round
+    /// again at once.
     fn released_wait(&self) -> Completion {
-        self.released
-            .lock()
-            .get_or_insert_with(Completion::new_wait)
-            .clone()
+        let mut released = self.released.lock();
+        if released.as_ref().is_some_and(Completion::finished) {
+            *released = None;
+        }
+        released.get_or_insert_with(Completion::new_wait).clone()
     }
 
     fn signal_released(&self) {

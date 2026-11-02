@@ -28,7 +28,7 @@
 //! [`super::meta`]), changed only by the logged records below.
 
 use super::aligned::AlignedBlock;
-use super::epoch::{Epochs, Limbo};
+use super::epoch::{Epochs, Retired};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
 use super::meta::{MetaCache, MetaFrame, MetaHold, MetaId, Tree};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
@@ -301,7 +301,7 @@ pub struct PageStore {
     erasure: Mutex<Option<Erasure>>,
     epochs: Arc<Epochs>,
     /// Page numbers freed and not yet reusable: a step that could hold one may still run.
-    retired: Limbo<PageId>,
+    retired: Retired<PageId>,
     /// The same numbers, which no allocation may take.
     retiring: Mutex<HashSet<PageId>>,
 }
@@ -370,7 +370,7 @@ impl PageStore {
             orphans: Mutex::new(Vec::new()),
             erasure: Mutex::new(None),
             epochs: Arc::new(Epochs::new()),
-            retired: Limbo::default(),
+            retired: Retired::default(),
             retiring: Mutex::new(HashSet::new()),
         })
     }

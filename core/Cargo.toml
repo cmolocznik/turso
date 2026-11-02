@@ -170,6 +170,11 @@ serde_json = { workspace = true }
 [target.'cfg(loom)'.dependencies]
 loom = { workspace = true }
 
+# The epochs' model checks (core/storage/atoll/epoch/loom_tests.rs): a cfg of their own, as
+# `cfg(loom)` would switch dependencies to their loom builds too.
+[target.'cfg(atoll_loom)'.dependencies]
+loom = { workspace = true }
+
 [target.'cfg(shuttle)'.dependencies]
 shuttle = { workspace = true }
 

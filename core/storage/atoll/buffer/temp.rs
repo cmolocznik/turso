@@ -4,7 +4,7 @@
 //! names, and read back from there. The files are deleted at every open, and recovery never reads
 //! them.
 
-use super::super::epoch::{Epochs, Limbo};
+use super::super::epoch::{Epochs, Retired};
 use super::super::page::{PageId, SizeClass, CLASS_COUNT};
 use super::super::whole;
 use super::source::ReadDone;
@@ -24,7 +24,7 @@ pub struct TempPages {
     lsn: AtomicU64,
     epochs: Arc<Epochs>,
     /// Numbers freed and not yet reusable: a step that could hold one may still run.
-    retired: Limbo<PageId>,
+    retired: Retired<PageId>,
 }
 
 #[derive(Default)]
@@ -56,7 +56,7 @@ impl TempPages {
             files: Mutex::new(Default::default()),
             lsn: AtomicU64::new(1),
             epochs,
-            retired: Limbo::default(),
+            retired: Retired::default(),
         })
     }
 

@@ -890,16 +890,17 @@ fn a_pass_writes_back_more_pages_than_the_writeback_buffer_holds() {
     }
 }
 
-/// A frame read into from disk is written plainly by the IO, so it is taken only once no step
-/// that could still read its memory's last pages is left: every 4 KiB grain it spans counts, not
-/// just the first. Two 1 MiB pages share a 2 MiB batch; the first is freed before a reader's step
-/// begins, the second while the reader is in its step and has the page fixed. The batch then goes
-/// to the 2 MiB class: a new page may take its frame at once, but a read waits for the reader.
-#[cfg(not(shuttle))]
-#[test]
-fn a_frame_is_read_into_only_once_every_grain_it_spans_is_quiet() {
+/// Two 1 MiB pages share a 2 MiB batch; the first is freed before a reader's step begins, the
+/// second while the reader is in its step and has the page fixed. The batch then goes to the 2 MiB
+/// class, so the only frame for a 2 MiB page spans memory the reader may still read. `during` runs
+/// while the reader is in its step, with the pool, the 2 MiB class, that frame, and a call that
+/// lets the reader leave and waits until it has.
+fn with_a_reader_in_freed_memory(
+    base: &str,
+    during: impl FnOnce(&Arc<BufferPool>, SizeClass, u32, &dyn Fn()),
+) {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let (_log, pool) = open_on(&io, "/db/quiet", MIN_BUDGET);
+    let (_log, pool) = open_on(&io, base, MIN_BUDGET);
     let (small, large) = (class(8), class(9));
     let first = drive(&io, || pool.allocate(small)).unwrap();
     let mut second = drive(&io, || pool.allocate(small)).unwrap();
@@ -946,6 +947,25 @@ fn a_frame_is_read_into_only_once_every_grain_it_spans_is_quiet() {
         entered_rx.recv().unwrap();
         free(pid);
         assert!(pool.memory.drain_for(small, batch, large));
+        let reader = std::cell::RefCell::new(Some((reader, leave)));
+        let let_go = || {
+            if let Some((reader, leave)) = reader.borrow_mut().take() {
+                leave.send(()).unwrap();
+                reader.join().unwrap();
+            }
+        };
+        during(pool, large, frame, &let_go);
+        let_go();
+    });
+}
+
+/// A frame read into from disk is written plainly by the IO, so it is taken only once no step
+/// that could still read its memory's last pages is left: every 4 KiB grain it spans counts, not
+/// just the first. A new page may take the frame at once, but a read waits for the reader.
+#[cfg(not(shuttle))]
+#[test]
+fn a_frame_is_read_into_only_once_every_grain_it_spans_is_quiet() {
+    with_a_reader_in_freed_memory("/db/quiet", |pool, large, frame, leave| {
         // A new page is written through the frame's writer, whose stores race with nothing.
         match pool.take_or_grow(large, Purpose::New) {
             Got::Frame(f) => assert_eq!(f, frame),
@@ -953,16 +973,46 @@ fn a_frame_is_read_into_only_once_every_grain_it_spans_is_quiet() {
         }
         pool.memory.put(large, frame);
         assert!(
-            matches!(pool.take_or_grow(large, Purpose::Read), Got::Quieting),
+            matches!(pool.take_or_grow(large, Purpose::Read), Got::Quieting(_)),
             "a read took memory a reader in its step may still be reading"
         );
-        leave.send(()).unwrap();
-        reader.join().unwrap();
+        leave();
+        match pool.take_or_grow(large, Purpose::Read) {
+            Got::Frame(f) => assert_eq!(f, frame),
+            _ => panic!("the frame stayed unquiet after the reader left"),
+        }
     });
-    match pool.take_or_grow(large, Purpose::Read) {
-        Got::Frame(f) => assert_eq!(f, frame),
-        _ => panic!("the frame stayed unquiet after the reader left"),
-    }
+}
+
+/// A read that finds the only free frame's memory still readable by a step under way waits on a
+/// completion, and the step's end finishes it: it neither yields to be retried at once, over and
+/// over while the step lasts, nor waits past it.
+#[cfg(not(shuttle))]
+#[test]
+fn a_read_into_unquiet_memory_waits_for_the_step_that_may_read_it() {
+    with_a_reader_in_freed_memory("/db/quiet-wait", |pool, large, frame, leave| {
+        let waited = match pool.claim(large, Purpose::Read).unwrap() {
+            IOResult::IO(IOCompletions(c)) => c,
+            IOResult::Done(f) => panic!("a read took frame {f} while a reader may read it"),
+        };
+        assert!(
+            !waited.finished(),
+            "the read handed back a yield while the reader's step lasts"
+        );
+        leave();
+        assert!(
+            waited.finished(),
+            "the reader left and the read still waits"
+        );
+        assert!(
+            !pool.released_wait().finished(),
+            "the pool hands out the wait the reader's end finished, so claims go round at once"
+        );
+        match pool.claim(large, Purpose::Read).unwrap() {
+            IOResult::Done(f) => assert_eq!(f, frame),
+            IOResult::IO(_) => panic!("the frame stayed unquiet after the reader left"),
+        }
+    });
 }
 
 /// A step holding a page of one class, as an operation holds the parent it reads a child through,

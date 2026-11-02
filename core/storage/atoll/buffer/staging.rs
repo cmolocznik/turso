@@ -318,6 +318,39 @@ mod loom_tests {
             units.fill(&whole, 3);
         });
     }
+
+    /// A holder gives its lease back as another holder moves the tail past it and leases its
+    /// room again: the second holder's writes there follow the first's.
+    #[test]
+    fn room_passed_by_another_holder_is_written_after_its_last_holder() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(|| {
+            let ring = Arc::new(Ring::new(2, 1));
+            let units = Arc::new(Units((0..2).map(|_| UnsafeCell::new(0)).collect()));
+            let first = ring.take(1).unwrap();
+            let other = {
+                let (ring, units) = (ring.clone(), units.clone());
+                thread::spawn(move || {
+                    let lease = ring.take(1).expect("room for one");
+                    units.fill(&lease, 2);
+                    ring.give_back(lease.at, lease.len as u64);
+                    // The first's room, once the tail has passed it.
+                    if let Some(again) = ring.take(1) {
+                        units.fill(&again, 3);
+                        ring.give_back(again.at, again.len as u64);
+                    }
+                })
+            };
+            units.fill(&first, 1);
+            ring.give_back(first.at, first.len as u64);
+            other.join().unwrap();
+            assert!(
+                ring.take(2).is_some(),
+                "room given back was left behind the tail"
+            );
+        });
+    }
 }
 
 #[cfg(all(test, not(atoll_loom)))]

@@ -1146,10 +1146,10 @@ mod loom_tests;
 mod tests {
     use super::*;
 
-    /// Takers take and free frames of four classes while a drainer drains their batches for
-    /// another class and reserves runs: no frame is handed out twice, a frame taken is its
-    /// class's, and once every frame is back every drain has ended, the last reservation is whole
-    /// and every batch is held or free.
+    /// Takers take and free frames of four classes while a drainer drains their batches, the
+    /// reserving class's among them, and reserves runs: no frame is handed out twice, a frame
+    /// taken is its class's, and once every frame is back every drain has ended, the last
+    /// reservation is whole and every batch is held or free.
     fn churn(rounds: usize) {
         use crate::sync::atomic::AtomicBool;
         let m = Arc::new(Memory::new(8 * BATCH).unwrap());
@@ -1187,7 +1187,9 @@ mod tests {
             let m = m.clone();
             crate::thread::spawn(move || {
                 for round in 0..rounds {
-                    let from = classes[round % 3];
+                    // Every class, the one runs are reserved for too: a run made whole is drained
+                    // again as its reservation clears.
+                    let from = classes[round % classes.len()];
                     if let Some(batch) = m.emptiest(from, class(0)) {
                         m.drain_for(from, batch, class(0));
                     }

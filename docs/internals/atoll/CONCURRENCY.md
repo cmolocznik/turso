@@ -217,6 +217,17 @@ in the last point.
   names it still does (`fix_optimistic_held`). An id freed after the check is not reused before
   that step ends, so the read finds it free; one freed before fails the check. No copy of a freed
   page stays in memory to meet a new page under its number.
+- **The page store's bookkeeping takes no lock** (phase 3). Tree heights, search cursors and the
+  count of plans holding free space are atomics; the numbers retiring and the slots not yet
+  erased are a growable bitmap per class (`bits.rs`, over `segmented.rs`), set before the page
+  table reads them free, so a search that finds a number free through a latched page sees it; the
+  data files are set-once cells in a growable array; orphans are a take-all stack. What bounds a
+  checkpoint's redo point (frees not yet erased, intents still open, pages still provisional) is
+  a registry of floors: a slot per holder, claimed and cleared by compare-and-swap, its LSN read
+  by a scan for the least. A scan is not a snapshot, but it misses only a holder registered after
+  it reached the holder's slot, which a snapshot under a lock misses too; and each holder is
+  registered while the metadata pages its record changed are still dirty, so the bound already
+  covers it until then.
 - **Metadata pages** (page table, free space) follow the same discipline as tree nodes: versioned
   latch, optimistic reads. A change takes the latches of every page it changes, in id order,
   without waiting, or none of them, and yields. A page write's completion only records that it
@@ -262,7 +273,6 @@ in the last point.
   - The mutexes that are waited for nest only as follows, outer first:
     - the metadata cache's map of pages, then its order of arrival, then a page's state, then
       the dirty list;
-    - the page store's erasing list, then its unerased slots or its open intents;
     - the log's flush, then its admission;
     - a transaction slot, then the log (step 4 replaces the slot's lock with a commit log of one
       writer);
@@ -342,6 +352,7 @@ in the last point.
 6. Lock-free throughout (2026-11-02), one part at a time, each with its design here, loom, Miri
    where it holds pointers, shuttle, stress and mutants before it is done: the epochs; then the
    buffer pool (its page table, allocator, IO in flight, wake, first error, writeback queue,
-   landed writes and ring done; its temporary pages next); the page store's sets and maps; the
-   metadata cache; the log's admission and flush; writeback's landed list; transactions; the
-   cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and stay.
+   landed writes, ring and temporary pages done); the page store (done but for the intents
+   recovery tracks while it replays alone); the metadata cache; the log's admission and flush;
+   transactions; the cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and
+   stay.

@@ -28,20 +28,24 @@
 //! [`super::meta`]), changed only by the logged records below.
 
 use super::aligned::AlignedBlock;
+use super::bits::GrowBits;
 use super::epoch::{Epochs, Retired};
+use super::floors::{Floor, Floors};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
 use super::meta::{MetaCache, MetaFrame, MetaHold, MetaId, Tree};
-use super::once::TakeOnce;
+use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
+use super::segmented::Segmented;
 use super::shared::{BytesMut, Writer};
+use super::stack::Stack;
 use super::{whole, whole_write};
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
-use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use crate::sync::{Arc, Mutex, OnceLock};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// Log record kinds the page store owns.
 pub mod kinds {
@@ -267,23 +271,28 @@ pub struct PageStore {
     /// the log ends.
     log: OnceLock<Arc<Log>>,
     meta: Arc<MetaCache>,
-    files: Mutex<HashMap<(SizeClass, u64), Arc<dyn File>>>,
-    /// Levels of the page table (`[0]`) and free space (`[1]`) per class.
-    heights: Mutex<[[u8; CLASS_COUNT]; 2]>,
+    /// Per class, its data files by number, each opened once.
+    files: [Segmented<SetOnce<Arc<dyn File>>>; CLASS_COUNT],
+    /// Levels of the page table (`[0]`) and free space (`[1]`) per class: written by the one
+    /// growing a tree, or by recovery, and only rising.
+    heights: [[AtomicU8; CLASS_COUNT]; 2],
     /// Owned by the one growing a tree; another grower yields.
     growing: Mutex<()>,
-    /// Where each class's next slot search starts.
-    cursors: Mutex<[u64; CLASS_COUNT]>,
+    /// Where each class's next slot search starts: a hint.
+    cursors: [AtomicU64; CLASS_COUNT],
     /// Slots freed and not yet erased, by where the record that freed them starts, with where it
     /// ends.
-    erasing: Mutex<BTreeMap<Lsn, Freed>>,
-    /// Intents whose slots are not all remapped or given back yet: by where the intent starts,
-    /// how many are left.
-    open_intents: Mutex<BTreeMap<Lsn, usize>>,
+    /// Slots freed, waiting for the eraser to take them (see [`Eraser`]).
+    freed: Stack<FreedSlot>,
+    /// What each slot freed and not yet erased holds the redo bound at: where its free starts.
+    frees: Floors,
+    /// Where each intent whose slots are not all remapped or given back yet starts: held by its
+    /// write plan, which counts what is left.
+    intents: Floors,
     /// Write plans holding pages of each class's free space; free space grows only when none does.
-    plans: Mutex<[u32; CLASS_COUNT]>,
-    /// The same slots, which no allocation may take.
-    unerased: Mutex<HashSet<(SizeClass, u64)>>,
+    plans: [AtomicU32; CLASS_COUNT],
+    /// The same slots, by class, which no allocation may take.
+    unerased: [GrowBits; CLASS_COUNT],
     /// Only frees whose record ends at or before this are erased. After a crash it is where the
     /// log restarted, until a checkpoint past the restart is durable: a recovery from before that
     /// checkpoint cannot read what was appended since, and could still need the copies it freed.
@@ -293,24 +302,53 @@ pub struct PageStore {
     /// Provisional pages: where the group that made each provisional starts, and where the
     /// record that settled it (adopted or freed it) ends, once one did. A settled page stays
     /// until that record is durable: a crash before then still finds it provisional.
-    provisional: Mutex<HashMap<PageId, Provisional>>,
+    provisional: Provisionals,
     /// Provisional pages their owner gave up on, waiting to be freed ([`take_orphans`]).
     ///
     /// [`take_orphans`]: Self::take_orphans
-    orphans: Mutex<Vec<PageId>>,
+    orphans: Stack<PageId>,
     /// The erasure in progress, if any.
-    erasure: Mutex<Option<Erasure>>,
+    /// The eraser: its slots freed and not yet erased, and the erasure in progress, if any.
+    /// Only tried, never waited for: it is ownership of the erasing, held across its IO.
+    erasure: Mutex<Eraser>,
     epochs: Arc<Epochs>,
     /// Page numbers freed and not yet reusable: a step that could hold one may still run.
     retired: Retired<PageId>,
-    /// The same numbers, which no allocation may take.
-    retiring: Mutex<HashSet<PageId>>,
+    /// The same numbers, by class, which no allocation may take.
+    retiring: [GrowBits; CLASS_COUNT],
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Provisional {
+/// A slot freed, on its way to the eraser.
+struct FreedSlot {
+    /// Where the record that freed it starts and ends.
     start: Lsn,
-    settled: Option<Lsn>,
+    end: Lsn,
+    class: SizeClass,
+    slot: u64,
+    floor: Floor,
+}
+
+/// The eraser's own: the slots freed and not yet erased, by where the record that freed them
+/// starts, with where it ends, each holding its floor; and the erasure in progress.
+#[derive(Default)]
+struct Eraser {
+    erasing: BTreeMap<Lsn, Freed>,
+    floors: HashMap<(SizeClass, u64), Floor>,
+    current: Option<Erasure>,
+}
+
+impl Eraser {
+    /// Takes every slot freed since.
+    fn take_freed(&mut self, freed: &Stack<FreedSlot>) {
+        for f in freed.take_all() {
+            self.erasing
+                .entry(f.start)
+                .or_insert((f.end, Vec::new()))
+                .1
+                .push((f.class, f.slot));
+            self.floors.insert((f.class, f.slot), f.floor);
+        }
+    }
 }
 
 /// Freed slots being erased: holes punched or zeros written, then their files synced.
@@ -351,28 +389,30 @@ impl PageStore {
     ) -> Arc<Self> {
         let meta = Arc::new(MetaCache::new(io.clone(), base, config.meta_pages));
         meta.set_recovering(true);
+        let epochs = Arc::new(Epochs::new());
         Arc::new(Self {
             io,
             base: base.to_string(),
             config,
             log: OnceLock::new(),
             meta,
-            files: Mutex::new(HashMap::new()),
-            heights: Mutex::new(heights.map(|h| h.map(|l| l.max(1)))),
+            files: Default::default(),
+            heights: heights.map(|h| h.map(|l| AtomicU8::new(l.max(1)))),
             growing: Mutex::new(()),
-            cursors: Mutex::new([0; CLASS_COUNT]),
-            erasing: Mutex::new(BTreeMap::new()),
-            open_intents: Mutex::new(BTreeMap::new()),
-            plans: Mutex::new([0; CLASS_COUNT]),
-            unerased: Mutex::new(HashSet::new()),
+            cursors: Default::default(),
+            freed: Stack::default(),
+            frees: Floors::new(epochs.clone()),
+            intents: Floors::new(epochs.clone()),
+            plans: Default::default(),
+            unerased: Default::default(),
             erase_limit: AtomicU64::new(u64::MAX),
             pending_intents: Mutex::new(HashMap::new()),
-            provisional: Mutex::new(HashMap::new()),
-            orphans: Mutex::new(Vec::new()),
-            erasure: Mutex::new(None),
-            epochs: Arc::new(Epochs::new()),
+            provisional: Provisionals::new(epochs.clone()),
+            orphans: Stack::default(),
+            erasure: Mutex::new(Eraser::default()),
+            epochs,
             retired: Retired::default(),
-            retiring: Mutex::new(HashSet::new()),
+            retiring: Default::default(),
         })
     }
 
@@ -401,19 +441,18 @@ impl PageStore {
     }
 
     pub fn heights(&self) -> [[u8; CLASS_COUNT]; 2] {
-        *self.heights.lock()
+        std::array::from_fn(|t| std::array::from_fn(|c| self.heights[t][c].load(Ordering::Acquire)))
     }
 
     fn class_heights(&self, class: SizeClass) -> Heights {
-        let h = self.heights.lock();
         [
-            h[Tree::Map as usize][class.index()],
-            h[Tree::Space as usize][class.index()],
+            self.height(Tree::Map, class),
+            self.height(Tree::Space, class),
         ]
     }
 
     fn height(&self, tree: Tree, class: SizeClass) -> u8 {
-        self.heights.lock()[tree as usize][class.index()]
+        self.heights[tree as usize][class.index()].load(Ordering::Acquire)
     }
 
     fn slots_per_file(&self, class: SizeClass) -> u64 {
@@ -424,17 +463,18 @@ impl PageStore {
     fn data_file(&self, class: SizeClass, slot: u64) -> Result<(Arc<dyn File>, u64)> {
         let per_file = self.slots_per_file(class);
         let (n, at) = (slot / per_file, (slot % per_file) * class.size() as u64);
-        if let Some(f) = self.files.lock().get(&(class, n)) {
-            return Ok((f.clone(), at));
+        let cell = self.files[class.index()].get_or_make(n);
+        if let Some(f) = cell.get() {
+            return Ok((f, at));
         }
         let path = format!("{}.c{}.{n}", self.base, class.index());
         let file = self
             .io
             .open_file(&path, OpenFlags::Create | OpenFlags::Direct, false)?;
-        // A remap may name a slot in this file only once the file's creation is durable.
+        // A remap may name a slot in this file only once the file's creation is durable. Two first
+        // users may both open it; the first to set it is kept.
         self.io.sync_directory(&directory(&self.base))?;
-        self.files.lock().insert((class, n), file.clone());
-        Ok((file, at))
+        Ok((cell.set(file), at))
     }
 
     // ---------------------------------------------------------------- reading
@@ -536,7 +576,7 @@ impl PageStore {
     /// until adopted ([`adopt`](Self::adopt), or [`StoreRecord::Adopt`] in a group).
     pub fn allocate(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<PageId>> {
         for pid in self.retired.reclaim(&self.epochs) {
-            self.retiring.lock().remove(&pid);
+            self.retiring[pid.class().index()].clear(pid.number());
         }
         let record_len = StoreRecord::New {
             pid: PageId::new(class, 0),
@@ -572,7 +612,7 @@ impl PageStore {
             let leaf = ids[0];
             if self.height(Tree::Map, class) != height
                 || radix::map_entry(locked.page_of(leaf), number) != FREE
-                || self.retiring.lock().contains(&pid)
+                || self.retiring[class.index()].get(pid.number())
             {
                 // Taken, or the tree grew, since the search: look again.
                 continue;
@@ -635,7 +675,7 @@ impl PageStore {
             heights[Tree::Space as usize][class.index()],
         ];
         // Waiting before it reads as free, so no allocation takes it in between.
-        self.retiring.lock().insert(pid);
+        self.retiring[class.index()].set(pid.number());
         let (start, lsn) = self.append(&mut admitted, &StoreRecord::Free { pid, old }, logged);
         set_map(&mut locked, Tree::Map, pid.number(), entry, FREE);
         if let Some(old) = old {
@@ -654,23 +694,13 @@ impl PageStore {
     // ---------------------------------------------------------------- provisional pages
 
     fn made_provisional(&self, pid: PageId, start: Lsn) {
-        let mut provisional = self.provisional.lock();
         // A page abandoned before its adoption was durable keeps the earlier start: a crash
         // could still lose the adoption.
-        let start = provisional.get(&pid).map_or(start, |p| p.start.min(start));
-        provisional.insert(
-            pid,
-            Provisional {
-                start,
-                settled: None,
-            },
-        );
+        self.provisional.made(pid, start);
     }
 
     fn settled(&self, pid: PageId, lsn: Lsn) {
-        if let Some(p) = self.provisional.lock().get_mut(&pid) {
-            p.settled = Some(lsn);
-        }
+        self.provisional.settled(pid, lsn);
     }
 
     /// The header and payload of an adoption or abandonment, to append in the group that links
@@ -722,13 +752,7 @@ impl PageStore {
     /// The pages still provisional and not settled: what recovery frees once it has replayed
     /// the log.
     pub fn provisional_pages(&self) -> Vec<PageId> {
-        let mut pids: Vec<PageId> = self
-            .provisional
-            .lock()
-            .iter()
-            .filter(|(_, p)| p.settled.is_none())
-            .map(|(&pid, _)| pid)
-            .collect();
+        let mut pids = self.provisional.unsettled();
         pids.sort();
         pids
     }
@@ -736,18 +760,22 @@ impl PageStore {
     /// Hands over a provisional page its owner gave up on: an operation dropped between
     /// allocating the page and adopting it, or between abandoning it and freeing it.
     pub fn orphaned(&self, pid: PageId) {
-        self.orphans.lock().push(pid);
+        self.orphans.push(pid);
     }
 
-    /// The pages handed over and not yet taken to be freed.
+    /// The pages handed over and not yet taken to be freed, taken and handed over again.
     #[cfg(test)]
     pub fn orphans(&self) -> Vec<PageId> {
-        self.orphans.lock().clone()
+        let orphans = self.orphans.take_all();
+        for &pid in &orphans {
+            self.orphans.push(pid);
+        }
+        orphans
     }
 
     /// The pages handed over with [`orphaned`](Self::orphaned), for whoever frees them.
     pub fn take_orphans(&self) -> Vec<PageId> {
-        std::mem::take(&mut *self.orphans.lock())
+        self.orphans.take_all()
     }
 
     /// The first free unit of `tree` at or after `from`, wrapping around, or `None` if the tree is
@@ -787,13 +815,11 @@ impl PageStore {
                         let Some(u) = free else {
                             break None;
                         };
-                        if skip_unerased && self.unerased.lock().contains(&(class, u)) {
+                        if skip_unerased && self.unerased[class.index()].get(u) {
                             at = u + 1;
                             continue;
                         }
-                        if tree == Tree::Map
-                            && self.retiring.lock().contains(&PageId::new(class, u))
-                        {
+                        if tree == Tree::Map && self.retiring[class.index()].get(u) {
                             at = u + 1;
                             continue;
                         }
@@ -843,7 +869,7 @@ impl PageStore {
     /// Adds a level to the top of `tree` for `class`. Free space grows only while no write plan
     /// holds its pages, whose paths would miss the new root.
     fn grow(self: &Arc<Self>, tree: Tree, class: SizeClass) -> Result<IOResult<()>> {
-        if tree == Tree::Space && self.plans.lock()[class.index()] > 0 {
+        if tree == Tree::Space && self.plans[class.index()].load(Ordering::Acquire) > 0 {
             return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
         }
         let record_len = StoreRecord::Grow {
@@ -891,7 +917,7 @@ impl PageStore {
         let (start, lsn) = self.append(&mut admitted, &record, self.class_heights(class));
         radix::set_used_below(locked.page_of(new_root), 0, used);
         locked.commit(&self.meta, start, lsn);
-        self.heights.lock()[tree as usize][class.index()] = height + 1;
+        self.heights[tree as usize][class.index()].store(height + 1, Ordering::Release);
         Ok(IOResult::Done(()))
     }
 
@@ -906,6 +932,8 @@ impl PageStore {
             slots: Vec::new(),
             intent: None,
             intent_start: 0,
+            intent_floor: None,
+            intent_open: 0,
             frames: Vec::new(),
             ready: false,
         }
@@ -931,38 +959,36 @@ impl PageStore {
     // ---------------------------------------------------------------- erasing
 
     fn freed(&self, (start, end): (Lsn, Lsn), class: SizeClass, slot: u64) {
-        self.unerased.lock().insert((class, slot));
-        self.erasing
-            .lock()
-            .entry(start)
-            .or_insert((end, Vec::new()))
-            .1
-            .push((class, slot));
+        self.unerased[class.index()].set(slot);
+        // The floor before the slot is queued: the redo bound keeps the free from here on.
+        let floor = self.frees.hold(start);
+        self.freed.push(FreedSlot {
+            start,
+            end,
+            class,
+            slot,
+            floor,
+        });
     }
 
     /// A slot taken by an intent replayed in recovery was erased before it was taken: forget any
     /// free of it replayed earlier, so erasing never reaches the copy written there since.
     fn retaken(&self, class: SizeClass, slot: u64) {
-        if !self.unerased.lock().remove(&(class, slot)) {
+        if !self.unerased[class.index()].clear(slot) {
             return;
         }
-        let mut erasing = self.erasing.lock();
-        for (_, slots) in erasing.values_mut() {
+        // Recovery replays alone, so the eraser is free.
+        let mut eraser = self
+            .erasure
+            .try_lock()
+            .expect("the eraser is idle in recovery");
+        eraser.take_freed(&self.freed);
+        for (_, slots) in eraser.erasing.values_mut() {
             slots.retain(|&s| s != (class, slot));
         }
-        erasing.retain(|_, (_, slots)| !slots.is_empty());
-    }
-
-    fn intent_opened(&self, start: Lsn, slots: usize) {
-        *self.open_intents.lock().entry(start).or_default() += slots;
-    }
-
-    fn intent_settled(&self, start: Lsn) {
-        let mut open = self.open_intents.lock();
-        let left = open.get_mut(&start).expect("an open intent");
-        *left -= 1;
-        if *left == 0 {
-            open.remove(&start);
+        eraser.erasing.retain(|_, (_, slots)| !slots.is_empty());
+        if let Some(floor) = eraser.floors.remove(&(class, slot)) {
+            self.frees.release(floor);
         }
     }
 
@@ -974,14 +1000,16 @@ impl PageStore {
     /// every file touched is synced, and only then do the slots count as erased. A failed write or
     /// sync leaves the slots to be erased again by the next call.
     pub fn erase_freed(&self) -> Result<IOResult<()>> {
-        let Some(mut erasure) = self.erasure.try_lock() else {
+        let Some(mut eraser) = self.erasure.try_lock() else {
             // Someone else is stepping it.
             return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
         };
+        let eraser = &mut *eraser;
         loop {
-            let Some(e) = erasure.as_mut() else {
-                match self.start_erasure()? {
-                    Some(e) => *erasure = Some(e),
+            let Some(e) = eraser.current.as_mut() else {
+                eraser.take_freed(&self.freed);
+                match self.start_erasure(&eraser.erasing)? {
+                    Some(e) => eraser.current = Some(e),
                     None => return Ok(IOResult::Done(())),
                 }
                 continue;
@@ -990,7 +1018,7 @@ impl PageStore {
                 return Ok(IOResult::IO(IOCompletions(c.clone())));
             }
             if let Some(err) = e.pending.iter().find_map(|c| c.get_error()) {
-                *erasure = None;
+                eraser.current = None;
                 return Err(LimboError::CompletionError(err));
             }
             if !e.synced {
@@ -1002,18 +1030,19 @@ impl PageStore {
                     .collect::<Result<_>>()?;
                 continue;
             }
-            let done = erasure.take().expect("an erasure");
-            let mut erasing = self.erasing.lock();
-            let mut unerased = self.unerased.lock();
+            let done = eraser.current.take().expect("an erasure");
             for (start, (_, slots)) in done.ready {
-                if let Some((_, left)) = erasing.get_mut(&start) {
+                if let Some((_, left)) = eraser.erasing.get_mut(&start) {
                     left.retain(|s| !slots.contains(s));
                     if left.is_empty() {
-                        erasing.remove(&start);
+                        eraser.erasing.remove(&start);
                     }
                 }
-                for slot in slots {
-                    unerased.remove(&slot);
+                for (class, slot) in slots {
+                    self.unerased[class.index()].clear(slot);
+                    if let Some(floor) = eraser.floors.remove(&(class, slot)) {
+                        self.frees.release(floor);
+                    }
                 }
             }
             return Ok(IOResult::Done(()));
@@ -1022,19 +1051,16 @@ impl PageStore {
 
     /// Punches out every slot whose freeing is durable, or starts writing zeros over it where
     /// the file cannot punch holes; `None` if there is none.
-    fn start_erasure(&self) -> Result<Option<Erasure>> {
+    fn start_erasure(&self, erasing: &BTreeMap<Lsn, Freed>) -> Result<Option<Erasure>> {
         let durable = self
             .log()
             .durable()
             .min(self.erase_limit.load(Ordering::Acquire));
-        let ready: Vec<(Lsn, Freed)> = {
-            let erasing = self.erasing.lock();
-            erasing
-                .iter()
-                .take_while(|(_, (end, _))| *end <= durable)
-                .map(|(&start, entry)| (start, entry.clone()))
-                .collect()
-        };
+        let ready: Vec<(Lsn, Freed)> = erasing
+            .iter()
+            .take_while(|(_, (end, _))| *end <= durable)
+            .map(|(&start, entry)| (start, entry.clone()))
+            .collect();
         if ready.is_empty() {
             return Ok(None);
         }
@@ -1101,9 +1127,7 @@ impl PageStore {
             ..
         } = &r
         {
-            let mut heights = self.heights.lock();
-            let h = &mut heights[*tree as usize][class.index()];
-            *h = (*h).max(*height);
+            self.heights[*tree as usize][class.index()].fetch_max(*height, Ordering::AcqRel);
         }
         let ids = record_pages(&r, heights);
         let frames = match self.meta.get_all(&ids)? {
@@ -1130,13 +1154,12 @@ impl PageStore {
                 }
             }
             StoreRecord::Adopt { pids } => {
-                let mut provisional = self.provisional.lock();
-                for p in pids {
-                    provisional.remove(p);
+                for &p in pids {
+                    self.provisional.remove(p);
                 }
             }
             StoreRecord::Free { pid, .. } => {
-                self.provisional.lock().remove(pid);
+                self.provisional.remove(*pid);
                 if let StoreRecord::Free { old: Some(old), .. } = &r {
                     self.freed(span, pid.class(), *old);
                 }
@@ -1246,16 +1269,11 @@ impl PageStore {
     /// change to a metadata page not yet on disk, no free not yet erased, and nothing that made a
     /// page provisional while it is, is before it.
     pub fn redo_bound(&self) -> Option<Lsn> {
-        let provisional = {
-            let durable = self.log().durable();
-            let mut provisional = self.provisional.lock();
-            provisional.retain(|_, p| p.settled.is_none_or(|s| s > durable));
-            provisional.values().map(|p| p.start).min()
-        };
+        let provisional = self.provisional.least(self.log().durable());
         [
             self.meta.oldest_unwritten(),
-            self.erasing.lock().keys().next().copied(),
-            self.open_intents.lock().keys().next().copied(),
+            self.frees.least(),
+            self.intents.least(),
             provisional,
         ]
         .into_iter()
@@ -1283,11 +1301,25 @@ pub struct WritePlan {
     slots: Vec<u64>,
     intent: Option<Lsn>,
     intent_start: Lsn,
+    /// The intent's floor against the redo bound, held while any of its slots is not remapped
+    /// or given back.
+    intent_floor: Option<Floor>,
+    intent_open: usize,
     frames: Vec<Vec<Arc<MetaFrame>>>,
     ready: bool,
 }
 
 impl WritePlan {
+    /// One more of the intent's slots remapped or given back; the last gives its floor back.
+    fn intent_settled(&mut self, store: &PageStore) {
+        self.intent_open -= 1;
+        if self.intent_open == 0 {
+            if let Some(floor) = self.intent_floor.take() {
+                store.intents.release(floor);
+            }
+        }
+    }
+
     /// Where it stands, for a test that stalled to show.
     #[cfg(test)]
     pub fn describe(&self) -> String {
@@ -1364,7 +1396,7 @@ impl WritePlan {
     fn take_slots(&mut self, store: &Arc<PageStore>, class: SizeClass) -> Result<IOResult<()>> {
         loop {
             let mut slots = Vec::with_capacity(self.pids.len());
-            let mut from = store.cursors.lock()[class.index()];
+            let mut from = store.cursors[class.index()].load(Ordering::Relaxed);
             while slots.len() < self.pids.len() {
                 match store.find_free(Tree::Space, class, from, true)? {
                     IOResult::Done(Some(s)) => {
@@ -1399,8 +1431,7 @@ impl WritePlan {
             }
             let taken = slots.iter().any(|&s| {
                 let leaf = radix::path(Tree::Space, class, 1, s)[0];
-                radix::space_bit(locked.page_of(leaf), s)
-                    || store.unerased.lock().contains(&(class, s))
+                radix::space_bit(locked.page_of(leaf), s) || store.unerased[class.index()].get(s)
             });
             if taken {
                 // Someone took one since the search: look again.
@@ -1412,8 +1443,11 @@ impl WritePlan {
                 set_space(&mut locked, class, s, true);
             }
             locked.commit(&store.meta, start, lsn);
-            store.intent_opened(start, slots.len());
-            store.cursors.lock()[class.index()] = slots.iter().max().map_or(0, |s| s + 1);
+            // Held before the plan's pages are written back: until then they bound the redo point.
+            self.intent_floor = Some(store.intents.hold(start));
+            self.intent_open = slots.len();
+            store.cursors[class.index()]
+                .store(slots.iter().max().map_or(0, |s| s + 1), Ordering::Relaxed);
             self.slots = slots;
             self.intent = Some(lsn);
             self.intent_start = start;
@@ -1454,7 +1488,7 @@ impl WritePlan {
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
             if self.frames.is_empty() {
-                store.plans.lock()[class.index()] += 1;
+                store.plans[class.index()].fetch_add(1, Ordering::AcqRel);
             }
             self.frames.push(frames);
         }
@@ -1563,7 +1597,7 @@ impl WritePlan {
         if let Some(old) = old {
             store.freed((start, lsn), class, old);
         }
-        store.intent_settled(self.intent_start);
+        self.intent_settled(&store);
         true
     }
 
@@ -1576,7 +1610,7 @@ impl WritePlan {
         if !store.release_locked(&self.frames[i], admitted, class, &[self.slots[i]]) {
             return false;
         }
-        store.intent_settled(self.intent_start);
+        self.intent_settled(&store);
         true
     }
 }
@@ -1585,7 +1619,7 @@ impl Drop for WritePlan {
     fn drop(&mut self) {
         if let Some(pid) = self.pids.first() {
             if !self.frames.is_empty() {
-                self.store.plans.lock()[pid.class().index()] -= 1;
+                self.store.plans[pid.class().index()].fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
@@ -1824,6 +1858,9 @@ fn directory(base: &str) -> String {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string())
 }
+
+mod provisional;
+use provisional::Provisionals;
 
 #[cfg(test)]
 mod tests;

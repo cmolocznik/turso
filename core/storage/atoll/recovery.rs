@@ -254,10 +254,12 @@ impl Recovery {
                 Next::Finish => self.finish(),
                 Next::Wait => {
                     // Another thread holds the work: the analysis, the finish, the reader, or
-                    // every partition ready. Step the IO, which may be what it waits on.
+                    // every partition ready. Step the IO, which may be what it waits on, and yield
+                    // through `crate::thread`: under shuttle nothing else in this loop hands the
+                    // holder the processor, so the std yield spins the waiter forever.
                     while !changed.finished() {
                         self.io.step()?;
-                        std::thread::yield_now();
+                        crate::thread::yield_now();
                     }
                     continue;
                 }

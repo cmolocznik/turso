@@ -2,18 +2,19 @@
 //! back and moves memory between size classes, pages freed and their numbers reused, continuous
 //! checkpoints, and recovery on several threads.
 
+use super::aligned::AlignedBlock;
 use super::blob;
 use super::buffer::{BufferConfig, MIN_BUDGET};
 use super::control::{self, Control, MAX_CONTINUATIONS};
 use super::db::{Atoll, AtollConfig, Opening};
-use super::log::{LogConfig, Lsn, BLOCK};
+use super::log::{Log, LogConfig, Lsn, BLOCK};
 use super::page::{PageId, SizeClass, HEADER_SIZE};
 use super::radix::FREE;
 use super::shared::Bytes;
 use super::store::StoreConfig;
 use super::testing::drive;
 use crate::io::crash::{CrashIO, Faults};
-use crate::io::IO;
+use crate::io::{Completion, OpenFlags, IO};
 use crate::sync::atomic::AtomicU32;
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
@@ -126,7 +127,7 @@ fn check(db: &Atoll, io: &Arc<dyn IO>, model: &BTreeMap<PageId, Lives>, end: Lsn
     for (&pid, lives) in model {
         let entry = drive(io, || db.store().entry(pid)).unwrap();
         let Some(places) = lives.at(end) else {
-            assert_eq!(entry, FREE, "{label}: {pid:?} was freed by {end}");
+            assert_eq!(entry, FREE, "{label}: {pid:?} is not live at {end}");
             continue;
         };
         assert_ne!(entry, FREE, "{label}: {pid:?} lost");
@@ -582,4 +583,107 @@ fn recovery_frees_pages_left_provisional_and_the_redo_point_waits_for_them() {
         redo >= db.recovered_end().unwrap(),
         "nothing provisional is left to hold the redo point at {redo}"
     );
+}
+
+#[test]
+fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_past_it() {
+    // Pages allocated, adopted and written, each flushed on its own, so each flush starts a block
+    // with a whole record.
+    let crash_io = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let db = open(io.clone(), 1);
+    let mut model = BTreeMap::new();
+    for _ in 0..32 {
+        let pid = drive(&io, || db.pool().allocate(class(0))).unwrap().pid();
+        drive(&io, || db.store().adopt(&[pid])).unwrap();
+        let born = db.log().end();
+        let mut admitted = drive(&io, || db.log().admit(blob::record_len(STAMP))).unwrap();
+        let mut page = drive(&io, || db.pool().fix_exclusive(pid, None)).unwrap();
+        let (offset, bytes) = stamp(pid, 1);
+        let lsn = blob::write(db.log(), &mut admitted, &mut page, offset, &bytes);
+        drop(page);
+        model.insert(
+            pid,
+            Lives(vec![Life {
+                born,
+                writes: vec![(lsn, 1)],
+                freed: None,
+            }]),
+        );
+        drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
+    }
+    let redo = db.checkpointer().superblock().redo;
+    let whole = crash_io.crash(0);
+    drop(db);
+    let log = config().log;
+    let read_to = |io: Arc<dyn IO>, from: Lsn| {
+        let mut reader = Log::reader(io, BASE, &log, from);
+        let mut starts = Vec::new();
+        while let Some(r) = reader.next_record().unwrap() {
+            starts.push(r.start);
+        }
+        (starts, reader.position())
+    };
+    // A crash that tore a block and kept the next: the bytes from a record inside the block to
+    // its end are lost, and the log ends inside the block, with whole records from before the
+    // crash at the next block boundary, where recovery reopens it and records a gap.
+    let (starts, _) = read_to(Arc::new(whole.crash(0)), redo);
+    let (torn, end, restart) = starts
+        .iter()
+        .filter(|&&b| b % BLOCK == 0 && b > redo + BLOCK)
+        .find_map(|&restart| {
+            let from = *starts.iter().rfind(|&&s| s < restart)?;
+            if from % BLOCK == 0 {
+                return None;
+            }
+            let torn = whole.crash(0);
+            let file = torn
+                .open_file(
+                    &format!("{BASE}.log.{:016x}", from / log.segment_bytes),
+                    OpenFlags::None,
+                    false,
+                )
+                .unwrap();
+            let len = (restart - from) as usize;
+            let zeros = Arc::new(AlignedBlock::zeroed(BLOCK as usize));
+            let at = from % log.segment_bytes;
+            let c = file
+                .pwrite(at, zeros.region(0, len), Completion::new_write(|_| {}))
+                .unwrap();
+            torn.wait_for_completion(c).unwrap();
+            let c = file.sync_data(Completion::new_sync(|_| {})).unwrap();
+            torn.wait_for_completion(c).unwrap();
+            let torn = Arc::new(torn);
+            let (_, end) = read_to(torn.clone(), redo);
+            (end % BLOCK != 0 && Log::resumes_at(end) == restart).then_some((torn, end, restart))
+        })
+        .expect("a block a crash can tear with whole records after it");
+    let (past, _) = read_to(torn.clone(), restart);
+    assert!(
+        !past.is_empty(),
+        "no record from before the crash past {restart}"
+    );
+    // Crashed after each operation of the recovery that records the gap, each image recovers the
+    // log up to its end and nothing the crash left past the gap.
+    torn.capture(|_| false, 1, 0);
+    let db = open(torn.clone(), 1);
+    let images = torn.captured();
+    let torn: Arc<dyn IO> = torn;
+    check(&db, &torn, &model, end, "recovered");
+    drop(db);
+    let count = images.len();
+    let mut gapped = 0;
+    for (i, image) in images.into_iter().enumerate() {
+        let image: Arc<dyn IO> = Arc::new(image);
+        gapped += usize::from(!gaps(&image).is_empty());
+        let label = format!(
+            "image {i} of {count}, the gap from {end} to {restart} before {} records from \
+             before the crash",
+            past.len()
+        );
+        let db = try_open(image.clone(), 1, MIN_BUDGET)
+            .unwrap_or_else(|e| panic!("{label}: recovery failed: {e}"));
+        check(&db, &image, &model, end, &label);
+    }
+    assert!(gapped > 0, "none of {count} images holds the gap");
 }

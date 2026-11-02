@@ -293,11 +293,12 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
   - and below the first record of the oldest transaction still writing, whose undo may need it;
   - and, with object storage, it has been uploaded.
 - **Reopening after a crash.** Appending resumes at the block boundary after the log's end. The
-  rest of that segment is zeroed and later segments removed, so nothing a crash left beyond the
-  end is ever read as log. Bytes between the end and that boundary stay unreadable: a reader stops
-  at the end. Before anything is appended, recovery records the gap in the superblock in charge,
-  durably, and every reader from that superblock goes past it (section 12). A gap stays recorded
-  until a checkpoint's redo point passes it.
+  rest of that segment is zeroed and later segments removed, durably, so nothing a crash left beyond
+  the end is ever read as log. Bytes between the end and that boundary stay unreadable: a reader
+  stops at the end. Only then, and before anything is appended, recovery records the gap in the
+  superblock in charge, durably, and every reader from that superblock goes past it (section 12).
+  A gap recorded before the zeroing lands would lead the next reader past it into records the
+  crash left there. A gap stays recorded until a checkpoint's redo point passes it.
 - **Readers.** Recovery, replicas, app servers and the archiver read segments by position. A segment
   no longer local is fetched from object storage.
 
@@ -638,8 +639,9 @@ otherwise.
    twice. The reader goes past every gap the superblock records, where a recovery that crashed
    reopened the log.
 
-   **Record the gap.** If the log reopens past its end, recovery writes the superblock in charge
-   again with that gap added, and waits until it is durable, before it appends anything. Its
+   **Record the gap.** If the log reopens past its end, recovery first zeroes the log from where
+   it reopens (section 7.4), then writes the superblock in charge again with that gap added, and
+   waits until it is durable, before it appends anything. Its
    checkpoint writes metadata pages, and the copies they name, before its own superblock lands;
    a crash in between leaves pages a later recovery explains only from what this one appended.
    With no room left for a gap, recovery fails before it changes anything. One reader keeps up with one device: CRC32C ran at 16 GB/s on one core of a Core Ultra 9

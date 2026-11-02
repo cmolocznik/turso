@@ -340,16 +340,20 @@ impl Recovery {
             }
         }
         let end = reader.position();
-        // Recorded before the log reopens past the gap, and before anything is appended there.
         let restart = Log::resumes_at(end);
+        if restart > end && superblock.continuations.len() >= MAX_CONTINUATIONS {
+            return Err(LimboError::InternalError(format!(
+                "recovery would reopen the log at {restart}, past its end at {end}, and the \
+                 superblock already records the {MAX_CONTINUATIONS} gaps it holds: recovering on \
+                 would leave a gap no reader goes past"
+            )));
+        }
+        // Reopening zeroes everything a crash left from `restart` on, durably. The gap is
+        // recorded only then, and before anything is appended: a reader that follows it finds
+        // nothing past it but what this recovery appends, never records the crash left there.
+        let log = Log::open(self.io.clone(), &self.base, self.log_config.clone(), end)?;
+        assert_eq!(log.end(), restart, "the log reopened elsewhere");
         if restart > end {
-            if superblock.continuations.len() >= MAX_CONTINUATIONS {
-                return Err(LimboError::InternalError(format!(
-                    "recovery would reopen the log at {restart}, past its end at {end}, and the \
-                     superblock already records the {MAX_CONTINUATIONS} gaps it holds: recovering \
-                     on would leave a gap no reader goes past"
-                )));
-            }
             let mut continuations = superblock.continuations.clone();
             continuations.push((end, restart));
             let recorded = Superblock {
@@ -364,8 +368,6 @@ impl Recovery {
                 .write_and_wait(&recorded)?;
             *self.superblock.lock() = recorded;
         }
-        let log = Log::open(self.io.clone(), &self.base, self.log_config.clone(), end)?;
-        assert_eq!(log.end(), restart, "the log reopened elsewhere");
         self.store.resume(log);
         let pool = BufferPool::new(
             self.buffer.clone(),

@@ -7,6 +7,11 @@ force them to; section 2 lists each departure and why.
 
 The code is in `core/storage/atoll`. Section 20 says which parts are built.
 
+[UNIFIED_STORAGE_DESIGN.md](UNIFIED_STORAGE_DESIGN.md) proposes analytical execution with
+DataFusion and DuckDB, Vortex column storage, transactional event streams, and OpenTelemetry
+storage on the same foundation. It describes future work separately from the implementation
+status here.
+
 ## 1. What it has to do
 
 - **Size.** One design from 100 MB to 100 TB. Memory follows the working set. Nothing held in

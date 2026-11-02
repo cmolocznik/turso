@@ -251,6 +251,62 @@ fn leases_from_threads_never_overlap_and_all_room_comes_back(threads: usize, rou
     );
 }
 
+/// The tail moved past a lease by the holder of an older one: a lease is given back while an older
+/// one is out, the older's holder then moves the tail past both, and a third holder leases the
+/// first's room. Relaxed flags put the three in that order and order none of their memory, so only
+/// the ring orders the third's writes after the first's, which Miri checks: the first's end, read
+/// by the older's holder, and the tail it moves, read by the third.
+#[cfg(all(test, not(atoll_loom), not(shuttle)))]
+#[test]
+fn room_passed_by_the_holder_of_an_older_lease_is_written_after_its_last_holder() {
+    use crate::sync::atomic::AtomicU8;
+    let wait = |step: &AtomicU8, at: u8| {
+        while step.load(Ordering::Relaxed) < at {
+            crate::thread::yield_now();
+        }
+    };
+    for _ in 0..if cfg!(miri) { 20 } else { 1_000 } {
+        let ring = Arc::new(Ring::new(2, 1));
+        let plain = Arc::new(Plain(
+            (0..2).map(|_| std::cell::UnsafeCell::new(0)).collect(),
+        ));
+        let step = Arc::new(AtomicU8::new(0));
+        let older = ring.take(1).expect("the first unit");
+        let first = {
+            let (ring, plain, step) = (ring.clone(), plain.clone(), step.clone());
+            crate::thread::spawn(move || {
+                let lease = ring.take(1).expect("the second unit");
+                // SAFETY: the lease's own unit; Miri checks the next holder's write follows.
+                unsafe { *plain.0[lease.start].get() = 1 };
+                ring.give_back(lease.at, lease.len as u64);
+                step.store(1, Ordering::Relaxed);
+            })
+        };
+        let third = {
+            let (ring, plain, step) = (ring.clone(), plain.clone(), step.clone());
+            crate::thread::spawn(move || {
+                wait(&step, 2);
+                let whole = loop {
+                    if let Some(lease) = ring.take(2) {
+                        break lease;
+                    }
+                    crate::thread::yield_now();
+                };
+                for u in whole.start..whole.start + whole.len {
+                    // SAFETY: as above.
+                    unsafe { *plain.0[u].get() = 3 };
+                }
+            })
+        };
+        wait(&step, 1);
+        // The tail is held at this lease: giving it back moves the tail past the first's too.
+        ring.give_back(older.at, older.len as u64);
+        step.store(2, Ordering::Relaxed);
+        first.join().unwrap();
+        third.join().unwrap();
+    }
+}
+
 #[cfg(all(test, not(atoll_loom), not(shuttle)))]
 #[test]
 fn leases_from_threads_never_overlap_and_all_room_comes_back_on_threads() {

@@ -706,56 +706,77 @@ fn a_metadata_page_keeps_its_oldest_change_whatever_order_commits_finish_in_shut
     );
 }
 
-/// A metadata page stays in the cache while anyone holds it, however small the cache: here two
-/// allocations in different classes and a checkpointer share a cache of one page. A page dropped
-/// while an allocation held it would lose the allocation's change, and its number would be handed
-/// out again.
+/// A metadata page stays in the cache while anyone holds it, however small the cache: here
+/// allocations in `classes` classes, `each` per class, and a checkpointer writing the metadata
+/// `writes` times share a cache of one page. A page dropped while an allocation held it would
+/// lose the allocation's change, and its number would be handed out again; a page dropped dirty,
+/// or written and still counted dirty, would leave a change unwritten once all are written.
+fn a_metadata_page_in_use_stays_in_a_cache_too_small_for_it(
+    classes: usize,
+    each: usize,
+    writes: usize,
+) {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let config = StoreConfig {
+        meta_pages: 1,
+        ..store_config()
+    };
+    let db = create_with(io.clone(), BASE, config);
+    let allocators: Vec<_> = (0..classes)
+        .map(|c| {
+            let (io, store) = (io.clone(), db.store.clone());
+            crate::thread::spawn(move || {
+                (0..each)
+                    .map(|_| drive(&io, || store.allocate(class(c))).unwrap())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let (cio, cstore, clog) = (io.clone(), db.store.clone(), db.log.clone());
+    let checkpointer = crate::thread::spawn(move || {
+        for _ in 0..writes {
+            drive(&cio, || cstore.write_metadata(clog.end())).unwrap();
+        }
+    });
+    let pids: Vec<PageId> = allocators
+        .into_iter()
+        .flat_map(|t| t.join().unwrap())
+        .collect();
+    checkpointer.join().unwrap();
+    let distinct: BTreeSet<PageId> = pids.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        pids.len(),
+        "a number was handed out twice: {pids:?}"
+    );
+    for &pid in &pids {
+        assert_ne!(
+            drive(&io, || db.store.entry(pid)).unwrap(),
+            FREE,
+            "{pid:?} lost"
+        );
+    }
+    drive(&io, || db.store.write_metadata(db.log.end())).unwrap();
+    assert_eq!(
+        db.store.meta.oldest_unwritten(),
+        None,
+        "a change was left unwritten"
+    );
+}
+
+#[cfg(not(shuttle))]
+#[test]
+fn a_metadata_page_in_use_stays_in_a_cache_too_small_for_it_on_threads() {
+    for _ in 0..if cfg!(miri) { 1 } else { 20 } {
+        a_metadata_page_in_use_stays_in_a_cache_too_small_for_it(11, 40, 40);
+    }
+}
+
 #[cfg(shuttle)]
 #[test]
 fn a_metadata_page_in_use_stays_in_a_cache_too_small_for_it_in_shuttle_schedules() {
     crate::storage::atoll::testing::schedules(
-        || {
-            let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-            let config = StoreConfig {
-                meta_pages: 1,
-                ..store_config()
-            };
-            let db = create_with(io.clone(), BASE, config);
-            let allocators: Vec<_> = (0..2)
-                .map(|c| {
-                    let (io, store) = (io.clone(), db.store.clone());
-                    crate::thread::spawn(move || {
-                        (0..3)
-                            .map(|_| drive(&io, || store.allocate(class(c))).unwrap())
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            let (cio, cstore, clog) = (io.clone(), db.store.clone(), db.log.clone());
-            let checkpointer = crate::thread::spawn(move || {
-                for _ in 0..3 {
-                    drive(&cio, || cstore.write_metadata(clog.end())).unwrap();
-                }
-            });
-            let pids: Vec<PageId> = allocators
-                .into_iter()
-                .flat_map(|t| t.join().unwrap())
-                .collect();
-            checkpointer.join().unwrap();
-            let distinct: BTreeSet<PageId> = pids.iter().copied().collect();
-            assert_eq!(
-                distinct.len(),
-                pids.len(),
-                "a number was handed out twice: {pids:?}"
-            );
-            for pid in pids {
-                assert_ne!(
-                    drive(&io, || db.store.entry(pid)).unwrap(),
-                    FREE,
-                    "{pid:?} lost"
-                );
-            }
-        },
+        || a_metadata_page_in_use_stays_in_a_cache_too_small_for_it(2, 3, 3),
         300,
     );
 }

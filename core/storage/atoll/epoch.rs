@@ -69,6 +69,7 @@ mod sync {
             Self(loom::sync::Mutex::new(value))
         }
 
+        #[cfg(test)]
         pub(super) fn lock(&self) -> loom::sync::MutexGuard<'_, T> {
             self.0.lock().unwrap()
         }

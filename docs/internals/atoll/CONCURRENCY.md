@@ -189,8 +189,8 @@ in the last point.
   marks its batch after counting the frame back, and a take that clears the mark rechecks the
   count, the mark's setting and clearing being acquire-release exchanges of one word, so one sees
   the other; and a batch lent while its run is being reserved is drained either by the reserving
-  drain or by the lending, across paired fences. Free batches are a bitmap in which aligned runs of up
-  to four lie in one word, so a run is taken with one compare-and-swap, from the smallest free
+  drain or by the lending, across paired fences. Free batches are a bitmap in which aligned runs
+  of up to four lie in one word, so a run is taken with one compare-and-swap, from the smallest free
   run that holds it as a buddy allocator would, and coalesces as its bits are set. The run held
   for a large class is one word too, counting down the batches it still misses; every holder of
   a batch in it is drained until it is whole, the class itself included.
@@ -233,6 +233,21 @@ in the last point.
   without waiting, or none of them, and yields. A page write's completion only records that it
   landed: the remap that follows latches metadata pages, so the writeback does it when next
   stepped, and a writeback stays queued until every write it submitted is settled.
+- **The metadata cache takes no lock** (phase 4, `meta.rs`, `pins.rs`). Each page has a cell, in
+  an array per file that grows to the highest page reached; a page is put in an empty cell by
+  compare-and-swap. Whoever finds a page pins it in a step, and only a page no pin holds is
+  evicted: pinning and evicting each exchange the page's pin word, eviction taking it from no
+  pins to evicted, so of the two racing one wins, and a page pinned stays in its cell. Whoever
+  unlinks a page from its cell lets the cell's reference go through the epochs, so a step that
+  read the cell still reaches it. A dirty page holds a pin of its own, and so does a load or a
+  write in flight: a page evicted is clean and idle. Its dirtiness is a bit of its count of
+  changes: a change sets it, by compare-and-swap, under the page's latch; a write that lands
+  clears it by compare-and-swap from the count its copy was taken at, so a change since keeps it
+  dirty. The dirty pages are a registry of floors tagged with their ids: the least is the oldest
+  unwritten change, and a checkpoint writes the pages whose floors are below its bound. A page's
+  file is a set-once cell; its write in flight and its load are completion cells. Eviction's
+  order of arrival is a take-all stack drained into a queue the eviction under way owns, only
+  ever tried.
 
 ## 7. B-trees
 
@@ -268,11 +283,9 @@ in the last point.
 - **The one lock order** for the short critical sections that remain.
   - Latches are never waited for, and some mutexes are only ever tried, as ownership of a piece
     of work (§3, class 3): a checkpointer's state, a writeback, the page store's erasure and its
-    tree growth, a reclaim of retired objects. Neither is in any order: busy means a yield, or for
+    tree growth, the metadata cache's eviction, a reclaim of retired objects. Neither is in any order: busy means a yield, or for
     a reclaim, nothing reclaimed this time. An owner may hold its mutex across IO it submits.
   - The mutexes that are waited for nest only as follows, outer first:
-    - the metadata cache's map of pages, then its order of arrival, then a page's state, then
-      the dirty list;
     - the log's flush, then its admission;
     - a transaction slot, then the log (step 4 replaces the slot's lock with a commit log of one
       writer);
@@ -297,12 +310,15 @@ in the last point.
 - **loom** (`--cfg atoll_loom`) explores the C11 model's reorderings as well as interleavings, in
   models of a few threads. Plain data one thread writes and others reach through a published
   pointer (an object a step reads, a retired object's stamp, a wait's epoch, a chunk's slots) is
-  a loom-checked cell under loom, so a read not ordered after its write fails. loom models
-  `fence(SeqCst)` and treats sequentially consistent accesses as acquire-release, which errs
-  toward false alarms. It hands a read-modify-write the latest write in its run, so it cannot
-  show that one needs an acquire to see another thread's earlier write. And it let through one
-  interleaving shuttle caught at once (the page table's walk without its re-read), which smaller
-  probes did not reproduce, so no part rests on loom alone for its interleavings.
+  a loom-checked cell under loom, so a read not ordered after its write fails. loom treats
+  sequentially consistent accesses as acquire-release, which errs toward false alarms; but it
+  makes a `fence(SeqCst)` synchronize with every such fence before it in the run, which C11 does
+  not, and a fence is no point it switches threads at, so where both sides fence, an acquire or
+  a release the fences seem to stand in for may still be needed. It hands a read-modify-write
+  the latest write in its run, so it cannot show that one needs an acquire to see another
+  thread's earlier write. And it let through one interleaving shuttle caught at once (the page
+  table's walk without its re-read), which smaller probes did not reproduce, so no part rests on
+  loom alone for its interleavings.
 - **Miri** (`cargo +nightly-2025-10-01 miri test`, `-Zmiri-many-seeds`) runs threaded tests,
   checking every access for undefined behaviour, a use after free among them, and data races, at
   the interleavings its scheduler draws. In eight seeds it caught none of six weakened
@@ -353,6 +369,7 @@ in the last point.
    where it holds pointers, shuttle, stress and mutants before it is done: the epochs; then the
    buffer pool (its page table, allocator, IO in flight, wake, first error, writeback queue,
    landed writes, ring and temporary pages done); the page store (done but for the intents
-   recovery tracks while it replays alone); the metadata cache; the log's admission and flush;
+   recovery tracks while it replays alone); the metadata cache (done); the log's admission and
+   flush;
    transactions; the cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and
    stay.

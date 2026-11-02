@@ -896,6 +896,7 @@ fn a_pass_writes_back_more_pages_than_the_writeback_buffer_holds() {
 /// class, so the only frame for a 2 MiB page spans memory the reader may still read. `during` runs
 /// while the reader is in its step, with the pool, the 2 MiB class, that frame, and a call that
 /// lets the reader leave and waits until it has.
+#[cfg(not(shuttle))]
 fn with_a_reader_in_freed_memory(
     base: &str,
     during: impl FnOnce(&Arc<BufferPool>, SizeClass, u32, &dyn Fn()),

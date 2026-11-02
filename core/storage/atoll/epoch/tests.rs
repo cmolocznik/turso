@@ -7,6 +7,7 @@ const OBJECTS: usize = 64;
 /// and undefined behaviour, thousands of times slower, so it runs fewer, over several schedule
 /// seeds: with its default chance of preempting a thread at each basic block, one in a hundred,
 /// two hundred rounds switch threads mid-operation many times in every run.
+#[cfg(not(shuttle))]
 const ROUNDS: usize = if cfg!(miri) { 200 } else { 20_000 };
 
 /// Readers take the current object inside a step and check it stays alive to the step's end,
@@ -397,6 +398,7 @@ fn retired_objects_come_back_once_in_shuttle_schedules() {
 /// Two threads only retire and one only reclaims, with nothing else between them: whatever the
 /// reclaimer reads of a retired object reaches it through the list alone, so Miri sees a push or a
 /// take that orders too little.
+#[cfg(not(shuttle))]
 fn retired_objects_cross_threads_through_the_list_alone(rounds: usize) {
     let epochs = Arc::new(Epochs::new());
     let retired: Arc<Retired<usize>> = Arc::new(Retired::default());

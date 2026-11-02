@@ -32,7 +32,7 @@ use super::bits::GrowBits;
 use super::epoch::{Epochs, Retired};
 use super::floors::{Floor, Floors};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
-use super::meta::{MetaCache, MetaFrame, MetaHold, MetaId, Tree};
+use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, Tree};
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
@@ -387,9 +387,14 @@ impl PageStore {
         config: StoreConfig,
         heights: [[u8; CLASS_COUNT]; 2],
     ) -> Arc<Self> {
-        let meta = Arc::new(MetaCache::new(io.clone(), base, config.meta_pages));
-        meta.set_recovering(true);
         let epochs = Arc::new(Epochs::new());
+        let meta = Arc::new(MetaCache::new(
+            io.clone(),
+            base,
+            config.meta_pages,
+            epochs.clone(),
+        ));
+        meta.set_recovering(true);
         Arc::new(Self {
             io,
             base: base.to_string(),
@@ -506,7 +511,7 @@ impl PageStore {
     /// The page-table leaf holding `pid`'s entry, which stays in the metadata cache while held, so
     /// every change to the entry reaches it; `None` if the page table does not reach `pid`, whose
     /// entry is then [`FREE`].
-    pub fn leaf(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Option<Arc<MetaFrame>>>> {
+    pub fn leaf(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Option<MetaRef>>> {
         let class = pid.class();
         if pid.number() >= radix::capacity(Tree::Map, self.height(Tree::Map, class)) {
             return Ok(IOResult::Done(None));
@@ -1239,7 +1244,7 @@ impl PageStore {
     /// held.
     fn release_locked(
         &self,
-        frames: &[Arc<MetaFrame>],
+        frames: &[MetaRef],
         admitted: &mut Admitted,
         class: SizeClass,
         slots: &[u64],
@@ -1305,7 +1310,7 @@ pub struct WritePlan {
     /// or given back.
     intent_floor: Option<Floor>,
     intent_open: usize,
-    frames: Vec<Vec<Arc<MetaFrame>>>,
+    frames: Vec<Vec<MetaRef>>,
     ready: bool,
 }
 
@@ -1634,14 +1639,14 @@ fn busy<T>() -> IOResult<T> {
 struct Locked<'a> {
     ids: Vec<MetaId>,
     holds: Vec<MetaHold<'a>>,
-    frames: Vec<&'a Arc<MetaFrame>>,
+    frames: Vec<&'a MetaRef>,
 }
 
 impl<'a> Locked<'a> {
     /// Latches every page of `frames`, or `None`, holding nothing, if one is held: the caller
     /// yields and tries again.
-    fn new(frames: &'a [Arc<MetaFrame>]) -> Option<Self> {
-        let mut order: Vec<&Arc<MetaFrame>> = frames.iter().collect();
+    fn new(frames: &'a [MetaRef]) -> Option<Self> {
+        let mut order: Vec<&MetaRef> = frames.iter().collect();
         order.sort_by_key(|f| f.id);
         order.dedup_by_key(|f| f.id);
         let mut holds = Vec::with_capacity(order.len());

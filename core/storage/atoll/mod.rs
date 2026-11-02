@@ -33,6 +33,7 @@ pub mod log;
 pub mod meta;
 pub mod once;
 pub mod page;
+pub mod pins;
 pub mod radix;
 mod recovery;
 pub mod redo;

@@ -8,7 +8,7 @@
 //! can change it until the read is done. `read` reads the entry without a lock, and yields if a
 //! change to the leaf holds its latch at that moment.
 
-use super::super::meta::MetaFrame;
+use super::super::meta::MetaRef;
 use super::super::page::PageId;
 use super::super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
 use super::super::store::{PageRead, PageStore};
@@ -60,7 +60,7 @@ struct LocalLocated {
     store: Arc<PageStore>,
     pid: PageId,
     /// The page-table leaf holding the page's entry, held in the metadata cache.
-    leaf: Option<Arc<MetaFrame>>,
+    leaf: Option<MetaRef>,
 }
 
 impl Located for LocalLocated {

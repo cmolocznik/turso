@@ -1,6 +1,7 @@
 //! A registry of floors: positions in the log that holders keep from being passed, a slot each,
-//! and the least of them, read by a scan. Lock-free: a slot is claimed from a free list, or past
-//! the last one handed out, and its position set and cleared with stores.
+//! and the least of them, read by a scan; a floor may carry a tag, and a scan finds the tags of
+//! the floors below a bound. Lock-free: a slot is claimed from a free list, or past the last one
+//! handed out, and its position set and cleared with stores.
 //!
 //! A scan reads every slot handed out once. It is not a snapshot, but it misses only a floor set
 //! after it read the floor's slot, which a snapshot taken under a lock misses too; a floor held
@@ -23,9 +24,16 @@ mod sync {
     pub(super) use loom::sync::atomic::{AtomicU64, Ordering};
 }
 
+#[derive(Default)]
+struct Slot {
+    /// The floor plus one; 0 for none.
+    floor: AtomicU64,
+    /// Written before the floor, so a scan that reads the floor reads its tag.
+    tag: AtomicU64,
+}
+
 pub struct Floors {
-    /// Per slot: the floor plus one; 0 for none.
-    slots: Segmented<AtomicU64>,
+    slots: Segmented<Slot>,
     /// Slots handed out so far: a scan reads no further.
     used: AtomicU64,
     free: FreeList<u64>,
@@ -51,20 +59,26 @@ impl Floors {
 
     /// Holds `at` until released.
     pub fn hold(&self, at: u64) -> Floor {
+        self.hold_tagged(at, 0)
+    }
+
+    /// Holds `at`, tagged `tag`, until released.
+    pub fn hold_tagged(&self, at: u64, tag: u64) -> Floor {
         let slot = {
             let step = self.epochs.enter();
             self.free.pop(&self.epochs, &step)
         }
         .unwrap_or_else(|| self.used.fetch_add(1, Ordering::AcqRel));
-        self.slots
-            .get_or_make(slot)
-            .store(at + 1, Ordering::Release);
+        let s = self.slots.get_or_make(slot);
+        s.tag.store(tag, Ordering::Relaxed);
+        s.floor.store(at + 1, Ordering::Release);
         Floor { slot }
     }
 
     pub fn release(&self, floor: Floor) {
         self.slots
             .get_or_make(floor.slot)
+            .floor
             .store(0, Ordering::Release);
         self.free.push(floor.slot);
     }
@@ -73,10 +87,35 @@ impl Floors {
     pub fn least(&self) -> Option<u64> {
         (0..self.used.load(Ordering::Acquire))
             .filter_map(|i| self.slots.get(i))
-            .map(|s| s.load(Ordering::Acquire))
+            .map(|s| s.floor.load(Ordering::Acquire))
             .filter(|&v| v != 0)
             .min()
             .map(|v| v - 1)
+    }
+
+    /// The tags of the floors held below `bound`. Like [`least`](Self::least), it reads every
+    /// floor held throughout the scan.
+    pub fn tagged_below(&self, bound: u64) -> Vec<u64> {
+        (0..self.used.load(Ordering::Acquire))
+            .filter_map(|i| self.slots.get(i))
+            .filter(|s| {
+                let v = s.floor.load(Ordering::Acquire);
+                v != 0 && v - 1 < bound
+            })
+            .map(|s| s.tag.load(Ordering::Relaxed))
+            .collect()
+    }
+}
+
+impl Floor {
+    /// The floor as its slot, to keep in a word.
+    pub fn into_slot(self) -> u64 {
+        self.slot
+    }
+
+    /// The floor kept as `slot` by [`into_slot`](Self::into_slot).
+    pub fn from_slot(slot: u64) -> Self {
+        Self { slot }
     }
 }
 

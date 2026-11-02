@@ -31,7 +31,7 @@
 //! **Failure.** A failed page write, like a failed log write (§7.5), stops the pool: every later
 //! miss fails until the database is reopened and recovered.
 
-mod cell;
+pub(super) mod cell;
 mod clean;
 mod frame;
 mod memory;

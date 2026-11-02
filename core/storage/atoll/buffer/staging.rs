@@ -211,17 +211,31 @@ impl Staging {
     }
 }
 
+/// The ring's units as plain memory, written by each lease's holder: Miri fails a write not
+/// ordered after the last holder's, so only the ring orders one holder after the next.
+#[cfg(all(test, not(atoll_loom)))]
+struct Plain(Vec<std::cell::UnsafeCell<usize>>);
+
+// SAFETY: shared to be raced on: Miri checks every access.
+#[cfg(all(test, not(atoll_loom)))]
+unsafe impl Sync for Plain {}
+
 /// Threads lease runs of a ring and give them back in whatever order they finish: no unit is
-/// leased twice at once, and once all are back the whole ring is free.
-#[cfg(test)]
+/// leased twice at once, each holder's writes to its units follow the last holder's, and once all
+/// are back the whole ring is free.
+#[cfg(all(test, not(atoll_loom)))]
 fn leases_from_threads_never_overlap_and_all_room_comes_back(threads: usize, rounds: usize) {
     use crate::sync::atomic::AtomicBool;
     let units = 8u64;
     let ring = Arc::new(Ring::new(units, 1));
+    // Relaxed throughout: these catch an overlap, and order nothing.
     let used: Arc<Vec<AtomicBool>> = Arc::new((0..units).map(|_| AtomicBool::new(false)).collect());
+    let plain = Arc::new(Plain(
+        (0..units).map(|_| std::cell::UnsafeCell::new(0)).collect(),
+    ));
     let handles: Vec<_> = (0..threads)
         .map(|t| {
-            let (ring, used) = (ring.clone(), used.clone());
+            let (ring, used, plain) = (ring.clone(), used.clone(), plain.clone());
             crate::thread::spawn(move || {
                 for round in 0..rounds {
                     let len = 1 + ((t + round) as u64 % 3);
@@ -229,15 +243,21 @@ fn leases_from_threads_never_overlap_and_all_room_comes_back(threads: usize, rou
                         crate::thread::yield_now();
                         continue;
                     };
+                    let mark = t * rounds + round + 1;
                     for u in lease.start..lease.start + lease.len {
                         assert!(
-                            !used[u].swap(true, Ordering::AcqRel),
+                            !used[u].swap(true, Ordering::Relaxed),
                             "unit {u} leased twice"
                         );
+                        // SAFETY: the lease's own unit; Miri fails it unless ordered after the
+                        // last holder's accesses.
+                        unsafe { *plain.0[u].get() = mark };
                     }
                     crate::thread::yield_now();
                     for u in lease.start..lease.start + lease.len {
-                        used[u].store(false, Ordering::Release);
+                        // SAFETY: as above.
+                        assert_eq!(unsafe { *plain.0[u].get() }, mark, "unit {u} overwritten");
+                        used[u].store(false, Ordering::Relaxed);
                     }
                     ring.give_back(lease.at, lease.len as u64);
                 }
@@ -256,7 +276,10 @@ fn leases_from_threads_never_overlap_and_all_room_comes_back(threads: usize, rou
 #[cfg(all(test, not(atoll_loom), not(shuttle)))]
 #[test]
 fn leases_from_threads_never_overlap_and_all_room_comes_back_on_threads() {
-    leases_from_threads_never_overlap_and_all_room_comes_back(3, 100_000);
+    leases_from_threads_never_overlap_and_all_room_comes_back(
+        3,
+        if cfg!(miri) { 2_000 } else { 100_000 },
+    );
 }
 
 #[cfg(all(test, shuttle))]

@@ -252,7 +252,7 @@ impl<T: Send + 'static> Drop for FreeList<T> {
 }
 
 /// Pushers push while a taker takes: every item comes out exactly once.
-#[cfg(test)]
+#[cfg(all(test, not(atoll_loom)))]
 fn every_item_comes_out_once(pushers: usize, items: usize) {
     use crate::sync::Arc;
     let stack = Arc::new(Stack::default());
@@ -280,7 +280,7 @@ fn every_item_comes_out_once(pushers: usize, items: usize) {
 }
 
 /// Threads push and pop numbers in steps: every number pushed comes out once.
-#[cfg(test)]
+#[cfg(all(test, not(atoll_loom)))]
 fn free_list_numbers_come_out_once(threads: u64, per: u64) {
     use crate::sync::Arc;
     let epochs = Arc::new(Epochs::new());

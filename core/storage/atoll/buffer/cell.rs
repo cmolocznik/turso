@@ -63,6 +63,23 @@ impl CompletionCell {
         debug_assert!(old.is_null(), "a completion put in a cell that held one");
     }
 
+    /// Puts `c` in the cell if it is empty: whether it went in. Of two putting at once one wins,
+    /// and the cell's owner is then whoever did.
+    pub fn try_put(&self, c: Completion) -> bool {
+        let raw = c.into_raw().cast_mut();
+        match self
+            .0
+            .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(_) => {
+                // SAFETY: never published, so still this thread's own.
+                drop(unsafe { Completion::from_raw(raw) });
+                false
+            }
+        }
+    }
+
     /// Takes the completion out of the cell, if any: for the cell's owner.
     pub fn take(&self, retiring: &Retiring) -> Option<Completion> {
         let raw = self.0.swap(ptr::null_mut(), Ordering::AcqRel);

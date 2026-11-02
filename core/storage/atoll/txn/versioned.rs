@@ -31,7 +31,8 @@ use crate::storage::atoll::btree::{Lookup, Mode, Outcome, Put, Stored, StoredVal
 use crate::storage::atoll::buffer::BufferPool;
 use crate::storage::atoll::page::{PageId, SizeClass, CLASS_COUNT};
 use crate::storage::atoll::store::PageStore;
-use crate::sync::{Arc, Mutex};
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::Arc;
 use crate::types::IOResult;
 use crate::{LimboError, Result};
 
@@ -148,8 +149,9 @@ pub struct Versions {
     io: Arc<dyn IO>,
     pool: Arc<BufferPool>,
     store: Arc<PageStore>,
-    /// Per slot and node class, the root of its version index, once created.
-    roots: Box<[Mutex<[Option<PageId>; CLASS_COUNT]>]>,
+    /// Per slot and node class, the root of its version index once created, set once by
+    /// compare-and-swap: its raw id plus one, 0 for none.
+    roots: Box<[[AtomicU64; CLASS_COUNT]]>,
 }
 
 impl Versions {
@@ -164,7 +166,7 @@ impl Versions {
             pool,
             store,
             roots: (0..slots)
-                .map(|_| Mutex::new([None; CLASS_COUNT]))
+                .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
                 .collect(),
         }
     }
@@ -178,29 +180,26 @@ impl Versions {
     /// `slot`'s version index for trees of `class`, created if it has none.
     fn index(&self, slot: u16, class: SizeClass) -> Result<IOResult<Tree>> {
         let class = Self::index_class(class);
-        let existing = self.roots[slot as usize].lock()[class.index()];
-        let root = match existing {
-            Some(root) => root,
-            None => {
+        let cell = &self.roots[slot as usize][class.index()];
+        let root = match cell.load(Ordering::Acquire) {
+            0 => {
                 let root = done!(Tree::create_temporary(
                     &self.io,
                     &self.pool,
                     &self.store,
                     class
                 ));
-                let mut roots = self.roots[slot as usize].lock();
-                match roots[class.index()] {
+                match cell.compare_exchange(0, root.raw() + 1, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => root,
                     // Created meanwhile by another reader: this one is never used.
-                    Some(other) => {
+                    Err(other) => {
                         self.store.orphaned(root);
-                        other
-                    }
-                    None => {
-                        roots[class.index()] = Some(root);
-                        root
+                        PageId::from_raw(other - 1)
                     }
                 }
             }
+            raw => PageId::from_raw(raw - 1),
         };
         Ok(IOResult::Done(Tree::open(
             self.io.clone(),

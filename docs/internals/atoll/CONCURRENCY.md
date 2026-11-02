@@ -299,9 +299,7 @@ in the last point.
     its mutex across IO it submits.
   - No mutex that is waited for nests another: the page store's orphans, which a version root's
     mutex once nested, are a stack.
-  - None is held across IO, while a callback runs, or while a completion is completed, except
-    a transaction slot: an append can submit log writes, whose completions run inside the
-    submission on some backends. It goes with step 4.
+  - None is held across IO, while a callback runs, or while a completion is completed.
   - Every other mutex is taken alone, nesting nothing.
   - Every acquisition in the engine was read for this list (2026-11-01): no two mutexes are taken
     in both orders.
@@ -379,5 +377,6 @@ in the last point.
    buffer pool (its page table, allocator, IO in flight, wake, first error, writeback queue,
    landed writes, ring and temporary pages done); the page store (done but for the intents
    recovery tracks while it replays alone); the metadata cache (done); the log's admission and
-   flush (done but for its segment files' map); transactions; the cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and
+   flush (done but for its segment files' map); transactions (done: commit logs, the published
+   horizon, slots and the version indexes' roots); the cold paths last. Mutexes only ever tried (§8) are ownership, not locks, and
    stay.

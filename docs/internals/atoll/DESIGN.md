@@ -536,17 +536,21 @@ Built in `txn/mod.rs`.
 - **Slots.** W transaction slots; W is the most transactions open at once, 100 by default,
   PostgreSQL's default `max_connections`. A transaction holds a slot from begin to end, so a slot
   runs one transaction at a time. A begin with every slot taken waits for one.
-- **Clock.** One global atomic clock issues start, snapshot and commit timestamps, each unique. A
+- **Clock.** One global atomic clock issues start and commit timestamps, each unique. A
   transaction's start names it in its log records, which chain to its previous record.
 - **Commit logs.** Each slot keeps a commit log: its committed (start, commit) pairs, in order.
   Garbage collection folds the pairs older than every snapshot into one start (section 11.5).
   - A version written by (slot s, start t) is visible to a snapshot at time T when the last
-    transaction of s committed before T started at or after t.
+    transaction of s committed at or before T started at or after t.
   - A snapshot caches that answer per slot, so a check consults another slot only for versions that
     slot wrote.
-  - The commit timestamp is drawn, the Commit record appended and the pair entered under the
-    slot's lock, which a snapshot reading the slot's log takes too: a snapshot taken after the
-    commit timestamp was drawn sees the pair.
+  - A slot's log has one writer, its committing transaction, which publishes each pair by the
+    log's length; readers search up to it.
+- **The published horizon.** A snapshot is the horizon H: every commit timestamped at or below H
+  is in its slot's commit log. A commit raises H once its pair is published, as far as every
+  commit below it has been, and is acknowledged once H covers it: so a snapshot taken after the
+  acknowledgement sees it, and no reader waits. A commit marks its slot before it draws its
+  timestamp, so H never passes one not yet published (CONCURRENCY.md §8).
 - **Statements.** A transaction sees what its own earlier statements wrote, and not what its
   current statement writes. Under read committed each statement takes a new snapshot.
 
@@ -597,9 +601,10 @@ Built in `txn/mod.rs`.
 
 ### 11.4 Commit
 
-1. Draw the commit timestamp and append the Commit record.
-2. Enter the timestamp in the slot's commit log. The transaction is visible from here.
-3. Acknowledge once the durability mode is met.
+1. Mark the slot, draw the commit timestamp and append the Commit record.
+2. Publish the pair in the slot's commit log, and raise the horizon. The transaction is visible to
+   every snapshot taken once the horizon covers it.
+3. Acknowledge once the horizon covers it and the durability mode is met.
 
 A transaction that saw this commit has its own commit later in the one log, so it can never be
 durable without this one. A read-only transaction acknowledges only once the log is durable up to

@@ -5,6 +5,7 @@ use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
+use crate::sync::Mutex;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
@@ -85,76 +86,94 @@ fn commit(io: &Arc<dyn IO>, db: &Atoll, txn: Txn) -> Option<Ts> {
 /// A reader's snapshot, a transaction it looked at, and whether that was visible.
 type Seen = (Ts, (u16, Ts), bool);
 
-#[test]
-fn a_snapshot_sees_exactly_the_transactions_committed_before_it() {
+/// Writers commit transactions, and abort some that wrote nothing, while readers look at whether
+/// the transactions begun so far are visible to their snapshots, under both isolations: each is
+/// visible exactly when it committed at or below the snapshot, and a commit once acknowledged is
+/// visible to the next snapshot taken.
+fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it(
+    writers: u64,
+    readers: u64,
+    rounds: usize,
+) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = open(&io, 6);
+    let db = Arc::new(open(&io, (writers + readers) as usize));
     // Every writing transaction begun, and the commit timestamp of each that committed.
-    let begun: Mutex<Vec<(u16, Ts)>> = Mutex::new(Vec::new());
-    let committed: Mutex<HashMap<(u16, Ts), Ts>> = Mutex::new(HashMap::new());
+    let begun: Arc<Mutex<Vec<(u16, Ts)>>> = Arc::new(Mutex::new(Vec::new()));
+    let committed: Arc<Mutex<HashMap<(u16, Ts), Ts>>> = Arc::new(Mutex::new(HashMap::new()));
     // What readers saw: their snapshot, the transaction, and whether it was visible.
-    let seen: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        for w in 0..3u64 {
-            let (io, db, begun, committed) = (&io, &db, &begun, &committed);
-            s.spawn(move || {
-                let mut rng = ChaCha8Rng::seed_from_u64(w);
-                for _ in 0..400 {
-                    let mut txn = begin(io, db, Isolation::Snapshot);
-                    if rng.random_range(0..4) == 0 {
-                        // Wrote nothing, and ends without committing.
-                        db.transactions().abort(txn);
-                        continue;
-                    }
-                    begun.lock().push((txn.slot(), txn.start()));
-                    write(io, db, &mut txn);
-                    let key = (txn.slot(), txn.start());
-                    let ts = commit(io, db, txn).expect("a commit timestamp");
-                    committed.lock().insert(key, ts);
-                }
-            });
-        }
-        for r in 0..3u64 {
-            let (io, db, begun, seen) = (&io, &db, &begun, &seen);
-            s.spawn(move || {
-                let mut rng = ChaCha8Rng::seed_from_u64(100 + r);
-                let isolation = [Isolation::Snapshot, Isolation::ReadCommitted][r as usize % 2];
-                for _ in 0..200 {
-                    let mut txn = begin(io, db, isolation);
-                    for _ in 0..3 {
-                        db.transactions().statement(&mut txn).unwrap();
-                        let known = begun.lock().clone();
-                        for _ in 0..20 {
-                            let Some(&(slot, start)) =
-                                known.get(rng.random_range(0..known.len().max(1)))
-                            else {
-                                continue;
-                            };
-                            let v = db.transactions().visible(&mut txn, slot, start, 1);
-                            // Asked again in the same statement, the answer holds.
-                            assert_eq!(v, db.transactions().visible(&mut txn, slot, start, 1));
-                            seen.lock().push((txn.snapshot, (slot, start), v));
-                        }
-                    }
+    let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut threads = Vec::new();
+    for w in 0..writers {
+        let (io, db, begun, committed) = (io.clone(), db.clone(), begun.clone(), committed.clone());
+        threads.push(crate::thread::spawn(move || {
+            let mut rng = ChaCha8Rng::seed_from_u64(w);
+            for _ in 0..rounds {
+                let mut txn = begin(&io, &db, Isolation::Snapshot);
+                if rng.random_range(0..4) == 0 {
+                    // Wrote nothing, and ends without committing.
                     db.transactions().abort(txn);
+                    continue;
                 }
-            });
-        }
-    });
+                begun.lock().push((txn.slot(), txn.start()));
+                write(&io, &db, &mut txn);
+                let key = (txn.slot(), txn.start());
+                let ts = commit(&io, &db, txn).expect("a commit timestamp");
+                committed.lock().insert(key, ts);
+                let mut after = begin(&io, &db, Isolation::Snapshot);
+                db.transactions().statement(&mut after).unwrap();
+                assert!(
+                    db.transactions().visible(&mut after, key.0, key.1, 1),
+                    "{key:?}, committed at {ts}, unseen by a snapshot taken after"
+                );
+                db.transactions().abort(after);
+            }
+        }));
+    }
+    for r in 0..readers {
+        let (io, db, begun, seen) = (io.clone(), db.clone(), begun.clone(), seen.clone());
+        threads.push(crate::thread::spawn(move || {
+            let mut rng = ChaCha8Rng::seed_from_u64(100 + r);
+            let isolation = [Isolation::Snapshot, Isolation::ReadCommitted][r as usize % 2];
+            for _ in 0..rounds / 2 {
+                let mut txn = begin(&io, &db, isolation);
+                for _ in 0..3 {
+                    db.transactions().statement(&mut txn).unwrap();
+                    let known = begun.lock().clone();
+                    for _ in 0..20 {
+                        let Some(&(slot, start)) =
+                            known.get(rng.random_range(0..known.len().max(1)))
+                        else {
+                            continue;
+                        };
+                        let v = db.transactions().visible(&mut txn, slot, start, 1);
+                        // Asked again in the same statement, the answer holds.
+                        assert_eq!(v, db.transactions().visible(&mut txn, slot, start, 1));
+                        seen.lock().push((txn.snapshot, (slot, start), v));
+                    }
+                }
+                db.transactions().abort(txn);
+            }
+        }));
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
     let committed = std::mem::take(&mut *committed.lock());
     let seen = std::mem::take(&mut *seen.lock());
-    // Both answers come up: visible, and committed only after the snapshot.
-    let after = seen
-        .iter()
-        .filter(|&&(at, key, v)| !v && committed.get(&key).is_some_and(|&ts| ts > at))
-        .count();
-    assert!(
-        after > 0 && seen.iter().any(|s| s.2),
-        "{after} of {}",
-        seen.len()
-    );
+    if rounds >= 100 {
+        // Both answers come up: visible, and committed only after the snapshot.
+        let after = seen
+            .iter()
+            .filter(|&&(at, key, v)| !v && committed.get(&key).is_some_and(|&ts| ts > at))
+            .count();
+        assert!(
+            after > 0 && seen.iter().any(|s| s.2),
+            "{after} of {}",
+            seen.len()
+        );
+    }
     for (snapshot, key, visible) in seen {
-        let before = committed.get(&key).is_some_and(|&ts| ts < snapshot);
+        let before = committed.get(&key).is_some_and(|&ts| ts <= snapshot);
         assert_eq!(
             visible,
             before,
@@ -162,6 +181,21 @@ fn a_snapshot_sees_exactly_the_transactions_committed_before_it() {
             committed.get(&key)
         );
     }
+}
+
+#[cfg(not(shuttle))]
+#[test]
+fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it_on_threads() {
+    a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it(6, 6, 400);
+}
+
+#[cfg(shuttle)]
+#[test]
+fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it(2, 1, 4),
+        300,
+    );
 }
 
 #[test]

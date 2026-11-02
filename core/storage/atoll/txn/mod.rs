@@ -9,19 +9,37 @@
 //!   after another, so that one and every earlier one committed before T; an aborted transaction's
 //!   versions are gone before its slot runs another. A snapshot caches that start per slot.
 //! - **Commit.** The commit timestamp is drawn, the Commit record appended and the pair entered in
-//!   the slot's commit log under the slot's lock, which a snapshot reading that slot's log takes
-//!   too. A snapshot taken after the commit timestamp was drawn therefore sees the pair, and one
-//!   taken before reads the transaction as not committed, which for it is so.
+//!   the slot's commit log, which its one writer publishes by its length, readers searching up to
+//!   it. A snapshot is the published horizon: every commit timestamped at or below it is in its
+//!   slot's log. A commit raises the horizon once it is published, as far as every commit below
+//!   has been, and is acknowledged once the horizon covers it, waiting only on committers still
+//!   publishing a lower timestamp: so a snapshot taken after the acknowledgement sees it, and no
+//!   reader waits ([`horizon`]).
 //! - **A transaction's records** carry its start timestamp as the transaction's id and chain to its
 //!   previous record, so its records are found from its last one.
 
+use self::sync::{fence, AtomicU64, Ordering};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
+use super::segmented::Segmented;
+use super::stack::Stack;
 use crate::io::Completion;
-use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
+use horizon::Horizon;
+
+/// The engine's atomics, or loom's.
+#[cfg(not(atoll_loom))]
+mod sync {
+    pub(super) use crate::sync::atomic::{fence, AtomicU64, Ordering};
+}
+
+#[cfg(atoll_loom)]
+mod sync {
+    pub(super) use loom::sync::atomic::{fence, AtomicU64, Ordering};
+}
+
+mod horizon;
 use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
-use std::collections::VecDeque;
 
 /// A timestamp of the transaction clock. 0 is before every transaction.
 pub type Ts = u64;
@@ -79,29 +97,78 @@ pub enum Isolation {
     Snapshot,
 }
 
+#[derive(Default)]
+struct Pair {
+    start: AtomicU64,
+    commit: AtomicU64,
+}
+
+/// A slot's committed transactions, written by the slot's transaction alone as it commits.
 struct CommitLog {
     /// Every transaction of the slot that started at or before this committed before any
     /// snapshot taken now.
     base: Ts,
-    /// The (start, commit) pairs of the slot's later committed transactions, in order.
-    entries: VecDeque<(Ts, Ts)>,
+    /// The (start, commit) pairs of the slot's later committed transactions, in order: both rise.
+    entries: Segmented<Pair>,
+    /// The pairs published: written after them, read before them.
+    len: AtomicU64,
 }
 
 impl CommitLog {
-    /// Whether the slot's transaction that started at `start` committed.
-    fn committed(&self, start: Ts) -> bool {
-        start <= self.base
-            || self
-                .entries
-                .binary_search_by_key(&start, |&(s, _)| s)
-                .is_ok()
+    fn new(base: Ts) -> Self {
+        Self {
+            base,
+            entries: Segmented::default(),
+            len: AtomicU64::new(0),
+        }
     }
 
-    /// The start of the slot's last transaction committed before `at`.
-    fn last_before(&self, at: Ts) -> Ts {
-        match self.entries.partition_point(|&(_, commit)| commit < at) {
+    /// Publishes the pair of the slot's transaction that started at `start` and committed at
+    /// `commit`: for that transaction alone.
+    fn push(&self, start: Ts, commit: Ts) {
+        let n = self.len.load(Ordering::Relaxed);
+        let pair = self.entries.get_or_make(n);
+        pair.start.store(start, Ordering::Relaxed);
+        pair.commit.store(commit, Ordering::Relaxed);
+        self.len.store(n + 1, Ordering::Release);
+    }
+
+    fn pair(&self, i: u64) -> (Ts, Ts) {
+        let pair = self.entries.get(i).expect("a published pair");
+        (
+            pair.start.load(Ordering::Relaxed),
+            pair.commit.load(Ordering::Relaxed),
+        )
+    }
+
+    /// How many of the published pairs `before` holds for, they holding for a prefix.
+    fn count(&self, before: impl Fn((Ts, Ts)) -> bool) -> u64 {
+        let (mut lo, mut hi) = (0, self.len.load(Ordering::Acquire));
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if before(self.pair(mid)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Whether the slot's transaction that started at `start` committed.
+    fn committed(&self, start: Ts) -> bool {
+        if start <= self.base {
+            return true;
+        }
+        let n = self.count(|(s, _)| s < start);
+        n < self.len.load(Ordering::Acquire) && self.pair(n).0 == start
+    }
+
+    /// The start of the slot's last transaction committed at or before `at`.
+    fn last_at(&self, at: Ts) -> Ts {
+        match self.count(|(_, commit)| commit <= at) {
             0 => self.base,
-            n => self.entries[n - 1].0,
+            n => self.pair(n - 1).0,
         }
     }
 }
@@ -109,12 +176,14 @@ impl CommitLog {
 pub struct Transactions {
     clock: Arc<Clock>,
     log: Arc<Log>,
-    slots: Box<[Mutex<CommitLog>]>,
+    slots: Box<[CommitLog]>,
     /// Per slot, the start of the transaction it runs; 0 for none.
     running: Box<[AtomicU64]>,
-    free: Mutex<Vec<u16>>,
-    /// Done when a slot is next freed, if anyone waits for one.
-    freed: Mutex<Option<Completion>>,
+    horizon: Horizon,
+    /// A bit per slot, set while it is free.
+    free: Box<[AtomicU64]>,
+    /// Waiting for a free slot, woken to look again whenever one is freed.
+    slot_waits: Stack<Completion>,
 }
 
 /// Where the writer of a version stands.
@@ -206,18 +275,22 @@ impl Transactions {
             config.slots
         );
         let base = clock.now();
+        let words = config.slots.div_ceil(64);
         Self {
-            slots: (0..config.slots)
-                .map(|_| {
-                    Mutex::new(CommitLog {
-                        base,
-                        entries: VecDeque::new(),
+            slots: (0..config.slots).map(|_| CommitLog::new(base)).collect(),
+            running: (0..config.slots).map(|_| AtomicU64::new(0)).collect(),
+            horizon: Horizon::new(config.slots, base),
+            free: (0..words)
+                .map(|w| {
+                    let bits = (config.slots - w * 64).min(64);
+                    AtomicU64::new(if bits == 64 {
+                        u64::MAX
+                    } else {
+                        (1 << bits) - 1
                     })
                 })
                 .collect(),
-            running: (0..config.slots).map(|_| AtomicU64::new(0)).collect(),
-            free: Mutex::new((0..config.slots).rev().map(|s| s as u16).collect()),
-            freed: Mutex::new(None),
+            slot_waits: Stack::default(),
             clock,
             log,
         }
@@ -227,24 +300,51 @@ impl Transactions {
         &self.clock
     }
 
+    /// A free slot, taken.
+    fn take_slot(&self) -> Option<u16> {
+        for (w, word) in self.free.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                match word.compare_exchange_weak(
+                    bits,
+                    bits & !(1 << bit),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Some((w * 64) as u16 + bit as u16),
+                    Err(now) => bits = now,
+                }
+            }
+        }
+        None
+    }
+
     /// Begins a transaction once a slot is free.
     pub fn begin(&self, isolation: Isolation) -> Result<IOResult<Txn>> {
-        // Waiting starts before the look, so a slot freed in between is not missed.
-        let wait = self
-            .freed
-            .lock()
-            .get_or_insert_with(Completion::new_wait)
-            .clone();
-        let Some(slot) = self.free.lock().pop() else {
-            return Ok(IOResult::IO(IOCompletions(wait)));
+        let slot = match self.take_slot() {
+            Some(slot) => slot,
+            None => {
+                let c = Completion::new_wait();
+                self.slot_waits.push(c.clone());
+                // Pairs with the fence of a slot freed: either it finds this waiting, or this
+                // finds the slot. A completion left behind is completed later, for no one.
+                fence(Ordering::SeqCst);
+                match self.take_slot() {
+                    Some(slot) => slot,
+                    None => return Ok(IOResult::IO(IOCompletions(c))),
+                }
+            }
         };
         let start = self.clock.next();
         self.running[slot as usize].store(start, Ordering::Release);
+        // The snapshot before the log's end: every commit it covers is in the log by then.
+        let snapshot = self.horizon.at();
         Ok(IOResult::Done(Txn {
             slot,
             start,
             isolation,
-            snapshot: start,
+            snapshot,
             command: 0,
             seen: vec![None; self.slots.len()],
             last: 0,
@@ -262,7 +362,7 @@ impl Transactions {
             ))
         })?;
         if txn.isolation == Isolation::ReadCommitted && txn.command > 1 {
-            txn.snapshot = self.clock.next();
+            txn.snapshot = self.horizon.at();
             txn.seen.fill(None);
             txn.log_at = self.log.end();
         }
@@ -277,15 +377,15 @@ impl Transactions {
         }
         let snapshot = txn.snapshot;
         let last = *txn.seen[slot as usize]
-            .get_or_insert_with(|| self.slots[slot as usize].lock().last_before(snapshot));
+            .get_or_insert_with(|| self.slots[slot as usize].last_at(snapshot));
         start <= last
     }
 
-    /// Commits `op`'s transaction (DESIGN.md §11.4). It is visible to every snapshot taken after
-    /// its commit timestamp, and done once the log is durable up to its Commit record. A
-    /// transaction that wrote nothing appends nothing, and is done once the log is durable up to
-    /// where it stood at its snapshot. Returns the commit timestamp, `None` for a transaction that
-    /// wrote nothing.
+    /// Commits `op`'s transaction (DESIGN.md §11.4). It is visible to every snapshot taken after it
+    /// is done, which is once the horizon covers its commit timestamp and the log is durable up to
+    /// its Commit record. A transaction that wrote nothing appends nothing, and is done once the
+    /// log is durable up to where it stood at its snapshot. Returns the commit timestamp, `None`
+    /// for a transaction that wrote nothing.
     pub fn commit(&self, op: &mut Commit) -> Result<IOResult<Option<Ts>>> {
         if let Some(txn) = &op.txn {
             if txn.wrote() && op.admitted.is_none() {
@@ -298,17 +398,22 @@ impl Transactions {
             op.durable = match op.admitted.take() {
                 None => txn.log_at,
                 Some(mut admitted) => {
-                    let mut commits = self.slots[txn.slot as usize].lock();
-                    let ts = self.clock.next();
+                    let ts = self.horizon.draw(txn.slot, &self.clock);
                     let lsn =
                         self.log
                             .append(&mut admitted, &txn.header(COMMIT), &[&ts.to_le_bytes()]);
-                    commits.entries.push_back((txn.start, ts));
+                    self.slots[txn.slot as usize].push(txn.start, ts);
+                    self.horizon.published(txn.slot, &self.clock);
                     op.ts = Some(ts);
                     lsn
                 }
             };
             self.release(txn.slot);
+        }
+        if let Some(ts) = op.ts {
+            if let Some(wait) = self.horizon.wait(ts, &self.clock) {
+                return Ok(IOResult::IO(IOCompletions(wait)));
+            }
         }
         Ok(match self.log.wait_durable(op.durable)? {
             IOResult::Done(()) => IOResult::Done(op.ts),
@@ -331,7 +436,7 @@ impl Transactions {
         // The slot first: a committing transaction enters its pair before it leaves the slot, so a
         // transaction gone from the slot by this read has its pair in the log by the next.
         let running = self.running[slot as usize].load(Ordering::Acquire);
-        if self.slots[slot as usize].lock().committed(start) {
+        if self.slots[slot as usize].committed(start) {
             Writer::Committed
         } else if running == start {
             Writer::Open
@@ -342,9 +447,10 @@ impl Transactions {
 
     fn release(&self, slot: u16) {
         self.running[slot as usize].store(0, Ordering::Release);
-        self.free.lock().push(slot);
-        let waiting = self.freed.lock().take();
-        if let Some(c) = waiting {
+        self.free[slot as usize / 64].fetch_or(1 << (slot % 64), Ordering::AcqRel);
+        // Pairs with the fence of a waiter: either this finds it, or it finds the slot.
+        fence(Ordering::SeqCst);
+        for c in self.slot_waits.take_all() {
             c.complete(0);
         }
     }
@@ -354,3 +460,34 @@ pub mod versioned;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, atoll_loom))]
+mod loom_tests {
+    use super::*;
+    use loom::thread;
+
+    /// A slot's transaction publishes its pair as a reader searches the slot's log: a pair found
+    /// is found whole, and the commits found rise with what the reader saw.
+    #[test]
+    fn a_pair_found_in_a_commit_log_is_read_whole() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(|| {
+            let log = Arc::new(CommitLog::new(0));
+            log.push(1, 2);
+            let writer = {
+                let log = log.clone();
+                thread::spawn(move || log.push(3, 4))
+            };
+            let committed = log.committed(3);
+            let last = log.last_at(4);
+            writer.join().unwrap();
+            assert!(
+                last == 1 || last == 3,
+                "a pair read before it was whole: {last}"
+            );
+            assert!(!committed || last == 3, "found committed, then not");
+            assert_eq!(log.last_at(3), 1);
+        });
+    }
+}

@@ -424,6 +424,7 @@ impl Tree {
             if !node.validate() {
                 return Ok(Found::Restart);
             }
+            // Relaxed: this thread's own cell, written by the fix above.
             let found = cell.load(Ordering::Relaxed);
             if found != hint {
                 if let Some(mut ex) = node.clone().upgrade() {

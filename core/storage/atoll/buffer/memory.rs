@@ -380,6 +380,8 @@ struct ClassIndex {
     /// batches emptier, and so cheaper to drain. Set by whoever frees a frame or adds a batch,
     /// cleared by a take that finds none.
     partial: Bits,
+    /// How many batches the class holds, and how many of those are live. Relaxed: counts, for
+    /// a sample's size and a hint whether the class holds any.
     held_count: AtomicU32,
     live_count: AtomicU32,
 }
@@ -789,6 +791,8 @@ impl Memory {
     fn release(&self, class: SizeClass, batch: u32) {
         let run = 1u32 << order(class);
         let index = self.index(class);
+        // Relaxed: the batch is draining, so no take promises a frame of it to read these, and its
+        // next class sets them before the release that opens it.
         for word in self.words(batch) {
             word.store(0, Ordering::Relaxed);
         }
@@ -971,7 +975,8 @@ impl Memory {
         self.index(class).held_count.load(Ordering::Relaxed) > 0
     }
 
-    /// Whether `frame` of `class` is free.
+    /// Whether `frame` of `class` is free. Relaxed: a hint, so a drain looks again at a frame
+    /// misread and its latch refuses one taken meanwhile.
     pub fn is_free(&self, class: SizeClass, frame: u32) -> bool {
         let (batch, i) = position(class, frame);
         self.words(batch)[i as usize / 64].load(Ordering::Relaxed) & (1 << (i % 64)) != 0

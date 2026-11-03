@@ -45,7 +45,8 @@ pub struct FrameHeader {
     pub flags: AtomicU8,
     pub tracker: Tracker,
     /// The global epoch when a step last fixed the page, the highest any did: a page marked at
-    /// or above the epochs' horizon may be held by a step under way.
+    /// or above the epochs' horizon may be held by a step under way. Relaxed: it only prices a
+    /// drain, and memory is read into again only once the epochs pass `given_up`'s stamps.
     pub held: AtomicU64,
 }
 

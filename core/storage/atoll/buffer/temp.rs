@@ -26,7 +26,8 @@ pub struct TempPages {
     classes: [Class; CLASS_COUNT],
     files: [SetOnce<Arc<dyn File>>; CLASS_COUNT],
     /// The next change's LSN. Nothing is logged, so these only order a page's changes and tell
-    /// its frame dirty. They start at 1: 0 is a page never changed.
+    /// its frame dirty. They start at 1: 0 is a page never changed. Relaxed: only each one's
+    /// uniqueness matters.
     lsn: AtomicU64,
     epochs: Arc<Epochs>,
     /// Numbers freed and not yet reusable: a step that could hold one may still run.
@@ -35,7 +36,7 @@ pub struct TempPages {
 
 #[derive(Default)]
 struct Class {
-    /// Numbers from here on were never handed out.
+    /// Numbers from here on were never handed out. Relaxed: only each one's uniqueness matters.
     next: AtomicU64,
     /// Numbers given back and reusable.
     free: FreeList<u64>,

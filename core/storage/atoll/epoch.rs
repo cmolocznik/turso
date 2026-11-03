@@ -355,6 +355,7 @@ impl Default for Epochs {
 impl Epochs {
     pub fn new() -> Self {
         Self {
+            // Relaxed: only its uniqueness matters.
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             global: CachePadded::new(AtomicU64::new(0)),
             registry: Arc::new(Registry {
@@ -383,6 +384,7 @@ impl Epochs {
     fn register(&self, entries: &RefCell<Vec<Entry>>) -> usize {
         let mut entries = entries.borrow_mut();
         // Entries for instances dropped since go.
+        // Relaxed: a stale read keeps an entry one more registration, its registry kept alive.
         entries.retain(|e| e.registry.open.load(Ordering::Relaxed));
         let slot: *const Slot = self.registry.join();
         entries.push(Entry {

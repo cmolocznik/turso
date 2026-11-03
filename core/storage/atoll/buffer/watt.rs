@@ -11,7 +11,8 @@
 //! Time is an epoch, advanced each time a quarter of the pool has been evicted (the paper's 4
 //! epochs per full replacement). An access in the epoch already recorded is not recorded again,
 //! so a hot page's tracker is read, not written, and never bounces between cores. Races between
-//! two recordings can leave one stale entry, which the paper shows harmless (§5.1).
+//! two recordings can leave one stale entry, which the paper shows harmless (§5.1). So a tracker
+//! is read and written relaxed: it orders nothing, and a stale entry only shifts an estimate.
 //!
 //! The paper divides by `now - t_i`, which is zero for an access in the current epoch. Here
 //! elapsed time counts the current epoch as one, `now - t_i + 1`, so pages used this epoch still

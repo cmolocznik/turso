@@ -58,6 +58,18 @@ Each object belongs to exactly one of four classes, named in its type's document
 
 Anything that fits none of these is a design error.
 
+**Orderings.** A word whose readers act on what was written before it, to free it, reuse it, read
+it or wake on it, is stored with a release and loaded with an acquire. Relaxed is kept only where
+nothing rides on the order, and each such site says which of these it is: the bytes of a class 2
+object, read optimistically and validated; a count or a statistic no decision's safety rests on;
+a value a following compare-and-swap checks again (its failure ordering among them, the value only
+feeding the retry) or a fence after it orders; a word one context owns (class 3); a word published
+by a later release or read after an earlier acquire; and a hint something checks before trusting
+it. A thread that stores one word and then loads another, against a thread doing the same the other
+way round, is never left to release and acquire, which let both read the old values: each side
+passes a sequentially consistent fence between its store and its load. Such a pair is named at both
+ends, since a half with no fence looks like ordinary code.
+
 ## 4. Epochs: when an identity may be reused
 
 Read-copy update's grace periods (McKenney and Slingwine, 1998; Desnoyers et al., "User-Level
@@ -279,8 +291,9 @@ in the last point.
   is a swap, not a store, so it is never ordered before an earlier one a turn takes unread. A
   sync and a segment's preparation are claims held across their IO, let go and then looked at
   again. Those waiting to be durable or admitted wait on take-all stacks, looking again across a
-  fence once on them, so a waker finds them or they see what it did. The first failure is set
-  once.
+  fence once on them, so a waker finds them or they see what it did. An append, having counted its
+  copy, looks for them across a fence of its own, so either it flushes for them or their flush
+  finds the copy. The first failure is set once.
 - **Checkpoints and writeback** own their work while stepping it and hold nothing across IO. A
   full checkpoint is asked for with one atomic add, and the superblock in charge is published in
   a cell (`arc_cell.rs`) anyone reads in a step.

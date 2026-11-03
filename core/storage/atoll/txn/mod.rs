@@ -128,6 +128,7 @@ impl CommitLog {
     /// Publishes the pair of the slot's transaction that started at `start` and committed at
     /// `commit`: for that transaction alone.
     fn push(&self, start: Ts, commit: Ts) {
+        // Relaxed: the slot's own count, and the pair published by its release below.
         let n = self.len.load(Ordering::Relaxed);
         let pair = self.entries.get_or_make(n);
         pair.start.store(start, Ordering::Relaxed);
@@ -137,6 +138,7 @@ impl CommitLog {
 
     fn pair(&self, i: u64) -> (Ts, Ts) {
         let pair = self.entries.get(i).expect("a published pair");
+        // Relaxed: read after the acquire of `len` that counted it.
         (
             pair.start.load(Ordering::Relaxed),
             pair.commit.load(Ordering::Relaxed),

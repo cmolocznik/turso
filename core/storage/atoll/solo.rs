@@ -52,6 +52,7 @@ impl Solo {
 
     /// A turn, if one was asked for and none is under way.
     pub fn turn(&self) -> Option<Turn<'_>> {
+        // Relaxed: read after the fence of a request or of the last turn's end, which orders it.
         if !self.asked.load(Ordering::Relaxed) {
             return None;
         }

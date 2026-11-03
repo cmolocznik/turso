@@ -55,6 +55,7 @@ impl Pins {
 
     /// Adds a pin to a value its caller already holds pinned.
     pub fn repin(&self) {
+        // Relaxed: the caller's pin keeps the value, as an `Arc` keeps what it clones.
         let was = self.0.fetch_add(1, Ordering::Relaxed);
         debug_assert!(
             was != 0 && was & EVICTED == 0,

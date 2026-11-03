@@ -70,6 +70,7 @@ impl Floors {
         }
         .unwrap_or_else(|| self.used.fetch_add(1, Ordering::AcqRel));
         let s = self.slots.get_or_make(slot);
+        // Relaxed: published by the floor's release, read after its acquire.
         s.tag.store(tag, Ordering::Relaxed);
         s.floor.store(at + 1, Ordering::Release);
         Floor { slot }

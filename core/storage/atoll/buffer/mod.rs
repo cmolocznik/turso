@@ -271,9 +271,9 @@ pub struct BufferPool {
     table: Table,
     source: Arc<dyn PageSource>,
     store: Arc<PageStore>,
-    /// The current WATT epoch.
+    /// The current WATT epoch. Relaxed: it only dates accesses for eviction's estimates.
     epoch: AtomicU32,
-    /// Bytes evicted since the pool opened; each quarter of the pool is an epoch.
+    /// Bytes evicted since the pool opened; each quarter of the pool is an epoch. Relaxed: a count.
     evicted: AtomicU64,
     epoch_bytes: u64,
     /// Done when a frame is next freed, if anyone waits for that.
@@ -487,6 +487,7 @@ impl BufferPool {
         holder: &dyn Fn() -> bool,
     ) -> Result<IOResult<Option<Fixed<'_>>>> {
         loop {
+            // Relaxed, read and written: a hint, the probe checks the frame it names.
             let hinted = hint
                 .map(|h| h.load(Ordering::Relaxed))
                 .filter(|&h| h != 0 && h <= self.memory.grains());
@@ -1790,6 +1791,7 @@ impl<'a> Exclusive<'a> {
     /// is dirty until a copy holding it is written back.
     pub fn changed(&mut self, lsn: Lsn) {
         let h = self.pool.header(self.frame);
+        // Relaxed: under the frame's exclusive latch.
         assert!(
             lsn > h.page_lsn.load(Ordering::Relaxed),
             "a change to {:?} at {lsn} is not after its last",

@@ -840,7 +840,7 @@ fn a_transactions_changes_name_it_and_its_tree_and_carry_what_undoes_them() {
                 }
                 Change::Update { key, undo, .. } if key == b"k" => {
                     seen.push((h.kind, h.txn, h.prev, r.group, r.lsn));
-                    assert_eq!(undo, Some((tree.root(), &b"one"[..])));
+                    assert_eq!(undo, Some((tree.root(), Some((&b"one"[..], false)))));
                 }
                 Change::Insert { key, undo, .. } if key == b"p" => {
                     assert_eq!((h.kind, h.txn, undo), (record::INSERT, 0, None));
@@ -862,33 +862,6 @@ fn a_transactions_changes_name_it_and_its_tree_and_carry_what_undoes_them() {
     let run = drive_runner(&io);
     let tree = tree_of(&io, &db, root);
     assert_eq!(get(&tree, &run, b"k"), Some(b"two".to_vec()));
-}
-
-/// A transaction that never ended put a value too long for its leaf, which no versioned tree
-/// does: recovery refuses to open the database rather than leave the change in place.
-#[test]
-fn recovery_refuses_an_unfinished_change_it_cannot_undo() {
-    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    {
-        let db = open(&io, MIN_BUDGET, 1);
-        let run = drive_runner(&io);
-        let tree = create(&io, &db, &run, false);
-        let long = vec![7u8; tree.limits().max_entry];
-        let mut put = Put::new(b"k", long, Mode::Insert).in_transaction(TxnTail::new(
-            42,
-            None,
-            Arc::new(Writers::new(1)),
-            0,
-        ));
-        assert_eq!(run_to(&run, || tree.put(&mut put)), Outcome::Inserted);
-        drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
-    }
-    let opening = Opening::new(io.clone(), BASE, config(MIN_BUDGET)).unwrap();
-    match opening.work().and_then(|()| opening.finish()) {
-        Err(LimboError::Corrupt(why)) if why.contains("out of line") => {}
-        Err(e) => panic!("recovery failed otherwise: {e}"),
-        Ok(_) => panic!("recovery left transaction 42's change in place"),
-    }
 }
 
 /// Two writers put and remove keys, each its own and both two shared ones, while a reader scans

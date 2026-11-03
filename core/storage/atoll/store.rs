@@ -24,15 +24,21 @@
 //! checkpoint's redo point never passes the record that made a page provisional while it is, so
 //! recovery always sees it.
 //!
-//! The page table and free space are radix trees of metadata pages ([`super::radix`],
-//! [`super::meta`]), changed only by the logged records below.
+//! **Retired pages** hold a version a snapshot may still read: the pages of an out-of-line value a
+//! versioned write replaced (DESIGN.md §6.5). Each is marked retired by a record in the group that
+//! replaces the value ([`PageStore::marks`]), and the compensation that puts the value back clears
+//! the mark in its own group. Recovery frees every page still marked once undo is done
+//! ([`PageStore::free_retired_pages`]), since no snapshot survives a crash.
+//!
+//! The page table, free space and retired marks are radix trees of metadata pages
+//! ([`super::radix`], [`super::meta`]), changed only by the logged records below.
 
 use super::aligned::AlignedBlock;
 use super::bits::GrowBits;
 use super::epoch::{Epochs, Retired};
 use super::floors::{Floor, Floors};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, OwnedRecord};
-use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, Tree};
+use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, Tree, TREES};
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
@@ -58,9 +64,11 @@ pub mod kinds {
     pub const GROW: Kind = Kind::new(6).unwrap();
     pub const ADOPT: Kind = Kind::new(7).unwrap();
     pub const ABANDON: Kind = Kind::new(8).unwrap();
+    pub const RETIRE: Kind = Kind::new(23).unwrap();
+    pub const REINSTATE: Kind = Kind::new(24).unwrap();
 
     pub fn owns(kind: Kind) -> bool {
-        (1..=8).contains(&kind.get())
+        (1..=8).contains(&kind.get()) || kind == RETIRE || kind == REINSTATE
     }
 }
 
@@ -72,8 +80,19 @@ pub enum StoreRecord {
     Adopt { pids: Vec<PageId> },
     /// These pages are unreachable now and are freed next: logged in the group that unlinks them.
     Abandon { pids: Vec<PageId> },
-    /// A page was dropped; its copy's slot, if it had one, is freed.
-    Free { pid: PageId, old: Option<u64> },
+    /// These pages, of one class, are retired: kept with their copies while a snapshot may read
+    /// the version they hold. Logged in the group that replaces it ([`PageStore::marks`]).
+    Retire { pids: Vec<PageId> },
+    /// These retired pages, of one class, are reachable again: logged in the group that puts their
+    /// value back.
+    Reinstate { pids: Vec<PageId> },
+    /// A page was dropped; its copy's slot, if it had one, is freed, and its retired mark cleared
+    /// if it had one.
+    Free {
+        pid: PageId,
+        old: Option<u64>,
+        retired: bool,
+    },
     /// These slots were taken for writes about to start.
     Intent { class: SizeClass, slots: Vec<u64> },
     /// A copy of `pid` landed in `new`; the slot it held before is freed.
@@ -98,9 +117,10 @@ const NONE: u64 = u64::MAX;
 /// Slots freed by one record, and where that record ends.
 type Freed = (Lsn, Vec<(SizeClass, u64)>);
 
-/// The levels of a class's page table and free space a record was logged under. Recovery lays
-/// out the record's paths with them, not with the levels the trees have grown to since.
-pub type Heights = [u8; 2];
+/// The levels of a class's page table, free space and retired marks a record was logged under.
+/// Recovery lays out the record's paths with them, not with the levels the trees have grown to
+/// since.
+pub type Heights = [u8; TREES];
 
 impl StoreRecord {
     fn kind(&self) -> Kind {
@@ -113,6 +133,8 @@ impl StoreRecord {
             Self::Grow { .. } => kinds::GROW,
             Self::Adopt { .. } => kinds::ADOPT,
             Self::Abandon { .. } => kinds::ABANDON,
+            Self::Retire { .. } => kinds::RETIRE,
+            Self::Reinstate { .. } => kinds::REINSTATE,
         }
     }
 
@@ -121,14 +143,18 @@ impl StoreRecord {
         let opt = |o: &Option<u64>| o.unwrap_or(NONE);
         match self {
             Self::New { pid } => out.extend(pid.raw().to_le_bytes()),
-            Self::Adopt { pids } | Self::Abandon { pids } => {
+            Self::Adopt { pids }
+            | Self::Abandon { pids }
+            | Self::Retire { pids }
+            | Self::Reinstate { pids } => {
                 for p in pids {
                     out.extend(p.raw().to_le_bytes());
                 }
             }
-            Self::Free { pid, old } => {
+            Self::Free { pid, old, retired } => {
                 out.extend(pid.raw().to_le_bytes());
                 out.extend(opt(old).to_le_bytes());
+                out.push(*retired as u8);
             }
             Self::Intent { class, slots } | Self::Release { class, slots } => {
                 out.push(class.index() as u8);
@@ -147,7 +173,7 @@ impl StoreRecord {
                 height,
                 used,
             } => {
-                out.push(matches!(tree, Tree::Space) as u8);
+                out.push(*tree as u8);
                 out.push(class.index() as u8);
                 out.push(*height);
                 out.extend(used.to_le_bytes());
@@ -187,6 +213,11 @@ impl StoreRecord {
             k if k == kinds::FREE => Self::Free {
                 pid: PageId::from_raw(word(0)?),
                 old: opt(8)?,
+                retired: match payload.get(16..)? {
+                    [0] => false,
+                    [1] => true,
+                    _ => return None,
+                },
             },
             k if k == kinds::INTENT => Self::Intent {
                 class: class(0)?,
@@ -203,11 +234,24 @@ impl StoreRecord {
             },
             k if k == kinds::ADOPT => Self::Adopt { pids: pids()? },
             k if k == kinds::ABANDON => Self::Abandon { pids: pids()? },
-            k if k == kinds::GROW => Self::Grow {
-                tree: if *payload.first()? == 1 {
-                    Tree::Space
+            k if k == kinds::RETIRE || k == kinds::REINSTATE => {
+                let pids = pids()?;
+                // One class: the levels logged with it are that class's.
+                if pids.iter().any(|p| p.class() != pids[0].class()) {
+                    return None;
+                }
+                if k == kinds::RETIRE {
+                    Self::Retire { pids }
                 } else {
-                    Tree::Map
+                    Self::Reinstate { pids }
+                }
+            }
+            k if k == kinds::GROW => Self::Grow {
+                tree: match *payload.first()? {
+                    0 => Tree::Map,
+                    1 => Tree::Space,
+                    2 => Tree::Retired,
+                    _ => return None,
                 },
                 class: class(1)?,
                 height: *payload.get(2)?,
@@ -226,12 +270,12 @@ impl StoreRecord {
 
     /// A payload from the log: the record and the levels it was logged under.
     pub fn decode_logged(kind: Kind, payload: &[u8]) -> Option<(Self, Heights)> {
-        let heights = [*payload.first()?, *payload.get(1)?];
-        Some((Self::decode(kind, &payload[2..])?, heights))
+        let heights: Heights = payload.get(..TREES)?.try_into().ok()?;
+        Some((Self::decode(kind, &payload[TREES..])?, heights))
     }
 
     fn framed_len(&self) -> u64 {
-        framed_len(2 + self.encode().len())
+        framed_len(TREES + self.encode().len())
     }
 }
 
@@ -273,9 +317,9 @@ pub struct PageStore {
     meta: Arc<MetaCache>,
     /// Per class, its data files by number, each opened once.
     files: [Segmented<SetOnce<Arc<dyn File>>>; CLASS_COUNT],
-    /// Levels of the page table (`[0]`) and free space (`[1]`) per class: written by the one
-    /// growing a tree, or by recovery, and only rising.
-    heights: [[AtomicU8; CLASS_COUNT]; 2],
+    /// Levels of the page table (`[0]`), free space (`[1]`) and retired marks (`[2]`) per class:
+    /// written by the one growing a tree, or by recovery, and only rising.
+    heights: [[AtomicU8; CLASS_COUNT]; TREES],
     /// Owned by the one growing a tree; another grower yields.
     growing: Mutex<()>,
     /// Where each class's next slot search starts: a hint.
@@ -313,9 +357,9 @@ pub struct PageStore {
     erasure: Mutex<Eraser>,
     epochs: Arc<Epochs>,
     /// Page numbers freed and not yet reusable: a step that could hold one may still run.
-    retired: Retired<PageId>,
+    freed_numbers: Retired<PageId>,
     /// The same numbers, by class, which no allocation may take.
-    retiring: [GrowBits; CLASS_COUNT],
+    unreusable: [GrowBits; CLASS_COUNT],
 }
 
 /// A slot freed, on its way to the eraser.
@@ -361,14 +405,14 @@ struct Erasure {
 }
 
 impl PageStore {
-    /// A page store over `log`, its page table and free space as the superblock in charge left
-    /// them (`heights`), or new.
+    /// A page store over `log`, its metadata trees as the superblock in charge left them
+    /// (`heights`), or new.
     pub fn new(
         io: Arc<dyn IO>,
         base: &str,
         config: StoreConfig,
         log: Arc<Log>,
-        heights: [[u8; CLASS_COUNT]; 2],
+        heights: [[u8; CLASS_COUNT]; TREES],
     ) -> Arc<Self> {
         let store = Self::recovering(io, base, config, heights);
         store.end_recovery();
@@ -376,16 +420,16 @@ impl PageStore {
         store
     }
 
-    /// A page store to recover, its page table and free space as the superblock in charge left
-    /// them. Its records are replayed with [`redo`](Self::redo) before the log is reopened, since
-    /// only the replay finds where the log ends; then [`resume`](Self::resume) gives it the log.
+    /// A page store to recover, its metadata trees as the superblock in charge left them. Its
+    /// records are replayed with [`redo`](Self::redo) before the log is reopened, since only the
+    /// replay finds where the log ends; then [`resume`](Self::resume) gives it the log.
     /// Until [`end_recovery`](Self::end_recovery), a metadata page with no whole copy reads as
     /// zeros: every change to it is in the log being replayed.
     pub fn recovering(
         io: Arc<dyn IO>,
         base: &str,
         config: StoreConfig,
-        heights: [[u8; CLASS_COUNT]; 2],
+        heights: [[u8; CLASS_COUNT]; TREES],
     ) -> Arc<Self> {
         let epochs = Arc::new(Epochs::new());
         let meta = Arc::new(MetaCache::new(
@@ -416,8 +460,8 @@ impl PageStore {
             orphans: Stack::default(),
             erasure: Mutex::new(Eraser::default()),
             epochs,
-            retired: Retired::default(),
-            retiring: Default::default(),
+            freed_numbers: Retired::default(),
+            unreusable: Default::default(),
         })
     }
 
@@ -445,7 +489,7 @@ impl PageStore {
             .expect("the page store's log is given before anything is appended")
     }
 
-    pub fn heights(&self) -> [[u8; CLASS_COUNT]; 2] {
+    pub fn heights(&self) -> [[u8; CLASS_COUNT]; TREES] {
         std::array::from_fn(|t| std::array::from_fn(|c| self.heights[t][c].load(Ordering::Acquire)))
     }
 
@@ -453,6 +497,7 @@ impl PageStore {
         [
             self.height(Tree::Map, class),
             self.height(Tree::Space, class),
+            self.height(Tree::Retired, class),
         ]
     }
 
@@ -580,8 +625,8 @@ impl PageStore {
     /// A new page of `class`, logged; it has no copy until its first write, and is provisional
     /// until adopted ([`adopt`](Self::adopt), or [`StoreRecord::Adopt`] in a group).
     pub fn allocate(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<PageId>> {
-        for pid in self.retired.reclaim(&self.epochs) {
-            self.retiring[pid.class().index()].clear(pid.number());
+        for pid in self.freed_numbers.reclaim(&self.epochs) {
+            self.unreusable[pid.class().index()].clear(pid.number());
         }
         let record_len = StoreRecord::New {
             pid: PageId::new(class, 0),
@@ -617,12 +662,16 @@ impl PageStore {
             let leaf = ids[0];
             if self.height(Tree::Map, class) != height
                 || radix::map_entry(locked.page_of(leaf), number) != FREE
-                || self.retiring[class.index()].get(pid.number())
+                || self.unreusable[class.index()].get(pid.number())
             {
                 // Taken, or the tree grew, since the search: look again.
                 continue;
             }
-            let heights = [height, self.height(Tree::Space, class)];
+            let heights = [
+                height,
+                self.height(Tree::Space, class),
+                self.height(Tree::Retired, class),
+            ];
             let (start, lsn) = self.append(&mut admitted, &StoreRecord::New { pid }, heights);
             set_map(&mut locked, Tree::Map, number, FREE, ALLOCATED);
             locked.commit(&self.meta, start, lsn);
@@ -633,8 +682,22 @@ impl PageStore {
 
     /// Drops `pid`: its number becomes free and its copy's slot, if any, is freed.
     pub fn free(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        self.free_page(pid, false)
+    }
+
+    /// Drops `pid`, which is retired, clearing its mark in the same record.
+    pub fn free_retired(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        self.free_page(pid, true)
+    }
+
+    fn free_page(self: &Arc<Self>, pid: PageId, retired: bool) -> Result<IOResult<()>> {
         let class = pid.class();
-        let record_len = StoreRecord::Free { pid, old: None }.framed_len();
+        let record_len = StoreRecord::Free {
+            pid,
+            old: None,
+            retired,
+        }
+        .framed_len();
         let mut admitted = match self.log().admit(record_len)? {
             IOResult::Done(a) => a,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -660,6 +723,14 @@ impl PageStore {
                 old,
             ));
         }
+        if retired {
+            ids.extend(radix::path(
+                Tree::Retired,
+                class,
+                self.height(Tree::Retired, class),
+                pid.number(),
+            ));
+        }
         let frames = match self.meta.get_all(&ids)? {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -670,7 +741,7 @@ impl PageStore {
         if self.heights() != heights {
             // A tree grew since the paths were taken.
             drop(locked);
-            return self.free(pid);
+            return self.free_page(pid, retired);
         }
         let leaf = radix::path(Tree::Map, class, 1, pid.number())[0];
         let current = radix::map_entry(locked.page_of(leaf), pid.number());
@@ -678,13 +749,18 @@ impl PageStore {
         let logged = [
             heights[Tree::Map as usize][class.index()],
             heights[Tree::Space as usize][class.index()],
+            heights[Tree::Retired as usize][class.index()],
         ];
         // Waiting before it reads as free, so no allocation takes it in between.
-        self.retiring[class.index()].set(pid.number());
-        let (start, lsn) = self.append(&mut admitted, &StoreRecord::Free { pid, old }, logged);
+        self.unreusable[class.index()].set(pid.number());
+        let record = StoreRecord::Free { pid, old, retired };
+        let (start, lsn) = self.append(&mut admitted, &record, logged);
         set_map(&mut locked, Tree::Map, pid.number(), entry, FREE);
         if let Some(old) = old {
             set_space(&mut locked, class, old, false);
+        }
+        if retired {
+            set_mark(&mut locked, class, pid.number(), false);
         }
         locked.commit(&self.meta, start, lsn);
         if let Some(old) = old {
@@ -692,8 +768,157 @@ impl PageStore {
         }
         self.settled(pid, lsn);
         // Its number waits for every step that could still hold it.
-        self.retired.retire(&self.epochs, pid);
+        self.freed_numbers.retire(&self.epochs, pid);
         Ok(IOResult::Done(()))
+    }
+
+    // ---------------------------------------------------------------- retired pages
+
+    /// The marks of `retire` and `reinstate` to change in one group another owner appends
+    /// (DESIGN.md §6.5): each class's retired marks grown to hold its pages, and the metadata
+    /// pages they change held in memory. Made before the owner takes its latches, latched with
+    /// [`Marks::lock`] while it holds them, and changed with [`LockedMarks::commit`] once its
+    /// group is appended. Step it until done.
+    pub fn marks(
+        self: &Arc<Self>,
+        retire: &[PageId],
+        reinstate: &[PageId],
+    ) -> Result<IOResult<Marks>> {
+        for &pid in retire.iter().chain(reinstate) {
+            let class = pid.class();
+            while pid.number() >= radix::capacity(Tree::Retired, self.height(Tree::Retired, class))
+            {
+                match self.grow(Tree::Retired, class)? {
+                    IOResult::Done(()) => {}
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                }
+            }
+        }
+        let mut records = Vec::new();
+        for class in SizeClass::all() {
+            let of = |pids: &[PageId]| -> Vec<PageId> {
+                pids.iter()
+                    .copied()
+                    .filter(|p| p.class() == class)
+                    .collect()
+            };
+            let heights = self.class_heights(class);
+            let (retire, reinstate) = (of(retire), of(reinstate));
+            if !retire.is_empty() {
+                records.push((StoreRecord::Retire { pids: retire }, heights));
+            }
+            if !reinstate.is_empty() {
+                records.push((StoreRecord::Reinstate { pids: reinstate }, heights));
+            }
+        }
+        let ids: Vec<MetaId> = records
+            .iter()
+            .flat_map(|(r, h)| record_pages(r, *h))
+            .collect();
+        let frames = match self.meta.get_all(&ids)? {
+            IOResult::Done(f) => f,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        Ok(IOResult::Done(Marks { records, frames }))
+    }
+
+    /// Frees every page still marked retired, each through `free`, which clears its mark as it
+    /// frees it (DESIGN.md §12, step 6): recovery's, once undo is done, since no snapshot survives
+    /// a crash to read the versions they held. Recovery frees them through the buffer pool
+    /// ([`BufferPool::free_retired`](super::buffer::BufferPool::free_retired)), since redo may have
+    /// put one back in a frame. Step it until done.
+    pub fn free_retired_pages(
+        self: &Arc<Self>,
+        mut free: impl FnMut(PageId) -> Result<IOResult<()>>,
+    ) -> Result<IOResult<()>> {
+        for class in SizeClass::all() {
+            loop {
+                let number = match self.find_used(Tree::Retired, class, 0)? {
+                    IOResult::Done(Some(n)) => n,
+                    IOResult::Done(None) => break,
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                };
+                match free(PageId::new(class, number))? {
+                    IOResult::Done(()) => {}
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                }
+            }
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Whether `pid` is marked retired.
+    #[cfg(test)]
+    pub fn retired(self: &Arc<Self>, pid: PageId) -> Result<IOResult<bool>> {
+        let class = pid.class();
+        if pid.number() >= radix::capacity(Tree::Retired, self.height(Tree::Retired, class)) {
+            return Ok(IOResult::Done(false));
+        }
+        let leaf = radix::path(Tree::Retired, class, 1, pid.number())[0];
+        let frame = match self.meta.get(leaf)? {
+            IOResult::Done(f) => f,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        match frame.read(|b| radix::space_bit(b, pid.number())) {
+            Some(retired) => Ok(IOResult::Done(retired)),
+            None => Ok(busy()),
+        }
+    }
+
+    /// The first unit of `tree` in use at or after `from`, or `None`.
+    fn find_used(
+        self: &Arc<Self>,
+        tree: Tree,
+        class: SizeClass,
+        from: u64,
+    ) -> Result<IOResult<Option<u64>>> {
+        let height = self.height(tree, class);
+        let mut from = from;
+        'search: loop {
+            if from >= radix::capacity(tree, height) {
+                return Ok(IOResult::Done(None));
+            }
+            let mut level = height - 1;
+            let mut index = 0u64;
+            loop {
+                let id = MetaId {
+                    tree,
+                    class,
+                    level,
+                    index,
+                };
+                let frame = match self.meta.get(id)? {
+                    IOResult::Done(f) => f,
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                };
+                let node_first = index * radix::span(tree, level);
+                let found = if level == 0 {
+                    frame.read(|b| radix::used_in_leaf(tree, b, index, from))
+                } else {
+                    let from_child = if from > node_first {
+                        radix::child(tree, level, from)
+                    } else {
+                        0
+                    };
+                    frame.read(|b| radix::child_in_use(b, from_child))
+                };
+                let Some(found) = found else {
+                    return Ok(busy());
+                };
+                match found {
+                    Some(u) if level == 0 => return Ok(IOResult::Done(Some(u))),
+                    Some(c) => {
+                        index = index * radix::FANOUT + c;
+                        level -= 1;
+                    }
+                    // Nothing in use from `from` on below this node: go on past it.
+                    None => {
+                        from = node_first + radix::span(tree, level);
+                        continue 'search;
+                    }
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- provisional pages
@@ -725,7 +950,12 @@ impl PageStore {
             prev: None,
         };
         // They change no metadata page, so no levels apply.
-        (header, record.logged([0, 0]))
+        (header, record.logged([0; TREES]))
+    }
+
+    /// Bytes an adoption or abandonment of `pages` pages takes in another owner's group.
+    pub fn group_record_len(pages: usize) -> u64 {
+        framed_len(TREES + 8 * pages)
     }
 
     /// Notes an adoption or abandonment appended in a group starting at `group`, ending at `lsn`.
@@ -824,7 +1054,7 @@ impl PageStore {
                             at = u + 1;
                             continue;
                         }
-                        if tree == Tree::Map && self.retiring[class.index()].get(u) {
+                        if tree == Tree::Map && self.unreusable[class.index()].get(u) {
                             at = u + 1;
                             continue;
                         }
@@ -1421,7 +1651,11 @@ impl WritePlan {
                 slots: slots.clone(),
             };
             let space_height = store.height(Tree::Space, class);
-            let heights = [store.height(Tree::Map, class), space_height];
+            let heights = [
+                store.height(Tree::Map, class),
+                space_height,
+                store.height(Tree::Retired, class),
+            ];
             let ids = record_pages(&record, heights);
             let frames = match store.meta.get_all(&ids)? {
                 IOResult::Done(f) => f,
@@ -1669,6 +1903,11 @@ impl<'a> Locked<'a> {
         })
     }
 
+    /// Lets every latch go, nothing written.
+    fn release_unchanged(self) {
+        self.holds.into_iter().for_each(MetaHold::release_unchanged);
+    }
+
     fn page_of(&mut self, id: MetaId) -> &mut Writer<'a> {
         let i = self
             .ids
@@ -1742,18 +1981,143 @@ fn set_space(locked: &mut Locked<'_>, class: SizeClass, slot: u64, used: bool) {
     }
 }
 
+/// Marks `number` of `class` retired or not, counting it above.
+fn set_mark(locked: &mut Locked<'_>, class: SizeClass, number: u64, retired: bool) {
+    let height = locked
+        .ids
+        .iter()
+        .filter(|id| id.tree == Tree::Retired && id.class == class)
+        .map(|id| id.level + 1)
+        .max()
+        .unwrap_or(1);
+    let path = radix::path(Tree::Retired, class, height, number);
+    let leaf = locked.page_of(path[0]);
+    let was = radix::space_bit(leaf, number);
+    assert_ne!(
+        was,
+        retired,
+        "page {number} of {class:?} is already {}",
+        if retired { "retired" } else { "not retired" }
+    );
+    radix::set_space_bit(leaf, number, retired);
+    let delta = if retired { 1 } else { -1 };
+    for id in &path[1..] {
+        radix::add_used_below(
+            locked.page_of(*id),
+            radix::child(Tree::Retired, id.level, number),
+            delta,
+        );
+    }
+}
+
+/// Retired marks to change in a group another owner appends: their records, and the metadata
+/// pages those change, held. Made by [`PageStore::marks`].
+pub struct Marks {
+    /// A retire and a reinstate per class at most, each with the levels it is laid out at.
+    records: Vec<(StoreRecord, Heights)>,
+    frames: Vec<MetaRef>,
+}
+
+impl Marks {
+    /// The records to append in the group, in order, after the owner's own.
+    pub fn records(&self) -> Vec<(Header, Vec<u8>)> {
+        self.records
+            .iter()
+            .map(|(r, h)| {
+                let header = Header {
+                    kind: r.kind(),
+                    flags: 0,
+                    txn: 0,
+                    prev: None,
+                };
+                (header, r.logged(*h))
+            })
+            .collect()
+    }
+
+    /// Latches the marks' pages; or `None`, holding nothing, if one is held or a tree grew since
+    /// the marks were made, whose paths they would miss: the owner lets its latches go, yields,
+    /// and makes the marks again.
+    pub fn lock<'a>(&'a self, store: &PageStore) -> Option<LockedMarks<'a>> {
+        let locked = Locked::new(&self.frames)?;
+        // A tree grows under its root's latch, which the marks hold: a height read now stays. A
+        // mark lays out its retired marks' path only, so only their height matters.
+        let at = Tree::Retired as usize;
+        let grown = self
+            .records
+            .iter()
+            .any(|(r, h)| store.height(Tree::Retired, record_class(r)) != h[at]);
+        if grown {
+            locked.release_unchanged();
+            return None;
+        }
+        Some(LockedMarks {
+            records: &self.records,
+            locked,
+        })
+    }
+}
+
+/// The class a retire or reinstate is of.
+fn record_class(r: &StoreRecord) -> SizeClass {
+    match r {
+        StoreRecord::Retire { pids } | StoreRecord::Reinstate { pids } => pids[0].class(),
+        _ => unreachable!("marks are retires and reinstates"),
+    }
+}
+
+/// Marks latched, to change once their records are appended.
+pub struct LockedMarks<'a> {
+    records: &'a [(StoreRecord, Heights)],
+    locked: Locked<'a>,
+}
+
+impl LockedMarks<'_> {
+    /// Sets and clears the marks, their records appended at `start..lsn`, and stamps their pages.
+    pub fn commit(mut self, store: &PageStore, start: Lsn, lsn: Lsn) {
+        for (r, _) in self.records {
+            let (pids, retired) = match r {
+                StoreRecord::Retire { pids } => (pids, true),
+                StoreRecord::Reinstate { pids } => (pids, false),
+                _ => unreachable!("marks are retires and reinstates"),
+            };
+            for pid in pids {
+                set_mark(&mut self.locked, pid.class(), pid.number(), retired);
+            }
+        }
+        self.locked.commit(&store.meta, start, lsn);
+    }
+}
+
 /// The metadata pages a record logged under `heights` changes.
-fn record_pages(r: &StoreRecord, [map_height, space_height]: Heights) -> Vec<MetaId> {
+fn record_pages(
+    r: &StoreRecord,
+    [map_height, space_height, retired_height]: Heights,
+) -> Vec<MetaId> {
     let map = |pid: &PageId| radix::path(Tree::Map, pid.class(), map_height, pid.number());
     let space = |class: SizeClass, slot: u64| radix::path(Tree::Space, class, space_height, slot);
+    let mark = |pid: &PageId| radix::path(Tree::Retired, pid.class(), retired_height, pid.number());
     let mut ids = match r {
         StoreRecord::New { pid } => map(pid),
-        StoreRecord::Free { pid, old } | StoreRecord::Remap { pid, old, .. } => {
+        StoreRecord::Free { pid, old, retired } => {
+            let mut ids = map(pid);
+            if let Some(old) = old {
+                ids.extend(space(pid.class(), *old));
+            }
+            if *retired {
+                ids.extend(mark(pid));
+            }
+            ids
+        }
+        StoreRecord::Remap { pid, old, .. } => {
             let mut ids = map(pid);
             if let Some(old) = old {
                 ids.extend(space(pid.class(), *old));
             }
             ids
+        }
+        StoreRecord::Retire { pids } | StoreRecord::Reinstate { pids } => {
+            pids.iter().flat_map(mark).collect()
         }
         StoreRecord::Intent { class, slots } | StoreRecord::Release { class, slots } => {
             slots.iter().flat_map(|&s| space(*class, s)).collect()
@@ -1781,7 +2145,11 @@ fn heights_of(ids: &[MetaId]) -> Heights {
             .max()
             .unwrap_or(1)
     };
-    [levels(Tree::Map), levels(Tree::Space)]
+    [
+        levels(Tree::Map),
+        levels(Tree::Space),
+        levels(Tree::Retired),
+    ]
 }
 
 /// What `r` does to the metadata page `id`, during recovery.
@@ -1807,19 +2175,41 @@ fn apply<P: BytesMut + ?Sized>(r: &StoreRecord, id: MetaId, page: &mut P) {
             );
         }
     };
+    let mark = |page: &mut P, number: u64, retired: bool| {
+        if id.level == 0 {
+            radix::set_space_bit(page, number, retired);
+        } else {
+            radix::add_used_below(
+                page,
+                radix::child(Tree::Retired, id.level, number),
+                if retired { 1 } else { -1 },
+            );
+        }
+    };
     let on =
         |tree: Tree, unit: u64| id.tree == tree && unit / radix::span(tree, id.level) == id.index;
     match r {
         StoreRecord::New { pid } if on(Tree::Map, pid.number()) => {
             map(page, pid.number(), false, ALLOCATED)
         }
-        StoreRecord::Free { pid, old } => {
+        StoreRecord::Free { pid, old, retired } => {
             if on(Tree::Map, pid.number()) {
                 map(page, pid.number(), true, FREE);
             }
             if let Some(old) = old {
                 if on(Tree::Space, *old) {
                     space(page, *old, false);
+                }
+            }
+            if *retired && on(Tree::Retired, pid.number()) {
+                mark(page, pid.number(), false);
+            }
+        }
+        StoreRecord::Retire { pids } | StoreRecord::Reinstate { pids } => {
+            let retired = matches!(r, StoreRecord::Retire { .. });
+            for p in pids {
+                if on(Tree::Retired, p.number()) {
+                    mark(page, p.number(), retired);
                 }
             }
         }

@@ -11,7 +11,8 @@
 //!    newer than the page. Whichever thread asks for work takes the next window to read or the
 //!    next partition ready to apply, so any number of threads recover together.
 //! 3. **Finishing.** Pages left provisional are freed, slots of intents no remap matched are
-//!    given back, every loser is undone ([`rollback::undo_loser`]), and a full checkpoint writes
+//!    given back, every loser is undone ([`rollback::undo_loser`]), every page still retired is
+//!    freed, since no snapshot survived to read the version it held, and a full checkpoint writes
 //!    back every page redone and undone. Its redo point is past where the log restarted, so
 //!    nothing replayed here is replayed again.
 //!
@@ -134,7 +135,7 @@ pub(super) struct Recovered {
     pub log: Arc<Log>,
     pub pool: Arc<BufferPool>,
     pub checkpointer: Checkpointer,
-    /// Restarted above every timestamp logged (DESIGN.md §12, step 6).
+    /// Restarted above every timestamp logged (DESIGN.md §12, step 7).
     pub clock: Arc<Clock>,
 }
 
@@ -391,9 +392,11 @@ impl Recovery {
         if let Some(at) = superblock.writers {
             let table = Log::read_group(self.io.clone(), &self.base, &self.log_config, at)?;
             match table.as_slice() {
-                [r] if r.header.kind == WRITERS => {
-                    open.extend(decode_table(&r.payload)?.into_iter().map(|w| (w.txn, w.last)))
-                }
+                [r] if r.header.kind == WRITERS => open.extend(
+                    decode_table(&r.payload)?
+                        .into_iter()
+                        .map(|w| (w.txn, w.last)),
+                ),
                 _ => {
                     return Err(LimboError::Corrupt(format!(
                         "the superblock's writer table at {} is no writer table",
@@ -643,6 +646,11 @@ impl Recovery {
                 last,
             )?;
         }
+        // Undo put back what was the losers', marks and all: what is still retired held versions
+        // only a snapshot could read. Through the pool: redo may have put such a page in a frame.
+        drive(&self.io, || {
+            self.store.free_retired_pages(|pid| pool.free_retired(pid))
+        })?;
         let control = self.control.take().expect("the control file");
         let superblock = self
             .recorded

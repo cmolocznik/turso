@@ -47,7 +47,7 @@ fn open_with(io: &Arc<dyn IO>, base: &str, config: BufferConfig) -> (Arc<Log>, A
             meta_pages: 1 << 10,
         },
         log.clone(),
-        [[1; CLASS_COUNT]; 2],
+        [[1; CLASS_COUNT]; crate::storage::atoll::meta::TREES],
     );
     let pool =
         BufferPool::new(config, Arc::new(LocalSource::new(store.clone())), store, 0).unwrap();
@@ -344,6 +344,76 @@ fn a_pass_writes_again_a_page_changed_while_its_earlier_write_was_in_flight() {
         "the shard's position passed a change no written copy holds"
     );
     model.check_all();
+}
+
+/// Marks `pid` retired, as the group of a versioned write that replaces its value does.
+fn retire(io: &Arc<dyn IO>, log: &Arc<Log>, store: &Arc<PageStore>, pid: PageId) {
+    let marks = drive(io, || store.marks(&[pid], &[])).unwrap();
+    let records = marks.records();
+    let lens: Vec<u64> = records.iter().map(|(_, p)| framed_len(p.len())).collect();
+    let mut admitted = drive(io, || log.admit(lens.iter().sum())).unwrap();
+    let locked = marks
+        .lock(store)
+        .expect("no one else latches the marks' pages");
+    let pieces: Vec<[&[u8]; 1]> = records.iter().map(|(_, p)| [p.as_slice()]).collect();
+    let group: Vec<(Header, &[&[u8]])> = records
+        .iter()
+        .zip(&pieces)
+        .map(|((h, _), p)| (*h, &p[..]))
+        .collect();
+    let lsn = if group.len() == 1 {
+        log.append(&mut admitted, &group[0].0, group[0].1)
+    } else {
+        *log.append_group(&mut admitted, &group).1.last().unwrap()
+    };
+    locked.commit(store, lsn - lens.iter().sum::<u64>(), lsn);
+}
+
+/// A retired page freed while its writeback is in flight (DESIGN.md §6.5): the free waits for the
+/// write to land, whose remap would otherwise bring the page back, and the page ends free,
+/// unmarked and in no frame.
+#[test]
+fn a_retired_page_freed_with_its_write_in_flight_stays_free_after_the_write_lands() {
+    // Writes complete only at a step, so the page's write stays in flight across the first try.
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
+    let (log, pool) = open_on(&io, "/db/retired", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        log: &log,
+        pool: &pool,
+        pages: Vec::new(),
+    };
+    model.allocate(class(0));
+    let pid = model.pages[0].pid;
+    let frame = model.pages[0].hint.load(Ordering::Relaxed) - 1;
+    retire(&io, &log, &pool.store, pid);
+    // Written back the way eviction does: marked, then stepped until the write is submitted.
+    pool.header(frame).flags.fetch_or(WRITING, Ordering::AcqRel);
+    let written = pool.write_back(class(0), vec![frame], false).unwrap();
+    while let Some(c) = pool.drive_writebacks().unwrap() {
+        io.wait_for_completion(c).unwrap();
+    }
+    assert!(!written.finished(), "the write is in flight");
+    assert!(
+        matches!(pool.free_retired(pid).unwrap(), IOResult::IO(_)),
+        "freed while its write was in flight"
+    );
+    drive(&io, || pool.free_retired(pid)).unwrap();
+    drive(&io, || pool.settle_writes()).unwrap();
+    assert!(written.finished(), "the write never landed");
+    assert_eq!(
+        drive(&io, || pool.store.entry(pid)).unwrap(),
+        crate::storage::atoll::radix::FREE,
+        "the write's remap brought the page back"
+    );
+    assert!(
+        !drive(&io, || pool.store.retired(pid)).unwrap(),
+        "still marked retired"
+    );
+    assert!(
+        pool.table.find(&pool.frames.headers, pid.raw()).is_none(),
+        "a frame still holds it"
+    );
 }
 
 /// A batch drained for another class empties even while a page in it changes faster than it can

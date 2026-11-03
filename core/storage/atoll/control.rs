@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! magic: u64 | version: u32 | reserved: u32 | seq: u64 | redo: u64 | segment_bytes: u64 |
-//! file_bytes: u64 | database_id: [u8; 16] | heights: [[u8; CLASS_COUNT]; 2] | clock: u64 |
+//! file_bytes: u64 | database_id: [u8; 16] | heights: [[u8; CLASS_COUNT]; 3] | clock: u64 |
 //! writers: u64 | continuations: u64 | (ended: u64, resumed: u64) * continuations | zeros |
 //! crc32c: u32
 //! ```
@@ -13,6 +13,7 @@
 
 use super::aligned::AlignedBlock;
 use super::log::{GroupStart, Lsn};
+use super::meta::TREES;
 use super::page::CLASS_COUNT;
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
@@ -25,7 +26,7 @@ const MAGIC: u64 = u64::from_le_bytes(*b"ATOLLSB1");
 const VERSION: u32 = 1;
 const SIZE: usize = 4096;
 const HEIGHTS: usize = 64;
-const CLOCK: usize = HEIGHTS + 2 * CLASS_COUNT;
+const CLOCK: usize = HEIGHTS + TREES * CLASS_COUNT;
 const WRITERS: usize = CLOCK + 8;
 const CONTINUATIONS: usize = WRITERS + 8;
 /// Continuations a superblock holds: all that fit between their count and the checksum.
@@ -39,8 +40,9 @@ pub struct Superblock {
     pub segment_bytes: u64,
     pub file_bytes: u64,
     pub database_id: [u8; 16],
-    /// Levels of the page table (`[0]`) and free space (`[1]`) of each size class.
-    pub heights: [[u8; CLASS_COUNT]; 2],
+    /// Levels of the page table (`[0]`), free space (`[1]`) and retired marks (`[2]`) of each
+    /// size class.
+    pub heights: [[u8; CLASS_COUNT]; TREES],
     /// The transaction clock when the superblock was written: above every timestamp of a change
     /// logged before the redo point.
     pub clock: u64,
@@ -64,8 +66,10 @@ impl Superblock {
         out[32..40].copy_from_slice(&self.segment_bytes.to_le_bytes());
         out[40..48].copy_from_slice(&self.file_bytes.to_le_bytes());
         out[48..64].copy_from_slice(&self.database_id);
-        out[HEIGHTS..HEIGHTS + CLASS_COUNT].copy_from_slice(&self.heights[0]);
-        out[HEIGHTS + CLASS_COUNT..HEIGHTS + 2 * CLASS_COUNT].copy_from_slice(&self.heights[1]);
+        for (t, heights) in self.heights.iter().enumerate() {
+            let at = HEIGHTS + t * CLASS_COUNT;
+            out[at..at + CLASS_COUNT].copy_from_slice(heights);
+        }
         out[CLOCK..CLOCK + 8].copy_from_slice(&self.clock.to_le_bytes());
         out[WRITERS..WRITERS + 8].copy_from_slice(&GroupStart::encode(self.writers).to_le_bytes());
         assert!(
@@ -123,9 +127,11 @@ impl Superblock {
                 word(WRITERS)
             ))
         })?;
-        let mut heights = [[0u8; CLASS_COUNT]; 2];
-        heights[0].copy_from_slice(&bytes[HEIGHTS..HEIGHTS + CLASS_COUNT]);
-        heights[1].copy_from_slice(&bytes[HEIGHTS + CLASS_COUNT..HEIGHTS + 2 * CLASS_COUNT]);
+        let mut heights = [[0u8; CLASS_COUNT]; TREES];
+        for (t, heights) in heights.iter_mut().enumerate() {
+            let at = HEIGHTS + t * CLASS_COUNT;
+            heights.copy_from_slice(&bytes[at..at + CLASS_COUNT]);
+        }
         Ok(Some(Self {
             seq: word(16),
             redo: word(24),
@@ -296,7 +302,7 @@ mod tests {
             segment_bytes: 1 << 28,
             file_bytes: 1 << 40,
             database_id: [9; 16],
-            heights: [[2; CLASS_COUNT], [1; CLASS_COUNT]],
+            heights: [[2; CLASS_COUNT], [1; CLASS_COUNT], [3; CLASS_COUNT]],
             clock: 1 << 40,
             writers: Some(GroupStart::at(0)),
             continuations: vec![(20_000, 20_480), (40_100, 40_960)],

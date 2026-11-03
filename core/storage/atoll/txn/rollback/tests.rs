@@ -3,14 +3,17 @@
 
 use super::*;
 use crate::io::crash::CrashIO;
+use crate::storage::atoll::btree::{value, Check};
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
 use crate::storage::atoll::control::{Control, Superblock};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::page::SizeClass;
+use crate::storage::atoll::page::CLASS_COUNT;
+use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
-use crate::storage::atoll::txn::versioned::Write;
+use crate::storage::atoll::txn::versioned::{Get, Write, WriteOp};
 use crate::storage::atoll::txn::{Abort, Commit, Isolation, TxnConfig};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const BASE: &str = "/db/undo";
 
@@ -47,8 +50,19 @@ fn run<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult<T>>) -> T {
 }
 
 fn value(tag: &str, i: usize) -> String {
+    sized(tag, i, VALUE)
+}
+
+/// Long enough to go out of line in a tree of either class: past a quarter of an 8 KiB node.
+const LARGE: usize = 12 << 10;
+
+fn large(tag: &str, i: usize) -> String {
+    sized(tag, i, LARGE)
+}
+
+fn sized(tag: &str, i: usize, len: usize) -> String {
     let head = format!("{tag}-{i}-");
-    format!("{head}{}", "v".repeat(VALUE - head.len()))
+    format!("{head}{}", "v".repeat(len - head.len()))
 }
 
 struct Db {
@@ -105,22 +119,17 @@ impl Db {
     }
 
     fn put(&self, txn: &mut Txn, tree: usize, key: &str, value: &str) {
+        let mut op = WriteOp::put(key.as_bytes(), value.as_bytes().to_vec(), Mode::Upsert);
         let write = run(&self.io, || {
-            self.trees[tree].put(
-                self.txns(),
-                &self.versions,
-                txn,
-                key.as_bytes(),
-                value.as_bytes(),
-                Mode::Upsert,
-            )
+            self.trees[tree].write(self.txns(), &self.versions, txn, &mut op)
         });
         assert!(matches!(write, Write::Done(_)), "{key}: {write:?}");
     }
 
     fn delete(&self, txn: &mut Txn, tree: usize, key: &str) {
+        let mut op = WriteOp::delete(key.as_bytes());
         run(&self.io, || {
-            self.trees[tree].delete(self.txns(), &self.versions, txn, key.as_bytes())
+            self.trees[tree].write(self.txns(), &self.versions, txn, &mut op)
         });
     }
 
@@ -151,8 +160,9 @@ impl Db {
         let mut out = BTreeMap::new();
         for tree in 0..2 {
             for key in keys {
+                let mut op = Get::new(key.as_bytes());
                 let v = run(&self.io, || {
-                    self.trees[tree].get(self.txns(), &self.versions, &mut txn, key.as_bytes())
+                    self.trees[tree].get(self.txns(), &self.versions, &mut txn, &mut op)
                 });
                 out.insert(
                     (tree, key.clone()),
@@ -162,6 +172,43 @@ impl Db {
         }
         self.commit(txn);
         out
+    }
+
+    /// Checks that the pages allocated are exactly the two trees' nodes and values, and those
+    /// handed over to be freed: none leaked, none retired, none freed that is in use.
+    fn check_whole(&self, label: &str) {
+        let mut expected = BTreeSet::new();
+        for tree in &self.trees {
+            let mut check = Check::default();
+            let stats = run(&self.io, || tree.tree().check(&mut check));
+            expected.extend(stats.pages.iter().copied());
+            for &v in &stats.values {
+                let pages = run(&self.io, || value::pages(self.db.pool(), v, &|| true));
+                expected.extend(pages.unwrap_or_else(|_| panic!("{label}: {v:?} lost its pages")));
+            }
+        }
+        let mut allocated = BTreeSet::new();
+        for c in 0..CLASS_COUNT {
+            let (mut number, mut free_run) = (0, 0);
+            // A run this long free is past every page: numbers are taken lowest first.
+            while free_run < 512 {
+                let pid = PageId::new(SizeClass::new(c).unwrap(), number);
+                if run(&self.io, || self.db.store().entry(pid)) != FREE {
+                    allocated.insert(pid);
+                    free_run = 0;
+                } else {
+                    free_run += 1;
+                }
+                number += 1;
+            }
+        }
+        expected.extend(self.db.store().orphans());
+        let leaked: Vec<_> = allocated.difference(&expected).collect();
+        let lost: Vec<_> = expected.difference(&allocated).collect();
+        assert!(
+            leaked.is_empty() && lost.is_empty(),
+            "{label}: pages allocated and unreachable {leaked:?}; reachable and free {lost:?}"
+        );
     }
 
     fn checkpoint(&self) -> Superblock {
@@ -239,6 +286,7 @@ fn recover_all(
         let crashed = (i % again == 0).then(|| image.crash(i as u64));
         let db = Db::recover(image, roots);
         assert_eq!(&db.state(keys), expected, "{label}: image {i}");
+        db.check_whole(&format!("{label}: image {i}"));
         out.recoveries += 1;
         drop(db);
         let Some(crashed) = crashed else {
@@ -285,6 +333,7 @@ fn recover_all(
                         expected,
                         "{label}: image {i}, in recovery {j}, in recovery {k}"
                     );
+                    db.check_whole(&format!("{label}: image {i}, in recovery {j}, {k}"));
                     out.recoveries += 1;
                 }
             }
@@ -294,6 +343,7 @@ fn recover_all(
                 expected,
                 "{label}: image {i}, in recovery {j}"
             );
+            db.check_whole(&format!("{label}: image {i}, in recovery {j}"));
             out.recoveries += 1;
         }
     }
@@ -361,6 +411,118 @@ fn crashes_through_a_transaction_and_its_rollback_recover_what_was_committed() {
             "{label}: no crash between two of a recovery's compensations: {r:?}"
         );
     }
+}
+
+/// As [`crashes_through_a_transaction_and_its_rollback_recover_what_was_committed`], with values
+/// too long for their leaves: the transaction replaces committed ones, replaces its own from an
+/// earlier statement, rewrites one again and again in one statement, deletes some and inserts new
+/// ones. Its log goes out in few, long writes, so it is crashed just before each lands, torn, and
+/// every few operations besides. Every image recovers to what was committed with no page leaked,
+/// left retired or freed in use, and so does the rollback running on: the pages of every value it
+/// wrote are freed, and the ones it replaced are kept.
+#[test]
+fn crashes_through_large_values_and_their_rollback_recover_what_was_committed_and_leak_nothing() {
+    // Where the crashes landed, over both seeds: the compensations go out in one write, which a
+    // crash tears inside them or not as its seed falls.
+    let (mut between, mut mid_undo) = (0, 0);
+    for seed in 0..2u64 {
+        let crash_io = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash_io.clone();
+        let db = Db::create(io);
+        let keys: Vec<String> = (0..12).map(|i| format!("k{i:03}")).collect();
+        let fresh: Vec<String> = (0..4).map(|i| format!("n{i:03}")).collect();
+        let mut txn = db.begin();
+        for (i, key) in keys.iter().enumerate() {
+            let v = if i % 3 == 0 {
+                value("committed", i)
+            } else {
+                large("committed", i)
+            };
+            for tree in 0..2 {
+                db.put(&mut txn, tree, key, &v);
+            }
+        }
+        db.commit(txn);
+        let every: Vec<String> = keys.iter().chain(&fresh).cloned().collect();
+        let expected = db.state(&every);
+        db.check_whole(&format!("seed {seed}: committed"));
+        crash_io.capture(crashes_in_recovery, 12, seed);
+        let mut t = db.begin();
+        for (i, key) in keys.iter().enumerate() {
+            db.put(&mut t, i % 2, key, &large("first", i));
+        }
+        for (i, key) in fresh.iter().enumerate() {
+            db.put(&mut t, i % 2, key, &large("fresh", i));
+        }
+        db.txns().statement(&mut t).unwrap();
+        // Its own versions from the first statement, and committed ones.
+        for key in keys.iter().skip(1).step_by(3) {
+            db.delete(&mut t, 1, key);
+        }
+        db.txns().statement(&mut t).unwrap();
+        for round in 0..4 {
+            db.put(&mut t, 0, &keys[0], &large("again", round));
+        }
+        let start = t.start();
+        db.rollback(t);
+        db.durable();
+        assert_eq!(
+            db.state(&every),
+            expected,
+            "seed {seed}: the rollback running on"
+        );
+        db.check_whole(&format!("seed {seed}: the rollback running on"));
+        let mut images = crash_io.captured();
+        images.push(crash_io.crash(seed));
+        let counts: Vec<usize> = images.iter().map(|i| compensations_in(i, start)).collect();
+        let all = *counts.iter().max().unwrap();
+        assert!(all > 0, "seed {seed}: no compensation durable: {counts:?}");
+        between += counts.iter().filter(|&&n| n > 0 && n < all).count();
+        let label = format!(
+            "seed {seed}, {} images, compensations {counts:?}",
+            images.len()
+        );
+        let r = recover_all(images, db.roots(), &every, &expected, 3, start, &label);
+        println!("{label}: {r:?}");
+        mid_undo += r.mid_undo;
+    }
+    assert!(
+        between > 0,
+        "no image between two of the rollback's compensations"
+    );
+    assert!(
+        mid_undo > 0,
+        "no crash between two of a recovery's compensations"
+    );
+}
+
+/// A value written since the last checkpoint and replaced by a commit is retired with no copy of
+/// its pages on disk, so redo puts them back in dirty frames. Recovery frees what is still retired
+/// (DESIGN.md §12, step 6), and those frames must go with the pages: a frame left dirty would be
+/// written back by the closing checkpoint as a page that is free.
+#[test]
+fn a_value_retired_before_any_copy_of_its_pages_was_written_leaves_the_pool_when_recovery_frees_it()
+{
+    let crash_io = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let db = Db::create(io);
+    db.checkpoint();
+    let key = "k".to_string();
+    for tag in ["old", "new"] {
+        let mut txn = db.begin();
+        db.put(&mut txn, 0, &key, &large(tag, 0));
+        db.commit(txn);
+    }
+    db.durable();
+    let roots = db.roots();
+    let image = Arc::new(crash_io.crash(0));
+    drop(db);
+    let db = Db::recover(image, roots);
+    assert_eq!(
+        db.state(std::slice::from_ref(&key))[&(0, key.clone())],
+        Some(large("new", 0))
+    );
+    db.check_whole("recovered");
 }
 
 /// A transaction changes `y`, then `x` in its next statement, and rolls back to between the two,

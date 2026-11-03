@@ -1,4 +1,4 @@
-//! Metadata pages: the page table and the free-space maps.
+//! Metadata pages: the page table, the free-space maps and the retired marks.
 //!
 //! They are 4 KiB pages in files of their own, one per tree, size class and level, and live in a
 //! cache of their own rather than the buffer pool, because a buffer miss needs the page table.
@@ -64,7 +64,12 @@ pub enum Tree {
     Map,
     /// Free space: which slots are in use.
     Space,
+    /// Retired marks: which pages hold a version a snapshot may still read (DESIGN.md §6.5).
+    Retired,
 }
+
+/// Metadata trees per size class.
+pub const TREES: usize = 3;
 
 /// A metadata page: its tree, the size class it describes, its level (0 for leaves) and its
 /// index within the level.
@@ -77,9 +82,9 @@ pub struct MetaId {
 }
 
 const META_BIT: u64 = 1 << 55;
-const TREE_SHIFT: u32 = 54;
-const CLASS_SHIFT: u32 = 50;
-const INDEX_BITS: u32 = 47;
+const TREE_SHIFT: u32 = 53;
+const CLASS_SHIFT: u32 = 49;
+const INDEX_BITS: u32 = 46;
 /// Levels an id has room for, in the bits between its index and its class.
 const LEVELS: usize = 1 << (CLASS_SHIFT - INDEX_BITS);
 
@@ -101,10 +106,11 @@ impl MetaId {
     /// The id whose [`pid`](Self::pid) has `number`.
     fn from_number(number: u64) -> Self {
         Self {
-            tree: if number >> TREE_SHIFT & 1 == 0 {
-                Tree::Map
-            } else {
-                Tree::Space
+            tree: match number >> TREE_SHIFT & 3 {
+                0 => Tree::Map,
+                1 => Tree::Space,
+                2 => Tree::Retired,
+                _ => unreachable!("the cache tags only ids it made"),
             },
             class: SizeClass::new((number >> CLASS_SHIFT & 0xf) as usize).expect("a size class"),
             level: (number >> INDEX_BITS & (LEVELS as u64 - 1)) as u8,
@@ -130,6 +136,7 @@ fn path(base: &str, (tree, class, level): FileKey) -> String {
     let tree = match tree {
         Tree::Map => "map",
         Tree::Space => "free",
+        Tree::Retired => "retired",
     };
     format!("{base}.{tree}{}.{level}", class.index())
 }
@@ -381,7 +388,7 @@ impl MetaCache {
             io,
             base: base.to_string(),
             budget,
-            files: (0..2 * CLASS_COUNT * LEVELS)
+            files: (0..TREES * CLASS_COUNT * LEVELS)
                 .map(|_| FileSlot::default())
                 .collect(),
             cells: Cells::new(epochs.clone()),

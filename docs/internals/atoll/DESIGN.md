@@ -94,6 +94,7 @@ Durability is chosen per database:
 {db}.c{k}.{n}      data file n of size class k, each at most a fixed size
 {db}.map{k}.{l}    page-table pages of size class k at level l
 {db}.free{k}.{l}   free-space pages of size class k at level l
+{db}.retired{k}.{l} retired-page marks of size class k at level l
 {db}.log.{n}       log segments by number, and the next one prepared
 {db}.temp{k}       temporary pages of size class k, deleted at every open
 ```
@@ -105,9 +106,11 @@ Durability is chosen per database:
   - the database id (128 random bits);
   - the creation parameters;
   - the checkpoint number and the redo point;
-  - per class, where the page-table root and the free-space root are;
+  - per class, the levels of its page table, free space and retired marks, which place their
+    roots;
   - the clock floor;
-  - the gaps the log goes on past (section 7.4), as many as fit: 249;
+  - where the checkpoint's writer table starts in the log (section 10);
+  - the gaps the log goes on past (section 7.4), as many as fit: 248;
   - a CRC32C.
 
   It is written with a durable write. A torn superblock leaves the other one in charge. A
@@ -146,14 +149,14 @@ churn. Where pages live in object storage, a second table beside it says where (
 
 ### 6.2 Metadata pages
 
-The page table and free space are radix trees of 4 KiB metadata pages, one of each per class
-(`core/storage/atoll/radix.rs`, `meta.rs`).
+The page table, free space and retired marks (section 6.5) are radix trees of 4 KiB metadata
+pages, one of each per class (`core/storage/atoll/radix.rs`, `meta.rs`).
 
 - **Leaves.** In the page table, 509 entries per page. In free space, a bit per slot, 32,576 per
-  page.
+  page. In the retired marks, a bit per page number, 32,576 per page.
 - **Above the leaves,** a `u64` per child: how many units below it are in use. A free number or
-  slot is found without reading pages that have none. A page of zeros is all free, which is how
-  every page starts.
+  slot is found without reading pages that have none, and so is every retired page. A page of
+  zeros is all free, which is how every page starts.
 - **Lookups** go straight to the leaf a page number falls in; only allocation descends.
 - **Growing.** A tree grows a level at the top, the old root becoming child 0 of the new one. A
   page's place in its file is fixed by its level and index.
@@ -221,6 +224,24 @@ deleted at every open, and recovery never reads them. Built in `buffer/temp.rs`:
 - **Trees.** A B-tree whose root is a temporary page is a temporary tree
   (`Tree::create_temporary`): its nodes and out-of-line values are temporary pages, and nothing it
   does is logged.
+
+### 6.5 Retired pages
+
+The pages of an out-of-line value that a versioned write replaced stay, copies and all, while a
+snapshot may still read the version they hold (section 11.2). The page store marks them retired:
+
+- **Marked with the change.** The mark is set by a record in the group that replaces the value,
+  under the latches of the marks' pages, which are only tried while the tree's leaf latch is held,
+  as every metadata latch is. A mark is never pending: once its group is in the log the pages are
+  retired, and nothing about them holds the redo point back.
+- **Cleared by the compensation** that puts the value back, a rollback's or recovery's undo, in
+  the same group, which abandons the pages of the version it removes.
+- **Freed** by garbage collection, through the version index entry of the committed transaction
+  that replaced the version: never through one of a transaction rolled back, whose value went
+  back. Recovery, once undo is done, frees every page still marked, since no snapshot survives a
+  crash. Freeing a retired page clears its mark in the same record, and goes through the buffer
+  pool, which lets a writeback in flight land and drops the page's frame: redo puts the pages of a
+  value written since the redo point back in frames.
 
 ## 7. The log
 
@@ -610,7 +631,12 @@ Built in `txn/mod.rs`.
     key and the 18 bytes around it.
   - **Reading.** A reader starts from the leaf's version and follows the chain while a version is
     not visible to it. A version flagged as the key's first ends the chain without a lookup.
-    Built in `txn/versioned.rs`, for values that fit their leaf.
+    Built in `txn/versioned.rs`.
+  - **Values out of line.** An index entry holds the replaced version's header and its value, or
+    the reference of a value out of line, whose pages are then retired (section 6.5). A version
+    its own statement replaces again is the exception: no reader can reach it, since others
+    follow the chain to the version the statement found and the statement reads its newest, so
+    its pages are abandoned at once.
   - **Fat tuples.** A tuple updated very often keeps its recent deltas inline instead (OSIC's fat
     tuples).
 - **Graveyard.** A deleted entry that no running OLTP snapshot can see, but an older snapshot still
@@ -650,6 +676,8 @@ where it stood at its snapshot.
   and the key's entry checked: an index entry is put before the leaf write it is for, which may
   never happen, so the entry is put back only if it is still that statement's. Then the entry it
   replaced goes back whole, version header and all, or the key is removed if it had no entry.
+  An entry put back that holds a value out of line clears its pages' retired mark, and the pages
+  of the version removed are abandoned, in the same compensation (section 6.5).
   - **Compensation.** Each key put back is one compensation record: the leaf's redo, and the unit
     of work it completed, `(transaction, statement, tree, key)`, every change that statement made
     to that key undone. A unit is never half done, so after a crash recovery skips exactly the
@@ -668,7 +696,9 @@ where it stood at its snapshot.
     (UNIFIED_STORAGE_DESIGN.md §4.1, §8.2, §11.2).
 - **Garbage collection** is cooperative, done between transactions (OSIC §3.5). Watermarks give the
   oldest snapshot, the oldest OLTP snapshot and the newest OLAP snapshot.
-  - Versions below them are dropped by range deletes on the version indexes.
+  - Versions below them are dropped by range deletes on the version indexes. An entry whose
+    replacing transaction committed frees the retired pages of the value it holds; one of a
+    transaction rolled back frees nothing, since its rollback put that value back.
   - Deleted entries are removed, or moved to the graveyard.
 
 ### 11.6 Isolation levels
@@ -728,11 +758,20 @@ creates it if there is no superblock, and recovers it otherwise.
    was compensated beyond the log and the tree, whatever a loser's size, and the losers may be
    undone in any order. Then End. Nothing here reads the version indexes, which do not survive a
    crash.
-6. **Restart the clock** above every logged timestamp: the clock the superblock recorded, which is
+   - A change its own statement made to a key again logs, as what undoes it, the entry the
+     statement found, not the one it replaced: the statement's earlier versions of the key were
+     abandoned when it replaced them, so undo puts back what the statement found once, at its
+     newest change, and the check skips the rest.
+   - Undoing a change of a value out of line clears the retired mark of the value it puts back
+     and abandons the pages of the value it removes, in the same compensation (section 6.5).
+6. **Free the retired pages** still marked (section 6.5): no snapshot survives a crash, so nothing
+   can read the versions they held. They go through the buffer pool, since redo may have put one
+   in a frame, which the closing checkpoint would otherwise write back as a page that is free.
+7. **Restart the clock** above every logged timestamp: the clock the superblock recorded, which is
    above every change logged before the redo point, and every transaction id and commit
    timestamp replayed. Every header left in a page is then a committed version: each slot's commit
    log starts with every transaction before the restart committed.
-7. **Checkpoint.** A full checkpoint writes back every page redone. Its redo point is past where
+8. **Checkpoint.** A full checkpoint writes back every page redone. Its redo point is past where
    the log restarted, which recovery checks, so nothing replayed is replayed again and the bytes
    between the old end and the restart are never read.
 
@@ -770,7 +809,9 @@ Built in `core/storage/atoll/btree`, except key encoding for SQL records, which 
     chunks under a directory page; a billion bytes, SQLite's limit, takes 120 chunks. Every page
     of a value carries a random id, so a reader that followed a reference before the value was
     replaced finds out and reads the leaf again. Its pages are written provisional, in log records
-    of at most one log chunk, and adopted by the record that puts the reference in the leaf.
+    of at most one log chunk, and adopted by the record that puts the reference in the leaf. A
+    value replaced in a plain tree is abandoned in the group that replaces it; in a versioned
+    tree it is retired instead (section 6.5).
 - **Child entries** hold the child's page id and a frame hint (section 9.2). A descent that finds a
   hint stale refreshes it if it can latch the parent at once, keeping the latch's version, since no
   reader trusts a hint.
@@ -942,7 +983,12 @@ submission or later from `IO::step`. Therefore:
   - a rollback to a savepoint, after which another transaction changes and commits a key put back;
   - a writer spanning several checkpoints and segment deletions;
   - recovery's own undo, between two of its compensations, and the recovery of that crash between
-    two of its own, with each checkpoint's superblock torn.
+    two of its own, with each checkpoint's superblock torn;
+  - all of it with values out of line, replaced, rewritten in one statement, deleted and
+    inserted: every recovery leaves each page reachable or free, none retired.
+- **Retired pages.** Crashes after every few IO operations of allocations, copies, frees, retires
+  and reinstates, and a mark only a metadata page holds, its record behind the redo point, in a
+  second leaf of marks (`store/tests.rs`).
 - **Followers.** An app server or replica at log position X reads exactly the committed state at X.
 - **Isolation.** Turso's `concurrent-simulator` runs Elle over SQL histories.
 - **Property tests:**
@@ -980,8 +1026,9 @@ work says which parts are done.
 7. **Transactions.** Temporary pages and temporary trees (done: `buffer/temp.rs`); slots, clock,
    commit logs, visibility, commit and restarting the clock (done: `txn/mod.rs`); version headers,
    version index, conflicts and waits (done: `txn/versioned.rs`); rollback, the writer table and
-   undo in recovery (done: `txn/rollback.rs`, `log/writers.rs`, `recovery.rs`); graveyard,
-   garbage collection.
+   undo in recovery (done: `txn/rollback.rs`, `log/writers.rs`, `recovery.rs`); values out of
+   line in versioned trees, and retired pages (done: `txn/versioned.rs`, `store.rs`); graveyard,
+   garbage collection, which frees retired pages as it drops the versions they hold.
 8. **Turso integration.**
    - the storage-mode interface;
    - `AtollCursor`, and the key encoding for SQL records (section 13);

@@ -1,8 +1,10 @@
 use super::*;
 use crate::io::MemoryIO;
+use crate::storage::atoll::btree::value;
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{Kind, LogConfig};
+use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
 use crate::storage::atoll::txn::{Commit, TxnConfig};
@@ -78,9 +80,42 @@ fn run<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult<T>>) -> T {
     out.unwrap()
 }
 
+/// `s`, then `pad` more bytes.
+fn padded(s: &str, pad: usize) -> String {
+    format!("{s}{}", ".".repeat(pad))
+}
+
+/// Long enough to go out of line in the tree's 4 KiB nodes, in a page of its own.
+const LARGE: usize = 12 << 10;
+
 impl Db {
     fn txns(&self) -> &Transactions {
         self.db.transactions()
+    }
+
+    /// The pages of the out-of-line value `key`'s newest version holds; none if inline.
+    fn pages_of(&self, key: &str) -> Vec<PageId> {
+        let stored = run(&self.io, || self.tree.tree().stored(key.as_bytes())).expect("an entry");
+        match stored.value {
+            StoredValue::Inline(_) => Vec::new(),
+            StoredValue::OutOfLine(r) => run(&self.io, || {
+                Ok(match value::pages(self.db.pool(), r, &|| true)? {
+                    IOResult::Done(Ok(pages)) => IOResult::Done(pages),
+                    IOResult::Done(Err(_)) => panic!("{key}: its value's pages are gone"),
+                    IOResult::IO(io) => IOResult::IO(io),
+                })
+            }),
+        }
+    }
+
+    fn retired(&self, pid: PageId) -> bool {
+        run(&self.io, || self.db.store().retired(pid))
+    }
+
+    /// Whether `pid` is free, or handed over to be freed.
+    fn freed(&self, pid: PageId) -> bool {
+        run(&self.io, || self.db.store().entry(pid)) == FREE
+            || self.db.store().orphans().contains(&pid)
     }
 
     fn begin(&self, isolation: Isolation) -> Txn {
@@ -90,30 +125,32 @@ impl Db {
     }
 
     fn get(&self, txn: &mut Txn, key: &str) -> Option<String> {
+        self.get_bytes(txn, key)
+            .map(|v| String::from_utf8(v).unwrap())
+    }
+
+    fn get_bytes(&self, txn: &mut Txn, key: &str) -> Option<Vec<u8>> {
+        let mut op = Get::new(key.as_bytes());
         run(&self.io, || {
-            self.tree
-                .get(self.txns(), &self.versions, txn, key.as_bytes())
+            self.tree.get(self.txns(), &self.versions, txn, &mut op)
         })
-        .map(|v| String::from_utf8(v).unwrap())
     }
 
     fn put(&self, txn: &mut Txn, key: &str, value: &str, mode: Mode) -> Write {
+        self.put_bytes(txn, key, value.as_bytes().to_vec(), mode)
+    }
+
+    fn put_bytes(&self, txn: &mut Txn, key: &str, value: Vec<u8>, mode: Mode) -> Write {
+        let mut op = WriteOp::put(key.as_bytes(), value, mode);
         run(&self.io, || {
-            self.tree.put(
-                self.txns(),
-                &self.versions,
-                txn,
-                key.as_bytes(),
-                value.as_bytes(),
-                mode,
-            )
+            self.tree.write(self.txns(), &self.versions, txn, &mut op)
         })
     }
 
     fn delete(&self, txn: &mut Txn, key: &str) -> Write {
+        let mut op = WriteOp::delete(key.as_bytes());
         run(&self.io, || {
-            self.tree
-                .delete(self.txns(), &self.versions, txn, key.as_bytes())
+            self.tree.write(self.txns(), &self.versions, txn, &mut op)
         })
     }
 
@@ -298,23 +335,18 @@ impl Db {
     /// `key` as a transaction begun now reads it in `tree`.
     fn read_in(&self, tree: &VersionedTree, key: &str) -> Option<String> {
         let mut txn = self.begin(Isolation::Snapshot);
+        let mut op = Get::new(key.as_bytes());
         let v = run(&self.io, || {
-            tree.get(self.txns(), &self.versions, &mut txn, key.as_bytes())
+            tree.get(self.txns(), &self.versions, &mut txn, &mut op)
         });
         self.commit(txn);
         v.map(|v| String::from_utf8(v).unwrap())
     }
 
     fn put_in(&self, tree: &VersionedTree, txn: &mut Txn, key: &str, value: &str, mode: Mode) {
+        let mut op = WriteOp::put(key.as_bytes(), value.as_bytes().to_vec(), mode);
         run(&self.io, || {
-            tree.put(
-                self.txns(),
-                &self.versions,
-                txn,
-                key.as_bytes(),
-                value.as_bytes(),
-                mode,
-            )
+            tree.write(self.txns(), &self.versions, txn, &mut op)
         });
     }
 
@@ -505,7 +537,7 @@ fn a_rollback_leaves_a_key_it_waited_on_to_the_transaction_that_wrote_it() {
     };
     let mut entry = Put::new(
         &index_key(t.start(), t.command(), db.tree.root(), b"k"),
-        encode_entry(Some(&committed)).unwrap(),
+        encode_entry(Some(&committed)),
         Mode::Upsert,
     );
     run(&db.io, || index.put(&mut entry));
@@ -530,12 +562,12 @@ fn put_waiting(db: &Db, txn: &mut Txn, key: &str, value: &str) {
 /// sees a value the rolled-back one wrote, and nothing reads as corrupt, a version rolled back
 /// under a writer that read it included. Every transaction takes the keys in one order, so no
 /// wait closes a cycle.
-fn rolled_back_values_are_never_read(rounds: usize) {
+fn rolled_back_values_are_never_read(rounds: usize, pad: usize) {
     const KEYS: [&str; 4] = ["k0", "k1", "k2", "k3"];
     let db = Arc::new(open());
     let mut setup = db.begin(Isolation::Snapshot);
     for k in KEYS {
-        db.put(&mut setup, k, "c", Mode::Insert);
+        db.put(&mut setup, k, &padded("c", pad), Mode::Insert);
     }
     db.commit(setup);
     let roller = {
@@ -544,10 +576,11 @@ fn rolled_back_values_are_never_read(rounds: usize) {
             for i in 0..rounds {
                 let mut t = db.begin(Isolation::ReadCommitted);
                 for k in KEYS {
-                    put_waiting(&db, &mut t, k, &format!("dead{i}"));
+                    put_waiting(&db, &mut t, k, &padded(&format!("dead{i}"), pad));
                 }
                 db.txns().statement(&mut t).unwrap();
-                put_waiting(&db, &mut t, KEYS[i % KEYS.len()], &format!("dead{i}again"));
+                let again = padded(&format!("dead{i}again"), pad);
+                put_waiting(&db, &mut t, KEYS[i % KEYS.len()], &again);
                 db.rollback(t);
             }
         })
@@ -558,7 +591,7 @@ fn rolled_back_values_are_never_read(rounds: usize) {
             for i in 0..rounds {
                 let mut t = db.begin(Isolation::ReadCommitted);
                 for k in &KEYS[..2] {
-                    put_waiting(&db, &mut t, k, &format!("u{i}"));
+                    put_waiting(&db, &mut t, k, &padded(&format!("u{i}"), pad));
                 }
                 db.commit(t);
             }
@@ -583,27 +616,94 @@ fn rolled_back_values_are_never_read(rounds: usize) {
     for t in [roller, updater, reader] {
         t.join().unwrap();
     }
-    let last = format!("u{}", rounds - 1);
+    let last = padded(&format!("u{}", rounds - 1), pad);
+    let c = padded("c", pad);
     assert_eq!(
         KEYS.map(|k| db.read_in(&db.tree, k)),
-        [
-            Some(last.clone()),
-            Some(last),
-            Some("c".into()),
-            Some("c".into())
-        ]
+        [Some(last.clone()), Some(last), Some(c.clone()), Some(c)]
     );
 }
 
 #[test]
 fn rolled_back_values_are_never_read_on_threads() {
-    rolled_back_values_are_never_read(200);
+    rolled_back_values_are_never_read(200, 0);
 }
 
 #[cfg(shuttle)]
 #[test]
 fn rolled_back_values_are_never_read_in_shuttle_schedules() {
-    crate::storage::atoll::testing::schedules(|| rolled_back_values_are_never_read(3), 300);
+    crate::storage::atoll::testing::schedules(|| rolled_back_values_are_never_read(3, 0), 300);
+}
+
+/// [`rolled_back_values_are_never_read`] with every value out of line: a reader follows a chain
+/// to a replaced version's value while the writer that replaced it rolls back and puts it back.
+#[test]
+fn rolled_back_values_out_of_line_are_never_read_on_threads() {
+    rolled_back_values_are_never_read(100, LARGE);
+}
+
+#[cfg(shuttle)]
+#[test]
+fn rolled_back_values_out_of_line_are_never_read_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(|| rolled_back_values_are_never_read(2, LARGE), 300);
+}
+
+/// Values too long for a leaf keep their versions: a snapshot reads the one replaced since from
+/// its version index, its pages kept and retired. A statement that writes one again frees the one
+/// it wrote before, which no one reads, the statement itself reading what it found; a rollback
+/// puts back the value its statement found by its reference, no longer retired, and frees the one
+/// it wrote.
+#[test]
+fn values_out_of_line_keep_their_versions_and_free_what_no_one_reads() {
+    let db = open();
+    let big = |tag: &str| padded(tag, LARGE);
+    let mut setup = db.begin(Isolation::Snapshot);
+    assert_eq!(
+        db.put(&mut setup, "k", &big("v1"), Mode::Insert),
+        DONE_INSERTED
+    );
+    db.commit(setup);
+    let v1 = db.pages_of("k");
+    assert!(!v1.is_empty(), "v1 stayed in its leaf");
+    let mut before = db.begin(Isolation::Snapshot);
+    let mut w = db.begin(Isolation::Snapshot);
+    assert_eq!(db.put(&mut w, "k", &big("v2"), Mode::Update), DONE_UPDATED);
+    assert!(
+        v1.iter().all(|&p| db.retired(p)),
+        "v1's pages are not retired"
+    );
+    db.commit(w);
+    assert_eq!(db.get(&mut before, "k"), Some(big("v1")));
+    db.commit(before);
+    assert_eq!(db.read_in(&db.tree, "k"), Some(big("v2")));
+    let v2 = db.pages_of("k");
+    let mut t = db.begin(Isolation::Snapshot);
+    assert_eq!(db.put(&mut t, "k", &big("v3"), Mode::Update), DONE_UPDATED);
+    let v3 = db.pages_of("k");
+    assert!(
+        v2.iter().all(|&p| db.retired(p)),
+        "v2's pages are not retired"
+    );
+    assert_eq!(db.put(&mut t, "k", &big("v4"), Mode::Update), DONE_UPDATED);
+    assert!(
+        v3.iter().all(|&p| db.freed(p)),
+        "a version only its own statement wrote kept its pages"
+    );
+    // The statement reads what it found, through its own index entry; the next one, what it wrote.
+    assert_eq!(db.get(&mut t, "k"), Some(big("v2")));
+    db.txns().statement(&mut t).unwrap();
+    assert_eq!(db.get(&mut t, "k"), Some(big("v4")));
+    let v4 = db.pages_of("k");
+    db.rollback(t);
+    assert_eq!(db.read_in(&db.tree, "k"), Some(big("v2")));
+    assert!(
+        v2.iter().all(|&p| !db.retired(p)),
+        "v2's pages stayed retired"
+    );
+    assert!(
+        v4.iter().all(|&p| db.freed(p)),
+        "the value rolled back kept its pages"
+    );
 }
 
 /// A writer reads a key whose newest version is another transaction's, and that one rolls back

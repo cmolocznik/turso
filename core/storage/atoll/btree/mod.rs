@@ -169,7 +169,7 @@ impl Tree {
         class: SizeClass,
         temporary: bool,
     ) -> Result<IOResult<PageId>> {
-        let adopt_len = framed_len(2 + 8);
+        let adopt_len = PageStore::group_record_len(1);
         let init_len = framed_len(8 + 4 + class.size());
         let mut grant = if temporary {
             Grant(None)
@@ -307,10 +307,26 @@ impl Tree {
         nodes: &[Record<'_>],
         store: &[StoreRecord],
     ) -> (Option<GroupStart>, Vec<Lsn>) {
+        let (start, lsns, _) = self.log_marked(grant, txn, nodes, store, &[]);
+        (start, lsns)
+    }
+
+    /// As [`log_as`](Self::log_as), with the records of retired marks ([`PageStore::marks`])
+    /// after the rest; returns too where they start and end, to change the marks with.
+    fn log_marked(
+        &self,
+        grant: &mut Grant,
+        txn: Option<&TxnTail>,
+        nodes: &[Record<'_>],
+        store: &[StoreRecord],
+        marks: &[(Header, Vec<u8>)],
+    ) -> (Option<GroupStart>, Vec<Lsn>, Option<(Lsn, Lsn)>) {
         let Some(admitted) = &mut grant.0 else {
+            assert!(marks.is_empty(), "a temporary tree retires nothing");
             return (
                 None,
                 nodes.iter().map(|_| self.pool.temporary_lsn()).collect(),
+                None,
             );
         };
         let mut payloads: Vec<(Header, Vec<u8>)> = nodes
@@ -330,6 +346,7 @@ impl Tree {
             })
             .collect();
         payloads.extend(store.iter().map(PageStore::group_record));
+        payloads.extend(marks.iter().cloned());
         let pieces: Vec<[&[u8]; 1]> = payloads.iter().map(|(_, p)| [p.as_slice()]).collect();
         let records: Vec<(Header, &[&[u8]])> = payloads
             .iter()
@@ -352,7 +369,12 @@ impl Tree {
         for (s, &lsn) in store.iter().zip(&lsns[nodes.len()..]) {
             self.store.grouped(s, start.get(), lsn);
         }
-        (Some(start), lsns[..nodes.len()].to_vec())
+        // The marks start where the record before them ends, which a node's always is.
+        let marked = (!marks.is_empty()).then(|| {
+            let first = nodes.len() + store.len();
+            (lsns[first - 1], *lsns.last().expect("a record"))
+        });
+        (Some(start), lsns[..nodes.len()].to_vec(), marked)
     }
 
     // ---------------------------------------------------------------- descending
@@ -566,8 +588,18 @@ impl Tree {
             if !done!(op.old_pages(&self.pool, self.head, present.as_ref(), &|| leaf.validate())) {
                 continue;
             }
-            let out_of_line = !self.limits.inline(op.key.len(), self.head + op.value_len);
-            if out_of_line {
+            if let Some((reference, pages)) = &mut op.restoring {
+                if pages.is_none() {
+                    // Retired, so no page of it is freed under this read.
+                    match done!(value::pages(&self.pool, *reference, &|| true)) {
+                        Ok(p) => *pages = Some(p),
+                        Err(_) => return Err(corrupt_value(*reference)),
+                    }
+                }
+            }
+            let out_of_line = op.restoring.is_some()
+                || !self.limits.inline(op.key.len(), self.head + op.value_len);
+            if out_of_line && op.restoring.is_none() {
                 let write = op.write.get_or_insert_with(|| {
                     ValueWrite::new(
                         std::mem::take(&mut op.value),
@@ -578,23 +610,55 @@ impl Tree {
                 done!(write.step(&self.pool, self.journal()));
             }
             let mut stored = op.head.clone();
-            match &op.write {
-                Some(w) => stored.extend_from_slice(&w.reference().encode()),
-                None => stored.extend_from_slice(&op.value),
+            match (&op.write, &op.restoring) {
+                (Some(w), _) => stored.extend_from_slice(&w.reference().encode()),
+                (None, Some((reference, _))) => stored.extend_from_slice(&reference.encode()),
+                (None, None) => stored.extend_from_slice(&op.value),
             }
             let adopt = op.write.as_ref().map(|w| w.pages()).unwrap_or_default();
-            let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
+            let replaced = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
+            let (abandon, retire) = if op.retire_old {
+                (Vec::new(), replaced)
+            } else {
+                (replaced, Vec::new())
+            };
+            let reinstate = op
+                .restoring
+                .as_ref()
+                .and_then(|(_, pages)| pages.clone())
+                .unwrap_or_default();
+            // Marks change in the group, under latches taken once the leaf's is held.
+            let marks = if retire.is_empty() && reinstate.is_empty() {
+                None
+            } else {
+                assert!(
+                    self.journal().is_some(),
+                    "a temporary tree retires and reinstates nothing"
+                );
+                Some(done!(self.store.marks(&retire, &reinstate)))
+            };
+            let mark_records = marks.as_ref().map(|m| m.records()).unwrap_or_default();
+            let marks_len: u64 = mark_records
+                .iter()
+                .map(|(_, payload)| framed_len(payload.len()))
+                .sum();
+            // What a transaction's update logs to undo it: the entry its statement found.
+            let found = match &op.found {
+                Some(found) => found.clone(),
+                None => present.clone(),
+            };
             // A transaction's change names the tree, and an update of one the value's length and
-            // the value it replaces.
+            // the entry undoing it puts back.
             let undo = match (&op.compensation, &op.txn, &present) {
                 (Some(_), ..) => COMPENSATION,
-                (None, Some(_), Some((old, _))) => 8 + 4 + old.len(),
+                (None, Some(_), Some(_)) => 8 + 4 + 1 + found.as_ref().map_or(0, |(b, _)| b.len()),
                 (None, Some(_), None) => 8,
                 (None, None, _) => 0,
             };
             let len = framed_len(8 + 3 + op.key.len() + stored.len() + undo)
                 + store_len(&adopt)
-                + store_len(&abandon);
+                + store_len(&abandon)
+                + marks_len;
             if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
                 op.admitted = None;
                 op.admitted = Some((done!(self.admit(len)), len));
@@ -632,6 +696,17 @@ impl Tree {
                 drop(ex);
                 return Ok(IOResult::Done(Outcome::Changed));
             }
+            let locked = match &marks {
+                Some(m) => match m.lock(&self.store) {
+                    Some(locked) => Some(locked),
+                    // Held, or grown since: let the leaf go, and make the marks again.
+                    None => {
+                        drop(ex);
+                        return yield_now();
+                    }
+                },
+                None => None,
+            };
             let in_txn = op.txn.is_some();
             let change = match (&now, op.compensation) {
                 (Some(_), Some(of)) => Change::Restore {
@@ -646,11 +721,12 @@ impl Tree {
                         "a compensation put back a key it found no entry of".into(),
                     ));
                 }
-                (Some((old, _)), None) => Change::Update {
+                (Some(_), None) => Change::Update {
                     key: &op.key,
                     value: &stored,
                     out_of_line,
-                    undo: in_txn.then_some((self.root, old.as_slice())),
+                    undo: in_txn
+                        .then_some((self.root, found.as_ref().map(|(b, o)| (b.as_slice(), *o)))),
                 },
                 (None, None) => Change::Insert {
                     key: &op.key,
@@ -666,10 +742,21 @@ impl Tree {
                 store.push(StoreRecord::Adopt { pids: adopt });
             }
             if !abandon.is_empty() {
-                store.push(StoreRecord::Abandon { pids: abandon });
+                store.push(StoreRecord::Abandon {
+                    pids: abandon.clone(),
+                });
             }
             let (mut admitted, _) = op.admitted.take().expect("admitted");
-            let (group, lsns) = self.log_as(&mut admitted, op.txn.as_ref(), &[record], &store);
+            let (group, lsns, marked) = self.log_marked(
+                &mut admitted,
+                op.txn.as_ref(),
+                &[record],
+                &store,
+                &mark_records,
+            );
+            if let (Some(locked), Some((start, end))) = (locked, marked) {
+                locked.commit(&self.store, start, end);
+            }
             op.group = group.filter(|_| op.txn.is_some());
             ex.changed(lsns[0]);
             op.lsn = lsns[0];
@@ -677,9 +764,11 @@ impl Tree {
             if let Some(w) = op.write.as_mut() {
                 w.adopted();
             }
-            if let Some((_, old)) = op.old.take() {
-                self.free_abandoned(old)?;
+            // Pages retired stay: a snapshot may still read the version they hold.
+            if !abandon.is_empty() {
+                self.free_abandoned(abandon)?;
             }
+            op.old = None;
             op.write = None;
             return Ok(IOResult::Done(if exact {
                 Outcome::Updated
@@ -1495,7 +1584,7 @@ fn store_len(pids: &[PageId]) -> u64 {
     if pids.is_empty() {
         0
     } else {
-        framed_len(2 + 8 * pids.len())
+        PageStore::group_record_len(pids.len())
     }
 }
 
@@ -1672,6 +1761,23 @@ pub struct Put {
     group: Option<GroupStart>,
     /// What the change puts back, as a compensation record.
     compensation: Option<Compensation>,
+    /// The pages of the out-of-line value it replaces are retired, not abandoned: kept while a
+    /// snapshot may read that version (DESIGN.md §6.5).
+    retire_old: bool,
+    /// What a transaction's update logs to undo it, when not the entry it replaces: the entry its
+    /// statement found, or `None` for none (DESIGN.md §12, step 5).
+    found: Option<Option<(Vec<u8>, bool)>>,
+    /// The out-of-line value it puts back as it stands, by its reference, with its pages once
+    /// learned: retired, and reinstated by the change.
+    restoring: Option<(ValueRef, Option<Vec<PageId>>)>,
+}
+
+/// `stored` as the leaf keeps it: its bytes, and whether its value is out of line.
+fn leaf_entry(stored: &Stored) -> (Vec<u8>, bool) {
+    match &stored.value {
+        StoredValue::Inline(v) => ([stored.head.as_slice(), v].concat(), false),
+        StoredValue::OutOfLine(r) => ([stored.head.as_slice(), &r.encode()].concat(), true),
+    }
 }
 
 impl Put {
@@ -1695,16 +1801,41 @@ impl Put {
             txn: None,
             group: None,
             compensation: None,
+            retire_old: false,
+            found: None,
+            restoring: None,
         }
+    }
+
+    /// Puts `entry` back as [`Tree::stored`] read it: a value out of line by its reference, its
+    /// pages reinstated (DESIGN.md §6.5).
+    pub fn restoring(key: &[u8], entry: &Stored, mode: Mode) -> Self {
+        match &entry.value {
+            StoredValue::Inline(v) => Self::with_head(key, entry.head.clone(), v.clone(), mode),
+            StoredValue::OutOfLine(r) => {
+                let mut put = Self::with_head(key, entry.head.clone(), Vec::new(), mode);
+                put.restoring = Some((*r, None));
+                put
+            }
+        }
+    }
+
+    /// Retires the pages of the out-of-line value it replaces instead of abandoning them.
+    pub fn retiring(mut self) -> Self {
+        self.retire_old = true;
+        self
+    }
+
+    /// Logs `found`, the entry the transaction's statement found, as what undoes the change.
+    pub fn undoing(mut self, found: Option<&Stored>) -> Self {
+        self.found = Some(found.map(leaf_entry));
+        self
     }
 
     /// Changes nothing, and reports [`Outcome::Changed`], unless the entry is `stored`, as
     /// [`Tree::stored`] read it, or absent for `None`.
     pub fn expecting(mut self, stored: Option<&Stored>) -> Self {
-        self.expected = Some(stored.map(|s| match &s.value {
-            StoredValue::Inline(v) => ([s.head.as_slice(), v].concat(), false),
-            StoredValue::OutOfLine(r) => ([s.head.as_slice(), &r.encode()].concat(), true),
-        }));
+        self.expected = Some(stored.map(leaf_entry));
         self
     }
 

@@ -1,10 +1,12 @@
-//! The page table and free space: radix trees of metadata pages, one of each per size class.
+//! The page table, free space and retired marks: radix trees of metadata pages, one of each per
+//! size class.
 //!
 //! - **Leaves.** In the page table, a `u64` per page number: [`FREE`], [`ALLOCATED`] (no copy on
 //!   disk yet), or the slot of its copy plus [`SLOT_BASE`]. In free space, a bit per slot, set
-//!   while the slot is in use.
+//!   while the slot is in use. In the retired marks, a bit per page number, set while the page is
+//!   retired (DESIGN.md §6.5).
 //! - **Above the leaves,** a `u64` per child: how many units below it are in use, so a free one is
-//!   found without reading pages that have none.
+//!   found without reading pages that have none, and so is every retired page.
 //!
 //! A page of zeros is all free, which is how every page starts. A node's place is fixed by its
 //! level and index; a tree grows by a level at the top, the old root becoming child 0 of the new
@@ -20,7 +22,7 @@ pub const SLOT_BASE: u64 = 2;
 
 /// Page numbers per page-table leaf.
 pub const MAP_ENTRIES: u64 = ((META_PAGE - HEADER_SIZE) / 8) as u64;
-/// Slots per free-space leaf.
+/// Slots per free-space leaf, and page numbers per retired-marks leaf.
 pub const SPACE_BITS: u64 = ((META_PAGE - HEADER_SIZE) * 8) as u64;
 /// Children per node above the leaves.
 pub const FANOUT: u64 = ((META_PAGE - HEADER_SIZE) / 8) as u64;
@@ -28,7 +30,7 @@ pub const FANOUT: u64 = ((META_PAGE - HEADER_SIZE) / 8) as u64;
 pub fn leaf_units(tree: Tree) -> u64 {
     match tree {
         Tree::Map => MAP_ENTRIES,
-        Tree::Space => SPACE_BITS,
+        Tree::Space | Tree::Retired => SPACE_BITS,
     }
 }
 
@@ -113,7 +115,7 @@ pub fn add_used_below<P: BytesMut + ?Sized>(node: &mut P, child: u64, delta: i64
 pub fn used<P: Bytes + ?Sized>(tree: Tree, leaf: &P, unit: u64) -> bool {
     match tree {
         Tree::Map => map_entry(leaf, unit) != FREE,
-        Tree::Space => space_bit(leaf, unit),
+        Tree::Space | Tree::Retired => space_bit(leaf, unit),
     }
 }
 
@@ -138,6 +140,23 @@ pub fn child_with_room<P: Bytes + ?Sized>(
 ) -> Option<u64> {
     let room = span(tree, level - 1);
     (from_child..FANOUT).find(|&c| used_below(node, c) < room)
+}
+
+/// The first unit at or after `from` in this leaf that is in use, if any.
+pub fn used_in_leaf<P: Bytes + ?Sized>(
+    tree: Tree,
+    leaf: &P,
+    leaf_index: u64,
+    from: u64,
+) -> Option<u64> {
+    let first = leaf_index * leaf_units(tree);
+    let start = from.clamp(first, first + leaf_units(tree));
+    (start..first + leaf_units(tree)).find(|&u| used(tree, leaf, u))
+}
+
+/// The first child at or after `from_child` of a node with a unit in use below it.
+pub fn child_in_use<P: Bytes + ?Sized>(node: &P, from_child: u64) -> Option<u64> {
+    (from_child..FANOUT).find(|&c| used_below(node, c) > 0)
 }
 
 #[cfg(test)]

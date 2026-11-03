@@ -56,7 +56,13 @@ fn create_with(io: Arc<dyn IO>, base: &str, config: StoreConfig) -> Db {
     let (control, sb) = Control::open(io.clone(), base).unwrap();
     assert!(sb.is_none());
     let log = Log::open(io.clone(), base, log_config(), 0).unwrap();
-    let store = PageStore::new(io.clone(), base, config, log.clone(), [[1; CLASS_COUNT]; 2]);
+    let store = PageStore::new(
+        io.clone(),
+        base,
+        config,
+        log.clone(),
+        [[1; CLASS_COUNT]; TREES],
+    );
     let mut db = Db {
         io,
         log,
@@ -85,7 +91,8 @@ fn write_superblock(db: &mut Db, redo: Lsn) {
 }
 
 /// Recovers the database at `base`: replays the page store's records after the superblock's
-/// redo point, gives back the slots of unmatched intents, checkpoints and erases.
+/// redo point, gives back the slots of unmatched intents, frees the pages still retired as
+/// recovery does once its undo is done, checkpoints and erases.
 fn recover(io: Arc<dyn IO>, base: &str) -> Db {
     let (control, sb) = Control::open(io.clone(), base).unwrap();
     let sb = sb.expect("a superblock");
@@ -100,6 +107,11 @@ fn recover(io: Arc<dyn IO>, base: &str) -> Db {
     store.resume(log.clone());
     drive(&io, || store.release_orphans()).unwrap();
     store.end_recovery();
+    // No buffer pool here, so no frame can hold one: the store frees them itself.
+    drive(&io, || {
+        store.free_retired_pages(|pid| store.free_retired(pid))
+    })
+    .unwrap();
     let mut db = Db {
         io,
         log,
@@ -187,8 +199,72 @@ fn read_back(db: &Db, pid: PageId) -> (u64, Option<u8>) {
     (entry, version)
 }
 
+/// Sets and clears retired marks in a group of their own, as an owner's group carries them.
+fn change_marks(
+    store: &Arc<PageStore>,
+    log: &Arc<Log>,
+    retire: &[PageId],
+    reinstate: &[PageId],
+    run: &Runner<'_>,
+) {
+    run(&mut || {
+        let marks = match store.marks(retire, reinstate)? {
+            IOResult::Done(m) => m,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        let records = marks.records();
+        let lens: Vec<u64> = records.iter().map(|(_, p)| framed_len(p.len())).collect();
+        let mut admitted = match log.admit(lens.iter().sum())? {
+            IOResult::Done(a) => a,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        let Some(locked) = marks.lock(store) else {
+            return Ok(busy());
+        };
+        let pieces: Vec<[&[u8]; 1]> = records.iter().map(|(_, p)| [p.as_slice()]).collect();
+        let group: Vec<(Header, &[&[u8]])> = records
+            .iter()
+            .zip(&pieces)
+            .map(|((h, _), p)| (*h, &p[..]))
+            .collect();
+        let lsn = if group.len() == 1 {
+            log.append(&mut admitted, &group[0].0, group[0].1)
+        } else {
+            *log.append_group(&mut admitted, &group).1.last().unwrap()
+        };
+        locked.commit(store, lsn - lens.iter().sum::<u64>(), lsn);
+        Ok(IOResult::Done(()))
+    });
+}
+
+/// The page numbers of `class` below `numbers` marked retired, read from the marks' leaves.
+fn retired_numbers(db: &Db, class: SizeClass, numbers: u64) -> BTreeSet<u64> {
+    let height = db.store.heights()[Tree::Retired as usize][class.index()];
+    let numbers = numbers.min(radix::capacity(Tree::Retired, height));
+    let mut retired = BTreeSet::new();
+    for leaf in 0..numbers.div_ceil(radix::SPACE_BITS) {
+        let id = MetaId {
+            tree: Tree::Retired,
+            class,
+            level: 0,
+            index: leaf,
+        };
+        let frame = drive(&db.io, || db.store.meta.get(id)).unwrap();
+        let bits = frame
+            .read(|b| {
+                (leaf * radix::SPACE_BITS..((leaf + 1) * radix::SPACE_BITS).min(numbers))
+                    .filter(|&n| radix::space_bit(b, n))
+                    .collect::<Vec<u64>>()
+            })
+            .expect("a still store's page is latched by no one");
+        retired.extend(bits);
+    }
+    retired
+}
+
 /// Checks the page table against free space for `class`: the slots the entries name are exactly
-/// the slots marked in use, each named once, and every count above the leaves adds up.
+/// the slots marked in use, each named once, every page marked retired is allocated, and every
+/// count above the leaves adds up.
 fn check_consistent(db: &Db, class: SizeClass, numbers: u64) {
     let mut referenced = BTreeSet::new();
     for n in 0..numbers {
@@ -228,7 +304,11 @@ fn check_consistent(db: &Db, class: SizeClass, numbers: u64) {
         referenced, used,
         "{class:?}: slots named by the page table and slots in use differ"
     );
-    for tree in [Tree::Map, Tree::Space] {
+    for n in retired_numbers(db, class, numbers) {
+        let entry = drive(&db.io, || db.store.entry(PageId::new(class, n))).unwrap();
+        assert_ne!(entry, FREE, "{class:?}: page {n} is retired and free");
+    }
+    for tree in [Tree::Map, Tree::Space, Tree::Retired] {
         let height = heights[tree as usize][class.index()];
         check_counts(db, tree, class, height - 1, 0);
     }
@@ -359,10 +439,16 @@ struct Expected {
     version: Option<u8>,
     pending: Vec<u8>,
     free_pending: bool,
+    /// Its retire is durable, and no reinstate since: recovery frees it.
+    retired: bool,
+    /// A retire or a reinstate of it may or may not have reached the log.
+    mark_pending: bool,
 }
 
-/// Runs a workload of allocations, copies, frees, erasures and checkpoints, and after every IO
-/// step recovers what a crash then would leave and checks it.
+/// Runs a workload of allocations, copies, frees, retires, reinstates, erasures and checkpoints,
+/// and after every few IO steps recovers what a crash then would leave and checks it: a page
+/// retired is freed by recovery, whether its mark was still in the log or only in a metadata page
+/// a checkpoint wrote, and one reinstated is kept.
 fn a_crash_at_any_moment_recovers_a_consistent_page_store(durable_writes: bool) {
     for seed in 0..4u64 {
         let crash_io = Arc::new(CrashIO::new(seed));
@@ -380,6 +466,16 @@ fn a_crash_at_any_moment_recovers_a_consistent_page_store(durable_writes: bool) 
             let expected = expected.borrow();
             for (&pid, e) in expected.iter() {
                 let (entry, version) = read_back(&db, pid);
+                if e.retired && !e.mark_pending {
+                    assert_eq!(
+                        entry, FREE,
+                        "seed {seed}/{crash_seed}: {pid:?} was retired, recovery left it"
+                    );
+                    continue;
+                }
+                if e.mark_pending && entry == FREE {
+                    continue;
+                }
                 if e.freed {
                     let reused = allocating.get() == Some(pid.class()) && entry == ALLOCATED;
                     assert!(
@@ -411,6 +507,11 @@ fn a_crash_at_any_moment_recovers_a_consistent_page_store(durable_writes: bool) 
                     .unwrap_or(0);
                 check_consistent(&db, c, numbers);
                 check_erased(&db, c, numbers);
+                assert_eq!(
+                    drive(&db.io, || db.store.find_used(Tree::Retired, c, 0)).unwrap(),
+                    None,
+                    "seed {seed}/{crash_seed}: {c:?} has a page still retired after recovery"
+                );
             }
         };
         let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| loop {
@@ -450,7 +551,7 @@ fn a_crash_at_any_moment_recovers_a_consistent_page_store(durable_writes: bool) 
                 let live: Vec<PageId> = expected
                     .borrow()
                     .iter()
-                    .filter(|(p, e)| p.class() == c && !e.freed && !e.free_pending)
+                    .filter(|(p, e)| p.class() == c && !e.freed && !e.free_pending && !e.retired)
                     .map(|(&p, _)| p)
                     .take(3 + (round as usize % 3))
                     .collect();
@@ -472,11 +573,46 @@ fn a_crash_at_any_moment_recovers_a_consistent_page_store(durable_writes: bool) 
                     e.pending.clear();
                 }
             }
+            // A page of each class retired, and from the third round on one retired before
+            // put back, so marks are set and cleared across checkpoints.
+            for &c in &classes {
+                let pick = |retired: bool| {
+                    expected
+                        .borrow()
+                        .iter()
+                        .filter(|(p, e)| {
+                            p.class() == c && !e.freed && !e.free_pending && e.retired == retired
+                        })
+                        .map(|(&p, _)| p)
+                        .last()
+                };
+                let retire: Vec<PageId> = pick(false).into_iter().collect();
+                let reinstate: Vec<PageId> =
+                    pick(true).filter(|_| round >= 2).into_iter().collect();
+                if retire.is_empty() && reinstate.is_empty() {
+                    continue;
+                }
+                for p in retire.iter().chain(&reinstate) {
+                    expected.borrow_mut().get_mut(p).unwrap().mark_pending = true;
+                }
+                change_marks(&db.store, &db.log, &retire, &reinstate, &run);
+                durable(&db);
+                for p in &retire {
+                    let mut ex = expected.borrow_mut();
+                    let e = ex.get_mut(p).unwrap();
+                    (e.retired, e.mark_pending) = (true, false);
+                }
+                for p in &reinstate {
+                    let mut ex = expected.borrow_mut();
+                    let e = ex.get_mut(p).unwrap();
+                    (e.retired, e.mark_pending) = (false, false);
+                }
+            }
             if round % 3 == 2 {
                 let victim = expected
                     .borrow()
                     .iter()
-                    .find(|(_, e)| !e.freed && !e.free_pending)
+                    .find(|(_, e)| !e.freed && !e.free_pending && !e.retired)
                     .map(|(&p, _)| p);
                 if let Some(victim) = victim {
                     expected.borrow_mut().get_mut(&victim).unwrap().free_pending = true;
@@ -498,6 +634,25 @@ fn a_crash_at_any_moment_recovers_a_consistent_page_store(durable_writes: bool) 
             "seed {seed}: only {} IO steps",
             steps.get()
         );
+        // Running on, every page retired is still allocated and marked.
+        let retired: Vec<PageId> = expected
+            .borrow()
+            .iter()
+            .filter(|(_, e)| e.retired)
+            .map(|(&p, _)| p)
+            .collect();
+        assert!(
+            retired.len() >= 2,
+            "seed {seed}: {} pages retired",
+            retired.len()
+        );
+        for &p in &retired {
+            assert!(
+                drive(&db.io, || db.store.retired(p)).unwrap(),
+                "{p:?} lost its mark"
+            );
+            assert_ne!(drive(&db.io, || db.store.entry(p)).unwrap(), FREE);
+        }
         check(seed);
     }
 }
@@ -512,13 +667,96 @@ fn a_crash_at_any_moment_recovers_a_consistent_page_store_with_writes_then_syncs
     a_crash_at_any_moment_recovers_a_consistent_page_store(false);
 }
 
+/// Pages retired past the marks' first leaf, which grows them a level, then a checkpoint whose
+/// redo point passes every mark record: recovery finds the marks in the metadata pages alone,
+/// through the levels the superblock records, and frees the pages still retired, while the one
+/// put back keeps its copy.
+#[test]
+fn marks_behind_the_redo_point_and_past_their_first_leaf_still_free_their_pages_in_recovery() {
+    let crash_io = Arc::new(CrashIO::new(3));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let mut db = create(io.clone(), BASE);
+    let c = class(0);
+    let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| drive(&io, op).unwrap();
+    // One leaf of marks holds SPACE_BITS page numbers: the last pages here are past it.
+    let numbers = radix::SPACE_BITS + 8;
+    let mut pids = Vec::new();
+    for _ in 0..numbers {
+        pids.push(drive(&io, || db.store.allocate(c)).unwrap());
+    }
+    for batch in pids.chunks(512) {
+        run(&mut || db.store.adopt(batch));
+    }
+    let (near, kept, far) = (pids[5], pids[7], pids[numbers as usize - 3]);
+    assert!(far.number() >= radix::SPACE_BITS);
+    write_copies(&db, &[near, kept, far], 1, &run);
+    change_marks(&db.store, &db.log, &[near, kept, far], &[], &run);
+    change_marks(&db.store, &db.log, &[], &[kept], &run);
+    assert_eq!(db.store.heights()[Tree::Retired as usize][c.index()], 2);
+    for (p, retired) in [(near, true), (kept, false), (far, true)] {
+        assert_eq!(
+            drive(&io, || db.store.retired(p)).unwrap(),
+            retired,
+            "{p:?}"
+        );
+    }
+    let marked = db.log.end();
+    run(&mut || db.log.wait_durable(marked));
+    let end = db.log.end();
+    run(&mut || db.store.write_metadata(end));
+    let redo = db.store.redo_bound().map_or(end, |b| b.min(end));
+    assert!(
+        redo >= marked,
+        "the redo point {redo} stays before the marks, which end at {marked}"
+    );
+    write_superblock(&mut db, redo);
+    let recovered = recover(Arc::new(crash_io.crash(0)), BASE);
+    assert_eq!(
+        read_back(&recovered, near).0,
+        FREE,
+        "a page still retired was kept"
+    );
+    assert_eq!(
+        read_back(&recovered, far).0,
+        FREE,
+        "a page retired past the first leaf was kept"
+    );
+    assert_eq!(
+        read_back(&recovered, kept).1,
+        Some(1),
+        "the page put back lost its copy"
+    );
+    check_consistent(&recovered, c, numbers);
+    assert_eq!(
+        drive(&recovered.io, || recovered.store.find_used(
+            Tree::Retired,
+            c,
+            0
+        ))
+        .unwrap(),
+        None
+    );
+}
+
 #[test]
 fn records_decode_as_encoded() {
     let pid = PageId::new(class(3), 77);
     for r in [
         StoreRecord::New { pid },
-        StoreRecord::Free { pid, old: Some(5) },
-        StoreRecord::Free { pid, old: None },
+        StoreRecord::Free {
+            pid,
+            old: Some(5),
+            retired: false,
+        },
+        StoreRecord::Free {
+            pid,
+            old: None,
+            retired: true,
+        },
+        StoreRecord::Retire {
+            pids: vec![pid, PageId::new(class(3), 9)],
+        },
+        StoreRecord::Reinstate { pids: vec![pid] },
         StoreRecord::Intent {
             class: class(3),
             slots: vec![1, 2, 9],
@@ -538,13 +776,82 @@ fn records_decode_as_encoded() {
             height: 3,
             used: 12345,
         },
+        StoreRecord::Grow {
+            tree: Tree::Retired,
+            class: class(3),
+            height: 2,
+            used: 7,
+        },
     ] {
         assert_eq!(StoreRecord::decode(r.kind(), &r.encode()), Some(r.clone()));
         assert_eq!(
-            StoreRecord::decode_logged(r.kind(), &r.logged([2, 3])),
-            Some((r.clone(), [2, 3]))
+            StoreRecord::decode_logged(r.kind(), &r.logged([2, 3, 4])),
+            Some((r.clone(), [2, 3, 4]))
         );
     }
+    // A retire's levels are one class's.
+    let mixed = StoreRecord::Retire {
+        pids: vec![pid, PageId::new(class(4), 9)],
+    };
+    assert_eq!(StoreRecord::decode(mixed.kind(), &mixed.encode()), None);
+}
+
+/// Writers on `threads` threads each retire their own pages, all under one leaf of marks, and put
+/// back every other one, while the checkpointer writes metadata back: every mark lands once, none
+/// is lost to another's change of the same page, and the counts above the leaf add up.
+fn marks_from_many_writers_each_land_once(threads: usize, pages: usize) {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let db = create(io.clone(), BASE);
+    let c = class(1);
+    let pids: Vec<PageId> = (0..threads * pages)
+        .map(|_| drive(&db.io, || db.store.allocate(c)).unwrap())
+        .collect();
+    drive(&db.io, || db.store.adopt(&pids)).unwrap();
+    let mut workers = Vec::new();
+    for own in pids.chunks(pages) {
+        let (io, store, log, own) = (io.clone(), db.store.clone(), db.log.clone(), own.to_vec());
+        workers.push(crate::thread::spawn(move || {
+            let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| drive(&io, op).unwrap();
+            for (i, &pid) in own.iter().enumerate() {
+                change_marks(&store, &log, &[pid], &[], &run);
+                if i % 2 == 1 {
+                    change_marks(&store, &log, &[], &[pid], &run);
+                }
+            }
+        }));
+    }
+    let (io, store, log) = (io.clone(), db.store.clone(), db.log.clone());
+    workers.push(crate::thread::spawn(move || {
+        for _ in 0..3 {
+            drive(&io, || store.write_metadata(log.end())).unwrap();
+        }
+    }));
+    for w in workers {
+        w.join().unwrap();
+    }
+    for own in pids.chunks(pages) {
+        for (i, &pid) in own.iter().enumerate() {
+            assert_eq!(
+                drive(&db.io, || db.store.retired(pid)).unwrap(),
+                i % 2 == 0,
+                "{pid:?}"
+            );
+        }
+    }
+    let retired = retired_numbers(&db, c, pids.len() as u64);
+    assert_eq!(retired.len(), threads * pages.div_ceil(2));
+    check_consistent(&db, c, pids.len() as u64);
+}
+
+#[test]
+fn marks_from_many_writers_each_land_once_on_threads() {
+    marks_from_many_writers_each_land_once(12, 40);
+}
+
+#[cfg(shuttle)]
+#[test]
+fn marks_from_many_writers_each_land_once_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(|| marks_from_many_writers_each_land_once(3, 2), 300);
 }
 
 /// Frees change the page table's leaves while the checkpointer writes them back: in no schedule

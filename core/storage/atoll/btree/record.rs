@@ -11,14 +11,18 @@
 //! branch: pid | left: u64 | right: u64 | sep  a parent taking a split: `sep` routes to `left`,
 //!                                             and the child after it, which was `left`, is `right`
 //! txn insert: pid | root: u64 | out: u8 | key_len: u16 | key | value
-//! txn update: pid | root: u64 | out: u8 | key_len: u16 | key | value_len: u32 | value | old
+//! txn update: pid | root: u64 | out: u8 | key_len: u16 | key | value_len: u32 | value | found: u8 |
+//!             old
 //! restore:    pid | root: u64 | statement: u16 | undid: u64 | out: u8 | key_len: u16 | key | value
 //! unput:      pid | root: u64 | statement: u16 | undid: u64 | key
 //! ```
 //!
 //! A transaction's insert and update also name the tree, by its root, and an update carries the
-//! value it replaces: what undoes them, by tree and key, after splits and merges (DESIGN.md §7.1).
-//! Their header names the transaction and chains to its previous group.
+//! entry its statement found, which undoing it puts back: what undoes them, by tree and key, after
+//! splits and merges (DESIGN.md §7.1). That entry is the one the update replaced, unless its
+//! statement had changed the key already, whose earlier versions are gone (DESIGN.md §12, step 5).
+//! `found` is 0 for an entry whose value is inline, 1 for one out of line, and 2 for none, `old`
+//! then being empty. Their header names the transaction and chains to its previous group.
 //!
 //! A restore puts a key's entry back and an unput removes a key that had none: the compensation
 //! records of putting back what a transaction's statement changed (DESIGN.md §11.5). Each names
@@ -63,6 +67,13 @@ pub struct Compensation {
 /// Bytes a compensation's unit takes in its record.
 pub const COMPENSATION: usize = 8 + 2 + 8;
 
+/// `found` of a transaction's update whose statement found no entry.
+const FOUND_NONE: u8 = 2;
+
+/// The entry a transaction's statement found for a key, which undoing its update puts back: as the
+/// leaf stores it, and whether its value is out of line; `None` for none.
+pub type Found<'a> = Option<(&'a [u8], bool)>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change<'a> {
     Init {
@@ -82,8 +93,8 @@ pub enum Change<'a> {
         key: &'a [u8],
         value: &'a [u8],
         out_of_line: bool,
-        /// For a transaction's update: the tree's root, and the value it replaces.
-        undo: Option<(PageId, &'a [u8])>,
+        /// For a transaction's update: the tree's root, and the entry its statement found.
+        undo: Option<(PageId, Found<'a>)>,
     },
     /// A key's entry put back, as `of` says.
     Restore {
@@ -165,10 +176,16 @@ impl<'a> Record<'a> {
                 out.push(*out_of_line as u8);
                 out.extend((key.len() as u16).to_le_bytes());
                 out.extend_from_slice(key);
-                if let Some((_, old)) = undo {
+                if let Some((_, found)) = undo {
                     out.extend((value.len() as u32).to_le_bytes());
                     out.extend_from_slice(value);
-                    out.extend_from_slice(old);
+                    match found {
+                        Some((old, old_out_of_line)) => {
+                            out.push(*old_out_of_line as u8);
+                            out.extend_from_slice(old);
+                        }
+                        None => out.push(FOUND_NONE),
+                    }
                 } else {
                     out.extend_from_slice(value);
                 }
@@ -296,11 +313,18 @@ impl<'a> Record<'a> {
                 let (key, rest, out_of_line) = keyed()?;
                 let len =
                     u32::from_le_bytes(rest.get(..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
+                let old = rest.get(5 + len..).ok_or_else(bad)?;
+                let found = match rest[4 + len] {
+                    0 => Some((old, false)),
+                    1 => Some((old, true)),
+                    FOUND_NONE if old.is_empty() => None,
+                    _ => return Err(bad()),
+                };
                 Change::Update {
                     key,
-                    value: rest.get(4..4 + len).ok_or_else(bad)?,
+                    value: &rest[4..4 + len],
                     out_of_line,
-                    undo: Some((root.expect("a root"), &rest[4 + len..])),
+                    undo: Some((root.expect("a root"), found)),
                 }
             }
             k if k == REMOVE => Change::Remove { key: rest },
@@ -463,5 +487,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A transaction's update reads back with the entry its statement found, inline, out of line
+    /// or none, and refuses a kind of entry it does not know.
+    #[test]
+    fn a_transactions_update_reads_back_with_the_entry_its_statement_found() {
+        let pid = PageId::from_raw(77);
+        let root = PageId::from_raw(5);
+        for found in [
+            Some((&b"head and old value"[..], false)),
+            Some((&b"head and reference"[..], true)),
+            None,
+        ] {
+            let record = Record {
+                pid,
+                change: Change::Update {
+                    key: b"key",
+                    value: b"head and new value",
+                    out_of_line: true,
+                    undo: Some((root, found)),
+                },
+            };
+            let bytes = record.encode();
+            assert_eq!(Record::decode(TXN_UPDATE, &bytes).unwrap(), Some(record));
+            let mut bad = bytes.clone();
+            let at = 16 + 3 + 3 + 4 + b"head and new value".len();
+            bad[at] = FOUND_NONE + 1;
+            assert!(Record::decode(TXN_UPDATE, &bad).is_err(), "{found:?}");
+        }
+        // None names no entry, so nothing may follow it.
+        let mut trailing = Record {
+            pid,
+            change: Change::Update {
+                key: b"key",
+                value: b"v",
+                out_of_line: false,
+                undo: Some((root, None)),
+            },
+        }
+        .encode();
+        trailing.push(0);
+        assert!(Record::decode(TXN_UPDATE, &trailing).is_err());
     }
 }

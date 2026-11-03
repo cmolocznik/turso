@@ -874,6 +874,12 @@ impl BufferPool {
     /// Drops the page `page` holds: its number becomes free, its copy's slot is freed, and its
     /// frame is free. On `IOResult::IO` the page is unlatched; fix it again and retry.
     pub fn free(self: &Arc<Self>, page: Exclusive<'_>) -> Result<IOResult<()>> {
+        self.free_as(page, false)
+    }
+
+    /// [`free`](Self::free), of a page that is retired when `retired` is set: its mark is cleared
+    /// in the record that frees it (DESIGN.md §6.5).
+    fn free_as(self: &Arc<Self>, page: Exclusive<'_>, retired: bool) -> Result<IOResult<()>> {
         let (frame, pid) = (page.frame, page.pid);
         if self.header(frame).has(WRITING) {
             // Its writeback's remap would bring the page back: let the write land first.
@@ -884,9 +890,13 @@ impl BufferPool {
             });
         }
         if !pid.is_temporary() {
-            match self.store.free(pid)? {
-                IOResult::Done(()) => {}
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            let freed = if retired {
+                self.store.free_retired(pid)?
+            } else {
+                self.store.free(pid)?
+            };
+            if let IOResult::IO(io) = freed {
+                return Ok(IOResult::IO(io));
             }
         }
         // Its latch is released by freeing the frame; its step ends last.
@@ -906,11 +916,27 @@ impl BufferPool {
     /// is taken for it unread and held exclusively, so no fix can read it in while its number is
     /// freed.
     pub fn free_unreferenced(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        self.free_unreferenced_as(pid, false)
+    }
+
+    /// Frees `pid`, which is retired and which no snapshot can read any more, clearing its mark in
+    /// the record that frees it (DESIGN.md §6.5). Through the pool, like
+    /// [`free_unreferenced`](Self::free_unreferenced): a frame still holding the page goes with
+    /// it, once a writeback in flight has landed, so no writeback finds it free afterwards.
+    pub fn free_retired(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        self.free_unreferenced_as(pid, true)
+    }
+
+    fn free_unreferenced_as(self: &Arc<Self>, pid: PageId, retired: bool) -> Result<IOResult<()>> {
+        assert!(
+            !(retired && pid.is_temporary()),
+            "a temporary page {pid:?} retired"
+        );
         let _step = self.store.epochs().enter();
         loop {
             if self.table.find(&self.frames.headers, pid.raw()).is_some() {
                 return match self.fix_exclusive(pid, None)? {
-                    IOResult::Done(page) => self.free(page),
+                    IOResult::Done(page) => self.free_as(page, retired),
                     IOResult::IO(io) => Ok(IOResult::IO(io)),
                 };
             }
@@ -944,13 +970,16 @@ impl BufferPool {
                 self.free_frame(class, frame, hold);
                 continue;
             }
-            return self.free(Exclusive {
-                pool: self,
-                frame,
-                pid,
-                hold,
-                step: self.store.epochs().enter(),
-            });
+            return self.free_as(
+                Exclusive {
+                    pool: self,
+                    frame,
+                    pid,
+                    hold,
+                    step: self.store.epochs().enter(),
+                },
+                retired,
+            );
         }
     }
 

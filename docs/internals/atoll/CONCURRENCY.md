@@ -338,6 +338,12 @@ in the last point.
     one. The slot is freed only once every version is put back, so a writer that read a version
     since put back finds its writer gone and reads the key again; a version found gone twice is
     corruption.
+  - **Retired marks** (`store.rs`, DESIGN.md §6.5) change in the group of the write or
+    compensation that retires or reinstates a value. Their metadata pages are latched, by trying,
+    while the tree's leaf latch is held, as every latch is taken; one found held, or a marks tree
+    grown since the marks' paths were laid out, lets the leaf go and yields. Writers marking pages
+    under one metadata page are ordered by its latch, so none loses another's mark. A reader of a
+    retired value needs no latch on it: nothing frees its pages while a snapshot may read them.
 - **The one lock order** for the short critical sections that remain.
   - Latches are never waited for, and some mutexes are only ever tried, as ownership of a piece
     of work (§3, class 3): a checkpointer's state, a writeback, the page store's erasure and its

@@ -19,6 +19,7 @@ use super::versioned::{decode_entry, index_key_parts, Version, VersionedTree, Ve
 use super::{Transactions, Ts, Txn};
 use crate::io::IO;
 use crate::storage::atoll::btree::record::{Change, Compensation, Record};
+use crate::storage::atoll::btree::value::ValueRef;
 use crate::storage::atoll::btree::{
     Cursor, Mode, Outcome, Put, Remove, Seek, Stored, StoredValue, Tree,
 };
@@ -181,23 +182,12 @@ pub fn undo(
                             undid: None,
                         };
                         match &replaced.entry {
-                            Some(entry) => {
-                                let StoredValue::Inline(value) = &entry.value else {
-                                    return Err(LimboError::Corrupt(
-                                        "a version index entry holds a value out of line".into(),
-                                    ));
-                                };
-                                Step::Put(
-                                    Put::with_head(
-                                        &replaced.key,
-                                        entry.head.clone(),
-                                        value.clone(),
-                                        Mode::Update,
-                                    )
+                            // A value out of line goes back by its reference, its pages kept.
+                            Some(entry) => Step::Put(
+                                Put::restoring(&replaced.key, entry, Mode::Update)
                                     .expecting(Some(&current))
                                     .compensating(txns.tail(txn), of),
-                                )
-                            }
+                            ),
                             None => Step::Remove(Remove::new(&replaced.key).compensating(
                                 txns.tail(txn),
                                 of,
@@ -295,25 +285,21 @@ pub(crate) fn undo_loser(
         let Some(record) = Record::decode(r.header.kind, &r.payload)? else {
             continue;
         };
-        let (root, key, wrote, replaced) = match record.change {
+        // What the change wrote, as the leaf stores it, and the entry its statement found, which
+        // undoing it puts back.
+        let (root, key, wrote, found) = match record.change {
             Change::Insert {
                 key,
                 value,
-                out_of_line: false,
+                out_of_line,
                 undo: Some(root),
-            } => (root, key, value, None),
+            } => (root, key, (value, out_of_line), None),
             Change::Update {
                 key,
                 value,
-                out_of_line: false,
-                undo: Some((root, old)),
-            } => (root, key, value, Some(old)),
-            Change::Insert { undo: Some(_), .. } | Change::Update { undo: Some(_), .. } => {
-                return Err(corrupt(format!(
-                    "a change at {} holds its value out of line, which no versioned tree writes",
-                    group.get()
-                )));
-            }
+                out_of_line,
+                undo: Some((root, found)),
+            } => (root, key, (value, out_of_line), found),
             // Compensations are redone, never undone. One from an earlier recovery's undo, which
             // went back along the chain to the change it names, says to go on from before that.
             Change::Restore { of, .. } | Change::Unput { of, .. } => {
@@ -337,7 +323,7 @@ pub(crate) fn undo_loser(
             | Change::Split { .. }
             | Change::Branch { .. } => continue,
         };
-        let statement = Version::decode(wrote.get(..HEADER).unwrap_or(&[]))
+        let statement = Version::decode(wrote.0.get(..HEADER).unwrap_or(&[]))
             .ok_or_else(|| corrupt("a change whose value holds no version header".into()))?
             .command;
         let tree = VersionedTree::open(io.clone(), pool.clone(), store.clone(), root);
@@ -349,21 +335,24 @@ pub(crate) fn undo_loser(
         loop {
             let current = drive(io, || tree.tree().stored(key))?;
             let still = current.as_ref().is_some_and(|c| match &c.value {
-                StoredValue::Inline(v) => [c.head.as_slice(), v].concat() == wrote,
-                StoredValue::OutOfLine(_) => false,
+                StoredValue::Inline(v) => !wrote.1 && [c.head.as_slice(), v].concat() == wrote.0,
+                StoredValue::OutOfLine(r) => {
+                    wrote.1 && [c.head.as_slice(), &r.encode()].concat() == wrote.0
+                }
             });
             if !still {
                 break;
             }
             let current = current.expect("an entry");
             let tail_now = TxnTail::new(txn, tail, writers.clone(), SLOT);
-            let logged = match replaced {
-                Some(old) => {
-                    if old.len() < HEADER {
-                        return Err(corrupt("an entry replaced holds no version header".into()));
-                    }
-                    let (head, value) = old.split_at(HEADER);
-                    let mut put = Put::with_head(key, head.to_vec(), value.to_vec(), Mode::Update)
+            let logged = match found {
+                Some((old, out_of_line)) => {
+                    let entry = found_entry(old, out_of_line).ok_or_else(|| {
+                        corrupt("the entry a statement found does not decode".into())
+                    })?;
+                    // A value out of line goes back by its reference, its pages kept; the one the
+                    // change wrote, if out of line, is abandoned.
+                    let mut put = Put::restoring(key, &entry, Mode::Update)
                         .expecting(Some(&current))
                         .compensating(tail_now, of);
                     match drive(io, || tree.tree().put(&mut put))? {
@@ -388,6 +377,19 @@ pub(crate) fn undo_loser(
     let end = TxnTail::new(txn, tail, writers.clone(), SLOT).header(super::END);
     log.append_with(&mut admitted, &end, &[], |_| writers.finished(SLOT, txn));
     Ok(())
+}
+
+/// The entry a statement found, as a transaction's update logs it.
+fn found_entry(old: &[u8], out_of_line: bool) -> Option<Stored> {
+    let (head, rest) = (old.get(..HEADER)?, &old[HEADER.min(old.len())..]);
+    Some(Stored {
+        head: head.to_vec(),
+        value: if out_of_line {
+            StoredValue::OutOfLine(ValueRef::decode(rest)?)
+        } else {
+            StoredValue::Inline(rest.to_vec())
+        },
+    })
 }
 
 #[cfg(all(test, not(shuttle), not(atoll_loom)))]

@@ -216,14 +216,16 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
                 );
                 let images = rerun.captured();
                 let count = images.len();
+                // One image, taken once the gap is recorded and before recovery's last superblock,
+                // crashes again in recovery, twice, each time with another buffer, then recovers
+                // whole. Whether a chain from an image records a second gap depends on the image:
+                // from some, no image its recoveries leave ends inside a block. So a chain that
+                // ends with fewer than two gaps starts again from the next image.
+                let start = (1 + (crash_seed / 10) as usize % count.saturating_sub(2).max(1))
+                    .min(count - 1);
+                let mut chaining = chain;
                 for (i, image) in images.into_iter().enumerate() {
-                    // One image, taken once the gap is recorded and before recovery's last
-                    // superblock, crashes again in recovery, twice, each time with another
-                    // buffer, then recovers whole.
-                    if chain
-                        && i == (1 + (crash_seed / 10) as usize % count.saturating_sub(2).max(1))
-                            .min(count - 1)
-                    {
+                    if chaining && i >= start {
                         let label = format!("{label}, crashed in recovery at capture {i}");
                         let mut image = image;
                         for (depth, budget) in
@@ -269,6 +271,7 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
                         let image: Arc<dyn IO> = Arc::new(image);
                         if gaps(&image).len() >= 2 {
                             chained.set(chained.get() + 1);
+                            chaining = false;
                         }
                         let label = format!("{label}, crashed twice more");
                         eprintln!("recovering {label}");

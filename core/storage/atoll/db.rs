@@ -5,6 +5,7 @@ use super::buffer::{BufferConfig, BufferPool, LocalSource};
 use super::checkpoint::Checkpointer;
 use super::control::{Control, Superblock};
 use super::log::{framed_len, table_len, Log, LogConfig, Lsn, Writers};
+use super::meta::TREES;
 use super::page::CLASS_COUNT;
 use super::recovery::Recovery;
 use super::store::{PageStore, StoreConfig};
@@ -171,7 +172,7 @@ impl Opening {
             segment_bytes: config.log.segment_bytes,
             file_bytes: config.store.file_bytes,
             database_id,
-            heights: [[1; CLASS_COUNT]; 2],
+            heights: [[1; CLASS_COUNT]; TREES],
             clock: 0,
             writers: None,
             continuations: Vec::new(),

@@ -873,6 +873,10 @@ index entry spills, and the graveyard.
       derived from the inequality once their layout is chosen.
   - **Reading.** A reader starts from the leaf's version and follows the chain while a version is
     not visible to it. A version flagged as the key's first ends the chain without a lookup.
+  - **Scanning** (`txn/versioned/cursor.rs`). A cursor moves a plain cursor, which copies each leaf
+    entry out whole, and judges each entry by its newest version. A version the statement does not
+    see is followed down its chain, as a point read follows it. A key with no version the statement
+    sees, or whose version is a tombstone, is passed over in the direction of the move.
   - **Values out of line.** An index entry holds the replaced version's header and either its value
     or the reference of a value out of line. Those pages are then retired (section 6.5), and freed
     through the todo item of the change that retired them (section 11.5). A version its own
@@ -1675,6 +1679,7 @@ work says which parts are done.
    Then update deltas and fat tuples, with the pruning of a chain's middle that the newest OLAP
    snapshot allows (OSIC §3.3).
 8. **Turso integration.**
+   - the versioned cursor under `AtollCursor` (done: `txn/versioned/cursor.rs`);
    - the storage-mode interface;
    - `AtollCursor`, and the key encoding for SQL records (section 13);
    - the catalog;

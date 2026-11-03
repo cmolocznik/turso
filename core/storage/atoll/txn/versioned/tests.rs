@@ -1,6 +1,7 @@
 use super::*;
 use crate::io::MemoryIO;
 use crate::storage::atoll::btree::value;
+use crate::storage::atoll::btree::Seek;
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{Kind, LogConfig};
@@ -8,6 +9,8 @@ use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
 use crate::storage::atoll::txn::{Commit, TxnConfig};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 
 const BASE: &str = "/db/versioned";
 
@@ -19,6 +22,11 @@ struct Db {
 }
 
 fn open() -> Db {
+    open_with(4)
+}
+
+/// A database whose transactions have `slots` slots.
+fn open_with(slots: usize) -> Db {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let config = AtollConfig {
         log: LogConfig {
@@ -38,7 +46,7 @@ fn open() -> Db {
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
-        txn: TxnConfig { slots: 4 },
+        txn: TxnConfig { slots },
     };
     let db = Atoll::open(io.clone(), BASE, config).unwrap();
     let mut root = None;
@@ -52,7 +60,7 @@ fn open() -> Db {
         Ok(IOResult::Done(()))
     })
     .unwrap();
-    let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), 4);
+    let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), slots);
     let tree = VersionedTree::open(
         io.clone(),
         db.pool().clone(),
@@ -752,5 +760,252 @@ fn a_writer_reads_again_past_a_version_rolled_back_under_it_in_shuttle_schedules
     crate::storage::atoll::testing::schedules(
         a_writer_reads_again_past_a_version_rolled_back_under_it,
         50,
+    );
+}
+
+impl Db {
+    /// Every row `txn`'s current statement sees, in key order, by a cursor moving `forward` or
+    /// backward from the tree's end.
+    fn scan(&self, txn: &mut Txn, forward: bool) -> Vec<(String, Vec<u8>)> {
+        let mut c = VersionedCursor::new();
+        let (from, seek): (&[u8], _) = if forward {
+            (b"", Seek::Ge)
+        } else {
+            (&[0xff; 8], Seek::Le)
+        };
+        let mut found = run(&self.io, || {
+            self.tree
+                .seek(self.txns(), &self.versions, txn, &mut c, from, seek)
+        });
+        let mut out = Vec::new();
+        while found {
+            out.push((
+                String::from_utf8(c.key().unwrap().to_vec()).unwrap(),
+                c.value().unwrap().to_vec(),
+            ));
+            found = run(&self.io, || {
+                if forward {
+                    self.tree.next(self.txns(), &self.versions, txn, &mut c)
+                } else {
+                    self.tree.prev(self.txns(), &self.versions, txn, &mut c)
+                }
+            });
+        }
+        if !forward {
+            out.reverse();
+        }
+        out
+    }
+
+    /// The key `seek` lands on from `key` for `txn`'s current statement.
+    fn seek_key(&self, txn: &mut Txn, key: &str, seek: Seek) -> Option<String> {
+        let mut c = VersionedCursor::new();
+        let found = run(&self.io, || {
+            self.tree.seek(
+                self.txns(),
+                &self.versions,
+                txn,
+                &mut c,
+                key.as_bytes(),
+                seek,
+            )
+        });
+        found.then(|| String::from_utf8(c.key().unwrap().to_vec()).unwrap())
+    }
+}
+
+/// A cursor sees each key as a point read does, in key order, both ways: through a history of
+/// commits, rollbacks, deletions and values out of line, for snapshots taken all along it, a
+/// transaction still open, one reading its own writes, and read committed. Every seek lands on the
+/// key the point reads say it should.
+#[test]
+fn a_cursor_sees_each_key_as_a_point_read_does_in_order_both_ways() {
+    for seed in 0..4u64 {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let db = open_with(16);
+        let keys: Vec<String> = (0..48).map(|i| format!("k{i:03}")).collect();
+        let mut setup = db.begin(Isolation::Snapshot);
+        for key in keys.iter().step_by(2) {
+            db.put(&mut setup, key, "v0", Mode::Insert);
+        }
+        db.commit(setup);
+        let mut views = Vec::new();
+        for round in 0..6 {
+            views.push(db.begin(Isolation::Snapshot));
+            let mut w = db.begin(Isolation::Snapshot);
+            for key in &keys {
+                match rng.random_range(0..6) {
+                    0 => {
+                        db.delete(&mut w, key);
+                    }
+                    1 => {
+                        let value = padded(&format!("r{round}"), LARGE);
+                        db.put(&mut w, key, &value, Mode::Upsert);
+                    }
+                    2 | 3 => {
+                        db.put(&mut w, key, &format!("r{round}"), Mode::Upsert);
+                    }
+                    _ => {}
+                }
+            }
+            if round % 3 == 2 {
+                db.rollback(w);
+            } else {
+                db.commit(w);
+            }
+        }
+        // Open, and writing: others see none of it, it sees all of it.
+        let mut open = db.begin(Isolation::Snapshot);
+        for key in keys.iter().step_by(3) {
+            if rng.random_bool(0.5) {
+                db.delete(&mut open, key);
+            } else {
+                db.put(&mut open, key, "open", Mode::Upsert);
+            }
+        }
+        views.push(db.begin(Isolation::Snapshot));
+        views.push(db.begin(Isolation::ReadCommitted));
+        views.push(open);
+        let mut distinct = std::collections::BTreeSet::new();
+        for (i, view) in views.iter_mut().enumerate() {
+            let model: Vec<(String, Vec<u8>)> = keys
+                .iter()
+                .filter_map(|k| db.get_bytes(view, k).map(|v| (k.clone(), v)))
+                .collect();
+            let label = format!("seed {seed}, view {i}");
+            assert_eq!(db.scan(view, true), model, "{label}: forward");
+            assert_eq!(db.scan(view, false), model, "{label}: backward");
+            let present: Vec<&String> = model.iter().map(|(k, _)| k).collect();
+            for probe in keys.iter().chain([&"k".to_string(), &"l".to_string()]) {
+                let want = |seek: Seek| -> Option<String> {
+                    let at = |k: &&&String| match seek {
+                        Seek::Ge => **k >= probe,
+                        Seek::Gt => **k > probe,
+                        Seek::Le => **k <= probe,
+                        Seek::Lt => **k < probe,
+                    };
+                    match seek {
+                        Seek::Ge | Seek::Gt => present.iter().find(at),
+                        Seek::Le | Seek::Lt => present.iter().rev().find(at),
+                    }
+                    .map(|k| (*k).clone())
+                };
+                for seek in [Seek::Ge, Seek::Gt, Seek::Le, Seek::Lt] {
+                    assert_eq!(
+                        db.seek_key(view, probe, seek),
+                        want(seek),
+                        "{label}: {seek:?} {probe}"
+                    );
+                }
+            }
+            distinct.insert(model);
+        }
+        // The views differ from one another, so the cursor met every kind of chain.
+        assert!(
+            distinct.len() >= 6,
+            "seed {seed}: only {} distinct views",
+            distinct.len()
+        );
+        for view in views {
+            db.rollback(view);
+        }
+    }
+}
+
+/// Snapshot readers scan every key, both ways, while one writer commits a new generation of all of
+/// them in each transaction and another writes some of them and rolls back: each scan reads one
+/// generation whole, every key present once, in order, and never a value rolled back. Every
+/// writer takes the keys in one order, so no wait closes a cycle.
+fn cursors_read_whole_snapshots_while_writers_commit_and_roll_back(
+    rounds: usize,
+    readers: usize,
+    pad: usize,
+) {
+    const KEYS: usize = 12;
+    let keys: Arc<Vec<String>> = Arc::new((0..KEYS).map(|i| format!("k{i:02}")).collect());
+    let db = Arc::new(open_with(readers + 4));
+    let mut setup = db.begin(Isolation::Snapshot);
+    for k in keys.iter() {
+        db.put(&mut setup, k, &padded("g0", pad), Mode::Insert);
+    }
+    db.commit(setup);
+    let writer = {
+        let (db, keys) = (db.clone(), keys.clone());
+        crate::thread::spawn(move || {
+            for i in 1..=rounds {
+                let mut t = db.begin(Isolation::ReadCommitted);
+                for k in keys.iter() {
+                    put_waiting(&db, &mut t, k, &padded(&format!("g{i}"), pad));
+                }
+                db.commit(t);
+            }
+        })
+    };
+    let roller = {
+        let (db, keys) = (db.clone(), keys.clone());
+        crate::thread::spawn(move || {
+            for i in 0..rounds {
+                let mut t = db.begin(Isolation::ReadCommitted);
+                for k in keys.iter().skip(i % 3).step_by(2) {
+                    put_waiting(&db, &mut t, k, &padded(&format!("dead{i}"), pad));
+                }
+                db.rollback(t);
+            }
+        })
+    };
+    let scanners: Vec<_> = (0..readers)
+        .map(|r| {
+            let (db, keys) = (db.clone(), keys.clone());
+            crate::thread::spawn(move || {
+                for n in 0..2 * rounds {
+                    let mut t = db.begin(Isolation::Snapshot);
+                    let rows = db.scan(&mut t, (r + n) % 2 == 0);
+                    let got: Vec<&String> = rows.iter().map(|(k, _)| k).collect();
+                    assert_eq!(got, keys.iter().collect::<Vec<_>>(), "keys of one scan");
+                    let first = &rows[0].1;
+                    for (k, v) in &rows {
+                        let text = String::from_utf8_lossy(v);
+                        assert!(!text.starts_with("dead"), "{k} read a rolled-back value");
+                        assert_eq!(v, first, "{k}: a scan read two generations");
+                    }
+                    db.commit(t);
+                }
+            })
+        })
+        .collect();
+    for t in [writer, roller].into_iter().chain(scanners) {
+        t.join().unwrap();
+    }
+}
+
+/// [`cursors_read_whole_snapshots_while_writers_commit_and_roll_back`] on twelve threads: ten
+/// scanning, a writer and a roller.
+#[test]
+fn cursors_read_whole_snapshots_while_writers_commit_and_roll_back_on_threads() {
+    cursors_read_whole_snapshots_while_writers_commit_and_roll_back(100, 10, 0);
+}
+
+/// The same with every value out of line: a scan reads a replaced value through its version index
+/// while the writer that replaced it commits or rolls back.
+#[test]
+fn cursors_read_whole_snapshots_out_of_line_while_writers_commit_and_roll_back_on_threads() {
+    cursors_read_whole_snapshots_while_writers_commit_and_roll_back(40, 10, LARGE);
+}
+
+#[cfg(shuttle)]
+#[test]
+fn cursors_read_whole_snapshots_while_writers_commit_and_roll_back_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || cursors_read_whole_snapshots_while_writers_commit_and_roll_back(2, 2, 0),
+        300,
+    );
+}
+
+#[cfg(shuttle)]
+#[test]
+fn cursors_read_whole_snapshots_out_of_line_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || cursors_read_whole_snapshots_while_writers_commit_and_roll_back(2, 2, LARGE),
+        300,
     );
 }

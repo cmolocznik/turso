@@ -305,8 +305,23 @@ pub struct Get {
     /// The newest version, seen and visible, holding its value out of line: read through the
     /// leaf, which tells whether that version is still the newest, by its head.
     newest: Option<(Lookup, Vec<u8>)>,
+    /// The key's chain, followed from a newest version the statement does not see.
+    chain: Option<Chain>,
+}
+
+/// Following a key's chain from a version the statement does not see, through the version index
+/// of each writer, to the newest version it does: step it with [`VersionedTree::follow`].
+struct Chain {
+    /// The version whose predecessor is looked up next.
+    at: Version,
     /// An earlier version's value out of line, read from where its index entry names it.
-    earlier: Option<ValueRead>,
+    reading: Option<ValueRead>,
+}
+
+impl Chain {
+    fn from(at: Version) -> Self {
+        Self { at, reading: None }
+    }
 }
 
 impl Get {
@@ -314,7 +329,7 @@ impl Get {
         Self {
             key: key.to_vec(),
             newest: None,
-            earlier: None,
+            chain: None,
         }
     }
 }
@@ -402,11 +417,44 @@ impl VersionedTree {
                     _ => continue,
                 }
             }
-            if let Some(read) = &mut op.earlier {
+            if let Some(chain) = &mut op.chain {
+                return self.follow(txns, versions, txn, &op.key, chain);
+            }
+            let Some(stored) = done!(self.tree.stored(&op.key)) else {
+                return Ok(IOResult::Done(None));
+            };
+            let v = Version::decode(&stored.head).ok_or_else(corrupt_header)?;
+            if !txns.visible(txn, v.slot, v.ts) {
+                op.chain = Some(Chain::from(v));
+                continue;
+            }
+            if v.deleted() {
+                return Ok(IOResult::Done(None));
+            }
+            match stored.value {
+                StoredValue::Inline(value) => return Ok(IOResult::Done(Some(value))),
+                StoredValue::OutOfLine(_) => op.newest = Some((Lookup::new(&op.key), stored.head)),
+            }
+        }
+    }
+
+    /// The value of `key` that `txn`'s current statement reads, following its chain from a
+    /// version the statement does not see: `None` for a key it reads as absent. Step it until
+    /// done.
+    fn follow(
+        &self,
+        txns: &Transactions,
+        versions: &Versions,
+        txn: &mut Txn,
+        key: &[u8],
+        chain: &mut Chain,
+    ) -> Result<IOResult<Option<Vec<u8>>>> {
+        loop {
+            if let Some(read) = &mut chain.reading {
                 // A replaced version's pages stay while a snapshot may read it (DESIGN.md §6.5):
                 // nothing frees them under this read.
                 let read = done!(read.step(&self.pool, &|| true));
-                let reference = op.earlier.take().expect("a read").reference();
+                let reference = chain.reading.take().expect("a read").reference();
                 return match read {
                     Read::Value(v) => Ok(IOResult::Done(Some(v))),
                     Read::Changed | Read::Unheld => Err(LimboError::Corrupt(format!(
@@ -414,48 +462,37 @@ impl VersionedTree {
                     ))),
                 };
             }
-            let Some(mut stored) = done!(self.tree.stored(&op.key)) else {
+            let v = chain.at;
+            if v.first() {
+                return Ok(IOResult::Done(None));
+            }
+            let index = done!(versions.index(v.slot, self.tree.root().class()));
+            let mut lookup = Lookup::new(&index_key(v.ts, v.command, self.root(), key));
+            let Some(entry) = done!(index.lookup(&mut lookup)) else {
+                return Err(LimboError::Corrupt(format!(
+                    "the version {v:?} of a key replaced nothing in its version index"
+                )));
+            };
+            let Some(earlier) = decode_entry(&entry)? else {
                 return Ok(IOResult::Done(None));
             };
-            let mut newest = true;
-            loop {
-                let v = Version::decode(&stored.head).ok_or_else(corrupt_header)?;
-                if txns.visible(txn, v.slot, v.ts) {
-                    if v.deleted() {
-                        return Ok(IOResult::Done(None));
-                    }
-                    match stored.value {
-                        StoredValue::Inline(value) => return Ok(IOResult::Done(Some(value))),
-                        StoredValue::OutOfLine(_) if newest => {
-                            op.newest = Some((Lookup::new(&op.key), stored.head))
-                        }
-                        StoredValue::OutOfLine(reference) => {
-                            op.earlier = Some(ValueRead::new(reference))
-                        }
-                    }
-                    break;
-                }
-                if v.first() {
-                    return Ok(IOResult::Done(None));
-                }
-                let index = done!(versions.index(v.slot, self.tree.root().class()));
-                let mut lookup = Lookup::new(&index_key(v.ts, v.command, self.root(), &op.key));
-                let Some(entry) = done!(index.lookup(&mut lookup)) else {
-                    return Err(LimboError::Corrupt(format!(
-                        "the version {v:?} of a key replaced nothing in its version index"
-                    )));
-                };
-                match decode_entry(&entry)? {
-                    Some(earlier) => {
-                        if Version::decode(&earlier.head) == Some(v) {
-                            return Err(LimboError::Corrupt(format!(
-                                "the version {v:?} replaced itself in its version index"
-                            )));
-                        }
-                        stored = earlier;
-                        newest = false;
-                    }
-                    None => return Ok(IOResult::Done(None)),
+            let e = Version::decode(&earlier.head).ok_or_else(corrupt_header)?;
+            if e == v {
+                return Err(LimboError::Corrupt(format!(
+                    "the version {v:?} replaced itself in its version index"
+                )));
+            }
+            if !txns.visible(txn, e.slot, e.ts) {
+                chain.at = e;
+                continue;
+            }
+            if e.deleted() {
+                return Ok(IOResult::Done(None));
+            }
+            match earlier.value {
+                StoredValue::Inline(value) => return Ok(IOResult::Done(Some(value))),
+                StoredValue::OutOfLine(reference) => {
+                    chain.reading = Some(ValueRead::new(reference))
                 }
             }
         }
@@ -627,6 +664,9 @@ impl Versions {
         }
     }
 }
+
+mod cursor;
+pub use cursor::VersionedCursor;
 
 #[cfg(test)]
 mod tests;

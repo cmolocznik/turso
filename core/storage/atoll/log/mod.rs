@@ -43,9 +43,13 @@ mod record;
 mod room;
 mod segment;
 mod waits;
+mod writers;
 
 pub use reader::{LogReader, OwnedRecord};
-pub use record::{framed_len, Header, Kind, Lsn, Place, ALIGN, BLOCK, MAX_PAYLOAD};
+pub use record::{
+    framed_len, GroupStart, Header, Kind, Lsn, Place, ALIGN, BLOCK, MAX_PAYLOAD, NO_GROUP,
+};
+pub use writers::{decode_table, encode_table, table_len, TxnTail, Writer, Writers, WRITERS};
 
 use super::aligned::AlignedBlock;
 use super::once::SetOnce;
@@ -352,14 +356,28 @@ impl Log {
         header: &Header,
         payload: &[&[u8]],
     ) -> Lsn {
+        self.append_with(admitted, header, payload, |_| {}).1
+    }
+
+    /// [`append`](Self::append), handing `reserved` where the record starts once its room is
+    /// reserved and before its copy completes: the log is never durable past the record before
+    /// `reserved` returns. Returns where the record starts and its LSN.
+    pub fn append_with(
+        self: &Arc<Self>,
+        admitted: &mut Admitted,
+        header: &Header,
+        payload: &[&[u8]],
+        reserved: impl FnOnce(GroupStart),
+    ) -> (GroupStart, Lsn) {
         let len = framed_len(payload_len(payload));
         let start = self.reserve(admitted, len);
+        reserved(GroupStart::at(start));
         let lsn = self.write_record(start, header, Place::ALONE, payload);
         self.count_copied(start, lsn);
         if self.flush_wanted() {
             self.flush();
         }
-        lsn
+        (GroupStart::at(start), lsn)
     }
 
     /// Appends `records` as one group: contiguous in the log, and replayed by recovery all
@@ -371,6 +389,18 @@ impl Log {
         admitted: &mut Admitted,
         records: &[(Header, &[&[u8]])],
     ) -> (Lsn, Vec<Lsn>) {
+        let (start, lsns) = self.append_group_with(admitted, records, |_| {});
+        (start.get(), lsns)
+    }
+
+    /// [`append_group`](Self::append_group), handing `reserved` where the group starts as
+    /// [`append_with`](Self::append_with) does.
+    pub fn append_group_with(
+        self: &Arc<Self>,
+        admitted: &mut Admitted,
+        records: &[(Header, &[&[u8]])],
+        reserved: impl FnOnce(GroupStart),
+    ) -> (GroupStart, Vec<Lsn>) {
         assert!(
             (2..=u8::MAX as usize).contains(&records.len()),
             "a group of {} records",
@@ -382,6 +412,7 @@ impl Log {
             .sum();
         // One reservation, so no other record lands inside the group.
         let start = self.reserve(admitted, total);
+        reserved(GroupStart::at(start));
         let size = records.len() as u8;
         let mut at = start;
         let lsns = records
@@ -400,7 +431,7 @@ impl Log {
         if self.flush_wanted() {
             self.flush();
         }
-        (start, lsns)
+        (GroupStart::at(start), lsns)
     }
 
     /// Takes `len` bytes of `admitted`'s room at the log's end; returns where they start.
@@ -844,6 +875,21 @@ impl Log {
             io.clone(),
             Arc::new(Segments::new(io, base, config.segment_bytes, config.direct)),
             start,
+        )
+    }
+
+    /// The group of this database's log that starts at `at`, read whole and checked: what a
+    /// transaction's chain, or a superblock, names.
+    pub fn read_group(
+        io: Arc<dyn IO>,
+        base: &str,
+        config: &LogConfig,
+        at: GroupStart,
+    ) -> Result<Vec<OwnedRecord>> {
+        LogReader::group_at(
+            io.clone(),
+            Arc::new(Segments::new(io, base, config.segment_bytes, config.direct)),
+            at,
         )
     }
 }

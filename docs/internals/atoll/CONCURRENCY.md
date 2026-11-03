@@ -324,6 +324,14 @@ in the last point.
     slots). A cycle aborts its youngest transaction. Under BEGIN CONCURRENT it fails at once.
   - Version indexes: written only by their slot's transaction, read optimistically by everyone;
     entries are removed by garbage collection through epochs.
+  - **The writer registry** (`log/writers.rs`) is a cell per slot, written by the slot's
+    transaction alone under a versioned latch nothing else takes, and read by a checkpoint
+    optimistically and validated, as a page is. A transaction enters its cell between reserving
+    a group and copying it in, and leaves as its Commit or End is reserved, so the log is never
+    durable past a group whose writer the registry misses, nor past a Commit or End whose writer
+    it still lists: a table taken once a redo point is fixed is exact for the log before it. A
+    cell held is one between a reservation and its copy, which takes no IO and no yield, so a
+    reader that finds it held yields and reads again.
 - **The one lock order** for the short critical sections that remain.
   - Latches are never waited for, and some mutexes are only ever tried, as ownership of a piece
     of work (§3, class 3): a checkpointer's state, a writeback, the page store's erasure and its

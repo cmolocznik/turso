@@ -162,12 +162,9 @@ fn commits() {
             let mut txn = drive(&io, || db.transactions().begin(Isolation::ReadCommitted)).unwrap();
             let log = db.log();
             let mut admitted = drive(&io, || log.admit(framed_len(8))).unwrap();
-            let lsn = log.append(
-                &mut admitted,
-                &txn.header(WRITE),
-                &[&txn.start().to_le_bytes()],
-            );
-            txn.logged(lsn);
+            let start = txn.start().to_le_bytes();
+            db.transactions()
+                .append(&mut txn, &mut admitted, WRITE, &[&start]);
             let mut op = Commit::new(txn);
             drive(&io, || db.transactions().commit(&mut op)).unwrap();
         })

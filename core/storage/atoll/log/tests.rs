@@ -23,7 +23,7 @@ fn header(txn: u64) -> Header {
         kind: Kind::new(1).unwrap(),
         flags: 0,
         txn,
-        prev: 0,
+        prev: None,
     }
 }
 
@@ -586,4 +586,47 @@ fn records_appended_after_a_partial_group_never_complete_it() {
         let (records, _) = read_all(io, BLOCK);
         assert_eq!(records.len(), 1 + later_group as usize);
     }
+}
+
+/// A walk from group to group reads each whole from where it starts, across blocks, chunks and
+/// segments, and refuses a position no group starts at.
+#[test]
+fn a_group_reads_whole_from_where_it_starts_and_nowhere_else() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
+    let mut starts = Vec::new();
+    for seq in 0..200 {
+        let records = unit(seq);
+        let len = records.iter().map(|r| framed_len(r.len())).sum();
+        let mut admitted = drive(&io, || log.admit(len)).unwrap();
+        let mut reserved = None;
+        let start = if records.len() == 1 {
+            log.append_with(&mut admitted, &header(seq), &[&records[0]], |s| {
+                reserved = Some(s)
+            })
+            .0
+        } else {
+            let pieces: Vec<[&[u8]; 1]> = records.iter().map(|r| [r.as_slice()]).collect();
+            let group: Vec<(Header, &[&[u8]])> =
+                pieces.iter().map(|p| (header(seq), &p[..])).collect();
+            log.append_group_with(&mut admitted, &group, |s| reserved = Some(s))
+                .0
+        };
+        assert_eq!(reserved, Some(start), "the hook saw another start");
+        starts.push((start, records));
+    }
+    drive(&io, || log.wait_durable(log.end())).unwrap();
+    for (start, records) in &starts {
+        let read = Log::read_group(io.clone(), BASE, &small(), *start).unwrap();
+        let payloads: Vec<&[u8]> = read.iter().map(|r| r.payload.as_slice()).collect();
+        let expected: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(payloads, expected, "the group at {}", start.get());
+    }
+    // A group's second record starts no group.
+    let (start, records) = starts.iter().find(|(_, r)| r.len() > 1).unwrap();
+    let inside = GroupStart::at(start.get() + framed_len(records[0].len()));
+    assert!(Log::read_group(io.clone(), BASE, &small(), inside).is_err());
+    // Past the end, nothing does.
+    let past = GroupStart::at(log.end().next_multiple_of(ALIGN));
+    assert!(Log::read_group(io.clone(), BASE, &small(), past).is_err());
 }

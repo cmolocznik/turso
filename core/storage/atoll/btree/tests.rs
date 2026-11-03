@@ -3,7 +3,7 @@ use crate::io::crash::CrashIO;
 use crate::io::MemoryIO;
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig, Opening};
-use crate::storage::atoll::log::LogConfig;
+use crate::storage::atoll::log::{LogConfig, TxnTail, Writer, Writers};
 use crate::storage::atoll::page::CLASS_COUNT;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
@@ -798,11 +798,25 @@ fn a_transactions_changes_name_it_and_its_tree_and_carry_what_undoes_them() {
         let db = open(&io, MIN_BUDGET, 1);
         let run = drive_runner(&io);
         let tree = create(&io, &db, &run, false);
-        let mut first = Put::new(b"k", b"one".to_vec(), Mode::Insert).in_transaction(42, 7);
+        let writers = Arc::new(Writers::new(1));
+        let mut first = Put::new(b"k", b"one".to_vec(), Mode::Insert).in_transaction(
+            TxnTail::new(42, None, writers.clone(), 0),
+        );
         assert_eq!(run_to(&run, || tree.put(&mut first)), Outcome::Inserted);
-        let mut second =
-            Put::new(b"k", b"two".to_vec(), Mode::Update).in_transaction(42, first.lsn());
+        let mut second = Put::new(b"k", b"two".to_vec(), Mode::Update).in_transaction(
+            TxnTail::new(42, first.group(), writers.clone(), 0),
+        );
         assert_eq!(run_to(&run, || tree.put(&mut second)), Outcome::Updated);
+        let (one, two) = (first.group().unwrap(), second.group().unwrap());
+        assert_eq!(
+            writers.snapshot(),
+            vec![Writer {
+                txn: 42,
+                first: one,
+                last: two
+            }],
+            "the changes' groups entered the registry"
+        );
         let mut plain = Put::new(b"p", b"x".to_vec(), Mode::Insert);
         run_to(&run, || tree.put(&mut plain));
         drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
@@ -817,11 +831,11 @@ fn a_transactions_changes_name_it_and_its_tree_and_carry_what_undoes_them() {
             };
             match rec.change {
                 Change::Insert { key, undo, .. } if key == b"k" => {
-                    seen.push((r.header.kind, r.header.txn, r.header.prev, r.lsn));
+                    seen.push((r.header.kind, r.header.txn, r.header.prev, r.group, r.lsn));
                     assert_eq!(undo, Some(tree.root()));
                 }
                 Change::Update { key, undo, .. } if key == b"k" => {
-                    seen.push((r.header.kind, r.header.txn, r.header.prev, r.lsn));
+                    seen.push((r.header.kind, r.header.txn, r.header.prev, r.group, r.lsn));
                     assert_eq!(undo, Some((tree.root(), &b"one"[..])));
                 }
                 Change::Insert { key, undo, .. } if key == b"p" => {
@@ -836,8 +850,8 @@ fn a_transactions_changes_name_it_and_its_tree_and_carry_what_undoes_them() {
         assert_eq!(
             seen,
             vec![
-                (record::TXN_INSERT, 42, 7, first.lsn()),
-                (record::TXN_UPDATE, 42, first.lsn(), second.lsn()),
+                (record::TXN_INSERT, 42, None, one.get(), first.lsn()),
+                (record::TXN_UPDATE, 42, Some(one), two.get(), second.lsn()),
             ]
         );
         tree.root()

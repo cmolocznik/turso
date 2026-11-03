@@ -99,7 +99,7 @@ impl Model<'_> {
             kind: CHANGE,
             flags: 0,
             txn: 0,
-            prev: 0,
+            prev: None,
         };
         self.log
             .append(admitted, &header, &[&pid.raw().to_le_bytes(), &payload])
@@ -726,7 +726,7 @@ fn header() -> Header {
         kind: CHANGE,
         flags: 0,
         txn: 0,
-        prev: 0,
+        prev: None,
     }
 }
 

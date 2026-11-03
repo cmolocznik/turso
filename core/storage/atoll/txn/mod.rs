@@ -16,10 +16,12 @@
 //!   publishing a lower timestamp: so a snapshot taken after the acknowledgement sees it, and no
 //!   reader waits ([`horizon`]).
 //! - **A transaction's records** carry its start timestamp as the transaction's id and chain to its
-//!   previous record, so its records are found from its last one.
+//!   previous group by where that group starts, so its records are found from its last one. Its
+//!   slot's cell in the writer registry holds its first and last groups from its first group's
+//!   reservation to its Commit's ([`super::log::Writers`]).
 
 use self::sync::{fence, AtomicU64, Ordering};
-use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
+use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn, TxnTail, Writers};
 use super::segmented::Segmented;
 use super::stack::Stack;
 use crate::io::Completion;
@@ -187,6 +189,8 @@ pub struct Transactions {
     /// transactions alone, so on a line of its own.
     running: Box<[CachePadded<AtomicU64>]>,
     horizon: Horizon,
+    /// The transactions that have logged a group and not yet their Commit or End.
+    writers: Arc<Writers>,
     /// A bit per slot, set while it is free.
     free: Box<[AtomicU64]>,
     /// Waiting for a free slot, woken to look again whenever one is freed.
@@ -213,8 +217,8 @@ pub struct Txn {
     command: u16,
     /// Per slot, the start of its last transaction committed before the snapshot, once looked up.
     seen: Vec<Option<Ts>>,
-    /// The transaction's last record; 0 while it has written nothing.
-    last: Lsn,
+    /// Where the transaction's last group starts; `None` while it has written nothing.
+    tail: Option<GroupStart>,
     /// Where the log stood at the snapshot: what a read-only commit waits to be durable.
     log_at: Lsn,
 }
@@ -239,18 +243,23 @@ impl Txn {
             kind,
             flags: 0,
             txn: self.start,
-            prev: self.last,
+            prev: self.tail,
         }
     }
 
-    /// Notes the transaction's record appended up to `lsn`.
-    pub fn logged(&mut self, lsn: Lsn) {
-        debug_assert!(lsn > self.last);
-        self.last = lsn;
+    /// Notes the transaction's group appended at `start`.
+    pub fn logged(&mut self, start: GroupStart) {
+        debug_assert!(self.tail.is_none_or(|t| t < start));
+        self.tail = Some(start);
+    }
+
+    /// Where the transaction's last group starts.
+    pub fn tail(&self) -> Option<GroupStart> {
+        self.tail
     }
 
     pub fn wrote(&self) -> bool {
-        self.last != 0
+        self.tail.is_some()
     }
 }
 
@@ -274,8 +283,14 @@ impl Commit {
 }
 
 impl Transactions {
-    /// `config.slots` slots over `clock`, every version already in the database committed.
-    pub fn new(config: &TxnConfig, clock: Arc<Clock>, log: Arc<Log>) -> Self {
+    /// `config.slots` slots over `clock`, every version already in the database committed, the
+    /// writers entered in `writers`.
+    pub fn new(
+        config: &TxnConfig,
+        clock: Arc<Clock>,
+        log: Arc<Log>,
+        writers: Arc<Writers>,
+    ) -> Self {
         assert!(
             (1..=u16::MAX as usize + 1).contains(&config.slots),
             "{} transaction slots",
@@ -291,6 +306,7 @@ impl Transactions {
                 .map(|_| CachePadded::new(AtomicU64::new(0)))
                 .collect(),
             horizon: Horizon::new(config.slots, base),
+            writers,
             free: (0..words)
                 .map(|w| {
                     let bits = (config.slots - w * 64).min(64);
@@ -309,6 +325,29 @@ impl Transactions {
 
     pub fn clock(&self) -> &Arc<Clock> {
         &self.clock
+    }
+
+    /// What `txn`'s next change is logged as: its group enters the writer registry as it is
+    /// reserved.
+    pub fn tail(&self, txn: &Txn) -> TxnTail {
+        TxnTail::new(txn.start, txn.tail, self.writers.clone(), txn.slot)
+    }
+
+    /// Appends a record of `txn`'s own of `kind`, outside any tree, within `admitted`'s room, and
+    /// returns its LSN.
+    pub fn append(
+        &self,
+        txn: &mut Txn,
+        admitted: &mut Admitted,
+        kind: Kind,
+        payload: &[&[u8]],
+    ) -> Lsn {
+        let (writers, slot, id) = (&self.writers, txn.slot, txn.start);
+        let (start, lsn) = self.log.append_with(admitted, &txn.header(kind), payload, |at| {
+            writers.reserved(slot, id, at)
+        });
+        txn.logged(start);
+        lsn
     }
 
     /// A free slot, taken.
@@ -358,7 +397,7 @@ impl Transactions {
             snapshot,
             command: 0,
             seen: vec![None; self.slots.len()],
-            last: 0,
+            tail: None,
             log_at: self.log.end(),
         }))
     }
@@ -410,9 +449,15 @@ impl Transactions {
                 None => txn.log_at,
                 Some(mut admitted) => {
                     let ts = self.horizon.draw(txn.slot, &self.clock);
-                    let lsn =
-                        self.log
-                            .append(&mut admitted, &txn.header(COMMIT), &[&ts.to_le_bytes()]);
+                    // Leaves the registry as its room is reserved: a checkpoint whose redo point
+                    // passes the Commit never lists it as needing undo.
+                    let (writers, slot, id) = (&self.writers, txn.slot, txn.start);
+                    let (_, lsn) = self.log.append_with(
+                        &mut admitted,
+                        &txn.header(COMMIT),
+                        &[&ts.to_le_bytes()],
+                        |_| writers.finished(slot, id),
+                    );
                     self.slots[txn.slot as usize].push(txn.start, ts);
                     self.horizon.published(txn.slot, &self.clock);
                     op.ts = Some(ts);

@@ -2,7 +2,7 @@ use super::*;
 use crate::io::MemoryIO;
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
-use crate::storage::atoll::log::{LogConfig, Lsn};
+use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
 use crate::storage::atoll::txn::{Commit, TxnConfig};
@@ -246,14 +246,14 @@ fn a_writer_waits_for_an_open_writer_and_conflicts_with_a_later_commit() {
 fn a_transactions_records_chain_and_carry_their_tree() {
     let db = open();
     let mut w = db.begin(Isolation::Snapshot);
-    let mut ends: Vec<Lsn> = Vec::new();
+    let mut groups = Vec::new();
     for key in ["a", "b", "c"] {
         db.put(&mut w, key, "v", Mode::Insert);
-        ends.push(w.last);
+        groups.push(w.tail().unwrap());
     }
     db.txns().statement(&mut w).unwrap();
     db.put(&mut w, "a", "w", Mode::Update);
-    ends.push(w.last);
+    groups.push(w.tail().unwrap());
     let start = w.start();
     db.commit(w);
     let mut reader = crate::storage::atoll::log::Log::reader(
@@ -271,13 +271,13 @@ fn a_transactions_records_chain_and_carry_their_tree() {
     let mut chain = Vec::new();
     while let Some(r) = reader.next_record().unwrap() {
         if r.header.txn == start {
-            chain.push((r.header.prev, r.lsn));
+            chain.push((r.header.prev, r.group));
         }
     }
-    let mut prev = 0;
-    for (i, &(p, lsn)) in chain.iter().enumerate().take(4) {
-        assert_eq!((p, lsn), (prev, ends[i]), "record {i}");
-        prev = lsn;
+    let mut prev = None;
+    for (i, &(p, group)) in chain.iter().enumerate().take(4) {
+        assert_eq!((p, group), (prev, groups[i].get()), "record {i}");
+        prev = Some(groups[i]);
     }
     assert_eq!(chain.len(), 5, "four changes and the commit");
 }

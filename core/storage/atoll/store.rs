@@ -722,7 +722,7 @@ impl PageStore {
             kind: record.kind(),
             flags: 0,
             txn: 0,
-            prev: 0,
+            prev: None,
         };
         // They change no metadata page, so no levels apply.
         (header, record.logged([0, 0]))
@@ -955,7 +955,7 @@ impl PageStore {
             kind: record.kind(),
             flags: 0,
             txn: 0,
-            prev: 0,
+            prev: None,
         };
         let lsn = self.log().append(admitted, &header, &[&payload]);
         (lsn - framed_len(payload.len()), lsn)

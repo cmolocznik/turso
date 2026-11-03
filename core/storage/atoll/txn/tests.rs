@@ -56,17 +56,13 @@ fn begin(io: &Arc<dyn IO>, db: &Atoll, isolation: Isolation) -> Txn {
     out.unwrap()
 }
 
-/// Logs a record for `txn`, as a change would.
+/// Logs a record for `txn`, as a change would; returns its LSN.
 fn write(io: &Arc<dyn IO>, db: &Atoll, txn: &mut Txn) -> Lsn {
     let log = db.log();
     let mut admitted = drive(io, || log.admit(framed_len(8))).unwrap();
-    let lsn = log.append(
-        &mut admitted,
-        &txn.header(WRITE),
-        &[&txn.start().to_le_bytes()],
-    );
-    txn.logged(lsn);
-    lsn
+    let start = txn.start().to_le_bytes();
+    db.transactions()
+        .append(txn, &mut admitted, WRITE, &[&start])
 }
 
 fn commit(io: &Arc<dyn IO>, db: &Atoll, txn: Txn) -> Option<Ts> {
@@ -254,13 +250,14 @@ fn a_commit_logs_its_timestamp_and_a_read_only_one_logs_nothing() {
     let mut txn = begin(&io, &db, Isolation::Snapshot);
     let start = txn.start();
     let written = write(&io, &db, &mut txn);
+    let group = txn.tail().expect("a group written");
     let ts = commit(&io, &db, txn).unwrap();
     assert!(ts > start);
     assert!(db.log().durable() >= db.log().end(), "done before durable");
     let mut reader = Log::reader(io.clone(), BASE, &log_config(), written);
     let r = reader.next_record().unwrap().expect("the Commit record");
     assert_eq!(r.header.kind, COMMIT);
-    assert_eq!((r.header.txn, r.header.prev), (start, written));
+    assert_eq!((r.header.txn, r.header.prev), (start, Some(group)));
     assert_eq!(commit_ts(&r.payload), Some(ts));
 }
 
@@ -323,4 +320,71 @@ fn the_clock_restarts_above_every_timestamp_and_what_was_written_reads_committed
             assert!(db.transactions().visible(&mut txn, slot, start, 1));
         }
     }
+}
+
+/// A full checkpoint, done; returns the superblock it leaves in charge.
+fn checkpoint(io: &Arc<dyn IO>, db: &Atoll) -> crate::storage::atoll::control::Superblock {
+    let ticket = db.checkpointer().request_full();
+    drive(io, || db.checkpointer().step_full(ticket)).unwrap();
+    db.checkpointer().superblock()
+}
+
+/// Commits transactions of 32 KiB records until `bytes` of log are appended.
+fn fill(io: &Arc<dyn IO>, db: &Atoll, bytes: u64) {
+    let filler = vec![7u8; 32 << 10];
+    let end = db.log().end() + bytes;
+    while db.log().end() < end {
+        let mut txn = begin(io, db, Isolation::Snapshot);
+        let mut admitted = drive(io, || db.log().admit(framed_len(filler.len()))).unwrap();
+        db.transactions()
+            .append(&mut txn, &mut admitted, WRITE, &[&filler]);
+        commit(io, db, txn);
+    }
+}
+
+#[test]
+fn a_writer_keeps_its_log_across_checkpoints_until_it_commits() {
+    use crate::storage::atoll::log::{decode_table, Writer};
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 4);
+    let mut long = begin(&io, &db, Isolation::Snapshot);
+    write(&io, &db, &mut long);
+    let first = long.tail().unwrap();
+    let segment = log_config().segment_bytes;
+    // Three segments' worth committed by others, checkpointed after each.
+    for _ in 0..3 {
+        fill(&io, &db, segment);
+        checkpoint(&io, &db);
+    }
+    let sb = checkpoint(&io, &db);
+    assert!(
+        sb.redo >= first.get() + 2 * segment,
+        "the redo point {} never passed the writer's segment",
+        sb.redo
+    );
+    let table = Log::read_group(io.clone(), BASE, &log_config(), sb.writers.expect("a table"))
+        .unwrap();
+    assert_eq!(
+        decode_table(&table[0].payload).unwrap(),
+        vec![Writer {
+            txn: long.start(),
+            first,
+            last: first
+        }]
+    );
+    let group = Log::read_group(io.clone(), BASE, &log_config(), first)
+        .expect("the writer's first group deleted while it may need undo");
+    assert_eq!(group[0].header.txn, long.start());
+    let held = db.checkpointer().retention().expect("retention reported");
+    assert_eq!((held.writer.txn, held.bytes), (long.start(), sb.redo - first.get()));
+    // Once it commits, the next checkpoint that moves the redo point lets its log go.
+    commit(&io, &db, long);
+    fill(&io, &db, segment);
+    let sb = checkpoint(&io, &db);
+    assert_eq!(sb.writers, None, "a table listing no one");
+    assert!(
+        Log::read_group(io.clone(), BASE, &log_config(), first).is_err(),
+        "the committed writer's segment kept"
+    );
+    assert_eq!(db.checkpointer().retention(), None);
 }

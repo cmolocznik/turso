@@ -36,7 +36,7 @@ use super::checkpoint::Checkpointer;
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::db::AtollConfig;
 use super::drive;
-use super::log::{Log, LogConfig, LogReader, Lsn, OwnedRecord};
+use super::log::{Log, LogConfig, LogReader, Lsn, OwnedRecord, Writers};
 use super::once::{Baton, SetOnce};
 use super::page::{self, PageId};
 use super::radix::FREE;
@@ -93,6 +93,8 @@ pub(super) struct Recovery {
     log_budget: u64,
     /// The superblock in charge as recovery found it.
     superblock: Superblock,
+    /// The writer registry its checkpoint, and then the database's transactions, use.
+    writers: Arc<Writers>,
     /// The superblock in charge once the analysis recorded the gap it leaves, if it leaves one.
     recorded: SetOnce<Superblock>,
     store: Arc<PageStore>,
@@ -187,6 +189,7 @@ impl Recovery {
         store: Arc<PageStore>,
         control: Control,
         superblock: Superblock,
+        writers: Arc<Writers>,
     ) -> Self {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let partitions = threads * PARTITIONS_PER_THREAD;
@@ -199,6 +202,7 @@ impl Recovery {
             buffer: config.buffer.clone(),
             log_budget,
             superblock,
+            writers,
             recorded: SetOnce::default(),
             store,
             control: Baton::new(Some(control)),
@@ -604,6 +608,7 @@ impl Recovery {
             superblock,
             self.log_budget,
             clock.clone(),
+            self.writers.clone(),
         );
         let ticket = checkpointer.request_full();
         drive(&self.io, || checkpointer.step_full(ticket))?;

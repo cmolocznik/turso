@@ -8,7 +8,7 @@
 //! record that does not continue the group being read ends it the same way; that is what a crash
 //! leaves when the log restarted past part of a group and later records follow.
 
-use super::record::{self, Header, Lsn, Parsed, Place, BLOCK};
+use super::record::{self, GroupStart, Header, Lsn, Parsed, Place, BLOCK};
 use super::segment::Segments;
 use crate::io::{Completion, IO};
 use crate::storage::atoll::aligned::AlignedBlock;
@@ -49,12 +49,18 @@ pub struct LogReader {
     /// No more bytes can be read: a segment is missing or ends.
     exhausted: bool,
     buffer: Arc<AlignedBlock>,
+    /// Bytes read at once: a whole [`READ`] in order, a block where one group is wanted.
+    read: usize,
     /// Gaps to read past, in order: where the log ended, and where it goes on.
     continuations: std::collections::VecDeque<(Lsn, Lsn)>,
 }
 
 impl LogReader {
     pub(super) fn new(io: Arc<dyn IO>, segments: Arc<Segments>, start: Lsn) -> Self {
+        Self::reading(io, segments, start, READ)
+    }
+
+    fn reading(io: Arc<dyn IO>, segments: Arc<Segments>, start: Lsn, read: usize) -> Self {
         assert!(
             start.is_multiple_of(record::ALIGN),
             "reading the log from {start}"
@@ -71,9 +77,39 @@ impl LogReader {
             window: Vec::new(),
             window_at,
             exhausted: false,
-            buffer: Arc::new(AlignedBlock::zeroed(READ)),
+            buffer: Arc::new(AlignedBlock::zeroed(read)),
+            read,
             continuations: Default::default(),
         }
+    }
+
+    /// The group that starts at `at`, read whole and checked to start there: one record outside
+    /// any group, or every record of one. Read a block at a time, for a walk from group to group.
+    pub(super) fn group_at(
+        io: Arc<dyn IO>,
+        segments: Arc<Segments>,
+        at: GroupStart,
+    ) -> Result<Vec<OwnedRecord>> {
+        let corrupt = || {
+            LimboError::Corrupt(format!(
+                "no whole group starts at {}, where a chain names one",
+                at.get()
+            ))
+        };
+        let mut reader = Self::reading(io, segments, at.get(), BLOCK as usize);
+        let first = reader.next_record()?.ok_or_else(corrupt)?;
+        if first.start != at.get() || first.group != at.get() {
+            return Err(corrupt());
+        }
+        let mut out = vec![first];
+        while out.last().is_some_and(|r| r.place.grouped() && !r.place.last()) {
+            let r = reader.next_record()?.ok_or_else(corrupt)?;
+            if r.group != at.get() {
+                return Err(corrupt());
+            }
+            out.push(r);
+        }
+        Ok(out)
     }
 
     /// Reads past the gaps a superblock records ([`super::super::control::Superblock`]): where
@@ -213,7 +249,7 @@ impl LogReader {
     /// Drops window bytes before the scan once they are a whole read's worth.
     fn forget_consumed(&mut self) {
         let consumed = (self.scan - self.window_at) as usize;
-        if consumed >= READ {
+        if consumed >= self.read {
             let keep_from = consumed - consumed % BLOCK as usize;
             self.window.drain(..keep_from);
             self.window_at += keep_from as u64;
@@ -233,7 +269,7 @@ impl LogReader {
                 return Ok(false);
             };
             let segment_end = self.segments.start(number + 1);
-            let len = ((segment_end - at) as usize).min(READ);
+            let len = ((segment_end - at) as usize).min(self.read);
             let into = self.buffer.region(0, len);
             // The bytes read, set once the read lands.
             let got = Arc::new(AtomicU64::new(0));

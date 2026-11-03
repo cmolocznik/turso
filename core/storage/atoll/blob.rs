@@ -47,7 +47,7 @@ pub fn write(
         kind: WRITE,
         flags: 0,
         txn: 0,
-        prev: 0,
+        prev: None,
     };
     let lsn = log.append(admitted, &header, &[&head, bytes]);
     apply(&mut page.page_mut(), offset, bytes);

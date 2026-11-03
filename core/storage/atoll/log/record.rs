@@ -7,6 +7,8 @@
 //! `index` and `size` place a record in a group of records appended as one ([`Place`]): recovery
 //! replays all of a group or none of it. A record outside any group has both 0.
 //!
+//! `prev` is where the transaction's previous group starts ([`GroupStart`]), or [`NO_GROUP`].
+//!
 //! A record starts at a multiple of [`ALIGN`] and is padded with zeros to the next one. The CRC
 //! covers the record's position, its first 24 bytes and its payload, so a record read at any other
 //! position, a torn record, and whatever an earlier use of the disk left there all read as the
@@ -25,6 +27,46 @@
 use crate::io::DIRECT_IO_ALIGNMENT;
 
 pub type Lsn = u64;
+
+/// Where a group of records starts, or a record outside any group: the position a reader begins
+/// at to read it whole. A type apart from [`Lsn`], where a record ends: LSNs order a page's
+/// changes and mark what is durable, group starts locate records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupStart(u64);
+
+impl GroupStart {
+    /// The group starting at `at`, a position records start at.
+    pub fn at(at: Lsn) -> Self {
+        assert!(
+            at.is_multiple_of(ALIGN),
+            "a group starting at {at}, off the {ALIGN}-byte grid records start on"
+        );
+        Self(at)
+    }
+
+    pub fn get(self) -> Lsn {
+        self.0
+    }
+
+    /// `group` as a header or a superblock holds it: [`NO_GROUP`] for none.
+    pub fn encode(group: Option<GroupStart>) -> u64 {
+        group.map_or(NO_GROUP, GroupStart::get)
+    }
+
+    /// What `raw`, as [`encode`](Self::encode) wrote it, names; `None` if it names neither a
+    /// group nor none.
+    pub fn decode(raw: u64) -> Option<Option<GroupStart>> {
+        match raw {
+            NO_GROUP => Some(None),
+            at if at.is_multiple_of(ALIGN) => Some(Some(GroupStart(at))),
+            _ => None,
+        }
+    }
+}
+
+/// No group, where a position names one. Groups start on the [`ALIGN`] grid, which this is off;
+/// 0 does name a group.
+pub const NO_GROUP: u64 = u64::MAX;
 
 /// Where records start.
 pub const ALIGN: u64 = 16;
@@ -64,8 +106,8 @@ pub struct Header {
     pub flags: u8,
     /// The transaction that wrote it; 0 for none.
     pub txn: u64,
-    /// The LSN of the transaction's previous record; 0 for none.
-    pub prev: Lsn,
+    /// Where the transaction's previous group starts; `None` for none.
+    pub prev: Option<GroupStart>,
 }
 
 /// Where a record stands in a group of records appended as one: its index, and how many records
@@ -115,7 +157,7 @@ pub fn header_bytes(header: &Header, place: Place, payload_len: usize) -> [u8; H
     out[6] = place.index;
     out[7] = place.size;
     out[8..16].copy_from_slice(&header.txn.to_le_bytes());
-    out[16..24].copy_from_slice(&header.prev.to_le_bytes());
+    out[16..24].copy_from_slice(&GroupStart::encode(header.prev).to_le_bytes());
     out
 }
 
@@ -202,13 +244,17 @@ pub fn parse(at: Lsn, bytes: &[u8]) -> Parsed<'_> {
     if stored != crc(at, &header, &[payload]) || !place.valid() {
         return Parsed::End;
     }
+    let Some(prev) = GroupStart::decode(u64::from_le_bytes(header[16..24].try_into().unwrap()))
+    else {
+        return Parsed::End;
+    };
     Parsed::Record(Record {
         place,
         header: Header {
             kind: Kind(header[4]),
             flags: header[5],
             txn: u64::from_le_bytes(header[8..16].try_into().unwrap()),
-            prev: u64::from_le_bytes(header[16..24].try_into().unwrap()),
+            prev,
         },
         payload,
         start: at,
@@ -238,8 +284,32 @@ mod tests {
             kind: Kind::new(7).unwrap(),
             flags: 3,
             txn: 42,
-            prev: 4096,
+            prev: Some(GroupStart::at(4096)),
         }
+    }
+
+    #[test]
+    fn a_previous_group_at_zero_reads_back_apart_from_none() {
+        for prev in [None, Some(GroupStart::at(0)), Some(GroupStart::at(4096))] {
+            let h = Header { prev, ..header() };
+            let bytes = encode(64, &h, Place::ALONE, b"x");
+            let Parsed::Record(r) = parse(64, &bytes) else {
+                panic!("no record for {prev:?}")
+            };
+            assert_eq!(r.header.prev, prev);
+        }
+    }
+
+    #[test]
+    fn a_prev_off_the_grid_is_no_record() {
+        let mut head = header_bytes(&header(), Place::ALONE, 1);
+        head[16..24].copy_from_slice(&8u64.to_le_bytes());
+        let crc = crc(64, &head, &[b"x"]);
+        let mut bytes = head.to_vec();
+        bytes.push(b'x');
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.resize(framed_len(1) as usize, 0);
+        assert_eq!(parse(64, &bytes), Parsed::End);
     }
 
     #[test]

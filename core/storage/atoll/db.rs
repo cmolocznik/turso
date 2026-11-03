@@ -4,7 +4,7 @@
 use super::buffer::{BufferConfig, BufferPool, LocalSource};
 use super::checkpoint::Checkpointer;
 use super::control::{Control, Superblock};
-use super::log::{Log, LogConfig, Lsn};
+use super::log::{framed_len, table_len, Log, LogConfig, Lsn, Writers};
 use super::page::CLASS_COUNT;
 use super::recovery::Recovery;
 use super::store::{PageStore, StoreConfig};
@@ -102,6 +102,8 @@ pub struct Opening {
     store: Arc<PageStore>,
     superblock: Superblock,
     txn: TxnConfig,
+    /// The writer registry the transactions enter and checkpoints read.
+    writers: Arc<Writers>,
     how: How,
 }
 
@@ -120,6 +122,15 @@ enum How {
 
 impl Opening {
     pub fn new(io: Arc<dyn IO>, base: &str, mut config: AtollConfig) -> Result<Self> {
+        // A checkpoint's writer table lists up to one writer per slot, in one record.
+        let table = framed_len(table_len(config.txn.slots));
+        if table > config.log.buffer_bytes {
+            return Err(LimboError::InternalError(format!(
+                "{} transaction slots need a writer table of up to {table} bytes of log, more \
+                 than the {} byte log buffer",
+                config.txn.slots, config.log.buffer_bytes
+            )));
+        }
         let (control, superblock) = Control::open(io.clone(), base)?;
         let Some(superblock) = superblock else {
             return Self::create(io, base, config, control);
@@ -129,6 +140,7 @@ impl Opening {
         config.store.file_bytes = superblock.file_bytes;
         let store =
             PageStore::recovering(io.clone(), base, config.store.clone(), superblock.heights);
+        let writers = Arc::new(Writers::new(config.txn.slots));
         let recovery = Recovery::new(
             io.clone(),
             base,
@@ -136,10 +148,12 @@ impl Opening {
             store.clone(),
             control,
             superblock.clone(),
+            writers.clone(),
         );
         Ok(Self {
             store,
             superblock,
+            writers,
             txn: config.txn,
             how: How::Recovering(Box::new(recovery)),
         })
@@ -159,6 +173,7 @@ impl Opening {
             database_id,
             heights: [[1; CLASS_COUNT]; 2],
             clock: 0,
+            writers: None,
             continuations: Vec::new(),
         };
         let log = Log::open(io.clone(), base, config.log.clone(), 0)?;
@@ -179,6 +194,7 @@ impl Opening {
             0,
         )?;
         let clock = Arc::new(Clock::after(0));
+        let writers = Arc::new(Writers::new(config.txn.slots));
         let checkpointer = Checkpointer::new(
             pool.clone(),
             store.clone(),
@@ -186,10 +202,12 @@ impl Opening {
             superblock.clone(),
             config.log_budget(),
             clock.clone(),
+            writers.clone(),
         );
         Ok(Self {
             store,
             superblock,
+            writers,
             txn: config.txn,
             how: How::Created(Box::new(Created {
                 log,
@@ -235,7 +253,7 @@ impl Opening {
         Ok(Atoll {
             database_id: self.superblock.database_id,
             recovered_end,
-            txns: Transactions::new(&self.txn, clock, log.clone()),
+            txns: Transactions::new(&self.txn, clock, log.clone(), self.writers),
             log,
             store: self.store,
             pool,

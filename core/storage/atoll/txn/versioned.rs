@@ -407,12 +407,12 @@ impl VersionedTree {
                 Mode::Upsert,
             )
             .expecting(stored.as_ref())
-            .in_transaction(txn.start, txn.last);
+            .in_transaction(txns.tail(txn));
             match done!(self.tree.put(&mut put)) {
                 // Another version came first: judge it.
                 Outcome::Changed => continue,
                 _ => {
-                    txn.logged(put.lsn());
+                    txn.logged(put.group().expect("a versioned tree's change is logged"));
                     return Ok(IOResult::Done(Write::Done(if present {
                         Outcome::Updated
                     } else {

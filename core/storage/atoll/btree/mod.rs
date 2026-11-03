@@ -39,7 +39,7 @@ pub mod value;
 mod tests;
 
 use super::buffer::{BufferPool, Exclusive, Optimistic};
-use super::log::{framed_len, Admitted, Header, Log, Lsn};
+use super::log::{framed_len, Admitted, GroupStart, Header, Log, Lsn, TxnTail};
 use super::page::{self, PageId, SizeClass};
 use super::shared::{Bytes, BytesMut};
 use super::store::{PageStore, StoreRecord};
@@ -294,35 +294,39 @@ impl Tree {
         nodes: &[Record<'_>],
         store: &[StoreRecord],
     ) -> Vec<Lsn> {
-        self.log_as(grant, None, nodes, store)
+        self.log_as(grant, None, nodes, store).1
     }
 
-    /// As [`log_batch`](Self::log_batch), with the first node record in transaction `txn`: its
-    /// id, and its previous record.
+    /// As [`log_batch`](Self::log_batch), with the first node record in transaction `txn`, its
+    /// group entered in the writer registry as it is reserved. Returns where the records start
+    /// too; `None` in a temporary tree.
     fn log_as(
         &self,
         grant: &mut Grant,
-        txn: Option<(u64, Lsn)>,
+        txn: Option<&TxnTail>,
         nodes: &[Record<'_>],
         store: &[StoreRecord],
-    ) -> Vec<Lsn> {
+    ) -> (Option<GroupStart>, Vec<Lsn>) {
         let Some(admitted) = &mut grant.0 else {
-            return nodes.iter().map(|_| self.pool.temporary_lsn()).collect();
+            return (
+                None,
+                nodes.iter().map(|_| self.pool.temporary_lsn()).collect(),
+            );
         };
         let mut payloads: Vec<(Header, Vec<u8>)> = nodes
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                let (txn, prev) = txn.filter(|_| i == 0).unwrap_or((0, 0));
-                (
-                    Header {
+                let header = match txn.filter(|_| i == 0) {
+                    Some(t) => t.header(r.kind()),
+                    None => Header {
                         kind: r.kind(),
                         flags: 0,
-                        txn,
-                        prev,
+                        txn: 0,
+                        prev: None,
                     },
-                    r.encode(),
-                )
+                };
+                (header, r.encode())
             })
             .collect();
         payloads.extend(store.iter().map(PageStore::group_record));
@@ -333,16 +337,22 @@ impl Tree {
             .map(|((h, _), p)| (*h, &p[..]))
             .collect();
         let log = self.store.log();
+        // A transaction's group enters the writer registry before its copy completes.
+        let reserved = |at: GroupStart| {
+            if let Some(t) = txn {
+                t.reserved(at);
+            }
+        };
         let (start, lsns) = if records.len() == 1 {
-            let lsn = log.append(admitted, &records[0].0, records[0].1);
-            (lsn - framed_len(payloads[0].1.len()), vec![lsn])
+            let (start, lsn) = log.append_with(admitted, &records[0].0, records[0].1, reserved);
+            (start, vec![lsn])
         } else {
-            log.append_group(admitted, &records)
+            log.append_group_with(admitted, &records, reserved)
         };
         for (s, &lsn) in store.iter().zip(&lsns[nodes.len()..]) {
-            self.store.grouped(s, start, lsn);
+            self.store.grouped(s, start.get(), lsn);
         }
-        lsns[..nodes.len()].to_vec()
+        (Some(start), lsns[..nodes.len()].to_vec())
     }
 
     // ---------------------------------------------------------------- descending
@@ -646,7 +656,8 @@ impl Tree {
                 store.push(StoreRecord::Abandon { pids: abandon });
             }
             let (mut admitted, _) = op.admitted.take().expect("admitted");
-            let lsns = self.log_as(&mut admitted, op.txn, &[record], &store);
+            let (group, lsns) = self.log_as(&mut admitted, op.txn.as_ref(), &[record], &store);
+            op.group = group.filter(|_| op.txn.is_some());
             ex.changed(lsns[0]);
             op.lsn = lsns[0];
             drop(ex);
@@ -1634,8 +1645,9 @@ pub struct Put {
     /// The entry the put expects to replace: its stored value and whether out of line, or `None`
     /// for an absent key.
     expected: Option<Option<(Vec<u8>, bool)>>,
-    /// The transaction the change belongs to: its id and previous record.
-    txn: Option<(u64, Lsn)>,
+    /// The transaction the change belongs to, and where its group starts once logged.
+    txn: Option<TxnTail>,
+    group: Option<GroupStart>,
 }
 
 impl Put {
@@ -1657,6 +1669,7 @@ impl Put {
             lsn: 0,
             expected: None,
             txn: None,
+            group: None,
         }
     }
 
@@ -1670,10 +1683,15 @@ impl Put {
         self
     }
 
-    /// Logs the change as transaction `txn`'s, after its record at `prev`, with what undoes it.
-    pub fn in_transaction(mut self, txn: u64, prev: Lsn) -> Self {
-        self.txn = Some((txn, prev));
+    /// Logs the change as `tail`'s transaction's, after its previous group, with what undoes it.
+    pub fn in_transaction(mut self, tail: TxnTail) -> Self {
+        self.txn = Some(tail);
         self
+    }
+
+    /// Where the transaction's group holding the change starts, once logged in a transaction.
+    pub fn group(&self) -> Option<GroupStart> {
+        self.group
     }
 
     /// Where the change's record ends, once made; 0 if nothing changed. The change is durable

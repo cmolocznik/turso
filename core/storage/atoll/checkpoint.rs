@@ -3,9 +3,12 @@
 //! Each time a share of the log budget has been appended, a pass writes back the dirty pages of
 //! the next shard of frames, round robin ([`Pass`]). After a pass, the redo point moves to the
 //! lowest position of any shard, as far as the page store allows too: its metadata pages are
-//! written up to there and the slots it freed before there are erased. A superblock naming the
-//! new redo point is written, and log segments wholly before it are deleted. In between, it frees
-//! the provisional pages operations gave up on ([`PageStore::orphaned`]).
+//! written up to there and the slots it freed before there are erased. Then the writer table is
+//! taken from the registry and appended, and once it is durable a superblock naming the new redo
+//! point and the table is written ([`Writers`]). Log segments wholly before the redo point and
+//! before the first group of every writer the table lists are deleted only once that superblock
+//! is durable. In between, it frees the provisional pages operations gave up on
+//! ([`PageStore::orphaned`]).
 //!
 //! With S shards each taking 1/S of the budget, the redo point trails the log's end by about the
 //! budget, plus what is appended while a pass runs.
@@ -14,7 +17,9 @@ use super::arc_cell::{ArcCell, Releasing};
 use super::buffer::{BufferPool, Pass};
 use super::control::{Control, Superblock};
 use super::epoch::Epochs;
-use super::log::{Log, Lsn};
+use super::log::{
+    encode_table, framed_len, Admitted, Header, Log, Lsn, Writer, Writers, WRITERS,
+};
 use super::store::PageStore;
 use super::txn::Clock;
 use crate::io::Completion;
@@ -30,6 +35,14 @@ pub struct Checkpointer {
     clock: Arc<Clock>,
     /// Log appended between passes: the budget split among the shards.
     increment: u64,
+    /// How much log recovery should replay at most.
+    budget: u64,
+    /// The writers that may need undo, which each superblock's table lists.
+    writers: Arc<Writers>,
+    /// The oldest writer the published table lists, and how far behind the redo point it holds
+    /// the log, while one does.
+    retention: ArcCell<Retention>,
+    releasing_retention: Releasing<Retention>,
     /// Full checkpoints asked for so far.
     full_wanted: AtomicU64,
     /// The superblock in charge, as the checkpoint stepping it last wrote it, for anyone to read.
@@ -57,6 +70,15 @@ enum Work {
     Advance(Advance),
 }
 
+/// A writer holding the log behind the redo point: segments from its first group on are kept for
+/// its undo, however far back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    pub writer: Writer,
+    /// Bytes of log kept behind the redo point for it.
+    pub bytes: u64,
+}
+
 /// Moving the redo point once passes are done.
 struct Advance {
     full: Option<u64>,
@@ -71,7 +93,18 @@ enum Stage {
     Durable,
     Metadata,
     Erase,
-    Superblock(Superblock, Option<Completion>),
+    /// The writer table the superblock names, durable before it is.
+    Table(Superblock, Table),
+    /// With the oldest writer its table lists.
+    Superblock(Superblock, Option<Completion>, Option<Writer>),
+}
+
+/// A writer table on its way to being durable.
+struct Table {
+    writers: Vec<Writer>,
+    admitted: Option<Admitted>,
+    /// Where its record ends, once appended.
+    end: Option<Lsn>,
 }
 
 impl Checkpointer {
@@ -84,17 +117,23 @@ impl Checkpointer {
         superblock: Superblock,
         budget: u64,
         clock: Arc<Clock>,
+        writers: Arc<Writers>,
     ) -> Self {
         let last_pass = store.log().end();
+        let epochs = Arc::new(Epochs::new());
         Self {
             increment: (budget / pool.shard_count() as u64).max(1),
+            budget,
+            writers,
+            retention: ArcCell::default(),
             pool,
             store,
             control,
             clock,
             full_wanted: AtomicU64::new(0),
             published: ArcCell::new(Arc::new(superblock.clone())),
-            releasing: Releasing::new(Arc::new(Epochs::new())),
+            releasing: Releasing::new(epochs.clone()),
+            releasing_retention: Releasing::new(epochs),
             state: Mutex::new(State {
                 superblock,
                 next_shard: 0,
@@ -107,6 +146,39 @@ impl Checkpointer {
 
     fn log(&self) -> &Arc<Log> {
         self.store.log()
+    }
+
+    /// The oldest writer the superblock in charge lists, if it holds the log behind the redo
+    /// point, and by how much.
+    pub fn retention(&self) -> Option<Retention> {
+        let step = self.releasing_retention.epochs().enter();
+        self.retention.get(&step).map(|r| *r)
+    }
+
+    /// Publishes how far `oldest`, the oldest writer the superblock just published lists, holds
+    /// the log behind `redo`, and says so as it first holds more than the budget: recovery reads
+    /// that much more, for its undo.
+    fn retained(&self, oldest: Option<Writer>, redo: Lsn) {
+        let now = oldest
+            .filter(|w| w.first.get() < redo)
+            .map(|writer| Retention {
+                writer,
+                bytes: redo - writer.first.get(),
+            });
+        if let Some(r) = now.filter(|r| r.bytes > self.budget) {
+            let before = self.retention();
+            if before.is_none_or(|b| b.writer.txn != r.writer.txn || b.bytes <= self.budget) {
+                tracing::warn!(
+                    "transaction {} holds {} bytes of log behind the redo point for its undo, \
+                     past the {} byte log budget",
+                    r.writer.txn,
+                    r.bytes,
+                    self.budget
+                );
+            }
+        }
+        self.retention
+            .replace(now.map(Arc::new), &self.releasing_retention);
     }
 
     /// The superblock in charge.
@@ -226,6 +298,7 @@ impl State {
                                 heights: cp.store.heights(),
                                 // Read after every change before the redo point was logged.
                                 clock: cp.clock.now(),
+                                writers: None,
                                 // A gap the redo point passed is read past by no one.
                                 continuations: self
                                     .superblock
@@ -236,21 +309,64 @@ impl State {
                                     .collect(),
                                 ..self.superblock.clone()
                             };
-                            a.stage = Stage::Superblock(sb, None);
+                            // Taken once the redo point is fixed: every writer with a group
+                            // before it is in the registry, and none whose Commit or End is.
+                            let table = Table {
+                                writers: cp.writers.snapshot(),
+                                admitted: None,
+                                end: None,
+                            };
+                            a.stage = Stage::Table(sb, table);
                         }
                         IOResult::IO(io) => return Ok(IOResult::IO(io)),
                     },
-                    Stage::Superblock(sb, written) => match cp.control.step_write(sb, written)? {
-                        IOResult::Done(()) => {
-                            self.superblock = sb.clone();
-                            cp.published
-                                .replace(Some(Arc::new(sb.clone())), &cp.releasing);
-                            let full = a.full;
-                            cp.log().release_before(self.superblock.redo)?;
-                            self.finish(full);
+                    Stage::Table(sb, table) => {
+                        if !table.writers.is_empty() && table.end.is_none() {
+                            let payload = encode_table(&table.writers);
+                            if table.admitted.is_none() {
+                                match cp.log().admit(framed_len(payload.len()))? {
+                                    IOResult::Done(admitted) => table.admitted = Some(admitted),
+                                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                                }
+                            }
+                            let header = Header {
+                                kind: WRITERS,
+                                flags: 0,
+                                txn: 0,
+                                prev: None,
+                            };
+                            let admitted = table.admitted.as_mut().expect("admitted");
+                            let (start, end) =
+                                cp.log().append_with(admitted, &header, &[&payload], |_| {});
+                            sb.writers = Some(start);
+                            table.end = Some(end);
                         }
-                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                    },
+                        if let Some(end) = table.end {
+                            if let IOResult::IO(io) = cp.log().wait_durable(end)? {
+                                return Ok(IOResult::IO(io));
+                            }
+                        }
+                        let oldest = table.writers.iter().copied().min_by_key(|w| w.first);
+                        let sb = sb.clone();
+                        a.stage = Stage::Superblock(sb, None, oldest);
+                    }
+                    Stage::Superblock(sb, written, oldest) => {
+                        match cp.control.step_write(sb, written)? {
+                            IOResult::Done(()) => {
+                                self.superblock = sb.clone();
+                                cp.published
+                                    .replace(Some(Arc::new(sb.clone())), &cp.releasing);
+                                let full = a.full;
+                                let redo = self.superblock.redo;
+                                // Undo needs every group of a writer the table lists.
+                                let keep = oldest.map_or(redo, |w| w.first.get().min(redo));
+                                cp.log().release_before(keep)?;
+                                cp.retained(*oldest, redo);
+                                self.finish(full);
+                            }
+                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        }
+                    }
                 },
             }
         }

@@ -237,8 +237,12 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
   position, its header and its payload, so a record read at another position, a torn record, or
   bytes a crash left behind never read as valid.
 - **LSN.** A record's LSN is the position just past its end.
-- **Chaining.** `prev` is the previous record of the same transaction, so a transaction's records
-  are found from its last one.
+- **Chaining.** `prev` is where the transaction's previous group starts: the position a reader
+  must begin at to read that group whole (a record outside any group is a group of one). A
+  transaction's tail is its last group's start, so its records are found from its last one, back.
+  Group starts are a type apart from LSNs: an LSN orders a page's changes and marks what is
+  durable, a group start locates records. A `prev` of `u64::MAX` names no previous group, since a
+  group can start at 0.
 - **Page records** carry the page id: New, Free, Remap, write intent, blob write, and the B-tree
   operations (insert, update with the changed columns, delete-mark, remove, split, merge, new root).
   - Redo is physical per page.
@@ -247,8 +251,10 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
     merges.
   - Logging undo costs about 20% more log volume (Haubenschild et al. §4: 2,230 against 1,850 bytes
     per TPC-C transaction).
-- **Transaction records:** Begin, Commit (with its timestamp), End, and compensation (the redo of one
-  undo step, naming the next record to undo).
+- **Transaction records:** Commit (with its timestamp); End, once a transaction that did not
+  commit has no undo left; and compensation, the redo of putting one key back, naming the work it
+  completed (section 11.5). There is no Begin: a transaction becomes a writer with its first group.
+  A checkpoint's writer table is a record too (section 10).
 - **Structure changes** (split, merge, the root growing or shrinking) are system operations. They
   are redo-only, logged atomically as one group (section 7.6), and never undone by a user
   transaction's rollback.
@@ -518,15 +524,28 @@ Checkpoints are continuous (LeanStore 2024 §2.7, Haubenschild et al. §3.4). Bu
    pass's writes are durable. Metadata pages changed before the lowest shard position are
    written, and slots whose freeing is durable are erased. The redo point is then the lowest
    shard position, or what the page store allows (section 6.3) if that is lower. When it moves,
-   a superblock naming it is written, and log segments wholly before it are deleted.
-6. **Log budget.** The log budget is how much log recovery may have to replay. It is configured,
+   a superblock naming it is written, and log segments wholly before it are deleted, as far as
+   the writer table allows.
+6. **Writer table.** Undo needs a transaction's records however old they are, so a checkpoint
+   records the writers that still need undo by the log before its redo point R: each one's
+   `txn | first group | last group`. It is taken once R is fixed, from a registry every writer
+   enters before its first group's copy completes and leaves as its Commit or End is reserved, so
+   no group before R, and no Commit or End before R, can be missed. It is appended as a record,
+   which is durable before the superblock naming it is written, so a superblock torn on the way
+   leaves the one before it in charge with its own table. Only once the superblock is durable are
+   segments deleted, and only those wholly below both R and the first group of every writer its
+   table lists. A transaction's End or the release of its slot frees nothing: the next checkpoint
+   drops it from the table, and an End lost in a crash is undone again from the log still kept. A
+   long writer holds the log back without limit; the checkpoint reports how far it holds it past
+   the log budget, and space running out fails appends, never the undo they need.
+7. **Log budget.** The log budget is how much log recovery may have to replay. It is configured,
    and by default scales with the pool: 0.4 times the pool, the ratio of Haubenschild's example (a
    20 GB WAL for a 50 GB pool). The redo point then trails the log's end by about the budget, plus
    what is appended while a pass runs. Like PostgreSQL's `max_wal_size`, it is a target: appends
    are never held back waiting for a pass.
-7. **No stalls.** Writing a page latches it only long enough to copy it. A page being written may
+8. **No stalls.** Writing a page latches it only long enough to copy it. A page being written may
    still change, and is clean afterwards only if it did not.
-8. **Stepped like any background work.** Whoever steps the checkpointer runs what is due: a pass,
+9. **Stepped like any background work.** Whoever steps the checkpointer runs what is due: a pass,
    moving the redo point, and erasing what has become erasable. A full checkpoint passes every
    shard at once; recovery ends with one.
 
@@ -573,13 +592,15 @@ Built in `txn/mod.rs`.
   - `flags` mark a deleted entry or a lock with no new data.
 - **Old versions.**
   - **Version index.** Each slot keeps a version index, a B-tree of temporary pages keyed
-    `slot | ts | tree | key | command` by the version that replaced the stored one: the replacing
-    transaction's start, the tree's root, the key and the replacing statement. The statement is in
+    `ts | command | tree | key` by the version that replaced the stored one: the replacing
+    transaction's start, the replacing statement, the tree's root and the key. The statement is in
     the key so that a statement changing a row an earlier statement of its transaction changed
-    keeps that earlier version, which it still reads. An update stores its delta there, or the
-    whole old value when the size changes. Inserts go to the right edge, and garbage collection is
-    a range delete. A slot has one per node class of the trees it writes, a class larger, so its
-    keys hold a tree's longest key and the 18 bytes around it.
+    keeps that earlier version, which it still reads, and before the tree so that a backward scan
+    of a transaction's entries reads them newest statement first, the order rollback needs
+    (section 11.5). An update stores its delta there, or the whole old value when the size
+    changes. Inserts go to the right edge, and garbage collection is a range delete. A slot has
+    one per node class of the trees it writes, a class larger, so its keys hold a tree's longest
+    key and the 18 bytes around it.
   - **Reading.** A reader starts from the leaf's version and follows the chain while a version is
     not visible to it. A version flagged as the key's first ends the chain without a lookup.
     Built in `txn/versioned.rs`, for values that fit their leaf.
@@ -617,8 +638,27 @@ where it stood at its snapshot.
 
 ### 11.5 Rollback and garbage collection
 
-- **Rollback.** A running transaction rolls back from its versions in the version index, logging a
-  compensation record per step. Savepoints and statement rollback stop at a remembered point.
+- **Rollback.** A running transaction rolls back from its version indexes, newest statement first
+  across every tree and node class. For each key a statement changed, the leaf's latch is taken
+  and the key's entry checked: an index entry is put before the leaf write it is for, which may
+  never happen, so the entry is put back only if it is still that statement's. Then the entry it
+  replaced goes back whole, version header and all, or the key is removed if it had no entry.
+  - **Compensation.** Each key put back is one compensation record: the leaf's redo, and the unit
+    of work it completed, `(transaction, statement, tree, key)`, every change that statement made
+    to that key undone. A unit is never half done, so after a crash recovery skips exactly the
+    units done and undoes the rest. Skipping a whole statement would not do: another transaction
+    may by then have changed a key put back, and undoing it again would lose that commit.
+  - **No flush.** Nothing waits for the log to be durable: a rollback lost in a crash is undone
+    again by recovery, from the log still kept (section 10).
+  - **End.** A full rollback then appends End and frees the slot without a commit pair. Every
+    aborted version is gone before the slot is freed: once the slot's next transaction commits,
+    the visibility rule would show one left behind as committed.
+  - **Savepoints and statement rollback** stop at a statement and append no End. Statement numbers
+    only rise: those rolled back are never used again, the transaction's tail runs on through its
+    compensations, and no index entry is removed, since a reader may be following one.
+  - **Before it starts,** whatever else works on the transaction has stopped and cleaned up, and
+    the capacity rollback needs (log room, memory, IO) is not given to work that could hold it
+    (UNIFIED_STORAGE_DESIGN.md §4.1, §8.2, §11.2).
 - **Garbage collection** is cooperative, done between transactions (OSIC §3.5). Watermarks give the
   oldest snapshot, the oldest OLTP snapshot and the newest OLAP snapshot.
   - Versions below them are dropped by range deletes on the version indexes.
@@ -642,7 +682,10 @@ otherwise.
    - replay the page store's records, so the page table and free space are as the log left them;
    - find the log's end: the first record that does not read back whole at its own position;
    - note the pages freed and allocated again within the replay: their records before the new
-     allocation belong to the page's earlier life.
+     allocation belong to the page's earlier life;
+   - find the losers: starting from the superblock's writer table (section 10), every group of a
+     transaction moves its tail on, a Commit makes it a winner and an End finishes it. Those left
+     have no undo done but what their compensation records name.
 
    Every page-store record is replayed before anything is appended: a new record would stamp the
    metadata pages it changes with an LSN past every record still to replay. So the log is read
@@ -666,9 +709,18 @@ otherwise.
    by default.
 4. **Free** the pages left provisional (section 6.3), and **erase** the slots of intents that got no
    remap.
-5. **Undo** every transaction with no Commit or End, from its records, following `prev` back from
-   its last one. Compensation records are logged, and steps already compensated are skipped.
-   (Step 7.)
+5. **Undo** every loser, back along its chain from its tail, each group read whole and checked
+   before its undo is used. Compensation records were redone with everything else and are never
+   undone:
+   - one from a rollback before the crash marks its unit done; the units done are kept in a
+     temporary tree, so a loser larger than memory spills;
+   - one from an earlier recovery names the change it undid. Recovery undoes back along the
+     chain, so every change after the oldest one named is done.
+
+   Every other change is undone by putting back the entry it replaced, once the key's entry is
+   checked to be the one the change wrote, and logged as a compensation naming the change: a
+   recovery that crashes while undoing starts again where its last durable compensation left off.
+   Then End. Nothing here reads the version indexes, which do not survive a crash.
 6. **Restart the clock** above every logged timestamp: the clock the superblock recorded, which is
    above every change logged before the redo point, and every transaction id and commit
    timestamp replayed. Every header left in a page is then a committed version: each slot's commit
@@ -876,6 +928,12 @@ submission or later from `IO::step`. Therefore:
 - **Model.** After every recovery, the database is compared with a model of committed state:
   - committed transactions are all there, and uncommitted ones are not;
   - every snapshot read matches the model.
+- **Undo.** Crashes at every IO point of:
+  - a rollback, between any two keys it puts back;
+  - a statement that updated one key several times;
+  - a rollback to a savepoint, after which another transaction changes and commits a key put back;
+  - a writer spanning several checkpoints and segment deletions;
+  - recovery's own undo, again and again, with its checkpoint's superblock torn.
 - **Followers.** An app server or replica at log position X reads exactly the committed state at X.
 - **Isolation.** Turso's `concurrent-simulator` runs Elle over SQL histories.
 - **Property tests:**

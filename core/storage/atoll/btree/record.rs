@@ -12,15 +12,22 @@
 //!                                             and the child after it, which was `left`, is `right`
 //! txn insert: pid | root: u64 | out: u8 | key_len: u16 | key | value
 //! txn update: pid | root: u64 | out: u8 | key_len: u16 | key | value_len: u32 | value | old
+//! restore:    pid | root: u64 | statement: u16 | undid: u64 | out: u8 | key_len: u16 | key | value
+//! unput:      pid | root: u64 | statement: u16 | undid: u64 | key
 //! ```
 //!
 //! A transaction's insert and update also name the tree, by its root, and an update carries the
 //! value it replaces: what undoes them, by tree and key, after splits and merges (DESIGN.md §7.1).
-//! Their header names the transaction and chains to its previous record.
+//! Their header names the transaction and chains to its previous group.
+//!
+//! A restore puts a key's entry back and an unput removes a key that had none: the compensation
+//! records of putting back what a transaction's statement changed (DESIGN.md §11.5). Each names
+//! the unit it completed, the tree, the statement and the key, and, from recovery, the change it
+//! undid ([`Compensation`]). They are redone like any change and never undone.
 //!
 //! A change to several nodes is a group of these ([`super::super::log::Log::append_group`]).
 
-use super::super::log::Kind;
+use super::super::log::{GroupStart, Kind};
 use super::super::page::PageId;
 use super::super::shared::BytesMut;
 use super::node::{self, child_value, View};
@@ -35,10 +42,26 @@ pub const SPLIT: Kind = Kind::new(14).unwrap();
 pub const BRANCH: Kind = Kind::new(15).unwrap();
 pub const TXN_INSERT: Kind = Kind::new(17).unwrap();
 pub const TXN_UPDATE: Kind = Kind::new(18).unwrap();
+pub const RESTORE: Kind = Kind::new(21).unwrap();
+pub const UNPUT: Kind = Kind::new(22).unwrap();
 
 pub fn owns(kind: Kind) -> bool {
-    (INIT.get()..=BRANCH.get()).contains(&kind.get()) || kind == TXN_INSERT || kind == TXN_UPDATE
+    (INIT.get()..=BRANCH.get()).contains(&kind.get())
+        || [TXN_INSERT, TXN_UPDATE, RESTORE, UNPUT].contains(&kind)
 }
+
+/// What a compensation record completed: every change its transaction's `statement` made to its
+/// key in the tree rooted at `root` put back, or, from recovery, the change whose group starts at
+/// `undid` undone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compensation {
+    pub root: PageId,
+    pub statement: u16,
+    pub undid: Option<GroupStart>,
+}
+
+/// Bytes a compensation's unit takes in its record.
+pub const COMPENSATION: usize = 8 + 2 + 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change<'a> {
@@ -61,6 +84,18 @@ pub enum Change<'a> {
         out_of_line: bool,
         /// For a transaction's update: the tree's root, and the value it replaces.
         undo: Option<(PageId, &'a [u8])>,
+    },
+    /// A key's entry put back, as `of` says.
+    Restore {
+        key: &'a [u8],
+        value: &'a [u8],
+        out_of_line: bool,
+        of: Compensation,
+    },
+    /// A key that had no entry removed again, as `of` says.
+    Unput {
+        key: &'a [u8],
+        of: Compensation,
     },
     Split {
         right: PageId,
@@ -95,6 +130,8 @@ impl<'a> Record<'a> {
             Change::Update { undo: Some(_), .. } => TXN_UPDATE,
             Change::Split { .. } => SPLIT,
             Change::Branch { .. } => BRANCH,
+            Change::Restore { .. } => RESTORE,
+            Change::Unput { .. } => UNPUT,
         }
     }
 
@@ -137,6 +174,22 @@ impl<'a> Record<'a> {
                 }
             }
             Change::Remove { key } => out.extend_from_slice(key),
+            Change::Restore {
+                key,
+                value,
+                out_of_line,
+                of,
+            } => {
+                encode_compensation(&mut out, of);
+                out.push(*out_of_line as u8);
+                out.extend((key.len() as u16).to_le_bytes());
+                out.extend_from_slice(key);
+                out.extend_from_slice(value);
+            }
+            Change::Unput { key, of } => {
+                encode_compensation(&mut out, of);
+                out.extend_from_slice(key);
+            }
             Change::Split { right, keep, sep } => {
                 out.extend(right.raw().to_le_bytes());
                 out.extend((*keep as u16).to_le_bytes());
@@ -168,6 +221,39 @@ impl<'a> Record<'a> {
             ))
         };
         let pid = PageId::from_raw(word(0)?);
+        if kind == RESTORE || kind == UNPUT {
+            let of = Compensation {
+                root: PageId::from_raw(word(8)?),
+                statement: u16::from_le_bytes(
+                    payload.get(16..18).ok_or_else(bad)?.try_into().unwrap(),
+                ),
+                undid: GroupStart::decode(word(18)?).ok_or_else(bad)?,
+            };
+            let rest = &payload[8 + COMPENSATION..];
+            if kind == UNPUT {
+                return Ok(Some(Self {
+                    pid,
+                    change: Change::Unput { key: rest, of },
+                }));
+            }
+            let out_of_line = match rest.first() {
+                Some(0) => false,
+                Some(1) => true,
+                _ => return Err(bad()),
+            };
+            let len =
+                u16::from_le_bytes(rest.get(1..3).ok_or_else(bad)?.try_into().unwrap()) as usize;
+            let key = rest.get(3..3 + len).ok_or_else(bad)?;
+            return Ok(Some(Self {
+                pid,
+                change: Change::Restore {
+                    key,
+                    value: &rest[3 + len..],
+                    out_of_line,
+                    of,
+                },
+            }));
+        }
         let txn = kind == TXN_INSERT || kind == TXN_UPDATE;
         let root = if txn {
             Some(PageId::from_raw(word(8)?))
@@ -256,12 +342,23 @@ impl<'a> Record<'a> {
                     _ => Err(corrupt("insert")),
                 }
             }
-            Change::Remove { key } => match View::new(&*page).search(key) {
-                Some((pos, true)) => {
-                    node::remove(page, pos);
-                    Ok(())
+            Change::Remove { key } | Change::Unput { key, .. } => {
+                match View::new(&*page).search(key) {
+                    Some((pos, true)) => {
+                        node::remove(page, pos);
+                        Ok(())
+                    }
+                    _ => Err(corrupt("remove")),
                 }
-                _ => Err(corrupt("remove")),
+            }
+            Change::Restore {
+                key,
+                value,
+                out_of_line,
+                ..
+            } => match View::new(&*page).search(key) {
+                Some((pos, true)) if node::set_value(page, pos, value, *out_of_line) => Ok(()),
+                _ => Err(corrupt("restore")),
             },
             Change::Update {
                 key,
@@ -288,6 +385,12 @@ impl<'a> Record<'a> {
             }
         }
     }
+}
+
+fn encode_compensation(out: &mut Vec<u8>, of: &Compensation) {
+    out.extend(of.root.raw().to_le_bytes());
+    out.extend(of.statement.to_le_bytes());
+    out.extend(GroupStart::encode(of.undid).to_le_bytes());
 }
 
 /// Keeps the first `keep` entries of the node in `page`, up to `sep`: a leaf's right neighbour
@@ -319,4 +422,46 @@ fn split<P: BytesMut + ?Sized>(page: &mut P, right: PageId, keep: usize, sep: &[
         (v.child(keep).ok_or_else(|| corrupt("split"))?.0, 0)
     };
     node::split_off(page, keep, sep, next).ok_or_else(|| corrupt("split"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A compensation reads back as written, and refuses being cut short.
+    #[test]
+    fn a_compensation_reads_back_as_written() {
+        let pid = PageId::from_raw(77);
+        let of = |undid| Compensation {
+            root: PageId::from_raw(5),
+            statement: 513,
+            undid,
+        };
+        for undid in [None, Some(GroupStart::at(0)), Some(GroupStart::at(1 << 30))] {
+            for change in [
+                Change::Restore {
+                    key: b"key",
+                    value: b"head and value",
+                    out_of_line: false,
+                    of: of(undid),
+                },
+                Change::Unput {
+                    key: b"key",
+                    of: of(undid),
+                },
+            ] {
+                let record = Record { pid, change };
+                let bytes = record.encode();
+                assert_eq!(
+                    Record::decode(record.kind(), &bytes).unwrap(),
+                    Some(record.clone())
+                );
+                assert!(
+                    Record::decode(record.kind(), &bytes[..8 + COMPENSATION - 1]).is_err(),
+                    "{:?} cut short decoded",
+                    record.kind()
+                );
+            }
+        }
+    }
 }

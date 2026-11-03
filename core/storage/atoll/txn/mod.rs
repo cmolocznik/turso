@@ -50,9 +50,9 @@ pub type Ts = u64;
 /// A commit's record: its timestamp.
 pub const COMMIT: Kind = Kind::new(16).unwrap();
 
-pub fn owns(kind: Kind) -> bool {
-    kind == COMMIT
-}
+/// The record of a transaction that ended without committing, with no undo left: every change it
+/// made put back. Empty.
+pub const END: Kind = Kind::new(19).unwrap();
 
 /// The commit timestamp a Commit record's payload carries.
 pub fn commit_ts(payload: &[u8]) -> Option<Ts> {
@@ -260,6 +260,23 @@ impl Txn {
 
     pub fn wrote(&self) -> bool {
         self.tail.is_some()
+    }
+}
+
+/// A whole rollback in progress: step it with [`Transactions::rollback`].
+pub struct Abort {
+    txn: Option<Txn>,
+    undo: Rollback,
+    admitted: Option<Admitted>,
+}
+
+impl Abort {
+    pub fn new(txn: Txn) -> Self {
+        Self {
+            txn: Some(txn),
+            undo: Rollback::after(0),
+            admitted: None,
+        }
     }
 }
 
@@ -477,14 +494,57 @@ impl Transactions {
         })
     }
 
-    /// Ends `txn` without committing it. It must have written nothing: rolling back what a
-    /// transaction wrote comes with undo.
+    /// Ends `txn`, which wrote nothing, without committing it. One that wrote is rolled back
+    /// ([`rollback`](Self::rollback)).
     pub fn abort(&self, txn: Txn) {
-        assert!(
-            !txn.wrote(),
-            "aborting a transaction that wrote: rollback comes with undo"
-        );
+        assert!(!txn.wrote(), "aborting a transaction that wrote: roll it back");
         self.release(txn.slot);
+    }
+
+    /// Rolls `op`'s transaction back whole (DESIGN.md §11.5): every change it made put back, its
+    /// End appended, and its slot freed with no commit pair. Nothing waits for the log to be
+    /// durable: a rollback a crash loses is undone again by recovery. Step it until done.
+    pub fn rollback(&self, versions: &Versions, op: &mut Abort) -> Result<IOResult<()>> {
+        let txn = op.txn.as_mut().expect("a rollback stepped after it was done");
+        if let IOResult::IO(io) = rollback::undo(self, versions, txn, &mut op.undo)? {
+            return Ok(IOResult::IO(io));
+        }
+        if txn.wrote() {
+            if op.admitted.is_none() {
+                op.admitted = Some(match self.log.admit(framed_len(0))? {
+                    IOResult::Done(a) => a,
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                });
+            }
+            let mut admitted = op.admitted.take().expect("admitted");
+            // Leaves the registry as its room is reserved, as a Commit does.
+            let (writers, slot, id) = (&self.writers, txn.slot, txn.start);
+            self.log
+                .append_with(&mut admitted, &txn.header(END), &[], |_| {
+                    writers.finished(slot, id)
+                });
+        }
+        let txn = op.txn.take().expect("a transaction");
+        // Every version it wrote is gone: the slot's next transaction may commit.
+        self.release(txn.slot);
+        Ok(IOResult::Done(()))
+    }
+
+    /// Rolls `txn` back to where it stood after its statement `to`: every change of the
+    /// statements since put back. It then starts its next statement, numbered past every one
+    /// rolled back, which are never used again. Step it until done.
+    pub fn rollback_to(
+        &self,
+        versions: &Versions,
+        txn: &mut Txn,
+        op: &mut Rollback,
+    ) -> Result<IOResult<()>> {
+        assert!(op.to() <= txn.command, "rolling back to a statement not yet run");
+        if let IOResult::IO(io) = rollback::undo(self, versions, txn, op)? {
+            return Ok(IOResult::IO(io));
+        }
+        self.statement(txn)?;
+        Ok(IOResult::Done(()))
     }
 
     /// Where the transaction that started at `start` in `slot` stands, for a version it wrote.
@@ -512,7 +572,11 @@ impl Transactions {
     }
 }
 
+pub mod rollback;
 pub mod versioned;
+
+use rollback::Rollback;
+use versioned::Versions;
 
 #[cfg(test)]
 mod tests;

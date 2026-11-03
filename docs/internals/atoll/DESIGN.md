@@ -673,9 +673,8 @@ where it stood at its snapshot.
 
 ## 12. Recovery
 
-Built in `core/storage/atoll/recovery.rs`, except undo and the clock, which come with transactions
-(step 7). Opening a database (`db.rs`) creates it if there is no superblock, and recovers it
-otherwise.
+Built in `core/storage/atoll/recovery.rs`, undo in `txn/rollback.rs`. Opening a database (`db.rs`)
+creates it if there is no superblock, and recovers it otherwise.
 
 1. Read the newest whole superblock.
 2. **Analysis**, by one reader from the redo point:
@@ -711,21 +710,21 @@ otherwise.
    remap.
 5. **Undo** every loser, back along its chain from its tail, each group read whole and checked
    before its undo is used. Compensation records were redone with everything else and are never
-   undone:
-   - one from a rollback before the crash marks its unit done; the units done are kept in a
-     temporary tree, so a loser larger than memory spills;
-   - one from an earlier recovery names the change it undid. Recovery undoes back along the
-     chain, so every change after the oldest one named is done.
-
-   Every other change is undone by putting back the entry it replaced, once the key's entry is
-   checked to be the one the change wrote, and logged as a compensation naming the change: a
-   recovery that crashes while undoing starts again where its last durable compensation left off.
-   Then End. Nothing here reads the version indexes, which do not survive a crash.
+   undone. A change is undone, by putting back the entry it replaced, only if the key's entry is
+   still exactly the one it wrote, version header included, checked under the leaf's latch. A
+   compensation from a rollback before the crash put back the entry its statement found, and a
+   statement number rolled back is never written again, so none of that statement's entries is
+   there any more; another transaction's change since left its own. Each undo here is logged as
+   a compensation naming the change it undid, in the chain's order, so a recovery that crashes
+   here goes on, the next time, from before the change its newest compensation names: every
+   change after that one in the chain was undone or found done. So undo needs no record of what
+   was compensated beyond the log and the tree, whatever a loser's size, and the losers may be
+   undone in any order. Then End. Nothing here reads the version indexes, which do not survive a
+   crash.
 6. **Restart the clock** above every logged timestamp: the clock the superblock recorded, which is
    above every change logged before the redo point, and every transaction id and commit
    timestamp replayed. Every header left in a page is then a committed version: each slot's commit
-   log starts with every transaction before the restart committed. (Built; undo, step 5, is not
-   yet.)
+   log starts with every transaction before the restart committed.
 7. **Checkpoint.** A full checkpoint writes back every page redone. Its redo point is past where
    the log restarted, which recovery checks, so nothing replayed is replayed again and the bytes
    between the old end and the restart are never read.
@@ -928,12 +927,15 @@ submission or later from `IO::step`. Therefore:
 - **Model.** After every recovery, the database is compared with a model of committed state:
   - committed transactions are all there, and uncommitted ones are not;
   - every snapshot read matches the model.
-- **Undo.** Crashes at every IO point of:
+- **Undo.** Crashes every few IO operations through each of these, and through the recovery of
+  each crash just before every write to the log or the superblock completes, the write torn
+  (`txn/rollback/tests.rs`, which counts where its crashes land):
   - a rollback, between any two keys it puts back;
   - a statement that updated one key several times;
   - a rollback to a savepoint, after which another transaction changes and commits a key put back;
   - a writer spanning several checkpoints and segment deletions;
-  - recovery's own undo, again and again, with its checkpoint's superblock torn.
+  - recovery's own undo, between two of its compensations, and the recovery of that crash between
+    two of its own, with each checkpoint's superblock torn.
 - **Followers.** An app server or replica at log position X reads exactly the committed state at X.
 - **Isolation.** Turso's `concurrent-simulator` runs Elle over SQL histories.
 - **Property tests:**
@@ -970,7 +972,9 @@ work says which parts are done.
    `log/`, `store.rs`). Key encoding moves to step 8, with the cursor that encodes.
 7. **Transactions.** Temporary pages and temporary trees (done: `buffer/temp.rs`); slots, clock,
    commit logs, visibility, commit and restarting the clock (done: `txn/mod.rs`); version headers,
-   version index, graveyard, conflicts and waits, rollback, undo in recovery, garbage collection.
+   version index, conflicts and waits (done: `txn/versioned.rs`); rollback, the writer table and
+   undo in recovery (done: `txn/rollback.rs`, `log/writers.rs`, `recovery.rs`); graveyard,
+   garbage collection.
 8. **Turso integration.**
    - the storage-mode interface;
    - `AtollCursor`, and the key encoding for SQL records (section 13);

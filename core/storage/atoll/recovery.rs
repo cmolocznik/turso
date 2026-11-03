@@ -11,11 +11,13 @@
 //!    newer than the page. Whichever thread asks for work takes the next window to read or the
 //!    next partition ready to apply, so any number of threads recover together.
 //! 3. **Finishing.** Pages left provisional are freed, slots of intents no remap matched are
-//!    given back, and a full checkpoint writes back every page redone. Its redo point is past where the log restarted, so nothing
-//!    replayed here is replayed again.
+//!    given back, every loser is undone ([`rollback::undo_loser`]), and a full checkpoint writes
+//!    back every page redone and undone. Its redo point is past where the log restarted, so
+//!    nothing replayed here is replayed again.
 //!
-//! Undoing open transactions and restarting the clock come with transactions (DESIGN.md §20, step
-//! 7).
+//! The analysis also finds the losers: the superblock's writer table names those that need undo
+//! by the log before the redo point, and each transaction's records after it move it on, a
+//! Commit or an End finishing it. The clock restarts above every timestamp logged.
 //!
 //! The page store's records are all replayed before anything is appended: a new record would
 //! stamp the metadata pages it changes with an LSN past every record still to replay. That is why
@@ -36,7 +38,9 @@ use super::checkpoint::Checkpointer;
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::db::AtollConfig;
 use super::drive;
-use super::log::{Log, LogConfig, LogReader, Lsn, OwnedRecord, Writers};
+use super::log::{
+    decode_table, GroupStart, Log, LogConfig, LogReader, Lsn, OwnedRecord, Writers, WRITERS,
+};
 use super::once::{Baton, SetOnce};
 use super::page::{self, PageId};
 use super::radix::FREE;
@@ -44,7 +48,7 @@ use super::redo::PageRecord;
 use super::stack::Stack;
 use super::store::{kinds, PageStore, StoreRecord};
 use super::txn::Ts;
-use super::txn::{self, Clock};
+use super::txn::{self, rollback, Clock};
 use crate::io::{Completion, IO};
 use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::sync::Arc;
@@ -144,6 +148,8 @@ struct Analyzed {
     reborn: HashMap<PageId, Lsn>,
     /// The highest timestamp the superblock and the replayed log hold.
     clock: Ts,
+    /// The transactions with no Commit or End, each with its last group: their undo is owed.
+    losers: Vec<(u64, GroupStart)>,
     pool: Arc<BufferPool>,
 }
 
@@ -379,10 +385,36 @@ impl Recovery {
         let mut freed = HashSet::new();
         let mut reborn = HashMap::new();
         let mut clock = superblock.clock;
+        // Every transaction that needs undo by the log before the redo point, and its last group;
+        // the log from there moves them on.
+        let mut open: HashMap<u64, GroupStart> = HashMap::new();
+        if let Some(at) = superblock.writers {
+            let table = Log::read_group(self.io.clone(), &self.base, &self.log_config, at)?;
+            match table.as_slice() {
+                [r] if r.header.kind == WRITERS => {
+                    open.extend(decode_table(&r.payload)?.into_iter().map(|w| (w.txn, w.last)))
+                }
+                _ => {
+                    return Err(LimboError::Corrupt(format!(
+                        "the superblock's writer table at {} is no writer table",
+                        at.get()
+                    )))
+                }
+            }
+        }
         while let Some(r) = reader.next_record()? {
             // A record's transaction is named by its start timestamp.
             clock = clock.max(r.header.txn);
-            if txn::owns(r.header.kind) {
+            if r.header.txn != 0 {
+                if r.header.kind == txn::COMMIT || r.header.kind == txn::END {
+                    open.remove(&r.header.txn);
+                } else {
+                    let group = GroupStart::at(r.group);
+                    let last = open.entry(r.header.txn).or_insert(group);
+                    *last = (*last).max(group);
+                }
+            }
+            if r.header.kind == txn::COMMIT {
                 let ts = txn::commit_ts(&r.payload).ok_or_else(|| {
                     LimboError::Corrupt(format!("a Commit record at {} does not decode", r.start))
                 })?;
@@ -444,11 +476,14 @@ impl Recovery {
             superblock.redo,
         )
         .following(&superblock.continuations);
+        let mut losers: Vec<(u64, GroupStart)> = open.into_iter().collect();
+        losers.sort_unstable();
         self.analyzed.set(Arc::new(Analyzed {
             end,
             restart,
             reborn,
             clock,
+            losers,
             pool,
         }));
         self.reader.put(reader);
@@ -596,6 +631,18 @@ impl Recovery {
         }
         drive(&self.io, || self.store.release_orphans())?;
         self.store.end_recovery();
+        for &(txn, last) in &analyzed.losers {
+            rollback::undo_loser(
+                &self.io,
+                &self.base,
+                &self.log_config,
+                &pool,
+                &self.store,
+                &self.writers,
+                txn,
+                last,
+            )?;
+        }
         let control = self.control.take().expect("the control file");
         let superblock = self
             .recorded

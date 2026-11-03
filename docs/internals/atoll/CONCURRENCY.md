@@ -332,6 +332,12 @@ in the last point.
     it still lists: a table taken once a redo point is fixed is exact for the log before it. A
     cell held is one between a reservation and its copy, which takes no IO and no yield, so a
     reader that finds it held yields and reads again.
+  - **Rollback** is the transaction's own work on its slot's indexes and its own versions, which
+    every other writer waits out. Each key goes back under its leaf's latch, once the entry is
+    checked still that statement's, and the index entries stay, since a reader may be following
+    one. The slot is freed only once every version is put back, so a writer that read a version
+    since put back finds its writer gone and reads the key again; a version found gone twice is
+    corruption.
 - **The one lock order** for the short critical sections that remain.
   - Latches are never waited for, and some mutexes are only ever tried, as ownership of a piece
     of work (§3, class 3): a checkpointer's state, a writeback, the page store's erasure and its

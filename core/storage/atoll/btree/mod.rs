@@ -49,7 +49,7 @@ use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
 use node::{Layout, Limits, View};
-use record::{Change, Record};
+use record::{Change, Compensation, Record, COMPENSATION};
 use value::{Read, ValueRead, ValueRef, ValueWrite};
 
 fn yield_now<T>() -> Result<IOResult<T>> {
@@ -586,10 +586,11 @@ impl Tree {
             let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
             // A transaction's change names the tree, and an update of one the value's length and
             // the value it replaces.
-            let undo = match (&op.txn, &present) {
-                (Some(_), Some((old, _))) => 8 + 4 + old.len(),
-                (Some(_), None) => 8,
-                (None, _) => 0,
+            let undo = match (&op.compensation, &op.txn, &present) {
+                (Some(_), ..) => COMPENSATION,
+                (None, Some(_), Some((old, _))) => 8 + 4 + old.len(),
+                (None, Some(_), None) => 8,
+                (None, None, _) => 0,
             };
             let len = framed_len(8 + 3 + op.key.len() + stored.len() + undo)
                 + store_len(&adopt)
@@ -632,14 +633,26 @@ impl Tree {
                 return Ok(IOResult::Done(Outcome::Changed));
             }
             let in_txn = op.txn.is_some();
-            let change = match &now {
-                Some((old, _)) => Change::Update {
+            let change = match (&now, op.compensation) {
+                (Some(_), Some(of)) => Change::Restore {
+                    key: &op.key,
+                    value: &stored,
+                    out_of_line,
+                    of,
+                },
+                (None, Some(_)) => {
+                    drop(ex);
+                    return Err(LimboError::InternalError(
+                        "a compensation put back a key it found no entry of".into(),
+                    ));
+                }
+                (Some((old, _)), None) => Change::Update {
                     key: &op.key,
                     value: &stored,
                     out_of_line,
                     undo: in_txn.then_some((self.root, old.as_slice())),
                 },
-                None => Change::Insert {
+                (None, None) => Change::Insert {
                     key: &op.key,
                     value: &stored,
                     out_of_line,
@@ -696,11 +709,15 @@ impl Tree {
             let Some(present) = present else {
                 return Ok(IOResult::Done(false));
             };
+            if op.expected.as_ref().is_some_and(|e| *e != present) {
+                return Ok(IOResult::Done(false));
+            }
             if !done!(op.old_pages(&self.pool, self.head, &present, &|| leaf.validate())) {
                 continue;
             }
             let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
-            let len = framed_len(8 + op.key.len()) + store_len(&abandon);
+            let unit = op.compensation.map_or(0, |_| COMPENSATION);
+            let len = framed_len(8 + unit + op.key.len()) + store_len(&abandon);
             if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
                 op.admitted = None;
                 op.admitted = Some((done!(self.admit(len)), len));
@@ -715,9 +732,13 @@ impl Tree {
                 drop(ex);
                 continue;
             }
+            let change = match op.compensation {
+                Some(of) => Change::Unput { key: &op.key, of },
+                None => Change::Remove { key: &op.key },
+            };
             let record = Record {
                 pid: ex.pid(),
-                change: Change::Remove { key: &op.key },
+                change,
             };
             record.apply(&mut ex.page_mut())?;
             let store = if abandon.is_empty() {
@@ -726,7 +747,8 @@ impl Tree {
                 vec![StoreRecord::Abandon { pids: abandon }]
             };
             let (mut admitted, _) = op.admitted.take().expect("admitted");
-            let lsns = self.log_batch(&mut admitted, &[record], &store);
+            let (group, lsns) = self.log_as(&mut admitted, op.txn.as_ref(), &[record], &store);
+            op.group = group.filter(|_| op.txn.is_some());
             ex.changed(lsns[0]);
             op.lsn = lsns[0];
             let underfull = self.underfull(&View::new(ex.page()));
@@ -1648,6 +1670,8 @@ pub struct Put {
     /// The transaction the change belongs to, and where its group starts once logged.
     txn: Option<TxnTail>,
     group: Option<GroupStart>,
+    /// What the change puts back, as a compensation record.
+    compensation: Option<Compensation>,
 }
 
 impl Put {
@@ -1670,6 +1694,7 @@ impl Put {
             expected: None,
             txn: None,
             group: None,
+            compensation: None,
         }
     }
 
@@ -1692,6 +1717,14 @@ impl Put {
     /// Where the transaction's group holding the change starts, once logged in a transaction.
     pub fn group(&self) -> Option<GroupStart> {
         self.group
+    }
+
+    /// Logs the change as `tail`'s compensation `of` (DESIGN.md §11.5), a key's entry put back
+    /// over the one there, which [`expecting`](Self::expecting) names.
+    pub fn compensating(mut self, tail: TxnTail, of: Compensation) -> Self {
+        self.txn = Some(tail);
+        self.compensation = Some(of);
+        self
     }
 
     /// Where the change's record ends, once made; 0 if nothing changed. The change is durable
@@ -1748,6 +1781,12 @@ pub struct Remove {
     /// The level of a merge still to try after the removal.
     merging: Option<u8>,
     lsn: Lsn,
+    /// The entry the removal expects: its stored value and whether out of line.
+    expected: Option<(Vec<u8>, bool)>,
+    /// The transaction the removal belongs to, and where its group starts once logged.
+    txn: Option<TxnTail>,
+    group: Option<GroupStart>,
+    compensation: Option<Compensation>,
 }
 
 impl Remove {
@@ -1758,7 +1797,29 @@ impl Remove {
             admitted: None,
             merging: None,
             lsn: 0,
+            expected: None,
+            txn: None,
+            group: None,
+            compensation: None,
         }
+    }
+
+    /// Logs the removal as `tail`'s compensation `of` (DESIGN.md §11.5), of a key that had no
+    /// entry. Removes nothing, and reports false, unless the key's entry is `entry`, as
+    /// [`Tree::stored`] read it.
+    pub fn compensating(mut self, tail: TxnTail, of: Compensation, entry: &Stored) -> Self {
+        self.expected = Some(match &entry.value {
+            StoredValue::Inline(v) => ([entry.head.as_slice(), v].concat(), false),
+            StoredValue::OutOfLine(r) => ([entry.head.as_slice(), &r.encode()].concat(), true),
+        });
+        self.txn = Some(tail);
+        self.compensation = Some(of);
+        self
+    }
+
+    /// Where the transaction's group holding the removal starts, once logged in a transaction.
+    pub fn group(&self) -> Option<GroupStart> {
+        self.group
     }
 
     /// Where the removal's record ends, once made; 0 if the key was absent.

@@ -5,9 +5,13 @@
 //! frame is named by the 4 KiB grain it starts at, so a frame index names the same memory whichever
 //! class holds it, and one array of headers serves every class.
 //!
-//! The region is backed by 2 MiB huge pages where the OS allows. Its memory is never unmapped: a
-//! freed frame is reused as it is, and memory moves between classes a whole batch at a time, so no
-//! huge page is ever split. A batch moves once every frame in it is free: the pool marks it
+//! The region is backed by huge pages where the OS allows, of the kernel's PMD size: 2 MiB with
+//! 4 KiB base pages, 32 MiB with 16 KiB, 512 MiB with 64 KiB, so a huge page holds a whole number
+//! of batches. Its start is aligned to a huge page, and only the whole huge pages inside it are
+//! advised; the rest keeps base pages, so no huge page reaches past the region and none of its
+//! memory is committed past its length. Its memory is never unmapped: a freed frame is reused as
+//! it is, and memory moves between classes a whole batch at a time in the pool's own bookkeeping,
+//! so no huge page is ever split. A batch moves once every frame in it is free: the pool marks it
 //! draining, which keeps new frames out of it, and moves or evicts what it holds.
 //!
 //! Untouched memory costs nothing: the region, the frame headers and the hash table are mapped
@@ -35,7 +39,8 @@ mod sync {
 
 /// log2 of the batch size.
 pub const BATCH_SHIFT: u32 = 21;
-/// A batch: 2 MiB, the huge page size of x86-64 and of aarch64 with 4 KiB base pages.
+/// A batch: 2 MiB, the smallest huge page of the four architectures, the PMD size with 4 KiB base
+/// pages; a larger huge page holds a whole number of batches.
 pub const BATCH: usize = 1 << BATCH_SHIFT;
 /// Grains of 4 KiB in a batch, which is also the most frames a batch holds.
 pub const GRAINS: u32 = (BATCH / MIN_PAGE_SIZE) as u32;
@@ -116,7 +121,7 @@ impl<T: Zeroable> Zeroed<T> {
             let bytes = (len * std::mem::size_of::<T>()).max(1);
             let align = std::mem::align_of::<T>().max(MIN_PAGE_SIZE);
             Ok(Self {
-                map: Mapping::new(bytes.next_multiple_of(MIN_PAGE_SIZE), align, false)?,
+                map: Mapping::new(bytes.next_multiple_of(MIN_PAGE_SIZE), align)?,
                 len,
                 _marker: std::marker::PhantomData,
             })
@@ -153,7 +158,7 @@ struct Mapping {
 }
 
 impl Mapping {
-    fn new(len: usize, align: usize, huge: bool) -> Result<Self> {
+    fn new(len: usize, align: usize) -> Result<Self> {
         #[cfg(all(unix, not(miri)))]
         {
             let raw_len = len + align;
@@ -180,14 +185,6 @@ impl Mapping {
             }
             let raw = raw.cast::<u8>();
             let start = (raw as usize).next_multiple_of(align) as *mut u8;
-            #[cfg(target_os = "linux")]
-            if huge {
-                // Huge pages only make the pool faster, so a refusal leaves 4 KiB pages.
-                // SAFETY: inside the mapping just made.
-                unsafe { libc::madvise(start.cast(), len, libc::MADV_HUGEPAGE) };
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = huge;
             Ok(Self {
                 start: NonNull::new(start).expect("a mapping is never at address zero"),
                 raw,
@@ -196,7 +193,6 @@ impl Mapping {
         }
         #[cfg(not(all(unix, not(miri))))]
         {
-            let _ = huge;
             let layout = std::alloc::Layout::from_size_align(len, align)
                 .map_err(|e| LimboError::InternalError(format!("buffer pool layout: {e}")))?;
             // SAFETY: the layout has a non-zero size.
@@ -240,12 +236,50 @@ pub struct Region {
     len: usize,
 }
 
+/// The kernel's transparent huge page size, its PMD size, where it has them.
+fn huge_page_size() -> Option<usize> {
+    if !cfg!(all(target_os = "linux", not(miri))) {
+        return None;
+    }
+    let text =
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size").ok()?;
+    parse_huge_page_size(&text)
+}
+
+/// A huge page size as the kernel writes it, in bytes: a power of two.
+fn parse_huge_page_size(text: &str) -> Option<usize> {
+    text.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| n.is_power_of_two())
+}
+
 impl Region {
     fn new(len: usize) -> Result<Self> {
-        Ok(Self {
-            map: Mapping::new(len, BATCH, true)?,
-            len,
-        })
+        Self::on_huge_pages(len, huge_page_size())
+    }
+
+    /// `len` bytes on huge pages of `huge` bytes, the kernel's, where it has them: the start
+    /// aligned to one, the whole huge pages inside advised, and the rest kept on base pages, so no
+    /// huge page reaches past the region. Huge pages only make the pool faster, so a refusal leaves
+    /// base pages.
+    fn on_huge_pages(len: usize, huge: Option<usize>) -> Result<Self> {
+        let map = Mapping::new(len, huge.map_or(BATCH, |h| h.max(BATCH)))?;
+        #[cfg(all(target_os = "linux", not(miri)))]
+        if let Some(huge) = huge {
+            let whole = len / huge * huge;
+            let start = map.start.as_ptr();
+            // SAFETY: inside the mapping just made, of `len` bytes from `start`.
+            unsafe {
+                if whole > 0 {
+                    libc::madvise(start.cast(), whole, libc::MADV_HUGEPAGE);
+                }
+                if whole < len {
+                    libc::madvise(start.add(whole).cast(), len - whole, libc::MADV_NOHUGEPAGE);
+                }
+            }
+        }
+        Ok(Self { map, len })
     }
 
     /// The first byte of `frame`.
@@ -1399,5 +1433,76 @@ mod tests {
             m.emptiest(class(9), class(10)).is_some_and(|b| b < 4),
             "a drain for 4 MiB frames chose a batch with no aligned run of two"
         );
+    }
+
+    /// A region starts on a huge page and advises only the whole huge pages inside it, the rest
+    /// kept on base pages, as the kernel's own flags for its mappings show: with this kernel's
+    /// huge pages, as the kernel reports them, and with 512 MiB ones, a 64 KiB-page kernel's,
+    /// under which a region smaller than one keeps base pages throughout.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_region_advises_only_the_whole_huge_pages_inside_it() {
+        let kernel = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+            .expect("this kernel reports no huge page size")
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        let large = 256 * BATCH;
+        for (huge, len) in [
+            (None, 5 * BATCH),
+            (Some(large), 5 * BATCH),
+            (Some(large), 320 * BATCH),
+        ] {
+            let region = match huge {
+                None => Region::new(len),
+                Some(h) => Region::on_huge_pages(len, Some(h)),
+            }
+            .unwrap();
+            let huge = huge.unwrap_or(kernel);
+            let start = region.ptr(0) as usize;
+            assert_eq!(
+                start % huge,
+                0,
+                "{huge} {len}: the region starts off a huge page"
+            );
+            let whole = len / huge * huge;
+            let has = |at: usize, flag: &str| {
+                let flags = vm_flags(start + at);
+                (flags.iter().any(|f| f == flag), flags)
+            };
+            if whole > 0 {
+                for at in [0, whole - 1] {
+                    let (hg, flags) = has(at, "hg");
+                    assert!(hg, "{huge} {len}: byte {at} is not advised huge: {flags:?}");
+                }
+            }
+            if whole < len {
+                for at in [whole, len - 1] {
+                    let (nh, flags) = has(at, "nh");
+                    assert!(
+                        nh && !flags.iter().any(|f| f == "hg"),
+                        "{huge} {len}: byte {at} may take a huge page past the region: {flags:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The flags of the mapping holding `at`, as `/proc/self/smaps` gives them.
+    #[cfg(target_os = "linux")]
+    fn vm_flags(at: usize) -> Vec<String> {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut holds = false;
+        for line in smaps.lines() {
+            let range = line.split(' ').next().and_then(|r| r.split_once('-'));
+            let range = range
+                .map(|(lo, hi)| (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16)));
+            if let Some((Ok(lo), Ok(hi))) = range {
+                holds = lo <= at && at < hi;
+            } else if let Some(flags) = line.strip_prefix("VmFlags:").filter(|_| holds) {
+                return flags.split_whitespace().map(String::from).collect();
+            }
+        }
+        panic!("no mapping holds {at:#x}");
     }
 }

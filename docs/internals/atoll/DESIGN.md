@@ -349,13 +349,20 @@ Built in `core/storage/atoll/buffer`.
 ### 9.1 Frames
 
 - **One region.** The pool is one anonymous region of the configured size, mapped without
-  reserving memory and backed by 2 MiB huge pages where the OS allows. It is carved into 2 MiB
-  batches, and each batch is lent to one size class at a time: 512 frames of 4 KiB, down to one of
-  2 MiB. A 4 MiB or 8 MiB frame takes an aligned run of 2 or 4 batches from a buddy allocator.
+  reserving memory and backed by huge pages where the OS allows. A huge page is the kernel's PMD
+  size, read from `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size`: 2 MiB with 4 KiB base
+  pages, 32 MiB with 16 KiB (LoongArch's default), 512 MiB with 64 KiB (RHEL's aarch64). The
+  region starts on one, only the whole huge pages inside it are advised, and the rest keeps base
+  pages, so no huge page reaches past the region and none of its memory is committed past the
+  configured size; a region smaller than a huge page keeps base pages throughout. It is carved
+  into 2 MiB batches, a whole number to a huge page, and each batch is lent to one size class at
+  a time: 512 frames of 4 KiB, down to one of 2 MiB. A 4 MiB or 8 MiB frame takes an aligned run
+  of 2 or 4 batches from a buddy allocator.
 - **Frame ids.** A frame is named by the 4 KiB grain it starts at, as a `u32`, so one pool holds
   at most 16 TiB. The id names the same memory whichever class holds it.
 - **Never unmapped.** A freed frame is reused as it is. Memory moves between classes a whole batch
-  at a time, so no huge page is ever split.
+  at a time in the pool's own bookkeeping, with nothing unmapped or advised away, so no huge page
+  is ever split.
 - **Bytes as atomic words.** Optimistic readers may overlap a writer, so a frame's bytes are read
   and written only as relaxed 64-bit atomics (`shared.rs`; CONCURRENCY.md §3). A page is read by
   its IO straight into its frame, which needs the frame's memory quiet: no step that could still

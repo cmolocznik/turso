@@ -266,11 +266,11 @@ A publication protocol must also define concurrent readers and writers, not only
 Readers retain a logically valid representation while replacements are installed. Old pages
 become reusable only after snapshot and memory-lifetime rules allow it.
 
-The Atoll wrapper needs its own versioning and corruption checks. Select a frozen Vortex
-wire-format edition and supported component set explicitly. Upgrading a dependency must retain
-read support for existing databases, including any custom encodings we introduce. Rolling
-upgrades must constrain writers to formats supported by their intended readers. See
-[Vortex compatibility][vortex-versioning].
+The Atoll wrapper needs its own version check and corruption checks. Select a frozen Vortex
+wire-format edition and supported component set explicitly. Formats are V1 only: nothing has
+shipped, so there is no older database to read and no older reader to write for. A dependency
+upgrade must leave the V1 bytes it writes unchanged, custom encodings included, and a database of
+any other version fails to open (DESIGN.md §4). See [Vortex compatibility][vortex-versioning].
 
 ## 7. Mutable tables and analytical projections
 
@@ -710,7 +710,8 @@ Correctness checks must cover the common storage contract and each adapter:
   accepted late corrections and crash before their replacement coverage is published.
 - Corrupt segment metadata and unsupported format versions; report errors without using invalid
   references or silently changing stored values.
-- Verify old databases remain readable across format and dependency upgrades.
+- Verify that a dependency upgrade leaves the V1 bytes it writes unchanged, and that a database of
+  any other format version fails to open.
 - Force memory pressure, errors, cancellation, early limits, and result-stream drop during IO,
   decompression, joins, and background work. Race completion with waiter registration, deliver
   callbacks late and out of order, and stop polling the result stream. Check independent cleanup

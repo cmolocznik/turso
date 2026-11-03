@@ -1,8 +1,8 @@
 # Atoll concurrency, from first principles
 
 How Atoll runs concurrently. It replaces every earlier mechanism: DESIGN.md §9.2-§9.4 (latching
-and replacement), the latching part of §13, §18, and the waits of §11.3. Step 1 of the order of
-work (§10) is built; step 2 is not finished, and steps 3 to 5 are not started.
+and replacement), the latching part of §13, §18, and the waits of §11.3. Its order of work (§10)
+says which parts are built.
 
 ## 1. What must hold
 
@@ -11,7 +11,8 @@ work (§10) is built; step 2 is not finished, and steps 3 to 5 are not started.
 3. **Nothing blocks or spins.** A thread never parks in Atoll and never loops waiting for another
    thread. Turso runs connections cooperatively, on any thread and on one: a thread that waits
    for another connection on the same thread waits forever.
-4. **A panic releases everything its thread held.**
+4. **A panic releases everything its thread held,** and one in the middle of a change stops the
+   database writing until it reopens (DESIGN.md §7.5).
 5. **No action is taken on unvalidated data.** Bytes read without a latch decide nothing (no IO,
    no write, no allocation, no free) until they are validated.
 6. **Every identity is reused only when no one can still hold it.** Frames, page ids, memory
@@ -41,15 +42,17 @@ Each object belongs to exactly one of four classes, named in its type's document
 1. **Immutable once published.** Log records, page copies on disk, a committed version,
    out-of-line value pages once linked, commit log entries. Read freely; never changed; reclaimed
    through epochs (section 4).
-2. **One writer, optimistic readers.** B-tree nodes, page table and free-space pages, frame
+2. **One writer, optimistic readers.** B-tree nodes, those of the temporary trees included (a
+   slot's version indexes and todo list, a graveyard), page table and free-space pages, frame
    headers. A writer holds the object's exclusive latch; readers read without a latch and
    validate its version afterwards. There is no shared latch mode at all. A reader may overlap a
    writer, so both touch the object's bytes only through atomic accesses, relaxed loads and
    stores: a plain read overlapping a write is a data race, undefined behaviour even when
-   validation then throws its result away.
+   validation then throws its result away. A slot's version indexes and todo list have several
+   writers at once, each under the node latches (§8).
 3. **Owned by one context at a time.** A transaction's state, an operation in progress, a
-   writeback, a recovery partition, a slot's version index while its transaction writes. Handed
-   over explicitly; no synchronization while owned.
+   writeback, a recovery partition, and a slot's collection progress, owned by whoever holds its
+   collector claim (§8). Handed over explicitly; no synchronization while owned.
 4. **Lock-free shared state.** A free list, a waiter list, a map or a counter shared between
    threads changes by atomic operations, never under a lock a thread can be descheduled holding:
    each is named with its design (§4, §6). Mutexes that remain until their part is rebuilt are
@@ -309,35 +312,108 @@ in the last point.
   wholly applied. Threads with nothing to do wait on a take-all stack, looking for work again
   once on it, and every change wakes them. Each window is immutable once read; each part is
   owned by the one thread applying it. The intents it has yet to match are a bitmap per class.
-- **Transactions.**
-  - A slot is owned by its transaction.
-  - Its commit log has one writer, the slot's transaction, which appends and then publishes the
-    new length with a release store. Readers search up to the published length. No lock.
+- **Transactions.** What garbage collection brings is listed in §10's step 7, and none of it is
+  built yet.
+  - A slot is owned by its transaction, or by the begin that takes it free until its transaction
+    starts. Collection has a claim of its own per slot (below), which begins and background passes
+    take alike, on a free slot or an occupied one.
+  - **A commit log** changes only under its latch, a versioned latch only ever tried: a commit
+    appending its pair, a compaction publishing its prefix, a tail being sealed.
+    - A commit takes the latch before it marks its slot, appends its pair, publishes the new length
+      with a release store, and lets the latch go. A busy latch is a yield before anything has
+      changed. Readers search up to the published length, without a lock.
+    - **Compaction** builds a compacted prefix outside the latch, from segments it holds by owning
+      reference, pairs being immutable once published. A slot's builds are serialized under its
+      collector claim. A build swaps its prefix in under the latch, after checking that the prefix
+      is still the one it captured.
+    - The suffix, where appends land, is shared, never copied, so no append is lost. The old
+      prefix goes through the epochs, and a reader still searching it finds every pair its snapshot
+      needs. A partly filled tail is sealed under the latch, so the next append opens a new
+      segment.
   - **The published horizon.** A snapshot takes the horizon H: every commit timestamped at or
-    below H is in its slot's commit log, and none above is visible to it. A commit draws its
-    timestamp, publishes its pair, and then advances H past its timestamp once every lower
-    timestamp is published. It waits, as a completion, only on committers still publishing a
-    lower one, and is acknowledged after that, so a snapshot taken after the acknowledgement sees
-    it. Readers never wait; a committer waits only for another committer's few instructions.
-  - A writer that meets an open writer waits on that transaction's end completion. Before it
-    waits, it records the edge in the slot wait-for graph and checks for a cycle (at most W
-    slots). A cycle aborts its youngest transaction. Under BEGIN CONCURRENT it fails at once.
-  - Version indexes: written only by their slot's transaction, read optimistically by everyone;
-    entries are removed by garbage collection through epochs.
+    below H is in its slot's commit log, and none above is visible to it.
+    - A commit draws its timestamp, publishes its pair, and then advances H past its timestamp once
+      every lower timestamp is published.
+    - It waits, as a completion, only on committers still publishing a lower one, and is
+      acknowledged after that, so a snapshot taken after the acknowledgement sees it.
+    - Readers never wait; a committer waits only for another committer's few instructions.
+    - A rollback's timestamp uses the same mark, draw and publish. Its mark is cleared before it
+      advances H and before its slot is freed (DESIGN.md §11.5). This comes with garbage
+      collection (§10, step 7): until then a rollback draws no timestamp.
+  - **Waiting on an open writer.** A writer that meets an open writer waits on that transaction's
+    end completion. Before it waits, it records the edge in the slot wait-for graph and checks for
+    a cycle (at most W slots). A cycle aborts its youngest transaction. Under BEGIN CONCURRENT it
+    fails at once.
+  - **Version indexes and todo lists** are read optimistically by everyone and written under their
+    trees' node latches, by:
+    - the slot's transaction, which appends its own entries above the eligible range;
+    - the holder of the slot's collector claim, which removes eligible ones;
+    - a rollback in another slot, which re-records a restored tombstone's item (DESIGN.md §11.5).
+
+    A todo item is buffered in its slot's own state under the leaf's latch, where its change lands,
+    so nothing between the change and the item can fail or yield. The pages a drop frees go
+    through the epochs.
+  - **The collector claim** is a word per slot, taken by compare-and-swap and held only within a
+    step, never across a returned IOResult. The slot's collection progress is read and written only
+    under it: cursors, page progress, a compaction being built, and a D scan.
+    - **The rewind word** is the one exception. Re-recording inserters lower it by an atomic
+      minimum after their insert, and the claim holder swaps it out at the start of each step.
+    - **A completion** is a conditional change on the item's revision, so a stale decision loses to
+      a restoration.
+  - **Snapshot words** (DESIGN.md §11.1), one per slot on a line of its own, with a floor word
+    beside them.
+    - A begin stores its provisional bound, passes a sequentially consistent fence, and then loads
+      the floor and the horizon.
+    - A scanner, computing watermarks or compacting, raises the floor to its horizon sample, passes
+      a sequentially consistent fence, and then loads every word.
+    - Each side is a store, a fence and a load (§3), named at both ends, so either the scan sees the
+      bound or the begin's snapshot is at or above the sample.
+    - The floor is raised by an acquire-release maximum and loaded with an acquire. A snapshot taken
+      from it is a horizon that a scanner loaded with an acquire, so every commit at or below it is
+      published to the begin.
+  - **Watermarks** are a cell anyone reads and whoever scans raises; a stale value only delays
+    collection.
+  - **Whether a writer committed**, once compaction drops pairs, reads the slot's running word, with
+    an acquire, and then the leaf again under its latch. A version still there once the running
+    word no longer holds its start was committed, whatever transaction the slot runs now, since a
+    rollback puts every version back before it frees its slot. Until compaction, the commit log
+    holds every pair and answers.
+  - **D cells** are each a latch with what it guards: a value, a pending table with one entry per
+    source slot, and a scan's flush minimum and epoch.
+    - Reservers try the latch before their reservation callback, letting the leaf go if it is busy,
+      as with metadata latches, so nothing is taken inside the infallible callback.
+    - A flush lowers the value before it clears its pending entry, under the latch.
+    - A collector's scan runs outside the latch, and publishes under it.
+    - A checkpoint reads cells optimistically and validates them; a held cell is a yield.
+  - **Graveyards** are shared temporary trees, latched as any tree is.
+    - A move holds the tree leaf's latch and then the graveyard leaf's, both tried, in that order;
+      cleanup takes graveyard leaves alone, so the order is never reversed.
+    - Room and log space are prepared before either changes, and a failed try lets the tree leaf
+      go and starts over.
+    - A removal from a leaf expects the exact version.
   - **The writer registry** (`log/writers.rs`) is a cell per slot, written by the slot's
     transaction alone under a versioned latch nothing else takes, and read by a checkpoint
-    optimistically and validated, as a page is. A transaction enters its cell between reserving
-    a group and copying it in, and leaves as its Commit or End is reserved, so the log is never
-    durable past a group whose writer the registry misses, nor past a Commit or End whose writer
-    it still lists: a table taken once a redo point is fixed is exact for the log before it. A
-    cell held is one between a reservation and its copy, which takes no IO and no yield, so a
-    reader that finds it held yields and reads again.
+    optimistically and validated, as a page is.
+    - A transaction enters its cell between reserving a group and copying it in, and leaves as its
+      Commit or End is reserved.
+    - So the log is never durable past a group whose writer the registry misses, nor past a Commit
+      or End whose writer it still lists: a table taken once a redo point is fixed is exact for the
+      log before it.
+    - A cell held is one between a reservation and its copy. A checkpoint that finds one held
+      yields, its redo point fixed and its sampling's progress kept, and reads again on its next
+      step. That comes with garbage collection (§10, step 7): until then the checkpoint yields its
+      thread and reads the cell again, a spin §1 forbids.
   - **Rollback** is the transaction's own work on its slot's indexes and its own versions, which
-    every other writer waits out. Each key goes back under its leaf's latch, once the entry is
-    checked still that statement's, and the index entries stay, since a reader may be following
-    one. The slot is freed only once every version is put back, so a writer that read a version
-    since put back finds its writer gone and reads the key again; a version found gone twice is
-    corruption.
+    every other writer waits out.
+    - Each key goes back under its leaf's latch, once the entry is checked still that statement's,
+      and the index entries stay, since a reader may be following one.
+    - The todo items of the keys put back go. A tombstone another transaction committed, put back,
+      has that transaction's item re-recorded.
+    - The slot is freed only once every version is put back. So a writer that read a version since
+      put back finds its writer gone, and reads the key again.
+    - With compaction (§10, step 7), the writer yields before it reads again, and a version can
+      leave and come back meanwhile, so finding it gone again is no corruption. Until then no pair
+      is dropped, and a version found gone twice is reported as corruption.
   - **Retired marks** (`store.rs`, DESIGN.md §6.5) change in the group of the write or
     compensation that retires or reinstates a value. Their metadata pages are latched, by trying,
     while the tree's leaf latch is held, as every latch is taken; one found held, or a marks tree
@@ -404,6 +480,11 @@ in the last point.
     reads the batch's state, the lending writes the state and reads the reservation, and only a
     sequentially consistent fence on each side forbids both reading the old value. loom let the
     removal of either fence through.
+  - A snapshot word and the floor, to be built (§10, step 7): a begin stores its provisional bound
+    and loads the floor, and a scanner raises the floor and loads the words. Only a sequentially
+    consistent fence on each side forbids both reading the old value, by the same argument as the
+    batch's. loom cannot show either fence is needed, since it makes each fence synchronize with
+    every one before it, so their mutants are expected to pass it, and this argument covers them.
   Orderings found redundant and kept, each saying what supplies it: a frame's claim is acquire,
   though the batch word's acquire-release chain already orders the freer before the next taker;
   and a tag is raised on both kinds of write to a link.
@@ -424,13 +505,25 @@ in the last point.
    reported as corruption.
 4. Transactions: lock-free commit logs, waits as completions, deadlock detection, and a log flush
    that holds no mutex across its writes. Schedule tests.
-5. Then step 7 resumes from what is committed, re-proved under the new rules.
+5. Then DESIGN.md §20's step 7 resumes from what is committed, re-proved under the new rules.
 6. Lock-free throughout (2026-11-02), one part at a time, each with its design here, loom, Miri
    where it holds pointers, shuttle, stress and mutants before it is done: the epochs; then the
    buffer pool (its page table, allocator, IO in flight, wake, first error, writeback queue,
    landed writes, ring and temporary pages done); the page store (done); the metadata cache
-   (done); the log's admission and
-   flush (done); transactions (done: commit logs, the published horizon, slots and the version
-   indexes' roots); the cold paths (done: recovery, the checkpointer's requests and superblock,
-   the control file's and the log reader's reads). Mutexes only ever tried (§8) are ownership,
-   not locks, and stay.
+   (done); the log's admission and flush (done); transactions (done: commit logs, the published
+   horizon for commits, slots and the version indexes' roots); the cold paths (done: recovery, the
+   checkpointer's requests and superblock, the control file's and the log reader's reads). Mutexes
+   only ever tried (§8) are ownership, not locks, and stay.
+7. Garbage collection (DESIGN.md §10, §11.1 to §11.5): each part with its design here, loom, Miri
+   where it holds pointers, shuttle, stress and mutants before it is done. The parts are:
+   - the clock's reserve, decided by one compare-and-swap;
+   - a rollback's timestamp, with its mark and cutoff, and End's order of release;
+   - todo items buffered under the leaf latch where their change lands, and a rollback removing
+     the items of the changes it undoes;
+   - the snapshot words, floor and watermarks;
+   - the commit-log latch and its segmented compaction, the test of whether a writer committed,
+     and a writer's retry on a version found gone;
+   - the collector claim, rewind word and item revisions;
+   - the D cells;
+   - graveyard moves;
+   - a checkpoint's sampling of the writer registry and the D cells, yielding on a held one.

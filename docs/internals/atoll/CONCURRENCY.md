@@ -69,11 +69,12 @@ in the last point.
 
 - **Participants.** Every thread stepping an instance is a participant. Its first step takes a
   slot in the instance's registry: a free one by compare-and-swap, or the next unused one. The
-  registry is a chain of chunks of slots, each slot on a cache line of its own; a full chain gets
-  another chunk with one compare-and-swap. Chunks are freed only with the registry, so a scan
-  reads them with no lock and nothing to reclaim. When the thread exits its slot is released for
-  the next thread to join, so the registry holds as many slots as threads have stepped at once,
-  not every thread that ever did.
+  registry is a chain of chunks of slots, each slot padded to a cache line of its own, or to the
+  pair of lines x86_64 and aarch64 cores fetch together; a full chain gets another chunk with one
+  compare-and-swap. Chunks are freed only with the registry, so a scan reads them with no lock and
+  nothing to reclaim. When the thread exits its slot is released for the next thread to join, so
+  the registry holds as many slots as threads have stepped at once, not every thread that ever
+  did.
 - **Announcing.** A thread entering a step (one call into Atoll that returns `Done` or `IO`)
   announces the global epoch in its slot's word: an acquire load, a release store and a
   sequentially consistent fence. Leaving, it swaps the word clear, one atomic exchange, which also

@@ -58,6 +58,7 @@ use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
+use crossbeam_utils::CachePadded;
 use room::{Pad, Room};
 use segment::Segments;
 use waits::Waits;
@@ -108,19 +109,23 @@ pub struct Log {
     room: Room,
     /// Past every write landed, in whole blocks: durable, with durable writes.
     landed: Prefix,
-    /// The furthest anyone has waited for the log to be durable to.
-    wanted: AtomicU64,
+    /// The furthest anyone has waited for the log to be durable to. Raised by every commit, so on
+    /// a line of its own.
+    wanted: CachePadded<AtomicU64>,
     /// Where the flush taking its turn writes from next: the turn's own.
     submitted: AtomicU64,
-    /// Writes submitted and not landed.
-    in_flight: AtomicUsize,
-    flushes: Solo,
+    /// Writes submitted and not landed. Moved by every write and its landing, so on a line of its
+    /// own.
+    in_flight: CachePadded<AtomicUsize>,
+    /// Asked for by every commit, so on a line of its own.
+    flushes: CachePadded<Solo>,
     /// The sync in flight, without durable writes.
     sync: Claim,
     /// The preparation of a segment under way.
     preparation: Claim,
-    /// Waiting for the log to be durable to a mark.
-    durable_waits: Waits,
+    /// Waiting for the log to be durable to a mark. Pushed onto by every commit that waits, so on a
+    /// line of its own.
+    durable_waits: CachePadded<Waits>,
     /// Waiting to be admitted, woken to try again whenever room may have been made.
     admitters: Stack<Completion>,
     failed: AtomicBool,
@@ -194,13 +199,13 @@ impl Log {
             room: Room::new(start, segments.start(current + 1), config.buffer_bytes),
             // The writes in flight lie within the ring of the position, in whole blocks.
             landed: Prefix::new(start, span, BLOCK),
-            wanted: AtomicU64::new(0),
+            wanted: CachePadded::new(AtomicU64::new(0)),
             submitted: AtomicU64::new(start),
-            in_flight: AtomicUsize::new(0),
-            flushes: Solo::default(),
+            in_flight: CachePadded::new(AtomicUsize::new(0)),
+            flushes: CachePadded::default(),
             sync: Claim::default(),
             preparation: Claim::default(),
-            durable_waits: Waits::default(),
+            durable_waits: CachePadded::default(),
             admitters: Stack::default(),
             failed: AtomicBool::new(false),
             failure: SetOnce::default(),

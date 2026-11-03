@@ -24,6 +24,7 @@ use super::segmented::Segmented;
 use super::stack::Stack;
 use crate::io::Completion;
 use crate::sync::Arc;
+use crossbeam_utils::CachePadded;
 use horizon::Horizon;
 
 /// The engine's atomics, or loom's.
@@ -56,13 +57,14 @@ pub fn commit_ts(payload: &[u8]) -> Option<Ts> {
     payload.try_into().ok().map(u64::from_le_bytes)
 }
 
+/// Drawn from by every commit and read by every begin, so on a line of its own.
 #[derive(Debug)]
-pub struct Clock(AtomicU64);
+pub struct Clock(CachePadded<AtomicU64>);
 
 impl Clock {
     /// A clock whose timestamps are all above `last`.
     pub fn after(last: Ts) -> Self {
-        Self(AtomicU64::new(last))
+        Self(CachePadded::new(AtomicU64::new(last)))
     }
 
     /// A new timestamp, above every one issued before.
@@ -176,9 +178,12 @@ impl CommitLog {
 pub struct Transactions {
     clock: Arc<Clock>,
     log: Arc<Log>,
-    slots: Box<[CommitLog]>,
-    /// Per slot, the start of the transaction it runs; 0 for none.
-    running: Box<[AtomicU64]>,
+    /// Per slot, published by its commits and read by every snapshot that looks at the slot, so
+    /// each on a line of its own.
+    slots: Box<[CachePadded<CommitLog>]>,
+    /// Per slot, the start of the transaction it runs; 0 for none. Each written by its slot's
+    /// transactions alone, so on a line of its own.
+    running: Box<[CachePadded<AtomicU64>]>,
     horizon: Horizon,
     /// A bit per slot, set while it is free.
     free: Box<[AtomicU64]>,
@@ -277,8 +282,12 @@ impl Transactions {
         let base = clock.now();
         let words = config.slots.div_ceil(64);
         Self {
-            slots: (0..config.slots).map(|_| CommitLog::new(base)).collect(),
-            running: (0..config.slots).map(|_| AtomicU64::new(0)).collect(),
+            slots: (0..config.slots)
+                .map(|_| CachePadded::new(CommitLog::new(base)))
+                .collect(),
+            running: (0..config.slots)
+                .map(|_| CachePadded::new(AtomicU64::new(0)))
+                .collect(),
             horizon: Horizon::new(config.slots, base),
             free: (0..words)
                 .map(|w| {

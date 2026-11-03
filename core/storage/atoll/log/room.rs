@@ -9,6 +9,7 @@
 //! the reach, and whichever comes second sees the first.
 
 use self::sync::{AtomicU64, Ordering};
+use crossbeam_utils::CachePadded;
 
 #[cfg(not(atoll_loom))]
 mod sync {
@@ -21,17 +22,22 @@ mod sync {
 }
 
 pub(super) struct Room {
+    /// Moved by every append, the reach then the end, so the two share a line of their own.
+    ends: CachePadded<Ends>,
+    /// Everything before it is durable. Raised by every flush, so on a line of its own.
+    durable: CachePadded<AtomicU64>,
+    /// Records may be written below this: every segment before it is prepared.
+    prepared_end: AtomicU64,
+    /// Bytes appended and not yet durable, past which nothing more is granted.
+    buffer: u64,
+}
+
+struct Ends {
     /// Where the next record will start.
     insert: AtomicU64,
     /// Where the records granted reach once appended: the end, plus the bytes granted and not
     /// yet appended.
     reach: AtomicU64,
-    /// Everything before it is durable.
-    durable: AtomicU64,
-    /// Records may be written below this: every segment before it is prepared.
-    prepared_end: AtomicU64,
-    /// Bytes appended and not yet durable, past which nothing more is granted.
-    buffer: u64,
 }
 
 /// What padding a partial block came to.
@@ -47,16 +53,18 @@ pub(super) enum Pad {
 impl Room {
     pub(super) fn new(start: u64, prepared_end: u64, buffer: u64) -> Self {
         Self {
-            insert: AtomicU64::new(start),
-            reach: AtomicU64::new(start),
-            durable: AtomicU64::new(start),
+            ends: CachePadded::new(Ends {
+                insert: AtomicU64::new(start),
+                reach: AtomicU64::new(start),
+            }),
+            durable: CachePadded::new(AtomicU64::new(start)),
             prepared_end: AtomicU64::new(prepared_end),
             buffer,
         }
     }
 
     pub(super) fn end(&self) -> u64 {
-        self.insert.load(Ordering::Acquire)
+        self.ends.insert.load(Ordering::Acquire)
     }
 
     pub(super) fn durable(&self) -> u64 {
@@ -77,7 +85,7 @@ impl Room {
 
     /// Where the records granted reach once appended.
     pub(super) fn reach(&self) -> u64 {
-        self.reach.load(Ordering::SeqCst)
+        self.ends.reach.load(Ordering::SeqCst)
     }
 
     /// Grants `bytes` if they fit within the prepared segments, and within the buffer if
@@ -86,14 +94,14 @@ impl Room {
         // Read first: it is at or behind the end, and so the reach, read after it. Read stale,
         // like the prepared segments' end, it only rises, and only makes the check stricter.
         let durable = self.durable.load(Ordering::SeqCst);
-        let mut reach = self.reach.load(Ordering::SeqCst);
+        let mut reach = self.ends.reach.load(Ordering::SeqCst);
         loop {
             let fits = (!buffer || reach - durable + bytes <= self.buffer)
                 && reach + bytes <= self.prepared_end.load(Ordering::SeqCst);
             if !fits {
                 return false;
             }
-            match self.reach.compare_exchange_weak(
+            match self.ends.reach.compare_exchange_weak(
                 reach,
                 reach + bytes,
                 Ordering::SeqCst,
@@ -107,12 +115,12 @@ impl Room {
 
     /// Gives back bytes granted and not appended.
     pub(super) fn give_back(&self, bytes: u64) {
-        self.reach.fetch_sub(bytes, Ordering::SeqCst);
+        self.ends.reach.fetch_sub(bytes, Ordering::SeqCst);
     }
 
     /// Takes `len` of the bytes granted at the end; returns where they start. The reach stays.
     pub(super) fn reserve(&self, len: u64) -> u64 {
-        self.insert.fetch_add(len, Ordering::SeqCst)
+        self.ends.insert.fetch_add(len, Ordering::SeqCst)
     }
 
     /// Moves the end from `at` to the end of its block, for padding, unless someone reserved past
@@ -123,6 +131,7 @@ impl Room {
             return Pad::Unprepared;
         }
         if self
+            .ends
             .insert
             .compare_exchange(at, to, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()

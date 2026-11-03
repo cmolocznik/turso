@@ -12,6 +12,7 @@ use self::sync::{fence, AtomicU64, Ordering};
 use super::super::stack::Stack;
 use super::{Clock, Ts};
 use crate::io::Completion;
+use crossbeam_utils::CachePadded;
 
 #[cfg(not(atoll_loom))]
 mod sync {
@@ -28,10 +29,12 @@ mod sync {
 const DRAWING: u64 = 1 << 63;
 
 pub(super) struct Horizon {
-    at: AtomicU64,
+    /// Raised by every commit and read by every snapshot, so on a line of its own.
+    at: CachePadded<AtomicU64>,
     /// Per slot, its commit under way: 0 for none; the clock as it began, with [`DRAWING`], until
-    /// its timestamp is drawn; then its timestamp, until its pair is published.
-    marks: Box<[AtomicU64]>,
+    /// its timestamp is drawn; then its timestamp, until its pair is published. Each written by its
+    /// slot's commits alone, so on a line of its own.
+    marks: Box<[CachePadded<AtomicU64>]>,
     /// Commits waiting for the horizon to reach them.
     waits: Stack<Completion>,
 }
@@ -40,8 +43,10 @@ impl Horizon {
     /// A horizon for `slots` slots, at `base`, every commit at or below it published.
     pub(super) fn new(slots: usize, base: Ts) -> Self {
         Self {
-            at: AtomicU64::new(base),
-            marks: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            at: CachePadded::new(AtomicU64::new(base)),
+            marks: (0..slots)
+                .map(|_| CachePadded::new(AtomicU64::new(0)))
+                .collect(),
             waits: Stack::default(),
         }
     }

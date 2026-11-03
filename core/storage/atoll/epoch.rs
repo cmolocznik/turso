@@ -25,6 +25,7 @@ use self::sync::{
     fence, Arc, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Mutex, Ordering, Plain,
 };
 use crate::io::Completion;
+use crossbeam_utils::CachePadded;
 use std::cell::{Cell, RefCell};
 use std::collections::BinaryHeap;
 use std::ptr;
@@ -110,10 +111,10 @@ fn announced(word: u64) -> Option<u64> {
     (word != IDLE).then_some(word >> 1)
 }
 
-/// Slots per chunk of the registry: a 4 KiB page of them, one cache line each. Under loom, two,
-/// so its few threads cross a chunk's end.
+/// Slots per chunk of the registry: a 4 KiB page of them. Under loom, two, so its few threads cross
+/// a chunk's end.
 #[cfg(not(atoll_loom))]
-const CHUNK_SLOTS: usize = 4096 / 64;
+const CHUNK_SLOTS: usize = 4096 / std::mem::size_of::<Slot>();
 #[cfg(atoll_loom)]
 const CHUNK_SLOTS: usize = 2;
 
@@ -121,9 +122,11 @@ const CHUNK_SLOTS: usize = 2;
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A participant's place in an instance's registry: what it announced, and whether a thread
-/// holds it. On a cache line of its own, so a thread's announcements never contend with another's.
-#[repr(align(64))]
-struct Slot {
+/// holds it. Padded to a cache line of its own, or to the pair of lines x86_64 and aarch64 cores
+/// fetch together, so a thread's announcements never contend with another's.
+type Slot = CachePadded<SlotWords>;
+
+struct SlotWords {
     /// [`IDLE`], or [`announcing`] an epoch, with [`WAITED`] set once a wait it holds back flags it.
     word: AtomicU64,
     taken: AtomicBool,
@@ -148,9 +151,11 @@ impl Chunk {
         Self {
             slots: Plain::new(
                 (0..CHUNK_SLOTS)
-                    .map(|_| Slot {
-                        word: AtomicU64::new(IDLE),
-                        taken: AtomicBool::new(false),
+                    .map(|_| {
+                        CachePadded::new(SlotWords {
+                            word: AtomicU64::new(IDLE),
+                            taken: AtomicBool::new(false),
+                        })
                     })
                     .collect(),
             ),
@@ -291,15 +296,17 @@ struct Wait {
 
 pub struct Epochs {
     id: u64,
-    global: AtomicU64,
+    /// Read by every step entered, so on a line of its own: no other word's writes take it away.
+    global: CachePadded<AtomicU64>,
     registry: Arc<Registry>,
     /// The waits registered and not yet finished, newest first. Taken whole by a wake, so no
     /// wait is ever unlinked under another thread.
     waits: AtomicPtr<Wait>,
     /// A horizon a scan found: the lowest announcement then, or the epoch then if lower. Every
     /// step under way since announced at or above it, or cannot reach what was retired at or
-    /// below it, so what is stamped at or below it may be reused without a scan.
-    known: AtomicU64,
+    /// below it, so what is stamped at or below it may be reused without a scan. Raised by every
+    /// scan and read by every reclaim, so on a line of its own.
+    known: CachePadded<AtomicU64>,
 }
 
 /// A thread's slot for one instance, and how deep its steps are nested. Dropped as the thread
@@ -349,13 +356,13 @@ impl Epochs {
     pub fn new() -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            global: AtomicU64::new(0),
+            global: CachePadded::new(AtomicU64::new(0)),
             registry: Arc::new(Registry {
                 first: Chunk::new(),
                 open: AtomicBool::new(true),
             }),
             waits: AtomicPtr::new(ptr::null_mut()),
-            known: AtomicU64::new(0),
+            known: CachePadded::new(AtomicU64::new(0)),
         }
     }
 

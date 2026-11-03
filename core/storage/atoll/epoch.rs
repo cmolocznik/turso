@@ -364,21 +364,27 @@ impl Epochs {
     fn with_entry<R>(&self, f: impl FnOnce(&Entry) -> R) -> R {
         ENTRIES.with(|entries| {
             let found = entries.borrow().iter().position(|e| e.id == self.id);
-            let i = found.unwrap_or_else(|| {
-                let mut entries = entries.borrow_mut();
-                // Entries for instances dropped since go.
-                entries.retain(|e| e.registry.open.load(Ordering::Relaxed));
-                let slot: *const Slot = self.registry.join();
-                entries.push(Entry {
-                    id: self.id,
-                    registry: self.registry.clone(),
-                    slot,
-                    depth: Cell::new(0),
-                });
-                entries.len() - 1
-            });
+            let i = found.unwrap_or_else(|| self.register(entries));
             f(&entries.borrow()[i])
         })
+    }
+
+    /// Registers the calling thread on its first step in this instance: takes it a slot, keeps its
+    /// entry, and returns where. Out of line, so the lookup every step makes carries none of it.
+    #[cold]
+    #[inline(never)]
+    fn register(&self, entries: &RefCell<Vec<Entry>>) -> usize {
+        let mut entries = entries.borrow_mut();
+        // Entries for instances dropped since go.
+        entries.retain(|e| e.registry.open.load(Ordering::Relaxed));
+        let slot: *const Slot = self.registry.join();
+        entries.push(Entry {
+            id: self.id,
+            registry: self.registry.clone(),
+            slot,
+            depth: Cell::new(0),
+        });
+        entries.len() - 1
     }
 
     /// Enters a step; it ends when the guard is dropped.

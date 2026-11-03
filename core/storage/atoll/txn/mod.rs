@@ -47,6 +47,9 @@ use crate::{LimboError, Result};
 /// A timestamp of the transaction clock. 0 is before every transaction.
 pub type Ts = u64;
 
+/// A statement's number within its transaction: 0 before the first.
+pub type Statement = u32;
+
 /// A commit's record: its timestamp.
 pub const COMMIT: Kind = Kind::new(16).unwrap();
 
@@ -214,7 +217,7 @@ pub struct Txn {
     /// The current statement's snapshot.
     snapshot: Ts,
     /// The current statement: 0 before the first.
-    command: u16,
+    command: Statement,
     /// Per slot, the start of its last transaction committed before the snapshot, once looked up.
     seen: Vec<Option<Ts>>,
     /// Where the transaction's last group starts; `None` while it has written nothing.
@@ -233,8 +236,15 @@ impl Txn {
         self.start
     }
 
-    pub fn command(&self) -> u16 {
+    pub fn command(&self) -> Statement {
         self.command
+    }
+
+    /// Moves the transaction on to statement `command`, as if it had run every one before: for a
+    /// test of the last statement number.
+    #[cfg(all(test, not(shuttle), not(atoll_loom)))]
+    pub(crate) fn skip_to(&mut self, command: Statement) {
+        self.command = command;
     }
 
     /// The header of the transaction's next record of `kind`.
@@ -425,7 +435,7 @@ impl Transactions {
         txn.command = txn.command.checked_add(1).ok_or_else(|| {
             LimboError::InternalError(format!(
                 "a transaction of more than {} statements",
-                u16::MAX
+                Statement::MAX
             ))
         })?;
         if txn.isolation == Isolation::ReadCommitted && txn.command > 1 {
@@ -438,7 +448,7 @@ impl Transactions {
 
     /// Whether the version written by the transaction that started at `start` in `slot`, in its
     /// statement `command`, is visible to `txn`'s current statement.
-    pub fn visible(&self, txn: &mut Txn, slot: u16, start: Ts, command: u16) -> bool {
+    pub fn visible(&self, txn: &mut Txn, slot: u16, start: Ts, command: Statement) -> bool {
         if slot == txn.slot && start == txn.start {
             return command < txn.command;
         }

@@ -294,7 +294,7 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
     key, so it works after splits and merges.
   - A transaction's change and its compensations name the tree by its root and its incarnation
     (section 13), and the statement by its 32-bit number (section 11.1). Until garbage collection
-    (section 20), they name the root alone, and a 16-bit statement.
+    (section 20), they name the root alone.
   - Logging undo costs log volume: Haubenschild et al. measure about 20% more with the old values
     of the changed columns (§4: 2,230 against 1,850 bytes per TPC-C transaction). Whole entries
     cost more, until update deltas come (section 20).
@@ -666,7 +666,6 @@ Built in `txn/mod.rs`, except what garbage collection brings (section 20):
 - the snapshot words and the watermarks;
 - the OLTP and OLAP classes;
 - a begin collecting its slot's garbage;
-- 32-bit statement numbers, which are 16 bits until then.
 
 Remote snapshots come with step 10.
 
@@ -827,8 +826,8 @@ Remote snapshots come with step 10.
 
 ### 11.2 Tuples and versions
 
-Built in `txn/versioned.rs`, except what garbage collection brings (section 20): the header and
-index keys of 32-bit statements, the rule that no index entry spills, and the graveyard.
+Built in `txn/versioned.rs`, except what garbage collection brings (section 20): the rule that no
+index entry spills, and the graveyard.
 
 - **Header.** Every entry of every B-tree, table or index, starts with a 16-byte header:
 
@@ -836,8 +835,6 @@ index keys of 32-bit statements, the rule that no index entry spills, and the gr
   slot: u16 | ts: u64 | command: u32 | updates: u8 | flags: u8
   ```
 
-  Until the 32-bit statement counter lands (section 20), `command` is a `u16` and the header is
-  14 bytes.
   - `ts` is the writer's start timestamp.
   - `command` is the statement within the writer's transaction.
   - `updates` counts updates while the oldest snapshot stays the same, for fat tuples; it is 0
@@ -856,7 +853,7 @@ index keys of 32-bit statements, the rule that no index entry spills, and the gr
       later (section 20).
     - Inserts go to the right edge, and garbage collection is a range delete.
     - A slot has one index per node class of the trees it writes, a class larger, so its keys hold
-      a tree's longest key and the 20 bytes around it, 18 while statements are 16 bits.
+      a tree's longest key and the 20 bytes around it.
   - **No index entry spills.** An index entry adds 20 key bytes and a 1-byte tag to the tree's
     entry. A versioned tree keeps a value inline only if its index entry would be inline in the
     index class too, so a drop of the index frees nothing but its own pages.
@@ -1645,9 +1642,10 @@ work says which parts are done.
    a version index of whole versions, conflicts and waits (done: `txn/versioned.rs`); rollback,
    the writer table and undo in recovery (done: `txn/rollback.rs`, `log/writers.rs`,
    `recovery.rs`); values out of line in versioned trees, and retired pages (done:
-   `txn/versioned.rs`, `store.rs`). Next, garbage collection, without the newest OLAP snapshot as a
+   `txn/versioned.rs`, `store.rs`); 32-bit statement numbers (done: `txn/`, `btree/record.rs`,
+   built first in step 8, which takes one per writing statement). Next, garbage collection, without the newest OLAP snapshot as a
    watermark:
-   - the clock's ceiling and reserve, and 32-bit statement numbers (sections 7.1, 11.1, 11.2);
+   - the clock's ceiling and reserve (sections 7.1, 11.1);
    - the timestamp a rollback draws, the cutoff it publishes, and End's order of release
      (section 11.5);
    - snapshot words, watermarks, OLTP and OLAP (section 11.1);

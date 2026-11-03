@@ -73,9 +73,22 @@ struct Db {
     trees: [VersionedTree; 2],
 }
 
+/// [`config`] with the log buffer at two chunks: under what the rollback of the few dozen changes
+/// of VALUE's length a test makes appends, so the log is flushed while that rollback runs and the
+/// crash images fall between its compensations.
+fn flushing() -> AtollConfig {
+    let mut config = config();
+    config.log.buffer_bytes = 2 * config.log.chunk_bytes;
+    config
+}
+
 impl Db {
     fn create(io: Arc<dyn IO>) -> Self {
-        let db = Atoll::open(io.clone(), BASE, config()).unwrap();
+        Self::create_with(io, config())
+    }
+
+    fn create_with(io: Arc<dyn IO>, config: AtollConfig) -> Self {
+        let db = Atoll::open(io.clone(), BASE, config).unwrap();
         let roots = [0, 1].map(|c| {
             run(&io, || {
                 Tree::create(&io, db.pool(), db.store(), SizeClass::new(c).unwrap())
@@ -143,7 +156,7 @@ impl Db {
         run(&self.io, || self.txns().rollback(&self.versions, &mut op));
     }
 
-    fn rollback_to(&self, txn: &mut Txn, to: u16) {
+    fn rollback_to(&self, txn: &mut Txn, to: Statement) {
         let mut op = Rollback::after(to);
         run(&self.io, || {
             self.txns().rollback_to(&self.versions, txn, &mut op)
@@ -560,6 +573,116 @@ fn a_key_put_back_and_changed_by_a_commit_since_keeps_that_commit_through_undo()
         println!("{label}: {r:?}");
         drop(t);
     }
+}
+
+/// A transaction past 65,535 statements (DESIGN.md §19): its statement numbers no longer fit 16
+/// bits in its version headers, its version index keys, the statement a rollback stops at and its
+/// compensations. One rolls back to a statement past the old limit and commits; another, as far
+/// past it, writes and rolls back, crashed every few operations, and every image recovers to what
+/// was committed, through recoveries crashed between two of their own compensations.
+#[test]
+fn a_transaction_past_65535_statements_rolls_back_to_one_commits_and_recovers() {
+    const PAST: Statement = u16::MAX as Statement + 2;
+    // The statement rolled back to ends in sixteen one bits, the next in sixteen zeros: read in
+    // 16 bits, the statement undone would sort before the one kept.
+    const KEPT: Statement = 2 * (u16::MAX as Statement + 1) - 1;
+    for seed in 0..2u64 {
+        let crash_io = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash_io.clone();
+        // The second transaction's rollback compensates 54 changes, each record carrying its
+        // VALUE: 37,800 bytes or more, past the 32 KiB buffer, so it is flushed while they run.
+        let db = Db::create_with(io, flushing());
+        let keys: Vec<String> = (0..40).map(|i| format!("k{i:03}")).collect();
+        committed(&db, &keys);
+        // A statement that writes nothing costs only its number.
+        let mut t = db.begin();
+        while t.command() < KEPT {
+            db.txns().statement(&mut t).unwrap();
+        }
+        for (i, key) in keys.iter().enumerate().take(20) {
+            db.put(&mut t, i % 2, key, &value("kept", i));
+        }
+        let kept = t.command();
+        assert_eq!(kept, KEPT);
+        db.txns().statement(&mut t).unwrap();
+        // Twice in one statement: undoing it puts back what the statement found, which only a
+        // statement number read whole tells from the statement's own first write.
+        for round in ["undone", "undone again"] {
+            for (i, key) in keys.iter().enumerate() {
+                db.put(&mut t, i % 2, key, &value(round, i));
+            }
+        }
+        db.rollback_to(&mut t, kept);
+        assert!(t.command() > kept + 1, "statement {} reused", t.command());
+        db.commit(t);
+        let expected = db.state(&keys);
+        for (i, key) in keys.iter().enumerate() {
+            let want = if i < 20 {
+                value("kept", i)
+            } else {
+                value("committed", i)
+            };
+            assert_eq!(
+                expected[&(i % 2, key.clone())],
+                Some(want),
+                "seed {seed}: {key}"
+            );
+            assert_eq!(
+                expected[&((i + 1) % 2, key.clone())],
+                Some(value("committed", i)),
+                "seed {seed}: {key}"
+            );
+        }
+        crash_io.capture(|_| false, 6, seed);
+        let mut u = db.begin();
+        while u.command() < PAST {
+            db.txns().statement(&mut u).unwrap();
+        }
+        for (i, key) in keys.iter().enumerate() {
+            db.put(&mut u, i % 2, key, &value("lost", i));
+        }
+        db.txns().statement(&mut u).unwrap();
+        for (i, key) in keys.iter().enumerate().step_by(3) {
+            db.put(&mut u, (i + 1) % 2, key, &value("lost again", i));
+        }
+        let start = u.start();
+        db.rollback(u);
+        db.durable();
+        let mut images = crash_io.captured();
+        images.push(crash_io.crash(seed));
+        let counts: Vec<usize> = images.iter().map(|i| compensations_in(i, start)).collect();
+        let all = *counts.iter().max().unwrap();
+        assert!(
+            counts.iter().any(|&n| n > 0 && n < all),
+            "seed {seed}: no image between compensations: {counts:?}"
+        );
+        let label = format!(
+            "seed {seed}, {} images, compensations {counts:?}",
+            images.len()
+        );
+        let r = recover_all(images, db.roots(), &keys, &expected, 2, start, &label);
+        println!("{label}: {r:?}");
+        assert!(
+            r.mid_undo > 0,
+            "{label}: no crash between two of a recovery's compensations: {r:?}"
+        );
+    }
+}
+
+/// A transaction's last statement is number 2^32 - 1: starting one more fails, and the
+/// transaction still rolls back whole.
+#[test]
+fn a_statement_past_the_last_number_fails_and_the_transaction_rolls_back() {
+    let io: Arc<dyn IO> = Arc::new(CrashIO::new(0));
+    let db = Db::create(io);
+    let mut t = db.begin();
+    db.put(&mut t, 0, "k", &value("v", 0));
+    t.skip_to(Statement::MAX);
+    let err = db.txns().statement(&mut t).unwrap_err();
+    assert!(err.to_string().contains("statements"), "{err}");
+    assert_eq!(t.command(), Statement::MAX);
+    db.rollback(t);
+    assert_eq!(db.state(&["k".to_string()])[&(0, "k".to_string())], None);
 }
 
 /// A writer's one change is followed by segments' worth of others' commits and checkpoints whose

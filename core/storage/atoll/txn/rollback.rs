@@ -16,7 +16,7 @@
 //! Nothing is removed from the indexes: a reader may be following one of their entries.
 
 use super::versioned::{decode_entry, index_key_parts, Version, VersionedTree, Versions, HEADER};
-use super::{Transactions, Ts, Txn};
+use super::{Statement, Transactions, Ts, Txn};
 use crate::io::IO;
 use crate::storage::atoll::btree::record::{Change, Compensation, Record};
 use crate::storage::atoll::btree::value::ValueRef;
@@ -43,7 +43,7 @@ macro_rules! done {
 
 /// What a statement replaced of a key: an entry of a version index.
 struct Replaced {
-    statement: u16,
+    statement: Statement,
     tree: PageId,
     key: Vec<u8>,
     /// The entry the statement's first change of the key replaced; `None` for none.
@@ -71,7 +71,7 @@ enum Step {
 /// A rollback in progress: every key a statement after `to` changed, put back. Step it with
 /// [`undo`].
 pub struct Rollback {
-    to: u16,
+    to: Statement,
     lanes: Option<Vec<Lane>>,
     /// The lane being worked on, and where that stands.
     working: Option<(usize, Step)>,
@@ -79,7 +79,7 @@ pub struct Rollback {
 
 impl Rollback {
     /// Puts back what every statement after `to` changed: 0 for the whole transaction.
-    pub fn after(to: u16) -> Self {
+    pub fn after(to: Statement) -> Self {
         Self {
             to,
             lanes: None,
@@ -88,14 +88,14 @@ impl Rollback {
     }
 
     /// The last statement kept.
-    pub fn to(&self) -> u16 {
+    pub fn to(&self) -> Statement {
         self.to
     }
 }
 
 impl Lane {
     /// The entry the cursor is at, if it is one of `start`'s statements after `to`.
-    fn read(&mut self, start: Ts, to: u16) -> Result<()> {
+    fn read(&mut self, start: Ts, to: Statement) -> Result<()> {
         self.at = match (self.cursor.key(), self.cursor.value()) {
             (Some(key), Some(value)) => {
                 let (ts, statement, tree, key) = index_key_parts(key).ok_or_else(|| {

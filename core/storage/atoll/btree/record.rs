@@ -13,8 +13,8 @@
 //! txn insert: pid | root: u64 | out: u8 | key_len: u16 | key | value
 //! txn update: pid | root: u64 | out: u8 | key_len: u16 | key | value_len: u32 | value | found: u8 |
 //!             old
-//! restore:    pid | root: u64 | statement: u16 | undid: u64 | out: u8 | key_len: u16 | key | value
-//! unput:      pid | root: u64 | statement: u16 | undid: u64 | key
+//! restore:    pid | root: u64 | statement: u32 | undid: u64 | out: u8 | key_len: u16 | key | value
+//! unput:      pid | root: u64 | statement: u32 | undid: u64 | key
 //! ```
 //!
 //! A transaction's insert and update also name the tree, by its root, and an update carries the
@@ -60,12 +60,12 @@ pub fn owns(kind: Kind) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Compensation {
     pub root: PageId,
-    pub statement: u16,
+    pub statement: u32,
     pub undid: Option<GroupStart>,
 }
 
 /// Bytes a compensation's unit takes in its record.
-pub const COMPENSATION: usize = 8 + 2 + 8;
+pub const COMPENSATION: usize = 8 + 4 + 8;
 
 /// `found` of a transaction's update whose statement found no entry.
 const FOUND_NONE: u8 = 2;
@@ -241,10 +241,10 @@ impl<'a> Record<'a> {
         if kind == RESTORE || kind == UNPUT {
             let of = Compensation {
                 root: PageId::from_raw(word(8)?),
-                statement: u16::from_le_bytes(
-                    payload.get(16..18).ok_or_else(bad)?.try_into().unwrap(),
+                statement: u32::from_le_bytes(
+                    payload.get(16..20).ok_or_else(bad)?.try_into().unwrap(),
                 ),
-                undid: GroupStart::decode(word(18)?).ok_or_else(bad)?,
+                undid: GroupStart::decode(word(20)?).ok_or_else(bad)?,
             };
             let rest = &payload[8 + COMPENSATION..];
             if kind == UNPUT {
@@ -458,7 +458,8 @@ mod tests {
         let pid = PageId::from_raw(77);
         let of = |undid| Compensation {
             root: PageId::from_raw(5),
-            statement: 513,
+            // Past 16 bits, so the round trip covers every byte of the number.
+            statement: (1 << 16) + 513,
             undid,
         };
         for undid in [None, Some(GroupStart::at(0)), Some(GroupStart::at(1 << 30))] {

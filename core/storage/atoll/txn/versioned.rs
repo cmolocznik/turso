@@ -3,7 +3,7 @@
 //! Every entry starts with a version header, kept in the leaf:
 //!
 //! ```text
-//! slot: u16 | ts: u64 | command: u16 | updates: u8 | flags: u8
+//! slot: u16 | ts: u64 | command: u32 | updates: u8 | flags: u8
 //! ```
 //!
 //! naming the transaction that wrote the version (its slot and start) and the statement within it.
@@ -32,7 +32,7 @@
 //! others follow the chain to what the statement found, so its pages go at once. The change then
 //! logs the entry its statement found as what undoes it, which a rollback put back already.
 
-use super::{Isolation, Transactions, Ts, Txn, Writer};
+use super::{Isolation, Statement, Transactions, Ts, Txn, Writer};
 use crate::io::IO;
 use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
 use crate::storage::atoll::btree::{Lookup, Mode, Outcome, Put, Stored, StoredValue, Tree};
@@ -45,7 +45,11 @@ use crate::types::IOResult;
 use crate::{LimboError, Result};
 
 /// Bytes of the version header.
-pub const HEADER: usize = 14;
+pub const HEADER: usize = 16;
+
+/// Bytes of a version index key before the tree's key: the replacing transaction's start, its
+/// statement and the tree's root.
+pub(super) const INDEX_PREFIX: usize = 8 + 4 + 8;
 
 /// The largest node class (64 KiB, the most 16-bit slots address).
 const MAX_NODE_CLASS: usize = 4;
@@ -63,7 +67,7 @@ macro_rules! done {
 pub struct Version {
     pub slot: u16,
     pub ts: Ts,
-    pub command: u16,
+    pub command: Statement,
     /// Updates while the oldest snapshot stayed the same: what turns a tuple fat.
     pub updates: u8,
     pub flags: u8,
@@ -79,9 +83,9 @@ impl Version {
         let mut out = [0u8; HEADER];
         out[0..2].copy_from_slice(&self.slot.to_le_bytes());
         out[2..10].copy_from_slice(&self.ts.to_le_bytes());
-        out[10..12].copy_from_slice(&self.command.to_le_bytes());
-        out[12] = self.updates;
-        out[13] = self.flags;
+        out[10..14].copy_from_slice(&self.command.to_le_bytes());
+        out[14] = self.updates;
+        out[15] = self.flags;
         out
     }
 
@@ -90,9 +94,9 @@ impl Version {
         Some(Self {
             slot: u16::from_le_bytes([head[0], head[1]]),
             ts: u64::from_le_bytes(head[2..10].try_into().unwrap()),
-            command: u16::from_le_bytes([head[10], head[11]]),
-            updates: head[12],
-            flags: head[13],
+            command: u32::from_le_bytes(head[10..14].try_into().unwrap()),
+            updates: head[14],
+            flags: head[15],
         })
     }
 
@@ -112,8 +116,8 @@ const ABSENT: u8 = 1;
 const OUT_OF_LINE: u8 = 2;
 
 /// The version index key of the version replaced by `(ts, command)`'s write of `key` in `tree`.
-pub(super) fn index_key(ts: Ts, command: u16, tree: PageId, key: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(18 + key.len());
+pub(super) fn index_key(ts: Ts, command: Statement, tree: PageId, key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(INDEX_PREFIX + key.len());
     out.extend_from_slice(&ts.to_be_bytes());
     out.extend_from_slice(&command.to_be_bytes());
     out.extend_from_slice(&tree.raw().to_be_bytes());
@@ -123,15 +127,15 @@ pub(super) fn index_key(ts: Ts, command: u16, tree: PageId, key: &[u8]) -> Vec<u
 
 /// What a version index key names: the replacing transaction's start and statement, the tree and
 /// the key.
-pub(super) fn index_key_parts(key: &[u8]) -> Option<(Ts, u16, PageId, &[u8])> {
-    if key.len() < 18 {
+pub(super) fn index_key_parts(key: &[u8]) -> Option<(Ts, Statement, PageId, &[u8])> {
+    if key.len() < INDEX_PREFIX {
         return None;
     }
     Some((
         u64::from_be_bytes(key[0..8].try_into().unwrap()),
-        u16::from_be_bytes(key[8..10].try_into().unwrap()),
-        PageId::from_raw(u64::from_be_bytes(key[10..18].try_into().unwrap())),
-        &key[18..],
+        u32::from_be_bytes(key[8..12].try_into().unwrap()),
+        PageId::from_raw(u64::from_be_bytes(key[12..20].try_into().unwrap())),
+        &key[INDEX_PREFIX..],
     ))
 }
 
@@ -238,7 +242,7 @@ impl Versions {
     }
 
     /// The node class of the version index for trees of `class`: one larger, so its keys hold a
-    /// tree's longest key and the 18 bytes before and after it.
+    /// tree's longest key and the [`INDEX_PREFIX`] bytes before it.
     fn index_class(class: SizeClass) -> SizeClass {
         SizeClass::new((class.index() + 1).min(MAX_NODE_CLASS)).expect("a class")
     }
@@ -372,7 +376,8 @@ impl VersionedTree {
     /// The longest key: the tree's, and what its version index keys hold.
     pub fn max_key(&self) -> usize {
         let index = Versions::index_class(self.tree.root().class());
-        let index_max = crate::storage::atoll::btree::node::Limits::of(index).max_key - 18;
+        let index_max =
+            crate::storage::atoll::btree::node::Limits::of(index).max_key - INDEX_PREFIX;
         self.tree.limits().max_key.min(index_max)
     }
 

@@ -325,7 +325,7 @@ impl Db {
         run(&self.io, || self.txns().rollback(&self.versions, &mut op));
     }
 
-    fn rollback_to(&self, txn: &mut Txn, to: u16) {
+    fn rollback_to(&self, txn: &mut Txn, to: Statement) {
         let mut op = crate::storage::atoll::txn::rollback::Rollback::after(to);
         run(&self.io, || {
             self.txns().rollback_to(&self.versions, txn, &mut op)
@@ -351,7 +351,7 @@ impl Db {
     }
 
     /// The kinds and statements of `start`'s records, in log order.
-    fn chain(&self, start: Ts) -> Vec<(Kind, Option<u16>)> {
+    fn chain(&self, start: Ts) -> Vec<(Kind, Option<Statement>)> {
         use crate::storage::atoll::btree::record::{Change, Record};
         drive(&self.io, || self.db.log().wait_durable(self.db.log().end())).unwrap();
         let mut reader = crate::storage::atoll::log::Log::reader(
@@ -449,7 +449,7 @@ fn a_rollback_puts_back_every_key_newest_statement_first_and_frees_its_slot() {
     // One compensation per key each statement changed, newest statement first across both
     // trees, then End.
     let chain = db.chain(start);
-    let compensations: Vec<u16> = chain.iter().filter_map(|(_, s)| *s).collect();
+    let compensations: Vec<Statement> = chain.iter().filter_map(|(_, s)| *s).collect();
     assert_eq!(compensations, vec![3, 3, 2, 2, 2, 1, 1, 1, 1], "{chain:?}");
     let unputs = chain.iter().filter(|(k, _)| *k == UNPUT).count();
     let restores = chain.iter().filter(|(k, _)| *k == RESTORE).count();
@@ -475,7 +475,7 @@ fn a_statement_that_changed_a_key_again_and_again_is_put_back_once_to_what_it_fo
     let start = t.start();
     db.rollback(t);
     assert_eq!(db.read_in(&db.tree, "k").as_deref(), Some("v0"));
-    let compensations: Vec<u16> = db.chain(start).iter().filter_map(|(_, s)| *s).collect();
+    let compensations: Vec<Statement> = db.chain(start).iter().filter_map(|(_, s)| *s).collect();
     assert_eq!(compensations, vec![1]);
 }
 

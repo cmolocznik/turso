@@ -213,19 +213,23 @@ fn a_snapshot_reads_the_versions_committed_before_it_through_the_chain() {
 }
 
 #[test]
-fn a_statement_reads_its_transactions_earlier_statements_and_not_its_own() {
+fn a_statement_reads_its_own_writes_as_soon_as_it_makes_them() {
     let db = open();
     let mut w = db.begin(Isolation::Snapshot);
     db.put(&mut w, "k", "s1", Mode::Insert);
-    assert_eq!(db.get(&mut w, "k"), None, "its own statement's insert");
+    assert_eq!(
+        db.get(&mut w, "k").as_deref(),
+        Some("s1"),
+        "its own statement's insert"
+    );
     db.txns().statement(&mut w).unwrap();
     assert_eq!(db.get(&mut w, "k").as_deref(), Some("s1"));
     db.put(&mut w, "k", "s2a", Mode::Update);
     db.put(&mut w, "k", "s2b", Mode::Update);
     assert_eq!(
         db.get(&mut w, "k").as_deref(),
-        Some("s1"),
-        "a row this statement changed twice reads as it was before it"
+        Some("s2b"),
+        "a row this statement changed twice reads as it last wrote it"
     );
     db.txns().statement(&mut w).unwrap();
     assert_eq!(db.get(&mut w, "k").as_deref(), Some("s2b"));
@@ -245,7 +249,7 @@ fn a_statement_reads_its_transactions_earlier_statements_and_not_its_own() {
     db.txns().statement(&mut w).unwrap();
     db.put(&mut w, "k", "t2", Mode::Update);
     assert_eq!(db.get(&mut later, "k").as_deref(), Some("s2b"));
-    assert_eq!(db.get(&mut w, "k").as_deref(), Some("t1"));
+    assert_eq!(db.get(&mut w, "k").as_deref(), Some("t2"));
 }
 
 #[test]
@@ -689,8 +693,9 @@ fn values_out_of_line_keep_their_versions_and_free_what_no_one_reads() {
         v3.iter().all(|&p| db.freed(p)),
         "a version only its own statement wrote kept its pages"
     );
-    // The statement reads what it found, through its own index entry; the next one, what it wrote.
-    assert_eq!(db.get(&mut t, "k"), Some(big("v2")));
+    // The statement reads what it last wrote, through the leaf that holds it, though the pages of
+    // the version before were freed; the next one reads the same.
+    assert_eq!(db.get(&mut t, "k"), Some(big("v4")));
     db.txns().statement(&mut t).unwrap();
     assert_eq!(db.get(&mut t, "k"), Some(big("v4")));
     let v4 = db.pages_of("k");

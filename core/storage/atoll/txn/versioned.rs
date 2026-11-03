@@ -420,7 +420,7 @@ impl VersionedTree {
             let mut newest = true;
             loop {
                 let v = Version::decode(&stored.head).ok_or_else(corrupt_header)?;
-                if txns.visible(txn, v.slot, v.ts, v.command) {
+                if txns.visible(txn, v.slot, v.ts) {
                     if v.deleted() {
                         return Ok(IOResult::Done(None));
                     }
@@ -519,8 +519,7 @@ impl VersionedTree {
                         )))
                     }
                     Writer::Committed => {
-                        if txn.isolation == Isolation::Snapshot
-                            && !txns.visible(txn, v.slot, v.ts, v.command)
+                        if txn.isolation == Isolation::Snapshot && !txns.visible(txn, v.slot, v.ts)
                         {
                             return Ok(IOResult::Done(Write::Conflict));
                         }

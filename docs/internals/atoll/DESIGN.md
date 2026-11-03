@@ -819,8 +819,12 @@ Remote snapshots come with step 10.
     S: the transaction's `log_at`. Every commit at or below S has its Commit record before that
     position, so a follower reads at S only once it has applied the log through it.
   - Built with step 10 (section 20).
-- **Statements.** A transaction sees what its own earlier statements wrote, and not what its
-  current statement writes. Under read committed each statement takes a new snapshot. Statements
+- **Statements.** A transaction sees everything it wrote, its current statement's writes
+  included, as Turso's VDBE expects of a cursor: a unique check, NotExists after an insert, UPSERT,
+  triggers and foreign-key checks read them (section 17). Turso's MVCC does the same, and SQLite's
+  planner already adds a temporary table where a statement must not read its own writes. Statement
+  numbers order the version index and bound statement rollback and savepoints. Under read
+  committed each statement takes a new snapshot. Statements
   are numbered by a 32-bit counter, the width of PostgreSQL's command counter, and a transaction
   past 2^32 − 1 statements fails.
 
@@ -872,9 +876,10 @@ index entry spills, and the graveyard.
   - **Values out of line.** An index entry holds the replaced version's header and either its value
     or the reference of a value out of line. Those pages are then retired (section 6.5), and freed
     through the todo item of the change that retired them (section 11.5). A version its own
-    statement replaces again is the exception: no reader can reach it, since every read, the
-    statement's own included, resolves to what the statement found (a statement sees only what
-    earlier statements wrote, section 11.1). So its pages are abandoned at once.
+    statement replaces again is the exception: no other transaction can reach it, and the
+    transaction's own reads take a newest version's value through the leaf that holds it, so a
+    read whose pages were replaced finds out and reads the leaf again (section 13). So its pages
+    are abandoned at once.
   - **Fat tuples.** A tuple updated very often would keep its recent deltas inline instead (OSIC's
     fat tuples, §3.3), with the pruning of a chain's middle that the newest OLAP snapshot allows.
     They come with deltas (section 20). OSIC judges the `updates` count against the oldest snapshot

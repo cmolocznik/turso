@@ -118,7 +118,7 @@ fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it(
                 let mut after = begin(&io, &db, Isolation::Snapshot);
                 db.transactions().statement(&mut after).unwrap();
                 assert!(
-                    db.transactions().visible(&mut after, key.0, key.1, 1),
+                    db.transactions().visible(&mut after, key.0, key.1),
                     "{key:?}, committed at {ts}, unseen by a snapshot taken after"
                 );
                 db.transactions().abort(after);
@@ -141,9 +141,9 @@ fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it(
                         else {
                             continue;
                         };
-                        let v = db.transactions().visible(&mut txn, slot, start, 1);
+                        let v = db.transactions().visible(&mut txn, slot, start);
                         // Asked again in the same statement, the answer holds.
-                        assert_eq!(v, db.transactions().visible(&mut txn, slot, start, 1));
+                        assert_eq!(v, db.transactions().visible(&mut txn, slot, start));
                         seen.lock().push((txn.snapshot, (slot, start), v));
                     }
                 }
@@ -195,7 +195,7 @@ fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it_in_shuttle
 }
 
 #[test]
-fn a_transaction_sees_its_own_writes_from_its_next_statement_and_others_once_committed() {
+fn a_transaction_sees_its_own_writes_at_once_and_others_once_committed() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, 4);
     let txns = db.transactions();
@@ -204,39 +204,39 @@ fn a_transaction_sees_its_own_writes_from_its_next_statement_and_others_once_com
     write(&io, &db, &mut a);
     let (slot, start) = (a.slot(), a.start());
     assert!(
-        !txns.visible(&mut a, slot, start, 1),
+        txns.visible(&mut a, slot, start),
         "its own statement's write"
     );
     txns.statement(&mut a).unwrap();
     assert!(
-        txns.visible(&mut a, slot, start, 1),
+        txns.visible(&mut a, slot, start),
         "an earlier statement's write"
     );
     let mut snapshot = begin(&io, &db, Isolation::Snapshot);
     let mut committed = begin(&io, &db, Isolation::ReadCommitted);
     for t in [&mut snapshot, &mut committed] {
         txns.statement(t).unwrap();
-        assert!(!txns.visible(t, slot, start, 1), "a write not committed");
+        assert!(!txns.visible(t, slot, start), "a write not committed");
     }
     commit(&io, &db, a);
     for t in [&mut snapshot, &mut committed] {
         assert!(
-            !txns.visible(t, slot, start, 1),
+            !txns.visible(t, slot, start),
             "within a statement, a commit after its snapshot"
         );
         txns.statement(t).unwrap();
     }
     assert!(
-        !txns.visible(&mut snapshot, slot, start, 1),
+        !txns.visible(&mut snapshot, slot, start),
         "snapshot isolation"
     );
     assert!(
-        txns.visible(&mut committed, slot, start, 1),
+        txns.visible(&mut committed, slot, start),
         "read committed"
     );
     let mut later = begin(&io, &db, Isolation::Snapshot);
     txns.statement(&mut later).unwrap();
-    assert!(txns.visible(&mut later, slot, start, 1));
+    assert!(txns.visible(&mut later, slot, start));
 }
 
 #[test]
@@ -317,7 +317,7 @@ fn the_clock_restarts_above_every_timestamp_and_what_was_written_reads_committed
         );
         db.transactions().statement(&mut txn).unwrap();
         for &(slot, start) in &versions {
-            assert!(db.transactions().visible(&mut txn, slot, start, 1));
+            assert!(db.transactions().visible(&mut txn, slot, start));
         }
     }
 }

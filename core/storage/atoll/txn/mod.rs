@@ -446,11 +446,12 @@ impl Transactions {
         Ok(())
     }
 
-    /// Whether the version written by the transaction that started at `start` in `slot`, in its
-    /// statement `command`, is visible to `txn`'s current statement.
-    pub fn visible(&self, txn: &mut Txn, slot: u16, start: Ts, command: Statement) -> bool {
+    /// Whether the version written by the transaction that started at `start` in `slot` is visible
+    /// to `txn`'s current statement. Every version of `txn` itself is, its current statement's
+    /// included, as Turso's VDBE expects of a cursor (DESIGN.md §11.1).
+    pub fn visible(&self, txn: &mut Txn, slot: u16, start: Ts) -> bool {
         if slot == txn.slot && start == txn.start {
-            return command < txn.command;
+            return true;
         }
         let snapshot = txn.snapshot;
         let last = *txn.seen[slot as usize]

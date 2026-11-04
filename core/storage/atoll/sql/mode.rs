@@ -336,6 +336,12 @@ impl ConnTxn {
     /// goes on. A take the gate lost to a victim's clearing is `Busy`.
     pub fn begin(&self, wants: Begin) -> Result<IOResult<()>> {
         let txns = self.db.atoll().transactions();
+        if let Begin::Write { .. } = wants {
+            // A writing statement nudges the checkpointer first, holding no latch: commits are
+            // not its only trigger, so long transactions are checkpointed too (DESIGN.md §17,
+            // §11).
+            nudge_checkpoint(&self.db)?;
+        }
         let mut guard = self.cell.lock();
         if guard.is_none() {
             let begun = match wants {
@@ -660,6 +666,13 @@ pub struct RetireOp {
     counted: Option<u64>,
 }
 
+/// Steps the checkpointer, which does whatever is due: a pass once its share of the log budget has
+/// been appended, and moving the redo point after one. Its IO is not waited for: the pass goes on
+/// at the next step, whoever takes it.
+fn nudge_checkpoint(db: &AtollDb) -> Result<()> {
+    db.atoll().checkpointer().step().map(|_| ())
+}
+
 /// CreateBtree's state across IO.
 pub struct CreateOp {
     id: u64,
@@ -682,6 +695,8 @@ enum Step {
     Commit(Commit),
     Rollback(Abort),
     Drain,
+    /// A full checkpoint, by its ticket.
+    Checkpoint(u64),
     Done,
 }
 
@@ -729,6 +744,22 @@ impl Ending {
                 }
                 Step::Drain => {
                     done!(self.db.drain());
+                    // A transaction's end steps the checkpointer, holding no latch. Past twice its
+                    // budget behind the log's end, the budget the design keeps the redo point to
+                    // and once more for what is appended while a pass runs (DESIGN.md §10, §17,
+                    // §11), the end waits for a full checkpoint: a pass is due per budget share
+                    // appended, so one bulk statement would otherwise leave the redo point behind
+                    // until as much again is written.
+                    let checkpointer = self.db.atoll().checkpointer();
+                    self.step = if checkpointer.lag() > 2 * checkpointer.budget() {
+                        Step::Checkpoint(checkpointer.request_full())
+                    } else {
+                        nudge_checkpoint(&self.db)?;
+                        Step::Done
+                    };
+                }
+                Step::Checkpoint(ticket) => {
+                    done!(self.db.atoll().checkpointer().step_full(*ticket));
                     self.step = Step::Done;
                 }
                 Step::Done => return Ok(IOResult::Done(())),
@@ -749,6 +780,7 @@ impl std::fmt::Debug for Ending {
             Step::Commit(_) => "committing",
             Step::Rollback(_) => "rolling back",
             Step::Drain => "draining",
+            Step::Checkpoint(_) => "checkpointing",
             Step::Done => "done",
         };
         f.debug_tuple("Ending").field(&step).finish()
@@ -784,6 +816,15 @@ pub struct SqlCursor {
     parks: Arc<AtomicBool>,
     /// The rowid counter's seed under way.
     seeding: Option<Seed>,
+    /// A count under way.
+    counting: Option<Counting>,
+}
+
+/// A count's progress: at a row, rows counted before it; or moving past one.
+#[derive(Debug, Clone, Copy)]
+enum Counting {
+    At(usize),
+    Moving(usize),
 }
 
 impl SqlCursor {
@@ -802,6 +843,7 @@ impl SqlCursor {
             waiting: Waiting::default(),
             parks: ct.parks.clone(),
             seeding: None,
+            counting: None,
         }
     }
 
@@ -1004,15 +1046,27 @@ impl CursorTrait for SqlCursor {
     }
 
     fn count(&mut self) -> IOResultOr<usize> {
-        // Counts from wherever a step after IO left it: the count so far rides in the record of
-        // nothing, so the walk starts over, as a rewind after IO repeats.
-        crate::return_if_io!(self.rewind());
-        let mut n = 0;
-        while !self.is_empty() {
-            n += 1;
-            crate::return_if_io!(self.next());
+        // A move IO cut short is stepped again before any other: the cursor resumes it, so a
+        // rewind after it would land where it went, not at the first row.
+        loop {
+            match self.counting {
+                None => {
+                    crate::return_if_io!(self.rewind());
+                    self.counting = Some(Counting::At(0));
+                }
+                Some(Counting::At(n)) => {
+                    if self.is_empty() {
+                        self.counting = None;
+                        return Ok(IOResult::Done(n));
+                    }
+                    self.counting = Some(Counting::Moving(n + 1));
+                }
+                Some(Counting::Moving(n)) => {
+                    crate::return_if_io!(self.next());
+                    self.counting = Some(Counting::At(n));
+                }
+            }
         }
-        Ok(IOResult::Done(n))
     }
 
     fn is_empty(&self) -> bool {

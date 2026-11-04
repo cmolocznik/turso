@@ -17,9 +17,7 @@ use super::arc_cell::{ArcCell, Releasing};
 use super::buffer::{BufferPool, Pass};
 use super::control::{Control, Superblock};
 use super::epoch::Epochs;
-use super::log::{
-    encode_table, framed_len, Admitted, Header, Log, Lsn, Writer, Writers, WRITERS,
-};
+use super::log::{encode_table, framed_len, Admitted, Header, Log, Lsn, Writer, Writers, WRITERS};
 use super::store::PageStore;
 use super::txn::Clock;
 use crate::io::Completion;
@@ -146,6 +144,17 @@ impl Checkpointer {
 
     fn log(&self) -> &Arc<Log> {
         self.store.log()
+    }
+
+    /// The log, in bytes, the checkpointer keeps a recovery to replaying: the redo point trails
+    /// the log's end by about this much.
+    pub fn budget(&self) -> u64 {
+        self.budget
+    }
+
+    /// How far the redo point in charge trails the log's end, in bytes.
+    pub fn lag(&self) -> u64 {
+        self.log().end().saturating_sub(self.superblock().redo)
     }
 
     /// The oldest writer the superblock in charge lists, if it holds the log behind the redo

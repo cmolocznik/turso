@@ -2,11 +2,17 @@
 //!
 //! - [`catalog`]: the system trees at their fixed roots, and the catalog of tree ids.
 //! - [`key`]: keys of SQL trees as byte strings in Turso's order.
+//! - [`header`]: the database header's fields as rows.
+//! - [`rowid`]: NewRowid's counters.
 
 pub mod catalog;
+pub mod header;
 pub mod key;
+pub mod rowid;
 
 use self::catalog::{ensure_system_trees, key, Catalog, Entry, Layout, System, SCHEMA_ID};
+use self::header::{Field, Header};
+use self::rowid::Rowids;
 use super::btree::{Cursor, Mode};
 use super::db::{Atoll, AtollConfig};
 use super::drive;
@@ -23,6 +29,8 @@ pub struct AtollDb {
     atoll: Atoll,
     versions: Versions,
     catalog: Catalog,
+    header: Header,
+    rowids: Rowids,
     /// The next tree id to draw, above every id the catalog held at open and every one drawn
     /// since. Not transactional: an id a rolled-back transaction drew is not drawn again while the
     /// database is open, and may be after a restart, when nothing durable names it.
@@ -57,14 +65,18 @@ impl AtollDb {
             slots,
         );
         let catalog = Catalog::open(io.clone(), atoll.pool().clone(), atoll.store().clone());
+        let header = Header::open(io.clone(), atoll.pool().clone(), atoll.store().clone());
         let db = Self {
             io,
             atoll,
             versions,
             catalog,
+            header,
+            rowids: Rowids::default(),
             next_id: AtomicU64::new(0),
         };
         db.ensure_schema_row()?;
+        db.load_committed_header()?;
         let mut cursor = Cursor::new();
         let largest = drive(&db.io, || db.catalog.largest_id(&mut cursor))?;
         db.next_id
@@ -105,6 +117,24 @@ impl AtollDb {
         Ok(())
     }
 
+    /// Reads every header field at a snapshot taken now and publishes it as committed, at that
+    /// transaction's start, below every commit to come.
+    fn load_committed_header(&self) -> Result<()> {
+        let txns = self.atoll.transactions();
+        let mut txn = drive(&self.io, || txns.begin(Isolation::Snapshot))?;
+        txns.statement(&mut txn)?;
+        for field in Field::ALL {
+            let mut get = Header::get_op(field);
+            let value = drive(&self.io, || {
+                self.header
+                    .get(txns, &self.versions, &mut txn, field, &mut get)
+            })?;
+            self.header.publish(field, txn.start(), value);
+        }
+        txns.abort(txn);
+        Ok(())
+    }
+
     pub fn atoll(&self) -> &Atoll {
         &self.atoll
     }
@@ -115,6 +145,14 @@ impl AtollDb {
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    pub fn rowids(&self) -> &Rowids {
+        &self.rowids
     }
 
     /// A new tree id, never drawn before while the database has been open.

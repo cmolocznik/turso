@@ -13,7 +13,8 @@ use std::collections::BTreeSet;
 
 const BASE: &str = "/db/catalog";
 
-fn config() -> AtollConfig {
+/// A small database's configuration, for every test of the SQL layer's trees.
+pub(crate) fn config() -> AtollConfig {
     AtollConfig {
         log: LogConfig {
             segment_bytes: 1 << 20,

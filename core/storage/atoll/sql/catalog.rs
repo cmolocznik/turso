@@ -233,4 +233,4 @@ pub fn ensure_system_trees(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -398,6 +398,22 @@ impl VersionedTree {
     }
 
     /// The longest key: the tree's, and what its version index keys hold.
+    /// The plain put of `key` by `txn`'s current statement into a tree that statement created:
+    /// no other transaction can see the tree, so the entry needs no earlier version and no index
+    /// entry, and an undo of the creation frees the tree whole (DESIGN.md §17). Every write the
+    /// creating statement makes into its tree is plain.
+    pub fn plain_put(&self, txn: &Txn, key: &[u8], value: Vec<u8>, mode: Mode) -> Put {
+        let head = Version {
+            slot: txn.slot,
+            ts: txn.start,
+            command: txn.command,
+            updates: 0,
+            flags: Version::FIRST,
+        }
+        .encode();
+        Put::with_head(key, head.to_vec(), value, mode)
+    }
+
     pub fn max_key(&self) -> usize {
         let index = Versions::index_class(self.tree.root().class());
         let index_max =

@@ -12,15 +12,23 @@
 //!   rowid of a UNIQUE index whose keys leave it out seeks on the columns, then compares the rowid
 //!   of the one entry they name. An eq-only seek is found only on an entry the key matches.
 //! - **Encoding versions.** A tree whose recorded encoding is not this build's is read by scans
-//!   alone: a seek into it is refused, naming REINDEX.
+//!   alone: a seek into it is refused, naming REINDEX, and so is a write into it.
+//! - **Writes.** An insert puts the row, or the index entry, under its key; one into a UNIQUE
+//!   index whose key leaves the rowid out is refused over a visible entry of another row. A key
+//!   longer than the tree holds fails its statement (R7). A write behind another transaction's
+//!   open version, or behind one committed after the snapshot, comes back as such, and stepping
+//!   the same write again goes on with it. The statement that created a tree writes it plainly
+//!   ([`VersionedTree::plain_put`]).
 
 use super::catalog::{Entry, Layout};
 use super::key;
 use super::AtollDb;
+use crate::error::{ConstraintKind, ConstraintViolation};
 use crate::numeric::Numeric;
-use crate::storage::atoll::btree::Seek;
-use crate::storage::atoll::txn::versioned::{VersionedCursor, VersionedTree};
+use crate::storage::atoll::btree::{Mode, Outcome, Put, Remove, Seek};
+use crate::storage::atoll::txn::versioned::{VersionedCursor, VersionedTree, Write, WriteOp};
 use crate::storage::atoll::txn::Txn;
+use crate::storage::btree::BTreeKey;
 use crate::sync::{Arc, Mutex};
 use crate::types::{
     IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey, SeekOp, SeekResult, ValueRef,
@@ -60,6 +68,16 @@ pub struct AtollCursor {
     /// The entry's record, once read.
     record: Option<ImmutableRecord>,
     null_row: bool,
+    /// Whether the transaction's current statement created the tree, and writes it plainly.
+    plain: bool,
+    /// The write under way, kept across IO and waits.
+    writing: Option<Writing>,
+}
+
+enum Writing {
+    Versioned(WriteOp, Mode),
+    PlainPut(Put, Mode),
+    PlainRemove(Remove),
 }
 
 /// A seek under way, kept so the call made again after IO goes on with it.
@@ -119,7 +137,15 @@ impl AtollCursor {
             seeking: None,
             record: None,
             null_row: false,
+            plain: false,
+            writing: None,
         }
+    }
+
+    /// From now on the cursor's writes are plain: its tree was created by the transaction's
+    /// current statement.
+    pub fn write_plainly(&mut self) {
+        self.plain = true;
     }
 
     pub fn id(&self) -> u64 {
@@ -132,9 +158,7 @@ impl AtollCursor {
 
     fn step(&mut self, to: Move<'_>) -> Result<IOResult<bool>> {
         let mut guard = self.txn.lock();
-        let txn = guard.as_mut().ok_or_else(|| {
-            LimboError::InternalError("an Atoll cursor used outside a transaction".into())
-        })?;
+        let txn = guard.as_mut().ok_or_else(outside)?;
         let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
         let moved = match to {
             Move::Seek(key, seek) => {
@@ -388,6 +412,147 @@ impl AtollCursor {
             (false, _) => Verdict::MoveOn,
         })
     }
+}
+
+impl AtollCursor {
+    /// The key, value and put mode of the entry `key` names.
+    fn entry_of(&self, key: &BTreeKey<'_>) -> Result<(Vec<u8>, Vec<u8>, Mode)> {
+        match key {
+            BTreeKey::TableRowId((rowid, record)) => {
+                let record = record.ok_or_else(|| {
+                    LimboError::InternalError("a table row written with no record".into())
+                })?;
+                Ok((
+                    key::rowid(*rowid).to_vec(),
+                    record.get_payload().to_vec(),
+                    Mode::Upsert,
+                ))
+            }
+            BTreeKey::IndexKey(record) => {
+                if !self.current {
+                    return Err(LimboError::InternalError(format!(
+                        "tree {} holds keys of another encoding, which cannot be written: \
+                         REINDEX it",
+                        self.id
+                    )));
+                }
+                let info = self.index.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "a key written into tree {} with no key",
+                        self.id
+                    ))
+                })?;
+                let values = record.iter()?.collect::<Result<Vec<ValueRef<'_>>>>()?;
+                let suffixless = info.is_unique
+                    && info.has_rowid
+                    && values.len() == info.num_cols
+                    && !values[..values.len() - 1]
+                        .iter()
+                        .any(|v| matches!(v, ValueRef::Null));
+                let columns = if suffixless {
+                    &values[..values.len() - 1]
+                } else {
+                    &values[..]
+                };
+                let mut k = Vec::new();
+                key::encode(columns.iter().cloned(), &info.key_info, &mut k)?;
+                let mode = if suffixless {
+                    Mode::Insert
+                } else {
+                    Mode::Upsert
+                };
+                Ok((k, record.get_payload().to_vec(), mode))
+            }
+        }
+    }
+
+    /// Writes the row or index entry `key` names. Step it until done; a write behind another
+    /// transaction comes back as [`Write::Wait`] or [`Write::Conflict`].
+    pub fn insert(&mut self, key: &BTreeKey<'_>) -> Result<IOResult<Write>> {
+        if self.writing.is_none() {
+            let (k, value, mode) = self.entry_of(key)?;
+            let max = self.tree.max_key();
+            if k.len() > max {
+                return Err(LimboError::InternalError(format!(
+                    "a key of {} bytes into tree {}, which holds keys of at most {max}",
+                    k.len(),
+                    self.id
+                )));
+            }
+            self.writing = Some(if self.plain {
+                let guard = self.txn.lock();
+                let txn = guard.as_ref().ok_or_else(outside)?;
+                Writing::PlainPut(self.tree.plain_put(txn, &k, value, mode), mode)
+            } else {
+                Writing::Versioned(WriteOp::put(&k, value, mode), mode)
+            });
+        }
+        self.write()
+    }
+
+    /// Deletes the row or index entry the cursor is at. Step it until done.
+    pub fn delete(&mut self) -> Result<IOResult<Write>> {
+        if self.writing.is_none() {
+            let k = self
+                .cursor
+                .key()
+                .filter(|_| !self.null_row)
+                .ok_or_else(|| LimboError::InternalError("a delete at no row".into()))?
+                .to_vec();
+            self.writing = Some(if self.plain {
+                Writing::PlainRemove(Remove::new(&k))
+            } else {
+                Writing::Versioned(WriteOp::delete(&k), Mode::Update)
+            });
+        }
+        self.write()
+    }
+
+    fn write(&mut self) -> Result<IOResult<Write>> {
+        let mut guard = self.txn.lock();
+        let txn = guard.as_mut().ok_or_else(outside)?;
+        let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
+        let (written, mode) = match self.writing.as_mut().expect("a write") {
+            Writing::Versioned(op, mode) => (self.tree.write(txns, versions, txn, op)?, *mode),
+            Writing::PlainPut(put, mode) => (
+                match self.tree.tree().put(put)? {
+                    IOResult::Done(outcome) => IOResult::Done(Write::Done(outcome)),
+                    IOResult::IO(io) => IOResult::IO(io),
+                },
+                *mode,
+            ),
+            Writing::PlainRemove(remove) => (
+                match self.tree.tree().remove(remove)? {
+                    IOResult::Done(true) => IOResult::Done(Write::Done(Outcome::Updated)),
+                    IOResult::Done(false) => IOResult::Done(Write::Done(Outcome::Unchanged)),
+                    IOResult::IO(io) => IOResult::IO(io),
+                },
+                Mode::Update,
+            ),
+        };
+        let IOResult::Done(write) = written else {
+            return Ok(written);
+        };
+        if let Write::Wait(_) = write {
+            // Kept: stepped again once the writer has ended.
+            return Ok(IOResult::Done(write));
+        }
+        self.writing = None;
+        self.record = None;
+        if mode == Mode::Insert && write == Write::Done(Outcome::Unchanged) {
+            return Err(LimboError::ConstraintViolation(Box::new(
+                ConstraintViolation::new(
+                    ConstraintKind::Unique,
+                    format!("UNIQUE constraint failed: tree {}", self.id),
+                ),
+            )));
+        }
+        Ok(IOResult::Done(write))
+    }
+}
+
+fn outside() -> LimboError {
+    LimboError::InternalError("an Atoll cursor used outside a transaction".into())
 }
 
 /// An integer column's value.

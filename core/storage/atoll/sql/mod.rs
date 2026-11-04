@@ -5,12 +5,14 @@
 //! - [`header`]: the database header's fields as rows.
 //! - [`rowid`]: NewRowid's counters.
 //! - [`lifecycle`]: trees created, dropped and cleared in a transaction, and their drain.
+//! - [`sequence`]: sequence values, changed outside any transaction.
 
 pub mod catalog;
 pub mod header;
 pub mod key;
 pub mod lifecycle;
 pub mod rowid;
+pub mod sequence;
 
 use self::catalog::{ensure_system_trees, key, Catalog, Entry, Layout, System, SCHEMA_ID};
 use self::header::{Field, Header};
@@ -96,6 +98,7 @@ impl AtollDb {
             next_id: AtomicU64::new(0),
         };
         db.drain_lists()?;
+        db.drop_unnamed_sequences()?;
         db.ensure_schema_row()?;
         db.load_committed_header()?;
         let mut cursor = Cursor::new();

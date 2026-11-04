@@ -202,7 +202,7 @@ impl AtollDb {
         Ok(())
     }
 
-    fn open_plain(&self, root: PageId) -> Tree {
+    pub(super) fn open_plain(&self, root: PageId) -> Tree {
         Tree::open(
             self.io.clone(),
             self.atoll.pool().clone(),

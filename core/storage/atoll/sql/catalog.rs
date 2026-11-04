@@ -34,7 +34,7 @@ pub enum System {
     Dropped = 2,
     /// Trees whose creation was undone, to free once their transaction has ended; plain.
     Abandoned = 3,
-    /// Sequence values, written outside any transaction; plain.
+    /// Sequence values, written outside any transaction; plain ([`super::sequence`]).
     Sequences = 4,
     /// `sqlite_schema`, tree 1; versioned.
     Schema = 5,
@@ -73,6 +73,8 @@ pub enum Layout {
     Index = 2,
     /// A WITHOUT ROWID table: its encoded key columns.
     WithoutRowid = 3,
+    /// A sequence: no tree of its own, its value a row of the sequences tree.
+    Sequence = 4,
 }
 
 impl Layout {
@@ -81,6 +83,7 @@ impl Layout {
             1 => Some(Layout::Table),
             2 => Some(Layout::Index),
             3 => Some(Layout::WithoutRowid),
+            4 => Some(Layout::Sequence),
             _ => None,
         }
     }

@@ -7,6 +7,7 @@
 //! - [`rowid`]: NewRowid's counters.
 //! - [`lifecycle`]: trees created, dropped and cleared in a transaction, and their drain.
 //! - [`sequence`]: sequence values, changed outside any transaction.
+//! - [`wait`]: the wait graph, over every transaction group of the process.
 
 pub mod catalog;
 pub mod cursor;
@@ -15,6 +16,7 @@ pub mod key;
 pub mod lifecycle;
 pub mod rowid;
 pub mod sequence;
+pub mod wait;
 
 use self::catalog::{ensure_system_trees, key, Catalog, Entry, Layout, System, SCHEMA_ID};
 use self::header::{Field, Header};

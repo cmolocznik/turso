@@ -171,6 +171,7 @@ impl AtollDb {
             if done!(self.open_plain(root).drain(&list, op)) == Drained::Gone {
                 *current = None;
                 self.rowids.forget(root);
+                self.stamps.forget(root);
             }
         }
     }

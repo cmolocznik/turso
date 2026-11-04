@@ -375,6 +375,11 @@ impl Txn {
     pub fn snapped(&self) -> bool {
         self.snapped
     }
+
+    /// The current statement's snapshot.
+    pub fn snapshot(&self) -> Ts {
+        self.snapshot
+    }
 }
 
 /// A whole rollback in progress: step it with [`Transactions::rollback`].
@@ -409,6 +414,7 @@ pub struct Commit {
     ts: Option<Ts>,
     durable: Lsn,
     abandoned: Vec<PageId>,
+    published: Option<Box<dyn FnOnce(Ts) + Send>>,
 }
 
 impl Commit {
@@ -419,7 +425,16 @@ impl Commit {
             ts: None,
             durable: 0,
             abandoned: Vec::new(),
+            published: None,
         }
+    }
+
+    /// Runs `hook` with the commit timestamp of a commit that wrote, once the horizon covers it
+    /// and before the write gate is released: what a taker of the gate after the commit must see,
+    /// such as the stamps of the trees it wrote and the header fields it set (DESIGN.md §17).
+    pub fn on_published(mut self, hook: impl FnOnce(Ts) + Send + 'static) -> Self {
+        self.published = Some(Box::new(hook));
+        self
     }
 
     /// Once the commit is done, the trees whose creation a statement rollback undid: each on its
@@ -805,7 +820,11 @@ impl Transactions {
                     lsn
                 }
             };
-            // The gate after the horizon covers the commit, before the slot is freed.
+            // The gate after the horizon covers the commit, and after what a taker of it after the
+            // commit must see, before the slot is freed.
+            if let (Some(ts), Some(hook)) = (op.ts, op.published.take()) {
+                hook(ts);
+            }
             let schema = op.ts.filter(|_| txn.wrote_schema);
             self.release_hold(&mut txn, schema);
             self.release(txn.slot);

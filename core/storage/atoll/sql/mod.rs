@@ -7,6 +7,7 @@
 //! - [`rowid`]: NewRowid's counters.
 //! - [`lifecycle`]: trees created, dropped and cleared in a transaction, and their drain.
 //! - [`sequence`]: sequence values, changed outside any transaction.
+//! - [`trees`]: per-tree commit stamps, for `BusySnapshot`.
 //! - [`wait`]: the wait graph, over every transaction group of the process.
 
 pub mod catalog;
@@ -16,6 +17,7 @@ pub mod key;
 pub mod lifecycle;
 pub mod rowid;
 pub mod sequence;
+pub mod trees;
 pub mod wait;
 
 use self::catalog::{ensure_system_trees, key, Catalog, Entry, Layout, System, SCHEMA_ID};
@@ -42,6 +44,7 @@ pub struct AtollDb {
     rowids: Rowids,
     /// The dropped list, written by transactions.
     dropped: VersionedTree,
+    stamps: self::trees::TreeStamps,
     /// Trees handed over to drain, the one being drained, and whether a drainer is at work.
     draining: Mutex<Vec<PageId>>,
     current: Mutex<Option<(PageId, Drain)>>,
@@ -96,6 +99,7 @@ impl AtollDb {
             header,
             rowids: Rowids::default(),
             dropped,
+            stamps: self::trees::TreeStamps::default(),
             draining: Mutex::new(Vec::new()),
             current: Mutex::new(None),
             drainer: AtomicBool::new(false),
@@ -196,6 +200,10 @@ impl AtollDb {
 
     pub fn dropped(&self) -> &VersionedTree {
         &self.dropped
+    }
+
+    pub fn stamps(&self) -> &self::trees::TreeStamps {
+        &self.stamps
     }
 
     /// A new tree id, never drawn before while the database has been open.

@@ -409,6 +409,36 @@ mod loom_tests {
         });
     }
 
+    /// A writer raises a tree's stamp and then releases shared while an exclusive taker drains: a
+    /// taker that holds reads the raised stamp.
+    #[test]
+    fn a_tree_stamp_raised_before_release_is_seen_after_the_drain() {
+        model(|| {
+            let gate = Arc::new(Gate::new(2));
+            let stamp = Arc::new(AtomicU64::new(0));
+            let c0 = Completion::new_wait();
+            assert_eq!(gate.take_shared(0, 10, &c0), Taken::Done);
+            let writer = {
+                let (gate, stamp) = (gate.clone(), stamp.clone());
+                thread::spawn(move || {
+                    stamp.fetch_max(5, Ordering::Release);
+                    gate.release_shared(0, 10);
+                })
+            };
+            let c = Completion::new_wait();
+            let mine = gate.begin_exclusive(1, &c).unwrap();
+            if gate.drain(1, mine, &c) == Taken::Done {
+                assert_eq!(
+                    stamp.load(Ordering::Acquire),
+                    5,
+                    "a drained commit's stamp missed"
+                );
+            }
+            gate.clear(mine);
+            writer.join().unwrap();
+        });
+    }
+
     /// An exclusive holder notes its schema write and releases while a writer takes shared: a
     /// writer past the gate reads the schema timestamp it stored.
     #[test]

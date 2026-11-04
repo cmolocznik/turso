@@ -177,6 +177,12 @@ pub struct Statement {
     busy: bool,
     /// Busy handler state for tracking invocations and timeouts
     busy_handler_state: Option<BusyHandlerState>,
+    /// In Atoll mode, when the statement first met a conflict it restarts on (DESIGN.md §17,
+    /// §3.2): its restarts count against the busy timeout from then.
+    conflict_since: Option<std::time::Instant>,
+    /// Whether the statement began outside any explicit transaction: a conflict rolls an explicit
+    /// one back too, so the connection's state after it cannot tell.
+    began_in_autocommit: bool,
     /// Per-execution timeout override for this statement.
     /// - `None`: use connection default
     /// - `Some(Some(duration))`: override with a query-specific timeout
@@ -278,6 +284,8 @@ impl Statement {
             query_mode,
             busy: false,
             busy_handler_state: None,
+            conflict_since: None,
+            began_in_autocommit: false,
             query_timeout_override: None,
             has_returned_row: false,
             tail_offset,
@@ -552,6 +560,7 @@ impl Statement {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
+            self.began_in_autocommit = self.program.connection.get_auto_commit();
             // After the root count, so the checkpoint guard's subtraction
             // can only read stale-high (see release_active_root_if_counted).
             if self.is_blob_handle {
@@ -640,6 +649,29 @@ impl Statement {
                 .step(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
+        // Atoll mode (DESIGN.md §17, §3.2): a sole autocommit statement that met a conflict, which
+        // rolled its transaction back, runs again from its first instruction with a new snapshot,
+        // as if it had run later. Each restart follows another's commit, so the database
+        // progresses; the restarts count against the busy timeout, then the statement is Busy.
+        while matches!(&res, Err(err) if matches!(**err, LimboError::WriteWriteConflict))
+            && self.restarts_on_conflict()
+        {
+            let now = std::time::Instant::now();
+            let since = *self.conflict_since.get_or_insert(now);
+            if now.duration_since(since) >= self.program.connection.get_busy_timeout() {
+                self.conflict_since = None;
+                res = Err(Box::new(LimboError::Busy));
+                break;
+            }
+            if let Err(err) = self.reset_internal(None, None, true) {
+                self.release_active_root_if_counted(true);
+                return Err(err);
+            }
+            res = self
+                .program
+                .step(&mut self.state, &self.pager, self.query_mode, waker);
+        }
+
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
             let connection = &self.program.connection;
@@ -647,6 +679,7 @@ impl Statement {
                 .with_metrics(|metrics| connection.metrics.write().record_statement(metrics));
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
+            self.conflict_since = None;
             self.state.query_deadline = None;
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
@@ -1494,6 +1527,18 @@ impl Statement {
             .store(0, std::sync::atomic::Ordering::Release);
         self.busy = false;
         self.has_returned_row = false;
+    }
+
+    /// Whether a conflict this statement met restarts it (DESIGN.md §17, §3.2): in Atoll mode, a
+    /// sole autocommit statement that has returned no row. An explicit transaction's conflict
+    /// fails it, as PostgreSQL's REPEATABLE READ does.
+    fn restarts_on_conflict(&self) -> bool {
+        let conn = &self.program.connection;
+        conn.atoll().is_some()
+            && self.began_in_autocommit
+            && conn.get_auto_commit()
+            && !self.has_returned_row
+            && conn.n_active_root_statements.load(Ordering::SeqCst) <= 1
     }
 
     fn reset_internal(

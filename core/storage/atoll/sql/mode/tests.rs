@@ -27,6 +27,24 @@ fn names(conn: &Arc<Connection>) -> Vec<Value> {
         .collect()
 }
 
+/// Whether tree `id` has a catalog row, as a transaction begun now reads it.
+fn catalogued(db: &Database, id: u64) -> bool {
+    use crate::storage::atoll::drive;
+    use crate::storage::atoll::sql::catalog::key;
+    use crate::storage::atoll::txn::versioned::Get;
+    use crate::storage::atoll::txn::Isolation;
+    let adb = db.atoll.as_ref().expect("Atoll mode");
+    let txns = adb.atoll().transactions();
+    let mut txn = drive(adb.io(), || txns.begin(Isolation::Snapshot)).unwrap();
+    let mut get = Get::new(&key(id));
+    let row = drive(adb.io(), || {
+        adb.catalog().get(txns, adb.versions(), &mut txn, &mut get)
+    })
+    .unwrap();
+    txns.abort(txn);
+    row.is_some()
+}
+
 fn text(s: &str) -> Value {
     Value::build_text(s.to_string())
 }
@@ -194,4 +212,253 @@ fn the_main_pager_refuses_its_transactions() {
         .commit_tx(&conn, conn.get_sync_mode(), false)
         .unwrap_err();
     assert!(err.to_string().contains("Atoll mode"), "{err}");
+}
+
+/// DDL and DML past first light: an index built over rows and read through, a UNIQUE index
+/// refusing a second key, an UPDATE and a DELETE through the index, a whole-table DELETE that
+/// clears the tree and counts its rows, and a DROP TABLE, each surviving a reopen.
+#[test]
+fn indexes_updates_deletes_clears_and_drops_reach_atoll() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    {
+        let db = open(&io, "/db/ddl");
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t (b, c) VALUES ('x', 3), ('y', 1), ('z', 2)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_c ON t (c)").unwrap();
+        conn.execute("CREATE UNIQUE INDEX t_b ON t (b)").unwrap();
+        assert_eq!(
+            rows(&conn, "SELECT b FROM t WHERE c >= 2 ORDER BY c"),
+            vec![vec![text("z")], vec![text("x")]],
+            "through the index on c"
+        );
+        let err = conn
+            .execute("INSERT INTO t (b, c) VALUES ('x', 9)")
+            .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+        conn.execute("UPDATE t SET c = 10 WHERE b = 'y'").unwrap();
+        conn.execute("DELETE FROM t WHERE c = 2").unwrap();
+        assert_eq!(
+            rows(&conn, "SELECT b, c FROM t ORDER BY c"),
+            vec![
+                vec![text("x"), Value::from_i64(3)],
+                vec![text("y"), Value::from_i64(10)]
+            ]
+        );
+        assert_eq!(
+            rows(&conn, "SELECT b FROM t WHERE c = 10"),
+            vec![vec![text("y")]]
+        );
+        conn.execute("CREATE TABLE gone (a)").unwrap();
+        conn.execute("INSERT INTO gone VALUES (1)").unwrap();
+        let gone = rows(
+            &conn,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'gone'",
+        );
+        let Value::Numeric(crate::numeric::Numeric::Integer(gone)) = gone[0][0] else {
+            panic!("a root page of {gone:?}");
+        };
+        assert!(catalogued(&db, gone as u64));
+        conn.execute("DROP TABLE gone").unwrap();
+        assert!(
+            !catalogued(&db, gone as u64),
+            "the dropped tree's catalog row"
+        );
+        conn.execute("CREATE TABLE cleared (a)").unwrap();
+        conn.execute("INSERT INTO cleared VALUES (1), (2), (3)")
+            .unwrap();
+        conn.execute("DELETE FROM cleared").unwrap();
+        assert_eq!(conn.changes(), 3, "the rows a clear removed");
+        assert!(rows(&conn, "SELECT a FROM cleared").is_empty());
+        conn.execute("INSERT INTO cleared VALUES (4)").unwrap();
+        conn.close().unwrap();
+    }
+    let db = open(&io, "/db/ddl");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT b FROM t WHERE c = 3"),
+        vec![vec![text("x")]]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT a FROM cleared"),
+        vec![vec![Value::from_i64(4)]]
+    );
+    let err = conn
+        .prepare("SELECT a FROM gone")
+        .err()
+        .expect("a dropped table");
+    assert!(err.to_string().contains("no such table"), "{err}");
+}
+
+/// Twelve connections on twelve threads, four transaction slots: each transaction adds one to a
+/// shared row and logs itself, the second writer of the row retrying in place behind the first and
+/// failing with a conflict once it commits, then retrying the transaction. No update is lost, every transaction's log row
+/// is there once, and conflicts were met: the waits and slots were reached.
+#[test]
+fn twelve_writers_through_sql_lose_no_update() {
+    const THREADS: i64 = 12;
+    const ROUNDS: i64 = 25;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/twelve");
+    let setup = db.connect(ConnectOpts::new()).unwrap();
+    setup
+        .execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    setup.execute("CREATE TABLE log (who, round)").unwrap();
+    setup.execute("INSERT INTO counter VALUES (1, 0)").unwrap();
+    let start = Arc::new(std::sync::Barrier::new(THREADS as usize));
+    let threads: Vec<_> = (0..THREADS)
+        .map(|who| {
+            let (db, start) = (db.clone(), start.clone());
+            std::thread::spawn(move || {
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                // A write behind an open writer comes back Busy and is retried in place, as SQLite
+                // waits on a lock, for as long as the busy timeout (R34).
+                conn.set_busy_timeout(std::time::Duration::from_secs(30));
+                start.wait();
+                let mut conflicts = 0;
+                for round in 0..ROUNDS {
+                    loop {
+                        conn.execute("BEGIN").unwrap();
+                        let done = conn
+                            .execute("UPDATE counter SET n = n + 1 WHERE id = 1")
+                            .and_then(|_| {
+                                conn.execute(format!("INSERT INTO log VALUES ({who}, {round})"))
+                            })
+                            .and_then(|_| conn.execute("COMMIT"));
+                        match done {
+                            Ok(()) => break,
+                            Err(crate::LimboError::WriteWriteConflict) => {
+                                conflicts += 1;
+                                // The conflict rolled the transaction back.
+                                assert!(conn.get_auto_commit(), "a conflict left it open");
+                            }
+                            Err(e) => panic!("thread {who}, round {round}: {e}"),
+                        }
+                    }
+                }
+                conflicts
+            })
+        })
+        .collect();
+    let conflicts: i64 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+    assert_eq!(
+        rows(&setup, "SELECT n FROM counter"),
+        vec![vec![Value::from_i64(THREADS * ROUNDS)]],
+        "an update lost"
+    );
+    assert_eq!(
+        rows(
+            &setup,
+            "SELECT count(*), count(DISTINCT who * 1000 + round) FROM log"
+        ),
+        vec![vec![
+            Value::from_i64(THREADS * ROUNDS),
+            Value::from_i64(THREADS * ROUNDS)
+        ]]
+    );
+    assert!(conflicts > 0, "no transaction met another's write");
+    eprintln!("twelve writers: {conflicts} conflicts retried");
+}
+
+/// An autocommit UPDATE behind an open writer of its row retries in place, then meets the
+/// writer's commit as a conflict and restarts with a new snapshot, as if it had run later: both
+/// increments land (§3.2).
+#[test]
+fn an_autocommit_update_behind_a_writer_restarts_after_its_commit() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/restart");
+    let a = db.connect(ConnectOpts::new()).unwrap();
+    a.execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    a.execute("INSERT INTO counter VALUES (1, 0)").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE counter SET n = n + 1 WHERE id = 1")
+        .unwrap();
+    let behind = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let b = db.connect(ConnectOpts::new()).unwrap();
+            b.set_busy_timeout(std::time::Duration::from_secs(30));
+            b.execute("UPDATE counter SET n = n + 1 WHERE id = 1")
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    a.execute("COMMIT").unwrap();
+    behind.join().unwrap().unwrap();
+    assert_eq!(
+        rows(&a, "SELECT n FROM counter"),
+        vec![vec![Value::from_i64(2)]]
+    );
+}
+
+/// Twelve connections each running autocommit increments of one row: every one lands, behind
+/// the others' writes and their commits, with no error reaching a caller (§3.2, R34).
+#[test]
+fn twelve_autocommit_incrementers_all_land() {
+    const THREADS: i64 = 12;
+    const ROUNDS: i64 = 25;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/incrementers");
+    let setup = db.connect(ConnectOpts::new()).unwrap();
+    setup
+        .execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO counter VALUES (1, 0)").unwrap();
+    let start = Arc::new(std::sync::Barrier::new(THREADS as usize));
+    let threads: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let (db, start) = (db.clone(), start.clone());
+            std::thread::spawn(move || {
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                conn.set_busy_timeout(std::time::Duration::from_secs(30));
+                start.wait();
+                for _ in 0..ROUNDS {
+                    conn.execute("UPDATE counter SET n = n + 1 WHERE id = 1")
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(
+        rows(&setup, "SELECT n FROM counter"),
+        vec![vec![Value::from_i64(THREADS * ROUNDS)]]
+    );
+}
+
+/// With no busy timeout, a write behind an open writer of its row is Busy at once, as SQLite's
+/// lock is: the SQLite frontend never parks, so no wait outlasts the busy timeout (R34).
+#[test]
+fn a_write_behind_a_writer_with_no_busy_timeout_is_busy_at_once() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/busy");
+    let a = db.connect(ConnectOpts::new()).unwrap();
+    a.execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    a.execute("INSERT INTO counter VALUES (1, 0)").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE counter SET n = n + 1 WHERE id = 1")
+        .unwrap();
+    let (sent, got) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let b = db.connect(ConnectOpts::new()).unwrap();
+            let _ = sent.send(b.execute("UPDATE counter SET n = n + 1 WHERE id = 1"));
+        });
+    }
+    let behind = got
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the write behind the writer parked");
+    assert!(matches!(behind, Err(crate::LimboError::Busy)), "{behind:?}");
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&a, "SELECT n FROM counter"),
+        vec![vec![Value::from_i64(1)]]
+    );
 }

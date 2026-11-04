@@ -1285,6 +1285,8 @@ pub struct ProgramState {
     pub(crate) atoll_statement: Option<crate::storage::atoll::txn::Statement>,
     /// In Atoll mode, a CreateBtree under way (DESIGN.md §17).
     pub(crate) atoll_create: Option<crate::storage::atoll::sql::mode::CreateOp>,
+    /// In Atoll mode, a Destroy or ClearBtree under way (DESIGN.md §17).
+    pub(crate) atoll_retire: Option<crate::storage::atoll::sql::mode::RetireOp>,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
     /// Write activity on the main database when this statement became an
@@ -1409,6 +1411,7 @@ impl ProgramState {
             uses_subjournal: false,
             atoll_statement: None,
             atoll_create: None,
+            atoll_retire: None,
             is_active_write: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
@@ -1593,6 +1596,7 @@ impl ProgramState {
         self.uses_subjournal = false;
         self.atoll_statement = None;
         self.atoll_create = None;
+        self.atoll_retire = None;
         self.is_active_write = false;
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;

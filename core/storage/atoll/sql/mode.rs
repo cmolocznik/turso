@@ -21,6 +21,7 @@ use super::catalog::{self, Catalog, Entry, Layout, System, SCHEMA_ID};
 use super::cursor::{AtollCursor, TxnCell};
 use super::header::{Field, Header};
 use super::key;
+use super::lifecycle::Destroy;
 use super::rowid::{Counter, Seed};
 use super::AtollDb;
 use crate::io::FileSyncType;
@@ -38,6 +39,7 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::database::IOContext;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{
     IOCompletions, IOResult, IOResultOr, ImmutableRecord, IndexInfo, SeekKey, SeekOp, SeekResult,
@@ -253,6 +255,18 @@ impl Waiting {
     }
 }
 
+/// Where a write, a begin or a gate take behind another transaction goes (R34): with `parks`,
+/// onto `c`, which the other's end completes, as the PostgreSQL frontend's unbounded waits do; else
+/// back as `Busy`, which Turso's busy handler retries in place, at the same instruction, with
+/// SQLite's backoff until the busy timeout, as SQLite waits on a lock.
+fn park<T>(parks: &AtomicBool, c: Completion) -> Result<IOResult<T>> {
+    if parks.load(Ordering::Relaxed) {
+        Ok(IOResult::IO(IOCompletions(c)))
+    } else {
+        Err(LimboError::Busy)
+    }
+}
+
 enum Judged {
     Done,
     Park(Completion),
@@ -280,6 +294,8 @@ pub struct ConnTxn {
     setting: Mutex<Option<(Field, WriteOp, Waiting)>>,
     /// A gate take waited on, kept so a take parks only on a completion registered before it.
     taking: Mutex<Option<Completion>>,
+    /// Whether waits park, or come back `Busy` to be retried in place (R34).
+    parks: Arc<AtomicBool>,
 }
 
 impl ConnTxn {
@@ -290,7 +306,14 @@ impl ConnTxn {
             written: Mutex::new(Vec::new()),
             setting: Mutex::new(None),
             taking: Mutex::new(None),
+            parks: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// From now on waits park until what is in the way ends, for the PostgreSQL frontend, whose
+    /// waits are unbounded (R2, R34).
+    pub fn park_waits(&self) {
+        self.parks.store(true, Ordering::Relaxed);
     }
 
     pub fn db(&self) -> &Arc<AtollDb> {
@@ -315,12 +338,16 @@ impl ConnTxn {
         let txns = self.db.atoll().transactions();
         let mut guard = self.cell.lock();
         if guard.is_none() {
-            let txn = match wants {
-                Begin::Read => done!(txns.begin(Isolation::Snapshot)),
+            let begun = match wants {
+                Begin::Read => txns.begin(Isolation::Snapshot)?,
                 // Its snapshot once it holds the gate: an exclusive taker's after the drain.
-                Begin::Write { .. } => done!(txns.begin_slot_in(Isolation::Snapshot, 0)),
+                Begin::Write { .. } => txns.begin_slot_in(Isolation::Snapshot, 0)?,
             };
-            *guard = Some(txn);
+            match begun {
+                IOResult::Done(txn) => *guard = Some(txn),
+                // No slot is free (R13).
+                IOResult::IO(IOCompletions(c)) => return park(&self.parks, c),
+            }
         }
         let txn = guard.as_mut().expect("a transaction");
         if let Begin::Write { schema } = wants {
@@ -350,8 +377,9 @@ impl ConnTxn {
                     return Err(LimboError::Busy);
                 }
                 Taken::Behind { .. } | Taken::Holders(_) => {
+                    // A pending exclusive take stays pending meanwhile (R15).
                     *taking = Some(c.clone());
-                    return Ok(IOResult::IO(IOCompletions(c)));
+                    return park(&self.parks, c);
                 }
             }
         }
@@ -504,10 +532,78 @@ impl ConnTxn {
                     self.written.lock().push((txn.command(), field, value));
                     *setting = None;
                 }
-                Judged::Park(c) => return Ok(IOResult::IO(IOCompletions(c))),
+                Judged::Park(c) => return park(&self.parks, c),
                 Judged::Again => {}
             }
         }
+    }
+
+    /// Destroy, or ClearBtree with `clear` (DESIGN.md §17, §5): tree `id`'s catalog row deleted,
+    /// or pointed at a new, empty tree, and its old root listed as dropped, in the current
+    /// statement. Step it with the same `op` until done; a Clear returns the rows the tree held at
+    /// the view, which its statement counts as changed.
+    pub fn retire_tree(
+        &self,
+        op: &mut Option<RetireOp>,
+        id: u64,
+        clear: bool,
+    ) -> Result<IOResult<u64>> {
+        let op = op.get_or_insert_with(|| RetireOp {
+            destroy: Destroy::new(id),
+            waiting: Waiting::default(),
+            counted: None,
+        });
+        if clear && op.counted.is_none() {
+            op.counted = Some(self.count_rows(id)?);
+        }
+        loop {
+            let mut guard = self.cell.lock();
+            let txn = guard.as_mut().ok_or_else(outside)?;
+            let w = done!(if clear {
+                self.db.clear(txn, &mut op.destroy)
+            } else {
+                self.db.destroy(txn, &mut op.destroy)
+            });
+            match op.waiting.judge(&self.db, w)? {
+                Judged::Done => {
+                    txn.wrote_schema();
+                    return Ok(IOResult::Done(op.counted.unwrap_or(0)));
+                }
+                Judged::Park(c) => return park(&self.parks, c),
+                Judged::Again => {}
+            }
+        }
+    }
+
+    /// The rows tree `id` holds as the current statement reads them.
+    fn count_rows(&self, id: u64) -> Result<u64> {
+        let entry = {
+            let mut guard = self.cell.lock();
+            let txn = guard.as_mut().ok_or_else(outside)?;
+            let mut get = Get::new(&catalog::key(id));
+            let db = &self.db;
+            drive(db.io(), || {
+                db.catalog()
+                    .get(db.atoll().transactions(), db.versions(), txn, &mut get)
+            })?
+            .ok_or_else(|| LimboError::InternalError(format!("no tree {id} in the catalog")))?
+        };
+        let mut cursor = AtollCursor::new(
+            self.db.clone(),
+            self.cell.clone(),
+            id,
+            entry,
+            None,
+            key::ENCODING,
+        );
+        let io = self.db.io().clone();
+        drive(&io, || cursor.rewind())?;
+        let mut n = 0;
+        while !cursor.is_empty() {
+            n += 1;
+            drive(&io, || cursor.next())?;
+        }
+        Ok(n)
     }
 
     /// CreateBtree (DESIGN.md §17, §5): draws a tree id, creates its tree in the current
@@ -554,6 +650,14 @@ impl ConnTxn {
             ))),
         }
     }
+}
+
+/// Destroy's or ClearBtree's state across IO and waits.
+pub struct RetireOp {
+    destroy: Destroy,
+    waiting: Waiting,
+    /// For a Clear, the rows the tree held at the view.
+    counted: Option<u64>,
 }
 
 /// CreateBtree's state across IO.
@@ -676,6 +780,8 @@ pub struct SqlCursor {
     null_row: bool,
     has_record: bool,
     waiting: Waiting,
+    /// Whether its writes' waits park (R34).
+    parks: Arc<AtomicBool>,
     /// The rowid counter's seed under way.
     seeding: Option<Seed>,
 }
@@ -694,6 +800,7 @@ impl SqlCursor {
             null_row: false,
             has_record: false,
             waiting: Waiting::default(),
+            parks: ct.parks.clone(),
             seeding: None,
         }
     }
@@ -778,7 +885,7 @@ impl SqlCursor {
                     }
                     return Ok(IOResult::Done(()));
                 }
-                Judged::Park(c) => return Ok(IOResult::IO(IOCompletions(c))),
+                Judged::Park(c) => return Ok(park(&self.parks, c)?),
                 Judged::Again => {}
             }
         }
@@ -957,6 +1064,13 @@ impl CursorTrait for SqlCursor {
 
     fn get_skip_advance(&self) -> bool {
         false
+    }
+
+    /// The tree was cleared under the cursor: it resolves its catalog row again at its next step,
+    /// reading the new tree.
+    fn invalidate_btree_cache(&mut self) {
+        self.open = None;
+        self.has_record = false;
     }
 }
 

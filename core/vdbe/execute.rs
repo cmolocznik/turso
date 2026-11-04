@@ -14411,6 +14411,14 @@ pub fn op_offset_limit(
 // this cursor may be reused for next insert
 // Update: tablemoveto is used to travers on not exists, on insert depending on flags if nonseek it traverses again.
 // If not there might be some optimizations obviously.
+/// The Atoll tree id a root page names (DESIGN.md §17): ids are positive, from 1, `sqlite_schema`.
+fn atoll_tree_id(root: i64) -> Result<u64> {
+    u64::try_from(root)
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| LimboError::InternalError(format!("an Atoll tree id of {root}")))
+}
+
 /// An Atoll-mode cursor over tree `root` (DESIGN.md §17), for OpenRead and OpenWrite: a rowid
 /// table's or an index's. A WITHOUT ROWID table and a materialized view are refused by name.
 fn open_atoll_cursor(
@@ -14434,8 +14442,7 @@ fn open_atoll_cursor(
             ))
         }
     };
-    let root = u64::try_from(root)
-        .map_err(|_| LimboError::InternalError(format!("an Atoll tree id of {root}")))?;
+    let root = atoll_tree_id(root)?;
     Ok(Cursor::new_btree_dyn(Box::new(
         crate::storage::atoll::sql::mode::SqlCursor::new(atoll, pager.clone(), root, index),
     )))
@@ -14987,6 +14994,16 @@ pub fn op_destroy(
         insn
     );
     check_db_write_allowed(program, state, None)?;
+    if let Some(atoll) = program.connection.atoll_for_db(*db) {
+        // Atoll mode: the catalog row deleted and the root listed as dropped, in the current
+        // statement (DESIGN.md §17, §5). Atoll has no auto-vacuum, so no root page moves.
+        let id = atoll_tree_id(*root)?;
+        return_if_io!(state, atoll.retire_tree(&mut state.atoll_retire, id, false));
+        state.atoll_retire = None;
+        state.registers[*former_root_reg].set_int(0);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
@@ -15054,6 +15071,37 @@ fn op_clear_btree_inner(
 ) -> InsnResult {
     load_insn!(ClearBtree { db, root, count }, insn);
 
+    if let Some(atoll) = program.connection.atoll_for_db(*db) {
+        // Atoll mode: the catalog row pointed at a new, empty tree and the old root listed as
+        // dropped (DESIGN.md §17, §5); the cursors over the tree read the new one from their next
+        // step.
+        let id = atoll_tree_id(*root)?;
+        let removed = return_if_io!(state, atoll.retire_tree(&mut state.atoll_retire, id, true));
+        state.atoll_retire = None;
+        for cursor in state.cursors.iter_mut().flatten() {
+            if let Cursor::Dyn(..) = cursor {
+                let cursor = cursor.as_btree_mut();
+                if cursor.root_page() == *root {
+                    cursor.invalidate_btree_cache();
+                }
+            }
+        }
+        match count {
+            ClearBtreeCount::Nothing => {}
+            ClearBtreeCount::RowsWritten => state.record_rows_written(removed),
+            ClearBtreeCount::ChangesAndRowsWritten => {
+                let changes = i64::try_from(removed).map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "ClearBtree: removed row count {removed} does not fit in i64"
+                    ))
+                })?;
+                state.record_statement_changes(changes);
+                state.record_rows_written(removed);
+            }
+        }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         return Err(LimboError::InternalError(

@@ -411,6 +411,13 @@ enum CommitState {
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
+    /// Ending the main database's Atoll transaction (DESIGN.md §17): dropped unfinished, the
+    /// ending drives itself to its end.
+    Atoll {
+        ending: Box<crate::storage::atoll::sql::mode::Ending>,
+        schema_did_change: bool,
+        rollback: bool,
+    },
 }
 
 impl CommitState {
@@ -422,7 +429,10 @@ impl CommitState {
             CommitState::CommittingAttachedMvcc { state_machine, .. } => {
                 state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
             }
-            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
+            CommitState::Ready
+            | CommitState::Committing
+            | CommitState::CommittingAttached
+            | CommitState::Atoll { .. } => {}
         }
     }
 
@@ -1271,6 +1281,10 @@ pub struct ProgramState {
     fk_immediate_violations_during_stmt: AtomicIsize,
     fk_immediate_violation: Option<LimboError>,
     uses_subjournal: bool,
+    /// In Atoll mode, the statement number a failure of this statement rolls back to (R18).
+    pub(crate) atoll_statement: Option<crate::storage::atoll::txn::Statement>,
+    /// In Atoll mode, a CreateBtree under way (DESIGN.md §17).
+    pub(crate) atoll_create: Option<crate::storage::atoll::sql::mode::CreateOp>,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
     /// Write activity on the main database when this statement became an
@@ -1393,6 +1407,8 @@ impl ProgramState {
             hash_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
+            atoll_statement: None,
+            atoll_create: None,
             is_active_write: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
@@ -1575,6 +1591,8 @@ impl ProgramState {
             self.ephemeral_temp_files.clear();
         }
         self.uses_subjournal = false;
+        self.atoll_statement = None;
+        self.atoll_create = None;
         self.is_active_write = false;
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
@@ -1885,7 +1903,10 @@ impl ProgramState {
         let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
         if write && in_explicit_txn {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
-            if let Some(mv_store) = connection.mv_store().as_ref() {
+            if connection.atoll().is_some() {
+                // Atoll mode: the statement's Atoll statement began at its Transaction opcode,
+                // and a rollback goes back to the number it recorded (R18).
+            } else if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
                 }
@@ -1999,7 +2020,13 @@ impl ProgramState {
             }
             EndStatement::RollbackSavepoint => {
                 // Rollback pager/MVCC savepoint if one was opened.
-                let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
+                let pager_err = if let Some(atoll) = connection.atoll() {
+                    // Driven to its end here, a synchronous site (R19).
+                    match self.atoll_statement {
+                        Some(n) => atoll.rollback_statement(n).err(),
+                        None => None,
+                    }
+                } else if let Some(mv_store) = connection.mv_store().as_ref() {
                     let mut err = None;
                     if let Some(tx_id) = connection.get_mv_tx_id() {
                         if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
@@ -2277,6 +2304,9 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Whether the statement writes the main database's schema: in Atoll mode it then takes the
+    /// write gate exclusive (DESIGN.md §17, R23).
+    pub writes_schema: bool,
 }
 
 #[derive(Clone)]
@@ -3216,7 +3246,9 @@ impl Program {
             // We don't want to commit on nested statements. Let parent handle it.
             return Ok(IOResult::Done(()));
         }
-        let res = if let Some(mv_store) = mv_store {
+        let res = if self.connection.atoll().is_some() {
+            self.commit_txn_atoll(program_state, rollback)
+        } else if let Some(mv_store) = mv_store {
             self.commit_txn_mvcc(pager, program_state, mv_store, rollback)
         } else {
             self.commit_txn_wal(pager, program_state, rollback)
@@ -3247,6 +3279,60 @@ impl Program {
             }
         }
         Ok(res)
+    }
+
+    /// The Atoll arm of `commit_txn` (DESIGN.md §17): in autocommit, the transaction's commit or
+    /// rollback, stepped until done, then the schema it changed published to the database, or
+    /// put back.
+    fn commit_txn_atoll(&self, program_state: &mut ProgramState, rollback: bool) -> IOResultOr<()> {
+        let connection = &self.connection;
+        if matches!(program_state.commit_state, CommitState::Ready) {
+            if !connection.auto_commit.load(Ordering::SeqCst) {
+                return Ok(IOResult::Done(()));
+            }
+            let schema_did_change = matches!(
+                connection.get_tx_state(),
+                TransactionState::Write {
+                    schema_did_change: true
+                }
+            );
+            let atoll = connection.atoll().expect("Atoll mode");
+            match atoll.end(!rollback) {
+                Some(ending) => {
+                    program_state.commit_state = CommitState::Atoll {
+                        ending: Box::new(ending),
+                        schema_did_change,
+                        rollback,
+                    };
+                }
+                None => {
+                    connection.set_tx_state(TransactionState::None);
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+        let CommitState::Atoll {
+            ending,
+            schema_did_change,
+            rollback,
+        } = &mut program_state.commit_state
+        else {
+            unreachable!("an Atoll commit in another commit state");
+        };
+        return_if_io!(ending.step());
+        let (schema_did_change, rollback) = (*schema_did_change, *rollback);
+        program_state.commit_state = CommitState::Ready;
+        if schema_did_change {
+            if rollback {
+                *connection.schema.write() = connection.db.clone_schema();
+                connection.bump_prepare_context_generation();
+            } else {
+                let schema = connection.schema.read().clone();
+                connection.db.update_schema_if_newer(schema);
+            }
+        }
+        connection.set_tx_state(TransactionState::None);
+        Ok(IOResult::Done(()))
     }
 
     fn commit_txn_wal(

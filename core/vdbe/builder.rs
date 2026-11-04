@@ -2519,6 +2519,24 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
+        // In Atoll mode a statement writing the main database's schema takes the write gate
+        // exclusive (DESIGN.md §17, R23): known here, once.
+        let writes_schema = self.insns.iter().any(|(insn, _)| match insn {
+            Insn::CreateBtree { db, .. }
+            | Insn::ClearBtree { db, .. }
+            | Insn::Destroy { db, .. } => *db == crate::MAIN_DB_ID,
+            Insn::OpenWrite {
+                root_page: crate::vdbe::insn::RegisterOrLiteral::Literal(1),
+                db,
+                ..
+            } => *db == crate::MAIN_DB_ID,
+            Insn::SetCookie {
+                cookie: crate::vdbe::insn::Cookie::SchemaVersion,
+                db,
+                ..
+            } => *db == crate::MAIN_DB_ID,
+            _ => false,
+        });
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2548,6 +2566,7 @@ impl ProgramBuilder {
             custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            writes_schema,
         };
         Ok(prepared)
     }

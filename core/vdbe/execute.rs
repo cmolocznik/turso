@@ -1322,6 +1322,16 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
+    if let Some(atoll) = program.connection.atoll_for_db(*db) {
+        let cursor = open_atoll_cursor(atoll, &pager, *root_page, cursor_type)?;
+        state
+            .cursors
+            .get_mut(*cursor_id)
+            .expect("cursor_id should be valid")
+            .replace(cursor);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
@@ -4743,7 +4753,39 @@ pub fn op_transaction_inner(
                 };
 
                 // 2. Start transaction if needed
-                if let Some(mv_store) = mv_store.as_ref() {
+                if let Some(atoll) = conn.atoll_for_db(*db) {
+                    // Atoll mode (DESIGN.md §17): the transaction begins at the outermost
+                    // statement's first Transaction opcode, and a writing statement takes the
+                    // write gate, exclusive when it writes the schema or begins IMMEDIATE (R5,
+                    // R12), then starts its Atoll statement (R18).
+                    if matches!(tx_mode, TransactionMode::Concurrent) {
+                        return Err(LimboError::TxError(
+                            "BEGIN CONCURRENT is refused in Atoll mode: a write behind an open \
+                             writer waits for it instead (R2)"
+                                .to_string(),
+                        )
+                        .into());
+                    }
+                    if !conn.is_nested_stmt() {
+                        use crate::storage::atoll::sql::mode::Begin;
+                        let wants = if write {
+                            Begin::Write {
+                                schema: !statement_writes_db || program.writes_schema,
+                            }
+                        } else {
+                            Begin::Read
+                        };
+                        if let IOResult::IO(io) = atoll.begin(wants)? {
+                            return Ok(state.suspend_on_io(io));
+                        }
+                        if updated && current_state.no_btree_tx_open() && conn.get_auto_commit() {
+                            state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        }
+                        if statement_writes_db && state.atoll_statement.is_none() {
+                            state.atoll_statement = Some(atoll.start_statement()?);
+                        }
+                    }
+                } else if let Some(mv_store) = mv_store.as_ref() {
                     if is_secondary_db {
                         // Attached databases don't participate in the connection-level
                         // transaction state machine above, so they must open
@@ -5374,6 +5416,9 @@ pub fn op_auto_commit(
                     }
                     pager.end_read_tx();
                     conn.rollback_attached_mvcc_txs(true);
+                } else if conn.atoll().is_some() {
+                    // Driven to its end here, a synchronous site (R19).
+                    conn.rollback_atoll();
                 } else {
                     pager.rollback_tx(&conn);
                 }
@@ -13863,6 +13908,34 @@ fn new_rowid_inner(
     loop {
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
+                if program.connection.atoll().is_some() {
+                    // Atoll mode: the tree's counter (DESIGN.md §17, §8, R30).
+                    let c = state.get_cursor(*cursor);
+                    let c = c.as_btree_mut() as &mut dyn Any;
+                    let Some(c) = c.downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
+                    else {
+                        return Err(LimboError::InternalError(
+                            "NewRowid on a cursor that is not Atoll's in Atoll mode".to_string(),
+                        )
+                        .into());
+                    };
+                    match return_if_io!(state, c.new_rowid()) {
+                        Some(rowid) => {
+                            state.registers[*rowid_reg].set_int(rowid);
+                            if *prev_largest_reg > 0 {
+                                state.registers[*prev_largest_reg].set_int(rowid - 1);
+                            }
+                            state.active_op_state.clear();
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+                        None => {
+                            *state.active_op_state.new_rowid() =
+                                OpNewRowidState::GeneratingRandom { attempts: 0 };
+                            continue;
+                        }
+                    }
+                }
                 if has_mv_store {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
@@ -14338,6 +14411,36 @@ pub fn op_offset_limit(
 // this cursor may be reused for next insert
 // Update: tablemoveto is used to travers on not exists, on insert depending on flags if nonseek it traverses again.
 // If not there might be some optimizations obviously.
+/// An Atoll-mode cursor over tree `root` (DESIGN.md §17), for OpenRead and OpenWrite: a rowid
+/// table's or an index's. A WITHOUT ROWID table and a materialized view are refused by name.
+fn open_atoll_cursor(
+    atoll: &crate::storage::atoll::sql::mode::ConnTxn,
+    pager: &Arc<Pager>,
+    root: i64,
+    cursor_type: &CursorType,
+) -> Result<Cursor> {
+    let index = match cursor_type {
+        CursorType::BTreeTable(table) if table.has_rowid => None,
+        CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
+        CursorType::BTreeTable(_) => {
+            return Err(LimboError::ParseError(
+                "WITHOUT ROWID tables are refused in Atoll mode until their arm is built"
+                    .to_string(),
+            ))
+        }
+        _ => {
+            return Err(LimboError::ParseError(
+                "this cursor is refused in Atoll mode until its arm is built".to_string(),
+            ))
+        }
+    };
+    let root = u64::try_from(root)
+        .map_err(|_| LimboError::InternalError(format!("an Atoll tree id of {root}")))?;
+    Ok(Cursor::new_btree_dyn(Box::new(
+        crate::storage::atoll::sql::mode::SqlCursor::new(atoll, pager.clone(), root, index),
+    )))
+}
+
 pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
@@ -14393,6 +14496,27 @@ pub fn op_open_write(
             }
         },
     };
+
+    if let Some(atoll) = program.connection.atoll_for_db(*db) {
+        let (_, cursor_type) = program
+            .cursor_ref
+            .get(*cursor_id)
+            .expect("cursor_id should exist in cursor_ref");
+        let reuse = matches!(
+            state.cursors.get(*cursor_id),
+            Some(Some(Cursor::Dyn(cursor, ..))) if cursor.root_page() == root_page
+        );
+        if !reuse {
+            let cursor = open_atoll_cursor(atoll, &pager, root_page, cursor_type)?;
+            state
+                .cursors
+                .get_mut(*cursor_id)
+                .expect("cursor_id should be valid")
+                .replace(cursor);
+        }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
 
@@ -14606,6 +14730,18 @@ pub fn op_create_btree(
     check_db_write_allowed(program, state, None)?;
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
+    }
+    if let Some(atoll) = program.connection.atoll_for_db(*db) {
+        // Atoll mode: a tree id, its tree and its catalog row, in the current statement
+        // (DESIGN.md §17, §5). An index's flags also mark a WITHOUT ROWID table (R29).
+        let id = return_if_io!(
+            state,
+            atoll.create_btree(&mut state.atoll_create, !flags.is_table())
+        );
+        state.atoll_create = None;
+        state.registers[*root].set_int(id as i64);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     let mv_store = program.connection.mv_store_for_db(*db);
 
@@ -20746,6 +20882,10 @@ fn with_header<T, F>(
 where
     F: Fn(&DatabaseHeader) -> T,
 {
+    if let Some(atoll) = program.connection.atoll_for_db(db) {
+        let header = atoll.header()?;
+        return Ok(IOResult::Done(f(&header)));
+    }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);
         mv_store
@@ -20767,6 +20907,9 @@ pub fn with_header_mut<T, F>(
 where
     F: Fn(&mut DatabaseHeader) -> T,
 {
+    if let Some(atoll) = program.connection.atoll_for_db(db) {
+        return Ok(atoll.set_header(&f)?);
+    }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);
         mv_store
@@ -20784,6 +20927,9 @@ fn get_schema_cookie(
     program: &Program,
     db: usize,
 ) -> IOResultOr<u32> {
+    if let Some(atoll) = program.connection.atoll_for_db(db) {
+        return Ok(IOResult::Done(atoll.schema_cookie()?));
+    }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);
         mv_store

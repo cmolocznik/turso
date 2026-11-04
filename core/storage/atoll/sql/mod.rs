@@ -6,6 +6,7 @@
 //! - [`header`]: the database header's fields as rows.
 //! - [`rowid`]: NewRowid's counters.
 //! - [`lifecycle`]: trees created, dropped and cleared in a transaction, and their drain.
+//! - [`mode`]: Atoll mode, the interface Turso's sites call.
 //! - [`sequence`]: sequence values, changed outside any transaction.
 //! - [`trees`]: per-tree commit stamps, for `BusySnapshot`.
 //! - [`wait`]: the wait graph, over every transaction group of the process.
@@ -15,6 +16,7 @@ pub mod cursor;
 pub mod header;
 pub mod key;
 pub mod lifecycle;
+pub mod mode;
 pub mod rowid;
 pub mod sequence;
 pub mod trees;

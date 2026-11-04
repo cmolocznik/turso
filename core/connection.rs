@@ -505,6 +505,8 @@ pub struct Connection {
     #[cfg(feature = "test_helper")]
     pub(crate) test_nondet_counter: AtomicI64,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
+    /// The main database's Atoll transaction, in Atoll mode (DESIGN.md §17).
+    pub(crate) atoll: Option<crate::storage::atoll::sql::mode::ConnTxn>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
@@ -654,6 +656,10 @@ impl Drop for Connection {
                 }
             }
             self.rollback_attached_mvcc_txs(false);
+            // An Atoll transaction's ending drives itself to its end where it drops (R19).
+            if let Some(atoll) = self.atoll.as_ref() {
+                drop(atoll.end(false));
+            }
 
             // Release any WAL locks the connection might be holding.
             // This prevents deadlocks if a connection is dropped (e.g., due to a panic)
@@ -1275,6 +1281,18 @@ impl Connection {
             return Ok(());
         }
         let had_main_mv_tx = self.get_mv_tx().is_some();
+        if let Some(atoll) = self.atoll() {
+            // Atoll mode (DESIGN.md §17): the committed cookie, and a reparse through SQL whose
+            // statements begin and end their own Atoll transactions. A newer schema it labels
+            // with the older cookie costs one more reparse, never a stale schema (R31).
+            if self.db.schema.lock().schema_version == atoll.schema_cookie()? {
+                return Ok(());
+            }
+            self.reparse_schema()?;
+            let schema = self.schema.read().clone();
+            self.db.update_schema_if_newer(schema);
+            return Ok(());
+        }
 
         if self.db.shared_wal_coordination()?.is_some() {
             // Cross-process schema changes can leave page 1 and sqlite_schema
@@ -1756,7 +1774,9 @@ impl Connection {
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
-        if let Some(mv_store) = self.mv_store().as_ref() {
+        if let Some(atoll) = self.atoll() {
+            atoll.schema_cookie()
+        } else if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
             mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
         } else {
@@ -1773,7 +1793,9 @@ impl Connection {
     /// while reading page 1. Idempotent across re-entry.
     pub(crate) fn read_current_schema_cookie_nonblock(&self) -> crate::types::IOResultOr<u32> {
         use crate::types::IOResult;
-        if let Some(mv_store) = self.mv_store().as_ref() {
+        if let Some(atoll) = self.atoll() {
+            Ok(IOResult::Done(atoll.schema_cookie()?))
+        } else if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
             let cookie =
                 mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())?;
@@ -2490,6 +2512,8 @@ impl Connection {
                         }
                     }
                     pager.end_read_tx();
+                } else if self.atoll().is_some() {
+                    self.rollback_atoll();
                 } else {
                     pager.rollback_tx(self);
                 }
@@ -2501,6 +2525,10 @@ impl Connection {
                 self.set_tx_state(TransactionState::None);
             }
         }
+        // An Atoll transaction the state did not show, ended all the same: none outlives a close.
+        if let Some(atoll) = self.atoll.as_ref() {
+            drop(atoll.end(false));
+        }
         self.index_methods_on_transaction_rolled_back();
         self.clear_mvcc_log_meta();
 
@@ -2509,10 +2537,13 @@ impl Connection {
             .wal
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
+        // An Atoll database's commits are durable in its log, and its checkpointer its own: a
+        // close has no WAL to checkpoint.
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db
             && should_checkpoint_on_close
+            && self.db.atoll.is_none()
         {
             self.pager
                 .load()
@@ -3117,6 +3148,47 @@ impl Connection {
 
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
+    }
+
+    /// The main database's Atoll transaction, in Atoll mode (DESIGN.md §17).
+    pub(crate) fn atoll(&self) -> Option<&crate::storage::atoll::sql::mode::ConnTxn> {
+        self.atoll.as_ref()
+    }
+
+    /// Database `db`'s Atoll transaction: the main database's in Atoll mode. Temp stays a pager
+    /// database, and an attached database is never in Atoll mode.
+    pub(crate) fn atoll_for_db(
+        &self,
+        db: usize,
+    ) -> Option<&crate::storage::atoll::sql::mode::ConnTxn> {
+        if db == crate::MAIN_DB_ID {
+            self.atoll.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Ends the Atoll transaction, rolling it back, at a synchronous site (R19); restores the
+    /// schema a rolled-back schema change left, as `Pager::rollback` does (R28).
+    pub(crate) fn rollback_atoll(&self) {
+        let Some(atoll) = self.atoll.as_ref() else {
+            return;
+        };
+        let schema_did_change = matches!(
+            self.get_tx_state(),
+            TransactionState::Write {
+                schema_did_change: true
+            }
+        );
+        if let Some(ending) = atoll.end(false) {
+            if let Err(e) = ending.finish() {
+                tracing::error!("rolling back an Atoll transaction failed: {e}");
+            }
+        }
+        if schema_did_change {
+            *self.schema.write() = self.db.clone_schema();
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
@@ -5106,6 +5178,9 @@ impl Connection {
             }
             pager.end_read_tx();
             self.rollback_attached_mvcc_txs(clear_attached_schemas);
+        } else if self.atoll().is_some() {
+            self.rollback_atoll();
+            self.auto_commit.store(true, Ordering::SeqCst);
         } else {
             pager.rollback_tx(self);
             self.auto_commit.store(true, Ordering::SeqCst);

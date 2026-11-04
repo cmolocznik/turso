@@ -152,6 +152,21 @@ impl AtollCursor {
         self.id
     }
 
+    /// Forgets the record read at the row, to read it again.
+    pub fn invalidate_record(&mut self) {
+        self.record = None;
+    }
+
+    /// The tree's root.
+    pub fn root(&self) -> crate::storage::atoll::page::PageId {
+        self.entry.root
+    }
+
+    /// The tree as plain records, for its rowid counter's seed.
+    pub fn plain_tree(&self) -> &crate::storage::atoll::btree::Tree {
+        self.tree.tree()
+    }
+
     pub fn index_info(&self) -> Option<&Arc<IndexInfo>> {
         self.index.as_ref()
     }

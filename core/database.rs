@@ -238,6 +238,9 @@ pub struct OpenOptions {
     /// time and shared by every user of the registered instance; a registry
     /// hit with a different dialect is an error.
     dialect: Arc<dyn Dialect>,
+    /// Opens the database at the path in Atoll mode (DESIGN.md §17), creating it if nothing is
+    /// there. An Atoll database at the path opens in Atoll mode without it.
+    atoll: Option<crate::storage::atoll::db::AtollConfig>,
 }
 
 impl OpenOptions {
@@ -255,6 +258,7 @@ impl OpenOptions {
             durable_storage: None,
             allocators: DatabaseAllocators::default(),
             dialect: dialect.clone(),
+            atoll: None,
         };
         dialect.register_native_extensions(options)
     }
@@ -297,6 +301,12 @@ impl OpenOptions {
         durable_storage: impl Into<Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>>,
     ) -> Self {
         self.durable_storage = durable_storage.into();
+        self
+    }
+
+    /// Opens the database in Atoll mode with `config` (DESIGN.md §17).
+    pub fn atoll(mut self, config: crate::storage::atoll::db::AtollConfig) -> Self {
+        self.atoll = Some(config);
         self
     }
 
@@ -544,6 +554,15 @@ impl ConnectAsyncState {
 }
 
 /// State machine for async database opening
+/// What the file at a database's path comes to for Atoll mode.
+#[cfg(feature = "fs")]
+enum AtollResolved {
+    /// A database of the path already open in the process.
+    Hit(Arc<Database>),
+    Atoll,
+    Sqlite,
+}
+
 pub struct OpenDbAsyncState {
     phase: OpenDbAsyncPhase,
     db: Option<Arc<Database>>,
@@ -569,6 +588,10 @@ pub struct OpenDbAsyncState {
     /// The `PRAGMA journal_mode = 'mvcc'` statement that converts the database
     /// when `DatabaseOpts::with_mvcc` is set, held across yields.
     mvcc_convert_stmt: Option<crate::Statement>,
+    /// Atoll mode's configuration, when the database opens in it (DESIGN.md §17).
+    atoll: Option<crate::storage::atoll::db::AtollConfig>,
+    /// The schema's load through SQL in Atoll mode, held across yields.
+    atoll_reparse: crate::connection::ReparseSchemaState,
 }
 
 impl Default for OpenDbAsyncState {
@@ -593,6 +616,8 @@ impl OpenDbAsyncState {
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
             mvcc_convert_stmt: None,
+            atoll: None,
+            atoll_reparse: crate::connection::ReparseSchemaState::Start,
         }
     }
 }
@@ -669,6 +694,8 @@ pub struct Database<
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
+    /// The Atoll database in Atoll mode (DESIGN.md §17): set at open, never changed after.
+    pub(crate) atoll: Option<Arc<crate::storage::atoll::sql::AtollDb>>,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
@@ -838,6 +865,7 @@ impl Database {
 
         let db = Database {
             mv_store,
+            atoll: None,
             allocators,
             path,
             wal_path,
@@ -999,6 +1027,9 @@ impl Database {
     }
 
     fn validate_open_options(options: &OpenOptions) -> Result<()> {
+        if options.atoll.is_some() {
+            Self::validate_atoll_options(options)?;
+        }
         Self::validate_external_page_codec_options(options.db_opts, options.page_codec.is_some())?;
         if options.encryption.is_some() && options.page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
@@ -1006,6 +1037,107 @@ impl Database {
             ));
         }
         Ok(())
+    }
+
+    /// The options Atoll mode refuses (DESIGN.md §17, R27): it keeps its own log and durability,
+    /// transforms no page, holds no MVCC store, is one process's, and writes its control file
+    /// at every open.
+    fn validate_atoll_options(options: &OpenOptions) -> Result<()> {
+        let refused = if options.encryption.is_some() {
+            Some("encryption")
+        } else if options.page_codec.is_some() {
+            Some("a page codec")
+        } else if options.db_opts.enable_mvcc {
+            Some("MVCC")
+        } else if options.db_opts.enable_multiprocess_wal {
+            Some("multiprocess WAL")
+        } else if options.flags.contains(OpenFlags::ReadOnly) {
+            Some("a read-only open")
+        } else if options.durable_storage.is_some() {
+            Some("a custom durable storage")
+        } else {
+            None
+        };
+        match refused {
+            Some(what) => Err(LimboError::InvalidArgument(format!(
+                "an Atoll database cannot be opened with {what}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Atoll mode at `path` (DESIGN.md §17, R16, R17): an Atoll database there, or the Atoll
+    /// option and no database there. Fills `options` for it, the main database's storage the
+    /// refusing one, so no SQLite descriptor is opened on the path. The probe runs under the
+    /// registry's lock and only while no open of the path is under way in the process: closing its
+    /// descriptor drops every lock the process holds on the file, an open Atoll's among them.
+    #[cfg(feature = "fs")]
+    fn resolve_atoll(
+        io: &Arc<dyn IO>,
+        path: &str,
+        options: &mut OpenOptions,
+        use_registry: bool,
+    ) -> Result<AtollResolved> {
+        use crate::storage::atoll::sql::mode::{self, Probed};
+        loop {
+            let registry = DATABASE_MANAGER.lock();
+            if !is_memory_like(path) {
+                if let Ok(file_id) = io.file_id(path) {
+                    match registry.get(&DatabaseKey::File(file_id)) {
+                        Some(RegistryEntry::Opening) => {
+                            drop(registry);
+                            crate::thread::yield_now();
+                            continue;
+                        }
+                        Some(RegistryEntry::Ready(weak)) if weak.strong_count() > 0 => {
+                            drop(registry);
+                            if let Some(db) = Self::lookup_in_registry(
+                                path,
+                                &options.encryption,
+                                options.dialect.as_ref(),
+                                options.page_codec.as_deref(),
+                            )? {
+                                return Ok(AtollResolved::Hit(db));
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let asked = options.atoll.is_some();
+            let atoll = match mode::probe(io, path)? {
+                Probed::Atoll => true,
+                Probed::Nothing => asked,
+                Probed::Absent if asked => {
+                    // Created before it registers, so the registry keys it by its file.
+                    drop(io.open_file(path, OpenFlags::Create | OpenFlags::NoLock, false)?);
+                    true
+                }
+                Probed::Absent => false,
+                Probed::Other if asked => {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "the file at {path} is not an Atoll database, and is not converted"
+                    )))
+                }
+                Probed::Other => false,
+            };
+            drop(registry);
+            if !atoll {
+                return Ok(AtollResolved::Sqlite);
+            }
+            if !use_registry {
+                return Err(LimboError::InvalidArgument(
+                    "an Atoll database opens through Database::open, which keeps one instance \
+                     per path: two would share one log"
+                        .to_string(),
+                ));
+            }
+            options.atoll = Some(mode::config_for(options.atoll.as_ref()));
+            Self::validate_atoll_options(options)?;
+            options.storage = Some(Arc::new(mode::RefusingStorage));
+            return Ok(AtollResolved::Atoll);
+        }
     }
 
     #[cfg(feature = "fs")]
@@ -1225,6 +1357,11 @@ impl Database {
                 return Ok(Some(db));
             }
         }
+        match Self::resolve_atoll(io, path, options, use_registry)? {
+            AtollResolved::Hit(db) => return Ok(Some(db)),
+            AtollResolved::Atoll => return Ok(None),
+            AtollResolved::Sqlite => {}
+        }
         // Mixed legacy/multiprocess opens are incompatible, but the two modes
         // advertise themselves through different lock domains (`.tshm` vs DB
         // file lock). We therefore probe both directions around the actual file
@@ -1300,6 +1437,13 @@ impl Database {
         // the custom wal_path before open_async runs its own check.
         Self::reject_wal_path_for_registry_open(&options)?;
         Self::validate_open_options(&options)?;
+        if options.atoll.is_some() && options.storage.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "an Atoll database keeps its own storage: OpenOptions::storage cannot be set with \
+                 OpenOptions::atoll"
+                    .to_string(),
+            ));
+        }
         if options.storage.is_none() {
             if let Some(db) = Self::resolve_default_storage(&io, path, &mut options, true)? {
                 return Ok(db);
@@ -1406,6 +1550,13 @@ impl Database {
             // of the same path without holding the mutex across yields.
         }
 
+        // Atoll mode: the main pager's storage refuses every page (DESIGN.md §17).
+        state.atoll = options.atoll.clone();
+        let storage: Arc<dyn DatabaseStorage> = if options.atoll.is_some() {
+            Arc::new(crate::storage::atoll::sql::mode::RefusingStorage)
+        } else {
+            storage
+        };
         // Open the database (no registry lock held; never re-consults it).
         let result = Self::do_open_async_guarded(
             state,
@@ -1482,6 +1633,14 @@ impl Database {
         options: &OpenOptions,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_open_options(options)?;
+        if options.atoll.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "an Atoll database opens through Database::open or open_async, which keep one \
+                 instance per path: two would share one log"
+                    .to_string(),
+            )
+            .into());
+        }
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::do_open_async".to_string(),
@@ -1614,14 +1773,25 @@ impl Database {
                         .building_db
                         .as_mut()
                         .expect("building_db must be set in Init phase");
-                    let mut hv_state = std::mem::take(&mut state.header_validation_state);
-                    let result = db.header_validation(
-                        &mut hv_state,
-                        state.encryption_key.as_ref(),
-                        page_codec.as_ref(),
-                    );
-                    state.header_validation_state = hv_state;
-                    let pager = return_if_io!(result);
+                    let pager = if let Some(config) = state.atoll.clone() {
+                        // Atoll mode: the database opens here, recovering what a crash left, and
+                        // the main pager reads nothing (DESIGN.md §17).
+                        db.atoll = Some(Arc::new(crate::storage::atoll::sql::AtollDb::open(
+                            io.clone(),
+                            path,
+                            config,
+                        )?));
+                        Arc::new(db.atoll_pager()?)
+                    } else {
+                        let mut hv_state = std::mem::take(&mut state.header_validation_state);
+                        let result = db.header_validation(
+                            &mut hv_state,
+                            state.encryption_key.as_ref(),
+                            page_codec.as_ref(),
+                        );
+                        state.header_validation_state = hv_state;
+                        return_if_io!(result)
+                    };
 
                     let mut db = state
                         .building_db
@@ -1634,7 +1804,10 @@ impl Database {
                             db.shared_wal.read().metadata.enabled.load(Ordering::SeqCst);
                         let mv_store_enabled = db.get_mv_store().is_some();
                         assert!(
-                            db.is_readonly() || wal_enabled || mv_store_enabled,
+                            db.is_readonly()
+                                || wal_enabled
+                                || mv_store_enabled
+                                || db.atoll.is_some(),
                             "Either WAL or MVStore must be enabled"
                         );
                     }
@@ -1666,6 +1839,11 @@ impl Database {
                 }
 
                 OpenDbAsyncPhase::ReadingHeader => {
+                    if state.atoll.is_some() {
+                        // The schema version comes with the schema, read through SQL.
+                        state.phase = OpenDbAsyncPhase::LoadingSchema;
+                        continue;
+                    }
                     let pager = state
                         .pager
                         .as_ref()
@@ -1689,6 +1867,26 @@ impl Database {
                 }
 
                 OpenDbAsyncPhase::LoadingSchema => {
+                    if state.atoll.is_some() {
+                        // Through SQL, at a transaction's view, as every reparse: the Atoll arms
+                        // of the Transaction and OpenRead opcodes read sqlite_schema. The guard
+                        // goes first, as the statements the reparse prepares take the schema.
+                        state.schema_guard = None;
+                        let conn = state
+                            .conn
+                            .as_ref()
+                            .expect("conn must be initialized in Init phase")
+                            .clone();
+                        return_if_io!(conn.reparse_schema_nonblock(&mut state.atoll_reparse));
+                        let schema = conn.schema.read().clone();
+                        state
+                            .db
+                            .as_ref()
+                            .expect("db must be initialized in Init phase")
+                            .replace_schema(schema);
+                        state.phase = OpenDbAsyncPhase::BootstrapMvStore;
+                        continue;
+                    }
                     let pager = state
                         .pager
                         .as_ref()
@@ -1818,6 +2016,24 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// The main pager in Atoll mode: over the refusing storage, with no WAL, its page size the SQL
+    /// trees' node size (DESIGN.md §17, R20).
+    fn atoll_pager(&self) -> Result<Pager> {
+        use crate::storage::atoll::sql::mode::PAGE;
+        self.buffer_pool.finalize_with_page_size(PAGE)?;
+        let pager = Pager::new(
+            self.db_file.clone(),
+            None,
+            self.io.clone(),
+            PageCache::default(),
+            self.buffer_pool.clone(),
+            self.pager_state.clone(),
+        )?;
+        pager.set_page_size(PageSize::new(PAGE as u32).expect("the SQL trees' node size"));
+        pager.refuse_transactions();
+        Ok(pager)
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.
@@ -2627,6 +2843,8 @@ impl Database {
         }
         let pager = if let Some(pager) = pager {
             pager
+        } else if self.atoll.is_some() {
+            Arc::new(self.atoll_pager()?)
         } else {
             // Pass encryption key to _init so it can set up encryption context
             // before reading page 1. This is required for reopening encrypted databases.
@@ -2725,6 +2943,10 @@ impl Database {
             #[cfg(feature = "test_helper")]
             test_nondet_counter: AtomicI64::new(0),
             mv_tx: RwLock::new(None),
+            atoll: self
+                .atoll
+                .as_ref()
+                .map(|db| crate::storage::atoll::sql::mode::ConnTxn::new(db.clone())),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]
             yield_injector: RwLock::new(None),

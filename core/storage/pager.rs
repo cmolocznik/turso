@@ -1666,6 +1666,10 @@ pub struct Pager {
     /// lock, so a reader that sees false can skip the lock: every page read
     /// checks for a pending entry first.
     has_pending_reads: AtomicBool,
+    /// Whether its transactions are refused: the main pager of a database in Atoll mode, whose
+    /// transactions are Atoll's (DESIGN.md §17). With no WAL they would otherwise succeed and
+    /// commit nothing.
+    refuses_transactions: AtomicBool,
     #[cfg(test)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
@@ -1979,6 +1983,7 @@ impl Pager {
             io,
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
+            refuses_transactions: AtomicBool::new(false),
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
@@ -3346,7 +3351,24 @@ impl Pager {
 
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    /// From now on its transactions are refused (DESIGN.md §17).
+    pub fn refuse_transactions(&self) {
+        self.refuses_transactions.store(true, Ordering::Release);
+    }
+
+    fn refused_transaction(&self) -> Result<()> {
+        if self.refuses_transactions.load(Ordering::Acquire) {
+            return Err(LimboError::InternalError(
+                "the main database is in Atoll mode: a pager transaction reached it without its \
+                 Atoll arm"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn begin_read_tx(&self) -> Result<()> {
+        self.refused_transaction()?;
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
@@ -3418,6 +3440,7 @@ impl Pager {
     pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> IOResultOr<()> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
+        self.refused_transaction()?;
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
@@ -3489,6 +3512,7 @@ impl Pager {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
         }
+        self.refused_transaction()?;
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             self.clear_savepoints()?;

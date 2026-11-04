@@ -39,7 +39,7 @@ pub mod value;
 mod tests;
 
 use super::buffer::{BufferPool, Exclusive, Optimistic};
-use super::log::{framed_len, Admitted, GroupStart, Header, Log, Lsn, TxnTail};
+use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn, TxnTail};
 use super::page::{self, PageId, SizeClass};
 use super::shared::{Bytes, BytesMut};
 use super::store::{PageStore, StoreRecord};
@@ -182,18 +182,7 @@ impl Tree {
             done!(pool.allocate(class))
         };
         let pid = page.pid();
-        node::build(
-            &mut page.page_mut(),
-            &Layout {
-                root: pid,
-                level: 0,
-                lower: None,
-                upper: None,
-                next: (PageId::from_raw(0), 0),
-            },
-            [],
-        );
-        let image = node::image(page.page());
+        let image = empty_root(&mut page);
         let tree = Self::open(io.clone(), pool.clone(), store.clone(), pid);
         let lsns = tree.log_batch(
             &mut grant,
@@ -205,6 +194,54 @@ impl Tree {
         );
         page.changed(lsns[0]);
         Ok(IOResult::Done(pid))
+    }
+
+    /// A new, empty tree whose nodes are of `class`, made in a transaction: one group of the
+    /// transaction's record of `kind`, whose payload is the root and then `extra`, the root's image
+    /// and the root's adoption, so no crash leaves the root adopted with no chain naming it.
+    /// Returns the root and where the group starts.
+    pub fn create_logged(
+        pool: &Arc<BufferPool>,
+        store: &Arc<PageStore>,
+        class: SizeClass,
+        tail: &TxnTail,
+        kind: Kind,
+        extra: &[u8],
+    ) -> Result<IOResult<(PageId, GroupStart)>> {
+        check_budget(store.log(), class, Limits::of(class))?;
+        let lead_len = framed_len(8 + extra.len());
+        let adopt_len = PageStore::group_record_len(1);
+        let init_len = framed_len(8 + 4 + class.size());
+        let mut admitted = done!(store.log().admit(lead_len + init_len + adopt_len));
+        let mut page = done!(pool.allocate(class));
+        let pid = page.pid();
+        let image = empty_root(&mut page);
+        let lead = [&pid.raw().to_le_bytes()[..], extra].concat();
+        let init = Record {
+            pid,
+            change: Change::Init { image: &image },
+        };
+        let init_header = Header {
+            kind: init.kind(),
+            flags: 0,
+            txn: 0,
+            prev: None,
+        };
+        let init = init.encode();
+        let adopt = StoreRecord::Adopt { pids: vec![pid] };
+        let (adopt_header, adopt_payload) = PageStore::group_record(&adopt);
+        let pieces: [[&[u8]; 1]; 3] = [[&lead], [&init], [&adopt_payload]];
+        let records = [
+            (tail.header(kind), &pieces[0][..]),
+            (init_header, &pieces[1][..]),
+            (adopt_header, &pieces[2][..]),
+        ];
+        let (start, lsns) = store
+            .log()
+            .append_group_with(&mut admitted, &records, |at| tail.reserved(at));
+        store.grouped(&adopt, start.get(), lsns[2]);
+        page.changed(lsns[1]);
+        Ok(IOResult::Done((pid, start)))
     }
 
     /// The tree whose root is `root`.
@@ -1592,6 +1629,23 @@ fn smo_len(class: SizeClass, limits: Limits) -> u64 {
     2 * framed_len(8 + 4 + class.size())
         + 2 * framed_len(8 + 16 + limits.max_key)
         + store_len(&[PageId::from_raw(0)])
+}
+
+/// Builds an empty root, a leaf naming itself, on the newly allocated `page`; returns its image.
+fn empty_root(page: &mut Exclusive<'_>) -> Vec<u8> {
+    let pid = page.pid();
+    node::build(
+        &mut page.page_mut(),
+        &Layout {
+            root: pid,
+            level: 0,
+            lower: None,
+            upper: None,
+            next: (PageId::from_raw(0), 0),
+        },
+        [],
+    );
+    node::image(page.page())
 }
 
 fn check_budget(log: &Log, class: SizeClass, limits: Limits) -> Result<()> {

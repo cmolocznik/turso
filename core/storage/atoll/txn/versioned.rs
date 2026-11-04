@@ -236,6 +236,15 @@ impl Versions {
         Tree::open(self.io.clone(), self.pool.clone(), self.store.clone(), root)
     }
 
+    /// The plain tree rooted at `root`.
+    pub(super) fn open_plain(&self, root: PageId) -> Tree {
+        Tree::open(self.io.clone(), self.pool.clone(), self.store.clone(), root)
+    }
+
+    pub(super) fn pool_and_store(&self) -> (&Arc<BufferPool>, &Arc<PageStore>) {
+        (&self.pool, &self.store)
+    }
+
     /// The versioned tree rooted at `root`.
     pub(super) fn open_tree(&self, root: PageId) -> VersionedTree {
         VersionedTree::open(self.io.clone(), self.pool.clone(), self.store.clone(), root)

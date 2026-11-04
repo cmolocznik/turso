@@ -14,9 +14,15 @@
 //! newest first, so the leaf holds this statement's version again unless the write never happened.
 //!
 //! Nothing is removed from the indexes: a reader may be following one of their entries.
+//!
+//! The trees the transaction created are one more lane, by the statement that created each: a
+//! creation is undone after every entry of its statement and later, so after every change to its
+//! tree. Undoing one puts the root on its plain list, keyed by its big-endian bytes, with the
+//! transaction's start as the value. The put is idempotent, and the list's entries are freed only
+//! once the transaction has ended (DESIGN.md §17).
 
 use super::versioned::{decode_entry, index_key_parts, Version, VersionedTree, Versions, HEADER};
-use super::{Statement, Transactions, Ts, Txn};
+use super::{creation, Statement, Transactions, Ts, Txn, CREATE};
 use crate::io::IO;
 use crate::storage::atoll::btree::record::{Change, Compensation, Record};
 use crate::storage::atoll::btree::value::ValueRef;
@@ -68,13 +74,20 @@ enum Step {
     Next,
 }
 
-/// A rollback in progress: every key a statement after `to` changed, put back. Step it with
-/// [`undo`].
+/// What a rollback is working on.
+enum Working {
+    /// A lane, and where putting its entry back stands.
+    Lane(usize, Step),
+    /// Putting the transaction's last creation on its list.
+    Creation(Put),
+}
+
+/// A rollback in progress: every key a statement after `to` changed, put back, and every tree a
+/// statement after `to` created put on its list. Step it with [`undo`].
 pub struct Rollback {
     to: Statement,
     lanes: Option<Vec<Lane>>,
-    /// The lane being worked on, and where that stands.
-    working: Option<(usize, Step)>,
+    working: Option<Working>,
 }
 
 impl Rollback {
@@ -118,8 +131,8 @@ impl Lane {
     }
 }
 
-/// Steps `op`, rolling `txn` back as far as `op` says. Done once every key is put back; the
-/// transaction's tail then runs through their compensation records.
+/// Steps `op`, rolling `txn` back as far as `op` says. Done once every key is put back and every
+/// creation undone; the transaction's tail then runs through their compensation records.
 pub fn undo(
     txns: &Transactions,
     versions: &Versions,
@@ -147,16 +160,44 @@ pub fn undo(
     }
     loop {
         let (i, step) = match op.working.take() {
-            Some(working) => working,
+            Some(Working::Lane(i, step)) => (i, step),
+            Some(Working::Creation(mut put)) => {
+                let created = *txn.created.last().expect("a creation being undone");
+                match versions.open_plain(created.list).put(&mut put)? {
+                    IOResult::IO(io) => {
+                        op.working = Some(Working::Creation(put));
+                        return Ok(IOResult::IO(io));
+                    }
+                    IOResult::Done(Outcome::Inserted | Outcome::Unchanged) => {
+                        txn.created.pop();
+                        txn.abandoned.push(created.root);
+                        continue;
+                    }
+                    IOResult::Done(other) => {
+                        return Err(LimboError::InternalError(format!(
+                            "putting tree {:?} on its list came to {other:?}",
+                            created.root
+                        )))
+                    }
+                }
+            }
             None => {
                 let newest = lanes
                     .iter()
                     .enumerate()
                     .filter_map(|(i, l)| l.at.as_ref().map(|r| (r.statement, i)))
                     .max();
-                match newest {
-                    Some((_, i)) => (i, Step::Look),
-                    None => return Ok(IOResult::Done(())),
+                let creation = txn.created.last().filter(|c| c.statement > op.to);
+                match (newest, creation) {
+                    // A lane's entry of the creation's statement or later first: its tree's
+                    // changes are undone before the tree is.
+                    (Some((statement, i)), Some(c)) if statement >= c.statement => (i, Step::Look),
+                    (_, Some(c)) => {
+                        op.working = Some(Working::Creation(abandoning(c.root, txn.start)));
+                        continue;
+                    }
+                    (Some((_, i)), None) => (i, Step::Look),
+                    (None, None) => return Ok(IOResult::Done(())),
                 }
             }
         };
@@ -165,7 +206,7 @@ pub fn undo(
         let tree = versions.open_tree(replaced.tree);
         let next = match step {
             Step::Look => {
-                op.working = Some((i, Step::Look));
+                op.working = Some(Working::Lane(i, Step::Look));
                 let current = done!(tree.tree().stored(&replaced.key));
                 let current = current.filter(|c| {
                     Version::decode(&c.head).is_some_and(|v| {
@@ -199,7 +240,7 @@ pub fn undo(
             }
             Step::Put(mut put) => match tree.tree().put(&mut put)? {
                 IOResult::IO(io) => {
-                    op.working = Some((i, Step::Put(put)));
+                    op.working = Some(Working::Lane(i, Step::Put(put)));
                     return Ok(IOResult::IO(io));
                 }
                 // Changed since the look: look again.
@@ -211,7 +252,7 @@ pub fn undo(
             },
             Step::Remove(mut remove) => match tree.tree().remove(&mut remove)? {
                 IOResult::IO(io) => {
-                    op.working = Some((i, Step::Remove(remove)));
+                    op.working = Some(Working::Lane(i, Step::Remove(remove)));
                     return Ok(IOResult::IO(io));
                 }
                 IOResult::Done(true) => {
@@ -221,15 +262,25 @@ pub fn undo(
                 IOResult::Done(false) => Step::Look,
             },
             Step::Next => {
-                op.working = Some((i, Step::Next));
+                op.working = Some(Working::Lane(i, Step::Next));
                 done!(lane.index.prev(&mut lane.cursor));
                 lane.read(txn.start, op.to)?;
                 op.working = None;
                 continue;
             }
         };
-        op.working = Some((i, next));
+        op.working = Some(Working::Lane(i, next));
     }
+}
+
+/// The put of the tree rooted at `root`, created by the transaction that started at `start`, on
+/// its list.
+fn abandoning(root: PageId, start: Ts) -> Put {
+    Put::new(
+        &root.raw().to_be_bytes(),
+        start.to_le_bytes().to_vec(),
+        Mode::Insert,
+    )
 }
 
 /// Undoes loser `txn` in recovery (DESIGN.md §12), back along its chain from its last group at
@@ -281,6 +332,26 @@ pub(crate) fn undo_loser(
         }
         if undone == Some(group) {
             continue;
+        }
+        // A creation: every later change to the tree is undone already, the chain running newest
+        // first. The put needs no compensation: a later one jumping past it is logged after it.
+        if r.header.kind == CREATE {
+            let (root, list) = creation(&r.payload).ok_or_else(|| {
+                corrupt(format!(
+                    "the creation record at {} does not decode",
+                    group.get()
+                ))
+            })?;
+            let list = Tree::open(io.clone(), pool.clone(), store.clone(), list);
+            let mut put = abandoning(root, txn);
+            match drive(io, || list.put(&mut put))? {
+                Outcome::Inserted | Outcome::Unchanged => continue,
+                other => {
+                    return Err(corrupt(format!(
+                        "putting tree {root:?} on its list came to {other:?}"
+                    )))
+                }
+            }
         }
         let Some(record) = Record::decode(r.header.kind, &r.payload)? else {
             continue;

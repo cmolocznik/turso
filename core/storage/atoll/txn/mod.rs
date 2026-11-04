@@ -19,9 +19,15 @@
 //!   previous group by where that group starts, so its records are found from its last one. Its
 //!   slot's cell in the writer registry holds its first and last groups from its first group's
 //!   reservation to its Commit's ([`super::log::Writers`]).
+//! - **Creating a tree** is a change of the transaction's: the root's creation record leads the
+//!   group that makes the root ([`Transactions::create_tree`]). Undoing it, by a rollback or in
+//!   recovery, puts the root on a plain list, after every later change to the tree is undone, and
+//!   frees nothing: the transaction's trees on the list are freed once it has ended.
 
 use self::sync::{fence, AtomicU64, Ordering};
+use super::btree::Tree;
 use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn, TxnTail, Writers};
+use super::page::{PageId, SizeClass};
 use super::segmented::Segmented;
 use super::stack::Stack;
 use crate::io::Completion;
@@ -56,6 +62,32 @@ pub const COMMIT: Kind = Kind::new(16).unwrap();
 /// The record of a transaction that ended without committing, with no undo left: every change it
 /// made put back. Empty.
 pub const END: Kind = Kind::new(19).unwrap();
+
+/// A tree's creation in a transaction: the root, then the root of the plain list its undo puts it
+/// on, each 8 bytes little-endian. It leads the group that makes the root.
+pub const CREATE: Kind = Kind::new(25).unwrap();
+
+/// The root a creation record names, and the list its undo puts it on.
+pub fn creation(payload: &[u8]) -> Option<(PageId, PageId)> {
+    let word = |at: usize| {
+        payload
+            .get(at..at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    };
+    let (root, list) = (PageId::from_raw(word(0)?), PageId::from_raw(word(8)?));
+    let valid = |p: PageId| SizeClass::new(p.class().index()).is_some() && !p.is_temporary();
+    (payload.len() == 16 && valid(root) && valid(list)).then_some((root, list))
+}
+
+/// A tree a transaction created and still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Created {
+    /// The statement that created it: a rollback past it undoes the creation.
+    pub statement: Statement,
+    pub root: PageId,
+    /// The plain list the creation's undo puts the root on, keyed by its big-endian bytes.
+    pub list: PageId,
+}
 
 /// The commit timestamp a Commit record's payload carries.
 pub fn commit_ts(payload: &[u8]) -> Option<Ts> {
@@ -224,6 +256,11 @@ pub struct Txn {
     tail: Option<GroupStart>,
     /// Where the log stood at the snapshot: what a read-only commit waits to be durable.
     log_at: Lsn,
+    /// The trees the transaction created and holds, oldest first.
+    created: Vec<Created>,
+    /// The trees whose creation was undone, each on its list: to free once the transaction has
+    /// ended.
+    abandoned: Vec<PageId>,
 }
 
 impl Txn {
@@ -271,6 +308,16 @@ impl Txn {
     pub fn wrote(&self) -> bool {
         self.tail.is_some()
     }
+
+    /// The trees the transaction created and holds, oldest first.
+    pub fn created(&self) -> &[Created] {
+        &self.created
+    }
+
+    /// The trees whose creation was undone so far.
+    pub fn abandoned(&self) -> &[PageId] {
+        &self.abandoned
+    }
 }
 
 /// A whole rollback in progress: step it with [`Transactions::rollback`].
@@ -278,6 +325,7 @@ pub struct Abort {
     txn: Option<Txn>,
     undo: Rollback,
     admitted: Option<Admitted>,
+    abandoned: Vec<PageId>,
 }
 
 impl Abort {
@@ -286,7 +334,14 @@ impl Abort {
             txn: Some(txn),
             undo: Rollback::after(0),
             admitted: None,
+            abandoned: Vec::new(),
         }
+    }
+
+    /// Once the rollback is done, the trees whose creation it or an earlier statement rollback
+    /// undid: each on its list, its transaction's End appended before them.
+    pub fn abandoned(&self) -> &[PageId] {
+        &self.abandoned
     }
 }
 
@@ -296,6 +351,7 @@ pub struct Commit {
     admitted: Option<Admitted>,
     ts: Option<Ts>,
     durable: Lsn,
+    abandoned: Vec<PageId>,
 }
 
 impl Commit {
@@ -305,7 +361,14 @@ impl Commit {
             admitted: None,
             ts: None,
             durable: 0,
+            abandoned: Vec::new(),
         }
+    }
+
+    /// Once the commit is done, the trees whose creation a statement rollback undid: each on its
+    /// list, the Commit appended before them.
+    pub fn abandoned(&self) -> &[PageId] {
+        &self.abandoned
     }
 }
 
@@ -426,7 +489,38 @@ impl Transactions {
             seen: vec![None; self.slots.len()],
             tail: None,
             log_at: self.log.end(),
+            created: Vec::new(),
+            abandoned: Vec::new(),
         }))
+    }
+
+    /// Creates an empty tree of `class` in `txn`'s current statement, its root's creation record
+    /// leading the group that makes it. A rollback past the statement, or recovery's undo of the
+    /// transaction, puts the root on the plain tree `list`, keyed by its big-endian bytes. Step it
+    /// until done.
+    pub fn create_tree(
+        &self,
+        versions: &Versions,
+        txn: &mut Txn,
+        class: SizeClass,
+        list: PageId,
+    ) -> Result<IOResult<PageId>> {
+        assert!(txn.command > 0, "a tree created before the first statement");
+        let tail = self.tail(txn);
+        let (pool, store) = versions.pool_and_store();
+        let made =
+            Tree::create_logged(pool, store, class, &tail, CREATE, &list.raw().to_le_bytes())?;
+        let (root, start) = match made {
+            IOResult::Done(made) => made,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        txn.logged(start);
+        txn.created.push(Created {
+            statement: txn.command,
+            root,
+            list,
+        });
+        Ok(IOResult::Done(root))
     }
 
     /// Starts `txn`'s next statement. It sees what the transaction's earlier statements wrote, and
@@ -472,7 +566,8 @@ impl Transactions {
                     IOResult::IO(io) => return Ok(IOResult::IO(io)),
                 });
             }
-            let txn = op.txn.take().expect("a transaction");
+            let mut txn = op.txn.take().expect("a transaction");
+            op.abandoned = std::mem::take(&mut txn.abandoned);
             op.durable = match op.admitted.take() {
                 None => txn.log_at,
                 Some(mut admitted) => {
@@ -535,7 +630,8 @@ impl Transactions {
                     writers.finished(slot, id)
                 });
         }
-        let txn = op.txn.take().expect("a transaction");
+        let mut txn = op.txn.take().expect("a transaction");
+        op.abandoned = std::mem::take(&mut txn.abandoned);
         // Every version it wrote is gone: the slot's next transaction may commit.
         self.release(txn.slot);
         Ok(IOResult::Done(()))

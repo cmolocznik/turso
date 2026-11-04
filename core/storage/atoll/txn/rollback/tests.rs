@@ -71,6 +71,24 @@ struct Db {
     versions: Versions,
     /// Two trees of different node classes, so a transaction has a version index of each.
     trees: [VersionedTree; 2],
+    /// The trees besides the two that a test made.
+    more: Lifecycle,
+}
+
+/// What a test made besides the two trees: a plain list that undone creations go on, as the SQL
+/// layer's abandoned list, the trees created and kept, and those a loser created.
+#[derive(Clone, Default)]
+struct Lifecycle {
+    list: Option<PageId>,
+    kept: Vec<PageId>,
+    made: Vec<PageId>,
+}
+
+/// The roots a database's checks walk.
+#[derive(Clone)]
+struct Roots {
+    trees: [PageId; 2],
+    more: Lifecycle,
 }
 
 /// [`config`] with the log buffer at two chunks: under what the rollback of the few dozen changes
@@ -94,19 +112,26 @@ impl Db {
                 Tree::create(&io, db.pool(), db.store(), SizeClass::new(c).unwrap())
             })
         });
-        Self::with(io, db, roots)
+        Self::with(
+            io,
+            db,
+            Roots {
+                trees: roots,
+                more: Lifecycle::default(),
+            },
+        )
     }
 
     /// What a crash left, recovered.
-    fn recover(io: Arc<dyn IO>, roots: [PageId; 2]) -> Self {
+    fn recover(io: Arc<dyn IO>, roots: Roots) -> Self {
         let db = Atoll::open(io.clone(), BASE, config()).unwrap();
         assert!(db.recovered_end().is_some(), "no recovery");
         Self::with(io, db, roots)
     }
 
-    fn with(io: Arc<dyn IO>, db: Atoll, roots: [PageId; 2]) -> Self {
+    fn with(io: Arc<dyn IO>, db: Atoll, roots: Roots) -> Self {
         let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), 4);
-        let trees = roots.map(|root| {
+        let trees = roots.trees.map(|root| {
             VersionedTree::open(io.clone(), db.pool().clone(), db.store().clone(), root)
         });
         Self {
@@ -114,11 +139,15 @@ impl Db {
             db,
             versions,
             trees,
+            more: roots.more,
         }
     }
 
-    fn roots(&self) -> [PageId; 2] {
-        [self.trees[0].root(), self.trees[1].root()]
+    fn roots(&self) -> Roots {
+        Roots {
+            trees: [self.trees[0].root(), self.trees[1].root()],
+            more: self.more.clone(),
+        }
     }
 
     fn txns(&self) -> &Transactions {
@@ -187,13 +216,40 @@ impl Db {
         out
     }
 
-    /// Checks that the pages allocated are exactly the two trees' nodes and values, and those
-    /// handed over to be freed: none leaked, none retired, none freed that is in use.
+    /// Checks that the pages allocated are exactly the trees' nodes and values, and those handed
+    /// over to be freed: none leaked, none retired, none freed that is in use. The trees are the
+    /// two, and those the test made: the list, every tree on it and every tree kept. A tree a
+    /// loser created is allocated exactly when it is on the list, and empty there.
     fn check_whole(&self, label: &str) {
         let mut expected = BTreeSet::new();
-        for tree in &self.trees {
+        let open = |root| self.versions.open_tree(root);
+        let mut more: Vec<VersionedTree> = self.more.kept.iter().map(|&r| open(r)).collect();
+        let mut plain = Vec::new();
+        if let Some(list) = self.more.list {
+            let listed = self.listed(list);
+            for &root in &self.more.made {
+                let allocated = run(&self.io, || self.db.store().entry(root)) != FREE;
+                assert_eq!(
+                    allocated,
+                    listed.contains(&root),
+                    "{label}: the loser's tree {root:?} allocated {allocated}, listed {}",
+                    listed.contains(&root)
+                );
+            }
+            for &root in &listed {
+                let mut check = Check::default();
+                let stats = run(&self.io, || open(root).tree().check(&mut check));
+                if self.more.made.contains(&root) {
+                    assert_eq!(stats.entries, 0, "{label}: {root:?} listed with entries");
+                }
+            }
+            more.extend(listed.into_iter().map(open));
+            plain.push(self.versions.open_plain(list));
+        }
+        let trees = self.trees.iter().chain(&more).map(|t| t.tree());
+        for tree in trees.chain(&plain) {
             let mut check = Check::default();
-            let stats = run(&self.io, || tree.tree().check(&mut check));
+            let stats = run(&self.io, || tree.check(&mut check));
             expected.extend(stats.pages.iter().copied());
             for &v in &stats.values {
                 let pages = run(&self.io, || value::pages(self.db.pool(), v, &|| true));
@@ -222,6 +278,69 @@ impl Db {
             leaked.is_empty() && lost.is_empty(),
             "{label}: pages allocated and unreachable {leaked:?}; reachable and free {lost:?}"
         );
+    }
+
+    /// Makes the plain list that undone creations go on.
+    fn make_list(&mut self) -> PageId {
+        let class = SizeClass::new(0).unwrap();
+        let list = run(&self.io, || {
+            Tree::create(&self.io, self.db.pool(), self.db.store(), class)
+        });
+        self.more.list = Some(list);
+        list
+    }
+
+    /// A tree of `class` created in `txn`'s current statement, undone onto the list.
+    fn create_tree(&self, txn: &mut Txn, class: usize) -> PageId {
+        let (list, class) = (
+            self.more.list.expect("a list"),
+            SizeClass::new(class).unwrap(),
+        );
+        run(&self.io, || {
+            self.txns().create_tree(&self.versions, txn, class, list)
+        })
+    }
+
+    fn put_in(&self, txn: &mut Txn, root: PageId, key: &str, value: &str) {
+        let mut op = WriteOp::put(key.as_bytes(), value.as_bytes().to_vec(), Mode::Upsert);
+        let tree = self.versions.open_tree(root);
+        let write = run(&self.io, || {
+            tree.write(self.txns(), &self.versions, txn, &mut op)
+        });
+        assert!(matches!(write, Write::Done(_)), "{key}: {write:?}");
+    }
+
+    fn get_in(&self, txn: &mut Txn, root: PageId, key: &str) -> Option<String> {
+        let mut op = Get::new(key.as_bytes());
+        let tree = self.versions.open_tree(root);
+        run(&self.io, || {
+            tree.get(self.txns(), &self.versions, txn, &mut op)
+        })
+        .map(|v| String::from_utf8(v).unwrap())
+    }
+
+    /// The roots on `list`, each keyed by its big-endian bytes.
+    fn listed(&self, list: PageId) -> BTreeSet<PageId> {
+        let tree = self.versions.open_plain(list);
+        let mut cursor = Cursor::new();
+        let mut out = BTreeSet::new();
+        let mut more = run(&self.io, || tree.seek(&mut cursor, &[], Seek::Ge));
+        while more {
+            let key = cursor.key().expect("an entry");
+            out.insert(PageId::from_raw(u64::from_be_bytes(
+                key.try_into().unwrap(),
+            )));
+            more = run(&self.io, || tree.next(&mut cursor));
+        }
+        out
+    }
+
+    fn entries(&self, root: PageId) -> usize {
+        let mut check = Check::default();
+        run(&self.io, || {
+            self.versions.open_tree(root).tree().check(&mut check)
+        })
+        .entries
     }
 
     fn checkpoint(&self) -> Superblock {
@@ -285,7 +404,7 @@ fn crashes_in_recovery(path: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn recover_all(
     images: Vec<CrashIO>,
-    roots: [PageId; 2],
+    roots: Roots,
     keys: &[String],
     expected: &BTreeMap<(usize, String), Option<String>>,
     again: usize,
@@ -297,7 +416,7 @@ fn recover_all(
     for (i, image) in images.into_iter().enumerate() {
         let image = Arc::new(image);
         let crashed = (i % again == 0).then(|| image.crash(i as u64));
-        let db = Db::recover(image, roots);
+        let db = Db::recover(image, roots.clone());
         assert_eq!(&db.state(keys), expected, "{label}: image {i}");
         db.check_whole(&format!("{label}: image {i}"));
         out.recoveries += 1;
@@ -308,7 +427,7 @@ fn recover_all(
         let crashed = Arc::new(crashed);
         let from = compensations_in(&crashed, txn);
         crashed.capture(crashes_in_recovery, 40, i as u64);
-        drop(Db::recover(crashed.clone(), roots));
+        drop(Db::recover(crashed.clone(), roots.clone()));
         let in_recovery = crashed.captured();
         assert!(
             !in_recovery.is_empty(),
@@ -329,7 +448,7 @@ fn recover_all(
             if j == deepest {
                 // Crashed in recovery, and that recovery crashed in turn.
                 image.capture(crashes_in_recovery, 40, j as u64);
-                drop(Db::recover(image.clone(), roots));
+                drop(Db::recover(image.clone(), roots.clone()));
                 let deeper = image.captured();
                 let again: Vec<usize> = deeper
                     .iter()
@@ -340,7 +459,7 @@ fn recover_all(
                     out.mid_undo_again += (between(counts[j], from, to)
                         && between(again[k], counts[j], to_again))
                         as usize;
-                    let db = Db::recover(Arc::new(deeper), roots);
+                    let db = Db::recover(Arc::new(deeper), roots.clone());
                     assert_eq!(
                         &db.state(keys),
                         expected,
@@ -350,7 +469,7 @@ fn recover_all(
                     out.recoveries += 1;
                 }
             }
-            let db = Db::recover(image, roots);
+            let db = Db::recover(image, roots.clone());
             assert_eq!(
                 &db.state(keys),
                 expected,
@@ -530,7 +649,7 @@ fn a_value_retired_before_any_copy_of_its_pages_was_written_leaves_the_pool_when
     let roots = db.roots();
     let image = Arc::new(crash_io.crash(0));
     drop(db);
-    let db = Db::recover(image, roots);
+    let db = Db::recover(image, roots.clone());
     assert_eq!(
         db.state(std::slice::from_ref(&key))[&(0, key.clone())],
         Some(large("new", 0))
@@ -746,4 +865,140 @@ fn a_writer_spanning_checkpoints_and_deleted_segments_is_undone_from_the_log_it_
     let r = recover_all(images, db.roots(), &keys, &expected, 3, t.start(), &label);
     println!("{label}: {r:?}");
     drop(t);
+}
+
+/// A rollback to an earlier statement puts on the list the trees its later statements created,
+/// once their changes to them are undone, and keeps the rest with their earlier statements'
+/// changes; a whole rollback puts every tree it created on the list. The commit or rollback that
+/// ends the transaction hands over the trees on the list.
+#[test]
+fn undone_creations_go_on_the_list_and_the_rest_stay_with_their_earlier_changes() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let mut db = Db::create(io);
+    let list = db.make_list();
+    let mut t = db.begin();
+    let a = db.create_tree(&mut t, 0);
+    db.put_in(&mut t, a, "a1", "kept");
+    db.txns().statement(&mut t).unwrap();
+    db.put_in(&mut t, a, "a2", "undone");
+    let b = db.create_tree(&mut t, 1);
+    db.put_in(&mut t, b, "b2", "undone");
+    db.put(&mut t, 0, "k", "undone");
+    db.txns().statement(&mut t).unwrap();
+    let c = db.create_tree(&mut t, 0);
+    db.put_in(&mut t, b, "b3", "undone");
+    db.put_in(&mut t, c, "c3", "undone");
+    db.rollback_to(&mut t, 1);
+    let held: Vec<PageId> = t.created().iter().map(|c| c.root).collect();
+    assert_eq!(held, vec![a]);
+    assert_eq!(t.abandoned(), &[c, b], "newest first");
+    assert_eq!(db.listed(list), BTreeSet::from([b, c]));
+    assert_eq!(db.get_in(&mut t, a, "a1").as_deref(), Some("kept"));
+    assert_eq!(db.get_in(&mut t, a, "a2"), None);
+    assert_eq!(
+        (db.entries(b), db.entries(c)),
+        (0, 0),
+        "their changes undone"
+    );
+    let mut commit = Commit::new(t);
+    run(&db.io, || db.txns().commit(&mut commit));
+    assert_eq!(commit.abandoned(), &[c, b]);
+    db.more.kept.push(a);
+    let mut t = db.begin();
+    let d = db.create_tree(&mut t, 0);
+    db.txns().statement(&mut t).unwrap();
+    db.put_in(&mut t, d, "d2", "undone");
+    let e = db.create_tree(&mut t, 1);
+    let mut abort = Abort::new(t);
+    run(&db.io, || db.txns().rollback(&db.versions, &mut abort));
+    assert_eq!(abort.abandoned(), &[e, d]);
+    assert_eq!(db.listed(list), BTreeSet::from([b, c, d, e]));
+    let mut t = db.begin();
+    assert_eq!(db.get_in(&mut t, a, "a1").as_deref(), Some("kept"));
+    db.commit(t);
+    db.check_whole("after both");
+}
+
+/// A loser that created trees in several statements and wrote them, crashed anywhere, through
+/// recoveries crashed between two of their own compensations: every root it made is on the list,
+/// emptied, exactly when it is allocated, so none leaks; a tree a committed transaction created
+/// stays off the list with its rows; and what was committed reads back.
+#[test]
+fn a_losers_created_trees_go_on_the_list_through_crashes_and_a_committed_ones_stay() {
+    for seed in 0..2u64 {
+        let crash_io = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash_io.clone();
+        let mut db = Db::create(io);
+        db.make_list();
+        let keys: Vec<String> = (0..40).map(|i| format!("k{i:03}")).collect();
+        committed(&db, &keys);
+        let mut t = db.begin();
+        let kept = db.create_tree(&mut t, 0);
+        db.put_in(&mut t, kept, "x", "kept");
+        db.commit(t);
+        db.durable();
+        db.more.kept.push(kept);
+        let expected = db.state(&keys);
+        crash_io.capture(|_| false, 3, seed);
+        let mut t = db.begin();
+        let start = t.start();
+        for s in 0..4 {
+            let root = db.create_tree(&mut t, s % 2);
+            db.more.made.push(root);
+            for (i, key) in keys.iter().enumerate() {
+                db.put_in(&mut t, root, key, &value("made", i));
+                db.put(&mut t, i % 2, key, &value("loser", i));
+            }
+            db.txns().statement(&mut t).unwrap();
+        }
+        db.durable();
+        let mut images = crash_io.captured();
+        images.push(crash_io.crash(seed));
+        let label = format!("seed {seed}, {} images", images.len());
+        let roots = db.roots();
+        let r = recover_all(images, roots.clone(), &keys, &expected, 3, start, &label);
+        println!("{label}: {r:?}");
+        assert!(
+            r.mid_undo > 0,
+            "{label}: no crash inside a recovery's undo: {r:?}"
+        );
+        // The last image holds every creation: each is on the list.
+        let db = Db::recover(Arc::new(crash_io.crash(seed + 1)), roots);
+        let listed = db.listed(db.more.list.unwrap());
+        assert!(db.more.made.iter().all(|r| listed.contains(r)), "{label}");
+        let mut t = db.begin();
+        assert_eq!(db.get_in(&mut t, kept, "x").as_deref(), Some("kept"));
+        db.commit(t);
+    }
+}
+
+/// A creation record leads the group that makes its root: the root's image and its adoption are
+/// in the same group, so no crash keeps one without the other.
+#[test]
+fn a_creation_record_leads_the_group_that_makes_and_adopts_its_root() {
+    use crate::storage::atoll::btree::record::INIT;
+    use crate::storage::atoll::store::kinds::ADOPT;
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let mut db = Db::create(io.clone());
+    let list = db.make_list();
+    let mut t = db.begin();
+    let root = db.create_tree(&mut t, 1);
+    let start = t.start();
+    db.commit(t);
+    let mut reader = Log::reader(io, BASE, &config().log, 0);
+    let mut groups = Vec::new();
+    while let Some(r) = reader.next_record().unwrap() {
+        groups.push(r);
+    }
+    let lead = groups
+        .iter()
+        .position(|r| r.header.kind == CREATE)
+        .expect("a creation record");
+    let group = groups[lead].group;
+    assert_eq!(groups[lead].header.txn, start);
+    assert_eq!(creation(&groups[lead].payload), Some((root, list)));
+    let members: Vec<_> = groups.iter().filter(|r| r.group == group).collect();
+    let kinds: Vec<_> = members.iter().map(|r| r.header.kind).collect();
+    assert_eq!(kinds, vec![CREATE, INIT, ADOPT], "{root:?}");
+    assert!(members[1..].iter().all(|r| r.header.txn == 0));
 }

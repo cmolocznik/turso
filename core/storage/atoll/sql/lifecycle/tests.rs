@@ -180,7 +180,9 @@ impl Db {
         let stats = run(&self.io, || tree.check(&mut check));
         let mut out: BTreeSet<PageId> = stats.pages.iter().copied().collect();
         for &v in &stats.values {
-            let pages = run(&self.io, || value::pages(self.db.atoll().pool(), v, &|| true));
+            let pages = run(&self.io, || {
+                value::pages(self.db.atoll().pool(), v, &|| true)
+            });
             out.extend(pages.unwrap_or_else(|_| panic!("{v:?} lost its pages")));
         }
         out

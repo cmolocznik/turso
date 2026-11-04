@@ -1,6 +1,7 @@
 //! Turso's SQL on Atoll (DESIGN.md §17).
 //!
 //! - [`catalog`]: the system trees at their fixed roots, and the catalog of tree ids.
+//! - [`cursor`]: AtollCursor, a Turso cursor over one SQL tree.
 //! - [`key`]: keys of SQL trees as byte strings in Turso's order.
 //! - [`header`]: the database header's fields as rows.
 //! - [`rowid`]: NewRowid's counters.
@@ -8,6 +9,7 @@
 //! - [`sequence`]: sequence values, changed outside any transaction.
 
 pub mod catalog;
+pub mod cursor;
 pub mod header;
 pub mod key;
 pub mod lifecycle;
@@ -157,6 +159,10 @@ impl AtollDb {
         }
         txns.abort(txn);
         Ok(())
+    }
+
+    pub fn io(&self) -> &Arc<dyn IO> {
+        &self.io
     }
 
     pub fn atoll(&self) -> &Atoll {

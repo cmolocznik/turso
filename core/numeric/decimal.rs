@@ -145,7 +145,7 @@ pub fn numeric_hash<H: Hasher>(value: ValueRef, state: &mut H) {
 }
 
 /// Where a value falls in the numeric type's order.
-enum NumericSortKey<'a> {
+pub(crate) enum NumericSortKey<'a> {
     Null,
     NegativeInfinity,
     Number(BigDecimal),
@@ -155,7 +155,7 @@ enum NumericSortKey<'a> {
 }
 
 impl<'a> NumericSortKey<'a> {
-    fn of(value: ValueRef<'a>) -> Self {
+    pub(crate) fn of(value: ValueRef<'a>) -> Self {
         match value {
             ValueRef::Null => Self::Null,
             ValueRef::Numeric(Numeric::Integer(i)) => Self::Number(BigDecimal::from(i)),

@@ -244,6 +244,12 @@ impl TextCollation {
         matches!(self, Self::Custom(_))
     }
 
+    /// The ICU sort key of `text` under the locale collation `id`: bytes whose order is the
+    /// collation's, for keys that Atoll's trees compare as bytes.
+    pub(crate) fn locale_sort_key(id: LocaleCollationId, text: &str) -> Vec<u8> {
+        LocaleCollationRegistry::global().sort_key(id, text)
+    }
+
     /// Removes a custom collation whose [ExternalCollation] is being dropped.
     pub(crate) fn remove_custom(self) {
         let Self::Custom(number) = self else {

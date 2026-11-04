@@ -1,8 +1,10 @@
 //! Turso's SQL on Atoll (DESIGN.md §17).
 //!
 //! - [`catalog`]: the system trees at their fixed roots, and the catalog of tree ids.
+//! - [`key`]: keys of SQL trees as byte strings in Turso's order.
 
 pub mod catalog;
+pub mod key;
 
 use self::catalog::{ensure_system_trees, key, Catalog, Entry, Layout, System, SCHEMA_ID};
 use super::btree::{Cursor, Mode};

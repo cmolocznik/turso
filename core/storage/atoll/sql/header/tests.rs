@@ -10,6 +10,7 @@ const BASE: &str = "/db/header";
 fn begin(db: &AtollDb, io: &Arc<dyn IO>) -> Txn {
     let txns = db.atoll().transactions();
     let mut t = drive(io, || txns.begin(Isolation::Snapshot)).unwrap();
+    crate::storage::atoll::testing::share(txns, &mut t);
     txns.statement(&mut t).unwrap();
     t
 }

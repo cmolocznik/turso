@@ -69,12 +69,11 @@ pub const SCHEMA_ID: u64 = 1;
 pub enum Layout {
     /// A rowid table: 8-byte keys.
     Table = 1,
-    /// An index: encoded columns, then the rowid where the index has one.
+    /// An index or a WITHOUT ROWID table, both index b-trees as in SQLite: encoded columns, then
+    /// the rowid where the tree has one, which its `IndexInfo` says.
     Index = 2,
-    /// A WITHOUT ROWID table: its encoded key columns.
-    WithoutRowid = 3,
     /// A sequence: no tree of its own, its value a row of the sequences tree.
-    Sequence = 4,
+    Sequence = 3,
 }
 
 impl Layout {
@@ -82,8 +81,7 @@ impl Layout {
         match b {
             1 => Some(Layout::Table),
             2 => Some(Layout::Index),
-            3 => Some(Layout::WithoutRowid),
-            4 => Some(Layout::Sequence),
+            3 => Some(Layout::Sequence),
             _ => None,
         }
     }

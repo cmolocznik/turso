@@ -19,7 +19,7 @@ use rand_chacha::ChaCha8Rng;
 use turso_parser::ast::SortOrder;
 
 const BASE: &str = "/db/cursor";
-const ENCODING: u32 = 1;
+use super::key::ENCODING;
 
 fn run<T>(io: &Arc<dyn IO>, op: impl FnMut() -> Result<IOResult<T>>) -> T {
     drive(io, op).unwrap()
@@ -40,6 +40,7 @@ impl Db {
     fn begin(&self) -> TxnCell {
         let txns = self.db.atoll().transactions();
         let mut t = run(&self.io, || txns.begin(Isolation::Snapshot));
+        crate::storage::atoll::testing::share(txns, &mut t);
         txns.statement(&mut t).unwrap();
         Arc::new(Mutex::new(Some(t)))
     }
@@ -457,6 +458,7 @@ impl Db {
     fn begin_rc(&self) -> TxnCell {
         let txns = self.db.atoll().transactions();
         let mut t = run(&self.io, || txns.begin(Isolation::ReadCommitted));
+        crate::storage::atoll::testing::share(txns, &mut t);
         txns.statement(&mut t).unwrap();
         Arc::new(Mutex::new(Some(t)))
     }

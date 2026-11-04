@@ -78,6 +78,16 @@ pub(super) fn schedules(test: impl Fn() + Send + Sync + 'static, iterations: usi
     .run(move || test());
 }
 
+/// Takes the write gate shared for `txn`, as Turso's Transaction opcode does for a writing
+/// statement: a test's writer needs it once its database requires the gate.
+pub(super) fn share(txns: &super::txn::Transactions, txn: &mut super::txn::Txn) {
+    let c = crate::io::Completion::new_wait();
+    assert!(
+        matches!(txns.take_shared(txn, &c).unwrap(), super::txn::Taken::Done),
+        "a test writer took the gate behind another"
+    );
+}
+
 /// The page numbers of `class` the store can have handed out: every page it holds is below the
 /// page table's capacity at its height now. A test that finds a store's pages scans this far,
 /// never stopping at a run of free numbers, which a drained tree leaves as long as it was.

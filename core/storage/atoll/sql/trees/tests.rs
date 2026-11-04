@@ -156,6 +156,7 @@ fn a_drained_tree_forgets_its_stamp() {
     let db = Db::open();
     let txns = db.db.atoll().transactions();
     let mut t = db.begin();
+    crate::storage::atoll::testing::share(txns, &mut t);
     let root = drive(&db.io, || {
         db.db.create_tree(&mut t, SizeClass::new(0).unwrap())
     })
@@ -167,4 +168,19 @@ fn a_drained_tree_forgets_its_stamp() {
     db.db.abandoned(abort.abandoned());
     drive(&db.io, || db.db.drain()).unwrap();
     assert!(db.db.stamps().is_empty(), "a drained tree's stamp kept");
+}
+
+/// A database Turso's SQL opens requires the write gate of every writer, judged at the write: a
+/// statement that missed its take fails where its cause is, not at the commit.
+#[test]
+#[should_panic(expected = "a write without the write gate")]
+fn a_write_without_the_gate_fails_at_the_write() {
+    let db = Db::open();
+    let tree = db.tree();
+    let mut t = db.begin();
+    let txns = db.db.atoll().transactions();
+    let mut op = WriteOp::put(b"k", b"v".to_vec(), Mode::Upsert);
+    let _ = drive(&db.io, || {
+        tree.write(txns, db.db.versions(), &mut t, &mut op)
+    });
 }

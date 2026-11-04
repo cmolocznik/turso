@@ -168,6 +168,7 @@ fn catalog_rows_are_versioned_and_ids_are_drawn_above_them() {
     };
     let begin = || {
         let mut t = drive(&io, || txns.begin(Isolation::Snapshot)).unwrap();
+        crate::storage::atoll::testing::share(txns, &mut t);
         txns.statement(&mut t).unwrap();
         t
     };
@@ -181,7 +182,7 @@ fn catalog_rows_are_versioned_and_ids_are_drawn_above_them() {
     commit(a);
     let mut before = begin();
     let mut b = begin();
-    write(&mut b, id, Some(entry(2, Layout::WithoutRowid)));
+    write(&mut b, id, Some(entry(2, Layout::Table)));
     let rolled = db.draw_tree_id();
     write(&mut b, rolled, Some(entry(3, Layout::Table)));
     let mut rollback = crate::storage::atoll::txn::Abort::new(b);

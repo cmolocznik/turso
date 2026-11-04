@@ -32,6 +32,10 @@ use bigdecimal::{BigDecimal, Zero};
 use num_bigint::Sign;
 use turso_parser::ast::{NullsOrder, SortOrder};
 
+/// The encoding revision this build writes, recorded on every tree with encoded keys (DESIGN.md
+/// §17): any change to the bytes of an encoding bumps it.
+pub const ENCODING: u32 = 1;
+
 /// A NULL that sorts before every value of its column.
 pub const NULL_FIRST: u8 = 0x01;
 /// A NULL that sorts after every value of its column.

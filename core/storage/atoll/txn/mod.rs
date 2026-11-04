@@ -305,6 +305,9 @@ pub struct Txn {
     /// Whether it has taken its snapshot: an exclusive taker begun without one takes it after the
     /// drain.
     snapped: bool,
+    /// Whether its database requires writers to hold the write gate
+    /// ([`Transactions::require_gate`]): then it logs only under a hold.
+    gated: bool,
 }
 
 impl Txn {
@@ -340,6 +343,14 @@ impl Txn {
 
     /// Notes the transaction's group appended at `start`.
     pub fn logged(&mut self, start: GroupStart) {
+        assert!(
+            !self.gated
+                || matches!(
+                    self.hold,
+                    Hold::Shared | Hold::Exclusive { .. } | Hold::Pending { shared: true, .. }
+                ),
+            "a write without the write gate"
+        );
         debug_assert!(self.tail.is_none_or(|t| t < start));
         self.tail = Some(start);
     }
@@ -612,6 +623,7 @@ impl Transactions {
             hold: Hold::None,
             wrote_schema: false,
             snapped: false,
+            gated: self.gated.load(std::sync::atomic::Ordering::Acquire),
         }))
     }
 

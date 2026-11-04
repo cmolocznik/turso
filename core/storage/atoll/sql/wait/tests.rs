@@ -236,6 +236,7 @@ mod plain {
         fn begin(&self, group: GroupId) -> Txn {
             let txns = self.db.atoll().transactions();
             let mut t = drive(&self.io, || txns.begin_in(Isolation::ReadCommitted, group)).unwrap();
+            crate::storage::atoll::testing::share(txns, &mut t);
             txns.statement(&mut t).unwrap();
             t
         }

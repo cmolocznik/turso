@@ -40,8 +40,9 @@ impl Field {
         Field::IncrementalVacuum,
     ];
 
-    /// The value of a field no transaction has written: SQLite's for a new database, schema format
-    /// 4 and text encoding 1, UTF-8.
+    /// The value of a field no transaction has written: the word SQLite's header holds for a new
+    /// database, schema format 4 and text encoding 1, UTF-8. A field holds its header word as is:
+    /// a default cache size of 0 reads as −2000, as Turso's `CacheSize` reads it on disk.
     pub fn default(self) -> u32 {
         match self {
             Field::SchemaFormat => 4,

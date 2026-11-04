@@ -32,6 +32,7 @@ impl Db {
     fn begin(&self) -> Txn {
         let txns = self.db.atoll().transactions();
         let mut t = drive(&self.io, || txns.begin(Isolation::Snapshot)).unwrap();
+        crate::storage::atoll::testing::share(txns, &mut t);
         txns.statement(&mut t).unwrap();
         t
     }

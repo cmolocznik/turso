@@ -74,6 +74,8 @@ impl AtollDb {
     pub fn open(io: Arc<dyn IO>, path: &str, config: AtollConfig) -> Result<Self> {
         let slots = config.txn.slots;
         let atoll = Atoll::open(io.clone(), path, config)?;
+        // Turso's SQL writes only under the write gate (DESIGN.md §17), its open's own included.
+        atoll.transactions().require_gate();
         drive(&io, || {
             ensure_system_trees(&io, atoll.pool(), atoll.store())
         })?;

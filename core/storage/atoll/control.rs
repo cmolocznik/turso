@@ -10,6 +10,12 @@
 //!
 //! A superblock whole but of a version this build does not know fails the open: it is neither
 //! absent nor torn, and the superblock before it may lack what that one recorded.
+//!
+//! A file with no superblock in charge is created over only when it holds nothing a database
+//! wrote ([`judge`]): it is empty, or it is a creation a crash cut short. Creation writes its first
+//! superblock, seq 1, to the second slot while the first was never written, so its first slot is
+//! all zeros and its second starts with zeros or the magic, however the write tore. Every other
+//! file, a SQLite database among them, is refused and never written.
 
 use super::aligned::AlignedBlock;
 use super::log::{GroupStart, Lsn};
@@ -151,8 +157,76 @@ pub struct Control {
     file: Arc<dyn File>,
 }
 
+/// What a control file holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// No database: an empty file, or a creation a crash cut short before its superblock was whole.
+    Nothing,
+    /// A database, and its superblock in charge.
+    Database(Superblock),
+}
+
+/// What the file at a database's path holds, read without writing it: an error for a file that
+/// is no Atoll control file. Turso's open asks this before it opens a database in Atoll mode.
+pub fn judge(io: &Arc<dyn IO>, file: &Arc<dyn File>) -> Result<Found> {
+    let len = file.size()?;
+    if len > 2 * SIZE as u64 {
+        return Err(not_atoll(&format!(
+            "{len} bytes, past a control file's {}",
+            2 * SIZE
+        )));
+    }
+    let block = Arc::new(AlignedBlock::zeroed(2 * SIZE));
+    // The bytes read, set once the read lands.
+    let got = Arc::new(AtomicUsize::new(0));
+    let out = got.clone();
+    let c = Completion::new_read(block.region(0, 2 * SIZE), move |res| match res {
+        Ok((_, n)) => {
+            out.store(n.max(0) as usize, Ordering::Release);
+            None
+        }
+        Err(e) => Some(e),
+    });
+    io.wait_for_completion(file.pread(0, c)?)?;
+    let read = got.load(Ordering::Acquire).min(len as usize);
+    // SAFETY: the read filled the block, which nothing else uses.
+    let bytes = unsafe { std::slice::from_raw_parts(block.as_ptr(), 2 * SIZE) };
+    judge_bytes(&bytes[..read])
+}
+
+/// [`judge`] over the bytes a control file holds.
+fn judge_bytes(bytes: &[u8]) -> Result<Found> {
+    let mut newest: Option<Superblock> = None;
+    for i in (0..2).filter(|i| bytes.len() >= (i + 1) * SIZE) {
+        if let Some(sb) = Superblock::decode(&bytes[i * SIZE..(i + 1) * SIZE])? {
+            if newest.as_ref().is_none_or(|n| sb.seq > n.seq) {
+                newest = Some(sb);
+            }
+        }
+    }
+    if let Some(sb) = newest {
+        return Ok(Found::Database(sb));
+    }
+    let first = &bytes[..bytes.len().min(SIZE)];
+    let second = bytes.get(SIZE..(SIZE + 8).min(bytes.len())).unwrap_or(&[]);
+    let magic = &MAGIC.to_le_bytes()[..second.len()];
+    if first.iter().all(|&b| b == 0) && (second.iter().all(|&b| b == 0) || second == magic) {
+        return Ok(Found::Nothing);
+    }
+    Err(not_atoll(
+        "no superblock, and bytes no creation of one writes",
+    ))
+}
+
+fn not_atoll(why: &str) -> LimboError {
+    LimboError::Corrupt(format!(
+        "the file at the database's path is not an Atoll database ({why}); it was left as it is"
+    ))
+}
+
 impl Control {
-    /// Opens the control file at `path` and returns the superblock in charge, if any.
+    /// Opens the control file at `path` and returns the superblock in charge, if any. A file that
+    /// is no Atoll control file fails the open and is left as it is ([`judge`]).
     pub fn open(io: Arc<dyn IO>, path: &str) -> Result<(Self, Option<Superblock>)> {
         let file = io.open_file(path, OpenFlags::Create | OpenFlags::Direct, false)?;
         // The control file's creation must survive a crash as its superblocks do.
@@ -161,29 +235,10 @@ impl Control {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
         io.sync_directory(&dir)?;
-        let block = Arc::new(AlignedBlock::zeroed(2 * SIZE));
-        // The bytes read, set once the read lands.
-        let got = Arc::new(AtomicUsize::new(0));
-        let out = got.clone();
-        let c = Completion::new_read(block.region(0, 2 * SIZE), move |res| match res {
-            Ok((_, n)) => {
-                out.store(n.max(0) as usize, Ordering::Release);
-                None
-            }
-            Err(e) => Some(e),
-        });
-        io.wait_for_completion(file.pread(0, c)?)?;
-        let read = got.load(Ordering::Acquire);
-        // SAFETY: the read filled the block, which nothing else uses.
-        let bytes = unsafe { std::slice::from_raw_parts(block.as_ptr(), 2 * SIZE) };
-        let mut newest: Option<Superblock> = None;
-        for i in (0..2).filter(|i| read >= (i + 1) * SIZE) {
-            if let Some(sb) = Superblock::decode(&bytes[i * SIZE..(i + 1) * SIZE])? {
-                if newest.as_ref().is_none_or(|n| sb.seq > n.seq) {
-                    newest = Some(sb);
-                }
-            }
-        }
+        let newest = match judge(&io, &file)? {
+            Found::Nothing => None,
+            Found::Database(sb) => Some(sb),
+        };
         Ok((Self { io, file }, newest))
     }
 
@@ -407,6 +462,89 @@ mod tests {
             crash.set_faults(Faults::default());
             let (_, newest) = Control::open(io, "/db/short").unwrap();
             assert_eq!(newest, Some(superblock(1)));
+        }
+    }
+
+    /// A creation cut short leaves its first superblock torn at any of its sectors, each landed or
+    /// not, over a file of any length up to it: every such file reads as nothing, to create again.
+    #[test]
+    fn a_creation_torn_at_any_sectors_reads_as_nothing() {
+        let sectors = SIZE / crate::io::crash::SECTOR;
+        let first = superblock(1).encode();
+        for landed in 0u32..1 << sectors {
+            let mut bytes = vec![0u8; 2 * SIZE];
+            for i in (0..sectors).filter(|i| landed & 1 << i != 0) {
+                let at = i * crate::io::crash::SECTOR;
+                bytes[SIZE + at..SIZE + at + crate::io::crash::SECTOR]
+                    .copy_from_slice(&first[at..at + crate::io::crash::SECTOR]);
+            }
+            // A sector left unwritten that the superblock holds as zeros leaves it whole all the
+            // same.
+            let whole = bytes[SIZE..] == first[..];
+            for len in [0, SIZE, SIZE + 8, SIZE + 100, 2 * SIZE] {
+                let found = judge_bytes(&bytes[..len]).unwrap();
+                if whole && len == 2 * SIZE {
+                    assert_eq!(found, Found::Database(superblock(1)));
+                } else {
+                    assert_eq!(
+                        found,
+                        Found::Nothing,
+                        "sectors {landed:#b} over {len} bytes"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A file no creation writes is refused and left as it is: a SQLite database, a file longer
+    /// than two superblocks, and a second slot that starts with neither zeros nor the magic.
+    #[test]
+    fn a_file_no_atoll_creation_writes_is_refused_and_left_as_it_is() {
+        let mut sqlite = vec![0u8; SIZE];
+        sqlite[..16].copy_from_slice(b"SQLite format 3\0");
+        let mut foreign = vec![0u8; 2 * SIZE];
+        foreign[SIZE] = 1;
+        for (path, bytes) in [
+            ("/db/sqlite", sqlite),
+            ("/db/long", vec![0u8; 3 * SIZE]),
+            ("/db/foreign", foreign),
+        ] {
+            let io: Arc<dyn IO> = Arc::new(CrashIO::new(7));
+            let file = io.open_file(path, OpenFlags::Create, false).unwrap();
+            let buffer = Arc::new(crate::io::Buffer::new(bytes.clone()));
+            let c = Completion::new_write(|_| {});
+            io.wait_for_completion(file.pwrite(0, buffer, c).unwrap())
+                .unwrap();
+            let err = match Control::open(io.clone(), path) {
+                Ok(_) => panic!("{path} opened as a control file"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("not an Atoll database"),
+                "{path}: {err}"
+            );
+            let err = super::super::db::Atoll::open(
+                io.clone(),
+                path,
+                super::super::db::AtollConfig::with_budget(super::super::buffer::MIN_BUDGET),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{path} opened as a database"));
+            assert!(
+                err.to_string().contains("not an Atoll database"),
+                "{path}: {err}"
+            );
+            assert_eq!(
+                file.size().unwrap(),
+                bytes.len() as u64,
+                "{path} changed size"
+            );
+            let back = Arc::new(AlignedBlock::zeroed(bytes.len()));
+            let c = Completion::new_read(back.region(0, bytes.len()), |_| None);
+            io.wait_for_completion(file.pread(0, c).unwrap()).unwrap();
+            // SAFETY: the read filled the block, which nothing else uses.
+            let read = unsafe { std::slice::from_raw_parts(back.as_ptr(), bytes.len()) };
+            assert_eq!(read, &bytes[..], "{path} was written");
         }
     }
 }

@@ -26,6 +26,7 @@ fn nextval(v: Value) -> Result<Value> {
 fn begin(db: &AtollDb, io: &Arc<dyn IO>) -> Txn {
     let txns = db.atoll().transactions();
     let mut t = run(io, || txns.begin(Isolation::Snapshot));
+    crate::storage::atoll::testing::share(txns, &mut t);
     txns.statement(&mut t).unwrap();
     t
 }

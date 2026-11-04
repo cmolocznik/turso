@@ -116,7 +116,7 @@ impl PageId {
         self.0
     }
 
-    pub fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 

@@ -15,6 +15,8 @@
 //!             old
 //! restore:    pid | root: u64 | statement: u32 | undid: u64 | out: u8 | key_len: u16 | key | value
 //! unput:      pid | root: u64 | statement: u32 | undid: u64 | key
+//! unbranch:   pid | child: u64            an inner node losing its first child, or, with no key
+//!                                         left, the child after its keys ([`super::Drain`])
 //! ```
 //!
 //! A transaction's insert and update also name the tree, by its root, and an update carries the
@@ -48,10 +50,11 @@ pub const TXN_INSERT: Kind = Kind::new(17).unwrap();
 pub const TXN_UPDATE: Kind = Kind::new(18).unwrap();
 pub const RESTORE: Kind = Kind::new(21).unwrap();
 pub const UNPUT: Kind = Kind::new(22).unwrap();
+pub const UNBRANCH: Kind = Kind::new(26).unwrap();
 
 pub fn owns(kind: Kind) -> bool {
     (INIT.get()..=BRANCH.get()).contains(&kind.get())
-        || [TXN_INSERT, TXN_UPDATE, RESTORE, UNPUT].contains(&kind)
+        || [TXN_INSERT, TXN_UPDATE, RESTORE, UNPUT, UNBRANCH].contains(&kind)
 }
 
 /// What a compensation record completed: every change its transaction's `statement` made to its
@@ -118,6 +121,11 @@ pub enum Change<'a> {
         right: PageId,
         sep: &'a [u8],
     },
+    /// An inner node's first child removed, or, once it has no key, the child after its keys,
+    /// which leaves it [`node::NO_CHILD`].
+    Unbranch {
+        child: PageId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +149,7 @@ impl<'a> Record<'a> {
             Change::Update { undo: Some(_), .. } => TXN_UPDATE,
             Change::Split { .. } => SPLIT,
             Change::Branch { .. } => BRANCH,
+            Change::Unbranch { .. } => UNBRANCH,
             Change::Restore { .. } => RESTORE,
             Change::Unput { .. } => UNPUT,
         }
@@ -217,6 +226,7 @@ impl<'a> Record<'a> {
                 out.extend(right.raw().to_le_bytes());
                 out.extend_from_slice(sep);
             }
+            Change::Unbranch { child } => out.extend(child.raw().to_le_bytes()),
         }
         out
     }
@@ -328,6 +338,10 @@ impl<'a> Record<'a> {
                 }
             }
             k if k == REMOVE => Change::Remove { key: rest },
+            k if k == UNBRANCH && payload.len() == 16 => Change::Unbranch {
+                child: PageId::from_raw(word(8)?),
+            },
+            k if k == UNBRANCH => return Err(bad()),
             k if k == SPLIT => Change::Split {
                 right: PageId::from_raw(word(8)?),
                 keep: u16::from_le_bytes(payload.get(16..18).ok_or_else(bad)?.try_into().unwrap())
@@ -394,6 +408,7 @@ impl<'a> Record<'a> {
                 _ => Err(corrupt("update")),
             },
             Change::Split { right, keep, sep } => split(page, *right, *keep, sep),
+            Change::Unbranch { child } => unbranch(page, *child),
             Change::Branch { left, right, sep } => {
                 let v = View::new(&*page);
                 let (pos, exact) = v.search(sep).ok_or_else(|| corrupt("branch"))?;
@@ -420,6 +435,26 @@ fn encode_compensation(out: &mut Vec<u8>, of: &Compensation) {
 /// Keeps the first `keep` entries of the node in `page`, up to `sep`: a leaf's right neighbour
 /// becomes `right`, and an inner node's rightmost child becomes the child of entry `keep`, whose
 /// key `sep` is. Checked and made in place.
+/// Removes `child` from the inner node `page`: its first keyed child, or, once it has no key, the
+/// child after its keys.
+fn unbranch<P: BytesMut + ?Sized>(page: &mut P, child: PageId) -> Result<()> {
+    let v = View::new(&*page);
+    if !v.is_node() || v.is_leaf() || child == node::NO_CHILD {
+        return Err(corrupt("unbranch"));
+    }
+    match v.count() {
+        Some(0) if v.next().0 == child => {
+            node::set_next(page, node::NO_CHILD, 0);
+            Ok(())
+        }
+        Some(n) if n > 0 && v.child(0).map(|c| c.0) == Some(child) => {
+            node::remove(page, 0);
+            Ok(())
+        }
+        _ => Err(corrupt("unbranch")),
+    }
+}
+
 fn split<P: BytesMut + ?Sized>(page: &mut P, right: PageId, keep: usize, sep: &[u8]) -> Result<()> {
     let v = View::new(&*page);
     let count = v.count().ok_or_else(|| corrupt("split"))?;
@@ -488,6 +523,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An unbranch reads back as written, removes an inner node's first child, then, with no key
+    /// left, the child after its keys, and refuses any other child, a leaf, and "no child" itself.
+    #[test]
+    fn an_unbranch_removes_the_first_child_then_the_last_and_nothing_else() {
+        let pid = PageId::from_raw(77);
+        let record = |child| Record {
+            pid,
+            change: Change::Unbranch { child },
+        };
+        let bytes = record(PageId::from_raw(3)).encode();
+        assert_eq!(
+            Record::decode(UNBRANCH, &bytes).unwrap(),
+            Some(record(PageId::from_raw(3)))
+        );
+        assert!(Record::decode(UNBRANCH, &bytes[..15]).is_err());
+        assert!(Record::decode(UNBRANCH, &[bytes.as_slice(), &[0]].concat()).is_err());
+        let (a, b, c) = (
+            PageId::from_raw(1),
+            PageId::from_raw(2),
+            PageId::from_raw(3),
+        );
+        let layout = |level, next| node::Layout {
+            root: pid,
+            level,
+            lower: None,
+            upper: None,
+            next: (next, 0),
+        };
+        let entries = [
+            node::Entry::child(b"m".to_vec(), a, 0),
+            node::Entry::child(b"t".to_vec(), b, 0),
+        ];
+        let mut page = vec![0u8; 4096];
+        node::build(page.as_mut_slice(), &layout(1, c), &entries);
+        assert!(
+            record(b).apply(page.as_mut_slice()).is_err(),
+            "not the first"
+        );
+        assert!(record(c).apply(page.as_mut_slice()).is_err(), "keys left");
+        for (child, left) in [(a, 1), (b, 0)] {
+            record(child).apply(page.as_mut_slice()).unwrap();
+            let v = View::new(page.as_slice());
+            assert_eq!((v.count(), v.next().0), (Some(left), c));
+        }
+        record(c).apply(page.as_mut_slice()).unwrap();
+        assert_eq!(View::new(page.as_slice()).next().0, node::NO_CHILD);
+        assert!(
+            record(c).apply(page.as_mut_slice()).is_err(),
+            "no child left"
+        );
+        assert!(record(node::NO_CHILD).apply(page.as_mut_slice()).is_err());
+        let mut leaf = vec![0u8; 4096];
+        node::build(leaf.as_mut_slice(), &layout(0, PageId::from_raw(0)), []);
+        assert!(record(a).apply(leaf.as_mut_slice()).is_err(), "a leaf");
     }
 
     /// A transaction's update reads back with the entry its statement found, inline, out of line

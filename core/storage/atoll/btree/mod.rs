@@ -35,6 +35,8 @@ pub mod node;
 pub mod record;
 pub mod value;
 
+pub use drain::{Drain, Drained};
+
 #[cfg(test)]
 mod tests;
 
@@ -94,6 +96,9 @@ macro_rules! done {
         }
     };
 }
+
+// Declared after the macros it uses, which macro_rules scopes by position.
+mod drain;
 
 /// How a descent routes at inner nodes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -841,7 +846,8 @@ impl Tree {
             if !done!(op.old_pages(&self.pool, self.head, &present, &|| leaf.validate())) {
                 continue;
             }
-            let abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
+            let mut abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
+            abandon.extend(&op.also);
             let unit = op.compensation.map_or(0, |_| COMPENSATION);
             let len = framed_len(8 + unit + op.key.len()) + store_len(&abandon);
             if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
@@ -882,6 +888,7 @@ impl Tree {
             if let Some((_, old)) = op.old.take() {
                 self.free_abandoned(old)?;
             }
+            self.free_abandoned(std::mem::take(&mut op.also))?;
             if !underfull {
                 return Ok(IOResult::Done(true));
             }
@@ -1972,6 +1979,8 @@ pub struct Remove {
     txn: Option<TxnTail>,
     group: Option<GroupStart>,
     compensation: Option<Compensation>,
+    /// Pages abandoned in the removal's group, and freed after it.
+    also: Vec<PageId>,
 }
 
 impl Remove {
@@ -1986,7 +1995,15 @@ impl Remove {
             txn: None,
             group: None,
             compensation: None,
+            also: Vec::new(),
         }
+    }
+
+    /// Abandons `pids` in the removal's group and frees them after it: pages what the entry named
+    /// leaves behind, gone with it.
+    pub fn abandoning(mut self, pids: Vec<PageId>) -> Self {
+        self.also = pids;
+        self
     }
 
     /// Logs the removal as `tail`'s compensation `of` (DESIGN.md §11.5), of a key that had no

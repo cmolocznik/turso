@@ -392,7 +392,8 @@ pub(crate) fn undo_loser(
             | Change::Init { .. }
             | Change::Remove { .. }
             | Change::Split { .. }
-            | Change::Branch { .. } => continue,
+            | Change::Branch { .. }
+            | Change::Unbranch { .. } => continue,
         };
         let statement = Version::decode(wrote.0.get(..HEADER).unwrap_or(&[]))
             .ok_or_else(|| corrupt("a change whose value holds no version header".into()))?

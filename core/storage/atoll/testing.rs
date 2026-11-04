@@ -77,3 +77,11 @@ pub(super) fn schedules(test: impl Fn() + Send + Sync + 'static, iterations: usi
     )
     .run(move || test());
 }
+
+/// The page numbers of `class` the store can have handed out: every page it holds is below the
+/// page table's capacity at its height now. A test that finds a store's pages scans this far,
+/// never stopping at a run of free numbers, which a drained tree leaves as long as it was.
+pub(super) fn page_numbers(store: &super::store::PageStore, class: super::page::SizeClass) -> u64 {
+    let map = super::meta::Tree::Map;
+    super::radix::capacity(map, store.heights()[map as usize][class.index()])
+}

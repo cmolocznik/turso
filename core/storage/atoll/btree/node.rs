@@ -623,6 +623,10 @@ pub fn shape<P: Bytes + ?Sized>(page: &P) -> Shape {
     }
 }
 
+/// The child an inner node is left with once a drain has removed its last ([`super::Drain`]). Its
+/// class byte is no size class's, so it names no page.
+pub const NO_CHILD: PageId = PageId::from_raw(u64::MAX);
+
 pub fn set_next<P: BytesMut + ?Sized>(page: &mut P, pid: PageId, hint: u32) {
     page.put_u64(NEXT, pid.raw());
     page.put_u32(NEXT_HINT, hint);

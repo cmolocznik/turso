@@ -32,7 +32,7 @@
 //! others follow the chain to what the statement found, so its pages go at once. The change then
 //! logs the entry its statement found as what undoes it, which a rollback put back already.
 
-use super::{Isolation, Statement, Transactions, Ts, Txn, Writer};
+use super::{Blocker, Isolation, Statement, Transactions, Ts, Txn, Writer};
 use crate::io::IO;
 use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
 use crate::storage::atoll::btree::{Lookup, Mode, Outcome, Put, Stored, StoredValue, Tree};
@@ -299,9 +299,9 @@ pub struct VersionedTree {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Write {
     Done(Outcome),
-    /// The newest version is another transaction's, still open, in this slot: wait for it to end
-    /// and write again.
-    Wait(u16),
+    /// The newest version is another transaction's, still open: wait for it to end and write
+    /// again ([`Transactions::wait_end`]).
+    Wait(Blocker),
     /// The newest version was committed after the snapshot: under snapshot isolation the
     /// transaction cannot write it.
     Conflict,
@@ -552,7 +552,13 @@ impl VersionedTree {
                 #[cfg(test)]
                 versions.stop_here();
                 match txns.writer(v.slot, v.ts) {
-                    Writer::Open => return Ok(IOResult::Done(Write::Wait(v.slot))),
+                    Writer::Open => {
+                        let blocker = Blocker {
+                            slot: v.slot,
+                            start: v.ts,
+                        };
+                        return Ok(IOResult::Done(Write::Wait(blocker)));
+                    }
                     // A rollback puts back every version before its slot is free: read again.
                     Writer::Gone if gone != Some(v) => {
                         gone = Some(v);

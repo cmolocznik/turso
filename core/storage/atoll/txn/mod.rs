@@ -46,6 +46,7 @@ mod sync {
     pub(super) use loom::sync::atomic::{fence, AtomicU64, Ordering};
 }
 
+mod ends;
 mod horizon;
 use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
@@ -230,6 +231,17 @@ pub struct Transactions {
     free: Box<[AtomicU64]>,
     /// Waiting for a free slot, woken to look again whenever one is freed.
     slot_waits: Stack<Completion>,
+    /// Per slot, its transactions' end waiters ([`ends`]).
+    ends: Box<[CachePadded<ends::Ends>]>,
+    /// Per slot, the group its transaction belongs to; 0 for none.
+    owner: Box<[CachePadded<AtomicU64>]>,
+}
+
+/// The transaction a write met with a version still open: what it waits for the end of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blocker {
+    pub slot: u16,
+    pub start: Ts,
 }
 
 /// Where the writer of a version stands.
@@ -408,6 +420,12 @@ impl Transactions {
                 })
                 .collect(),
             slot_waits: Stack::default(),
+            ends: (0..config.slots)
+                .map(|_| CachePadded::new(ends::Ends::default()))
+                .collect(),
+            owner: (0..config.slots)
+                .map(|_| CachePadded::new(AtomicU64::new(0)))
+                .collect(),
             clock,
             log,
         }
@@ -460,8 +478,14 @@ impl Transactions {
         None
     }
 
-    /// Begins a transaction once a slot is free.
+    /// Begins a transaction of no group once a slot is free.
     pub fn begin(&self, isolation: Isolation) -> Result<IOResult<Txn>> {
+        self.begin_in(isolation, 0)
+    }
+
+    /// Begins a transaction of `group` once a slot is free: a wait on it is a wait on the group
+    /// ([`holder`](Self::holder)).
+    pub fn begin_in(&self, isolation: Isolation, group: u64) -> Result<IOResult<Txn>> {
         let slot = match self.take_slot() {
             Some(slot) => slot,
             None => {
@@ -477,7 +501,12 @@ impl Transactions {
             }
         };
         let start = self.clock.next();
-        self.running[slot as usize].store(start, Ordering::Release);
+        ends::seat(
+            &self.running[slot as usize],
+            &self.owner[slot as usize],
+            start,
+            group,
+        );
         // The snapshot before the log's end: every commit it covers is in the log by then.
         let snapshot = self.horizon.at();
         Ok(IOResult::Done(Txn {
@@ -650,6 +679,9 @@ impl Transactions {
         if let IOResult::IO(io) = rollback::undo(self, versions, txn, op)? {
             return Ok(IOResult::IO(io));
         }
+        // Its keys are put back with the transaction still running: whoever waited on it judges
+        // them again.
+        self.ends[txn.slot as usize].wake();
         self.statement(txn)?;
         Ok(IOResult::Done(()))
     }
@@ -668,14 +700,28 @@ impl Transactions {
         }
     }
 
+    /// Registers `c` to be completed at the end of `blocker`'s transaction, or when a statement
+    /// rollback of it puts keys back. The caller then steps its write again, and parks on `c` only
+    /// if it waits on the same blocker still. A wait reuses its completion while it is unfinished.
+    pub fn wait_end(&self, blocker: Blocker, c: &Completion) {
+        self.ends[blocker.slot as usize].register(c);
+    }
+
+    /// The group of `blocker`'s transaction while it runs; `None` once it has ended.
+    pub fn holder(&self, blocker: Blocker) -> Option<u64> {
+        let slot = blocker.slot as usize;
+        ends::holder(&self.running[slot], &self.owner[slot], blocker.start)
+    }
+
     fn release(&self, slot: u16) {
-        self.running[slot as usize].store(0, Ordering::Release);
+        ends::vacate(&self.running[slot as usize], &self.owner[slot as usize]);
         self.free[slot as usize / 64].fetch_or(1 << (slot % 64), Ordering::AcqRel);
         // Pairs with the fence of a waiter: either this finds it, or it finds the slot.
         fence(Ordering::SeqCst);
         for c in self.slot_waits.take_all() {
             c.complete(0);
         }
+        self.ends[slot as usize].wake();
     }
 }
 

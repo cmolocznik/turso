@@ -1,5 +1,5 @@
 use super::*;
-use crate::io::MemoryIO;
+use crate::io::{Completion, MemoryIO};
 use crate::storage::atoll::btree::value;
 use crate::storage::atoll::btree::Seek;
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
@@ -270,14 +270,17 @@ fn a_writer_waits_for_an_open_writer_and_conflicts_with_a_later_commit() {
     let mut committed = db.begin(Isolation::ReadCommitted);
     let mut b = db.begin(Isolation::Snapshot);
     assert_eq!(db.put(&mut b, "k", "b", Mode::Update), DONE_UPDATED);
-    let slot = b.slot();
+    let blocker = Blocker {
+        slot: b.slot(),
+        start: b.start(),
+    };
     assert_eq!(
         db.put(&mut snapshot, "k", "s", Mode::Update),
-        Write::Wait(slot)
+        Write::Wait(blocker)
     );
     assert_eq!(
         db.put(&mut committed, "k", "c", Mode::Update),
-        Write::Wait(slot)
+        Write::Wait(blocker)
     );
     db.commit(b);
     assert_eq!(
@@ -1007,5 +1010,165 @@ fn cursors_read_whole_snapshots_out_of_line_in_shuttle_schedules() {
     crate::storage::atoll::testing::schedules(
         || cursors_read_whole_snapshots_while_writers_commit_and_roll_back(2, 2, LARGE),
         300,
+    );
+}
+
+/// Writes `key` under read committed, parking on its writer's end whenever it meets one open, as
+/// the SQL layer does: it registers, writes again, and parks only while it still waits on the
+/// same writer, reusing its wait. Returns how often it parked.
+fn put_parking(db: &Db, txn: &mut Txn, key: &str, value: &str) -> usize {
+    let mut parks = 0;
+    let mut wait: Option<(Blocker, Completion)> = None;
+    loop {
+        match db.put(txn, key, value, Mode::Update) {
+            Write::Done(_) => return parks,
+            Write::Conflict => panic!("a conflict under read committed"),
+            Write::Wait(blocker) => match &wait {
+                Some((b, c)) if *b == blocker && !c.finished() => {
+                    parks += 1;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !c.finished() {
+                        assert!(std::time::Instant::now() < deadline, "a wait never woken");
+                        crate::thread::yield_now();
+                    }
+                }
+                _ => {
+                    let c = Completion::new_wait();
+                    db.txns().wait_end(blocker, &c);
+                    wait = Some((blocker, c));
+                }
+            },
+        }
+    }
+}
+
+/// A wait registered on a writer's end is woken by its commit, by its rollback, and by a
+/// statement rollback that puts the key back while it runs on; until then, judged again, the
+/// write still waits on the same writer.
+#[test]
+fn a_wait_on_a_writer_is_woken_by_its_commit_rollback_and_statement_rollback() {
+    let db = open();
+    let mut setup = db.begin(Isolation::Snapshot);
+    db.put(&mut setup, "k", "c0", Mode::Insert);
+    db.commit(setup);
+    for end in ["commit", "rollback", "statement rollback"] {
+        let mut a = db.begin(Isolation::Snapshot);
+        db.txns().statement(&mut a).unwrap();
+        assert!(matches!(
+            db.put(&mut a, "k", "a", Mode::Update),
+            Write::Done(_)
+        ));
+        let mut b = db.begin(Isolation::ReadCommitted);
+        let blocker = Blocker {
+            slot: a.slot(),
+            start: a.start(),
+        };
+        assert_eq!(db.put(&mut b, "k", "b", Mode::Update), Write::Wait(blocker));
+        let c = Completion::new_wait();
+        db.txns().wait_end(blocker, &c);
+        assert_eq!(db.put(&mut b, "k", "b", Mode::Update), Write::Wait(blocker));
+        assert!(!c.finished(), "{end}: woken before it");
+        let still = match end {
+            "commit" => {
+                db.commit(a);
+                None
+            }
+            "rollback" => {
+                db.rollback(a);
+                None
+            }
+            _ => {
+                db.rollback_to(&mut a, 1);
+                Some(a)
+            }
+        };
+        assert!(c.finished(), "{end}: no waiter woken");
+        assert!(
+            matches!(db.put(&mut b, "k", "b", Mode::Update), Write::Done(_)),
+            "{end}"
+        );
+        db.commit(b);
+        if let Some(a) = still {
+            db.commit(a);
+        }
+    }
+}
+
+/// A blocker's holder is its transaction's group while it runs, and none once it has ended, even
+/// with its slot running another group's transaction.
+#[test]
+fn a_blockers_holder_is_its_group_while_it_runs() {
+    let db = open_with(1);
+    let a = run(&db.io, || db.txns().begin_in(Isolation::Snapshot, 7));
+    let first = Blocker {
+        slot: a.slot(),
+        start: a.start(),
+    };
+    assert_eq!(db.txns().holder(first), Some(7));
+    db.txns().abort(a);
+    assert_eq!(db.txns().holder(first), None);
+    let b = run(&db.io, || db.txns().begin_in(Isolation::Snapshot, 9));
+    assert_eq!(b.slot(), first.slot, "one slot, taken again");
+    assert_eq!(db.txns().holder(first), None, "the slot's next group");
+    let second = Blocker {
+        slot: b.slot(),
+        start: b.start(),
+    };
+    assert_eq!(db.txns().holder(second), Some(9));
+    db.txns().abort(b);
+}
+
+/// Writers on a few hot keys in one order, parking on one another, rolling back whole and to an
+/// earlier statement, and committing: every wait parked is woken, and every writer finishes.
+fn parked_writers_all_finish(threads: usize, rounds: usize) -> usize {
+    const KEYS: [&str; 3] = ["h0", "h1", "h2"];
+    let db = Arc::new(open_with(threads));
+    let mut setup = db.begin(Isolation::Snapshot);
+    for k in KEYS {
+        db.put(&mut setup, k, "0", Mode::Insert);
+    }
+    db.commit(setup);
+    let workers: Vec<_> = (0..threads)
+        .map(|w| {
+            let db = db.clone();
+            crate::thread::spawn(move || {
+                let mut parks = 0;
+                for r in 0..rounds {
+                    let mut t = db.begin(Isolation::ReadCommitted);
+                    db.txns().statement(&mut t).unwrap();
+                    for k in KEYS {
+                        parks += put_parking(&db, &mut t, k, &format!("{w}-{r}"));
+                    }
+                    match (w + r) % 3 {
+                        0 => db.commit(t),
+                        1 => db.rollback(t),
+                        _ => {
+                            db.rollback_to(&mut t, 1);
+                            db.commit(t);
+                        }
+                    }
+                }
+                parks
+            })
+        })
+        .collect();
+    workers.into_iter().map(|w| w.join().unwrap()).sum()
+}
+
+#[test]
+fn parked_writers_all_finish_on_twelve_threads() {
+    let parks = parked_writers_all_finish(12, 40);
+    println!("{parks} parks");
+    assert!(parks > 0, "no writer parked");
+}
+
+#[cfg(shuttle)]
+#[test]
+fn parked_writers_all_finish_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || {
+            parked_writers_all_finish(3, 2);
+        },
+        500,
     );
 }

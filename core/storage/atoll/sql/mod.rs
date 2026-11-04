@@ -4,23 +4,26 @@
 //! - [`key`]: keys of SQL trees as byte strings in Turso's order.
 //! - [`header`]: the database header's fields as rows.
 //! - [`rowid`]: NewRowid's counters.
+//! - [`lifecycle`]: trees created, dropped and cleared in a transaction, and their drain.
 
 pub mod catalog;
 pub mod header;
 pub mod key;
+pub mod lifecycle;
 pub mod rowid;
 
 use self::catalog::{ensure_system_trees, key, Catalog, Entry, Layout, System, SCHEMA_ID};
 use self::header::{Field, Header};
 use self::rowid::Rowids;
-use super::btree::{Cursor, Mode};
+use super::btree::{Cursor, Drain, Mode};
 use super::db::{Atoll, AtollConfig};
 use super::drive;
-use super::txn::versioned::{Get, Versions, Write};
+use super::page::PageId;
+use super::txn::versioned::{Get, VersionedTree, Versions, Write};
 use super::txn::{Commit, Isolation};
 use crate::io::IO;
-use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 
 /// An Atoll database as Turso's SQL layer uses it.
@@ -31,6 +34,12 @@ pub struct AtollDb {
     catalog: Catalog,
     header: Header,
     rowids: Rowids,
+    /// The dropped list, written by transactions.
+    dropped: VersionedTree,
+    /// Trees handed over to drain, the one being drained, and whether a drainer is at work.
+    draining: Mutex<Vec<PageId>>,
+    current: Mutex<Option<(PageId, Drain)>>,
+    drainer: AtomicBool,
     /// The next tree id to draw, above every id the catalog held at open and every one drawn
     /// since. Not transactional: an id a rolled-back transaction drew is not drawn again while the
     /// database is open, and may be after a restart, when nothing durable names it.
@@ -50,8 +59,9 @@ impl Drop for AtollDb {
 }
 
 impl AtollDb {
-    /// Opens the database at `path`, creating it, and its system trees, if it does not exist, and
-    /// completing a creation a crash cut short.
+    /// Opens the database at `path`, creating it, and its system trees, if it does not exist,
+    /// completing a creation a crash cut short, and draining every tree on the abandoned and
+    /// dropped lists.
     pub fn open(io: Arc<dyn IO>, path: &str, config: AtollConfig) -> Result<Self> {
         let slots = config.txn.slots;
         let atoll = Atoll::open(io.clone(), path, config)?;
@@ -66,6 +76,12 @@ impl AtollDb {
         );
         let catalog = Catalog::open(io.clone(), atoll.pool().clone(), atoll.store().clone());
         let header = Header::open(io.clone(), atoll.pool().clone(), atoll.store().clone());
+        let dropped = VersionedTree::open(
+            io.clone(),
+            atoll.pool().clone(),
+            atoll.store().clone(),
+            System::Dropped.root(),
+        );
         let db = Self {
             io,
             atoll,
@@ -73,8 +89,13 @@ impl AtollDb {
             catalog,
             header,
             rowids: Rowids::default(),
+            dropped,
+            draining: Mutex::new(Vec::new()),
+            current: Mutex::new(None),
+            drainer: AtomicBool::new(false),
             next_id: AtomicU64::new(0),
         };
+        db.drain_lists()?;
         db.ensure_schema_row()?;
         db.load_committed_header()?;
         let mut cursor = Cursor::new();
@@ -153,6 +174,10 @@ impl AtollDb {
 
     pub fn rowids(&self) -> &Rowids {
         &self.rowids
+    }
+
+    pub fn dropped(&self) -> &VersionedTree {
+        &self.dropped
     }
 
     /// A new tree id, never drawn before while the database has been open.

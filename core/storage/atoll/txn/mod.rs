@@ -19,6 +19,10 @@
 //!   previous group by where that group starts, so its records are found from its last one. Its
 //!   slot's cell in the writer registry holds its first and last groups from its first group's
 //!   reservation to its Commit's ([`super::log::Writers`]).
+//! - **The write gate** ([`gate`]): a transaction takes it shared to write and exclusive to write
+//!   the schema, and every end of the transaction releases it, before its slot is freed. A database
+//!   whose writers must hold it ([`Transactions::require_gate`]) refuses a commit that wrote
+//!   without it.
 //! - **Creating a tree** is a change of the transaction's: the root's creation record leads the
 //!   group that makes the root ([`Transactions::create_tree`]). Undoing it, by a rollback or in
 //!   recovery, puts the root on a plain list, after every later change to the tree is undone, and
@@ -47,9 +51,11 @@ mod sync {
 }
 
 mod ends;
+mod gate;
 mod horizon;
 use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
+pub use gate::Taken;
 
 /// A timestamp of the transaction clock. 0 is before every transaction.
 pub type Ts = u64;
@@ -235,6 +241,25 @@ pub struct Transactions {
     ends: Box<[CachePadded<ends::Ends>]>,
     /// Per slot, the group its transaction belongs to; 0 for none.
     owner: Box<[CachePadded<AtomicU64>]>,
+    gate: gate::Gate,
+    /// Whether every transaction that writes must hold the gate.
+    gated: std::sync::atomic::AtomicBool,
+}
+
+/// What a transaction holds of the write gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    None,
+    Shared,
+    /// An exclusive take in the word, still draining; `shared` if it held shared before.
+    Pending {
+        word: u64,
+        shared: bool,
+    },
+    Exclusive {
+        word: u64,
+        shared: bool,
+    },
 }
 
 /// The transaction a write met with a version still open: what it waits for the end of.
@@ -273,6 +298,13 @@ pub struct Txn {
     /// The trees whose creation was undone, each on its list: to free once the transaction has
     /// ended.
     abandoned: Vec<PageId>,
+    hold: Hold,
+    /// Whether it wrote the schema: its commit, under an exclusive hold, raises the schema
+    /// timestamp.
+    wrote_schema: bool,
+    /// Whether it has taken its snapshot: an exclusive taker begun without one takes it after the
+    /// drain.
+    snapped: bool,
 }
 
 impl Txn {
@@ -329,6 +361,19 @@ impl Txn {
     /// The trees whose creation was undone so far.
     pub fn abandoned(&self) -> &[PageId] {
         &self.abandoned
+    }
+
+    pub fn hold(&self) -> Hold {
+        self.hold
+    }
+
+    /// Notes that the transaction wrote the schema.
+    pub fn wrote_schema(&mut self) {
+        self.wrote_schema = true;
+    }
+
+    pub fn snapped(&self) -> bool {
+        self.snapped
     }
 }
 
@@ -426,9 +471,17 @@ impl Transactions {
             owner: (0..config.slots)
                 .map(|_| CachePadded::new(AtomicU64::new(0)))
                 .collect(),
+            gate: gate::Gate::new(config.slots),
+            gated: std::sync::atomic::AtomicBool::new(false),
             clock,
             log,
         }
+    }
+
+    /// From now on, every transaction that writes must hold the write gate: a commit of one that
+    /// wrote without it is refused. Turso's SQL layer requires it; a key-value user need not.
+    pub fn require_gate(&self) {
+        self.gated.store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn clock(&self) -> &Arc<Clock> {
@@ -486,6 +539,27 @@ impl Transactions {
     /// Begins a transaction of `group` once a slot is free: a wait on it is a wait on the group
     /// ([`holder`](Self::holder)).
     pub fn begin_in(&self, isolation: Isolation, group: u64) -> Result<IOResult<Txn>> {
+        Ok(match self.begin_slot_in(isolation, group)? {
+            IOResult::Done(mut txn) => {
+                self.take_snapshot(&mut txn);
+                IOResult::Done(txn)
+            }
+            IOResult::IO(io) => IOResult::IO(io),
+        })
+    }
+
+    /// Takes the snapshot of `txn`, begun without one ([`begin_slot_in`](Self::begin_slot_in)).
+    pub fn take_snapshot(&self, txn: &mut Txn) {
+        assert!(!txn.snapped, "a second snapshot of one transaction");
+        txn.snapshot = self.horizon.at();
+        txn.seen.fill(None);
+        txn.log_at = self.log.end();
+        txn.snapped = true;
+    }
+
+    /// Begins a transaction of `group` once a slot is free, without a snapshot: an exclusive
+    /// taker takes its slot before it marks itself pending, and its snapshot after the drain.
+    pub fn begin_slot_in(&self, isolation: Isolation, group: u64) -> Result<IOResult<Txn>> {
         let slot = match self.take_slot() {
             Some(slot) => slot,
             None => {
@@ -507,20 +581,128 @@ impl Transactions {
             start,
             group,
         );
-        // The snapshot before the log's end: every commit it covers is in the log by then.
-        let snapshot = self.horizon.at();
+        // The snapshot, when it is taken, before the log's end: every commit it covers is in the
+        // log by then.
         Ok(IOResult::Done(Txn {
             slot,
             start,
             isolation,
-            snapshot,
+            snapshot: 0,
             command: 0,
             seen: vec![None; self.slots.len()],
             tail: None,
-            log_at: self.log.end(),
+            log_at: 0,
             created: Vec::new(),
             abandoned: Vec::new(),
+            hold: Hold::None,
+            wrote_schema: false,
+            snapped: false,
         }))
+    }
+
+    /// Takes the gate shared for `txn`, which is to write. Behind another's exclusive take it
+    /// registers `c` on that take's end and reports it; the caller takes again once `c` is done.
+    /// A transaction whose snapshot is older than the schema timestamp fails with
+    /// `SchemaConflict`.
+    pub fn take_shared(&self, txn: &mut Txn, c: &Completion) -> Result<Taken> {
+        if txn.hold != Hold::None {
+            return Ok(Taken::Done);
+        }
+        let taken = self.gate.take_shared(txn.slot, txn.start, c);
+        if taken == Taken::Done {
+            if txn.snapped && txn.snapshot < self.gate.schema() {
+                self.gate.release_shared(txn.slot, txn.start);
+                return Err(LimboError::SchemaConflict);
+            }
+            txn.hold = Hold::Shared;
+        }
+        Ok(taken)
+    }
+
+    /// Takes the gate exclusive for `txn`: its take put in the word, pending, then held once every
+    /// other shared holder has left. Behind another's take, or with holders left, it registers `c`
+    /// and reports them; the caller takes again once `c` is done, its take staying pending
+    /// meanwhile ([`give_up`](Self::give_up)). A taker with no snapshot takes it once held; one
+    /// with a snapshot older than the schema timestamp fails with `SchemaConflict`.
+    pub fn take_exclusive(&self, txn: &mut Txn, c: &Completion) -> Result<Taken> {
+        let (word, shared) = match txn.hold {
+            Hold::Exclusive { .. } => return Ok(Taken::Done),
+            Hold::Pending { word, shared } => (word, shared),
+            hold => {
+                let shared = hold == Hold::Shared;
+                match self.gate.begin_exclusive(txn.slot, c) {
+                    Ok(word) => {
+                        txn.hold = Hold::Pending { word, shared };
+                        (word, shared)
+                    }
+                    Err(taken) => return Ok(taken),
+                }
+            }
+        };
+        match self.gate.drain(txn.slot, word, c) {
+            Taken::Done => {}
+            Taken::Lost => {
+                txn.hold = if shared { Hold::Shared } else { Hold::None };
+                return Ok(Taken::Lost);
+            }
+            other => return Ok(other),
+        }
+        txn.hold = Hold::Exclusive { word, shared };
+        if !txn.snapped {
+            self.take_snapshot(txn);
+        } else if txn.snapshot < self.gate.schema() {
+            return Err(LimboError::SchemaConflict);
+        }
+        Ok(Taken::Done)
+    }
+
+    /// Gives up `txn`'s pending exclusive take, waking whoever waits behind it; a shared hold it
+    /// had before stays.
+    pub fn give_up(&self, txn: &mut Txn) {
+        if let Hold::Pending { word, shared } = txn.hold {
+            self.gate.clear(word);
+            txn.hold = if shared { Hold::Shared } else { Hold::None };
+        }
+    }
+
+    /// Clears the exclusive take numbered `take` from the gate while it is still pending, for a
+    /// victim of the wait graph that is not stepping: its taker finds it lost.
+    pub fn clear_take(&self, take: u64) {
+        let w = self.gate.word();
+        if w != 0 && gate::take_of(w) == take && !gate::held(w) {
+            self.gate.clear(w);
+        }
+    }
+
+    /// The transaction owning the exclusive take numbered `take`, while it is in the gate.
+    pub fn take_holder(&self, take: u64) -> Option<Blocker> {
+        let slot = self.gate.take_owner(take)?;
+        let start = self.running[slot as usize].load(Ordering::Acquire);
+        (start != 0).then_some(Blocker { slot, start })
+    }
+
+    /// Whether `blocker`'s transaction holds the gate shared.
+    pub fn holds_shared(&self, blocker: Blocker) -> bool {
+        self.gate.holds_shared(blocker.slot, blocker.start)
+    }
+
+    /// Releases whatever `txn` holds of the gate, at its end, before its slot is freed; `schema`
+    /// is its commit timestamp when it wrote the schema under an exclusive hold.
+    fn release_hold(&self, txn: &mut Txn, schema: Option<Ts>) {
+        match txn.hold {
+            Hold::None => {}
+            Hold::Shared => self.gate.release_shared(txn.slot, txn.start),
+            Hold::Pending { word, shared } | Hold::Exclusive { word, shared } => {
+                let schema = matches!(txn.hold, Hold::Exclusive { .. })
+                    .then_some(schema)
+                    .flatten();
+                self.gate.release_exclusive(word, schema);
+                if shared {
+                    self.gate.release_shared(txn.slot, txn.start);
+                }
+            }
+        }
+        txn.hold = Hold::None;
     }
 
     /// Creates an empty tree of `class` in `txn`'s current statement, its root's creation record
@@ -573,6 +755,7 @@ impl Transactions {
     /// to `txn`'s current statement. Every version of `txn` itself is, its current statement's
     /// included, as Turso's VDBE expects of a cursor (DESIGN.md §11.1).
     pub fn visible(&self, txn: &mut Txn, slot: u16, start: Ts) -> bool {
+        debug_assert!(txn.snapped, "a read before the transaction's snapshot");
         if slot == txn.slot && start == txn.start {
             return true;
         }
@@ -597,6 +780,12 @@ impl Transactions {
             }
             let mut txn = op.txn.take().expect("a transaction");
             op.abandoned = std::mem::take(&mut txn.abandoned);
+            assert!(
+                !txn.wrote()
+                    || txn.hold != Hold::None
+                    || !self.gated.load(std::sync::atomic::Ordering::Acquire),
+                "a commit of a transaction that wrote without the write gate"
+            );
             op.durable = match op.admitted.take() {
                 None => txn.log_at,
                 Some(mut admitted) => {
@@ -616,6 +805,9 @@ impl Transactions {
                     lsn
                 }
             };
+            // The gate after the horizon covers the commit, before the slot is freed.
+            let schema = op.ts.filter(|_| txn.wrote_schema);
+            self.release_hold(&mut txn, schema);
             self.release(txn.slot);
         }
         if let Some(ts) = op.ts {
@@ -631,8 +823,9 @@ impl Transactions {
 
     /// Ends `txn`, which wrote nothing, without committing it. One that wrote is rolled back
     /// ([`rollback`](Self::rollback)).
-    pub fn abort(&self, txn: Txn) {
+    pub fn abort(&self, mut txn: Txn) {
         assert!(!txn.wrote(), "aborting a transaction that wrote: roll it back");
+        self.release_hold(&mut txn, None);
         self.release(txn.slot);
     }
 
@@ -661,7 +854,9 @@ impl Transactions {
         }
         let mut txn = op.txn.take().expect("a transaction");
         op.abandoned = std::mem::take(&mut txn.abandoned);
-        // Every version it wrote is gone: the slot's next transaction may commit.
+        // Every version it wrote is gone: the slot's next transaction may commit, and writers
+        // behind the gate may go on.
+        self.release_hold(&mut txn, None);
         self.release(txn.slot);
         Ok(IOResult::Done(()))
     }

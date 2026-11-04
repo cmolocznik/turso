@@ -26,7 +26,7 @@ use super::db::{Atoll, AtollConfig};
 use super::drive;
 use super::page::PageId;
 use super::txn::versioned::{Get, VersionedTree, Versions, Write};
-use super::txn::{Commit, Isolation};
+use super::txn::{Commit, Isolation, Taken};
 use crate::io::IO;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -112,11 +112,18 @@ impl AtollDb {
         Ok(db)
     }
 
-    /// Writes `sqlite_schema`'s catalog row, in a transaction of its own, unless it is there.
+    /// Writes `sqlite_schema`'s catalog row, in a transaction of its own holding the write gate
+    /// exclusive, as every schema writer does, unless it is there.
     fn ensure_schema_row(&self) -> Result<()> {
         let txns = self.atoll.transactions();
         let mut txn = drive(&self.io, || txns.begin(Isolation::Snapshot))?;
         txns.statement(&mut txn)?;
+        let taken = txns.take_exclusive(&mut txn, &crate::io::Completion::new_wait())?;
+        if taken != Taken::Done {
+            return Err(LimboError::InternalError(format!(
+                "the write gate at open, with nothing else open, came to {taken:?}"
+            )));
+        }
         let mut get = Get::new(&key(SCHEMA_ID));
         let have = drive(&self.io, || {
             self.catalog.get(txns, &self.versions, &mut txn, &mut get)

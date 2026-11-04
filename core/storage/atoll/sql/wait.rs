@@ -47,15 +47,42 @@ mod sync {
 /// A transaction group: its node's index in the high 32 bits, the node's generation in the low.
 pub type GroupId = u64;
 
-/// Where a waiting transaction's holders are named: a database's transactions.
+/// Where a waiting transaction's holders are named: a database's transactions and write gate.
 pub trait Holders: Send + Sync {
     /// The group of `blocker`'s transaction while it runs.
     fn holder(&self, blocker: Blocker) -> Option<GroupId>;
+
+    /// The group owning the gate's exclusive take numbered `take`, while it is in the gate.
+    fn take_group(&self, _take: u64) -> Option<GroupId> {
+        None
+    }
+
+    /// The group of `blocker`'s transaction while it holds the gate shared.
+    fn shared_group(&self, _blocker: Blocker) -> Option<GroupId> {
+        None
+    }
+
+    /// Clears the gate's pending take numbered `take`, for a victim that is not stepping.
+    fn clear_take(&self, _take: u64) {}
 }
 
 impl Holders for Transactions {
     fn holder(&self, blocker: Blocker) -> Option<GroupId> {
         Transactions::holder(self, blocker).filter(|&g| g != 0)
+    }
+
+    fn take_group(&self, take: u64) -> Option<GroupId> {
+        Holders::holder(self, Transactions::take_holder(self, take)?)
+    }
+
+    fn shared_group(&self, blocker: Blocker) -> Option<GroupId> {
+        Transactions::holds_shared(self, blocker)
+            .then(|| Holders::holder(self, blocker))
+            .flatten()
+    }
+
+    fn clear_take(&self, take: u64) {
+        Transactions::clear_take(self, take)
     }
 }
 
@@ -63,15 +90,37 @@ impl Holders for super::AtollDb {
     fn holder(&self, blocker: Blocker) -> Option<GroupId> {
         Holders::holder(self.atoll().transactions(), blocker)
     }
+
+    fn take_group(&self, take: u64) -> Option<GroupId> {
+        self.atoll().transactions().take_group(take)
+    }
+
+    fn shared_group(&self, blocker: Blocker) -> Option<GroupId> {
+        self.atoll().transactions().shared_group(blocker)
+    }
+
+    fn clear_take(&self, take: u64) {
+        Holders::clear_take(self.atoll().transactions(), take)
+    }
 }
 
-/// What a waiting statement waits on.
+/// What a waiting statement waits on, in the database whose transactions and gate `db` names.
 #[derive(Clone)]
 pub enum Edge {
-    /// The end of `blocker`'s transaction, in the database whose transactions `db` are.
+    /// The end of `blocker`'s transaction.
     Row {
         db: Arc<dyn Holders>,
         blocker: Blocker,
+    },
+    /// The end of the gate's exclusive take numbered `take`: a shared taker, or a later exclusive
+    /// taker, behind it.
+    Take { db: Arc<dyn Holders>, take: u64 },
+    /// The release of each of `holders`' shared holds: the drain of the pending take `take`, the
+    /// waiter's own, which a flagger clears if the waiter is the victim.
+    Drain {
+        db: Arc<dyn Holders>,
+        holders: Vec<Blocker>,
+        take: u64,
     },
 }
 
@@ -79,6 +128,10 @@ impl Edge {
     fn targets(&self) -> Vec<GroupId> {
         match self {
             Edge::Row { db, blocker } => db.holder(*blocker).into_iter().collect(),
+            Edge::Take { db, take } => db.take_group(*take).into_iter().collect(),
+            Edge::Drain { db, holders, .. } => {
+                holders.iter().filter_map(|b| db.shared_group(*b)).collect()
+            }
         }
     }
 }
@@ -367,6 +420,10 @@ impl WaitGraph {
         }
         if let Some(node) = self.live(record.group) {
             node.doomed.store(true, Ordering::Release);
+        }
+        // A pending take of the victim's blocks the others' shared takes: clear it.
+        if let Edge::Drain { db, take, .. } = &record.edge {
+            db.clear_take(*take);
         }
         if let Some(c) = lock(&record.parked).take() {
             c.complete(0);

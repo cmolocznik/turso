@@ -307,6 +307,23 @@ pub enum Write {
     Conflict,
 }
 
+/// What a probe of a key on a write path found, judged by the key's newest version (DESIGN.md
+/// §17): what a uniqueness or rowid check goes by, since a version the snapshot cannot see may be
+/// committed before this transaction commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// The newest version, the transaction's own or one it may act on, says the key is present.
+    Present,
+    /// It says the key is absent, or there is none.
+    Absent,
+    /// The newest version is another transaction's, still open: wait for it to end and probe
+    /// again ([`Transactions::wait_end`]).
+    Wait(Blocker),
+    /// The newest version was committed after the snapshot: under snapshot isolation the
+    /// transaction cannot act on it.
+    Conflict,
+}
+
 /// A read of one key's value as a transaction's statement sees it: step it with
 /// [`VersionedTree::get`] until done.
 pub struct Get {
@@ -398,6 +415,56 @@ impl VersionedTree {
     }
 
     /// The longest key: the tree's, and what its version index keys hold.
+    /// Probes `key` on a write path, judged by its newest version as a write would judge it: a
+    /// version another transaction holds open is waited for, and under snapshot isolation one
+    /// committed after the snapshot is a conflict. Step it until done.
+    pub fn probe(&self, txns: &Transactions, txn: &mut Txn, key: &[u8]) -> Result<IOResult<Probe>> {
+        // A version found gone: rolled back since it was read, unless it is still there.
+        let mut gone = None;
+        loop {
+            let stored = done!(self.tree.stored(key));
+            let Some(v) = stored
+                .as_ref()
+                .map(|s| Version::decode(&s.head).ok_or_else(corrupt_header))
+                .transpose()?
+            else {
+                return Ok(IOResult::Done(Probe::Absent));
+            };
+            if v.slot != txn.slot || v.ts != txn.start {
+                match txns.writer(v.slot, v.ts) {
+                    Writer::Open => {
+                        let blocker = Blocker {
+                            slot: v.slot,
+                            start: v.ts,
+                        };
+                        return Ok(IOResult::Done(Probe::Wait(blocker)));
+                    }
+                    Writer::Gone if gone != Some(v) => {
+                        gone = Some(v);
+                        continue;
+                    }
+                    Writer::Gone => {
+                        return Err(LimboError::Corrupt(format!(
+                            "the version {v:?} is the newest, and its writer neither committed \
+                             nor is open"
+                        )))
+                    }
+                    Writer::Committed => {
+                        if txn.isolation == Isolation::Snapshot && !txns.visible(txn, v.slot, v.ts)
+                        {
+                            return Ok(IOResult::Done(Probe::Conflict));
+                        }
+                    }
+                }
+            }
+            return Ok(IOResult::Done(if v.deleted() {
+                Probe::Absent
+            } else {
+                Probe::Present
+            }));
+        }
+    }
+
     /// The plain put of `key` by `txn`'s current statement into a tree that statement created:
     /// no other transaction can see the tree, so the entry needs no earlier version and no index
     /// entry, and an undo of the creation frees the tree whole (DESIGN.md §17). Every write the

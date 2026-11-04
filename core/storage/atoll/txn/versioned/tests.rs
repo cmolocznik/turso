@@ -1172,3 +1172,65 @@ fn parked_writers_all_finish_in_shuttle_schedules() {
         500,
     );
 }
+
+fn probe(db: &Db, txn: &mut Txn, key: &str) -> Probe {
+    run(&db.io, || db.tree.probe(db.txns(), txn, key.as_bytes()))
+}
+
+/// A probe judges a key by its newest version: absent with none, present or absent by the
+/// transaction's own version, a wait on another's open version, and, once that commits, a
+/// conflict under snapshot isolation and the committed version's word under read committed; a
+/// version rolled back leaves the key as it was.
+#[test]
+fn a_probe_judges_a_key_by_its_newest_version() {
+    let db = open();
+    let mut setup = db.begin(Isolation::Snapshot);
+    db.put(&mut setup, "kept", "v", Mode::Insert);
+    db.put(&mut setup, "doomed", "v", Mode::Insert);
+    db.commit(setup);
+    let mut snap = db.begin(Isolation::Snapshot);
+    let mut rc = db.begin(Isolation::ReadCommitted);
+    assert_eq!(probe(&db, &mut snap, "none"), Probe::Absent);
+    assert_eq!(probe(&db, &mut snap, "kept"), Probe::Present);
+    let mut own = db.begin(Isolation::Snapshot);
+    db.put(&mut own, "mine", "v", Mode::Insert);
+    db.delete(&mut own, "kept");
+    assert_eq!(
+        probe(&db, &mut own, "mine"),
+        Probe::Present,
+        "its own insert"
+    );
+    assert_eq!(
+        probe(&db, &mut own, "kept"),
+        Probe::Absent,
+        "its own delete"
+    );
+    db.rollback(own);
+    assert_eq!(
+        probe(&db, &mut snap, "mine"),
+        Probe::Absent,
+        "a rolled-back insert"
+    );
+    assert_eq!(
+        probe(&db, &mut snap, "kept"),
+        Probe::Present,
+        "a rolled-back delete"
+    );
+    let mut other = db.begin(Isolation::Snapshot);
+    db.put(&mut other, "new", "v", Mode::Insert);
+    db.delete(&mut other, "doomed");
+    let blocker = Blocker {
+        slot: other.slot(),
+        start: other.start(),
+    };
+    assert_eq!(probe(&db, &mut snap, "new"), Probe::Wait(blocker));
+    assert_eq!(probe(&db, &mut rc, "doomed"), Probe::Wait(blocker));
+    db.commit(other);
+    assert_eq!(probe(&db, &mut snap, "new"), Probe::Conflict);
+    assert_eq!(probe(&db, &mut snap, "doomed"), Probe::Conflict);
+    db.txns().statement(&mut rc).unwrap();
+    assert_eq!(probe(&db, &mut rc, "new"), Probe::Present);
+    assert_eq!(probe(&db, &mut rc, "doomed"), Probe::Absent);
+    db.commit(snap);
+    db.commit(rc);
+}

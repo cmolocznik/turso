@@ -14,6 +14,7 @@
 //! - [`page`]: size classes, page ids and the page header.
 //! - [`latch`]: the versioned latch every buffer frame carries.
 //! - [`aligned`]: memory aligned for direct IO.
+//! - [`sql`]: Turso's SQL on it (DESIGN.md §17): the system trees and the catalog.
 //!
 //! Every IO goes through Turso's [`crate::io::IO`] and returns its completion, so this runs under
 //! the VDBE's `IOResult` stepping on every backend: io_uring, the syscall backend and memory.
@@ -42,6 +43,7 @@ pub mod redo;
 pub mod segmented;
 pub mod shared;
 pub mod solo;
+pub mod sql;
 pub mod stack;
 pub mod store;
 pub mod txn;

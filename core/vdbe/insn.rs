@@ -2418,6 +2418,17 @@ pub enum Insn {
     FkGuardRow {
         cursor_id: CursorID,
     },
+
+    /// Atoll mode's probe of a key on a write path, before the read that answers it (A4.9): in
+    /// the tree `cursor_id` reads, the key the `num_regs` registers from `start_reg` make (a
+    /// table's rowid, or an index's columns) is judged by its newest version: another
+    /// transaction's open version waits for its writer, and one committed after the snapshot is
+    /// a write conflict.
+    KeyProbe {
+        cursor_id: CursorID,
+        start_reg: usize,
+        num_regs: usize,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2671,6 +2682,7 @@ impl InsnVariants {
             InsnVariants::FkGuard => execute::op_fk_guard,
             InsnVariants::FkUnseen => execute::op_fk_unseen,
             InsnVariants::FkGuardRow => execute::op_fk_guard_row,
+            InsnVariants::KeyProbe => execute::op_key_probe,
         }
     }
 }

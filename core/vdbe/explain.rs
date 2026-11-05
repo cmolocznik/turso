@@ -2948,6 +2948,23 @@ pub fn insn_to_row(
             0,
             "guard the unseen version".to_string(),
         ),
+        Insn::KeyProbe {
+            cursor_id,
+            start_reg,
+            num_regs,
+        } => (
+            "KeyProbe",
+            *cursor_id as i64,
+            *start_reg as i64,
+            *num_regs as i64,
+            Value::build_text(""),
+            0,
+            format!(
+                "probe key=r[{}..{}] by its newest version",
+                start_reg,
+                start_reg + num_regs
+            ),
+        ),
     }
 }
 

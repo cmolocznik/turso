@@ -549,6 +549,15 @@ struct Savepoint {
 }
 
 impl ConnTxn {
+    /// The page arm of `PRAGMA integrity_check`, in the transaction's current statement, which
+    /// holds the write gate exclusive (DESIGN.md §17, §12, R36): what it found wrong, at most
+    /// `max` of it.
+    pub fn check_pages(&self, max: usize) -> Result<Vec<String>> {
+        let mut guard = self.cell.lock();
+        let txn = guard.as_mut().ok_or_else(outside)?;
+        self.db.check_pages(txn, max)
+    }
+
     pub fn new(db: Arc<AtollDb>) -> Self {
         Self {
             db,
@@ -1363,6 +1372,36 @@ impl SqlCursor {
             vacant: false,
             stamped: ct.stamped.clone(),
             unseen: false,
+        }
+    }
+
+    /// A write path's probe of `key` before the read that answers it (NoConflict on a UNIQUE
+    /// index, KeyProbe before an insert's rowid check; A3.12, A4.9): its newest version decides. Another
+    /// transaction's open version waits for it as a write does, on the same edge; one committed
+    /// after the snapshot is `WriteWriteConflict`, which an autocommit statement restarts on. Done,
+    /// the newest version is one the snapshot sees, or there is none, so the read that follows
+    /// answers as it would have.
+    pub fn probe(&mut self, key: GuardKey<'_>) -> IOResultOr<()> {
+        use crate::storage::atoll::txn::versioned::Probe;
+        if self.vacant {
+            return Ok(IOResult::Done(()));
+        }
+        loop {
+            let cursor = self.resolve()?;
+            let prefix = cursor.guard_prefix(&key)?;
+            let w = match cursor.probe(&prefix)? {
+                IOResult::Done(Probe::Present | Probe::Absent) => {
+                    Write::Done(crate::storage::atoll::btree::Outcome::Unchanged)
+                }
+                IOResult::Done(Probe::Wait(blocker)) => Write::Wait(blocker),
+                IOResult::Done(Probe::Conflict) => Write::Conflict,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            match self.waiting.judge(&self.db, &self.waits, w)? {
+                Judged::Done => return Ok(IOResult::Done(())),
+                Judged::Park(c) => return Ok(self.waiting.wait(&self.waits, c)?),
+                Judged::Again => {}
+            }
         }
     }
 

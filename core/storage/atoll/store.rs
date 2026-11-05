@@ -567,6 +567,62 @@ impl PageStore {
         })
     }
 
+    /// Walks one radix tree of one class for an integrity check (DESIGN.md §17, §12): every
+    /// unit in use, in order, with its leaf's value, and every count read above the leaves.
+    /// Only nodes a count says hold a unit in use are read, so a unit under a count of zero is
+    /// not seen here: a page a tree reaches is looked up by [`entry`](Self::entry) as well. Step
+    /// it until done.
+    pub fn census(self: &Arc<Self>, op: &mut Census) -> Result<IOResult<()>> {
+        let (tree, class) = (op.tree, op.class);
+        let height = self.height(tree, class);
+        let stack = op
+            .stack
+            .get_or_insert_with(|| vec![radix::root(tree, class, height)]);
+        while let Some(&id) = stack.last() {
+            let node = match self.meta.get(id)? {
+                IOResult::Done(f) => f,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            let units = radix::leaf_units(tree);
+            let read = node.read(|b| {
+                if id.level == 0 {
+                    let first = id.index * units;
+                    let used: Vec<(u64, u64)> = (first..first + units)
+                        .filter(|&u| radix::used(tree, b, u))
+                        .map(|u| match tree {
+                            Tree::Map => (u, radix::map_entry(b, u)),
+                            Tree::Space | Tree::Retired => (u, ALLOCATED),
+                        })
+                        .collect();
+                    (used, Vec::new())
+                } else {
+                    let counts: Vec<(u64, u64)> = (0..radix::FANOUT)
+                        .map(|c| (c, radix::used_below(b, c)))
+                        .filter(|&(_, n)| n > 0)
+                        .collect();
+                    (Vec::new(), counts)
+                }
+            });
+            let Some((used, counts)) = read else {
+                return Ok(busy());
+            };
+            stack.pop();
+            op.units.extend(used);
+            for &(c, n) in counts.iter().rev() {
+                let child = MetaId {
+                    tree,
+                    class,
+                    level: id.level - 1,
+                    index: id.index * radix::FANOUT + c,
+                };
+                op.counts.push((child.level, child.index, n));
+                stack.push(child);
+            }
+        }
+        op.units.sort_unstable();
+        Ok(IOResult::Done(()))
+    }
+
     /// The slot holding `pid`'s current copy, if it has one.
     pub fn location(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Option<u64>>> {
         Ok(match self.entry(pid)? {
@@ -1020,8 +1076,9 @@ impl PageStore {
         self.orphans.push(pid);
     }
 
-    /// The pages handed over and not yet taken to be freed, taken and handed over again.
-    #[cfg(test)]
+    /// The pages handed over and not yet taken to be freed, taken and handed over again: exact
+    /// while nothing hands one over or takes them, as for an integrity check, which holds the
+    /// write gate and the checkpointer (DESIGN.md §17, §12; R36).
     pub fn orphans(&self) -> Vec<PageId> {
         let orphans = self.orphans.take_all();
         for &pid in &orphans {
@@ -1889,6 +1946,129 @@ impl Drop for WritePlan {
 }
 
 /// What a step that met a latched metadata page returns: try again shortly.
+/// Faults a test plants behind the log's back, for an integrity check to find.
+#[cfg(test)]
+impl PageStore {
+    fn plant(
+        self: &Arc<Self>,
+        tree: Tree,
+        class: SizeClass,
+        unit: u64,
+        change: impl FnOnce(&mut Locked<'_>, &[MetaId]),
+    ) -> Result<IOResult<()>> {
+        let ids = radix::path(tree, class, self.height(tree, class), unit);
+        let frames = match self.meta.get_all(&ids)? {
+            IOResult::Done(f) => f,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        let Some(mut locked) = Locked::new(&frames) else {
+            return Ok(busy());
+        };
+        change(&mut locked, &ids);
+        let end = self.log().end();
+        locked.commit(&self.meta, end, end);
+        Ok(IOResult::Done(()))
+    }
+
+    /// Sets `pid`'s page-table entry to `entry`, counted above.
+    pub fn plant_entry(self: &Arc<Self>, pid: PageId, entry: u64) -> Result<IOResult<()>> {
+        self.plant(Tree::Map, pid.class(), pid.number(), |locked, ids| {
+            let from = radix::map_entry(locked.page_of(ids[0]), pid.number());
+            set_map(locked, Tree::Map, pid.number(), from, entry);
+        })
+    }
+
+    /// Marks `slot` of `class` in use or free, counted above.
+    pub fn plant_slot(
+        self: &Arc<Self>,
+        class: SizeClass,
+        slot: u64,
+        used: bool,
+    ) -> Result<IOResult<()>> {
+        self.plant(Tree::Space, class, slot, |locked, _| {
+            set_space(locked, class, slot, used)
+        })
+    }
+
+    /// Marks `pid` retired, counted above.
+    pub fn plant_retired(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        let number = pid.number();
+        self.plant(Tree::Retired, pid.class(), number, |locked, ids| {
+            radix::set_space_bit(locked.page_of(ids[0]), number, true);
+            for id in &ids[1..] {
+                radix::add_used_below(
+                    locked.page_of(*id),
+                    radix::child(Tree::Retired, id.level, number),
+                    1,
+                );
+            }
+        })
+    }
+
+    /// Sets the count the page table's level-1 node over `pid` keeps for the leaf holding it,
+    /// leaving the leaf as it is: a miscount. The page table must have two levels at least.
+    pub fn plant_miscount(self: &Arc<Self>, pid: PageId, count: u64) -> Result<IOResult<()>> {
+        let number = pid.number();
+        self.plant(Tree::Map, pid.class(), number, |locked, ids| {
+            radix::set_used_below(
+                locked.page_of(ids[1]),
+                radix::child(Tree::Map, 1, number),
+                count,
+            );
+        })
+    }
+}
+
+/// A walk of one radix tree of one class for an integrity check: step it with
+/// [`PageStore::census`].
+pub struct Census {
+    tree: Tree,
+    class: SizeClass,
+    /// The nodes still to read; `None` before the walk starts.
+    stack: Option<Vec<MetaId>>,
+    /// Each count read above the leaves: the level and index of the child it counts, and its count.
+    counts: Vec<(u8, u64, u64)>,
+    /// Every unit in use, in order, with its leaf's value: a page-table entry, or [`ALLOCATED`]
+    /// for a bit in use.
+    pub units: Vec<(u64, u64)>,
+}
+
+impl Census {
+    pub fn new(tree: Tree, class: SizeClass) -> Self {
+        Self {
+            tree,
+            class,
+            stack: None,
+            counts: Vec::new(),
+            units: Vec::new(),
+        }
+    }
+
+    /// Every count above the leaves that differs from the units in use below it, once walked.
+    pub fn miscounts(&self) -> Vec<String> {
+        self.counts
+            .iter()
+            .filter_map(|&(level, index, count)| {
+                let span = radix::span(self.tree, level);
+                let start = index * span;
+                let below = self.units.partition_point(|&(u, _)| u < start);
+                let held = self
+                    .units
+                    .partition_point(|&(u, _)| u < start.saturating_add(span))
+                    - below;
+                (held as u64 != count).then(|| {
+                    format!(
+                        "the {:?} of class {} counts {count} in use below node {index} of level \
+                         {level}, which holds {held}",
+                        self.tree,
+                        self.class.index()
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
 fn busy<T>() -> IOResult<T> {
     IOResult::IO(IOCompletions(Completion::new_yield()))
 }

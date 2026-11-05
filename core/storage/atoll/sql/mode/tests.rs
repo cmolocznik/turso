@@ -2561,3 +2561,102 @@ fn an_update_of_another_column_ignores_a_mismatched_foreign_key() {
         vec![vec![Value::from_i64(7), Value::from_i64(1), Value::Null]]
     );
 }
+
+/// NoConflict on a UNIQUE index judges a key by its newest version (A3.12): an autocommit insert
+/// of a value another open transaction is deleting waits for that delete, then restarts on its
+/// commit and goes in, where judged by the snapshot alone it would fail its constraint. A visible
+/// present version is a UNIQUE violation as ever.
+#[test]
+fn a_unique_insert_waits_for_a_delete_of_its_value_held_open() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/no-conflict-waits");
+    let a = db.connect(ConnectOpts::new()).unwrap();
+    a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE)")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("DELETE FROM t WHERE k = 'a'").unwrap();
+    let behind = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let b = db.connect(ConnectOpts::new()).unwrap();
+            b.set_busy_timeout(std::time::Duration::from_secs(30));
+            b.execute("INSERT INTO t VALUES (3, 'a')")
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !behind.is_finished(),
+        "the insert did not wait for the delete held open"
+    );
+    a.execute("COMMIT").unwrap();
+    behind.join().unwrap().unwrap();
+    assert_eq!(
+        rows(&a, "SELECT id, k FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(2), text("b")],
+            vec![Value::from_i64(3), text("a")]
+        ]
+    );
+    let err = a.execute("INSERT INTO t VALUES (4, 'b')").unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "{err}");
+}
+
+/// An explicit transaction whose insert meets a UNIQUE value deleted by a commit after its
+/// snapshot conflicts, as under PostgreSQL's REPEATABLE READ (A3.12).
+#[test]
+fn a_unique_insert_in_a_transaction_conflicts_with_a_later_delete_of_its_value() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/no-conflict-conflicts");
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE)")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    b.execute("BEGIN").unwrap();
+    rows(&b, "SELECT count(*) FROM t");
+    a.execute("DELETE FROM t WHERE k = 'a'").unwrap();
+    let err = b.execute("INSERT INTO t VALUES (3, 'a')").unwrap_err();
+    assert!(
+        matches!(err, crate::LimboError::WriteWriteConflict),
+        "{err}"
+    );
+    assert!(b.get_auto_commit());
+}
+
+/// An insert's rowid check judges the rowid by its newest version (A4.9): an autocommit insert of
+/// a rowid another open transaction is deleting waits for that delete, then restarts on its
+/// commit and goes in, where judged by the snapshot alone it would fail its primary key.
+#[test]
+fn an_insert_of_a_rowid_waits_for_its_delete_held_open() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/key-probe-waits");
+    let a = db.connect(ConnectOpts::new()).unwrap();
+    a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("DELETE FROM t WHERE id = 1").unwrap();
+    let behind = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let b = db.connect(ConnectOpts::new()).unwrap();
+            b.set_busy_timeout(std::time::Duration::from_secs(30));
+            b.execute("INSERT INTO t VALUES (1, 'new')")
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !behind.is_finished(),
+        "the insert did not wait for the delete held open"
+    );
+    a.execute("COMMIT").unwrap();
+    behind.join().unwrap().unwrap();
+    assert_eq!(
+        rows(&a, "SELECT id, v FROM t"),
+        vec![vec![Value::from_i64(1), text("new")]]
+    );
+}

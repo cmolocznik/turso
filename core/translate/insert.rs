@@ -3110,6 +3110,15 @@ fn emit_pk_uniqueness_check(
     }
 
     let make_record_label = program.allocate_label();
+    if program.is_atoll_db(ctx.namespace.database_id) {
+        // The rowid judged by its newest version first (A4.9): a row another transaction is
+        // deleting is waited for, and one committed past the snapshot conflicts.
+        program.emit_insn(Insn::KeyProbe {
+            cursor_id: ctx.cursor_id,
+            start_reg: insertion.key_register(),
+            num_regs: 1,
+        });
+    }
     program.emit_insn(Insn::NotExists {
         cursor: ctx.cursor_id,
         rowid_reg: insertion.key_register(),

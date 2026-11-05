@@ -4782,6 +4782,8 @@ pub fn op_transaction_inner(
                             Begin::Write {
                                 schema: !statement_writes_db || program.writes_schema,
                             }
+                        } else if program.checks_pages {
+                            Begin::Write { schema: true }
                         } else {
                             Begin::Read
                         };
@@ -14361,6 +14363,38 @@ pub fn op_no_conflict(
                 }
             }
             OpNoConflictState::Seeking(record_source) => {
+                // Atoll mode: the key is judged by its newest version first (A3.12), so a value
+                // another transaction is deleting waits for it, and one committed past the
+                // snapshot conflicts; then the seek finds what the snapshot sees.
+                if program.connection.atoll().is_some() {
+                    use crate::storage::atoll::sql::cursor::GuardKey;
+                    let record = match &record_source {
+                        RecordSource::Packed { record_reg } => {
+                            match &state.registers[*record_reg] {
+                                Register::Record(r) => r.clone(),
+                                _ => {
+                                    return Err(LimboError::InternalError(
+                                        "NoConflict: expected a record in the register".into(),
+                                    )
+                                    .into())
+                                }
+                            }
+                        }
+                        RecordSource::Unpacked {
+                            start_reg,
+                            num_regs,
+                        } => ImmutableRecord::from_registers(
+                            &state.registers[*start_reg..*start_reg + *num_regs],
+                            *num_regs,
+                        )?,
+                    };
+                    let c = state.get_cursor(*cursor_id);
+                    if let Some(c) = (c.as_btree_mut() as &mut dyn Any)
+                        .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
+                    {
+                        return_if_io!(state, c.probe(GuardKey::Columns(&record)));
+                    }
+                }
                 return match seek_internal(
                     program,
                     state,
@@ -17723,6 +17757,17 @@ pub fn op_integrity_check(
     let physical_header_store = mv_store
         .as_ref()
         .filter(|mv_store| !mv_store.uses_passive_checkpoint());
+    // Atoll mode: the page arm checks Atoll's trees and page store (DESIGN.md §17, §12, R36).
+    if let Some(atoll) = program.connection.atoll_for_db(*db) {
+        let found = atoll.check_pages(*max_errors)?;
+        if found.is_empty() {
+            state.registers[*message_register].set_null();
+        } else {
+            state.registers[*message_register].set_text(Text::new(found.join("\n")))?;
+        }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) = return_if_io!(
@@ -22144,7 +22189,6 @@ pub fn op_fk_guard(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    use crate::storage::atoll::sql::cursor::GuardKey;
     load_insn!(
         FkGuard {
             cursor_id,
@@ -22154,48 +22198,90 @@ pub fn op_fk_guard(
         },
         insn
     );
-    let table = matches!(program.cursor_ref[*cursor_id].1, CursorType::BTreeTable(_));
-    let record;
-    let key = if *num_regs == 0 {
-        GuardKey::All
-    } else if table {
-        match state.registers[*start_reg].get_value() {
-            Value::Numeric(Numeric::Integer(rowid)) => GuardKey::Rowid(*rowid),
-            other => {
-                return Err(LimboError::InternalError(format!(
-                    "FkGuard: a rowid that is no integer: {other:?}"
-                ))
-                .into())
-            }
-        }
-    } else {
-        record = ImmutableRecord::from_registers(
-            &state.registers[*start_reg..*start_reg + *num_regs],
-            *num_regs,
-        )?;
-        GuardKey::Columns(&record)
-    };
-    let c = state.get_cursor(*cursor_id);
-    let c = (c.as_btree_mut() as &mut dyn Any)
-        .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
-        .ok_or_else(|| {
-            LimboError::InternalError("FkGuard on a cursor that is not Atoll's".into())
-        })?;
-    return_if_io!(state, c.guard(key, *guarded));
+    let key = AtollKey::read(program, state, *cursor_id, *start_reg, *num_regs)?;
+    return_if_io!(
+        state,
+        atoll_cursor(state, *cursor_id)?.guard(key.as_key(), *guarded)
+    );
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// The Atoll cursor an FkUnseen or FkGuardRow names.
-fn fk_walk_cursor<'a>(
-    state: &'a mut ProgramState,
+/// KeyProbe (A4.9): an Atoll write path's probe of a key by its newest version, before the
+/// read that answers it. Only a statement on an Atoll database emits it.
+pub fn op_key_probe(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        KeyProbe {
+            cursor_id,
+            start_reg,
+            num_regs,
+        },
+        insn
+    );
+    let key = AtollKey::read(program, state, *cursor_id, *start_reg, *num_regs)?;
+    return_if_io!(state, atoll_cursor(state, *cursor_id)?.probe(key.as_key()));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// The key an Atoll guard or probe names, read from its registers: every key for none, a table's
+/// rowid, or an index's first columns.
+enum AtollKey {
+    All,
+    Rowid(i64),
+    Columns(ImmutableRecord),
+}
+
+impl AtollKey {
+    fn read(
+        program: &Program,
+        state: &ProgramState,
+        cursor_id: usize,
+        start_reg: usize,
+        num_regs: usize,
+    ) -> Result<Self> {
+        if num_regs == 0 {
+            return Ok(Self::All);
+        }
+        if matches!(program.cursor_ref[cursor_id].1, CursorType::BTreeTable(_)) {
+            return match state.registers[start_reg].get_value() {
+                Value::Numeric(Numeric::Integer(rowid)) => Ok(Self::Rowid(*rowid)),
+                other => Err(LimboError::InternalError(format!(
+                    "an Atoll key whose rowid is no integer: {other:?}"
+                ))),
+            };
+        }
+        Ok(Self::Columns(ImmutableRecord::from_registers(
+            &state.registers[start_reg..start_reg + num_regs],
+            num_regs,
+        )?))
+    }
+
+    fn as_key(&self) -> crate::storage::atoll::sql::cursor::GuardKey<'_> {
+        use crate::storage::atoll::sql::cursor::GuardKey;
+        match self {
+            Self::All => GuardKey::All,
+            Self::Rowid(rowid) => GuardKey::Rowid(*rowid),
+            Self::Columns(record) => GuardKey::Columns(record),
+        }
+    }
+}
+
+/// The Atoll cursor `cursor_id` names.
+fn atoll_cursor(
+    state: &mut ProgramState,
     cursor_id: usize,
-) -> Result<&'a mut crate::storage::atoll::sql::mode::SqlCursor> {
+) -> Result<&mut crate::storage::atoll::sql::mode::SqlCursor> {
     let c = state.get_cursor(cursor_id);
     (c.as_btree_mut() as &mut dyn Any)
         .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
         .ok_or_else(|| {
-            LimboError::InternalError("a foreign-key walk on a cursor that is not Atoll's".into())
+            LimboError::InternalError("an Atoll opcode on a cursor that is not Atoll's".into())
         })
 }
 
@@ -22207,7 +22293,7 @@ pub fn op_fk_unseen(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(FkUnseen { cursor_id }, insn);
-    fk_walk_cursor(state, *cursor_id)?.walk_unseen();
+    atoll_cursor(state, *cursor_id)?.walk_unseen();
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -22220,8 +22306,7 @@ pub fn op_fk_guard_row(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(FkGuardRow { cursor_id }, insn);
-    let c = fk_walk_cursor(state, *cursor_id)?;
-    return_if_io!(state, c.unseen_hit());
+    return_if_io!(state, atoll_cursor(state, *cursor_id)?.unseen_hit());
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

@@ -14,6 +14,7 @@
 pub mod catalog;
 pub mod cursor;
 pub mod header;
+pub mod integrity;
 pub mod key;
 pub mod lifecycle;
 pub mod mode;

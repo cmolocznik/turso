@@ -206,6 +206,13 @@ impl Checkpointer {
         }
     }
 
+    /// Holds the checkpointer idle, if no one is stepping it: no pass, no erase and no move of
+    /// the redo point happens until the hold is dropped, so the page store holds still for an
+    /// integrity check (DESIGN.md §17, §12; R36).
+    pub fn hold(&self) -> Option<impl Sized + '_> {
+        self.state.try_lock()
+    }
+
     /// Asks for a full checkpoint: every shard passed, then the redo point moved as far as it
     /// goes. Step it with [`step_full`](Self::step_full).
     pub fn request_full(&self) -> u64 {

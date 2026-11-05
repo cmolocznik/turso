@@ -1106,6 +1106,11 @@ impl ProgramBuilder {
     /// Whether a write into `database_id` owes its foreign-key guards (R10): only an Atoll
     /// database's do, and only main is ever one.
     pub fn owes_fk_guards(&self, database_id: usize) -> bool {
+        self.is_atoll_db(database_id)
+    }
+
+    /// Whether `database_id` is an Atoll database: only main is ever one.
+    pub fn is_atoll_db(&self, database_id: usize) -> bool {
         self.atoll && database_id == crate::MAIN_DB_ID
     }
 
@@ -2556,8 +2561,14 @@ impl ProgramBuilder {
             } => *db == crate::MAIN_DB_ID,
             _ => false,
         });
+        // An integrity check of an Atoll database's pages takes the gate exclusive too, so the page
+        // store holds still while it walks (DESIGN.md §17, §12, R36).
+        let checks_pages = self.atoll
+            && self.insns.iter().any(|(insn, _)| {
+                matches!(insn, Insn::IntegrityCk { data } if data.db == crate::MAIN_DB_ID)
+            });
         // The trees a schema writer reads rows of, sqlite_schema aside (DESIGN.md §17, §3, defect 4).
-        let mut schema_reads: Vec<u64> = if writes_schema {
+        let mut schema_reads: Vec<u64> = if writes_schema || checks_pages {
             self.insns
                 .iter()
                 .filter_map(|(insn, _)| match insn {
@@ -2604,6 +2615,7 @@ impl ProgramBuilder {
             write_databases: self.write_databases,
             read_databases: self.read_databases,
             writes_schema,
+            checks_pages,
             schema_reads,
         };
         Ok(prepared)

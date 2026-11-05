@@ -663,6 +663,17 @@ impl AtollCursor {
         self.insert(key)
     }
 
+    /// A write path's probe of `key`, judged by its newest version as a write would judge it
+    /// (A3.12, A4.9; [`VersionedTree::probe`]). Step it until done.
+    pub fn probe(
+        &mut self,
+        key: &[u8],
+    ) -> Result<IOResult<crate::storage::atoll::txn::versioned::Probe>> {
+        let mut lock = self.txn.lock();
+        let txn = lock.as_mut().ok_or_else(outside)?;
+        self.tree.probe(self.db.atoll().transactions(), txn, key)
+    }
+
     /// The keys a foreign-key guard of `key` judges start with this (R10): a table's rowid key, or
     /// the encoded columns of an index or WITHOUT ROWID table, as a seek on them encodes them;
     /// empty for every key. A tree of another encoding refuses it, naming REINDEX, as it refuses a

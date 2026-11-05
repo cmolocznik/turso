@@ -148,8 +148,10 @@ fn commits() {
             buffer: BufferConfig {
                 budget: MIN_BUDGET,
                 writeback_bytes: WRITEBACK_BYTES,
+                kept_bytes: None,
             },
             log_budget: None,
+            checkpoint_write_bytes: None,
             txn: TxnConfig {
                 slots: threads.max(TxnConfig::default().slots),
             },
@@ -564,6 +566,351 @@ fn sql() {
     assert_eq!(left, vec![vec![Value::from_i64(0)]], "every row deleted");
 }
 
+/// Sustained random updates on real files, the pool a quarter of the data or less, so pages are
+/// evicted and checkpoints run all along (the audit's benchmark, with the stepau review's three
+/// phases): first with no reader; then with one reader holding an older snapshot, whose values are
+/// read again at the phase's end and must not have moved; then with that reader gone, while the
+/// versions and copies it held are given back. One writer, in transactions of [`TXN_ROWS`] rows,
+/// the next begun as the last commits. Each second prints the rows committed, the commit
+/// latencies, the bytes the process wrote, and for Atoll the checkpoint's pages and bytes, the
+/// swap copies written, the kept copies' room (peak, refusals, the writers' wait), the temporary
+/// pages the versions hold and the log appended. The end prints the work left: for Atoll the pages
+/// owed an image and the log a recovery would replay, for WAL the WAL's size. WAL runs with
+/// `ATOLL_BENCH_WAL`, its page cache the pool's size:
+///
+/// ```text
+/// ATOLL_BENCH_DIR=/data/bench cargo test --release -p turso_core --lib storage::atoll::bench::sustained -- --ignored --nocapture
+/// ```
+///
+/// `ATOLL_BENCH_POOL` (bytes, 256 MiB), `ATOLL_BENCH_ROWS` (4,000,000), `ATOLL_BENCH_VALUE` (bytes,
+/// 200) and `ATOLL_BENCH_PHASE` (seconds, 30) change the sizes.
+#[test]
+#[ignore]
+fn sustained() {
+    use crate::{ConnectOpts, Database, OpenOptions, SqliteDialect, Value};
+    use std::num::NonZero;
+
+    let env =
+        |name: &str, default: u64| std::env::var(name).map_or(default, |v| v.parse().expect(name));
+    let dir =
+        std::env::var("ATOLL_BENCH_DIR").expect("ATOLL_BENCH_DIR: a directory on a real disk");
+    let pool = env("ATOLL_BENCH_POOL", 256 << 20) as usize;
+    let rows = env("ATOLL_BENCH_ROWS", 4_000_000);
+    let length = env("ATOLL_BENCH_VALUE", 200) as usize;
+    let phase_secs = env("ATOLL_BENCH_PHASE", 30);
+    let wal = std::env::var_os("ATOLL_BENCH_WAL").is_some();
+    let journal = if wal { "wal" } else { "atoll" };
+    let path = format!("{dir}/sustained-{journal}-{}.db", std::process::id());
+    let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect));
+    let options = if wal {
+        options
+    } else {
+        options.atoll(AtollConfig::with_budget(pool))
+    };
+    let db = Database::open(io, &path, options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    if wal {
+        conn.execute(format!("PRAGMA cache_size = -{}", pool >> 10))
+            .unwrap();
+    }
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+        .unwrap();
+    let value = |id: u64, round: u64| {
+        let head = format!("{id}:{round}:");
+        Value::build_text(format!(
+            "{head}{}",
+            "v".repeat(length.saturating_sub(head.len()))
+        ))
+    };
+    let (mut begin, mut commit) = (
+        conn.prepare("BEGIN").unwrap(),
+        conn.prepare("COMMIT").unwrap(),
+    );
+    let mut insert = conn
+        .prepare("INSERT INTO t (id, data) VALUES (?1, ?2)")
+        .unwrap();
+    let loading = Instant::now();
+    for chunk in (0..rows).collect::<Vec<_>>().chunks(1000) {
+        begin.run_ignore_rows().unwrap();
+        begin.reset().unwrap();
+        for &id in chunk {
+            insert
+                .bind_at(NonZero::<usize>::MIN, Value::from_i64(id as i64))
+                .unwrap();
+            insert
+                .bind_at(NonZero::new(2).unwrap(), value(id, 0))
+                .unwrap();
+            insert.run_ignore_rows().unwrap();
+            insert.reset().unwrap();
+        }
+        commit.run_ignore_rows().unwrap();
+        commit.reset().unwrap();
+    }
+    let synchronous = conn
+        .prepare("PRAGMA synchronous")
+        .and_then(|mut s| s.run_collect_rows())
+        .map_or("unknown".to_string(), |r| format!("{r:?}"));
+    println!(
+        "sustained {journal} pool {} MiB rows {rows} value {length} loaded in {:.1} s, \
+         synchronous {synchronous}",
+        pool >> 20,
+        loading.elapsed().as_secs_f64()
+    );
+    let atoll = db.atoll.clone();
+    // The scope the run is capped in: its memory and the time its tasks stalled on memory, as
+    // the kernel counts them for either engine, page cache included.
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("0::").map(|p| format!("/sys/fs/cgroup{p}")))
+        })
+        .filter(|d| std::path::Path::new(&format!("{d}/memory.current")).exists());
+    let cg_read = |file: &str| {
+        cgroup
+            .as_ref()
+            .and_then(|d| std::fs::read_to_string(format!("{d}/{file}")).ok())
+    };
+    let cg_value = |file: &str| cg_read(file).and_then(|s| s.trim().parse::<u64>().ok());
+    let cg_stat = |key: &str| {
+        cg_read("memory.stat").and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ')?.parse::<u64>().ok())
+        })
+    };
+    // Microseconds some or all of the scope's tasks stalled on memory, since it began.
+    let cg_stall = |kind: &str| {
+        cg_read("memory.pressure").and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix(kind)?
+                    .split_whitespace()
+                    .find_map(|f| f.strip_prefix("total=")?.parse::<u64>().ok())
+            })
+        })
+    };
+    println!(
+        "sustained {journal} binary {} cgroup {} memory.max {}",
+        std::env::current_exe().map_or("unread".to_string(), |p| p.display().to_string()),
+        cgroup.as_deref().unwrap_or("none"),
+        cg_read("memory.max").map_or("unread".to_string(), |s| s.trim().to_string()),
+    );
+    let written = || {
+        std::fs::read_to_string("/proc/self/io")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| {
+                        l.strip_prefix("write_bytes: ")
+                            .map(|n| n.parse::<u64>().ok())
+                    })
+                    .flatten()
+            })
+            .unwrap_or(0)
+    };
+    /// What a second of the run counts, read before and after it.
+    #[derive(Clone, Copy, Default)]
+    struct Counts {
+        written: u64,
+        checkpoint_pages: u64,
+        checkpoint_bytes: u64,
+        swap: u64,
+        log: u64,
+        refusals: u64,
+        waited_ns: u64,
+        stall_some_us: u64,
+        stall_full_us: u64,
+    }
+    let counts = || {
+        let mut c = Counts {
+            written: written(),
+            stall_some_us: cg_stall("some").unwrap_or(0),
+            stall_full_us: cg_stall("full").unwrap_or(0),
+            ..Counts::default()
+        };
+        if let Some(a) = &atoll {
+            let (cp, pool) = (a.atoll().checkpointer().stats(), a.atoll().pool());
+            let kept = pool.kept_stats();
+            c.checkpoint_pages = cp.pages;
+            c.checkpoint_bytes = cp.bytes;
+            c.swap = pool.swap_written();
+            c.log = a.atoll().log().end();
+            c.refusals = kept.refusals;
+            c.waited_ns = kept.waited_ns;
+        }
+        c
+    };
+    let mut update = conn
+        .prepare("UPDATE t SET data = ?2 WHERE id = ?1")
+        .unwrap();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next_id = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % rows
+    };
+    let mut round = 0u64;
+    let mut run_phase = |name: &str| {
+        let mb = |b: u64| b as f64 / (1 << 20) as f64;
+        let began = Instant::now();
+        // The second's start, its counts then, its rows, and each transaction's time from
+        // BEGIN through COMMIT and its COMMIT's alone.
+        let mut window = (
+            Instant::now(),
+            counts(),
+            0u64,
+            Vec::<u64>::new(),
+            Vec::<u64>::new(),
+        );
+        while began.elapsed() < Duration::from_secs(phase_secs) {
+            round += 1;
+            let txn = Instant::now();
+            begin.run_ignore_rows().unwrap();
+            begin.reset().unwrap();
+            for _ in 0..TXN_ROWS {
+                let id = next_id();
+                update
+                    .bind_at(NonZero::<usize>::MIN, Value::from_i64(id as i64))
+                    .unwrap();
+                update
+                    .bind_at(NonZero::new(2).unwrap(), value(id, round))
+                    .unwrap();
+                update.run_ignore_rows().unwrap();
+                update.reset().unwrap();
+            }
+            let committing = Instant::now();
+            commit.run_ignore_rows().unwrap();
+            commit.reset().unwrap();
+            window.2 += TXN_ROWS as u64;
+            window.3.push(txn.elapsed().as_micros() as u64);
+            window.4.push(committing.elapsed().as_micros() as u64);
+            let secs = window.0.elapsed().as_secs_f64();
+            if secs >= 1.0 {
+                let now = counts();
+                let was = window.1;
+                let (mut txns, mut commits) =
+                    (std::mem::take(&mut window.3), std::mem::take(&mut window.4));
+                txns.sort_unstable();
+                commits.sort_unstable();
+                let pcts = |lat: &[u64]| {
+                    let pct = |p: usize| lat[(lat.len() * p / 100).min(lat.len() - 1)];
+                    format!("p50 {} p99 {} max {}", pct(50), pct(99), lat[lat.len() - 1])
+                };
+                let mut line = format!(
+                    "sustained {journal} {name} t {:.0} rows/s {:.0} txn_us {} commit_us {} \
+                     written_MB/s {:.1}",
+                    began.elapsed().as_secs_f64(),
+                    window.2 as f64 / secs,
+                    pcts(&txns),
+                    pcts(&commits),
+                    mb(now.written - was.written) / secs,
+                );
+                match &cgroup {
+                    Some(_) => {
+                        let unread = |v: Option<u64>| {
+                            v.map_or("unread".to_string(), |b| format!("{:.1}", mb(b)))
+                        };
+                        line += &format!(
+                            " mem_MB {} anon_MB {} file_MB {} stall_some_ms {:.1} stall_full_ms {:.1}",
+                            unread(cg_value("memory.current")),
+                            unread(cg_stat("anon")),
+                            unread(cg_stat("file")),
+                            (now.stall_some_us - was.stall_some_us) as f64 / 1e3,
+                            (now.stall_full_us - was.stall_full_us) as f64 / 1e3,
+                        );
+                    }
+                    None => line += " cgroup none",
+                }
+                if let Some(a) = &atoll {
+                    let kept = a.atoll().pool().kept_stats();
+                    line += &format!(
+                        " ckpt_pages {} ckpt_MB {:.1} swap_MB {:.1} log_MB {:.1} kept_peak_MB {:.1} \
+                         refusals {} waited_ms {:.1} longest_wait_ms {:.1} temp_MB {:.1}",
+                        now.checkpoint_pages - was.checkpoint_pages,
+                        mb(now.checkpoint_bytes - was.checkpoint_bytes),
+                        mb(now.swap - was.swap),
+                        mb(now.log - was.log),
+                        mb(kept.peak as u64),
+                        now.refusals - was.refusals,
+                        (now.waited_ns - was.waited_ns) as f64 / 1e6,
+                        kept.longest_wait_ns as f64 / 1e6,
+                        mb(a.atoll().pool().temporary_bytes()),
+                    );
+                    a.atoll().pool().reset_kept_peaks();
+                }
+                println!("{line}");
+                txns.clear();
+                commits.clear();
+                window = (Instant::now(), now, 0, txns, commits);
+            }
+        }
+    };
+    run_phase("no-reader");
+    // A reader holding the snapshot of now, its values of a sample read and kept.
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let mut lookup = reader.prepare("SELECT data FROM t WHERE id = ?1").unwrap();
+    reader.execute("BEGIN").unwrap();
+    let sample: Vec<u64> = (0..1000).map(|i| i * (rows / 1000)).collect();
+    let read = |lookup: &mut crate::Statement| {
+        sample
+            .iter()
+            .map(|&id| {
+                lookup
+                    .bind_at(NonZero::<usize>::MIN, Value::from_i64(id as i64))
+                    .unwrap();
+                let got = lookup.run_collect_rows().unwrap();
+                lookup.reset().unwrap();
+                got
+            })
+            .collect::<Vec<_>>()
+    };
+    let seen = read(&mut lookup);
+    run_phase("old-reader");
+    assert!(
+        read(&mut lookup) == seen,
+        "the older snapshot read values committed after it"
+    );
+    reader.execute("COMMIT").unwrap();
+    println!(
+        "sustained {journal} old-reader: its {} values unmoved",
+        sample.len()
+    );
+    run_phase("reader-gone");
+    match &atoll {
+        Some(a) => {
+            let cp = a.atoll().checkpointer().stats();
+            println!(
+                "sustained atoll end: owed_pages {} replay_MB {:.1} temp_MB {:.1} \
+                 checkpoint working_peak_KiB {} flying_peak_KiB {} stepping_s {:.1} \
+                 kept {:?}",
+                a.atoll().pool().owed_pages(),
+                a.atoll().checkpointer().lag() as f64 / (1 << 20) as f64,
+                a.atoll().pool().temporary_bytes() as f64 / (1 << 20) as f64,
+                cp.working_peak >> 10,
+                cp.flying_peak >> 10,
+                cp.stepping_ns as f64 / 1e9,
+                a.atoll().pool().kept_stats(),
+            );
+        }
+        None => println!(
+            "sustained wal end: wal_MB {:.1}",
+            std::fs::metadata(format!("{path}-wal")).map_or(0, |m| m.len()) as f64
+                / (1 << 20) as f64
+        ),
+    }
+    if cgroup.is_some() {
+        println!(
+            "sustained {journal} cgroup end: memory.peak {} events {}",
+            cg_read("memory.peak").map_or("unread".to_string(), |s| s.trim().to_string()),
+            cg_read("memory.events").map_or("unread".to_string(), |s| s
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")),
+        );
+    }
+}
+
 /// Rows per transaction in [`paths`]'s versioned inserts, as the SQL throughput benchmark writes.
 const TXN_ROWS: usize = 100;
 
@@ -607,8 +954,10 @@ fn bench_config() -> AtollConfig {
         buffer: BufferConfig {
             budget: 2 << 30,
             writeback_bytes: WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: None,
+        checkpoint_write_bytes: None,
         txn: TxnConfig::default(),
     }
 }

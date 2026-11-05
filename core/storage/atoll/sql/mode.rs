@@ -765,11 +765,7 @@ impl ConnTxn {
             // checkpoint is due or under way: commits are not its only trigger, so long
             // transactions are checkpointed too (DESIGN.md §17, §11). Its IO is not waited for:
             // the checkpoint goes on at the next step, whoever takes it.
-            self.db
-                .atoll()
-                .checkpointer()
-                .step_due(txns, self.db.versions())
-                .map(|_| ())?;
+            self.db.atoll().checkpointer().step_due(txns).map(|_| ())?;
         }
         let mut guard = self.cell.lock();
         if guard.is_none() {
@@ -1225,9 +1221,7 @@ pub fn full_checkpoint(db: &AtollDb) -> Result<()> {
     let checkpointer = db.atoll().checkpointer();
     let ticket = checkpointer.request_full();
     let txns = db.atoll().transactions();
-    drive(db.io(), || {
-        checkpointer.step_full(ticket, txns, db.versions())
-    })
+    drive(db.io(), || checkpointer.step_full(ticket, txns))
 }
 
 /// Steps the checkpointer, which does whatever is due: a checkpoint once its share of the log
@@ -1236,7 +1230,7 @@ pub fn full_checkpoint(db: &AtollDb) -> Result<()> {
 fn nudge_checkpoint(db: &AtollDb) -> Result<()> {
     db.atoll()
         .checkpointer()
-        .step(db.atoll().transactions(), db.versions())
+        .step(db.atoll().transactions())
         .map(|_| ())
 }
 
@@ -1335,11 +1329,7 @@ impl Ending {
                 }
                 Step::Checkpoint(ticket) => {
                     let txns = self.db.atoll().transactions();
-                    done!(self.db.atoll().checkpointer().step_full(
-                        *ticket,
-                        txns,
-                        self.db.versions()
-                    ));
+                    done!(self.db.atoll().checkpointer().step_full(*ticket, txns));
                     self.step = Step::Done;
                 }
                 Step::Done => return Ok(IOResult::Done(())),

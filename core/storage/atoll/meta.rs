@@ -41,7 +41,7 @@ use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::Stack;
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
-use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
@@ -195,6 +195,62 @@ impl Dirt {
     }
 }
 
+/// Bytes of the metadata pages kept as a cut found them, now and at most. No one waits for
+/// them, so a checkpoint always reaches the writes that drop them; their bound is a page each,
+/// kept once a cut, beside the pages the checkpoint writes anyway (DESIGN.md §9.6).
+#[derive(Default)]
+pub struct CutBytes {
+    used: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl CutBytes {
+    /// Bytes held now, and the most held.
+    pub fn stats(&self) -> (usize, usize) {
+        (
+            self.used.load(Ordering::Acquire),
+            self.peak.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// A page as a cut found it, counted until its bytes are dropped.
+struct CutCopy {
+    bytes: Box<[u8]>,
+    of: Arc<CutBytes>,
+}
+
+impl CutCopy {
+    fn new(bytes: Box<[u8]>, of: &Arc<CutBytes>) -> Self {
+        let used = of.used.fetch_add(bytes.len(), Ordering::AcqRel) + bytes.len();
+        of.peak.fetch_max(used, Ordering::AcqRel);
+        Self {
+            bytes,
+            of: of.clone(),
+        }
+    }
+}
+
+impl std::ops::Deref for CutCopy {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::ops::DerefMut for CutCopy {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+}
+
+impl Drop for CutCopy {
+    fn drop(&mut self) {
+        self.of.used.fetch_sub(self.bytes.len(), Ordering::AcqRel);
+    }
+}
+
 pub struct MetaFrame {
     pub id: MetaId,
     latch: VersionedLatch,
@@ -215,7 +271,8 @@ pub struct MetaFrame {
     cutting: Arc<crate::sync::atomic::AtomicU64>,
     /// The page as it stood at the cut of checkpoint `cut_for`, kept by its first change since,
     /// or by that checkpoint's own edit of the cut alone.
-    cut: Mutex<Option<Box<[u8]>>>,
+    cut: Mutex<Option<CutCopy>>,
+    cut_bytes: Arc<CutBytes>,
     cut_for: crate::sync::atomic::AtomicU64,
     /// The write in flight, if any.
     writing: CompletionCell,
@@ -233,7 +290,11 @@ impl Pinnable for MetaFrame {
 }
 
 impl MetaFrame {
-    fn new(id: MetaId, cutting: Arc<crate::sync::atomic::AtomicU64>) -> Self {
+    fn new(
+        id: MetaId,
+        cutting: Arc<crate::sync::atomic::AtomicU64>,
+        cut_bytes: Arc<CutBytes>,
+    ) -> Self {
         Self {
             id,
             latch: VersionedLatch::default(),
@@ -247,6 +308,7 @@ impl MetaFrame {
             written_side: AtomicU8::new(0),
             cutting,
             cut: Mutex::new(None),
+            cut_bytes,
             cut_for: crate::sync::atomic::AtomicU64::new(0),
             writing: CompletionCell::default(),
             loaded: CompletionCell::default(),
@@ -265,7 +327,7 @@ impl MetaFrame {
     fn keep_cut(&self) {
         let n = self.cutting.load(Ordering::Acquire);
         if n != 0 && self.cut_for.load(Ordering::Acquire) != n {
-            *self.cut.lock() = Some(self.copy_bytes());
+            *self.cut.lock() = Some(CutCopy::new(self.copy_bytes(), &self.cut_bytes));
             self.cut_for.store(n, Ordering::Release);
         }
     }
@@ -405,6 +467,8 @@ pub struct MetaCache {
     in_charge: crate::sync::atomic::AtomicU64,
     /// The checkpoint whose cut is in effect, 0 for none, shared with every frame.
     cutting: Arc<crate::sync::atomic::AtomicU64>,
+    /// The bytes of the pages kept as a cut found them, shared with every frame.
+    cut_bytes: Arc<CutBytes>,
     /// Pages a checkpoint cut short by a crash may have written, as recovery found them in the
     /// log: their bytes past a copy in charge may be torn, which is no corruption.
     torn_ok: AtomicBool,
@@ -434,6 +498,7 @@ impl MetaCache {
             epochs,
             in_charge: crate::sync::atomic::AtomicU64::new(in_charge),
             cutting: Arc::new(crate::sync::atomic::AtomicU64::new(0)),
+            cut_bytes: Arc::default(),
             torn_ok: AtomicBool::new(false),
         }
     }
@@ -476,7 +541,11 @@ impl MetaCache {
                 break frame;
             }
             drop(step);
-            let fresh = Pinned::new(MetaFrame::new(id, self.cutting.clone()));
+            let fresh = Pinned::new(MetaFrame::new(
+                id,
+                self.cutting.clone(),
+                self.cut_bytes.clone(),
+            ));
             if cell.put(&fresh, &self.cells) {
                 self.arrivals.push(id);
                 self.load(&fresh)?;
@@ -636,7 +705,7 @@ impl MetaCache {
         debug_assert_eq!(self.cutting.load(Ordering::Acquire), n);
         let hold = Held::try_take(&frame.latch)?;
         if cut_only && frame.cut_for.load(Ordering::Acquire) != n {
-            *frame.cut.lock() = Some(frame.copy_bytes());
+            *frame.cut.lock() = Some(CutCopy::new(frame.copy_bytes(), &self.cut_bytes));
             frame.cut_for.store(n, Ordering::Release);
         }
         if frame.cut_for.load(Ordering::Acquire) == n {
@@ -784,6 +853,11 @@ impl MetaCache {
     /// The checkpoint whose cut is in effect, 0 for none.
     pub fn cutting(&self) -> u64 {
         self.cutting.load(Ordering::Acquire)
+    }
+
+    /// Bytes of the pages kept as a cut found them, now and at most.
+    pub fn cut_stats(&self) -> (usize, usize) {
+        self.cut_bytes.stats()
     }
 
     /// Checkpoint `n` has written every page it writes: changes no longer keep a page first, and

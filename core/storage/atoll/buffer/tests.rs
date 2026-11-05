@@ -872,6 +872,7 @@ fn a_sweep_writes_back_more_pages_than_the_writeback_buffer_holds() {
         BufferConfig {
             budget: MIN_BUDGET,
             writeback_bytes: page::MAX_PAGE_SIZE,
+            kept_bytes: None,
         },
     );
     let room = page::MAX_PAGE_SIZE / class(0).size();

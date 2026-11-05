@@ -99,7 +99,16 @@ impl Tree {
             }
         }
         match parent {
-            Some(parent) => self.unbranch(parent, pid, values),
+            Some(parent) => match done!(self.unbranch(parent, pid, values)) {
+                Some(drained) => Ok(IOResult::Done(drained)),
+                None => {
+                    // Its latches let go: the change gate too, then room for the copies, and the
+                    // step again.
+                    drop(change);
+                    done!(self.pool.wait_for_room());
+                    Ok(IOResult::Done(Drained::More))
+                }
+            },
             None => {
                 drop(change);
                 let pids = std::iter::once(pid).chain(values).collect();
@@ -147,12 +156,14 @@ impl Tree {
     }
 
     /// Removes `node` from `parent`, then frees it with every page of its values, `values`.
+    /// `None` if there was no room for the copies a checkpoint's cut needs of the two: nothing
+    /// changed.
     fn unbranch(
         &self,
         parent: PageId,
         node: PageId,
         values: Vec<PageId>,
-    ) -> Result<IOResult<Drained>> {
+    ) -> Result<IOResult<Option<Drained>>> {
         let mut p = done!(self.pool.fix_exclusive(parent, None));
         let n = done!(self.pool.fix_exclusive(node, None));
         let w = View::new(n.page());
@@ -171,6 +182,12 @@ impl Tree {
         if !names {
             return Err(corrupt_node(parent));
         }
+        // The node is freed once unlinked: its copy too, as a cut may still write it.
+        if !self.pool.keep(&[&p, &n]) {
+            p.release_unchanged();
+            n.release_unchanged();
+            return Ok(IOResult::Done(None));
+        }
         Record {
             pid: parent,
             change: Change::Unbranch { child: node },
@@ -183,7 +200,7 @@ impl Tree {
             self.store.orphaned(node);
         }
         self.free_abandoned(values)?;
-        Ok(IOResult::Done(Drained::More))
+        Ok(IOResult::Done(Some(Drained::More)))
     }
 }
 

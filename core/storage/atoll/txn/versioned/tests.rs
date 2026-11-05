@@ -30,6 +30,17 @@ fn open() -> Db {
 
 /// A database whose transactions have `slots` slots.
 fn open_with(slots: usize) -> Db {
+    open_sized(
+        slots,
+        MIN_BUDGET,
+        SizeClass::new(0).unwrap(),
+        Some(512 << 10),
+    )
+}
+
+/// [`open_with`], on a pool of `budget` bytes, the tree's nodes of `class`, and a log recovery
+/// replays `log_budget` of.
+fn open_sized(slots: usize, budget: usize, class: SizeClass, log_budget: Option<u64>) -> Db {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let config = AtollConfig {
         log: LogConfig {
@@ -44,21 +55,21 @@ fn open_with(slots: usize) -> Db {
             meta_pages: 1 << 10,
         },
         buffer: BufferConfig {
-            budget: MIN_BUDGET,
+            budget,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
+            kept_bytes: None,
         },
-        log_budget: Some(512 << 10),
+        log_budget,
+        checkpoint_write_bytes: None,
         txn: TxnConfig { slots },
     };
     let db = Atoll::open(io.clone(), BASE, config).unwrap();
     let mut root = None;
     drive(&io, || {
-        root = Some(
-            match Tree::create_versioned(db.pool(), SizeClass::new(0).unwrap())? {
-                IOResult::Done(r) => r,
-                IOResult::IO(io) => return Ok(IOResult::IO(io)),
-            },
-        );
+        root = Some(match Tree::create_versioned(db.pool(), class)? {
+            IOResult::Done(r) => r,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        });
         Ok(IOResult::Done(()))
     })
     .unwrap();
@@ -239,7 +250,7 @@ fn a_leaf_an_older_snapshot_reads_below_is_taken_for_an_image_only_once_it_ends(
     db.commit(w);
     let cp = db.db.checkpointer();
     let ticket = cp.request_full();
-    drive(&db.io, || cp.step_full(ticket, db.txns(), &db.versions)).unwrap();
+    drive(&db.io, || cp.step_full(ticket, db.txns())).unwrap();
     let pool = db.db.pool();
     let mut sweep = pool.sweep();
     drive(&db.io, || sweep.step(pool)).unwrap();
@@ -251,12 +262,125 @@ fn a_leaf_an_older_snapshot_reads_below_is_taken_for_an_image_only_once_it_ends(
     );
     db.commit(old);
     let ticket = cp.request_full();
-    drive(&db.io, || cp.step_full(ticket, db.txns(), &db.versions)).unwrap();
+    drive(&db.io, || cp.step_full(ticket, db.txns())).unwrap();
     assert!(
         db.db.store().swap_slot(db.tree.root()).is_none(),
         "the leaf kept its swap copy"
     );
     assert!(pool.evict_clean(db.tree.root()), "the leaf settled, clean");
+}
+
+/// An older snapshot reads its versions while a writer refused room for kept copies steps the
+/// checkpoint itself: the images of the leaves it reads below are not taken for the leaves, so
+/// each, evicted, reads back as it stands, and the snapshot follows its chains to the versions
+/// it saw (the regression above, under memory pressure). The leaves are 64 KiB, so 128 copies fill
+/// the room of a 64 MiB pool; the writer changes the leaves of the first 12,000 keys, more than
+/// that, and leaves the rest as the cut found them, the leaves an image could be taken for.
+#[test]
+fn an_older_snapshot_reads_its_versions_while_a_writer_refused_room_steps_the_checkpoint() {
+    let db = open_sized(
+        4,
+        64 << 20,
+        SizeClass::new(node::MAX_CLASS).unwrap(),
+        Some(1 << 30),
+    );
+    let orphan = run(&db.io, || {
+        Tree::create(db.db.pool(), SizeClass::new(0).unwrap())
+    });
+    let keys: Vec<String> = (0..20_000).map(|i| format!("k{i:06}")).collect();
+    let changed = 12_000;
+    let v = |round: u8, k: &str| padded(&format!("{k}:{round}"), 900);
+    let mut w = db.begin(Isolation::Snapshot);
+    for k in &keys {
+        assert_eq!(db.put(&mut w, k, &v(1, k), Mode::Insert), DONE_INSERTED);
+    }
+    db.commit(w);
+    let cp = db.db.checkpointer();
+    let ticket = cp.request_full();
+    drive(&db.io, || cp.step_full(ticket, db.txns())).unwrap();
+    let mut old = db.begin(Isolation::Snapshot);
+    assert_eq!(db.get(&mut old, &keys[0]), Some(v(1, &keys[0])));
+    let mut w = db.begin(Isolation::Snapshot);
+    for k in &keys {
+        assert_eq!(db.put(&mut w, k, &v(2, k), Mode::Update), DONE_UPDATED);
+    }
+    db.commit(w);
+    // The next checkpoint held after its cut, in its first edit of the orphan.
+    db.db.store().orphaned(orphan);
+    let frame = drive(&db.io, || db.db.store().leaf(orphan))
+        .unwrap()
+        .expect("the orphan's page-table leaf");
+    let mut hold = Some(frame.try_lock().expect("the leaf is free"));
+    let ticket = cp.request_full();
+    assert!(
+        matches!(cp.step_full(ticket, db.txns()).unwrap(), IOResult::IO(_)),
+        "the checkpoint went on under a held latch"
+    );
+    assert!(cp.cut_taken().is_some(), "the hold came before the cut");
+    let pool = db.db.pool();
+    let mut w = db.begin(Isolation::Snapshot);
+    for k in &keys[..changed] {
+        let mut op = WriteOp::put(k.as_bytes(), v(3, k).into_bytes(), Mode::Update);
+        // Bounded, so a writer waiting on what nothing advances fails rather than hangs: each
+        // return images a page, lands a write or ends the cut.
+        let mut out = None;
+        for _ in 0..1 << 20 {
+            if pool.kept_stats().refusals > 0 {
+                if let Some(h) = hold.take() {
+                    h.release_unchanged();
+                }
+            }
+            match db
+                .tree
+                .write(db.txns(), &db.versions, &mut w, &mut op)
+                .unwrap()
+            {
+                IOResult::Done(written) => {
+                    out = Some(written);
+                    break;
+                }
+                IOResult::IO(crate::types::IOCompletions(c)) => {
+                    let mut steps = 0;
+                    while !c.finished() {
+                        db.io.step().unwrap();
+                        steps += 1;
+                        assert!(steps <= 64, "a wait no IO in flight ends");
+                    }
+                }
+            }
+        }
+        assert_eq!(out, Some(DONE_UPDATED), "{k}");
+    }
+    assert!(hold.is_none(), "no write was refused room");
+    let stats = pool.kept_stats();
+    assert!(stats.peak <= stats.limit, "the copies: {stats:?}");
+    db.commit(w);
+    drive(&db.io, || cp.step_full(ticket, db.txns())).unwrap();
+    drop(hold);
+    drop(frame);
+    // Every page of the tree in its copies alone.
+    let mut sweep = pool.sweep();
+    drive(&db.io, || sweep.step(pool)).unwrap();
+    let mut check = crate::storage::atoll::btree::Check::default();
+    let pages = drive(&db.io, || db.tree.tree().check(&mut check))
+        .unwrap()
+        .pages;
+    let evicted = pages.iter().filter(|&&p| pool.evict_clean(p)).count();
+    assert!(evicted > 128, "{evicted} of {} pages evicted", pages.len());
+    for k in &keys {
+        assert_eq!(
+            db.get(&mut old, k),
+            Some(v(1, k)),
+            "the older snapshot's {k}"
+        );
+    }
+    db.commit(old);
+    let mut now = db.begin(Isolation::Snapshot);
+    for (i, k) in keys.iter().enumerate().step_by(97) {
+        let round = if i < changed { 3 } else { 2 };
+        assert_eq!(db.get(&mut now, k), Some(v(round, k)), "the newest {k}");
+    }
+    db.commit(now);
 }
 
 #[test]
@@ -1444,7 +1568,7 @@ impl Db {
     /// The leaf `page` as of the snapshot taken at `at`.
     fn as_of(&self, page: &[u8], at: Ts) -> Vec<u8> {
         let mut as_of = AsOf::new(page, at).unwrap();
-        run(&self.io, || as_of.step(self.txns(), &self.versions));
+        run(&self.io, || as_of.step(self.txns(), self.db.pool()));
         as_of.image().unwrap()
     }
 

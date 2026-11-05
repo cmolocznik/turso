@@ -7,7 +7,6 @@ use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
-use crate::storage::atoll::txn::versioned::Versions;
 use crate::sync::Mutex;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -36,8 +35,10 @@ fn open(io: &Arc<dyn IO>, slots: usize) -> Atoll {
         buffer: BufferConfig {
             budget: MIN_BUDGET,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: Some(512 << 10),
+        checkpoint_write_bytes: None,
         txn: TxnConfig { slots },
     };
     let db = Atoll::open(io.clone(), BASE, config).unwrap();
@@ -330,11 +331,9 @@ fn the_clock_restarts_above_every_timestamp_and_what_was_written_reads_committed
 
 /// A full checkpoint, done.
 fn checkpoint(io: &Arc<dyn IO>, db: &Atoll) {
-    let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), 1);
     let ticket = db.checkpointer().request_full();
     drive(io, || {
-        db.checkpointer()
-            .step_full(ticket, db.transactions(), &versions)
+        db.checkpointer().step_full(ticket, db.transactions())
     })
     .unwrap();
 }

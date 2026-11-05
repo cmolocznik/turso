@@ -123,6 +123,16 @@ crate::thread::thread_local! {
     pub(crate) static LEAF_REACHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Splits begun on this thread, for tests to tell an operation that split a node.
     pub(crate) static SPLITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Splits and merges refused room for kept copies on this thread, for tests to see a change
+    /// of several pages wait.
+    pub(crate) static SPLITS_REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static MERGES_REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static SHRINKS_REFUSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// While set, a root left with one child is not shrunk on this thread: the merge yields
+    /// there, as it would to a checkpoint's cut taken between its changes, and counts in
+    /// `SHRINKS_HELD`.
+    pub(crate) static HOLD_SHRINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static SHRINKS_HELD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Near {
@@ -297,6 +307,11 @@ impl Tree {
             let Some(mut ex) = leaf.upgrade() else {
                 continue;
             };
+            if !self.pool.keep(&[&ex]) {
+                ex.release_unchanged();
+                done!(self.pool.wait_for_room());
+                continue;
+            }
             let reserved = View::new(ex.page()).reserved();
             let record = Record {
                 pid: ex.pid(),
@@ -457,7 +472,7 @@ impl Tree {
             let found = cell.load(Ordering::Relaxed);
             if found != hint {
                 if let Some(mut ex) = node.clone().upgrade() {
-                    node::set_child_hint(&mut ex.page_mut(), pos, found);
+                    node::set_child_hint(&mut ex.page_mut_unkept(), pos, found);
                     node = ex.release_unchanged();
                 }
             }
@@ -778,6 +793,11 @@ impl Tree {
             drop(ex);
             return Ok(Some(IOResult::Done(Outcome::Changed)));
         }
+        if !self.pool.keep(&[&ex]) {
+            ex.release_unchanged();
+            step!(self.pool.wait_for_room());
+            return Ok(None);
+        }
         let change = match now {
             Some(_) => Change::Update {
                 key: &op.key,
@@ -850,6 +870,11 @@ impl Tree {
                 drop(ex);
                 continue;
             }
+            if !self.pool.keep(&[&ex]) {
+                ex.release_unchanged();
+                done!(self.pool.wait_for_room());
+                continue;
+            }
             Record {
                 pid: ex.pid(),
                 change: Change::Remove { key: &op.key },
@@ -897,6 +922,12 @@ impl Tree {
                 Split::Done => return Ok(IOResult::Done(())),
                 Split::Again => {}
                 Split::ParentFull(need) => done!(self.make_room(key, level + 1, need)),
+                // Its latches and the change gate let go: room for its copies, then again.
+                Split::Refused => {
+                    #[cfg(test)]
+                    SPLITS_REFUSED.with(|n| n.set(n.get() + 1));
+                    done!(self.pool.wait_for_room())
+                }
             }
         }
     }
@@ -981,6 +1012,9 @@ impl Tree {
         if pv.free().ok_or_else(|| corrupt_node(p.pid()))? < sep_need {
             return untouched(p, n, Split::ParentFull(sep_need));
         }
+        if !self.pool.keep(&[&p, &n]) {
+            return untouched(p, n, Split::Refused);
+        }
         let mut r = done!(self.allocate());
         // The right half's entries copied straight from the node, their keys cut again.
         let mut page = r.page_mut();
@@ -1042,6 +1076,10 @@ impl Tree {
             return Ok(IOResult::Done(Split::Done));
         }
         let level = v.level();
+        if !self.pool.keep(&[&root]) {
+            root.release_unchanged();
+            return Ok(IOResult::Done(Split::Refused));
+        }
         let mut child = done!(self.allocate());
         let image = node::image(root.page());
         node::apply_image(&mut child.page_mut(), &image).ok_or_else(|| corrupt_node(root.pid()))?;
@@ -1103,7 +1141,19 @@ impl Tree {
             // The parent has this child alone: the root then shrinks, and any other parent
             // merges at its own level.
             if parent.pid() == self.root {
-                return self.shrink(parent, node, merging);
+                #[cfg(test)]
+                if HOLD_SHRINK.with(|h| h.get()) {
+                    SHRINKS_HELD.with(|n| n.set(n.get() + 1));
+                    return yield_now();
+                }
+                if !done!(self.shrink(parent, node, merging)) {
+                    #[cfg(test)]
+                    SHRINKS_REFUSED.with(|n| n.set(n.get() + 1));
+                    // Its latches let go: the change gate too, then room for the copies.
+                    drop(_change);
+                    done!(self.pool.wait_for_room());
+                }
+                return Ok(IOResult::Done(()));
             }
             *merging = Some(level + 1);
             return Ok(IOResult::Done(()));
@@ -1116,11 +1166,20 @@ impl Tree {
                 level,
                 (left_pos, left, left_hint, right, right_hint),
             )) {
-                Some(next) => {
+                Paired::Merged(next) => {
                     *merging = next;
                     return Ok(IOResult::Done(()));
                 }
-                None => continue,
+                Paired::Unfit => continue,
+                Paired::Refused => {
+                    #[cfg(test)]
+                    MERGES_REFUSED.with(|n| n.set(n.get() + 1));
+                    // Its latches let go: the change gate too, then room for the copies, and
+                    // the merge again.
+                    drop((parent, node, _change));
+                    done!(self.pool.wait_for_room());
+                    return Ok(IOResult::Done(()));
+                }
             }
         }
         *merging = None;
@@ -1128,7 +1187,7 @@ impl Tree {
     }
 
     /// Merges one pair of children of `parent`, the left into the right, if the node at `pos`
-    /// is underfull and the two fit. `None` if they do not; else the level to look at next.
+    /// is underfull and the two fit.
     #[allow(clippy::too_many_arguments)]
     fn merge_pair(
         &self,
@@ -1137,7 +1196,7 @@ impl Tree {
         pos: usize,
         level: u8,
         (left_pos, left, left_hint, right, right_hint): (usize, PageId, u32, PageId, u32),
-    ) -> Result<IOResult<Option<Option<u8>>>> {
+    ) -> Result<IOResult<Paired>> {
         let fix = |pid: PageId, hint: u32| -> Result<IOResult<Optimistic<'_>>> {
             if pid == node.pid() {
                 return Ok(IOResult::Done(node.clone()));
@@ -1176,7 +1235,7 @@ impl Tree {
         }
         if !self.underfull(if pos == left_pos { &lv } else { &rv }) {
             untouched(p, l, r);
-            return Ok(IOResult::Done(Some(None)));
+            return Ok(IOResult::Done(Paired::Merged(None)));
         }
         let sep = pv.key(left_pos).ok_or_else(|| corrupt_node(p.pid()))?;
         let (left_shape, right_shape) = (node::shape(l.page()), node::shape(r.page()));
@@ -1213,7 +1272,7 @@ impl Tree {
             .ok_or_else(|| corrupt_node(r.pid()))?;
         if size > self.limits.capacity * 3 / 4 {
             untouched(p, l, r);
-            return Ok(IOResult::Done(None));
+            return Ok(IOResult::Done(Paired::Unfit));
         }
         // Built in a page of the thread's own, as the right node still holds what goes into it,
         // then copied over it once.
@@ -1234,6 +1293,11 @@ impl Tree {
         });
         if !built {
             return Err(corrupt_node(r.pid()));
+        }
+        // The left one is freed once merged: its copy too, as a cut may still write it.
+        if !self.pool.keep(&[&p, &l, &r]) {
+            untouched(p, l, r);
+            return Ok(IOResult::Done(Paired::Refused));
         }
         SCRATCH.with(|scratch| {
             let merged = scratch.borrow();
@@ -1266,19 +1330,20 @@ impl Tree {
         if let IOResult::IO(_) = self.pool.free(l)? {
             self.store.orphaned(freed);
         }
-        Ok(IOResult::Done(Some(next)))
+        Ok(IOResult::Done(Paired::Merged(next)))
     }
 
-    /// The root has one child left: the child's contents move up into it.
+    /// The root has one child left: the child's contents move up into it. Whether there was
+    /// room for the copies a checkpoint's cut needs of the two; if not, nothing changed.
     fn shrink(
         &self,
         parent: Optimistic<'_>,
         child: Optimistic<'_>,
         merging: &mut Option<u8>,
-    ) -> Result<IOResult<()>> {
+    ) -> Result<IOResult<bool>> {
         if parent.pid() != self.root {
             *merging = None;
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(true));
         }
         let (Some(mut root), Some(child)) = (parent.upgrade(), child.upgrade()) else {
             return yield_now();
@@ -1286,6 +1351,12 @@ impl Tree {
         let rv = View::new(root.page());
         if rv.count() != Some(0) || rv.next().0 != child.pid() {
             return yield_now();
+        }
+        // The child is freed once moved up: its copy too, as a cut may still write it.
+        if !self.pool.keep(&[&root, &child]) {
+            root.release_unchanged();
+            child.release_unchanged();
+            return Ok(IOResult::Done(false));
         }
         let image = node::image(child.page());
         node::apply_image(&mut root.page_mut(), &image).ok_or_else(|| corrupt_node(child.pid()))?;
@@ -1297,7 +1368,7 @@ impl Tree {
             self.store.orphaned(freed);
         }
         *merging = None;
-        Ok(IOResult::Done(()))
+        Ok(IOResult::Done(true))
     }
 
     // ---------------------------------------------------------------- scanning
@@ -1772,6 +1843,18 @@ enum Split {
     Again,
     /// The parent has no room for the separator, which takes this many bytes.
     ParentFull(usize),
+    /// No room for the copies a checkpoint's cut needs of its pages: wait for it, then again.
+    Refused,
+}
+
+/// What merging a pair came to.
+enum Paired {
+    /// Merged: the level to look at next, if any.
+    Merged(Option<u8>),
+    /// They do not fit together.
+    Unfit,
+    /// No room for the copies a checkpoint's cut needs of their pages: nothing changed.
+    Refused,
 }
 
 /// A point lookup.

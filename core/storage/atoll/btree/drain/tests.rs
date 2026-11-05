@@ -11,7 +11,6 @@ use crate::storage::atoll::page::CLASS_COUNT;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
-use crate::storage::atoll::txn::versioned::Versions;
 use std::collections::BTreeSet;
 
 const BASE: &str = "/db/drain";
@@ -32,8 +31,10 @@ fn config(chunk_bytes: u64) -> AtollConfig {
         buffer: BufferConfig {
             budget: MIN_BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: Some(512 << 10),
+        checkpoint_write_bytes: None,
         txn: Default::default(),
     }
 }
@@ -45,7 +46,6 @@ fn run<T>(io: &Arc<dyn IO>, op: impl FnMut() -> Result<IOResult<T>>) -> T {
 struct Db {
     io: Arc<dyn IO>,
     db: Atoll,
-    versions: Versions,
     list: Tree,
 }
 
@@ -64,14 +64,7 @@ impl Db {
 
     fn with(io: Arc<dyn IO>, db: Atoll, list: PageId) -> Self {
         let list = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), list);
-        let slots = config(0).txn.slots;
-        let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), slots);
-        Self {
-            io,
-            db,
-            versions,
-            list,
-        }
+        Self { io, db, list }
     }
 
     /// A full checkpoint, done.
@@ -79,7 +72,7 @@ impl Db {
         let checkpointer = self.db.checkpointer();
         let ticket = checkpointer.request_full();
         run(&self.io, || {
-            checkpointer.step_full(ticket, self.db.transactions(), &self.versions)
+            checkpointer.step_full(ticket, self.db.transactions())
         });
     }
 

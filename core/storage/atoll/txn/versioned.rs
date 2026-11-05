@@ -226,20 +226,25 @@ impl Versions {
     /// The version below `v`, a version of a key, as the arena entry `v` names holds it: `None`
     /// for a key that had no entry before. Step it until done.
     pub(super) fn below(&self, v: &Version) -> Result<IOResult<Option<Stored>>> {
-        let Some(ptr) = v.prev else {
-            return Ok(IOResult::Done(None));
-        };
-        let entry = done!(self.arenas.read(ptr));
-        let earlier = decode_entry(&entry.replaced)?;
-        if let Some(e) = &earlier {
-            if Version::decode(&e.head).ok_or_else(corrupt_header)? == *v {
-                return Err(LimboError::Corrupt(format!(
-                    "the version {v:?} replaced itself in its arena"
-                )));
-            }
-        }
-        Ok(IOResult::Done(earlier))
+        below(&self.pool, v)
     }
+}
+
+/// [`Versions::below`], read through `pool` alone: for the checkpointer.
+pub(super) fn below(pool: &Arc<BufferPool>, v: &Version) -> Result<IOResult<Option<Stored>>> {
+    let Some(ptr) = v.prev else {
+        return Ok(IOResult::Done(None));
+    };
+    let entry = done!(super::arena::read(pool, ptr));
+    let earlier = decode_entry(&entry.replaced)?;
+    if let Some(e) = &earlier {
+        if Version::decode(&e.head).ok_or_else(corrupt_header)? == *v {
+            return Err(LimboError::Corrupt(format!(
+                "the version {v:?} replaced itself in its arena"
+            )));
+        }
+    }
+    Ok(IOResult::Done(earlier))
 }
 
 /// A tree whose entries are versioned.

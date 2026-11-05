@@ -41,8 +41,10 @@ fn open(slots: usize) -> Db {
         buffer: BufferConfig {
             budget: MIN_BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: Some(512 << 10),
+        checkpoint_write_bytes: None,
         txn: TxnConfig { slots },
     };
     let db = Atoll::open(io.clone(), "/db/gate", config).unwrap();

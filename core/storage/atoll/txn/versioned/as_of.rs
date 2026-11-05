@@ -15,9 +15,11 @@
 //! the arenas are read. The arena entries it follows stay while the snapshot is held. It fits the
 //! page, whose reserves kept room for every version it puts back ([`super`]: `reserve`).
 
-use super::{corrupt_header, Version, Versions, HEADER};
+use super::{below, corrupt_header, Version, HEADER};
 use crate::storage::atoll::btree::node::{self, Entry, Layout, Limits, Shape, View};
 use crate::storage::atoll::btree::{Stored, StoredValue};
+use crate::storage::atoll::buffer::BufferPool;
+use crate::sync::Arc;
 use crate::storage::atoll::page::{self, SizeClass};
 use crate::storage::atoll::shared::Bytes;
 use crate::storage::atoll::txn::{Transactions, Ts};
@@ -98,7 +100,7 @@ impl AsOf {
     }
 
     /// Judges every entry, following the arenas where the snapshot does not see the leaf's.
-    pub fn step(&mut self, txns: &Transactions, versions: &Versions) -> Result<IOResult<()>> {
+    pub fn step(&mut self, txns: &Transactions, pool: &Arc<BufferPool>) -> Result<IOResult<()>> {
         while self.next < self.copied.len() {
             let v = match self.chain {
                 Some(v) => v,
@@ -126,7 +128,7 @@ impl AsOf {
                     v
                 }
             };
-            let Some(Stored { head, value }) = done!(versions.below(&v)) else {
+            let Some(Stored { head, value }) = done!(below(pool, &v)) else {
                 self.chain = None;
                 self.next += 1;
                 continue;

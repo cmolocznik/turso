@@ -28,7 +28,6 @@ use super::radix::FREE;
 use super::replay::{Apply, Gather};
 use super::store::PageStore;
 use super::txn::changes::{Change, Decode};
-use super::txn::versioned::Versions;
 use super::txn::{self, Clock, Transactions};
 use crate::io::IO;
 use crate::sync::Arc;
@@ -142,11 +141,11 @@ pub fn recover(
         control,
         in_charge,
         config.log_budget(),
+        config.checkpoint_write_bytes(),
     );
     // What was recovered is in memory alone until a checkpoint writes it.
-    let versions = Versions::new(io.clone(), pool.clone(), store.clone(), config.txn.slots);
     let ticket = checkpointer.request_full();
-    drive(&io, || checkpointer.step_full(ticket, &txns, &versions))?;
+    drive(&io, || checkpointer.step_full(ticket, &txns))?;
     Ok(Recovered {
         log,
         pool,

@@ -129,6 +129,32 @@ pub struct Arenas {
     pages: Box<[AtomicU64]>,
 }
 
+/// The entry at `ptr` in `pool`'s arena pages, for a reader with no [`Arenas`] of its own: the
+/// checkpointer. Step it until done.
+pub fn read(pool: &Arc<BufferPool>, ptr: Ptr) -> Result<IOResult<Entry>> {
+    let (entry, _) = done!(read_with_before(pool, ptr));
+    Ok(IOResult::Done(entry))
+}
+
+/// The entry at `ptr`, and where its page's entry before it starts, 0 for none.
+fn read_with_before(pool: &Arc<BufferPool>, ptr: Ptr) -> Result<IOResult<(Entry, usize)>> {
+    loop {
+        let page = done!(pool.fix_optimistic(ptr.page(), None));
+        // Changed meanwhile, by an append after it or an eviction: read it again.
+        let Some(read) = page.read(|p| parse(p, ptr.offset())) else {
+            continue;
+        };
+        return match read {
+            Some(read) => Ok(IOResult::Done(read)),
+            None => Err(LimboError::Corrupt(format!(
+                "no arena entry at {} of {:?}",
+                ptr.offset(),
+                ptr.page()
+            ))),
+        };
+    }
+}
+
 /// The entry at `at` of `page`, if it reads whole: `None` for bytes that do not hold together,
 /// which only a change under an optimistic read (or corruption) leaves.
 fn parse<P: Bytes + ?Sized>(page: &P, at: usize) -> Option<(Entry, usize)> {
@@ -248,27 +274,12 @@ impl Arenas {
 
     /// The entry at `ptr`. Step it until done.
     pub fn read(&self, ptr: Ptr) -> Result<IOResult<Entry>> {
-        let (entry, _) = done!(self.read_with_before(ptr));
-        Ok(IOResult::Done(entry))
+        read(&self.pool, ptr)
     }
 
     /// The entry at `ptr`, and where its page's entry before it starts, 0 for none.
     fn read_with_before(&self, ptr: Ptr) -> Result<IOResult<(Entry, usize)>> {
-        loop {
-            let page = done!(self.pool.fix_optimistic(ptr.page(), None));
-            // Changed meanwhile, by an append after it or an eviction: read it again.
-            let Some(read) = page.read(|p| parse(p, ptr.offset())) else {
-                continue;
-            };
-            return match read {
-                Some(read) => Ok(IOResult::Done(read)),
-                None => Err(LimboError::Corrupt(format!(
-                    "no arena entry at {} of {:?}",
-                    ptr.offset(),
-                    ptr.page()
-                ))),
-            };
-        }
+        read_with_before(&self.pool, ptr)
     }
 
     /// The entry before `ptr` in its slot's arena, `None` at the arena's first. Step it until

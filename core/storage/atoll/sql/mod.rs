@@ -95,9 +95,7 @@ impl AtollDb {
         if made {
             let checkpointer = atoll.checkpointer();
             let ticket = checkpointer.request_full();
-            drive(&io, || {
-                checkpointer.step_full(ticket, atoll.transactions(), &versions)
-            })?;
+            drive(&io, || checkpointer.step_full(ticket, atoll.transactions()))?;
         }
         let catalog = Catalog::open(io.clone(), atoll.pool().clone(), atoll.store().clone());
         let header = Header::open(io.clone(), atoll.pool().clone(), atoll.store().clone());

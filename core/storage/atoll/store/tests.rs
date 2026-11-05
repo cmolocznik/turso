@@ -27,8 +27,10 @@ fn config() -> AtollConfig {
         buffer: BufferConfig {
             budget: MIN_BUDGET,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: Some(512 << 10),
+        checkpoint_write_bytes: None,
         txn: Default::default(),
     }
 }
@@ -61,10 +63,7 @@ impl Db {
     fn checkpoint(&self) {
         let cp = self.db.checkpointer();
         let ticket = cp.request_full();
-        drive(&self.io, || {
-            cp.step_full(ticket, self.db.transactions(), &self.versions)
-        })
-        .unwrap();
+        drive(&self.io, || cp.step_full(ticket, self.db.transactions())).unwrap();
     }
 
     /// A new plain tree's root, a node a checkpoint images.
@@ -164,9 +163,7 @@ fn a_slot_a_checkpoint_stops_naming_is_kept_until_it_is_in_charge_then_freed_and
     let ticket = cp.request_full();
     let mut steps = 0;
     loop {
-        let out = cp
-            .step_full(ticket, db.db.transactions(), &db.versions)
-            .unwrap();
+        let out = cp.step_full(ticket, db.db.transactions()).unwrap();
         if cp.superblock().checkpoint == in_charge {
             // An eraser may run at any time: none erases a slot the checkpoint in charge names.
             drive(&db.io, || db.store().erase_freed()).unwrap();
@@ -227,9 +224,7 @@ fn a_page_in_its_swap_copy_alone_at_a_cut_is_imaged_as_the_cut_found_it() {
     let cp = db.db.checkpointer();
     let ticket = cp.request_full();
     loop {
-        let out = cp
-            .step_full(ticket, db.db.transactions(), &db.versions)
-            .unwrap();
+        let out = cp.step_full(ticket, db.db.transactions()).unwrap();
         if cp.cut_taken().is_some() {
             break;
         }
@@ -243,10 +238,7 @@ fn a_page_in_its_swap_copy_alone_at_a_cut_is_imaged_as_the_cut_found_it() {
         }
     }
     db.change(pid, b"b");
-    drive(&db.io, || {
-        cp.step_full(ticket, db.db.transactions(), &db.versions)
-    })
-    .unwrap();
+    drive(&db.io, || cp.step_full(ticket, db.db.transactions())).unwrap();
     assert_eq!(
         db.copy_in(pid, db.slot_of(pid)),
         Some(at_cut),
@@ -277,8 +269,7 @@ fn a_value_removed_while_a_checkpoint_yields_after_its_cut_is_written_as_the_cut
     let hold = frame.try_lock().expect("the leaf is free");
     assert!(
         matches!(
-            cp.step_full(ticket, db.db.transactions(), &db.versions)
-                .unwrap(),
+            cp.step_full(ticket, db.db.transactions()).unwrap(),
             IOResult::IO(_)
         ),
         "the checkpoint went on under a held latch"
@@ -287,10 +278,7 @@ fn a_value_removed_while_a_checkpoint_yields_after_its_cut_is_written_as_the_cut
     let mut remove = crate::storage::atoll::btree::Remove::new(b"k");
     drive(&db.io, || db.tree(root).remove(&mut remove)).unwrap();
     hold.release_unchanged();
-    drive(&db.io, || {
-        cp.step_full(ticket, db.db.transactions(), &db.versions)
-    })
-    .unwrap();
+    drive(&db.io, || cp.step_full(ticket, db.db.transactions())).unwrap();
     drop(frame);
     let Db {
         io,
@@ -410,17 +398,13 @@ fn an_orphan_whose_free_yielded_is_free_in_the_checkpoint_and_after_a_reopen() {
     let hold = frame.try_lock().expect("the leaf is free");
     assert!(
         matches!(
-            cp.step_full(ticket, db.db.transactions(), &db.versions)
-                .unwrap(),
+            cp.step_full(ticket, db.db.transactions()).unwrap(),
             IOResult::IO(_)
         ),
         "the checkpoint went on under a held latch"
     );
     hold.release_unchanged();
-    drive(&db.io, || {
-        cp.step_full(ticket, db.db.transactions(), &db.versions)
-    })
-    .unwrap();
+    drive(&db.io, || cp.step_full(ticket, db.db.transactions())).unwrap();
     assert_eq!(drive(&db.io, || db.store().entry(root)).unwrap(), FREE);
     drop(frame);
     let Db {

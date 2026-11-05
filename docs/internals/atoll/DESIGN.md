@@ -530,9 +530,8 @@ A checkpoint (audit 18) writes every page owed an image as of one snapshot `C`, 
 the same cut, and a superblock naming them, so recovery replays the log from the cut's position
 `L`, applying only the commits above `C` (section 12). Pages are never logged. Built in
 `core/storage/atoll/checkpoint.rs`, the pool's part in `buffer/mod.rs` (the cut, the copy hook,
-settling), the store's in `store.rs` (the cut's metadata edits, the frees that wait for a
-checkpoint). Not built: a bound on the memory the copy hook keeps (past it, a change would write
-the page's image itself before changing it).
+settling) and `buffer/kept.rs` (the room for kept copies), the store's in `store.rs` (the cut's
+metadata edits, the frees that wait for a checkpoint).
 
 1. **Owed and clean are two facts.** A frame counts its changes. It is clean while a slot holds
    exactly its bytes, its swap copy or its checkpoint copy, and only a clean frame may be dropped.
@@ -549,7 +548,26 @@ the page's image itself before changing it).
 3. **The copy hook.** A pending page's first change or free after the cut keeps its bytes for the
    checkpoint. A value's page freed while a cut is in effect is not freed: an image the cut owes
    may name the value as the cut found it, and reads its pages. It waits, named by nothing, for the
-   next checkpoint.
+   next checkpoint. A value's page is written only before a leaf names its value, so no image of a
+   cut that found it unwritten names it, and its change keeps nothing; nor does a child hint's,
+   which every reader checks, nor the checkpoint's own free of an orphan its cut left out.
+
+   **The room for kept copies** (Clay's ruling of 2026-11-05) bounds the copies of data pages;
+   the metadata's are accounted apart (item 11). The copies are charged to a room of
+   `max(P, min(B/8, 256 MiB))` bytes, P the largest page and B the frame budget, an initial choice
+   that `kept_bytes` overrides; a charge is given back only when its copy's bytes are dropped,
+   wherever they then are. A change latches every page it will change and asks for room for the
+   copies they need before its first edit, all or none; an edit of a page the cut owes that asked
+   for none fails an invariant check rather than copy past the limit. Only node pages are kept,
+   64 KiB at most, and a change asks for three at most, so every request fits. Refused, it lets go
+   of its latches and the change gate, and the writer steps the checkpoint itself, as an embedded
+   database may have one connection and no other thread, until the room takes what it asked for,
+   and no further. While a writer waits, the checkpoint images kept copies first. How many images
+   that takes is not bounded by the request: with pages of several sizes, or other writers taking
+   the room given back, it can take more; the time writers wait is measured, the longest wait with
+   it. While someone else steps the checkpoint, the writer waits on the room, woken by every copy
+   given back and by every stepper leaving. A free never waits: with no room, the page goes to the
+   checkpointer unchanged since the cut, imaged as it stands, and the next checkpoint frees it.
 4. **Images.** Each pending node page is written to a fresh slot: a versioned leaf as `C` reads it
    (each key at the version `C` sees, settled, deleted keys gone), any other as it stood at the
    cut. A node of a tree set aside is left out. Then each pending value page is written if an
@@ -578,7 +596,20 @@ the page's image itself before changing it).
    checkpointer only once one is due (section 17).
 10. **Failure.** A checkpoint that cannot finish leaves the one in charge in charge. What it marked
     imaged, and the page table entries it named as they stand, are not undone, so none runs again
-    until the database is opened again and recovers from the one in charge.
+    until the database is opened again and recovers from the one in charge. Its cut ends and its
+    copies are dropped; a writer that was stepping it for room goes on, as commits do, and the
+    failure is told to whoever steps checkpoints next. A write that lands short is a failure.
+11. **Memory beyond the frames**, each amount accounted, so a total-memory setting can later divide
+    one allowance among them: the room for kept copies; the checkpoint's working memory, one page
+    imaged at a time (its source read live, its image and its write buffer, three pages of the
+    largest class at most) and image write buffers in flight within `checkpoint_write_bytes`, one
+    such page by default, beside the 32 writes, so a large page's writes go fewer at once (32 small
+    writes keep a device busy up to pages of 256 KiB; a larger write is itself several of the
+    device's commands); and the metadata pages kept as a cut found them, outside the room. No one
+    waits for those, so the checkpoint always reaches the writes that drop them; they are a page
+    each, kept once a cut, so they grow with the metadata, which nothing here bounds. Each is
+    reported with its peak, with the refusals, the time writers waited and the longest wait, and
+    the checkpoint's pages, bytes and stepping time.
 
 ## 11. Transactions and versions
 

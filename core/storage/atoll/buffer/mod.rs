@@ -33,6 +33,7 @@
 pub(super) mod cell;
 mod clean;
 mod frame;
+mod kept;
 mod memory;
 mod source;
 mod staging;
@@ -45,6 +46,7 @@ mod watt;
 #[cfg(test)]
 mod tests;
 
+pub use kept::{default_limit as default_kept_bytes, KeptCopy, KeptStats, KEPT_CAP};
 pub use memory::MIN_BUDGET;
 pub use source::{LocalSource, Located, PageSource, ReadDone};
 
@@ -61,6 +63,7 @@ use clean::{Progress, Writeback};
 use frame::{
     FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
 };
+use kept::KeptRoom;
 use memory::{Memory, Take, Zeroed};
 use table::Table;
 use temp::TempPages;
@@ -209,6 +212,10 @@ pub struct BufferConfig {
     /// stay in their frames are made in, and so a bound on such writes in flight. At least the
     /// largest page.
     pub writeback_bytes: usize,
+    /// Bytes of the copies a checkpoint's cut keeps of pages changed before it images them
+    /// ([`kept`]), beyond the frames: `None` for [`default_kept_bytes`] of the budget. At least
+    /// the largest page.
+    pub kept_bytes: Option<usize>,
 }
 
 /// The default writeback buffer: two of the largest page, so a write of one never waits behind
@@ -221,6 +228,7 @@ impl BufferConfig {
         Self {
             budget,
             writeback_bytes: WRITEBACK_BYTES,
+            kept_bytes: None,
         }
     }
 }
@@ -276,12 +284,18 @@ pub struct BufferPool {
     /// Where copies of pages written back while they stay in their frames are made.
     staging: Arc<staging::Staging>,
     writes_in_flight: AtomicUsize,
+    /// Bytes of swap copies written since the pool opened. Relaxed: a count.
+    swap_written: AtomicU64,
     failure: SetOnce<CompletionError>,
     /// The checkpoint whose cut is in effect, 0 for none.
     cutting: AtomicU64,
     /// Pages that checkpoint found owed, kept as they stood by their first change or free since
     /// (the copy hook, audit 18).
-    kept: Mutex<HashMap<PageId, Box<[u8]>>>,
+    kept: Mutex<HashMap<PageId, KeptCopy>>,
+    /// The room the copies are charged to ([`kept`]).
+    room: Arc<KeptRoom>,
+    /// What a writer refused room drives: the checkpoint, once the database is open.
+    relief: SetOnce<Arc<dyn Relief>>,
     /// The pages that checkpoint found owed and has neither imaged nor kept: one read in again is
     /// pending.
     cut_owed: Mutex<HashSet<PageId>>,
@@ -334,6 +348,16 @@ impl BufferPool {
         source: Arc<dyn PageSource>,
         store: Arc<PageStore>,
     ) -> Result<Arc<Self>> {
+        let kept_bytes = config
+            .kept_bytes
+            .unwrap_or_else(|| kept::default_limit(config.budget));
+        if kept_bytes < page::MAX_PAGE_SIZE {
+            return Err(LimboError::InternalError(format!(
+                "a room of {kept_bytes} bytes for kept copies holds no copy of the largest page, \
+                 {} bytes",
+                page::MAX_PAGE_SIZE
+            )));
+        }
         let memory = Memory::new(config.budget)?;
         if config.writeback_bytes < page::MAX_PAGE_SIZE
             || !config.writeback_bytes.is_multiple_of(page::MIN_PAGE_SIZE)
@@ -366,9 +390,12 @@ impl BufferPool {
             queued: AtomicUsize::new(0),
             staging: Arc::new(staging::Staging::new(config.writeback_bytes)),
             writes_in_flight: AtomicUsize::new(0),
+            swap_written: AtomicU64::new(0),
             failure: SetOnce::default(),
             cutting: AtomicU64::new(0),
             kept: Mutex::new(HashMap::new()),
+            room: KeptRoom::new(kept_bytes, store.epochs().clone(), store.io().clone()),
+            relief: SetOnce::default(),
             cut_owed: Mutex::new(HashSet::new()),
             temp: Arc::new(TempPages::new(
                 store.io().clone(),
@@ -923,8 +950,17 @@ impl BufferPool {
             });
         }
         if !pid.is_temporary() {
-            // A checkpoint cut before the free still writes the page as it stood.
-            self.keep_for_cut(frame, pid);
+            if !wait_out_a_cut {
+                // An orphan the checkpoint left out: no image of its cut names it.
+                self.left_out_of_cut(frame, pid);
+            } else if !self.try_keep(&[&page]) {
+                // A checkpoint cut before the free still writes the page as it stood: with no
+                // room for a copy, it is handed to the checkpointer as it stands, unchanged since
+                // the cut, and the next checkpoint frees it. A free never waits.
+                page.release_unchanged();
+                self.store.orphaned(pid);
+                return Ok(IOResult::Done(()));
+            }
             if let IOResult::IO(io) = self.store.free(pid)? {
                 return Ok(IOResult::IO(io));
             }
@@ -1713,23 +1749,180 @@ impl BufferPool {
 
     // ---------------------------------------------------------------- checkpoints
 
-    /// Keeps the page in `frame`, `pid`, as it stands for the checkpoint whose cut found it owed,
-    /// before its first change or free since: under the frame's exclusive latch.
-    fn keep_for_cut(&self, frame: u32, pid: PageId) {
+    /// Checks that the page in `frame`, `pid`, latched exclusively, owes the cut in effect no
+    /// copy before it changes. Every change asks for its copies first ([`keep`](Self::keep));
+    /// one that reaches here owing a copy asked for none, and a copy made now would pass the
+    /// room's limit, so it is a fault.
+    fn assert_kept(&self, frame: u32, pid: PageId) {
         let n = self.cutting.load(Ordering::Acquire);
-        if n == 0 {
-            return;
-        }
+        assert!(
+            n == 0 || !self.owes_copy(frame, pid, n),
+            "{pid:?} changed past checkpoint {n}'s cut with no room asked for its copy"
+        );
+    }
+
+    /// `pid`, in `frame` latched exclusively, is a page the cut in effect left out: owed no
+    /// image, it needs no copy.
+    fn left_out_of_cut(&self, frame: u32, pid: PageId) {
+        let n = self.cutting.load(Ordering::Acquire);
         let h = self.header(frame);
-        // Relaxed: under the frame's exclusive latch, which the cut's marking took too.
-        if h.pending.load(Ordering::Relaxed) != n {
-            return;
+        // Relaxed: under the frame's exclusive latch.
+        if n != 0 && h.pending.load(Ordering::Relaxed) == n {
+            h.pending.store(0, Ordering::Release);
+            self.cut_owed.lock().remove(&pid);
         }
+    }
+
+    /// Whether `pid`, in `frame` latched exclusively, needs a copy before it changes for
+    /// checkpoint `n`: its cut marked it, and nothing kept it since. A value's page needs none:
+    /// it is written only before a leaf names its value, so no image of a cut that found it
+    /// unwritten names it.
+    fn owes_copy(&self, frame: u32, pid: PageId, n: u64) -> bool {
+        // Relaxed: under the frame's exclusive latch, which the cut's marking took too.
+        self.header(frame).pending.load(Ordering::Relaxed) == n
+            && page::kind(self.bytes(frame, pid.class())) != blob::KIND
+    }
+
+    /// Copies `pid`, in `frame` latched exclusively, for the cut in effect, its room charged.
+    fn copy_for_cut(&self, frame: u32, pid: PageId) {
         let mut bytes = vec![0u8; pid.class().size()].into_boxed_slice();
         self.bytes(frame, pid.class()).copy_to(0, &mut bytes);
-        self.kept.lock().insert(pid, bytes);
+        self.kept
+            .lock()
+            .insert(pid, KeptCopy::charged(bytes, &self.room));
         self.cut_owed.lock().remove(&pid);
-        h.pending.store(0, Ordering::Release);
+        self.header(frame).pending.store(0, Ordering::Release);
+    }
+
+    /// Room for the copies the cut in effect needs of `pages`, each latched exclusively, before
+    /// any of them changes: every one still owed a copy is copied as it stands, all within the
+    /// room or none. Refused, the change lets go of every latch it holds and of the change gate,
+    /// then waits ([`wait_for_room`](Self::wait_for_room)) and starts again: nothing yields once
+    /// a change has begun.
+    pub fn keep(&self, pages: &[&Exclusive<'_>]) -> bool {
+        if self.try_keep(pages) {
+            self.room.admitted();
+            return true;
+        }
+        let n = self.cutting.load(Ordering::Acquire);
+        self.room.refused(self.owed_bytes(pages, n));
+        false
+    }
+
+    fn try_keep(&self, pages: &[&Exclusive<'_>]) -> bool {
+        let n = self.cutting.load(Ordering::Acquire);
+        if n == 0 {
+            return true;
+        }
+        let bytes = self.owed_bytes(pages, n);
+        if bytes == 0 {
+            return true;
+        }
+        if !self.room.charge(bytes) {
+            return false;
+        }
+        for p in pages {
+            if self.owes_copy(p.frame, p.pid, n) {
+                self.copy_for_cut(p.frame, p.pid);
+            }
+        }
+        true
+    }
+
+    /// Bytes the copies of `pages` for checkpoint `n` take, each page counted once.
+    fn owed_bytes(&self, pages: &[&Exclusive<'_>], n: u64) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        pages
+            .iter()
+            .enumerate()
+            .filter(|&(i, p)| {
+                pages[..i].iter().all(|q| q.frame != p.frame) && self.owes_copy(p.frame, p.pid, n)
+            })
+            .map(|(_, p)| p.pid.class().size())
+            .sum()
+    }
+
+    /// For a change refused room, which has let go of every latch and the change gate: drives
+    /// the checkpoint whose cut is in effect until its images give room back, or waits for
+    /// whoever is stepping it. An embedded database may have one connection and no other thread,
+    /// so the writer waiting is the one to step it. Done to start the change again at once.
+    pub fn wait_for_room(&self) -> Result<IOResult<()>> {
+        // Taken first, so a release or a stepper leaving after the look below finishes it.
+        let wait = self.room.wait();
+        if self.cutting.load(Ordering::Acquire) == 0 {
+            return Ok(IOResult::Done(()));
+        }
+        match self.relief.get_ref().and_then(|relief| relief.relieve()) {
+            Some(stepped) => stepped,
+            None => Ok(IOResult::IO(IOCompletions(wait))),
+        }
+    }
+
+    /// Sets what a writer refused room drives: once, when the database opens.
+    pub fn set_relief(&self, relief: Arc<dyn Relief>) {
+        self.relief.set(relief);
+    }
+
+    /// Whoever waits for room tries again: a stepper of the checkpoint leaving.
+    pub fn wake_room(&self) {
+        self.room.wake();
+    }
+
+    /// Whether the room takes the largest request it refused since it last admitted one: a
+    /// refused writer stepping the checkpoint stops then.
+    pub fn room_takes_refused(&self) -> bool {
+        self.cutting.load(Ordering::Acquire) == 0 || self.room.takes_refused()
+    }
+
+    /// Whether a change was refused room since one was last admitted: the checkpoint then images
+    /// kept copies first.
+    pub fn room_pressed(&self) -> bool {
+        self.room.pressed()
+    }
+
+    /// A page the cut in effect kept, its copy taken out, if any.
+    pub fn take_kept(&self) -> Option<(PageId, KeptCopy)> {
+        let mut kept = self.kept.lock();
+        let pid = *kept.keys().next()?;
+        kept.remove_entry(&pid)
+    }
+
+    /// What the room for kept copies has held, and refused.
+    pub fn kept_stats(&self) -> KeptStats {
+        self.room.stats()
+    }
+
+    /// Bytes of swap copies written since the pool opened.
+    pub fn swap_written(&self) -> u64 {
+        self.swap_written.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the temporary pages held: the versions the arenas keep, beside any temporary
+    /// tree's.
+    pub fn temporary_bytes(&self) -> u64 {
+        self.temp.live_bytes()
+    }
+
+    /// The pages owed an image now, resident or in their swap copies alone: the work the next
+    /// checkpoint has. A walk over every frame, for a report.
+    pub fn owed_pages(&self) -> usize {
+        let mut owed: HashSet<PageId> = self.store.swap_pages().into_iter().collect();
+        for frame in 0..self.memory.grains() {
+            let h = self.header(frame);
+            let pid = PageId::from_raw(h.pid());
+            if h.status() == RESIDENT && !pid.is_temporary() && h.owed() {
+                owed.insert(pid);
+            }
+        }
+        owed.len()
+    }
+
+    /// Starts the kept copies' peak again from what is held now, and their longest wait from
+    /// none, for a measurement.
+    pub fn reset_kept_peaks(&self) {
+        self.room.reset_peaks();
     }
 
     /// The cut of checkpoint `n`, under the store's closed change gate: every page owed an image
@@ -1790,17 +1983,17 @@ impl BufferPool {
     /// since kept it, or the page as it stands, with its change count, which no change can be
     /// making meanwhile. Step it until done.
     pub fn image_source(self: &Arc<Self>, n: u64, pid: PageId) -> Result<IOResult<Source>> {
-        if let Some(bytes) = self.kept.lock().remove(&pid) {
-            return Ok(IOResult::Done(Source::Kept(bytes)));
+        if let Some(copy) = self.kept.lock().remove(&pid) {
+            return Ok(IOResult::Done(Source::Kept(copy)));
         }
         let page = match self.fix_exclusive(pid, None)? {
             IOResult::Done(p) => p,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
         // Kept between the look and the latch.
-        if let Some(bytes) = self.kept.lock().remove(&pid) {
+        if let Some(copy) = self.kept.lock().remove(&pid) {
             page.release_unchanged();
-            return Ok(IOResult::Done(Source::Kept(bytes)));
+            return Ok(IOResult::Done(Source::Kept(copy)));
         }
         let h = self.header(page.frame);
         let mut bytes = vec![0u8; pid.class().size()];
@@ -1875,8 +2068,11 @@ impl BufferPool {
     pub fn end_cut(&self, n: u64) {
         debug_assert_eq!(self.cutting.load(Ordering::Acquire), n);
         self.cutting.store(0, Ordering::SeqCst);
-        self.kept.lock().clear();
+        // Each copy's room is given back as it drops.
+        let kept = std::mem::take(&mut *self.kept.lock());
+        drop(kept);
         self.cut_owed.lock().clear();
+        self.room.cut_ended();
     }
 }
 
@@ -1890,10 +2086,18 @@ pub struct CutScan {
     swapped: Vec<PageId>,
 }
 
+/// What a writer refused room for kept copies drives ([`BufferPool::wait_for_room`]).
+pub trait Relief: Send + Sync {
+    /// Steps the checkpoint whose cut is in effect while it is: `None` while someone else steps
+    /// it, who wakes the waiters as it leaves.
+    fn relieve(&self) -> Option<Result<IOResult<()>>>;
+}
+
 /// What a checkpoint images of a page.
 pub enum Source {
-    /// The page as its first change or free after the cut kept it.
-    Kept(Box<[u8]>),
+    /// The page as its first change or free after the cut kept it, charged to the room until
+    /// dropped.
+    Kept(KeptCopy),
     /// The page as it stands, at its change count.
     Live { bytes: Vec<u8>, count: u64 },
 }
@@ -1997,7 +2201,14 @@ impl<'a> Exclusive<'a> {
     /// The page, to change. Every change is reported with [`changed`](Self::changed) before the
     /// latch is released; a change not reported is lost when the page is evicted.
     pub fn page_mut(&mut self) -> Writer<'_> {
-        self.pool.keep_for_cut(self.frame, self.pid);
+        self.pool.assert_kept(self.frame, self.pid);
+        // SAFETY: latched exclusively, and the writer borrows the guard.
+        unsafe { self.pool.writer(self.frame, self.pid.class()) }
+    }
+
+    /// The page, for a write nothing depends on: a child hint, which every reader checks before
+    /// use. No copy is kept for a cut: an image with the hint reads as one without.
+    pub fn page_mut_unkept(&mut self) -> Writer<'_> {
         // SAFETY: latched exclusively, and the writer borrows the guard.
         unsafe { self.pool.writer(self.frame, self.pid.class()) }
     }

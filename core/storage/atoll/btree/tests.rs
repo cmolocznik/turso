@@ -8,7 +8,6 @@ use crate::storage::atoll::page::CLASS_COUNT;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
-use crate::storage::atoll::txn::versioned::Versions;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::cell::{Cell, RefCell};
@@ -36,8 +35,10 @@ fn config(budget: usize) -> AtollConfig {
         buffer: BufferConfig {
             budget,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: Some(512 << 10),
+        checkpoint_write_bytes: None,
         txn: Default::default(),
     }
 }
@@ -214,29 +215,17 @@ fn create(io: &Arc<dyn IO>, db: &Atoll, run: &Runner<'_>, temporary: bool) -> Tr
     tree_of(io, db, root)
 }
 
-fn versions_of(io: &Arc<dyn IO>, db: &Atoll) -> Versions {
-    Versions::new(
-        io.clone(),
-        db.pool().clone(),
-        db.store().clone(),
-        config(0).txn.slots,
-    )
-}
-
 /// A full checkpoint, done: every page owed an image written, and its superblock in charge.
-fn checkpoint(db: &Atoll, versions: &Versions, run: &Runner<'_>) {
+fn checkpoint(db: &Atoll, run: &Runner<'_>) {
     let ticket = db.checkpointer().request_full();
-    run(&mut || {
-        db.checkpointer()
-            .step_full(ticket, db.transactions(), versions)
-    });
+    run(&mut || db.checkpointer().step_full(ticket, db.transactions()));
 }
 
 /// One step of the full checkpoint `ticket`, the IO it started waited out: true once it is done.
-fn step_checkpoint(io: &Arc<dyn IO>, db: &Atoll, versions: &Versions, ticket: u64) -> bool {
+fn step_checkpoint(io: &Arc<dyn IO>, db: &Atoll, ticket: u64) -> bool {
     match db
         .checkpointer()
-        .step_full(ticket, db.transactions(), versions)
+        .step_full(ticket, db.transactions())
         .unwrap()
     {
         IOResult::Done(()) => true,
@@ -263,7 +252,6 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, MIN_BUDGET, 1);
     let run = drive_runner(&io);
-    let versions = versions_of(&io, &db);
     let tree = create(&io, &db, &run, temporary);
     let max = tree.limits().max_key;
     let mut ticket = None;
@@ -340,7 +328,7 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
             ticket.get_or_insert_with(|| db.checkpointer().request_full());
         }
         if let Some(t) = ticket {
-            if step_checkpoint(&io, &db, &versions, t) {
+            if step_checkpoint(&io, &db, t) {
                 ticket = None;
             }
         }
@@ -357,7 +345,7 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
             model.remove(key);
         }
     }
-    checkpoint(&db, &versions, &run);
+    checkpoint(&db, &run);
     compare(&model, "after removing");
     let after = check_whole(&tree, &db, &run, "after removing").nodes;
     assert!(
@@ -368,14 +356,14 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
     for key in model.keys().cloned().collect::<Vec<_>>() {
         assert!(remove(&key));
     }
-    checkpoint(&db, &versions, &run);
+    checkpoint(&db, &run);
     model.clear();
     let stats = check_whole(&tree, &db, &run, "empty");
     assert_eq!(stats.nodes, 1, "an empty tree is its root");
     if !temporary {
         // What the checkpoint wrote is the tree, whole, with nothing else in use.
         let root = tree.root();
-        drop((tree, versions, db));
+        drop((tree, db));
         let db = open(&io, MIN_BUDGET, 1);
         let tree = tree_of(&io, &db, root);
         assert!(scan(&tree, &run, true).is_empty(), "reopened");
@@ -462,7 +450,6 @@ fn long_values(temporary: bool) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, 64 << 20, 1);
     let run = drive_runner(&io);
-    let versions = versions_of(&io, &db);
     let tree = create(&io, &db, &run, temporary);
     let chunk = value::chunk();
     let sizes = [chunk, chunk + 1, 2 * chunk + 12_345];
@@ -486,13 +473,13 @@ fn long_values(temporary: bool) {
     // Replaced by a small value, then removed: every page of the long one is freed.
     let mut op = Put::new(b"big2", b"small".to_vec(), Mode::Update);
     assert_eq!(run_to(&run, || tree.put(&mut op)), Outcome::Updated);
-    checkpoint(&db, &versions, &run);
+    checkpoint(&db, &run);
     check_whole(&tree, &db, &run, "replaced");
     for i in 0..3 {
         let mut op = Remove::new(format!("big{i}").as_bytes());
         assert!(run_to(&run, || tree.remove(&mut op)));
     }
-    checkpoint(&db, &versions, &run);
+    checkpoint(&db, &run);
     let stats = check_whole(&tree, &db, &run, "removed");
     assert_eq!((stats.nodes, stats.entries), (1, 0));
 }
@@ -502,7 +489,6 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, 64 << 20, 1);
     let run = drive_runner(&io);
-    let versions = versions_of(&io, &db);
     let root = run_to(&run, || Tree::create(db.pool(), class(0)));
     let tree = tree_of(&io, &db, root);
     let writers = 4u64;
@@ -534,7 +520,7 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
             .collect();
         let handles: Vec<_> = (0..writers)
             .map(|t| {
-                let (io, tree, db, shared, versions) = (&io, &tree, &db, &shared, &versions);
+                let (io, tree, db, shared) = (&io, &tree, &db, &shared);
                 s.spawn(move || {
                     let run = drive_runner(io);
                     let mut rng = ChaCha8Rng::seed_from_u64(100 + t);
@@ -561,7 +547,7 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
                         }
                         assert_eq!(get(tree, &run, &key), model.get(&key).cloned());
                         if op % 64 == 0 {
-                            checkpoint(db, versions, &run);
+                            checkpoint(db, &run);
                         }
                     }
                     model
@@ -589,7 +575,7 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
         entries == expected,
         "the tree differs from what the writers wrote"
     );
-    checkpoint(&db, &versions, &run);
+    checkpoint(&db, &run);
     check_whole(&tree, &db, &run, "after the writers");
 }
 
@@ -607,7 +593,6 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
         crash_io.set_durable_writes(durable_writes);
         let io: Arc<dyn IO> = crash_io.clone();
         let db = open(&io, MIN_BUDGET, 1);
-        let versions = versions_of(&io, &db);
         let at_cut: RefCell<AtCut> = RefCell::new(BTreeMap::new());
         let model: RefCell<BTreeMap<Vec<u8>, Vec<u8>>> = RefCell::new(BTreeMap::new());
         let acknowledged = Cell::new(0u64);
@@ -677,7 +662,7 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
         // found it is the tree at any cut it took.
         let step = |ticket: u64| {
             let cp = db.checkpointer();
-            let out = cp.step_full(ticket, db.transactions(), &versions).unwrap();
+            let out = cp.step_full(ticket, db.transactions()).unwrap();
             let n = cp.cut_taken().unwrap_or_else(|| cp.superblock().checkpoint);
             at_cut
                 .borrow_mut()
@@ -1003,7 +988,6 @@ fn concurrent_tree(seed: u64, ops: u64) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Arc::new(open(&io, MIN_BUDGET, 1));
     let run = drive_runner(&io);
-    let versions = Arc::new(versions_of(&io, &db));
     let root = run_to(&run, || Tree::create(db.pool(), class(0)));
     let tree = Arc::new(tree_of(&io, &db, root));
     let shared: Vec<Vec<u8>> = (0..2).map(|i| format!("hot{i}").into_bytes()).collect();
@@ -1031,13 +1015,7 @@ fn concurrent_tree(seed: u64, ops: u64) {
     };
     let writers: Vec<_> = (0..2u64)
         .map(|t| {
-            let (io, db, tree, shared, versions) = (
-                io.clone(),
-                db.clone(),
-                tree.clone(),
-                shared.clone(),
-                versions.clone(),
-            );
+            let (io, db, tree, shared) = (io.clone(), db.clone(), tree.clone(), shared.clone());
             crate::thread::spawn(move || {
                 let run = drive_runner(&io);
                 let mut rng = ChaCha8Rng::seed_from_u64(seed * 10 + t);
@@ -1063,7 +1041,7 @@ fn concurrent_tree(seed: u64, ops: u64) {
                         model.insert(key, value);
                     }
                     if op == ops / 2 {
-                        checkpoint(&db, &versions, &run);
+                        checkpoint(&db, &run);
                     }
                 }
                 model
@@ -1087,7 +1065,7 @@ fn concurrent_tree(seed: u64, ops: u64) {
     // A merge whose free of the node it emptied had to wait hands the node to the checkpointer,
     // which frees it in its next checkpoint: until then those are the only pages unreachable.
     check_reachable(&tree, &db, &run, "schedules, before the checkpointer", true);
-    checkpoint(&db, &versions, &run);
+    checkpoint(&db, &run);
     check_whole(&tree, &db, &run, "schedules");
 }
 
@@ -1104,7 +1082,7 @@ fn a_tree_recovered_on_threads_at_once_reads_back_whole(threads: usize, keys: u6
             let mut op = Put::new(&k.to_be_bytes(), value(k), Mode::Upsert);
             run_to(&run, || tree.put(&mut op));
         }
-        checkpoint(&db, &versions_of(&io, &db), &run);
+        checkpoint(&db, &run);
         tree.root()
     };
     let opening = Arc::new(Opening::new(io.clone(), BASE, config(MIN_BUDGET)).unwrap());

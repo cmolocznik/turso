@@ -2,7 +2,7 @@
 //! recovered from what a crash left.
 
 use super::buffer::{BufferConfig, BufferPool, LocalSource};
-use super::checkpoint::Checkpointer;
+use super::checkpoint::{CheckpointRelief, Checkpointer, WRITE_BYTES};
 use super::control::{Control, Superblock};
 use super::log::{Log, LogConfig, Lsn};
 use super::meta::TREES;
@@ -23,6 +23,9 @@ pub struct AtollConfig {
     /// ratio of Haubenschild et al.'s example (SIGMOD 2020, §3.4: a 20 GB log for a 50 GB pool):
     /// the checkpoint work per byte of log then stays the same whatever the pool's size.
     pub log_budget: Option<u64>,
+    /// Bytes of a checkpoint's image writes in flight, beside its 32: `None` for
+    /// [`WRITE_BYTES`], one page of the largest class. Less is taken as that.
+    pub checkpoint_write_bytes: Option<usize>,
     pub txn: TxnConfig,
 }
 
@@ -34,6 +37,7 @@ impl AtollConfig {
             store: StoreConfig::default(),
             buffer: BufferConfig::with_budget(budget),
             log_budget: None,
+            checkpoint_write_bytes: None,
             txn: TxnConfig::default(),
         }
     }
@@ -57,8 +61,13 @@ impl AtollConfig {
             },
             buffer: BufferConfig::with_budget(super::buffer::MIN_BUDGET),
             log_budget: Some(512 << 10),
+            checkpoint_write_bytes: None,
             txn: TxnConfig::default(),
         }
+    }
+
+    pub(super) fn checkpoint_write_bytes(&self) -> usize {
+        self.checkpoint_write_bytes.unwrap_or(WRITE_BYTES)
     }
 
     pub(super) fn log_budget(&self) -> u64 {
@@ -74,8 +83,8 @@ pub struct Atoll {
     log: Arc<Log>,
     store: Arc<PageStore>,
     pool: Arc<BufferPool>,
-    checkpointer: Checkpointer,
-    txns: Transactions,
+    checkpointer: Arc<Checkpointer>,
+    txns: Arc<Transactions>,
 }
 
 impl Atoll {
@@ -211,6 +220,7 @@ impl Opening {
             control,
             superblock.clone(),
             config.log_budget(),
+            config.checkpoint_write_bytes(),
         );
         Ok(Self {
             store,
@@ -270,6 +280,9 @@ impl Opening {
             txns,
             ..
         } = *r;
+        let (checkpointer, txns) = (Arc::new(checkpointer), Arc::new(txns));
+        // A writer refused room for kept copies steps the checkpoint itself.
+        pool.set_relief(Arc::new(CheckpointRelief::new(&checkpointer, &txns)));
         Ok(Atoll {
             database_id: self.superblock.database_id,
             recovered_end,

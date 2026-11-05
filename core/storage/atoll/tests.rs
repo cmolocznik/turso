@@ -40,8 +40,10 @@ fn config() -> AtollConfig {
         buffer: BufferConfig {
             budget: MIN_BUDGET,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: Some(96 << 10),
+        checkpoint_write_bytes: None,
         txn: Default::default(),
     }
 }
@@ -150,7 +152,7 @@ impl Db {
         let checkpointer = self.db.checkpointer();
         let ticket = checkpointer.request_full();
         drive(&self.io, || {
-            checkpointer.step_full(ticket, self.db.transactions(), &self.versions)
+            checkpointer.step_full(ticket, self.db.transactions())
         })
         .unwrap();
     }
@@ -158,9 +160,7 @@ impl Db {
     /// Steps the checkpointer as a writing statement does.
     fn step_checkpoints(&self) {
         drive(&self.io, || {
-            self.db
-                .checkpointer()
-                .step_due(self.db.transactions(), &self.versions)
+            self.db.checkpointer().step_due(self.db.transactions())
         })
         .unwrap();
     }
@@ -391,7 +391,7 @@ fn a_checkpoint_that_fails_leaves_the_one_in_charge_and_none_runs_until_the_data
     // Stepped here, not through `drive`, which returns a failed write's error from its completion
     // before the checkpointer has seen it: the checkpointer meets the failure itself.
     let step = |ticket: u64| loop {
-        match checkpointer.step_full(ticket, db.db.transactions(), &db.versions) {
+        match checkpointer.step_full(ticket, db.db.transactions()) {
             Err(e) => return Err(e),
             Ok(IOResult::Done(())) => return Ok(()),
             Ok(IOResult::IO(IOCompletions(c))) => {
@@ -494,9 +494,7 @@ fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Opti
             drive_for(io, left, || txns.commit(&mut commit))?;
         }
         let ticket = db.db.checkpointer().request_full();
-        drive_for(io, left, || {
-            db.db.checkpointer().step_full(ticket, txns, &db.versions)
-        })?;
+        drive_for(io, left, || db.db.checkpointer().step_full(ticket, txns))?;
         // The next segment's zeros go one write at a time, then its sync: all of it lands.
         settle(crash, io, left)?;
         // Twice the pool of them: a pool's worth at least is written out, and the tree's pages

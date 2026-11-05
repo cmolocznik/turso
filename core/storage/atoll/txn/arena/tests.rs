@@ -24,8 +24,10 @@ fn open(budget: usize) -> (Arc<dyn IO>, Atoll) {
         buffer: BufferConfig {
             budget,
             writeback_bytes: WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: Some(512 << 10),
+        checkpoint_write_bytes: None,
         txn: TxnConfig { slots: 4 },
     };
     let db = Atoll::open(io.clone(), "/db/arena", config).unwrap();

@@ -44,8 +44,10 @@ fn config() -> AtollConfig {
         buffer: BufferConfig {
             budget: MIN_BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
+            kept_bytes: None,
         },
         log_budget: Some(512 << 10),
+        checkpoint_write_bytes: None,
         txn: TxnConfig { slots: 4 },
     }
 }
@@ -350,9 +352,7 @@ impl Db {
     fn checkpoint(&self) -> Superblock {
         let ticket = self.db.checkpointer().request_full();
         run(&self.io, || {
-            self.db
-                .checkpointer()
-                .step_full(ticket, self.txns(), &self.versions)
+            self.db.checkpointer().step_full(ticket, self.txns())
         });
         self.db.checkpointer().superblock()
     }

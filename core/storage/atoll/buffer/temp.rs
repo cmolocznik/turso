@@ -28,6 +28,9 @@ pub struct TempPages {
     epochs: Arc<Epochs>,
     /// Numbers freed and not yet reusable: a step that could hold one may still run.
     retired: Retired<PageId>,
+    /// Bytes of the pages allocated and not freed: the versions the arenas hold, beside any
+    /// temporary tree's.
+    live: AtomicU64,
 }
 
 #[derive(Default)]
@@ -60,7 +63,13 @@ impl TempPages {
             files: Default::default(),
             epochs,
             retired: Retired::default(),
+            live: AtomicU64::new(0),
         })
+    }
+
+    /// Bytes of the temporary pages allocated and not freed.
+    pub fn live_bytes(&self) -> u64 {
+        self.live.load(Ordering::Relaxed)
     }
 
     /// A new temporary page of `class`. It has no copy until it is first written: it is zeros.
@@ -76,12 +85,15 @@ impl TempPages {
             .free
             .pop(&self.epochs, &step)
             .unwrap_or_else(|| c.next.fetch_add(1, Ordering::Relaxed));
+        self.live.fetch_add(class.size() as u64, Ordering::Relaxed);
         PageId::temporary(class, number)
     }
 
     /// Gives `pid`'s number back, once no step that could hold it is left. Its frame must be gone
     /// already. It has no copy from here on: a stale reader reads zeros.
     pub fn free(&self, pid: PageId) {
+        self.live
+            .fetch_sub(pid.class().size() as u64, Ordering::Relaxed);
         self.classes[pid.class().index()]
             .written
             .clear(pid.temporary_number());

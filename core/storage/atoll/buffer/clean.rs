@@ -169,7 +169,11 @@ impl Writeback {
             if let Some(slot) = self.slots[i] {
                 // A copy that landed is the page's swap copy; one that did not gives its slot up.
                 match &res {
-                    Ok(()) => pool.store.set_swap(self.pids[i], slot),
+                    Ok(()) => {
+                        pool.store.set_swap(self.pids[i], slot);
+                        pool.swap_written
+                            .fetch_add(self.class.size() as u64, Ordering::Relaxed);
+                    }
                     Err(_) => pool.store.untake_swap_slot(self.class, slot),
                 }
             }

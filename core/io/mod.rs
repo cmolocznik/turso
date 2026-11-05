@@ -652,7 +652,12 @@ pub trait IO: Clock + Send + Sync {
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
         while !c.finished() {
-            self.step()?
+            if c.is_remote_wait() {
+                // Another thread completes it, not this backend's step.
+                c.block_on();
+            } else {
+                self.step()?
+            }
         }
         if let Some(inner) = &c.inner {
             if let Some(Some(err)) = inner.result.get().copied() {

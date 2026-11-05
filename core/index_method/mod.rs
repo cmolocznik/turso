@@ -841,7 +841,10 @@ pub(crate) fn open_table_cursor(
     };
     let root_page = table.get_root_page()?;
     if let Some(atoll) = connection.atoll_for_db(database_id) {
-        return Ok(Box::new(atoll.open_cursor(pager, root_page, None)?));
+        // Its writes meet another writer as MVCC's do: they fail at once and change nothing.
+        return Ok(Box::new(
+            atoll.open_cursor(pager, root_page, None)?.no_wait(),
+        ));
     }
     let cursor = Box::new(BTreeCursor::new_table(
         pager,

@@ -653,8 +653,10 @@ impl Statement {
         // rolled its transaction back, runs again from its first instruction with a new snapshot,
         // as if it had run later. Each restart follows another's commit, so the database
         // progresses; the restarts count against the busy timeout, then the statement is Busy.
-        while matches!(&res, Err(err) if matches!(**err, LimboError::WriteWriteConflict))
-            && self.restarts_on_conflict()
+        while matches!(
+            &res,
+            Err(err) if matches!(**err, LimboError::WriteWriteConflict | LimboError::Deadlock)
+        ) && self.restarts_on_conflict()
         {
             let now = std::time::Instant::now();
             let since = *self.conflict_since.get_or_insert(now);
@@ -705,9 +707,14 @@ impl Statement {
             self.busy_handler_state = None;
         }
 
-        // A checkpoint that parked until its busy timeout has waited the time the busy handler
-        // would have slept: the Busy goes to the caller.
-        if std::mem::take(&mut self.state.checkpoint_wait_spent) {
+        // A checkpoint that parked until its busy timeout, or an Atoll wait that did (R34), has
+        // waited the time the busy handler would have slept: the Busy goes to the caller.
+        let atoll_wait_spent = self
+            .program
+            .connection
+            .atoll()
+            .is_some_and(|atoll| atoll.take_wait_spent());
+        if std::mem::take(&mut self.state.checkpoint_wait_spent) || atoll_wait_spent {
             self.busy_handler_state = None;
         } else if matches!(res, Ok(StepResult::Busy)) {
             // Handle busy result by invoking the busy handler
@@ -840,6 +847,20 @@ impl Statement {
         result
     }
 
+    /// Advances what the statement waits for once it stepped to IO: the IO backend, or, when it
+    /// is parked on a wait another thread completes (an Atoll wait on another transaction), the
+    /// calling thread blocks until that thread completes it, rather than spinning on an IO step
+    /// with nothing to do.
+    fn step_io(&self) -> Result<()> {
+        if let Some(io) = &self.state.io_completions {
+            if io.0.is_remote_wait() && !io.0.finished() {
+                io.0.block_on();
+                return Ok(());
+            }
+        }
+        self.pager.io.step()
+    }
+
     /// Runs the statement to completion, discarding rows. A busy wait sleeps out each delay the
     /// busy handler asks for: stepping the IO instead would spin until the timeout passed, on any
     /// backend whose step returns at once with nothing pending.
@@ -847,7 +868,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.step_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -864,7 +885,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.step_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
@@ -886,7 +907,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.step_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
@@ -970,7 +991,7 @@ impl Statement {
                 vdbe::StepResult::Done => break None,
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
-                    self.pager.io.step()?;
+                    self.step_io()?;
                     post_io_func()?;
                 }
                 vdbe::StepResult::Sleep { duration } => {

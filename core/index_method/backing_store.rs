@@ -325,11 +325,13 @@ impl BackingStore {
         let connection = self.connection()?;
         let pager = connection.get_pager_from_database_index(&self.database_id)?;
         if let Some(atoll) = connection.atoll_for_db(self.database_id) {
-            return Ok(Box::new(atoll.open_cursor(
-                pager,
-                self.root_page,
-                Some(Arc::clone(&self.index_info)),
-            )?));
+            // Its writes meet another writer as MVCC's do, which index methods are written
+            // against: they fail at once and change nothing.
+            return Ok(Box::new(
+                atoll
+                    .open_cursor(pager, self.root_page, Some(Arc::clone(&self.index_info)))?
+                    .no_wait(),
+            ));
         }
         let mut cursor = BTreeCursor::new(
             pager,

@@ -314,8 +314,8 @@ fn twelve_writers_through_sql_lose_no_update() {
             let (db, start) = (db.clone(), start.clone());
             std::thread::spawn(move || {
                 let conn = db.connect(ConnectOpts::new()).unwrap();
-                // A write behind an open writer comes back Busy and is retried in place, as SQLite
-                // waits on a lock, for as long as the busy timeout (R34).
+                // A write behind an open writer parks until that writer ends, for as long as the
+                // busy timeout (R34).
                 conn.set_busy_timeout(std::time::Duration::from_secs(30));
                 start.wait();
                 let mut conflicts = 0;
@@ -1294,6 +1294,278 @@ fn a_backing_store_index_method_answers_through_a_rollback_and_a_reopen() {
     let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(nearest(&conn, "[0, 1, 0]"), one(2));
     assert_eq!(nearest(&conn, "[1, 0, 0]"), one(1));
+}
+
+/// Steps `stmt` until it is done, busy or fails, doing its IO meanwhile.
+fn step_until_busy(stmt: &mut crate::Statement) -> crate::Result<crate::StepResult> {
+    loop {
+        match stmt.step() {
+            Ok(crate::StepResult::IO | crate::StepResult::Yield) => stmt._io().step()?,
+            Ok(crate::StepResult::Row) => {}
+            Err(crate::LimboError::Busy) => return Ok(crate::StepResult::Busy),
+            other => return other,
+        }
+    }
+}
+
+/// Two transactions waiting on each other's rows close a cycle in the wait graph, and the younger
+/// fails with `Deadlock` at once and is rolled back, though neither has a busy timeout and each
+/// `Busy` is retried in place: the older's write, retried, then goes on (DESIGN.md §17, §3.1; R34
+/// as re-ruled 2026-11-04). Without the graph both come back `Busy` for ever. The younger begins
+/// with BEGIN CONCURRENT, which is BEGIN in Atoll mode.
+#[test]
+fn a_cycle_of_writers_retrying_busy_in_place_fails_the_younger() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/deadlock-busy");
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET v = 'a1' WHERE id = 1").unwrap();
+    b.execute("BEGIN CONCURRENT").unwrap();
+    b.execute("UPDATE t SET v = 'b2' WHERE id = 2").unwrap();
+    let mut a2 = a.prepare("UPDATE t SET v = 'a2' WHERE id = 2").unwrap();
+    assert!(matches!(
+        step_until_busy(&mut a2),
+        Ok(crate::StepResult::Busy)
+    ));
+    let err = b.execute("UPDATE t SET v = 'b1' WHERE id = 1").unwrap_err();
+    assert!(matches!(err, crate::LimboError::Deadlock), "{err}");
+    assert!(
+        b.get_auto_commit(),
+        "the victim's transaction was rolled back"
+    );
+    assert!(matches!(
+        step_until_busy(&mut a2),
+        Ok(crate::StepResult::Done)
+    ));
+    drop(a2);
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&b, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), text("a1")],
+            vec![Value::from_i64(2), text("a2")],
+        ]
+    );
+}
+
+/// A writer parked behind another, with a busy timeout, and the other then waiting on it: the
+/// younger fails with `Deadlock` at once, not at its timeout, and the parked one wakes at its end
+/// and commits.
+#[test]
+fn a_cycle_through_a_parked_writer_fails_the_younger_at_once() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/deadlock-park");
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    let timeout = std::time::Duration::from_secs(10);
+    a.set_busy_timeout(timeout);
+    b.set_busy_timeout(timeout);
+    a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET v = 'a1' WHERE id = 1").unwrap();
+    b.execute("BEGIN").unwrap();
+    b.execute("UPDATE t SET v = 'b2' WHERE id = 2").unwrap();
+    let parked = std::thread::spawn(move || {
+        let done = a.execute("UPDATE t SET v = 'a2' WHERE id = 2");
+        (a, done)
+    });
+    // Until a's wait is published, b's write only waits too: it closes the cycle once it is.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let err = b.execute("UPDATE t SET v = 'b1' WHERE id = 1").unwrap_err();
+    let took = started.elapsed();
+    assert!(matches!(err, crate::LimboError::Deadlock), "{err}");
+    assert!(took < timeout / 4, "the cycle was broken after {took:?}");
+    let (a, done) = parked.join().unwrap();
+    done.unwrap();
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&b, "SELECT v FROM t ORDER BY id"),
+        vec![vec![text("a1")], vec![text("a2")]]
+    );
+}
+
+/// A write behind an open writer that never ends parks until its busy timeout and then comes back
+/// `Busy` once: the busy handler does not wait the timeout again.
+#[test]
+fn a_wait_past_its_busy_timeout_comes_back_busy_once() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/wait-timeout");
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    let timeout = std::time::Duration::from_millis(500);
+    b.set_busy_timeout(timeout);
+    a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET v = 'a1' WHERE id = 1").unwrap();
+    let started = std::time::Instant::now();
+    let err = b.execute("UPDATE t SET v = 'b1' WHERE id = 1").unwrap_err();
+    let took = started.elapsed();
+    assert!(matches!(err, crate::LimboError::Busy), "{err}");
+    assert!(
+        took >= timeout && took < timeout * 19 / 10,
+        "Busy after {took:?}, for a {timeout:?} timeout"
+    );
+    a.execute("ROLLBACK").unwrap();
+}
+
+/// Twelve threads move money between accounts in transactions that take two rows in a random
+/// order, so their waits close cycles: each cycle fails one of them with `Deadlock`, which retries
+/// its transfer, and in the end no money is lost or made and some cycle was met.
+#[test]
+fn twelve_transferring_writers_break_their_deadlocks_and_lose_nothing() {
+    const THREADS: usize = 12;
+    const ROUNDS: usize = 20;
+    const ACCOUNTS: i64 = 6;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/transfers");
+    let setup = db.connect(ConnectOpts::new()).unwrap();
+    setup
+        .execute("CREATE TABLE acct(id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    for id in 1..=ACCOUNTS {
+        setup
+            .execute(format!("INSERT INTO acct VALUES ({id}, 100)"))
+            .unwrap();
+    }
+    let start = Arc::new(std::sync::Barrier::new(THREADS));
+    let threads: Vec<_> = (0..THREADS)
+        .map(|who| {
+            let (db, start) = (db.clone(), start.clone());
+            std::thread::spawn(move || {
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                conn.set_busy_timeout(std::time::Duration::from_secs(30));
+                let mut state = who as u64 * 2654435761 + 1;
+                let mut next = |n: i64| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % n as u64) as i64 + 1
+                };
+                start.wait();
+                let (mut deadlocks, mut conflicts) = (0, 0);
+                for _ in 0..ROUNDS {
+                    let from = next(ACCOUNTS);
+                    let to = (from + next(ACCOUNTS - 1) - 1) % ACCOUNTS + 1;
+                    loop {
+                        conn.execute("BEGIN").unwrap();
+                        let done = conn
+                            .execute(format!("UPDATE acct SET n = n - 1 WHERE id = {from}"))
+                            .and_then(|_| {
+                                conn.execute(format!("UPDATE acct SET n = n + 1 WHERE id = {to}"))
+                            })
+                            .and_then(|_| conn.execute("COMMIT"));
+                        match done {
+                            Ok(()) => break,
+                            Err(crate::LimboError::Deadlock) => deadlocks += 1,
+                            Err(crate::LimboError::WriteWriteConflict) => conflicts += 1,
+                            Err(e) => panic!("thread {who}: {e}"),
+                        }
+                        assert!(conn.get_auto_commit(), "a failed transfer left it open");
+                    }
+                }
+                (deadlocks, conflicts)
+            })
+        })
+        .collect();
+    let (mut deadlocks, mut conflicts) = (0, 0);
+    for t in threads {
+        let (d, c) = t.join().unwrap();
+        deadlocks += d;
+        conflicts += c;
+    }
+    assert_eq!(
+        rows(&setup, "SELECT sum(n), count(*) FROM acct"),
+        vec![vec![
+            Value::from_i64(100 * ACCOUNTS),
+            Value::from_i64(ACCOUNTS)
+        ]]
+    );
+    eprintln!("transfers: {deadlocks} deadlocks and {conflicts} conflicts retried");
+    assert!(deadlocks > 0, "no cycle of waits was met");
+}
+
+/// A write parked behind another transaction wakes at that transaction's end, not at the next poll
+/// of a busy handler (R34): over a hundred hand-offs, a waiter behind a writer that commits after
+/// 5 ms finishes a median of well under the 3 ms a poll at SQLite's backoff (1, 3, 8 ms) would
+/// leave it waiting past the commit. The lateness is counted past the waiter's own run of the same
+/// prepared statement with nothing in its way, so a slow machine slows both sides alike.
+#[test]
+fn a_parked_write_wakes_at_its_blockers_commit_not_at_a_poll() {
+    const HANDOFFS: usize = 100;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/wake");
+    let holder = db.connect(ConnectOpts::new()).unwrap();
+    holder
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    holder.execute("INSERT INTO t VALUES (1, 0)").unwrap();
+    let (go, gone) = std::sync::mpsc::channel::<()>();
+    let (done, finished) = std::sync::mpsc::channel::<(std::time::Instant, std::time::Duration)>();
+    let waiter = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.set_busy_timeout(std::time::Duration::from_secs(10));
+            let mut update = conn.prepare("UPDATE t SET n = n + 1 WHERE id = 1").unwrap();
+            while gone.recv().is_ok() {
+                update.run_ignore_rows().unwrap();
+                update.reset().unwrap();
+                let woke = std::time::Instant::now();
+                update.run_ignore_rows().unwrap();
+                update.reset().unwrap();
+                done.send((woke, woke.elapsed())).unwrap();
+            }
+        })
+    };
+    let (mut late, mut own) = (Vec::with_capacity(HANDOFFS), Vec::with_capacity(HANDOFFS));
+    for _ in 0..HANDOFFS {
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("UPDATE t SET n = n + 1 WHERE id = 1")
+            .unwrap();
+        go.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        holder.execute("COMMIT").unwrap();
+        let committed = std::time::Instant::now();
+        let (woke, alone) = finished.recv().unwrap();
+        late.push(woke.saturating_duration_since(committed));
+        own.push(alone);
+    }
+    drop(go);
+    waiter.join().unwrap();
+    late.sort();
+    own.sort();
+    let (median, p99, alone) = (
+        late[HANDOFFS / 2],
+        late[HANDOFFS * 99 / 100],
+        own[HANDOFFS / 2],
+    );
+    eprintln!("wake after commit: median {median:?}, p99 {p99:?}; the statement alone: {alone:?}");
+    assert_eq!(
+        rows(&holder, "SELECT n FROM t"),
+        vec![vec![Value::from_i64(3 * HANDOFFS as i64)]]
+    );
+    assert!(
+        median.saturating_sub(alone) < std::time::Duration::from_micros(1500),
+        "a waiter finished a median {median:?} after its blocker's commit, past its own {alone:?}"
+    );
 }
 
 /// A statement that destroys a tree, then opens a cursor on it, reads the tree as empty, as

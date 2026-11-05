@@ -391,6 +391,14 @@ impl Txn {
     pub fn snapshot(&self) -> Ts {
         self.snapshot
     }
+
+    /// The number of its exclusive take of the gate while that take is pending.
+    pub fn pending_take(&self) -> Option<u64> {
+        match self.hold {
+            Hold::Pending { word, .. } => Some(gate::take_of(word)),
+            _ => None,
+        }
+    }
 }
 
 /// A whole rollback in progress: step it with [`Transactions::rollback`].
@@ -589,7 +597,7 @@ impl Transactions {
         let slot = match self.take_slot() {
             Some(slot) => slot,
             None => {
-                let c = Completion::new_wait();
+                let c = Completion::new_remote_wait();
                 self.slot_waits.push(c.clone());
                 // Pairs with the fence of a slot freed: either it finds this waiting, or this
                 // finds the slot. A completion left behind is completed later, for no one.
@@ -949,6 +957,12 @@ impl Transactions {
     /// if it waits on the same blocker still. A wait reuses its completion while it is unfinished.
     pub fn wait_end(&self, blocker: Blocker, c: &Completion) {
         self.ends[blocker.slot as usize].register(c);
+    }
+
+    /// Joins `txn` to `group` in the wait graph, before it writes or takes the gate: a wait on
+    /// it from then on is a wait on the group (DESIGN.md §17, §3.1).
+    pub fn join(&self, txn: &Txn, group: u64) {
+        self.owner[txn.slot as usize].store(group, Ordering::Release);
     }
 
     /// The group of `blocker`'s transaction while it runs; `None` once it has ended.

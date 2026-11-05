@@ -23,6 +23,7 @@ use super::header::{Field, Header};
 use super::key;
 use super::lifecycle::Destroy;
 use super::rowid::{Counter, Seed};
+use super::wait::{graph, Edge, GroupId, Seat, WaitRecord};
 use super::AtollDb;
 use crate::io::FileSyncType;
 use crate::io::{Completion, OpenFlags, IO};
@@ -48,6 +49,7 @@ use crate::vdbe::Register;
 use crate::{Buffer, CompletionError, LimboError, Result, Value};
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::time::{Duration, Instant};
 
 macro_rules! done {
     ($e:expr) => {
@@ -222,27 +224,109 @@ fn words_of(header: &DatabaseHeader) -> [u32; 7] {
     Field::ALL.map(|field| word(header, offset(field)))
 }
 
-/// A write behind another transaction: the completion it waits on, registered on the blocker's
-/// end before the write was judged again. Reused while unfinished (DESIGN.md §17, §3.1).
+/// How a connection's statements wait for another transaction (DESIGN.md §17, §3.1; R34 as Clay
+/// re-ruled it on 2026-11-04: one model for every client). A wait publishes its edge in the
+/// process's wait graph, which fails the youngest member of any cycle with `Deadlock`; the
+/// statement then parks on the end it waits for, woken by that end, until its bound passes, when
+/// it comes back `Busy`. The edge stays published across `Busy`, so callers that retry in place
+/// still close a cycle, until the wait ends, its statement lets it go or its transaction ends.
+pub(super) struct Waits {
+    seat: Mutex<Option<Seat>>,
+    /// The open transaction's group in the graph; 0 for none.
+    group: AtomicU64,
+    /// A wait's bound in nanoseconds: 0 comes back `Busy` at once, [`UNBOUNDED`] never does.
+    bound: AtomicU64,
+    /// Whether the last wait came back `Busy` having waited its bound, which the busy handler
+    /// then does not wait again.
+    spent: AtomicBool,
+}
+
+/// The bound of a wait that parks until its blocker ends, the PostgreSQL frontend's.
+const UNBOUNDED: u64 = u64::MAX;
+
+impl Waits {
+    fn new() -> Self {
+        Self {
+            seat: Mutex::new(Some(graph().seat())),
+            group: AtomicU64::new(0),
+            bound: AtomicU64::new(0),
+            spent: AtomicBool::new(false),
+        }
+    }
+
+    /// The open transaction's group, begun if it has none: before its slot is taken, so that a
+    /// wait on the transaction is a wait on the group.
+    fn group(&self) -> GroupId {
+        let group = self.group.load(Ordering::Acquire);
+        if group != 0 {
+            return group;
+        }
+        let seat = self.seat.lock();
+        let group = graph().begin(seat.as_ref().expect("a seat until the connection closes"));
+        self.group.store(group, Ordering::Release);
+        group
+    }
+
+    /// Ends the transaction's group: its waits are over, and a statement of it still parked wakes.
+    fn end_group(&self) {
+        let group = self.group.swap(0, Ordering::AcqRel);
+        if group != 0 {
+            graph().end(group);
+        }
+    }
+}
+
+impl Drop for Waits {
+    fn drop(&mut self) {
+        self.end_group();
+        if let Some(seat) = self.seat.lock().take() {
+            graph().unseat(seat);
+        }
+    }
+}
+
+/// What a wait's edge names, so that a wait on something else publishes a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum On {
+    Row(Blocker),
+    Take(u64),
+    Drain(u64),
+}
+
+/// One wait of a statement (DESIGN.md §17, §3.1): the completion it parks on, registered on the
+/// blocker's end before the write was judged again and reused while unfinished; its edge in the
+/// wait graph; and when it began, which its bound counts from.
 #[derive(Default)]
 struct Waiting {
     on: Option<(Blocker, Completion)>,
+    record: Option<(On, Arc<WaitRecord>)>,
+    since: Option<Instant>,
+}
+
+fn deadlock(_: super::wait::Deadlock) -> LimboError {
+    LimboError::Deadlock
 }
 
 impl Waiting {
     /// What a write that came back `w` comes to: done, a park on its blocker's end, or judged
-    /// again after registering on it.
-    fn judge(&mut self, db: &AtollDb, w: Write) -> Result<Judged> {
+    /// again after registering on it. A wait publishes its edge first.
+    fn judge(&mut self, db: &Arc<AtollDb>, waits: &Waits, w: Write) -> Result<Judged> {
         match w {
             Write::Done(_) => {
                 self.on = None;
+                self.over()?;
                 Ok(Judged::Done)
             }
             Write::Conflict => {
                 self.on = None;
+                let _ = self.over();
                 Err(LimboError::WriteWriteConflict)
             }
             Write::Wait(blocker) => {
+                self.publish(waits, On::Row(blocker), || Edge::Row {
+                    db: db.clone(),
+                    blocker,
+                })?;
                 if let Some((on, c)) = &self.on {
                     if *on == blocker && !c.finished() {
                         return Ok(Judged::Park(c.clone()));
@@ -250,7 +334,7 @@ impl Waiting {
                 }
                 let c = match self.on.take() {
                     Some((_, c)) if !c.finished() => c,
-                    _ => Completion::new_wait(),
+                    _ => Completion::new_remote_wait(),
                 };
                 db.atoll().transactions().wait_end(blocker, &c);
                 self.on = Some((blocker, c));
@@ -258,17 +342,56 @@ impl Waiting {
             }
         }
     }
+
+    /// Publishes the edge of a wait on `on`, unless this wait published it: `Deadlock` if it
+    /// closes a cycle whose victim is this transaction.
+    fn publish(&mut self, waits: &Waits, on: On, edge: impl FnOnce() -> Edge) -> Result<()> {
+        if self.record.as_ref().is_some_and(|(o, _)| *o == on) {
+            return Ok(());
+        }
+        self.over()?;
+        let record = graph().publish(waits.group(), edge()).map_err(deadlock)?;
+        self.record = Some((on, record));
+        Ok(())
+    }
+
+    /// Ends the wait, its edge withdrawn: `Deadlock` if it was chosen as a victim first.
+    fn over(&mut self) -> Result<()> {
+        self.since = None;
+        match self.record.take() {
+            Some((_, record)) => graph().withdraw(&record).map_err(deadlock),
+            None => Ok(()),
+        }
+    }
+
+    /// Waits on `c`, which the blocker's end completes: parked until the bound passes, then
+    /// `Busy` with the edge kept. `Deadlock` if the wait was chosen as a victim.
+    fn wait<T>(&mut self, waits: &Waits, c: Completion) -> Result<IOResult<T>> {
+        if let Some((_, record)) = &self.record {
+            if graph().park(record, &c).is_err() {
+                let _ = self.over();
+                return Err(LimboError::Deadlock);
+            }
+        }
+        let bound = waits.bound.load(Ordering::Acquire);
+        if bound == UNBOUNDED {
+            return Ok(IOResult::IO(IOCompletions(c)));
+        }
+        let now = Instant::now();
+        let deadline = *self.since.get_or_insert(now) + Duration::from_nanos(bound);
+        // The timer wakes it at the bound, unless the blocker's end does first.
+        if now < deadline && crate::timer::complete_at(deadline, c.clone()) {
+            return Ok(IOResult::IO(IOCompletions(c)));
+        }
+        self.since = None;
+        waits.spent.store(bound != 0, Ordering::Release);
+        Err(LimboError::Busy)
+    }
 }
 
-/// Where a write, a begin or a gate take behind another transaction goes (R34): with `parks`,
-/// onto `c`, which the other's end completes, as the PostgreSQL frontend's unbounded waits do; else
-/// back as `Busy`, which Turso's busy handler retries in place, at the same instruction, with
-/// SQLite's backoff until the busy timeout, as SQLite waits on a lock.
-fn park<T>(parks: &AtomicBool, c: Completion) -> Result<IOResult<T>> {
-    if parks.load(Ordering::Relaxed) {
-        Ok(IOResult::IO(IOCompletions(c)))
-    } else {
-        Err(LimboError::Busy)
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let _ = self.over();
     }
 }
 
@@ -299,8 +422,10 @@ pub struct ConnTxn {
     setting: Mutex<Option<(Field, WriteOp, Waiting)>>,
     /// A gate take waited on, kept so a take parks only on a completion registered before it.
     taking: Mutex<Option<Completion>>,
-    /// Whether waits park, or come back `Busy` to be retried in place (R34).
-    parks: Arc<AtomicBool>,
+    /// The wait of a begin for a free slot or of a gate take, with its edge.
+    begin_wait: Mutex<Waiting>,
+    /// How its statements wait, and its transaction's group in the wait graph.
+    waits: Arc<Waits>,
     /// The named savepoints, oldest first.
     savepoints: Mutex<Vec<Savepoint>>,
     /// Whether a schema reparse holds the transaction, which its statements read in and do not
@@ -431,7 +556,8 @@ impl ConnTxn {
             written: Mutex::new(Vec::new()),
             setting: Mutex::new(None),
             taking: Mutex::new(None),
-            parks: Arc::new(AtomicBool::new(false)),
+            begin_wait: Mutex::new(Waiting::default()),
+            waits: Arc::new(Waits::new()),
             savepoints: Mutex::new(Vec::new()),
             pinned: AtomicBool::new(false),
             pin_began: AtomicBool::new(false),
@@ -519,7 +645,22 @@ impl ConnTxn {
     /// From now on waits park until what is in the way ends, for the PostgreSQL frontend, whose
     /// waits are unbounded (R2, R34).
     pub fn park_waits(&self) {
-        self.parks.store(true, Ordering::Relaxed);
+        self.waits.bound.store(UNBOUNDED, Ordering::Release);
+    }
+
+    /// Bounds each wait by the client's busy timeout: it parks until then, and then comes back
+    /// `Busy`; with none it comes back `Busy` at once, its edge still in the wait graph (R34).
+    pub fn bound_waits(&self, timeout: Duration) {
+        let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(UNBOUNDED - 1);
+        self.waits
+            .bound
+            .store(nanos.min(UNBOUNDED - 1), Ordering::Release);
+    }
+
+    /// Whether the last wait came back `Busy` having waited its bound: the busy handler then
+    /// does not wait again. Taken: a second call reads false.
+    pub fn take_wait_spent(&self) -> bool {
+        self.waits.spent.swap(false, Ordering::AcqRel)
     }
 
     pub fn db(&self) -> &Arc<AtollDb> {
@@ -586,13 +727,20 @@ impl ConnTxn {
                 Begin::Write { .. } => txns.begin_slot_in(Isolation::Snapshot, 0)?,
             };
             match begun {
-                IOResult::Done(txn) => *guard = Some(txn),
-                // No slot is free (R13).
-                IOResult::IO(IOCompletions(c)) => return park(&self.parks, c),
+                IOResult::Done(txn) => {
+                    *guard = Some(txn);
+                    self.begin_wait.lock().over()?;
+                }
+                // No slot is free (R13): no one transaction is in the way, so no edge.
+                IOResult::IO(IOCompletions(c)) => {
+                    return self.begin_wait.lock().wait(&self.waits, c);
+                }
             }
         }
         let txn = guard.as_mut().expect("a transaction");
         if let Begin::Write { schema } = wants {
+            // A writer is waited on by its group from before its take: a reader never is.
+            txns.join(txn, self.waits.group());
             let checks = schema && !reads.is_empty() && txn.snapped();
             if checks
                 && !matches!(txn.hold(), Hold::Pending { .. } | Hold::Exclusive { .. })
@@ -603,7 +751,7 @@ impl ConnTxn {
             let mut taking = self.taking.lock();
             let c = match taking.take() {
                 Some(c) if !c.finished() => c,
-                _ => Completion::new_wait(),
+                _ => Completion::new_remote_wait(),
             };
             let taken = match if schema {
                 txns.take_exclusive(txn, &c)
@@ -620,20 +768,50 @@ impl ConnTxn {
             };
             match taken {
                 Taken::Done => {
+                    self.begin_wait.lock().over()?;
                     if checks && self.read_since_snapshot(txn, reads)? {
                         txns.hand_back_exclusive(txn);
                         return Err(LimboError::BusySnapshot);
                     }
                 }
                 Taken::Lost => {
+                    // Cleared for a victim: this one, if its wait was flagged.
+                    let flagged = self.begin_wait.lock().over().is_err();
                     drop(taking);
                     self.end_if_fresh(&mut guard);
-                    return Err(LimboError::Busy);
+                    return Err(if flagged {
+                        LimboError::Deadlock
+                    } else {
+                        LimboError::Busy
+                    });
                 }
-                Taken::Behind { .. } | Taken::Holders(_) => {
+                Taken::Behind { take, .. } => {
                     // A pending exclusive take stays pending meanwhile (R15).
                     *taking = Some(c.clone());
-                    return park(&self.parks, c);
+                    let db: Arc<dyn super::wait::Holders> = self.db.clone();
+                    let mut wait = self.begin_wait.lock();
+                    wait.publish(&self.waits, On::Take(take), || Edge::Take { db, take })?;
+                    return wait.wait(&self.waits, c);
+                }
+                Taken::Holders(holders) => {
+                    *taking = Some(c.clone());
+                    let take = txn.pending_take().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "a drain of shared holders with no take pending".to_string(),
+                        )
+                    })?;
+                    let db: Arc<dyn super::wait::Holders> = self.db.clone();
+                    let holders = holders
+                        .into_iter()
+                        .map(|(slot, start)| Blocker { slot, start })
+                        .collect();
+                    let mut wait = self.begin_wait.lock();
+                    wait.publish(&self.waits, On::Drain(take), || Edge::Drain {
+                        db,
+                        holders,
+                        take,
+                    })?;
+                    return wait.wait(&self.waits, c);
                 }
             }
         }
@@ -669,6 +847,8 @@ impl ConnTxn {
         {
             let txn = guard.take().expect("a transaction");
             self.db.atoll().transactions().abort(txn);
+            let _ = self.begin_wait.lock().over();
+            self.waits.end_group();
         }
     }
 
@@ -678,6 +858,7 @@ impl ConnTxn {
             self.db.atoll().transactions().give_up(txn);
         }
         *self.taking.lock() = None;
+        let _ = self.begin_wait.lock().over();
     }
 
     /// Starts the Atoll statement of a statement that writes: returns the number to roll back
@@ -727,6 +908,8 @@ impl ConnTxn {
             .collect();
         *self.setting.lock() = None;
         *self.taking.lock() = None;
+        let _ = self.begin_wait.lock().over();
+        self.waits.end_group();
         Some(if commit {
             Ending::commit(self.db.clone(), txn, written, stamped)
         } else {
@@ -824,7 +1007,7 @@ impl ConnTxn {
                 txn,
                 op
             ));
-            match waiting.judge(&self.db, w)? {
+            match waiting.judge(&self.db, &self.waits, w)? {
                 Judged::Done => {
                     if field == Field::SchemaCookie {
                         txn.wrote_schema();
@@ -832,7 +1015,7 @@ impl ConnTxn {
                     self.written.lock().push((txn.command(), field, value));
                     *setting = None;
                 }
-                Judged::Park(c) => return park(&self.parks, c),
+                Judged::Park(c) => return waiting.wait(&self.waits, c),
                 Judged::Again => {}
             }
         }
@@ -864,7 +1047,7 @@ impl ConnTxn {
             } else {
                 self.db.destroy(txn, &mut op.destroy)
             });
-            match op.waiting.judge(&self.db, w)? {
+            match op.waiting.judge(&self.db, &self.waits, w)? {
                 Judged::Done => {
                     txn.wrote_schema();
                     if clear {
@@ -874,7 +1057,7 @@ impl ConnTxn {
                     }
                     return Ok(IOResult::Done(op.counted.unwrap_or(0)));
                 }
-                Judged::Park(c) => return park(&self.parks, c),
+                Judged::Park(c) => return op.waiting.wait(&self.waits, c),
                 Judged::Again => {}
             }
         }
@@ -1128,8 +1311,10 @@ pub struct SqlCursor {
     null_row: bool,
     has_record: bool,
     waiting: Waiting,
-    /// Whether its writes' waits park (R34).
-    parks: Arc<AtomicBool>,
+    /// How its connection's statements wait (R34).
+    waits: Arc<Waits>,
+    /// Whether a write meeting another transaction's open version fails at once, as MVCC's do.
+    no_wait: bool,
     /// The rowid counter's seed under way.
     seeding: Option<Seed>,
     /// A count under way.
@@ -1166,7 +1351,8 @@ impl SqlCursor {
             null_row: false,
             has_record: false,
             waiting: Waiting::default(),
-            parks: ct.parks.clone(),
+            waits: ct.waits.clone(),
+            no_wait: false,
             seeding: None,
             counting: None,
             changes: ct.changes.clone(),
@@ -1227,6 +1413,14 @@ impl SqlCursor {
     /// The cursor's position is current with its connection's changes.
     fn positioned(&mut self) {
         self.seen = self.changes.epoch();
+    }
+
+    /// The cursor, whose writes meeting another transaction's open version fail at once with
+    /// `WriteWriteConflict`, changing nothing, as MVCC's do: an index method's, written against
+    /// that contract (DESIGN.md §17, §3.1).
+    pub fn no_wait(mut self) -> Self {
+        self.no_wait = true;
+        self
     }
 
     /// The tree's rowid counter, seeded from the tree's largest key once it is (DESIGN.md §17,
@@ -1332,7 +1526,11 @@ impl SqlCursor {
                 IOResult::Done(w) => w,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            match self.waiting.judge(&self.db, w)? {
+            if let (true, Write::Wait(_)) = (self.no_wait, w) {
+                self.open.as_mut().expect("resolved").abandon_write();
+                return Err(Box::new(LimboError::WriteWriteConflict));
+            }
+            match self.waiting.judge(&self.db, &self.waits, w)? {
                 Judged::Done => {
                     if self.id == SCHEMA_ID {
                         if let Some(txn) = self.cell.lock().as_mut() {
@@ -1352,7 +1550,7 @@ impl SqlCursor {
                     }
                     return Ok(IOResult::Done(()));
                 }
-                Judged::Park(c) => return Ok(park(&self.parks, c)?),
+                Judged::Park(c) => return Ok(self.waiting.wait(&self.waits, c)?),
                 Judged::Again => {}
             }
         }

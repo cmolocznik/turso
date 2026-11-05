@@ -582,6 +582,13 @@ impl AtollCursor {
     }
 
     /// Deletes the row or index entry the cursor is at. Step it until done.
+    /// Drops a write that came back `Write::Wait`, which wrote nothing, so that the cursor's next
+    /// write starts afresh.
+    pub fn abandon_write(&mut self) {
+        self.writing = None;
+        self.inserted = None;
+    }
+
     pub fn delete(&mut self) -> Result<IOResult<Write>> {
         if self.writing.is_none() {
             let k = self

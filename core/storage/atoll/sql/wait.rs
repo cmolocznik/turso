@@ -188,9 +188,17 @@ impl Default for WaitGraph {
     }
 }
 
-/// A connection's place in the graph, from its open to its close.
+/// The process's wait graph, which every Atoll connection's waits publish in.
+pub fn graph() -> &'static WaitGraph {
+    static GRAPH: std::sync::OnceLock<WaitGraph> = std::sync::OnceLock::new();
+    GRAPH.get_or_init(WaitGraph::default)
+}
+
+/// A connection's place in the graph, from its open to its close, holding its node so that its
+/// groups begin and end without the graph's lock.
 pub struct Seat {
     index: u32,
+    node: Arc<Node>,
 }
 
 fn index_of(id: GroupId) -> u32 {
@@ -205,18 +213,23 @@ impl WaitGraph {
     /// A node for a new connection.
     pub fn seat(&self) -> Seat {
         if let Some(index) = lock(&self.free).pop() {
-            return Seat { index };
+            return Seat {
+                index,
+                node: self.node(index),
+            };
         }
         let mut nodes = lock(&self.nodes);
-        nodes.push(Arc::new(Node {
+        let node = Arc::new(Node {
             generation: AtomicU32::new(0),
             born: AtomicU64::new(0),
             exclusive: AtomicU32::new(0),
             doomed: AtomicBool::new(false),
             waits: Mutex::new(Vec::new()),
-        }));
+        });
+        nodes.push(node.clone());
         Seat {
             index: (nodes.len() - 1) as u32,
+            node,
         }
     }
 
@@ -237,7 +250,7 @@ impl WaitGraph {
 
     /// Begins the seat's next group, younger than every group begun before.
     pub fn begin(&self, seat: &Seat) -> GroupId {
-        let node = self.node(seat.index);
+        let node = &seat.node;
         node.born.store(
             self.ages.fetch_add(1, Ordering::AcqRel) + 1,
             Ordering::Release,
@@ -251,10 +264,31 @@ impl WaitGraph {
     /// Ends group `id`: its records are over, and every statement of it still parked is woken,
     /// to fail.
     pub fn end(&self, id: GroupId) {
-        let Some(node) = self.live(id) else {
+        if let Some(node) = self.live(id) {
+            Self::end_on(&node, id);
+        }
+    }
+
+    /// [`end`](Self::end) for the group `id` of `seat`, without the graph's lock.
+    pub fn end_seated(&self, seat: &Seat, id: GroupId) {
+        if seat.node.generation.load(Ordering::Acquire) == generation_of(id) {
+            Self::end_on(&seat.node, id);
+        }
+    }
+
+    fn end_on(node: &Node, id: GroupId) {
+        if node
+            .generation
+            .compare_exchange(
+                generation_of(id),
+                generation_of(id).wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
             return;
-        };
-        node.generation.fetch_add(1, Ordering::AcqRel);
+        }
         let records = std::mem::take(&mut *lock(&node.waits));
         for r in records {
             r.state

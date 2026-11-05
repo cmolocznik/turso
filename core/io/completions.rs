@@ -266,6 +266,7 @@ impl Debug for CompletionType {
             Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
             Self::Group(..) => f.debug_tuple("Group").finish(),
             Self::Yield => f.debug_tuple("Yield").finish(),
+            Self::Remote => f.debug_tuple("Remote").finish(),
         }
     }
 }
@@ -277,6 +278,8 @@ pub enum CompletionType {
     Truncate(TruncateCompletion),
     Group(GroupCompletion),
     Yield,
+    /// A wait that another thread completes, never an IO step: a waiter may block on it.
+    Remote,
 }
 
 impl CompletionInner {
@@ -365,6 +368,19 @@ impl Completion {
         Self::new(CompletionType::Yield)
     }
 
+    /// A wait that another thread completes, never an IO step on this one: the end of another
+    /// transaction, or a timer. A synchronous waiter blocks on it ([`block_on`](Self::block_on)).
+    pub fn new_remote_wait() -> Self {
+        Self::new(CompletionType::Remote)
+    }
+
+    /// Whether another thread completes this wait, so that a waiter may block on it.
+    pub fn is_remote_wait(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| matches!(inner.completion_type, CompletionType::Remote))
+    }
+
     /// This completion as a raw pointer holding its reference, for a lock-free cell that hands
     /// it to other threads; null for a yield.
     pub(crate) fn into_raw(self) -> *const () {
@@ -408,9 +424,12 @@ impl Completion {
     }
 
     pub fn is_wait(&self) -> bool {
-        self.inner
-            .as_ref()
-            .is_some_and(|inner| matches!(inner.completion_type, CompletionType::Yield))
+        self.inner.as_ref().is_some_and(|inner| {
+            matches!(
+                inner.completion_type,
+                CompletionType::Yield | CompletionType::Remote
+            )
+        })
     }
 
     pub fn wake(&self) {
@@ -434,6 +453,31 @@ impl Completion {
                 group.wake();
             }
             inner.context.wake();
+        }
+    }
+
+    /// Blocks the calling thread until the completion finishes: for a [remote
+    /// wait](Self::new_remote_wait), which another thread completes and no IO step does, so the
+    /// thread neither spins on an IO step with nothing to do nor sleeps past the finish. A waker
+    /// unparks it; an unpark before the park leaves the thread's token, so no wake is lost.
+    pub fn block_on(&self) {
+        struct Unpark(crate::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        if self.finished() {
+            return;
+        }
+        self.set_waker(&Waker::from(std::sync::Arc::new(Unpark(
+            crate::thread::current(),
+        ))));
+        while !self.finished() {
+            crate::thread::park();
         }
     }
 
@@ -529,7 +573,7 @@ impl Completion {
                     g.callback(result);
                     None
                 }
-                CompletionType::Yield => None,
+                CompletionType::Yield | CompletionType::Remote => None,
             };
 
             // Use callback error if present, otherwise use the original IO error

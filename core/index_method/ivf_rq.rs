@@ -3695,8 +3695,8 @@ impl IvfRqCursor {
                 Some(wal) => (Clock::Wal(wal), context.transaction_mode() == IndexMethodTransactionMode::Read),
                 None => return Ok(()),
             },
-            // Atoll's commits have no clock here yet: each attachment reads its own, as with a
-            // multiprocess WAL; concurrent writers are open work (step 8 audit 9, item 28).
+            // Atoll mode shares nothing across attachments: each reads its own rows, as with a
+            // multiprocess WAL, and its writers' maintenance meets another's rows at the write.
             IndexMethodSnapshotIdentity::Atoll { .. } => return Ok(()),
         };
         let writes = self.writes(context.database().incarnation, &clock);
@@ -7003,6 +7003,16 @@ mod tests {
         (db, conn)
     }
 
+    /// [`database`] in Atoll mode.
+    fn atoll_database(name: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
+        use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect};
+        let options = OpenOptions::new(Arc::new(SqliteDialect)).atoll(crate::storage::atoll::sql::catalog::tests::config()).db_opts(DatabaseOpts::new().with_index_method(true));
+        let db = Database::open(Arc::new(MemoryIO::new()), name, options).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();
+        (db, conn)
+    }
+
     /// A vector near one of `centres`, the centre chosen by the generator.
     fn near(state: &mut u64, centres: &[Vec<f32>], spread: f32) -> Vec<f32> {
         let pick = ((random(state, 1)[0] + 0.5) * centres.len() as f32) as usize;
@@ -7883,9 +7893,21 @@ mod tests {
     /// jobs claiming every partition, a writer's COMMIT failed.
     #[test]
     fn concurrent_writers_maintaining_the_index_all_commit() {
+        concurrent_writers_all_commit(false);
+    }
+
+    /// The same in Atoll mode, where BEGIN CONCURRENT is BEGIN and every writer runs beside the
+    /// others, and the index's stores write as MVCC's do, failing at once on a row another holds
+    /// (Atoll's DESIGN.md §17, R34 as re-ruled 2026-11-04).
+    #[test]
+    fn concurrent_writers_maintaining_the_index_all_commit_in_atoll_mode() {
+        concurrent_writers_all_commit(true);
+    }
+
+    fn concurrent_writers_all_commit(atoll: bool) {
         const DIMS: usize = 16;
         const WRITERS: usize = 3;
-        let (db, conn) = database("ivf-rq-concurrent-writers.db", true);
+        let (db, conn) = if atoll { atoll_database("ivf-rq-concurrent-writers-atoll.db") } else { database("ivf-rq-concurrent-writers.db", true) };
         let mut state = 233;
         let centres: Vec<Vec<f32>> = (0..4).map(|_| random(&mut state, DIMS).iter().map(|x| 3.0 * x).collect()).collect();
         let mut live: HashMap<i64, Vec<f32>> = (1..=3000i64).map(|id| (id, near(&mut state, &centres, 0.4))).collect();
@@ -8564,13 +8586,14 @@ mod tests {
 
     /// Deleting every vector of half the clusters retires the partitions that held them: none is
     /// left live with fewer entries than the retirement bound, and the queries stay exact. A query
-    /// probes the retired partitions only under MVCC, where a concurrent writer coding against an
-    /// older model can leave a tail entry in one.
+    /// probes the retired partitions only where writers run at once, under MVCC and in Atoll mode,
+    /// where a concurrent writer coding against an older model can leave a tail entry in one.
     #[test]
     fn emptied_partitions_retire() {
         const DIMS: usize = 16;
-        for mvcc in [false, true] {
-            let (_db, conn) = database(&format!("ivf-rq-retire-{mvcc}.db"), mvcc);
+        for mode in ["wal", "mvcc", "atoll"] {
+            let concurrent = mode != "wal";
+            let (_db, conn) = if mode == "atoll" { atoll_database("ivf-rq-retire-atoll.db") } else { database(&format!("ivf-rq-retire-{mode}.db"), mode == "mvcc") };
             conn.execute("CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 1000, refine = 4)").unwrap();
             let mut state = 47;
             let centres: Vec<Vec<f32>> = (0..8).map(|_| random(&mut state, DIMS).iter().map(|x| 4.0 * x).collect()).collect();
@@ -8586,18 +8609,18 @@ mod tests {
             live.retain(|id, _| *id > 1200);
             optimize(&conn, "v_ivf");
             let index = stored(&conn);
-            assert!(index.pending().is_empty(), "mvcc={mvcc}: {:?}", index.pending());
+            assert!(index.pending().is_empty(), "{mode}: {:?}", index.pending());
             let retired = index.parts.values().filter(|part| part.state == State::Retired).count();
-            assert!(retired > 0, "mvcc={mvcc}: no partition of {before} retired");
+            assert!(retired > 0, "{mode}: no partition of {before} retired");
             for centre in &centres {
                 let q = near(&mut state, std::slice::from_ref(centre), 0.2);
-                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "mvcc={mvcc}");
+                assert_eq!(top_ten(&conn, &q), exact_top_ten(&live, &q), "{mode}");
             }
             let probes = PROBES.with(|c| c.get());
             top_ten(&conn, &near(&mut state, &centres, 0.2));
             let probed = PROBES.with(|c| c.get()) - probes;
-            let wanted = index.live().len() + if mvcc { retired } else { 0 };
-            assert_eq!(probed, wanted, "mvcc={mvcc}: {probed} partitions probed, {} live and {retired} retired", index.live().len());
+            let wanted = index.live().len() + if concurrent { retired } else { 0 };
+            assert_eq!(probed, wanted, "{mode}: {probed} partitions probed, {} live and {retired} retired", index.live().len());
         }
     }
 

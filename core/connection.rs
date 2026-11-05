@@ -4642,6 +4642,10 @@ impl Connection {
             Some(callback) => BusyHandler::Custom { callback },
             None => BusyHandler::None,
         };
+        // An Atoll wait comes back Busy at once, for the callback to decide on (R34).
+        if let Some(atoll) = self.atoll() {
+            atoll.bound_waits(Duration::ZERO);
+        }
         self.bump_prepare_context_generation();
     }
 
@@ -4652,6 +4656,10 @@ impl Connection {
         } else {
             BusyHandler::Timeout(duration)
         };
+        // An Atoll wait parks until the timeout, woken as soon as its blocker ends (R34).
+        if let Some(atoll) = self.atoll() {
+            atoll.bound_waits(duration);
+        }
         self.bump_prepare_context_generation();
     }
 

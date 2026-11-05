@@ -4770,10 +4770,9 @@ pub fn op_transaction_inner(
                     // write gate, exclusive when it writes the schema or begins IMMEDIATE (R5,
                     // R12), then starts its Atoll statement (R18).
                     if matches!(tx_mode, TransactionMode::Concurrent) {
-                        return Err(LimboError::TxError(
-                            "BEGIN CONCURRENT is refused in Atoll mode: a write behind an open \
-                             writer waits for it instead (R2)"
-                                .to_string(),
+                        // BEGIN CONCURRENT is BEGIN here, which never sets the concurrent mode.
+                        return Err(LimboError::InternalError(
+                            "a concurrent transaction mode in Atoll mode".to_string(),
                         )
                         .into());
                     }
@@ -5487,7 +5486,9 @@ pub fn op_auto_commit(
                     !conn.tx_is_poisoned(),
                     "rollback-only marker leaked outside an explicit transaction"
                 );
-                if *concurrent && mv_store.is_none() {
+                // In Atoll mode every transaction runs beside the others, so BEGIN CONCURRENT is
+                // BEGIN (DESIGN.md §17, R34 as re-ruled 2026-11-04).
+                if *concurrent && mv_store.is_none() && conn.atoll().is_none() {
                     return Err(LimboError::TxError(
                         "Concurrent transaction mode is only supported when MVCC is enabled"
                             .to_string(),

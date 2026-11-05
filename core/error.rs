@@ -162,6 +162,10 @@ pub enum LimboError {
     TxTerminated,
     #[error("Write-write conflict")]
     WriteWriteConflict,
+    /// The transaction was chosen to break a cycle of waits (Atoll's DESIGN.md §17, §3.1): it is
+    /// rolled back, and the others go on.
+    #[error("database is deadlocked: this transaction was rolled back to break a cycle of waits")]
+    Deadlock,
     #[error("Commit dependency aborted")]
     CommitDependencyAborted,
     #[error("No such transaction ID: {0}")]

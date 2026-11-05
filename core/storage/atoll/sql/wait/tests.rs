@@ -214,7 +214,7 @@ mod plain {
         let db = Arc::new(AtollDb::open(io.clone(), "/db/wait", config).unwrap());
         let a = db.atoll();
         let root = drive(&io, || {
-            crate::storage::atoll::btree::Tree::create(
+            crate::storage::atoll::btree::Tree::create_versioned(
                 &io,
                 a.pool(),
                 a.store(),

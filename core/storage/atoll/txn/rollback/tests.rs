@@ -109,7 +109,7 @@ impl Db {
         let db = Atoll::open(io.clone(), BASE, config).unwrap();
         let roots = [0, 1].map(|c| {
             run(&io, || {
-                Tree::create(&io, db.pool(), db.store(), SizeClass::new(c).unwrap())
+                Tree::create_versioned(&io, db.pool(), db.store(), SizeClass::new(c).unwrap())
             })
         });
         Self::with(
@@ -1004,4 +1004,42 @@ fn a_creation_record_leads_the_group_that_makes_and_adopts_its_root() {
     let kinds: Vec<_> = members.iter().map(|r| r.header.kind).collect();
     assert_eq!(kinds, vec![CREATE, INIT, ADOPT], "{root:?}");
     assert!(members[1..].iter().all(|r| r.header.txn == 0));
+}
+
+/// A settle reaches the log: a crash after writes took the room it gave back recovers them, though
+/// the leaf's copy on disk, written before, still keeps the reserves.
+#[test]
+fn a_crash_after_a_settle_recovers_the_writes_that_took_its_room() {
+    let crash_io = Arc::new(CrashIO::new(0));
+    let db = Db::create(crash_io.clone());
+    let xs: Vec<String> = (0..4).map(|i| format!("x{i}")).collect();
+    let ys: Vec<String> = (0..4).map(|i| format!("y{i}")).collect();
+    let mut t = db.begin();
+    for (i, key) in xs.iter().enumerate() {
+        db.put(&mut t, 0, key, &value("wide", i));
+    }
+    db.commit(t);
+    let mut shrink = db.begin();
+    for key in &xs {
+        db.put(&mut shrink, 0, key, "-");
+    }
+    db.commit(shrink);
+    db.checkpoint();
+    let mut fill = db.begin();
+    for (i, key) in ys.iter().enumerate() {
+        db.put(&mut fill, 0, key, &value("fill", i));
+    }
+    db.commit(fill);
+    db.durable();
+    let keys: Vec<String> = xs.iter().chain(&ys).cloned().collect();
+    let expected = db.state(&keys);
+    assert_eq!(
+        expected[&(0, ys[3].clone())].as_deref(),
+        Some(value("fill", 3).as_str())
+    );
+    let roots = db.roots();
+    drop(db);
+    let recovered = Db::recover(Arc::new(crash_io.crash(0)), roots);
+    assert_eq!(recovered.state(&keys), expected);
+    recovered.check_whole("recovered");
 }

@@ -6,7 +6,8 @@
 //! [`Version::SETTLED`], since every snapshot after a recovery from the checkpoint sees it.
 //!
 //! It is built from a copy of the leaf's bytes, taken under its latch, so writers go on while
-//! the arenas are read. The arena entries it follows stay while the snapshot is held.
+//! the arenas are read. The arena entries it follows stay while the snapshot is held. It fits the
+//! page, whose reserves kept room for every version it puts back ([`super`]: `reserve`).
 
 use super::{corrupt_header, Version, Versions, HEADER};
 use crate::storage::atoll::btree::node::{self, Entry, Layout, Limits, Shape, View};
@@ -44,13 +45,6 @@ pub struct AsOf {
     kept: Vec<Entry>,
     /// Per slot, the start of its last transaction the snapshot sees, once read.
     seen: Vec<Option<Ts>>,
-}
-
-/// A leaf whose versions as of the snapshot take more than its page holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Overflow {
-    pub needs: usize,
-    pub capacity: usize,
 }
 
 impl AsOf {
@@ -105,7 +99,8 @@ impl AsOf {
                         .ok_or_else(corrupt_header)?;
                     if self.sees(txns, &v)? {
                         let e = &mut self.copied[self.next];
-                        let (key, value) = (std::mem::take(&mut e.key), std::mem::take(&mut e.value));
+                        let (key, value) =
+                            (std::mem::take(&mut e.key), std::mem::take(&mut e.value));
                         let out_of_line = e.out_of_line;
                         self.keep(&v, key, &value[HEADER..], out_of_line);
                         continue;
@@ -136,7 +131,7 @@ impl AsOf {
     /// Keeps `key` at version `v`, its value or reference `rest`, unless `v` deletes it.
     fn keep(&mut self, v: &Version, key: Vec<u8>, rest: &[u8], out_of_line: bool) {
         self.next += 1;
-        if v.deleted() {
+        if v.deleted {
             return;
         }
         let mut value = Vec::with_capacity(HEADER + rest.len());
@@ -150,15 +145,20 @@ impl AsOf {
     }
 
     /// The leaf's image, its page header as copied: what [`step`](Self::step) kept, in the
-    /// leaf's layout. An [`Overflow`] if it does not fit.
-    pub fn image(self) -> Result<std::result::Result<Vec<u8>, Overflow>> {
-        assert_eq!(self.next, self.copied.len(), "an image not yet judged whole");
+    /// leaf's layout.
+    pub fn image(self) -> Result<Vec<u8>> {
+        assert_eq!(
+            self.next,
+            self.copied.len(),
+            "an image not yet judged whole"
+        );
         let Shape {
             root,
             level,
             lower,
             upper,
             next,
+            reserving,
         } = &self.shape;
         let layout = Layout {
             root: *root,
@@ -166,17 +166,22 @@ impl AsOf {
             lower: lower.as_deref(),
             upper: upper.as_deref(),
             next: *next,
+            reserving: *reserving,
         };
         let class = SizeClass::fitting(self.len)
             .filter(|c| c.size() == self.len)
             .ok_or_else(|| LimboError::Corrupt(format!("a leaf of {} bytes", self.len)))?;
         let (needs, capacity) = (layout.size(&self.kept), Limits::of(class).capacity);
         if needs > capacity {
-            return Ok(Err(Overflow { needs, capacity }));
+            return Err(LimboError::Corrupt(format!(
+                "a leaf as of {} takes {needs} bytes of its page's {capacity}: its reserves kept \
+                 too little",
+                self.at
+            )));
         }
         let mut out = vec![0u8; self.len];
         out[..page::HEADER_SIZE].copy_from_slice(&self.header);
         node::build(&mut out[..], &layout, &self.kept);
-        Ok(Ok(out))
+        Ok(out)
     }
 }

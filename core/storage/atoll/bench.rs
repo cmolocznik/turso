@@ -316,7 +316,7 @@ fn paths() {
     if versioned.iter().any(|v| runs(v)) {
         let (io, db) = open();
         let root = drive(&io, || {
-            Tree::create(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
+            Tree::create_versioned(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
         })
         .unwrap();
         let slots = TxnConfig::default().slots;

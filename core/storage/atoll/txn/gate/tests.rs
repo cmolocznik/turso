@@ -48,7 +48,7 @@ fn open(slots: usize) -> Db {
     };
     let db = Atoll::open(io.clone(), "/db/gate", config).unwrap();
     let root = drive(&io, || {
-        Tree::create(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
+        Tree::create_versioned(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
     })
     .unwrap();
     let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), slots);

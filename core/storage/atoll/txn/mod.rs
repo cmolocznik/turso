@@ -894,6 +894,15 @@ impl Transactions {
         start <= last
     }
 
+    /// Whether every snapshot taken from now on sees the version written by the slot's transaction
+    /// that started at `start`: no checkpoint needs any version below it.
+    pub fn seen_from_now(&self, slot: u16, start: Ts) -> bool {
+        let at = self.horizon.at();
+        self.slots
+            .get(slot as usize)
+            .is_some_and(|log| start <= log.last_at(at))
+    }
+
     /// Commits `op`'s transaction (DESIGN.md §11.4). It is visible to every snapshot taken after it
     /// is done, which is once the horizon covers its commit timestamp and the log is durable up to
     /// its Commit record. A transaction that wrote nothing appends nothing, and is done once the

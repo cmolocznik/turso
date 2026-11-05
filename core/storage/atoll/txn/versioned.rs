@@ -3,12 +3,17 @@
 //! Every entry starts with a version header, kept in the leaf:
 //!
 //! ```text
-//! slot: u16 | flags: u8 | updates: u8 | command: u32 | ts: u64 | prev: u64
+//! slot: u16 | reserve: u16 | command: u32 | ts: u64 | prev: u64
 //! ```
 //!
 //! naming the transaction that wrote the version (its slot and start), the statement within it,
 //! and where the version below it lies: an entry of the writer's slot's version arena
-//! ([`super::arena`]), or none for a key that had no entry before. The leaf holds the newest
+//! ([`super::arena`]), or none for a key that had no entry before. `reserve`'s top bit marks a
+//! deletion; the rest are bytes the leaf keeps free for the key, so that the newest version
+//! committed under it fits when a checkpoint writes it in this one's place (audit 17, stage 2,
+//! `node::RESERVE`). A write reserves what the entry it replaces takes past it, that entry's
+//! reserve included while it is the writer's own; a reserve is given back once the version is
+//! seen by every new snapshot ([`Transactions::seen_from_now`]). The leaf holds the newest
 //! version. A reader starts from it and, while a version is not visible, follows `prev` to the
 //! entry holding the one below: a pointer, never a search.
 //!
@@ -29,7 +34,7 @@ use super::{Blocker, Isolation, Statement, Transactions, Ts, Txn, Writer};
 use crate::io::IO;
 use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
 use crate::storage::atoll::btree::{
-    Kept, Lookup, Mode, Near, Outcome, Put, Stored, StoredValue, Tree,
+    node, Kept, Lookup, Mode, Near, Outcome, Put, Stored, StoredValue, Tree,
 };
 use crate::storage::atoll::buffer::BufferPool;
 use crate::storage::atoll::page::PageId;
@@ -55,32 +60,35 @@ pub struct Version {
     pub slot: u16,
     pub ts: Ts,
     pub command: Statement,
-    /// Updates while the oldest snapshot stayed the same: what turns a tuple fat.
-    pub updates: u8,
-    pub flags: u8,
+    /// Bytes its leaf keeps free for the key.
+    pub reserve: u16,
+    /// The key was deleted: this version says it is absent.
+    pub deleted: bool,
     /// The arena entry holding the version below this one: `None` if the key had no entry before.
     pub prev: Option<Ptr>,
 }
 
-impl Version {
-    /// The key was deleted: this version says it is absent.
-    pub const DELETED: u8 = 1;
+/// `reserve`'s bit for a deletion.
+const DELETED: u16 = !node::RESERVE_MASK;
+const _: () = assert!(node::RESERVE.start == 2 && node::RESERVE.end == 4);
 
+impl Version {
     /// A version every snapshot sees: written by no transaction, before every one.
     pub const SETTLED: Version = Version {
         slot: 0,
         ts: 0,
         command: 0,
-        updates: 0,
-        flags: 0,
+        reserve: 0,
+        deleted: false,
         prev: None,
     };
 
     pub fn encode(&self) -> [u8; HEADER] {
+        debug_assert!(self.reserve <= node::RESERVE_MASK, "{self:?}");
         let mut out = [0u8; HEADER];
         out[0..2].copy_from_slice(&self.slot.to_le_bytes());
-        out[2] = self.flags;
-        out[3] = self.updates;
+        let reserve = self.reserve | if self.deleted { DELETED } else { 0 };
+        out[2..4].copy_from_slice(&reserve.to_le_bytes());
         out[4..8].copy_from_slice(&self.command.to_le_bytes());
         out[8..16].copy_from_slice(&self.ts.to_le_bytes());
         out[16..24].copy_from_slice(&self.prev.map_or(0, Ptr::raw).to_le_bytes());
@@ -89,18 +97,15 @@ impl Version {
 
     pub fn decode(head: &[u8]) -> Option<Self> {
         let head: &[u8; HEADER] = head.try_into().ok()?;
+        let reserve = u16::from_le_bytes([head[2], head[3]]);
         Some(Self {
             slot: u16::from_le_bytes([head[0], head[1]]),
-            flags: head[2],
-            updates: head[3],
+            reserve: reserve & node::RESERVE_MASK,
+            deleted: reserve & DELETED != 0,
             command: u32::from_le_bytes(head[4..8].try_into().unwrap()),
             ts: u64::from_le_bytes(head[8..16].try_into().unwrap()),
             prev: Ptr::from_raw(u64::from_le_bytes(head[16..24].try_into().unwrap())),
         })
-    }
-
-    fn deleted(&self) -> bool {
-        self.flags & Self::DELETED != 0
     }
 }
 
@@ -388,6 +393,19 @@ pub struct WriteOp {
     near: Near,
     /// A look at the key's leaf a probe on its behalf made, redeemed instead of looking again.
     kept: Option<Kept>,
+    /// What the write has done about a full leaf keeping reserves.
+    reserves: Reserves,
+}
+
+/// A write's dealings with the reserves of a leaf too full for it ([`Tree::settle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reserves {
+    /// A full leaf keeping reserves is to say so.
+    Untouched,
+    /// The leaf was full: give back what no checkpoint needs, then put again.
+    GivingBack,
+    /// Given back once: a leaf still full splits.
+    GivenBack,
 }
 
 impl WriteOp {
@@ -412,6 +430,7 @@ impl WriteOp {
             put: None,
             near: Near::NONE,
             kept: None,
+            reserves: Reserves::Untouched,
         }
     }
 
@@ -431,6 +450,7 @@ impl WriteOp {
             put: None,
             near: Near::NONE,
             kept: None,
+            reserves: Reserves::Untouched,
         }
     }
 
@@ -482,7 +502,9 @@ impl VersionedTree {
         root: PageId,
     ) -> Self {
         Self {
-            tree: Tree::open(io, pool.clone(), store, root).with_head(HEADER),
+            tree: Tree::open(io, pool.clone(), store, root)
+                .with_head(HEADER)
+                .with_reserves(),
             pool,
         }
     }
@@ -551,7 +573,7 @@ impl VersionedTree {
                 }
             }
             *kept = Some(looked.keep());
-            return Ok(IOResult::Done(if v.deleted() {
+            return Ok(IOResult::Done(if v.deleted {
                 Probe::Absent
             } else {
                 Probe::Present
@@ -588,7 +610,7 @@ impl VersionedTree {
             if txns.visible(txn, v.slot, v.ts) {
                 return Ok(IOResult::Done(Guard::Clear));
             }
-            let holds = !v.deleted();
+            let holds = !v.deleted;
             if holds == (op.guarded == Guarded::Present) {
                 match txns.writer(v.slot, v.ts) {
                     Writer::Open => {
@@ -635,8 +657,8 @@ impl VersionedTree {
             slot: txn.slot,
             ts: txn.start,
             command: txn.command,
-            updates: 0,
-            flags: 0,
+            reserve: 0,
+            deleted: false,
             prev: None,
         }
         .encode();
@@ -682,7 +704,7 @@ impl VersionedTree {
                 op.chain = Some(Chain::from(v));
                 continue;
             }
-            if v.deleted() {
+            if v.deleted {
                 return Ok(IOResult::Done(None));
             }
             match stored.value {
@@ -724,7 +746,7 @@ impl VersionedTree {
                 chain.at = e;
                 continue;
             }
-            if e.deleted() {
+            if e.deleted {
                 return Ok(IOResult::Done(None));
             }
             match earlier.value {
@@ -761,14 +783,29 @@ impl VersionedTree {
                     None => done!(self.tree.put(put)),
                 };
                 let (put, _) = op.put.take().expect("a put");
-                // Another version came first: judge it.
-                if outcome == Outcome::Changed {
-                    op.take_back(put);
-                    continue;
+                match outcome {
+                    // Another version came first: judge it.
+                    Outcome::Changed => {
+                        op.take_back(put);
+                        continue;
+                    }
+                    Outcome::Full => {
+                        op.take_back(put);
+                        op.reserves = Reserves::GivingBack;
+                        continue;
+                    }
+                    _ => {}
                 }
                 return Ok(IOResult::Done(Write::Done(
                     self.wrote(txn, op, put, present),
                 )));
+            }
+            if op.reserves == Reserves::GivingBack {
+                let settled = |head: &[u8]| {
+                    Version::decode(head).is_some_and(|v| txns.seen_from_now(v.slot, v.ts))
+                };
+                done!(self.tree.settle(&op.key, op.near, &settled));
+                op.reserves = Reserves::GivenBack;
             }
             // One look serves the judgment and the write: the put goes in at its leaf if the leaf
             // is still as the look found it. A probe's look, its leaf unchanged, is that look.
@@ -816,7 +853,7 @@ impl VersionedTree {
                     }
                 }
             }
-            let present = newest.is_some_and(|v| !v.deleted());
+            let present = newest.is_some_and(|v| !v.deleted);
             match (op.mode, present) {
                 (Mode::Insert, true) | (Mode::Update, false) => {
                     return Ok(IOResult::Done(Write::Done(Outcome::Unchanged)))
@@ -844,16 +881,13 @@ impl VersionedTree {
                     (None, Some(ptr))
                 }
             };
-            let flags = match op.deletes {
-                false => 0,
-                true => Version::DELETED,
-            };
+            // Its reserve is the tree's to set, over the entry the put replaces.
             let head = Version {
                 slot: txn.slot,
                 ts: txn.start,
                 command: txn.command,
-                updates: 0,
-                flags,
+                reserve: 0,
+                deleted: op.deletes,
                 prev,
             }
             .encode();
@@ -875,9 +909,17 @@ impl VersionedTree {
                     op.entry = entry.clone();
                 }
             }
+            // The entry replaced keeps its reserve in this one while some new snapshot may read
+            // below it: it is the writer's own, or committed past what the writer sees.
+            let keep = newest.is_some_and(|v| own || !txns.visible(txn, v.slot, v.ts));
             let put = Put::with_owned(std::mem::take(&mut op.key), entry, HEADER, Mode::Upsert)
                 .expecting_entry(leaf_entry)
-                .in_transaction(txns.tail(txn));
+                .in_transaction(txns.tail(txn))
+                .reserving(keep);
+            let put = match op.reserves {
+                Reserves::Untouched => put.settling(),
+                _ => put,
+            };
             let put = match &found {
                 // A version only this statement wrote is read by no one: its pages go.
                 Some(found) => put.undoing(found.as_ref()),
@@ -906,6 +948,17 @@ impl VersionedTree {
             Outcome::Inserted
         }
     }
+}
+
+/// Clears the reserve in `head`, the header of a version a rollback of `txn` puts back, unless the
+/// version is `txn`'s own or not yet seen by every new snapshot: its entry then takes no more room
+/// than the one it replaces, whose reserve kept what this one needs.
+pub(super) fn restored_reserve(head: &mut [u8], txns: &Transactions, txn: &Txn) -> Result<()> {
+    let v = Version::decode(head).ok_or_else(corrupt_header)?;
+    if (v.slot, v.ts) != (txn.slot, txn.start) && txns.seen_from_now(v.slot, v.ts) {
+        node::set_reserve(head, 0);
+    }
+    Ok(())
 }
 
 fn corrupt_header() -> LimboError {
@@ -952,7 +1005,7 @@ impl Versions {
 }
 
 mod as_of;
-pub use as_of::{AsOf, Overflow};
+pub use as_of::AsOf;
 mod cursor;
 pub use cursor::VersionedCursor;
 

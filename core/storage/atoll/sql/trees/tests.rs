@@ -34,7 +34,7 @@ impl Db {
     fn tree(&self) -> VersionedTree {
         let a = self.db.atoll();
         let root = drive(&self.io, || {
-            crate::storage::atoll::btree::Tree::create(
+            crate::storage::atoll::btree::Tree::create_versioned(
                 &self.io,
                 a.pool(),
                 a.store(),

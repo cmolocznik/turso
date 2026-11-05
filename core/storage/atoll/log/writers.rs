@@ -298,11 +298,17 @@ mod tests {
         }
         let mut off_grid = bytes.clone();
         off_grid[4 + 8] = 1;
-        assert!(decode_table(&off_grid).is_err(), "a first group off the grid");
+        assert!(
+            decode_table(&off_grid).is_err(),
+            "a first group off the grid"
+        );
         let mut backwards = bytes.clone();
         backwards[4 + 16..4 + 24].copy_from_slice(&0u64.to_le_bytes());
         backwards[4 + 8..4 + 16].copy_from_slice(&64u64.to_le_bytes());
-        assert!(decode_table(&backwards).is_err(), "a first group past the last");
+        assert!(
+            decode_table(&backwards).is_err(),
+            "a first group past the last"
+        );
         let mut nobody = bytes.clone();
         nobody[4..12].copy_from_slice(&0u64.to_le_bytes());
         assert!(decode_table(&nobody).is_err(), "transaction 0");

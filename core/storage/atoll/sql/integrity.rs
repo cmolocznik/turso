@@ -159,10 +159,10 @@ impl AtollDb {
             }
             // Every tree is versioned, its values behind a version head, but the abandoned list
             // and the sequence values, which are plain.
-            let plain = root == System::Abandoned.root() || root == System::Sequences.root();
+            let plain = System::ALL.iter().any(|s| s.plain() && s.root() == root);
             let tree = match plain {
                 true => self.open_plain(root),
-                false => self.open_plain(root).with_head(HEADER),
+                false => self.open_plain(root).with_head(HEADER).with_reserves(),
             };
             let mut op = Check::default();
             let stats = match drive(self.io(), || tree.check(&mut op)) {

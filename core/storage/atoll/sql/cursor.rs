@@ -512,8 +512,7 @@ impl AtollCursor {
                 .ok_or_else(|| LimboError::Corrupt("a version header does not decode".into()))?;
                 let mut guard = self.txn.lock();
                 let txn = guard.as_mut().ok_or_else(outside)?;
-                v.flags & crate::storage::atoll::txn::versioned::Version::DELETED != 0
-                    && self.db.atoll().transactions().visible(txn, v.slot, v.ts)
+                v.deleted && self.db.atoll().transactions().visible(txn, v.slot, v.ts)
             }
         };
         if absent {

@@ -114,7 +114,7 @@ impl Apply {
         let tree = Tree::open(self.io.clone(), self.pool.clone(), self.store.clone(), root);
         match plain {
             true => tree,
-            false => tree.with_head(HEADER),
+            false => tree.with_head(HEADER).with_reserves(),
         }
     }
 
@@ -137,9 +137,12 @@ impl Apply {
                 } => {
                     let mut put = match plain {
                         true => Put::new(key, value.to_vec(), Mode::Upsert),
-                        false => {
-                            Put::with_head(key, Version::SETTLED.encode().to_vec(), value.to_vec(), Mode::Upsert)
-                        }
+                        false => Put::with_head(
+                            key,
+                            Version::SETTLED.encode().to_vec(),
+                            value.to_vec(),
+                            Mode::Upsert,
+                        ),
                     };
                     let t = self.tree(tree, plain);
                     drive(&self.io, || t.put(&mut put))?;

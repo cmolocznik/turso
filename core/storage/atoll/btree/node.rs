@@ -5,7 +5,7 @@
 //! ```text
 //! page header (24) | root: u64 | next: u64 | next_hint: u32 | count: u16 | level: u8 | fences: u8
 //!   | data_start: u32 | space: u32 | prefix: u16 | lower: (off u16, len u16) | upper: (off u16, len u16)
-//!   | 2 | hints: [u32; 16] | slots: [slot; count] | free | data
+//!   | reserved: u16 | hints: [u32; 16] | slots: [slot; count] | free | data
 //! slot: off: u16 | key_len: u16 | value_len: u16 | head: u32
 //! ```
 //!
@@ -20,6 +20,11 @@
 //!   [`super::value`]).
 //! - Entries hold the key's suffix past the prefix, then the value; data grows down from the end
 //!   of the page. Removing an entry leaves a hole that compaction reclaims.
+//! - A reserving leaf (a bit of `fences`) belongs to a versioned tree: each value starts with a
+//!   version header whose bytes [`RESERVE`] hold, in their low 15 bits, bytes the leaf keeps free
+//!   for the key, so that the version a checkpoint writes always fits (audit 17, stage 2).
+//!   `reserved` is their sum, and free space is what is left past it. A versioned tree's root is
+//!   reserving from its creation, and every leaf a split or merge makes of it is too.
 //!
 //! Slots and lengths are 16 bits, so the largest node is 64 KiB. Every entry, slot included, takes
 //! at most a quarter of the space past the slots' start ([`Limits`]), so any two entries fit in a
@@ -48,6 +53,7 @@ const SPACE: usize = 52;
 const PREFIX: usize = 56;
 const LOWER: usize = 58;
 const UPPER: usize = 62;
+const RESERVED: usize = 66;
 const HINTS: usize = 68;
 /// Heads sampled at even distances over the slots, narrowing a binary search before it starts:
 /// sixteen heads fill one 64-byte cache line (LeanStore's choice).
@@ -58,6 +64,30 @@ pub const SLOT: usize = 10;
 
 const LOWER_INFINITE: u8 = 1;
 const UPPER_INFINITE: u8 = 2;
+/// `fences`' bit for a reserving leaf.
+const RESERVING: u8 = 4;
+/// Where a reserving leaf's value holds its reserve: a version header's bytes, their top bit not
+/// the reserve's.
+pub const RESERVE: std::ops::Range<usize> = 2..4;
+pub const RESERVE_MASK: u16 = 0x7FFF;
+
+/// The reserve `value`, a reserving leaf's, holds.
+pub fn reserve_of(value: &[u8]) -> usize {
+    value.get(RESERVE).map_or(0, |b| {
+        (u16::from_le_bytes([b[0], b[1]]) & RESERVE_MASK) as usize
+    })
+}
+
+/// Sets the reserve `value`, a reserving leaf's, holds, its other bits as they are.
+pub fn set_reserve(value: &mut [u8], reserve: usize) {
+    assert!(
+        reserve <= RESERVE_MASK as usize,
+        "a reserve of {reserve} bytes"
+    );
+    let b = &mut value[RESERVE];
+    let word = (u16::from_le_bytes([b[0], b[1]]) & !RESERVE_MASK) | reserve as u16;
+    b.copy_from_slice(&word.to_le_bytes());
+}
 /// `value_len`'s top bit: the value is a reference to blob pages.
 const OUT_OF_LINE: u16 = 1 << 15;
 /// An inner node's value: the child's page id and frame hint.
@@ -100,6 +130,21 @@ impl Limits {
     /// the whole key, so the choice does not depend on the node's prefix.
     pub fn inline(&self, key_len: usize, value_len: usize) -> bool {
         SLOT + key_len + value_len <= self.max_entry
+    }
+}
+
+/// The reserve the value of slot `s` holds, read as a reserving leaf's whatever the node.
+fn reserve_at<P: Bytes + ?Sized>(p: &P, s: Slot) -> usize {
+    match s.value_len < RESERVE.end {
+        true => 0,
+        false => (p.u16_at(s.off + s.key_len + RESERVE.start) & RESERVE_MASK) as usize,
+    }
+}
+
+/// Adds `add` to the node's reserved bytes and takes `take` from them.
+fn adjust_reserved<P: BytesMut + ?Sized>(page: &mut P, add: usize, take: usize) {
+    if add != take {
+        put16(page, RESERVED, u16_at(page, RESERVED) + add - take);
     }
 }
 
@@ -219,6 +264,29 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         self.0.u32_at(SPACE) as usize
     }
 
+    /// Whether the node is a reserving leaf.
+    pub fn reserving(&self) -> bool {
+        self.0.u8_at(FENCES) & RESERVING != 0
+    }
+
+    /// Bytes kept free for its entries' reserves.
+    pub fn reserved(&self) -> usize {
+        u16_at(self.0, RESERVED)
+    }
+
+    /// Entry `i`'s reserve: 0 unless the node is a reserving leaf.
+    pub fn reserve(&self, i: usize) -> Option<usize> {
+        let s = self.slot(i)?;
+        Some(self.reserve_in(s))
+    }
+
+    fn reserve_in(&self, s: Slot) -> usize {
+        match self.reserving() {
+            true => reserve_at(self.0, s),
+            false => 0,
+        }
+    }
+
     fn slot(&self, i: usize) -> Option<Slot> {
         self.slot_of(i, self.count()?)
     }
@@ -332,6 +400,12 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         self.0.copy_to(prefix.off, &mut out[..prefix.len]);
         self.0.copy_to(s.off, &mut out[prefix.len..]);
         Some(())
+    }
+
+    /// The first `out.len()` bytes of entry `i`'s value, into `out`.
+    pub fn value_head_into(&self, i: usize, out: &mut [u8]) -> Option<()> {
+        let s = self.slot(i)?;
+        (out.len() <= s.value_len).then(|| self.0.copy_to(s.off + s.key_len, out))
     }
 
     /// Entry `i`'s value, into `out`, its bytes replaced: whether it is a reference to blob pages.
@@ -463,9 +537,9 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         Some(self.search(key)?.0)
     }
 
-    /// Bytes free once compacted.
+    /// Bytes free once compacted, past those reserved.
     pub fn free(&self) -> Option<usize> {
-        let used = SLOTS + self.count()? * SLOT + self.space();
+        let used = SLOTS + self.count()? * SLOT + self.space() + self.reserved();
         self.0.len().checked_sub(used)
     }
 
@@ -518,12 +592,12 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         Some(shared)
     }
 
-    /// Bytes the entries in `range` take, slots included, in a node whose keys share a prefix
-    /// of `prefix` bytes.
+    /// Bytes the entries in `range` take, slots and reserves included, in a node whose keys
+    /// share a prefix of `prefix` bytes.
     pub fn entries_size(&self, range: std::ops::Range<usize>, prefix: usize) -> Option<usize> {
         let mut size = 0;
         for i in range {
-            size += (SLOT + self.entry_len(i)?).checked_sub(prefix)?;
+            size += (SLOT + self.entry_len(i)? + self.reserve(i)?).checked_sub(prefix)?;
         }
         Some(size)
     }
@@ -575,6 +649,8 @@ pub struct Layout<'k> {
     pub lower: Option<&'k [u8]>,
     pub upper: Option<&'k [u8]>,
     pub next: (PageId, u32),
+    /// A reserving leaf.
+    pub reserving: bool,
 }
 
 impl Layout<'_> {
@@ -591,14 +667,17 @@ impl Layout<'_> {
         self.lower.map_or(0, <[u8]>::len) + self.upper.map_or(0, <[u8]>::len)
     }
 
-    /// Bytes these entries take in a node with this layout, fences included.
+    /// Bytes these entries take in a node with this layout, fences and reserves included.
     pub fn size<'e>(&self, entries: impl IntoIterator<Item = &'e Entry>) -> usize {
         let prefix = self.prefix_len();
-        let fences = self.lower.map_or(0, <[u8]>::len) + self.upper.map_or(0, <[u8]>::len);
-        fences
+        let reserve = |e: &Entry| match self.reserving {
+            true => reserve_of(&e.value),
+            false => 0,
+        };
+        self.fences_len()
             + entries
                 .into_iter()
-                .map(|e| SLOT + e.key.len() - prefix + e.value.len())
+                .map(|e| SLOT + e.key.len() - prefix + e.value.len() + reserve(e))
                 .sum::<usize>()
     }
 }
@@ -630,6 +709,10 @@ pub fn build<'e, P: BytesMut + ?Sized>(
             None => fences |= infinite,
         }
     }
+    if layout.reserving {
+        debug_assert_eq!(layout.level, 0, "a reserving inner node");
+        fences |= RESERVING;
+    }
     page.put_u8(FENCES, fences);
     put16(page, PREFIX, layout.prefix_len());
     page.put_u32(DATA_START, data as u32);
@@ -652,6 +735,7 @@ pub struct Shape {
     pub lower: Option<Vec<u8>>,
     pub upper: Option<Vec<u8>>,
     pub next: (PageId, u32),
+    pub reserving: bool,
 }
 
 /// The shape of the node in `page`.
@@ -663,6 +747,7 @@ pub fn shape<P: Bytes + ?Sized>(page: &P) -> Shape {
         lower: v.lower().unwrap(),
         upper: v.upper().unwrap(),
         next: v.next(),
+        reserving: v.reserving(),
     }
 }
 
@@ -714,7 +799,11 @@ pub fn insert<P: BytesMut + ?Sized>(
     debug_assert!(pos <= count && key.len() >= prefix);
     let suffix = &key[prefix..];
     let need = suffix.len() + value.len();
-    if v.free().unwrap() < SLOT + need {
+    let reserve = match v.reserving() {
+        true => reserve_of(value),
+        false => 0,
+    };
+    if v.free().unwrap() < SLOT + need + reserve {
         return false;
     }
     let slots_end = SLOTS + (count + 1) * SLOT;
@@ -737,12 +826,14 @@ pub fn insert<P: BytesMut + ?Sized>(
     );
     page.put_u32(at + 6, head(suffix));
     put16(page, COUNT, count + 1);
+    adjust_reserved(page, reserve, 0);
     update_hints_inserted(page, pos);
     true
 }
 
 /// Changes entry `pos`'s inline value in place: `head` over its start, and `bytes` at `at` past
-/// the head. False if the value is out of line or too short to hold them.
+/// the head. False if the value is out of line or too short to hold them, or if in a reserving
+/// leaf the head's reserve does not fit.
 pub fn patch<P: BytesMut + ?Sized>(
     page: &mut P,
     pos: usize,
@@ -750,15 +841,24 @@ pub fn patch<P: BytesMut + ?Sized>(
     at: usize,
     bytes: &[u8],
 ) -> bool {
-    let Some(s) = View::new(&*page).slot(pos) else {
+    let v = View::new(&*page);
+    let Some(s) = v.slot(pos) else {
         return false;
     };
     if s.out_of_line || head.len() + at + bytes.len() > s.value_len {
         return false;
     }
+    let (was, will) = match v.reserving() {
+        true if head.len() >= RESERVE.end => (v.reserve_in(s), reserve_of(head)),
+        _ => (0, 0),
+    };
+    if will > was && v.free().unwrap() < will - was {
+        return false;
+    }
     let value = s.off + s.key_len;
     page.write(value, head);
     page.write(value + head.len() + at, bytes);
+    adjust_reserved(page, will, was);
     true
 }
 
@@ -783,7 +883,11 @@ pub fn append_from<S: Bytes + ?Sized, D: BytesMut + ?Sized>(
         let need = suffix + s.value_len;
         let v = View::new(&*dst);
         let count = v.count().unwrap();
-        if v.free().unwrap() < SLOT + need {
+        let reserve = match v.reserving() {
+            true => reserve_at(src.page(), s),
+            false => 0,
+        };
+        if v.free().unwrap() < SLOT + need + reserve {
             return false;
         }
         if v.data_start().unwrap() < SLOTS + (count + 1) * SLOT + need {
@@ -825,6 +929,7 @@ pub fn append_from<S: Bytes + ?Sized, D: BytesMut + ?Sized>(
         put16(dst, COUNT, count + 1);
         dst.put_u32(DATA_START, data as u32);
         dst.put_u32(SPACE, (dst.u32_at(SPACE) as usize + need) as u32);
+        adjust_reserved(dst, reserve, 0);
     }
     update_hints(dst);
     true
@@ -849,13 +954,14 @@ pub fn split_off<P: BytesMut + ?Sized>(
     };
     let cut = new.checked_sub(old)?;
     // Every kept key is checked whole before anything changes.
-    let mut kept = 0;
+    let (mut kept, mut reserved) = (0, 0);
     for i in 0..keep {
         let s = v.slot_of(i, count)?;
         if s.key_len < cut {
             return None;
         }
         kept += s.key_len + s.value_len;
+        reserved += v.reserve_in(s);
     }
     let lower_len = v.fence_run(LOWER, LOWER_INFINITE)?.map_or(0, |r| r.len);
     let gap = v.data_start()?.checked_sub(SLOTS + keep * SLOT)?;
@@ -873,6 +979,7 @@ pub fn split_off<P: BytesMut + ?Sized>(
         }
     }
     put16(page, COUNT, keep);
+    put16(page, RESERVED, reserved);
     put16(page, PREFIX, new);
     // The old upper fence is no longer one: a compaction leaves it behind, and until one does it
     // is a hole, as an entry removed is. Compacted only if the new fence does not fit before the
@@ -903,10 +1010,12 @@ pub fn remove<P: BytesMut + ?Sized>(page: &mut P, pos: usize) {
     let v = View::new(&*page);
     let count = v.count().unwrap();
     let s = v.slot(pos).unwrap();
+    let reserve = v.reserve_in(s);
     page.put_u32(
         SPACE,
         (page.u32_at(SPACE) as usize - s.key_len - s.value_len) as u32,
     );
+    adjust_reserved(page, 0, reserve);
     let at = SLOTS + pos * SLOT;
     page.copy_within(at + SLOT..SLOTS + count * SLOT, at);
     put16(page, COUNT, count - 1);
@@ -926,13 +1035,18 @@ pub fn set_value<P: BytesMut + ?Sized>(
     let s = v.slot(pos).unwrap();
     let at = SLOTS + pos * SLOT;
     let lengths = value.len() | if out_of_line { OUT_OF_LINE as usize } else { 0 };
+    let (was, will) = match v.reserving() {
+        true => (v.reserve_in(s), reserve_of(value)),
+        false => (0, 0),
+    };
+    if v.free().unwrap() + s.value_len + was < value.len() + will {
+        return false;
+    }
     if s.value_len == value.len() {
         page.write(s.off + s.key_len, value);
         put16(page, at + 4, lengths);
+        adjust_reserved(page, will, was);
         return true;
-    }
-    if v.free().unwrap() + s.value_len < value.len() {
-        return false;
     }
     let need = s.key_len + value.len();
     let slots_end = SLOTS + v.count().unwrap() * SLOT;
@@ -963,7 +1077,23 @@ pub fn set_value<P: BytesMut + ?Sized>(
     put16(page, at + 4, lengths);
     page.put_u32(DATA_START, data as u32);
     page.put_u32(SPACE, (space - s.value_len + value.len()) as u32);
+    adjust_reserved(page, will, was);
     true
+}
+
+/// Clears entry `pos`'s reserve, the rest of its value as it is: room no checkpoint needs any
+/// more. Returns the bytes given back.
+pub fn clear_reserve<P: BytesMut + ?Sized>(page: &mut P, pos: usize) -> usize {
+    let v = View::new(&*page);
+    let s = v.slot(pos).unwrap();
+    let reserve = v.reserve_in(s);
+    if reserve > 0 {
+        let at = s.off + s.key_len + RESERVE.start;
+        let word = page.u16_at(at) & !RESERVE_MASK;
+        page.put_u16(at, word);
+        adjust_reserved(page, 0, reserve);
+    }
+    reserve
 }
 
 /// A run of data in a node, named for its compaction: a fence, or entry `i`'s key and value.
@@ -1179,6 +1309,19 @@ pub fn check<P: Bytes + ?Sized>(page: &P) -> Result<(), String> {
     if space != v.space() {
         return Err(format!("space {} where entries take {space}", v.space()));
     }
+    if v.reserving() && !v.is_leaf() {
+        return Err("a reserving inner node".into());
+    }
+    let reserved: usize = (0..count).map(|i| v.reserve(i).unwrap()).sum();
+    if reserved != v.reserved() {
+        return Err(format!(
+            "reserved {} where entries reserve {reserved}",
+            v.reserved()
+        ));
+    }
+    if v.free().is_none() {
+        return Err(format!("reserved {} past the free space", v.reserved()));
+    }
     let dist = count / (HINT_COUNT + 1);
     for i in 0..HINT_COUNT {
         let expected = if count > HINT_COUNT * 2 {
@@ -1219,6 +1362,7 @@ mod tests {
             lower,
             upper,
             next: (PageId::from_raw(0), 0),
+            reserving: false,
         }
     }
 
@@ -1360,6 +1504,141 @@ mod tests {
                 }
             }
             let _ = check(&torn);
+        }
+    }
+
+    /// A value of a reserving leaf: a version header's first four bytes with `reserve` in them,
+    /// the top bit set when `deleted`, then `len` bytes of `fill`.
+    fn reserved_value(reserve: usize, deleted: bool, fill: u8, len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; RESERVE.end];
+        set_reserve(&mut v, reserve);
+        if deleted {
+            v[RESERVE.end - 1] |= 0x80;
+        }
+        v.extend(std::iter::repeat_n(fill, len));
+        v
+    }
+
+    #[test]
+    fn a_reserving_leaf_keeps_every_reserve_out_of_its_free_space_through_its_changes() {
+        let size = class(0).size();
+        let free_by_model = |model: &BTreeMap<Vec<u8>, Vec<u8>>| {
+            size - SLOTS
+                - model
+                    .iter()
+                    .map(|(k, v)| SLOT + k.len() + v.len() + reserve_of(v))
+                    .sum::<usize>()
+        };
+        for seed in 0..4u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let mut page = vec![0u8; size];
+            build(
+                &mut page,
+                &Layout {
+                    reserving: true,
+                    ..leaf(None, None)
+                },
+                [],
+            );
+            let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for op in 0..20_000 {
+                let key = random_key(&mut rng, 7);
+                let v = View::new(&page);
+                let (pos, exact) = v.search(&key).unwrap();
+                let value = reserved_value(
+                    rng.random_range(0..200),
+                    rng.random_bool(0.2),
+                    op as u8,
+                    rng.random_range(0..40),
+                );
+                match (exact, rng.random_range(0..5)) {
+                    (false, _) => {
+                        let fits = free_by_model(&model)
+                            >= SLOT + key.len() + value.len() + reserve_of(&value);
+                        assert_eq!(insert(&mut page, pos, &key, &value, false), fits, "op {op}");
+                        if fits {
+                            model.insert(key, value);
+                        }
+                    }
+                    (true, 0) => {
+                        remove(&mut page, pos);
+                        model.remove(&key);
+                    }
+                    (true, 1) => {
+                        clear_reserve(&mut page, pos);
+                        let v = model.get_mut(&key).unwrap();
+                        set_reserve(v, 0);
+                    }
+                    (true, 2) => {
+                        // A head of the same bytes but its reserve, over a value at least as long.
+                        let old = model[&key].clone();
+                        let mut head = old[..RESERVE.end].to_vec();
+                        set_reserve(&mut head, reserve_of(&value));
+                        let grows = reserve_of(&value).saturating_sub(reserve_of(&old));
+                        let fits = free_by_model(&model) >= grows;
+                        assert_eq!(patch(&mut page, pos, &head, 0, &[]), fits, "op {op}");
+                        if fits {
+                            model.get_mut(&key).unwrap()[..RESERVE.end].copy_from_slice(&head);
+                        }
+                    }
+                    (true, _) => {
+                        let old = &model[&key];
+                        let fits = free_by_model(&model) + old.len() + reserve_of(old)
+                            >= value.len() + reserve_of(&value);
+                        assert_eq!(set_value(&mut page, pos, &value, false), fits, "op {op}");
+                        if fits {
+                            model.insert(key, value);
+                        }
+                    }
+                }
+                check(&page).unwrap_or_else(|e| panic!("seed {seed} op {op}: {e}"));
+                let v = View::new(&page);
+                assert_eq!(v.free(), Some(free_by_model(&model)), "seed {seed} op {op}");
+            }
+            // Split in two and joined again, each half's reserves its own.
+            let count = View::new(&page).count().unwrap();
+            let keep = count / 2;
+            let v = View::new(&page);
+            let sep = separator(&v.key(keep - 1).unwrap(), &v.key(keep).unwrap());
+            let mut right = vec![0u8; size];
+            build(
+                &mut right,
+                &Layout {
+                    reserving: true,
+                    ..leaf(Some(&sep), None)
+                },
+                [],
+            );
+            assert!(append_from(&mut right, &View::new(&page), keep..count));
+            let mut left = page.clone();
+            split_off(&mut left, keep, &sep, (PageId::from_raw(0), 0)).unwrap();
+            for (half, range) in [(&left, 0..keep), (&right, keep..count)] {
+                check(half.as_slice()).unwrap();
+                let reserved: usize = model
+                    .values()
+                    .skip(range.start)
+                    .take(range.len())
+                    .map(|v| reserve_of(v))
+                    .sum();
+                assert_eq!(View::new(half.as_slice()).reserved(), reserved);
+            }
+            let mut joined = vec![0u8; size];
+            build(
+                &mut joined,
+                &Layout {
+                    reserving: true,
+                    ..leaf(None, None)
+                },
+                [],
+            );
+            assert!(append_from(&mut joined, &View::new(&left), 0..keep));
+            assert!(append_from(
+                &mut joined,
+                &View::new(&right),
+                0..count - keep
+            ));
+            check(&joined).unwrap();
+            assert_eq!(View::new(&joined).reserved(), View::new(&page).reserved());
         }
     }
 }

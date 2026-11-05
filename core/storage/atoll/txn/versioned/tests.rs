@@ -1,11 +1,11 @@
 use super::*;
 use crate::io::{Completion, MemoryIO};
+use crate::storage::atoll::btree::node;
 use crate::storage::atoll::btree::value;
 use crate::storage::atoll::btree::Seek;
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{Kind, LogConfig};
-use crate::storage::atoll::btree::node;
 use crate::storage::atoll::page::{self, SizeClass};
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::shared::Bytes;
@@ -55,7 +55,7 @@ fn open_with(slots: usize) -> Db {
     let mut root = None;
     drive(&io, || {
         root = Some(
-            match Tree::create(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())? {
+            match Tree::create_versioned(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())? {
                 IOResult::Done(r) => r,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             },
@@ -406,7 +406,7 @@ impl Db {
 /// index of each class.
 fn second_tree(db: &Db) -> VersionedTree {
     let root = run(&db.io, || {
-        Tree::create(
+        Tree::create_versioned(
             &db.io,
             db.db.pool(),
             db.db.store(),
@@ -545,8 +545,8 @@ fn a_rollback_leaves_a_key_it_waited_on_to_the_transaction_that_wrote_it() {
             slot: 0,
             ts: 1,
             command: 1,
-            updates: 0,
-            flags: 0,
+            reserve: 0,
+            deleted: false,
             prev: None,
         }
         .encode()
@@ -1370,7 +1370,7 @@ fn deletes_and_changes_in_place_log_patches_and_keep_what_snapshots_read() {
     // The tombstone holds the value it replaced, past a head that says deleted.
     let stored = run(&db.io, || db.tree.tree().stored(b"d")).expect("a tombstone");
     let head = Version::decode(&stored.head).unwrap();
-    assert_eq!(head.flags & Version::DELETED, Version::DELETED);
+    assert!(head.deleted);
     assert_eq!(stored.value, StoredValue::Inline(b"value-AAAA".to_vec()));
     // Both logged as patches: the delete with no bytes, the change with the two that differ.
     let kinds: Vec<Kind> = db.chain(t.start()).into_iter().map(|(k, _)| k).collect();
@@ -1473,15 +1473,35 @@ fn an_insert_appends_nothing_to_the_arena_and_its_rollback_removes_it() {
 
 impl Db {
     /// The tree's root, a leaf, as of the snapshot taken at `at`.
-    fn root_as_of(&self, at: Ts) -> std::result::Result<Vec<u8>, Overflow> {
-        let root = self.tree.root();
-        let page = run(&self.io, || self.db.pool().fix_exclusive(root, None));
-        let mut bytes = vec![0u8; page.page().len()];
-        page.page().copy_to(0, &mut bytes);
-        drop(page);
-        let mut as_of = AsOf::new(&bytes[..], at).unwrap();
+    fn root_as_of(&self, at: Ts) -> Vec<u8> {
+        self.as_of(&self.page(self.tree.root()), at)
+    }
+
+    /// The leaf `page` as of the snapshot taken at `at`.
+    fn as_of(&self, page: &[u8], at: Ts) -> Vec<u8> {
+        let mut as_of = AsOf::new(page, at).unwrap();
         run(&self.io, || as_of.step(self.txns(), &self.versions));
         as_of.image().unwrap()
+    }
+
+    /// A copy of page `pid`.
+    fn page(&self, pid: PageId) -> Vec<u8> {
+        let page = run(&self.io, || self.db.pool().fix_exclusive(pid, None));
+        let mut bytes = vec![0u8; page.page().len()];
+        page.page().copy_to(0, &mut bytes);
+        bytes
+    }
+
+    /// The tree's leaves, leftmost first, copied, its every node checked.
+    fn leaves(&self) -> Vec<Vec<u8>> {
+        let mut check = crate::storage::atoll::btree::Check::default();
+        let stats = run(&self.io, || self.tree.tree().check(&mut check));
+        stats
+            .pages
+            .into_iter()
+            .map(|pid| self.page(pid))
+            .filter(|p| node::View::new(&p[..]).is_leaf())
+            .collect()
     }
 }
 
@@ -1523,7 +1543,7 @@ fn a_leaf_as_of_a_snapshot_holds_each_key_as_the_snapshot_reads_it_settled() {
     db.put(&mut t3, "d", "44", Mode::Update);
     db.put(&mut t3, "h", "8", Mode::Insert);
 
-    let image = db.root_as_of(at).expect("a leaf as it was fits");
+    let image = db.root_as_of(at);
     let entries = View::new(&image[..]).entries().unwrap();
     let keys: Vec<&[u8]> = entries.iter().map(|e| &e.key[..]).collect();
     assert_eq!(
@@ -1568,8 +1588,11 @@ fn a_leaf_as_of_a_snapshot_holds_each_key_as_the_snapshot_reads_it_settled() {
 }
 
 #[test]
-fn a_leaf_as_of_a_snapshot_that_does_not_fit_its_page_says_by_how_much() {
-    use crate::storage::atoll::btree::node::{Limits, View};
+fn an_open_shrink_keeps_its_room_so_its_leaf_as_of_a_snapshot_fits_and_its_rollback_splits_nothing()
+{
+    use crate::storage::atoll::btree::node::View;
+    use crate::storage::atoll::btree::SPLITS;
+    let splits = || SPLITS.with(|n| n.get());
     let db = open();
     let wide = |s: &str| padded(s, 700);
     let mut setup = db.begin(Isolation::Snapshot);
@@ -1577,30 +1600,122 @@ fn a_leaf_as_of_a_snapshot_that_does_not_fit_its_page_says_by_how_much() {
         db.put(&mut setup, key, &wide(key), Mode::Insert);
     }
     db.commit(setup);
-    // An update that shrinks every row, still open, and an insert committed into the room it
-    // freed before the snapshot.
+    // An update that shrinks every row, still open, and inserts committed after it that would fit
+    // in the room it freed.
     let mut shrink = db.begin(Isolation::Snapshot);
     for key in ["x0", "x1", "x2", "x3"] {
         db.put(&mut shrink, key, "-", Mode::Update);
     }
+    let before = splits();
     let mut fill = db.begin(Isolation::Snapshot);
     for key in ["y0", "y1", "y2", "y3"] {
         db.put(&mut fill, key, &wide(key), Mode::Insert);
     }
     db.commit(fill);
-    let reader = db.begin(Isolation::Snapshot);
-    let page = run(&db.io, || db.db.pool().fix_exclusive(db.tree.root(), None));
-    assert!(View::new(page.page()).is_leaf(), "one leaf");
-    drop(page);
-    let capacity = Limits::of(SizeClass::new(0).unwrap()).capacity;
-    let entry = |key: &str| node::SLOT + key.len() + HEADER + wide(key).len();
-    let needs: usize = ["x0", "x1", "x2", "x3", "y0", "y1", "y2", "y3"]
-        .into_iter()
-        .map(entry)
-        .sum();
-    assert_eq!(
-        db.root_as_of(reader.snapshot),
-        Err(Overflow { needs, capacity })
+    assert!(
+        splits() > before,
+        "the inserts took the room the shrink keeps"
     );
+    let mut reader = db.begin(Isolation::Snapshot);
+    let at = reader.snapshot;
+    let leaves = db.leaves();
+    assert!(leaves.len() > 1);
+    let mut keys = Vec::new();
+    for leaf in &leaves {
+        for e in View::new(&db.as_of(leaf, at)[..]).entries().unwrap() {
+            let key = String::from_utf8(e.key).unwrap();
+            assert_eq!(
+                db.get(&mut reader, &key).as_deref().map(str::as_bytes),
+                Some(&e.value[HEADER..]),
+                "{key}"
+            );
+            keys.push(key);
+        }
+    }
+    assert_eq!(keys, ["x0", "x1", "x2", "x3", "y0", "y1", "y2", "y3"]);
+    let before = splits();
     db.rollback(shrink);
+    assert_eq!(splits(), before, "every row put back where it was");
+    db.leaves();
+    let mut after = db.begin(Isolation::Snapshot);
+    for key in ["x0", "x1", "x2", "x3"] {
+        assert_eq!(db.get(&mut after, key), Some(wide(key)), "{key}");
+    }
+}
+
+#[test]
+fn a_reserve_is_given_back_once_every_new_snapshot_sees_the_version_that_made_it() {
+    use crate::storage::atoll::btree::node::View;
+    use crate::storage::atoll::btree::SPLITS;
+    let splits = || SPLITS.with(|n| n.get());
+    let db = open();
+    let wide = |s: &str| padded(s, 700);
+    let mut setup = db.begin(Isolation::Snapshot);
+    for key in ["x0", "x1", "x2", "x3"] {
+        db.put(&mut setup, key, &wide(key), Mode::Insert);
+    }
+    db.commit(setup);
+    let mut shrink = db.begin(Isolation::Snapshot);
+    for key in ["x0", "x1", "x2", "x3"] {
+        db.put(&mut shrink, key, "-", Mode::Update);
+    }
+    db.commit(shrink);
+    let reserved = |db: &Db| View::new(&db.page(db.tree.root())[..]).reserved();
+    let one = (HEADER + wide("x0").len()) - (HEADER + 1);
+    assert_eq!(reserved(&db), 4 * one, "kept until a write needs the room");
+    // A version put back that every snapshot sees keeps no reserve.
+    let mut grow = db.begin(Isolation::Snapshot);
+    db.put(&mut grow, "x0", &wide("x0"), Mode::Update);
+    db.rollback(grow);
+    assert_eq!(reserved(&db), 3 * one);
+    let before = splits();
+    let mut fill = db.begin(Isolation::Snapshot);
+    for key in ["y0", "y1", "y2", "y3"] {
+        db.put(&mut fill, key, &wide(key), Mode::Insert);
+    }
+    db.commit(fill);
+    assert_eq!(splits(), before, "the room given back, not split for");
+    assert_eq!(reserved(&db), 0);
+    let mut reader = db.begin(Isolation::Snapshot);
+    for key in ["x0", "x1", "x2", "x3"] {
+        assert_eq!(db.get(&mut reader, key).as_deref(), Some("-"), "{key}");
+    }
+    for key in ["y0", "y1", "y2", "y3"] {
+        assert_eq!(db.get(&mut reader, key), Some(wide(key)), "{key}");
+    }
+    db.leaves();
+}
+
+#[test]
+fn a_write_keeps_the_reserve_of_its_own_version_and_of_one_its_statement_does_not_see() {
+    let db = open();
+    let reserve_of = |key: &[u8]| {
+        let stored = run(&db.io, || db.tree.tree().stored(key)).unwrap();
+        Version::decode(&stored.head).unwrap().reserve as usize
+    };
+    let mut setup = db.begin(Isolation::Snapshot);
+    db.put(&mut setup, "x", &padded("x", 700), Mode::Insert);
+    db.put(&mut setup, "o", &padded("o", 700), Mode::Insert);
+    db.commit(setup);
+    // Shrunk twice by one transaction: the second keeps the room the first kept.
+    let mut own = db.begin(Isolation::Snapshot);
+    db.put(&mut own, "o", &padded("o", 300), Mode::Update);
+    db.txns().statement(&mut own).unwrap();
+    db.put(&mut own, "o", "-", Mode::Update);
+    assert_eq!(reserve_of(b"o"), (HEADER + 701) - (HEADER + 1));
+    db.rollback(own);
+    let mut w = db.begin(Isolation::ReadCommitted);
+    let mut s = db.begin(Isolation::Snapshot);
+    assert_eq!(db.put(&mut s, "x", "-", Mode::Update), DONE_UPDATED);
+    db.commit(s);
+    // Committed after `w`'s statement began, so not what it sees, yet written over.
+    assert_eq!(db.put(&mut w, "x", "--", Mode::Update), DONE_UPDATED);
+    let stored = run(&db.io, || db.tree.tree().stored(b"x")).unwrap();
+    let reserve = |len: usize| (HEADER + 701) - (HEADER + len);
+    assert_eq!(
+        Version::decode(&stored.head).unwrap().reserve as usize,
+        reserve(2),
+        "room for the 701-byte row below the version it replaced"
+    );
+    db.rollback(w);
 }

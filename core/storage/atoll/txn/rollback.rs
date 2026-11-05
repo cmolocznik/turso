@@ -19,7 +19,7 @@
 //! once the transaction has ended (DESIGN.md §17).
 
 use super::changes::Change as Changed;
-use super::versioned::{decode_entry, Version, VersionedTree, Versions, HEADER};
+use super::versioned::{decode_entry, restored_reserve, Version, VersionedTree, Versions, HEADER};
 use super::{creation, Statement, Transactions, Ts, Txn, CREATE};
 use crate::io::IO;
 use crate::storage::atoll::btree::record::{Change, Compensation, Record};
@@ -177,12 +177,15 @@ pub fn undo(
                     // Put back already, at a later change of the statement.
                     None => Step::Next,
                     Some((current, v)) => {
-                        let replaced = match v.prev {
+                        let mut replaced = match v.prev {
                             None => None,
                             Some(ptr) => {
                                 decode_entry(&done!(versions.arenas().read(ptr)).replaced)?
                             }
                         };
+                        if let Some(r) = &mut replaced {
+                            restored_reserve(&mut r.head, txns, txn)?;
+                        }
                         let of = Compensation {
                             root,
                             statement,
@@ -412,7 +415,8 @@ pub(crate) fn undo_loser(
             | Change::Remove { .. }
             | Change::Split { .. }
             | Change::Branch { .. }
-            | Change::Unbranch { .. } => continue,
+            | Change::Unbranch { .. }
+            | Change::Settle { .. } => continue,
         };
         let statement = Version::decode(wrote.0.get(..HEADER).unwrap_or(&[]))
             .ok_or_else(|| corrupt("a change whose value holds no version header".into()))?

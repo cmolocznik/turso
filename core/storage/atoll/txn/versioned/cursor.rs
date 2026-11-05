@@ -268,7 +268,7 @@ impl VersionedTree {
                 cursor.chain = Some((key, Chain::from(v)));
                 continue;
             }
-            if v.deleted() {
+            if v.deleted {
                 cursor.moving = Some(Move::Step {
                     forward: moving.forward(),
                 });
@@ -349,7 +349,7 @@ impl VersionedTree {
                         cursor.unseen = Some(Unseen::Key { first: false });
                         continue;
                     }
-                    if v.deleted() {
+                    if v.deleted {
                         let (key, v) = (std::mem::take(key), *v);
                         cursor.unseen = Some(Unseen::Below { key, v });
                         continue;

@@ -152,6 +152,9 @@ pub struct Tree {
     /// Bytes at the start of every value kept in the leaf even when the rest goes out of line:
     /// a version header the leaf must show without reading the value.
     head: usize,
+    /// A versioned tree's: its leaves reserve, the head holding each entry's reserve
+    /// ([`node::RESERVE`]).
+    reserving: bool,
 }
 
 /// What a put should do, and what it did.
@@ -172,6 +175,8 @@ pub enum Outcome {
     Unchanged,
     /// The entry was not the one the put expected ([`Put::expecting`]); nothing changed.
     Changed,
+    /// The leaf is full while it keeps reserves ([`Put::settling`]); nothing changed.
+    Full,
 }
 
 impl Tree {
@@ -183,7 +188,19 @@ impl Tree {
         class: SizeClass,
     ) -> Result<IOResult<PageId>> {
         check_budget(store.log(), class, Limits::of(class))?;
-        Self::create_in(io, pool, store, class, false)
+        Self::create_in_at(io, pool, store, class, false, None, false)
+    }
+
+    /// [`create`](Self::create), a versioned tree's: its root a reserving leaf
+    /// ([`node::RESERVE`]).
+    pub fn create_versioned(
+        io: &Arc<dyn IO>,
+        pool: &Arc<BufferPool>,
+        store: &Arc<PageStore>,
+        class: SizeClass,
+    ) -> Result<IOResult<PageId>> {
+        check_budget(store.log(), class, Limits::of(class))?;
+        Self::create_in_at(io, pool, store, class, false, None, true)
     }
 
     /// A new, empty temporary tree (DESIGN.md §6.4), whose nodes and values are temporary pages:
@@ -194,11 +211,11 @@ impl Tree {
         store: &Arc<PageStore>,
         class: SizeClass,
     ) -> Result<IOResult<PageId>> {
-        Self::create_in(io, pool, store, class, true)
+        Self::create_in_at(io, pool, store, class, true, None, false)
     }
 
-    /// A new, empty tree at `root`, which must be free: replay's creation of a tree at the root
-    /// its change names (audit 17).
+    /// A new, empty versioned tree at `root`, which must be free: replay's creation of a tree at
+    /// the root its change names, made by a transaction (audit 17).
     pub fn create_at(
         io: &Arc<dyn IO>,
         pool: &Arc<BufferPool>,
@@ -206,17 +223,7 @@ impl Tree {
         root: PageId,
     ) -> Result<IOResult<PageId>> {
         check_budget(store.log(), root.class(), Limits::of(root.class()))?;
-        Self::create_in_at(io, pool, store, root.class(), false, Some(root))
-    }
-
-    fn create_in(
-        io: &Arc<dyn IO>,
-        pool: &Arc<BufferPool>,
-        store: &Arc<PageStore>,
-        class: SizeClass,
-        temporary: bool,
-    ) -> Result<IOResult<PageId>> {
-        Self::create_in_at(io, pool, store, class, temporary, None)
+        Self::create_in_at(io, pool, store, root.class(), false, Some(root), true)
     }
 
     fn create_in_at(
@@ -226,6 +233,7 @@ impl Tree {
         class: SizeClass,
         temporary: bool,
         at: Option<PageId>,
+        versioned: bool,
     ) -> Result<IOResult<PageId>> {
         let adopt_len = PageStore::group_record_len(1);
         let init_len = framed_len(8 + 4 + class.size());
@@ -240,7 +248,7 @@ impl Tree {
             (false, None) => done!(pool.allocate(class)),
         };
         let pid = page.pid();
-        let image = empty_root(&mut page);
+        let image = empty_root(&mut page, versioned);
         let tree = Self::open(io.clone(), pool.clone(), store.clone(), pid);
         let lsns = tree.log_batch(
             &mut grant,
@@ -254,7 +262,7 @@ impl Tree {
         Ok(IOResult::Done(pid))
     }
 
-    /// A new, empty tree whose nodes are of `class`, made in a transaction: one group of the
+    /// A new, empty versioned tree whose nodes are of `class`, made in a transaction: one group of the
     /// transaction's record of `kind`, whose payload is the root and then `extra`, the root's image
     /// and the root's adoption, so no crash leaves the root adopted with no chain naming it.
     /// Returns the root and where the group starts.
@@ -273,7 +281,7 @@ impl Tree {
         let mut admitted = done!(store.log().admit(lead_len + init_len + adopt_len));
         let mut page = done!(pool.allocate(class));
         let pid = page.pid();
-        let image = empty_root(&mut page);
+        let image = empty_root(&mut page, true);
         let lead = [&pid.raw().to_le_bytes()[..], extra].concat();
         let init = Record {
             pid,
@@ -317,6 +325,7 @@ impl Tree {
             root_hint: AtomicU32::new(0),
             limits: Limits::of(root.class()),
             head: 0,
+            reserving: false,
         }
     }
 
@@ -330,6 +339,76 @@ impl Tree {
 
     pub fn head(&self) -> usize {
         self.head
+    }
+
+    /// The tree as a versioned tree's, whose leaves reserve: its head is a version header.
+    pub fn with_reserves(mut self) -> Self {
+        assert!(
+            self.head >= node::RESERVE.end,
+            "a reserving tree's head of {} bytes",
+            self.head
+        );
+        self.reserving = true;
+        self
+    }
+
+    /// Gives back the reserves of the leaf holding `key` that `settled` judges, by an entry's
+    /// head, no checkpoint needs any more: the bytes given back. Step it until done.
+    pub fn settle(
+        &self,
+        key: &[u8],
+        near: Near,
+        settled: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<IOResult<usize>> {
+        let mut grant: Option<(Grant, u64)> = None;
+        loop {
+            let looked = done!(self.look(key, near));
+            let leaf = looked.leaf;
+            // The keys to settle, each its length and its bytes, judged on a copy of the leaf.
+            let Some(judged) = leaf.read(|p| {
+                let v = View::new(p);
+                let mut keys = Vec::new();
+                let mut head = vec![0u8; self.head];
+                for pos in 0..v.count()? {
+                    if v.reserve(pos)? > 0 {
+                        v.value_head_into(pos, &mut head)?;
+                        if settled(&head) {
+                            let key = v.key(pos)?;
+                            keys.extend((key.len() as u16).to_le_bytes());
+                            keys.extend(key);
+                        }
+                    }
+                }
+                Some(keys)
+            }) else {
+                continue;
+            };
+            let keys = judged.ok_or_else(|| corrupt_node(leaf.pid()))?;
+            if keys.is_empty() {
+                return Ok(IOResult::Done(0));
+            }
+            let len = framed_len(8 + keys.len());
+            if grant.as_ref().is_none_or(|(_, l)| *l < len) {
+                // A grant too small goes back before a larger one is taken.
+                drop(grant.take());
+                grant = Some((done!(self.admit(len)), len));
+            }
+            // Latched at the version the judgment read: the keys are still there, reserving.
+            let Some(mut ex) = leaf.upgrade() else {
+                continue;
+            };
+            let reserved = View::new(ex.page()).reserved();
+            let record = Record {
+                pid: ex.pid(),
+                change: Change::Settle { keys: &keys },
+            };
+            record.apply(&mut ex.page_mut())?;
+            let given = reserved - View::new(ex.page()).reserved();
+            let (mut admitted, _) = grant.take().expect("admitted");
+            let (_, lsn) = self.log_one(&mut admitted, None, &record);
+            ex.changed(lsn);
+            return Ok(IOResult::Done(given));
+        }
     }
 
     pub fn root(&self) -> PageId {
@@ -849,6 +928,17 @@ impl Tree {
         }
         let out_of_line =
             op.restoring.is_some() || !self.limits.inline(op.key.len(), self.head + op.value_len);
+        if let Some(keep) = op.reserve_over {
+            let len = match out_of_line {
+                true => self.head + value::REF,
+                false => self.head + op.value_len,
+            };
+            let was = present.as_ref().map_or(0, |(b, _)| match keep {
+                true => b.len() + node::reserve_of(b),
+                false => b.len(),
+            });
+            node::set_reserve(&mut op.entry, was.saturating_sub(len));
+        }
         if out_of_line && op.restoring.is_none() {
             let write = op.write.get_or_insert_with(|| {
                 ValueWrite::new(
@@ -928,13 +1018,35 @@ impl Tree {
             return yield_now().map(Some);
         };
         let v = View::new(ex.page());
+        if v.reserving() != self.reserving {
+            return Err(LimboError::Corrupt(format!(
+                "a leaf {:?} reserving {} in a tree reserving {}",
+                ex.pid(),
+                v.reserving(),
+                self.reserving
+            )));
+        }
         let now = &present;
+        let reserve = |value: &[u8]| match v.reserving() {
+            true => node::reserve_of(value),
+            false => 0,
+        };
         let need = match now {
-            None => v.entry_size(&op.key, stored.len()),
-            Some((old, _)) => Some(stored.len().saturating_sub(old.len())),
+            None => v
+                .entry_size(&op.key, stored.len())
+                .map(|n| n + reserve(stored)),
+            Some((old, _)) => {
+                Some((stored.len() + reserve(stored)).saturating_sub(old.len() + reserve(old)))
+            }
         }
         .ok_or_else(|| corrupt_node(ex.pid()))?;
-        if v.free().ok_or_else(|| corrupt_node(ex.pid()))? < need {
+        let free = v.free().ok_or_else(|| corrupt_node(ex.pid()))?;
+        if free < need && op.settle && v.reserved() > 0 {
+            drop(ex);
+            op.admitted = None;
+            return Ok(Some(IOResult::Done(Outcome::Full)));
+        }
+        if free < need {
             drop(ex);
             // A split admits its own log space; holding this meanwhile could leave too
             // little of the log buffer for it.
@@ -1211,6 +1323,7 @@ impl Tree {
             lower,
             upper,
             next,
+            reserving,
         } = node::shape(n.page());
         let at = nv.search(key).ok_or_else(|| corrupt_node(n.pid()))?.0;
         let right = |keep: usize| {
@@ -1230,6 +1343,7 @@ impl Tree {
                     lower,
                     upper,
                     next,
+                    reserving,
                 };
                 nv.entries_size(range, layout.prefix_len())
                     .is_some_and(|size| layout.fences_len() + size <= capacity)
@@ -1256,6 +1370,7 @@ impl Tree {
                 lower: Some(&sep),
                 upper: upper.as_deref(),
                 next,
+                reserving,
             },
             [],
         );
@@ -1333,6 +1448,7 @@ impl Tree {
                 lower: None,
                 upper: None,
                 next: (child.pid(), child.hint()),
+                reserving: false,
             },
             [],
         );
@@ -1475,6 +1591,9 @@ impl Tree {
         }
         let sep = pv.key(left_pos).ok_or_else(|| corrupt_node(p.pid()))?;
         let (left_shape, right_shape) = (node::shape(l.page()), node::shape(r.page()));
+        if left_shape.reserving != right_shape.reserving {
+            return Err(corrupt_node(r.pid()));
+        }
         let (root, lower) = (left_shape.root, left_shape.lower);
         let (upper, next) = (right_shape.upper, right_shape.next);
         let layout = Layout {
@@ -1483,6 +1602,7 @@ impl Tree {
             lower: lower.as_deref(),
             upper: upper.as_deref(),
             next,
+            reserving: left_shape.reserving,
         };
         // Both nodes' entries, and an inner node's separator over the left's rightmost child,
         // under the merged fences.
@@ -1967,8 +2087,9 @@ fn smo_len(class: SizeClass, limits: Limits) -> u64 {
         + store_len(&[PageId::from_raw(0)])
 }
 
-/// Builds an empty root, a leaf naming itself, on the newly allocated `page`; returns its image.
-fn empty_root(page: &mut Exclusive<'_>) -> Vec<u8> {
+/// Builds an empty root, a leaf naming itself and reserving if `versioned`, on the newly
+/// allocated `page`; returns its image.
+fn empty_root(page: &mut Exclusive<'_>, versioned: bool) -> Vec<u8> {
     let pid = page.pid();
     node::build(
         &mut page.page_mut(),
@@ -1978,6 +2099,7 @@ fn empty_root(page: &mut Exclusive<'_>) -> Vec<u8> {
             lower: None,
             upper: None,
             next: (PageId::from_raw(0), 0),
+            reserving: versioned,
         },
         [],
     );
@@ -2224,6 +2346,11 @@ pub struct Put {
     restoring: Option<(ValueRef, Option<Vec<PageId>>)>,
     /// The leaf tried first, then the leaf it reached.
     near: Near,
+    /// A versioned tree's write, its reserve set over the entry it replaces: whether it keeps
+    /// that entry's reserve (`node::RESERVE`).
+    reserve_over: Option<bool>,
+    /// A full leaf keeping reserves answers [`Outcome::Full`] instead of splitting.
+    settle: bool,
 }
 
 /// `stored` as the leaf keeps it: its bytes, and whether its value is out of line.
@@ -2276,7 +2403,24 @@ impl Put {
             found: None,
             restoring: None,
             near: Near::NONE,
+            reserve_over: None,
+            settle: false,
         }
+    }
+
+    /// Sets the entry's reserve over the one it replaces: what that entry takes past what this
+    /// one does, and its own reserve with it if it `keep`s it. So a version a checkpoint may
+    /// write in this one's place keeps its room (audit 17, stage 2).
+    pub fn reserving(mut self, keep: bool) -> Self {
+        self.reserve_over = Some(keep);
+        self
+    }
+
+    /// A leaf with no room for it that keeps reserves answers [`Outcome::Full`], for the caller to
+    /// give back what no checkpoint needs ([`Tree::settle`]) before a split.
+    pub fn settling(mut self) -> Self {
+        self.settle = true;
+        self
     }
 
     /// Tries `near` before a descent.

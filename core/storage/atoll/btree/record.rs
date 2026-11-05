@@ -52,10 +52,14 @@ pub const RESTORE: Kind = Kind::new(21).unwrap();
 pub const UNPUT: Kind = Kind::new(22).unwrap();
 pub const UNBRANCH: Kind = Kind::new(26).unwrap();
 pub const TXN_PATCH: Kind = Kind::new(27).unwrap();
+pub const SETTLE: Kind = Kind::new(30).unwrap();
 
 pub fn owns(kind: Kind) -> bool {
     (INIT.get()..=BRANCH.get()).contains(&kind.get())
-        || [TXN_INSERT, TXN_UPDATE, RESTORE, UNPUT, UNBRANCH, TXN_PATCH].contains(&kind)
+        || [
+            TXN_INSERT, TXN_UPDATE, RESTORE, UNPUT, UNBRANCH, TXN_PATCH, SETTLE,
+        ]
+        .contains(&kind)
 }
 
 /// What a compensation record completed: every change its transaction's `statement` made to its
@@ -141,6 +145,11 @@ pub enum Change<'a> {
     Unbranch {
         child: PageId,
     },
+    /// A reserving leaf's reserves given back for `keys`, each a length (u16) and a key
+    /// ([`node::clear_reserve`]): room no checkpoint needs any more.
+    Settle {
+        keys: &'a [u8],
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +174,7 @@ impl<'a> Record<'a> {
             Change::Split { .. } => SPLIT,
             Change::Branch { .. } => BRANCH,
             Change::Unbranch { .. } => UNBRANCH,
+            Change::Settle { .. } => SETTLE,
             Change::Restore { .. } => RESTORE,
             Change::Unput { .. } => UNPUT,
             Change::Patch { .. } => TXN_PATCH,
@@ -330,6 +340,7 @@ impl<'a> Record<'a> {
                 out.extend_from_slice(sep);
             }
             Change::Unbranch { child } => out.extend(child.raw().to_le_bytes()),
+            Change::Settle { keys } => out.extend_from_slice(keys),
             Change::Patch {
                 key,
                 head,
@@ -493,6 +504,7 @@ impl<'a> Record<'a> {
                 }
             }
             k if k == REMOVE => Change::Remove { key: rest },
+            k if k == SETTLE => Change::Settle { keys: rest },
             k if k == UNBRANCH && payload.len() == 16 => Change::Unbranch {
                 child: PageId::from_raw(word(8)?),
             },
@@ -593,6 +605,7 @@ impl<'a> Record<'a> {
             },
             Change::Split { right, keep, sep } => split(page, *right, *keep, sep),
             Change::Unbranch { child } => unbranch(page, *child),
+            Change::Settle { keys } => settle(page, keys),
             Change::Branch { left, right, sep } => {
                 let v = View::new(&*page);
                 let (pos, exact) = v.search(sep).ok_or_else(|| corrupt("branch"))?;
@@ -619,6 +632,28 @@ fn encode_compensation(out: &mut Vec<u8>, of: &Compensation) {
 /// Keeps the first `keep` entries of the node in `page`, up to `sep`: a leaf's right neighbour
 /// becomes `right`, and an inner node's rightmost child becomes the child of entry `keep`, whose
 /// key `sep` is. Checked and made in place.
+/// Gives back the reserves of `keys`, each a length and a key, in the reserving leaf `page`.
+fn settle<P: BytesMut + ?Sized>(page: &mut P, mut keys: &[u8]) -> Result<()> {
+    if !View::new(&*page).reserving() {
+        return Err(corrupt("settle"));
+    }
+    while !keys.is_empty() {
+        let len = keys
+            .get(..2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+            .ok_or_else(|| corrupt("settle"))?;
+        let key = keys.get(2..2 + len).ok_or_else(|| corrupt("settle"))?;
+        match View::new(&*page).search(key) {
+            Some((pos, true)) => {
+                node::clear_reserve(page, pos);
+            }
+            _ => return Err(corrupt("settle")),
+        }
+        keys = &keys[2 + len..];
+    }
+    Ok(())
+}
+
 /// Removes `child` from the inner node `page`: its first keyed child, or, once it has no key, the
 /// child after its keys.
 fn unbranch<P: BytesMut + ?Sized>(page: &mut P, child: PageId) -> Result<()> {
@@ -774,6 +809,7 @@ mod tests {
             lower: None,
             upper: None,
             next: (PageId::from_raw(0), 0),
+            reserving: false,
         };
         let mut page = vec![0u8; 4096];
         node::build(
@@ -886,6 +922,7 @@ mod tests {
             lower: None,
             upper: None,
             next: (next, 0),
+            reserving: false,
         };
         let entries = [
             node::Entry::child(b"m".to_vec(), a, 0),

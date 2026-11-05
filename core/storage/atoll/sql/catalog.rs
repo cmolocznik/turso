@@ -60,6 +60,11 @@ impl System {
     pub fn root(self) -> PageId {
         PageId::new(Self::class(), self as u64)
     }
+
+    /// Whether its entries carry no version header: written outside any transaction's versions.
+    pub fn plain(self) -> bool {
+        matches!(self, System::Abandoned | System::Sequences)
+    }
 }
 
 /// The tree id of `sqlite_schema`.
@@ -240,7 +245,11 @@ pub fn ensure_system_trees(
         if entry != FREE {
             continue;
         }
-        let made = match Tree::create(io, pool, store, System::class())? {
+        let made = match system.plain() {
+            true => Tree::create(io, pool, store, System::class())?,
+            false => Tree::create_versioned(io, pool, store, System::class())?,
+        };
+        let made = match made {
             IOResult::Done(pid) => pid,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };

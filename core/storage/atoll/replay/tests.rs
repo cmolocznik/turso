@@ -52,6 +52,7 @@ fn contents(db: &AtollDb, root: PageId, plain: bool) -> Vec<(Vec<u8>, Vec<u8>)> 
     })
     .unwrap();
     while found {
+        drive(io, || tree.load(&mut c)).unwrap();
         out.push((c.key().unwrap().to_vec(), c.value().unwrap().to_vec()));
         found = drive(io, || tree.next(txns, versions, &mut txn, &mut c)).unwrap();
     }

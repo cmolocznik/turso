@@ -737,6 +737,27 @@ impl VersionedTree {
                     ))),
                 };
             }
+            match done!(self.follow_to(txns, versions, txn, chain)) {
+                None => return Ok(IOResult::Done(None)),
+                Some(StoredValue::Inline(value)) => return Ok(IOResult::Done(Some(value))),
+                Some(StoredValue::OutOfLine(reference)) => {
+                    chain.reading = Some(ValueRead::new(reference))
+                }
+            }
+        }
+    }
+
+    /// The version of the chain's key that `txn`'s current statement reads, its value as its
+    /// version index stores it, a value out of line unread: `None` for a key it reads as absent.
+    /// Step it until done.
+    fn follow_to(
+        &self,
+        txns: &Transactions,
+        versions: &Versions,
+        txn: &mut Txn,
+        chain: &mut Chain,
+    ) -> Result<IOResult<Option<StoredValue>>> {
+        loop {
             let v = chain.at;
             let Some(earlier) = done!(versions.below(&v)) else {
                 return Ok(IOResult::Done(None));
@@ -749,12 +770,7 @@ impl VersionedTree {
             if e.deleted {
                 return Ok(IOResult::Done(None));
             }
-            match earlier.value {
-                StoredValue::Inline(value) => return Ok(IOResult::Done(Some(value))),
-                StoredValue::OutOfLine(reference) => {
-                    chain.reading = Some(ValueRead::new(reference))
-                }
-            }
+            return Ok(IOResult::Done(Some(earlier.value)));
         }
     }
 

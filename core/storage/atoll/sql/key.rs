@@ -171,12 +171,12 @@ fn nocase(text: &str, out: &mut Vec<u8>) {
 /// binary digit, biased, and the digits after it, seven to a byte with the low bit saying whether
 /// more follow. A negative number's body is inverted, so a larger magnitude sorts first.
 fn binary_number(n: Numeric, out: &mut Vec<u8>) {
-    let (negative, exponent, fraction) = match n {
+    let (negative, exponent, digits, top) = match n {
         Numeric::Integer(0) => return out.push(ZERO),
         Numeric::Integer(i) => {
             let magnitude = i.unsigned_abs();
             let top = 63 - magnitude.leading_zeros();
-            (i < 0, top as i32, bits_below(magnitude, top))
+            (i < 0, top as i32, magnitude, top)
         }
         Numeric::Float(f) => {
             let f = f64::from(f);
@@ -196,13 +196,13 @@ fn binary_number(n: Numeric, out: &mut Vec<u8>) {
                 (stored | (1 << 52), biased - 1075)
             };
             let top = 63 - significand.leading_zeros();
-            (f < 0.0, power + top as i32, bits_below(significand, top))
+            (f < 0.0, power + top as i32, significand, top)
         }
     };
     out.push(if negative { NEGATIVE } else { POSITIVE });
     let start = out.len();
     out.extend_from_slice(&((exponent + BINARY_EXPONENT_BIAS) as u16).to_be_bytes());
-    seven_bit_groups(&fraction, out);
+    digits_below(digits, top, out);
     if negative {
         for b in &mut out[start..] {
             *b = !*b;
@@ -210,30 +210,25 @@ fn binary_number(n: Numeric, out: &mut Vec<u8>) {
     }
 }
 
-/// The `top` binary digits of `value` below its digit `top`, most significant first, without the
-/// trailing zeros.
-fn bits_below(value: u64, top: u32) -> Vec<bool> {
-    let mut bits: Vec<bool> = (0..top).rev().map(|i| ((value >> i) & 1) == 1).collect();
-    while bits.last() == Some(&false) {
-        bits.pop();
-    }
-    bits
-}
-
-/// `bits` seven to a byte, zero-padded, each byte's low bit set when another byte follows; none
-/// gives one zero byte.
-fn seven_bit_groups(bits: &[bool], out: &mut Vec<u8>) {
-    if bits.is_empty() {
+/// The binary digits of `value` below its digit `top` (at most 63), most significant first and
+/// without the trailing zeros, seven to a byte, zero-padded, each byte's low bit set when another
+/// byte follows; none gives one zero byte.
+fn digits_below(value: u64, top: u32, out: &mut Vec<u8>) {
+    let below = if top == 0 {
+        0
+    } else {
+        value & (u64::MAX >> (64 - top))
+    };
+    if below == 0 {
         return out.push(0);
     }
-    let groups: Vec<&[bool]> = bits.chunks(7).collect();
-    for (i, group) in groups.iter().enumerate() {
-        let mut v = 0u8;
-        for (j, &bit) in group.iter().enumerate() {
-            v |= (bit as u8) << (6 - j);
-        }
-        let more = (i + 1 < groups.len()) as u8;
-        out.push((v << 1) | more);
+    let groups = (top - below.trailing_zeros()).div_ceil(7);
+    // The first digit below `top` at bit 63.
+    let mut aligned = below << (64 - top);
+    for i in 0..groups {
+        let more = (i + 1 < groups) as u8;
+        out.push((((aligned >> 57) as u8) << 1) | more);
+        aligned <<= 7;
     }
 }
 

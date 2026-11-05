@@ -33,11 +33,37 @@ use crate::storage::atoll::txn::Txn;
 use crate::storage::btree::BTreeKey;
 use crate::sync::{Arc, Mutex};
 use crate::types::{
-    IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey, SeekOp, SeekResult, ValueRef,
+    IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey, SeekOp, SeekResult, ValueBlob,
+    ValueRef,
 };
 use crate::{LimboError, Result};
 use std::borrow::Cow;
 use std::cmp::Ordering;
+
+/// A row's bytes as a record's payload: the same allocation where the crate allocates with the
+/// global allocator.
+#[cfg(not(nightly))]
+fn payload_of(bytes: Vec<u8>) -> ValueBlob {
+    bytes
+}
+
+#[cfg(nightly)]
+fn payload_of(bytes: Vec<u8>) -> ValueBlob {
+    let mut payload = crate::alloc::vec![];
+    payload.extend_from_slice(&bytes);
+    payload
+}
+
+/// A record's payload as a row's bytes again: [`payload_of`]'s inverse.
+#[cfg(not(nightly))]
+fn bytes_of(payload: ValueBlob) -> Vec<u8> {
+    payload
+}
+
+#[cfg(nightly)]
+fn bytes_of(payload: ValueBlob) -> Vec<u8> {
+    payload.to_vec()
+}
 
 macro_rules! done {
     ($e:expr) => {
@@ -77,7 +103,7 @@ pub struct AtollCursor {
     /// The buffer the last seek's key was in, kept for the next.
     seek_key: Vec<u8>,
     /// The entry's record, once read.
-    record: Option<ImmutableRecord>,
+    record: Record,
     null_row: bool,
     /// Whether the transaction's current statement created the tree, and writes it plainly.
     plain: bool,
@@ -105,6 +131,52 @@ pub struct AtollCursor {
     /// Whether rewinds and moves on walk the versions the statement does not see, each holding
     /// its key, as rows (R10, [`VersionedTree::unseen_first`]).
     unseen: bool,
+}
+
+/// The record of the row a cursor rests on, once read, and the allocation the next is built in.
+#[derive(Default)]
+struct Record {
+    read: Option<ImmutableRecord>,
+    /// Whether the record's bytes are the row's value lent by the cursor
+    /// ([`VersionedCursor::lend_value`]), to be given back.
+    lent: bool,
+    /// The allocation the next copied record is built in.
+    buf: Option<RecordBuf>,
+}
+
+impl Record {
+    /// The record of the row `cursor` rests on, its value read: a value out of line taken whole,
+    /// one in the entry copied.
+    fn of(&mut self, cursor: &mut VersionedCursor) -> Result<&ImmutableRecord> {
+        if self.read.is_none() {
+            let record = match cursor.lend_value() {
+                Some(bytes) => {
+                    self.lent = true;
+                    ImmutableRecord::from_bin_record(payload_of(bytes))
+                }
+                None => {
+                    let value = cursor.value().expect("a row");
+                    let buf = self.buf.take().unwrap_or_else(RecordBuf::alloc);
+                    ImmutableRecord::copy_payload(value, buf)?
+                }
+            };
+            self.read = Some(record);
+        }
+        Ok(self.read.as_ref().expect("a record"))
+    }
+
+    /// Forgets the record read at the row: lent bytes go back to `cursor`, a copy's allocation is
+    /// kept for the next.
+    fn forget(&mut self, cursor: &mut VersionedCursor) {
+        let Some(record) = self.read.take() else {
+            return;
+        };
+        if std::mem::take(&mut self.lent) {
+            cursor.give_back(bytes_of(record.into_payload()));
+        } else {
+            self.buf = Some(record.retire());
+        }
+    }
 }
 
 /// What a foreign-key guard judges the keys of (R10).
@@ -143,6 +215,8 @@ struct Seeking {
     suffix: Option<i64>,
     /// The landing needs one move on, under way.
     moving_on: bool,
+    /// Landed on an entry whose value the judgment reads, being read.
+    loading: bool,
 }
 
 /// A move of the versioned cursor.
@@ -192,7 +266,7 @@ impl AtollCursor {
             cursor: VersionedCursor::new(),
             seeking: None,
             seek_key: Vec::new(),
-            record: None,
+            record: Record::default(),
             null_row: false,
             plain: false,
             writing: None,
@@ -248,7 +322,7 @@ impl AtollCursor {
         if let IOResult::IO(io) = moved {
             return Ok(IOResult::IO(io));
         }
-        self.record = None;
+        self.record.forget(&mut self.cursor);
         self.null_row = false;
         self.left = None;
         Ok(IOResult::Done(()))
@@ -286,7 +360,7 @@ impl AtollCursor {
         self.index = index;
         self.plain = plain;
         self.seeking = None;
-        self.record = None;
+        self.record.forget(&mut self.cursor);
         self.null_row = false;
         self.writing = None;
         self.left = None;
@@ -314,7 +388,7 @@ impl AtollCursor {
 
     /// Forgets the record read at the row, to read it again.
     pub fn invalidate_record(&mut self) {
-        self.record = None;
+        self.record.forget(&mut self.cursor);
     }
 
     /// The tree's root.
@@ -344,7 +418,7 @@ impl AtollCursor {
             Move::Prev => self.tree.prev(txns, versions, txn, &mut self.cursor)?,
         };
         if let IOResult::Done(_) = moved {
-            self.record = None;
+            self.record.forget(&mut self.cursor);
             self.null_row = false;
             self.left = None;
         }
@@ -376,7 +450,7 @@ impl AtollCursor {
             return self.step_unseen(false);
         }
         if self.left.take().is_some() {
-            self.record = None;
+            self.record.forget(&mut self.cursor);
             return Ok(IOResult::Done(()));
         }
         done!(self.step(Move::Next));
@@ -448,24 +522,25 @@ impl AtollCursor {
         if !self.index.as_ref().is_some_and(|i| i.has_rowid) {
             return Ok(IOResult::Done(None));
         }
+        done!(self.tree.load(&mut self.cursor));
         let record = self.record_now()?.expect("a row");
         Ok(IOResult::Done(Some(last_rowid(record)?)))
     }
 
-    /// The row's record.
+    /// The row's record. Step it until done.
     pub fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>> {
+        if !self.is_empty() {
+            done!(self.tree.load(&mut self.cursor));
+        }
         Ok(IOResult::Done(self.record_now()?))
     }
 
+    /// The row's record, its value read.
     fn record_now(&mut self) -> Result<Option<&ImmutableRecord>> {
         if self.is_empty() {
             return Ok(None);
         }
-        if self.record.is_none() {
-            let value = self.cursor.value().expect("a row");
-            self.record = Some(ImmutableRecord::copy_payload(value, RecordBuf::alloc())?);
-        }
-        Ok(self.record.as_ref())
+        self.record.of(&mut self.cursor).map(Some)
     }
 
     /// Moves to the row `op` finds from `key`.
@@ -518,7 +593,7 @@ impl AtollCursor {
         if absent {
             let near = kept.near();
             self.cursor.rest_nowhere(near);
-            self.record = None;
+            self.record.forget(&mut self.cursor);
             self.null_row = false;
             self.left = None;
         }
@@ -581,12 +656,22 @@ impl AtollCursor {
             prefix,
             suffix,
             moving_on: false,
+            loading: false,
         })
     }
 
     fn seek_planned(&mut self, s: &mut Seeking) -> Result<IOResult<SeekResult>> {
         loop {
             let (op, table) = (s.op, self.entry.layout == Layout::Table);
+            if s.loading {
+                done!(self.tree.load(&mut self.cursor));
+                s.loading = false;
+                match self.judge(s)? {
+                    Verdict::Found => return Ok(IOResult::Done(SeekResult::Found)),
+                    Verdict::NotFound => return Ok(IOResult::Done(SeekResult::NotFound)),
+                    Verdict::MoveOn => s.moving_on = true,
+                }
+            }
             if s.moving_on {
                 let forward = matches!(op, SeekOp::GE { .. } | SeekOp::GT);
                 let found = done!(self.step(if forward { Move::Next } else { Move::Prev }));
@@ -628,6 +713,11 @@ impl AtollCursor {
             };
             if !found {
                 return Ok(IOResult::Done(SeekResult::NotFound));
+            }
+            // The judgment reads an index landing's rowid from its record.
+            if !table && s.suffix.is_some() {
+                s.loading = true;
+                continue;
             }
             match self.judge(s)? {
                 Verdict::Found => return Ok(IOResult::Done(SeekResult::Found)),
@@ -969,7 +1059,7 @@ impl AtollCursor {
             // Kept: stepped again once the writer has ended.
             return Ok(IOResult::Done(write));
         }
-        self.record = None;
+        self.record.forget(&mut self.cursor);
         // An insert's row is where the cursor now stands, shown from the entry it stored; any
         // write's buffers serve the next.
         let (k, entry, put) = match self.writing.take().expect("a write") {

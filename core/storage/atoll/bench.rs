@@ -459,12 +459,14 @@ fn paths() {
 }
 
 /// SQL's cost per row through Turso, one connection, every page and the log in memory: rows
-/// inserted in transactions of [`TXN_ROWS`], in no order, then each updated, its value changed at
-/// the same length, then each deleted, in transactions of the same rows. Atoll's, or with
-/// `ATOLL_BENCH_WAL` set SQLite's WAL journal's, on the same statements. Each phase runs, since
-/// the next reads its rows; `ATOLL_BENCH=sql-<phase>` times one alone, as [`paths`] times its
-/// cases, under the same `ATOLL_BENCH_ROWS` and perf fifo pair. With `ATOLL_BENCH_SEQ` set, every
-/// phase goes in key order, as rowids a table assigns are inserted.
+/// inserted in transactions of [`TXN_ROWS`], in no order; read, by a scan summing rowids, a scan
+/// summing values' lengths, and a lookup of each value by its rowid, each in one transaction;
+/// then each updated, its value changed at the same length, then each deleted, in transactions of
+/// [`TXN_ROWS`]. Atoll's, or with `ATOLL_BENCH_WAL` set SQLite's WAL journal's, on the same
+/// statements. Each phase runs, since the next reads its rows; `ATOLL_BENCH=sql-<phase>` times one
+/// alone, as [`paths`] times its cases, under the same `ATOLL_BENCH_ROWS` and perf fifo pair. With
+/// `ATOLL_BENCH_SEQ` set, every phase goes in key order, as rowids a table assigns are inserted.
+/// `ATOLL_BENCH_VALUE` sets the values' length (100 bytes; at least 44).
 ///
 /// ```text
 /// cargo test --release -p turso_core --lib storage::atoll::bench::sql -- --ignored --nocapture
@@ -494,8 +496,10 @@ fn sql() {
         Some(_) => (0..rows).collect(),
         None => permutation(rows),
     };
-    let value = Value::build_text("v".repeat(100));
-    let changed = Value::build_text(format!("{}abcd{}", "v".repeat(40), "v".repeat(56)));
+    let length: usize = std::env::var("ATOLL_BENCH_VALUE").map_or(100, |v| v.parse().unwrap());
+    assert!(length >= 44, "values of {length} bytes");
+    let value = Value::build_text("v".repeat(length));
+    let changed = Value::build_text(format!("{}abcd{}", "v".repeat(40), "v".repeat(length - 44)));
     let (mut begin, mut commit) = (
         conn.prepare("BEGIN").unwrap(),
         conn.prepare("COMMIT").unwrap(),
@@ -503,11 +507,29 @@ fn sql() {
     let mut phase = |name: &str, sql: &str, data: Option<&Value>| {
         let timed = only.as_deref().is_none_or(|o| o == format!("sql-{name}"));
         let mut stmt = conn.prepare(sql).unwrap();
+        let reads = sql.starts_with("SELECT");
+        if reads {
+            begin.run_ignore_rows().unwrap();
+            begin.reset().unwrap();
+        }
         if timed {
             perf_control("enable");
         }
         let began = Instant::now();
-        for chunk in shuffled.chunks(TXN_ROWS) {
+        if reads && sql.contains("?1") {
+            // A lookup per row, in the order rows went in.
+            for &n in &shuffled {
+                stmt.bind_at(NonZero::<usize>::MIN, Value::from_i64(n as i64))
+                    .unwrap();
+                stmt.run_ignore_rows().unwrap();
+                stmt.reset().unwrap();
+            }
+        } else if reads {
+            // A scan, once over every row.
+            stmt.run_ignore_rows().unwrap();
+            stmt.reset().unwrap();
+        }
+        for chunk in shuffled.chunks(TXN_ROWS).filter(|_| !reads) {
             begin.run_ignore_rows().unwrap();
             begin.reset().unwrap();
             for &n in chunk {
@@ -528,12 +550,19 @@ fn sql() {
             perf_control("disable");
             println!("bench sql-{name} {journal} ops {rows} ns/op {ns:.0}");
         }
+        if reads {
+            commit.run_ignore_rows().unwrap();
+            commit.reset().unwrap();
+        }
     };
     phase(
         "insert",
         "INSERT INTO t (id, data) VALUES (?1, ?2)",
         Some(&value),
     );
+    phase("scan-rowid", "SELECT sum(id) FROM t", None);
+    phase("scan-data", "SELECT sum(length(data)) FROM t", None);
+    phase("lookup", "SELECT data FROM t WHERE id = ?1", None);
     phase(
         "update",
         "UPDATE t SET data = ?2 WHERE id = ?1",

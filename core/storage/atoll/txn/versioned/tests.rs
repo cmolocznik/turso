@@ -8,7 +8,7 @@ use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{Kind, LogConfig};
 use crate::storage::atoll::page::{self, SizeClass};
 use crate::storage::atoll::radix::FREE;
-use crate::storage::atoll::shared::Bytes;
+use crate::storage::atoll::shared::{Bytes, BytesMut};
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
 use crate::storage::atoll::txn::{Commit, TxnConfig};
@@ -838,6 +838,7 @@ impl Db {
         });
         let mut out = Vec::new();
         while found {
+            run(&self.io, || self.tree.load(&mut c));
             out.push((
                 String::from_utf8(c.key().unwrap().to_vec()).unwrap(),
                 c.value().unwrap().to_vec(),
@@ -854,6 +855,33 @@ impl Db {
             out.reverse();
         }
         out
+    }
+
+    /// Every key `txn`'s current statement sees, in key order, its rows' values never asked for.
+    fn keys(&self, txn: &mut Txn) -> Vec<String> {
+        let mut c = VersionedCursor::new();
+        let mut found = run(&self.io, || {
+            self.tree
+                .seek(self.txns(), &self.versions, txn, &mut c, b"", Seek::Ge)
+        });
+        let mut out = Vec::new();
+        while found {
+            assert!(c.unread(), "{:?}: its value out of line was read", c.key());
+            out.push(String::from_utf8(c.key().unwrap().to_vec()).unwrap());
+            found = run(&self.io, || {
+                self.tree.next(self.txns(), &self.versions, txn, &mut c)
+            });
+        }
+        out
+    }
+
+    /// Makes page `pid` no page of any value: a read of the value that names it finds it gone.
+    fn unvalue(&self, pid: PageId) {
+        let mut page = run(&self.io, || self.db.pool().fix_exclusive(pid, None));
+        let mut id = [0u8; 8];
+        page.page().copy_to(page::HEADER_SIZE, &mut id);
+        id[0] ^= 0xff;
+        page.page_mut().write(page::HEADER_SIZE, &id);
     }
 
     /// The key `seek` lands on from `key` for `txn`'s current statement.
@@ -1718,4 +1746,140 @@ fn a_write_keeps_the_reserve_of_its_own_version_and_of_one_its_statement_does_no
         "room for the 701-byte row below the version it replaced"
     );
     db.rollback(w);
+}
+
+/// A move rests on a row whose value is out of line without reading it, so a scan of keys reads
+/// no value page, and a newest version the reader does not see has its value never read: here the
+/// pages of that version, and of a row the reader does see, are no value's, and the scan still
+/// finds every key. A row's value is read when asked for: a version below, through its index
+/// entry, whole; the row whose pages are gone, found gone.
+#[test]
+fn a_move_reads_no_value_out_of_line_until_its_row_is_asked_for() {
+    let db = open();
+    let big = |tag: &str| padded(tag, LARGE);
+    let mut setup = db.begin(Isolation::Snapshot);
+    for key in ["a", "b", "c"] {
+        assert_eq!(
+            db.put(&mut setup, key, &big(key), Mode::Insert),
+            DONE_INSERTED
+        );
+    }
+    db.commit(setup);
+    let mut reader = db.begin(Isolation::Snapshot);
+    assert_eq!(db.get_bytes(&mut reader, "a"), Some(big("a").into_bytes()));
+    let mut w = db.begin(Isolation::Snapshot);
+    assert_eq!(db.put(&mut w, "b", &big("b2"), Mode::Update), DONE_UPDATED);
+    db.commit(w);
+    let (b2, c) = (db.pages_of("b"), db.pages_of("c"));
+    assert!(!b2.is_empty() && !c.is_empty(), "values in their leaf");
+    for &pid in b2.iter().chain(&c) {
+        db.unvalue(pid);
+    }
+    assert_eq!(db.keys(&mut reader), ["a", "b", "c"]);
+    let mut cursor = VersionedCursor::new();
+    for (key, value) in [("a", Some(big("a"))), ("b", Some(big("b"))), ("c", None)] {
+        let found = run(&db.io, || {
+            db.tree.seek(
+                db.txns(),
+                &db.versions,
+                &mut reader,
+                &mut cursor,
+                key.as_bytes(),
+                Seek::Ge,
+            )
+        });
+        assert!(
+            found && cursor.key() == Some(key.as_bytes()) && cursor.unread(),
+            "{key}"
+        );
+        let loaded = drive(&db.io, || db.tree.load(&mut cursor));
+        match value {
+            Some(v) => {
+                loaded.unwrap();
+                assert_eq!(cursor.value(), Some(v.as_bytes()), "{key}");
+            }
+            None => assert!(
+                matches!(loaded, Err(LimboError::Corrupt(_))),
+                "{key}: {loaded:?}"
+            ),
+        }
+    }
+    db.commit(reader);
+}
+
+/// A row's value read out of line is lent whole and taken back: while the cursor stays it is the
+/// row's value again; once the cursor has moved, only an allocation for the next row's.
+#[test]
+fn a_row_read_out_of_line_is_lent_whole_and_taken_back_while_the_cursor_stays() {
+    let db = open();
+    let big = |tag: &str| padded(tag, LARGE);
+    let mut setup = db.begin(Isolation::Snapshot);
+    for key in ["a", "b"] {
+        assert_eq!(
+            db.put(&mut setup, key, &big(key), Mode::Insert),
+            DONE_INSERTED
+        );
+    }
+    db.commit(setup);
+    let mut reader = db.begin(Isolation::Snapshot);
+    let mut c = VersionedCursor::new();
+    assert!(run(&db.io, || {
+        db.tree
+            .seek(db.txns(), &db.versions, &mut reader, &mut c, b"", Seek::Ge)
+    }));
+    assert!(c.lend_value().is_none(), "lent before it is read");
+    run(&db.io, || db.tree.load(&mut c));
+    let lent = c.lend_value().expect("a value read");
+    assert_eq!(lent, big("a").as_bytes());
+    assert!(c.lend_value().is_none(), "lent twice");
+    c.give_back(lent);
+    assert_eq!(c.value(), Some(big("a").as_bytes()));
+    let lent = c.lend_value().expect("a value given back");
+    assert!(run(&db.io, || db.tree.next(
+        db.txns(),
+        &db.versions,
+        &mut reader,
+        &mut c
+    )));
+    assert!(c.unread(), "the next row read before it is asked for");
+    c.give_back(lent);
+    assert!(
+        c.unread(),
+        "a value given back after a move is the next row's"
+    );
+    run(&db.io, || db.tree.load(&mut c));
+    assert_eq!(c.value(), Some(big("b").as_bytes()));
+    db.commit(reader);
+}
+
+/// A walk over the versions a statement does not see reads each one's value out of line whole,
+/// through the leaf that holds it: an open writer's version may lose its pages under a later read.
+#[test]
+fn an_unseen_walk_reads_each_version_out_of_line_whole() {
+    let db = open();
+    let big = |tag: &str| padded(tag, LARGE);
+    let mut reader = db.begin(Isolation::Snapshot);
+    assert_eq!(db.get_bytes(&mut reader, "k"), None);
+    let mut w = db.begin(Isolation::Snapshot);
+    assert_eq!(
+        db.put(&mut w, "k", &big("open"), Mode::Insert),
+        DONE_INSERTED
+    );
+    let mut c = VersionedCursor::new();
+    // A move first, which leaves the row's value unread, then the walk.
+    assert!(!run(&db.io, || {
+        db.tree
+            .seek(db.txns(), &db.versions, &mut reader, &mut c, b"", Seek::Ge)
+    }));
+    assert!(run(&db.io, || db.tree.unseen_first(
+        db.txns(),
+        &db.versions,
+        &mut reader,
+        &mut c
+    )));
+    assert!(!c.unread());
+    assert_eq!(c.key(), Some(&b"k"[..]));
+    assert_eq!(c.value(), Some(big("open").as_bytes()));
+    db.rollback(w);
+    db.commit(reader);
 }

@@ -1778,6 +1778,7 @@ impl<'a> Optimistic<'a> {
     /// meanwhile, `None` if it did. `read` may see the page mid-change, so it must not trust
     /// what it reads to be consistent: offsets and lengths are checked before use, and nothing
     /// it does may panic on garbage.
+    #[inline]
     pub fn read<R>(&self, read: impl FnOnce(&Shared) -> R) -> Option<R> {
         let out = read(self.pool.bytes(self.frame, self.pid.class()));
         self.validate().then_some(out)

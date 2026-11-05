@@ -297,6 +297,17 @@ impl ValueRead {
         }
     }
 
+    /// A read into `out`'s allocation, its bytes dropped.
+    pub fn reusing(reference: ValueRef, mut out: Vec<u8>) -> Self {
+        out.clear();
+        out.reserve_exact(reference.len as usize);
+        Self {
+            reference,
+            out,
+            chunks: None,
+        }
+    }
+
     pub fn reference(&self) -> ValueRef {
         self.reference
     }

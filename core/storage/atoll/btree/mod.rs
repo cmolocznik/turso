@@ -723,6 +723,12 @@ impl Tree {
             .is_some_and(|l| l.version() == version)
     }
 
+    /// The reference of `cursor`'s entry, whose value is out of line and unread.
+    pub fn unread_reference(&self, cursor: &Cursor) -> Option<ValueRef> {
+        let (_, value) = cursor.entry.as_ref().filter(|_| cursor.unread)?;
+        Some(self.split_reference(value)?.1)
+    }
+
     /// The value of `key`, if present. Step it until done.
     pub fn lookup(&self, op: &mut Lookup) -> Result<IOResult<Option<Vec<u8>>>> {
         loop {
@@ -1777,6 +1783,7 @@ impl Tree {
                         let mut value = std::mem::take(head);
                         value.extend_from_slice(&v);
                         cursor.entry = Some((std::mem::take(key), value));
+                        cursor.unread = false;
                         cursor.reading = None;
                         cursor.held = None;
                         cursor.pending = None;
@@ -1835,6 +1842,7 @@ impl Tree {
                 }
             };
             // Into the buffers of the entry before, or kept ones.
+            cursor.unread = false;
             let (mut key, mut value) = match cursor.entry.take() {
                 Some(buffers) => buffers,
                 None => (
@@ -1880,10 +1888,13 @@ impl Tree {
                     let at = (leaf.pid(), leaf.hint(), leaf.version());
                     cursor.leaf = Some(at);
                     // A value out of line is read through the leaf, and found again by its key if
-                    // the read is lost: no step from it is taken by position.
-                    cursor.at = (!out_of_line).then_some(pos);
-                    if !out_of_line {
+                    // the read is lost: no step from it is taken by position. One left unread is
+                    // the entry as the leaf holds it.
+                    let rests = !out_of_line || cursor.lazy;
+                    cursor.at = rests.then_some(pos);
+                    if rests {
                         cursor.entry = Some((key, value));
+                        cursor.unread = out_of_line;
                         cursor.spare.2 = target;
                         cursor.reading = None;
                         return Ok(IOResult::Done(true));
@@ -1905,6 +1916,7 @@ impl Tree {
                 Scan::End => {
                     cursor.reading = None;
                     cursor.entry = None;
+                    cursor.unread = false;
                     cursor.spare.2 = target;
                     cursor.leaf = None;
                     cursor.at = None;
@@ -2667,11 +2679,36 @@ pub struct Cursor {
     failed: Option<ValueRef>,
     /// The leaf it last read or was placed at, tried before a descent once `leaf` no longer holds.
     near: Near,
+    /// Whether a move leaves an out-of-line value unread, its entry holding the head and the
+    /// reference: for a reader whose values' pages stay while it may read them, as a versioned
+    /// tree's (DESIGN.md §6.5), which reads one when it is asked for.
+    lazy: bool,
+    /// The entry's value is out of line and unread.
+    unread: bool,
 }
 
 impl Cursor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A cursor whose moves leave an out-of-line value unread.
+    pub fn lazy() -> Self {
+        Self {
+            lazy: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether its moves read an out-of-line value: the next move's scan, not the entry it holds.
+    pub fn set_lazy(&mut self, lazy: bool) {
+        self.lazy = lazy;
+    }
+
+    /// Whether the entry's value is out of line and unread: its value is the head and the
+    /// reference, as the leaf holds them.
+    pub fn unread(&self) -> bool {
+        self.unread
     }
 
     /// Stands at `key`, with no leaf to step from and its value unread: the next move seeks from
@@ -2694,6 +2731,7 @@ impl Cursor {
         self.reading = None;
         self.held = None;
         self.near = near;
+        self.unread = false;
     }
 
     /// The leaf it last read or was placed at.
@@ -2746,7 +2784,8 @@ enum Scan {
 /// The entry `seek` from `target` lands on in the leaf `v`, its key and value copied into `key`
 /// and `value`. A leaf found by its hint (`cached`) must hold where the seek lands: cover the
 /// target, or, seeking above it, start right there. A step from the entry at `at` of the same
-/// leaf, unchanged since, is the slot beside it.
+/// leaf, unchanged since, is the slot beside it. Its one caller is a scan's every step.
+#[inline(always)]
 fn scan_leaf<P: Bytes + ?Sized>(
     v: View<'_, P>,
     seek: Seek,

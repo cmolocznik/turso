@@ -110,6 +110,7 @@ impl AtollDb {
             )
         })?;
         while found {
+            drive(self.io(), || catalog.load(&mut cursor))?;
             let row = cursor.value().expect("a row");
             named.insert(super::catalog::Entry::decode(row)?.root);
             found = drive(self.io(), || {

@@ -289,3 +289,49 @@ fn info(collation: CollationSeq, sort_order: SortOrder) -> KeyInfo {
         nulls_order: None,
     }
 }
+
+/// The digits below a number's leading one, as integer operations emit them, are the bytes of the
+/// digit-by-digit reading: each digit in turn, trailing zeros dropped, seven to a byte with the
+/// low bit saying whether more follow, for every position of the leading digit and values with
+/// every count of trailing zeros.
+#[test]
+fn digits_below_the_leading_one_are_the_digit_by_digit_bytes() {
+    fn by_digit(value: u64, top: u32) -> Vec<u8> {
+        let mut digits: Vec<bool> = (0..top).rev().map(|i| (value >> i) & 1 == 1).collect();
+        while digits.last() == Some(&false) {
+            digits.pop();
+        }
+        if digits.is_empty() {
+            return vec![0];
+        }
+        let groups: Vec<&[bool]> = digits.chunks(7).collect();
+        let mut out = Vec::new();
+        for (i, group) in groups.iter().enumerate() {
+            let mut v = 0u8;
+            for (j, &digit) in group.iter().enumerate() {
+                v |= (digit as u8) << (6 - j);
+            }
+            out.push((v << 1) | (i + 1 < groups.len()) as u8);
+        }
+        out
+    }
+    let mut rng = ChaCha8Rng::seed_from_u64(23);
+    let mut cases = 0;
+    for top in 0..64u32 {
+        for zeros in 0..=top {
+            for _ in 0..8 {
+                let low = if top == 0 {
+                    0
+                } else {
+                    rng.random::<u64>() >> (64 - top)
+                };
+                let value = (1u64 << top) | (low >> zeros << zeros);
+                let mut out = Vec::new();
+                digits_below(value, top, &mut out);
+                assert_eq!(out, by_digit(value, top), "{value:#x} below digit {top}");
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 8 * (1..=64).sum::<usize>());
+}

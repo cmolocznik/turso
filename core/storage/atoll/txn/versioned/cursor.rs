@@ -1,11 +1,17 @@
 //! A cursor over a versioned tree as a transaction's statement sees it (DESIGN.md §11.2, §17).
 //!
-//! It moves a plain [`Cursor`], which copies each leaf entry out whole, head and value, a value out
-//! of line read through the leaf that holds it. Each entry is judged by its newest version: one the
+//! It moves a plain [`Cursor`], which copies each leaf entry out, head and value, a value out of
+//! line left unread: its head is in the leaf. Each entry is judged by its newest version: one the
 //! statement sees is its row, or no row if it is a tombstone; one it does not is followed down its
-//! chain ([`VersionedTree::follow`]) to the version it does. A key with no version the statement
+//! chain ([`VersionedTree::follow_to`]) to the version it does. A key with no version the statement
 //! sees, or whose version is a tombstone, is passed over in the direction of the move. Like the
 //! plain cursor it holds no latch between steps.
+//!
+//! A row's value out of line is read only when asked for ([`VersionedTree::load`]), so a move that
+//! needs only keys, and an entry passed over, read no value page. Reading it later needs no check
+//! of the leaf: the pages of a version a statement sees stay while it may read them (DESIGN.md
+//! §6.5), a committed one's and an earlier statement's retired when replaced, and only a version
+//! the statement itself wrote, which it never sees, freed.
 //!
 //! Walking unseen ([`VersionedTree::unseen_first`]), it rests instead on each version the
 //! statement does not see that holds its key, newest first within a key and keys in order, with
@@ -13,7 +19,7 @@
 //! foreign key reads, so its scan compares each such version as the probe compares a row.
 
 use super::{corrupt_header, Chain, Transactions, Txn, Version, VersionedTree, Versions, HEADER};
-use crate::storage::atoll::btree::value::{Read, ValueRead};
+use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
 use crate::storage::atoll::btree::{Cursor, Near, Seek, StoredValue};
 use crate::types::IOResult;
 use crate::{LimboError, Result};
@@ -28,7 +34,6 @@ macro_rules! done {
 }
 
 /// A position in a versioned tree: a key and the value of the version the statement sees.
-#[derive(Default)]
 pub struct VersionedCursor {
     cursor: Cursor,
     /// The move under way, kept across steps.
@@ -42,6 +47,26 @@ pub struct VersionedCursor {
     target: Vec<u8>,
     /// The walk over versions the statement does not see, once begun.
     unseen: Option<Unseen>,
+    /// Where the row's value is.
+    value: Value,
+    /// The row's value read out of line, or the allocation kept for the next.
+    body: Vec<u8>,
+}
+
+/// Where the value of the row a cursor rests on is.
+#[derive(Default)]
+enum Value {
+    /// In the entry the row shows, or there is no row.
+    #[default]
+    InEntry,
+    /// Out of line, not read: by its reference.
+    Unread(ValueRef),
+    /// Out of line, being read.
+    Reading(ValueRead),
+    /// Read, in the cursor's body.
+    Read,
+    /// Read, and lent to the caller until given back.
+    Lent,
 }
 
 /// The row a cursor rests on.
@@ -55,6 +80,8 @@ enum Shown {
     /// A row held apart: a version below the newest, or the one the statement just wrote: its
     /// key, and the bytes its value is in from the offset given.
     Held(Vec<u8>, Vec<u8>, usize),
+    /// A version below the newest whose value is out of line: its key.
+    Apart(Vec<u8>),
 }
 
 /// Where a walk over unseen versions stands.
@@ -96,25 +123,76 @@ impl Move {
     }
 }
 
+impl Default for VersionedCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VersionedCursor {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            cursor: Cursor::lazy(),
+            moving: None,
+            chain: None,
+            entry: Shown::None,
+            spare: Default::default(),
+            target: Vec::new(),
+            unseen: None,
+            value: Value::InEntry,
+            body: Vec::new(),
+        }
     }
 
     pub fn key(&self) -> Option<&[u8]> {
         match &self.entry {
             Shown::None => None,
             Shown::Plain => self.cursor.key(),
-            Shown::Held(k, _, _) => Some(k),
+            Shown::Held(k, _, _) | Shown::Apart(k) => Some(k),
         }
     }
 
-    /// The value of the version the statement sees, without its header.
+    /// Whether the row's value is out of line and not read yet: [`VersionedTree::load`] reads it.
+    pub fn unread(&self) -> bool {
+        matches!(self.value, Value::Unread(_) | Value::Reading(_))
+    }
+
+    /// The value of the version the statement sees, without its header. A value out of line is
+    /// read first ([`VersionedTree::load`]).
     pub fn value(&self) -> Option<&[u8]> {
-        match &self.entry {
-            Shown::None => None,
-            Shown::Plain => self.cursor.value().and_then(|v| v.get(HEADER..)),
-            Shown::Held(_, v, from) => v.get(*from..),
+        match (&self.entry, &self.value) {
+            (Shown::None, _) => None,
+            (_, Value::Read) => Some(&self.body),
+            (_, Value::Unread(_) | Value::Reading(_)) => {
+                panic!("a row's value out of line asked for before it is read")
+            }
+            (_, Value::Lent) => panic!("a row's value asked for while it is lent"),
+            (Shown::Plain, Value::InEntry) => self.cursor.value().and_then(|v| v.get(HEADER..)),
+            (Shown::Held(_, v, from), Value::InEntry) => v.get(*from..),
+            (Shown::Apart(_), Value::InEntry) => {
+                unreachable!("a row apart keeps its value out of line")
+            }
+        }
+    }
+
+    /// The row's value, read out of line, handed over whole: the cursor keeps no copy until it is
+    /// given back. `None` where the value is in the row's entry.
+    pub fn lend_value(&mut self) -> Option<Vec<u8>> {
+        if !matches!(self.value, Value::Read) {
+            return None;
+        }
+        self.value = Value::Lent;
+        Some(std::mem::take(&mut self.body))
+    }
+
+    /// Takes back a value [lent](Self::lend_value): the row's again while the cursor has not
+    /// moved since, else an allocation kept for the next read.
+    pub fn give_back(&mut self, bytes: Vec<u8>) {
+        if matches!(self.value, Value::Lent) {
+            self.body = bytes;
+            self.value = Value::Read;
+        } else if bytes.capacity() > self.body.capacity() {
+            self.body = bytes;
         }
     }
 
@@ -143,8 +221,10 @@ impl VersionedCursor {
         self.moving = None;
         self.chain = None;
         self.unseen = None;
+        self.value = Value::InEntry;
         match std::mem::replace(&mut self.entry, Shown::Held(key, entry, from)) {
             Shown::Held(k, v, _) => (k, v),
+            Shown::Apart(k) => (k, std::mem::take(&mut self.spare.1)),
             _ => std::mem::take(&mut self.spare),
         }
     }
@@ -183,6 +263,7 @@ impl VersionedTree {
             cursor.target.extend_from_slice(key);
             cursor.moving = Some(Move::Seek(seek));
             cursor.chain = None;
+            cursor.cursor.set_lazy(true);
         }
         self.settle(txns, versions, txn, cursor)
     }
@@ -223,6 +304,7 @@ impl VersionedTree {
             }
             cursor.moving = Some(Move::Step { forward });
             cursor.chain = None;
+            cursor.cursor.set_lazy(true);
         }
         self.settle(txns, versions, txn, cursor)
     }
@@ -239,10 +321,18 @@ impl VersionedTree {
         loop {
             let moving = cursor.moving.expect("a move under way");
             if let Some((_, chain)) = &mut cursor.chain {
-                let found = done!(self.follow(txns, versions, txn, chain));
+                let found = done!(self.follow_to(txns, versions, txn, chain));
                 let (key, _) = cursor.chain.take().expect("a chain");
-                if let Some(value) = found {
-                    return Ok(IOResult::Done(cursor.rest(Shown::Held(key, value, 0))));
+                match found {
+                    Some(StoredValue::Inline(value)) => {
+                        return Ok(IOResult::Done(cursor.rest(Shown::Held(key, value, 0))))
+                    }
+                    Some(StoredValue::OutOfLine(reference)) => {
+                        let found = cursor.rest(Shown::Apart(key));
+                        cursor.value = Value::Unread(reference);
+                        return Ok(IOResult::Done(found));
+                    }
+                    None => {}
                 }
                 // No row for this key: on in the move's direction.
                 cursor.moving = Some(Move::Step {
@@ -275,7 +365,12 @@ impl VersionedTree {
                 continue;
             }
             // The newest version, shown where the plain cursor holds it.
-            return Ok(IOResult::Done(cursor.rest(Shown::Plain)));
+            let unread = self.tree().unread_reference(&cursor.cursor);
+            let found = cursor.rest(Shown::Plain);
+            if let Some(reference) = unread {
+                cursor.value = Value::Unread(reference);
+            }
+            return Ok(IOResult::Done(found));
         }
     }
 }
@@ -295,6 +390,8 @@ impl VersionedTree {
             cursor.unseen = Some(Unseen::Key { first: true });
             cursor.moving = Some(Move::Step { forward: true });
             cursor.chain = None;
+            // An unseen version's pages may go under a later read: read each through its leaf.
+            cursor.cursor.set_lazy(false);
         }
         self.walk_unseen(txns, versions, txn, cursor)
     }
@@ -314,6 +411,7 @@ impl VersionedTree {
             let key = cursor.key().expect("a shown version").to_vec();
             cursor.unseen = Some(Unseen::Below { key, v });
             cursor.moving = Some(Move::Step { forward: true });
+            cursor.cursor.set_lazy(false);
         }
         self.walk_unseen(txns, versions, txn, cursor)
     }
@@ -373,6 +471,7 @@ impl VersionedTree {
                     cursor.unseen = Some(Unseen::Shown { v });
                     cursor.moving = None;
                     cursor.chain = None;
+                    cursor.value = Value::InEntry;
                     cursor.entry = Shown::Held(key, read, 0);
                     return Ok(IOResult::Done(true));
                 }
@@ -398,13 +497,48 @@ impl VersionedTree {
     }
 }
 
+impl VersionedTree {
+    /// Reads the value of the row `cursor` rests on, where its move left it unread. Step it until
+    /// done.
+    pub fn load(&self, cursor: &mut VersionedCursor) -> Result<IOResult<()>> {
+        loop {
+            match &mut cursor.value {
+                Value::Unread(reference) => {
+                    let read = ValueRead::reusing(*reference, std::mem::take(&mut cursor.body));
+                    cursor.value = Value::Reading(read);
+                }
+                Value::Reading(read) => {
+                    // The row's version is one the statement sees: nothing frees its pages under
+                    // this read.
+                    match done!(read.step(&self.pool, &|| true)) {
+                        Read::Value(bytes) => {
+                            cursor.body = bytes;
+                            cursor.value = Value::Read;
+                        }
+                        Read::Changed | Read::Unheld => {
+                            return Err(LimboError::Corrupt(format!(
+                                "the out-of-line value {:?} of a version a snapshot reads is gone",
+                                read.reference()
+                            )))
+                        }
+                    }
+                }
+                _ => return Ok(IOResult::Done(())),
+            }
+        }
+    }
+}
+
 impl VersionedCursor {
     /// Ends the move at `entry`, or at no row: whether it found one.
     fn rest(&mut self, entry: Shown) -> bool {
         self.moving = None;
         self.chain = None;
-        if let Shown::Held(k, v, _) = std::mem::replace(&mut self.entry, entry) {
-            self.spare = (k, v);
+        self.value = Value::InEntry;
+        match std::mem::replace(&mut self.entry, entry) {
+            Shown::Held(k, v, _) => self.spare = (k, v),
+            Shown::Apart(k) => self.spare.0 = k,
+            _ => {}
         }
         !matches!(self.entry, Shown::None)
     }

@@ -3,56 +3,41 @@
 //! Every entry starts with a version header, kept in the leaf:
 //!
 //! ```text
-//! slot: u16 | ts: u64 | command: u32 | updates: u8 | flags: u8
+//! slot: u16 | flags: u8 | updates: u8 | command: u32 | ts: u64 | prev: u64
 //! ```
 //!
-//! naming the transaction that wrote the version (its slot and start) and the statement within it.
-//! The leaf holds the newest version. Each slot keeps a version index per node class: a temporary
-//! tree of the versions its transactions replaced, keyed
-//!
-//! ```text
-//! ts | command | tree | key
-//! ```
-//!
-//! by the version that replaced it: the replacing transaction's start, the replacing statement,
-//! the tree's root and the key. A reader starts from the newest version and, while it is not
-//! visible, follows the chain into the writer's version index. The statement is in the key so that
-//! a statement changing a row an earlier statement of its transaction changed keeps that earlier
-//! version, which it still reads, and before the tree so that a transaction's entries, read
-//! backward, come newest statement first, as rollback puts them back ([`super::rollback`]).
+//! naming the transaction that wrote the version (its slot and start), the statement within it,
+//! and where the version below it lies: an entry of the writer's slot's version arena
+//! ([`super::arena`]), or none for a key that had no entry before. The leaf holds the newest
+//! version. A reader starts from it and, while a version is not visible, follows `prev` to the
+//! entry holding the one below: a pointer, never a search.
 //!
 //! A writer judges the newest version first: another slot's open transaction makes it wait, and,
-//! under snapshot isolation, one committed after its snapshot is a conflict. It then puts the
-//! version it replaces into its version index, and writes over the newest version only if that is
-//! still the one it judged.
+//! under snapshot isolation, one committed after its snapshot is a conflict. It then appends what
+//! it replaces to its arena, and writes over the newest version only if that is still the one it
+//! judged. A statement writing a key again keeps the entry its first write made, which holds what
+//! the statement found: no one reads the versions between, every read resolving to that.
 //!
-//! A value too long for its leaf goes out of line, and an index entry holds the replaced version's
+//! A value too long for its leaf goes out of line, and an arena entry holds the replaced version's
 //! reference to it. The pages of a version replaced are retired, kept while a snapshot may read it
 //! (DESIGN.md §6.5), unless only the replacing statement wrote that version: no one reads it, since
 //! others follow the chain to what the statement found, so its pages go at once. The change then
 //! logs the entry its statement found as what undoes it, which a rollback put back already.
 
+use super::arena::{Arenas, Ptr};
 use super::{Blocker, Isolation, Statement, Transactions, Ts, Txn, Writer};
 use crate::io::IO;
 use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
-use crate::storage::atoll::btree::{Lookup, Mode, Outcome, Put, Stored, StoredValue, Tree};
+use crate::storage::atoll::btree::{Lookup, Mode, Near, Outcome, Put, Stored, StoredValue, Tree};
 use crate::storage::atoll::buffer::BufferPool;
-use crate::storage::atoll::page::{PageId, SizeClass, CLASS_COUNT};
+use crate::storage::atoll::page::PageId;
 use crate::storage::atoll::store::PageStore;
-use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::types::IOResult;
 use crate::{LimboError, Result};
 
 /// Bytes of the version header.
-pub const HEADER: usize = 16;
-
-/// Bytes of a version index key before the tree's key: the replacing transaction's start, its
-/// statement and the tree's root.
-pub(super) const INDEX_PREFIX: usize = 8 + 4 + 8;
-
-/// The largest node class (64 KiB, the most 16-bit slots address).
-const MAX_NODE_CLASS: usize = 4;
+pub const HEADER: usize = 24;
 
 macro_rules! done {
     ($e:expr) => {
@@ -71,21 +56,22 @@ pub struct Version {
     /// Updates while the oldest snapshot stayed the same: what turns a tuple fat.
     pub updates: u8,
     pub flags: u8,
+    /// The arena entry holding the version below this one: `None` if the key had no entry before.
+    pub prev: Option<Ptr>,
 }
 
 impl Version {
     /// The key was deleted: this version says it is absent.
     pub const DELETED: u8 = 1;
-    /// The key had no entry before this version: there is no earlier one to follow.
-    pub const FIRST: u8 = 2;
 
     pub fn encode(&self) -> [u8; HEADER] {
         let mut out = [0u8; HEADER];
         out[0..2].copy_from_slice(&self.slot.to_le_bytes());
-        out[2..10].copy_from_slice(&self.ts.to_le_bytes());
-        out[10..14].copy_from_slice(&self.command.to_le_bytes());
-        out[14] = self.updates;
-        out[15] = self.flags;
+        out[2] = self.flags;
+        out[3] = self.updates;
+        out[4..8].copy_from_slice(&self.command.to_le_bytes());
+        out[8..16].copy_from_slice(&self.ts.to_le_bytes());
+        out[16..24].copy_from_slice(&self.prev.map_or(0, Ptr::raw).to_le_bytes());
         out
     }
 
@@ -93,19 +79,16 @@ impl Version {
         let head: &[u8; HEADER] = head.try_into().ok()?;
         Some(Self {
             slot: u16::from_le_bytes([head[0], head[1]]),
-            ts: u64::from_le_bytes(head[2..10].try_into().unwrap()),
-            command: u32::from_le_bytes(head[10..14].try_into().unwrap()),
-            updates: head[14],
-            flags: head[15],
+            flags: head[2],
+            updates: head[3],
+            command: u32::from_le_bytes(head[4..8].try_into().unwrap()),
+            ts: u64::from_le_bytes(head[8..16].try_into().unwrap()),
+            prev: Ptr::from_raw(u64::from_le_bytes(head[16..24].try_into().unwrap())),
         })
     }
 
     fn deleted(&self) -> bool {
         self.flags & Self::DELETED != 0
-    }
-
-    fn first(&self) -> bool {
-        self.flags & Self::FIRST != 0
     }
 }
 
@@ -115,32 +98,20 @@ const ABSENT: u8 = 1;
 /// reference to it follows its header.
 const OUT_OF_LINE: u8 = 2;
 
-/// The version index key of the version replaced by `(ts, command)`'s write of `key` in `tree`.
-pub(super) fn index_key(ts: Ts, command: Statement, tree: PageId, key: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(INDEX_PREFIX + key.len());
-    out.extend_from_slice(&ts.to_be_bytes());
-    out.extend_from_slice(&command.to_be_bytes());
-    out.extend_from_slice(&tree.raw().to_be_bytes());
-    out.extend_from_slice(key);
-    out
-}
-
-/// What a version index key names: the replacing transaction's start and statement, the tree and
-/// the key.
-pub(super) fn index_key_parts(key: &[u8]) -> Option<(Ts, Statement, PageId, &[u8])> {
-    if key.len() < INDEX_PREFIX {
-        return None;
+/// The first byte of an arena entry's version replaced, for the entry `leaf` as its leaf stores it
+/// and whether its value is out of line; [`ABSENT`] for none. The leaf's bytes follow it whole.
+fn entry_kind(leaf: Option<(&[u8], bool)>) -> u8 {
+    match leaf {
+        None => ABSENT,
+        Some((_, false)) => 0,
+        Some((_, true)) => OUT_OF_LINE,
     }
-    Some((
-        u64::from_be_bytes(key[0..8].try_into().unwrap()),
-        u32::from_be_bytes(key[8..12].try_into().unwrap()),
-        PageId::from_raw(u64::from_be_bytes(key[12..20].try_into().unwrap())),
-        &key[INDEX_PREFIX..],
-    ))
 }
 
-/// A replaced version as its index entry holds it: none, or its header, then its inline value or
-/// the reference to its value out of line.
+/// A replaced version as an arena entry holds it: none, or its header, then its inline value or
+/// the reference to its value out of line. A write appends the same bytes in pieces, from its
+/// look at the leaf.
+#[cfg(test)]
 fn encode_entry(stored: Option<&Stored>) -> Vec<u8> {
     let Some(s) = stored else {
         return vec![ABSENT];
@@ -162,7 +133,7 @@ fn encode_entry(stored: Option<&Stored>) -> Vec<u8> {
 }
 
 pub(super) fn decode_entry(entry: &[u8]) -> Result<Option<Stored>> {
-    let corrupt = || LimboError::Corrupt("a version index entry does not decode".into());
+    let corrupt = || LimboError::Corrupt("an arena entry's version does not decode".into());
     match entry.first() {
         Some(&ABSENT) => Ok(None),
         Some(&kind @ (0 | OUT_OF_LINE)) if entry.len() > HEADER => {
@@ -181,14 +152,12 @@ pub(super) fn decode_entry(entry: &[u8]) -> Result<Option<Stored>> {
     }
 }
 
-/// The version indexes of every slot.
+/// Every slot's version arena, and what reading and rolling back through them needs.
 pub struct Versions {
     io: Arc<dyn IO>,
     pool: Arc<BufferPool>,
     store: Arc<PageStore>,
-    /// Per slot and node class, the root of its version index once created, set once by
-    /// compare-and-swap: its raw id plus one, 0 for none.
-    roots: Box<[[AtomicU64; CLASS_COUNT]]>,
+    arenas: Arenas,
     /// A test's stop for a writer ([`Versions::stop_next_writer`]): 0, [`STOP`] or [`STOPPED`].
     #[cfg(test)]
     stop: crate::sync::atomic::AtomicU8,
@@ -210,30 +179,17 @@ impl Versions {
     ) -> Self {
         Self {
             io,
+            arenas: Arenas::new(pool.clone(), slots),
             pool,
             store,
-            roots: (0..slots)
-                .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
-                .collect(),
             #[cfg(test)]
             stop: crate::sync::atomic::AtomicU8::new(0),
         }
     }
 
-    /// The roots of `slot`'s version indexes made so far, one per node class at most.
-    pub(super) fn index_roots(&self, slot: u16) -> Vec<PageId> {
-        self.roots[slot as usize]
-            .iter()
-            .filter_map(|cell| match cell.load(Ordering::Acquire) {
-                0 => None,
-                raw => Some(PageId::from_raw(raw - 1)),
-            })
-            .collect()
-    }
-
-    /// The version index rooted at `root`.
-    pub(super) fn open_index(&self, root: PageId) -> Tree {
-        Tree::open(self.io.clone(), self.pool.clone(), self.store.clone(), root)
+    /// The slots' arenas.
+    pub(super) fn arenas(&self) -> &Arenas {
+        &self.arenas
     }
 
     /// The plain tree rooted at `root`.
@@ -250,42 +206,22 @@ impl Versions {
         VersionedTree::open(self.io.clone(), self.pool.clone(), self.store.clone(), root)
     }
 
-    /// The node class of the version index for trees of `class`: one larger, so its keys hold a
-    /// tree's longest key and the [`INDEX_PREFIX`] bytes before it.
-    fn index_class(class: SizeClass) -> SizeClass {
-        SizeClass::new((class.index() + 1).min(MAX_NODE_CLASS)).expect("a class")
-    }
-
-    /// `slot`'s version index for trees of `class`, created if it has none.
-    fn index(&self, slot: u16, class: SizeClass) -> Result<IOResult<Tree>> {
-        let class = Self::index_class(class);
-        let cell = &self.roots[slot as usize][class.index()];
-        let root = match cell.load(Ordering::Acquire) {
-            0 => {
-                let root = done!(Tree::create_temporary(
-                    &self.io,
-                    &self.pool,
-                    &self.store,
-                    class
-                ));
-                match cell.compare_exchange(0, root.raw() + 1, Ordering::AcqRel, Ordering::Acquire)
-                {
-                    Ok(_) => root,
-                    // Created meanwhile by another reader: this one is never used.
-                    Err(other) => {
-                        self.store.orphaned(root);
-                        PageId::from_raw(other - 1)
-                    }
-                }
-            }
-            raw => PageId::from_raw(raw - 1),
+    /// The version below `v`, a version of a key, as the arena entry `v` names holds it: `None`
+    /// for a key that had no entry before. Step it until done.
+    pub(super) fn below(&self, v: &Version) -> Result<IOResult<Option<Stored>>> {
+        let Some(ptr) = v.prev else {
+            return Ok(IOResult::Done(None));
         };
-        Ok(IOResult::Done(Tree::open(
-            self.io.clone(),
-            self.pool.clone(),
-            self.store.clone(),
-            root,
-        )))
+        let entry = done!(self.arenas.read(ptr));
+        let earlier = decode_entry(&entry.replaced)?;
+        if let Some(e) = &earlier {
+            if Version::decode(&e.head).ok_or_else(corrupt_header)? == *v {
+                return Err(LimboError::Corrupt(format!(
+                    "the version {v:?} replaced itself in its arena"
+                )));
+            }
+        }
+        Ok(IOResult::Done(earlier))
     }
 }
 
@@ -431,6 +367,8 @@ pub struct WriteOp {
     /// The tree's put under way, kept across steps so a value out of line is written once, and
     /// whether the key was present when the put was judged.
     put: Option<(Put, bool)>,
+    /// The leaf tried first, then the leaf the write reached.
+    near: Near,
 }
 
 impl WriteOp {
@@ -440,6 +378,7 @@ impl WriteOp {
             value: Some(value),
             mode,
             put: None,
+            near: Near::NONE,
         }
     }
 
@@ -451,7 +390,19 @@ impl WriteOp {
             value: None,
             mode: Mode::Update,
             put: None,
+            near: Near::NONE,
         }
+    }
+
+    /// Tries `near` before a descent.
+    pub fn near(mut self, near: Near) -> Self {
+        self.near = near;
+        self
+    }
+
+    /// The leaf the write reached: where its key is, unless the leaf has changed since.
+    pub fn reached(&self) -> Near {
+        self.near
     }
 }
 
@@ -479,11 +430,18 @@ impl VersionedTree {
     /// Probes `key` on a write path, judged by its newest version as a write would judge it: a
     /// version another transaction holds open is waited for, and under snapshot isolation one
     /// committed after the snapshot is a conflict. Step it until done.
-    pub fn probe(&self, txns: &Transactions, txn: &mut Txn, key: &[u8]) -> Result<IOResult<Probe>> {
+    /// The leaf at `near` is tried first.
+    pub fn probe(
+        &self,
+        txns: &Transactions,
+        txn: &mut Txn,
+        key: &[u8],
+        near: Near,
+    ) -> Result<IOResult<Probe>> {
         // A version found gone: rolled back since it was read, unless it is still there.
         let mut gone = None;
         loop {
-            let stored = done!(self.tree.stored(key));
+            let stored = done!(self.tree.stored_near(key, near));
             let Some(v) = stored
                 .as_ref()
                 .map(|s| Version::decode(&s.head).ok_or_else(corrupt_header))
@@ -579,33 +537,17 @@ impl VersionedTree {
                     }
                 }
             }
-            if v.first() {
-                return Ok(IOResult::Done(Guard::Clear));
-            }
-            let index = done!(versions.index(v.slot, self.tree.root().class()));
-            let mut lookup = Lookup::new(&index_key(v.ts, v.command, self.root(), &op.key));
-            let Some(entry) = done!(index.lookup(&mut lookup)) else {
-                return Err(LimboError::Corrupt(format!(
-                    "the version {v:?} of a key replaced nothing in its version index"
-                )));
-            };
             // The key had no entry before: the snapshot reads it absent.
-            let Some(earlier) = decode_entry(&entry)? else {
+            let Some(earlier) = done!(versions.below(&v)) else {
                 return Ok(IOResult::Done(Guard::Clear));
             };
-            let e = Version::decode(&earlier.head).ok_or_else(corrupt_header)?;
-            if e == v {
-                return Err(LimboError::Corrupt(format!(
-                    "the version {v:?} replaced itself in its version index"
-                )));
-            }
-            op.at = Some(e);
+            op.at = Some(Version::decode(&earlier.head).ok_or_else(corrupt_header)?);
             op.newest = false;
         }
     }
 
     /// The plain put of `key` by `txn`'s current statement into a tree that statement created:
-    /// no other transaction can see the tree, so the entry needs no earlier version and no index
+    /// no other transaction can see the tree, so the entry needs no earlier version and no arena
     /// entry, and an undo of the creation frees the tree whole (DESIGN.md §17). Every write the
     /// creating statement makes into its tree is plain.
     pub fn plain_put(&self, txn: &Txn, key: &[u8], value: Vec<u8>, mode: Mode) -> Put {
@@ -614,18 +556,17 @@ impl VersionedTree {
             ts: txn.start,
             command: txn.command,
             updates: 0,
-            flags: Version::FIRST,
+            flags: 0,
+            prev: None,
         }
         .encode();
         Put::with_head(key, head.to_vec(), value, mode)
     }
 
-    /// The longest key: the tree's, and what its version index keys hold.
+    /// The longest key: the tree's. An arena page holds an entry of any key a tree of any class
+    /// holds ([`super::arena::CLASS`]).
     pub fn max_key(&self) -> usize {
-        let index = Versions::index_class(self.tree.root().class());
-        let index_max =
-            crate::storage::atoll::btree::node::Limits::of(index).max_key - INDEX_PREFIX;
-        self.tree.limits().max_key.min(index_max)
+        self.tree.limits().max_key
     }
 
     /// The value of `op`'s key that `txn`'s current statement reads. Step it until done.
@@ -650,7 +591,7 @@ impl VersionedTree {
                 }
             }
             if let Some(chain) = &mut op.chain {
-                return self.follow(txns, versions, txn, &op.key, chain);
+                return self.follow(txns, versions, txn, chain);
             }
             let Some(stored) = done!(self.tree.stored(&op.key)) else {
                 return Ok(IOResult::Done(None));
@@ -670,7 +611,7 @@ impl VersionedTree {
         }
     }
 
-    /// The value of `key` that `txn`'s current statement reads, following its chain from a
+    /// The value of the chain's key that `txn`'s current statement reads, following it from a
     /// version the statement does not see: `None` for a key it reads as absent. Step it until
     /// done.
     fn follow(
@@ -678,7 +619,6 @@ impl VersionedTree {
         txns: &Transactions,
         versions: &Versions,
         txn: &mut Txn,
-        key: &[u8],
         chain: &mut Chain,
     ) -> Result<IOResult<Option<Vec<u8>>>> {
         loop {
@@ -695,25 +635,10 @@ impl VersionedTree {
                 };
             }
             let v = chain.at;
-            if v.first() {
-                return Ok(IOResult::Done(None));
-            }
-            let index = done!(versions.index(v.slot, self.tree.root().class()));
-            let mut lookup = Lookup::new(&index_key(v.ts, v.command, self.root(), key));
-            let Some(entry) = done!(index.lookup(&mut lookup)) else {
-                return Err(LimboError::Corrupt(format!(
-                    "the version {v:?} of a key replaced nothing in its version index"
-                )));
-            };
-            let Some(earlier) = decode_entry(&entry)? else {
+            let Some(earlier) = done!(versions.below(&v)) else {
                 return Ok(IOResult::Done(None));
             };
             let e = Version::decode(&earlier.head).ok_or_else(corrupt_header)?;
-            if e == v {
-                return Err(LimboError::Corrupt(format!(
-                    "the version {v:?} replaced itself in its version index"
-                )));
-            }
             if !txns.visible(txn, e.slot, e.ts) {
                 chain.at = e;
                 continue;
@@ -756,6 +681,7 @@ impl VersionedTree {
                     }
                     _ => {
                         let (put, _) = op.put.take().expect("a put");
+                        op.near = put.reached();
                         txn.logged(put.group().expect("a versioned tree's change is logged"));
                         return Ok(IOResult::Done(Write::Done(if present {
                             Outcome::Updated
@@ -765,10 +691,17 @@ impl VersionedTree {
                     }
                 }
             }
-            let stored = done!(self.tree.stored(&op.key));
-            let newest = match &stored {
+            // One look serves the judgment and the write: the put goes in at its leaf if the leaf
+            // is still as the look found it.
+            let looked = done!(self.tree.look(&op.key, op.near));
+            op.near = looked.near();
+            let leaf_entry = looked.present();
+            let newest = match leaf_entry {
                 None => None,
-                Some(s) => Some(Version::decode(&s.head).ok_or_else(corrupt_header)?),
+                Some((b, _)) => Some(
+                    Version::decode(b.get(..HEADER).ok_or_else(corrupt_header)?)
+                        .ok_or_else(corrupt_header)?,
+                ),
             };
             let own = newest.is_some_and(|v| v.slot == txn.slot && v.ts == txn.start);
             if let Some(v) = newest.filter(|_| !own) {
@@ -808,58 +741,72 @@ impl VersionedTree {
                 }
                 _ => {}
             }
-            let same_statement = own && newest.is_some_and(|v| v.command == txn.command);
-            let index = done!(versions.index(txn.slot, self.tree.root().class()));
-            let at = index_key(txn.start, txn.command, self.root(), &op.key);
-            // The version replaced, unless this statement already replaced one of the key's: then
-            // what the statement found, which undoing this change puts back.
-            let found = if same_statement {
-                let Some(entry) = done!(index.lookup(&mut Lookup::new(&at))) else {
-                    return Err(LimboError::Corrupt(format!(
-                        "a statement's version of a key replaced nothing in its version index: \
-                         {newest:?}"
-                    )));
-                };
-                Some(decode_entry(&entry)?)
-            } else {
-                done!(index.put(&mut Put::new(
-                    &at,
-                    encode_entry(stored.as_ref()),
-                    Mode::Upsert
-                )));
-                None
+            // A statement writing the key again keeps the entry its first write made, which holds
+            // what it found: what undoing this change puts back. Any other write appends what it
+            // replaces, and its version names that entry unless the key had none.
+            let (found, prev) = match newest.filter(|v| own && v.command == txn.command) {
+                Some(v) => (Some(done!(versions.below(&v))), v.prev),
+                None => {
+                    // Its kind, then the entry as the leaf stores it, copied from the look.
+                    let kind = [entry_kind(leaf_entry)];
+                    let entry = leaf_entry.map_or(&[][..], |(b, _)| b);
+                    let ptr = done!(versions.arenas().append_pieces(
+                        txn,
+                        self.root(),
+                        &op.key,
+                        &[&kind, entry]
+                    ));
+                    (None, leaf_entry.is_some().then_some(ptr))
+                }
             };
-            // Still no earlier version if the key had none, or only this statement's.
-            let mut flags = 0;
-            if stored.is_none() || (same_statement && newest.is_some_and(|v| v.first())) {
-                flags |= Version::FIRST;
-            }
-            if op.value.is_none() {
-                flags |= Version::DELETED;
-            }
+            let flags = match op.value {
+                Some(_) => 0,
+                None => Version::DELETED,
+            };
             let head = Version {
                 slot: txn.slot,
                 ts: txn.start,
                 command: txn.command,
                 updates: 0,
                 flags,
+                prev,
             }
             .encode();
-            let put = Put::with_head(
-                &op.key,
-                head.to_vec(),
-                op.value.clone().unwrap_or_default(),
-                Mode::Upsert,
-            )
-            .expecting(stored.as_ref())
-            .in_transaction(txns.tail(txn));
+            // A delete keeps an inline value where it lies, so only the head changes: a reader
+            // below it reads that value with the head it replaced. A value out of line goes, its
+            // pages retired.
+            let value = match (&op.value, leaf_entry) {
+                (Some(value), _) => value.as_slice(),
+                (None, Some((entry, false))) => entry.get(HEADER..).ok_or_else(corrupt_header)?,
+                (None, _) => &[],
+            };
+            let mut entry = Vec::with_capacity(HEADER + value.len());
+            entry.extend_from_slice(&head);
+            entry.extend_from_slice(value);
+            let put = Put::with_entry(&op.key, entry, HEADER, Mode::Upsert)
+                .expecting_entry(leaf_entry)
+                .in_transaction(txns.tail(txn));
             let put = match &found {
                 // A version only this statement wrote is read by no one: its pages go.
                 Some(found) => put.undoing(found.as_ref()),
                 // Another's may be read by a snapshot: they stay, retired.
                 None => put.retiring(),
             };
-            op.put = Some((put, present));
+            let (put, _) = op.put.insert((put, present));
+            match done!(self.tree.put_looked(put, looked)) {
+                // Another version came first: judge it.
+                Outcome::Changed => op.put = None,
+                _ => {
+                    let (put, _) = op.put.take().expect("a put");
+                    op.near = put.reached();
+                    txn.logged(put.group().expect("a versioned tree's change is logged"));
+                    return Ok(IOResult::Done(Write::Done(if present {
+                        Outcome::Updated
+                    } else {
+                        Outcome::Inserted
+                    })));
+                }
+            }
         }
     }
 }
@@ -875,28 +822,32 @@ impl Versions {
     /// Stops the next writer to read a key whose newest version is another transaction's, before
     /// it looks at that transaction, until [`Versions::go_on`].
     fn stop_next_writer(&self) {
-        self.stop.store(STOP, Ordering::Release);
+        self.stop
+            .store(STOP, crate::sync::atomic::Ordering::Release);
     }
 
     /// Waits until a writer is stopped.
     fn stopped_writer(&self) {
-        while self.stop.load(Ordering::Acquire) != STOPPED {
+        while self.stop.load(crate::sync::atomic::Ordering::Acquire) != STOPPED {
             crate::thread::yield_now();
         }
     }
 
     /// Lets the stopped writer go on.
     fn go_on(&self) {
-        self.stop.store(0, Ordering::Release);
+        self.stop.store(0, crate::sync::atomic::Ordering::Release);
     }
 
     /// Where a writer stops, if the next one is to.
     fn stop_here(&self) {
-        let stop = self
-            .stop
-            .compare_exchange(STOP, STOPPED, Ordering::AcqRel, Ordering::Acquire);
+        let stop = self.stop.compare_exchange(
+            STOP,
+            STOPPED,
+            crate::sync::atomic::Ordering::AcqRel,
+            crate::sync::atomic::Ordering::Acquire,
+        );
         if stop.is_ok() {
-            while self.stop.load(Ordering::Acquire) == STOPPED {
+            while self.stop.load(crate::sync::atomic::Ordering::Acquire) == STOPPED {
                 crate::thread::yield_now();
             }
         }

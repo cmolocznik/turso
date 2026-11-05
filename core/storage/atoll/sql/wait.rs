@@ -156,6 +156,12 @@ impl WaitRecord {
     pub fn flagged(&self) -> bool {
         self.state.load(Ordering::Acquire) == FLAGGED
     }
+
+    /// Whether its waiter has parked on it, for a test to order a wake after the park.
+    #[cfg(test)]
+    pub fn parked(&self) -> bool {
+        lock(&self.parked).is_some()
+    }
 }
 
 struct Node {

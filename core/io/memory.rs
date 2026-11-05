@@ -87,6 +87,18 @@ impl IO for MemoryIO {
         Ok(())
     }
 
+    fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        let mut files = self.files.lock();
+        let file = files
+            .remove(from)
+            .ok_or(crate::error::CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                "rename",
+            ))?;
+        files.insert(to.to_string(), file);
+        Ok(true)
+    }
+
     fn file_id(&self, path: &str) -> Result<super::FileId> {
         Ok(super::FileId::from_path_hash(path))
     }

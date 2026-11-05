@@ -12,12 +12,9 @@
 //! that version's value as the row: what R10's guard of a child table with no index on its
 //! foreign key reads, so its scan compares each such version as the probe compares a row.
 
-use super::{
-    corrupt_header, decode_entry, index_key, Chain, Transactions, Txn, Version, VersionedTree,
-    Versions, HEADER,
-};
+use super::{corrupt_header, Chain, Transactions, Txn, Version, VersionedTree, Versions, HEADER};
 use crate::storage::atoll::btree::value::{Read, ValueRead};
-use crate::storage::atoll::btree::{Cursor, Lookup, Seek, StoredValue};
+use crate::storage::atoll::btree::{Cursor, Near, Seek, StoredValue};
 use crate::types::IOResult;
 use crate::{LimboError, Result};
 
@@ -38,9 +35,25 @@ pub struct VersionedCursor {
     moving: Option<Move>,
     /// The chain of the entry the plain cursor is at, being followed: its key and where it stands.
     chain: Option<(Vec<u8>, Chain)>,
-    entry: Option<(Vec<u8>, Vec<u8>)>,
+    entry: Shown,
+    /// The buffers of the last row held apart, for the next.
+    spare: (Vec<u8>, Vec<u8>),
+    /// The key of the seek under way.
+    target: Vec<u8>,
     /// The walk over versions the statement does not see, once begun.
     unseen: Option<Unseen>,
+}
+
+/// The row a cursor rests on.
+#[derive(Default)]
+enum Shown {
+    #[default]
+    None,
+    /// The plain cursor's entry: the newest version, which the statement sees, read where the
+    /// plain cursor holds it, its value past the version header.
+    Plain,
+    /// A row held apart: a version below the newest, or the one the statement just wrote.
+    Held(Vec<u8>, Vec<u8>),
 }
 
 /// Where a walk over unseen versions stands.
@@ -53,7 +66,7 @@ enum Unseen {
         v: Version,
         value: UnseenValue,
     },
-    /// On to the version below `v` of `key`, through its writer's version index.
+    /// On to the version below `v` of `key`, through the arena entry `v` names.
     Below { key: Vec<u8>, v: Version },
     /// Resting on `v`, which the cursor's entry shows.
     Shown { v: Version },
@@ -65,19 +78,19 @@ enum UnseenValue {
     OutOfLine(ValueRead),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum Move {
-    /// The plain cursor's seek, not yet done.
-    Seek(Seek, Vec<u8>),
+    /// The plain cursor's seek from the cursor's target, not yet done.
+    Seek(Seek),
     /// On past the plain cursor's entry, forward or backward.
     Step { forward: bool },
 }
 
 impl Move {
-    fn forward(&self) -> bool {
+    fn forward(self) -> bool {
         match self {
-            Move::Seek(seek, _) => matches!(seek, Seek::Ge | Seek::Gt),
-            Move::Step { forward } => *forward,
+            Move::Seek(seek) => matches!(seek, Seek::Ge | Seek::Gt),
+            Move::Step { forward } => forward,
         }
     }
 }
@@ -88,12 +101,49 @@ impl VersionedCursor {
     }
 
     pub fn key(&self) -> Option<&[u8]> {
-        self.entry.as_ref().map(|(k, _)| k.as_slice())
+        match &self.entry {
+            Shown::None => None,
+            Shown::Plain => self.cursor.key(),
+            Shown::Held(k, _) => Some(k),
+        }
     }
 
     /// The value of the version the statement sees, without its header.
     pub fn value(&self) -> Option<&[u8]> {
-        self.entry.as_ref().map(|(_, v)| v.as_slice())
+        match &self.entry {
+            Shown::None => None,
+            Shown::Plain => self.cursor.value().and_then(|v| v.get(HEADER..)),
+            Shown::Held(_, v) => Some(v),
+        }
+    }
+
+    /// The leaf it last read or was placed at.
+    pub fn near(&self) -> Near {
+        self.cursor.near()
+    }
+
+    /// Tries `near` before its next descent.
+    pub fn set_near(&mut self, near: Near) {
+        self.cursor.set_near(near);
+    }
+
+    /// Stands at `key`, whose value `txn`'s statement just wrote as `value`: the row reads as
+    /// that, the statement's own version, and a move from it starts from the key, as after a seek
+    /// to it, trying `near` first.
+    pub fn place(&mut self, key: &[u8], value: &[u8], near: Near) {
+        self.cursor.place(key, near);
+        self.moving = None;
+        self.chain = None;
+        self.unseen = None;
+        let (mut k, mut v) = match std::mem::take(&mut self.entry) {
+            Shown::Held(k, v) => (k, v),
+            _ => std::mem::take(&mut self.spare),
+        };
+        k.clear();
+        k.extend_from_slice(key);
+        v.clear();
+        v.extend_from_slice(value);
+        self.entry = Shown::Held(k, v);
     }
 
     /// The unseen version a walk over them rests on.
@@ -118,7 +168,9 @@ impl VersionedTree {
         seek: Seek,
     ) -> Result<IOResult<bool>> {
         if cursor.moving.is_none() {
-            cursor.moving = Some(Move::Seek(seek, key.to_vec()));
+            cursor.target.clear();
+            cursor.target.extend_from_slice(key);
+            cursor.moving = Some(Move::Seek(seek));
             cursor.chain = None;
         }
         self.settle(txns, versions, txn, cursor)
@@ -155,7 +207,7 @@ impl VersionedTree {
         forward: bool,
     ) -> Result<IOResult<bool>> {
         if cursor.moving.is_none() {
-            if cursor.entry.is_none() {
+            if matches!(cursor.entry, Shown::None) {
                 return Ok(IOResult::Done(false));
             }
             cursor.moving = Some(Move::Step { forward });
@@ -174,12 +226,12 @@ impl VersionedTree {
         cursor: &mut VersionedCursor,
     ) -> Result<IOResult<bool>> {
         loop {
-            let moving = cursor.moving.clone().expect("a move under way");
-            if let Some((key, chain)) = &mut cursor.chain {
-                let found = done!(self.follow(txns, versions, txn, key, chain));
+            let moving = cursor.moving.expect("a move under way");
+            if let Some((_, chain)) = &mut cursor.chain {
+                let found = done!(self.follow(txns, versions, txn, chain));
                 let (key, _) = cursor.chain.take().expect("a chain");
                 if let Some(value) = found {
-                    return Ok(IOResult::Done(cursor.rest(Some((key, value)))));
+                    return Ok(IOResult::Done(cursor.rest(Shown::Held(key, value))));
                 }
                 // No row for this key: on in the move's direction.
                 cursor.moving = Some(Move::Step {
@@ -187,19 +239,21 @@ impl VersionedTree {
                 });
                 continue;
             }
-            let found = match &moving {
-                Move::Seek(seek, key) => done!(self.tree().seek(&mut cursor.cursor, key, *seek)),
+            let found = match moving {
+                Move::Seek(seek) => {
+                    done!(self.tree().seek(&mut cursor.cursor, &cursor.target, seek))
+                }
                 Move::Step { forward: true } => done!(self.tree().next(&mut cursor.cursor)),
                 Move::Step { forward: false } => done!(self.tree().prev(&mut cursor.cursor)),
             };
             if !found {
-                return Ok(IOResult::Done(cursor.rest(None)));
+                return Ok(IOResult::Done(cursor.rest(Shown::None)));
             }
-            let key = cursor.cursor.key().expect("an entry").to_vec();
             let value = cursor.cursor.value().expect("an entry");
             let v =
                 Version::decode(value.get(..HEADER).unwrap_or(&[])).ok_or_else(corrupt_header)?;
             if !txns.visible(txn, v.slot, v.ts) {
+                let key = cursor.cursor.key().expect("an entry").to_vec();
                 cursor.chain = Some((key, Chain::from(v)));
                 continue;
             }
@@ -209,8 +263,8 @@ impl VersionedTree {
                 });
                 continue;
             }
-            let value = value[HEADER..].to_vec();
-            return Ok(IOResult::Done(cursor.rest(Some((key, value)))));
+            // The newest version, shown where the plain cursor holds it.
+            return Ok(IOResult::Done(cursor.rest(Shown::Plain)));
         }
     }
 }
@@ -246,7 +300,7 @@ impl VersionedTree {
             let Some(Unseen::Shown { v }) = cursor.unseen else {
                 return Ok(IOResult::Done(false));
             };
-            let key = cursor.entry.as_ref().expect("a shown version").0.clone();
+            let key = cursor.key().expect("a shown version").to_vec();
             cursor.unseen = Some(Unseen::Below { key, v });
             cursor.moving = Some(Move::Step { forward: true });
         }
@@ -270,7 +324,7 @@ impl VersionedTree {
                     };
                     if !found {
                         cursor.unseen = None;
-                        return Ok(IOResult::Done(cursor.rest(None)));
+                        return Ok(IOResult::Done(cursor.rest(Shown::None)));
                     }
                     let key = cursor.cursor.key().expect("an entry").to_vec();
                     let value = cursor.cursor.value().expect("an entry");
@@ -308,32 +362,16 @@ impl VersionedTree {
                     cursor.unseen = Some(Unseen::Shown { v });
                     cursor.moving = None;
                     cursor.chain = None;
-                    cursor.entry = Some((key, read));
+                    cursor.entry = Shown::Held(key, read);
                     return Ok(IOResult::Done(true));
                 }
                 Unseen::Below { key, v } => {
                     let v = *v;
-                    if v.first() {
-                        cursor.unseen = Some(Unseen::Key { first: false });
-                        continue;
-                    }
-                    let index = done!(versions.index(v.slot, self.tree().root().class()));
-                    let mut lookup = Lookup::new(&index_key(v.ts, v.command, self.root(), key));
-                    let Some(entry) = done!(index.lookup(&mut lookup)) else {
-                        return Err(LimboError::Corrupt(format!(
-                            "the version {v:?} of a key replaced nothing in its version index"
-                        )));
-                    };
-                    let Some(earlier) = decode_entry(&entry)? else {
+                    let Some(earlier) = done!(versions.below(&v)) else {
                         cursor.unseen = Some(Unseen::Key { first: false });
                         continue;
                     };
                     let e = Version::decode(&earlier.head).ok_or_else(corrupt_header)?;
-                    if e == v {
-                        return Err(LimboError::Corrupt(format!(
-                            "the version {v:?} replaced itself in its version index"
-                        )));
-                    }
                     let value = match earlier.value {
                         StoredValue::Inline(value) => UnseenValue::Read(value),
                         StoredValue::OutOfLine(reference) => {
@@ -351,10 +389,12 @@ impl VersionedTree {
 
 impl VersionedCursor {
     /// Ends the move at `entry`, or at no row: whether it found one.
-    fn rest(&mut self, entry: Option<(Vec<u8>, Vec<u8>)>) -> bool {
+    fn rest(&mut self, entry: Shown) -> bool {
         self.moving = None;
         self.chain = None;
-        self.entry = entry;
-        self.entry.is_some()
+        if let Shown::Held(k, v) = std::mem::replace(&mut self.entry, entry) {
+            self.spare = (k, v);
+        }
+        !matches!(self.entry, Shown::None)
     }
 }

@@ -308,6 +308,9 @@ pub struct Txn {
     /// Whether its database requires writers to hold the write gate
     /// ([`Transactions::require_gate`]): then it logs only under a hold.
     gated: bool,
+    /// Its first and last entries in its slot's version arena, once it has one: what a rollback
+    /// walks back (DESIGN.md §11.5).
+    replaced: Option<(arena::Ptr, arena::Ptr)>,
 }
 
 impl Txn {
@@ -538,9 +541,11 @@ impl Transactions {
         payload: &[&[u8]],
     ) -> Lsn {
         let (writers, slot, id) = (&self.writers, txn.slot, txn.start);
-        let (start, lsn) = self.log.append_with(admitted, &txn.header(kind), payload, |at| {
-            writers.reserved(slot, id, at)
-        });
+        let (start, lsn) = self
+            .log
+            .append_with(admitted, &txn.header(kind), payload, |at| {
+                writers.reserved(slot, id, at)
+            });
         txn.logged(start);
         lsn
     }
@@ -632,6 +637,7 @@ impl Transactions {
             wrote_schema: false,
             snapped: false,
             gated: self.gated.load(std::sync::atomic::Ordering::Acquire),
+            replaced: None,
         }))
     }
 
@@ -881,7 +887,10 @@ impl Transactions {
     /// Ends `txn`, which wrote nothing, without committing it. One that wrote is rolled back
     /// ([`rollback`](Self::rollback)).
     pub fn abort(&self, mut txn: Txn) {
-        assert!(!txn.wrote(), "aborting a transaction that wrote: roll it back");
+        assert!(
+            !txn.wrote(),
+            "aborting a transaction that wrote: roll it back"
+        );
         self.release_hold(&mut txn, None);
         self.release(txn.slot);
     }
@@ -890,7 +899,10 @@ impl Transactions {
     /// End appended, and its slot freed with no commit pair. Nothing waits for the log to be
     /// durable: a rollback a crash loses is undone again by recovery. Step it until done.
     pub fn rollback(&self, versions: &Versions, op: &mut Abort) -> Result<IOResult<()>> {
-        let txn = op.txn.as_mut().expect("a rollback stepped after it was done");
+        let txn = op
+            .txn
+            .as_mut()
+            .expect("a rollback stepped after it was done");
         if let IOResult::IO(io) = rollback::undo(self, versions, txn, &mut op.undo)? {
             return Ok(IOResult::IO(io));
         }
@@ -927,7 +939,10 @@ impl Transactions {
         txn: &mut Txn,
         op: &mut Rollback,
     ) -> Result<IOResult<()>> {
-        assert!(op.to() <= txn.command, "rolling back to a statement not yet run");
+        assert!(
+            op.to() <= txn.command,
+            "rolling back to a statement not yet run"
+        );
         if let IOResult::IO(io) = rollback::undo(self, versions, txn, op)? {
             return Ok(IOResult::IO(io));
         }
@@ -983,6 +998,7 @@ impl Transactions {
     }
 }
 
+pub mod arena;
 pub mod rollback;
 pub mod versioned;
 

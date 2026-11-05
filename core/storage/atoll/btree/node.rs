@@ -220,18 +220,23 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
     }
 
     fn slot(&self, i: usize) -> Option<Slot> {
-        if i >= self.count()? {
+        self.slot_of(i, self.count()?)
+    }
+
+    /// Slot `i` of a node holding `count`, as [`count`](Self::count) read it.
+    #[inline(always)]
+    fn slot_of(&self, i: usize, count: usize) -> Option<Slot> {
+        if i >= count {
             return None;
         }
         let at = SLOTS + i * SLOT;
-        let b: [u8; SLOT] = self.0.bytes(at);
-        let value = u16::from_le_bytes([b[4], b[5]]);
+        let value = self.0.u16_at(at + 4);
         let s = Slot {
-            off: u16::from_le_bytes([b[0], b[1]]) as usize,
-            key_len: u16::from_le_bytes([b[2], b[3]]) as usize,
+            off: self.0.u16_at(at) as usize,
+            key_len: self.0.u16_at(at + 2) as usize,
             value_len: (value & !OUT_OF_LINE) as usize,
             out_of_line: value & OUT_OF_LINE != 0,
-            head: u32::from_le_bytes(b[6..10].try_into().unwrap()),
+            head: self.0.u32_at(at + 6),
         };
         (s.off + s.key_len + s.value_len <= self.0.len()).then_some(s)
     }
@@ -319,6 +324,24 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         Some(key)
     }
 
+    /// Entry `i`'s whole key, into `out`, its bytes replaced.
+    pub fn key_into(&self, i: usize, out: &mut Vec<u8>) -> Option<()> {
+        let s = self.slot(i)?;
+        let prefix = self.prefix_run()?;
+        out.resize(prefix.len + s.key_len, 0);
+        self.0.copy_to(prefix.off, &mut out[..prefix.len]);
+        self.0.copy_to(s.off, &mut out[prefix.len..]);
+        Some(())
+    }
+
+    /// Entry `i`'s value, into `out`, its bytes replaced: whether it is a reference to blob pages.
+    pub fn value_into(&self, i: usize, out: &mut Vec<u8>) -> Option<bool> {
+        let s = self.slot(i)?;
+        out.resize(s.value_len, 0);
+        self.0.copy_to(s.off + s.key_len, out);
+        Some(s.out_of_line)
+    }
+
     /// Entry `i`'s value, and whether it is a reference to blob pages.
     pub fn value(&self, i: usize) -> Option<(Vec<u8>, bool)> {
         let s = self.slot(i)?;
@@ -331,10 +354,15 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
 
     /// An inner node's child `i`, the rightmost at `i == count`, and its frame hint.
     pub fn child(&self, i: usize) -> Option<(PageId, u32)> {
-        if i == self.count()? {
+        self.child_of(i, self.count()?)
+    }
+
+    /// Child `i` of an inner node holding `count`, as [`count`](Self::count) read it.
+    pub fn child_of(&self, i: usize, count: usize) -> Option<(PageId, u32)> {
+        if i == count {
             return Some(self.next());
         }
-        let s = self.slot(i)?;
+        let s = self.slot_of(i, count)?;
         if s.value_len < CHILD {
             return None;
         }
@@ -350,6 +378,18 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         let below = self
             .fence_run(UPPER, UPPER_INFINITE)?
             .is_none_or(|u| self.order(u, key) != Ordering::Less);
+        Some(above && below)
+    }
+
+    /// Whether the keys just above `key` lie between the fences: the lower fence at or below it,
+    /// the upper above it.
+    pub fn covers_above(&self, key: &[u8]) -> Option<bool> {
+        let above = self
+            .fence_run(LOWER, LOWER_INFINITE)?
+            .is_none_or(|l| self.order(l, key) != Ordering::Greater);
+        let below = self
+            .fence_run(UPPER, UPPER_INFINITE)?
+            .is_none_or(|u| self.order(u, key) == Ordering::Greater);
         Some(above && below)
     }
 
@@ -389,15 +429,18 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         }
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let s = self.slot(mid)?;
-            let ord = match s.head.cmp(&key_head) {
-                Ordering::Equal => self.order(
-                    Run {
-                        off: s.off,
-                        len: s.key_len,
-                    },
-                    suffix,
-                ),
+            // The head alone, until heads tie: `count` read whole slots up to `mid`.
+            let ord = match self.0.u32_at(SLOTS + mid * SLOT + 6).cmp(&key_head) {
+                Ordering::Equal => {
+                    let s = self.slot_of(mid, count)?;
+                    self.order(
+                        Run {
+                            off: s.off,
+                            len: s.key_len,
+                        },
+                        suffix,
+                    )
+                }
                 o => o,
             };
             match ord {
@@ -694,7 +737,28 @@ pub fn insert<P: BytesMut + ?Sized>(
     );
     page.put_u32(at + 6, head(suffix));
     put16(page, COUNT, count + 1);
-    update_hints(page);
+    update_hints_inserted(page, pos);
+    true
+}
+
+/// Changes entry `pos`'s inline value in place: `head` over its start, and `bytes` at `at` past
+/// the head. False if the value is out of line or too short to hold them.
+pub fn patch<P: BytesMut + ?Sized>(
+    page: &mut P,
+    pos: usize,
+    head: &[u8],
+    at: usize,
+    bytes: &[u8],
+) -> bool {
+    let Some(s) = View::new(&*page).slot(pos) else {
+        return false;
+    };
+    if s.out_of_line || head.len() + at + bytes.len() > s.value_len {
+        return false;
+    }
+    let value = s.off + s.key_len;
+    page.write(value, head);
+    page.write(value + head.len() + at, bytes);
     true
 }
 
@@ -784,30 +848,41 @@ pub fn split_off<P: BytesMut + ?Sized>(
         None => 0,
     };
     let cut = new.checked_sub(old)?;
-    if keep > count || (0..keep).any(|i| v.slot(i).is_none_or(|s| s.key_len < cut)) {
-        return None;
-    }
-    let kept: usize = (0..keep)
-        .map(|i| v.slot(i).map_or(0, |s| s.key_len + s.value_len))
-        .sum();
-    let lower_len = v.fence_run(LOWER, LOWER_INFINITE)?.map_or(0, |r| r.len);
+    // Every kept key is checked whole before anything changes.
+    let mut kept = 0;
     for i in 0..keep {
-        let s = View::new(&*page).slot(i)?;
-        let at = SLOTS + i * SLOT;
-        let mut first = [0u8; 4];
-        let n = (s.key_len - cut).min(4);
-        page.copy_to(s.off + cut, &mut first[..n]);
-        put16(page, at, s.off + cut);
-        put16(page, at + 2, s.key_len - cut);
-        page.put_u32(at + 6, head(&first[..n]));
+        let s = v.slot_of(i, count)?;
+        if s.key_len < cut {
+            return None;
+        }
+        kept += s.key_len + s.value_len;
+    }
+    let lower_len = v.fence_run(LOWER, LOWER_INFINITE)?.map_or(0, |r| r.len);
+    let gap = v.data_start()?.checked_sub(SLOTS + keep * SLOT)?;
+    // A longer prefix cuts every kept key again; the same one leaves them as they are.
+    if cut > 0 {
+        for i in 0..keep {
+            let s = View::new(&*page).slot_of(i, count)?;
+            let at = SLOTS + i * SLOT;
+            let mut first = [0u8; 4];
+            let n = (s.key_len - cut).min(4);
+            page.copy_to(s.off + cut, &mut first[..n]);
+            put16(page, at, s.off + cut);
+            put16(page, at + 2, s.key_len - cut);
+            page.put_u32(at + 6, head(&first[..n]));
+        }
     }
     put16(page, COUNT, keep);
     put16(page, PREFIX, new);
-    // The old upper fence is no longer one: compaction leaves it behind.
+    // The old upper fence is no longer one: a compaction leaves it behind, and until one does it
+    // is a hole, as an entry removed is. Compacted only if the new fence does not fit before the
+    // data: an append's split keeps every entry where it is.
     let fences = page.u8_at(FENCES);
     page.put_u8(FENCES, fences | UPPER_INFINITE);
     page.put_u32(SPACE, (lower_len + kept - keep * cut) as u32);
-    compact(page);
+    if gap < upper.len() {
+        compact(page);
+    }
     let data = page.u32_at(DATA_START) as usize - upper.len();
     page.write(data, upper);
     put16(page, UPPER, data);
@@ -816,7 +891,10 @@ pub fn split_off<P: BytesMut + ?Sized>(
     page.put_u32(DATA_START, data as u32);
     page.put_u32(SPACE, (page.u32_at(SPACE) as usize + upper.len()) as u32);
     set_next(page, next.0, next.1);
-    update_hints(page);
+    // Hints name slots by position and head: unmoved when every entry stays, its head uncut.
+    if keep < count || cut > 0 {
+        update_hints(page);
+    }
     Some(())
 }
 
@@ -953,17 +1031,34 @@ pub fn compact<P: BytesMut + ?Sized>(page: &mut P) {
 }
 
 fn update_hints<P: BytesMut + ?Sized>(page: &mut P) {
-    let v = View::new(&*page);
-    let count = v.count().unwrap();
+    let count = View::new(&*page).count().unwrap();
     let dist = count / (HINT_COUNT + 1);
-    let heads: [u32; HINT_COUNT] = std::array::from_fn(|i| {
-        if count > HINT_COUNT * 2 {
-            v.slot(dist * (i + 1)).unwrap().head
-        } else {
-            0
-        }
-    });
-    for (i, h) in heads.into_iter().enumerate() {
+    for i in 0..HINT_COUNT {
+        let h = match count > HINT_COUNT * 2 {
+            true => page.u32_at(SLOTS + dist * (i + 1) * SLOT + 6),
+            false => 0,
+        };
+        page.put_u32(HINTS + 4 * i, h);
+    }
+}
+
+/// The hints after an entry went in at `pos`, as [`update_hints`] leaves them, rewriting only those
+/// that can have moved. Hint `i` is the head of slot `dist * (i + 1)`; while `dist` is what it was
+/// before the insert, a slot before `pos` holds the entry it held, so only the hints from the first
+/// at or past `pos` change (LeanStore's `updateHint`, Leis et al., ICDE 2018). A node of at most
+/// twice as many entries as hints keeps them all 0, as it did before the insert.
+fn update_hints_inserted<P: BytesMut + ?Sized>(page: &mut P, pos: usize) {
+    let count = View::new(&*page).count().unwrap();
+    let before = count - 1;
+    if count <= HINT_COUNT * 2 {
+        return;
+    }
+    let dist = count / (HINT_COUNT + 1);
+    if before <= HINT_COUNT * 2 || before / (HINT_COUNT + 1) != dist {
+        return update_hints(page);
+    }
+    for i in (pos.div_ceil(dist).saturating_sub(1))..HINT_COUNT {
+        let h = page.u32_at(SLOTS + dist * (i + 1) * SLOT + 6);
         page.put_u32(HINTS + 4 * i, h);
     }
 }

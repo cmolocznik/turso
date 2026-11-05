@@ -158,7 +158,10 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
     let (chained, refused) = (Cell::new(0u64), Cell::new(0u64));
     // Crashes whose log ends inside a block, interrupted in recovery with a chain.
     let gapped = Cell::new(0u64);
-    for seed in 0..2u64 {
+    // Two seeds, and more while no chain has recorded two gaps: a seed gives 12 to 30 chains, of
+    // which 1 in 15 to 30 records a second gap (measured over three runs), so eight seeds leave
+    // a chance of about e^-8 that none does.
+    for seed in (0..8u64).take_while(|&seed| seed < 2 || chained.get() == 0) {
         let crash_io = Arc::new(CrashIO::new(seed));
         crash_io.set_durable_writes(durable_writes);
         let io: Arc<dyn IO> = crash_io.clone();
@@ -200,8 +203,9 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
                 path == BASE || metadata.iter().any(|m| path.starts_with(m.as_str()))
             };
             // Every log ending inside a block makes recovery record a gap; two such crashes a
-            // seed also start a chain of crashes in recovery.
-            let chain = end % BLOCK != 0 && gapped.get() < 2 * (seed + 1);
+            // seed also start a chain of crashes in recovery, and more while no chain has yet
+            // recorded two gaps.
+            let chain = end % BLOCK != 0 && (gapped.get() < 2 * (seed + 1) || chained.get() == 0);
             if crash_seed % 10 == 0 || chain {
                 if chain {
                     gapped.set(gapped.get() + 1);
@@ -269,11 +273,12 @@ fn crashes_recover_every_durable_write_and_nothing_torn(durable_writes: bool) {
                             image = images.swap_remove(at);
                         }
                         let image: Arc<dyn IO> = Arc::new(image);
-                        if gaps(&image).len() >= 2 {
+                        let recorded = gaps(&image).len();
+                        if recorded >= 2 {
                             chained.set(chained.get() + 1);
                             chaining = false;
                         }
-                        let label = format!("{label}, crashed twice more");
+                        let label = format!("{label}, crashed twice more, {recorded} gaps");
                         eprintln!("recovering {label}");
                         let again = try_open(image.clone(), 2, 2 * MIN_BUDGET).unwrap();
                         check(&again, &image, &model.borrow(), end, &label);

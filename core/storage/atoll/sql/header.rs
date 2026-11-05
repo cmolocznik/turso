@@ -12,6 +12,7 @@ use crate::storage::atoll::buffer::BufferPool;
 use crate::storage::atoll::store::PageStore;
 use crate::storage::atoll::txn::versioned::{Get, VersionedTree, Versions, Write, WriteOp};
 use crate::storage::atoll::txn::{Transactions, Ts, Txn};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::IOResult;
 use crate::{LimboError, Result};
@@ -55,7 +56,7 @@ impl Field {
         [self as u8]
     }
 
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self as usize - 1
     }
 }
@@ -65,6 +66,10 @@ pub struct Header {
     tree: VersionedTree,
     /// Per field, the value and the commit timestamp of the newest commit that published it.
     committed: [Mutex<(Ts, u32)>; 7],
+    /// Writes begun by any transaction, and rollbacks of statements, which may undo one: a
+    /// transaction's snapshot sees no other transaction's write, so a field it read reads the same
+    /// while this is unchanged.
+    changes: AtomicU64,
 }
 
 impl Header {
@@ -72,6 +77,7 @@ impl Header {
         Self {
             tree: VersionedTree::open(io, pool, store, System::Header.root()),
             committed: Field::ALL.map(|f| Mutex::new((0, f.default()))),
+            changes: AtomicU64::new(0),
         }
     }
 
@@ -104,7 +110,21 @@ impl Header {
         txn: &mut Txn,
         op: &mut WriteOp,
     ) -> Result<IOResult<Write>> {
+        self.note_change();
         self.tree.write(txns, versions, txn, op)
+    }
+
+    /// Counts a change to what a transaction reads of the header: a write, or a rollback of
+    /// statements.
+    pub fn note_change(&self) {
+        // Relaxed: only the transaction making a change is told of it by this, and its statements
+        // follow one another through its connection's lock on it.
+        self.changes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The changes counted so far ([`note_change`](Self::note_change)).
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Relaxed)
     }
 
     pub fn put_op(field: Field, value: u32) -> WriteOp {

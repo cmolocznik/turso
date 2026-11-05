@@ -617,6 +617,13 @@ pub trait IO: Clock + Send + Sync {
         Ok(())
     }
 
+    /// Renames the file `from` to `to`, replacing any file `to`, in one step: no moment has
+    /// neither name. Durable once their directory is synced. `false`, with nothing done, from a
+    /// backend that cannot.
+    fn rename_file(&self, _from: &str, _to: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Whether this IO backend can back host-filesystem shared WAL coordination.
     fn supports_shared_wal_coordination(&self) -> bool {
         false

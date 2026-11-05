@@ -322,6 +322,87 @@ fn no_byte_of_the_log_is_written_twice() {
     );
 }
 
+/// Segments released below where the log is kept become spares, and later segments are those
+/// spares renamed, prepared with no zeros: every byte written to the log is a zero of a segment
+/// prepared fresh or a block of records, each once. A reader from where the log is kept reads
+/// exactly the records appended since, never one a spare held in its earlier life, and so does
+/// every crash, which keeps an unbroken prefix of them; a crash reopened takes its spares back.
+#[test]
+fn released_segments_come_back_as_spares_whose_old_records_never_read() {
+    let crash_io = Arc::new(CrashIO::new(3));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let config = small();
+    let size = config.segment_bytes;
+    let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
+    let mut lsns = Vec::new();
+    // Where the log is kept from, and the first record a reader from there reads.
+    let (mut from, mut first) = (0, 0);
+    let mut acknowledged = 0;
+    for seq in 0..3_000u64 {
+        let p = payload(0, seq);
+        let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+        lsns.push(log.append(&mut admitted, &header(0), &[&p]));
+        if seq % 50 == 49 {
+            let lsn = *lsns.last().unwrap();
+            drive(&io, || log.wait_durable(lsn)).unwrap();
+            acknowledged = lsns.len();
+            // As a checkpoint does: the log before a record two segments back is let go.
+            if let Some(i) = lsns.iter().rposition(|&l| l + 2 * size <= lsn) {
+                (from, first) = (lsns[i], i + 1);
+                log.release_before(from).unwrap();
+            }
+        }
+    }
+    let used = log.end().div_ceil(size);
+    assert!(used >= 8, "only {used} segments used");
+    let segment = |n: u64| format!("{BASE}.log.{n:016x}");
+    let written: u64 = (0..used)
+        .flat_map(|n| crash_io.writes_to(&segment(n)))
+        .map(|(_, len)| len as u64)
+        .sum();
+    let flushed = log.durable().next_multiple_of(BLOCK);
+    let zeroed = written - flushed;
+    assert_eq!(
+        zeroed % size,
+        0,
+        "{written} bytes written, {flushed} of records"
+    );
+    let fresh = zeroed / size;
+    assert!(
+        fresh + 2 < used,
+        "{fresh} of {used} segments were prepared with zeros"
+    );
+    let expect = |records: &[OwnedRecord], label: &str| {
+        for (k, r) in records.iter().enumerate() {
+            assert_eq!(
+                r.payload,
+                payload(0, (first + k) as u64),
+                "{label}: record {k}"
+            );
+        }
+    };
+    let (records, _) = read_all(io.clone(), from);
+    assert_eq!(records.len(), lsns.len() - first);
+    expect(&records, "the log");
+    for c in 0..16 {
+        let crashed: Arc<dyn IO> = Arc::new(crash_io.crash(c));
+        let (records, end) = read_all(crashed.clone(), from);
+        assert!(
+            records.len() >= acknowledged - first,
+            "crash {c}: {} records from {from}",
+            records.len()
+        );
+        expect(&records, &format!("crash {c}"));
+        let reopened = Log::open(crashed.clone(), BASE, config.clone(), end).unwrap();
+        let p = payload(1, 0);
+        let mut admitted = drive(&crashed, || reopened.admit(framed_len(p.len()))).unwrap();
+        let lsn = reopened.append(&mut admitted, &header(1), &[&p]);
+        drive(&crashed, || reopened.wait_durable(lsn)).unwrap();
+        let (again, _) = read_all(crashed, from);
+        assert_eq!(again[..records.len()], records[..], "crash {c}: reopened");
+    }
+}
+
 #[test]
 fn a_failed_write_fails_its_waiters_and_every_later_operation() {
     let crash_io = Arc::new(CrashIO::new(3));

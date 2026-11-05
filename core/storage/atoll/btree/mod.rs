@@ -109,6 +109,31 @@ enum Route {
     Above,
 }
 
+/// A leaf a caller reached last, kept by the caller and tried before a descent
+/// ([`Tree::descend_to_leaf`]): its page and frame hint, or none. The caller's own, so no thread
+/// writes what another reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Near(Option<(PageId, u32)>);
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Descents a caller's leaf spared on this thread, for tests to see which way a look went.
+    pub(crate) static NEAR_TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+impl Near {
+    pub const NONE: Self = Self(None);
+
+    fn of(leaf: &Optimistic<'_>) -> Self {
+        Self(Some((leaf.pid(), leaf.hint())))
+    }
+
+    /// The leaf's page.
+    pub fn page(self) -> Option<PageId> {
+        self.0.map(|(pid, _)| pid)
+    }
+}
+
 /// Log space admitted for a change; none for a temporary tree.
 pub struct Grant(Option<Admitted>);
 
@@ -353,6 +378,38 @@ impl Tree {
         (start, lsns)
     }
 
+    /// As [`log_as`](Self::log_as) for one node record alone, its pieces copied straight into
+    /// the log: nothing is assembled on the way. Returns where it starts and its LSN.
+    fn log_one(
+        &self,
+        grant: &mut Grant,
+        txn: Option<&TxnTail>,
+        record: &Record<'_>,
+    ) -> (Option<GroupStart>, Lsn) {
+        let Some(admitted) = &mut grant.0 else {
+            return (None, self.pool.temporary_lsn());
+        };
+        let header = match txn {
+            Some(t) => t.header(record.kind()),
+            None => Header {
+                kind: record.kind(),
+                flags: 0,
+                txn: 0,
+                prev: None,
+            },
+        };
+        // A transaction's group enters the writer registry before its copy completes.
+        let reserved = |at: GroupStart| {
+            if let Some(t) = txn {
+                t.reserved(at);
+            }
+        };
+        let log = self.store.log();
+        let (start, lsn) =
+            record.with_pieces(|pieces| log.append_with(admitted, &header, pieces, reserved));
+        (Some(start), lsn)
+    }
+
     /// As [`log_as`](Self::log_as), with the records of retired marks ([`PageStore::marks`])
     /// after the rest; returns too where they start and end, to change the marks with.
     fn log_marked(
@@ -421,6 +478,40 @@ impl Tree {
 
     // ---------------------------------------------------------------- descending
 
+    /// The leaf covering `key` by `route`, for a caller that needs no parent: `near`, the leaf the
+    /// caller last reached, if it still answers the key, else a descent. That leaf is in its
+    /// frame, a leaf of this tree not abandoned by a merge (the frame holding it says so:
+    /// [`BufferPool::fix_optimistic_at`]), and its fences answer the key, so it is the one leaf
+    /// that does: a split or merge moving them changes its version, which every read of it
+    /// validates. A leaf holds the keys above its lower fence up to its upper fence, so it answers
+    /// a key at it ([`Route::At`]) between the two, the upper included, and the keys just above
+    /// it ([`Route::Above`]) from the lower fence, included, to below the upper.
+    fn descend_to_leaf(&self, key: &[u8], route: Route, near: Near) -> Result<Found<'_>> {
+        if let Some((pid, hint)) = near.0 {
+            if let Some(leaf) = self.pool.fix_optimistic_at(pid, hint) {
+                let answers = leaf.read(|p| -> Option<bool> {
+                    let v = View::new(p);
+                    if !(v.is_node() && v.root() == self.root && v.is_leaf()) {
+                        return Some(false);
+                    }
+                    match route {
+                        Route::At => v.covers(key),
+                        Route::Above => v.covers_above(key),
+                    }
+                });
+                if answers == Some(Some(true)) {
+                    #[cfg(test)]
+                    NEAR_TAKEN.with(|n| n.set(n.get() + 1));
+                    return Ok(Found::Node {
+                        node: leaf,
+                        parent: None,
+                    });
+                }
+            }
+        }
+        self.descend(key, 0, route)
+    }
+
     /// Descends optimistically to the node at `level` covering `key`.
     fn descend(&self, key: &[u8], level: u8, route: Route) -> Result<Found<'_>> {
         let mut node = match self.pool.fix_optimistic(self.root, Some(&self.root_hint))? {
@@ -435,23 +526,26 @@ impl Tree {
                     return None;
                 }
                 // Reached by a descent its parent validated, the node holds what the parent
-                // routed here: a split or merge that moves its fences changes the parent too.
-                let reaches = match route {
-                    Route::At => v.covers(key)?,
-                    Route::Above => v.covers(key)? || v.lower_is(key)?,
-                };
-                if !reaches {
-                    return Some(Err((v.level(), v.lower()?, v.upper()?)));
-                }
+                // routed here: a split or merge that moves its fences changes the parent too,
+                // and the parent is validated once the child is fixed. So an inner node's fences
+                // are not compared on the way; the node the descent stops at checks its own.
                 let at = v.level();
                 if at <= level {
+                    let reaches = match route {
+                        Route::At => v.covers(key)?,
+                        Route::Above => v.covers(key)? || v.lower_is(key)?,
+                    };
+                    if !reaches {
+                        return Some(Err((at, v.lower()?, v.upper()?)));
+                    }
                     return Some(Ok((at, None)));
                 }
+                let count = v.count()?;
                 let pos = match route {
                     Route::At => v.route(key)?,
                     Route::Above => v.search_above(key)?,
                 };
-                Some(Ok((at, Some((pos, v.child(pos)?)))))
+                Some(Ok((at, Some((pos, v.child_of(pos, count)?)))))
             });
             let Some(read) = read else {
                 return Ok(Found::Restart);
@@ -537,7 +631,7 @@ impl Tree {
                 }
                 op.held = None;
             }
-            let (leaf, _) = found!(self.descend(&op.key, 0, Route::At));
+            let (leaf, _) = found!(self.descend_to_leaf(&op.key, Route::At, Near::NONE));
             let Some(found) = leaf.read(|p| {
                 let v = View::new(p);
                 let (pos, exact) = v.search(&op.key)?;
@@ -572,31 +666,33 @@ impl Tree {
     /// `key`'s entry as the leaf holds it, with nothing read out of line: its head, and the rest
     /// of its value or the reference to it. Step it until done.
     pub fn stored(&self, key: &[u8]) -> Result<IOResult<Option<Stored>>> {
-        loop {
-            let (leaf, _) = found!(self.descend(key, 0, Route::At));
-            let Some(found) = leaf.read(|p| look(View::new(p), key)) else {
-                continue;
-            };
-            let Some(found) = found.ok_or_else(|| corrupt_node(leaf.pid()))? else {
-                continue;
-            };
-            return Ok(IOResult::Done(match found {
-                None => None,
-                Some((stored, false)) => Some(Stored {
-                    head: stored[..self.head.min(stored.len())].to_vec(),
-                    value: StoredValue::Inline(stored[self.head.min(stored.len())..].to_vec()),
-                }),
-                Some((stored, true)) => {
-                    let (head, reference) = self
-                        .split_reference(&stored)
-                        .ok_or_else(|| corrupt_node(leaf.pid()))?;
-                    Some(Stored {
-                        head: head.to_vec(),
-                        value: StoredValue::OutOfLine(reference),
-                    })
-                }
-            }));
-        }
+        self.stored_near(key, Near::NONE)
+    }
+
+    /// [`stored`](Self::stored), tried first at `near`.
+    pub fn stored_near(&self, key: &[u8], near: Near) -> Result<IOResult<Option<Stored>>> {
+        let looked = done!(self.look(key, near));
+        Ok(IOResult::Done(self.stored_of(&looked)?))
+    }
+
+    /// The entry a look found, as [`stored`](Self::stored) gives it.
+    pub fn stored_of(&self, looked: &Looked<'_>) -> Result<Option<Stored>> {
+        Ok(match &looked.present {
+            None => None,
+            Some((stored, false)) => Some(Stored {
+                head: stored[..self.head.min(stored.len())].to_vec(),
+                value: StoredValue::Inline(stored[self.head.min(stored.len())..].to_vec()),
+            }),
+            Some((stored, true)) => {
+                let (head, reference) = self
+                    .split_reference(stored)
+                    .ok_or_else(|| corrupt_node(looked.leaf.pid()))?;
+                Some(Stored {
+                    head: head.to_vec(),
+                    value: StoredValue::OutOfLine(reference),
+                })
+            }
+        })
     }
 
     /// An out-of-line value as the leaf stores it: its head, and the reference to the rest.
@@ -611,184 +707,279 @@ impl Tree {
     pub fn put(&self, op: &mut Put) -> Result<IOResult<Outcome>> {
         loop {
             // Whether the key is there, and what an out-of-line value it holds takes: learned
-            // before writing anything, and checked again under the leaf's latch.
-            let (leaf, _) = found!(self.descend(&op.key, 0, Route::At));
-            let Some(seen) = leaf.read(|p| look(View::new(p), &op.key)) else {
+            // before writing anything, and holding still once the leaf is latched at the version
+            // the look read.
+            let Looked {
+                leaf,
+                pos,
+                exact,
+                present,
+            } = done!(self.look(&op.key, op.near));
+            op.near = Near::of(&leaf);
+            if let Some(done) = self.put_from(op, leaf, pos, exact, present)? {
+                return Ok(done);
+            }
+        }
+    }
+
+    /// The leaf of `key` looked at, tried first at `near`: where the key is or goes, and its
+    /// entry, the leaf held optimistically at the version read. Step it until done.
+    pub fn look(&self, key: &[u8], near: Near) -> Result<IOResult<Looked<'_>>> {
+        let mut near = near;
+        loop {
+            let (leaf, _) = found!(self.descend_to_leaf(key, Route::At, near));
+            near = Near::NONE;
+            let Some(seen) = leaf.read(|p| look_at(View::new(p), key)) else {
                 continue;
             };
-            let Some(present) = seen.ok_or_else(|| corrupt_node(leaf.pid()))? else {
+            let Some((pos, exact, present)) = seen.ok_or_else(|| corrupt_node(leaf.pid()))? else {
                 // The leaf split since the descent read its parent.
                 continue;
             };
-            match (op.mode, &present) {
-                (Mode::Insert, Some(_)) | (Mode::Update, None) => {
-                    return Ok(IOResult::Done(Outcome::Unchanged))
+            return Ok(IOResult::Done(Looked {
+                leaf,
+                pos,
+                exact,
+                present,
+            }));
+        }
+    }
+
+    /// [`put`](Self::put) from `looked`, a look at the key's leaf this step made: written there if
+    /// the leaf is still as the look found it, else put as by `put`. Step it until done.
+    pub fn put_looked(&self, op: &mut Put, looked: Looked<'_>) -> Result<IOResult<Outcome>> {
+        let Looked {
+            leaf,
+            pos,
+            exact,
+            present,
+        } = looked;
+        op.near = Near::of(&leaf);
+        match self.put_from(op, leaf, pos, exact, present)? {
+            Some(done) => Ok(done),
+            None => self.put(op),
+        }
+    }
+
+    /// The rest of a put, from a look at its leaf: `None` to look again.
+    fn put_from(
+        &self,
+        op: &mut Put,
+        leaf: Optimistic<'_>,
+        pos: usize,
+        exact: bool,
+        present: Option<(Vec<u8>, bool)>,
+    ) -> Result<Option<IOResult<Outcome>>> {
+        macro_rules! step {
+            ($e:expr) => {
+                match $e? {
+                    IOResult::Done(v) => v,
+                    IOResult::IO(io) => return Ok(Some(IOResult::IO(io))),
                 }
-                _ => {}
+            };
+        }
+        match (op.mode, &present) {
+            (Mode::Insert, Some(_)) | (Mode::Update, None) => {
+                return Ok(Some(IOResult::Done(Outcome::Unchanged)))
             }
-            assert_eq!(op.head.len(), self.head, "a put's head is not the tree's");
-            if !done!(op.old_pages(&self.pool, self.head, present.as_ref(), &|| leaf.validate())) {
-                continue;
-            }
-            if let Some((reference, pages)) = &mut op.restoring {
-                if pages.is_none() {
-                    // Retired, so no page of it is freed under this read.
-                    match done!(value::pages(&self.pool, *reference, &|| true)) {
-                        Ok(p) => *pages = Some(p),
-                        Err(_) => return Err(corrupt_value(*reference)),
-                    }
+            _ => {}
+        }
+        assert_eq!(op.head_len, self.head, "a put's head is not the tree's");
+        if !step!(op.old_pages(&self.pool, self.head, present.as_ref(), &|| leaf.validate())) {
+            return Ok(None);
+        }
+        if let Some((reference, pages)) = &mut op.restoring {
+            if pages.is_none() {
+                // Retired, so no page of it is freed under this read.
+                match step!(value::pages(&self.pool, *reference, &|| true)) {
+                    Ok(p) => *pages = Some(p),
+                    Err(_) => return Err(corrupt_value(*reference)),
                 }
             }
-            let out_of_line = op.restoring.is_some()
-                || !self.limits.inline(op.key.len(), self.head + op.value_len);
-            if out_of_line && op.restoring.is_none() {
-                let write = op.write.get_or_insert_with(|| {
-                    ValueWrite::new(
-                        std::mem::take(&mut op.value),
-                        self.io.generate_random_number() as u64,
-                        self.store.clone(),
-                    )
-                });
-                done!(write.step(&self.pool, self.journal()));
+        }
+        let out_of_line =
+            op.restoring.is_some() || !self.limits.inline(op.key.len(), self.head + op.value_len);
+        if out_of_line && op.restoring.is_none() {
+            let write = op.write.get_or_insert_with(|| {
+                ValueWrite::new(
+                    op.entry.split_off(op.head_len),
+                    self.io.generate_random_number() as u64,
+                    self.store.clone(),
+                )
+            });
+            step!(write.step(&self.pool, self.journal()));
+        }
+        // As the leaf stores it: the entry itself, or its head and the reference to a value out
+        // of line.
+        let reference = match (&op.write, &op.restoring) {
+            (Some(w), _) => Some(w.reference()),
+            (None, Some((reference, _))) => Some(*reference),
+            (None, None) => None,
+        };
+        let referred;
+        let stored: &[u8] = match reference {
+            Some(r) => {
+                referred = [&op.entry[..op.head_len], &r.encode()].concat();
+                &referred
             }
-            let mut stored = op.head.clone();
-            match (&op.write, &op.restoring) {
-                (Some(w), _) => stored.extend_from_slice(&w.reference().encode()),
-                (None, Some((reference, _))) => stored.extend_from_slice(&reference.encode()),
-                (None, None) => stored.extend_from_slice(&op.value),
-            }
-            let adopt = op.write.as_ref().map(|w| w.pages()).unwrap_or_default();
-            let replaced = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
-            let (abandon, retire) = if op.retire_old {
-                (Vec::new(), replaced)
-            } else {
-                (replaced, Vec::new())
-            };
-            let reinstate = op
-                .restoring
-                .as_ref()
-                .and_then(|(_, pages)| pages.clone())
-                .unwrap_or_default();
-            // Marks change in the group, under latches taken once the leaf's is held.
-            let marks = if retire.is_empty() && reinstate.is_empty() {
-                None
-            } else {
-                assert!(
-                    self.journal().is_some(),
-                    "a temporary tree retires and reinstates nothing"
-                );
-                Some(done!(self.store.marks(&retire, &reinstate)))
-            };
-            let mark_records = marks.as_ref().map(|m| m.records()).unwrap_or_default();
-            let marks_len: u64 = mark_records
-                .iter()
-                .map(|(_, payload)| framed_len(payload.len()))
-                .sum();
-            // What a transaction's update logs to undo it: the entry its statement found.
-            let found = match &op.found {
-                Some(found) => found.clone(),
-                None => present.clone(),
-            };
-            // A transaction's change names the tree, and an update of one the value's length and
-            // the entry undoing it puts back.
-            let undo = match (&op.compensation, &op.txn, &present) {
-                (Some(_), ..) => COMPENSATION,
-                (None, Some(_), Some(_)) => 8 + 4 + 1 + found.as_ref().map_or(0, |(b, _)| b.len()),
-                (None, Some(_), None) => 8,
-                (None, None, _) => 0,
-            };
-            let len = framed_len(8 + 3 + op.key.len() + stored.len() + undo)
-                + store_len(&adopt)
-                + store_len(&abandon)
-                + marks_len;
-            if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
-                op.admitted = None;
-                op.admitted = Some((done!(self.admit(len)), len));
-            }
-            let Some(mut ex) = leaf.upgrade() else {
-                return yield_now();
-            };
-            let v = View::new(ex.page());
-            if v.covers(&op.key) != Some(true) {
-                drop(ex);
-                continue;
-            }
-            let (pos, exact) = v.search(&op.key).ok_or_else(|| corrupt_node(ex.pid()))?;
-            let now = exact.then(|| v.value(pos)).flatten();
-            if now != present {
-                // Changed since the look: look again.
-                drop(ex);
-                continue;
-            }
-            let need = match &now {
-                None => v.entry_size(&op.key, stored.len()),
-                Some((old, _)) => Some(stored.len().saturating_sub(old.len())),
-            }
-            .ok_or_else(|| corrupt_node(ex.pid()))?;
-            if v.free().ok_or_else(|| corrupt_node(ex.pid()))? < need {
-                drop(ex);
-                // A split admits its own log space; holding this meanwhile could leave too
-                // little of the log buffer for it.
-                op.admitted = None;
-                done!(self.make_room(&op.key, 0, need));
-                continue;
-            }
-            let pid = ex.pid();
-            if op.expected.as_ref().is_some_and(|e| *e != now) {
-                drop(ex);
-                return Ok(IOResult::Done(Outcome::Changed));
-            }
-            let locked = match &marks {
-                Some(m) => match m.lock(&self.store) {
-                    Some(locked) => Some(locked),
-                    // Held, or grown since: let the leaf go, and make the marks again.
-                    None => {
-                        drop(ex);
-                        return yield_now();
-                    }
-                },
-                None => None,
-            };
-            let in_txn = op.txn.is_some();
-            let change = match (&now, op.compensation) {
-                (Some(_), Some(of)) => Change::Restore {
-                    key: &op.key,
-                    value: &stored,
-                    out_of_line,
-                    of,
-                },
-                (None, Some(_)) => {
+            None => &op.entry,
+        };
+        let adopt = op.write.as_ref().map(|w| w.pages()).unwrap_or_default();
+        let replaced = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
+        let (abandon, retire) = if op.retire_old {
+            (Vec::new(), replaced)
+        } else {
+            (replaced, Vec::new())
+        };
+        let reinstate = op
+            .restoring
+            .as_ref()
+            .and_then(|(_, pages)| pages.clone())
+            .unwrap_or_default();
+        // Marks change in the group, under latches taken once the leaf's is held.
+        let marks = if retire.is_empty() && reinstate.is_empty() {
+            None
+        } else {
+            assert!(
+                self.journal().is_some(),
+                "a temporary tree retires and reinstates nothing"
+            );
+            Some(step!(self.store.marks(&retire, &reinstate)))
+        };
+        let mark_records = marks.as_ref().map(|m| m.records()).unwrap_or_default();
+        let marks_len: u64 = mark_records
+            .iter()
+            .map(|(_, payload)| framed_len(payload.len()))
+            .sum();
+        // What a transaction's update logs to undo it: the entry its statement found, borrowed.
+        let found: Option<(&[u8], bool)> = match &op.found {
+            Some(found) => found.as_ref().map(|(b, o)| (b.as_slice(), *o)),
+            None => present.as_ref().map(|(b, o)| (b.as_slice(), *o)),
+        };
+        // A transaction's change names the tree, and an update of one the value's length and
+        // the entry undoing it puts back.
+        let undo = match (&op.compensation, &op.txn, &present) {
+            (Some(_), ..) => COMPENSATION,
+            (None, Some(_), Some(_)) => 8 + 4 + 1 + found.map_or(0, |(b, _)| b.len()),
+            (None, Some(_), None) => 8,
+            (None, None, _) => 0,
+        };
+        let len = framed_len(8 + 3 + op.key.len() + stored.len() + undo)
+            + store_len(&adopt)
+            + store_len(&abandon)
+            + marks_len;
+        if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
+            op.admitted = None;
+            op.admitted = Some((step!(self.admit(len)), len));
+        }
+        // Latched at the version the look read, so the leaf is as the look found it: still
+        // covering the key, which is at `pos` or goes there, with the entry `present`.
+        let Some(mut ex) = leaf.upgrade() else {
+            return yield_now().map(Some);
+        };
+        let v = View::new(ex.page());
+        let now = &present;
+        let need = match now {
+            None => v.entry_size(&op.key, stored.len()),
+            Some((old, _)) => Some(stored.len().saturating_sub(old.len())),
+        }
+        .ok_or_else(|| corrupt_node(ex.pid()))?;
+        if v.free().ok_or_else(|| corrupt_node(ex.pid()))? < need {
+            drop(ex);
+            // A split admits its own log space; holding this meanwhile could leave too
+            // little of the log buffer for it.
+            op.admitted = None;
+            step!(self.make_room(&op.key, 0, need));
+            return Ok(None);
+        }
+        let pid = ex.pid();
+        if op.expected.as_ref().is_some_and(|e| e != now) {
+            drop(ex);
+            return Ok(Some(IOResult::Done(Outcome::Changed)));
+        }
+        let locked = match &marks {
+            Some(m) => match m.lock(&self.store) {
+                Some(locked) => Some(locked),
+                // Held, or grown since: let the leaf go, and make the marks again.
+                None => {
                     drop(ex);
-                    return Err(LimboError::InternalError(
-                        "a compensation put back a key it found no entry of".into(),
-                    ));
+                    return yield_now().map(Some);
                 }
-                (Some(_), None) => Change::Update {
-                    key: &op.key,
-                    value: &stored,
-                    out_of_line,
-                    undo: in_txn
-                        .then_some((self.root, found.as_ref().map(|(b, o)| (b.as_slice(), *o)))),
-                },
-                (None, None) => Change::Insert {
-                    key: &op.key,
-                    value: &stored,
-                    out_of_line,
-                    undo: in_txn.then_some(self.root),
-                },
-            };
-            let record = Record { pid, change };
-            record.apply(&mut ex.page_mut())?;
-            let mut store = Vec::new();
-            if !adopt.is_empty() {
-                store.push(StoreRecord::Adopt { pids: adopt });
+            },
+            None => None,
+        };
+        let in_txn = op.txn.is_some();
+        let change = match (now, op.compensation) {
+            (Some(_), Some(of)) => Change::Restore {
+                key: &op.key,
+                value: stored,
+                out_of_line,
+                of,
+            },
+            (None, Some(_)) => {
+                drop(ex);
+                return Err(LimboError::InternalError(
+                    "a compensation put back a key it found no entry of".into(),
+                ));
             }
-            if !abandon.is_empty() {
-                store.push(StoreRecord::Abandon {
-                    pids: abandon.clone(),
-                });
+            // A transaction's first change of the key, its value inline before and after and
+            // as long: the head, and the bytes that differ, changed in place. What undoes it is
+            // the entry it replaced, which is what its statement found.
+            (Some((old, false)), None)
+                if in_txn
+                    && op.found.is_none()
+                    && !out_of_line
+                    && self.head > 0
+                    && old.len() == stored.len() =>
+            {
+                let h = self.head;
+                let (was, is) = (&old[h..], &stored[h..]);
+                let same = was.iter().zip(is).take_while(|(a, b)| a == b).count();
+                let tail = was[same..]
+                    .iter()
+                    .rev()
+                    .zip(is[same..].iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let differ = same..was.len() - tail;
+                Change::Patch {
+                    key: &op.key,
+                    head: &stored[..h],
+                    at: same,
+                    bytes: &is[differ.clone()],
+                    root: self.root,
+                    old_head: &old[..h],
+                    old_bytes: &was[differ],
+                }
             }
-            let (mut admitted, _) = op.admitted.take().expect("admitted");
+            (Some(_), None) => Change::Update {
+                key: &op.key,
+                value: stored,
+                out_of_line,
+                undo: in_txn.then_some((self.root, found)),
+            },
+            (None, None) => Change::Insert {
+                key: &op.key,
+                value: stored,
+                out_of_line,
+                undo: in_txn.then_some(self.root),
+            },
+        };
+        let record = Record { pid, change };
+        record.apply_at(&mut ex.page_mut(), Some((pos, exact)))?;
+        let mut store = Vec::new();
+        if !adopt.is_empty() {
+            store.push(StoreRecord::Adopt { pids: adopt });
+        }
+        if !abandon.is_empty() {
+            store.push(StoreRecord::Abandon {
+                pids: abandon.clone(),
+            });
+        }
+        let (mut admitted, _) = op.admitted.take().expect("admitted");
+        let (group, lsn) = if store.is_empty() && mark_records.is_empty() {
+            self.log_one(&mut admitted, op.txn.as_ref(), &record)
+        } else {
             let (group, lsns, marked) = self.log_marked(
                 &mut admitted,
                 op.txn.as_ref(),
@@ -799,25 +990,26 @@ impl Tree {
             if let (Some(locked), Some((start, end))) = (locked, marked) {
                 locked.commit(&self.store, start, end);
             }
-            op.group = group.filter(|_| op.txn.is_some());
-            ex.changed(lsns[0]);
-            op.lsn = lsns[0];
-            drop(ex);
-            if let Some(w) = op.write.as_mut() {
-                w.adopted();
-            }
-            // Pages retired stay: a snapshot may still read the version they hold.
-            if !abandon.is_empty() {
-                self.free_abandoned(abandon)?;
-            }
-            op.old = None;
-            op.write = None;
-            return Ok(IOResult::Done(if exact {
-                Outcome::Updated
-            } else {
-                Outcome::Inserted
-            }));
+            (group, lsns[0])
+        };
+        op.group = group.filter(|_| op.txn.is_some());
+        ex.changed(lsn);
+        op.lsn = lsn;
+        drop(ex);
+        if let Some(w) = op.write.as_mut() {
+            w.adopted();
         }
+        // Pages retired stay: a snapshot may still read the version they hold.
+        if !abandon.is_empty() {
+            self.free_abandoned(abandon)?;
+        }
+        op.old = None;
+        op.write = None;
+        Ok(Some(IOResult::Done(if exact {
+            Outcome::Updated
+        } else {
+            Outcome::Inserted
+        })))
     }
 
     /// Removes `key`; whether it was there. Step it until done.
@@ -830,7 +1022,7 @@ impl Tree {
                 }
                 continue;
             }
-            let (leaf, _) = found!(self.descend(&op.key, 0, Route::At));
+            let (leaf, _) = found!(self.descend_to_leaf(&op.key, Route::At, Near::NONE));
             let Some(seen) = leaf.read(|p| look(View::new(p), &op.key)) else {
                 continue;
             };
@@ -1377,30 +1569,28 @@ impl Tree {
     /// Moves `cursor` as `seek` says. Step it until done; then whether it found an entry.
     pub fn seek(&self, cursor: &mut Cursor, key: &[u8], seek: Seek) -> Result<IOResult<bool>> {
         if cursor.pending.is_none() {
-            cursor.pending = Some((seek, key.to_vec()));
+            let mut target = std::mem::take(&mut cursor.spare.2);
+            target.clear();
+            target.extend_from_slice(key);
+            cursor.pending = Some((seek, target));
             cursor.leaf = None;
+            cursor.at = None;
         }
         self.run(cursor)
     }
 
     /// The entry after the cursor's. Step it until done.
     pub fn next(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
-        if cursor.pending.is_none() {
-            let Some((key, _)) = &cursor.entry else {
-                return Ok(IOResult::Done(false));
-            };
-            cursor.pending = Some((Seek::Gt, key.clone()));
+        if cursor.pending.is_none() && !cursor.step(Seek::Gt) {
+            return Ok(IOResult::Done(false));
         }
         self.run(cursor)
     }
 
     /// The entry before the cursor's. Step it until done.
     pub fn prev(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
-        if cursor.pending.is_none() {
-            let Some((key, _)) = &cursor.entry else {
-                return Ok(IOResult::Done(false));
-            };
-            cursor.pending = Some((Seek::Lt, key.clone()));
+        if cursor.pending.is_none() && !cursor.step(Seek::Lt) {
+            return Ok(IOResult::Done(false));
         }
         self.run(cursor)
     }
@@ -1433,12 +1623,16 @@ impl Tree {
                 }
                 cursor.held = None;
             }
-            let (seek, target) = cursor.pending.clone().expect("a seek pending");
+            let (seek, target) = cursor.pending.take().expect("a seek pending");
+            // Put back for every way out but an entry or the end.
+            let pending = |cursor: &mut Cursor, target| cursor.pending = Some((seek, target));
             let cached = cursor.leaf.and_then(|(pid, hint, version)| {
                 self.pool
                     .fix_optimistic_at(pid, hint)
                     .filter(|l| l.version() == version)
             });
+            // One slot along from the entry, in the leaf it was read from.
+            let at = cursor.at.filter(|_| cached.is_some());
             let leaf = match &cached {
                 // The leaf of the last entry is as it was: no descent.
                 Some(leaf) => leaf.clone(),
@@ -1448,26 +1642,81 @@ impl Tree {
                     } else {
                         Route::At
                     };
-                    found!(self.descend(&target, 0, route)).0
+                    let found = match self.descend_to_leaf(&target, route, cursor.near) {
+                        Ok(found) => found,
+                        Err(e) => {
+                            pending(cursor, target);
+                            return Err(e);
+                        }
+                    };
+                    match found {
+                        Found::Node { node, .. } => node,
+                        Found::Restart | Found::Shorter => {
+                            pending(cursor, target);
+                            return yield_now();
+                        }
+                        Found::Io(io) => {
+                            pending(cursor, target);
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
                 }
             };
-            let Some(step) =
-                leaf.read(|p| scan_leaf(View::new(p), seek, &target, cached.is_some()))
-            else {
+            // Into the buffers of the entry before, or kept ones.
+            let (mut key, mut value) = match cursor.entry.take() {
+                Some(buffers) => buffers,
+                None => (
+                    std::mem::take(&mut cursor.spare.0),
+                    std::mem::take(&mut cursor.spare.1),
+                ),
+            };
+            let read = leaf.read(|p| {
+                scan_leaf(
+                    View::new(p),
+                    seek,
+                    &target,
+                    cached.is_some(),
+                    at,
+                    &mut key,
+                    &mut value,
+                )
+            });
+            let Some(step) = read else {
                 // Changed while read: a writer holds it for a moment.
+                cursor.near = Near::NONE;
+                cursor.spare.0 = key;
+                cursor.spare.1 = value;
                 cursor.leaf = None;
+                cursor.at = None;
+                pending(cursor, target);
                 return yield_now();
             };
-            match step.ok_or_else(|| corrupt_node(leaf.pid()))? {
-                Scan::Entry(key, value, out_of_line) => {
+            let step = match step {
+                Some(step) => step,
+                None => {
+                    pending(cursor, target);
+                    return Err(corrupt_node(leaf.pid()));
+                }
+            };
+            cursor.near = Near::of(&leaf);
+            if !matches!(step, Scan::Entry(..)) {
+                cursor.spare.0 = std::mem::take(&mut key);
+                cursor.spare.1 = std::mem::take(&mut value);
+            }
+            match step {
+                Scan::Entry(out_of_line, pos) => {
                     let at = (leaf.pid(), leaf.hint(), leaf.version());
                     cursor.leaf = Some(at);
+                    // A value out of line is read through the leaf, and found again by its key if
+                    // the read is lost: no step from it is taken by position.
+                    cursor.at = (!out_of_line).then_some(pos);
                     if !out_of_line {
                         cursor.entry = Some((key, value));
-                        cursor.pending = None;
+                        cursor.spare.2 = target;
                         cursor.reading = None;
                         return Ok(IOResult::Done(true));
                     }
+                    pending(cursor, target);
                     let (head, reference) = self
                         .split_reference(&value)
                         .ok_or_else(|| corrupt_node(leaf.pid()))?;
@@ -1484,11 +1733,16 @@ impl Tree {
                 Scan::End => {
                     cursor.reading = None;
                     cursor.entry = None;
-                    cursor.pending = None;
+                    cursor.spare.2 = target;
                     cursor.leaf = None;
+                    cursor.at = None;
                     return Ok(IOResult::Done(false));
                 }
-                Scan::Stale => cursor.leaf = None,
+                Scan::Stale => {
+                    cursor.leaf = None;
+                    cursor.at = None;
+                    pending(cursor, target);
+                }
                 Scan::Beyond(pid, hint, fence) => {
                     // A leaf holds the keys up to its upper fence. A descent above the target
                     // goes right of a separator equal to it, so the leaf it finds ends past the
@@ -1501,9 +1755,13 @@ impl Tree {
                         _ => fence >= target,
                     };
                     if !advances {
-                        return Err(stuck_scan(leaf.pid(), seek, &target, &fence));
+                        let e = stuck_scan(leaf.pid(), seek, &target, &fence);
+                        pending(cursor, target);
+                        return Err(e);
                     }
                     cursor.leaf = None;
+                    cursor.at = None;
+                    cursor.spare.2 = target;
                     // The next leaf by its hint, if its frame still holds it; else a descent.
                     if let Some(n) = self.pool.fix_optimistic_at(pid, hint) {
                         let neighbour = n.read(|p| {
@@ -1522,9 +1780,13 @@ impl Tree {
                 Scan::Before(fence) => {
                     // A leaf's lower fence lies below every key it covers.
                     if fence >= target {
-                        return Err(stuck_scan(leaf.pid(), seek, &target, &fence));
+                        let e = stuck_scan(leaf.pid(), seek, &target, &fence);
+                        pending(cursor, target);
+                        return Err(e);
                     }
                     cursor.leaf = None;
+                    cursor.at = None;
+                    cursor.spare.2 = target;
                     cursor.pending = Some((Seek::Le, fence));
                 }
             }
@@ -1612,6 +1874,21 @@ impl Tree {
 /// What the look at a leaf found: `None` if it no longer covers the key; else the key's value
 /// and whether it is out of line, if present.
 type Look = Option<Option<(Vec<u8>, bool)>>;
+
+/// What [`look`] finds, with where the key is or goes in the leaf and whether it is there.
+type LookAt = Option<(usize, bool, Option<(Vec<u8>, bool)>)>;
+
+fn look_at<P: Bytes + ?Sized>(v: View<'_, P>, key: &[u8]) -> Option<LookAt> {
+    if !v.covers(key)? {
+        return Some(None);
+    }
+    let (pos, exact) = v.search(key)?;
+    let value = match exact {
+        true => Some(v.value(pos)?),
+        false => None,
+    };
+    Some(Some((pos, exact, value)))
+}
 
 fn look<P: Bytes + ?Sized>(v: View<'_, P>, key: &[u8]) -> Option<Look> {
     if !v.covers(key)? {
@@ -1788,6 +2065,29 @@ impl Lookup {
     }
 }
 
+/// A look at a key's leaf, held optimistically at the version read: where the key is or goes,
+/// whether it is there, and its entry as the leaf holds it. A guard of the step that made it: it
+/// is used, or dropped, before the step returns.
+pub struct Looked<'a> {
+    leaf: Optimistic<'a>,
+    pos: usize,
+    exact: bool,
+    present: Option<(Vec<u8>, bool)>,
+}
+
+impl Looked<'_> {
+    /// The leaf looked at, as a hint for the next look ([`Near`]).
+    pub fn near(&self) -> Near {
+        Near::of(&self.leaf)
+    }
+
+    /// The key's entry as the leaf stores it, and whether its value is out of line; `None` for
+    /// none.
+    pub fn present(&self) -> Option<(&[u8], bool)> {
+        self.present.as_ref().map(|(b, out)| (b.as_slice(), *out))
+    }
+}
+
 /// An entry as its leaf holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
@@ -1804,9 +2104,10 @@ pub enum StoredValue {
 /// A put of one key's value.
 pub struct Put {
     key: Vec<u8>,
-    /// Kept in the leaf whatever the value's length: the tree's head.
-    head: Vec<u8>,
-    value: Vec<u8>,
+    /// The entry as the leaf stores it inline: the tree's head, kept in the leaf whatever the
+    /// value's length, then the value, until a value out of line takes it, leaving the head.
+    entry: Vec<u8>,
+    head_len: usize,
     value_len: usize,
     mode: Mode,
     write: Option<ValueWrite>,
@@ -1831,6 +2132,8 @@ pub struct Put {
     /// The out-of-line value it puts back as it stands, by its reference, with its pages once
     /// learned: retired, and reinstated by the change.
     restoring: Option<(ValueRef, Option<Vec<PageId>>)>,
+    /// The leaf tried first, then the leaf it reached.
+    near: Near,
 }
 
 /// `stored` as the leaf keeps it: its bytes, and whether its value is out of line.
@@ -1848,11 +2151,22 @@ impl Put {
 
     /// A put into a tree whose values start with a head of `head`'s length.
     pub fn with_head(key: &[u8], head: Vec<u8>, value: Vec<u8>, mode: Mode) -> Self {
+        let head_len = head.len();
+        let entry = match head.is_empty() {
+            true => value,
+            false => [head, value].concat(),
+        };
+        Self::with_entry(key, entry, head_len, mode)
+    }
+
+    /// A put of `entry`, the head of a tree whose values start with one of `head_len` bytes,
+    /// then the value: built once, in the bytes the leaf and the log copy.
+    pub fn with_entry(key: &[u8], entry: Vec<u8>, head_len: usize, mode: Mode) -> Self {
         Self {
             key: key.to_vec(),
-            head,
-            value_len: value.len(),
-            value,
+            value_len: entry.len() - head_len,
+            head_len,
+            entry,
             mode,
             write: None,
             old: None,
@@ -1865,7 +2179,19 @@ impl Put {
             retire_old: false,
             found: None,
             restoring: None,
+            near: Near::NONE,
         }
+    }
+
+    /// Tries `near` before a descent.
+    pub fn near(mut self, near: Near) -> Self {
+        self.near = near;
+        self
+    }
+
+    /// The leaf the put reached: where the key it wrote is, unless the leaf has changed since.
+    pub fn reached(&self) -> Near {
+        self.near
     }
 
     /// Puts `entry` back as [`Tree::stored`] read it: a value out of line by its reference, its
@@ -1897,6 +2223,12 @@ impl Put {
     /// [`Tree::stored`] read it, or absent for `None`.
     pub fn expecting(mut self, stored: Option<&Stored>) -> Self {
         self.expected = Some(stored.map(leaf_entry));
+        self
+    }
+
+    /// [`expecting`](Self::expecting) the entry a [`Looked`] found, as the leaf stores it.
+    pub fn expecting_entry(mut self, entry: Option<(&[u8], bool)>) -> Self {
+        self.expected = Some(entry.map(|(b, out)| (b.to_vec(), out)));
         self
     }
 
@@ -2061,17 +2393,70 @@ pub struct Cursor {
     pending: Option<(Seek, Vec<u8>)>,
     /// The leaf of the entry: page, frame hint, and the version it was read at.
     leaf: Option<(PageId, u32, u64)>,
+    /// Where the entry is in `leaf`, while the leaf is the one it was read from: a step to the
+    /// next or previous entry of a leaf unchanged since is one slot along, with no search.
+    at: Option<usize>,
+    /// Buffers kept from earlier entries and targets, so a scan copies each row into memory it
+    /// already has: an entry's key and value, and a target.
+    spare: (Vec<u8>, Vec<u8>, Vec<u8>),
     /// The key, the head and the read of an out-of-line value.
     reading: Option<(Vec<u8>, Vec<u8>, ValueRead)>,
     /// The leaf the value's reference was read from, while it is known to hold it: page, frame
     /// hint and version.
     held: Option<(PageId, u32, u64)>,
     failed: Option<ValueRef>,
+    /// The leaf it last read or was placed at, tried before a descent once `leaf` no longer holds.
+    near: Near,
 }
 
 impl Cursor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stands at `key`, with no leaf to step from and its value unread: the next move seeks from
+    /// the key, as from an entry a seek found there, trying `near` first.
+    pub fn place(&mut self, key: &[u8], near: Near) {
+        let (mut k, mut v) = match self.entry.take() {
+            Some(buffers) => buffers,
+            None => (
+                std::mem::take(&mut self.spare.0),
+                std::mem::take(&mut self.spare.1),
+            ),
+        };
+        k.clear();
+        k.extend_from_slice(key);
+        v.clear();
+        self.entry = Some((k, v));
+        self.pending = None;
+        self.leaf = None;
+        self.at = None;
+        self.reading = None;
+        self.held = None;
+        self.near = near;
+    }
+
+    /// The leaf it last read or was placed at.
+    pub fn near(&self) -> Near {
+        self.near
+    }
+
+    /// Tries `near` before its next descent.
+    pub fn set_near(&mut self, near: Near) {
+        self.near = near;
+    }
+
+    /// Sets the move past the entry, `Gt` or `Lt`, pending: false with no entry. The target is
+    /// the entry's key, copied into a kept buffer.
+    fn step(&mut self, seek: Seek) -> bool {
+        let Some((key, _)) = &self.entry else {
+            return false;
+        };
+        let mut target = std::mem::take(&mut self.spare.2);
+        target.clear();
+        target.extend_from_slice(key);
+        self.pending = Some((seek, target));
+        true
     }
 
     pub fn key(&self) -> Option<&[u8]> {
@@ -2085,8 +2470,9 @@ impl Cursor {
 
 /// What a scan of one leaf found.
 enum Scan {
-    /// The entry: its key, its value or reference, and whether the value is out of line.
-    Entry(Vec<u8>, Vec<u8>, bool),
+    /// The entry, its key and its value or reference copied out: whether the value is out of
+    /// line, and where the entry is in the leaf.
+    Entry(bool, usize),
     /// Nothing more in this direction.
     End,
     /// Past the leaf's upper end: the next leaf's hint and the fence to seek above.
@@ -2097,32 +2483,44 @@ enum Scan {
     Before(Vec<u8>),
 }
 
-/// The entry `seek` from `target` lands on in the leaf `v`. A leaf found by its hint (`cached`)
-/// must hold where the seek lands: cover the target, or, seeking above it, start right there.
+/// The entry `seek` from `target` lands on in the leaf `v`, its key and value copied into `key`
+/// and `value`. A leaf found by its hint (`cached`) must hold where the seek lands: cover the
+/// target, or, seeking above it, start right there. A step from the entry at `at` of the same
+/// leaf, unchanged since, is the slot beside it.
 fn scan_leaf<P: Bytes + ?Sized>(
     v: View<'_, P>,
     seek: Seek,
     target: &[u8],
     cached: bool,
+    at: Option<usize>,
+    key: &mut Vec<u8>,
+    value: &mut Vec<u8>,
 ) -> Option<Scan> {
     if !v.is_leaf() {
         return None;
     }
-    if cached && !(v.covers(target)? || seek == Seek::Gt && v.lower_is(target)?) {
-        return Some(Scan::Stale);
-    }
     let count = v.count()?;
-    let (pos, exact) = v.search(target)?;
-    let pos = match seek {
-        Seek::Ge => Some(pos),
-        Seek::Gt => Some(pos + exact as usize),
-        Seek::Le => (pos + exact as usize).checked_sub(1),
-        Seek::Lt => pos.checked_sub(1),
+    let pos = match (at, seek) {
+        (Some(p), Seek::Gt) => Some(p + 1),
+        (Some(p), Seek::Lt) => p.checked_sub(1),
+        _ => {
+            if cached && !(v.covers(target)? || seek == Seek::Gt && v.lower_is(target)?) {
+                return Some(Scan::Stale);
+            }
+            let (pos, exact) = v.search(target)?;
+            match seek {
+                Seek::Ge => Some(pos),
+                Seek::Gt => Some(pos + exact as usize),
+                Seek::Le => (pos + exact as usize).checked_sub(1),
+                Seek::Lt => pos.checked_sub(1),
+            }
+        }
     };
     match pos {
         Some(p) if p < count => {
-            let (value, out) = v.value(p)?;
-            Some(Scan::Entry(v.key(p)?, value, out))
+            v.key_into(p, key)?;
+            let out = v.value_into(p, value)?;
+            Some(Scan::Entry(out, p))
         }
         Some(_) => Some(match v.upper()? {
             None => Scan::End,

@@ -337,7 +337,9 @@ mod plain {
                     let parked = d.put_waiting(graph, a, &mut ta, 1);
                     (parked, ta)
                 });
-                while !graph.waits_of(a).iter().any(|r| !r.flagged()) {
+                // Parked, not only published: a rollback that lands before the park would leave
+                // the older's next write nothing to wait on.
+                while !graph.waits_of(a).iter().any(|r| !r.flagged() && r.parked()) {
                     std::thread::yield_now();
                 }
                 assert_eq!(d.put_waiting(graph, b, &mut tb, 0), Err(Deadlock));

@@ -1,19 +1,20 @@
-//! Rolling a running transaction back (DESIGN.md §11.5), from its version indexes.
+//! Rolling a running transaction back (DESIGN.md §11.5), from its version arena.
 //!
-//! A transaction's entries in its slot's version index of one node class, read backward from its
-//! last, come newest statement first ([`super::versioned`]); the indexes of every class the slot
-//! has are merged by statement, so the whole transaction goes back newest statement first. Each
-//! entry names a key one of its statements changed and the entry that statement replaced.
+//! A transaction's entries lie in its slot's arena between its first and its last
+//! ([`super::arena`]), in the order its writes made them, so walked back from the last they come
+//! newest statement first. Each names a key one of its statements changed and the entry that
+//! statement replaced, or that the key had none.
 //!
-//! An index entry is put before the leaf write it is for, which may never happen: a write that
+//! An entry is appended before the leaf write it is for, which may never happen: a write that
 //! found another transaction's version open, or a conflict, stops between the two. So a key is put
-//! back only once the leaf, under its latch, holds this transaction's version from that statement.
-//! Then the entry it replaced goes back whole, version header and all, or the key is removed if
-//! it had none, in one compensation record that names the unit it completed: the transaction, the
-//! statement, the tree and the key. Statements a key had after this one were put back before it,
-//! newest first, so the leaf holds this statement's version again unless the write never happened.
+//! back only once the leaf, under its latch, holds this transaction's version from that statement,
+//! naming this entry as the version below it (none, for a key that had no entry). Then the entry
+//! it replaced goes back whole, version header and all, or the key is removed if it had none, in
+//! one compensation record that names the unit it completed: the transaction, the statement, the
+//! tree and the key. Statements a key had after this one were put back before it, newest first,
+//! so the leaf holds this statement's version again unless the write never happened.
 //!
-//! Nothing is removed from the indexes: a reader may be following one of their entries.
+//! Nothing is removed from the arena: a reader may be following one of its entries.
 //!
 //! The trees the transaction created are one more lane, by the statement that created each: a
 //! creation is undone after every entry of its statement and later, so after every change to its
@@ -21,14 +22,13 @@
 //! transaction's start as the value. The put is idempotent, and the list's entries are freed only
 //! once the transaction has ended (DESIGN.md §17).
 
-use super::versioned::{decode_entry, index_key_parts, Version, VersionedTree, Versions, HEADER};
+use super::arena::{Entry, Ptr};
+use super::versioned::{decode_entry, Version, VersionedTree, Versions, HEADER};
 use super::{creation, Statement, Transactions, Ts, Txn, CREATE};
 use crate::io::IO;
 use crate::storage::atoll::btree::record::{Change, Compensation, Record};
 use crate::storage::atoll::btree::value::ValueRef;
-use crate::storage::atoll::btree::{
-    Cursor, Mode, Outcome, Put, Remove, Seek, Stored, StoredValue, Tree,
-};
+use crate::storage::atoll::btree::{Mode, Outcome, Put, Remove, Stored, StoredValue, Tree};
 use crate::storage::atoll::buffer::BufferPool;
 use crate::storage::atoll::drive;
 use crate::storage::atoll::log::{framed_len, GroupStart, Log, LogConfig, TxnTail, Writers};
@@ -47,37 +47,20 @@ macro_rules! done {
     };
 }
 
-/// What a statement replaced of a key: an entry of a version index.
-struct Replaced {
-    statement: Statement,
-    tree: PageId,
-    key: Vec<u8>,
-    /// The entry the statement's first change of the key replaced; `None` for none.
-    entry: Option<Stored>,
-}
-
-/// One version index read backward: the entry its cursor is at, still to put back.
-struct Lane {
-    index: Tree,
-    cursor: Cursor,
-    positioned: bool,
-    at: Option<Replaced>,
-}
-
-/// Where putting back the entry of the lane being worked on stands.
+/// Where putting back the entry being worked on stands.
 enum Step {
     /// Reading the key's entry, to check it is still the statement's.
     Look,
     Put(Put),
     Remove(Remove),
-    /// Done with the entry: the lane moves to the one before.
+    /// Done with the entry: on to the one before.
     Next,
 }
 
 /// What a rollback is working on.
 enum Working {
-    /// A lane, and where putting its entry back stands.
-    Lane(usize, Step),
+    /// The arena entry being put back, and where that stands.
+    Entry(Step),
     /// Putting the transaction's last creation on its list.
     Creation(Put),
 }
@@ -86,7 +69,9 @@ enum Working {
 /// statement after `to` created put on its list. Step it with [`undo`].
 pub struct Rollback {
     to: Statement,
-    lanes: Option<Vec<Lane>>,
+    /// The arena entry walked back to, still to put back: `None` before the walk begins, then
+    /// `Some(None)` once no entry of a statement after `to` is left.
+    at: Option<Option<(Ptr, Entry)>>,
     working: Option<Working>,
 }
 
@@ -95,7 +80,7 @@ impl Rollback {
     pub fn after(to: Statement) -> Self {
         Self {
             to,
-            lanes: None,
+            at: None,
             working: None,
         }
     }
@@ -106,29 +91,9 @@ impl Rollback {
     }
 }
 
-impl Lane {
-    /// The entry the cursor is at, if it is one of `start`'s statements after `to`.
-    fn read(&mut self, start: Ts, to: Statement) -> Result<()> {
-        self.at = match (self.cursor.key(), self.cursor.value()) {
-            (Some(key), Some(value)) => {
-                let (ts, statement, tree, key) = index_key_parts(key).ok_or_else(|| {
-                    LimboError::Corrupt("a version index key does not decode".into())
-                })?;
-                if ts != start || statement <= to {
-                    None
-                } else {
-                    Some(Replaced {
-                        statement,
-                        tree,
-                        key: key.to_vec(),
-                        entry: decode_entry(value)?,
-                    })
-                }
-            }
-            _ => None,
-        };
-        Ok(())
-    }
+/// The entry at `ptr` of `txn`'s, if it is one of a statement after `to`.
+fn kept(entry: Entry, ptr: Ptr, to: Statement) -> Option<(Ptr, Entry)> {
+    (entry.statement > to).then_some((ptr, entry))
 }
 
 /// Steps `op`, rolling `txn` back as far as `op` says. Done once every key is put back and every
@@ -139,28 +104,16 @@ pub fn undo(
     txn: &mut Txn,
     op: &mut Rollback,
 ) -> Result<IOResult<()>> {
-    let lanes = op.lanes.get_or_insert_with(|| {
-        versions
-            .index_roots(txn.slot)
-            .into_iter()
-            .map(|root| Lane {
-                index: versions.open_index(root),
-                cursor: Cursor::new(),
-                positioned: false,
-                at: None,
-            })
-            .collect()
-    });
-    // Each lane at its transaction's last entry: the last key below the next start's.
-    for lane in lanes.iter_mut().filter(|l| !l.positioned) {
-        let past = (txn.start + 1).to_be_bytes();
-        done!(lane.index.seek(&mut lane.cursor, &past, Seek::Lt));
-        lane.positioned = true;
-        lane.read(txn.start, op.to)?;
+    let arenas = versions.arenas();
+    if op.at.is_none() {
+        op.at = Some(match txn.replaced {
+            Some((_, last)) => kept(done!(arenas.read(last)), last, op.to),
+            None => None,
+        });
     }
     loop {
-        let (i, step) = match op.working.take() {
-            Some(Working::Lane(i, step)) => (i, step),
+        let step = match op.working.take() {
+            Some(Working::Entry(step)) => step,
             Some(Working::Creation(mut put)) => {
                 let created = *txn.created.last().expect("a creation being undone");
                 match versions.open_plain(created.list).put(&mut put)? {
@@ -182,35 +135,42 @@ pub fn undo(
                 }
             }
             None => {
-                let newest = lanes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, l)| l.at.as_ref().map(|r| (r.statement, i)))
-                    .max();
+                let newest = op
+                    .at
+                    .as_ref()
+                    .and_then(|at| at.as_ref().map(|(_, e)| e.statement));
                 let creation = txn.created.last().filter(|c| c.statement > op.to);
                 match (newest, creation) {
-                    // A lane's entry of the creation's statement or later first: its tree's
-                    // changes are undone before the tree is.
-                    (Some((statement, i)), Some(c)) if statement >= c.statement => (i, Step::Look),
+                    // An entry of the creation's statement or later first: its tree's changes are
+                    // undone before the tree is.
+                    (Some(statement), Some(c)) if statement >= c.statement => Step::Look,
                     (_, Some(c)) => {
                         op.working = Some(Working::Creation(abandoning(c.root, txn.start)));
                         continue;
                     }
-                    (Some((_, i)), None) => (i, Step::Look),
+                    (Some(_), None) => Step::Look,
                     (None, None) => return Ok(IOResult::Done(())),
                 }
             }
         };
-        let lane = &mut lanes[i];
-        let replaced = lane.at.as_ref().expect("a lane at an entry");
-        let tree = versions.open_tree(replaced.tree);
+        let (ptr, entry) = op
+            .at
+            .as_ref()
+            .and_then(|at| at.as_ref())
+            .expect("an entry being put back");
+        let (ptr, statement) = (*ptr, entry.statement);
+        let tree = versions.open_tree(entry.root);
         let next = match step {
             Step::Look => {
-                op.working = Some(Working::Lane(i, Step::Look));
-                let current = done!(tree.tree().stored(&replaced.key));
+                op.working = Some(Working::Entry(Step::Look));
+                let replaced = decode_entry(&entry.replaced)?;
+                // What the version the write made names below it: this entry, or none for a key
+                // that had no entry.
+                let names = replaced.as_ref().map(|_| ptr);
+                let current = done!(tree.tree().stored(&entry.key));
                 let current = current.filter(|c| {
                     Version::decode(&c.head).is_some_and(|v| {
-                        (v.slot, v.ts, v.command) == (txn.slot, txn.start, replaced.statement)
+                        (v.slot, v.ts, v.command, v.prev) == (txn.slot, txn.start, statement, names)
                     })
                 });
                 match current {
@@ -218,18 +178,18 @@ pub fn undo(
                     None => Step::Next,
                     Some(current) => {
                         let of = Compensation {
-                            root: replaced.tree,
-                            statement: replaced.statement,
+                            root: entry.root,
+                            statement,
                             undid: None,
                         };
-                        match &replaced.entry {
+                        match &replaced {
                             // A value out of line goes back by its reference, its pages kept.
-                            Some(entry) => Step::Put(
-                                Put::restoring(&replaced.key, entry, Mode::Update)
+                            Some(replaced) => Step::Put(
+                                Put::restoring(&entry.key, replaced, Mode::Update)
                                     .expecting(Some(&current))
                                     .compensating(txns.tail(txn), of),
                             ),
-                            None => Step::Remove(Remove::new(&replaced.key).compensating(
+                            None => Step::Remove(Remove::new(&entry.key).compensating(
                                 txns.tail(txn),
                                 of,
                                 &current,
@@ -240,7 +200,7 @@ pub fn undo(
             }
             Step::Put(mut put) => match tree.tree().put(&mut put)? {
                 IOResult::IO(io) => {
-                    op.working = Some(Working::Lane(i, Step::Put(put)));
+                    op.working = Some(Working::Entry(Step::Put(put)));
                     return Ok(IOResult::IO(io));
                 }
                 // Changed since the look: look again.
@@ -252,7 +212,7 @@ pub fn undo(
             },
             Step::Remove(mut remove) => match tree.tree().remove(&mut remove)? {
                 IOResult::IO(io) => {
-                    op.working = Some(Working::Lane(i, Step::Remove(remove)));
+                    op.working = Some(Working::Entry(Step::Remove(remove)));
                     return Ok(IOResult::IO(io));
                 }
                 IOResult::Done(true) => {
@@ -262,14 +222,21 @@ pub fn undo(
                 IOResult::Done(false) => Step::Look,
             },
             Step::Next => {
-                op.working = Some(Working::Lane(i, Step::Next));
-                done!(lane.index.prev(&mut lane.cursor));
-                lane.read(txn.start, op.to)?;
+                op.working = Some(Working::Entry(Step::Next));
+                let (first, _) = txn.replaced.expect("an entry walked back to");
+                let before = match ptr == first {
+                    true => None,
+                    false => done!(arenas.before(ptr)),
+                };
+                op.at = Some(match before {
+                    Some(before) => kept(done!(arenas.read(before)), before, op.to),
+                    None => None,
+                });
                 op.working = None;
                 continue;
             }
         };
-        op.working = Some(Working::Lane(i, next));
+        op.working = Some(Working::Entry(next));
     }
 }
 
@@ -356,6 +323,60 @@ pub(crate) fn undo_loser(
         let Some(record) = Record::decode(r.header.kind, &r.payload)? else {
             continue;
         };
+        // A patch: undone while the leaf holds the version it made, its head and the bytes it
+        // wrote, by the entry it replaced, which its statement found.
+        if let Change::Patch {
+            key,
+            head,
+            at,
+            bytes,
+            root,
+            old_head,
+            old_bytes,
+        } = record.change
+        {
+            let statement = Version::decode(head)
+                .ok_or_else(|| corrupt("a patch whose head is no version header".into()))?
+                .command;
+            let tree = VersionedTree::open(io.clone(), pool.clone(), store.clone(), root);
+            let of = Compensation {
+                root,
+                statement,
+                undid: Some(group),
+            };
+            loop {
+                let current = drive(io, || tree.tree().stored(key))?;
+                let Some(current) = current.filter(|c| {
+                    c.head == head
+                        && matches!(&c.value, StoredValue::Inline(v)
+                            if v.get(at..at + bytes.len()) == Some(bytes))
+                }) else {
+                    break;
+                };
+                let StoredValue::Inline(value) = &current.value else {
+                    unreachable!("filtered to an inline value");
+                };
+                let mut was = value.clone();
+                was[at..at + old_bytes.len()].copy_from_slice(old_bytes);
+                let entry = Stored {
+                    head: old_head.to_vec(),
+                    value: StoredValue::Inline(was),
+                };
+                let tail_now = TxnTail::new(txn, tail, writers.clone(), SLOT);
+                let mut put = Put::restoring(key, &entry, Mode::Update)
+                    .expecting(Some(&current))
+                    .compensating(tail_now, of);
+                if drive(io, || tree.tree().put(&mut put))? == Outcome::Changed {
+                    continue;
+                }
+                tail = Some(
+                    put.group()
+                        .ok_or_else(|| corrupt("a compensation not logged".into()))?,
+                );
+                break;
+            }
+            continue;
+        }
         // What the change wrote, as the leaf stores it, and the entry its statement found, which
         // undoing it puts back.
         let (root, key, wrote, found) = match record.change {
@@ -386,6 +407,7 @@ pub(crate) fn undo_loser(
                 }
                 continue;
             }
+            Change::Patch { .. } => unreachable!("a patch is undone above"),
             // Changes outside any transaction were not its.
             Change::Insert { undo: None, .. }
             | Change::Update { undo: None, .. }

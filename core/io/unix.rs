@@ -69,6 +69,11 @@ impl IO for UnixIO {
         Ok(())
     }
 
+    fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        std::fs::rename(from, to).map_err(|e| io_error(e, "rename_file"))?;
+        Ok(true)
+    }
+
     fn sync_directory(&self, path: &str) -> Result<()> {
         common::sync_directory(path)
     }

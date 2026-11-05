@@ -5,6 +5,7 @@ use crate::storage::atoll::btree::Seek;
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{Kind, LogConfig};
+use crate::storage::atoll::page::SizeClass;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
@@ -532,30 +533,30 @@ fn a_rollback_leaves_a_key_it_waited_on_to_the_transaction_that_wrote_it() {
         db.put(&mut t, "k", "t1", Mode::Update),
         Write::Wait(_)
     ));
-    // The entry a write puts before its leaf write, left as when the leaf changed between the two
-    // and the write then found that change open: naming what `t` would have replaced, with no
+    // The entry a write appends before its leaf write, left as when the leaf changed between the
+    // two and the write then found that change open: naming what `t` would have replaced, with no
     // version of `t` in the leaf.
-    let index = run(&db.io, || {
-        db.versions.index(t.slot(), db.tree.root().class())
-    });
     let committed = Stored {
         head: Version {
             slot: 0,
             ts: 1,
             command: 1,
             updates: 0,
-            flags: Version::FIRST,
+            flags: 0,
+            prev: None,
         }
         .encode()
         .to_vec(),
         value: StoredValue::Inline(b"k0".to_vec()),
     };
-    let mut entry = Put::new(
-        &index_key(t.start(), t.command(), db.tree.root(), b"k"),
-        encode_entry(Some(&committed)),
-        Mode::Upsert,
-    );
-    run(&db.io, || index.put(&mut entry));
+    run(&db.io, || {
+        db.versions.arenas().append(
+            &mut t,
+            db.tree.root(),
+            b"k",
+            &encode_entry(Some(&committed)),
+        )
+    });
     db.rollback(t);
     db.commit(u);
     assert_eq!(db.read_in(&db.tree, "k").as_deref(), Some("u1"));
@@ -1174,7 +1175,9 @@ fn parked_writers_all_finish_in_shuttle_schedules() {
 }
 
 fn probe(db: &Db, txn: &mut Txn, key: &str) -> Probe {
-    run(&db.io, || db.tree.probe(db.txns(), txn, key.as_bytes()))
+    run(&db.io, || {
+        db.tree.probe(db.txns(), txn, key.as_bytes(), Near::NONE)
+    })
 }
 
 /// A probe judges a key by its newest version: absent with none, present or absent by the
@@ -1233,4 +1236,137 @@ fn a_probe_judges_a_key_by_its_newest_version() {
     assert_eq!(probe(&db, &mut rc, "doomed"), Probe::Absent);
     db.commit(snap);
     db.commit(rc);
+}
+
+/// A delete changes the head alone and leaves an inline value in the tombstone, and a change of a
+/// value to one as long changes only the bytes that differ: each logs one patch, a snapshot taken
+/// before reads the value it replaced, and a rollback puts it back whole.
+/// A write names the leaf it reached, where its key is, and the next write and probe try it
+/// first: keys written in order miss it once at the start and once after each split.
+#[test]
+fn a_write_names_the_leaf_it_reached_and_the_next_one_starts_there() {
+    use crate::storage::atoll::btree::{Cursor, NEAR_TAKEN};
+    let db = open();
+    let mut t = db.begin(Isolation::Snapshot);
+    let key = |n: u64| format!("key-{n:05}");
+    let (mut near, mut misses) = (Near::NONE, 0);
+    let writes = 2_000;
+    for n in 0..writes {
+        let taken = NEAR_TAKEN.with(|c| c.get());
+        let mut op = WriteOp::put(key(n).as_bytes(), vec![b'v'; 40], Mode::Insert).near(near);
+        let wrote = run(&db.io, || {
+            db.tree.write(db.txns(), &db.versions, &mut t, &mut op)
+        });
+        assert_eq!(wrote, DONE_INSERTED);
+        misses += (NEAR_TAKEN.with(|c| c.get()) == taken) as u64;
+        near = op.reached();
+        // The leaf named is the one a seek finds the key in.
+        let mut cursor = Cursor::new();
+        assert!(run(&db.io, || {
+            db.tree
+                .tree()
+                .seek(&mut cursor, key(n).as_bytes(), Seek::Ge)
+        }));
+        assert_eq!(cursor.key(), Some(key(n).as_bytes()));
+        assert_eq!(near.page(), cursor.near().page(), "{}", key(n));
+        // A probe from it finds the statement's own version.
+        let taken = NEAR_TAKEN.with(|c| c.get());
+        let probed = run(&db.io, || {
+            db.tree.probe(db.txns(), &mut t, key(n).as_bytes(), near)
+        });
+        assert_eq!(probed, Probe::Present, "{}", key(n));
+        assert_eq!(NEAR_TAKEN.with(|c| c.get()), taken + 1, "{}", key(n));
+    }
+    let mut leaves = 0;
+    let mut last = None;
+    let mut cursor = Cursor::new();
+    let mut more = run(&db.io, || db.tree.tree().seek(&mut cursor, b"", Seek::Ge));
+    while more {
+        if last != Some(cursor.near()) {
+            leaves += 1;
+            last = Some(cursor.near());
+        }
+        more = run(&db.io, || db.tree.tree().next(&mut cursor));
+    }
+    assert!(leaves >= 10, "only {leaves} leaves");
+    assert!(misses <= leaves + 1, "{misses} misses over {leaves} leaves");
+    db.commit(t);
+}
+
+#[test]
+fn deletes_and_changes_in_place_log_patches_and_keep_what_snapshots_read() {
+    use crate::storage::atoll::btree::record::{Change, Record, TXN_PATCH};
+    let db = open();
+    let mut setup = db.begin(Isolation::Snapshot);
+    db.put(&mut setup, "d", "value-AAAA", Mode::Insert);
+    db.put(&mut setup, "u", "value-AAAA", Mode::Insert);
+    db.commit(setup);
+    let mut before = db.begin(Isolation::Snapshot);
+    assert_eq!(db.get(&mut before, "d").as_deref(), Some("value-AAAA"));
+    let mut t = db.begin(Isolation::Snapshot);
+    assert_eq!(db.delete(&mut t, "d"), Write::Done(Outcome::Updated));
+    db.txns().statement(&mut t).unwrap();
+    assert_eq!(
+        db.put(&mut t, "u", "value-ABBA", Mode::Update),
+        Write::Done(Outcome::Updated)
+    );
+    // The tombstone holds the value it replaced, past a head that says deleted.
+    let stored = run(&db.io, || db.tree.tree().stored(b"d")).expect("a tombstone");
+    let head = Version::decode(&stored.head).unwrap();
+    assert_eq!(head.flags & Version::DELETED, Version::DELETED);
+    assert_eq!(stored.value, StoredValue::Inline(b"value-AAAA".to_vec()));
+    // Both logged as patches: the delete with no bytes, the change with the two that differ.
+    let kinds: Vec<Kind> = db.chain(t.start()).into_iter().map(|(k, _)| k).collect();
+    assert_eq!(kinds, vec![TXN_PATCH, TXN_PATCH]);
+    drive(&db.io, || db.db.log().wait_durable(db.db.log().end())).unwrap();
+    let mut reader = crate::storage::atoll::log::Log::reader(
+        db.io.clone(),
+        BASE,
+        &LogConfig {
+            segment_bytes: 1 << 20,
+            buffer_bytes: 256 << 10,
+            chunk_bytes: 16 << 10,
+            writes_in_flight: 3,
+            direct: true,
+        },
+        0,
+    );
+    let mut patches = Vec::new();
+    while let Some(r) = reader.next_record().unwrap() {
+        if r.header.txn != t.start() {
+            continue;
+        }
+        if let Some(Record {
+            change:
+                Change::Patch {
+                    key,
+                    at,
+                    bytes,
+                    old_bytes,
+                    ..
+                },
+            ..
+        }) = Record::decode(r.header.kind, &r.payload).unwrap()
+        {
+            patches.push((key.to_vec(), at, bytes.to_vec(), old_bytes.to_vec()));
+        }
+    }
+    assert_eq!(
+        patches,
+        vec![
+            (b"d".to_vec(), 10, vec![], vec![]),
+            (b"u".to_vec(), 7, b"BB".to_vec(), b"AA".to_vec()),
+        ]
+    );
+    // The snapshot from before reads what both replaced; the transaction reads its own.
+    assert_eq!(db.get(&mut before, "d").as_deref(), Some("value-AAAA"));
+    assert_eq!(db.get(&mut before, "u").as_deref(), Some("value-AAAA"));
+    assert_eq!(db.get(&mut t, "d"), None);
+    assert_eq!(db.get(&mut t, "u").as_deref(), Some("value-ABBA"));
+    db.rollback(t);
+    let mut after = db.begin(Isolation::Snapshot);
+    assert_eq!(db.get(&mut after, "d").as_deref(), Some("value-AAAA"));
+    assert_eq!(db.get(&mut after, "u").as_deref(), Some("value-AAAA"));
+    db.commit(after);
+    db.commit(before);
 }

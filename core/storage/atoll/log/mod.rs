@@ -111,27 +111,29 @@ pub struct Log {
     durable_writes: bool,
     ring: Box<[Slot]>,
     room: Room,
-    /// Past every write landed, in whole blocks: durable, with durable writes.
-    landed: Prefix,
+    /// Past every write landed, in whole blocks: durable, with durable writes. Raised by every
+    /// write landing, so on a line of its own, as is every field below written often: an append
+    /// reads the fields around them.
+    landed: CachePadded<Prefix>,
     /// The furthest anyone has waited for the log to be durable to. Raised by every commit, so on
     /// a line of its own.
     wanted: CachePadded<AtomicU64>,
     /// Where the flush taking its turn writes from next: the turn's own.
-    submitted: AtomicU64,
+    submitted: CachePadded<AtomicU64>,
     /// Writes submitted and not landed. Moved by every write and its landing, so on a line of its
     /// own.
     in_flight: CachePadded<AtomicUsize>,
     /// Asked for by every commit, so on a line of its own.
     flushes: CachePadded<Solo>,
     /// The sync in flight, without durable writes.
-    sync: Claim,
+    sync: CachePadded<Claim>,
     /// The preparation of a segment under way.
-    preparation: Claim,
+    preparation: CachePadded<Claim>,
     /// Waiting for the log to be durable to a mark. Pushed onto by every commit that waits, so on a
     /// line of its own.
     durable_waits: CachePadded<Waits>,
     /// Waiting to be admitted, woken to try again whenever room may have been made.
-    admitters: Stack<Completion>,
+    admitters: CachePadded<Stack<Completion>>,
     failed: AtomicBool,
     failure: SetOnce<CompletionError>,
     zeros: Arc<AlignedBlock>,
@@ -182,6 +184,7 @@ impl Log {
             "a log buffer smaller than one chunk"
         );
         let segments = Segments::new(io.clone(), base, config.segment_bytes, config.direct);
+        segments.adopt_spares()?;
         let start = Self::resumes_at(end);
         let current = segments.number(start);
         let durable_writes = Self::open_segments(&io, &segments, end, start)?;
@@ -202,15 +205,15 @@ impl Log {
             ring,
             room: Room::new(start, segments.start(current + 1), config.buffer_bytes),
             // The writes in flight lie within the ring of the position, in whole blocks.
-            landed: Prefix::new(start, span, BLOCK),
+            landed: CachePadded::new(Prefix::new(start, span, BLOCK)),
             wanted: CachePadded::new(AtomicU64::new(0)),
-            submitted: AtomicU64::new(start),
+            submitted: CachePadded::new(AtomicU64::new(start)),
             in_flight: CachePadded::new(AtomicUsize::new(0)),
             flushes: CachePadded::default(),
-            sync: Claim::default(),
-            preparation: Claim::default(),
+            sync: CachePadded::default(),
+            preparation: CachePadded::default(),
             durable_waits: CachePadded::default(),
-            admitters: Stack::default(),
+            admitters: CachePadded::default(),
             failed: AtomicBool::new(false),
             failure: SetOnce::default(),
             zeros: Arc::new(AlignedBlock::zeroed(config.chunk_bytes as usize)),
@@ -227,7 +230,7 @@ impl Log {
         let current = segments.number(start);
         let mut later = current + 1;
         while segments.open(later)?.is_some() {
-            segments.remove(later)?;
+            segments.release(later)?;
             later += 1;
         }
         let keeps_records = end > segments.start(current);
@@ -322,10 +325,8 @@ impl Log {
             return Ok(IOResult::Done(admitted()));
         }
         let c = Completion::new_wait();
-        self.admitters.push(c.clone());
-        // Pairs with the fence of whoever makes room: either it finds this waiting, or this sees
-        // the room. A completion left behind is completed by the next wake, for no one.
-        fence(Ordering::SeqCst);
+        // A completion left behind is completed by the next wake, for no one.
+        room::wait_on(&self.admitters, c.clone());
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
@@ -446,15 +447,17 @@ impl Log {
         start
     }
 
-    /// Copies a record into the ring at `start`; returns its LSN.
+    /// Copies a record into the ring at `start`; returns its LSN. Its CRC is taken over the bytes
+    /// once they are in the ring, in one run (two where the record crosses a chunk), the value
+    /// [`record::crc`] gives from the pieces.
     fn write_record(&self, start: Lsn, header: &Header, place: Place, payload: &[&[u8]]) -> Lsn {
         let payload_len = payload_len(payload);
         let head = record::header_bytes(header, place, payload_len);
-        let crc = record::crc(start, &head, payload);
         let mut at = self.copy_in(start, &head);
         for piece in payload {
             at = self.copy_in(at, piece);
         }
+        let crc = self.crc_in(start, at);
         at = self.copy_in(at, &crc.to_le_bytes());
         let end = start + framed_len(payload_len);
         self.zero_to(at, end);
@@ -496,7 +499,7 @@ impl Log {
             if self.segments.open(n)?.is_none() {
                 break;
             }
-            self.segments.remove(n)?;
+            self.segments.release(n)?;
             removed = true;
         }
         if removed {
@@ -525,6 +528,23 @@ impl Log {
             at += n as u64;
         }
         at
+    }
+
+    /// The CRC of the record copied into the ring from `start` to `end`, as [`record::crc`] takes
+    /// it: its position, then its bytes.
+    fn crc_in(&self, start: Lsn, end: Lsn) -> u32 {
+        let mut crc = crc32c::crc32c(&start.to_le_bytes());
+        let mut at = start;
+        while at < end {
+            let (slot, offset) = self.slot(at);
+            let n = ((end - at) as usize).min(self.config.chunk_bytes as usize - offset);
+            // SAFETY: inside the chunk, in bytes this appender reserved alone and has copied in;
+            // no write reads them before the copy is counted.
+            let bytes = unsafe { std::slice::from_raw_parts(slot.block.as_ptr().add(offset), n) };
+            crc = crc32c::crc32c_append(crc, bytes);
+            at += n as u64;
+        }
+        crc
     }
 
     fn zero_to(&self, mut at: Lsn, end: Lsn) {
@@ -770,12 +790,7 @@ impl Log {
 
     /// Wakes everyone waiting to be admitted, to try again.
     fn wake_admitters(&self) {
-        // Pairs with the fence of an admitter that waits: either this finds it, or it sees the
-        // room made.
-        fence(Ordering::SeqCst);
-        for c in self.admitters.take_all() {
-            c.complete(0);
-        }
+        room::wake(&self.admitters, |c| c.complete(0));
     }
 
     /// Starts preparing the next segment when less than one is left ahead of what is admitted.
@@ -785,9 +800,20 @@ impl Log {
         let needed = |log: &Self| {
             log.room.prepared_end().saturating_sub(log.room.reach()) <= log.segments.size
         };
+        // Read alone first, so an admission that needs no segment writes nothing shared: one
+        // whose grant makes the need finds it here, and a holder letting go looks again.
+        if !needed(self) {
+            return;
+        }
         while self.preparation.take() {
             if needed(self) {
                 let number = self.segments.number(self.room.prepared_end());
+                // A spare is whole already: renamed, it is ready once its directory is synced.
+                match self.segments.reuse(number) {
+                    Ok(Some(_)) => return self.prepared(number),
+                    Ok(None) => {}
+                    Err(e) => return self.fail(io_failure(&e)),
+                }
                 let file = match self.segments.create(number) {
                     Ok(file) => file,
                     Err(e) => return self.fail(io_failure(&e)),

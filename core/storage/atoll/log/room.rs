@@ -8,17 +8,38 @@
 //! prepared segments, before the end moves: a grant and a padding racing are then two exchanges of
 //! the reach, and whichever comes second sees the first.
 
-use self::sync::{AtomicU64, Ordering};
+use self::sync::{fence, AtomicU64, Ordering};
+use crate::storage::atoll::stack::Stack;
 use crossbeam_utils::CachePadded;
 
 #[cfg(not(atoll_loom))]
 mod sync {
-    pub(super) use crate::sync::atomic::{AtomicU64, Ordering};
+    pub(super) use crate::sync::atomic::{fence, AtomicU64, Ordering};
 }
 
 #[cfg(atoll_loom)]
 mod sync {
-    pub(super) use loom::sync::atomic::{AtomicU64, Ordering};
+    pub(super) use loom::sync::atomic::{fence, AtomicU64, Ordering};
+}
+
+/// Puts `wait` on `waiting` and passes a fence, before the caller looks at the room again: paired
+/// with [`wake`]'s, either that look finds the room a waker made, or the waker finds the wait.
+pub(super) fn wait_on<T>(waiting: &Stack<T>, wait: T) {
+    waiting.push(wait);
+    fence(Ordering::SeqCst);
+}
+
+/// Wakes everyone on `waiting`, after the caller made room: a fence, paired with [`wait_on`]'s,
+/// then the stack read, and taken only if anyone is on it, since every operation's room left over
+/// comes back through here and a take from an empty stack still writes its line.
+pub(super) fn wake<T>(waiting: &Stack<T>, mut woken: impl FnMut(T)) {
+    fence(Ordering::SeqCst);
+    if waiting.is_empty() {
+        return;
+    }
+    for w in waiting.take_all() {
+        woken(w);
+    }
 }
 
 pub(super) struct Room {
@@ -174,6 +195,41 @@ mod loom_tests {
                 room.reach() <= room.prepared_end(),
                 "the room granted overruns"
             );
+        });
+    }
+
+    /// An admission that finds no room, as [`Log::admit`](super::super::Log::admit) does, while
+    /// another operation gives room back, as dropping its admission does: either the admission's
+    /// second look finds the room, or the give-back wakes it. Never neither.
+    #[test]
+    fn a_give_back_wakes_or_is_seen_by_an_admission_that_found_no_room() {
+        use loom::sync::atomic::AtomicBool;
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(|| {
+            // A buffer of 64 bytes, which the giver's admission holds whole.
+            let room = Arc::new(Room::new(0, u64::MAX, 64));
+            assert!(room.grant(64, true));
+            let waiting = Arc::new(Stack::<Arc<AtomicBool>>::default());
+            let giver = {
+                let (room, waiting) = (room.clone(), waiting.clone());
+                thread::spawn(move || {
+                    room.give_back(64);
+                    wake(&waiting, |w| w.store(true, Ordering::Release));
+                })
+            };
+            let first = room.grant(64, true);
+            let wait = (!first).then(|| {
+                let woken = Arc::new(AtomicBool::new(false));
+                wait_on(&waiting, woken.clone());
+                woken
+            });
+            let admitted = first || room.grant(64, true);
+            giver.join().unwrap();
+            if !admitted {
+                let woken = wait.expect("a wait");
+                assert!(woken.load(Ordering::Acquire), "a wait no give-back woke");
+            }
         });
     }
 }

@@ -760,6 +760,188 @@ fn a_log_ending_at_any_record_of_a_structure_change_recovers_a_whole_tree() {
     }
 }
 
+/// A leaf a caller reached last ([`Near`]) is used only for the keys it answers: a key between
+/// its fences, the upper included, and the keys just above one from its lower fence to below its
+/// upper. From every leaf of a tree, every seek from each fence and from a key inside lands where
+/// a sorted map says, a seek above an upper fence going on to the next leaf, and a put of a key
+/// another leaf holds lands there.
+#[test]
+fn a_leaf_a_caller_reached_answers_only_the_keys_between_its_fences() {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, MIN_BUDGET, 1);
+    let run = drive_runner(&io);
+    let tree = create(&io, &db, &run, false);
+    let key = |n: u64| format!("k{n:05}").into_bytes();
+    let mut map = BTreeMap::new();
+    for n in 0..1_000 {
+        let value = vec![n as u8; 100];
+        let mut op = Put::new(&key(n), value.clone(), Mode::Insert);
+        run_to(&run, || tree.put(&mut op));
+        map.insert(key(n), value);
+    }
+    // Every leaf, in order, by the leaf a scan read each entry in.
+    let mut leaves: Vec<Near> = Vec::new();
+    let mut cursor = Cursor::new();
+    let mut more = run_to(&run, || tree.seek(&mut cursor, &[], Seek::Ge));
+    while more {
+        if leaves.last() != Some(&cursor.near()) {
+            leaves.push(cursor.near());
+        }
+        more = run_to(&run, || tree.next(&mut cursor));
+    }
+    assert!(leaves.len() >= 10, "only {} leaves", leaves.len());
+    let fences = |near: Near| {
+        let (pid, hint) = near.0.expect("a leaf");
+        let leaf = db
+            .pool()
+            .fix_optimistic_at(pid, hint)
+            .expect("in its frame");
+        leaf.read(|p| {
+            let v = View::new(p);
+            Some((v.lower()?, v.upper()?))
+        })
+        .flatten()
+        .expect("fences")
+    };
+    let expected = |map: &BTreeMap<Vec<u8>, Vec<u8>>, target: &[u8], seek: Seek| {
+        let t = target.to_vec();
+        match seek {
+            Seek::Ge => map.range((Included(t), Unbounded)).next(),
+            Seek::Gt => map.range((Excluded(t), Unbounded)).next(),
+            Seek::Le => map.range((Unbounded, Included(t))).next_back(),
+            Seek::Lt => map.range((Unbounded, Excluded(t))).next_back(),
+        }
+        .map(|(k, _)| k.clone())
+    };
+    let (mut seeks, mut at_answered, mut above_answered) = (0, 0, 0);
+    for (i, &near) in leaves.iter().enumerate() {
+        let (lower, upper) = fences(near);
+        // Each fence, the leaf's first key, and a key just after it that the tree lacks.
+        let first = match &lower {
+            Some(l) => map.range::<Vec<u8>, _>((Excluded(l), Unbounded)).next(),
+            None => map.iter().next(),
+        }
+        .map(|(k, _)| k.clone())
+        .unwrap();
+        let after_first = [first.as_slice(), &[0]].concat();
+        let mut targets: Vec<Vec<u8>> = [lower.clone(), upper.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
+        targets.extend([first, after_first]);
+        for target in &targets {
+            let (pid, hint) = near.0.unwrap();
+            let leaf = db.pool().fix_optimistic_at(pid, hint).unwrap();
+            let (at, above) = leaf
+                .read(|p| {
+                    let v = View::new(p);
+                    Some((v.covers(target)?, v.covers_above(target)?))
+                })
+                .flatten()
+                .unwrap();
+            let after_lower = lower
+                .as_ref()
+                .is_none_or(|l| l.as_slice() < target.as_slice());
+            let from_lower = lower
+                .as_ref()
+                .is_none_or(|l| l.as_slice() <= target.as_slice());
+            let to_upper = upper
+                .as_ref()
+                .is_none_or(|u| target.as_slice() <= u.as_slice());
+            let below_upper = upper
+                .as_ref()
+                .is_none_or(|u| target.as_slice() < u.as_slice());
+            assert_eq!(at, after_lower && to_upper, "leaf {i} at {target:?}");
+            assert_eq!(
+                above,
+                from_lower && below_upper,
+                "leaf {i} above {target:?}"
+            );
+            at_answered += at as usize;
+            above_answered += above as usize;
+            for seek in [Seek::Ge, Seek::Gt, Seek::Le, Seek::Lt] {
+                let mut cursor = Cursor::new();
+                cursor.place(b"", near);
+                let taken = NEAR_TAKEN.with(|n| n.get());
+                let found = run_to(&run, || tree.seek(&mut cursor, target, seek));
+                let answers = if seek == Seek::Gt { above } else { at };
+                assert_eq!(
+                    NEAR_TAKEN.with(|n| n.get()) - taken,
+                    answers as u64,
+                    "leaf {i}, {seek:?} from {target:?}: the leaf near taken"
+                );
+                let got = found.then(|| cursor.key().unwrap().to_vec());
+                assert_eq!(
+                    got,
+                    expected(&map, target, seek),
+                    "leaf {i}, {seek:?} from {target:?}"
+                );
+                seeks += 1;
+            }
+        }
+        // A key the next leaf holds, put from this one: it lands in the next.
+        if let Some(&next) = leaves.get(i + 1) {
+            let (_, upper) = fences(near);
+            let (k, _) = map
+                .range((Excluded(upper.unwrap()), Unbounded))
+                .next()
+                .unwrap();
+            let k = k.clone();
+            let mut op = Put::new(&k, vec![0xaa; 100], Mode::Update).near(near);
+            assert_eq!(run_to(&run, || tree.put(&mut op)), Outcome::Updated);
+            assert_eq!(
+                op.reached().page(),
+                next.page(),
+                "leaf {i}'s neighbour's key"
+            );
+            map.insert(k.clone(), vec![0xaa; 100]);
+            assert_eq!(get(&tree, &run, &k), Some(vec![0xaa; 100]));
+        }
+    }
+    // Every leaf answered its first key, at it and above it: the leaf near was taken that often.
+    assert!(
+        seeks >= 4 * 4 * 10 && at_answered >= 2 * leaves.len() && above_answered >= leaves.len(),
+        "{seeks} seeks, {at_answered} at and {above_answered} above answered"
+    );
+    assert_eq!(scan(&tree, &run, true), map.into_iter().collect::<Vec<_>>());
+}
+
+/// A value out of line whose page no longer carries the value's id, as corruption leaves it, is
+/// read again by its key once, then refused, though its leaf is unchanged: a scan that steps onto
+/// it reports it and never steps past it to the next entry.
+#[test]
+fn a_scan_refuses_a_value_out_of_line_its_page_no_longer_names_rather_than_step_past_it() {
+    use crate::storage::atoll::page::HEADER_SIZE;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, MIN_BUDGET, 1);
+    let run = drive_runner(&io);
+    let tree = create(&io, &db, &run, false);
+    for (key, len) in [(&b"k0"[..], 10), (b"k1", 2_000), (b"k2", 10)] {
+        let mut op = Put::new(key, vec![1u8; len], Mode::Insert);
+        run_to(&run, || tree.put(&mut op));
+    }
+    let stored = run_to(&run, || tree.stored(b"k1")).expect("k1");
+    let StoredValue::OutOfLine(reference) = stored.value else {
+        panic!("k1's value is inline");
+    };
+    let pages = run_to(&run, || value::pages(db.pool(), reference, &|| true))
+        .unwrap_or_else(|_| panic!("k1's pages unread"));
+    {
+        let mut page = run_to(&run, || db.pool().fix_exclusive(pages[0], None));
+        let id = page.page().u64_at(HEADER_SIZE);
+        page.page_mut().put_u64(HEADER_SIZE, !id);
+    }
+    let mut cursor = Cursor::new();
+    assert!(run_to(&run, || tree.seek(&mut cursor, b"", Seek::Ge)));
+    assert_eq!(cursor.key(), Some(&b"k0"[..]));
+    match drive(&io, || tree.next(&mut cursor)) {
+        Err(LimboError::Corrupt(_)) => {}
+        Err(e) => panic!("the step onto k1 failed otherwise: {e}"),
+        Ok(found) => panic!("the step onto k1 came to {found}, at {:?}", cursor.key()),
+    }
+}
+
 #[test]
 fn a_put_expecting_an_entry_changes_nothing_when_the_entry_differs() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

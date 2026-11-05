@@ -27,7 +27,7 @@ use super::wait::{graph, Edge, GroupId, Seat, WaitRecord};
 use super::AtollDb;
 use crate::io::FileSyncType;
 use crate::io::{Completion, OpenFlags, IO};
-use crate::storage::atoll::btree::{Mode, Outcome};
+use crate::storage::atoll::btree::{Mode, Near, Outcome};
 use crate::storage::atoll::buffer::MIN_BUDGET;
 use crate::storage::atoll::control::{self, Found};
 use crate::storage::atoll::db::AtollConfig;
@@ -437,6 +437,42 @@ pub struct ConnTxn {
     /// The stamps of the trees the open transaction wrote, raised to its commit timestamp once it
     /// is published (DESIGN.md §17, §3, defect 4).
     stamped: Arc<Mutex<HashMap<PageId, super::trees::Stamp>>>,
+    /// What its cursors learned of each tree, for the next to open on it.
+    known: Arc<Mutex<HashMap<u64, Known>>>,
+    /// Each header field as a transaction read it: the word, the transaction's slot and start,
+    /// and the header's changes when it read it. Its own while the header counts no change, as a
+    /// catalog row is ([`Known`]).
+    fields: Mutex<[Option<(u32, (u16, u64), u64)>; 7]>,
+}
+
+/// What a connection's cursors learned of one tree: its catalog row as a transaction read it, and
+/// the leaf the last cursor over it stood at. The row holds for that transaction while the catalog
+/// counts no change ([`Catalog::changes`]): its snapshot sees no other transaction's write, and
+/// each of its own, and each rollback of its statements, is counted. The leaf is a hint, which a
+/// cursor checks before it uses it, so it holds across transactions.
+#[derive(Default)]
+struct Known {
+    row: Option<KnownRow>,
+    near: Near,
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The trees whose catalog row a cursor opened on this thread read, for tests to see which
+    /// opens the connection's cursors answered.
+    pub(crate) static CATALOG_READS: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The header fields read on this thread, for the same.
+    pub(crate) static HEADER_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone, Copy)]
+struct KnownRow {
+    entry: Entry,
+    /// The transaction that read it: its slot and start.
+    txn: (u16, u64),
+    /// The catalog's changes when it read it.
+    changes: u64,
 }
 
 /// Slots the trees a connection changes fall into: a cursor whose tree shares a slot with
@@ -572,6 +608,8 @@ impl ConnTxn {
             pin_began: AtomicBool::new(false),
             changes: Arc::new(TreeChanges::new()),
             stamped: Arc::new(Mutex::new(HashMap::new())),
+            known: Arc::new(Mutex::new(HashMap::new())),
+            fields: Mutex::new([None; 7]),
         }
     }
 
@@ -747,7 +785,13 @@ impl ConnTxn {
             }
         }
         let txn = guard.as_mut().expect("a transaction");
-        if let Begin::Write { schema } = wants {
+        // A row writer already holding the gate, as every statement after its transaction's
+        // first does, has nothing to take.
+        let held = matches!(wants, Begin::Write { schema: false })
+            && matches!(txn.hold(), Hold::Shared | Hold::Exclusive { .. });
+        if held {
+            txns.join(txn, self.waits.group());
+        } else if let Begin::Write { schema } = wants {
             // A writer is waited on by its group from before its take: a reader never is.
             txns.join(txn, self.waits.group());
             let checks = schema && !reads.is_empty() && txn.snapped();
@@ -899,6 +943,9 @@ impl ConnTxn {
         *self.setting.lock() = None;
         self.changes.destroyed.lock().retain(|(_, s)| *s <= n);
         self.changes.rolled_back();
+        // It may have undone a catalog or header write the transaction read.
+        self.db.catalog().note_change();
+        self.db.header().note_change();
         Ok(())
     }
 
@@ -938,8 +985,16 @@ impl ConnTxn {
             return Ok(self.db.header().committed(field));
         };
         let (db, io) = (&self.db, self.db.io());
+        let (identity, changes) = ((txn.slot(), txn.start()), db.header().changes());
+        if let Some((word, t, c)) = self.fields.lock()[field.index()] {
+            if t == identity && c == changes {
+                return Ok(word);
+            }
+        }
+        #[cfg(test)]
+        HEADER_READS.with(|r| r.set(r.get() + 1));
         let mut get = Header::get_op(field);
-        drive(io, || {
+        let word = drive(io, || {
             db.header().get(
                 db.atoll().transactions(),
                 db.versions(),
@@ -947,7 +1002,9 @@ impl ConnTxn {
                 field,
                 &mut get,
             )
-        })
+        })?;
+        self.fields.lock()[field.index()] = Some((word, identity, changes));
+        Ok(word)
     }
 
     /// The header as SQLite lays it out: every field's word at the transaction's view, or
@@ -1315,7 +1372,8 @@ pub struct SqlCursor {
     pager: Arc<Pager>,
     id: u64,
     index: Option<Arc<IndexInfo>>,
-    open: Option<AtollCursor>,
+    /// Boxed: a statement's cursor is opened, moved and dropped whole, and the cursor is large.
+    open: Option<Box<AtollCursor>>,
     /// The null flag set before the cursor resolved.
     null_row: bool,
     has_record: bool,
@@ -1339,6 +1397,17 @@ pub struct SqlCursor {
     stamped: Arc<Mutex<HashMap<PageId, super::trees::Stamp>>>,
     /// Whether it walks the versions its statement does not see (R10, FkUnseen).
     unseen: bool,
+    /// What its connection's cursors learned of the trees.
+    known: Arc<Mutex<HashMap<u64, Known>>>,
+}
+
+/// A cursor leaves the leaf it stood at to the next over its tree.
+impl Drop for SqlCursor {
+    fn drop(&mut self) {
+        if let Some(cursor) = &self.open {
+            self.known.lock().entry(self.id).or_default().near = cursor.near();
+        }
+    }
 }
 
 /// A count's progress: at a row, rows counted before it; or moving past one.
@@ -1372,6 +1441,7 @@ impl SqlCursor {
             vacant: false,
             stamped: ct.stamped.clone(),
             unseen: false,
+            known: ct.known.clone(),
         }
     }
 
@@ -1551,42 +1621,69 @@ impl SqlCursor {
             )));
         }
         if self.open.is_none() {
-            let (entry, plain) = {
+            let (entry, plain, near) = {
                 let mut guard = self.cell.lock();
                 let txn = guard.as_mut().ok_or_else(outside)?;
-                let mut get = Get::new(&catalog::key(self.id));
                 let db = &self.db;
-                let entry = drive(db.io(), || {
-                    db.catalog()
-                        .get(db.atoll().transactions(), db.versions(), txn, &mut get)
-                })?
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!("no tree {} in the catalog", self.id))
-                })?;
+                let (identity, changes) = ((txn.slot(), txn.start()), db.catalog().changes());
+                let (known, near) = match self.known.lock().get(&self.id) {
+                    Some(k) => (
+                        k.row.filter(|r| r.txn == identity && r.changes == changes),
+                        k.near,
+                    ),
+                    None => (None, Near::NONE),
+                };
+                let entry = match known {
+                    Some(row) => row.entry,
+                    None => {
+                        #[cfg(test)]
+                        CATALOG_READS.with(|r| r.borrow_mut().push(self.id));
+                        let mut get = Get::new(&catalog::key(self.id));
+                        let entry = drive(db.io(), || {
+                            db.catalog().get(
+                                db.atoll().transactions(),
+                                db.versions(),
+                                txn,
+                                &mut get,
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!("no tree {} in the catalog", self.id))
+                        })?;
+                        let row = KnownRow {
+                            entry,
+                            txn: identity,
+                            changes,
+                        };
+                        self.known.lock().entry(self.id).or_default().row = Some(row);
+                        entry
+                    }
+                };
                 let plain = txn
                     .created()
                     .iter()
                     .any(|c| c.root == entry.root && c.statement == txn.command());
-                (entry, plain)
+                (entry, plain, near)
             };
-            let mut cursor = AtollCursor::new(
+            let mut cursor = Box::new(AtollCursor::new(
                 self.db.clone(),
                 self.cell.clone(),
                 self.id,
                 entry,
                 self.index.clone(),
                 key::ENCODING,
-            );
+            ));
             if plain {
                 cursor.write_plainly();
             }
+            cursor.start_near(near);
             if self.unseen {
                 cursor.walk_unseen();
             }
             cursor.set_null_flag(self.null_row);
             self.open = Some(cursor);
         }
-        Ok(self.open.as_mut().expect("resolved"))
+        Ok(self.open.as_deref_mut().expect("resolved"))
     }
 
     /// A write's step: done, a park on its blocker, or the write judged again after registering.
@@ -1816,7 +1913,7 @@ impl CursorTrait for SqlCursor {
     }
 
     fn is_empty(&self) -> bool {
-        self.open.as_ref().is_none_or(AtollCursor::is_empty)
+        self.open.as_deref().is_none_or(AtollCursor::is_empty)
     }
 
     fn root_page(&self) -> i64 {

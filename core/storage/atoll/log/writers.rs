@@ -17,6 +17,7 @@ use super::record::{GroupStart, Header, Kind};
 use crate::storage::atoll::latch::{Held, VersionedLatch};
 use crate::sync::Arc;
 use crate::{LimboError, Result};
+use crossbeam_utils::CachePadded;
 
 /// A checkpoint's writer table, a record of its own:
 ///
@@ -99,13 +100,17 @@ struct Cell {
 }
 
 pub struct Writers {
-    cells: Box<[Cell]>,
+    /// Each written by its slot's transaction at every group it logs, so each on a line of its
+    /// own.
+    cells: Box<[CachePadded<Cell>]>,
 }
 
 impl Writers {
     pub fn new(slots: usize) -> Self {
         Self {
-            cells: (0..slots).map(|_| Cell::default()).collect(),
+            cells: (0..slots)
+                .map(|_| CachePadded::new(Cell::default()))
+                .collect(),
         }
     }
 

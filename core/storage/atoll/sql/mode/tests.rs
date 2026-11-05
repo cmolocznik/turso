@@ -857,6 +857,177 @@ fn catalogued_in(ct: &crate::storage::atoll::sql::mode::ConnTxn, id: u64) -> boo
 
 /// An ALTER COLUMN that the table's rows refuse fails whole, in autocommit: the schema row it
 /// rewrote before its check ran is put back, as the statement's every write is.
+/// A transaction reads a tree's catalog row once for all its statements, and each cursor starts
+/// at the leaf the one before it stood at; the row is read again after a statement of its own
+/// changes the catalog and after a rollback of statements, which may undo one. Rows a Clear took
+/// read back after a rollback to before it, and a row written after the Clear goes into the tree
+/// the Clear made.
+#[test]
+fn a_transaction_reads_a_trees_catalog_row_once_and_again_after_its_own_change_or_a_rollback() {
+    use crate::storage::atoll::btree::NEAR_TAKEN;
+    use crate::storage::atoll::sql::mode::CATALOG_READS;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/known-rows");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    let reads = || CATALOG_READS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    let taken = || NEAR_TAKEN.with(|n| n.get());
+    conn.execute("BEGIN").unwrap();
+    reads();
+    let before = taken();
+    let statements = 50;
+    for i in 0..statements {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'r{i}')"))
+            .unwrap();
+    }
+    let read = reads();
+    let once: std::collections::BTreeSet<u64> = read.iter().copied().collect();
+    assert!(
+        !read.is_empty() && once.len() == read.len(),
+        "each tree's row read once over {statements} statements: {read:?}"
+    );
+    // Every statement after the first starts at the leaf the last left: its probe, its rowid
+    // check and its write descend no further.
+    assert!(
+        taken() - before >= 2 * (statements - 1),
+        "{} descents spared over {statements} statements",
+        taken() - before
+    );
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("DELETE FROM t").unwrap();
+    conn.execute("INSERT INTO t VALUES (100, 'after')").unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(100)]]
+    );
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT count(*), min(a), max(a) FROM t"),
+        vec![vec![
+            Value::from_i64(statements as i64),
+            Value::from_i64(0),
+            Value::from_i64(statements as i64 - 1)
+        ]]
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(statements as i64)]]
+    );
+}
+
+/// A catalog row a transaction read is its own: one read at a snapshot before another
+/// connection's Clear committed is not the next transaction's, which reads the tree the Clear made.
+#[test]
+fn a_catalog_row_read_at_an_older_snapshot_is_not_the_next_transactions() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/known-snapshot");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (a INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    // The snapshot, taken before the Clear commits.
+    assert_eq!(
+        rows(&conn, "SELECT a FROM u"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    other.execute("DELETE FROM t").unwrap();
+    // Read at the snapshot: the tree before the Clear, with both rows.
+    assert_eq!(
+        rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    conn.execute("INSERT INTO t VALUES (3, 'z')").unwrap();
+    assert_eq!(
+        rows(&other, "SELECT a FROM t"),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
+/// A transaction reads a header field once for all its statements, and again after a statement of
+/// its own writes the header and after a rollback of statements: the schema version reads as each
+/// CREATE left it, and as it stood before the CREATE a rollback to a savepoint undid.
+#[test]
+fn a_transaction_reads_a_header_field_once_and_again_after_its_own_write_or_a_rollback() {
+    use crate::storage::atoll::sql::mode::HEADER_READS;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/known-fields");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY)")
+        .unwrap();
+    let version =
+        |conn: &Arc<Connection>| match rows(conn, "PRAGMA schema_version").remove(0).remove(0) {
+            Value::Numeric(crate::numeric::Numeric::Integer(v)) => v,
+            other => panic!("a schema version of {other:?}"),
+        };
+    let reads = || HEADER_READS.with(|r| r.get());
+    conn.execute("BEGIN").unwrap();
+    let v0 = version(&conn);
+    let before = reads();
+    let statements = 50;
+    for i in 0..statements {
+        conn.execute(format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    // At most each of the header's fields read once.
+    let (read, fields) = (
+        reads() - before,
+        crate::storage::atoll::sql::header::Field::ALL.len() as u64,
+    );
+    assert!(
+        read <= fields,
+        "{read} header reads over {statements} statements"
+    );
+    conn.execute("CREATE TABLE a (x)").unwrap();
+    assert_eq!(version(&conn), v0 + 1);
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("CREATE TABLE b (x)").unwrap();
+    assert_eq!(version(&conn), v0 + 2);
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(version(&conn), v0 + 1);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(version(&conn), v0 + 1);
+    assert!(reads() > before, "the header was read at all");
+}
+
+/// A header field a transaction read is its own: the schema version read at a snapshot before
+/// another connection's CREATE committed is not the next transaction's, which reads the CREATE's.
+#[test]
+fn a_header_field_read_at_an_older_snapshot_is_not_the_next_transactions() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/known-field-snapshot");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE u (a INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1)").unwrap();
+    let version = |conn: &Arc<Connection>| rows(conn, "PRAGMA schema_version");
+    conn.execute("BEGIN").unwrap();
+    // The snapshot, taken before the CREATE commits.
+    assert_eq!(
+        rows(&conn, "SELECT a FROM u"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    let before = version(&conn);
+    other.execute("CREATE TABLE z (x)").unwrap();
+    // Read at the snapshot: the version before the CREATE.
+    assert_eq!(version(&conn), before);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(version(&conn), version(&other));
+    assert_ne!(version(&conn), before);
+}
+
 #[test]
 fn a_rejected_alter_column_leaves_the_schema_as_it_was() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

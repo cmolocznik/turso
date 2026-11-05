@@ -1831,6 +1831,19 @@ impl<'a> Exclusive<'a> {
         h.tracker.write(self.pool.now());
     }
 
+    /// [`changed`](Self::changed) for a temporary page, whose changes are never logged: its LSN
+    /// only orders its own changes, so the next is one past its last, with nothing shared.
+    pub fn changed_temporary(&mut self) {
+        debug_assert!(self.pid.is_temporary(), "{:?} is not temporary", self.pid);
+        // Relaxed: under the frame's exclusive latch.
+        let last = self
+            .pool
+            .header(self.frame)
+            .page_lsn
+            .load(Ordering::Relaxed);
+        self.changed(last + 1);
+    }
+
     pub fn pid(&self) -> PageId {
         self.pid
     }

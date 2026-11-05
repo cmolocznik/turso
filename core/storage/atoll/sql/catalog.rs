@@ -19,6 +19,7 @@ use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::PageStore;
 use crate::storage::atoll::txn::versioned::{Get, VersionedTree, Versions, Write, WriteOp};
 use crate::storage::atoll::txn::{Transactions, Ts, Txn};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::types::IOResult;
 use crate::{LimboError, Result};
@@ -137,12 +138,17 @@ pub fn key(id: u64) -> [u8; 8] {
 /// The catalog of a database.
 pub struct Catalog {
     tree: VersionedTree,
+    /// Writes begun by any transaction, and rollbacks of statements, which may undo one. A
+    /// transaction's snapshot sees no other transaction's write, so a row it read reads the same
+    /// while this is unchanged.
+    changes: AtomicU64,
 }
 
 impl Catalog {
     pub fn open(io: Arc<dyn IO>, pool: Arc<BufferPool>, store: Arc<PageStore>) -> Self {
         Self {
             tree: VersionedTree::open(io, pool, store, System::Catalog.root()),
+            changes: AtomicU64::new(0),
         }
     }
 
@@ -174,7 +180,21 @@ impl Catalog {
         txn: &mut Txn,
         op: &mut WriteOp,
     ) -> Result<IOResult<Write>> {
+        self.note_change();
         self.tree.write(txns, versions, txn, op)
+    }
+
+    /// Counts a change to what a transaction reads of the catalog: a write, or a rollback of
+    /// statements.
+    pub fn note_change(&self) {
+        // Relaxed: only the transaction making a change is told of it by this, and its statements
+        // follow one another through its connection's lock on it.
+        self.changes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The changes counted so far ([`note_change`](Self::note_change)).
+    pub fn changes(&self) -> u64 {
+        self.changes.load(Ordering::Relaxed)
     }
 
     pub fn put_op(id: u64, entry: &Entry, mode: Mode) -> WriteOp {

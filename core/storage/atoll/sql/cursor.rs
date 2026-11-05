@@ -25,7 +25,7 @@ use super::key;
 use super::AtollDb;
 use crate::error::{ConstraintKind, ConstraintViolation};
 use crate::numeric::Numeric;
-use crate::storage::atoll::btree::{Cursor, Mode, Outcome, Put, Remove, Seek};
+use crate::storage::atoll::btree::{Cursor, Mode, Near, Outcome, Put, Remove, Seek};
 use crate::storage::atoll::txn::versioned::{
     Guard, GuardOp, Guarded, VersionedCursor, VersionedTree, Write, WriteOp,
 };
@@ -36,6 +36,7 @@ use crate::types::{
     IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey, SeekOp, SeekResult, ValueRef,
 };
 use crate::{LimboError, Result};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 macro_rules! done {
@@ -67,6 +68,8 @@ pub struct AtollCursor {
     tree: VersionedTree,
     cursor: VersionedCursor,
     seeking: Option<Seeking>,
+    /// The buffer the last seek's key was in, kept for the next.
+    seek_key: Vec<u8>,
     /// The entry's record, once read.
     record: Option<ImmutableRecord>,
     null_row: bool,
@@ -77,6 +80,8 @@ pub struct AtollCursor {
     /// An insert's key, and, once its write is done, what it came to, while the cursor moves to
     /// the entry it wrote.
     inserted: Option<(Vec<u8>, Option<Write>)>,
+    /// The leaf the last write reached, where the cursor stands after an insert.
+    reached: Near,
     /// The key of the entry the cursor stood at, found gone when it read again: it stands at the
     /// entry after it, or at none, read as no row until it moves.
     left: Option<Vec<u8>>,
@@ -171,11 +176,13 @@ impl AtollCursor {
             tree,
             cursor: VersionedCursor::new(),
             seeking: None,
+            seek_key: Vec::new(),
             record: None,
             null_row: false,
             plain: false,
             writing: None,
             inserted: None,
+            reached: Near::NONE,
             left: None,
             refreshing: None,
             guarding: None,
@@ -233,6 +240,17 @@ impl AtollCursor {
     /// current statement.
     pub fn write_plainly(&mut self) {
         self.plain = true;
+    }
+
+    /// Starts from `near`, the leaf a cursor over the tree last stood at.
+    pub fn start_near(&mut self, near: Near) {
+        self.cursor.set_near(near);
+        self.reached = near;
+    }
+
+    /// The leaf it last read or wrote at.
+    pub fn near(&self) -> Near {
+        self.cursor.near()
     }
 
     pub fn id(&self) -> u64 {
@@ -400,15 +418,20 @@ impl AtollCursor {
         if self.seeking.is_none() {
             self.seeking = Some(self.plan(key, op)?);
         }
-        let out = self.seek_planned();
-        if !matches!(out, Ok(IOResult::IO(_))) {
-            self.seeking = None;
+        // Held apart while it runs, so its key is read where it lies.
+        let mut s = self.seeking.take().expect("a seek");
+        let out = self.seek_planned(&mut s);
+        match out {
+            Ok(IOResult::IO(_)) => self.seeking = Some(s),
+            _ => self.seek_key = s.prefix,
         }
         out
     }
 
-    fn plan(&self, key: SeekKey<'_>, op: SeekOp) -> Result<Seeking> {
-        let (prefix, suffix) = match key {
+    fn plan(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<Seeking> {
+        let mut prefix = std::mem::take(&mut self.seek_key);
+        prefix.clear();
+        let suffix = match key {
             SeekKey::TableRowId(rowid) => {
                 if self.entry.layout != Layout::Table {
                     return Err(LimboError::InternalError(format!(
@@ -416,7 +439,8 @@ impl AtollCursor {
                         self.id
                     )));
                 }
-                (key::rowid(rowid).to_vec(), None)
+                prefix.extend_from_slice(&key::rowid(rowid));
+                None
             }
             SeekKey::IndexKey(record) => {
                 if !self.current {
@@ -451,9 +475,8 @@ impl AtollCursor {
                     }
                     _ => (values.as_slice(), None),
                 };
-                let mut prefix = Vec::new();
                 key::encode(columns.iter().cloned(), &info.key_info, &mut prefix)?;
-                (prefix, suffix)
+                suffix
             }
         };
         Ok(Seeking {
@@ -464,74 +487,71 @@ impl AtollCursor {
         })
     }
 
-    fn seek_planned(&mut self) -> Result<IOResult<SeekResult>> {
-        let s = self.seeking.as_ref().expect("a seek");
-        let (op, table) = (s.op, self.entry.layout == Layout::Table);
-        if s.moving_on {
-            let forward = matches!(op, SeekOp::GE { .. } | SeekOp::GT);
-            let found = done!(self.step(if forward { Move::Next } else { Move::Prev }));
-            // Past the entry the columns name: every entry now is on the op's side of the key.
-            return Ok(IOResult::Done(if found && !op.eq_only() {
-                SeekResult::Found
-            } else {
-                SeekResult::NotFound
-            }));
-        }
-        let (p, suffixed) = (s.prefix.clone(), s.suffix.is_some());
-        let succ = key::successor(&p);
-        // Up to the last key starting with p; with no bound, the last key of all.
-        let up_to = || match &succ {
-            Some(q) => (q.clone(), Seek::Lt),
-            None => (ABOVE_ENCODED.to_vec(), Seek::Le),
-        };
-        let (target, seek) = if table {
-            let seek = match op {
-                SeekOp::GE { .. } => Seek::Ge,
-                SeekOp::GT => Seek::Gt,
-                SeekOp::LE { .. } => Seek::Le,
-                SeekOp::LT => Seek::Lt,
-            };
-            (p.clone(), seek)
-        } else {
-            match op {
-                SeekOp::GE { .. } => (p.clone(), Seek::Ge),
-                SeekOp::GT if suffixed => (p.clone(), Seek::Ge),
-                SeekOp::GT => match &succ {
-                    Some(q) => (q.clone(), Seek::Ge),
-                    // Every key starts with the empty prefix: none is above them.
-                    None => (ABOVE_ENCODED.to_vec(), Seek::Gt),
-                },
-                SeekOp::LE { .. } => up_to(),
-                SeekOp::LT if suffixed => up_to(),
-                SeekOp::LT => (p.clone(), Seek::Lt),
+    fn seek_planned(&mut self, s: &mut Seeking) -> Result<IOResult<SeekResult>> {
+        loop {
+            let (op, table) = (s.op, self.entry.layout == Layout::Table);
+            if s.moving_on {
+                let forward = matches!(op, SeekOp::GE { .. } | SeekOp::GT);
+                let found = done!(self.step(if forward { Move::Next } else { Move::Prev }));
+                // Past the entry the columns name: every entry now is on the op's side of the key.
+                return Ok(IOResult::Done(if found && !op.eq_only() {
+                    SeekResult::Found
+                } else {
+                    SeekResult::NotFound
+                }));
             }
-        };
-        if !done!(self.step(Move::Seek(&target, seek))) {
-            return Ok(IOResult::Done(SeekResult::NotFound));
-        }
-        match self.judge()? {
-            Verdict::Found => Ok(IOResult::Done(SeekResult::Found)),
-            Verdict::NotFound => Ok(IOResult::Done(SeekResult::NotFound)),
-            Verdict::MoveOn => {
-                self.seeking.as_mut().expect("a seek").moving_on = true;
-                self.seek_planned()
+            let p = s.prefix.as_slice();
+            let found = if table {
+                let seek = match op {
+                    SeekOp::GE { .. } => Seek::Ge,
+                    SeekOp::GT => Seek::Gt,
+                    SeekOp::LE { .. } => Seek::Le,
+                    SeekOp::LT => Seek::Lt,
+                };
+                done!(self.step(Move::Seek(p, seek)))
+            } else {
+                // Up to the last key starting with p; with no bound, the last key of all.
+                let up_to = || match key::successor(p) {
+                    Some(q) => (Cow::Owned(q), Seek::Lt),
+                    None => (Cow::Borrowed(&ABOVE_ENCODED[..]), Seek::Le),
+                };
+                let (target, seek) = match op {
+                    SeekOp::GE { .. } => (Cow::Borrowed(p), Seek::Ge),
+                    SeekOp::GT if s.suffix.is_some() => (Cow::Borrowed(p), Seek::Ge),
+                    SeekOp::GT => match key::successor(p) {
+                        Some(q) => (Cow::Owned(q), Seek::Ge),
+                        // Every key starts with the empty prefix: none is above them.
+                        None => (Cow::Borrowed(&ABOVE_ENCODED[..]), Seek::Gt),
+                    },
+                    SeekOp::LE { .. } => up_to(),
+                    SeekOp::LT if s.suffix.is_some() => up_to(),
+                    SeekOp::LT => (Cow::Borrowed(p), Seek::Lt),
+                };
+                done!(self.step(Move::Seek(&target, seek)))
+            };
+            if !found {
+                return Ok(IOResult::Done(SeekResult::NotFound));
+            }
+            match self.judge(s)? {
+                Verdict::Found => return Ok(IOResult::Done(SeekResult::Found)),
+                Verdict::NotFound => return Ok(IOResult::Done(SeekResult::NotFound)),
+                Verdict::MoveOn => s.moving_on = true,
             }
         }
     }
 
     /// Judges the entry a seek landed on.
-    fn judge(&mut self) -> Result<Verdict> {
-        let s = self.seeking.as_ref().expect("a seek");
-        let (op, prefix, suffix) = (s.op, s.prefix.clone(), s.suffix);
+    fn judge(&mut self, s: &Seeking) -> Result<Verdict> {
+        let (op, prefix, suffix) = (s.op, s.prefix.as_slice(), s.suffix);
         let key = self.cursor.key().expect("a landing");
         if self.entry.layout == Layout::Table {
-            return Ok(if !op.eq_only() || key == prefix.as_slice() {
+            return Ok(if !op.eq_only() || key == prefix {
                 Verdict::Found
             } else {
                 Verdict::NotFound
             });
         }
-        let named = key.starts_with(&prefix);
+        let named = key.starts_with(prefix);
         let Some(rowid) = suffix else {
             return Ok(if !op.eq_only() || named {
                 Verdict::Found
@@ -621,10 +641,20 @@ impl AtollCursor {
     /// [`Write::Conflict`].
     pub fn insert(&mut self, key: &BTreeKey<'_>) -> Result<IOResult<Write>> {
         if let Some((k, Some(written))) = self.inserted.take_if(|(_, written)| written.is_some()) {
-            if let IOResult::IO(io) = self.step(Move::Seek(&k, Seek::Ge))? {
-                self.inserted = Some((k, Some(written)));
-                return Ok(IOResult::IO(io));
-            }
+            // At the entry written, as written: no search for what the write just put there.
+            let value = match key {
+                BTreeKey::TableRowId((_, Some(record))) => record.get_payload(),
+                BTreeKey::IndexKey(record) => record.get_payload(),
+                BTreeKey::TableRowId((_, None)) => {
+                    return Err(LimboError::InternalError(
+                        "a table row written with no record".into(),
+                    ))
+                }
+            };
+            self.cursor.place(&k, value, self.reached);
+            self.record = None;
+            self.null_row = false;
+            self.left = None;
             return Ok(IOResult::Done(written));
         }
         if self.writing.is_none() {
@@ -643,7 +673,7 @@ impl AtollCursor {
                 let txn = guard.as_ref().ok_or_else(outside)?;
                 Writing::PlainPut(self.tree.plain_put(txn, &k, value, mode), mode)
             } else {
-                Writing::Versioned(WriteOp::put(&k, value, mode), mode)
+                Writing::Versioned(WriteOp::put(&k, value, mode).near(self.cursor.near()), mode)
             });
         }
         let written = match self.write() {
@@ -671,7 +701,9 @@ impl AtollCursor {
     ) -> Result<IOResult<crate::storage::atoll::txn::versioned::Probe>> {
         let mut lock = self.txn.lock();
         let txn = lock.as_mut().ok_or_else(outside)?;
-        self.tree.probe(self.db.atoll().transactions(), txn, key)
+        let near = self.cursor.near();
+        self.tree
+            .probe(self.db.atoll().transactions(), txn, key, near)
     }
 
     /// The keys a foreign-key guard of `key` judges start with this (R10): a table's rowid key, or
@@ -789,7 +821,7 @@ impl AtollCursor {
             self.writing = Some(if self.plain {
                 Writing::PlainRemove(Remove::new(&k))
             } else {
-                Writing::Versioned(WriteOp::delete(&k), Mode::Update)
+                Writing::Versioned(WriteOp::delete(&k).near(self.cursor.near()), Mode::Update)
             });
         }
         self.write()
@@ -820,6 +852,11 @@ impl AtollCursor {
         let IOResult::Done(write) = written else {
             return Ok(written);
         };
+        match &self.writing {
+            Some(Writing::Versioned(op, _)) => self.reached = op.reached(),
+            Some(Writing::PlainPut(put, _)) => self.reached = put.reached(),
+            _ => {}
+        }
         if let Write::Wait(_) = write {
             // Kept: stepped again once the writer has ended.
             return Ok(IOResult::Done(write));

@@ -51,10 +51,11 @@ pub const TXN_UPDATE: Kind = Kind::new(18).unwrap();
 pub const RESTORE: Kind = Kind::new(21).unwrap();
 pub const UNPUT: Kind = Kind::new(22).unwrap();
 pub const UNBRANCH: Kind = Kind::new(26).unwrap();
+pub const TXN_PATCH: Kind = Kind::new(27).unwrap();
 
 pub fn owns(kind: Kind) -> bool {
     (INIT.get()..=BRANCH.get()).contains(&kind.get())
-        || [TXN_INSERT, TXN_UPDATE, RESTORE, UNPUT, UNBRANCH].contains(&kind)
+        || [TXN_INSERT, TXN_UPDATE, RESTORE, UNPUT, UNBRANCH, TXN_PATCH].contains(&kind)
 }
 
 /// What a compensation record completed: every change its transaction's `statement` made to its
@@ -98,6 +99,20 @@ pub enum Change<'a> {
         out_of_line: bool,
         /// For a transaction's update: the tree's root, and the entry its statement found.
         undo: Option<(PageId, Found<'a>)>,
+    },
+    /// A transaction's change of a key's entry in place, its value inline and its length kept:
+    /// the new head, and `bytes` at `at` of the value past the head, with what undoes it, the
+    /// tree's root and the old head and bytes. A delete's has no bytes: the tombstone keeps the
+    /// value it replaced. Only a statement's first change of a key is a patch, so what it undoes
+    /// to is the entry the statement found.
+    Patch {
+        key: &'a [u8],
+        head: &'a [u8],
+        at: usize,
+        bytes: &'a [u8],
+        root: PageId,
+        old_head: &'a [u8],
+        old_bytes: &'a [u8],
     },
     /// A key's entry put back, as `of` says.
     Restore {
@@ -152,6 +167,94 @@ impl<'a> Record<'a> {
             Change::Unbranch { .. } => UNBRANCH,
             Change::Restore { .. } => RESTORE,
             Change::Unput { .. } => UNPUT,
+            Change::Patch { .. } => TXN_PATCH,
+        }
+    }
+
+    /// The payload [`encode`](Self::encode) makes, handed to `f` in pieces in order, with the
+    /// key and values borrowed: an insert or an update is a few scalars on the stack and its
+    /// byte strings, so a row's bytes go from the caller straight to where `f` copies them. Any
+    /// other change is encoded.
+    pub fn with_pieces<R>(&self, f: impl FnOnce(&[&[u8]]) -> R) -> R {
+        // pid, root, flag and key length; a value's length; a found entry's flag. A patch's pid,
+        // root, key length, head length, offset and length are no more.
+        let mut scalars = [0u8; 8 + 8 + 1 + 2 + 4 + 1];
+        let mut n = 0;
+        let mut push = |scalars: &mut [u8], bytes: &[u8]| {
+            scalars[n..n + bytes.len()].copy_from_slice(bytes);
+            n += bytes.len();
+            n
+        };
+        push(&mut scalars, &self.pid.raw().to_le_bytes());
+        match &self.change {
+            Change::Insert {
+                key,
+                value,
+                out_of_line,
+                undo,
+            } => {
+                if let Some(root) = undo {
+                    push(&mut scalars, &root.raw().to_le_bytes());
+                }
+                push(&mut scalars, &[*out_of_line as u8]);
+                let a = push(&mut scalars, &(key.len() as u16).to_le_bytes());
+                f(&[&scalars[..a], key, value])
+            }
+            Change::Update {
+                key,
+                value,
+                out_of_line,
+                undo: None,
+            } => {
+                push(&mut scalars, &[*out_of_line as u8]);
+                let a = push(&mut scalars, &(key.len() as u16).to_le_bytes());
+                f(&[&scalars[..a], key, value])
+            }
+            Change::Update {
+                key,
+                value,
+                out_of_line,
+                undo: Some((root, found)),
+            } => {
+                push(&mut scalars, &root.raw().to_le_bytes());
+                push(&mut scalars, &[*out_of_line as u8]);
+                let a = push(&mut scalars, &(key.len() as u16).to_le_bytes());
+                let b = push(&mut scalars, &(value.len() as u32).to_le_bytes());
+                match found {
+                    Some((old, old_out_of_line)) => {
+                        let c = push(&mut scalars, &[*old_out_of_line as u8]);
+                        f(&[
+                            &scalars[..a],
+                            key,
+                            &scalars[a..b],
+                            value,
+                            &scalars[b..c],
+                            old,
+                        ])
+                    }
+                    None => {
+                        let c = push(&mut scalars, &[FOUND_NONE]);
+                        f(&[&scalars[..a], key, &scalars[a..b], value, &scalars[b..c]])
+                    }
+                }
+            }
+            Change::Patch {
+                key,
+                head,
+                at,
+                bytes,
+                root,
+                old_head,
+                old_bytes,
+            } => {
+                push(&mut scalars, &root.raw().to_le_bytes());
+                push(&mut scalars, &(key.len() as u16).to_le_bytes());
+                push(&mut scalars, &[head.len() as u8]);
+                push(&mut scalars, &(*at as u16).to_le_bytes());
+                let a = push(&mut scalars, &(bytes.len() as u16).to_le_bytes());
+                f(&[&scalars[..a], key, head, bytes, old_head, old_bytes])
+            }
+            _ => f(&[&self.encode()]),
         }
     }
 
@@ -227,6 +330,24 @@ impl<'a> Record<'a> {
                 out.extend_from_slice(sep);
             }
             Change::Unbranch { child } => out.extend(child.raw().to_le_bytes()),
+            Change::Patch {
+                key,
+                head,
+                at,
+                bytes,
+                root,
+                old_head,
+                old_bytes,
+            } => {
+                out.extend(root.raw().to_le_bytes());
+                out.extend((key.len() as u16).to_le_bytes());
+                out.push(head.len() as u8);
+                out.extend((*at as u16).to_le_bytes());
+                out.extend((bytes.len() as u16).to_le_bytes());
+                for piece in [*key, *head, *bytes, *old_head, *old_bytes] {
+                    out.extend_from_slice(piece);
+                }
+            }
         }
         out
     }
@@ -278,6 +399,40 @@ impl<'a> Record<'a> {
                     value: &rest[3 + len..],
                     out_of_line,
                     of,
+                },
+            }));
+        }
+        if kind == TXN_PATCH {
+            let root = PageId::from_raw(word(8)?);
+            let u16_at = |at: usize| -> Result<usize> {
+                let b = payload.get(at..at + 2).ok_or_else(bad)?;
+                Ok(u16::from_le_bytes([b[0], b[1]]) as usize)
+            };
+            let key_len = u16_at(16)?;
+            let head_len = *payload.get(18).ok_or_else(bad)? as usize;
+            let at = u16_at(19)?;
+            let len = u16_at(21)?;
+            let mut cut = 23;
+            let mut take = |n: usize| -> Result<&'a [u8]> {
+                let piece = payload.get(cut..cut + n).ok_or_else(bad)?;
+                cut += n;
+                Ok(piece)
+            };
+            let (key, head, bytes) = (take(key_len)?, take(head_len)?, take(len)?);
+            let (old_head, old_bytes) = (take(head_len)?, take(len)?);
+            if cut != payload.len() {
+                return Err(bad());
+            }
+            return Ok(Some(Self {
+                pid,
+                change: Change::Patch {
+                    key,
+                    head,
+                    at,
+                    bytes,
+                    root,
+                    old_head,
+                    old_bytes,
                 },
             }));
         }
@@ -360,6 +515,30 @@ impl<'a> Record<'a> {
     /// Makes the change on `page`, the node `pid` as the change found it. Frame hints it stores
     /// are 0; the caller sets them where it knows them.
     pub fn apply<P: BytesMut + ?Sized>(&self, page: &mut P) -> Result<()> {
+        self.apply_at(page, None)
+    }
+
+    /// [`apply`](Self::apply), with where the change's key is or goes in the node, and whether
+    /// it is there, when the caller knows: what a search found under the latch the change is made
+    /// under, which a search here would find again. Replay passes none, and searches.
+    pub fn apply_at<P: BytesMut + ?Sized>(
+        &self,
+        page: &mut P,
+        at: Option<(usize, bool)>,
+    ) -> Result<()> {
+        // An insert's key must lie between the fences too; the others are found by search alone.
+        let found = |page: &P, key: &[u8], fenced: bool| -> Option<(usize, bool)> {
+            let v = View::new(page);
+            match at {
+                Some(found) => {
+                    debug_assert_eq!(v.search(key), Some(found));
+                    debug_assert!(!fenced || v.covers(key) == Some(true));
+                    Some(found)
+                }
+                None if fenced && v.covers(key) != Some(true) => None,
+                None => v.search(key),
+            }
+        };
         match &self.change {
             Change::Init { image } => node::apply_image(page, image).ok_or_else(|| corrupt("init")),
             Change::Insert {
@@ -367,34 +546,29 @@ impl<'a> Record<'a> {
                 value,
                 out_of_line,
                 ..
-            } => {
-                let v = View::new(&*page);
-                match v.search(key) {
-                    Some((pos, false)) if v.covers(key) == Some(true) => {
-                        if node::insert(page, pos, key, value, *out_of_line) {
-                            Ok(())
-                        } else {
-                            Err(corrupt("insert"))
-                        }
-                    }
-                    _ => Err(corrupt("insert")),
-                }
-            }
-            Change::Remove { key } | Change::Unput { key, .. } => {
-                match View::new(&*page).search(key) {
-                    Some((pos, true)) => {
-                        node::remove(page, pos);
+            } => match found(page, key, true) {
+                Some((pos, false)) => {
+                    if node::insert(page, pos, key, value, *out_of_line) {
                         Ok(())
+                    } else {
+                        Err(corrupt("insert"))
                     }
-                    _ => Err(corrupt("remove")),
                 }
-            }
+                _ => Err(corrupt("insert")),
+            },
+            Change::Remove { key } | Change::Unput { key, .. } => match found(page, key, false) {
+                Some((pos, true)) => {
+                    node::remove(page, pos);
+                    Ok(())
+                }
+                _ => Err(corrupt("remove")),
+            },
             Change::Restore {
                 key,
                 value,
                 out_of_line,
                 ..
-            } => match View::new(&*page).search(key) {
+            } => match found(page, key, false) {
                 Some((pos, true)) if node::set_value(page, pos, value, *out_of_line) => Ok(()),
                 _ => Err(corrupt("restore")),
             },
@@ -403,9 +577,19 @@ impl<'a> Record<'a> {
                 value,
                 out_of_line,
                 ..
-            } => match View::new(&*page).search(key) {
+            } => match found(page, key, false) {
                 Some((pos, true)) if node::set_value(page, pos, value, *out_of_line) => Ok(()),
                 _ => Err(corrupt("update")),
+            },
+            Change::Patch {
+                key,
+                head,
+                at,
+                bytes,
+                ..
+            } => match found(page, key, false) {
+                Some((pos, true)) if node::patch(page, pos, head, *at, bytes) => Ok(()),
+                _ => Err(corrupt("patch")),
             },
             Change::Split { right, keep, sep } => split(page, *right, *keep, sep),
             Change::Unbranch { child } => unbranch(page, *child),
@@ -486,6 +670,156 @@ fn split<P: BytesMut + ?Sized>(page: &mut P, right: PageId, keep: usize, sep: &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every change's pieces, joined, are its encoding, byte for byte.
+    #[test]
+    fn a_records_pieces_are_its_encoding() {
+        let (pid, root) = (PageId::from_raw(0x0102_0304_0506_0708), PageId::from_raw(5));
+        let of = Compensation {
+            root,
+            statement: 513,
+            undid: Some(GroupStart::at(80)),
+        };
+        let mut changes = vec![
+            Change::Init { image: b"image" },
+            Change::Remove { key: b"key" },
+            Change::Restore {
+                key: b"key",
+                value: b"value",
+                out_of_line: true,
+                of,
+            },
+            Change::Unput { key: b"key", of },
+            Change::Split {
+                right: root,
+                keep: 3,
+                sep: b"s",
+            },
+            Change::Unbranch { child: root },
+            Change::Patch {
+                key: b"a key",
+                head: b"new head",
+                at: 3,
+                bytes: b"new",
+                root,
+                old_head: b"old head",
+                old_bytes: b"old",
+            },
+            Change::Patch {
+                key: b"a key",
+                head: b"new head",
+                at: 0,
+                bytes: b"",
+                root,
+                old_head: b"old head",
+                old_bytes: b"",
+            },
+        ];
+        for out_of_line in [false, true] {
+            for undo in [None, Some(root)] {
+                changes.push(Change::Insert {
+                    key: b"a key",
+                    value: b"head and value",
+                    out_of_line,
+                    undo,
+                });
+            }
+            for undo in [
+                None,
+                Some((root, None)),
+                Some((root, Some((&b"old"[..], false)))),
+                Some((root, Some((&b"old reference"[..], true)))),
+            ] {
+                changes.push(Change::Update {
+                    key: b"a key",
+                    value: b"head and new value",
+                    out_of_line,
+                    undo,
+                });
+            }
+        }
+        for change in changes {
+            let record = Record { pid, change };
+            let joined = record.with_pieces(|pieces| pieces.concat());
+            assert_eq!(joined, record.encode(), "{:?}", record.change);
+        }
+    }
+
+    /// A patch reads back as written and refuses being cut short or running on; applied, it changes
+    /// the entry's head and the bytes it names, in place, and refuses a value out of line or too
+    /// short to hold them.
+    #[test]
+    fn a_patch_reads_back_and_changes_its_bytes_in_place() {
+        let pid = PageId::from_raw(77);
+        let record = |head, at, bytes, old_head, old_bytes| Record {
+            pid,
+            change: Change::Patch {
+                key: b"k",
+                head,
+                at,
+                bytes,
+                root: PageId::from_raw(5),
+                old_head,
+                old_bytes,
+            },
+        };
+        let r = record(&b"HEAD"[..], 2, &b"xy"[..], &b"head"[..], &b"cd"[..]);
+        let bytes = r.encode();
+        assert_eq!(Record::decode(TXN_PATCH, &bytes).unwrap(), Some(r.clone()));
+        assert!(Record::decode(TXN_PATCH, &bytes[..bytes.len() - 1]).is_err());
+        assert!(Record::decode(TXN_PATCH, &[bytes.as_slice(), &[0]].concat()).is_err());
+        let layout = node::Layout {
+            root: pid,
+            level: 0,
+            lower: None,
+            upper: None,
+            next: (PageId::from_raw(0), 0),
+        };
+        let mut page = vec![0u8; 4096];
+        node::build(
+            page.as_mut_slice(),
+            &layout,
+            &[
+                node::Entry {
+                    key: b"j".to_vec(),
+                    value: b"headabcdef".to_vec(),
+                    out_of_line: false,
+                },
+                node::Entry {
+                    key: b"k".to_vec(),
+                    value: b"headabcdef".to_vec(),
+                    out_of_line: false,
+                },
+                node::Entry {
+                    key: b"l".to_vec(),
+                    value: b"headabcdef".to_vec(),
+                    out_of_line: false,
+                },
+            ],
+        );
+        r.apply(page.as_mut_slice()).unwrap();
+        let v = View::new(page.as_slice());
+        assert_eq!(v.value(1), Some((b"HEADabxyef".to_vec(), false)));
+        assert_eq!(v.value(0), Some((b"headabcdef".to_vec(), false)));
+        assert_eq!(v.value(2), Some((b"headabcdef".to_vec(), false)));
+        // Past the value's end, and a key with no entry.
+        assert!(
+            record(&b"HEAD"[..], 5, &b"xyz"[..], &b"head"[..], &b"cde"[..])
+                .apply(page.as_mut_slice())
+                .is_err()
+        );
+        let mut out = vec![0u8; 4096];
+        node::build(
+            out.as_mut_slice(),
+            &layout,
+            &[node::Entry {
+                key: b"k".to_vec(),
+                value: b"head and ref".to_vec(),
+                out_of_line: true,
+            }],
+        );
+        assert!(r.apply(out.as_mut_slice()).is_err(), "a value out of line");
+    }
 
     /// A compensation reads back as written, and refuses being cut short.
     #[test]

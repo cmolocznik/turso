@@ -640,6 +640,41 @@ impl IO for CrashIO {
         }
     }
 
+    /// The rename's two names are each durable only once their directory is synced, so a crash
+    /// before then may leave either, both or neither: stricter than a real file system, where
+    /// exactly one survives.
+    fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        let mut state = self.state.lock();
+        let data = match state.paths.get_mut(from) {
+            Some(entry) if entry.exists => {
+                entry.exists = false;
+                let data = entry.data.clone();
+                if !entry.durable {
+                    state.paths.remove(from);
+                }
+                data
+            }
+            _ => return Err(CompletionError::IOError(ErrorKind::NotFound, "rename").into()),
+        };
+        match state.paths.get_mut(to) {
+            Some(entry) => {
+                entry.exists = true;
+                entry.data = data;
+            }
+            None => {
+                state.paths.insert(
+                    to.to_string(),
+                    Entry {
+                        data,
+                        exists: true,
+                        durable: false,
+                    },
+                );
+            }
+        }
+        Ok(true)
+    }
+
     fn sync_directory(&self, dir: &str) -> Result<()> {
         let mut state = self.state.lock();
         state.paths.retain(|path, entry| {

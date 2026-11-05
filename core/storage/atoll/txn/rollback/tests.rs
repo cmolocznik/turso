@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::io::crash::CrashIO;
-use crate::storage::atoll::btree::{value, Check};
+use crate::storage::atoll::btree::{value, Check, Cursor, Seek};
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
 use crate::storage::atoll::control::{Control, Superblock};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
@@ -690,7 +690,7 @@ fn a_key_put_back_and_changed_by_a_commit_since_keeps_that_commit_through_undo()
 }
 
 /// A transaction past 65,535 statements (DESIGN.md §19): its statement numbers no longer fit 16
-/// bits in its version headers, its version index keys, the statement a rollback stops at and its
+/// bits in its version headers, its arena entries, the statement a rollback stops at and its
 /// compensations. One rolls back to a statement past the old limit and commits; another, as far
 /// past it, writes and rolls back, crashed every few operations, and every image recovers to what
 /// was committed, through recoveries crashed between two of their own compensations.
@@ -774,7 +774,10 @@ fn a_transaction_past_65535_statements_rolls_back_to_one_commits_and_recovers() 
             "seed {seed}, {} images, compensations {counts:?}",
             images.len()
         );
-        let r = recover_all(images, db.roots(), &keys, &expected, 2, start, &label);
+        // Every image crashed in its recovery too: only an image from before the rollback's
+        // compensations reached the log leaves its recovery more of them to log than the log
+        // buffer holds, so a crash between two of them, and there are few such images.
+        let r = recover_all(images, db.roots(), &keys, &expected, 1, start, &label);
         println!("{label}: {r:?}");
         assert!(
             r.mid_undo > 0,

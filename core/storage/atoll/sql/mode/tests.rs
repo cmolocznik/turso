@@ -1199,6 +1199,103 @@ fn a_materialized_view_follows_its_table_through_a_rollback_and_a_reopen() {
     assert_eq!(counts(&conn), vec![row("a", 1), row("b", 2), row("d", 2)]);
 }
 
+/// A statement changing an attached database's table, with change capture on, writes the main
+/// database's CDC table too, so it holds main's write gate for it: its transaction there is a
+/// write, where Turso had it a read and the write ran without the gate (Atoll's R24).
+#[test]
+fn a_captured_change_to_an_attached_table_writes_the_main_cdc_table_under_its_gate() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open(
+        io.clone(),
+        "/db/attached-cdc",
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .atoll(config())
+            .db_opts(DatabaseOpts::default().with_attach(true)),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute(
+        "CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, \
+         change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("ATTACH ':memory:' AS aux").unwrap();
+    conn.execute("CREATE TABLE aux.t1(x INTEGER)").unwrap();
+    conn.execute("INSERT INTO aux.t1 VALUES (1)").unwrap();
+    conn.execute("DELETE FROM aux.t1 WHERE x = 1").unwrap();
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT table_name, change_type FROM turso_cdc WHERE table_name != 'sqlite_schema' \
+             ORDER BY change_id"
+        ),
+        vec![
+            vec![text("t1"), Value::from_i64(1)],
+            vec![text("t1"), Value::from_i64(-1)],
+        ]
+    );
+}
+
+/// An index method whose rows are a backing store, the toy sparse IVF, keeps them in Atoll trees
+/// (DESIGN.md §17): its query goes through the index and finds the nearest row, an update in a
+/// transaction is read through it, a rollback leaves it as it stood, and it answers the same after
+/// a reopen.
+#[test]
+fn a_backing_store_index_method_answers_through_a_rollback_and_a_reopen() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let open = || {
+        Database::open(
+            io.clone(),
+            "/db/toy-ivf",
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .atoll(config())
+                .db_opts(DatabaseOpts::default().with_index_method(true)),
+        )
+        .unwrap()
+    };
+    let nearest = |conn: &Arc<Connection>, vector: &str| {
+        let sql = format!(
+            "SELECT id FROM vectors ORDER BY \
+             vector_distance_jaccard(embedding, vector32_sparse('{vector}')) LIMIT 1"
+        );
+        let plan = rows(conn, &format!("EXPLAIN {sql}"));
+        assert!(
+            plan.iter()
+                .any(|row| row[1].to_string() == "IndexMethodQuery"),
+            "the query does not go through the index"
+        );
+        rows(conn, &sql)
+    };
+    let one = |id: i64| vec![vec![Value::from_i64(id)]];
+    {
+        let db = open();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE vectors(id INTEGER PRIMARY KEY, embedding)")
+            .unwrap();
+        conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO vectors VALUES (1, vector32_sparse('[1, 0, 0]')), \
+             (2, vector32_sparse('[0, 1, 0]'))",
+        )
+        .unwrap();
+        assert_eq!(nearest(&conn, "[1, 0, 0]"), one(1));
+        conn.execute("BEGIN").unwrap();
+        conn.execute("UPDATE vectors SET embedding = vector32_sparse('[0, 0, 1]') WHERE id = 2")
+            .unwrap();
+        assert_eq!(nearest(&conn, "[0, 0, 1]"), one(2), "its own update");
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(nearest(&conn, "[0, 1, 0]"), one(2));
+        conn.close().unwrap();
+    }
+    let db = open();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(nearest(&conn, "[0, 1, 0]"), one(2));
+    assert_eq!(nearest(&conn, "[1, 0, 0]"), one(1));
+}
+
 /// A statement that destroys a tree, then opens a cursor on it, reads the tree as empty, as
 /// SQLite's cursor reads a freed root: a DROP of CDC's version table, which deletes that table's
 /// rows after its Destroy, succeeds.

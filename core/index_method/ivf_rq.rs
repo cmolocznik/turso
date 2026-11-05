@@ -2380,6 +2380,9 @@ fn position(snapshot: IndexMethodSnapshotIdentity) -> Option<Position> {
         IndexMethodSnapshotIdentity::Wal { checkpoint_sequence, max_frame } => Some((checkpoint_sequence as u64, max_frame)),
         IndexMethodSnapshotIdentity::Mvcc { begin_timestamp: u64::MAX, .. } => None,
         IndexMethodSnapshotIdentity::Mvcc { begin_timestamp, .. } => Some((MVCC_POSITIONS, begin_timestamp)),
+        // Atoll mode shares no writes across attachments (`Clock` has no Atoll arm), so its
+        // snapshots name no position.
+        IndexMethodSnapshotIdentity::Atoll { .. } => None,
     }
 }
 
@@ -3354,7 +3357,9 @@ impl IvfRqCursor {
     fn note_snapshot(&mut self, context: &IndexMethodContext) {
         (self.concurrent, self.writer) = match context.snapshot() {
             IndexMethodSnapshotIdentity::Mvcc { begin_timestamp, .. } => (true, i64::try_from(begin_timestamp).unwrap_or(0)),
-            _ => (false, 0),
+            // Atoll's writers run at once, as MVCC's do (Atoll's DESIGN.md §17, R2).
+            IndexMethodSnapshotIdentity::Atoll { snapshot_timestamp } => (true, i64::try_from(snapshot_timestamp).unwrap_or(0)),
+            IndexMethodSnapshotIdentity::Wal { .. } => (false, 0),
         };
     }
 
@@ -3690,6 +3695,9 @@ impl IvfRqCursor {
                 Some(wal) => (Clock::Wal(wal), context.transaction_mode() == IndexMethodTransactionMode::Read),
                 None => return Ok(()),
             },
+            // Atoll's commits have no clock here yet: each attachment reads its own, as with a
+            // multiprocess WAL; concurrent writers are open work (step 8 audit 9, item 28).
+            IndexMethodSnapshotIdentity::Atoll { .. } => return Ok(()),
         };
         let writes = self.writes(context.database().incarnation, &clock);
         let snapshot = position(context.snapshot());
@@ -6750,21 +6758,34 @@ mod tests {
 
     /// An ivf_rq index written through inserts, updates, deletes and maintenance answers each
     /// top-10 query with the rows an exact scan of the live vectors ranks first, in WAL and MVCC
-    /// mode.
+    /// mode and in Atoll mode, where its backing stores are Atoll trees (Atoll's DESIGN.md §17).
     #[test]
-    fn the_index_answers_the_exact_top_ten_in_wal_and_mvcc() {
-        use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect};
+    fn the_index_answers_the_exact_top_ten_in_wal_mvcc_and_atoll() {
+        use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, SqliteDialect};
         const DIMS: usize = 32;
-        for mvcc in [false, true] {
-            let db = Database::open_file_with_flags(
-                Arc::new(MemoryIO::new()),
-                &format!("ivf-rq-top-ten-{mvcc}.db"),
-                OpenFlags::default(),
-                DatabaseOpts::new().with_index_method(true),
-                None,
-                Arc::new(SqliteDialect),
-            )
-            .unwrap();
+        for mode in ["wal", "mvcc", "atoll"] {
+            let mvcc = mode == "mvcc";
+            let db = if mode == "atoll" {
+                Database::open(
+                    Arc::new(MemoryIO::new()),
+                    "ivf-rq-top-ten-atoll.db",
+                    OpenOptions::new(Arc::new(SqliteDialect))
+                        .atoll(crate::storage::atoll::sql::catalog::tests::config())
+                        .db_opts(DatabaseOpts::new().with_index_method(true)),
+                )
+                .unwrap()
+            } else {
+                Database::open_file_with_flags(
+                    Arc::new(MemoryIO::new()),
+                    &format!("ivf-rq-top-ten-{mvcc}.db"),
+                    OpenFlags::default(),
+                    DatabaseOpts::new().with_index_method(true),
+                    None,
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap()
+            };
+            assert_eq!(db.atoll.is_some(), mode == "atoll");
             let conn = db.connect(ConnectOpts::new()).unwrap();
             if mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -6805,7 +6826,7 @@ mod tests {
                 let plan = rows(&conn, &format!("EXPLAIN {sql}"));
                 assert!(
                     plan.iter().any(|row| row[1].to_string() == "IndexMethodQuery"),
-                    "mvcc={mvcc}: the query does not go through the index"
+                    "{mode}: the query does not go through the index"
                 );
                 let got: Vec<i64> = rows(&conn, &sql)
                 .iter()
@@ -6814,7 +6835,7 @@ mod tests {
                 let mut exact: Vec<(f64, i64)> = live.iter().map(|(id, v)| (dot(&q, v), *id)).collect();
                 exact.sort_by(|a, b| b.0.total_cmp(&a.0));
                 let expected: Vec<i64> = exact[..10].iter().map(|(_, id)| *id).collect();
-                assert_eq!(got, expected, "mvcc={mvcc}");
+                assert_eq!(got, expected, "{mode}");
             }
         }
     }

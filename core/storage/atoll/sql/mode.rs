@@ -405,6 +405,15 @@ impl TreeChanges {
     }
 }
 
+/// The Atoll tree id Turso holds as a root page (DESIGN.md §17): ids are positive, from 1,
+/// `sqlite_schema`.
+pub fn tree_id(root: i64) -> Result<u64> {
+    u64::try_from(root)
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| LimboError::InternalError(format!("an Atoll tree id of {root}")))
+}
+
 /// A named savepoint (DESIGN.md §17, §3): the statement it rolls back to, whether it began the
 /// transaction, and the deferred foreign-key count a rollback to it restores.
 struct Savepoint {
@@ -525,6 +534,27 @@ impl ConnTxn {
     /// Whether the open transaction has written.
     pub fn wrote(&self) -> bool {
         self.cell.lock().as_ref().is_some_and(Txn::wrote)
+    }
+
+    /// A cursor over the tree whose id Turso holds as the root page `root`, opened as OpenRead and
+    /// OpenWrite open one: an index's or a WITHOUT ROWID table's with `index`, a rowid table's
+    /// without.
+    pub fn open_cursor(
+        &self,
+        pager: Arc<Pager>,
+        root: i64,
+        index: Option<Arc<IndexInfo>>,
+    ) -> Result<SqlCursor> {
+        SqlCursor::new(self, pager, tree_id(root)?, index).opened()
+    }
+
+    /// The snapshot timestamp of the open transaction's current statement, once it has one.
+    pub fn snapshot(&self) -> Option<u64> {
+        self.cell
+            .lock()
+            .as_ref()
+            .filter(|txn| txn.snapped())
+            .map(Txn::snapshot)
     }
 
     /// Begins the transaction a Transaction opcode needs, if none is open, and for a write takes

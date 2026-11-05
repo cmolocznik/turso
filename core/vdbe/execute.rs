@@ -1300,9 +1300,7 @@ pub fn op_open_read(
     state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
-        if mv_store.is_some() {
-            crate::index_method::ensure_mvcc_support(&module.definition(), false)?;
-        }
+        ensure_index_method_support(program, *db, mv_store.is_some(), module.as_ref(), false)?;
         let context =
             ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
         if state.cursors[*cursor_id].is_none() {
@@ -14463,14 +14461,6 @@ pub fn op_offset_limit(
 // this cursor may be reused for next insert
 // Update: tablemoveto is used to travers on not exists, on insert depending on flags if nonseek it traverses again.
 // If not there might be some optimizations obviously.
-/// The Atoll tree id a root page names (DESIGN.md §17): ids are positive, from 1, `sqlite_schema`.
-fn atoll_tree_id(root: i64) -> Result<u64> {
-    u64::try_from(root)
-        .ok()
-        .filter(|id| *id > 0)
-        .ok_or_else(|| LimboError::InternalError(format!("an Atoll tree id of {root}")))
-}
-
 /// An Atoll-mode cursor over tree `root` (DESIGN.md §17), for OpenRead and OpenWrite: a rowid
 /// table's, an index's, a WITHOUT ROWID table's, keyed as an index on its primary key (R29), or a
 /// materialized view's, whose rows are a rowid table's read through the view's cursor, which adds
@@ -14495,11 +14485,7 @@ fn open_atoll_cursor(
             ))
         }
     };
-    let root = atoll_tree_id(root)?;
-    let cursor = Box::new(
-        crate::storage::atoll::sql::mode::SqlCursor::new(atoll, pager.clone(), root, index)
-            .opened()?,
-    );
+    let cursor = Box::new(atoll.open_cursor(pager.clone(), root, index)?);
     Ok(Cursor::new_btree_dyn(match cursor_type {
         CursorType::MaterializedView(..) => {
             Box::new(crate::incremental::cursor::MaterializedViewCursor::new(
@@ -14535,9 +14521,7 @@ pub fn op_open_write(
     state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
-        if mv_store.is_some() {
-            crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
-        }
+        ensure_index_method_support(program, *db, mv_store.is_some(), module.as_ref(), true)?;
         let context =
             ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
         if state.cursors[*cursor_id].is_none() {
@@ -14834,6 +14818,25 @@ pub fn op_create_btree(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// An index method opens under MVCC, and in Atoll mode, whose writers run at once as MVCC's do, on
+/// the terms MVCC sets (Atoll's DESIGN.md §17); under WAL it opens on any.
+fn ensure_index_method_support(
+    program: &Program,
+    db: usize,
+    mvcc: bool,
+    module: &dyn crate::index_method::IndexMethodAttachment,
+    write: bool,
+) -> Result<()> {
+    let mode = if mvcc {
+        "MVCC"
+    } else if program.connection.atoll_for_db(db).is_some() {
+        "Atoll mode"
+    } else {
+        return Ok(());
+    };
+    crate::index_method::ensure_concurrent_support(&module.definition(), write, mode)
+}
+
 pub fn op_index_method_create(
     program: &Program,
     state: &mut ProgramState,
@@ -14844,20 +14847,11 @@ pub fn op_index_method_create(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
-    if program.connection.atoll_for_db(*db).is_some() {
-        return Err(LimboError::ParseError(
-            "index methods build their trees over the pager, and are refused in Atoll mode until \
-             their arm is built"
-                .to_string(),
-        )
-        .into());
-    }
     let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] else {
         unreachable!("IndexMethodCreate emitted against a non-index-method cursor {cursor_id}");
     };
-    if program.connection.mv_store_for_db(*db).is_some() {
-        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
-    }
+    let mvcc = program.connection.mv_store_for_db(*db).is_some();
+    ensure_index_method_support(program, *db, mvcc, module.as_ref(), true)?;
     // Build the context before installing the cursor: a context error must
     // not leave a cursor in the slot with no context, a state the statement
     // outcome helpers cannot deliver hooks to.
@@ -14889,9 +14883,8 @@ pub fn op_index_method_destroy(
     let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) else {
         unreachable!("IndexMethodDestroy emitted against a non-index-method cursor {cursor_id}");
     };
-    if program.connection.mv_store_for_db(*db).is_some() {
-        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
-    }
+    let mvcc = program.connection.mv_store_for_db(*db).is_some();
+    ensure_index_method_support(program, *db, mvcc, module.as_ref(), true)?;
     // Context before cursor install; see op_index_method_create.
     let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
     if state.cursors[*cursor_id].is_none() {
@@ -14921,9 +14914,8 @@ pub fn op_index_method_optimize(
     let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) else {
         unreachable!("IndexMethodOptimize emitted against a non-index-method cursor {cursor_id}");
     };
-    if program.connection.mv_store_for_db(*db).is_some() {
-        crate::index_method::ensure_mvcc_support(&module.definition(), true)?;
-    }
+    let mvcc = program.connection.mv_store_for_db(*db).is_some();
+    ensure_index_method_support(program, *db, mvcc, module.as_ref(), true)?;
     // Context before cursor install; see op_index_method_create.
     let context = ensure_index_method_context(program, state, *cursor_id, *db, module.as_ref())?;
     if state.cursors[*cursor_id].is_none() {
@@ -15070,7 +15062,7 @@ pub fn op_destroy(
     if let Some(atoll) = program.connection.atoll_for_db(*db) {
         // Atoll mode: the catalog row deleted and the root listed as dropped, in the current
         // statement (DESIGN.md §17, §5). Atoll has no auto-vacuum, so no root page moves.
-        let id = atoll_tree_id(*root)?;
+        let id = crate::storage::atoll::sql::mode::tree_id(*root)?;
         return_if_io!(state, atoll.retire_tree(&mut state.atoll_retire, id, false));
         state.atoll_retire = None;
         state.registers[*former_root_reg].set_int(0);
@@ -15148,7 +15140,7 @@ fn op_clear_btree_inner(
         // Atoll mode: the catalog row pointed at a new, empty tree and the old root listed as
         // dropped (DESIGN.md §17, §5); the cursors over the tree read the new one from their next
         // step.
-        let id = atoll_tree_id(*root)?;
+        let id = crate::storage::atoll::sql::mode::tree_id(*root)?;
         let removed = return_if_io!(state, atoll.retire_tree(&mut state.atoll_retire, id, true));
         state.atoll_retire = None;
         for cursor in state.cursors.iter_mut().flatten() {

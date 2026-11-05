@@ -1149,6 +1149,9 @@ pub fn prepare_cdc_if_necessary(
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_btree.clone()));
+    // A change to an attached database's table writes the main database too: its transaction
+    // there is a write, not the read the statement's other reads of main would open.
+    program.begin_write_on_database(crate::MAIN_DB_ID, schema.schema_version)?;
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
         root_page: cdc_btree.root_page.into(),

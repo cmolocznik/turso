@@ -201,6 +201,10 @@ pub enum IndexMethodSnapshotIdentity {
         transaction_id: u64,
         begin_timestamp: u64,
     },
+    /// Atoll readers are pinned to their statement's snapshot timestamp, `u64::MAX` before the
+    /// transaction has taken one (Atoll's DESIGN.md §17). Atoll runs writers at once, as MVCC
+    /// does.
+    Atoll { snapshot_timestamp: u64 },
 }
 
 /// Append-only synthetic-yield markers for index-method lifecycle boundaries.
@@ -364,6 +368,21 @@ impl IndexMethodContext {
                 },
                 mv_store.schema_generation(),
             )
+        } else if let Some(atoll) = connection.atoll_for_db(database_id) {
+            // Atoll's log is the database's journal, which reports itself as `wal` (DESIGN.md
+            // §17); the schema's generation is its cookie, a row of Atoll's header tree.
+            (
+                JournalMode::Wal,
+                if connection.is_in_write_tx() {
+                    IndexMethodTransactionMode::Write
+                } else {
+                    IndexMethodTransactionMode::Read
+                },
+                IndexMethodSnapshotIdentity::Atoll {
+                    snapshot_timestamp: atoll.snapshot().unwrap_or(u64::MAX),
+                },
+                connection.with_schema(database_id, |schema| u64::from(schema.schema_version)),
+            )
         } else {
             let (checkpoint_sequence, max_frame) = pager.wal_pos();
             (
@@ -444,11 +463,13 @@ impl IndexMethodContext {
         self.transaction_mode
     }
 
-    /// The MVCC transaction this operation runs inside; `None` under WAL.
+    /// The MVCC transaction this operation runs inside; `None` under WAL and in Atoll mode.
     pub fn transaction_id(&self) -> Option<u64> {
         match self.snapshot {
             IndexMethodSnapshotIdentity::Mvcc { transaction_id, .. } => Some(transaction_id),
-            IndexMethodSnapshotIdentity::Wal { .. } => None,
+            IndexMethodSnapshotIdentity::Wal { .. } | IndexMethodSnapshotIdentity::Atoll { .. } => {
+                None
+            }
         }
     }
 
@@ -497,17 +518,21 @@ impl crate::mvcc::yield_hooks::ProvidesYieldContext for IndexMethodContext {
     }
 }
 
-pub(crate) fn ensure_mvcc_support(
+/// Whether an index method opens, for a write or a read, under `mode`: MVCC, or Atoll mode, whose
+/// writers run at once as MVCC's do, so that it admits a method on the terms MVCC sets (Atoll's
+/// DESIGN.md §17).
+pub(crate) fn ensure_concurrent_support(
     definition: &IndexMethodDefinition<'_>,
     write: bool,
+    mode: &str,
 ) -> Result<()> {
     match (definition.mvcc_support, write) {
         (IndexMethodMvccSupport::Unsupported, _) => Err(LimboError::ParseError(format!(
-            "index method '{}' does not support MVCC",
+            "index method '{}' does not support {mode}",
             definition.method_name
         ))),
         (IndexMethodMvccSupport::ReadOnly, true) => Err(LimboError::ParseError(format!(
-            "index method '{}' is read-only in MVCC",
+            "index method '{}' is read-only in {mode}",
             definition.method_name
         ))),
         (
@@ -815,6 +840,9 @@ pub(crate) fn open_table_cursor(
         )));
     };
     let root_page = table.get_root_page()?;
+    if let Some(atoll) = connection.atoll_for_db(database_id) {
+        return Ok(Box::new(atoll.open_cursor(pager, root_page, None)?));
+    }
     let cursor = Box::new(BTreeCursor::new_table(
         pager,
         btree_root_page(connection, database_id, root_page),
@@ -852,7 +880,14 @@ pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_mvcc_support, IndexMethodDefinition, IndexMethodMvccSupport};
+    use super::{ensure_concurrent_support, IndexMethodDefinition, IndexMethodMvccSupport};
+
+    fn ensure_mvcc_support(
+        definition: &IndexMethodDefinition<'_>,
+        write: bool,
+    ) -> crate::Result<()> {
+        ensure_concurrent_support(definition, write, "MVCC")
+    }
 
     fn definition(support: IndexMethodMvccSupport) -> IndexMethodDefinition<'static> {
         IndexMethodDefinition {
@@ -879,6 +914,27 @@ mod tests {
         ensure_mvcc_support(
             &definition(IndexMethodMvccSupport::TransactionalBackingStore),
             true,
+        )
+        .unwrap();
+    }
+
+    /// Atoll mode admits a method on MVCC's terms, and says it is Atoll mode that refused.
+    #[test]
+    fn atoll_mode_admits_an_index_method_on_mvccs_terms() {
+        let refusal = |support, write| {
+            ensure_concurrent_support(&definition(support), write, "Atoll mode")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(refusal(IndexMethodMvccSupport::Unsupported, false)
+            .contains("does not support Atoll mode"));
+        assert!(
+            refusal(IndexMethodMvccSupport::ReadOnly, true).contains("is read-only in Atoll mode")
+        );
+        ensure_concurrent_support(
+            &definition(IndexMethodMvccSupport::TransactionalBackingStore),
+            true,
+            "Atoll mode",
         )
         .unwrap();
     }

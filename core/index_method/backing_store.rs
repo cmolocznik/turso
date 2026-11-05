@@ -319,10 +319,18 @@ impl BackingStore {
     }
 
     /// Open a cursor over the rows of the store. Under MVCC, the cursor
-    /// reads the snapshot of the transaction and writes versioned rows.
+    /// reads the snapshot of the transaction and writes versioned rows; in
+    /// Atoll mode it is the store's tree's own cursor.
     pub fn open_cursor(&self) -> Result<Box<dyn CursorTrait>> {
         let connection = self.connection()?;
         let pager = connection.get_pager_from_database_index(&self.database_id)?;
+        if let Some(atoll) = connection.atoll_for_db(self.database_id) {
+            return Ok(Box::new(atoll.open_cursor(
+                pager,
+                self.root_page,
+                Some(Arc::clone(&self.index_info)),
+            )?));
+        }
         let mut cursor = BTreeCursor::new(
             pager,
             btree_root_page(&connection, self.database_id, self.root_page),

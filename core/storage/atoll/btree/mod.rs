@@ -1753,22 +1753,36 @@ impl Tree {
             cursor.pending = Some((seek, target));
             cursor.leaf = None;
             cursor.at = None;
+            cursor.stepping = false;
+            cursor.batch.drop_entries();
         }
         self.run(cursor)
     }
 
     /// The entry after the cursor's. Step it until done.
     pub fn next(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
-        if cursor.pending.is_none() && !cursor.step(Seek::Gt) {
-            return Ok(IOResult::Done(false));
+        if cursor.pending.is_none() {
+            if cursor.from_batch(true) {
+                return Ok(IOResult::Done(true));
+            }
+            if !cursor.step(Seek::Gt) {
+                return Ok(IOResult::Done(false));
+            }
+            cursor.stepping = true;
         }
         self.run(cursor)
     }
 
     /// The entry before the cursor's. Step it until done.
     pub fn prev(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
-        if cursor.pending.is_none() && !cursor.step(Seek::Lt) {
-            return Ok(IOResult::Done(false));
+        if cursor.pending.is_none() {
+            if cursor.from_batch(false) {
+                return Ok(IOResult::Done(true));
+            }
+            if !cursor.step(Seek::Lt) {
+                return Ok(IOResult::Done(false));
+            }
+            cursor.stepping = true;
         }
         self.run(cursor)
     }
@@ -1850,6 +1864,7 @@ impl Tree {
                     std::mem::take(&mut cursor.spare.1),
                 ),
             };
+            let batch = (cursor.lazy && cursor.stepping).then_some(&mut cursor.batch);
             let read = leaf.read(|p| {
                 scan_leaf(
                     View::new(p),
@@ -1859,10 +1874,12 @@ impl Tree {
                     at,
                     &mut key,
                     &mut value,
+                    batch,
                 )
             });
             let Some(step) = read else {
                 // Changed while read: a writer holds it for a moment.
+                cursor.batch.drop_entries();
                 cursor.near = Near::NONE;
                 cursor.spare.0 = key;
                 cursor.spare.1 = value;
@@ -2685,6 +2702,78 @@ pub struct Cursor {
     lazy: bool,
     /// The entry's value is out of line and unread.
     unread: bool,
+    /// The run of a lazy cursor's step, when a step lands on its first entry.
+    stepping: bool,
+    batch: Batch,
+}
+
+/// The entries past a lazy cursor's in the direction of the step that found it, copied from its
+/// leaf in the same read: what its next steps that way take, touching no page. Its reader is a
+/// statement whose snapshot was taken before the batch was read, and which changed nothing since
+/// (the versioned cursor drops the batch on any change of its transaction): every version it
+/// sees was in the leaf as read, and a version written since is one it does not see.
+#[derive(Default)]
+struct Batch {
+    /// The entries' keys and values, back to back.
+    bytes: Vec<u8>,
+    entries: Vec<Batched>,
+    /// The entry the next step takes.
+    next: usize,
+    forward: bool,
+    /// How many entries past its landing a step copies: one at first, doubled by each batch taken
+    /// to its end, one again after a batch is dropped before it is: entries copied and never
+    /// taken are at most those taken. A leaf holds what one copies.
+    ahead: usize,
+}
+
+/// A batched entry: where its key and value end in the batch's bytes, each starting where the one
+/// before ends, whether the value is out of line, and its slot in the leaf.
+#[derive(Clone, Copy)]
+struct Batched {
+    key_end: usize,
+    value_end: usize,
+    out_of_line: bool,
+    pos: usize,
+}
+
+impl Batch {
+    /// Drops the entries, before or after they are taken.
+    fn drop_entries(&mut self) {
+        if self.next < self.entries.len() {
+            self.ahead = 1;
+        }
+        self.bytes.clear();
+        self.entries.clear();
+        self.next = 0;
+    }
+
+    /// Copies up to `ahead` entries of leaf `v` past slot `p` in the direction `forward`.
+    fn fill<P: Bytes + ?Sized>(
+        &mut self,
+        v: &View<'_, P>,
+        p: usize,
+        count: usize,
+        forward: bool,
+    ) -> Option<()> {
+        self.drop_entries();
+        self.forward = forward;
+        let n = self.ahead.max(1);
+        let (bytes, entries) = (&mut self.bytes, &mut self.entries);
+        let mut each = |pos, key_end, value_end, out_of_line| {
+            entries.push(Batched {
+                key_end,
+                value_end,
+                out_of_line,
+                pos,
+            })
+        };
+        if forward {
+            v.append_entries((p + 1..count).take(n), bytes, &mut each)?;
+        } else {
+            v.append_entries((0..p).rev().take(n), bytes, &mut each)?;
+        }
+        Some(())
+    }
 }
 
 impl Cursor {
@@ -2703,6 +2792,46 @@ impl Cursor {
     /// Whether its moves read an out-of-line value: the next move's scan, not the entry it holds.
     pub fn set_lazy(&mut self, lazy: bool) {
         self.lazy = lazy;
+        if !lazy {
+            self.batch.drop_entries();
+        }
+    }
+
+    /// Drops the entries a step copied ahead: its reader's view of them may have changed.
+    pub fn drop_batch(&mut self) {
+        self.batch.drop_entries();
+    }
+
+    /// Takes the next batched entry in the direction `forward` as the entry: whether there was one.
+    fn from_batch(&mut self, forward: bool) -> bool {
+        let b = &mut self.batch;
+        if b.next >= b.entries.len() || b.forward != forward {
+            return false;
+        }
+        let e = b.entries[b.next];
+        let start = match b.next {
+            0 => 0,
+            n => b.entries[n - 1].value_end,
+        };
+        let (key, value) = self.entry.get_or_insert_with(|| {
+            (
+                std::mem::take(&mut self.spare.0),
+                std::mem::take(&mut self.spare.1),
+            )
+        });
+        key.clear();
+        key.extend_from_slice(&b.bytes[start..e.key_end]);
+        value.clear();
+        value.extend_from_slice(&b.bytes[e.key_end..e.value_end]);
+        self.unread = e.out_of_line;
+        self.at = Some(e.pos);
+        self.reading = None;
+        self.held = None;
+        b.next += 1;
+        if b.next == b.entries.len() {
+            b.ahead = b.ahead.max(1).saturating_mul(2);
+        }
+        true
     }
 
     /// Whether the entry's value is out of line and unread: its value is the head and the
@@ -2732,6 +2861,8 @@ impl Cursor {
         self.held = None;
         self.near = near;
         self.unread = false;
+        self.stepping = false;
+        self.batch.drop_entries();
     }
 
     /// The leaf it last read or was placed at.
@@ -2784,8 +2915,10 @@ enum Scan {
 /// The entry `seek` from `target` lands on in the leaf `v`, its key and value copied into `key`
 /// and `value`. A leaf found by its hint (`cached`) must hold where the seek lands: cover the
 /// target, or, seeking above it, start right there. A step from the entry at `at` of the same
-/// leaf, unchanged since, is the slot beside it. Its one caller is a scan's every step.
+/// leaf, unchanged since, is the slot beside it. Its one caller is a scan's every step. With a
+/// `batch`, the entries past the one it lands on in the step's direction are copied there too.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn scan_leaf<P: Bytes + ?Sized>(
     v: View<'_, P>,
     seek: Seek,
@@ -2794,6 +2927,7 @@ fn scan_leaf<P: Bytes + ?Sized>(
     at: Option<usize>,
     key: &mut Vec<u8>,
     value: &mut Vec<u8>,
+    batch: Option<&mut Batch>,
 ) -> Option<Scan> {
     if !v.is_leaf() {
         return None;
@@ -2815,6 +2949,12 @@ fn scan_leaf<P: Bytes + ?Sized>(
             }
         }
     };
+    if let Some(b) = batch {
+        match pos {
+            Some(p) if p < count => b.fill(&v, p, count, matches!(seek, Seek::Ge | Seek::Gt))?,
+            _ => b.drop_entries(),
+        }
+    }
     match pos {
         Some(p) if p < count => {
             v.key_into(p, key)?;

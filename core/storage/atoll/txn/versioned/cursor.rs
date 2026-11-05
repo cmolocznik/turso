@@ -51,6 +51,9 @@ pub struct VersionedCursor {
     value: Value,
     /// The row's value read out of line, or the allocation kept for the next.
     body: Vec<u8>,
+    /// Its transaction's count of changes as its last move began: the entries the plain cursor
+    /// copied ahead are as the statement reads them only while it is unchanged.
+    edits: u64,
 }
 
 /// Where the value of the row a cursor rests on is.
@@ -141,6 +144,7 @@ impl VersionedCursor {
             unseen: None,
             value: Value::InEntry,
             body: Vec::new(),
+            edits: 0,
         }
     }
 
@@ -264,6 +268,7 @@ impl VersionedTree {
             cursor.moving = Some(Move::Seek(seek));
             cursor.chain = None;
             cursor.cursor.set_lazy(true);
+            cursor.edits = txn.changes().edits();
         }
         self.settle(txns, versions, txn, cursor)
     }
@@ -305,6 +310,13 @@ impl VersionedTree {
             cursor.moving = Some(Move::Step { forward });
             cursor.chain = None;
             cursor.cursor.set_lazy(true);
+            // A change of the statement's own may be one it sees, which the entries copied ahead
+            // do not hold.
+            let edits = txn.changes().edits();
+            if edits != cursor.edits {
+                cursor.cursor.drop_batch();
+                cursor.edits = edits;
+            }
         }
         self.settle(txns, versions, txn, cursor)
     }

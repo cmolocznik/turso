@@ -402,6 +402,36 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         Some(())
     }
 
+    /// The entries at `slots`, in that order, each appended to `out` whole, key then value, and
+    /// handed to `each` with its slot, where its key and its value end in `out` and whether the
+    /// value is out of line: the prefix read from the page once, each key and value in one copy.
+    pub fn append_entries(
+        &self,
+        slots: impl Iterator<Item = usize>,
+        out: &mut Vec<u8>,
+        mut each: impl FnMut(usize, usize, usize, bool),
+    ) -> Option<()> {
+        let prefix = self.prefix_run()?;
+        let mut first = None;
+        for i in slots {
+            let s = self.slot(i)?;
+            let at = out.len();
+            match first {
+                None => {
+                    out.resize(at + prefix.len, 0);
+                    self.0.copy_to(prefix.off, &mut out[at..]);
+                    first = Some(at);
+                }
+                Some(from) => out.extend_from_within(from..from + prefix.len),
+            }
+            let key = out.len();
+            out.resize(key + s.key_len + s.value_len, 0);
+            self.0.copy_to(s.off, &mut out[key..]);
+            each(i, key + s.key_len, out.len(), s.out_of_line);
+        }
+        Some(())
+    }
+
     /// The first `out.len()` bytes of entry `i`'s value, into `out`.
     pub fn value_head_into(&self, i: usize, out: &mut [u8]) -> Option<()> {
         let s = self.slot(i)?;

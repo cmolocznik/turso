@@ -1883,3 +1883,72 @@ fn an_unseen_walk_reads_each_version_out_of_line_whole() {
     db.rollback(w);
     db.commit(reader);
 }
+
+impl Db {
+    /// Moves `c` for `txn`'s current statement, by a seek from `key` or a step: the key it rests
+    /// on.
+    fn move_to(
+        &self,
+        txn: &mut Txn,
+        c: &mut VersionedCursor,
+        to: Option<(&str, Seek)>,
+        forward: bool,
+    ) -> Option<String> {
+        let found = run(&self.io, || match to {
+            Some((key, seek)) => {
+                self.tree
+                    .seek(self.txns(), &self.versions, txn, c, key.as_bytes(), seek)
+            }
+            None if forward => self.tree.next(self.txns(), &self.versions, txn, c),
+            None => self.tree.prev(self.txns(), &self.versions, txn, c),
+        });
+        found.then(|| String::from_utf8(c.key().unwrap().to_vec()).unwrap())
+    }
+}
+
+/// A step takes the entries it copied ahead of it only while they are what its statement reads:
+/// a key the transaction writes past it since is found, a step back returns to the key before,
+/// and a seek elsewhere moves on from where it lands.
+#[test]
+fn a_step_takes_entries_copied_ahead_only_while_they_are_what_its_statement_reads() {
+    let db = open();
+    let mut setup = db.begin(Isolation::Snapshot);
+    for key in ["k00", "k02", "k04", "k06", "k08", "k10", "k12"] {
+        assert_eq!(db.put(&mut setup, key, "v", Mode::Insert), DONE_INSERTED);
+    }
+    db.commit(setup);
+    let mut t = db.begin(Isolation::Snapshot);
+    let mut c = VersionedCursor::new();
+    let mut to = |t: &mut Txn, c: &mut VersionedCursor, at, forward| db.move_to(t, c, at, forward);
+    assert_eq!(
+        to(&mut t, &mut c, Some(("", Seek::Ge)), true).as_deref(),
+        Some("k00")
+    );
+    // Each batch taken to its end doubles the next: k02 copies k04, k06 copies k08 and k10.
+    for key in ["k02", "k04", "k06"] {
+        assert_eq!(to(&mut t, &mut c, None, true).as_deref(), Some(key));
+    }
+    assert_eq!(db.put(&mut t, "k07", "own", Mode::Insert), DONE_INSERTED);
+    assert_eq!(
+        to(&mut t, &mut c, None, true).as_deref(),
+        Some("k07"),
+        "its own write"
+    );
+    assert_eq!(to(&mut t, &mut c, None, true).as_deref(), Some("k08"));
+    assert_eq!(
+        to(&mut t, &mut c, None, false).as_deref(),
+        Some("k07"),
+        "a step back"
+    );
+    assert_eq!(to(&mut t, &mut c, None, true).as_deref(), Some("k08"));
+    assert_eq!(
+        to(&mut t, &mut c, Some(("k01", Seek::Ge)), true).as_deref(),
+        Some("k02")
+    );
+    assert_eq!(
+        to(&mut t, &mut c, None, true).as_deref(),
+        Some("k04"),
+        "after a seek"
+    );
+    db.commit(t);
+}

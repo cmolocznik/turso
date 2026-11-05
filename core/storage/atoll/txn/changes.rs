@@ -76,6 +76,8 @@ pub struct Changes {
     bytes: Vec<u8>,
     /// Each statement that changed anything, and where its changes begin, in order.
     marks: Vec<(Statement, usize)>,
+    /// Every change made and every rollback to a mark, counted: it only rises.
+    edits: u64,
 }
 
 impl Changes {
@@ -152,6 +154,7 @@ impl Changes {
             debug_assert!(self.marks.last().is_none_or(|&(s, _)| s < statement));
             self.marks.push((statement, self.bytes.len()));
         }
+        self.edits += 1;
         self.bytes.reserve(HEAD + key.len() + value_len);
         self.bytes.push(kind);
         self.bytes
@@ -168,6 +171,7 @@ impl Changes {
     /// Drops the changes of every statement after `statement`: a rollback to it, or of the whole
     /// transaction for 0.
     pub fn back_to(&mut self, statement: Statement) {
+        self.edits += 1;
         let keep = self.marks.partition_point(|&(s, _)| s <= statement);
         if let Some(&(_, at)) = self.marks.get(keep) {
             self.bytes.truncate(at);
@@ -177,6 +181,12 @@ impl Changes {
 
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+
+    /// How many changes and rollbacks there have been: equal counts mean the transaction changed
+    /// nothing between.
+    pub fn edits(&self) -> u64 {
+        self.edits
     }
 
     /// The bytes it holds room for: what it grows past only by allocating.

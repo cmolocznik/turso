@@ -873,11 +873,13 @@ fn a_transaction_reads_a_trees_catalog_row_once_and_again_after_its_own_change_o
         .unwrap();
     let reads = || CATALOG_READS.with(|r| std::mem::take(&mut *r.borrow_mut()));
     let taken = || NEAR_TAKEN.with(|n| n.get());
+    let reaches = || crate::storage::atoll::btree::LEAF_REACHES.with(|n| n.get());
     conn.execute("BEGIN").unwrap();
     reads();
-    let before = taken();
     let statements = 50;
-    for i in 0..statements {
+    conn.execute("INSERT INTO t VALUES (0, 'r0')").unwrap();
+    let (before, reached) = (taken(), reaches());
+    for i in 1..statements {
         conn.execute(format!("INSERT INTO t VALUES ({i}, 'r{i}')"))
             .unwrap();
     }
@@ -887,12 +889,12 @@ fn a_transaction_reads_a_trees_catalog_row_once_and_again_after_its_own_change_o
         !read.is_empty() && once.len() == read.len(),
         "each tree's row read once over {statements} statements: {read:?}"
     );
-    // Every statement after the first starts at the leaf the last left: its probe, its rowid
-    // check and its write descend no further.
-    assert!(
-        taken() - before >= 2 * (statements - 1),
-        "{} descents spared over {statements} statements",
-        taken() - before
+    // Every statement after the first reaches one leaf, the one the last left, by its probe: its
+    // rowid check and its write answer from the probe's look.
+    assert_eq!(
+        (reaches() - reached, taken() - before),
+        ((statements - 1) as u64, (statements - 1) as u64),
+        "leaves reached, and reached from the last, over {statements} statements"
     );
     conn.execute("SAVEPOINT s").unwrap();
     conn.execute("DELETE FROM t").unwrap();
@@ -2829,5 +2831,223 @@ fn an_insert_of_a_rowid_waits_for_its_delete_held_open() {
     assert_eq!(
         rows(&a, "SELECT id, v FROM t"),
         vec![vec![Value::from_i64(1), text("new")]]
+    );
+}
+
+/// Runs `stmt` with `values` bound, to its end, and resets it.
+fn run_with(stmt: &mut crate::Statement, values: &[Value]) {
+    for (i, v) in values.iter().enumerate() {
+        stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), v.clone())
+            .unwrap();
+    }
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+}
+
+fn cursors_built() -> u64 {
+    crate::storage::atoll::sql::cursor::CURSORS_BUILT.with(|n| n.get())
+}
+
+/// A prepared statement run again takes up the cursors its last run parked, within a transaction
+/// and across transactions, and a read through one reads what the writes put there.
+#[test]
+fn a_statement_run_again_takes_up_the_cursors_it_parked() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/parked");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    let mut insert = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    let row = |i: i64| [Value::from_i64(i), text(&format!("r{i}"))];
+    conn.execute("BEGIN").unwrap();
+    run_with(&mut insert, &row(0));
+    let mut built = 0;
+    for i in 1..20 {
+        let before = cursors_built();
+        run_with(&mut insert, &row(i));
+        built += cursors_built() - before;
+    }
+    conn.execute("COMMIT").unwrap();
+    for i in 20..25 {
+        let before = cursors_built();
+        run_with(&mut insert, &row(i));
+        built += cursors_built() - before;
+    }
+    assert_eq!(built, 0, "cursors built for the inserts after the first");
+    let mut select = conn.prepare("SELECT b FROM t WHERE a = ?").unwrap();
+    for i in [3, 17, 24, 3] {
+        select
+            .bind_at(std::num::NonZero::<usize>::MIN, Value::from_i64(i))
+            .unwrap();
+        assert_eq!(next_row(&mut select), Some(vec![text(&format!("r{i}"))]));
+        assert_eq!(next_row(&mut select), None);
+        select.reset().unwrap();
+    }
+}
+
+/// A parked cursor over a tree a Clear replaced since is not taken up: the statement's next run
+/// reads the tree the Clear made.
+#[test]
+fn a_parked_cursor_over_a_tree_a_clear_replaced_reads_the_new_tree() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/parked-clear");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    for i in 0..30 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'r{i}')"))
+            .unwrap();
+    }
+    let mut count = conn.prepare("SELECT count(*), max(b) FROM t").unwrap();
+    assert_eq!(
+        next_row(&mut count),
+        Some(vec![Value::from_i64(30), text("r9")])
+    );
+    assert_eq!(next_row(&mut count), None);
+    count.reset().unwrap();
+    conn.execute("DELETE FROM t").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+    assert_eq!(
+        next_row(&mut count),
+        Some(vec![Value::from_i64(1), text("new")])
+    );
+}
+
+/// A statement prepared again after another connection's DDL writes through what its new program
+/// opens: a cursor its old program parked is checked again against the tree and catalog row the
+/// new one opens, as any parked cursor is.
+#[test]
+fn a_statement_prepared_again_writes_through_its_new_program() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/parked-reprepare");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    let mut insert = conn.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+    run_with(&mut insert, &[Value::from_i64(1), text("one")]);
+    run_with(&mut insert, &[Value::from_i64(2), text("two")]);
+    other.execute("CREATE TABLE u (x)").unwrap();
+    run_with(&mut insert, &[Value::from_i64(3), text("three")]);
+    assert_eq!(
+        rows(&conn, "SELECT a, b FROM t ORDER BY a"),
+        vec![
+            vec![Value::from_i64(1), text("one")],
+            vec![Value::from_i64(2), text("two")],
+            vec![Value::from_i64(3), text("three")],
+        ]
+    );
+}
+
+/// A statement whose write came back busy inside a transaction, reset, leaves no wait in the wait
+/// graph: a later wait on that transaction closes no cycle through it, so the transaction is no
+/// deadlock's victim, and the statement run again writes.
+#[test]
+fn a_busy_statement_reset_leaves_no_wait_behind() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/parked-wait");
+    let a = db.connect(ConnectOpts::new()).unwrap();
+    let b = db.connect(ConnectOpts::new()).unwrap();
+    a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (1, 0), (2, 0)").unwrap();
+    let mut update = b.prepare("UPDATE t SET n = n + 1 WHERE id = ?").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET n = 10 WHERE id = 1").unwrap();
+    b.execute("BEGIN").unwrap();
+    update
+        .bind_at(std::num::NonZero::<usize>::MIN, Value::from_i64(1))
+        .unwrap();
+    let busy = update.run_ignore_rows();
+    assert!(matches!(busy, Err(crate::LimboError::Busy)), "{busy:?}");
+    update.reset().unwrap();
+    b.execute("UPDATE t SET n = 20 WHERE id = 2").unwrap();
+    let behind = a.execute("UPDATE t SET n = 11 WHERE id = 2");
+    assert!(matches!(behind, Err(crate::LimboError::Busy)), "{behind:?}");
+    update
+        .bind_at(std::num::NonZero::<usize>::MIN, Value::from_i64(2))
+        .unwrap();
+    let again = update.run_ignore_rows();
+    assert!(again.is_ok(), "{again:?}");
+    update.reset().unwrap();
+    assert_eq!(
+        rows(&b, "SELECT n FROM t WHERE id = 2"),
+        vec![vec![Value::from_i64(21)]]
+    );
+    b.execute("ROLLBACK").unwrap();
+    a.execute("ROLLBACK").unwrap();
+}
+
+/// A statement whose write came back busy, reset and run again, writes its next run's row: the
+/// write the busy run left is not taken up with its cursor.
+#[test]
+fn a_statement_run_again_after_a_busy_write_writes_its_own_row() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/parked-busy");
+    let a = db.connect(ConnectOpts::new()).unwrap();
+    let b = db.connect(ConnectOpts::new()).unwrap();
+    a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (1, 0), (2, 0)").unwrap();
+    let mut update = b.prepare("UPDATE t SET n = n + 1 WHERE id = ?").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET n = 10 WHERE id = 1").unwrap();
+    update
+        .bind_at(std::num::NonZero::<usize>::MIN, Value::from_i64(1))
+        .unwrap();
+    let busy = update.run_ignore_rows();
+    assert!(matches!(busy, Err(crate::LimboError::Busy)), "{busy:?}");
+    update.reset().unwrap();
+    a.execute("ROLLBACK").unwrap();
+    run_with(&mut update, &[Value::from_i64(2)]);
+    assert_eq!(
+        rows(&a, "SELECT id, n FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(0)],
+            vec![Value::from_i64(2), Value::from_i64(1)]
+        ]
+    );
+}
+
+/// A writing statement steps the checkpointer only while a pass is due or under way: fifty small
+/// inserts in one transaction, far short of a pass's share of the log, each pass over it.
+#[test]
+fn a_writing_statement_passes_over_a_checkpointer_with_nothing_due() {
+    use crate::storage::atoll::checkpoint::STEPS_PASSED_OVER;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/nothing-due");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let before = STEPS_PASSED_OVER.with(|n| n.get());
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'r{i}')"))
+            .unwrap();
+    }
+    assert_eq!(STEPS_PASSED_OVER.with(|n| n.get()) - before, 50);
+    conn.execute("COMMIT").unwrap();
+}
+
+/// A prepared insert looks its table's rowid counter up once: the cursor it parks keeps it, and
+/// the rowids it draws go on from the rows written.
+#[test]
+fn a_prepared_insert_looks_its_rowid_counter_up_once() {
+    use crate::storage::atoll::sql::rowid::LOOKUPS;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/counter-kept");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    let mut insert = conn.prepare("INSERT INTO t (b) VALUES (?)").unwrap();
+    run_with(&mut insert, &[text("first")]);
+    let before = LOOKUPS.with(|n| n.get());
+    for i in 0..20 {
+        run_with(&mut insert, &[text(&format!("r{i}"))]);
+    }
+    assert_eq!(LOOKUPS.with(|n| n.get()) - before, 0);
+    assert_eq!(
+        rows(&conn, "SELECT count(*), max(a) FROM t"),
+        vec![vec![Value::from_i64(21), Value::from_i64(21)]]
     );
 }

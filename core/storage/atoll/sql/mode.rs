@@ -761,10 +761,11 @@ impl ConnTxn {
     pub fn begin_reading(&self, wants: Begin, reads: &[u64]) -> Result<IOResult<()>> {
         let txns = self.db.atoll().transactions();
         if let Begin::Write { .. } = wants {
-            // A writing statement nudges the checkpointer first, holding no latch: commits are
-            // not its only trigger, so long transactions are checkpointed too (DESIGN.md §17,
-            // §11).
-            nudge_checkpoint(&self.db)?;
+            // A writing statement steps the checkpointer first, holding no latch, while a pass
+            // is due or under way: commits are not its only trigger, so long transactions are
+            // checkpointed too (DESIGN.md §17, §11). Its IO is not waited for: the pass goes on
+            // at the next step, whoever takes it.
+            self.db.atoll().checkpointer().step_due().map(|_| ())?;
         }
         let mut guard = self.cell.lock();
         if guard.is_none() {
@@ -1568,14 +1569,16 @@ impl SqlCursor {
 
     /// The tree's rowid counter, seeded from the tree's largest key once it is (DESIGN.md §17,
     /// §8). Step it until done.
-    fn counter(&mut self) -> Result<IOResult<Arc<Counter>>> {
+    fn counter(&mut self) -> Result<IOResult<&Counter>> {
         self.resolve()?;
-        let cursor = self.open.as_ref().expect("resolved");
-        let counter = self.db.rowids().counter(cursor.root());
+        let cursor = self.open.as_mut().expect("resolved");
+        cursor.hold_counter(self.db.rowids());
         let seed = self.seeding.get_or_insert_with(Seed::default);
-        done!(counter.seed(cursor.plain_tree(), seed));
+        done!(cursor.counter_held().seed(cursor.plain_tree(), seed));
         self.seeding = None;
-        Ok(IOResult::Done(counter))
+        Ok(IOResult::Done(
+            self.open.as_ref().expect("resolved").counter_held(),
+        ))
     }
 
     /// NewRowid (DESIGN.md §17, §8, R30): one above the largest rowid the tree's counter drew,
@@ -1583,6 +1586,50 @@ impl SqlCursor {
     /// rowids.
     pub fn new_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
         Ok(IOResult::Done(done!(self.counter()).draw()))
+    }
+
+    /// Takes the cursor up again for its statement's next open of its tree (DESIGN.md §17), as
+    /// [`opened`](Self::opened) opens one, in `ct`'s transaction: its tree cursor is kept, at no
+    /// row, its buffers and its last look with it, where the catalog row the statement reads is
+    /// the one it was over; else it resolves afresh. `false` for a cursor of another connection,
+    /// which the caller drops.
+    pub fn reopened(
+        &mut self,
+        ct: &ConnTxn,
+        pager: Arc<Pager>,
+        index: Option<Arc<IndexInfo>>,
+    ) -> Result<bool> {
+        if !Arc::ptr_eq(&self.cell, &ct.cell) || !Arc::ptr_eq(&self.db, &ct.db) {
+            return Ok(false);
+        }
+        self.pager = pager;
+        self.index = index;
+        self.null_row = false;
+        self.has_record = false;
+        self.no_wait = false;
+        self.seen = self.changes.epoch();
+        let destroyed = {
+            let guard = self.cell.lock();
+            let txn = guard.as_ref().ok_or_else(outside)?;
+            self.changes.destroyed_in(self.id, txn.command())
+        };
+        if destroyed {
+            self.open = None;
+            self.vacant = true;
+            return Ok(true);
+        }
+        self.vacant = false;
+        let (entry, plain, _) = self.entry_now()?;
+        match self.open.as_mut() {
+            Some(cursor) if cursor.entry() == entry => {
+                cursor.reuse(self.index.clone(), plain);
+            }
+            _ => {
+                self.open = None;
+                self.resolved()?;
+            }
+        }
+        Ok(true)
     }
 
     /// The cursor with its tree resolved, as OpenRead and OpenWrite open it: bound to the tree its
@@ -1612,6 +1659,49 @@ impl SqlCursor {
         self.resolved()
     }
 
+    /// The tree's catalog row as the transaction's current statement reads it, whether that
+    /// statement created the tree, and the leaf a cursor of the connection last stood at in it.
+    fn entry_now(&self) -> Result<(Entry, bool, Near)> {
+        let mut guard = self.cell.lock();
+        let txn = guard.as_mut().ok_or_else(outside)?;
+        let db = &self.db;
+        let (identity, changes) = ((txn.slot(), txn.start()), db.catalog().changes());
+        let (known, near) = match self.known.lock().get(&self.id) {
+            Some(k) => (
+                k.row.filter(|r| r.txn == identity && r.changes == changes),
+                k.near,
+            ),
+            None => (None, Near::NONE),
+        };
+        let entry = match known {
+            Some(row) => row.entry,
+            None => {
+                #[cfg(test)]
+                CATALOG_READS.with(|r| r.borrow_mut().push(self.id));
+                let mut get = Get::new(&catalog::key(self.id));
+                let entry = drive(db.io(), || {
+                    db.catalog()
+                        .get(db.atoll().transactions(), db.versions(), txn, &mut get)
+                })?
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!("no tree {} in the catalog", self.id))
+                })?;
+                let row = KnownRow {
+                    entry,
+                    txn: identity,
+                    changes,
+                };
+                self.known.lock().entry(self.id).or_default().row = Some(row);
+                entry
+            }
+        };
+        let plain = txn
+            .created()
+            .iter()
+            .any(|c| c.root == entry.root && c.statement == txn.command());
+        Ok((entry, plain, near))
+    }
+
     /// The cursor over the tree it holds, or over the tree its catalog row names if it holds none.
     fn resolved(&mut self) -> Result<&mut AtollCursor> {
         if self.vacant {
@@ -1621,50 +1711,7 @@ impl SqlCursor {
             )));
         }
         if self.open.is_none() {
-            let (entry, plain, near) = {
-                let mut guard = self.cell.lock();
-                let txn = guard.as_mut().ok_or_else(outside)?;
-                let db = &self.db;
-                let (identity, changes) = ((txn.slot(), txn.start()), db.catalog().changes());
-                let (known, near) = match self.known.lock().get(&self.id) {
-                    Some(k) => (
-                        k.row.filter(|r| r.txn == identity && r.changes == changes),
-                        k.near,
-                    ),
-                    None => (None, Near::NONE),
-                };
-                let entry = match known {
-                    Some(row) => row.entry,
-                    None => {
-                        #[cfg(test)]
-                        CATALOG_READS.with(|r| r.borrow_mut().push(self.id));
-                        let mut get = Get::new(&catalog::key(self.id));
-                        let entry = drive(db.io(), || {
-                            db.catalog().get(
-                                db.atoll().transactions(),
-                                db.versions(),
-                                txn,
-                                &mut get,
-                            )
-                        })?
-                        .ok_or_else(|| {
-                            LimboError::InternalError(format!("no tree {} in the catalog", self.id))
-                        })?;
-                        let row = KnownRow {
-                            entry,
-                            txn: identity,
-                            changes,
-                        };
-                        self.known.lock().entry(self.id).or_default().row = Some(row);
-                        entry
-                    }
-                };
-                let plain = txn
-                    .created()
-                    .iter()
-                    .any(|c| c.root == entry.root && c.statement == txn.command());
-                (entry, plain, near)
-            };
+            let (entry, plain, near) = self.entry_now()?;
             let mut cursor = Box::new(AtollCursor::new(
                 self.db.clone(),
                 self.cell.clone(),
@@ -1775,6 +1822,24 @@ impl SqlCursor {
 }
 
 impl CursorTrait for SqlCursor {
+    /// Parked at its statement's reset for the next execution's open of its tree
+    /// ([`SqlCursor::reopened`]): what it waited on let go, the leaf it stood at left to the
+    /// connection's other cursors over the tree, as a drop leaves it.
+    fn park(&mut self) -> bool {
+        self.waiting = Waiting::default();
+        self.seeding = None;
+        self.counting = None;
+        self.rebinding = None;
+        if self.unseen {
+            // A walk over unseen versions is its statement's alone: the next opens afresh.
+            return false;
+        }
+        if let Some(cursor) = &self.open {
+            self.known.lock().entry(self.id).or_default().near = cursor.near();
+        }
+        true
+    }
+
     fn last(&mut self) -> IOResultOr<()> {
         if self.vacant {
             return Ok(IOResult::Done(()));
@@ -1837,13 +1902,16 @@ impl CursorTrait for SqlCursor {
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         // A row's rowid, drawn or explicit, raises its table's counter past it: seeded first, so
         // it never hides the tree's larger keys from the seed (R30).
-        let counter = match key.maybe_rowid() {
-            Some(_) => Some(crate::return_if_io!(self.counter())),
-            None => None,
-        };
+        if key.maybe_rowid().is_some() {
+            crate::return_if_io!(self.counter());
+        }
         crate::return_if_io!(self.wrote(false, Some(key)));
-        if let (Some(counter), Some(rowid)) = (counter, key.maybe_rowid()) {
-            counter.inserted(rowid);
+        if let Some(rowid) = key.maybe_rowid() {
+            self.open
+                .as_ref()
+                .expect("written through its cursor")
+                .counter_held()
+                .inserted(rowid);
         }
         Ok(IOResult::Done(()))
     }

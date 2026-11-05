@@ -753,6 +753,57 @@ fn a_writer_reads_again_past_a_version_rolled_back_under_it() {
     assert_eq!(db.read_in(&db.tree, "k").as_deref(), Some("w"));
 }
 
+/// A writer looks at a key, and another transaction writes the key before the writer's put goes
+/// in: the put finds the entry changed, the writer judges the key again with its own key and
+/// entry, waits out the other's version while it is open, and writes over it once it commits,
+/// with a value inline or, `pad` past a node's longest, out of line. The writer is stopped between
+/// its look and its judgment, so the other's write falls there.
+fn a_writer_judges_again_a_key_written_since_its_look(pad: usize) {
+    let db = Arc::new(open());
+    let w = padded("w", pad);
+    let mut setup = db.begin(Isolation::Snapshot);
+    db.put(&mut setup, "k", "c", Mode::Insert);
+    db.commit(setup);
+    db.versions.stop_next_writer();
+    let writer = {
+        let db = db.clone();
+        crate::thread::spawn(move || {
+            let mut u = db.begin(Isolation::ReadCommitted);
+            put_waiting(&db, &mut u, "k", &padded("w", pad));
+            db.commit(u);
+        })
+    };
+    db.versions.stopped_writer();
+    let mut t = db.begin(Isolation::ReadCommitted);
+    assert!(matches!(
+        db.put(&mut t, "k", "t", Mode::Update),
+        Write::Done(_)
+    ));
+    db.versions.go_on();
+    db.commit(t);
+    writer.join().unwrap();
+    assert_eq!(db.read_in(&db.tree, "k"), Some(w));
+}
+
+#[test]
+fn a_writer_judges_again_a_key_written_since_its_look_on_threads() {
+    a_writer_judges_again_a_key_written_since_its_look(0);
+}
+
+#[test]
+fn a_writer_judges_again_a_key_written_since_its_look_out_of_line_on_threads() {
+    a_writer_judges_again_a_key_written_since_its_look(LARGE);
+}
+
+#[cfg(shuttle)]
+#[test]
+fn a_writer_judges_again_a_key_written_since_its_look_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || a_writer_judges_again_a_key_written_since_its_look(0),
+        50,
+    );
+}
+
 #[test]
 fn a_writer_reads_again_past_a_version_rolled_back_under_it_on_threads() {
     a_writer_reads_again_past_a_version_rolled_back_under_it();
@@ -1176,7 +1227,8 @@ fn parked_writers_all_finish_in_shuttle_schedules() {
 
 fn probe(db: &Db, txn: &mut Txn, key: &str) -> Probe {
     run(&db.io, || {
-        db.tree.probe(db.txns(), txn, key.as_bytes(), Near::NONE)
+        db.tree
+            .probe(db.txns(), txn, key.as_bytes(), Near::NONE, &mut None)
     })
 }
 
@@ -1272,7 +1324,8 @@ fn a_write_names_the_leaf_it_reached_and_the_next_one_starts_there() {
         // A probe from it finds the statement's own version.
         let taken = NEAR_TAKEN.with(|c| c.get());
         let probed = run(&db.io, || {
-            db.tree.probe(db.txns(), &mut t, key(n).as_bytes(), near)
+            db.tree
+                .probe(db.txns(), &mut t, key(n).as_bytes(), near, &mut None)
         });
         assert_eq!(probed, Probe::Present, "{}", key(n));
         assert_eq!(NEAR_TAKEN.with(|c| c.get()), taken + 1, "{}", key(n));

@@ -942,6 +942,44 @@ fn a_scan_refuses_a_value_out_of_line_its_page_no_longer_names_rather_than_step_
     }
 }
 
+/// A look kept past its step is given back while its leaf is unchanged, with the place and entry
+/// it found, and a put goes in there; once the leaf changed it is not, and nothing answers from it.
+#[test]
+fn a_kept_look_is_given_back_only_while_its_leaf_is_unchanged() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, MIN_BUDGET, 1);
+    let run = drive_runner(&io);
+    let tree = create(&io, &db, &run, false);
+    let put = |key: &[u8], value: &[u8]| {
+        let mut op = Put::new(key, value.to_vec(), Mode::Upsert);
+        run_to(&run, || tree.put(&mut op))
+    };
+    put(b"a", b"1");
+    put(b"c", b"3");
+    let kept = run_to(&run, || tree.look(b"b", Near::NONE)).keep();
+    assert!(tree.holds_kept(&kept));
+    let looked = tree.redeem(kept).expect("the leaf is unchanged");
+    assert!(looked.present().is_none());
+    let mut op = Put::new(b"b", b"2".to_vec(), Mode::Upsert);
+    let mut looked = Some(looked);
+    let put_there = run_to(&run, || match looked.take() {
+        Some(l) => tree.put_looked(&mut op, l),
+        None => tree.put(&mut op),
+    });
+    assert_eq!(put_there, Outcome::Inserted);
+    let kept = run_to(&run, || tree.look(b"b", Near::NONE)).keep();
+    assert_eq!(kept.present(), Some((&b"2"[..], false)));
+    put(b"d", b"4");
+    assert!(!tree.holds_kept(&kept), "the leaf changed");
+    assert!(tree.redeem(kept).is_none(), "the leaf changed");
+    assert_eq!(
+        scan(&tree, &run, true),
+        [(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")]
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .to_vec()
+    );
+}
+
 #[test]
 fn a_put_expecting_an_entry_changes_nothing_when_the_entry_differs() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

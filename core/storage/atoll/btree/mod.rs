@@ -119,6 +119,11 @@ pub struct Near(Option<(PageId, u32)>);
 crate::thread::thread_local! {
     /// Descents a caller's leaf spared on this thread, for tests to see which way a look went.
     pub(crate) static NEAR_TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Leaves reached on this thread, by a caller's leaf or a descent, for tests to count an
+    /// operation's positionings.
+    pub(crate) static LEAF_REACHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Splits begun on this thread, for tests to tell an operation that split a node.
+    pub(crate) static SPLITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Near {
@@ -487,6 +492,8 @@ impl Tree {
     /// a key at it ([`Route::At`]) between the two, the upper included, and the keys just above
     /// it ([`Route::Above`]) from the lower fence, included, to below the upper.
     fn descend_to_leaf(&self, key: &[u8], route: Route, near: Near) -> Result<Found<'_>> {
+        #[cfg(test)]
+        LEAF_REACHES.with(|n| n.set(n.get() + 1));
         if let Some((pid, hint)) = near.0 {
             if let Some(leaf) = self.pool.fix_optimistic_at(pid, hint) {
                 let answers = leaf.read(|p| -> Option<bool> {
@@ -743,6 +750,26 @@ impl Tree {
                 present,
             }));
         }
+    }
+
+    /// The look `kept` was, while its leaf is unchanged since in the frame it was in: `None` once
+    /// the leaf changed or left the frame, when the caller looks again. Equal latch versions of a
+    /// frame holding one page mean no change between ([`Optimistic::version`]), so the leaf still
+    /// covers the key, which is at the kept position or goes there, with the kept entry.
+    pub fn redeem(&self, kept: Kept) -> Option<Looked<'_>> {
+        let leaf = self.pool.fix_optimistic_at(kept.pid, kept.hint)?;
+        (leaf.version() == kept.version).then_some(Looked {
+            leaf,
+            pos: kept.pos,
+            exact: kept.exact,
+            present: kept.present,
+        })
+    }
+
+    /// Whether the leaf of `kept` is unchanged since its look, as [`redeem`](Self::redeem) would
+    /// find it.
+    pub fn holds_kept(&self, kept: &Kept) -> bool {
+        self.holds(kept.pid, kept.hint, kept.version)
     }
 
     /// [`put`](Self::put) from `looked`, a look at the key's leaf this step made: written there if
@@ -1122,6 +1149,8 @@ impl Tree {
 
     /// One split of the node at `level` covering `key`, if it lacks `need` bytes.
     fn split(&self, key: &[u8], level: u8, need: usize) -> Result<IOResult<Split>> {
+        #[cfg(test)]
+        SPLITS.with(|n| n.set(n.get() + 1));
         let mut admitted = done!(self.admit(self.smo_len()));
         let (node, parent) = match self.descend(key, level, Route::At)? {
             Found::Node { node, parent } => (node, parent),
@@ -2081,10 +2110,48 @@ impl Looked<'_> {
         Near::of(&self.leaf)
     }
 
+    /// The look kept past its step, holding no latch: given back by [`Tree::redeem`] while its leaf
+    /// is unchanged.
+    pub fn keep(self) -> Kept {
+        Kept {
+            pid: self.leaf.pid(),
+            hint: self.leaf.hint(),
+            version: self.leaf.version(),
+            pos: self.pos,
+            exact: self.exact,
+            present: self.present,
+        }
+    }
+
     /// The key's entry as the leaf stores it, and whether its value is out of line; `None` for
     /// none.
     pub fn present(&self) -> Option<(&[u8], bool)> {
         self.present.as_ref().map(|(b, out)| (b.as_slice(), *out))
+    }
+}
+
+/// A look kept past the step that made it ([`Looked::keep`]): the leaf's page and frame, the latch
+/// version the look read, where the key is or goes, and its entry. A later step of the same caller
+/// redeems it instead of reaching the leaf again ([`Tree::redeem`]).
+#[derive(Debug)]
+pub struct Kept {
+    pid: PageId,
+    hint: u32,
+    version: u64,
+    pos: usize,
+    exact: bool,
+    present: Option<(Vec<u8>, bool)>,
+}
+
+impl Kept {
+    /// The key's entry as the look found it, and whether its value is out of line.
+    pub fn present(&self) -> Option<(&[u8], bool)> {
+        self.present.as_ref().map(|(b, out)| (b.as_slice(), *out))
+    }
+
+    /// The leaf looked at.
+    pub fn near(&self) -> Near {
+        Near(Some((self.pid, self.hint)))
     }
 }
 
@@ -2162,8 +2229,14 @@ impl Put {
     /// A put of `entry`, the head of a tree whose values start with one of `head_len` bytes,
     /// then the value: built once, in the bytes the leaf and the log copy.
     pub fn with_entry(key: &[u8], entry: Vec<u8>, head_len: usize, mode: Mode) -> Self {
+        Self::with_owned(key.to_vec(), entry, head_len, mode)
+    }
+
+    /// [`with_entry`](Self::with_entry), the key in a buffer of the caller's, which
+    /// [`into_buffers`](Self::into_buffers) gives back.
+    pub fn with_owned(key: Vec<u8>, entry: Vec<u8>, head_len: usize, mode: Mode) -> Self {
         Self {
-            key: key.to_vec(),
+            key,
             value_len: entry.len() - head_len,
             head_len,
             entry,
@@ -2192,6 +2265,15 @@ impl Put {
     /// The leaf the put reached: where the key it wrote is, unless the leaf has changed since.
     pub fn reached(&self) -> Near {
         self.near
+    }
+
+    /// Its key, and its entry while whole: `None` once its value went out of line, taking the
+    /// entry's bytes past its head.
+    pub fn into_buffers(self) -> (Vec<u8>, Option<Vec<u8>>) {
+        // A value gone out of line took the entry's bytes past its head, whether or not its
+        // write is still held.
+        let whole = self.restoring.is_none() && self.entry.len() == self.head_len + self.value_len;
+        (self.key, whole.then_some(self.entry))
     }
 
     /// Puts `entry` back as [`Tree::stored`] read it: a value out of line by its reference, its

@@ -46,8 +46,16 @@ pub struct Seed {
     cursor: Cursor,
 }
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Counters looked up on this thread, for tests to see a cursor keep its own.
+    pub(crate) static LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Rowids {
     pub fn counter(&self, root: PageId) -> Arc<Counter> {
+        #[cfg(test)]
+        LOOKUPS.with(|n| n.set(n.get() + 1));
         self.counters
             .lock()
             .entry(root)

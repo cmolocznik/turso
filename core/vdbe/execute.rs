@@ -1333,8 +1333,15 @@ pub fn op_open_read(
         program.connection.atoll_for_db(*db),
         matches!(cursor_type, CursorType::ViewDelta { .. }),
     ) {
-        let cursor =
-            open_atoll_cursor(atoll, &program.connection, &pager, *root_page, cursor_type)?;
+        let cursor = open_atoll_cursor_in(
+            state,
+            *cursor_id,
+            atoll,
+            &program.connection,
+            &pager,
+            *root_page,
+            cursor_type,
+        )?;
         state
             .cursors
             .get_mut(*cursor_id)
@@ -14500,14 +14507,10 @@ pub fn op_offset_limit(
 /// table's, an index's, a WITHOUT ROWID table's, keyed as an index on its primary key (R29), or a
 /// materialized view's, whose rows are a rowid table's read through the view's cursor, which adds
 /// the transaction's own changes to them.
-fn open_atoll_cursor(
-    atoll: &crate::storage::atoll::sql::mode::ConnTxn,
-    connection: &Arc<Connection>,
-    pager: &Arc<Pager>,
-    root: i64,
-    cursor_type: &CursorType,
-) -> Result<Cursor> {
-    let index = match cursor_type {
+/// The keys an Atoll cursor of `cursor_type` reads: an index's or WITHOUT ROWID table's, none for
+/// a rowid table or a view.
+fn atoll_index_info(cursor_type: &CursorType) -> Result<Option<Arc<IndexInfo>>> {
+    Ok(match cursor_type {
         CursorType::BTreeTable(table) if table.has_rowid => None,
         CursorType::BTreeTable(table) => {
             Some(Arc::new(IndexInfo::new_from_without_rowid_table(table)?))
@@ -14519,7 +14522,50 @@ fn open_atoll_cursor(
                 "this cursor is refused in Atoll mode until its arm is built".to_string(),
             ))
         }
-    };
+    })
+}
+
+/// The Atoll cursor slot `cursor_id` opens over tree `root`: the one its statement's last
+/// execution parked there, taken up again where it was over that tree (DESIGN.md §17), else a new
+/// one.
+fn open_atoll_cursor_in(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    atoll: &crate::storage::atoll::sql::mode::ConnTxn,
+    connection: &Arc<Connection>,
+    pager: &Arc<Pager>,
+    root: i64,
+    cursor_type: &CursorType,
+) -> Result<Cursor> {
+    let parked = state
+        .parked_cursors
+        .get_mut(cursor_id)
+        .and_then(Option::take);
+    if let (Some(mut parked), CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)) =
+        (parked, cursor_type)
+    {
+        if parked.root_page() == root {
+            let index = atoll_index_info(cursor_type)?;
+            if let Some(sql) = (parked.as_mut() as &mut dyn Any)
+                .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
+            {
+                if sql.reopened(atoll, pager.clone(), index)? {
+                    return Ok(Cursor::new_btree_dyn(parked));
+                }
+            }
+        }
+    }
+    open_atoll_cursor(atoll, connection, pager, root, cursor_type)
+}
+
+fn open_atoll_cursor(
+    atoll: &crate::storage::atoll::sql::mode::ConnTxn,
+    connection: &Arc<Connection>,
+    pager: &Arc<Pager>,
+    root: i64,
+    cursor_type: &CursorType,
+) -> Result<Cursor> {
+    let index = atoll_index_info(cursor_type)?;
     let cursor = Box::new(atoll.open_cursor(pager.clone(), root, index)?);
     Ok(Cursor::new_btree_dyn(match cursor_type {
         CursorType::MaterializedView(..) => {
@@ -14597,8 +14643,15 @@ pub fn op_open_write(
             Some(Some(Cursor::Dyn(cursor, ..))) if cursor.root_page() == root_page
         );
         if !reuse {
-            let cursor =
-                open_atoll_cursor(atoll, &program.connection, &pager, root_page, cursor_type)?;
+            let cursor = open_atoll_cursor_in(
+                state,
+                *cursor_id,
+                atoll,
+                &program.connection,
+                &pager,
+                root_page,
+                cursor_type,
+            )?;
             state
                 .cursors
                 .get_mut(*cursor_id)

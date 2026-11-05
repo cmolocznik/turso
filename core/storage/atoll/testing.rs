@@ -95,3 +95,55 @@ pub(super) fn page_numbers(store: &super::store::PageStore, class: super::page::
     let map = super::meta::Tree::Map;
     super::radix::capacity(map, store.heights()[map as usize][class.index()])
 }
+
+/// The lib's test binary allocates through the system allocator, counting each thread's
+/// allocations, so a test can count what an operation allocates on its own thread
+/// ([`allocations`]).
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    std::thread_local! {
+        /// Allocations made on this thread. Initialized as a constant, with no destructor, so
+        /// reading it never allocates.
+        pub(super) static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct Counting;
+
+    fn count() {
+        ALLOCATIONS.with(|n| n.set(n.get() + 1));
+    }
+
+    // SAFETY: every call goes to `System` with the arguments it was given.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            count();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            count();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+}
+
+/// Allocations this thread has made, a growth of one in place included.
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+pub(super) fn allocations() -> u64 {
+    counting::ALLOCATIONS.with(|n| n.get())
+}

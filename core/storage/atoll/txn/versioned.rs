@@ -28,7 +28,9 @@ use super::arena::{Arenas, Ptr};
 use super::{Blocker, Isolation, Statement, Transactions, Ts, Txn, Writer};
 use crate::io::IO;
 use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
-use crate::storage::atoll::btree::{Lookup, Mode, Near, Outcome, Put, Stored, StoredValue, Tree};
+use crate::storage::atoll::btree::{
+    Kept, Lookup, Mode, Near, Outcome, Put, Stored, StoredValue, Tree,
+};
 use crate::storage::atoll::buffer::BufferPool;
 use crate::storage::atoll::page::PageId;
 use crate::storage::atoll::store::PageStore;
@@ -359,38 +361,87 @@ impl Get {
 }
 
 /// A put or delete of one key in a transaction: step it with [`VersionedTree::write`] until done.
+/// Its key and entry are buffers the caller may take back once it is done
+/// ([`WriteOp::into_buffers`]), to build its next write in.
 pub struct WriteOp {
     key: Vec<u8>,
-    /// `None` deletes.
-    value: Option<Vec<u8>>,
+    /// A put's entry: [`HEADER`] bytes the version header goes in, then the value, built once, in
+    /// the bytes the leaf and the log copy. A delete's: bytes its header and the value it keeps
+    /// are written into.
+    entry: Vec<u8>,
+    deletes: bool,
     mode: Mode,
     /// The tree's put under way, kept across steps so a value out of line is written once, and
     /// whether the key was present when the put was judged.
     put: Option<(Put, bool)>,
     /// The leaf tried first, then the leaf the write reached.
     near: Near,
+    /// A look at the key's leaf a probe on its behalf made, redeemed instead of looking again.
+    kept: Option<Kept>,
 }
 
 impl WriteOp {
     pub fn put(key: &[u8], value: Vec<u8>, mode: Mode) -> Self {
+        let mut entry = value;
+        entry.splice(0..0, [0; HEADER]);
+        Self::put_entry(key.to_vec(), entry, mode)
+    }
+
+    /// Puts `entry`'s value under `key`: `entry` holds [`HEADER`] bytes for the version header,
+    /// then the value.
+    pub fn put_entry(key: Vec<u8>, entry: Vec<u8>, mode: Mode) -> Self {
+        assert!(
+            entry.len() >= HEADER,
+            "a put's entry with no room for its header"
+        );
         Self {
-            key: key.to_vec(),
-            value: Some(value),
+            key,
+            entry,
+            deletes: false,
             mode,
             put: None,
             near: Near::NONE,
+            kept: None,
         }
     }
 
     /// Deletes `key`: [`Outcome::Updated`] if the transaction reads it present, else
     /// [`Outcome::Unchanged`].
     pub fn delete(key: &[u8]) -> Self {
+        Self::delete_into(key.to_vec(), Vec::new())
+    }
+
+    /// [`delete`](Self::delete), its entry built in `spare`.
+    pub fn delete_into(key: Vec<u8>, spare: Vec<u8>) -> Self {
         Self {
-            key: key.to_vec(),
-            value: None,
+            key,
+            entry: spare,
+            deletes: true,
             mode: Mode::Update,
             put: None,
             near: Near::NONE,
+            kept: None,
+        }
+    }
+
+    /// Whether it deletes its key.
+    pub fn deletes(&self) -> bool {
+        self.deletes
+    }
+
+    /// Its key, and the entry it wrote once done: a put's as the leaf stores it inline, its
+    /// version header then its value.
+    pub fn into_buffers(self) -> (Vec<u8>, Vec<u8>) {
+        (self.key, self.entry)
+    }
+
+    /// The put's buffers back from `put`, once it is done or must be built again: the entry, whole
+    /// unless its value went out of line, when the copy kept for that is the entry.
+    fn take_back(&mut self, put: Put) {
+        let (key, entry) = put.into_buffers();
+        self.key = key;
+        if let Some(entry) = entry {
+            self.entry = entry;
         }
     }
 
@@ -403,6 +454,13 @@ impl WriteOp {
     /// The leaf the write reached: where its key is, unless the leaf has changed since.
     pub fn reached(&self) -> Near {
         self.near
+    }
+
+    /// Starts from `kept`, the look at the key's leaf a probe of the key made
+    /// ([`VersionedTree::probe`]): the write's look, while the leaf is unchanged since.
+    pub fn kept(mut self, kept: Option<Kept>) -> Self {
+        self.kept = kept;
+        self
     }
 }
 
@@ -430,23 +488,29 @@ impl VersionedTree {
     /// Probes `key` on a write path, judged by its newest version as a write would judge it: a
     /// version another transaction holds open is waited for, and under snapshot isolation one
     /// committed after the snapshot is a conflict. Step it until done.
-    /// The leaf at `near` is tried first.
+    /// The leaf at `near` is tried first. Done present or absent, its look at the leaf is kept in
+    /// `kept`, for the read and the write of the key that follow ([`WriteOp::kept`]).
     pub fn probe(
         &self,
         txns: &Transactions,
         txn: &mut Txn,
         key: &[u8],
         near: Near,
+        kept: &mut Option<Kept>,
     ) -> Result<IOResult<Probe>> {
         // A version found gone: rolled back since it was read, unless it is still there.
         let mut gone = None;
         loop {
-            let stored = done!(self.tree.stored_near(key, near));
-            let Some(v) = stored
-                .as_ref()
-                .map(|s| Version::decode(&s.head).ok_or_else(corrupt_header))
-                .transpose()?
-            else {
+            let looked = done!(self.tree.look(key, near));
+            let newest = match looked.present() {
+                None => None,
+                Some((b, _)) => Some(
+                    Version::decode(b.get(..HEADER).ok_or_else(corrupt_header)?)
+                        .ok_or_else(corrupt_header)?,
+                ),
+            };
+            let Some(v) = newest else {
+                *kept = Some(looked.keep());
                 return Ok(IOResult::Done(Probe::Absent));
             };
             if v.slot != txn.slot || v.ts != txn.start {
@@ -476,6 +540,7 @@ impl VersionedTree {
                     }
                 }
             }
+            *kept = Some(looked.keep());
             return Ok(IOResult::Done(if v.deleted() {
                 Probe::Absent
             } else {
@@ -546,11 +611,16 @@ impl VersionedTree {
         }
     }
 
-    /// The plain put of `key` by `txn`'s current statement into a tree that statement created:
+    /// The plain put of `key` by `txn`'s current statement into a tree that statement created, its
+    /// `entry` holding [`HEADER`] bytes for the version header and then the value:
     /// no other transaction can see the tree, so the entry needs no earlier version and no arena
     /// entry, and an undo of the creation frees the tree whole (DESIGN.md §17). Every write the
     /// creating statement makes into its tree is plain.
-    pub fn plain_put(&self, txn: &Txn, key: &[u8], value: Vec<u8>, mode: Mode) -> Put {
+    pub fn plain_put(&self, txn: &Txn, key: Vec<u8>, mut entry: Vec<u8>, mode: Mode) -> Put {
+        assert!(
+            entry.len() >= HEADER,
+            "a put's entry with no room for its header"
+        );
         let head = Version {
             slot: txn.slot,
             ts: txn.start,
@@ -560,7 +630,8 @@ impl VersionedTree {
             prev: None,
         }
         .encode();
-        Put::with_head(key, head.to_vec(), value, mode)
+        entry[..HEADER].copy_from_slice(&head);
+        Put::with_owned(key, entry, HEADER, mode)
     }
 
     /// The longest key: the tree's. An arena page holds an entry of any key a tree of any class
@@ -670,30 +741,31 @@ impl VersionedTree {
         );
         // A version found gone: rolled back since it was read, unless it is still there.
         let mut gone = None;
+        // The look a put just built goes in from, once.
+        let mut from = None;
         loop {
             if let Some((put, present)) = &mut op.put {
                 let present = *present;
-                match done!(self.tree.put(put)) {
-                    // Another version came first: judge it.
-                    Outcome::Changed => {
-                        op.put = None;
-                        continue;
-                    }
-                    _ => {
-                        let (put, _) = op.put.take().expect("a put");
-                        op.near = put.reached();
-                        txn.logged(put.group().expect("a versioned tree's change is logged"));
-                        return Ok(IOResult::Done(Write::Done(if present {
-                            Outcome::Updated
-                        } else {
-                            Outcome::Inserted
-                        })));
-                    }
+                let outcome = match from.take() {
+                    Some(looked) => done!(self.tree.put_looked(put, looked)),
+                    None => done!(self.tree.put(put)),
+                };
+                let (put, _) = op.put.take().expect("a put");
+                // Another version came first: judge it.
+                if outcome == Outcome::Changed {
+                    op.take_back(put);
+                    continue;
                 }
+                return Ok(IOResult::Done(Write::Done(
+                    self.wrote(txn, op, put, present),
+                )));
             }
             // One look serves the judgment and the write: the put goes in at its leaf if the leaf
-            // is still as the look found it.
-            let looked = done!(self.tree.look(&op.key, op.near));
+            // is still as the look found it. A probe's look, its leaf unchanged, is that look.
+            let looked = match op.kept.take().and_then(|k| self.tree.redeem(k)) {
+                Some(looked) => looked,
+                None => done!(self.tree.look(&op.key, op.near)),
+            };
             op.near = looked.near();
             let leaf_entry = looked.present();
             let newest = match leaf_entry {
@@ -759,9 +831,9 @@ impl VersionedTree {
                     (None, leaf_entry.is_some().then_some(ptr))
                 }
             };
-            let flags = match op.value {
-                Some(_) => 0,
-                None => Version::DELETED,
+            let flags = match op.deletes {
+                false => 0,
+                true => Version::DELETED,
             };
             let head = Version {
                 slot: txn.slot,
@@ -772,18 +844,25 @@ impl VersionedTree {
                 prev,
             }
             .encode();
-            // A delete keeps an inline value where it lies, so only the head changes: a reader
-            // below it reads that value with the head it replaced. A value out of line goes, its
-            // pages retired.
-            let value = match (&op.value, leaf_entry) {
-                (Some(value), _) => value.as_slice(),
-                (None, Some((entry, false))) => entry.get(HEADER..).ok_or_else(corrupt_header)?,
-                (None, _) => &[],
-            };
-            let mut entry = Vec::with_capacity(HEADER + value.len());
-            entry.extend_from_slice(&head);
-            entry.extend_from_slice(value);
-            let put = Put::with_entry(&op.key, entry, HEADER, Mode::Upsert)
+            let mut entry = std::mem::take(&mut op.entry);
+            if op.deletes {
+                // A delete keeps an inline value where it lies, so only the head changes: a
+                // reader below it reads that value with the head it replaced. A value out of line
+                // goes, its pages retired.
+                entry.clear();
+                entry.extend_from_slice(&head);
+                if let Some((stored, false)) = leaf_entry {
+                    entry.extend_from_slice(stored.get(HEADER..).ok_or_else(corrupt_header)?);
+                }
+            } else {
+                entry[..HEADER].copy_from_slice(&head);
+                if !self.tree.limits().inline(op.key.len(), entry.len()) {
+                    // A value going out of line leaves the put's entry: kept whole here, for a put
+                    // built again.
+                    op.entry = entry.clone();
+                }
+            }
+            let put = Put::with_owned(std::mem::take(&mut op.key), entry, HEADER, Mode::Upsert)
                 .expecting_entry(leaf_entry)
                 .in_transaction(txns.tail(txn));
             let put = match &found {
@@ -792,21 +871,20 @@ impl VersionedTree {
                 // Another's may be read by a snapshot: they stay, retired.
                 None => put.retiring(),
             };
-            let (put, _) = op.put.insert((put, present));
-            match done!(self.tree.put_looked(put, looked)) {
-                // Another version came first: judge it.
-                Outcome::Changed => op.put = None,
-                _ => {
-                    let (put, _) = op.put.take().expect("a put");
-                    op.near = put.reached();
-                    txn.logged(put.group().expect("a versioned tree's change is logged"));
-                    return Ok(IOResult::Done(Write::Done(if present {
-                        Outcome::Updated
-                    } else {
-                        Outcome::Inserted
-                    })));
-                }
-            }
+            op.put = Some((put, present));
+            from = Some(looked);
+        }
+    }
+
+    /// A write's put done: its leaf and group noted, its buffers back in `op`, and what it came to.
+    fn wrote(&self, txn: &mut Txn, op: &mut WriteOp, put: Put, present: bool) -> Outcome {
+        op.near = put.reached();
+        txn.logged(put.group().expect("a versioned tree's change is logged"));
+        op.take_back(put);
+        if present {
+            Outcome::Updated
+        } else {
+            Outcome::Inserted
         }
     }
 }

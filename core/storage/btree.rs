@@ -871,6 +871,12 @@ pub trait CursorTrait: Any + Send + Sync {
     /// allocation in the pager's pool for the next cursor; the default is a
     /// plain drop.
     fn recycle(self: Box<Self>) {}
+    /// At statement reset, makes the cursor ready to be taken up again by its
+    /// statement's next open of the same tree, and says whether it is: the
+    /// default keeps none.
+    fn park(&mut self) -> bool {
+        false
+    }
     /// Mirror of SQLite's BTCF_Multiple flag; toggled by Pager when a bucket
     /// crosses the 1↔2 threshold.
     fn set_has_peers_for_external_writes(&self, _has_peers: bool) {}

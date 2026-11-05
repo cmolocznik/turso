@@ -25,9 +25,9 @@ use super::key;
 use super::AtollDb;
 use crate::error::{ConstraintKind, ConstraintViolation};
 use crate::numeric::Numeric;
-use crate::storage::atoll::btree::{Cursor, Mode, Near, Outcome, Put, Remove, Seek};
+use crate::storage::atoll::btree::{Cursor, Kept, Mode, Near, Outcome, Put, Remove, Seek};
 use crate::storage::atoll::txn::versioned::{
-    Guard, GuardOp, Guarded, VersionedCursor, VersionedTree, Write, WriteOp,
+    Guard, GuardOp, Guarded, VersionedCursor, VersionedTree, Write, WriteOp, HEADER,
 };
 use crate::storage::atoll::txn::Txn;
 use crate::storage::btree::BTreeKey;
@@ -55,6 +55,12 @@ pub type TxnCell = Arc<Mutex<Option<Txn>>>;
 /// NULL's (0x01 or 0xfe) or a tag between them, inverted or not.
 const ABOVE_ENCODED: [u8; 1] = [0xff];
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Cursors built on this thread, for tests to see a statement take up the ones it parked.
+    pub(crate) static CURSORS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// A cursor over one SQL tree.
 pub struct AtollCursor {
     db: Arc<AtollDb>,
@@ -77,11 +83,18 @@ pub struct AtollCursor {
     plain: bool,
     /// The write under way, kept across IO and waits.
     writing: Option<Writing>,
-    /// An insert's key, and, once its write is done, what it came to, while the cursor moves to
-    /// the entry it wrote.
-    inserted: Option<(Vec<u8>, Option<Write>)>,
+    /// Buffers the next write's key and entry are built in: the last write's, or the row the
+    /// cursor showed before it, handed back.
+    spare: (Vec<u8>, Vec<u8>),
     /// The leaf the last write reached, where the cursor stands after an insert.
     reached: Near,
+    /// The last probe's key and its look at the key's leaf ([`VersionedTree::probe`]): the rowid
+    /// read and the write of that key that follow it answer from the look while its leaf is
+    /// unchanged, reaching no leaf again.
+    probed: Vec<u8>,
+    kept: Option<Kept>,
+    /// The tree's rowid counter, once asked for: the tree's while the cursor is over it.
+    counter: Option<Arc<super::rowid::Counter>>,
     /// The key of the entry the cursor stood at, found gone when it read again: it stands at the
     /// entry after it, or at none, read as no row until it moves.
     left: Option<Vec<u8>>,
@@ -159,6 +172,8 @@ impl AtollCursor {
         index: Option<Arc<IndexInfo>>,
         encoding: u32,
     ) -> Self {
+        #[cfg(test)]
+        CURSORS_BUILT.with(|n| n.set(n.get() + 1));
         let a = db.atoll();
         let tree = VersionedTree::open(
             db.io().clone(),
@@ -181,8 +196,11 @@ impl AtollCursor {
             null_row: false,
             plain: false,
             writing: None,
-            inserted: None,
+            spare: Default::default(),
             reached: Near::NONE,
+            probed: Vec::new(),
+            kept: None,
+            counter: None,
             left: None,
             refreshing: None,
             guarding: None,
@@ -240,6 +258,43 @@ impl AtollCursor {
     /// current statement.
     pub fn write_plainly(&mut self) {
         self.plain = true;
+    }
+
+    /// The catalog row of the tree it is over.
+    pub fn entry(&self) -> Entry {
+        self.entry
+    }
+
+    /// Holds the tree's rowid counter, from `rowids` the first time; kept, since a cursor is over
+    /// one tree for its life.
+    pub fn hold_counter(&mut self, rowids: &super::rowid::Rowids) {
+        if self.counter.is_none() {
+            self.counter = Some(rowids.counter(self.entry.root));
+        }
+    }
+
+    /// The counter [`hold_counter`](Self::hold_counter) holds.
+    pub fn counter_held(&self) -> &super::rowid::Counter {
+        self.counter.as_deref().expect("a counter held")
+    }
+
+    /// Ready for another statement's use of its tree: at no row, at the leaf it stood at, with no
+    /// move, read or write under way, writing plainly if that statement created the tree, and
+    /// describing its keys by `index`. Its buffers and its last probe's look are kept: the look
+    /// answers only while its leaf is unchanged.
+    pub fn reuse(&mut self, index: Option<Arc<IndexInfo>>, plain: bool) {
+        self.index = index;
+        self.plain = plain;
+        self.seeking = None;
+        self.record = None;
+        self.null_row = false;
+        self.writing = None;
+        self.left = None;
+        self.refreshing = None;
+        self.guarding = None;
+        self.unseen = false;
+        let near = self.cursor.near();
+        self.cursor.rest_nowhere(near);
     }
 
     /// Starts from `near`, the leaf a cursor over the tree last stood at.
@@ -415,6 +470,13 @@ impl AtollCursor {
 
     /// Moves to the row `op` finds from `key`.
     pub fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
+        if let (None, SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }) =
+            (&self.seeking, &key, op)
+        {
+            if self.absent_by_probe(&key::rowid(*rowid))? {
+                return Ok(IOResult::Done(SeekResult::NotFound));
+            }
+        }
         if self.seeking.is_none() {
             self.seeking = Some(self.plan(key, op)?);
         }
@@ -426,6 +488,42 @@ impl AtollCursor {
             _ => self.seek_key = s.prefix,
         }
         out
+    }
+
+    /// Whether the last probe's look answers that the statement reads `key` absent: the probe was
+    /// of `key`, its leaf is unchanged since, and the newest version there is none, or a tombstone
+    /// the statement sees. Then the cursor stands at no row, at that leaf, as a seek finding no
+    /// row leaves it. Any other answer is the seek's.
+    fn absent_by_probe(&mut self, key: &[u8]) -> Result<bool> {
+        let Some(kept) = self.kept.as_ref().filter(|_| self.probed == key) else {
+            return Ok(false);
+        };
+        if !self.tree.tree().holds_kept(kept) {
+            return Ok(false);
+        }
+        let absent = match kept.present() {
+            None => true,
+            Some((entry, _)) => {
+                let v = crate::storage::atoll::txn::versioned::Version::decode(
+                    entry
+                        .get(..crate::storage::atoll::txn::versioned::HEADER)
+                        .unwrap_or(&[]),
+                )
+                .ok_or_else(|| LimboError::Corrupt("a version header does not decode".into()))?;
+                let mut guard = self.txn.lock();
+                let txn = guard.as_mut().ok_or_else(outside)?;
+                v.flags & crate::storage::atoll::txn::versioned::Version::DELETED != 0
+                    && self.db.atoll().transactions().visible(txn, v.slot, v.ts)
+            }
+        };
+        if absent {
+            let near = kept.near();
+            self.cursor.rest_nowhere(near);
+            self.record = None;
+            self.null_row = false;
+            self.left = None;
+        }
+        Ok(absent)
     }
 
     fn plan(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<Seeking> {
@@ -584,18 +682,21 @@ impl AtollCursor {
 }
 
 impl AtollCursor {
-    /// The key, value and put mode of the entry `key` names.
-    fn entry_of(&self, key: &BTreeKey<'_>) -> Result<(Vec<u8>, Vec<u8>, Mode)> {
+    /// The key, entry and put mode of the row or index entry `key` names, built in the cursor's
+    /// spare buffers: the entry is [`HEADER`] bytes for the version header, then the value.
+    fn entry_of(&mut self, key: &BTreeKey<'_>) -> Result<(Vec<u8>, Vec<u8>, Mode)> {
+        let (mut k, mut entry) = std::mem::take(&mut self.spare);
+        k.clear();
+        entry.clear();
+        entry.resize(HEADER, 0);
         match key {
             BTreeKey::TableRowId((rowid, record)) => {
                 let record = record.ok_or_else(|| {
                     LimboError::InternalError("a table row written with no record".into())
                 })?;
-                Ok((
-                    key::rowid(*rowid).to_vec(),
-                    record.get_payload().to_vec(),
-                    Mode::Upsert,
-                ))
+                k.extend_from_slice(&key::rowid(*rowid));
+                entry.extend_from_slice(record.get_payload());
+                Ok((k, entry, Mode::Upsert))
             }
             BTreeKey::IndexKey(record) => {
                 if !self.current {
@@ -623,74 +724,49 @@ impl AtollCursor {
                 } else {
                     &values[..]
                 };
-                let mut k = Vec::new();
                 key::encode(columns.iter().cloned(), &info.key_info, &mut k)?;
                 let mode = if suffixless {
                     Mode::Insert
                 } else {
                     Mode::Upsert
                 };
-                Ok((k, record.get_payload().to_vec(), mode))
+                entry.extend_from_slice(record.get_payload());
+                Ok((k, entry, mode))
             }
         }
     }
 
     /// Writes the row or index entry `key` names, and leaves the cursor at it, as a b-tree's
-    /// insert does: the VDBE reads the row an UPDATE wrote back through the cursor. Step it until
-    /// done; a write behind another transaction comes back as [`Write::Wait`] or
-    /// [`Write::Conflict`].
+    /// insert does: the VDBE reads the row an UPDATE wrote back through the cursor, which shows
+    /// it from the bytes the write stored. Step it until done; a write behind another transaction
+    /// comes back as [`Write::Wait`] or [`Write::Conflict`].
     pub fn insert(&mut self, key: &BTreeKey<'_>) -> Result<IOResult<Write>> {
-        if let Some((k, Some(written))) = self.inserted.take_if(|(_, written)| written.is_some()) {
-            // At the entry written, as written: no search for what the write just put there.
-            let value = match key {
-                BTreeKey::TableRowId((_, Some(record))) => record.get_payload(),
-                BTreeKey::IndexKey(record) => record.get_payload(),
-                BTreeKey::TableRowId((_, None)) => {
-                    return Err(LimboError::InternalError(
-                        "a table row written with no record".into(),
-                    ))
-                }
-            };
-            self.cursor.place(&k, value, self.reached);
-            self.record = None;
-            self.null_row = false;
-            self.left = None;
-            return Ok(IOResult::Done(written));
-        }
         if self.writing.is_none() {
-            let (k, value, mode) = self.entry_of(key)?;
-            self.inserted = Some((k.clone(), None));
+            let (k, entry, mode) = self.entry_of(key)?;
             let max = self.tree.max_key();
             if k.len() > max {
+                let len = k.len();
+                self.spare = (k, entry);
                 return Err(LimboError::InternalError(format!(
-                    "a key of {} bytes into tree {}, which holds keys of at most {max}",
-                    k.len(),
+                    "a key of {len} bytes into tree {}, which holds keys of at most {max}",
                     self.id
                 )));
             }
+            let kept = self.kept.take().filter(|_| self.probed == k);
             self.writing = Some(if self.plain {
                 let guard = self.txn.lock();
                 let txn = guard.as_ref().ok_or_else(outside)?;
-                Writing::PlainPut(self.tree.plain_put(txn, &k, value, mode), mode)
+                Writing::PlainPut(self.tree.plain_put(txn, k, entry, mode), mode)
             } else {
-                Writing::Versioned(WriteOp::put(&k, value, mode).near(self.cursor.near()), mode)
+                Writing::Versioned(
+                    WriteOp::put_entry(k, entry, mode)
+                        .near(self.cursor.near())
+                        .kept(kept),
+                    mode,
+                )
             });
         }
-        let written = match self.write() {
-            Ok(IOResult::Done(written @ Write::Done(_))) => written,
-            other => {
-                if !matches!(
-                    other,
-                    Ok(IOResult::IO(_)) | Ok(IOResult::Done(Write::Wait(_)))
-                ) {
-                    self.inserted = None;
-                }
-                return other;
-            }
-        };
-        let (k, _) = self.inserted.take().expect("an insert's key");
-        self.inserted = Some((k, Some(written)));
-        self.insert(key)
+        self.write()
     }
 
     /// A write path's probe of `key`, judged by its newest version as a write would judge it
@@ -702,8 +778,19 @@ impl AtollCursor {
         let mut lock = self.txn.lock();
         let txn = lock.as_mut().ok_or_else(outside)?;
         let near = self.cursor.near();
-        self.tree
-            .probe(self.db.atoll().transactions(), txn, key, near)
+        self.kept = None;
+        let probed = self.tree.probe(
+            self.db.atoll().transactions(),
+            txn,
+            key,
+            near,
+            &mut self.kept,
+        )?;
+        if self.kept.is_some() {
+            self.probed.clear();
+            self.probed.extend_from_slice(key);
+        }
+        Ok(probed)
     }
 
     /// The keys a foreign-key guard of `key` judges start with this (R10): a table's rowid key, or
@@ -806,22 +893,29 @@ impl AtollCursor {
     /// write starts afresh.
     pub fn abandon_write(&mut self) {
         self.writing = None;
-        self.inserted = None;
     }
 
     /// Deletes the row or index entry the cursor is at. Step it until done.
     pub fn delete(&mut self) -> Result<IOResult<Write>> {
+        self.kept = None;
         if self.writing.is_none() {
-            let k = self
+            let at = self
                 .cursor
                 .key()
                 .filter(|_| !self.null_row && self.left.is_none())
-                .ok_or_else(|| LimboError::InternalError("a delete at no row".into()))?
-                .to_vec();
+                .ok_or_else(|| LimboError::InternalError("a delete at no row".into()))?;
+            let (mut k, entry) = std::mem::take(&mut self.spare);
+            k.clear();
+            k.extend_from_slice(at);
             self.writing = Some(if self.plain {
-                Writing::PlainRemove(Remove::new(&k))
+                let remove = Remove::new(&k);
+                self.spare = (k, entry);
+                Writing::PlainRemove(remove)
             } else {
-                Writing::Versioned(WriteOp::delete(&k).near(self.cursor.near()), Mode::Update)
+                Writing::Versioned(
+                    WriteOp::delete_into(k, entry).near(self.cursor.near()),
+                    Mode::Update,
+                )
             });
         }
         self.write()
@@ -861,8 +955,30 @@ impl AtollCursor {
             // Kept: stepped again once the writer has ended.
             return Ok(IOResult::Done(write));
         }
-        self.writing = None;
         self.record = None;
+        // An insert's row is where the cursor now stands, shown from the entry it stored; any
+        // write's buffers serve the next.
+        let (k, entry, put) = match self.writing.take().expect("a write") {
+            Writing::Versioned(op, _) => {
+                let put = !op.deletes();
+                let (k, entry) = op.into_buffers();
+                (k, entry, put)
+            }
+            Writing::PlainPut(put, _) => {
+                let (k, entry) = put.into_buffers();
+                (k, entry.unwrap_or_default(), true)
+            }
+            Writing::PlainRemove(_) => (Vec::new(), Vec::new(), false),
+        };
+        match write {
+            Write::Done(Outcome::Inserted | Outcome::Updated) if put && entry.len() >= HEADER => {
+                self.spare = self.cursor.place_entry(k, entry, HEADER, self.reached);
+                self.null_row = false;
+                self.left = None;
+            }
+            _ if !k.is_empty() || !entry.is_empty() => self.spare = (k, entry),
+            _ => {}
+        }
         if mode == Mode::Insert && write == Write::Done(Outcome::Unchanged) {
             return Err(LimboError::ConstraintViolation(Box::new(
                 ConstraintViolation::new(

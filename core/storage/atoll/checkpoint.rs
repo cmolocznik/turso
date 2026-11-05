@@ -26,6 +26,12 @@ use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResult};
 use crate::Result;
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Writing statements' steps that found nothing due, on this thread.
+    pub(crate) static STEPS_PASSED_OVER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub struct Checkpointer {
     pool: Arc<BufferPool>,
     store: Arc<PageStore>,
@@ -43,6 +49,9 @@ pub struct Checkpointer {
     releasing_retention: Releasing<Retention>,
     /// Full checkpoints asked for so far.
     full_wanted: AtomicU64,
+    /// Where the log ended when the last pass began, as the state last left it: what a writing
+    /// statement reads before stepping ([`step_due`](Self::step_due)).
+    pass_from: AtomicU64,
     /// The superblock in charge, as the checkpoint stepping it last wrote it, for anyone to read.
     published: ArcCell<Superblock>,
     releasing: Releasing<Superblock>,
@@ -129,6 +138,7 @@ impl Checkpointer {
             control,
             clock,
             full_wanted: AtomicU64::new(0),
+            pass_from: AtomicU64::new(last_pass),
             published: ArcCell::new(Arc::new(superblock.clone())),
             releasing: Releasing::new(epochs.clone()),
             releasing_retention: Releasing::new(epochs),
@@ -206,6 +216,24 @@ impl Checkpointer {
         }
     }
 
+    /// A writing statement's step (DESIGN.md §17): only once a pass is due by the log appended
+    /// since the last began. A pass under way goes on at that step or at a transaction's end, and
+    /// freeing what operations gave up and erasing what was freed are left to the steps
+    /// transactions' ends take.
+    pub fn step_due(&self) -> Result<IOResult<()>> {
+        let due = self
+            .log()
+            .end()
+            .saturating_sub(self.pass_from.load(Ordering::Acquire))
+            >= self.increment;
+        if !due {
+            #[cfg(test)]
+            STEPS_PASSED_OVER.with(|n| n.set(n.get() + 1));
+            return Ok(IOResult::Done(()));
+        }
+        self.step()
+    }
+
     /// Holds the checkpointer idle, if no one is stepping it: no pass, no erase and no move of
     /// the redo point happens until the hold is dropped, so the page store holds still for an
     /// integrity check (DESIGN.md §17, §12; R36).
@@ -253,6 +281,7 @@ impl State {
                     let end = cp.log().end();
                     if end - self.last_pass >= cp.increment {
                         self.last_pass = end;
+                        cp.pass_from.store(end, Ordering::Release);
                         let shard = self.next_shard;
                         self.next_shard = (shard + 1) % cp.pool.shard_count();
                         self.work = Work::Passes(vec![cp.pool.pass(shard)], None);

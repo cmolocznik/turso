@@ -1114,6 +1114,10 @@ pub struct ProgramState {
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    /// Cursors the last execution left parked in their slots ([`CursorTrait::park`]), taken up by
+    /// the next open of the same tree in the slot, which checks them again against what it opens;
+    /// dropped by an open of another tree there.
+    pub(crate) parked_cursors: Vec<Option<Box<dyn crate::storage::btree::CursorTrait>>>,
     /// Database id associated with each opened cursor. Ephemeral and pseudo
     /// cursors have no database id.
     cursor_databases: Vec<Option<usize>>,
@@ -1359,6 +1363,7 @@ impl ProgramState {
             extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
             cursors,
+            parked_cursors: (0..max_cursors).map(|_| None).collect(),
             cursor_databases,
             index_method_contexts: vec![None; max_cursors],
             closed_index_method_cursors: Vec::new(),
@@ -1494,6 +1499,7 @@ impl ProgramState {
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
+            self.parked_cursors.resize_with(max_cursors, || None);
             self.cursors.resize_with(max_cursors, || None);
             self.cursor_databases.resize(max_cursors, None);
             self.index_method_contexts.resize_with(max_cursors, || None);
@@ -1510,10 +1516,13 @@ impl ProgramState {
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
         self.cursor_databases.fill(None);
-        for (cursor, context) in self
+        // One parking place per slot, so the walk below reaches every cursor.
+        self.parked_cursors.resize_with(self.cursors.len(), || None);
+        for ((cursor, context), parked) in self
             .cursors
             .iter_mut()
             .zip(self.index_method_contexts.iter_mut())
+            .zip(self.parked_cursors.iter_mut())
         {
             if let (Some(Cursor::IndexMethod(cursor)), Some(context)) =
                 (cursor.as_mut(), context.as_ref())
@@ -1524,7 +1533,13 @@ impl ProgramState {
                 Some(Cursor::BTree(cursor, ..)) => {
                     crate::storage::btree::CursorTrait::recycle(cursor)
                 }
-                Some(Cursor::Dyn(cursor, ..)) => cursor.recycle(),
+                Some(Cursor::Dyn(mut cursor, ..)) => {
+                    if cursor.park() {
+                        *parked = Some(cursor);
+                    } else {
+                        cursor.recycle()
+                    }
+                }
                 _ => {}
             }
             *context = None;

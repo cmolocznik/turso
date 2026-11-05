@@ -8,7 +8,7 @@ use crate::storage::atoll::btree::Mode;
 use crate::storage::atoll::page::SizeClass;
 use crate::storage::atoll::sql::catalog::tests::config;
 use crate::storage::atoll::testing::drive;
-use crate::storage::atoll::txn::versioned::{Write, WriteOp};
+use crate::storage::atoll::txn::versioned::{Probe, Write, WriteOp};
 use crate::storage::atoll::txn::{Commit, Isolation};
 use crate::storage::btree::BTreeKey;
 use crate::translate::collate::CollationSeq;
@@ -665,5 +665,187 @@ fn a_write_behind_an_open_writer_waits_and_goes_on_once_it_commits() {
     assert_eq!(
         walk(&mut db.cursor(entry, None), &db.io, true),
         vec![vec![Value::from_i64(2)]]
+    );
+}
+
+fn probe_of(c: &mut AtollCursor, io: &Arc<dyn IO>, rowid: i64) -> Probe {
+    run(io, || c.probe(&key::rowid(rowid)))
+}
+
+fn rowid_read(c: &mut AtollCursor, io: &Arc<dyn IO>, rowid: i64) -> SeekResult {
+    run(io, || {
+        c.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+    })
+}
+
+fn leaf_reaches() -> u64 {
+    crate::storage::atoll::btree::LEAF_REACHES.with(|n| n.get())
+}
+
+/// An insert after its rowid's probe reaches its leaf once, by the probe: the rowid read answers
+/// absent from the probe's look, and the write goes in where that look found its place, whether
+/// the key goes after every key, past a gap or before every key.
+#[test]
+fn an_insert_after_its_probe_reaches_its_leaf_once() {
+    let db = Db::open();
+    let rows: Vec<_> = (1..=50)
+        .map(|r| (key::rowid(r).to_vec(), vec![Value::from_i64(r)]))
+        .collect();
+    let entry = db.tree(Layout::Table, &rows);
+    let cell = db.begin();
+    let mut c = db.on(&cell, entry, None);
+    for r in [51, 60, 0] {
+        let before = leaf_reaches();
+        assert_eq!(probe_of(&mut c, &db.io, r), Probe::Absent);
+        assert_eq!(leaf_reaches() - before, 1, "the probe of {r}");
+        assert_eq!(rowid_read(&mut c, &db.io, r), SeekResult::NotFound);
+        assert!(c.is_empty(), "{r}: at no row");
+        let record = record_of(&[Value::from_i64(r * 10)]);
+        assert_eq!(
+            written(&mut c, &db.io, &table_key(r, &record)),
+            Write::Done(Outcome::Inserted)
+        );
+        assert_eq!(
+            leaf_reaches() - before,
+            1,
+            "{r}: the read and the write reach no leaf again"
+        );
+    }
+    let mut expected: Vec<Vec<Value>> = (1..=50).map(|r| vec![Value::from_i64(r)]).collect();
+    expected.insert(0, vec![Value::from_i64(0)]);
+    expected.extend([vec![Value::from_i64(510)], vec![Value::from_i64(600)]]);
+    assert_eq!(walk(&mut c, &db.io, true), expected);
+}
+
+/// An insert of a value too long for its leaf leaves the cursor at the row it wrote, whole: shown
+/// from the entry the write built, which keeps the value the leaf holds out of line.
+#[test]
+fn an_insert_of_a_value_out_of_line_shows_the_row_it_wrote() {
+    let db = Db::open();
+    let entry = db.empty(Layout::Table);
+    let cell = db.begin();
+    let mut c = db.on(&cell, entry, None);
+    let long = Value::build_text("y".repeat(5000));
+    let record = record_of(&[Value::from_i64(1), long.clone()]);
+    assert_eq!(
+        written(&mut c, &db.io, &table_key(1, &record)),
+        Write::Done(Outcome::Inserted)
+    );
+    assert_eq!(values_of(&mut c, &db.io), vec![Value::from_i64(1), long]);
+}
+
+/// A probe's look answers only its own key, and only while its leaf is unchanged: a read of
+/// another key, a read after another cursor of the transaction wrote the leaf, and a write of
+/// another key each reach the leaf again and answer as they would with no probe.
+#[test]
+fn a_probes_look_answers_only_its_key_while_its_leaf_is_unchanged() {
+    let db = Db::open();
+    let rows: Vec<_> = (1..=3)
+        .map(|r| (key::rowid(r).to_vec(), vec![Value::from_i64(r)]))
+        .collect();
+    let entry = db.tree(Layout::Table, &rows);
+    let cell = db.begin();
+    let mut c = db.on(&cell, entry, None);
+    let mut other = db.on(&cell, entry, None);
+    assert_eq!(probe_of(&mut c, &db.io, 4), Probe::Absent);
+    assert_eq!(
+        rowid_read(&mut c, &db.io, 1),
+        SeekResult::Found,
+        "another key"
+    );
+    assert_eq!(probe_of(&mut c, &db.io, 2), Probe::Present);
+    assert_eq!(
+        rowid_read(&mut c, &db.io, 2),
+        SeekResult::Found,
+        "a key present"
+    );
+    assert_eq!(probe_of(&mut c, &db.io, 4), Probe::Absent);
+    let four = record_of(&[Value::from_i64(4)]);
+    assert_eq!(
+        written(&mut other, &db.io, &table_key(4, &four)),
+        Write::Done(Outcome::Inserted)
+    );
+    assert_eq!(
+        rowid_read(&mut c, &db.io, 4),
+        SeekResult::Found,
+        "the row the other cursor put"
+    );
+    assert_eq!(probe_of(&mut c, &db.io, 10), Probe::Absent);
+    let zero = record_of(&[Value::from_i64(0)]);
+    assert_eq!(
+        written(&mut c, &db.io, &table_key(0, &zero)),
+        Write::Done(Outcome::Inserted),
+        "a key other than the probe's"
+    );
+    let expected: Vec<Vec<Value>> = (0..=4).map(|r| vec![Value::from_i64(r)]).collect();
+    assert_eq!(walk(&mut c, &db.io, true), expected);
+    assert_eq!(db.entries(entry.root), 5);
+}
+
+/// A tombstone the probe finds answers the rowid read absent only where the statement sees it:
+/// under read committed, a delete committed after the statement began is a tombstone the probe
+/// passes and the read reads past, to the row the statement sees.
+#[test]
+fn a_probes_tombstone_answers_absent_only_where_the_statement_sees_it() {
+    let db = Db::open();
+    let entry = db.tree(
+        Layout::Table,
+        &[(key::rowid(1).to_vec(), vec![Value::from_i64(1)])],
+    );
+    let reader = db.begin_rc();
+    let deleter = db.begin();
+    let mut d = db.on(&deleter, entry, None);
+    assert_eq!(rowid_read(&mut d, &db.io, 1), SeekResult::Found);
+    assert_eq!(run(&db.io, || d.delete()), Write::Done(Outcome::Updated));
+    assert_eq!(probe_of(&mut d, &db.io, 1), Probe::Absent);
+    assert_eq!(
+        rowid_read(&mut d, &db.io, 1),
+        SeekResult::NotFound,
+        "its own tombstone"
+    );
+    db.commit(&deleter);
+    let mut c = db.on(&reader, entry, None);
+    assert_eq!(probe_of(&mut c, &db.io, 1), Probe::Absent);
+    assert_eq!(
+        rowid_read(&mut c, &db.io, 1),
+        SeekResult::Found,
+        "the statement began before the delete"
+    );
+}
+
+/// Inserts through a cursor build each row in buffers the cursor hands round, from its write to
+/// the row it shows and back: past its first rows, an insert that splits no node allocates
+/// nothing.
+#[test]
+fn an_insert_that_splits_nothing_allocates_nothing() {
+    use crate::storage::atoll::btree::SPLITS;
+    use crate::storage::atoll::testing::allocations;
+    let db = Db::open();
+    let entry = db.empty(Layout::Table);
+    let cell = db.begin();
+    let mut c = db.on(&cell, entry, None);
+    let rows = 1000;
+    let records: Vec<_> = (0..rows)
+        .map(|r| record_of(&[Value::from_i64(r), Value::build_text("x".repeat(100))]))
+        .collect();
+    for r in 0..10 {
+        written(&mut c, &db.io, &table_key(r, &records[r as usize]));
+    }
+    let (mut plain, mut allocating) = (0, Vec::new());
+    for r in 10..rows {
+        let (splits, before) = (SPLITS.with(|n| n.get()), allocations());
+        written(&mut c, &db.io, &table_key(r, &records[r as usize]));
+        let made = allocations() - before;
+        if SPLITS.with(|n| n.get()) == splits {
+            plain += 1;
+            if made > 0 {
+                allocating.push((r, made));
+            }
+        }
+    }
+    assert!(plain > rows / 2, "{plain} inserts split nothing");
+    assert!(
+        allocating.is_empty(),
+        "inserts that split nothing and allocated: {allocating:?}"
     );
 }

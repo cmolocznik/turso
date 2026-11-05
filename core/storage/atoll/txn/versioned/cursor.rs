@@ -52,8 +52,9 @@ enum Shown {
     /// The plain cursor's entry: the newest version, which the statement sees, read where the
     /// plain cursor holds it, its value past the version header.
     Plain,
-    /// A row held apart: a version below the newest, or the one the statement just wrote.
-    Held(Vec<u8>, Vec<u8>),
+    /// A row held apart: a version below the newest, or the one the statement just wrote: its
+    /// key, and the bytes its value is in from the offset given.
+    Held(Vec<u8>, Vec<u8>, usize),
 }
 
 /// Where a walk over unseen versions stands.
@@ -104,7 +105,7 @@ impl VersionedCursor {
         match &self.entry {
             Shown::None => None,
             Shown::Plain => self.cursor.key(),
-            Shown::Held(k, _) => Some(k),
+            Shown::Held(k, _, _) => Some(k),
         }
     }
 
@@ -113,7 +114,7 @@ impl VersionedCursor {
         match &self.entry {
             Shown::None => None,
             Shown::Plain => self.cursor.value().and_then(|v| v.get(HEADER..)),
-            Shown::Held(_, v) => Some(v),
+            Shown::Held(_, v, from) => v.get(*from..),
         }
     }
 
@@ -127,23 +128,33 @@ impl VersionedCursor {
         self.cursor.set_near(near);
     }
 
-    /// Stands at `key`, whose value `txn`'s statement just wrote as `value`: the row reads as
-    /// that, the statement's own version, and a move from it starts from the key, as after a seek
-    /// to it, trying `near` first.
-    pub fn place(&mut self, key: &[u8], value: &[u8], near: Near) {
-        self.cursor.place(key, near);
+    /// Stands at `key`, whose entry `txn`'s statement just wrote as `entry`, the value from
+    /// `from` on: the row reads as that, the statement's own version, and a move from it starts
+    /// from the key, as after a seek to it, trying `near` first. Gives back buffers for the
+    /// caller's next entry: the row it showed before, or its spares.
+    pub fn place_entry(
+        &mut self,
+        key: Vec<u8>,
+        entry: Vec<u8>,
+        from: usize,
+        near: Near,
+    ) -> (Vec<u8>, Vec<u8>) {
+        self.cursor.place(&key, near);
         self.moving = None;
         self.chain = None;
         self.unseen = None;
-        let (mut k, mut v) = match std::mem::take(&mut self.entry) {
-            Shown::Held(k, v) => (k, v),
+        match std::mem::replace(&mut self.entry, Shown::Held(key, entry, from)) {
+            Shown::Held(k, v, _) => (k, v),
             _ => std::mem::take(&mut self.spare),
-        };
-        k.clear();
-        k.extend_from_slice(key);
-        v.clear();
-        v.extend_from_slice(value);
-        self.entry = Shown::Held(k, v);
+        }
+    }
+
+    /// Stands at no row, at the leaf `near`, as a seek that found none: a move from it finds no
+    /// row, and the next seek tries `near` first.
+    pub fn rest_nowhere(&mut self, near: Near) {
+        self.cursor.set_near(near);
+        self.unseen = None;
+        self.rest(Shown::None);
     }
 
     /// The unseen version a walk over them rests on.
@@ -231,7 +242,7 @@ impl VersionedTree {
                 let found = done!(self.follow(txns, versions, txn, chain));
                 let (key, _) = cursor.chain.take().expect("a chain");
                 if let Some(value) = found {
-                    return Ok(IOResult::Done(cursor.rest(Shown::Held(key, value))));
+                    return Ok(IOResult::Done(cursor.rest(Shown::Held(key, value, 0))));
                 }
                 // No row for this key: on in the move's direction.
                 cursor.moving = Some(Move::Step {
@@ -362,7 +373,7 @@ impl VersionedTree {
                     cursor.unseen = Some(Unseen::Shown { v });
                     cursor.moving = None;
                     cursor.chain = None;
-                    cursor.entry = Shown::Held(key, read);
+                    cursor.entry = Shown::Held(key, read, 0);
                     return Ok(IOResult::Done(true));
                 }
                 Unseen::Below { key, v } => {
@@ -392,7 +403,7 @@ impl VersionedCursor {
     fn rest(&mut self, entry: Shown) -> bool {
         self.moving = None;
         self.chain = None;
-        if let Shown::Held(k, v) = std::mem::replace(&mut self.entry, entry) {
+        if let Shown::Held(k, v, _) = std::mem::replace(&mut self.entry, entry) {
             self.spare = (k, v);
         }
         !matches!(self.entry, Shown::None)

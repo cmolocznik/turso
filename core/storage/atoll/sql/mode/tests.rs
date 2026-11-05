@@ -539,3 +539,310 @@ fn a_long_transactions_statements_step_the_checkpointer_before_its_commit() {
     assert!(lag <= 2 * budget, "the redo point trails by {lag} bytes");
     conn.execute("COMMIT").unwrap();
 }
+
+/// Named savepoints: ROLLBACK TO puts back what was written since and keeps the savepoint,
+/// RELEASE of an inner one keeps the transaction open, and a SAVEPOINT that began the transaction
+/// commits it at its RELEASE.
+#[test]
+fn savepoints_roll_back_to_where_they_stood_and_commit_at_the_outermost_release() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/savepoints");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t (b) VALUES ('a')").unwrap();
+    conn.execute("SAVEPOINT s1").unwrap();
+    conn.execute("INSERT INTO t (b) VALUES ('b')").unwrap();
+    conn.execute("SAVEPOINT s2").unwrap();
+    conn.execute("INSERT INTO t (b) VALUES ('c')").unwrap();
+    conn.execute("ROLLBACK TO s1").unwrap();
+    assert_eq!(names(&conn), vec![text("a")]);
+    conn.execute("INSERT INTO t (b) VALUES ('d')").unwrap();
+    conn.execute("RELEASE s1").unwrap();
+    assert!(
+        !conn.get_auto_commit(),
+        "an inner release keeps the transaction"
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(names(&conn), vec![text("a"), text("d")]);
+
+    conn.execute("SAVEPOINT outer").unwrap();
+    conn.execute("INSERT INTO t (b) VALUES ('e')").unwrap();
+    conn.execute("ROLLBACK TO outer").unwrap();
+    conn.execute("INSERT INTO t (b) VALUES ('f')").unwrap();
+    conn.execute("RELEASE outer").unwrap();
+    assert!(conn.get_auto_commit(), "the outermost release committed");
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(names(&other), vec![text("a"), text("d"), text("f")]);
+}
+
+/// An UPDATE whose row a subquery chose deletes and reinserts it through the table's cursor, then
+/// reads the row back through it for RETURNING: an insert leaves the cursor at the entry it wrote.
+#[test]
+fn an_update_returns_the_row_it_wrote_through_its_cursor() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/returning");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE q (id INTEGER PRIMARY KEY, attempts INTEGER, locked INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO q VALUES (1, 0, NULL), (2, 1, NULL)")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &conn,
+            "UPDATE q SET attempts = attempts + 1, locked = 100 WHERE id = \
+             (SELECT id FROM q ORDER BY attempts, id LIMIT 1) RETURNING id, attempts"
+        ),
+        vec![vec![Value::from_i64(1), Value::from_i64(1)]]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT id, attempts, locked FROM q ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(1), Value::from_i64(100)],
+            vec![Value::from_i64(2), Value::from_i64(1), Value::Null],
+        ]
+    );
+}
+
+/// Steps `stmt` to its next row, through its IO; `None` at its end.
+fn next_row(stmt: &mut crate::Statement) -> Option<Vec<Value>> {
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Row => {
+                return Some(stmt.row().unwrap().get_values().cloned().collect())
+            }
+            crate::StepResult::IO | crate::StepResult::Yield => stmt._io().step().unwrap(),
+            crate::StepResult::Done => return None,
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// A temporary table lives in temp's pager, not Atoll: its rowids come from its own cursor, and
+/// its writes commit with the statement, as the WAL arm ends temp's transaction.
+#[test]
+fn a_temporary_tables_rows_take_their_rowids_and_commit_in_temps_pager() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/temp");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TEMP TABLE tt (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO tt (b) VALUES ('x'), ('y')")
+        .unwrap();
+    conn.execute("INSERT INTO tt (b) VALUES ('z')").unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT a, b FROM tt ORDER BY a"),
+        vec![
+            vec![Value::from_i64(1), text("x")],
+            vec![Value::from_i64(2), text("y")],
+            vec![Value::from_i64(3), text("z")],
+        ]
+    );
+}
+
+/// A writer's halt commits the connection's shared autocommit transaction while a sibling
+/// statement still reads: the sibling goes on in a read transaction begun at that commit, to the
+/// end of its rows (DESIGN.md §17, §3).
+#[test]
+fn a_statement_reading_while_a_sibling_writes_reads_on_after_the_writers_commit() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/siblings");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (b) VALUES ('x'), ('y'), ('z')")
+        .unwrap();
+    let mut reading = conn.prepare("SELECT b FROM t ORDER BY a").unwrap();
+    let mut seen = vec![next_row(&mut reading).expect("a first row")];
+    conn.execute("INSERT INTO t (b) VALUES ('w')").unwrap();
+    while let Some(row) = next_row(&mut reading) {
+        seen.push(row);
+    }
+    // As in SQLite, where a scan reads on in the tree its connection's write changed, the row
+    // written past where the reader stood is read.
+    assert_eq!(
+        seen,
+        [
+            vec![text("x")],
+            vec![text("y")],
+            vec![text("z")],
+            vec![text("w")]
+        ]
+    );
+    drop(reading);
+    assert_eq!(names(&conn).len(), 4, "the writer's row committed");
+}
+
+/// A schema reparse reads the cookie, `sqlite_schema` and every sequence's descriptor in one
+/// Atoll view it holds, its nested reads among them: another connection's CREATE SEQUENCE is seen,
+/// and so is the sequence by the reparse of a database opened again (DESIGN.md §17, §6).
+#[test]
+fn a_reparse_reads_the_schema_and_its_sequences_in_one_view() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    {
+        let db = open(&io, "/db/reparse");
+        let (a, b) = (
+            db.connect(ConnectOpts::new()).unwrap(),
+            db.connect(ConnectOpts::new()).unwrap(),
+        );
+        a.execute("CREATE TABLE t (a)").unwrap();
+        assert!(rows(&b, "SELECT a FROM t").is_empty());
+        a.execute("CREATE SEQUENCE s START 10 INCREMENT 1").unwrap();
+        assert_eq!(
+            rows(&b, "SELECT nextval('s')"),
+            vec![vec![Value::from_i64(10)]]
+        );
+        assert_eq!(
+            rows(&a, "SELECT nextval('s')"),
+            vec![vec![Value::from_i64(11)]]
+        );
+        a.close().unwrap();
+        b.close().unwrap();
+    }
+    let db = open(&io, "/db/reparse");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT nextval('s')"),
+        vec![vec![Value::from_i64(12)]],
+        "a drawn value stays drawn across the reopen"
+    );
+}
+
+/// Atoll's log is the database's journal: reading the journal mode or setting the one it has
+/// works, and changing it is refused by name.
+#[test]
+fn the_journal_mode_cannot_change() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/journal");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let mode = rows(&conn, "PRAGMA journal_mode");
+    eprintln!("journal mode {mode:?}");
+    let [row] = &mode[..] else { panic!("{mode:?}") };
+    let Value::Text(current) = &row[0] else {
+        panic!("{mode:?}")
+    };
+    conn.execute(format!("PRAGMA journal_mode = {}", current.as_str()))
+        .unwrap();
+    let other = if current.as_str().eq_ignore_ascii_case("delete") {
+        "wal"
+    } else {
+        "delete"
+    };
+    let err = conn
+        .execute(format!("PRAGMA journal_mode = {other}"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("journal mode cannot change"),
+        "{err}"
+    );
+}
+
+/// `PRAGMA wal_checkpoint` runs a full checkpoint of Atoll's log, the redo point moved past every
+/// record written before it, and reports what SQLite reports for a database not in WAL mode.
+#[test]
+fn a_wal_checkpoint_pragma_checkpoints_atolls_log_whole() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/wal-checkpoint");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+        .unwrap();
+    conn.execute("INSERT INTO t (b) VALUES (zeroblob(4096))")
+        .unwrap();
+    let atoll = db.atoll.as_ref().unwrap().atoll();
+    let end = atoll.log().end();
+    assert!(
+        atoll.checkpointer().superblock().redo < end,
+        "the insert's records follow the redo point"
+    );
+    let reported = rows(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+    eprintln!("wal_checkpoint reported {reported:?}");
+    let redo = atoll.checkpointer().superblock().redo;
+    assert!(
+        redo >= end,
+        "the redo point at {redo}, before the log's end {end}"
+    );
+}
+
+/// VACUUM rebuilds every tree under the write gate, with garbage collection's runtime drain (R9),
+/// and is refused by name in Atoll mode until then.
+#[test]
+fn vacuum_is_refused_in_atoll_mode() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open(
+        io.clone(),
+        "/db/vacuum",
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .atoll(config())
+            .db_opts(crate::DatabaseOpts::default().with_vacuum(true)),
+    )
+    .unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a)").unwrap();
+    let err = conn.execute("VACUUM").unwrap_err();
+    assert!(
+        err.to_string().contains("VACUUM is refused in Atoll mode"),
+        "{err}"
+    );
+    assert!(
+        rows(&conn, "SELECT a FROM t").is_empty(),
+        "the database goes on"
+    );
+}
+
+/// A cursor resolves its tree as it opens and stays bound to it, as a b-tree cursor is to its
+/// root (R22): a Destroy of the tree later in its statement, as a DROP's, leaves it reading the
+/// rows of the tree it opened.
+#[test]
+fn a_cursor_stays_on_the_tree_it_opened_through_a_destroy_in_its_statement() {
+    use crate::storage::atoll::drive;
+    use crate::storage::atoll::sql::mode::{Begin, SqlCursor};
+    use crate::storage::btree::CursorTrait;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/opened");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (b) VALUES ('x'), ('y'), ('z')")
+        .unwrap();
+    let id = match &rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[..] {
+        [row] => match row[0] {
+            Value::Numeric(crate::Numeric::Integer(id)) => id as u64,
+            ref other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    let ct = conn.atoll().expect("Atoll mode");
+    drive(&io, || ct.begin(Begin::Write { schema: true })).unwrap();
+    ct.start_statement().unwrap();
+    let mut cursor = SqlCursor::new(ct, conn.pager.load().clone(), id, None)
+        .opened()
+        .unwrap();
+    let mut op = None;
+    drive(&io, || ct.retire_tree(&mut op, id, false)).unwrap();
+    assert!(!catalogued_in(ct, id), "the Destroy took the catalog row");
+    assert_eq!(drive(&io, || cursor.count().map_err(|e| *e)).unwrap(), 3);
+    drop(cursor);
+    ct.end(false)
+        .expect("a transaction to end")
+        .finish()
+        .unwrap();
+    assert_eq!(names(&conn), vec![text("x"), text("y"), text("z")]);
+}
+
+/// Whether tree `id` has a catalog row as `ct`'s transaction reads it now.
+fn catalogued_in(ct: &crate::storage::atoll::sql::mode::ConnTxn, id: u64) -> bool {
+    use crate::storage::atoll::drive;
+    use crate::storage::atoll::sql::catalog::key;
+    use crate::storage::atoll::txn::versioned::Get;
+    let db = ct.db();
+    let mut guard = ct.cell.lock();
+    let txn = guard.as_mut().expect("an open transaction");
+    let mut get = Get::new(&key(id));
+    drive(db.io(), || {
+        db.catalog()
+            .get(db.atoll().transactions(), db.versions(), txn, &mut get)
+    })
+    .unwrap()
+    .is_some()
+}

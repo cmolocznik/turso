@@ -1491,6 +1491,31 @@ impl Connection {
         state: &mut ReparseSchemaState,
     ) -> crate::types::IOResultOr<()> {
         use crate::types::IOResult;
+        if let Some(atoll) = self.atoll() {
+            // Atoll mode: the cookie, `sqlite_schema` and every row the reparse reads after them,
+            // in one Atoll view the reparse holds (DESIGN.md §17, §6).
+            if matches!(state, ReparseSchemaState::Start) {
+                atoll.pin()?;
+                let built = atoll
+                    .schema_cookie()
+                    .and_then(|cookie| self.init_reparse_building(cookie, None));
+                match built {
+                    Ok(inner) => *state = ReparseSchemaState::Building(Box::new(inner)),
+                    Err(e) => {
+                        let _ = atoll.unpin();
+                        return Err(e.into());
+                    }
+                }
+            }
+            let out = self.drive_reparse_building(state);
+            if !matches!(out, Ok(IOResult::IO(_))) {
+                let unpinned = atoll.unpin();
+                if out.is_ok() {
+                    unpinned?;
+                }
+            }
+            return out;
+        }
         if matches!(state, ReparseSchemaState::Start) {
             // read cookie before consuming statement program - otherwise we can
             // end up reading cookie with closed transaction state
@@ -2430,6 +2455,11 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        if self.db.atoll.is_some() {
+            // Atoll mode: a commit is durable in Atoll's log, and its pool writes pages back
+            // itself (DESIGN.md §17, §11): nothing waits in a cache for a flush.
+            return Ok(Vec::new());
+        }
         let pager = self.pager.load();
         pager.io.block(|| pager.cacheflush())
     }
@@ -2446,6 +2476,11 @@ impl Connection {
         // The guard also rejects new statements until the checkpoint finishes
         // and cleans up pager checkpoint state if we bail out mid-flight.
         let _checkpoint_guard = self.begin_explicit_checkpoint(self.pager.load().clone(), false)?;
+        if let Some(atoll) = self.db.atoll.as_ref() {
+            // Atoll mode: a full checkpoint of Atoll's log (DESIGN.md §17, §11); no WAL frames.
+            crate::storage::atoll::sql::mode::full_checkpoint(atoll)?;
+            return Ok(CheckpointResult::new(0, 0, 0));
+        }
         if let Some(mv_store) = self.mv_store().as_ref() {
             let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
                 assert!(

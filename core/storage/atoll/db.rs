@@ -38,6 +38,32 @@ impl AtollConfig {
         }
     }
 
+    /// A small database's configuration, for suites and tools that open many: the sizes every
+    /// test of Atoll's SQL layer runs on, 1 MiB log segments, the smallest pool Atoll takes and a
+    /// 512 KiB log budget, with the default transaction slots, so connections the suites hold at
+    /// once never wait for one.
+    pub fn small() -> Self {
+        Self {
+            log: LogConfig {
+                segment_bytes: 1 << 20,
+                buffer_bytes: 256 << 10,
+                chunk_bytes: 16 << 10,
+                writes_in_flight: 3,
+                ..LogConfig::default()
+            },
+            store: StoreConfig {
+                file_bytes: 1 << 30,
+                meta_pages: 1 << 10,
+            },
+            buffer: BufferConfig {
+                checkpoint_shards: 8,
+                ..BufferConfig::with_budget(super::buffer::MIN_BUDGET)
+            },
+            log_budget: Some(512 << 10),
+            txn: TxnConfig::default(),
+        }
+    }
+
     pub(super) fn log_budget(&self) -> u64 {
         self.log_budget
             .unwrap_or(self.buffer.budget as u64 * 2 / 5)

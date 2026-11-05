@@ -586,6 +586,14 @@ pub fn op_checkpoint(
     {
         return Err(LimboError::TableLocked.into());
     }
+    if let Some(atoll) = program.connection.atoll_for_db(*database) {
+        // Atoll mode: a full checkpoint of Atoll's log (DESIGN.md §17, §11), reported as SQLite
+        // reports a database not in WAL mode.
+        crate::storage::atoll::sql::mode::full_checkpoint(atoll.db())?;
+        set_not_in_wal_result(state, *dest);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     if !pager.has_wal() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -5614,7 +5622,17 @@ pub fn op_savepoint(
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
                     let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
 
-                    if let Some(mv_store) = mv_store.as_ref() {
+                    if let Some(atoll) = conn.atoll() {
+                        // Atoll mode: the statement it rolls back to (DESIGN.md §17, §3).
+                        atoll.open_savepoint(
+                            name.clone(),
+                            starts_transaction,
+                            deferred_fk_violations,
+                        );
+                        if conn.get_tx_state().no_btree_tx_open() {
+                            conn.set_tx_state(TransactionState::Read);
+                        }
+                    } else if let Some(mv_store) = mv_store.as_ref() {
                         let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
                             tx_id
                         } else {
@@ -5698,7 +5716,9 @@ pub fn op_savepoint(
                         // does not linger without a connection-level frame
                         // recording it (which would leak past commit /
                         // rollback).
-                        if let Some(mv_store) = mv_store.as_ref() {
+                        if let Some(atoll) = conn.atoll() {
+                            let _ = atoll.release_savepoint(name);
+                        } else if let Some(mv_store) = mv_store.as_ref() {
                             if let Some(tx_id) = conn.get_mv_tx_id() {
                                 let _ = mv_store.release_named_savepoint(tx_id, name);
                             }
@@ -5729,7 +5749,9 @@ pub fn op_savepoint(
             if !matches!(state.commit_state, CommitState::Ready) {
                 return op_auto_commit(program, state, &release_commit_insn(), pager);
             }
-            let release_result = if let Some(mv_store) = mv_store.as_ref() {
+            let release_result = if let Some(atoll) = conn.atoll() {
+                atoll.release_savepoint(name)
+            } else if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
                     None => SavepointResult::NotFound,
@@ -5764,7 +5786,10 @@ pub fn op_savepoint(
             Ok(InsnFunctionStepResult::Step)
         }
         SavepointOp::RollbackTo => {
-            let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
+            let deferred_fk_snapshot = if let Some(atoll) = conn.atoll() {
+                // Driven to its end here, a synchronous site (R19).
+                atoll.rollback_to_savepoint(name)?
+            } else if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
                     None => None,
@@ -9681,10 +9706,15 @@ pub fn op_sorter_open(
         order_collations_nulls,
     } = data.as_ref();
     // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
-    let page_size = match pager.with_header(|header| header.page_size) {
-        Ok(IOResult::Done(page_size)) => page_size,
-        Err(_) => PageSize::default(),
-        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+    let page_size = if program.connection.atoll().is_some() {
+        // Atoll mode: the SQL trees' node size; the main pager holds no header (DESIGN.md §17).
+        PageSize::new(crate::storage::atoll::sql::mode::PAGE as u32).expect("a valid page size")
+    } else {
+        match pager.with_header(|header| header.page_size) {
+            Ok(IOResult::Done(page_size)) => page_size,
+            Err(_) => PageSize::default(),
+            Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+        }
     };
     let page_size = page_size.get() as usize;
 
@@ -13908,17 +13938,18 @@ fn new_rowid_inner(
     loop {
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
-                if program.connection.atoll().is_some() {
-                    // Atoll mode: the tree's counter (DESIGN.md §17, §8, R30).
+                let atoll_cursor = program.connection.atoll().is_some() && {
                     let c = state.get_cursor(*cursor);
-                    let c = c.as_btree_mut() as &mut dyn Any;
-                    let Some(c) = c.downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
-                    else {
-                        return Err(LimboError::InternalError(
-                            "NewRowid on a cursor that is not Atoll's in Atoll mode".to_string(),
-                        )
-                        .into());
-                    };
+                    (c.as_btree_mut() as &mut dyn Any)
+                        .is::<crate::storage::atoll::sql::mode::SqlCursor>()
+                };
+                if atoll_cursor {
+                    // Atoll mode: the tree's counter (DESIGN.md §17, §8, R30). A temp or
+                    // ephemeral table's cursor is the pager's, and goes on below.
+                    let c = state.get_cursor(*cursor);
+                    let c = (c.as_btree_mut() as &mut dyn Any)
+                        .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
+                        .expect("an Atoll cursor");
                     match return_if_io!(state, c.new_rowid()) {
                         Some(rowid) => {
                             state.registers[*rowid_reg].set_int(rowid);
@@ -14444,7 +14475,8 @@ fn open_atoll_cursor(
     };
     let root = atoll_tree_id(root)?;
     Ok(Cursor::new_btree_dyn(Box::new(
-        crate::storage::atoll::sql::mode::SqlCursor::new(atoll, pager.clone(), root, index),
+        crate::storage::atoll::sql::mode::SqlCursor::new(atoll, pager.clone(), root, index)
+            .opened()?,
     )))
 }
 
@@ -14778,6 +14810,14 @@ pub fn op_index_method_create(
     load_insn!(IndexMethodCreate { db, cursor_id }, insn);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
+    }
+    if program.connection.atoll_for_db(*db).is_some() {
+        return Err(LimboError::ParseError(
+            "index methods build their trees over the pager, and are refused in Atoll mode until \
+             their arm is built"
+                .to_string(),
+        )
+        .into());
     }
     let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] else {
         unreachable!("IndexMethodCreate emitted against a non-index-method cursor {cursor_id}");
@@ -20113,6 +20153,17 @@ fn op_journal_mode_inner(
 
                 // Parse the new mode. If unknown or unsupported, silently return
                 // current mode (matches SQLite behavior).
+                if program.connection.atoll_for_db(*db).is_some()
+                    && journal_mode::JournalMode::from_str(mode_str.as_str()).ok()
+                        != Some(prev_mode)
+                {
+                    // Atoll mode: Atoll's log is the database's journal (DESIGN.md §17).
+                    return Err(LimboError::InvalidArgument(
+                        "an Atoll database keeps Atoll's log: its journal mode cannot change"
+                            .to_string(),
+                    )
+                    .into());
+                }
                 let new_mode = match journal_mode::JournalMode::from_str(mode_str.as_str()) {
                     Ok(mode) if mode.supported() => mode,
                     _ => {
@@ -20603,7 +20654,19 @@ fn cleanup_op_vacuum_into(
     Ok(())
 }
 
+/// VACUUM in Atoll mode: it rebuilds every tree under the write gate, built with garbage
+/// collection's runtime drain (DESIGN.md §17, R9), and is refused until then.
+fn atoll_vacuum_refused() -> LimboError {
+    LimboError::InternalError(
+        "VACUUM is refused in Atoll mode until it is built, with garbage collection (R9)"
+            .to_string(),
+    )
+}
+
 fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn) -> InsnResult {
+    if program.connection.atoll().is_some() {
+        return Err(atoll_vacuum_refused().into());
+    }
     load_insn!(
         VacuumInto {
             schema_name,
@@ -20878,6 +20941,9 @@ pub fn op_vacuum(
 ) -> InsnResult {
     load_insn!(Vacuum { db }, insn);
 
+    if program.connection.atoll_for_db(*db).is_some() {
+        return Err(atoll_vacuum_refused().into());
+    }
     if matches!(state.op_vacuum_state, VacuumOpState::None) {
         state.op_vacuum_state = VacuumOpState::InPlace(Box::new(VacuumInPlaceOpContext::new(*db)));
     }

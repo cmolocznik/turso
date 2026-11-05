@@ -258,17 +258,12 @@ impl Db {
         }
         let mut allocated = BTreeSet::new();
         for c in 0..CLASS_COUNT {
-            let (mut number, mut free_run) = (0, 0);
-            // A run this long free is past every page: numbers are taken lowest first.
-            while free_run < 512 {
-                let pid = PageId::new(SizeClass::new(c).unwrap(), number);
+            let class = SizeClass::new(c).unwrap();
+            for number in 0..crate::storage::atoll::testing::page_numbers(self.db.store(), class) {
+                let pid = PageId::new(class, number);
                 if run(&self.io, || self.db.store().entry(pid)) != FREE {
                     allocated.insert(pid);
-                    free_run = 0;
-                } else {
-                    free_run += 1;
                 }
-                number += 1;
             }
         }
         expected.extend(self.db.store().orphans());

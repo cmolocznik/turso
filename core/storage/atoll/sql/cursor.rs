@@ -72,6 +72,9 @@ pub struct AtollCursor {
     plain: bool,
     /// The write under way, kept across IO and waits.
     writing: Option<Writing>,
+    /// An insert's key, and, once its write is done, what it came to, while the cursor moves to
+    /// the entry it wrote.
+    inserted: Option<(Vec<u8>, Option<Write>)>,
 }
 
 enum Writing {
@@ -139,6 +142,7 @@ impl AtollCursor {
             null_row: false,
             plain: false,
             writing: None,
+            inserted: None,
         }
     }
 
@@ -481,11 +485,21 @@ impl AtollCursor {
         }
     }
 
-    /// Writes the row or index entry `key` names. Step it until done; a write behind another
-    /// transaction comes back as [`Write::Wait`] or [`Write::Conflict`].
+    /// Writes the row or index entry `key` names, and leaves the cursor at it, as a b-tree's
+    /// insert does: the VDBE reads the row an UPDATE wrote back through the cursor. Step it until
+    /// done; a write behind another transaction comes back as [`Write::Wait`] or
+    /// [`Write::Conflict`].
     pub fn insert(&mut self, key: &BTreeKey<'_>) -> Result<IOResult<Write>> {
+        if let Some((k, Some(written))) = self.inserted.take_if(|(_, written)| written.is_some()) {
+            if let IOResult::IO(io) = self.step(Move::Seek(&k, Seek::Ge))? {
+                self.inserted = Some((k, Some(written)));
+                return Ok(IOResult::IO(io));
+            }
+            return Ok(IOResult::Done(written));
+        }
         if self.writing.is_none() {
             let (k, value, mode) = self.entry_of(key)?;
+            self.inserted = Some((k.clone(), None));
             let max = self.tree.max_key();
             if k.len() > max {
                 return Err(LimboError::InternalError(format!(
@@ -502,7 +516,21 @@ impl AtollCursor {
                 Writing::Versioned(WriteOp::put(&k, value, mode), mode)
             });
         }
-        self.write()
+        let written = match self.write() {
+            Ok(IOResult::Done(written @ Write::Done(_))) => written,
+            other => {
+                if !matches!(
+                    other,
+                    Ok(IOResult::IO(_)) | Ok(IOResult::Done(Write::Wait(_)))
+                ) {
+                    self.inserted = None;
+                }
+                return other;
+            }
+        };
+        let (k, _) = self.inserted.take().expect("an insert's key");
+        self.inserted = Some((k, Some(written)));
+        self.insert(key)
     }
 
     /// Deletes the row or index entry the cursor is at. Step it until done.

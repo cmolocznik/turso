@@ -37,7 +37,7 @@ use crate::storage::atoll::txn::{Abort, Blocker, Commit, Isolation, Statement, T
 use crate::storage::btree::{BTreeKey, CursorTrait};
 use crate::storage::database::DatabaseStorage;
 use crate::storage::database::IOContext;
-use crate::storage::pager::Pager;
+use crate::storage::pager::{Pager, SavepointResult};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -296,6 +296,21 @@ pub struct ConnTxn {
     taking: Mutex<Option<Completion>>,
     /// Whether waits park, or come back `Busy` to be retried in place (R34).
     parks: Arc<AtomicBool>,
+    /// The named savepoints, oldest first.
+    savepoints: Mutex<Vec<Savepoint>>,
+    /// Whether a schema reparse holds the transaction, which its statements read in and do not
+    /// end (DESIGN.md §17, §6), and whether it began it.
+    pinned: AtomicBool,
+    pin_began: AtomicBool,
+}
+
+/// A named savepoint (DESIGN.md §17, §3): the statement it rolls back to, whether it began the
+/// transaction, and the deferred foreign-key count a rollback to it restores.
+struct Savepoint {
+    name: String,
+    at: Statement,
+    starts_transaction: bool,
+    deferred_fk: isize,
 }
 
 impl ConnTxn {
@@ -307,7 +322,86 @@ impl ConnTxn {
             setting: Mutex::new(None),
             taking: Mutex::new(None),
             parks: Arc::new(AtomicBool::new(false)),
+            savepoints: Mutex::new(Vec::new()),
+            pinned: AtomicBool::new(false),
+            pin_began: AtomicBool::new(false),
         }
+    }
+
+    /// Holds a read transaction for a schema reparse, beginning one if none is open: the cookie
+    /// and `sqlite_schema` are read in one view, and so is every row the reparse reads after them,
+    /// its nested statements' among them, which begin no transaction of their own (DESIGN.md §17,
+    /// §6). The statements it runs read in it and do not end it; [`unpin`](Self::unpin) does.
+    pub fn pin(&self) -> Result<()> {
+        if self.pinned.swap(true, Ordering::AcqRel) {
+            return Err(LimboError::InternalError(
+                "a schema reparse inside another on one connection".to_string(),
+            ));
+        }
+        self.pin_began.store(!self.is_open(), Ordering::Release);
+        let io = self.db.io().clone();
+        drive(&io, || self.begin(Begin::Read)).inspect_err(|_| {
+            self.pinned.store(false, Ordering::Release);
+        })
+    }
+
+    /// Lets go of the reparse's transaction: ended here if the reparse began it; one the caller
+    /// had open before goes on.
+    pub fn unpin(&self) -> Result<()> {
+        if !self.pinned.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if !self.pin_began.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self.end(true) {
+            Some(ending) => ending.finish(),
+            None => Ok(()),
+        }
+    }
+
+    /// SAVEPOINT: records where the transaction stands, at no statement when none has begun, as a
+    /// deferred transaction's first read begins it.
+    pub fn open_savepoint(&self, name: String, starts_transaction: bool, deferred_fk: isize) {
+        let at = self.cell.lock().as_ref().map_or(0, Txn::command);
+        self.savepoints.lock().push(Savepoint {
+            name,
+            at,
+            starts_transaction,
+            deferred_fk,
+        });
+    }
+
+    /// RELEASE: forgets the newest savepoint of `name` and every one after it; releasing the
+    /// outermost, when it began the transaction, commits it.
+    pub fn release_savepoint(&self, name: &str) -> SavepointResult {
+        let mut savepoints = self.savepoints.lock();
+        let Some(i) = savepoints.iter().rposition(|s| s.name == name) else {
+            return SavepointResult::NotFound;
+        };
+        let commit = i == 0 && savepoints[i].starts_transaction;
+        savepoints.truncate(i);
+        if commit {
+            SavepointResult::Commit
+        } else {
+            SavepointResult::Release
+        }
+    }
+
+    /// ROLLBACK TO: rolls the transaction back to where the newest savepoint of `name` stood,
+    /// which stays, and forgets every one after it. Returns the deferred foreign-key count to
+    /// restore, `None` with no such savepoint.
+    pub fn rollback_to_savepoint(&self, name: &str) -> Result<Option<isize>> {
+        let (at, deferred_fk) = {
+            let mut savepoints = self.savepoints.lock();
+            let Some(i) = savepoints.iter().rposition(|s| s.name == name) else {
+                return Ok(None);
+            };
+            savepoints.truncate(i + 1);
+            (savepoints[i].at, savepoints[i].deferred_fk)
+        };
+        self.rollback_statement(at)?;
+        Ok(Some(deferred_fk))
     }
 
     /// From now on waits park until what is in the way ends, for the PostgreSQL frontend, whose
@@ -445,8 +539,13 @@ impl ConnTxn {
         Ok(())
     }
 
-    /// The ending of the open transaction: its commit, or its rollback. `None` with none open.
+    /// The ending of the open transaction: its commit, or its rollback. `None` with none open, or
+    /// while a schema reparse holds it.
     pub fn end(&self, commit: bool) -> Option<Ending> {
+        if self.pinned.load(Ordering::Acquire) {
+            return None;
+        }
+        self.savepoints.lock().clear();
         let txn = self.cell.lock().take()?;
         let written = std::mem::take(&mut *self.written.lock());
         *self.setting.lock() = None;
@@ -666,6 +765,15 @@ pub struct RetireOp {
     counted: Option<u64>,
 }
 
+/// A full checkpoint (DESIGN.md §17, §11): every shard written back and the redo point moved as
+/// far as it goes, for `PRAGMA wal_checkpoint` and `Connection::checkpoint`. Driven to its end
+/// here, as a WAL checkpoint of the whole log is.
+pub fn full_checkpoint(db: &AtollDb) -> Result<()> {
+    let checkpointer = db.atoll().checkpointer();
+    let ticket = checkpointer.request_full();
+    drive(db.io(), || checkpointer.step_full(ticket))
+}
+
 /// Steps the checkpointer, which does whatever is due: a pass once its share of the log budget has
 /// been appended, and moving the redo point after one. Its IO is not waited for: the pass goes on
 /// at the next step, whoever takes it.
@@ -799,8 +907,8 @@ impl Drop for Ending {
     }
 }
 
-/// A Turso cursor over one SQL tree, which resolves its catalog row at its first step (R22):
-/// OpenRead and OpenWrite build cursors with no IO to step.
+/// A Turso cursor over one SQL tree, which resolves its catalog row when it opens, a read driven
+/// to its end, and again after a Clear replaced its tree (R22).
 pub struct SqlCursor {
     db: Arc<AtollDb>,
     cell: TxnCell,
@@ -864,6 +972,14 @@ impl SqlCursor {
     /// rowids.
     pub fn new_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
         Ok(IOResult::Done(done!(self.counter()).draw()))
+    }
+
+    /// The cursor with its tree resolved, as OpenRead and OpenWrite open it: bound to the tree its
+    /// id names when it opens, as a b-tree cursor is to its root, so a Destroy later in its
+    /// statement leaves it on the tree it opened (R22).
+    pub fn opened(mut self) -> Result<Self> {
+        self.resolve()?;
+        Ok(self)
     }
 
     /// The tree's catalog row as the transaction's current statement reads it, and a cursor over

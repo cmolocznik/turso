@@ -466,7 +466,8 @@ mod tests {
     }
 
     /// A creation cut short leaves its first superblock torn at any of its sectors, each landed or
-    /// not, over a file of any length up to it: every such file reads as nothing, to create again.
+    /// not, over a file of any length up to it: every such file reads as nothing, to create again,
+    /// unless what landed is the superblock whole.
     #[test]
     fn a_creation_torn_at_any_sectors_reads_as_nothing() {
         let sectors = SIZE / crate::io::crash::SECTOR;

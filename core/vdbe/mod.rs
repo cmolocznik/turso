@@ -3285,9 +3285,10 @@ impl Program {
         Ok(res)
     }
 
-    /// The Atoll arm of `commit_txn` (DESIGN.md §17): in autocommit, the transaction's commit or
-    /// rollback, stepped until done, then the schema it changed published to the database, or
-    /// put back.
+    /// The Atoll arm of `commit_txn` (DESIGN.md §17): in autocommit, the main database's Atoll
+    /// transaction committed or rolled back, stepped until done, and the schema it changed
+    /// published or put back; then temp's and the attached databases' pager transactions, ended as
+    /// the WAL arm ends them.
     fn commit_txn_atoll(&self, program_state: &mut ProgramState, rollback: bool) -> IOResultOr<()> {
         let connection = &self.connection;
         if matches!(program_state.commit_state, CommitState::Ready) {
@@ -3301,41 +3302,53 @@ impl Program {
                 }
             );
             let atoll = connection.atoll().expect("Atoll mode");
-            match atoll.end(!rollback) {
-                Some(ending) => {
-                    program_state.commit_state = CommitState::Atoll {
-                        ending: Box::new(ending),
-                        schema_did_change,
-                        rollback,
-                    };
-                }
-                None => {
-                    connection.set_tx_state(TransactionState::None);
-                    return Ok(IOResult::Done(()));
-                }
-            }
+            program_state.commit_state = match atoll.end(!rollback) {
+                Some(ending) => CommitState::Atoll {
+                    ending: Box::new(ending),
+                    schema_did_change,
+                    rollback,
+                },
+                None => CommitState::CommittingAttached,
+            };
         }
-        let CommitState::Atoll {
+        if let CommitState::Atoll {
             ending,
             schema_did_change,
             rollback,
         } = &mut program_state.commit_state
-        else {
-            unreachable!("an Atoll commit in another commit state");
-        };
-        return_if_io!(ending.step());
-        let (schema_did_change, rollback) = (*schema_did_change, *rollback);
-        program_state.commit_state = CommitState::Ready;
-        if schema_did_change {
-            if rollback {
-                *connection.schema.write() = connection.db.clone_schema();
-                connection.bump_prepare_context_generation();
-            } else {
-                let schema = connection.schema.read().clone();
-                connection.db.update_schema_if_newer(schema);
+        {
+            return_if_io!(ending.step());
+            let (schema_did_change, rollback) = (*schema_did_change, *rollback);
+            if schema_did_change {
+                if rollback {
+                    *connection.schema.write() = connection.db.clone_schema();
+                    connection.bump_prepare_context_generation();
+                } else {
+                    let schema = connection.schema.read().clone();
+                    connection.db.update_schema_if_newer(schema);
+                }
             }
+            program_state.commit_state = CommitState::CommittingAttached;
         }
+        turso_assert!(
+            matches!(program_state.commit_state, CommitState::CommittingAttached),
+            "an Atoll commit in another commit state"
+        );
+        return_if_io!(self.end_attached_write_txns(connection, rollback, false));
+        self.end_attached_read_txns(connection);
+        program_state.commit_state = CommitState::Ready;
         connection.set_tx_state(TransactionState::None);
+        // A writer ends the shared autocommit transaction at its own halt, as SQLite's does,
+        // while sibling statements still read (DESIGN.md §17, §3): they go on in a read
+        // transaction begun now, which sees what the writer left and ends with the last of them.
+        if connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+            let atoll = connection.atoll().expect("Atoll mode");
+            let io = connection.db.io.clone();
+            crate::storage::atoll::drive(&io, || {
+                atoll.begin(crate::storage::atoll::sql::mode::Begin::Read)
+            })?;
+            connection.set_tx_state(TransactionState::Read);
+        }
         Ok(IOResult::Done(()))
     }
 

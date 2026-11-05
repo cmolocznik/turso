@@ -132,16 +132,12 @@ fn check_reachable(
         allocated.extend(db.pool().temporary_pages());
     }
     for c in 0..CLASS_COUNT {
-        let (mut number, mut free_run) = (0, 0);
-        while free_run < 512 {
-            let pid = PageId::new(class(c), number);
+        let class = class(c);
+        for number in 0..crate::storage::atoll::testing::page_numbers(db.store(), class) {
+            let pid = PageId::new(class, number);
             if run_to(run, || db.store().entry(pid)) != FREE {
                 allocated.insert(pid);
-                free_run = 0;
-            } else {
-                free_run += 1;
             }
-            number += 1;
         }
     }
     let orphans: BTreeSet<PageId> = db.store().orphans().into_iter().collect();

@@ -39,7 +39,7 @@ use crate::storage::database::DatabaseStorage;
 use crate::storage::database::IOContext;
 use crate::storage::pager::{Pager, SavepointResult};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::types::{
     IOCompletions, IOResult, IOResultOr, ImmutableRecord, IndexInfo, SeekKey, SeekOp, SeekResult,
@@ -180,6 +180,10 @@ impl DatabaseStorage for RefusingStorage {
 /// The page size Turso sees: SQL trees' node size (R7).
 pub const PAGE: usize = 4096;
 
+/// What `PRAGMA max_page_count` reads in Atoll mode, which has no page cap (R35): SQLite's default,
+/// the most its header's page count allows.
+pub const NO_PAGE_CAP: u32 = 0xffff_fffe;
+
 /// Each field's offset in SQLite's header, whose word it holds.
 fn offset(field: Field) -> usize {
     match field {
@@ -302,6 +306,99 @@ pub struct ConnTxn {
     /// end (DESIGN.md §17, §6), and whether it began it.
     pinned: AtomicBool,
     pin_began: AtomicBool,
+    /// What its statements changed in each tree, which a cursor positioned before reads again.
+    changes: Arc<TreeChanges>,
+}
+
+/// Slots the trees a connection changes fall into: a cursor whose tree shares a slot with
+/// another the connection changed reads its entry again for nothing, which costs a seek and never
+/// a wrong read; 256 keep any two trees apart but for one in 256, at 4 KiB a connection.
+const CHANGE_SLOTS: usize = 256;
+
+/// What a connection's statements changed in its trees (DESIGN.md §17, §3). They share the trees
+/// they write, as SQLite's statements share the b-tree: a cursor positioned before another
+/// statement's change reads its entry again at its next read or move, and one whose tree a Clear
+/// replaced is bound to the new tree. Each change takes the next epoch; a slot keeps, per tree
+/// falling into it, the epoch of its last row change and of its last Clear. A Destroy changes
+/// nothing a cursor reads: it stays on the tree it opened (R22).
+pub struct TreeChanges {
+    epoch: AtomicU64,
+    /// The epoch of the last rollback of statements, which may have changed any tree.
+    rolled_back: AtomicU64,
+    slots: Box<[[AtomicU64; 2]]>,
+    /// The trees a Destroy took in the open transaction, with the statement that ran it: a cursor
+    /// that statement opens on one after it reads it as empty, as SQLite's does a freed root.
+    destroyed: Mutex<Vec<(u64, Statement)>>,
+}
+
+/// What a cursor positioned at an epoch has to catch up with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Behind {
+    Nothing,
+    Rows,
+    Cleared,
+}
+
+impl TreeChanges {
+    fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            rolled_back: AtomicU64::new(0),
+            slots: (0..CHANGE_SLOTS)
+                .map(|_| [AtomicU64::new(0), AtomicU64::new(0)])
+                .collect(),
+            destroyed: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Whether statement `statement` destroyed tree `id`.
+    fn destroyed_in(&self, id: u64, statement: Statement) -> bool {
+        self.destroyed.lock().contains(&(id, statement))
+    }
+
+    fn next(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn slot(&self, id: u64) -> &[AtomicU64; 2] {
+        &self.slots[(id % CHANGE_SLOTS as u64) as usize]
+    }
+
+    /// A row of tree `id` written or removed.
+    fn wrote(&self, id: u64) {
+        let e = self.next();
+        self.slot(id)[0].store(e, Ordering::Release);
+    }
+
+    /// Tree `id`'s catalog row pointed at a new, empty tree.
+    fn cleared(&self, id: u64) {
+        let e = self.next();
+        self.slot(id)[1].store(e, Ordering::Release);
+    }
+
+    /// Statements rolled back, whichever trees they wrote.
+    fn rolled_back(&self) {
+        let e = self.next();
+        self.rolled_back.store(e, Ordering::Release);
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// What changed in tree `id` after `seen`.
+    fn since(&self, id: u64, seen: u64) -> Behind {
+        let [rows, clears] = self.slot(id);
+        if clears.load(Ordering::Acquire) > seen {
+            Behind::Cleared
+        } else if rows.load(Ordering::Acquire) > seen
+            || self.rolled_back.load(Ordering::Acquire) > seen
+        {
+            Behind::Rows
+        } else {
+            Behind::Nothing
+        }
+    }
 }
 
 /// A named savepoint (DESIGN.md §17, §3): the statement it rolls back to, whether it began the
@@ -325,6 +422,7 @@ impl ConnTxn {
             savepoints: Mutex::new(Vec::new()),
             pinned: AtomicBool::new(false),
             pin_began: AtomicBool::new(false),
+            changes: Arc::new(TreeChanges::new()),
         }
     }
 
@@ -536,6 +634,8 @@ impl ConnTxn {
         })?;
         self.written.lock().retain(|(s, _, _)| *s <= n);
         *self.setting.lock() = None;
+        self.changes.destroyed.lock().retain(|(_, s)| *s <= n);
+        self.changes.rolled_back();
         Ok(())
     }
 
@@ -547,12 +647,14 @@ impl ConnTxn {
         }
         self.savepoints.lock().clear();
         let txn = self.cell.lock().take()?;
+        self.changes.destroyed.lock().clear();
         let written = std::mem::take(&mut *self.written.lock());
         *self.setting.lock() = None;
         *self.taking.lock() = None;
         Some(if commit {
             Ending::commit(self.db.clone(), txn, written)
         } else {
+            self.changes.rolled_back();
             Ending::rollback(self.db.clone(), txn)
         })
     }
@@ -581,13 +683,30 @@ impl ConnTxn {
     }
 
     /// The header as SQLite lays it out: every field's word at the transaction's view, or
-    /// committed outside one.
+    /// committed outside one. Its database size and free-list count are the main pager's, which
+    /// holds no pages: what reads them walks the pager's pages. `PRAGMA page_count` reads the page
+    /// store ([`pages`](Self::pages)); `freelist_count` stays 0, which is so, Atoll keeping no free
+    /// list in its files, a freed slot being erased and taken again.
     pub fn header(&self) -> Result<DatabaseHeader> {
         let mut words = [0u32; 7];
         for field in Field::ALL {
             words[field as usize - 1] = self.field(field)?;
         }
         Ok(header_of(&words))
+    }
+
+    /// The pages the page store holds in use (DESIGN.md §17, §12), every class's in node-size
+    /// units, rounded up, as `PRAGMA page_count` reports them; past `u32::MAX`, the most a header
+    /// word holds.
+    pub fn pages(&self) -> Result<u32> {
+        let store = self.db.atoll().store();
+        let mut bytes: u64 = 0;
+        for class in 0..crate::storage::atoll::page::CLASS_COUNT {
+            let class = crate::storage::atoll::page::SizeClass::new(class).expect("a class");
+            let n = drive(self.db.io(), || store.pages_in_use(class))?;
+            bytes = bytes.saturating_add(n.saturating_mul(class.size() as u64));
+        }
+        Ok(u32::try_from(bytes.div_ceil(PAGE as u64)).unwrap_or(u32::MAX))
     }
 
     /// Applies `f` to the header and writes every field it changed, in the open transaction's
@@ -672,6 +791,11 @@ impl ConnTxn {
             match op.waiting.judge(&self.db, w)? {
                 Judged::Done => {
                     txn.wrote_schema();
+                    if clear {
+                        self.changes.cleared(id);
+                    } else {
+                        self.changes.destroyed.lock().push((id, txn.command()));
+                    }
                     return Ok(IOResult::Done(op.counted.unwrap_or(0)));
                 }
                 Judged::Park(c) => return park(&self.parks, c),
@@ -926,6 +1050,13 @@ pub struct SqlCursor {
     seeding: Option<Seed>,
     /// A count under way.
     counting: Option<Counting>,
+    /// Its connection's changes, and the epoch its position was taken at.
+    changes: Arc<TreeChanges>,
+    seen: u64,
+    /// Bound again to the tree a Clear made, at the key it stood at, under way.
+    rebinding: Option<Option<Vec<u8>>>,
+    /// Opened on a tree its statement had destroyed: it reads as empty, and refuses writes.
+    vacant: bool,
 }
 
 /// A count's progress: at a row, rows counted before it; or moving past one.
@@ -952,7 +1083,45 @@ impl SqlCursor {
             parks: ct.parks.clone(),
             seeding: None,
             counting: None,
+            changes: ct.changes.clone(),
+            seen: ct.changes.epoch(),
+            rebinding: None,
+            vacant: false,
         }
+    }
+
+    /// Brings the cursor up to what other statements of its connection changed in its tree since
+    /// it took its position (DESIGN.md §17, §3): its entry read again at its key, or, the tree
+    /// replaced by a Clear, the cursor bound to the new tree at that key. Step it until done.
+    fn caught_up(&mut self) -> Result<IOResult<()>> {
+        let epoch = self.changes.epoch();
+        if epoch == self.seen {
+            return Ok(IOResult::Done(()));
+        }
+        let behind = self.changes.since(self.id, self.seen);
+        if behind == Behind::Cleared && self.rebinding.is_none() {
+            if let Some(open) = self.open.take() {
+                self.rebinding = Some(open.position());
+            }
+        }
+        if let Some(key) = self.rebinding.clone() {
+            if let Some(key) = key {
+                done!(self.resolve()?.refresh(Some(key)));
+            }
+            self.rebinding = None;
+        } else if behind != Behind::Nothing {
+            if let Some(open) = self.open.as_mut() {
+                done!(open.refresh(None));
+            }
+        }
+        self.seen = epoch;
+        self.has_record = !self.is_empty();
+        Ok(IOResult::Done(()))
+    }
+
+    /// The cursor's position is current with its connection's changes.
+    fn positioned(&mut self) {
+        self.seen = self.changes.epoch();
     }
 
     /// The tree's rowid counter, seeded from the tree's largest key once it is (DESIGN.md §17,
@@ -976,8 +1145,19 @@ impl SqlCursor {
 
     /// The cursor with its tree resolved, as OpenRead and OpenWrite open it: bound to the tree its
     /// id names when it opens, as a b-tree cursor is to its root, so a Destroy later in its
-    /// statement leaves it on the tree it opened (R22).
+    /// statement leaves it on the tree it opened (R22). One opened on a tree its statement had
+    /// destroyed is vacant: it reads as empty, as SQLite's cursor on a freed root does, and a
+    /// write through it fails.
     pub fn opened(mut self) -> Result<Self> {
+        let destroyed = {
+            let guard = self.cell.lock();
+            let txn = guard.as_ref().ok_or_else(outside)?;
+            self.changes.destroyed_in(self.id, txn.command())
+        };
+        if destroyed {
+            self.vacant = true;
+            return Ok(self);
+        }
         self.resolve()?;
         Ok(self)
     }
@@ -985,6 +1165,12 @@ impl SqlCursor {
     /// The tree's catalog row as the transaction's current statement reads it, and a cursor over
     /// it, writing plainly where the current statement created the tree.
     fn resolve(&mut self) -> Result<&mut AtollCursor> {
+        if self.vacant {
+            return Err(LimboError::InternalError(format!(
+                "a write into tree {}, which its statement destroyed",
+                self.id
+            )));
+        }
         if self.open.is_none() {
             let (entry, plain) = {
                 let mut guard = self.cell.lock();
@@ -1041,6 +1227,9 @@ impl SqlCursor {
                             txn.wrote_schema();
                         }
                     }
+                    // The cursor's own change: it stands where its write left it.
+                    self.changes.wrote(self.id);
+                    self.positioned();
                     return Ok(IOResult::Done(()));
                 }
                 Judged::Park(c) => return Ok(park(&self.parks, c)?),
@@ -1053,6 +1242,7 @@ impl SqlCursor {
         let out = out?;
         if let IOResult::Done(()) = out {
             self.has_record = !self.is_empty();
+            self.positioned();
         }
         Ok(out)
     }
@@ -1067,21 +1257,33 @@ impl SqlCursor {
 
 impl CursorTrait for SqlCursor {
     fn last(&mut self) -> IOResultOr<()> {
+        if self.vacant {
+            return Ok(IOResult::Done(()));
+        }
         let out = self.resolve()?.last();
         self.moved(out)
     }
 
     fn next(&mut self) -> IOResultOr<()> {
+        if self.vacant {
+            return Ok(IOResult::Done(()));
+        }
+        crate::return_if_io!(self.caught_up());
         let out = self.resolve()?.next();
         self.moved(out)
     }
 
     fn prev(&mut self) -> IOResultOr<()> {
+        if self.vacant {
+            return Ok(IOResult::Done(()));
+        }
+        crate::return_if_io!(self.caught_up());
         let out = self.resolve()?.prev();
         self.moved(out)
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
+        crate::return_if_io!(self.caught_up());
         match self.open.as_mut() {
             Some(c) => Ok(c.rowid()?),
             None => Ok(IOResult::Done(None)),
@@ -1089,6 +1291,7 @@ impl CursorTrait for SqlCursor {
     }
 
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
+        crate::return_if_io!(self.caught_up());
         match self.open.as_mut() {
             Some(c) => Ok(c.record()?),
             None => Ok(IOResult::Done(None)),
@@ -1096,9 +1299,13 @@ impl CursorTrait for SqlCursor {
     }
 
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        if self.vacant {
+            return Ok(IOResult::Done(SeekResult::NotFound));
+        }
         let out = self.resolve()?.seek(key, op)?;
         if let IOResult::Done(_) = out {
             self.has_record = !self.is_empty();
+            self.positioned();
         }
         Ok(out)
     }
@@ -1123,6 +1330,7 @@ impl CursorTrait for SqlCursor {
     }
 
     fn delete(&mut self) -> IOResultOr<()> {
+        crate::return_if_io!(self.caught_up());
         self.wrote(true, None)
     }
 
@@ -1194,6 +1402,9 @@ impl CursorTrait for SqlCursor {
     }
 
     fn rewind(&mut self) -> IOResultOr<()> {
+        if self.vacant {
+            return Ok(IOResult::Done(()));
+        }
         let out = self.resolve()?.rewind();
         self.moved(out)
     }

@@ -16116,6 +16116,12 @@ pub fn op_page_count(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(PageCount { db, dest }, insn);
+    if let Some(atoll) = program.connection.atoll_for_db(*db) {
+        // Atoll mode: the page store's pages in use (DESIGN.md §17, §12).
+        state.registers[*dest].set_int(atoll.pages()?.into());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     let count = match with_header(&pager, mv_store.as_ref(), program, *db, |header| {
@@ -19980,6 +19986,19 @@ pub fn op_max_pgcnt(
 ) -> InsnResult {
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
 
+    if program.connection.atoll_for_db(*db).is_some() {
+        // Atoll mode: the page store has no page cap (DESIGN.md §17, R35). Read, the most there
+        // is, SQLite's own default; set, refused by name.
+        if *new_max != 0 {
+            return Err(LimboError::InvalidArgument(
+                "an Atoll database has no page cap: max_page_count cannot be set".to_string(),
+            )
+            .into());
+        }
+        state.registers[*dest].set_int(crate::storage::atoll::sql::mode::NO_PAGE_CAP.into());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let pager = program.get_pager_from_database_index(db)?;
     let result_value = if *new_max == 0 {
         // If new_max is 0, just return current maximum without changing it

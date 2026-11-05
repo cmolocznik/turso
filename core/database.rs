@@ -1089,17 +1089,19 @@ impl Database {
                             crate::thread::yield_now();
                             continue;
                         }
-                        Some(RegistryEntry::Ready(weak)) if weak.strong_count() > 0 => {
-                            drop(registry);
-                            if let Some(db) = Self::lookup_in_registry(
-                                path,
-                                &options.encryption,
-                                options.dialect.as_ref(),
-                                options.page_codec.as_deref(),
-                            )? {
-                                return Ok(AtollResolved::Hit(db));
+                        // The instance this IO keys the path to, the one entry its open would
+                        // collide with: a lookup through the file system's identity could miss
+                        // it under an IO whose files are not on disk, and wait for it forever.
+                        Some(RegistryEntry::Ready(weak)) => {
+                            if let Some(db) = weak.upgrade() {
+                                drop(registry);
+                                return Ok(AtollResolved::Hit(Self::registry_hit(
+                                    db,
+                                    &options.encryption,
+                                    options.dialect.as_ref(),
+                                    options.page_codec.as_deref(),
+                                )?));
                             }
-                            continue;
                         }
                         _ => {}
                     }
@@ -1268,7 +1270,16 @@ impl Database {
             _ => return Ok(None),
         };
         drop(registry);
+        Self::registry_hit(db, encryption_opts, dialect, page_codec).map(Some)
+    }
 
+    /// A registered instance, if the options of the open that found it are compatible with it.
+    fn registry_hit(
+        db: Arc<Database>,
+        encryption_opts: &Option<EncryptionOpts>,
+        dialect: &dyn Dialect,
+        page_codec: Option<&dyn PageCodec>,
+    ) -> Result<Arc<Database>> {
         // Validate encryption compatibility (key is not stored for security,
         // so we can only check cipher mode)
         let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
@@ -1281,7 +1292,7 @@ impl Database {
 
         Self::check_registry_dialect(&db, dialect)?;
 
-        Ok(Some(db))
+        Ok(db)
     }
 
     fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {

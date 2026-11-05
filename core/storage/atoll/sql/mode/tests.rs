@@ -846,3 +846,210 @@ fn catalogued_in(ct: &crate::storage::atoll::sql::mode::ConnTxn, id: u64) -> boo
     .unwrap()
     .is_some()
 }
+
+/// An ALTER COLUMN that the table's rows refuse fails whole, in autocommit: the schema row it
+/// rewrote before its check ran is put back, as the statement's every write is.
+#[test]
+fn a_rejected_alter_column_leaves_the_schema_as_it_was() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/alter");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, -1), (2, NULL)")
+        .unwrap();
+    let schema = "SELECT sql FROM sqlite_schema WHERE name = 't'";
+    let before = rows(&conn, schema);
+    let err = conn
+        .execute("ALTER TABLE t ALTER COLUMN v TO v2 INTEGER CHECK(v2 > 0)")
+        .unwrap_err();
+    assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+    assert_eq!(rows(&conn, schema), before);
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(rows(&other, schema), before, "nothing of it committed");
+}
+
+/// Steps `scan`, running `between` after each row it returns with the row's number, and returns
+/// the rows.
+fn scan_running(
+    scan: &mut crate::Statement,
+    mut between: impl FnMut(usize, &[Value]),
+) -> Vec<Vec<Value>> {
+    let mut seen = Vec::new();
+    while let Some(row) = next_row(scan) {
+        between(seen.len(), &row);
+        seen.push(row);
+    }
+    seen
+}
+
+/// A whole-table DELETE of another statement of the connection, while a scan stands at one of
+/// the table's rows, replaces the tree under it: the scan reads no row there and goes on to the
+/// end of the new tree, as SQLite's cursor reads NULL once its table is cleared (DESIGN.md §17,
+/// §3, the writer's view).
+#[test]
+fn a_scan_reads_no_row_where_its_connection_cleared_the_table() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/cleared-under");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t1(a, b)").unwrap();
+    conn.execute("CREATE TABLE t2(c, d)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES(1, 2)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES(3, 4), (5, 6)").unwrap();
+    let mut scan = conn
+        .prepare("SELECT CASE WHEN c = 5 THEN b ELSE NULL END AS b, c, d FROM t1, t2")
+        .unwrap();
+    let seen = scan_running(&mut scan, |_, _| {
+        conn.execute("DELETE FROM t1").unwrap();
+    });
+    let int = Value::from_i64;
+    assert_eq!(
+        seen,
+        vec![
+            vec![Value::Null, int(3), int(4)],
+            vec![Value::Null, int(5), int(6)],
+        ]
+    );
+}
+
+/// In an explicit transaction, a row another statement of the connection deletes under a scan
+/// reads as no row, and the scan goes on from its key; a row another statement updates reads as
+/// it now is (DESIGN.md §17, §3, its own writes).
+#[test]
+fn a_scan_reads_the_row_under_it_as_its_connection_left_it() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/changed-under");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t2 VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (10, 'a'), (20, 'b'), (30, 'c')")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut scan = conn
+        .prepare("SELECT t1.id, t1.v, t2.x FROM t1, t2")
+        .unwrap();
+    let seen = scan_running(&mut scan, |_, row| {
+        if row[0] == Value::from_i64(10) && row[2] == Value::from_i64(1) {
+            conn.execute("UPDATE t1 SET v = 'a2' WHERE id = 10")
+                .unwrap();
+        }
+        if row[0] == Value::from_i64(20) && row[2] == Value::from_i64(1) {
+            conn.execute("DELETE FROM t1 WHERE id = 20").unwrap();
+        }
+    });
+    drop(scan);
+    conn.execute("COMMIT").unwrap();
+    let (int, null) = (Value::from_i64, Value::Null);
+    assert_eq!(
+        seen,
+        vec![
+            vec![int(10), text("a"), int(1)],
+            vec![int(10), text("a2"), int(2)],
+            vec![int(20), text("b"), int(1)],
+            vec![null.clone(), null, int(2)],
+            vec![int(30), text("c"), int(1)],
+            vec![int(30), text("c"), int(2)],
+        ]
+    );
+}
+
+/// A ROLLBACK TO of the connection under a scan puts back rows the scan read changed: the scan
+/// reads the row it stands at as the rollback left it.
+#[test]
+fn a_scan_reads_the_row_under_it_as_a_rollback_to_left_it() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/rolled-under");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t2 VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (10, 'a')").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("UPDATE t1 SET v = 'changed' WHERE id = 10")
+        .unwrap();
+    let mut scan = conn.prepare("SELECT t1.v, t2.x FROM t1, t2").unwrap();
+    let seen = scan_running(&mut scan, |i, _| {
+        if i == 0 {
+            conn.execute("ROLLBACK TO s").unwrap();
+        }
+    });
+    drop(scan);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        seen,
+        vec![
+            vec![text("changed"), Value::from_i64(1)],
+            vec![text("a"), Value::from_i64(2)],
+        ]
+    );
+}
+
+/// A statement that destroys a tree, then opens a cursor on it, reads the tree as empty, as
+/// SQLite's cursor reads a freed root: a DROP of CDC's version table, which deletes that table's
+/// rows after its Destroy, succeeds.
+#[test]
+fn a_cursor_its_statement_opens_on_a_tree_it_destroyed_reads_as_empty() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/destroyed-open");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    let named = "SELECT count(*) FROM sqlite_schema WHERE name = 'turso_cdc_version'";
+    assert_eq!(rows(&conn, named), vec![vec![Value::from_i64(1)]]);
+    conn.execute("DROP TABLE turso_cdc_version").unwrap();
+    assert_eq!(rows(&conn, named), vec![vec![Value::from_i64(0)]]);
+}
+
+/// `PRAGMA page_count` counts the page store's pages in use (DESIGN.md §17, §12), and grows by at
+/// least the bytes written; `max_page_count` reads as SQLite's no-cap default and cannot be set,
+/// Atoll having no page cap (R35).
+#[test]
+fn page_count_comes_from_the_page_store_and_there_is_no_page_cap() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/page-count");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+        .unwrap();
+    let count = |conn: &Arc<Connection>| match &rows(conn, "PRAGMA page_count")[..] {
+        [row] => match row[0] {
+            Value::Numeric(crate::Numeric::Integer(n)) => n,
+            ref other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    let before = count(&conn);
+    assert!(before > 0, "the catalog's and the schema's pages");
+    let (n, bytes) = (100, 4000);
+    for _ in 0..n {
+        conn.execute(format!("INSERT INTO t (b) VALUES (zeroblob({bytes}))"))
+            .unwrap();
+    }
+    let after = count(&conn);
+    assert!(
+        after - before >= n * bytes / super::PAGE as i64,
+        "{before} pages before {n} rows of {bytes} bytes, {after} after"
+    );
+    assert_eq!(
+        rows(&conn, "PRAGMA max_page_count"),
+        vec![vec![Value::from_i64(super::NO_PAGE_CAP as i64)]]
+    );
+    let err = conn.execute("PRAGMA max_page_count = 50").unwrap_err();
+    assert!(err.to_string().contains("no page cap"), "{err}");
+}
+
+/// Two opens of one path while the first is alive get one instance, under an IO whose files are
+/// not on disk, as under one whose files are: the registry keys the path by the IO's identity.
+#[test]
+fn two_opens_of_a_path_share_one_instance() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let first = open(&io, "/db/shared-instance");
+    let second = open(&io, "/db/shared-instance");
+    assert!(Arc::ptr_eq(&first, &second));
+}

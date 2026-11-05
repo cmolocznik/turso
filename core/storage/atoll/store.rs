@@ -545,6 +545,28 @@ impl PageStore {
         })
     }
 
+    /// How many page ids of `class` are in use: the page table's root counts those below each of
+    /// its children, or, a root that is a leaf, holds their entries.
+    pub fn pages_in_use(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<u64>> {
+        let height = self.height(Tree::Map, class);
+        let root = radix::root(Tree::Map, class, height);
+        Ok(match self.meta.get(root)? {
+            IOResult::Done(f) => match f.read(|b| {
+                if height == 1 {
+                    (0..radix::MAP_ENTRIES)
+                        .filter(|&n| radix::used(Tree::Map, b, n))
+                        .count() as u64
+                } else {
+                    (0..radix::FANOUT).map(|c| radix::used_below(b, c)).sum()
+                }
+            }) {
+                Some(n) => IOResult::Done(n),
+                None => busy(),
+            },
+            IOResult::IO(io) => IOResult::IO(io),
+        })
+    }
+
     /// The slot holding `pid`'s current copy, if it has one.
     pub fn location(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Option<u64>>> {
         Ok(match self.entry(pid)? {

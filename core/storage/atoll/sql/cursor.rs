@@ -75,6 +75,11 @@ pub struct AtollCursor {
     /// An insert's key, and, once its write is done, what it came to, while the cursor moves to
     /// the entry it wrote.
     inserted: Option<(Vec<u8>, Option<Write>)>,
+    /// The key of the entry the cursor stood at, found gone when it read again: it stands at the
+    /// entry after it, or at none, read as no row until it moves.
+    left: Option<Vec<u8>>,
+    /// The key a [`refresh`](Self::refresh) seeks, kept across IO.
+    refreshing: Option<Vec<u8>>,
 }
 
 enum Writing {
@@ -143,6 +148,8 @@ impl AtollCursor {
             plain: false,
             writing: None,
             inserted: None,
+            left: None,
+            refreshing: None,
         }
     }
 
@@ -190,6 +197,7 @@ impl AtollCursor {
         if let IOResult::Done(_) = moved {
             self.record = None;
             self.null_row = false;
+            self.left = None;
         }
         Ok(moved)
     }
@@ -210,19 +218,59 @@ impl AtollCursor {
         Ok(IOResult::Done(()))
     }
 
+    /// Moves to the next row: from an entry found gone, the one after it, where it already stands.
     pub fn next(&mut self) -> Result<IOResult<()>> {
+        if self.left.take().is_some() {
+            self.record = None;
+            return Ok(IOResult::Done(()));
+        }
         done!(self.step(Move::Next));
         Ok(IOResult::Done(()))
     }
 
+    /// Moves to the previous row: from an entry found gone, the last one before its key.
     pub fn prev(&mut self) -> Result<IOResult<()>> {
+        if let Some(key) = self.left.take() {
+            if let IOResult::IO(io) = self.step(Move::Seek(&key, Seek::Lt))? {
+                self.left = Some(key);
+                return Ok(IOResult::IO(io));
+            }
+            return Ok(IOResult::Done(()));
+        }
         done!(self.step(Move::Prev));
         Ok(IOResult::Done(()))
     }
 
     /// Whether the cursor is at no row.
     pub fn is_empty(&self) -> bool {
-        self.null_row || self.cursor.key().is_none()
+        self.null_row || self.left.is_some() || self.cursor.key().is_none()
+    }
+
+    /// The key the cursor stands at, or the one it found gone.
+    pub fn position(&self) -> Option<Vec<u8>> {
+        self.left
+            .clone()
+            .or_else(|| self.cursor.key().map(<[u8]>::to_vec))
+    }
+
+    /// Reads its entry again in the view the transaction now has, after another statement of its
+    /// connection changed the tree (DESIGN.md §17, §3), or at `key` for a cursor bound again to a
+    /// tree a Clear replaced: at the same key it reads the entry as it now is; a key gone leaves
+    /// it at the entry after it, read as no row until its next move, which stays there, as
+    /// SQLite's cursor steps past a deleted row. A cursor at no row, or on a null row, stays.
+    pub fn refresh(&mut self, key: Option<Vec<u8>>) -> Result<IOResult<()>> {
+        if self.null_row {
+            return Ok(IOResult::Done(()));
+        }
+        let Some(key) = self.refreshing.take().or(key).or_else(|| self.position()) else {
+            return Ok(IOResult::Done(()));
+        };
+        if let IOResult::IO(io) = self.step(Move::Seek(&key, Seek::Ge))? {
+            self.refreshing = Some(key);
+            return Ok(IOResult::IO(io));
+        }
+        self.left = (self.cursor.key() != Some(key.as_slice())).then_some(key);
+        Ok(IOResult::Done(()))
     }
 
     pub fn set_null_flag(&mut self, flag: bool) {
@@ -539,7 +587,7 @@ impl AtollCursor {
             let k = self
                 .cursor
                 .key()
-                .filter(|_| !self.null_row)
+                .filter(|_| !self.null_row && self.left.is_none())
                 .ok_or_else(|| LimboError::InternalError("a delete at no row".into()))?
                 .to_vec();
             self.writing = Some(if self.plain {

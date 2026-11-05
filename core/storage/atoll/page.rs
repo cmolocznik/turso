@@ -7,12 +7,13 @@
 //! Every page starts with a [`HEADER_SIZE`]-byte header:
 //!
 //! ```text
-//! lsn: u64 | checksum: u32 | class: u8 | kind: u8 | flags: u16 | pid: u64
+//! seq: u64 | checksum: u32 | class: u8 | kind: u8 | flags: u16 | pid: u64
 //! ```
 //!
 //! The checksum is CRC32C over the whole page with the checksum field taken as zero, so a copy
-//! torn on its way to disk, or a slot never written, reads as invalid. The page id and LSN tell a
-//! copy apart from the others the same place has held.
+//! torn on its way to disk, or a slot never written, reads as invalid. `seq` is its owner's: a data
+//! page's change count when the copy was taken, a metadata page's checkpoint number. The page id
+//! and `seq` tell a copy apart from the others the same place has held.
 
 /// log2 of the smallest page size.
 use super::shared::{Bytes, BytesMut};
@@ -27,7 +28,7 @@ pub const MAX_PAGE_SIZE: usize = MIN_PAGE_SIZE << (CLASS_COUNT - 1);
 /// Bytes at the start of every page reserved for the header.
 pub const HEADER_SIZE: usize = 24;
 
-const LSN: std::ops::Range<usize> = 0..8;
+const SEQ: std::ops::Range<usize> = 0..8;
 const CHECKSUM: std::ops::Range<usize> = 8..12;
 const CLASS: usize = 12;
 const KIND: usize = 13;
@@ -130,12 +131,12 @@ impl PageId {
     }
 }
 
-pub fn lsn<P: Bytes + ?Sized>(page: &P) -> u64 {
-    page.u64_at(LSN.start)
+pub fn seq<P: Bytes + ?Sized>(page: &P) -> u64 {
+    page.u64_at(SEQ.start)
 }
 
-pub fn set_lsn<P: BytesMut + ?Sized>(page: &mut P, lsn: u64) {
-    page.put_u64(LSN.start, lsn);
+pub fn set_seq<P: BytesMut + ?Sized>(page: &mut P, seq: u64) {
+    page.put_u64(SEQ.start, seq);
 }
 
 pub fn kind<P: Bytes + ?Sized>(page: &P) -> PageKind {
@@ -200,12 +201,12 @@ mod tests {
         let pid = PageId::new(class, 7);
         let mut page = vec![0u8; class.size()];
         page[HEADER_SIZE..HEADER_SIZE + 5].copy_from_slice(b"hello");
-        set_lsn(&mut page, 42);
+        set_seq(&mut page, 42);
         set_kind(&mut page, PageKind(3));
         seal(&mut page, pid);
         assert!(verify(&page, pid));
         assert_eq!(
-            (lsn(&page), self::pid(&page), kind(&page)),
+            (seq(&page), self::pid(&page), kind(&page)),
             (42, pid, PageKind(3))
         );
         assert!(

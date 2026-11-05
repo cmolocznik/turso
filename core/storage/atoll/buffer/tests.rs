@@ -1,7 +1,6 @@
 use super::*;
 use crate::io::crash::CrashIO;
 use crate::io::{OpenFlags, IO};
-use crate::storage::atoll::log::{framed_len, Admitted, Header, Kind, Log, LogConfig};
 use crate::storage::atoll::page::HEADER_SIZE;
 use crate::storage::atoll::shared::{Bytes, BytesMut};
 use crate::storage::atoll::store::StoreConfig;
@@ -10,48 +9,30 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::collections::BTreeMap;
 
-/// The kind of the records logging test changes; the page store owns kinds 1 to 6.
-const CHANGE: Kind = Kind::new(100).unwrap();
-
 fn class(i: usize) -> SizeClass {
     SizeClass::new(i).unwrap()
 }
 
-fn open(b: &Backend, budget: usize) -> (Arc<Log>, Arc<BufferPool>) {
+fn open(b: &Backend, budget: usize) -> Arc<BufferPool> {
     open_on(&b.io, &b.base, budget)
 }
 
-fn open_on(io: &Arc<dyn IO>, base: &str, budget: usize) -> (Arc<Log>, Arc<BufferPool>) {
+fn open_on(io: &Arc<dyn IO>, base: &str, budget: usize) -> Arc<BufferPool> {
     open_with(io, base, BufferConfig::with_budget(budget))
 }
 
-fn open_with(io: &Arc<dyn IO>, base: &str, config: BufferConfig) -> (Arc<Log>, Arc<BufferPool>) {
-    let log = Log::open(
-        io.clone(),
-        base,
-        LogConfig {
-            segment_bytes: 4 << 20,
-            buffer_bytes: 256 << 10,
-            chunk_bytes: 16 << 10,
-            writes_in_flight: 3,
-            direct: true,
-        },
-        0,
-    )
-    .unwrap();
-    let store = PageStore::new(
+fn open_with(io: &Arc<dyn IO>, base: &str, config: BufferConfig) -> Arc<BufferPool> {
+    let store = PageStore::open(
         io.clone(),
         base,
         StoreConfig {
             file_bytes: 1 << 30,
             meta_pages: 1 << 10,
         },
-        log.clone(),
         [[1; CLASS_COUNT]; crate::storage::atoll::meta::TREES],
+        0,
     );
-    let pool =
-        BufferPool::new(config, Arc::new(LocalSource::new(store.clone())), store, 0).unwrap();
-    (log, pool)
+    BufferPool::new(config, Arc::new(LocalSource::new(store.clone())), store).unwrap()
 }
 
 /// Writes `version` into `page` beside its id: after the header, and at its end, so a copy torn
@@ -79,42 +60,16 @@ struct Page {
 
 struct Model<'a> {
     io: &'a Arc<dyn IO>,
-    log: &'a Arc<Log>,
     pool: &'a Arc<BufferPool>,
     pages: Vec<Page>,
 }
 
 impl Model<'_> {
-    /// Logs a change to `pid` before latching it, as every change is admitted.
-    fn change<P: BytesMut + ?Sized>(
-        &self,
-        page: &mut P,
-        pid: PageId,
-        version: u64,
-        admitted: &mut Admitted,
-    ) -> Lsn {
-        stamp(page, pid, version);
-        let payload = version.to_le_bytes();
-        let header = Header {
-            kind: CHANGE,
-            flags: 0,
-            txn: 0,
-            prev: None,
-        };
-        self.log
-            .append(admitted, &header, &[&pid.raw().to_le_bytes(), &payload])
-    }
-
-    fn admit(&self) -> Admitted {
-        drive(self.io, || self.log.admit(framed_len(16))).unwrap()
-    }
-
     fn allocate(&mut self, class: SizeClass) {
-        let mut admitted = self.admit();
         let mut g = drive(self.io, || self.pool.allocate(class)).unwrap();
         let pid = g.pid();
-        let lsn = self.change(&mut g.page_mut(), pid, 1, &mut admitted);
-        g.changed(lsn);
+        stamp(&mut g.page_mut(), pid, 1);
+        g.changed();
         let hint = AtomicU32::new(g.hint());
         drop(g);
         self.pages.push(Page {
@@ -125,7 +80,6 @@ impl Model<'_> {
     }
 
     fn update(&mut self, i: usize) {
-        let mut admitted = self.admit();
         let (pid, version) = (self.pages[i].pid, self.pages[i].version + 1);
         let mut g = drive(self.io, || {
             self.pool.fix_exclusive(pid, Some(&self.pages[i].hint))
@@ -136,8 +90,8 @@ impl Model<'_> {
             Some(version - 1),
             "{pid:?} before an update"
         );
-        let lsn = self.change(&mut g.page_mut(), pid, version, &mut admitted);
-        g.changed(lsn);
+        stamp(&mut g.page_mut(), pid, version);
+        g.changed();
         drop(g);
         self.pages[i].version = version;
     }
@@ -181,10 +135,9 @@ impl Model<'_> {
 #[test]
 fn pages_keep_their_contents_through_eviction_writeback_and_moves_between_classes() {
     for b in backends() {
-        let (log, pool) = open(&b, MIN_BUDGET);
+        let pool = open(&b, MIN_BUDGET);
         let mut model = Model {
             io: &b.io,
-            log: &log,
             pool: &pool,
             pages: Vec::new(),
         };
@@ -222,18 +175,13 @@ fn pages_keep_their_contents_through_eviction_writeback_and_moves_between_classe
             held[3]
         );
         model.check_all();
-        // A pass over every shard leaves no page dirty, and the pool's redo floor at the log's
-        // end when the passes began.
-        let end = log.end();
-        for shard in 0..pool.shard_count() {
-            let mut pass = pool.pass(shard);
-            drive(&b.io, || pass.step(&pool)).unwrap();
-        }
+        // A sweep leaves no page dirty.
+        let mut sweep = pool.sweep();
+        drive(&b.io, || sweep.step(&pool)).unwrap();
         let dirty = (0..pool.memory.grains())
             .filter(|&f| pool.header(f).status() == RESIDENT && pool.header(f).dirty())
             .count();
-        assert_eq!(dirty, 0, "{}: pages left dirty by passes", b.name);
-        assert_eq!(pool.redo_floor(), end, "{}", b.name);
+        assert_eq!(dirty, 0, "{}: pages left dirty by the sweep", b.name);
         // Dropped pages free their frames; the rest still read back.
         let kept = model.pages.split_off(model.pages.len() / 2);
         for p in std::mem::replace(&mut model.pages, kept) {
@@ -254,10 +202,9 @@ fn concurrent_fixes_lose_no_change() {
     const THREADS: usize = 4;
     const OPS: usize = 3000;
     for b in backends() {
-        let (log, pool) = open(&b, MIN_BUDGET);
+        let pool = open(&b, MIN_BUDGET);
         let mut model = Model {
             io: &b.io,
-            log: &log,
             pool: &pool,
             pages: Vec::new(),
         };
@@ -277,14 +224,13 @@ fn concurrent_fixes_lose_no_change() {
                             let i = rng.random_range(0..pages.len());
                             let p = &pages[i];
                             if rng.random_bool(0.5) {
-                                let mut admitted = model.admit();
                                 let mut g = drive(model.io, || {
                                     model.pool.fix_exclusive(p.pid, Some(&p.hint))
                                 })
                                 .unwrap();
                                 let n = stamped(g.page(), p.pid).expect("a whole page") + 1;
-                                let lsn = model.change(&mut g.page_mut(), p.pid, n, &mut admitted);
-                                g.changed(lsn);
+                                stamp(&mut g.page_mut(), p.pid, n);
+                                g.changed();
                                 counts[i] += 1;
                             } else {
                                 loop {
@@ -312,16 +258,15 @@ fn concurrent_fixes_lose_no_change() {
     }
 }
 
-/// A page whose write was in flight when a pass began may have changed since its copy was taken,
-/// by a change logged before the pass: the pass waits for the write, and writes the page again.
+/// A page whose write was in flight when a sweep began may have changed since its copy was taken,
+/// by a change made before the sweep: the sweep waits for the write, and writes the page again.
 #[test]
-fn a_pass_writes_again_a_page_changed_while_its_earlier_write_was_in_flight() {
+fn a_sweep_writes_again_a_page_changed_while_its_earlier_write_was_in_flight() {
     // Writes complete only at a step, so one stays in flight while the page changes.
     let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
-    let (log, pool) = open_on(&io, "/db/pass", MIN_BUDGET);
+    let pool = open_on(&io, "/db/sweep", MIN_BUDGET);
     let mut model = Model {
         io: &io,
-        log: &log,
         pool: &pool,
         pages: Vec::new(),
     };
@@ -334,39 +279,51 @@ fn a_pass_writes_again_a_page_changed_while_its_earlier_write_was_in_flight() {
         io.wait_for_completion(c).unwrap();
     }
     assert!(!written.finished(), "the write is in flight");
-    let changed = log.end();
     model.update(0);
-    let shard = pool.shard_of(frame);
-    let mut pass = pool.pass(shard);
-    drive(&io, || pass.step(&pool)).unwrap();
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
     assert!(
-        !pool.header(frame).dirty() || pool.shards[shard].position() <= changed,
-        "the shard's position passed a change no written copy holds"
+        !pool.header(frame).dirty(),
+        "a page changed while its write was in flight was not written again"
     );
     model.check_all();
 }
 
-/// Marks `pid` retired, as the group of a versioned write that replaces its value does.
-fn retire(io: &Arc<dyn IO>, log: &Arc<Log>, store: &Arc<PageStore>, pid: PageId) {
-    let marks = drive(io, || store.marks(&[pid], &[])).unwrap();
-    let records = marks.records();
-    let lens: Vec<u64> = records.iter().map(|(_, p)| framed_len(p.len())).collect();
-    let mut admitted = drive(io, || log.admit(lens.iter().sum())).unwrap();
-    let locked = marks
-        .lock(store)
-        .expect("no one else latches the marks' pages");
-    let pieces: Vec<[&[u8]; 1]> = records.iter().map(|(_, p)| [p.as_slice()]).collect();
-    let group: Vec<(Header, &[&[u8]])> = records
-        .iter()
-        .zip(&pieces)
-        .map(|((h, _), p)| (*h, &p[..]))
-        .collect();
-    let lsn = if group.len() == 1 {
-        log.append(&mut admitted, &group[0].0, group[0].1)
-    } else {
-        *log.append_group(&mut admitted, &group).1.last().unwrap()
+/// A checkpoint settles a page at the change count it imaged. A page changed past that count, and
+/// written back since, has its newest copy in its swap slot: it keeps that copy, and evicted, reads
+/// back as it stands.
+#[test]
+fn a_page_settled_at_a_count_it_has_moved_past_keeps_its_newer_swap_copy() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/settled", MIN_BUDGET);
+    let mut model = Model {
+        io: &io,
+        pool: &pool,
+        pages: Vec::new(),
     };
-    locked.commit(store, lsn - lens.iter().sum::<u64>(), lsn);
+    model.allocate(class(0));
+    let pid = model.pages[0].pid;
+    let frame = model.pages[0].hint.load(Ordering::Relaxed) - 1;
+    let imaged = pool.header(frame).changes.load(Ordering::Acquire);
+    model.update(0);
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
+    assert!(
+        pool.store.swap_slot(pid).is_some(),
+        "written to a swap copy"
+    );
+    pool.settled(pid, imaged);
+    assert!(
+        pool.store.swap_slot(pid).is_some(),
+        "the newer swap copy was given up"
+    );
+    assert!(pool.evict_clean(pid), "the page left its frame");
+    model.check(0, false);
+}
+
+/// Marks `pid` retired, as a versioned write that replaces its value does.
+fn retire(store: &Arc<PageStore>, pid: PageId) {
+    store.retire(pid);
 }
 
 /// A retired page freed while its writeback is in flight (DESIGN.md §6.5): the free waits for the
@@ -376,17 +333,16 @@ fn retire(io: &Arc<dyn IO>, log: &Arc<Log>, store: &Arc<PageStore>, pid: PageId)
 fn a_retired_page_freed_with_its_write_in_flight_stays_free_after_the_write_lands() {
     // Writes complete only at a step, so the page's write stays in flight across the first try.
     let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
-    let (log, pool) = open_on(&io, "/db/retired", MIN_BUDGET);
+    let pool = open_on(&io, "/db/retired", MIN_BUDGET);
     let mut model = Model {
         io: &io,
-        log: &log,
         pool: &pool,
         pages: Vec::new(),
     };
     model.allocate(class(0));
     let pid = model.pages[0].pid;
     let frame = model.pages[0].hint.load(Ordering::Relaxed) - 1;
-    retire(&io, &log, &pool.store, pid);
+    retire(&pool.store, pid);
     // Written back the way eviction does: marked, then stepped until the write is submitted.
     pool.header(frame).flags.fetch_or(WRITING, Ordering::AcqRel);
     let written = pool.write_back(class(0), vec![frame], false).unwrap();
@@ -395,21 +351,22 @@ fn a_retired_page_freed_with_its_write_in_flight_stays_free_after_the_write_land
     }
     assert!(!written.finished(), "the write is in flight");
     assert!(
-        matches!(pool.free_retired(pid).unwrap(), IOResult::IO(_)),
+        matches!(pool.free_unreferenced(pid).unwrap(), IOResult::IO(_)),
         "freed while its write was in flight"
     );
-    drive(&io, || pool.free_retired(pid)).unwrap();
+    drive(&io, || pool.free_unreferenced(pid)).unwrap();
     drive(&io, || pool.settle_writes()).unwrap();
     assert!(written.finished(), "the write never landed");
     assert_eq!(
         drive(&io, || pool.store.entry(pid)).unwrap(),
         crate::storage::atoll::radix::FREE,
-        "the write's remap brought the page back"
+        "the write brought the page back"
     );
     assert!(
-        !drive(&io, || pool.store.retired(pid)).unwrap(),
-        "still marked retired"
+        pool.store.swap_slot(pid).is_none(),
+        "the write named a swap copy of a page freed"
     );
+    assert!(!pool.store.retired(pid), "still marked retired");
     assert!(
         pool.table.find(&pool.frames.headers, pid.raw()).is_none(),
         "a frame still holds it"
@@ -423,10 +380,9 @@ fn a_retired_page_freed_with_its_write_in_flight_stays_free_after_the_write_land
 fn a_drain_empties_its_batch_while_a_page_in_it_keeps_changing() {
     // Writes complete only at a step, so a page can change while its write is in flight.
     let io: Arc<dyn IO> = Arc::new(CrashIO::new(5));
-    let (log, pool) = open_on(&io, "/db/drain", MIN_BUDGET);
+    let pool = open_on(&io, "/db/drain", MIN_BUDGET);
     let mut model = Model {
         io: &io,
-        log: &log,
         pool: &pool,
         pages: Vec::new(),
     };
@@ -449,11 +405,10 @@ fn a_drain_empties_its_batch_while_a_page_in_it_keeps_changing() {
             if pool.table.find(&pool.frames.headers, p.pid.raw()).is_none() {
                 continue;
             }
-            let mut admitted = model.admit();
             if let IOResult::Done(mut g) = pool.fix_exclusive(p.pid, Some(&p.hint)).unwrap() {
                 let version = p.version + 1;
-                let lsn = model.change(&mut g.page_mut(), p.pid, version, &mut admitted);
-                g.changed(lsn);
+                stamp(&mut g.page_mut(), p.pid, version);
+                g.changed();
                 drop(g);
                 model.pages[i].version = version;
             }
@@ -472,10 +427,9 @@ fn a_drain_empties_its_batch_while_a_page_in_it_keeps_changing() {
 #[test]
 fn a_write_out_queued_when_the_pool_is_dropped_does_not_keep_it() {
     let io: Arc<dyn IO> = Arc::new(CrashIO::new(5));
-    let (log, pool) = open_on(&io, "/db/dropped", MIN_BUDGET);
+    let pool = open_on(&io, "/db/dropped", MIN_BUDGET);
     let mut model = Model {
         io: &io,
-        log: &log,
         pool: &pool,
         pages: Vec::new(),
     };
@@ -495,7 +449,7 @@ fn a_write_out_queued_when_the_pool_is_dropped_does_not_keep_it() {
 #[test]
 fn a_failed_upgrade_leaves_the_holders_latch_alone() {
     let b = &backends()[0];
-    let (_log, pool) = open(b, MIN_BUDGET);
+    let pool = open(b, MIN_BUDGET);
     let page = drive(&b.io, || pool.allocate(class(0))).unwrap();
     let pid = page.pid();
     drop(page);
@@ -517,10 +471,9 @@ fn a_failed_upgrade_leaves_the_holders_latch_alone() {
 #[test]
 fn a_drain_chosen_before_its_batch_changed_class_leaves_the_new_class_alone() {
     for b in backends() {
-        let (log, pool) = open(&b, MIN_BUDGET);
+        let pool = open(&b, MIN_BUDGET);
         let mut model = Model {
             io: &b.io,
-            log: &log,
             pool: &pool,
             pages: Vec::new(),
         };
@@ -528,10 +481,8 @@ fn a_drain_chosen_before_its_batch_changed_class_leaves_the_new_class_alone() {
             model.allocate(class(2));
         }
         // Written back, so a wrong eviction drops them at once rather than writing them first.
-        for shard in 0..pool.shard_count() {
-            let mut pass = pool.pass(shard);
-            drive(&b.io, || pass.step(&pool)).unwrap();
-        }
+        let mut sweep = pool.sweep();
+        drive(&b.io, || sweep.step(&pool)).unwrap();
         let frame = |p: &Page| p.hint.load(Ordering::Relaxed) - 1;
         let batch = frame(&model.pages[0]) / memory::GRAINS;
         // A drain of the batch as class 0's, chosen before it went to class 2.
@@ -551,10 +502,9 @@ fn a_drain_chosen_before_its_batch_changed_class_leaves_the_new_class_alone() {
 }
 
 #[test]
-fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
+fn temporary_pages_go_to_their_files_and_never_to_a_checkpoint() {
     for b in backends() {
-        let (log, pool) = open(&b, MIN_BUDGET);
-        let end = log.end();
+        let pool = open(&b, MIN_BUDGET);
         let read = |pid: PageId| loop {
             let g = drive(&b.io, || pool.fix_optimistic(pid, None)).unwrap();
             if let Some(seen) = g.read(|p| {
@@ -572,7 +522,7 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
             let mut g = drive(&b.io, || pool.allocate_temporary(class(3))).unwrap();
             let pid = g.pid();
             stamp(&mut g.page_mut(), pid, v);
-            g.changed(pool.temporary_lsn());
+            g.changed();
             pages.push((pid, v));
         }
         for &(pid, v) in &pages {
@@ -584,20 +534,31 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
             "{}",
             b.name
         );
-        assert_eq!(log.end(), end, "{}: a temporary page was logged", b.name);
-        // Passes leave them dirty, and hold the redo floor back for none of them.
-        for shard in 0..pool.shard_count() {
-            let mut pass = pool.pass(shard);
-            drive(&b.io, || pass.step(&pool)).unwrap();
-        }
+        // A sweep leaves them dirty, and a checkpoint's cut finds none of them owed an image: a
+        // page of the store changed beside them is the one it finds.
+        let mut g = drive(&b.io, || pool.allocate(class(0))).unwrap();
+        let stored = g.pid();
+        stamp(&mut g.page_mut(), stored, 1);
+        g.changed();
+        drop(g);
+        let mut scan = CutScan::default();
+        assert!(matches!(pool.begin_cut(1, &mut scan), IOResult::Done(())));
+        pool.end_cut(1);
+        assert_eq!(
+            scan.owed,
+            vec![stored],
+            "{}: what the cut found owed",
+            b.name
+        );
+        let mut sweep = pool.sweep();
+        drive(&b.io, || sweep.step(&pool)).unwrap();
         let dirty = (0..pool.memory.grains())
             .filter(|&f| {
                 let h = pool.header(f);
                 h.status() == RESIDENT && h.dirty() && PageId::from_raw(h.pid()).is_temporary()
             })
             .count();
-        assert!(dirty > 0, "{}: a pass wrote temporary pages", b.name);
-        assert_eq!(pool.redo_floor(), end, "{}", b.name);
+        assert!(dirty > 0, "{}: a sweep wrote temporary pages", b.name);
         // A freed number comes back as a new page, zeros, even once evicted unchanged.
         let freed: Vec<PageId> = pages.drain(..100).map(|(pid, _)| pid).collect();
         for &pid in &freed {
@@ -628,13 +589,12 @@ fn temporary_pages_go_to_their_files_and_never_to_the_log_or_a_checkpoint() {
         for &pid in &again {
             assert!(read(pid).1, "{}: {pid:?} reads its earlier life", b.name);
         }
-        assert_eq!(log.end(), end, "{}", b.name);
         // Opening again deletes the files.
         let path = format!("{}.t3", b.base);
         let file = b.io.open_file(&path, OpenFlags::Create, false).unwrap();
         assert!(file.size().unwrap() > 0, "{}: nothing was written", b.name);
         drop((file, pool));
-        let (_log, _pool) = open(&b, MIN_BUDGET);
+        let _pool = open(&b, MIN_BUDGET);
         let file = b.io.open_file(&path, OpenFlags::Create, false).unwrap();
         assert_eq!(
             file.size().unwrap(),
@@ -654,13 +614,13 @@ type Slot = Mutex<Option<(PageId, u64)>>;
 /// the version last written to it.
 fn concurrent_pages(ops: usize, seed: u64) {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let (log, pool) = open_on(&io, "/db/schedules", MIN_BUDGET);
+    let pool = open_on(&io, "/db/schedules", MIN_BUDGET);
     // Pages and the versions written to them, behind one lock per page: a thread changing a page
     // holds its entry, so the version it writes is the one it records.
     let pages: Arc<Vec<Slot>> = Arc::new((0..6).map(|_| Mutex::new(None)).collect());
     let mut handles = Vec::new();
     for t in 0..3u64 {
-        let (io, log, pool, pages) = (io.clone(), log.clone(), pool.clone(), pages.clone());
+        let (io, pool, pages) = (io.clone(), pool.clone(), pages.clone());
         handles.push(crate::thread::spawn(move || {
             let mut rng = ChaCha8Rng::seed_from_u64(seed * 10 + t);
             for _ in 0..ops {
@@ -668,27 +628,22 @@ fn concurrent_pages(ops: usize, seed: u64) {
                 let Some(mut slot) = pages[i].try_lock() else {
                     continue;
                 };
-                let admit = || named(&io, "admit", || log.admit(framed_len(16)));
                 let class = class(8 + i % 3);
                 match (*slot, rng.random_range(0..4)) {
                     (None, _) => {
-                        let mut admitted = admit();
                         let mut g = named_in(&io, "allocate", Some(&pool), || pool.allocate(class));
                         let pid = g.pid();
                         stamp(&mut g.page_mut(), pid, 1);
-                        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-                        g.changed(lsn);
+                        g.changed();
                         *slot = Some((pid, 1));
                     }
                     (Some((pid, version)), 0) => {
-                        let mut admitted = admit();
                         let mut g = named_in(&io, "fix_exclusive", Some(&pool), || {
                             pool.fix_exclusive(pid, None)
                         });
                         assert_eq!(stamped(g.page(), pid), Some(version));
                         stamp(&mut g.page_mut(), pid, version + 1);
-                        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-                        g.changed(lsn);
+                        g.changed();
                         *slot = Some((pid, version + 1));
                     }
                     (Some((pid, _)), 1) => {
@@ -713,15 +668,13 @@ fn concurrent_pages(ops: usize, seed: u64) {
             }
         }));
     }
-    // The checkpointer's part: metadata pages written back while allocations and frees change
-    // them.
+    // The checkpointer's part: checkpoints of the metadata, each cut while allocations and
+    // frees change it.
     {
         let io = io.clone();
         handles.push(crate::thread::spawn(move || {
             for _ in 0..ops {
-                named_in(&io, "write_metadata", Some(&pool), || {
-                    pool.store.write_metadata(log.end())
-                });
+                checkpoint_meta(&io, &pool.store);
             }
         }));
     }
@@ -791,15 +744,6 @@ fn named_in<T>(
     .unwrap()
 }
 
-fn header() -> Header {
-    Header {
-        kind: CHANGE,
-        flags: 0,
-        txn: 0,
-        prev: None,
-    }
-}
-
 #[cfg(not(shuttle))]
 #[test]
 fn pages_survive_concurrent_fixes_evictions_and_frees() {
@@ -822,18 +766,16 @@ fn pages_survive_concurrent_fixes_evictions_and_frees_in_shuttle_schedules() {
 /// which the writer must not evict in its stead.
 fn written_page_eviction() {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let (log, pool) = open_on(&io, "/db/written", MIN_BUDGET);
+    let pool = open_on(&io, "/db/written", MIN_BUDGET);
     let class = class(9);
     // Five 2 MiB frames fill the pool; four stay latched, so the page written back is the only
     // one another thread can evict.
     let mut held = Vec::new();
     for v in 0..5u64 {
-        let mut admitted = named(&io, "admit", || log.admit(framed_len(16)));
         let mut g = named(&io, "allocate", || pool.allocate(class));
         let pid = g.pid();
         stamp(&mut g.page_mut(), pid, v);
-        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-        g.changed(lsn);
+        g.changed();
         held.push(g);
     }
     let written = held.remove(0);
@@ -877,80 +819,73 @@ fn a_written_page_is_evicted_only_while_its_write_pins_it_in_shuttle_schedules()
     crate::storage::atoll::testing::schedules(written_page_eviction, 300);
 }
 
-/// A pass waiting for its own writeback wakes when another thread finishes it. A writeback
-/// finishes after its last write settles, so a pass that looks in between, while the other thread
+/// A sweep waiting for its own writeback wakes when another thread finishes it. A writeback
+/// finishes after its last write settles, so a sweep that looks in between, while the other thread
 /// holds the writeback, waits on the pool: only the finish can wake it.
 #[test]
-fn a_pass_waiting_on_its_writeback_wakes_when_another_thread_finishes_it() {
-    // Writes stay in flight until the IO steps, so the pass cannot settle its own on submitting.
+fn a_sweep_waiting_on_its_writeback_wakes_when_another_thread_finishes_it() {
+    // Writes stay in flight until the IO steps, so the sweep cannot settle its own on submitting.
     let io: Arc<dyn IO> = Arc::new(CrashIO::new(1));
-    let (log, pool) = open_on(&io, "/db/woken", MIN_BUDGET);
-    let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+    let pool = open_on(&io, "/db/woken", MIN_BUDGET);
     let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
     let pid = g.pid();
     stamp(&mut g.page_mut(), pid, 1);
-    let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-    g.changed(lsn);
-    let frame = g.frame;
+    g.changed();
     drop(g);
-    drop(admitted);
-    // The pass claims the page and submits its write, which stays in flight until the IO steps.
-    let mut pass = pool.pass(pool.shard_of(frame));
+    // The sweep claims the page and submits its write, which stays in flight until the IO steps.
+    let mut sweep = pool.sweep();
     while pool.writes_in_flight.load(Ordering::Acquire) == 0 {
-        match pass.step(&pool).unwrap() {
+        match sweep.step(&pool).unwrap() {
             IOResult::IO(IOCompletions(c)) => io.wait_for_completion(c).unwrap(),
-            IOResult::Done(()) => panic!("the pass wrote nothing"),
+            IOResult::Done(()) => panic!("the sweep wrote nothing"),
         }
     }
-    // Another thread settles the write; the pass steps once its last write has settled and before
+    // Another thread settles the write; the sweep steps once its last write has settled and before
     // the writeback finishes, and finds the writeback held.
     let waited: Arc<Mutex<Option<Completion>>> = Arc::new(Mutex::new(None));
     pool.with_queued(|wb| {
         wb.before_finish = Some({
             let (pool, waited) = (pool.clone(), waited.clone());
-            Box::new(move || match pass.step(&pool).unwrap() {
+            Box::new(move || match sweep.step(&pool).unwrap() {
                 IOResult::IO(IOCompletions(c)) => *waited.lock() = Some(c),
-                IOResult::Done(()) => panic!("the pass finished before its writeback"),
+                IOResult::Done(()) => panic!("the sweep finished before its writeback"),
             })
         })
     });
     drive(&io, || pool.settle_writes()).unwrap();
-    let waited = waited.lock().take().expect("the pass stepped");
+    let waited = waited.lock().take().expect("the sweep stepped");
     assert!(
         waited.finished(),
-        "the pass waits on a wakeup no one sends once its writeback has finished"
+        "the sweep waits on a wakeup no one sends once its writeback has finished"
     );
 }
 
-/// A pass writing back more pages than the writeback buffer holds copies of writes what fits,
+/// A sweep writing back more pages than the writeback buffer holds copies of writes what fits,
 /// takes room again as writes land, and writes every page: none is left dirty, and each reads
 /// back as written. The writes stay in flight until the IO steps, so the buffer fills.
 #[test]
-fn a_pass_writes_back_more_pages_than_the_writeback_buffer_holds() {
+fn a_sweep_writes_back_more_pages_than_the_writeback_buffer_holds() {
     let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
-    let (log, pool) = open_with(
+    let pool = open_with(
         &io,
         "/db/room",
         BufferConfig {
             budget: MIN_BUDGET,
-            checkpoint_shards: 1,
             writeback_bytes: page::MAX_PAGE_SIZE,
         },
     );
     let room = page::MAX_PAGE_SIZE / class(0).size();
     let mut pids = Vec::new();
     for v in 0..(room + room / 8) as u64 {
-        let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
         let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
         let pid = g.pid();
         stamp(&mut g.page_mut(), pid, v);
-        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-        g.changed(lsn);
+        g.changed();
         pids.push((pid, v));
     }
     assert!(pids.len() > room, "the pages fit the buffer");
-    let mut pass = pool.pass(0);
-    drive(&io, || pass.step(&pool)).unwrap();
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(&pool)).unwrap();
     let dirty = (0..pool.memory.grains())
         .filter(|&f| pool.header(f).status() == RESIDENT && pool.header(f).dirty())
         .count();
@@ -972,7 +907,7 @@ fn with_a_reader_in_freed_memory(
     during: impl FnOnce(&Arc<BufferPool>, SizeClass, u32, &dyn Fn()),
 ) {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let (_log, pool) = open_on(&io, base, MIN_BUDGET);
+    let pool = open_on(&io, base, MIN_BUDGET);
     let (small, large) = (class(8), class(9));
     let first = drive(&io, || pool.allocate(small)).unwrap();
     let mut second = drive(&io, || pool.allocate(small)).unwrap();
@@ -1095,7 +1030,7 @@ fn a_read_into_unquiet_memory_waits_for_the_step_that_may_read_it() {
 #[test]
 fn a_class_holding_no_memory_drains_none_its_step_holds() {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let (_log, pool) = open_on(&io, "/db/held", MIN_BUDGET);
+    let pool = open_on(&io, "/db/held", MIN_BUDGET);
     let parent = drive(&io, || pool.allocate(class(0))).unwrap().pid();
     // Of the other four 2 MiB batches, two to a 4 MiB page and two to four 1 MiB pages, each
     // read this epoch.
@@ -1128,14 +1063,12 @@ fn a_class_holding_no_memory_drains_none_its_step_holds() {
 #[test]
 fn a_fix_that_finds_its_page_leaving_wakes_when_the_write_out_is_queued() {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let (log, pool) = open_on(&io, "/db/leaving", MIN_BUDGET);
-    let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+    let pool = open_on(&io, "/db/leaving", MIN_BUDGET);
     let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
     let (pid, frame) = (g.pid(), g.frame);
     stamp(&mut g.page_mut(), pid, 1);
-    let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-    g.changed(lsn);
-    drop((g, admitted));
+    g.changed();
+    drop(g);
     // As a drain does: the page marked leaving, then its writeback queued.
     let latch = || FrameLatch {
         frames: pool.frames.clone(),
@@ -1167,10 +1100,9 @@ fn a_fix_that_finds_its_page_leaving_wakes_when_the_write_out_is_queued() {
 fn a_drain_that_queues_no_write_out_wakes_no_one() {
     // Writes complete only at a step.
     let io: Arc<dyn IO> = Arc::new(CrashIO::new(5));
-    let (log, pool) = open_on(&io, "/db/nothing-queued", MIN_BUDGET);
+    let pool = open_on(&io, "/db/nothing-queued", MIN_BUDGET);
     let mut model = Model {
         io: &io,
-        log: &log,
         pool: &pool,
         pages: Vec::new(),
     };
@@ -1190,32 +1122,28 @@ fn a_drain_that_queues_no_write_out_wakes_no_one() {
 #[test]
 fn a_write_landing_during_another_threads_step_wakes_whoever_waits_on_the_writeback() {
     // Writes stay in flight until the IO steps, which completes them in an order its seed picks:
-    // a seed whose write is still in flight once the pass submitted it builds the case.
+    // a seed whose write is still in flight once the sweep submitted it builds the case.
     let mut built = 0;
     for seed in 0..32 {
         let crash = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash.clone();
-        let (log, pool) = open_on(&io, "/db/landed", MIN_BUDGET);
-        let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+        let pool = open_on(&io, "/db/landed", MIN_BUDGET);
         let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
         let pid = g.pid();
         stamp(&mut g.page_mut(), pid, 1);
-        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-        g.changed(lsn);
-        let frame = g.frame;
+        g.changed();
         drop(g);
-        drop(admitted);
         // Stepped until it submits the write, and no further: its wait ends only once it lands.
-        let mut pass = pool.pass(pool.shard_of(frame));
+        let mut sweep = pool.sweep();
         loop {
-            match pass.step(&pool).unwrap() {
+            match sweep.step(&pool).unwrap() {
                 IOResult::IO(IOCompletions(_))
                     if pool.writes_in_flight.load(Ordering::Acquire) > 0 =>
                 {
                     break
                 }
                 IOResult::IO(IOCompletions(c)) => io.wait_for_completion(c).unwrap(),
-                IOResult::Done(()) => panic!("the pass wrote nothing"),
+                IOResult::Done(()) => panic!("the sweep wrote nothing"),
             }
         }
         let mut landings = None;
@@ -1226,7 +1154,7 @@ fn a_write_landing_during_another_threads_step_wakes_whoever_waits_on_the_writeb
         }
         built += 1;
         // Inside the step, once it took the landed writes (none): the write lands, its wakeup
-        // passes, and a waiter finds the writeback held.
+        // sweeps, and a waiter finds the writeback held.
         let waited: Arc<Mutex<Option<Completion>>> = Arc::new(Mutex::new(None));
         pool.with_queued(|wb| {
             wb.after_taking_landed = Some({
@@ -1263,16 +1191,13 @@ fn a_reader_of_a_page_written_out_wakes_when_its_write_out_waits_before_submitti
     // Reads stay in flight until the IO steps, so the write plan's metadata page waits.
     let crash = Arc::new(CrashIO::new(3));
     let io: Arc<dyn IO> = crash.clone();
-    let (log, pool) = open_on(&io, "/db/outgoing", MIN_BUDGET);
-    let mut admitted = drive(&io, || log.admit(framed_len(16))).unwrap();
+    let pool = open_on(&io, "/db/outgoing", MIN_BUDGET);
     let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
     let pid = g.pid();
     stamp(&mut g.page_mut(), pid, 1);
-    let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-    g.changed(lsn);
+    g.changed();
     let frame = g.frame;
     drop(g);
-    drop(admitted);
     // The page leaves its frame, as a drain makes it.
     let hold = pool
         .latch_to_evict(class(0), frame, || FrameLatch {
@@ -1401,21 +1326,17 @@ fn fixed<T>(r: Result<IOResult<T>>, directory: &Optimistic<'_>, class: SizeClass
 /// page and in the life the directory names: never a freed number's next page.
 fn linked_pages(ops: usize, seed: u64) {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let (log, pool) = open_on(&io, "/db/linked", MIN_BUDGET);
-    let admit = |log: &Arc<Log>| named(&io, "admit", || log.admit(framed_len(16)));
+    let pool = open_on(&io, "/db/linked", MIN_BUDGET);
     let dir = {
-        let mut admitted = admit(&log);
         let mut g = named_in(&io, "allocate", Some(&pool), || pool.allocate(class(0)));
-        let lsn = log.append(&mut admitted, &header(), &[&g.pid().raw().to_le_bytes()]);
-        g.changed(lsn);
+        g.changed();
         g.pid()
     };
     let lives = Arc::new(AtomicU64::new(1));
     let mut handles = Vec::new();
     for t in 0..3u64 {
-        let (io, log, pool, lives) = (io.clone(), log.clone(), pool.clone(), lives.clone());
+        let (io, pool, lives) = (io.clone(), pool.clone(), lives.clone());
         handles.push(crate::thread::spawn(move || {
-            let admit = || named(&io, "admit", || log.admit(framed_len(16)));
             let free = |pid: PageId| {
                 named_in(&io, "free", Some(&pool), || {
                     match pool.fix_exclusive(pid, None)? {
@@ -1431,16 +1352,13 @@ fn linked_pages(ops: usize, seed: u64) {
                     // Allocate a child and link it, if the slot is still empty then.
                     0 => {
                         let life = lives.fetch_add(1, Ordering::Relaxed);
-                        let mut admitted = admit();
                         let mut g = named_in(&io, "allocate", Some(&pool), || {
                             pool.allocate(class(8 + i % 3))
                         });
                         let pid = g.pid();
                         stamp(&mut g.page_mut(), pid, life << 32);
-                        let lsn = log.append(&mut admitted, &header(), &[&pid.raw().to_le_bytes()]);
-                        g.changed(lsn);
+                        g.changed();
                         drop(g);
-                        let mut admitted = admit();
                         let linked = through(&io, &pool, "link", || {
                             let mut d = match pool.fix_exclusive(dir, None).unwrap() {
                                 IOResult::Done(d) => d,
@@ -1454,9 +1372,7 @@ fn linked_pages(ops: usize, seed: u64) {
                             }
                             d.page_mut().put_u64(slot_at(i), pid.raw());
                             d.page_mut().put_u64(slot_at(i) + 8, life);
-                            let lsn =
-                                log.append(&mut admitted, &header(), &[&dir.raw().to_le_bytes()]);
-                            d.changed(lsn);
+                            d.changed();
                             Try::Done(true)
                         });
                         if !linked {
@@ -1465,7 +1381,6 @@ fn linked_pages(ops: usize, seed: u64) {
                     }
                     // Unlink a child, then free it.
                     1 => {
-                        let mut admitted = admit();
                         let unlinked = through(&io, &pool, "unlink", || {
                             let mut d = match pool.fix_exclusive(dir, None).unwrap() {
                                 IOResult::Done(d) => d,
@@ -1480,9 +1395,7 @@ fn linked_pages(ops: usize, seed: u64) {
                             }
                             d.page_mut().put_u64(slot_at(i), 0);
                             d.page_mut().put_u64(slot_at(i) + 8, 0);
-                            let lsn =
-                                log.append(&mut admitted, &header(), &[&dir.raw().to_le_bytes()]);
-                            d.changed(lsn);
+                            d.changed();
                             Try::Done(Some(PageId::from_raw(raw)))
                         });
                         if let Some(pid) = unlinked {
@@ -1491,7 +1404,6 @@ fn linked_pages(ops: usize, seed: u64) {
                     }
                     // Change a child, reached through the directory.
                     2..4 => {
-                        let mut admitted = admit();
                         through(&io, &pool, "change", || {
                             let d = match pool.fix_optimistic(dir, None).unwrap() {
                                 IOResult::Done(d) => d,
@@ -1523,8 +1435,7 @@ fn linked_pages(ops: usize, seed: u64) {
                             });
                             assert_eq!(v >> 32, life, "{pid:?} changed in another life");
                             stamp(&mut g.page_mut(), pid, v + 1);
-                            let lsn = log.append(&mut admitted, &header(), &[&raw.to_le_bytes()]);
-                            g.changed(lsn);
+                            g.changed();
                             Try::Done(())
                         });
                     }
@@ -1573,15 +1484,13 @@ fn linked_pages(ops: usize, seed: u64) {
             }
         }));
     }
-    // The checkpointer's part: metadata pages written back while allocations and frees change
-    // them.
+    // The checkpointer's part: checkpoints of the metadata, each cut while allocations and
+    // frees change it.
     {
         let (io, pool) = (io.clone(), pool.clone());
         handles.push(crate::thread::spawn(move || {
             for _ in 0..ops {
-                named_in(&io, "write_metadata", Some(&pool), || {
-                    pool.store.write_metadata(log.end())
-                });
+                checkpoint_meta(&io, &pool.store);
             }
         }));
     }
@@ -1605,4 +1514,22 @@ fn children_read_through_their_directory_are_whole_and_in_the_life_it_names_in_s
         || linked_pages(12, crate::storage::atoll::testing::workload_seed()),
         300,
     );
+}
+
+/// One checkpoint of the store's metadata alone: cut, every page dirty at the cut written as it
+/// stood then, the cut ended and the checkpoint put in charge, its waiting frees done.
+fn checkpoint_meta(io: &Arc<dyn IO>, store: &Arc<PageStore>) {
+    let n = store.meta().in_charge() + 1;
+    let (dirty, _) = store.begin_cut(n);
+    let frames = drive(io, || store.meta().get_all(&dirty)).unwrap();
+    for frame in &frames {
+        if let Some(c) = store.meta().write_for(frame, n).unwrap() {
+            while !c.finished() {
+                io.step().unwrap();
+            }
+        }
+    }
+    store.meta().end_cut(n, &frames);
+    store.meta().checkpointed(n, &frames);
+    drive(io, || store.after(n)).unwrap();
 }

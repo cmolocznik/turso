@@ -11,9 +11,10 @@
 //! directory page listing them. A value of a billion bytes, SQLite's limit, takes 120 chunks and a
 //! 4 KiB directory.
 //!
-//! **Writing.** Pages are allocated provisional, and their bytes logged as blob writes in pieces
-//! of at most one log chunk, so a large value never holds a flush back by more than a chunk. The
-//! record that puts the reference in a leaf adopts them; until then a crash frees them.
+//! **Writing.** Pages are taken, then each written whole, then the reference goes in a leaf.
+//! Nothing is logged: a checkpoint maps a value's pages only once an image it writes names the
+//! value, so a crash before that leaves them free. A write given up hands its pages to the
+//! checkpointer to free ([`PageStore::orphaned`]).
 //!
 //! **Reading.** Every page of a value carries the value's id, drawn at random when it was written.
 //! A reader that followed a reference before the value was replaced may find its pages freed and
@@ -21,7 +22,6 @@
 
 use super::super::blob;
 use super::super::buffer::{BufferPool, Optimistic};
-use super::super::log::Log;
 use super::super::page::{self, PageId, SizeClass, CLASS_COUNT, HEADER_SIZE};
 use super::super::shared::Bytes;
 use super::super::store::PageStore;
@@ -100,9 +100,9 @@ pub fn max_len() -> usize {
     holds(chunk_class()) / 8 * chunk()
 }
 
-/// Writing a value into provisional blob pages. Step it to the end; then put [`reference`] in a
-/// leaf in a group that adopts [`pages`]. Dropped before that, it hands its pages to the store,
-/// whose checkpointer frees them.
+/// Writing a value into blob pages. Step it to the end; then put [`reference`] in a leaf, which
+/// [`adopted`](Self::adopted) notes. Dropped before that, it hands its pages to the store, whose
+/// checkpointer frees them.
 ///
 /// [`reference`]: Self::reference
 /// [`pages`]: Self::pages
@@ -146,7 +146,7 @@ impl ValueWrite {
         self.pages.iter().map(|p| p.0).collect()
     }
 
-    /// The record putting the reference in a leaf adopted the pages.
+    /// The put of the reference in a leaf took the pages.
     pub fn adopted(&mut self) {
         self.adopted = true;
     }
@@ -175,14 +175,13 @@ impl ValueWrite {
         bytes
     }
 
-    /// Writes the value through `log`, or, for a temporary tree, into temporary pages with
-    /// nothing logged.
-    pub fn step(&mut self, pool: &Arc<BufferPool>, log: Option<&Arc<Log>>) -> Result<IOResult<()>> {
+    /// Writes the value into its pages, temporary ones for a temporary tree. Step it until done.
+    pub fn step(&mut self, pool: &Arc<BufferPool>, temporary: bool) -> Result<IOResult<()>> {
         while self.pages.len() < self.plan.len() {
             let class = self.plan[self.pages.len()];
-            let allocated = match log {
-                Some(_) => pool.allocate(class)?,
-                None => pool.allocate_temporary(class)?,
+            let allocated = match temporary {
+                false => pool.allocate(class)?,
+                true => pool.allocate_temporary(class)?,
             };
             let page = match allocated {
                 IOResult::Done(p) => p,
@@ -196,10 +195,6 @@ impl ValueWrite {
                     .collect();
             }
         }
-        // Pieces of at most a log chunk, record framing included; unlogged, a page at once.
-        let piece = log.map_or(usize::MAX, |l| {
-            (l.chunk_bytes() as usize).saturating_sub(64).max(1)
-        });
         loop {
             let (j, done) = self.at;
             if j == self.pages.len() {
@@ -210,14 +205,6 @@ impl ValueWrite {
                 self.at = (j + 1, 0);
                 continue;
             }
-            let n = (total - done).min(piece);
-            let mut admitted = match log {
-                Some(log) => match log.admit(blob::record_len(n))? {
-                    IOResult::Done(a) => Some(a),
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                },
-                None => None,
-            };
             let (pid, hint) = self.pages[j];
             let hint = crate::sync::atomic::AtomicU32::new(hint);
             let mut page = match pool.fix_exclusive(pid, Some(&hint))? {
@@ -225,17 +212,10 @@ impl ValueWrite {
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
             self.pages[j].1 = page.hint();
-            let bytes = self.piece(j, done, n);
-            match (log, &mut admitted) {
-                (Some(log), Some(admitted)) => {
-                    blob::write(log, admitted, &mut page, HEADER_SIZE + done, &bytes);
-                }
-                _ => {
-                    blob::apply(&mut page.page_mut(), HEADER_SIZE + done, &bytes);
-                    page.changed(pool.temporary_lsn());
-                }
-            }
-            self.at.1 += n;
+            let bytes = self.piece(j, done, total - done);
+            blob::apply(&mut page.page_mut(), HEADER_SIZE + done, &bytes);
+            page.changed();
+            self.at.1 = total;
         }
     }
 }

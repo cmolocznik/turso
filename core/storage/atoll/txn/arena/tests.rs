@@ -23,7 +23,6 @@ fn open(budget: usize) -> (Arc<dyn IO>, Atoll) {
         },
         buffer: BufferConfig {
             budget,
-            checkpoint_shards: 8,
             writeback_bytes: WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),

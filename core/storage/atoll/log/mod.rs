@@ -43,13 +43,11 @@ mod record;
 mod room;
 mod segment;
 mod waits;
-mod writers;
 
 pub use reader::{LogReader, OwnedRecord};
 pub use record::{
     framed_len, GroupStart, Header, Kind, Lsn, Place, ALIGN, BLOCK, MAX_PAYLOAD, NO_GROUP,
 };
-pub use writers::{decode_table, encode_table, table_len, TxnTail, Writer, Writers, WRITERS};
 
 use super::aligned::AlignedBlock;
 use super::once::SetOnce;

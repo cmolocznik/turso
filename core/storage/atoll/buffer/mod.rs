@@ -5,7 +5,6 @@
 //! - [`frame`]: frame headers: the latch, the page id, dirtiness and the replacement tracker.
 //! - [`watt`]: write-aware timestamp tracking, which chooses what to evict.
 //! - [`clean`]: writing dirty pages back through the page store.
-//! - [`pass`]: checkpoint passes over shards of frames, which bound the log recovery replays.
 //! - [`source`]: where a missing page comes from.
 //!
 //! **Finding a page.** A reference to a page may carry a frame hint beside the page id: the frame
@@ -35,9 +34,10 @@ pub(super) mod cell;
 mod clean;
 mod frame;
 mod memory;
-mod pass;
 mod source;
 mod staging;
+#[cfg(test)]
+mod sweep;
 mod table;
 mod temp;
 mod watt;
@@ -46,15 +46,14 @@ mod watt;
 mod tests;
 
 pub use memory::MIN_BUDGET;
-pub use pass::Pass;
 pub use source::{LocalSource, Located, PageSource, ReadDone};
 
+use super::blob;
 use super::epoch::Step;
 use super::latch::{Held, VersionedLatch};
-use super::log::Lsn;
 use super::once::SetOnce;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
-use super::shared::{BytesMut, Shared, Writer};
+use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::Stack;
 use super::store::PageStore;
 use cell::{CompletionCell, Retiring};
@@ -63,13 +62,11 @@ use frame::{
     FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
 };
 use memory::{Memory, Take, Zeroed};
-use pass::Shard;
 use table::Table;
 use temp::TempPages;
 
 use crate::io::{Buffer, Completion};
 use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-#[cfg(test)]
 use crate::sync::Mutex;
 use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
@@ -181,15 +178,15 @@ impl Outgoing {
             .frame
     }
 
-    /// Ends the write-out with the write of a copy holding changes up to `lsn`.
+    /// Ends the write-out with the write of a copy holding change count `count`.
     pub(super) fn end(
         mut self,
         pool: &BufferPool,
-        lsn: Lsn,
+        count: u64,
         res: std::result::Result<(), CompletionError>,
     ) {
         let hold = self.hold.take().expect("a write-out ends once");
-        pool.written_out(self.pid, hold, lsn, res);
+        pool.written_out(self.pid, hold, count, res);
     }
 }
 
@@ -201,19 +198,13 @@ impl Drop for Outgoing {
         }
     }
 }
-#[cfg(test)]
-use std::collections::HashMap;
-use std::ops::Range;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct BufferConfig {
     /// Bytes of memory for frames, at least [`MIN_BUDGET`]. Frame headers take 2% more and the
     /// hash table 0.2%, and none of it takes physical memory until used.
     pub budget: usize,
-    /// Shards of frames that checkpoint passes take in turn ([`Pass`]). Haubenschild et al.
-    /// (SIGMOD 2020, §3.4) found 128 smoother than 10: each pass writes less at once, and the
-    /// log kept for recovery strays less from its budget.
-    pub checkpoint_shards: usize,
     /// Bytes of the writeback buffer ([`staging`]): what copies of pages written back while they
     /// stay in their frames are made in, and so a bound on such writes in flight. At least the
     /// largest page.
@@ -229,7 +220,6 @@ impl BufferConfig {
     pub fn with_budget(budget: usize) -> Self {
         Self {
             budget,
-            checkpoint_shards: 128,
             writeback_bytes: WRITEBACK_BYTES,
         }
     }
@@ -287,8 +277,14 @@ pub struct BufferPool {
     staging: Arc<staging::Staging>,
     writes_in_flight: AtomicUsize,
     failure: SetOnce<CompletionError>,
-    /// Checkpoint shards, each a run of frames by position.
-    shards: Box<[Shard]>,
+    /// The checkpoint whose cut is in effect, 0 for none.
+    cutting: AtomicU64,
+    /// Pages that checkpoint found owed, kept as they stood by their first change or free since
+    /// (the copy hook, audit 18).
+    kept: Mutex<HashMap<PageId, Box<[u8]>>>,
+    /// The pages that checkpoint found owed and has neither imaged nor kept: one read in again is
+    /// pending.
+    cut_owed: Mutex<HashSet<PageId>>,
     temp: Arc<TempPages>,
     /// Each queued writeback's state after its last step, by address, for a test that stalled to
     /// show while another thread steps it.
@@ -332,14 +328,11 @@ fn io_failure(e: &LimboError) -> CompletionError {
 }
 
 impl BufferPool {
-    /// A pool reading missing pages from `source` and writing dirty ones to `store`. `redo` is
-    /// where a recovery would start replaying the log now: every change the pool's pages will
-    /// receive is logged at or after it.
+    /// A pool reading missing pages from `source` and writing dirty ones to `store`.
     pub fn new(
         config: BufferConfig,
         source: Arc<dyn PageSource>,
         store: Arc<PageStore>,
-        redo: Lsn,
     ) -> Result<Arc<Self>> {
         let memory = Memory::new(config.budget)?;
         if config.writeback_bytes < page::MAX_PAGE_SIZE
@@ -353,11 +346,6 @@ impl BufferPool {
             )));
         }
         let grains = memory.grains();
-        assert!(
-            config.checkpoint_shards > 0,
-            "a pool with no checkpoint shards"
-        );
-        let shards = config.checkpoint_shards.min(grains as usize);
         let epoch_bytes =
             (memory.batches as u64 * memory::BATCH as u64) / watt::EPOCHS_PER_TURNOVER as u64;
         Ok(Arc::new(Self {
@@ -379,7 +367,9 @@ impl BufferPool {
             staging: Arc::new(staging::Staging::new(config.writeback_bytes)),
             writes_in_flight: AtomicUsize::new(0),
             failure: SetOnce::default(),
-            shards: (0..shards).map(|_| Shard::new(redo)).collect(),
+            cutting: AtomicU64::new(0),
+            kept: Mutex::new(HashMap::new()),
+            cut_owed: Mutex::new(HashSet::new()),
             temp: Arc::new(TempPages::new(
                 store.io().clone(),
                 store.base(),
@@ -686,9 +676,18 @@ impl BufferPool {
         match res {
             Ok(()) => {
                 let waiting = self.frames.end_transit(frame);
-                let lsn = page::lsn(self.bytes(frame, pid.class()));
-                h.page_lsn.store(lsn, Ordering::Release);
-                h.written_lsn.store(lsn, Ordering::Release);
+                let count = page::seq(self.bytes(frame, pid.class()));
+                h.changes.store(count, Ordering::Release);
+                h.written.store(count, Ordering::Release);
+                // A page read from its swap copy differs from its checkpoint copy.
+                let owed = !pid.is_temporary() && self.store.swap_slot(pid).is_some();
+                h.imaged
+                    .store(if owed { 0 } else { count }, Ordering::Release);
+                // Evicted owed at a cut and not yet imaged: still the page as the cut found it.
+                let n = self.cutting.load(Ordering::Acquire);
+                let pending = n != 0 && owed && self.cut_owed.lock().contains(&pid);
+                h.pending
+                    .store(if pending { n } else { 0 }, Ordering::Release);
                 h.status.store(RESIDENT, Ordering::Release);
                 drop(hold);
                 if let Some(c) = waiting {
@@ -835,8 +834,8 @@ impl BufferPool {
         Ok(IOResult::Done(self.install(frame, pid, step)))
     }
 
-    /// A new temporary page of `class` (DESIGN.md §6.4), all zeros, fixed exclusively. Its
-    /// changes are never logged: stamp them with [`temporary_lsn`](Self::temporary_lsn).
+    /// A new temporary page of `class` (DESIGN.md §6.4), all zeros, fixed exclusively. No
+    /// checkpoint writes it, and recovery never reads it.
     pub fn allocate_temporary(
         self: &Arc<Self>,
         class: SizeClass,
@@ -859,11 +858,6 @@ impl BufferPool {
         self.temp.allocated()
     }
 
-    /// The LSN to stamp the next change to a temporary page with.
-    pub fn temporary_lsn(&self) -> Lsn {
-        self.temp.next_lsn()
-    }
-
     /// Puts the new page `pid`, all zeros, in the claimed `frame`, fixed exclusively.
     fn install<'a>(self: &'a Arc<Self>, frame: u32, pid: PageId, step: Step<'a>) -> Exclusive<'a> {
         let class = pid.class();
@@ -873,8 +867,10 @@ impl BufferPool {
         unsafe { self.writer(frame, class) }.fill(0..class.size(), 0);
         h.pid.store(pid.raw(), Ordering::Release);
         h.flags.store(0, Ordering::Release);
-        h.page_lsn.store(0, Ordering::Release);
-        h.written_lsn.store(0, Ordering::Release);
+        h.changes.store(0, Ordering::Release);
+        h.written.store(0, Ordering::Release);
+        h.imaged.store(0, Ordering::Release);
+        h.pending.store(0, Ordering::Release);
         h.tracker.clear();
         h.tracker.read(self.now());
         self.mark_held(frame);
@@ -895,16 +891,31 @@ impl BufferPool {
 
     /// Drops the page `page` holds: its number becomes free, its copy's slot is freed, and its
     /// frame is free. On `IOResult::IO` the page is unlatched; fix it again and retry.
+    ///
+    /// A value's page freed while a cut is in effect is not freed yet: an image the cut owes may
+    /// name the value as the cut found it, and reads its pages. It is handed to the checkpointer,
+    /// named by nothing, and the next checkpoint frees it ([`PageStore::orphaned`]).
     pub fn free(self: &Arc<Self>, page: Exclusive<'_>) -> Result<IOResult<()>> {
-        self.free_as(page, false)
+        self.free_page(page, true)
     }
 
-    /// [`free`](Self::free), of a page that is retired when `retired` is set: its mark is cleared
-    /// in the record that frees it (DESIGN.md §6.5).
-    fn free_as(self: &Arc<Self>, page: Exclusive<'_>, retired: bool) -> Result<IOResult<()>> {
+    fn free_page(
+        self: &Arc<Self>,
+        page: Exclusive<'_>,
+        wait_out_a_cut: bool,
+    ) -> Result<IOResult<()>> {
         let (frame, pid) = (page.frame, page.pid);
+        if wait_out_a_cut
+            && !pid.is_temporary()
+            && self.cutting.load(Ordering::Acquire) != 0
+            && page::kind(page.page()) == blob::KIND
+        {
+            page.release_unchanged();
+            self.store.orphaned(pid);
+            return Ok(IOResult::Done(()));
+        }
         if self.header(frame).has(WRITING) {
-            // Its writeback's remap would bring the page back: let the write land first.
+            // Its writeback would name a swap copy of it: let the write land first.
             drop(page);
             return self.settle_writes().map(|r| match r {
                 IOResult::Done(()) => IOResult::IO(IOCompletions(Completion::new_yield())),
@@ -912,12 +923,9 @@ impl BufferPool {
             });
         }
         if !pid.is_temporary() {
-            let freed = if retired {
-                self.store.free_retired(pid)?
-            } else {
-                self.store.free(pid)?
-            };
-            if let IOResult::IO(io) = freed {
+            // A checkpoint cut before the free still writes the page as it stood.
+            self.keep_for_cut(frame, pid);
+            if let IOResult::IO(io) = self.store.free(pid)? {
                 return Ok(IOResult::IO(io));
             }
         }
@@ -933,32 +941,33 @@ impl BufferPool {
         Ok(IOResult::Done(()))
     }
 
-    /// Frees `pid`, which nothing refers to any more: a provisional page left over by an
-    /// operation that gave up on it, or by a crash. A page not in memory is not read in: a frame
-    /// is taken for it unread and held exclusively, so no fix can read it in while its number is
-    /// freed.
+    /// Frees `pid`, which nothing refers to any more: a page an operation gave up on, or one a
+    /// retired version held that no snapshot reads any more. A page not in memory is not read in:
+    /// a frame is taken for it unread and held exclusively, so no fix can read it in while its
+    /// number is freed.
     pub fn free_unreferenced(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
-        self.free_unreferenced_as(pid, false)
+        self.free_unreferenced_page(pid, true)
     }
 
-    /// Frees `pid`, which is retired and which no snapshot can read any more, clearing its mark in
-    /// the record that frees it (DESIGN.md §6.5). Through the pool, like
-    /// [`free_unreferenced`](Self::free_unreferenced): a frame still holding the page goes with
-    /// it, once a writeback in flight has landed, so no writeback finds it free afterwards.
-    pub fn free_retired(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
-        self.free_unreferenced_as(pid, true)
+    /// [`free_unreferenced`](Self::free_unreferenced), for the checkpointer's orphans, freed at
+    /// once: named by nothing as of the cut under way, no image it owes names them.
+    pub fn free_orphan(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        self.free_unreferenced_page(pid, false)
     }
 
-    fn free_unreferenced_as(self: &Arc<Self>, pid: PageId, retired: bool) -> Result<IOResult<()>> {
-        assert!(
-            !(retired && pid.is_temporary()),
-            "a temporary page {pid:?} retired"
-        );
+    fn free_unreferenced_page(
+        self: &Arc<Self>,
+        pid: PageId,
+        wait_out_a_cut: bool,
+    ) -> Result<IOResult<()>> {
         let _step = self.store.epochs().enter();
         loop {
-            if self.table.find(&self.frames.headers, pid.raw()).is_some() {
+            // During a cut the page is read in: a checkpoint may owe its image, which its free
+            // keeps.
+            let cut = self.cutting.load(Ordering::Acquire) != 0 && !pid.is_temporary();
+            if cut || self.table.find(&self.frames.headers, pid.raw()).is_some() {
                 return match self.fix_exclusive(pid, None)? {
-                    IOResult::Done(page) => self.free_as(page, retired),
+                    IOResult::Done(page) => self.free_page(page, wait_out_a_cut),
                     IOResult::IO(io) => Ok(IOResult::IO(io)),
                 };
             }
@@ -979,8 +988,10 @@ impl BufferPool {
             unsafe { self.writer(frame, class) }.fill(0..page::HEADER_SIZE, 0);
             h.pid.store(pid.raw(), Ordering::Release);
             h.flags.store(0, Ordering::Release);
-            h.page_lsn.store(0, Ordering::Release);
-            h.written_lsn.store(0, Ordering::Release);
+            h.changes.store(0, Ordering::Release);
+            h.written.store(0, Ordering::Release);
+            h.imaged.store(0, Ordering::Release);
+            h.pending.store(0, Ordering::Release);
             h.tracker.clear();
             h.status.store(RESIDENT, Ordering::Release);
             if self
@@ -992,7 +1003,7 @@ impl BufferPool {
                 self.free_frame(class, frame, hold);
                 continue;
             }
-            return self.free_as(
+            return self.free_page(
                 Exclusive {
                     pool: self,
                     frame,
@@ -1000,7 +1011,7 @@ impl BufferPool {
                     hold,
                     step: self.store.epochs().enter(),
                 },
-                retired,
+                wait_out_a_cut,
             );
         }
     }
@@ -1490,20 +1501,20 @@ impl BufferPool {
     }
 
     /// Ends the write-out of `pid` from the frame `hold` holds, with the write of a copy holding
-    /// changes up to `lsn`. Written, the page leaves the frame, and whoever waits reads it again
+    /// changes up to `count`. Written, the page leaves the frame, and whoever waits reads it again
     /// from that copy, already in the page table; not written, the page stays, dirty.
     fn written_out(
         &self,
         pid: PageId,
         hold: Held<FrameLatch>,
-        lsn: Lsn,
+        count: u64,
         res: std::result::Result<(), CompletionError>,
     ) {
         let frame = hold.latch().frame;
         match res {
             Ok(()) => {
                 let h = self.header(frame);
-                h.written_lsn.fetch_max(lsn, Ordering::AcqRel);
+                h.written.fetch_max(count, Ordering::AcqRel);
                 debug_assert!(!h.dirty(), "{pid:?} changed while held for its write-out");
                 let waiting = self.frames.end_transit(frame);
                 self.table.remove(&self.frames.headers, pid.raw(), frame);
@@ -1656,12 +1667,12 @@ impl BufferPool {
         Ok(IOResult::Done(()))
     }
 
-    /// Ends the write of a copy of `pid`, in `frame`, holding changes up to `lsn`.
+    /// Ends the write of a copy of `pid`, in `frame`, holding change count `count`.
     fn write_ended(
         &self,
         frame: u32,
         pid: PageId,
-        lsn: Lsn,
+        count: u64,
         evict_after: bool,
         res: std::result::Result<(), CompletionError>,
     ) {
@@ -1673,7 +1684,7 @@ impl BufferPool {
             .flatten();
         match res {
             Ok(()) => {
-                h.written_lsn.fetch_max(lsn, Ordering::AcqRel);
+                h.written.fetch_max(count, Ordering::AcqRel);
             }
             Err(e) => self.fail(e),
         }
@@ -1702,38 +1713,189 @@ impl BufferPool {
 
     // ---------------------------------------------------------------- checkpoints
 
-    /// How many checkpoint shards the frames are split into.
-    pub fn shard_count(&self) -> usize {
-        self.shards.len()
+    /// Keeps the page in `frame`, `pid`, as it stands for the checkpoint whose cut found it owed,
+    /// before its first change or free since: under the frame's exclusive latch.
+    fn keep_for_cut(&self, frame: u32, pid: PageId) {
+        let n = self.cutting.load(Ordering::Acquire);
+        if n == 0 {
+            return;
+        }
+        let h = self.header(frame);
+        // Relaxed: under the frame's exclusive latch, which the cut's marking took too.
+        if h.pending.load(Ordering::Relaxed) != n {
+            return;
+        }
+        let mut bytes = vec![0u8; pid.class().size()].into_boxed_slice();
+        self.bytes(frame, pid.class()).copy_to(0, &mut bytes);
+        self.kept.lock().insert(pid, bytes);
+        self.cut_owed.lock().remove(&pid);
+        h.pending.store(0, Ordering::Release);
     }
 
-    /// The frames of `shard`, as indexes of 4 KiB grains.
-    fn shard_frames(&self, shard: usize) -> Range<u32> {
-        let (grains, n) = (self.memory.grains() as u64, self.shards.len() as u64);
-        let at = |s: u64| (s * grains).div_ceil(n) as u32;
-        at(shard as u64)..at(shard as u64 + 1)
+    /// The cut of checkpoint `n`, under the store's closed change gate: every page owed an image
+    /// is marked pending, under its latch, so its first change from then on keeps it as it
+    /// stands. `scan` collects them, those with a swap copy and no frame included. Eviction goes
+    /// on meanwhile, so the swap copies are listed after the frames, and every page owed stays
+    /// listed until it is imaged or kept: one read in again comes in pending. Step it until done.
+    pub fn begin_cut(&self, n: u64, scan: &mut CutScan) -> IOResult<()> {
+        self.cutting.store(n, Ordering::SeqCst);
+        while scan.next < self.memory.grains() {
+            let h = self.header(scan.next);
+            if h.status() == RESIDENT {
+                // A change holds it for a moment: come back.
+                let Some(hold) = Held::try_take(&h.latch) else {
+                    return IOResult::IO(IOCompletions(Completion::new_yield()));
+                };
+                self.mark_owed(scan.next, n, &mut scan.owed);
+                hold.release_unchanged();
+            }
+            scan.next += 1;
+        }
+        if !scan.listed {
+            let mut seen: HashSet<PageId> = scan.owed.iter().copied().collect();
+            scan.swapped = self.store.swap_pages();
+            scan.owed
+                .extend(scan.swapped.iter().copied().filter(|pid| seen.insert(*pid)));
+            *self.cut_owed.lock() = seen;
+            scan.listed = true;
+        }
+        // A page with a swap copy read in after the walk passed its frame, before the list was
+        // set: unchanged since, the gate being closed.
+        while let Some(&pid) = scan.swapped.last() {
+            if let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) {
+                let h = self.header(frame);
+                let Some(hold) = Held::try_take(&h.latch) else {
+                    return IOResult::IO(IOCompletions(Completion::new_yield()));
+                };
+                if h.status() == RESIDENT && h.pid() == pid.raw() {
+                    h.pending.store(n, Ordering::Release);
+                }
+                hold.release_unchanged();
+            }
+            scan.swapped.pop();
+        }
+        IOResult::Done(())
     }
 
+    fn mark_owed(&self, frame: u32, n: u64, owed: &mut Vec<PageId>) {
+        let h = self.header(frame);
+        let pid = PageId::from_raw(h.pid());
+        if h.status() == RESIDENT && !pid.is_temporary() && h.owed() {
+            h.pending.store(n, Ordering::Release);
+            owed.push(pid);
+        }
+    }
+
+    /// What checkpoint `n` images of `pid`, which its cut found owed: the page as its first change
+    /// since kept it, or the page as it stands, with its change count, which no change can be
+    /// making meanwhile. Step it until done.
+    pub fn image_source(self: &Arc<Self>, n: u64, pid: PageId) -> Result<IOResult<Source>> {
+        if let Some(bytes) = self.kept.lock().remove(&pid) {
+            return Ok(IOResult::Done(Source::Kept(bytes)));
+        }
+        let page = match self.fix_exclusive(pid, None)? {
+            IOResult::Done(p) => p,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        // Kept between the look and the latch.
+        if let Some(bytes) = self.kept.lock().remove(&pid) {
+            page.release_unchanged();
+            return Ok(IOResult::Done(Source::Kept(bytes)));
+        }
+        let h = self.header(page.frame);
+        let mut bytes = vec![0u8; pid.class().size()];
+        page.page().copy_to(0, &mut bytes);
+        let count = h.changes.load(Ordering::Acquire);
+        if h.pending.load(Ordering::Acquire) == n {
+            h.pending.store(0, Ordering::Release);
+        }
+        self.cut_owed.lock().remove(&pid);
+        page.release_unchanged();
+        Ok(IOResult::Done(Source::Live { bytes, count }))
+    }
+
+    /// A checkpoint wrote, as `pid`'s checkpoint copy, the page as it stood at change count
+    /// `count`, or an image that reads to every reader as that page does: if the page is still at
+    /// that count, it is owed nothing and is clean, the copy standing for it once it is evicted,
+    /// and its swap copy, which is no newer, is given up. A page changed since keeps its swap copy,
+    /// which a later eviction may have made the newest.
+    pub fn settled(&self, pid: PageId, count: u64) {
+        let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) else {
+            return;
+        };
+        let h = self.header(frame);
+        let Some(hold) = Held::try_take(&h.latch) else {
+            // Changing: it differs from the copy, and stays owed.
+            return;
+        };
+        if h.status() != RESIDENT
+            || h.pid() != pid.raw()
+            || h.changes.load(Ordering::Acquire) != count
+        {
+            hold.release_unchanged();
+            return;
+        }
+        h.imaged.store(count, Ordering::Release);
+        h.written.fetch_max(count, Ordering::AcqRel);
+        self.store.drop_swap(pid);
+        hold.release_unchanged();
+    }
+
+    /// A sweep writing back every dirty page, for a test ([`sweep`]).
     #[cfg(test)]
-    fn shard_of(&self, frame: u32) -> usize {
-        let (grains, n) = (self.memory.grains() as u64, self.shards.len() as u64);
-        (frame as u64 * n / grains) as usize
+    pub fn sweep(&self) -> sweep::Sweep {
+        sweep::Sweep::new()
     }
 
-    /// Starts a checkpoint pass over `shard`. Passes leave temporary pages alone.
-    pub fn pass(&self, shard: usize) -> Pass {
-        Pass::new(self, shard)
+    /// Evicts `pid`, resident, clean and unheld, for a test: the page is then in its copies alone.
+    /// Whether it was.
+    #[cfg(test)]
+    pub fn evict_clean(&self, pid: PageId) -> bool {
+        let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) else {
+            return false;
+        };
+        let h = self.header(frame);
+        let Some(hold) = self.latch_to_evict(pid.class(), frame, || &h.latch) else {
+            return false;
+        };
+        if h.dirty() {
+            hold.release_unchanged();
+            return false;
+        }
+        self.evict(pid.class(), frame, hold);
+        true
     }
 
-    /// Where a recovery could start replaying the log now, as far as the pool is concerned: the
-    /// lowest position of any shard.
-    pub fn redo_floor(&self) -> Lsn {
-        self.shards
-            .iter()
-            .map(Shard::position)
-            .min()
-            .expect("a shard")
+    /// The checkpoint whose cut is in effect, 0 for none.
+    pub fn cutting(&self) -> u64 {
+        self.cutting.load(Ordering::Acquire)
     }
+
+    /// Checkpoint `n` has imaged every page its cut found owed: changes no longer keep pages.
+    pub fn end_cut(&self, n: u64) {
+        debug_assert_eq!(self.cutting.load(Ordering::Acquire), n);
+        self.cutting.store(0, Ordering::SeqCst);
+        self.kept.lock().clear();
+        self.cut_owed.lock().clear();
+    }
+}
+
+/// A cut's walk over the frames for the pages owed an image ([`BufferPool::begin_cut`]).
+#[derive(Default)]
+pub struct CutScan {
+    next: u32,
+    pub owed: Vec<PageId>,
+    /// Whether the swap copies are listed, and those still to look at.
+    listed: bool,
+    swapped: Vec<PageId>,
+}
+
+/// What a checkpoint images of a page.
+pub enum Source {
+    /// The page as its first change or free after the cut kept it.
+    Kept(Box<[u8]>),
+    /// The page as it stands, at its change count.
+    Live { bytes: Vec<u8>, count: u64 },
 }
 
 /// A temporary page about to be read in.
@@ -1832,39 +1994,23 @@ impl<'a> Exclusive<'a> {
         self.pool.bytes(self.frame, self.pid.class())
     }
 
-    /// The page, to change. Every change is logged, and reported with [`changed`](Self::changed)
-    /// before the latch is released; a change not reported is lost when the page is evicted.
+    /// The page, to change. Every change is reported with [`changed`](Self::changed) before the
+    /// latch is released; a change not reported is lost when the page is evicted.
     pub fn page_mut(&mut self) -> Writer<'_> {
+        self.pool.keep_for_cut(self.frame, self.pid);
         // SAFETY: latched exclusively, and the writer borrows the guard.
         unsafe { self.pool.writer(self.frame, self.pid.class()) }
     }
 
-    /// Notes a change whose log record ends at `lsn`: the page's LSN becomes `lsn`, and the page
-    /// is dirty until a copy holding it is written back.
-    pub fn changed(&mut self, lsn: Lsn) {
+    /// Notes a change, made under the exclusive latch: the page's change count rises, and it
+    /// differs from every copy on disk until one holding the change is written.
+    pub fn changed(&mut self) {
         let h = self.pool.header(self.frame);
         // Relaxed: under the frame's exclusive latch.
-        assert!(
-            lsn > h.page_lsn.load(Ordering::Relaxed),
-            "a change to {:?} at {lsn} is not after its last",
-            self.pid
-        );
-        page::set_lsn(&mut self.page_mut(), lsn);
-        h.page_lsn.store(lsn, Ordering::Release);
+        let count = h.changes.load(Ordering::Relaxed) + 1;
+        page::set_seq(&mut self.page_mut(), count);
+        h.changes.store(count, Ordering::Release);
         h.tracker.write(self.pool.now());
-    }
-
-    /// [`changed`](Self::changed) for a temporary page, whose changes are never logged: its LSN
-    /// only orders its own changes, so the next is one past its last, with nothing shared.
-    pub fn changed_temporary(&mut self) {
-        debug_assert!(self.pid.is_temporary(), "{:?} is not temporary", self.pid);
-        // Relaxed: under the frame's exclusive latch.
-        let last = self
-            .pool
-            .header(self.frame)
-            .page_lsn
-            .load(Ordering::Relaxed);
-        self.changed(last + 1);
     }
 
     pub fn pid(&self) -> PageId {

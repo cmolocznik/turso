@@ -7,6 +7,10 @@
 //! page's entry reaches the copy `read` looks at, and once the pool has claimed the page nothing
 //! can change it until the read is done. `read` reads the entry without a lock, and yields if a
 //! change to the leaf holds its latch at that moment.
+//!
+//! A page evicted while it differed from its checkpoint copy has its newest copy in a swap slot
+//! (audit 18): `read` looks there first. Only a resident frame names a swap copy or gives one up,
+//! so the claim holds the swap map's entry still too.
 
 use super::super::meta::MetaRef;
 use super::super::page::PageId;
@@ -66,6 +70,9 @@ struct LocalLocated {
 impl Located for LocalLocated {
     fn read(mut self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<IOResult<()>> {
         let pid = self.pid;
+        if let Some(slot) = self.store.swap_slot(pid) {
+            return self.read_copy(slot, into, done);
+        }
         let entry = match self.leaf.take() {
             Some(leaf) => match leaf.read(|b| radix::map_entry(b, pid.number())) {
                 Some(entry) => entry,
@@ -83,21 +90,23 @@ impl Located for LocalLocated {
                 done(Ok(()));
                 Ok(IOResult::Done(()))
             }
-            entry => {
-                let c = self
-                    .store
-                    .read_slot_into(pid, entry - SLOT_BASE, into, move |read| {
-                        done(match read {
-                            PageRead::Valid(_) => Ok(()),
-                            PageRead::Invalid => {
-                                Err(CompletionError::CorruptPage { page: pid.raw() })
-                            }
-                            PageRead::Failed(e) => Err(e),
-                        })
-                    })?;
-                drop(c);
-                Ok(IOResult::Done(()))
-            }
+            entry => self.read_copy(entry - SLOT_BASE, into, done),
         }
+    }
+}
+
+impl LocalLocated {
+    /// Reads the copy of the page in `slot`.
+    fn read_copy(&self, slot: u64, into: Arc<Buffer>, done: ReadDone) -> Result<IOResult<()>> {
+        let pid = self.pid;
+        let c = self.store.read_slot_into(pid, slot, into, move |read| {
+            done(match read {
+                PageRead::Valid(_) => Ok(()),
+                PageRead::Invalid => Err(CompletionError::CorruptPage { page: pid.raw() }),
+                PageRead::Failed(e) => Err(e),
+            })
+        })?;
+        drop(c);
+        Ok(IOResult::Done(()))
     }
 }

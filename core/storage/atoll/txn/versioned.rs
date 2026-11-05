@@ -930,7 +930,6 @@ impl VersionedTree {
             let keep = newest.is_some_and(|v| own || !txns.visible(txn, v.slot, v.ts));
             let put = Put::with_owned(std::mem::take(&mut op.key), entry, HEADER, Mode::Upsert)
                 .expecting_entry(leaf_entry)
-                .in_transaction(txns.tail(txn))
                 .reserving(keep);
             let put = match op.reserves {
                 Reserves::Untouched => put.settling(),
@@ -938,7 +937,7 @@ impl VersionedTree {
             };
             let put = match &found {
                 // A version only this statement wrote is read by no one: its pages go.
-                Some(found) => put.undoing(found.as_ref()),
+                Some(_) => put.abandoning(),
                 // Another's may be read by a snapshot: they stay, retired.
                 None => put.retiring(),
             };
@@ -947,11 +946,10 @@ impl VersionedTree {
         }
     }
 
-    /// A write's put done: its leaf and group noted, its change noted by key, its buffers back in
-    /// `op`, and what it came to.
+    /// A write's put done: its leaf noted, its change noted by key, its buffers back in `op`, and
+    /// what it came to.
     fn wrote(&self, txn: &mut Txn, op: &mut WriteOp, put: Put, present: bool) -> Outcome {
         op.near = put.reached();
-        txn.logged(put.group().expect("a versioned tree's change is logged"));
         op.take_back(put);
         let root = self.root();
         txn.changed(|statement, changes| match op.deletes {

@@ -8,6 +8,7 @@ use crate::storage::atoll::btree::{Cursor, Seek};
 use crate::storage::atoll::db::AtollConfig;
 use crate::storage::atoll::log::Log;
 use crate::storage::atoll::page::SizeClass;
+use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::sql::catalog::tests::config;
 use crate::storage::atoll::sql::catalog::{Entry, Layout, System};
 use crate::storage::atoll::sql::AtollDb;
@@ -166,7 +167,7 @@ fn replaying_the_published_changes_rebuilds_every_tree() {
     }
 
     // Changes published alone are durable with the log, not when made: wait for all of it.
-    let log = source.atoll().store().log().clone();
+    let log = source.atoll().log().clone();
     drive(&io, || log.wait_durable(log.end())).unwrap();
     let mut reader = Log::reader(io.clone(), path, &keeping_the_log().log, 0);
     let mut gather = Gather::new();
@@ -180,7 +181,7 @@ fn replaying_the_published_changes_rebuilds_every_tree() {
             let start = u64::from_le_bytes(r.payload[..8].try_into().unwrap());
             *parts.entry(start).or_default() += 1;
         }
-        if let Some(body) = gather
+        if let Some((_, body)) = gather
             .record(r.header.kind, r.header.txn, &r.payload)
             .unwrap()
         {
@@ -266,7 +267,8 @@ fn parts_are_joined_in_order_and_refused_out_of_it() {
     assert_eq!(g.unfinished(), 1);
     assert_eq!(
         g.record(COMMIT, 3, &commit(a.len() as u64, b)).unwrap(),
-        Some(bytes.clone())
+        Some((Some(5), bytes.clone())),
+        "joined, with the Commit's timestamp"
     );
     assert_eq!(g.unfinished(), 0);
     assert!(
@@ -279,16 +281,20 @@ fn parts_are_joined_in_order_and_refused_out_of_it() {
         g.record(COMMIT, 4, &commit(0, &bytes)).is_err(),
         "a commit over its parts"
     );
-    assert_eq!(g.record(RUN, 0, &bytes).unwrap(), Some(bytes.clone()));
     assert_eq!(
-        g.record(crate::storage::atoll::txn::END, 4, &[]).unwrap(),
+        g.record(RUN, 0, &bytes).unwrap(),
+        Some((None, bytes.clone()))
+    );
+    assert_eq!(
+        g.record(crate::storage::atoll::checkpoint::META_INTENT, 0, &[])
+            .unwrap(),
         None
     );
 }
 
-/// Replay frees whole a tree it made and then reads drained, so the root can be made again; a
-/// drain of a root it never made only takes the root off its list, leaving whatever the page
-/// holds here, such as a tree of the system's.
+/// Replay frees whole a tree it made and then reads drained, its root with it; a drain of a root
+/// it never made only takes the root off its list, leaving whatever the page holds here, such as a
+/// tree of the system's.
 #[test]
 fn a_drain_frees_only_a_tree_replay_made() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -304,20 +310,16 @@ fn a_drain_frees_only_a_tree_replay_made() {
     made.put(1, dropped, &root.raw().to_be_bytes(), b"dropped");
     let mut drained = Changes::new();
     drained.drained(root, dropped);
-    let mut again = Changes::new();
-    again.create(1, root, System::Abandoned.root());
-    again.put(1, root, b"again", b"1");
     a.store().reserve([root]);
     let mut apply = Apply::new(io.clone(), a.pool().clone(), a.store().clone());
     apply.apply(made.bytes()).unwrap();
     assert_eq!(contents(&db, root, false).len(), 200);
     apply.apply(drained.bytes()).unwrap();
     assert!(contents(&db, dropped, false).is_empty(), "off its list");
-    apply.apply(again.bytes()).unwrap();
     assert_eq!(
-        contents(&db, root, false),
-        vec![(b"again".to_vec(), b"1".to_vec())],
-        "made again at the root drained"
+        drive(db.io(), || a.store().entry(root)).unwrap(),
+        FREE,
+        "its root freed"
     );
     a.store().release_reserved();
     let schema = System::Schema.root();

@@ -1,18 +1,24 @@
-//! Rollback and undo under crashes (DESIGN.md §19): a crash image taken every few operations of a
-//! workload recovers to exactly what was committed.
+//! Rollback, and recovery under crashes (DESIGN.md §19; audit 18): a crash image taken every few
+//! operations of a workload recovers to exactly what was committed.
 
 use super::*;
 use crate::io::crash::CrashIO;
+use crate::io::IO;
+use crate::storage::atoll::btree::Tree;
 use crate::storage::atoll::btree::{value, Check, Cursor, Seek};
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
-use crate::storage::atoll::control::{Control, Superblock};
+use crate::storage::atoll::control::Superblock;
 use crate::storage::atoll::db::{Atoll, AtollConfig};
+use crate::storage::atoll::drive;
+use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::page::SizeClass;
 use crate::storage::atoll::page::CLASS_COUNT;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
+use crate::storage::atoll::txn::versioned::VersionedTree;
 use crate::storage::atoll::txn::versioned::{Get, Write, WriteOp};
 use crate::storage::atoll::txn::{Abort, Commit, Isolation, TxnConfig};
+use crate::sync::Arc;
 use std::collections::{BTreeMap, BTreeSet};
 
 const BASE: &str = "/db/undo";
@@ -37,7 +43,6 @@ fn config() -> AtollConfig {
         },
         buffer: BufferConfig {
             budget: MIN_BUDGET,
-            checkpoint_shards: 8,
             writeback_bytes: WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
@@ -109,17 +114,21 @@ impl Db {
         let db = Atoll::open(io.clone(), BASE, config).unwrap();
         let roots = [0, 1].map(|c| {
             run(&io, || {
-                Tree::create_versioned(&io, db.pool(), db.store(), SizeClass::new(c).unwrap())
+                Tree::create_versioned(db.pool(), SizeClass::new(c).unwrap())
             })
         });
-        Self::with(
+        let made = Self::with(
             io,
             db,
             Roots {
                 trees: roots,
                 more: Lifecycle::default(),
             },
-        )
+        );
+        // Trees made outside any transaction are in no log: a checkpoint maps them before any
+        // write is admitted, as a database's creation does its system trees.
+        made.checkpoint();
+        made
     }
 
     /// What a crash left, recovered.
@@ -278,10 +287,10 @@ impl Db {
     /// Makes the plain list that undone creations go on.
     fn make_list(&mut self) -> PageId {
         let class = SizeClass::new(0).unwrap();
-        let list = run(&self.io, || {
-            Tree::create(&self.io, self.db.pool(), self.db.store(), class)
-        });
+        let list = run(&self.io, || Tree::create(self.db.pool(), class));
         self.more.list = Some(list);
+        // Made outside any transaction: in no log until a checkpoint maps it.
+        self.checkpoint();
         list
     }
 
@@ -340,26 +349,13 @@ impl Db {
 
     fn checkpoint(&self) -> Superblock {
         let ticket = self.db.checkpointer().request_full();
-        run(&self.io, || self.db.checkpointer().step_full(ticket));
+        run(&self.io, || {
+            self.db
+                .checkpointer()
+                .step_full(ticket, self.txns(), &self.versions)
+        });
         self.db.checkpointer().superblock()
     }
-}
-
-/// How many compensations of transaction `txn` the log of a crash image holds, read across the
-/// gaps recoveries left after torn tails, as its newest superblock records them.
-fn compensations_in(image: &CrashIO, txn: Ts) -> usize {
-    let io: Arc<dyn IO> = Arc::new(image.crash(0));
-    let (_, superblock) = Control::open(io.clone(), BASE).unwrap();
-    let gaps = superblock.map_or_else(Vec::new, |s| s.continuations);
-    let mut reader = Log::reader(io, BASE, &config().log, 0).following(&gaps);
-    let mut n = 0;
-    while let Some(r) = reader.next_record().unwrap() {
-        let kind = r.header.kind;
-        n += (r.header.txn == txn
-            && (kind == crate::storage::atoll::btree::record::RESTORE
-                || kind == crate::storage::atoll::btree::record::UNPUT)) as usize;
-    }
-    n
 }
 
 /// `keys` committed in both trees, durably.
@@ -373,54 +369,41 @@ fn committed(db: &Db, keys: &[String]) {
     db.commit(txn);
 }
 
-/// What [`recover_all`] checked.
-#[derive(Debug, Default)]
-struct Recovered {
-    recoveries: usize,
-    /// Crashes in a recovery that fell between two of its own compensations.
-    mid_undo: usize,
-    /// Crashes in the recovery of one of those that fell between two of its own in turn.
-    mid_undo_again: usize,
-}
-
-/// Where a recovery is crashed: just before each write to the log or the superblock completes,
-/// the write in flight torn, and every few operations besides. A recovery's compensations reach
-/// the log in a burst as its checkpoint forces it, so a crash between two of them is one in that
-/// burst; the last images before the checkpoint is published hold them all, and none after it
-/// reads them, since its redo point passed the gap they follow.
+/// Where a recovery is crashed: just before each write to any of the database's files completes,
+/// the write in flight torn, and every few operations besides: its log reopened, its checkpoint's
+/// images, metadata and superblock.
 fn crashes_in_recovery(path: &str) -> bool {
-    path == BASE || path.starts_with(&format!("{BASE}.log."))
+    path.starts_with(BASE)
 }
 
 /// Recovers every image to `expected`, and every `again`th one also through crashes while its
-/// recovery undoes and checkpoints ([`crashes_in_recovery`]), each recovered in turn, and one of
-/// them crashed again in its own recovery: the first that fell between two of the compensations
-/// of `txn` that recovery logged, else the middle one.
-#[allow(clippy::too_many_arguments)]
+/// recovery runs ([`crashes_in_recovery`]), each recovered in turn, and the middle one crashed
+/// again in its own recovery. Returns how many recoveries it checked.
 fn recover_all(
     images: Vec<CrashIO>,
     roots: Roots,
     keys: &[String],
     expected: &BTreeMap<(usize, String), Option<String>>,
     again: usize,
-    txn: Ts,
     label: &str,
-) -> Recovered {
-    let between = |n: usize, from: usize, to: usize| from < n && n < to;
-    let mut out = Recovered::default();
+) -> usize {
+    let mut recoveries = 0;
+    let mut check = |db: &Db, what: String| {
+        assert_eq!(&db.state(keys), expected, "{what}");
+        db.check_whole(&what);
+        recoveries += 1;
+    };
     for (i, image) in images.into_iter().enumerate() {
         let image = Arc::new(image);
         let crashed = (i % again == 0).then(|| image.crash(i as u64));
-        let db = Db::recover(image, roots.clone());
-        assert_eq!(&db.state(keys), expected, "{label}: image {i}");
-        db.check_whole(&format!("{label}: image {i}"));
-        out.recoveries += 1;
-        drop(db);
+        check(
+            &Db::recover(image, roots.clone()),
+            format!("{label}: image {i}"),
+        );
         let Some(crashed) = crashed else {
             continue;
         };
         let crashed = Arc::new(crashed);
-        let from = compensations_in(&crashed, txn);
         crashed.capture(crashes_in_recovery, 40, i as u64);
         drop(Db::recover(crashed.clone(), roots.clone()));
         let in_recovery = crashed.captured();
@@ -428,53 +411,27 @@ fn recover_all(
             !in_recovery.is_empty(),
             "{label}: image {i}: no image in recovery"
         );
-        let counts: Vec<usize> = in_recovery
-            .iter()
-            .map(|image| compensations_in(image, txn))
-            .collect();
-        let to = counts.iter().copied().max().unwrap_or(from);
-        out.mid_undo += counts.iter().filter(|&&n| between(n, from, to)).count();
-        let deepest = counts
-            .iter()
-            .position(|&n| between(n, from, to))
-            .unwrap_or(counts.len() / 2);
+        let deepest = in_recovery.len() / 2;
         for (j, image) in in_recovery.into_iter().enumerate() {
             let image = Arc::new(image);
             if j == deepest {
                 // Crashed in recovery, and that recovery crashed in turn.
                 image.capture(crashes_in_recovery, 40, j as u64);
                 drop(Db::recover(image.clone(), roots.clone()));
-                let deeper = image.captured();
-                let again: Vec<usize> = deeper
-                    .iter()
-                    .map(|image| compensations_in(image, txn))
-                    .collect();
-                let to_again = again.iter().copied().max().unwrap_or(counts[j]);
-                for (k, deeper) in deeper.into_iter().enumerate() {
-                    out.mid_undo_again += (between(counts[j], from, to)
-                        && between(again[k], counts[j], to_again))
-                        as usize;
-                    let db = Db::recover(Arc::new(deeper), roots.clone());
-                    assert_eq!(
-                        &db.state(keys),
-                        expected,
-                        "{label}: image {i}, in recovery {j}, in recovery {k}"
+                for (k, deeper) in image.captured().into_iter().enumerate() {
+                    check(
+                        &Db::recover(Arc::new(deeper), roots.clone()),
+                        format!("{label}: image {i}, in recovery {j}, in recovery {k}"),
                     );
-                    db.check_whole(&format!("{label}: image {i}, in recovery {j}, {k}"));
-                    out.recoveries += 1;
                 }
             }
-            let db = Db::recover(image, roots.clone());
-            assert_eq!(
-                &db.state(keys),
-                expected,
-                "{label}: image {i}, in recovery {j}"
+            check(
+                &Db::recover(image, roots.clone()),
+                format!("{label}: image {i}, in recovery {j}"),
             );
-            db.check_whole(&format!("{label}: image {i}, in recovery {j}"));
-            out.recoveries += 1;
         }
     }
-    out
+    recoveries
 }
 
 /// A transaction changes every key in several statements, one key again and again in one of
@@ -512,31 +469,13 @@ fn crashes_through_a_transaction_and_its_rollback_recover_what_was_committed() {
         for round in 0..5 {
             db.put(&mut t, 0, &keys[0], &value("again", round));
         }
-        let start = t.start();
         db.rollback(t);
         db.durable();
         let mut images = crash_io.captured();
         images.push(crash_io.crash(seed));
-        let counts: Vec<usize> = images.iter().map(|i| compensations_in(i, start)).collect();
-        let all = *counts.iter().max().unwrap();
-        assert!(
-            all > 100,
-            "seed {seed}: {all} compensations durable at most"
-        );
-        assert!(
-            counts.iter().any(|&n| n > 0 && n < all),
-            "seed {seed}: no image between compensations: {counts:?}"
-        );
-        let label = format!(
-            "seed {seed}, {} images, compensations {counts:?}",
-            images.len()
-        );
-        let r = recover_all(images, db.roots(), &every, &expected, 1, start, &label);
-        println!("{label}: {r:?}");
-        assert!(
-            r.mid_undo > 0 && r.mid_undo_again > 0,
-            "{label}: no crash between two of a recovery's compensations: {r:?}"
-        );
+        let label = format!("seed {seed}, {} images", images.len());
+        let n = recover_all(images, db.roots(), &every, &expected, 1, &label);
+        assert!(n > 1, "{label}: {n} recoveries");
     }
 }
 
@@ -549,9 +488,6 @@ fn crashes_through_a_transaction_and_its_rollback_recover_what_was_committed() {
 /// wrote are freed, and the ones it replaced are kept.
 #[test]
 fn crashes_through_large_values_and_their_rollback_recover_what_was_committed_and_leak_nothing() {
-    // Where the crashes landed, over both seeds: the compensations go out in one write, which a
-    // crash tears inside them or not as its seed falls.
-    let (mut between, mut mid_undo) = (0, 0);
     for seed in 0..2u64 {
         let crash_io = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash_io.clone();
@@ -590,7 +526,6 @@ fn crashes_through_large_values_and_their_rollback_recover_what_was_committed_an
         for round in 0..4 {
             db.put(&mut t, 0, &keys[0], &large("again", round));
         }
-        let start = t.start();
         db.rollback(t);
         db.durable();
         assert_eq!(
@@ -601,26 +536,10 @@ fn crashes_through_large_values_and_their_rollback_recover_what_was_committed_an
         db.check_whole(&format!("seed {seed}: the rollback running on"));
         let mut images = crash_io.captured();
         images.push(crash_io.crash(seed));
-        let counts: Vec<usize> = images.iter().map(|i| compensations_in(i, start)).collect();
-        let all = *counts.iter().max().unwrap();
-        assert!(all > 0, "seed {seed}: no compensation durable: {counts:?}");
-        between += counts.iter().filter(|&&n| n > 0 && n < all).count();
-        let label = format!(
-            "seed {seed}, {} images, compensations {counts:?}",
-            images.len()
-        );
-        let r = recover_all(images, db.roots(), &every, &expected, 3, start, &label);
-        println!("{label}: {r:?}");
-        mid_undo += r.mid_undo;
+        let label = format!("seed {seed}, {} images", images.len());
+        let n = recover_all(images, db.roots(), &every, &expected, 3, &label);
+        assert!(n > 1, "{label}: {n} recoveries");
     }
-    assert!(
-        between > 0,
-        "no image between two of the rollback's compensations"
-    );
-    assert!(
-        mid_undo > 0,
-        "no crash between two of a recovery's compensations"
-    );
 }
 
 /// A value written since the last checkpoint and replaced by a commit is retired with no copy of
@@ -683,8 +602,8 @@ fn a_key_put_back_and_changed_by_a_commit_since_keeps_that_commit_through_undo()
         let mut images = crash_io.captured();
         images.push(crash_io.crash(seed));
         let label = format!("seed {seed}, {} images", images.len());
-        let r = recover_all(images, db.roots(), &keys, &expected, 4, t.start(), &label);
-        println!("{label}: {r:?}");
+        let n = recover_all(images, db.roots(), &keys, &expected, 4, &label);
+        assert!(n > 1, "{label}: {n} recoveries");
         drop(t);
     }
 }
@@ -759,9 +678,6 @@ fn a_transaction_past_65535_statements_rolls_back_to_one_commits_and_recovers() 
         for (i, key) in keys.iter().enumerate().step_by(3) {
             db.put(&mut u, (i + 1) % 2, key, &value("lost again", i));
         }
-        let start = u.start();
-        // An image with every change of the transaction durable and none of its compensations:
-        // its recovery logs them all, more than the log buffer holds.
         db.durable();
         let before = crash_io.crash(seed);
         db.rollback(u);
@@ -769,25 +685,10 @@ fn a_transaction_past_65535_statements_rolls_back_to_one_commits_and_recovers() 
         let mut images = crash_io.captured();
         images.push(before);
         images.push(crash_io.crash(seed));
-        let counts: Vec<usize> = images.iter().map(|i| compensations_in(i, start)).collect();
-        let all = *counts.iter().max().unwrap();
-        assert!(
-            counts.iter().any(|&n| n > 0 && n < all),
-            "seed {seed}: no image between compensations: {counts:?}"
-        );
-        let label = format!(
-            "seed {seed}, {} images, compensations {counts:?}",
-            images.len()
-        );
-        // Every image crashed in its recovery too: only an image from before the rollback's
-        // compensations reached the log leaves its recovery more of them to log than the log
-        // buffer holds, so a crash between two of them, and there are few such images.
-        let r = recover_all(images, db.roots(), &keys, &expected, 1, start, &label);
-        println!("{label}: {r:?}");
-        assert!(
-            r.mid_undo > 0,
-            "{label}: no crash between two of a recovery's compensations: {r:?}"
-        );
+        let label = format!("seed {seed}, {} images", images.len());
+        // Every image crashed in its recovery too.
+        let n = recover_all(images, db.roots(), &keys, &expected, 1, &label);
+        assert!(n > 1, "{label}: {n} recoveries");
     }
 }
 
@@ -805,69 +706,6 @@ fn a_statement_past_the_last_number_fails_and_the_transaction_rolls_back() {
     assert_eq!(t.command(), Statement::MAX);
     db.rollback(t);
     assert_eq!(db.state(&["k".to_string()])[&(0, "k".to_string())], None);
-}
-
-/// A writer's one change is followed by segments' worth of others' commits and checkpoints whose
-/// redo points pass it: segments before it are deleted, its own are kept, and a crash at any
-/// point, a torn superblock included, undoes it from them. Nothing of it follows the redo point,
-/// so only the writer table names it.
-#[test]
-fn a_writer_spanning_checkpoints_and_deleted_segments_is_undone_from_the_log_it_kept() {
-    let crash_io = Arc::new(CrashIO::new(7));
-    let io: Arc<dyn IO> = crash_io.clone();
-    let db = Db::create(io.clone());
-    let keys: Vec<String> = (0..4).map(|i| format!("k{i}")).collect();
-    committed(&db, &keys);
-    let expected = db.state(&keys);
-    let segment = config().log.segment_bytes;
-    let filler = vec![7u8; 32 << 10];
-    let filler_kind = crate::storage::atoll::log::Kind::new(100).unwrap();
-    // Commits of others, `bytes` of log, each a record outside any tree; the group of the first.
-    let fill = |bytes: u64| {
-        let end = db.db.log().end() + bytes;
-        let mut first = None;
-        while db.db.log().end() < end {
-            let mut other = db.begin();
-            let mut admitted = run(&db.io, || db.db.log().admit(framed_len(filler.len())));
-            db.txns()
-                .append(&mut other, &mut admitted, filler_kind, &[&filler]);
-            first = first.or(other.tail());
-            db.commit(other);
-        }
-        first.unwrap()
-    };
-    // Segments before the writer begins, deleted by the checkpoints after them.
-    let before = fill(2 * segment);
-    db.checkpoint();
-    let mut t = db.begin();
-    db.put(&mut t, 0, &keys[0], &value("early", 0));
-    let first = t.tail().unwrap();
-    // A crash image as each superblock is written, which tears it, and every so often.
-    crash_io.capture(|path| path == BASE, 200, 7);
-    let mut checkpoints = 0;
-    while db.checkpoint().redo < first.get() + 2 * segment {
-        fill(segment);
-        checkpoints += 1;
-    }
-    db.durable();
-    let mut images = crash_io.captured();
-    images.push(crash_io.crash(7));
-    assert!(
-        checkpoints >= 2,
-        "{checkpoints} checkpoints past the writer's first change"
-    );
-    assert!(
-        Log::read_group(io.clone(), BASE, &config().log, before).is_err(),
-        "the segments before the writer were kept"
-    );
-    assert!(
-        Log::read_group(io.clone(), BASE, &config().log, first).is_ok(),
-        "the writer's first change was deleted"
-    );
-    let label = format!("{} images", images.len());
-    let r = recover_all(images, db.roots(), &keys, &expected, 3, t.start(), &label);
-    println!("{label}: {r:?}");
-    drop(t);
 }
 
 /// A rollback to an earlier statement puts on the list the trees its later statements created,
@@ -923,11 +761,11 @@ fn undone_creations_go_on_the_list_and_the_rest_stay_with_their_earlier_changes(
 }
 
 /// A loser that created trees in several statements and wrote them, crashed anywhere, through
-/// recoveries crashed between two of their own compensations: every root it made is on the list,
-/// emptied, exactly when it is allocated, so none leaks; a tree a committed transaction created
-/// stays off the list with its rows; and what was committed reads back.
+/// recoveries crashed in turn: none of its creations reached the log, so no root it made is on
+/// the list or allocated and none leaks; a tree a committed transaction created stays off the list
+/// with its rows; and what was committed reads back.
 #[test]
-fn a_losers_created_trees_go_on_the_list_through_crashes_and_a_committed_ones_stay() {
+fn a_losers_created_trees_are_gone_after_crashes_and_a_committed_ones_stay() {
     for seed in 0..2u64 {
         let crash_io = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash_io.clone();
@@ -944,7 +782,6 @@ fn a_losers_created_trees_go_on_the_list_through_crashes_and_a_committed_ones_st
         let expected = db.state(&keys);
         crash_io.capture(|_| false, 3, seed);
         let mut t = db.begin();
-        let start = t.start();
         for s in 0..4 {
             let root = db.create_tree(&mut t, s % 2);
             db.more.made.push(root);
@@ -959,51 +796,21 @@ fn a_losers_created_trees_go_on_the_list_through_crashes_and_a_committed_ones_st
         images.push(crash_io.crash(seed));
         let label = format!("seed {seed}, {} images", images.len());
         let roots = db.roots();
-        let r = recover_all(images, roots.clone(), &keys, &expected, 3, start, &label);
-        println!("{label}: {r:?}");
-        assert!(
-            r.mid_undo > 0,
-            "{label}: no crash inside a recovery's undo: {r:?}"
-        );
-        // The last image holds every creation: each is on the list.
+        let n = recover_all(images, roots.clone(), &keys, &expected, 3, &label);
+        assert!(n > 1, "{label}: {n} recoveries");
+        // The last image holds every creation of the loser: none reached the log, so none is
+        // on the list and none is allocated.
         let db = Db::recover(Arc::new(crash_io.crash(seed + 1)), roots);
         let listed = db.listed(db.more.list.unwrap());
-        assert!(db.more.made.iter().all(|r| listed.contains(r)), "{label}");
+        for root in &db.more.made {
+            assert!(!listed.contains(root), "{label}: {root:?} listed");
+            let entry = run(&db.io, || db.db.store().entry(*root));
+            assert_eq!(entry, FREE, "{label}: {root:?} allocated");
+        }
         let mut t = db.begin();
         assert_eq!(db.get_in(&mut t, kept, "x").as_deref(), Some("kept"));
         db.commit(t);
     }
-}
-
-/// A creation record leads the group that makes its root: the root's image and its adoption are
-/// in the same group, so no crash keeps one without the other.
-#[test]
-fn a_creation_record_leads_the_group_that_makes_and_adopts_its_root() {
-    use crate::storage::atoll::btree::record::INIT;
-    use crate::storage::atoll::store::kinds::ADOPT;
-    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
-    let mut db = Db::create(io.clone());
-    let list = db.make_list();
-    let mut t = db.begin();
-    let root = db.create_tree(&mut t, 1);
-    let start = t.start();
-    db.commit(t);
-    let mut reader = Log::reader(io, BASE, &config().log, 0);
-    let mut groups = Vec::new();
-    while let Some(r) = reader.next_record().unwrap() {
-        groups.push(r);
-    }
-    let lead = groups
-        .iter()
-        .position(|r| r.header.kind == CREATE)
-        .expect("a creation record");
-    let group = groups[lead].group;
-    assert_eq!(groups[lead].header.txn, start);
-    assert_eq!(creation(&groups[lead].payload), Some((root, list)));
-    let members: Vec<_> = groups.iter().filter(|r| r.group == group).collect();
-    let kinds: Vec<_> = members.iter().map(|r| r.header.kind).collect();
-    assert_eq!(kinds, vec![CREATE, INIT, ADOPT], "{root:?}");
-    assert!(members[1..].iter().all(|r| r.header.txn == 0));
 }
 
 /// A settle reaches the log: a crash after writes took the room it gave back recovers them, though

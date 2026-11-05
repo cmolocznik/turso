@@ -1,5 +1,5 @@
-//! Draining a tree whole (DESIGN.md §17): every page of it freed, groups within their bounds, and
-//! a drain a crash cut short gone on with from the tree the crash left.
+//! Draining a tree whole (DESIGN.md §17): every page of it freed, a node a step, and a drain a crash
+//! cut short gone on with from the tree the checkpoint in charge left.
 
 use super::*;
 use crate::io::crash::CrashIO;
@@ -11,6 +11,7 @@ use crate::storage::atoll::page::CLASS_COUNT;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
+use crate::storage::atoll::txn::versioned::Versions;
 use std::collections::BTreeSet;
 
 const BASE: &str = "/db/drain";
@@ -30,7 +31,6 @@ fn config(chunk_bytes: u64) -> AtollConfig {
         },
         buffer: BufferConfig {
             budget: MIN_BUDGET,
-            checkpoint_shards: 8,
             writeback_bytes: WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
@@ -45,33 +45,42 @@ fn run<T>(io: &Arc<dyn IO>, op: impl FnMut() -> Result<IOResult<T>>) -> T {
 struct Db {
     io: Arc<dyn IO>,
     db: Atoll,
+    versions: Versions,
     list: Tree,
-    chunk_bytes: u64,
 }
 
 impl Db {
     /// A new database, with a plain list for the trees to drain.
     fn create(io: Arc<dyn IO>, chunk_bytes: u64) -> Self {
         let db = Atoll::open(io.clone(), BASE, config(chunk_bytes)).unwrap();
-        let list = run(&io, || {
-            Tree::create(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
-        });
-        Self::with(io, db, list, chunk_bytes)
+        let list = run(&io, || Tree::create(db.pool(), SizeClass::new(0).unwrap()));
+        Self::with(io, db, list)
     }
 
     fn recover(io: Arc<dyn IO>, chunk_bytes: u64, list: PageId) -> Self {
         let db = Atoll::open(io.clone(), BASE, config(chunk_bytes)).unwrap();
-        Self::with(io, db, list, chunk_bytes)
+        Self::with(io, db, list)
     }
 
-    fn with(io: Arc<dyn IO>, db: Atoll, list: PageId, chunk_bytes: u64) -> Self {
+    fn with(io: Arc<dyn IO>, db: Atoll, list: PageId) -> Self {
         let list = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), list);
+        let slots = config(0).txn.slots;
+        let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), slots);
         Self {
             io,
             db,
+            versions,
             list,
-            chunk_bytes,
         }
+    }
+
+    /// A full checkpoint, done.
+    fn checkpoint(&self) {
+        let checkpointer = self.db.checkpointer();
+        let ticket = checkpointer.request_full();
+        run(&self.io, || {
+            checkpointer.step_full(ticket, self.db.transactions(), &self.versions)
+        });
     }
 
     /// How many levels the tree rooted at `root` has.
@@ -92,9 +101,7 @@ impl Db {
     /// A tree of `class` holding `values`, keyed by their position, listed.
     fn listed_tree(&self, class: usize, values: &[Vec<u8>]) -> PageId {
         let class = SizeClass::new(class).unwrap();
-        let root = run(&self.io, || {
-            Tree::create(&self.io, self.db.pool(), self.db.store(), class)
-        });
+        let root = run(&self.io, || Tree::create(self.db.pool(), class));
         let tree = self.tree(root);
         for (i, v) in values.iter().enumerate() {
             let mut put = Put::new(&(i as u64).to_be_bytes(), v.clone(), Mode::Insert);
@@ -163,17 +170,17 @@ impl Db {
         self.drain_with(root, false)
     }
 
-    /// Drains `root`, the log made durable after each step when `durably`, so each step's group
-    /// reaches the log file while the drain runs, and a crash can fall between two of them.
-    fn drain_with(&self, root: PageId, durably: bool) -> usize {
+    /// Drains `root`, a full checkpoint after each step when `checkpointed`, so the tree a step
+    /// leaves is in charge while the drain runs, and a crash can fall inside any of them.
+    fn drain_with(&self, root: PageId, checkpointed: bool) -> usize {
         let tree = self.tree(root);
         let mut op = Drain::new(&root.raw().to_be_bytes());
         let mut steps = 0;
         loop {
             steps += 1;
             let drained = run(&self.io, || tree.drain(&self.list, &mut op));
-            if durably {
-                run(&self.io, || self.db.log().wait_durable(self.db.log().end()));
+            if checkpointed {
+                self.checkpoint();
             }
             if drained == Drained::Gone {
                 return steps;
@@ -212,24 +219,6 @@ impl Db {
             leaked.is_empty() && lost.is_empty(),
             "{label}: allocated and unreachable {leaked:?}; reachable and free {lost:?}"
         );
-    }
-
-    /// The log's groups since `from`: each group's record count and framed bytes.
-    fn groups_since(&self, from: Lsn) -> Vec<(usize, u64)> {
-        run(&self.io, || self.db.log().wait_durable(self.db.log().end()));
-        let mut reader = Log::reader(self.io.clone(), BASE, &config(self.chunk_bytes).log, from);
-        let mut groups: Vec<(Lsn, usize, u64)> = Vec::new();
-        while let Some(r) = reader.next_record().unwrap() {
-            let len = framed_len(r.payload.len());
-            match groups.last_mut() {
-                Some((g, n, bytes)) if *g == r.group => {
-                    *n += 1;
-                    *bytes += len;
-                }
-                _ => groups.push((r.group, 1, len)),
-            }
-        }
-        groups.into_iter().map(|(_, n, b)| (n, b)).collect()
     }
 }
 
@@ -270,7 +259,7 @@ fn a_tree_drains_whole_with_every_page_of_its_values() {
         "the walk by position reaches what the check does"
     );
     let steps = db.drain(root);
-    assert_eq!(steps, stats.nodes, "a group per node");
+    assert_eq!(steps, stats.nodes, "a step per node");
     assert_eq!(db.listed(), vec![keep]);
     let orphans: BTreeSet<_> = db.db.store().orphans().into_iter().collect();
     for &pid in &pages {
@@ -285,63 +274,13 @@ fn a_tree_drains_whole_with_every_page_of_its_values() {
     db.check_nothing_leaked("drained");
 }
 
-/// A leaf of more values than one group frees is drained in groups of removals, each within a log
-/// chunk and 255 records, the chunk's bytes binding: each value past a quarter of a 32 KiB node,
-/// so out of line in a page of its own, and a leaf's page ids past a one-block chunk.
-///
-/// The record count cannot bind through a tree a test builds: 255 removals take more than a 12 KiB
-/// chunk, and the largest node's leaf of one-page values names fewer page ids than a 16 KiB chunk
-/// holds, so it drains in one group. Only values of several chunks, of more than the largest page
-/// each, reach it, and `a_group_takes_fewer_removals_than_255_records_and_no_more_than_a_chunk`
-/// takes it alone; every group here is checked against it all the same.
+/// A drain crashed anywhere, a checkpoint after each of its steps: each image recovers the list
+/// and the tree as the checkpoint in charge left them, the tree whole, partly drained or gone, with
+/// nothing leaked; the drain goes on from there, and in the end the tree is gone, every page of it
+/// freed and no other page touched. Images are taken before each superblock write, where a
+/// checkpoint's pages are written and the one before is still in charge, and at operations between.
 #[test]
-fn a_leaf_of_more_values_than_a_group_frees_drains_in_groups_within_both_bounds() {
-    for (chunk_bytes, class, len, count) in [(4 << 10, 3, 9 << 10, 1200)] {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Db::create(io, chunk_bytes);
-        let values: Vec<Vec<u8>> = (0..count).map(|i| bytes(i, len)).collect();
-        let root = db.listed_tree(class, &values);
-        let from = db.db.log().end();
-        let steps = db.drain(root);
-        let groups = db.groups_since(from);
-        let label = format!(
-            "chunk {chunk_bytes}: {steps} steps, {} groups",
-            groups.len()
-        );
-        for &(n, len) in &groups {
-            assert!(
-                n <= 255 && len <= chunk_bytes,
-                "{label}: a group of {n}, {len} bytes"
-            );
-        }
-        // Full: at its record count, or with no room for one more entry's removal and page.
-        let entry = framed_len(8 + 8) + 8;
-        let full = |&&(n, len): &&(usize, u64)| n == 255 || len + entry > chunk_bytes;
-        assert!(
-            groups.iter().filter(full).count() >= 2,
-            "{label}: {groups:?}"
-        );
-        assert!(db.listed().is_empty(), "{label}");
-        db.check_nothing_leaked(&label);
-    }
-}
-
-/// A group's removals stop at 254, leaving the abandonment of their pages its record, however
-/// small they are, and at a log chunk's bytes, however few: 300 removals of 8-byte keys and one page
-/// each, 48 bytes a removal and 8 a page, fit a 64 KiB chunk whole, and 72 fill a 4 KiB one.
-#[test]
-fn a_group_takes_fewer_removals_than_255_records_and_no_more_than_a_chunk() {
-    let one_page = || std::iter::repeat_n((8, 1), 300);
-    assert_eq!(removals_fitting(one_page(), 64 << 10), 254);
-    let fill = |n: u64| n * framed_len(16) + PageStore::group_record_len(n as usize);
-    assert!(fill(72) <= 4 << 10 && fill(73) > 4 << 10);
-    assert_eq!(removals_fitting(one_page(), 4 << 10), 72);
-}
-
-/// A drain crashed anywhere: each image recovers, the drain goes on from the tree it left, and in
-/// the end the tree is gone, every page of it freed and no other page touched.
-#[test]
-fn a_drain_crashed_anywhere_goes_on_from_the_tree_it_left() {
+fn a_drain_crashed_anywhere_goes_on_from_the_tree_the_checkpoint_in_charge_left() {
     for seed in 0..2u64 {
         let crash_io = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash_io.clone();
@@ -351,30 +290,36 @@ fn a_drain_crashed_anywhere_goes_on_from_the_tree_it_left() {
             .collect();
         let root = db.listed_tree(0, &values);
         let list = db.list.root();
-        run(&db.io, || db.db.log().wait_durable(db.db.log().end()));
-        let ticket = db.db.checkpointer().request_full();
-        run(&db.io, || db.db.checkpointer().step_full(ticket));
-        crash_io.capture(|path| path.starts_with(&format!("{BASE}.log.")), 2, seed);
+        let pages = db.pages(root).len();
+        db.checkpoint();
+        crash_io.capture(|path| path == BASE, 2, seed);
         let steps = db.drain_with(root, true);
         let mut images = crash_io.captured();
         images.push(crash_io.crash(seed));
         let label = format!("seed {seed}: {steps} steps, {} images", images.len());
-        let (mut resumed, mut whole) = (0, 0);
+        let (mut whole, mut partly, mut gone) = (0, 0, 0);
         for (i, image) in images.into_iter().enumerate() {
             let db = Db::recover(Arc::new(image), 4 << 10, list);
             match db.listed().as_slice() {
-                [] => whole += 1,
+                [] => gone += 1,
                 [r] if *r == root => {
                     db.check_nothing_leaked(&format!("{label}: image {i}, recovered"));
+                    match db.pages(root).len() {
+                        n if n == pages => whole += 1,
+                        n if n < pages => partly += 1,
+                        n => panic!("{label}: image {i}: {n} pages, of {pages}"),
+                    }
                     db.drain(root);
-                    resumed += 1;
                 }
                 other => panic!("{label}: image {i} lists {other:?}"),
             }
             assert!(db.listed().is_empty(), "{label}: image {i}");
             db.check_nothing_leaked(&format!("{label}: image {i}"));
         }
-        println!("{label}: {resumed} resumed, {whole} already drained");
-        assert!(resumed > 2, "{label}: {resumed} resumed");
+        println!("{label}: {whole} whole, {partly} partly drained, {gone} gone");
+        assert!(
+            partly > 1 && gone > 0,
+            "{label}: {partly} partly drained, {gone} gone"
+        );
     }
 }

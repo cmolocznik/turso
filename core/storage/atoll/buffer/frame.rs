@@ -34,11 +34,17 @@ pub struct FrameHeader {
     pub latch: VersionedLatch,
     /// The page held; meaningful only with `status` RESIDENT, LOADING or OUTGOING.
     pub pid: AtomicU64,
-    /// The LSN of the page's last change, mirrored from its header.
-    pub page_lsn: AtomicU64,
-    /// The LSN of the newest copy written back, or loaded: the page is dirty while `page_lsn` is
-    /// past it.
-    pub written_lsn: AtomicU64,
+    /// The page's change count, mirrored in its header: one more at each change.
+    pub changes: AtomicU64,
+    /// The count of the newest copy written, or loaded: the page is dirty while `changes` is past
+    /// it, and may be dropped once it is not.
+    pub written: AtomicU64,
+    /// The count its checkpoint copy holds: the page is owed an image while `changes` differs
+    /// from it (audit 18, review 1).
+    pub imaged: AtomicU64,
+    /// The checkpoint whose cut found the page owed and has not imaged it yet: its first change
+    /// meanwhile keeps its bytes for that checkpoint.
+    pub pending: AtomicU64,
     /// This frame's link in its hash chain: the next frame, a mark and a tag ([`super::table`]).
     pub next: super::table::Link,
     pub status: AtomicU8,
@@ -63,7 +69,12 @@ impl FrameHeader {
     }
 
     pub fn dirty(&self) -> bool {
-        self.page_lsn.load(Ordering::Acquire) > self.written_lsn.load(Ordering::Acquire)
+        self.changes.load(Ordering::Acquire) > self.written.load(Ordering::Acquire)
+    }
+
+    /// Whether the page differs from its checkpoint copy.
+    pub fn owed(&self) -> bool {
+        self.changes.load(Ordering::Acquire) != self.imaged.load(Ordering::Acquire)
     }
 
     pub fn has(&self, flag: u8) -> bool {
@@ -73,4 +84,4 @@ impl FrameHeader {
 
 // Shuttle's and loom's atomics are larger than the hardware's.
 #[cfg(not(any(shuttle, atoll_loom)))]
-const _: () = assert!(std::mem::size_of::<FrameHeader>() == 104);
+const _: () = assert!(std::mem::size_of::<FrameHeader>() == 120);

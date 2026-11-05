@@ -11,7 +11,7 @@ use super::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
 use super::db::{Atoll, AtollConfig};
 use super::drive;
 use super::epoch::{Epochs, Retired};
-use super::log::{framed_len, Kind, LogConfig};
+use super::log::LogConfig;
 use super::stack::FreeList;
 use super::store::StoreConfig;
 use super::txn::{Commit, Isolation, TxnConfig};
@@ -27,9 +27,6 @@ const RUN: Duration = Duration::from_secs(1);
 /// Runs per thread count, of which the median is reported: one run disturbed by the rest of the
 /// machine cannot move it.
 const REPEATS: usize = 5;
-
-/// A record a benchmark transaction writes, standing for a change.
-const WRITE: Kind = Kind::new(100).unwrap();
 
 type Op = Arc<dyn Fn() + Send + Sync>;
 
@@ -128,8 +125,9 @@ fn free_list_pop_and_push() {
     });
 }
 
-/// A transaction that logs one record and commits, durable on memory: the log's admission,
-/// reservation, copy and flush, the clock, the horizon and the commit logs.
+/// A transaction that commits one small change, durable on memory: the Commit record's admission,
+/// reservation, copy and flush, the clock, the horizon and the commit logs. The change is noted
+/// and not made: the commit pays for its body alone.
 #[test]
 #[ignore]
 fn commits() {
@@ -149,7 +147,6 @@ fn commits() {
             },
             buffer: BufferConfig {
                 budget: MIN_BUDGET,
-                checkpoint_shards: 8,
                 writeback_bytes: WRITEBACK_BYTES,
             },
             log_budget: None,
@@ -158,13 +155,12 @@ fn commits() {
             },
         };
         let db = Arc::new(Atoll::open(io.clone(), "/db/bench", config).unwrap());
+        let class = super::page::SizeClass::new(0).unwrap();
+        let root = drive(&io, || super::btree::Tree::create(db.pool(), class)).unwrap();
         Arc::new(move || {
             let mut txn = drive(&io, || db.transactions().begin(Isolation::ReadCommitted)).unwrap();
-            let log = db.log();
-            let mut admitted = drive(&io, || log.admit(framed_len(8))).unwrap();
-            let start = txn.start().to_le_bytes();
-            db.transactions()
-                .append(&mut txn, &mut admitted, WRITE, &[&start]);
+            let start = txn.start().to_be_bytes();
+            txn.changed(|s, c| c.plain_put(s, root, &start, &[]));
             let mut op = Commit::new(txn);
             drive(&io, || db.transactions().commit(&mut op)).unwrap();
         })
@@ -202,10 +198,7 @@ fn paths() {
         let config = bench_config();
         let db = Atoll::open(io.clone(), "/db/bench", config).unwrap();
         // The log's segments are prepared by its first appends: here, not in a timed phase.
-        let root = drive(&io, || {
-            Tree::create(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
-        })
-        .unwrap();
+        let root = drive(&io, || Tree::create(db.pool(), SizeClass::new(0).unwrap())).unwrap();
         let scratch = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), root);
         for n in 0..1_000 {
             let mut op = Put::new(&key(n), value.clone(), Mode::Insert);
@@ -231,10 +224,7 @@ fn paths() {
             continue;
         }
         let (io, db) = open();
-        let root = drive(&io, || {
-            Tree::create(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
-        })
-        .unwrap();
+        let root = drive(&io, || Tree::create(db.pool(), SizeClass::new(0).unwrap())).unwrap();
         let tree = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), root);
         // Each put tries the leaf the one before reached, as a cursor's writes do.
         let mut put = || {
@@ -282,10 +272,7 @@ fn paths() {
     }
     if runs("tree-update") {
         let (io, db) = open();
-        let root = drive(&io, || {
-            Tree::create(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
-        })
-        .unwrap();
+        let root = drive(&io, || Tree::create(db.pool(), SizeClass::new(0).unwrap())).unwrap();
         let tree = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), root);
         for &n in &shuffled {
             let mut op = Put::new(&key(n), value.clone(), Mode::Insert);
@@ -316,7 +303,7 @@ fn paths() {
     if versioned.iter().any(|v| runs(v)) {
         let (io, db) = open();
         let root = drive(&io, || {
-            Tree::create_versioned(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
+            Tree::create_versioned(db.pool(), SizeClass::new(0).unwrap())
         })
         .unwrap();
         let slots = TxnConfig::default().slots;
@@ -619,7 +606,6 @@ fn bench_config() -> AtollConfig {
         },
         buffer: BufferConfig {
             budget: 2 << 30,
-            checkpoint_shards: 128,
             writeback_bytes: WRITEBACK_BYTES,
         },
         log_budget: None,

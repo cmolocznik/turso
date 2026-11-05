@@ -1,27 +1,22 @@
 //! Writing dirty pages back.
 //!
 //! A writeback takes dirty frames of one class, already marked WRITING by whoever chose them, so
-//! they are neither evicted nor dropped while it runs. It plans their writes with the page store,
-//! which takes fresh slots under a logged intent. Then it copies each page optimistically, checked
-//! against its latch, and writes the copy. A page changed while its copy is in flight stays dirty.
+//! they are neither evicted nor dropped while it runs. Each page takes a swap slot from the page
+//! store, claimed in memory alone (audit 18). Then it copies each page optimistically, checked
+//! against its latch, and writes the copy, not made durable: a crash frees every swap slot, and a
+//! checkpoint writes what a page owes. A page changed while its copy is in flight stays dirty.
 //!
 //! A write-out ([`Outgoing`]) is a writeback of a page leaving its frame for good: the frame is
 //! held until the write lands, so the copy needs no check, and settling the write frees the frame.
 //!
 //! **Settling.** A write's completion only records that it landed and wakes the pool's waiters:
-//! what follows (the remap, which latches metadata pages; the frame's state) is done when the
-//! writeback is next stepped, where a latched page means a yield rather than a wait. So a
-//! writeback stays queued until every write it submitted is settled, and whoever waits for a
-//! write steps the queue when it wakes.
-//!
-//! No log flush comes first: a copy's remap is logged after the copy lands, so a remap that
-//! survives a crash names a copy whose records survived too (DESIGN.md §6.3).
+//! what follows (the swap copy named, the frame's state) is done when the writeback is next
+//! stepped. So a writeback stays queued until every write it submitted is settled, and whoever
+//! waits for a write steps the queue when it wakes.
 
-use super::super::log::Lsn;
 use super::super::page::{self, PageId, SizeClass};
 use super::super::shared::Bytes;
 use super::super::stack::Stack;
-use super::super::store::WritePlan;
 use super::frame::{EVICT_AFTER, RESIDENT, WRITING};
 use super::{BufferPool, Outgoing};
 use crate::io::Completion;
@@ -50,13 +45,14 @@ pub struct Writeback {
     /// Per frame, its write-out, for a page leaving the frame; `None` for a page that stays.
     outgoing: Vec<Option<Outgoing>>,
     evict_after: bool,
-    /// The pages are temporary: written to the temporary files, with no plan.
+    /// The pages are temporary: written to the temporary files, with no swap slot.
     temporary: bool,
-    plan: Option<WritePlan>,
+    /// Per frame, its swap slot once taken.
+    slots: Vec<Option<u64>>,
     /// The next frame to copy and write.
     next: usize,
-    /// Per frame, the LSN its copy holds changes up to, once taken.
-    lsns: Vec<Lsn>,
+    /// Per frame, the change count its copy holds, once taken.
+    counts: Vec<u64>,
     landed: Landed,
     /// Writes submitted and not yet settled.
     unsettled: usize,
@@ -92,12 +88,12 @@ impl Writeback {
         Self {
             class,
             outgoing: frames.iter().map(|_| None).collect(),
-            lsns: vec![0; frames.len()],
+            counts: vec![0; frames.len()],
+            slots: vec![None; frames.len()],
             frames,
             pids,
             evict_after,
             temporary,
-            plan: None,
             next: 0,
             landed: Arc::new(Stack::default()),
             unsettled: 0,
@@ -125,7 +121,7 @@ impl Writeback {
     #[cfg(test)]
     pub fn describe(&self) -> String {
         format!(
-            "{:?} frames {:?} next {} unsettled {} landed {} outgoing {} plan {}",
+            "{:?} frames {:?} next {} unsettled {} landed {} outgoing {} slots {:?}",
             self.class,
             self.frames,
             self.next,
@@ -136,9 +132,7 @@ impl Writeback {
                 "some"
             },
             self.outgoing.iter().filter(|o| o.is_some()).count(),
-            self.plan
-                .as_ref()
-                .map_or_else(|| "none".to_string(), WritePlan::describe),
+            self.slots,
         )
     }
 
@@ -171,22 +165,20 @@ impl Writeback {
             hook();
         }
         let mut landed = landed.into_iter();
-        while let Some((i, res)) = landed.next() {
-            if let Some(plan) = &mut self.plan {
-                if let IOResult::IO(IOCompletions(c)) = plan.settle(i, &res) {
-                    self.landed.push((i, res));
-                    for rest in landed {
-                        self.landed.push(rest);
-                    }
-                    return Progress::Waiting(c);
+        for (i, res) in landed.by_ref() {
+            if let Some(slot) = self.slots[i] {
+                // A copy that landed is the page's swap copy; one that did not gives its slot up.
+                match &res {
+                    Ok(()) => pool.store.set_swap(self.pids[i], slot),
+                    Err(_) => pool.store.untake_swap_slot(self.class, slot),
                 }
             }
             match self.outgoing[i].take() {
-                Some(out) => out.end(pool, self.lsns[i], res),
+                Some(out) => out.end(pool, self.counts[i], res),
                 None => pool.write_ended(
                     self.frames[i],
                     self.pids[i],
-                    self.lsns[i],
+                    self.counts[i],
                     self.evict_after,
                     res,
                 ),
@@ -196,8 +188,6 @@ impl Writeback {
         if self.next < self.frames.len() || self.unsettled > 0 {
             return Progress::InFlight;
         }
-        // The plan held the metadata pages its remaps changed until now.
-        self.plan = None;
         #[cfg(test)]
         if let Some(hook) = self.before_finish.take() {
             hook();
@@ -213,16 +203,18 @@ impl Writeback {
             return None;
         }
         if !self.temporary {
-            let plan = self
-                .plan
-                .get_or_insert_with(|| pool.store.plan_writes(self.pids.clone()));
-            match plan.step() {
-                Ok(IOResult::Done(())) => {}
-                Ok(IOResult::IO(IOCompletions(c))) => return Some(c),
-                Err(e) => {
-                    pool.fail(super::io_failure(&e));
-                    self.abandon(pool);
-                    return None;
+            for i in self.next..self.frames.len() {
+                if self.slots[i].is_some() {
+                    continue;
+                }
+                match pool.store.take_swap_slot(self.class) {
+                    Ok(IOResult::Done(slot)) => self.slots[i] = Some(slot),
+                    Ok(IOResult::IO(IOCompletions(c))) => return Some(c),
+                    Err(e) => {
+                        pool.fail(super::io_failure(&e));
+                        self.abandon(pool);
+                        return None;
+                    }
                 }
             }
         }
@@ -243,7 +235,7 @@ impl Writeback {
                     // SAFETY: the write-out holds the frame exclusively.
                     page::seal(&mut unsafe { pool.writer(frame, self.class) }, self.pids[i]);
                 }
-                self.lsns[i] = h.page_lsn.load(Ordering::Acquire);
+                self.counts[i] = h.changes.load(Ordering::Acquire);
                 pool.memory.region.buffer(frame, size)
             } else {
                 // The frame keeps its page, which may change while it is written: a copy, whole
@@ -259,14 +251,14 @@ impl Writeback {
                     return Some(Completion::new_yield());
                 };
                 pool.bytes(frame, self.class).copy_to(0, copy.bytes());
-                let lsn = h.page_lsn.load(Ordering::Acquire);
+                let count = h.changes.load(Ordering::Acquire);
                 if !h.latch.validate(version) {
                     return Some(Completion::new_yield());
                 }
                 if sealed {
                     page::seal(copy.bytes(), self.pids[i]);
                 }
-                self.lsns[i] = lsn;
+                self.counts[i] = count;
                 held = Some(copy);
                 held.as_ref().map(|c| c.buffer()).expect("just leased")
             };
@@ -284,8 +276,11 @@ impl Writeback {
                     pool.write_landed(frame, outgoing);
                 }
             };
-            let written = match &self.plan {
-                Some(plan) => plan.write(i, buffer, ended).map(drop),
+            let written = match self.slots[i] {
+                Some(slot) => pool
+                    .store
+                    .write_slot(self.class, slot, buffer, ended)
+                    .map(drop),
                 None => pool.temp.write(self.pids[i], buffer, ended),
             };
             if let Err(e) = written {
@@ -299,8 +294,11 @@ impl Writeback {
     }
 
     /// Gives up every frame not yet written: they stay dirty, and pages being written out stay
-    /// in their frames.
+    /// in their frames; the swap slots they took go back.
     fn abandon(&mut self, pool: &BufferPool) {
+        for slot in self.slots[self.next..].iter_mut().filter_map(Option::take) {
+            pool.store.untake_swap_slot(self.class, slot);
+        }
         for (&frame, out) in self.frames[self.next..]
             .iter()
             .zip(&mut self.outgoing[self.next..])

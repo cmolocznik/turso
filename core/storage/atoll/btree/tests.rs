@@ -3,11 +3,12 @@ use crate::io::crash::CrashIO;
 use crate::io::MemoryIO;
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig, Opening};
-use crate::storage::atoll::log::{LogConfig, TxnTail, Writer, Writers};
+use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::page::CLASS_COUNT;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
+use crate::storage::atoll::txn::versioned::Versions;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::cell::{Cell, RefCell};
@@ -34,7 +35,6 @@ fn config(budget: usize) -> AtollConfig {
         },
         buffer: BufferConfig {
             budget,
-            checkpoint_shards: 8,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
@@ -206,12 +206,47 @@ fn stamped_key(value: &[u8]) -> Option<&[u8]> {
 fn create(io: &Arc<dyn IO>, db: &Atoll, run: &Runner<'_>, temporary: bool) -> Tree {
     let root = run_to(run, || {
         if temporary {
-            Tree::create_temporary(io, db.pool(), db.store(), class(0))
+            Tree::create_temporary(db.pool(), class(0))
         } else {
-            Tree::create(io, db.pool(), db.store(), class(0))
+            Tree::create(db.pool(), class(0))
         }
     });
     tree_of(io, db, root)
+}
+
+fn versions_of(io: &Arc<dyn IO>, db: &Atoll) -> Versions {
+    Versions::new(
+        io.clone(),
+        db.pool().clone(),
+        db.store().clone(),
+        config(0).txn.slots,
+    )
+}
+
+/// A full checkpoint, done: every page owed an image written, and its superblock in charge.
+fn checkpoint(db: &Atoll, versions: &Versions, run: &Runner<'_>) {
+    let ticket = db.checkpointer().request_full();
+    run(&mut || {
+        db.checkpointer()
+            .step_full(ticket, db.transactions(), versions)
+    });
+}
+
+/// One step of the full checkpoint `ticket`, the IO it started waited out: true once it is done.
+fn step_checkpoint(io: &Arc<dyn IO>, db: &Atoll, versions: &Versions, ticket: u64) -> bool {
+    match db
+        .checkpointer()
+        .step_full(ticket, db.transactions(), versions)
+        .unwrap()
+    {
+        IOResult::Done(()) => true,
+        IOResult::IO(IOCompletions(c)) => {
+            while !c.finished() {
+                io.step().unwrap();
+            }
+            false
+        }
+    }
 }
 
 #[test]
@@ -220,7 +255,7 @@ fn a_tree_holds_what_a_sorted_map_holds_through_puts_removes_merges_and_eviction
 }
 
 #[test]
-fn a_temporary_tree_holds_what_a_sorted_map_holds_and_logs_nothing() {
+fn a_temporary_tree_holds_what_a_sorted_map_holds() {
     holds_what_a_sorted_map_holds(true);
 }
 
@@ -228,9 +263,10 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, MIN_BUDGET, 1);
     let run = drive_runner(&io);
-    let end = db.log().end();
+    let versions = versions_of(&io, &db);
     let tree = create(&io, &db, &run, temporary);
     let max = tree.limits().max_key;
+    let mut ticket = None;
     let mut rng = ChaCha8Rng::seed_from_u64(1);
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut version = 0u64;
@@ -298,7 +334,16 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
             }
             _ => assert_eq!(get(&tree, &run, &key), model.get(&key).cloned(), "op {op}"),
         }
-        run(&mut || db.checkpointer().step());
+        // A checkpoint steps between the changes: a page changed after its cut keeps what it
+        // writes.
+        if op % 1000 == 0 {
+            ticket.get_or_insert_with(|| db.checkpointer().request_full());
+        }
+        if let Some(t) = ticket {
+            if step_checkpoint(&io, &db, &versions, t) {
+                ticket = None;
+            }
+        }
         if op % 3000 == 2999 {
             compare(&model, &format!("op {op}"));
         }
@@ -312,7 +357,7 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
             model.remove(key);
         }
     }
-    run(&mut || db.checkpointer().step());
+    checkpoint(&db, &versions, &run);
     compare(&model, "after removing");
     let after = check_whole(&tree, &db, &run, "after removing").nodes;
     assert!(
@@ -323,12 +368,19 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
     for key in model.keys().cloned().collect::<Vec<_>>() {
         assert!(remove(&key));
     }
-    run(&mut || db.checkpointer().step());
+    checkpoint(&db, &versions, &run);
     model.clear();
     let stats = check_whole(&tree, &db, &run, "empty");
     assert_eq!(stats.nodes, 1, "an empty tree is its root");
-    if temporary {
-        assert_eq!(db.log().end(), end, "a temporary tree logged");
+    if !temporary {
+        // What the checkpoint wrote is the tree, whole, with nothing else in use.
+        let root = tree.root();
+        drop((tree, versions, db));
+        let db = open(&io, MIN_BUDGET, 1);
+        let tree = tree_of(&io, &db, root);
+        assert!(scan(&tree, &run, true).is_empty(), "reopened");
+        let stats = check_whole(&tree, &db, &run, "reopened");
+        assert_eq!(stats.nodes, 1, "reopened");
     }
 }
 
@@ -340,7 +392,7 @@ fn keys_appended_with_long_shared_starts_split_leaves_that_fit() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, 64 << 20, 1);
     let run = drive_runner(&io);
-    let root = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
+    let root = run_to(&run, || Tree::create(db.pool(), class(0)));
     let tree = tree_of(&io, &db, root);
     let start = "x".repeat(300);
     let keys: Vec<Vec<u8>> = (0..400)
@@ -410,7 +462,7 @@ fn long_values(temporary: bool) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, 64 << 20, 1);
     let run = drive_runner(&io);
-    let end = db.log().end();
+    let versions = versions_of(&io, &db);
     let tree = create(&io, &db, &run, temporary);
     let chunk = value::chunk();
     let sizes = [chunk, chunk + 1, 2 * chunk + 12_345];
@@ -434,18 +486,15 @@ fn long_values(temporary: bool) {
     // Replaced by a small value, then removed: every page of the long one is freed.
     let mut op = Put::new(b"big2", b"small".to_vec(), Mode::Update);
     assert_eq!(run_to(&run, || tree.put(&mut op)), Outcome::Updated);
-    run(&mut || db.checkpointer().step());
+    checkpoint(&db, &versions, &run);
     check_whole(&tree, &db, &run, "replaced");
     for i in 0..3 {
         let mut op = Remove::new(format!("big{i}").as_bytes());
         assert!(run_to(&run, || tree.remove(&mut op)));
     }
-    run(&mut || db.checkpointer().step());
+    checkpoint(&db, &versions, &run);
     let stats = check_whole(&tree, &db, &run, "removed");
     assert_eq!((stats.nodes, stats.entries), (1, 0));
-    if temporary {
-        assert_eq!(db.log().end(), end, "a temporary tree logged");
-    }
 }
 
 #[test]
@@ -453,7 +502,8 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open(&io, 64 << 20, 1);
     let run = drive_runner(&io);
-    let root = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
+    let versions = versions_of(&io, &db);
+    let root = run_to(&run, || Tree::create(db.pool(), class(0)));
     let tree = tree_of(&io, &db, root);
     let writers = 4u64;
     let shared: Vec<Vec<u8>> = (0..40).map(|i| format!("hot{i:03}").into_bytes()).collect();
@@ -484,7 +534,7 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
             .collect();
         let handles: Vec<_> = (0..writers)
             .map(|t| {
-                let (io, tree, db, shared) = (&io, &tree, &db, &shared);
+                let (io, tree, db, shared, versions) = (&io, &tree, &db, &shared, &versions);
                 s.spawn(move || {
                     let run = drive_runner(io);
                     let mut rng = ChaCha8Rng::seed_from_u64(100 + t);
@@ -511,7 +561,7 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
                         }
                         assert_eq!(get(tree, &run, &key), model.get(&key).cloned());
                         if op % 64 == 0 {
-                            run(&mut || db.checkpointer().step());
+                            checkpoint(db, versions, &run);
                         }
                     }
                     model
@@ -539,33 +589,31 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order() {
         entries == expected,
         "the tree differs from what the writers wrote"
     );
-    run(&mut || db.checkpointer().step());
+    checkpoint(&db, &versions, &run);
     check_whole(&tree, &db, &run, "after the writers");
 }
 
-/// Every key's history: the LSN of each change and what it left.
-type History = BTreeMap<Vec<u8>, Vec<(u64, Option<Vec<u8>>)>>;
+/// The tree each checkpoint wrote, by its number: as the tree stood at that checkpoint's cut.
+type AtCut = BTreeMap<u64, BTreeMap<Vec<u8>, Vec<u8>>>;
 
-fn state_at(history: &History, end: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    history
-        .iter()
-        .filter_map(|(k, changes)| {
-            let last = changes.iter().rev().find(|(lsn, _)| *lsn <= end)?;
-            Some((k.clone(), last.1.clone()?))
-        })
-        .collect()
-}
-
-fn crashes_recover_every_durable_change_and_a_whole_tree(durable_writes: bool) {
+/// A plain tree is the checkpoint in charge's (audit 18): a crash anywhere recovers it exactly as
+/// the checkpoint whose superblock landed last cut it, whole, that checkpoint never older than the
+/// last one acknowledged. Checkpoints step between the changes, so the pages a change after a cut
+/// touches are written as their first change since kept them, and a crash lands inside every
+/// phase of one.
+fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
     for seed in 0..2u64 {
         let crash_io = Arc::new(CrashIO::new(seed));
         crash_io.set_durable_writes(durable_writes);
         let io: Arc<dyn IO> = crash_io.clone();
         let db = open(&io, MIN_BUDGET, 1);
-        let history: RefCell<History> = RefCell::new(BTreeMap::new());
+        let versions = versions_of(&io, &db);
+        let at_cut: RefCell<AtCut> = RefCell::new(BTreeMap::new());
+        let model: RefCell<BTreeMap<Vec<u8>, Vec<u8>>> = RefCell::new(BTreeMap::new());
         let acknowledged = Cell::new(0u64);
         let steps = Cell::new(0u64);
         let checks = Cell::new(0u64);
+        let in_charge_seen = RefCell::new(BTreeSet::new());
         let root = Cell::new(None);
         let crash_and_check = |crash_seed: u64| {
             let Some(root) = root.get() else {
@@ -575,20 +623,26 @@ fn crashes_recover_every_durable_change_and_a_whole_tree(durable_writes: bool) {
             let crashed: Arc<dyn IO> = Arc::new(crash_io.crash(crash_seed));
             let label = format!("seed {seed}/{crash_seed}, {threads} threads");
             let recovered = open(&crashed, MIN_BUDGET, threads);
-            let end = recovered.recovered_end().expect("a recovery");
+            // Recovery ends with a full checkpoint of its own, one past the one in charge.
+            let in_charge = recovered.checkpointer().superblock().checkpoint - 1;
+            in_charge_seen.borrow_mut().insert(in_charge);
             assert!(
-                end >= acknowledged.get(),
-                "{label}: recovery ended at {end}, before {}, which was durable",
+                in_charge >= acknowledged.get(),
+                "{label}: checkpoint {in_charge} in charge, before {}, which was acknowledged",
                 acknowledged.get()
             );
-            let expected = state_at(&history.borrow(), end);
+            let expected = at_cut
+                .borrow()
+                .get(&in_charge)
+                .cloned()
+                .unwrap_or_else(|| panic!("{label}: checkpoint {in_charge} in charge, uncut"));
             let verify = |db: &Atoll, label: &str| {
                 let run = drive_runner(&crashed);
                 let tree = tree_of(&crashed, db, root);
                 let entries: BTreeMap<_, _> = scan(&tree, &run, true).into_iter().collect();
                 assert!(
                     entries == expected,
-                    "{label}: the tree differs from the log up to {end}"
+                    "{label}: the tree differs from checkpoint {in_charge}'s cut"
                 );
                 for (k, v) in &expected {
                     assert!(get(&tree, &run, k).as_ref() == Some(v), "{label}: {k:?}");
@@ -604,48 +658,70 @@ fn crashes_recover_every_durable_change_and_a_whole_tree(durable_writes: bool) {
             );
             checks.set(checks.get() + 1);
         };
-        let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| loop {
-            match op().unwrap() {
-                IOResult::Done(()) => return,
-                IOResult::IO(IOCompletions(c)) => {
-                    while !c.finished() {
-                        io.step().unwrap();
-                        steps.set(steps.get() + 1);
-                        if steps.get() % 5 == 0 {
-                            crash_and_check(seed * 1_000_000 + steps.get());
-                        }
-                    }
+        let wait = |c: &crate::io::Completion| {
+            while !c.finished() {
+                io.step().unwrap();
+                steps.set(steps.get() + 1);
+                if steps.get() % 5 == 0 {
+                    crash_and_check(seed * 1_000_000 + steps.get());
                 }
             }
         };
-        let created = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
-        run(&mut || db.log().wait_durable(db.log().end()));
-        acknowledged.set(db.log().end());
+        let run = |op: &mut dyn FnMut() -> Result<IOResult<()>>| loop {
+            match op().unwrap() {
+                IOResult::Done(()) => return,
+                IOResult::IO(IOCompletions(c)) => wait(&c),
+            }
+        };
+        // One step of the full checkpoint `ticket`: true once it is done. The tree as the step
+        // found it is the tree at any cut it took.
+        let step = |ticket: u64| {
+            let cp = db.checkpointer();
+            let out = cp.step_full(ticket, db.transactions(), &versions).unwrap();
+            let n = cp.cut_taken().unwrap_or_else(|| cp.superblock().checkpoint);
+            at_cut
+                .borrow_mut()
+                .entry(n)
+                .or_insert_with(|| model.borrow().clone());
+            match out {
+                IOResult::Done(()) => {
+                    acknowledged.set(cp.superblock().checkpoint);
+                    true
+                }
+                IOResult::IO(IOCompletions(c)) => {
+                    wait(&c);
+                    false
+                }
+            }
+        };
+        let created = run_to(&run, || Tree::create(db.pool(), class(0)));
+        let first = db.checkpointer().request_full();
+        while !step(first) {}
         root.set(Some(created));
         let tree = tree_of(&io, &db, created);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut version = 0u64;
+        let mut ticket = None;
         for op in 0..1400u32 {
             let key = format!("k{:04}", rng.random_range(0..600)).into_bytes();
             version += 1;
-            let change = if rng.random_range(0..3) == 0 {
+            if rng.random_range(0..3) == 0 {
                 let mut remove = Remove::new(&key);
                 run_to(&run, || tree.remove(&mut remove));
-                (remove.lsn(), None)
+                model.borrow_mut().remove(&key);
             } else {
                 let value = random_value(&mut rng, &key, version);
                 let mut put = Put::new(&key, value.clone(), Mode::Upsert);
                 run_to(&run, || tree.put(&mut put));
-                (put.lsn(), Some(value))
-            };
-            if change.0 > 0 {
-                history.borrow_mut().entry(key).or_default().push(change);
+                model.borrow_mut().insert(key, value);
             }
-            run(&mut || db.checkpointer().step());
-            if op % 16 == 15 {
-                let end = db.log().end();
-                run(&mut || db.log().wait_durable(end));
-                acknowledged.set(end);
+            if op % 50 == 0 {
+                ticket.get_or_insert_with(|| db.checkpointer().request_full());
+            }
+            if let Some(t) = ticket {
+                if step(t) {
+                    ticket = None;
+                }
             }
         }
         assert!(
@@ -653,111 +729,23 @@ fn crashes_recover_every_durable_change_and_a_whole_tree(durable_writes: bool) {
             "seed {seed}: only {} crashes",
             checks.get()
         );
+        assert!(
+            in_charge_seen.borrow().len() >= 2,
+            "seed {seed}: every crash found checkpoint {:?} in charge",
+            in_charge_seen.borrow()
+        );
         crash_and_check(seed);
     }
 }
 
 #[test]
-fn crashes_recover_every_durable_change_and_a_whole_tree_with_durable_writes() {
-    crashes_recover_every_durable_change_and_a_whole_tree(true);
+fn crashes_recover_the_tree_the_checkpoint_in_charge_cut_with_durable_writes() {
+    crashes_recover_the_tree_the_checkpoint_in_charge_cut(true);
 }
 
 #[test]
-fn crashes_recover_every_durable_change_and_a_whole_tree_with_writes_then_syncs() {
-    crashes_recover_every_durable_change_and_a_whole_tree(false);
-}
-
-/// Ends the log at `at`, as a crash that kept everything before it and nothing after would.
-fn cut_log(io: &Arc<dyn IO>, segment_bytes: u64, at: u64) {
-    use crate::io::{Buffer, Completion, OpenFlags};
-    let mut n = at / segment_bytes;
-    loop {
-        let path = format!("{BASE}.log.{n:016x}");
-        let Ok(file) = io.open_file(&path, OpenFlags::None, false) else {
-            break;
-        };
-        let from = if n == at / segment_bytes {
-            at % segment_bytes
-        } else {
-            0
-        };
-        let zeros = Arc::new(Buffer::new(vec![0u8; (segment_bytes - from) as usize]));
-        let c = file
-            .pwrite(from, zeros, Completion::new_write(|_| {}))
-            .unwrap();
-        io.wait_for_completion(c).unwrap();
-        n += 1;
-    }
-}
-
-#[test]
-fn a_log_ending_at_any_record_of_a_structure_change_recovers_a_whole_tree() {
-    let crash_io = Arc::new(CrashIO::new(0));
-    let io: Arc<dyn IO> = crash_io.clone();
-    // A pool that holds everything: no page is written back, so recovery rebuilds every node
-    // from the log alone, up to wherever it ends.
-    let db = open(&io, 64 << 20, 1);
-    let run = drive_runner(&io);
-    let root = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
-    let tree = tree_of(&io, &db, root);
-    let ticket = db.checkpointer().request_full();
-    run(&mut || db.checkpointer().step_full(ticket));
-    let start = db.log().end();
-    let mut history: History = BTreeMap::new();
-    // Splits, the root growing twice, then merges and the root shrinking.
-    let keys: Vec<Vec<u8>> = (0..240u32)
-        .map(|i| format!("{:06}", i * 7919 % 1000).into_bytes())
-        .collect();
-    for (i, key) in keys.iter().enumerate() {
-        let mut op = Put::new(key, stamp(key, i as u64, 400), Mode::Upsert);
-        run_to(&run, || tree.put(&mut op));
-        history
-            .entry(key.clone())
-            .or_default()
-            .push((op.lsn(), Some(stamp(key, i as u64, 400))));
-    }
-    let grown = check_whole(&tree, &db, &run, "grown");
-    for key in keys.iter().take(230) {
-        let mut op = Remove::new(key);
-        if run_to(&run, || tree.remove(&mut op)) {
-            history.get_mut(key).unwrap().push((op.lsn(), None));
-        }
-    }
-    let shrunk = check_whole(&tree, &db, &run, "shrunk");
-    assert!(
-        grown.nodes > 20 && shrunk.nodes < 4,
-        "{} nodes, then {}",
-        grown.nodes,
-        shrunk.nodes
-    );
-    run(&mut || db.log().wait_durable(db.log().end()));
-    while crash_io.in_flight() > 0 {
-        io.step().unwrap();
-    }
-    let mut reader = Log::reader(io.clone(), BASE, &config(0).log, start);
-    let mut boundaries = vec![start];
-    let mut grouped = 0;
-    while let Some(r) = reader.next_record().unwrap() {
-        boundaries.push(r.lsn);
-        grouped += r.place.grouped() as usize;
-    }
-    assert!(grouped > 100, "only {grouped} records in groups");
-    for (i, &at) in boundaries.iter().enumerate() {
-        let cut: Arc<dyn IO> = Arc::new(crash_io.crash(i as u64));
-        cut_log(&cut, config(0).log.segment_bytes, at);
-        let db = open(&cut, 64 << 20, 1);
-        let end = db.recovered_end().unwrap();
-        assert!(end <= at, "recovery read past the cut at {at}, to {end}");
-        let run = drive_runner(&cut);
-        let tree = tree_of(&cut, &db, root);
-        let expected = state_at(&history, end);
-        let entries: BTreeMap<_, _> = scan(&tree, &run, true).into_iter().collect();
-        assert!(
-            entries == expected,
-            "the log cut at {at} (recovered to {end})"
-        );
-        check_whole(&tree, &db, &run, &format!("the log cut at {at}"));
-    }
+fn crashes_recover_the_tree_the_checkpoint_in_charge_cut_with_writes_then_syncs() {
+    crashes_recover_the_tree_the_checkpoint_in_charge_cut(false);
 }
 
 /// A leaf a caller reached last ([`Near`]) is used only for the keys it answers: a key between
@@ -1007,79 +995,6 @@ fn a_put_expecting_an_entry_changes_nothing_when_the_entry_differs() {
     );
 }
 
-#[test]
-fn a_transactions_changes_name_it_and_its_tree_and_carry_what_undoes_them() {
-    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let root = {
-        let db = open(&io, MIN_BUDGET, 1);
-        let run = drive_runner(&io);
-        let tree = create(&io, &db, &run, false);
-        let writers = Arc::new(Writers::new(1));
-        let tail = |prev| TxnTail::new(42, prev, writers.clone(), 0);
-        let mut first = Put::new(b"k", b"one".to_vec(), Mode::Insert).in_transaction(tail(None));
-        assert_eq!(run_to(&run, || tree.put(&mut first)), Outcome::Inserted);
-        let mut second =
-            Put::new(b"k", b"two".to_vec(), Mode::Update).in_transaction(tail(first.group()));
-        assert_eq!(run_to(&run, || tree.put(&mut second)), Outcome::Updated);
-        let (one, two) = (first.group().unwrap(), second.group().unwrap());
-        assert_eq!(
-            writers.snapshot(),
-            vec![Writer {
-                txn: 42,
-                first: one,
-                last: two
-            }],
-            "the changes' groups entered the registry"
-        );
-        let mut plain = Put::new(b"p", b"x".to_vec(), Mode::Insert);
-        run_to(&run, || tree.put(&mut plain));
-        // Committed, so recovery replays its changes rather than undoing them.
-        let commit = tail(Some(two)).header(crate::storage::atoll::txn::COMMIT);
-        let mut admitted = drive(&io, || db.log().admit(framed_len(8))).unwrap();
-        let ts = 43u64.to_le_bytes();
-        db.log().append(&mut admitted, &commit, &[&ts]);
-        drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
-        let mut reader = Log::reader(io.clone(), BASE, &config(0).log, 0);
-        let mut seen = Vec::new();
-        while reader.position() < plain.lsn() {
-            let Some(r) = reader.next_record().unwrap() else {
-                break;
-            };
-            let Some(rec) = Record::decode(r.header.kind, &r.payload).unwrap() else {
-                continue;
-            };
-            let h = &r.header;
-            match rec.change {
-                Change::Insert { key, undo, .. } if key == b"k" => {
-                    seen.push((h.kind, h.txn, h.prev, r.group, r.lsn));
-                    assert_eq!(undo, Some(tree.root()));
-                }
-                Change::Update { key, undo, .. } if key == b"k" => {
-                    seen.push((h.kind, h.txn, h.prev, r.group, r.lsn));
-                    assert_eq!(undo, Some((tree.root(), Some((&b"one"[..], false)))));
-                }
-                Change::Insert { key, undo, .. } if key == b"p" => {
-                    assert_eq!((h.kind, h.txn, undo), (record::INSERT, 0, None));
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(
-            seen,
-            vec![
-                (record::TXN_INSERT, 42, None, one.get(), first.lsn()),
-                (record::TXN_UPDATE, 42, Some(one), two.get(), second.lsn()),
-            ]
-        );
-        tree.root()
-    };
-    // Committed, replayed like any other change.
-    let db = open(&io, MIN_BUDGET, 1);
-    let run = drive_runner(&io);
-    let tree = tree_of(&io, &db, root);
-    assert_eq!(get(&tree, &run, b"k"), Some(b"two".to_vec()));
-}
-
 /// Two writers put and remove keys, each its own and both two shared ones, while a reader scans
 /// both ways, four times. Values take most of an inline entry's room, so a node holds a few entries and
 /// splits and merges come within a few operations. Scans see keys in order, each value whole and
@@ -1088,7 +1003,8 @@ fn concurrent_tree(seed: u64, ops: u64) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Arc::new(open(&io, MIN_BUDGET, 1));
     let run = drive_runner(&io);
-    let root = run_to(&run, || Tree::create(&io, db.pool(), db.store(), class(0)));
+    let versions = Arc::new(versions_of(&io, &db));
+    let root = run_to(&run, || Tree::create(db.pool(), class(0)));
     let tree = Arc::new(tree_of(&io, &db, root));
     let shared: Vec<Vec<u8>> = (0..2).map(|i| format!("hot{i}").into_bytes()).collect();
     let max_entry = Limits::of(class(0)).max_entry;
@@ -1115,7 +1031,13 @@ fn concurrent_tree(seed: u64, ops: u64) {
     };
     let writers: Vec<_> = (0..2u64)
         .map(|t| {
-            let (io, db, tree, shared) = (io.clone(), db.clone(), tree.clone(), shared.clone());
+            let (io, db, tree, shared, versions) = (
+                io.clone(),
+                db.clone(),
+                tree.clone(),
+                shared.clone(),
+                versions.clone(),
+            );
             crate::thread::spawn(move || {
                 let run = drive_runner(&io);
                 let mut rng = ChaCha8Rng::seed_from_u64(seed * 10 + t);
@@ -1141,7 +1063,7 @@ fn concurrent_tree(seed: u64, ops: u64) {
                         model.insert(key, value);
                     }
                     if op == ops / 2 {
-                        run(&mut || db.checkpointer().step());
+                        checkpoint(&db, &versions, &run);
                     }
                 }
                 model
@@ -1163,15 +1085,14 @@ fn concurrent_tree(seed: u64, ops: u64) {
         "the tree differs from what the writers wrote"
     );
     // A merge whose free of the node it emptied had to wait hands the node to the checkpointer,
-    // which frees it on its next step: until then those are the only pages unreachable.
+    // which frees it in its next checkpoint: until then those are the only pages unreachable.
     check_reachable(&tree, &db, &run, "schedules, before the checkpointer", true);
-    run(&mut || db.checkpointer().step());
+    checkpoint(&db, &versions, &run);
     check_whole(&tree, &db, &run, "schedules");
 }
 
-/// A tree's puts, durable, its database then dropped without a checkpoint past them and recovered
-/// on `threads` threads at once: every key reads back, and the tree is whole. The recovering
-/// threads take the analysis, the windows to read and the partitions to apply from one another.
+/// A tree's puts, checkpointed, its database then dropped and recovered on `threads` threads at
+/// once: one recovers while the rest wait for it, every key reads back, and the tree is whole.
 fn a_tree_recovered_on_threads_at_once_reads_back_whole(threads: usize, keys: u64) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let value = |k: u64| stamp(&k.to_be_bytes(), k, 40 + (k % 7) as usize * 30);
@@ -1183,13 +1104,10 @@ fn a_tree_recovered_on_threads_at_once_reads_back_whole(threads: usize, keys: u6
             let mut op = Put::new(&k.to_be_bytes(), value(k), Mode::Upsert);
             run_to(&run, || tree.put(&mut op));
         }
-        drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
+        checkpoint(&db, &versions_of(&io, &db), &run);
         tree.root()
     };
-    // A budget small enough that recovery reads the log in windows several times its ring's.
-    let mut small = config(MIN_BUDGET);
-    small.log_budget = Some(64 << 10);
-    let opening = Arc::new(Opening::new(io.clone(), BASE, small).unwrap());
+    let opening = Arc::new(Opening::new(io.clone(), BASE, config(MIN_BUDGET)).unwrap());
     let others: Vec<_> = (1..threads)
         .map(|_| {
             let opening = opening.clone();

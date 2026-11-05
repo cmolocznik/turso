@@ -229,12 +229,13 @@ impl Catalog {
     }
 }
 
-/// Creates whichever system trees a database lacks, at their fixed roots, in order. A database
-/// whose lowest pages hold anything else is refused. Step it until done.
+/// Creates whichever system trees a database lacks, at their fixed roots, in order, setting `made`
+/// once it creates one. A database whose lowest pages hold anything else is refused. Step it until
+/// done.
 pub fn ensure_system_trees(
-    io: &Arc<dyn IO>,
     pool: &Arc<BufferPool>,
     store: &Arc<PageStore>,
+    made: &mut bool,
 ) -> Result<IOResult<()>> {
     for system in System::ALL {
         let root = system.root();
@@ -245,19 +246,20 @@ pub fn ensure_system_trees(
         if entry != FREE {
             continue;
         }
-        let made = match system.plain() {
-            true => Tree::create(io, pool, store, System::class())?,
-            false => Tree::create_versioned(io, pool, store, System::class())?,
+        let made_at = match system.plain() {
+            true => Tree::create(pool, System::class())?,
+            false => Tree::create_versioned(pool, System::class())?,
         };
-        let made = match made {
+        let made_at = match made_at {
             IOResult::Done(pid) => pid,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        if made != root {
+        if made_at != root {
             return Err(LimboError::Corrupt(format!(
-                "the system tree {system:?} was made at {made:?}, not at its root {root:?}"
+                "the system tree {system:?} was made at {made_at:?}, not at its root {root:?}"
             )));
         }
+        *made = true;
     }
     Ok(IOResult::Done(()))
 }

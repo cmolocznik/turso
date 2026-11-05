@@ -21,7 +21,7 @@ fn open() -> Db {
     let db = AtollDb::open(io.clone(), BASE, config()).unwrap();
     let a = db.atoll();
     let root = drive(&io, || {
-        Tree::create_versioned(&io, a.pool(), a.store(), SizeClass::new(0).unwrap())
+        Tree::create_versioned(a.pool(), SizeClass::new(0).unwrap())
     })
     .unwrap();
     let tree = VersionedTree::open(io.clone(), a.pool().clone(), a.store().clone(), root);

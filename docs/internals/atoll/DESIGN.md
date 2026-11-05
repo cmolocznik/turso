@@ -42,7 +42,9 @@ status here.
   atomically.
 - **Erasure.** Deleted data leaves the files promptly (section 6.3). That is the file system's view:
   an SSD remaps writes, so the physical blocks can keep old data until the device reuses them, and
-  the log, temporary files and replicas keep copies until they are removed themselves. Data that
+  the log, temporary files and replicas keep copies until they are removed themselves. A spare
+  log segment keeps the records of its earlier life until new ones overwrite them (section 7.4),
+  a segment's worth of logging later. Data that
   must not be recoverable from the device needs encryption with per-subject keys destroyed on
   deletion, which is not designed yet.
 - **No SQLite file compatibility.**
@@ -106,14 +108,11 @@ Durability is chosen per database:
   - a magic number and the format version;
   - the database id (128 random bits);
   - the creation parameters;
-  - the checkpoint number and the redo point;
-  - per class, the levels of its page table, free space and retired marks, which place their
-    roots;
-  - the clock floor;
-  - where the checkpoint's writer-state record starts in the log: its writer table, and the floor
-    D from which recovery finds the tombstones a crash left (section 10). Until D comes with
-    garbage collection (section 20), the record holds the table alone, and a checkpoint with no
-    writers writes none;
+  - its write sequence, the checkpoint in charge and its snapshot `C`, and the redo point `L`
+    (section 10);
+  - per class, the levels of its page table and free space as of the checkpoint's cut, which place
+    their roots;
+  - the clock as of the cut;
   - where the newest record of the gap chain starts in the log (section 7.4); until the chain
     lands (section 20), the gaps themselves, as many as fit: 248;
   - a CRC32C.
@@ -126,7 +125,8 @@ Durability is chosen per database:
 
 - **Size classes:** 4 KiB × 2^k for k = 0..11, so 4 KiB to 8 MiB. B-tree nodes are 4 KiB unless a
   tree is created with a larger class. Larger classes hold large values.
-- **Header (24 bytes):** `lsn: u64 | crc32c: u32 | class: u8 | kind: u8 | flags: u16 | pid: u64`.
+- **Header (24 bytes):** `count: u64 | crc32c: u32 | class: u8 | kind: u8 | flags: u16 | pid: u64`.
+  - `count` is the page's change count when the copy was taken (section 9.1).
   - The checksum covers the whole page with its own field taken as zero.
   - It is checked on every read from disk, from a node and from object storage.
   - A copy that fails it is torn, or corrupt, or a stale slot. It is never read as valid.
@@ -136,7 +136,7 @@ Durability is chosen per database:
   - transaction slot table;
   - B-tree inner and leaf;
   - blob;
-  - version index, todo list and graveyard (temporary, section 11).
+  - version arena, todo list and graveyard (temporary, section 11).
 
   Each kind provides how to replay its log records and how to check its structure.
 
@@ -154,11 +154,11 @@ churn. Where pages live in object storage, a second table beside it says where (
 
 ### 6.2 Metadata pages
 
-The page table, free space and retired marks (section 6.5) are radix trees of 4 KiB metadata
-pages, one of each per class (`core/storage/atoll/radix.rs`, `meta.rs`).
+The page table and free space are radix trees of 4 KiB metadata pages, one of each per class
+(`core/storage/atoll/radix.rs`, `meta.rs`).
 
 - **Leaves.** In the page table, 509 entries per page. In free space, a bit per slot, 32,576 per
-  page. In the retired marks, a bit per page number, 32,576 per page.
+  page.
 - **Above the leaves,** a `u64` per child: how many units below it are in use. A free number or
   slot is found without reading pages that have none, and so is every retired page. A page of
   zeros is all free, which is how every page starts.
@@ -167,51 +167,38 @@ pages, one of each per class (`core/storage/atoll/radix.rs`, `meta.rs`).
   page's place in its file is fixed by its level and index.
 - **Two places per page.** A metadata page has two places side by side. It is always written to
   the place that does not hold its newest durable copy, so a torn write leaves that copy whole, and
-  a read takes both places and keeps the newest whole copy. This costs twice the space of the
-  metadata, 0.4% of the data, and needs no free space, no parent pointers and no cascade of writes
-  up the tree.
+  a read takes the newest whole copy numbered at or below the checkpoint in charge (section 10).
+  This costs twice the space of the metadata, 0.4% of the data, and needs no free space, no parent
+  pointers and no cascade of writes up the tree.
 - **A cache of their own.** Metadata pages live outside the buffer pool, because a buffer miss
   needs the page table.
-- **Logged first.** Every change is logged first, under the latches of the pages it changes, so
-  changes reach a page in log order. A page is written only once the log is durable up to its LSN.
+- **Changed live, written as of a cut.** A change takes the latches of the pages it changes, and
+  is never logged. A checkpoint's cut keeps each page as it stood at its first change after the
+  cut, and the checkpoint writes that copy (section 10).
 
 ### 6.3 The life of a slot
 
-1. **Intent.** A writeback batch takes free slots, marked in use, and logs an intent naming them.
-   The intent is durable before any of those writes starts.
-2. **Write.** Each copy is durable when its write completes: a write with `RWF_DSYNC`, or a write
-   followed by `fdatasync`.
-3. **Remap.** `Remap { pid, new, old }` is logged. The entry points at `new`, and `old` is freed in
-   the same change.
-4. **Erase.** Once the record that freed `old` is durable, `old` is erased (a hole punched, or
-   zeros written). Only then may it be taken again.
+Page numbers and slots are taken and freed in memory, and nothing about them is logged
+(`core/storage/atoll/store.rs`). A crash loses what memory held, and the checkpoint in charge is
+the state.
 
-After a crash, frees logged after the point where the log restarted are erased only once the
-checkpoint that ends recovery is durable (section 12).
+1. **Taken.** A slot is taken for a write: a swap copy (section 9.5) or a checkpoint's image. A
+   taken slot is claimed in memory until its write lands, so no other write takes it.
+2. **Named.** A swap copy is named in an in-memory map, and a miss reads it first. An image is
+   named in the page table as of its checkpoint's cut, and as the page stands once it lands.
+3. **Freed.** A slot no copy needs any more is freed only once a durable checkpoint no longer
+   names it: the slot of a copy a checkpoint replaced, or of a page freed, waits for the
+   checkpoint begun after. A swap copy's slot, which no checkpoint names, waits only for every
+   step that may have looked it up.
+4. **Erased.** A freed slot is erased (a hole punched, or zeros written), each file synced once,
+   before it is taken again: a deleted page's bytes leave the disk.
 
-- **Copies ahead of the log.** A copy may hold changes whose log records are not durable yet. Its
-  remap is appended after it lands, behind every record it holds, so a remap that survives a crash
-  names a copy whose records survived too.
-- **What the redo point waits for.** A checkpoint's redo point never passes:
-  - a metadata change not yet written;
-  - a free not yet erased;
-  - an intent with slots not yet remapped or given back.
-
-  So recovery always replays what it must finish.
-- **What recovery finishes.** It erases what replayed records freed. A replayed intent first cancels
-  any earlier replayed free of the same slots: they were erased before they were taken again. Slots
-  of intents no remap matched are given back and erased, so a crash leaves no copy that nothing
-  refers to.
-- **Provisional pages.** A new page is provisional until a record adopts it: the record, or group
-  of records (section 7.6), that makes it reachable, such as a split's new node or a value's blob
-  pages. A page being dropped is abandoned the same way, in the group that unlinks it, and freed
-  afterwards.
-  - Recovery frees every page still provisional, so a crash between allocating a page and linking
-    it in, or between unlinking it and freeing it, leaves no page that nothing refers to.
-  - The redo point never passes the record that made a page provisional while it is. A page counts
-    as settled once the record adopting or freeing it is durable.
-  - An operation dropped with provisional pages in hand gives them to the page store, and the
-    checkpointer frees them.
+- **Numbers.** A page number freed is taken again only once a checkpoint begun after its free is
+  durable, since the checkpoint in charge may name the page, and every step that may hold it has
+  ended.
+- **Pages nothing names.** A page an operation took and gave up, or a node a merge emptied whose
+  free had to wait, is handed to the checkpointer (orphaned), which frees it in its next
+  checkpoint.
 
 ### 6.4 Temporary pages
 
@@ -222,41 +209,24 @@ which are deleted at every open, and recovery never reads them. Built in `buffer
 - **Ids.** The top bit of a page number names a temporary page; the page store never sees one.
 - **Place.** Each class has one temporary file, and a page's copy sits at its number times its
   size. A freed number is handed out again, and a page that was never written reads as zeros.
-- **Changes** are stamped with LSNs from a counter of their own, which only orders a page's changes
-  and tells its frame dirty.
-- **Checkpoints** pass over temporary pages: they are written only when evicted, and hold back no
-  redo point.
+- **Checkpoints** pass over temporary pages: they are written only when evicted, and never owed an
+  image.
 - **Trees.** A B-tree whose root is a temporary page is a temporary tree
-  (`Tree::create_temporary`): its nodes and out-of-line values are temporary pages, and nothing it
-  does is logged.
+  (`Tree::create_temporary`): its nodes and out-of-line values are temporary pages.
 
 ### 6.5 Retired pages
 
 The pages of an out-of-line value that a versioned write replaced stay, copies and all, while a
-snapshot may still read the version they hold (section 11.2). The page store marks them retired:
+snapshot may still read the version they hold (section 11.2). The page store marks them retired,
+in memory:
 
-- **Marked with the change.** The mark is set by a record in the group that replaces the value,
-  under the latches of the marks' pages, which are only tried while the tree's leaf latch is held,
-  as every metadata latch is. A mark is never pending: once its group is in the log the pages are
-  retired, and nothing about them holds the redo point back.
-- **Cleared by the compensation** that puts the value back, a rollback's or recovery's undo, in
-  the same group, which abandons the pages of the version it removes.
-- **Freed** by garbage collection, through the todo item recorded where the replacing change
-  landed, once every snapshot sees that change (section 11.5). Never through a version index
-  entry: an entry is put before the leaf write it is for, which may never happen, and it stays when
-  a rollback puts the value back, in a transaction that then commits too. The pages it names are
-  then live, or retired by another write. Recovery, once undo is done, frees every page still
-  marked, since no snapshot survives a crash.
-- **Freeing one** clears its mark in the record that frees it, and goes through the buffer pool,
-  since redo puts the pages of a value written since the redo point back in frames. In this order:
-  1. a writeback of the page in flight lands first;
-  2. the page's frame, or a frame taken for it unread, is held exclusively while the page store
-     frees the number and clears the mark;
-  3. only once that free has succeeded does the frame leave the table.
-
-  A free that has to wait for IO changes nothing, and lets the frame go to be fixed again. A frame
-  dropped before the free would let a fix read the page back in from its copy while its number is
-  freed, and the pool would later write that frame back as a page that is free.
+- **Marked with the change**, under the leaf's latch, and cleared by the rollback that puts the
+  value back, which frees the pages of the version it removes.
+- **Freed** by garbage collection, once every snapshot sees the change that replaced the value
+  (section 11.5).
+- **A crash** loses the marks, and needs none: a checkpoint maps a value's pages only where an image
+  it writes as of its snapshot names the value (section 10), so pages only an older version named
+  are free in the checkpoint, and no snapshot survives to read them.
 
 ## 7. The log
 
@@ -273,40 +243,15 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
   position, its header and its payload, so a record read at another position, a torn record, or
   bytes a crash left behind never read as valid.
 - **LSN.** A record's LSN is the position just past its end.
-- **Chaining.** `prev` is where the transaction's previous group starts: the position a reader
-  must begin at to read that group whole (a record outside any group is a group of one). A
-  transaction's tail is its last group's start, so its records are found from its last one, back.
-  Group starts are a type apart from LSNs: an LSN orders a page's changes and marks what is
-  durable, a group start locates records. A `prev` of `u64::MAX` names no previous group, since a
-  group can start at 0.
-- **Page records** carry the page id: New, Free, Remap, write intent, blob write, and the B-tree
-  records (`btree/record.rs`):
-  - init, insert, remove, update, split and branch;
-  - a transaction's insert and update, and the restore and unput that compensate them;
-  - to come with garbage collection (section 20), its removal of a tombstone: a remove outside
-    any transaction that carries the exact version it removes (section 11.5).
-
-  A delete in a versioned tree is an update to a tombstone, and a merge or a root change is a group
-  of these.
-  - Redo is physical per page.
-  - A transaction's change also carries what undoes it: for an update, the whole entry its
-    statement found; for an insert, the key to remove. Undo applies these logically, by tree and
-    key, so it works after splits and merges.
-  - A transaction's change and its compensations name the tree by its root and its incarnation
-    (section 13), and the statement by its 32-bit number (section 11.1). Until garbage collection
-    (section 20), they name the root alone.
-  - Logging undo costs log volume: Haubenschild et al. measure about 20% more with the old values
-    of the changed columns (§4: 2,230 against 1,850 bytes per TPC-C transaction). Whole entries
-    cost more, until update deltas come (section 20).
-- **Transaction records:** Commit (with its timestamp); End, once a transaction that did not
-  commit has no undo left; and compensation, a restore or an unput (page records above), the redo
-  of putting one key back, naming the work it completed (section 11.5). There is no Begin: a
-  transaction becomes a writer with its first group. A checkpoint's writer-state record
-  (section 10) is a record too, and so are the gap chain's (section 7.4), which come with garbage
-  collection (section 20).
-- **Structure changes** (split, merge, the root growing or shrinking) are system operations. They
-  are redo-only, logged atomically as one group (section 7.6), and never undone by a user
-  transaction's rollback.
+- **What is logged** is what recovery replays (audit 17): a transaction's changes by key, kept in
+  memory until its commit and published then, in parts ahead of its Commit when they outgrow a log
+  chunk (`SPILL`), the last part in the Commit with its timestamp (`COMMIT`); changes made outside
+  any transaction, such as a sequence's or a drain's, in a run of their own (`RUN`); a
+  checkpoint's metadata intent (section 10). Nothing of a transaction reaches the log before its
+  commit, and a rollback logs nothing. No page change is logged: a checkpoint writes the pages as
+  of its snapshot, and recovery replays the changes past it (section 12).
+- **Not built yet:** the record header still carries `prev` and a group's index and size, which
+  nothing writes since page records went; they go with the log's next format change.
 
 ### 7.2 Filling the log in parallel
 
@@ -316,8 +261,6 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
   progress starts. It does so before reserving, with sequentially consistent ordering. A flusher
   reads the insert position and then the array, so it sees every copy still running below that
   position. It writes only the prefix every appender has finished.
-- **Write-ahead rule.** A change's record is appended before the page latch is released, and the
-  page's LSN is set to it.
 - **Never blocking mid-change.** Space is never waited for in the middle of a change. An operation
   waits, if it must, before its first latch, until the unflushed bytes are below the buffer's size.
 
@@ -345,16 +288,24 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
 - **Layout.** The log is a sequence of segment files of S bytes. S is a creation parameter,
   256 MiB by default: at the 1 GB/s log rate Umbra measured (VLDB 2022 §4), that is a quarter of a
   second. LSN `l` lives in segment `l / S`, and records may span segments.
-- **Preparation.** Segments are created, written full of zeros and synced, with their directory,
-  before any record goes in, so later writes change no file metadata. Background work keeps the
-  next one ready.
-- **Removal.** A segment is deleted, which also erases it, once it is wholly below `min(R, U, D)`
-  as the superblock in charge names them (section 10), and, with object storage, once it has been
-  uploaded:
-  - R, the redo point;
-  - U, the first group of every writer the checkpoint's table lists, whose undo may need it;
-  - D, where recovery starts to look for the tombstones a crash left (section 12), which comes with
-    garbage collection (section 20).
+- **Preparation.** A segment is whole, allocated and synced, with its directory, before any record
+  goes in, so later writes change no file metadata. Background work keeps the next one ready.
+  - **From a spare.** A segment released (below) is renamed a spare, `{db}.log.spare{k}`, while
+    one of the two spare names is free, and the next segment prepared is a spare renamed again:
+    no byte is written to prepare it. Two, because preparation stays one segment ahead and so
+    takes one spare per segment filled, and a release may land before the spare it follows is
+    taken.
+  - **Fresh.** With no spare, or a backend that cannot rename, a segment is created and written
+    full of zeros. Only a database's first segments, and those after a crash removed the spares,
+    cost these writes.
+  - **Why a spare's old bytes are harmless.** A record's CRC covers its position (section 7.1)
+    and padding names its own, so what a segment held before reads as the end of the log wherever
+    it now lies, as a torn record does.
+  - **Opening** takes back the spares on disk; a spare whose size is not a segment's is removed.
+- **Removal.** A segment is released, kept as a spare or else deleted, once it is wholly below the
+  redo point `L` the superblock in charge names (section 10), and, with object storage, once it
+  has been uploaded. Nothing of a running transaction is in the log (section 11.4), so no undo
+  holds a segment back.
 
   A segment holding a record of the gap chain that the superblock in charge still reaches stays
   too.
@@ -375,8 +326,8 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
   - **Finding a gap.** A reader that reaches the end of what reads back whole at position p finds
     the gap starting there in O(log n) record reads, holding O(log n) positions. It validates each
     link's direction and each gap's range.
-  - **How long a gap stays.** Until `min(R, U, D)` passes it, since recovery reads from D and goes
-    past it too. A checkpoint rewrites the chain with only the gaps still above that floor. A record
+  - **How long a gap stays.** Until the redo point passes it, since recovery reads from there and
+    goes past it too. A checkpoint rewrites the chain with only the gaps still above that floor. A record
     stays, with the segment holding it, until a durable superblock names its replacement.
   - **Status.** It comes with garbage collection (section 20). Until then the superblock holds up to
     248 gaps, and a gap stays until the redo point passes it.
@@ -397,19 +348,9 @@ garbage collection (section 20).
 
 ### 7.6 Groups
 
-A change spanning several pages appends its records as one group, which recovery replays whole or
-not at all. Built in `log/mod.rs` (`Log::append_group`) and `log/reader.rs`.
-
-- **Contiguous.** A group takes one reservation, so no other record lands inside it, and padding
-  never does either.
-- **Placed.** Each record carries its index in the group and the group's size, in the header's two
-  former reserved bytes.
-- **Read whole.** A reader returns a group's records only once it has read all of them. Where the
-  log ends inside a group, or the record where the group's next one belongs does not continue it,
-  the log ends at the group's start. A record that does continue a group must have the next index
-  and the same size, so records appended after a restart past part of a group never complete it.
-- **Where to read from.** Every record reports where its group starts, the position a reader must
-  begin at to replay it. Redo points are always outside groups.
+A group is records appended under one reservation, read whole or not at all (`Log::append_group`,
+`log/reader.rs`). Since page records went, nothing appends one; the machinery goes with the log's
+next format change (section 7.1).
 
 ## 8. Commit latency
 
@@ -453,9 +394,10 @@ Built in `core/storage/atoll/buffer`.
   hint however stale always reads a header. Each header holds:
   - the versioned latch, whose version also rises on eviction;
   - the page id and the frame's state (free, loading, resident);
-  - the page's LSN and the LSN of its newest copy written back. The page is dirty while the first
-    is past the second. Checkpoints need no first-unwritten LSN per page, because their passes
-    record the log's end before writing a shard (section 10);
+  - the page's change count, the count its newest copy written holds (a swap copy or its
+    checkpoint copy), and the count its checkpoint copy holds. The page is clean, and may be
+    dropped, while the first two agree, and owed an image while the first and third differ
+    (section 10); the checkpoint its cut found it owed, while that one runs;
   - writeback flags;
   - the link to the next frame in its hash chain;
   - WATT's timestamps;
@@ -493,8 +435,9 @@ Built in `core/storage/atoll/buffer`.
 - **No guard is held across a VDBE yield.** A cursor keeps the frame, the version it saw, its
   position and its key. On resuming it validates the version, and if the page changed it seeks again
   by key.
-- **Changes.** Every change is logged before the latch is released and reported with the end of
-  its record, which becomes the page's LSN and makes the page dirty.
+- **Changes.** Every change is reported before the latch is released, which counts it and makes the
+  page dirty; a pending page's first change after a cut first keeps its bytes for the checkpoint
+  (section 10).
 - **A miss** asks the page source to locate the page, which may wait on IO with nothing claimed.
   It then claims a frame, links it as loading, and reads the page into it. A reader that finds the
   page loading waits on that read.
@@ -540,9 +483,10 @@ frame goes stale.
 
 ### 9.5 Writing back
 
-- A writeback takes dirty frames of one class and marks them writing, so they are neither evicted
-  nor dropped meanwhile. The page store takes fresh slots for them under a logged intent (section
-  6.3).
+- A writeback, eviction's, takes dirty frames of one class and marks them writing, so they are
+  neither evicted nor dropped meanwhile. Each takes a fresh swap slot (section 6.3), and on landing
+  the slot is named the page's swap copy, the one it replaces given up. A swap copy is never made
+  durable: it only lets the frame go.
 - A page written out of its frame (a draining batch, an eviction) is held by its write-out until
   the write lands, so it is sealed in its frame and written from there: no copy.
 - A page that stays in its frame may change while it is written, so it is copied optimistically,
@@ -551,13 +495,10 @@ frame goes stale.
   at least the largest page, two of it by default), leased per write and given back as it lands.
   Its size bounds such writes in flight, and so the cleaner's share of the device; a writeback
   finding no room submits no more until writes land.
-- A write's completion only records that it landed and wakes the pool's waiters. Its remap, which
-  latches metadata pages, and the frame's new state are settled the next time the writeback is
-  stepped: a latched page means a yield there, which a completion cannot do.
-- No log flush comes first. A copy's remap is logged after the copy lands, so a remap that
-  survives a crash names a copy whose records survived too.
-- A writeback is stepped by whoever needs frames, or by a checkpoint pass over a shard of frames
-  (section 10).
+- A write's completion only records that it landed and wakes the pool's waiters; the frame's new
+  state is settled the next time the writeback is stepped.
+- A writeback is stepped by whoever needs frames. Checkpoints write their images themselves
+  (section 10), and never through a writeback.
 - A failed page write, like a failed log write, stops the pool until the database is reopened.
 
 ### 9.6 Page sources
@@ -585,73 +526,59 @@ Still to come, for app servers and replicas (section 15):
 
 ## 10. Checkpoints
 
-Checkpoints are continuous (LeanStore 2024 §2.7, Haubenschild et al. §3.4). Built in
-`core/storage/atoll/checkpoint.rs` and `buffer/pass.rs`, except four parts of item 6, which come
-with garbage collection (section 20): D, the record at a checkpoint with no writers, sampling
-that yields, and the gap chain's rewrite. Until then a checkpoint that meets a held registry cell
-yields its thread and reads the cell again, a spin CONCURRENCY.md §1 forbids, and a gap leaves the
-superblock once the redo point passes it.
+A checkpoint (audit 18) writes every page owed an image as of one snapshot `C`, the metadata as of
+the same cut, and a superblock naming them, so recovery replays the log from the cut's position
+`L`, applying only the commits above `C` (section 12). Pages are never logged. Built in
+`core/storage/atoll/checkpoint.rs`, the pool's part in `buffer/mod.rs` (the cut, the copy hook,
+settling), the store's in `store.rs` (the cut's metadata edits, the frees that wait for a
+checkpoint). Not built: a bound on the memory the copy hook keeps (past it, a change would write
+the page's image itself before changing it).
 
-1. **Shards.** The pool's frames are split into S shards by position; S is 128 by default, which
-   Haubenschild found smoother than 10.
-2. **Positions.** Each shard has a position: every change to a page in its frames that is not yet
-   in a written copy has its record start at or after it. Recovery may start at the lowest
-   position of any shard.
-3. **Passes.** Each time 1/S of the log budget has been appended, a pass takes the next shard,
-   round robin. It records where the log ends, then makes every change logged before that part of
-   a written copy:
-   - a page clean when looked at is done;
-   - a dirty page is written; its copy is taken under a latch granted after the end was recorded,
-     and a change's record is appended under the page's latch, so the copy holds every change
-     logged before the end;
-   - a page already being written is looked at again once its write lands, and written again if
-     it changed meanwhile.
-
-   Then the shard's position is the end the pass recorded.
-4. **Pages stay in their frames.** A page never moves to another frame, so it never changes
-   shard. A page being written out of a draining batch (section 9.4) is looked at again once its
-   write lands, like one being written back.
-5. **Redo point.** After a pass, the log is made durable up to its end, so the remaps of the
-   pass's writes are durable. Metadata pages changed before the lowest shard position are
-   written, and slots whose freeing is durable are erased. The redo point is then the lowest
-   shard position, or what the page store allows (section 6.3) if that is lower. When it moves,
-   a superblock naming it is written, and log segments wholly before it are deleted, as far as
-   the writer table allows.
-6. **Writer table.** Undo needs a transaction's records however old they are, so a checkpoint
-   records the writers that still need undo by the log before its redo point R: each one's
-   `txn | first group | last group`. It is taken once R is fixed, from a registry every writer
-   enters before its first group's copy completes and leaves as its Commit or End is reserved, so
-   no group before R, and no Commit or End before R, can be missed. The record is appended at
-   every checkpoint, writers or none, since it also carries D.
-   - **D.** The minimum of R and every slot's D cell, its value and its pending entries, sampled
-     once R is fixed (section 11.5). Recovery looks for the tombstones a crash left from D on
-     (section 12).
-   - **Sampling.** Cells and registry entries are read optimistically and validated. A busy one
-     makes the step yield, with R fixed and the sampling's progress kept.
-   - **Durability.** The record is appended, and is durable before the superblock naming it is
-     written. So a superblock torn on the way leaves the one before it in charge, with its own
-     table and D.
-   - **The gap chain.** The same checkpoint rewrites the chain with only the gaps still above
-     `min(R, U, D)` (section 7.4).
-
-   Only once the superblock is durable are segments deleted, and only those wholly below
-   `min(R, U, D)`, U being the first group of every writer its table lists.
-   - A long OLAP snapshot never holds D back: the tombstones only it needs are in the graveyard
-     (section 11.2). Only long OLTP snapshots and collection falling behind do.
-   - A transaction's End or the release of its slot frees nothing: the next checkpoint drops it
-     from the table, and an End lost in a crash is undone again from the log still kept.
-   - A long writer holds the log back without limit. The checkpoint reports how far it holds the
-     log past the log budget, and space running out fails appends, never the undo they need.
-7. **Log budget.** The log budget is how much log recovery may have to replay. It is configured,
-   and by default scales with the pool: 0.4 times the pool, the ratio of Haubenschild's example (a
-   20 GB WAL for a 50 GB pool). The redo point then trails the log's end by about the budget, plus
-   what is appended while a pass runs. Like PostgreSQL's `max_wal_size`, it is a target: appends
-   are never held back waiting for a pass.
-8. **No stalls.** Writing a page latches it only long enough to copy it. A page being written may
-   still change, and is clean afterwards only if it did not.
-9. **Stepped like any background work.** Whoever steps the checkpointer runs what is due: a pass,
-   moving the redo point, and erasing what has become erasable. A full checkpoint passes every
-   shard at once; recovery ends with one.
+1. **Owed and clean are two facts.** A frame counts its changes. It is clean while a slot holds
+   exactly its bytes, its swap copy or its checkpoint copy, and only a clean frame may be dropped.
+   It is owed an image while it differs from its checkpoint copy: changed since, or last imaged
+   unsettled. A page evicted while it is owed goes to a swap slot, which a miss reads first and no
+   checkpoint or recovery reads.
+2. **The cut**, with the store's change gate closed, so every change of several pages lies wholly
+   before it or wholly after: `L` and `C` (section 11.4: `C` is the clock as the cut reads it, the
+   horizon waited for up to it); every resident page owed an image marked pending, under its
+   latch; then every page with a swap copy; the metadata cut. Eviction goes on meanwhile, so every
+   page owed stays listed until it is imaged or kept, and one read in again comes back pending.
+   Trees whose creation `C` does not see are set aside; pages handed to the checkpointer before
+   the cut (orphans) are taken then, and freed first.
+3. **The copy hook.** A pending page's first change or free after the cut keeps its bytes for the
+   checkpoint. A value's page freed while a cut is in effect is not freed: an image the cut owes
+   may name the value as the cut found it, and reads its pages. It waits, named by nothing, for the
+   next checkpoint.
+4. **Images.** Each pending node page is written to a fresh slot: a versioned leaf as `C` reads it
+   (each key at the version `C` sees, settled, deleted keys gone), any other as it stood at the
+   cut. A node of a tree set aside is left out. Then each pending value page is written if an
+   image written names its value, and left out if none does. Every page owed an image is a node or
+   a value's, its writer setting its kind before the change that makes it owed; any other is
+   corrupt. The page table names each copy as of the cut, and as it stands
+   once the copy has landed. An image settles its page, which is then owed nothing, clean, and its
+   swap copy given up, when it is the page as it stands, or when every version the leaf holds is
+   seen by the oldest snapshot running and by `C`, so that the image reads to every reader as the
+   leaf does: a snapshot older than `C` that reads below a version the leaf holds would read the
+   image's settled version instead. Each slot publishes a timestamp at or below its transaction's
+   snapshot, 0 while it takes one, before it reads the horizon, so a checkpoint reading the slots
+   after its cut misses only snapshots taken after, at or above `C`.
+5. **Metadata.** A record naming the metadata pages it writes is made durable first; each page is
+   then written as of the cut, numbered with the checkpoint, to the place not holding the copy in
+   charge.
+6. **Durable.** Each data file is synced once, and the log made durable to its end.
+7. **The superblock** `(n, C, L, clock, heights, continuations)` is written durably: checkpoint
+   `n` is in charge.
+8. **After.** The frees that waited for `n` are done: numbers reusable once no step holds them,
+   slots erased before they are taken again, each file synced once. The creations it mapped are
+   forgotten, the log before `L` released, and `C` let go.
+9. **When.** A checkpoint begins once half the log budget has been appended since the last began,
+   or when a full one is asked for. The log budget is how much log recovery may have to replay; by
+   default 0.4 times the pool, the ratio of Haubenschild's example. A writing statement steps the
+   checkpointer only once one is due (section 17).
+10. **Failure.** A checkpoint that cannot finish leaves the one in charge in charge. What it marked
+    imaged, and the page table entries it named as they stand, are not undone, so none runs again
+    until the database is opened again and recovers from the one in charge.
 
 ## 11. Transactions and versions
 
@@ -666,6 +593,7 @@ Built in `txn/mod.rs`, except what garbage collection brings (section 20):
 - the snapshot words and the watermarks;
 - the OLTP and OLAP classes;
 - a begin collecting its slot's garbage;
+- 32-bit statement numbers, which are 16 bits until then.
 
 Remote snapshots come with step 10.
 
@@ -819,24 +747,20 @@ Remote snapshots come with step 10.
     S: the transaction's `log_at`. Every commit at or below S has its Commit record before that
     position, so a follower reads at S only once it has applied the log through it.
   - Built with step 10 (section 20).
-- **Statements.** A transaction sees everything it wrote, its current statement's writes
-  included, as Turso's VDBE expects of a cursor: a unique check, NotExists after an insert, UPSERT,
-  triggers and foreign-key checks read them (section 17). Turso's MVCC does the same, and SQLite's
-  planner already adds a temporary table where a statement must not read its own writes. Statement
-  numbers order the version index and bound statement rollback and savepoints. Under read
-  committed each statement takes a new snapshot. Statements
+- **Statements.** A transaction sees what its own earlier statements wrote, and not what its
+  current statement writes. Under read committed each statement takes a new snapshot. Statements
   are numbered by a 32-bit counter, the width of PostgreSQL's command counter, and a transaction
   past 2^32 − 1 statements fails.
 
 ### 11.2 Tuples and versions
 
-Built in `txn/versioned.rs`, except what garbage collection brings (section 20): the rule that no
-index entry spills, and the graveyard.
+Built in `txn/versioned.rs` and `txn/arena.rs`, except what garbage collection brings (section
+20) and the graveyard.
 
-- **Header.** Every entry of every B-tree, table or index, starts with a 16-byte header:
+- **Header.** Every entry of every B-tree, table or index, starts with a 24-byte header:
 
   ```text
-  slot: u16 | ts: u64 | command: u32 | updates: u8 | flags: u8
+  slot: u16 | flags: u8 | updates: u8 | command: u32 | ts: u64 | prev: u64
   ```
 
   - `ts` is the writer's start timestamp.
@@ -844,46 +768,40 @@ index entry spills, and the graveyard.
   - `updates` counts updates while the oldest snapshot stays the same, for fat tuples; it is 0
     until they are built (section 20).
   - `flags` mark a deleted entry or a lock with no new data.
-- **Old versions.**
-  - **Version index.** Each slot keeps a version index, a B-tree of temporary pages keyed
-    `ts | command | tree | key` by the version that replaced the stored one.
-    - The key's fields are the replacing transaction's start, the replacing statement, the tree's
-      root and the key.
-    - The statement is in the key so that a statement changing a row an earlier statement of its
-      transaction changed keeps that earlier version, which it still reads.
-    - It comes before the tree, so that a backward scan of a transaction's entries reads them
-      newest statement first, the order rollback needs (section 11.5).
-    - An entry holds the whole version it replaced, header and all, not a delta; deltas come
-      later (section 20).
-    - Inserts go to the right edge, and garbage collection is a range delete.
-    - A slot has one index per node class of the trees it writes, a class larger, so its keys hold
-      a tree's longest key and the 20 bytes around it.
-  - **No index entry spills.** An index entry adds 20 key bytes and a 1-byte tag to the tree's
-    entry. A versioned tree keeps a value inline only if its index entry would be inline in the
-    index class too, so a drop of the index frees nothing but its own pages.
-    - The index entry of a value out of line must always fit, since a value too long for the
-      index entry to fit inline goes out of line instead. So a versioned tree's longest key is the
-      largest key_len for which slot + key_len + 20 + (tag + header + value reference) ≤
-      max_entry in the index class, max_entry being a quarter of the node past its header
-      (`btree/node.rs`, section 13).
-    - For example, with the node header as built today, 132 bytes (`btree/node.rs`), the largest
-      class has max_entry = (65536 − 132) / 4 = 16351. Then 10 + key_len + 20 + (1 + 16 + 24)
-      ≤ 16351, so key_len ≤ 16280.
-    - The root's kind and incarnation are not yet laid out (section 13). The final limit is
-      derived from the inequality once their layout is chosen.
-  - **Reading.** A reader starts from the leaf's version and follows the chain while a version is
-    not visible to it. A version flagged as the key's first ends the chain without a lookup.
-  - **Scanning** (`txn/versioned/cursor.rs`). A cursor moves a plain cursor, which copies each leaf
-    entry out whole, and judges each entry by its newest version. A version the statement does not
-    see is followed down its chain, as a point read follows it. A key with no version the statement
-    sees, or whose version is a tombstone, is passed over in the direction of the move.
-  - **Values out of line.** An index entry holds the replaced version's header and either its value
-    or the reference of a value out of line. Those pages are then retired (section 6.5), and freed
-    through the todo item of the change that retired them (section 11.5). A version its own
-    statement replaces again is the exception: no other transaction can reach it, and the
-    transaction's own reads take a newest version's value through the leaf that holds it, so a
-    read whose pages were replaced finds out and reads the leaf again (section 13). So its pages
-    are abandoned at once.
+  - `prev` names the arena entry holding the version below this one (below), 0 for a key that had
+    no entry before.
+- **Old versions.** Where Atoll departs from OSIC's version index, a B-tree each worker keeps
+  (Alhomssi and Leis §3.1): a version below the newest is found by a pointer, not a search.
+  - **Version arenas.** Each slot keeps an arena: an append-only run of temporary pages of 64 KiB
+    (`txn/arena.rs`). A write appends one entry before its leaf write: the statement, the tree's
+    root, the key, and the entry the leaf held, header and all, or that it held none. An
+    insert's entry is its key alone, which rollback reads.
+    - The version the write makes names the entry in `prev`: a reader whose snapshot does not see
+      it follows the pointer, with no search, and an insert of a new key names none, so a reader
+      learns the key was absent from the header alone.
+    - Appending is one exclusive fix of the slot's last page and a copy: no tree, no descent, no
+      split. A page is taken when the last one is full. An entry is written by its slot's
+      transaction alone and never changes once a version names it, so readers read it
+      optimistically, with no latch.
+    - A statement writing a key again keeps the entry its first write made, which holds what the
+      statement found: every read, the statement's own included, resolves to that, so the
+      versions in between are read by no one.
+    - An entry's page holds the largest entry of any node class (a key and an inline entry, each
+      under a quarter of a 64 KiB node), so no key is shorter for its version's sake: a versioned
+      tree's longest key is the tree's own (section 13).
+    - Entries hold the whole version replaced; deltas come next (section 20).
+  - **Tombstones keep an inline value.** A delete changes the version header alone, so the leaf
+    and the log change by 24 bytes and a key, not a row (section 7.1), and a reader below the
+    delete reads that value with the header it replaced. The space goes when garbage collection
+    removes the tombstone (section 11.5). A value out of line goes at the delete, its pages
+    retired.
+  - **Reading.** A reader starts from the leaf's version and follows `prev` while a version is not
+    visible to it. A version with none ends the chain.
+  - **Values out of line.** An entry holds the replaced version's header and either its value or
+    the reference of a value out of line. Those pages are then retired (section 6.5). A version its
+    own statement replaces again is the exception: no reader can reach it, since every read, the
+    statement's own included, resolves to what the statement found (a statement sees only what
+    earlier statements wrote, section 11.1). So its pages are abandoned at once.
   - **Fat tuples.** A tuple updated very often would keep its recent deltas inline instead (OSIC's
     fat tuples, §3.3), with the pruning of a chain's middle that the newest OLAP snapshot allows.
     They come with deltas (section 20). OSIC judges the `updates` count against the oldest snapshot
@@ -891,7 +809,7 @@ index entry spills, and the graveyard.
     tuples are designed. A tree may choose its head length, as a property of the tree, but never to
     keep a tree of an older format readable: there is one format.
 - **Graveyard.** Each versioned tree has one: a temporary tree keyed by the tree's key and a
-  generation, a class larger, as a version index is. It holds tombstones as their leaf held them,
+  generation, a class larger than the tree's. It holds tombstones as their leaf held them,
   header and all, one entry for each deletion of a key still needed. OSIC keys it as the tree is
   (§3.2), where a newer tombstone of a key would have to wait for an older one to leave.
   - **Moving.** A committed tombstone moves once the oldest OLTP snapshot sees its delete, that
@@ -968,34 +886,42 @@ A transaction that saw this commit has its own commit later in the one log, so i
 durable without this one. A read-only transaction acknowledges only once the log is durable up to
 where it stood at its snapshot.
 
+**Changes by key** (audit 17). A transaction keeps its changes by key as it makes them
+(`txn/changes.rs`): each put and delete with its tree and statement, each tree it creates, with
+plain stores into a buffer of its own. A statement rolled back drops its changes. The Commit
+record carries them after its timestamp; what does not fit one log chunk goes ahead of it in Spill
+records, each carrying the transaction's start. Changes made outside any transaction, a sequence's
+value and a tree drained, go out at once in Run records. Replaying the bodies in log order through
+the trees (`replay.rs`) rebuilds every tree: the replay oracle checks it against the database that
+published them, and recovery replays them past the checkpoint in charge (section 12).
+
 Step 1's latch comes with garbage collection (section 20). Until then a commit marks its slot
 without it.
 
 ### 11.5 Rollback and garbage collection
 
 Rollback is built in `txn/rollback.rs` and `txn/mod.rs`, except three parts, which come with
-garbage collection (section 20): the timestamp and cutoff of End's steps 1 to 3, the re-recording
-of a tombstone put back, and the background rollback of a transaction abandoned open. Until then
-End frees the slot at once. Garbage collection itself is the next part of step 7 (section 20).
+garbage collection (section 20): the timestamp and cutoff of the end's steps 1 to 3, the
+re-recording of a tombstone put back, and the background rollback of a transaction abandoned open.
+Until then the end frees the slot at once. Garbage collection itself is the next part of step 7 (section 20).
 
-- **Rollback.** A running transaction rolls back from its version indexes, newest statement first
-  across every tree and node class.
-  - For each key a statement changed, the leaf's latch is taken and the key's entry checked. An
-    index entry is put before the leaf write it is for, which may never happen, so the entry is put
-    back only if it is still that statement's.
-  - Then the entry it replaced goes back whole, version header and all, or the key is removed if it
-    had no entry.
+- **Rollback.** A running transaction rolls back from its own changes by key (audit 17), which
+  name every key its statements wrote, in order, each by its statement, so walked back they come
+  newest statement first across every tree. Nothing is read from the log. A write appends an arena
+  entry only when it replaces an entry: an insert of a key with none costs no arena entry at all.
+  - For each key a statement changed, the leaf's latch is taken and the key's entry checked: it is
+    put back only if the leaf holds that statement's version. A statement writing a key again
+    keeps the entry its first write made, so the key is put back once, at its newest change.
+  - Then the entry the version's header names below it goes back whole from the arena, version
+    header and all, or the key is removed if the header names none.
+  - A write the creating statement made plainly into its own tree is never put back by key: the
+    tree goes whole when the creation is undone.
   - An entry put back that holds a value out of line clears its pages' retired mark, and the pages
-    of the version removed are abandoned, in the same compensation (section 6.5).
-  - **Compensation.** Each key put back is one compensation record: the leaf's redo, and the unit
-    of work it completed, `(transaction, statement, tree, key)`, every change that statement made
-    to that key undone. A unit is never half done, so after a crash recovery skips exactly the
-    units done and undoes the rest. Skipping a whole statement would not do: another transaction
-    may by then have changed a key put back, and undoing it again would lose that commit.
-  - **No flush.** Nothing waits for the log to be durable: a rollback lost in a crash is undone
-    again by recovery, from the log still kept (section 10).
-  - **End.** Once undo, and the cleanup of its retained read contexts, are done, a full rollback
-    appends End and then:
+    of the version removed are freed (section 6.5).
+  - **Nothing logged.** Putting a key back is logged nowhere: the changes undone never reached the
+    log (section 11.4), and a crash loses the running transaction with memory.
+  - **The end.** Once undo, and the cleanup of its retained read contexts, are done, a full
+    rollback:
     1. marks its slot, draws a timestamp e (section 11.1) and publishes its cutoff, its start and
        e, in the slot's state;
     2. clears the slot's horizon mark, since a mark holding e keeps the horizon below e;
@@ -1005,17 +931,17 @@ End frees the slot at once. Garbage collection itself is the next part of step 7
 
     Every aborted version is gone before the slot is freed: once the slot's next transaction
     commits, the visibility rule would show one left behind as committed.
-  - **Savepoints and statement rollback** stop at a statement and append no End. Statement numbers
-    only rise: those rolled back are never used again, the transaction's tail runs on through its
-    compensations, and no index entry is removed, since a reader may be following one.
+  - **Savepoints and statement rollback** stop at a statement. Statement numbers only rise: those
+    rolled back are never used again, no arena entry is removed, since a reader may be following
+    one, and the changes of the statements rolled back are dropped from the transaction's own.
   - **A tombstone put back.** A rollback that puts back a tombstone another transaction committed
     re-records that transaction's todo item (below).
     - The item goes in the deleting slot's list, under the deleting transaction's start and
-      statement, the key it had. Its tombstone part is pending again, and its revision is set to the
-      compensation's group start. It keeps the item's retirement progress, or is recreated as
-      tombstone-only if the item is gone.
-    - The rollback enters the compensation's group start in that slot's D cell (below), adds the
-      item to the tree, and then lowers the slot's rewind word, an atomic minimum. The slot's
+      statement, the key it had. Its tombstone part is pending again, and its revision is set anew.
+      It keeps the item's retirement progress, or is recreated as tombstone-only if the item is
+      gone.
+    - The rollback adds the item to the tree, and then lowers the slot's rewind word, an atomic
+      minimum. The slot's
       collector swaps the rewind word out at the start of each step and moves its cursors back to
       it.
     - The item is eligible by the deleting version, and never waits for the rolling-back
@@ -1027,33 +953,31 @@ End frees the slot at once. Garbage collection itself is the next part of step 7
     (UNIFIED_STORAGE_DESIGN.md §4.1, §8.2, §11.2).
   - **Abandoned.** A transaction dropped open would leave its slot running, and writers that meet
     its versions would wait forever. The embedder or adapter hands it to a background rollback
-    instead, as an operation dropped with provisional pages hands them to the page store
+    instead, as an operation dropped with pages in hand hands them to the checkpointer
     (section 6.3).
 - **Garbage collection** is cooperative (OSIC §3.1, §3.5). Its work belongs to the slot whose
   transactions made it, so a dropped connection loses none.
-  - **Todo lists.** Beside its version indexes, each slot keeps a todo list, a temporary tree keyed
+  - **Todo lists.** Beside its version arena, each slot keeps a todo list, a temporary tree keyed
     `ts | command | tree | key`.
     - It holds one net item per transaction, statement, tree and key. A start and a statement
       belong to one live transaction of the slot, so a statement writing a key again updates the
       same item.
     - An item holds a retired reference, if the statement replaced a value others could reach
-      (section 6.5); a tombstone as the leaf holds it, with its group start, if the statement's last
+      (section 6.5); a tombstone as the leaf holds it, if the statement's last
       change of the key left a delete; or both.
-    - It also holds a revision: the group start of the change or compensation that last set it,
-      which never repeats.
+    - It also holds a revision: a number drawn when it was last set, which never repeats.
     - This is OSIC's tombstone index (§3.2), widened to retired references.
   - **Recorded where the change lands.** The item goes into slot-owned state under the leaf's
     latch, in room reserved before the latch, and into the todo tree at a safe point. Nothing that
     can do IO or fail sits between a change and its item. Once its change is in, a put can still
     fail freeing what it abandoned, and a remove can still return for IO, merging.
-  - **Rollback** removes the items of the changes it undoes. The retired marks are still cleared in
-    the compensation's group (section 6.5); the item is separate.
+  - **Rollback** removes the items of the changes it undoes. The retired marks are cleared by the
+    rollback itself (section 6.5); the item is separate.
   - **The collector claim.** Each slot has a collector claim: one word taken by compare-and-swap,
     separate from a transaction's ownership of the slot.
     - **Held only within a step**, never across a returned IOResult.
     - **Progress lives in the slot**, read and written only under the claim: the slot's two cursors,
-      the next page of an item being freed, a compaction being built (section 11.1), and the scan
-      of its D cell (below).
+      the next page of an item being freed, and a compaction being built (section 11.1).
     - **So nothing is lost or repeated.** A pass that is dropped, or no longer polled, loses
       nothing, and no free is repeated. A store free either happens whole or returns IO having
       changed nothing, and progress records a page only once it is freed.
@@ -1111,42 +1035,16 @@ End frees the slot at once. Garbage collection itself is the next part of step 7
     another write, and a retry that freed a page if still retired would free the new value's.
   - **Tombstones** are removed from their leaf once the oldest snapshot sees their delete, and
     moved to the graveyard once the oldest OLTP snapshot does (section 11.2).
-    - A removal is a remove outside any transaction that expects exactly that version and logs it,
-      behind the delete's commit. So a crash never recovers a row missing without the delete that
-      removed it.
+    - A removal is a remove outside any transaction that expects exactly that version, logged
+      nowhere: the snapshot of a checkpoint under way is among those it waits for, and an image
+      drops a key its snapshot reads deleted anyway (section 10).
     - Where the leaf's newest version is another committed one, the tombstone has left the leaf
       already and that part is finished.
     - A moved tombstone's item stays until the oldest snapshot sees the delete, and its cleanup then
       removes the graveyard copy.
-  - **D cells.** Each slot has a D cell, under a latch of its own, holding:
-    - a value: the conservative minimum group start of the slot's tombstone items in its todo
-      tree;
-    - a pending table, with one fixed entry per source slot, for reservations whose items are not
-      yet in the tree;
-    - a flush minimum and an epoch, for its scan.
-
-    It is used like this:
-    - **Reserving.** A reserver tries the cell's latch before its reservation callback, letting
-      the leaf go and yielding if it is busy, and enters its group start in its own entry.
-      - The reserver is the slot's owner, or a rollback re-recording an item.
-      - Nothing is taken inside the infallible callback.
-      - A source flushes its last item before its next tombstone reservation for that cell.
-    - **Flushing.** A flush that has put its item in the tree takes the cell's latch. It lowers the
-      value to its group start, and the flush minimum of any scan under way, and only then clears
-      its pending entry.
-    - **Raising the value.** A collector raises the value only once the removal or move of the
-      oldest item has its log reservation:
-      1. it starts an epoch under the latch, resetting the flush minimum;
-      2. it scans the tree's standing tombstone items outside the latch, over as many bounded steps
-         as it takes, temporary-file reads included;
-      3. it publishes, under the latch, the minimum of its scan and the epoch's flush minimum.
-    - **One scan per slot.** Its state is the slot's, under the collector claim. A collector that
-      takes the claim continues it, or marks it void under the cell's latch before starting a new
-      epoch. A void scan never publishes. While a scan runs, the value stays conservative.
-    - **Sampling.** Checkpoints sample the value and every pending entry (section 10), so a
-      standing tombstone is always counted in one of them.
-  - **A crash** loses the todo lists with every temporary page. Recovery frees every page still
-    marked retired, and removes the tombstones D leads it to (section 12).
+  - **A crash** loses the todo lists and the retired marks with memory, and needs neither: a
+    recovered database holds no tombstone and no page only an older version named (sections 6.5,
+    12).
 
 ### 11.6 Isolation levels
 
@@ -1157,119 +1055,49 @@ End frees the slot at once. Garbage collection itself is the next part of step 7
 
 ## 12. Recovery
 
-Built in `core/storage/atoll/recovery.rs`, undo in `txn/rollback.rs`, except two parts, which come
-with garbage collection (section 20): the gap chain of step 2, and step 8. Until the chain lands,
-step 2 records gaps in the superblock itself, at most 248 of them. Once they are full, recovery
-fails before it changes anything, and a gap stays until the redo point passes it. Opening a
-database (`db.rs`) creates it if there is no superblock, and recovers it otherwise.
+Built in `core/storage/atoll/recovery.rs` and `replay.rs`. Opening a database (`db.rs`) creates it
+if there is no superblock, writing one with checkpoint 0, and recovers it otherwise; a database
+whose system trees an open makes writes a checkpoint before any write (section 17).
 
-1. Read the newest whole superblock.
-2. **Analysis**, by one reader from the redo point:
-   - replay the page store's records, so the page table and free space are as the log left them;
-   - find the log's end: the first record that does not read back whole at its own position;
-   - note the pages freed and allocated again within the replay: their records before the new
-     allocation belong to the page's earlier life;
-   - find the losers: starting from the superblock's writer table (section 10), every group of a
-     transaction moves its tail on, a Commit makes it a winner and an End finishes it. Those left
-     have no undo done but what their compensation records name.
+1. **The checkpoint in charge.** Read the newest whole superblock. The metadata in charge is each
+   page's copy numbered at or below its checkpoint. A metadata page a later checkpoint, cut short,
+   named in its intent record may hold a torn copy in its other place: it is owed a write, and the
+   next checkpoint, which takes the same number, writes over it.
+2. **Scan** the log from `L` to its end: the roots that replayed creations name, kept from every
+   other allocation; which drained roots the mapping holds; the clock; the intent records; and
+   where the log ends, the first record that does not read back whole. Gaps the superblock records
+   (section 7.4) are followed. If reopening past the end would leave a gap the superblock has no
+   room for, recovery fails here, before it changes anything.
+3. **Replay**, in log order: every committed body whose commit timestamp is above `C`, joined from
+   its parts, and every run (`Apply`). A body at or below `C` is in the checkpoint's pages already.
+   A put lands settled, since no snapshot survives a crash; a delete removes its key; a drain of a
+   tree the replay made, or the mapping held, frees it whole.
+4. **Record the gap.** If the log reopens past its end, it is zeroed from there durably and the gap
+   recorded in a superblock before anything is appended.
+5. **Restart the clock** above every timestamp read: the superblock's clock, every transaction's
+   start and every commit timestamp replayed. Every version left in a page is committed.
+6. **Checkpoint.** A full checkpoint makes what was recovered the state in charge.
 
-   Every page-store record is replayed before anything is appended: a new record would stamp the
-   metadata pages it changes with an LSN past every record still to replay. So the log is read
-   twice. The reader goes past every gap the chain records (section 7.4), where a recovery that
-   crashed reopened the log.
+No analysis of losers, no undo, no compensation, no page LSN: nothing of a transaction reaches the
+log before its commit (section 11.4), and no page change is logged at all.
 
-   **Record the gap.** If the log reopens past its end, recovery puts the gap in the chain
-   (section 7.4) before it makes any other change:
-   1. it zeroes the log from where it reopens, durably;
-   2. it appends the gap record and syncs it;
-   3. it writes the superblock naming that record and syncs it;
-   4. only then does it make any other change.
+**Threads.** Turso core starts no threads. Any number of threads may call `Opening::work`: one
+recovers while the rest wait for it.
 
-   The gap is durable first because recovery's checkpoint writes metadata pages, and the copies
-   they name, before its own superblock lands; a crash in between leaves pages a later recovery
-   explains only from what this one appended. One reader keeps up with one device: CRC32C ran at
-   16 GB/s on one core of a Core Ultra 9 285H, above the 7 GB/s a PCIe 4 NVMe drive reads
-   sequentially.
-3. **Redo**, in parallel. The log is read again in windows of one checkpoint pass's share of the
-   budget. Each window's page records are split into partitions by page id; a partition's records
-   apply in log order, window after window. A page starts from its newest copy whose remap is
-   durable, which is what the replayed page table names, or from zeros if it has none. A record
-   applies only if it is newer than the page and not from an earlier life. Dirty pages are
-   written back as memory runs short, as in normal running. At most four windows are held, so
-   recovery needs memory beyond the pool of four passes' shares of the budget, 1.25% of the pool
-   by default.
-4. **Free** the pages left provisional (section 6.3), and **erase** the slots of intents that got no
-   remap.
-5. **Undo** every loser, back along its chain from its tail, each group read whole and checked
-   before its undo is used. Compensation records were redone with everything else and are never
-   undone. A change is undone, by putting back the entry it replaced, only if the key's entry is
-   still exactly the one it wrote, version header included, checked under the leaf's latch. A
-   compensation from a rollback before the crash put back the entry its statement found, and a
-   statement number rolled back is never written again, so none of that statement's entries is
-   there any more; another transaction's change since left its own. Each undo here is logged as
-   a compensation naming the change it undid, in the chain's order, so a recovery that crashes
-   here goes on, the next time, from before the change its newest compensation names: every
-   change after that one in the chain was undone or found done. So undo needs no record of what
-   was compensated beyond the log and the tree, whatever a loser's size, and the losers may be
-   undone in any order. Then End. Nothing here reads the version indexes, which do not survive a
-   crash.
-   - A change its own statement made to a key again logs, as what undoes it, the entry the
-     statement found, not the one it replaced: the statement's earlier versions of the key were
-     abandoned when it replaced them, so undo puts back what the statement found once, at its
-     newest change, and the check skips the rest.
-   - Undoing a change of a value out of line clears the retired mark of the value it puts back
-     and abandons the pages of the value it removes, in the same compensation (section 6.5).
-6. **Free the retired pages** still marked (section 6.5): no snapshot survives a crash, so nothing
-   can read the versions they held. They go through the buffer pool, in section 6.5's order,
-   since redo may have put one in a frame, which the closing checkpoint would otherwise write back
-   as a page that is free.
-7. **Restart the clock** above every logged timestamp: the clock the superblock recorded, which is
-   above every change logged before the redo point, and every transaction id and commit
-   timestamp replayed. Every header left in a page is then a committed version: each slot's commit
-   log starts with every transaction before the restart committed.
-8. **Remove the tombstones a crash left.** The todo lists did not survive, so a committed delete
-   whose tombstone garbage collection had not removed would leave it in its leaf for good. From D,
-   which the superblock's writer-state record carries (section 10), to the log's end as undo left
-   it, the compensations step 5 appended included, recovery reads every change that left a
-   tombstone and every compensation that put one back. It removes each such tombstone that is
-   still its leaf's newest version and exactly the one read. Redo starts from R; this reads from
-   D, and the log is kept from `min(R, U, D)` (section 7.4).
-   - A crash during it repeats it: D, and the tombstones, stay until the closing checkpoint is
-     durable.
-   - **The tree is checked before any entry is read.** A record names its tree by its root and
-     incarnation (section 13), and recovery reads the root first.
-     - The record is skipped as its tree gone if the root's number is free, or its page is of
-       another kind, or a plain tree, or another incarnation. A root page number freed and handed
-       out again, to a blob or to another tree, is told apart that way, and a plain tree is never
-       read as a versioned one.
-     - A page of the B-tree kind whose contents do not decode is corruption, and fails recovery:
-       it is never read as a tree gone.
-   - A tombstone left anyway costs time, never correctness: after a restart every header is a
-     committed version, so a tombstone only ever reads as absent. If D ever needs a cap, the
-     fallback is a background sweep that resumes from the start, never a sweep at open.
-9. **Checkpoint.** A full checkpoint writes back every page redone. Its redo point is past where
-   the log restarted, which recovery checks, so nothing replayed is replayed again and the bytes
-   between the old end and the restart are never read.
-
-**Threads.** Turso core starts no threads. Whichever threads call `Opening::work` take the next
-work: the window to read, or the next partition ready to apply. Opening on one thread recovers on
-one thread.
-
-Recovery reads at most the log budget (plus what was appended during the last pass) twice, plus
-the undo of open transactions, plus the log from D where D is below the redo point. Haubenschild
-et al. replay 100 GB of log in 38 s on 40 threads (§4).
+Recovery reads at most the log budget, plus what was appended while the last checkpoint ran, twice.
 
 ## 13. B+-trees
 
-Built in `core/storage/atoll/btree`, except key encoding for SQL records, which comes with the
-cursor (step 8), and the roots' kind and incarnation and the conditional remove, which come with
-garbage collection (step 7).
+Built in `core/storage/atoll/btree`, except the roots' kind and the conditional remove, which come
+with garbage collection (step 7).
 
 - **Nodes** are slotted (LeanStore, BTW 2023 §4; `btree/node.rs`):
   - fence keys: the lower exclusive, the upper inclusive, a missing one infinite;
   - the fences' common prefix stripped from every key;
   - a 4-byte head of each key in its slot, so a search compares integers until heads tie;
   - a hint array of 16 heads sampled over the slots, one cache line, narrowing the binary search.
+    An insert rewrites only the hints from the first it can have moved, while their spacing holds
+    (LeanStore, ICDE 2018), so an append rewrites one at most.
 
   ```text
   slot: off: u16 | key_len: u16 | value_len: u16 (top bit: out of line) | head: u32
@@ -1277,19 +1105,17 @@ garbage collection (step 7).
 
   A node names its tree by its root's page id, and holds its level, its right neighbour (a leaf) or
   rightmost child (an inner node), with a frame hint beside it.
-- **Roots.** A root records, durably, whether its tree is versioned or plain, and the tree's
-  incarnation: the LSN of the record that created it, unique to that tree's lifetime.
-  - It keeps both through every growth and shrink, so a structural init never starts a new
-    lifetime.
-  - A transaction's changes and their compensations carry the incarnation beside the root
-    (section 7.1), so recovery can tell a tree from a later one at the same page (section 12).
-  - This comes with garbage collection (section 20). Where these fields go is not chosen yet, and
-    the limits of section 11.2 are derived from the layout that holds them.
+- **Roots.** A root records whether its tree is versioned or plain, and keeps it through every
+  growth and shrink. A transaction's changes name the tree by its root alone: replay meets a
+  root's trees in log order, a drain between them, and a root freed is taken again only after a
+  checkpoint begun after its free, so a replay never makes a second tree at a root it freed
+  (sections 6.3, 12).
 - **Node size.** 4 KiB unless the tree chose a larger class, up to 64 KiB, the most 16-bit slots
   address.
   - Every entry, slot included, takes at most a quarter of the node past its header, so any two
     entries fit beside the fences and a split always makes room. Keys are at most that less a
-    slot and a value reference: 957 bytes in a 4 KiB node.
+    slot and a value reference: 957 bytes in a 4 KiB node, and 933 in a versioned tree's, whose
+    leaf entries keep their 24-byte version header beside the key.
   - **Values out of line** (`btree/value.rs`). A value whose entry would pass a quarter goes into a
     blob page of the smallest class that holds it. Beyond the largest class it is cut into 8 MiB
     chunks under a directory page; a billion bytes, SQLite's limit, takes 120 chunks. Every page
@@ -1318,14 +1144,26 @@ garbage collection (step 7).
   - **Proof:** a property test compares the encoding's order with `compare_immutable` on random
     records.
 - **Latching:** optimistic lock coupling (LeanStore, ICDE 2018 §IV-F).
+- **The caller's leaf.** A cursor, a put and a transaction's write keep the leaf they last reached,
+  with its frame hint, and try it before a descent: a leaf of the tree that answers the key, by
+  the route the descent would take, is the one leaf that does. It answers a key at it from above
+  its lower fence to its upper, included, and the keys just above one from its lower fence,
+  included, to below its upper. The caller holds the hint, so nothing another thread reads is
+  written. An append's split keeps every entry of the left leaf where it is: it writes the new
+  upper fence and compacts only when the fence would not fit.
+- **A look kept.** A look at a key's leaf (where the key is or goes, and its entry) can be kept past
+  its step with the leaf's page, frame and the latch version it read. Kept, it holds no latch; it
+  is given back while the frame still holds the leaf at that version, since equal versions mean no
+  change between, and a put goes in from it as from the look. A probe of a key keeps its look, so
+  the read and the write of the key that follow reach no leaf again (section 17).
   - A descent fixes each node without a lock and validates the parent after finding the child, so
     readers take no latch. A child freed meanwhile fails the parent's validation, never the read.
   - A writer latches its leaf alone and checks under the latch that the leaf covers its key.
   - A structure change is its own step: it descends again and latches exactly the nodes it changes,
     then the operation that needed it starts over. A busy latch is a cooperative yield, and no
     latch is held across a returned `IOResult`.
-- **Structure changes**, each one log group (section 7.6) with the adoption or abandonment of its
-  page (section 6.3):
+- **Structure changes**, each inside the store's change gate, so a checkpoint's cut finds it whole or
+  not begun (section 10):
   - **Split:** the new right node's image, the left's truncation to its first entries and a new
     upper fence, and the parent's new separator, with the old pointer moved to the new node. A
     parent without room is split first. Separators are the shortest key between the halves.
@@ -1356,7 +1194,7 @@ garbage collection (step 7).
   - **Sealed log segments.** The open segment's tail is also uploaded in chunks when commits wait for
     the upload.
   - **Page copies,** packed by the cleaner into large immutable objects. Uploading one is followed by
-    a logged remap naming its remote place.
+    naming its remote place in the next checkpoint's metadata.
   - **A manifest per checkpoint:** the redo point, and where the page-table roots are.
 - **Local slots are a cache.** A page whose copy is uploaded may lose its local slot whenever space
   is needed.
@@ -1442,7 +1280,7 @@ review in full before it is built.
 - **Replicas.** A replica, server or device, is a follower of the log holding all of the database or
   part of it. It works like an app server, with its own disk.
   - Its snapshots are leased at the primary like an app server's (section 11.1).
-  - It keeps its own version indexes, from the entries the log's updates carry, and its own
+  - It keeps its own version arenas, from the entries the log's updates carry, and its own
     graveyards (section 11.2). A removal the primary's collection logs carries the exact version
     removed. A replica moves that version into its own graveyard before applying the removal while
     a snapshot at or above its OLAP floor may still read it (section 11.2).
@@ -1480,6 +1318,25 @@ MVCC plugs into the same places with 38 explicit branches in `core/vdbe/execute.
     see them.
 - **Header fields.** Schema cookie, user version, application id and the rest are rows in a system
   tree, versioned like data.
+- **What a connection keeps.** Per tree, the catalog row its transaction read and the leaf its last
+  cursor stood at, and per header field the word its transaction read, so a statement's cursor
+  open and its schema check read nothing. A transaction's snapshot sees no other transaction's
+  write, so what it read holds until a write of its own or a rollback of its statements, each of
+  which the catalog and the header count; a row or word read by another transaction is not used.
+  The leaf is a hint (section 13), kept across transactions.
+- **One reach per row.** An insert's KeyProbe keeps its look at the key's leaf (section 13).
+  NotExists answers from it when the newest version there is none, or a tombstone the statement
+  sees, and the Insert writes from it, while the leaf is unchanged; any other answer is a seek's.
+- **What a statement keeps.** At its reset a statement parks each Atoll cursor in its slot: what
+  it waited on is withdrawn from the wait graph, and the leaf it stood at is left to the
+  connection. The next execution's open of the same tree in the slot takes the cursor up again:
+  at no row, with no move or write under way, its catalog row checked again against the one the
+  statement reads, and built afresh where they differ. An open of another tree drops it. A cursor
+  keeps its tree's rowid counter, so an insert looks it up once.
+- **Rows built once.** A write's key and entry are buffers the cursor hands round: the entry is
+  built once, with room for the version header, then stored in the leaf and the log from there,
+  and the cursor shows the row it wrote from that entry, handing back the row it showed before
+  for the next write. An insert that splits no node allocates nothing.
 - **NewRowid.** A per-tree counter, seeded from the tree's largest key, safe for concurrent inserters.
 - **Routing pager calls.** Where the VDBE and the connection call the pager (transactions, header,
   CreateBtree/Destroy/Clear, savepoints, checkpoint, integrity check, page counts), calls go through
@@ -1517,61 +1374,29 @@ submission or later from `IO::step`. Therefore:
 - **Model.** After every recovery, the database is compared with a model of committed state:
   - committed transactions are all there, and uncommitted ones are not;
   - every snapshot read matches the model.
-- **Undo.** Crashes every few IO operations through each of these, and through the recovery of
-  each crash just before every write to the log or the superblock completes, the write torn
-  (`txn/rollback/tests.rs`, which counts where its crashes land):
-  - a rollback, between any two keys it puts back;
-  - a statement that updated one key several times;
-  - a rollback to a savepoint, after which another transaction changes and commits a key put back;
-  - a writer spanning several checkpoints and segment deletions;
-  - recovery's own undo, between two of its compensations, and the recovery of that crash between
-    two of its own, with each checkpoint's superblock torn;
+- **Rollback and recovery.** Crash images every few IO operations through each of these, and
+  through the recovery of each, recovered to exactly what was committed, checkpoints running
+  between (`txn/rollback/tests.rs`, `tests.rs`):
+  - a rollback, and a rollback to a savepoint after which another transaction changes and commits
+    a key put back;
+  - a transaction's created trees, gone after a crash or a rollback, a committed one's kept;
+  - a settle, and the writes that took its room;
   - all of it with values out of line, replaced, rewritten in one statement, deleted and
-    inserted: every recovery leaves each page reachable or free, none retired.
-- **Retired pages.** Crashes after every few IO operations of allocations, copies, frees, retires
-  and reinstates, and a mark only a metadata page holds, its record behind the redo point, in a
-  second leaf of marks (`store/tests.rs`).
-- **Garbage collection.**
-  - **Freeing.**
-    - Pages are freed exactly once, and only through changes that landed. A write under read
-      committed that loses its race, and a rollback to a savepoint in a transaction that then
-      commits, each fail first against freeing through index entries.
-    - A pass stopped inside a value resumes without freeing a page twice, the page's number handed
-      out and retired again meanwhile. A collector whose completion loses to a restoration keeps
-      the page it freed.
-    - Recovery frees a retired value whose pages redo put back in frames. A retired page freed with
-      its write in flight stays free.
-  - **Drops and cursors.**
-    - Version index drops cover transactions aborted, statements rolled back, writes that never
-      happened, and a slot whose last transactions rolled back.
-    - A pass over a blocked slot costs O(1). A long writer on top of a tombstone stops nothing
-      behind it, and frees waiting on an OLAP snapshot stop no moves.
-    - With all W slots occupied by open transactions, background passes still collect every
-      slot's eligible todo items and version index entries.
-  - **Restorations.**
-    - A restored committed tombstone is removed, and D moves past it, while the writer that
-      restored it stays open.
-    - A restoration landing behind a collector in mid-pass, and a collector paused between seeing
-      the open writer and completing the item, both leave the tombstone pending and later
-      removed.
-  - **Snapshots and commit logs**, under loom and shuttle:
-    - No snapshot misses a commit before it, one published between a provisional bound and a
-      scanner's sample included.
-    - A remote holder's snapshot between its floor and the horizon keeps its answers through
-      compaction.
-    - A commit that has drawn its timestamp stalls before publishing its pair while other slots
-      publish above it: compaction keeps every pair a snapshot can still ask for.
-    - A compaction taking several quanta while its owner commits loses no pair, and every snapshot
-      keeps its answers.
-    - An occupied, idle slot sheds obsolete pairs, partial tails included.
-    - A version rolled back is never taken for committed. One overwritten and restored repeatedly,
-      between a writer's look and its reread, is no corruption.
+    inserted: every recovery leaves each page reachable or free.
+- **Checkpoints.** A crash anywhere, checkpoints stepping between changes, recovers a plain tree
+  exactly as the checkpoint in charge cut it (`btree/tests.rs`), and a drain from the tree the
+  checkpoint in charge left (`btree/drain/tests.rs`). A cut's snapshot is the clock it read,
+  never a commit drawn after (`txn/tests.rs`). A checkpoint that fails leaves the one in charge,
+  and none runs until a reopen recovers (`tests.rs`).
+- **The page store.** A number freed is taken again only once a checkpoint begun after its free is
+  in charge; a slot a checkpoint stops naming holds its copy until that checkpoint is in charge,
+  then is freed and erased; a latched metadata page makes its users yield (`store/tests.rs`).
   - **The clock.** With W = 1 and exactly one timestamp left, a begin is refused and a rollback
     still draws; also concurrent draws at the boundary. A rollback's mark is cleared before its
     slot is freed, so a new owner's mark is never cleared by the old one.
   - **Statements.** A transaction past 65,535 statements rolls back to savepoints, commits, and is
-    recovered after a crash. That covers the widening in headers, index keys and compensations,
-    and in the statement a rollback to a savepoint stops at.
+    recovered after a crash. That covers the widening in headers and index keys, and in the
+    statement a rollback to a savepoint stops at.
   - **The graveyard**, against the model:
     - OLAP scans and point reads through moves, several deletions of one key, and merges changing
       fences in the middle of a scan.
@@ -1592,16 +1417,12 @@ submission or later from `IO::step`. Therefore:
   - **Index entries.** At the largest class, maximum keys with values out of line, and values at
     the inline threshold, never spill.
   - **Crashes** through all of it:
-    - every tombstone left is removed from D on, a crash during that is repeated, the log is kept
-      from D, and a long OLAP snapshot never holds D back;
-    - an old delete across its tree's drop, and its root number's reuse by a plain tree, then by a
-      blob. The plain tree holds the delete's key with exactly the old tombstone's bytes as its
-      value, since different bytes would let a check of the entry alone pass;
+    - a recovered database holds no tombstone and no page only an older version named, whatever
+      the collection had reached;
     - more gaps than one record holds, and crashes around each step of publishing the chain.
   - **Failure.**
     - A panic in the middle of a change refuses writes until the database reopens.
     - A transaction abandoned open is rolled back in the background.
-    - A checkpoint step that meets a held registry entry or D cell yields with its R kept.
 - **Followers.** An app server or replica at log position X reads exactly the committed state at X.
   - An app server holds an OLAP snapshot and has never fetched a key's leaf. The primary deletes
     the key and moves its tombstone, and the app server then fetches the leaf. A point read and a
@@ -1639,23 +1460,21 @@ work says which parts are done.
 4. **Buffer manager.** Frames on huge pages, lent to size classes in batches; the hash table and
    frame hints; WATT replacement; fixes and prefetch; the page source for the local store;
    writeback. Done (`buffer/`).
-5. **Checkpoints and recovery** over the new pieces: shard passes, continuous checkpoints,
-   parallel redo, opening a database, and blob writes, the first page record. Done
-   (`checkpoint.rs`, `buffer/pass.rs`, `recovery.rs`, `redo.rs`, `blob.rs`, `db.rs`). Undo and
-   the clock move to step 7.
+5. **Checkpoints and recovery** over the new pieces: opening a database, checkpoints, recovery.
+   Built first as continuous checkpoints over shard passes with physical redo of page records;
+   replaced by the plain checkpoint and replay of the logical changes (audits 17, 18:
+   `checkpoint.rs`, `recovery.rs`, `replay.rs`, `db.rs`).
 6. **B+-trees.** Nodes, values out of line, optimistic lock coupling, splits, merges and root
-   changes, cursors, and the log groups and provisional pages they need. Done (`btree/`,
-   `log/`, `store.rs`). Key encoding moves to step 8, with the cursor that encodes.
+   changes, and cursors. Done (`btree/`). Key encoding moves to step 8, with the cursor that encodes.
 7. **Transactions.** Temporary pages and temporary trees (done: `buffer/temp.rs`); slots, clock,
    commit logs, visibility, commit and restarting the clock (done: `txn/mod.rs`); version headers,
-   a version index of whole versions, conflicts and waits (done: `txn/versioned.rs`); rollback,
-   the writer table and undo in recovery (done: `txn/rollback.rs`, `log/writers.rs`,
-   `recovery.rs`); values out of line in versioned trees, and retired pages (done:
-   `txn/versioned.rs`, `store.rs`); 32-bit statement numbers (done: `txn/`, `btree/record.rs`,
-   built first in step 8, which takes one per writing statement). Next, garbage collection, without the newest OLAP snapshot as a
+   version arenas of whole versions, conflicts and waits (done: `txn/versioned.rs`,
+   `txn/arena.rs`); rollback (done: `txn/rollback.rs`); values out of line in versioned trees,
+   and retired pages (done:
+   `txn/versioned.rs`, `store.rs`). Next, garbage collection, without the newest OLAP snapshot as a
    watermark:
-   - the clock's ceiling and reserve (sections 7.1, 11.1);
-   - the timestamp a rollback draws, the cutoff it publishes, and End's order of release
+   - the clock's ceiling and reserve, and 32-bit statement numbers (sections 7.1, 11.1, 11.2);
+   - the timestamp a rollback draws, the cutoff it publishes, and the end's order of release
      (section 11.5);
    - snapshot words, watermarks, OLTP and OLAP (section 11.1);
    - the commit-log latch, and segmented compaction with its test of whether a writer committed,
@@ -1665,21 +1484,16 @@ work says which parts are done.
    - the drops, frees, removals and restorations those passes make (section 11.5);
    - the graveyard, its moves and cleanup, and OLAP reads through it, with no index entry spilling
      (section 11.2);
-   - root kinds and incarnations, and the conditional remove (section 13);
-   - D cells and D in the writer-state record (sections 10, 11.5);
-   - the gap chain (section 7.4);
-   - recovery's removal of the tombstones a crash left (section 12);
+   - root kinds, and the conditional remove (section 13);
+   - the gap chain (section 7.4), and the checkpoint's rewrite of it (section 10);
    - fail-stop on a panic in the middle of a change (section 7.5);
-   - the background rollback of a transaction abandoned open (section 11.5);
-   - checkpoint sampling that yields, the writer-state record at every checkpoint, and its rewrite
-     of the gap chain (section 10).
+   - the background rollback of a transaction abandoned open (section 11.5).
 
    Remote snapshots, and followers' own graveyards, come with step 10.
 
    Then update deltas and fat tuples, with the pruning of a chain's middle that the newest OLAP
    snapshot allows (OSIC §3.3).
 8. **Turso integration.**
-   - the versioned cursor under `AtollCursor` (done: `txn/versioned/cursor.rs`);
    - the storage-mode interface;
    - `AtollCursor`, and the key encoding for SQL records (section 13);
    - the catalog;

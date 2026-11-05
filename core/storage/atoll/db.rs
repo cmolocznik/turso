@@ -4,14 +4,14 @@
 use super::buffer::{BufferConfig, BufferPool, LocalSource};
 use super::checkpoint::Checkpointer;
 use super::control::{Control, Superblock};
-use super::log::{framed_len, table_len, Log, LogConfig, Lsn, Writers};
+use super::log::{Log, LogConfig, Lsn};
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
-use super::recovery::Recovery;
+use super::recovery::{self, Recovered};
 use super::store::{PageStore, StoreConfig};
 use super::txn::{Clock, Transactions, TxnConfig};
 use crate::io::IO;
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 
 #[derive(Debug, Clone)]
@@ -55,10 +55,7 @@ impl AtollConfig {
                 file_bytes: 1 << 30,
                 meta_pages: 1 << 10,
             },
-            buffer: BufferConfig {
-                checkpoint_shards: 8,
-                ..BufferConfig::with_budget(super::buffer::MIN_BUDGET)
-            },
+            buffer: BufferConfig::with_budget(super::buffer::MIN_BUDGET),
             log_budget: Some(512 << 10),
             txn: TxnConfig::default(),
         }
@@ -112,7 +109,6 @@ impl Atoll {
         &self.pool
     }
 
-    /// Continuous checkpoints, stepped like any background work ([`Checkpointer::step`]).
     pub fn transactions(&self) -> &Transactions {
         &self.txns
     }
@@ -123,41 +119,30 @@ impl Atoll {
 }
 
 /// Opening a database, which recovery may make long. Any number of threads may call
-/// [`work`](Self::work) at once; once every call has returned, [`finish`](Self::finish) gives the
-/// database.
+/// [`work`](Self::work) at once: one recovers while the rest wait for it; once every call has
+/// returned, [`finish`](Self::finish) gives the database.
 pub struct Opening {
     store: Arc<PageStore>,
     superblock: Superblock,
-    txn: TxnConfig,
-    /// The writer registry the transactions enter and checkpoints read.
-    writers: Arc<Writers>,
-    how: How,
-}
-
-/// A new database, ready to open.
-struct Created {
-    log: Arc<Log>,
-    pool: Arc<BufferPool>,
-    checkpointer: Checkpointer,
-    clock: Arc<Clock>,
+    how: Mutex<How>,
 }
 
 enum How {
-    Created(Box<Created>),
-    Recovering(Box<Recovery>),
+    /// A new database, ready to open.
+    Created(Box<Recovered>),
+    /// A database to recover from its superblock, and what recovery needs.
+    Recovering {
+        io: Arc<dyn IO>,
+        base: String,
+        config: Box<AtollConfig>,
+        control: Option<Control>,
+    },
+    Recovered(Box<Recovered>),
+    Taken,
 }
 
 impl Opening {
     pub fn new(io: Arc<dyn IO>, base: &str, mut config: AtollConfig) -> Result<Self> {
-        // A checkpoint's writer table lists up to one writer per slot, in one record.
-        let table = framed_len(table_len(config.txn.slots));
-        if table > config.log.buffer_bytes {
-            return Err(LimboError::InternalError(format!(
-                "{} transaction slots need a writer table of up to {table} bytes of log, more \
-                 than the {} byte log buffer",
-                config.txn.slots, config.log.buffer_bytes
-            )));
-        }
         let (control, superblock) = Control::open(io.clone(), base)?;
         let Some(superblock) = superblock else {
             return Self::create(io, base, config, control);
@@ -165,27 +150,27 @@ impl Opening {
         // What the database was created with holds, whatever this configuration says.
         config.log.segment_bytes = superblock.segment_bytes;
         config.store.file_bytes = superblock.file_bytes;
-        let store =
-            PageStore::recovering(io.clone(), base, config.store.clone(), superblock.heights);
-        let writers = Arc::new(Writers::new(config.txn.slots));
-        let recovery = Recovery::new(
+        let store = PageStore::open(
             io.clone(),
             base,
-            &config,
-            store.clone(),
-            control,
-            superblock.clone(),
-            writers.clone(),
+            config.store.clone(),
+            superblock.heights,
+            superblock.checkpoint,
         );
         Ok(Self {
             store,
             superblock,
-            writers,
-            txn: config.txn,
-            how: How::Recovering(Box::new(recovery)),
+            how: Mutex::new(How::Recovering {
+                io,
+                base: base.to_string(),
+                config: Box::new(config),
+                control: Some(control),
+            }),
         })
     }
 
+    /// A database made from nothing: its first superblock names checkpoint 0, no page and no log,
+    /// written before anything is appended, so a log with no superblock is no database yet.
     fn create(io: Arc<dyn IO>, base: &str, config: AtollConfig, control: Control) -> Result<Self> {
         // From the IO, so a simulation that seeds it creates the same database every time.
         let mut database_id = [0u8; 16];
@@ -200,87 +185,95 @@ impl Opening {
             database_id,
             heights: [[1; CLASS_COUNT]; TREES],
             clock: 0,
-            writers: None,
+            snapshot: 0,
+            checkpoint: 0,
             continuations: Vec::new(),
         };
         let log = Log::open(io.clone(), base, config.log.clone(), 0)?;
-        let store = PageStore::new(
+        let store = PageStore::open(
             io.clone(),
             base,
             config.store.clone(),
-            log.clone(),
             superblock.heights,
+            0,
         );
-        // Before anything is appended: a log with no superblock is not a database yet, and is
-        // created again from nothing.
         control.write_and_wait(&superblock)?;
         let pool = BufferPool::new(
             config.buffer.clone(),
             Arc::new(LocalSource::new(store.clone())),
             store.clone(),
-            0,
         )?;
-        let clock = Arc::new(Clock::after(0));
-        let writers = Arc::new(Writers::new(config.txn.slots));
+        let txns = Transactions::new(&config.txn, Arc::new(Clock::after(0)), log.clone());
         let checkpointer = Checkpointer::new(
             pool.clone(),
             store.clone(),
+            log.clone(),
             control,
             superblock.clone(),
             config.log_budget(),
-            clock.clone(),
-            writers.clone(),
         );
         Ok(Self {
             store,
             superblock,
-            writers,
-            txn: config.txn,
-            how: How::Created(Box::new(Created {
+            how: Mutex::new(How::Created(Box::new(Recovered {
                 log,
                 pool,
                 checkpointer,
-                clock,
-            })),
+                txns,
+                end: 0,
+            }))),
         })
     }
 
-    /// Recovers alongside every other thread calling this; returns once recovery is done.
+    /// Recovers, if this open recovers and no one has yet; returns once recovery is done.
     pub fn work(&self) -> Result<()> {
-        match &self.how {
-            How::Created(..) => Ok(()),
-            How::Recovering(r) => r.work(),
-        }
+        let mut how = self.how.lock();
+        let How::Recovering {
+            io,
+            base,
+            config,
+            control,
+        } = &mut *how
+        else {
+            return Ok(());
+        };
+        let control = control.take().ok_or_else(|| {
+            LimboError::InternalError("a recovery that failed is not tried again".into())
+        })?;
+        let recovered = recovery::recover(
+            io.clone(),
+            base,
+            config,
+            self.store.clone(),
+            control,
+            self.superblock.clone(),
+        )?;
+        *how = How::Recovered(Box::new(recovered));
+        Ok(())
     }
 
     pub fn finish(self) -> Result<Atoll> {
-        let (recovered_end, log, pool, checkpointer, clock) = match self.how {
-            How::Created(created) => {
-                let Created {
-                    log,
-                    pool,
-                    checkpointer,
-                    clock,
-                } = *created;
-                (None, log, pool, checkpointer, clock)
-            }
-            How::Recovering(r) => {
-                let done = r.take_recovered().ok_or_else(|| {
-                    LimboError::InternalError("finishing an open before recovery is done".into())
-                })?;
-                (
-                    Some(done.end),
-                    done.log,
-                    done.pool,
-                    done.checkpointer,
-                    done.clock,
-                )
+        let how = std::mem::replace(&mut *self.how.lock(), How::Taken);
+        let (recovered_end, r) = match how {
+            How::Created(r) => (None, r),
+            How::Recovered(r) => (Some(r.end), r),
+            How::Recovering { .. } | How::Taken => {
+                return Err(LimboError::InternalError(
+                    "finishing an open before recovery is done".into(),
+                ))
             }
         };
+        let Recovered {
+            log,
+            pool,
+            checkpointer,
+            txns,
+            ..
+        } = *r;
         Ok(Atoll {
             database_id: self.superblock.database_id,
             recovered_end,
-            txns: Transactions::new(&self.txn, clock, log.clone(), self.writers),
+            txns,
             log,
             store: self.store,
             pool,

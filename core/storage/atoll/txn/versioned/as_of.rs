@@ -5,6 +5,12 @@
 //! snapshot reads as absent or deleted is dropped. Every version kept is settled, its header
 //! [`Version::SETTLED`], since every snapshot after a recovery from the checkpoint sees it.
 //!
+//! Where every version the leaf holds is one the oldest snapshot running sees, and so every snapshot
+//! running or taken from now on ([`Transactions::oldest_snapshot`]), the image reads to every
+//! reader exactly as the leaf does, and stands for it ([`AsOf::adoptable`]): the leaf is owed
+//! nothing more until it changes, and once evicted is read back as the image. An older snapshot
+//! that reads below a version the leaf holds would read the image's settled version instead.
+//!
 //! It is built from a copy of the leaf's bytes, taken under its latch, so writers go on while
 //! the arenas are read. The arena entries it follows stay while the snapshot is held. It fits the
 //! page, whose reserves kept room for every version it puts back ([`super`]: `reserve`).
@@ -45,6 +51,10 @@ pub struct AsOf {
     kept: Vec<Entry>,
     /// Per slot, the start of its last transaction the snapshot sees, once read.
     seen: Vec<Option<Ts>>,
+    /// Whether every version the leaf holds is seen by every snapshot running or to come.
+    adoptable: bool,
+    /// At or below every snapshot running or to come, `at` at most, once read.
+    oldest: Option<Ts>,
 }
 
 impl AsOf {
@@ -68,6 +78,8 @@ impl AsOf {
             chain: None,
             kept: Vec::new(),
             seen: Vec::new(),
+            adoptable: true,
+            oldest: None,
         })
     }
 
@@ -97,7 +109,13 @@ impl AsOf {
                         .get(..HEADER)
                         .and_then(Version::decode)
                         .ok_or_else(corrupt_header)?;
-                    if self.sees(txns, &v)? {
+                    let sees = self.sees(txns, &v)?;
+                    // Read after the cut, the horizon at or above `at`.
+                    let oldest = *self
+                        .oldest
+                        .get_or_insert_with(|| txns.oldest_snapshot(self.at));
+                    self.adoptable &= txns.committed_by(v.slot, v.ts, oldest);
+                    if sees {
                         let e = &mut self.copied[self.next];
                         let (key, value) =
                             (std::mem::take(&mut e.key), std::mem::take(&mut e.value));
@@ -142,6 +160,14 @@ impl AsOf {
             value,
             out_of_line,
         });
+    }
+
+    /// Once judged whole: whether every version the leaf held is seen by every snapshot running or
+    /// taken from now on, the snapshot's included, so that the image, each version settled and each
+    /// deleted key gone, reads to every reader as the leaf does.
+    pub fn adoptable(&self) -> bool {
+        assert_eq!(self.next, self.copied.len(), "a leaf not yet judged whole");
+        self.adoptable
     }
 
     /// The leaf's image, its page header as copied: what [`step`](Self::step) kept, in the

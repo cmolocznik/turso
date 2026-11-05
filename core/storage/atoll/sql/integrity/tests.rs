@@ -70,7 +70,7 @@ fn a_database_in_use_accounts_for_every_page() {
     assert_eq!(rows(&conn, "PRAGMA quick_check"), ok());
 }
 
-/// A page allocated and adopted that nothing reaches is found as never used, through the pragma.
+/// A page allocated that nothing reaches is found as never used, through the pragma.
 #[test]
 fn a_leaked_page_is_found() {
     let (db, conn) = used("/db/integrity-leak");
@@ -78,7 +78,6 @@ fn a_leaked_page_is_found() {
     let io = atoll(&db).io().clone();
     let class = crate::storage::atoll::page::SizeClass::new(0).unwrap();
     let pid = drive(&io, || store.allocate(class)).unwrap();
-    drive(&io, || store.adopt(&[pid])).unwrap();
     let found = integrity(&conn);
     let text = format!("{found:?}");
     assert!(
@@ -235,7 +234,7 @@ fn a_reached_page_marked_retired_is_found() {
     let adb = atoll(&db);
     let (pid, _) = copies(adb, entry_of(&conn, adb, "t").root)[0];
     let store = adb.atoll().store();
-    drive(adb.io(), || store.plant_retired(pid)).unwrap();
+    store.retire(pid);
     found(
         &conn,
         &[format!("page {} is reached by a node of tree", pid.raw())],
@@ -383,18 +382,5 @@ fn an_integrity_check_waits_for_an_open_writer() {
     );
     drop(check);
     writer.execute("COMMIT").unwrap();
-    assert_eq!(integrity(&conn), ok());
-}
-
-/// A page an operation holds provisional, not yet adopted by the record that links it, is
-/// accounted for: it is neither reached nor never used.
-#[test]
-fn a_provisional_page_is_accounted_for() {
-    let (db, conn) = used("/db/integrity-provisional");
-    let adb = atoll(&db);
-    let store = adb.atoll().store().clone();
-    let class = crate::storage::atoll::page::SizeClass::new(0).unwrap();
-    let pid = drive(adb.io(), || store.allocate(class)).unwrap();
-    assert!(store.provisional_pages().contains(&pid));
     assert_eq!(integrity(&conn), ok());
 }

@@ -30,7 +30,7 @@ pub const FANOUT: u64 = ((META_PAGE - HEADER_SIZE) / 8) as u64;
 pub fn leaf_units(tree: Tree) -> u64 {
     match tree {
         Tree::Map => MAP_ENTRIES,
-        Tree::Space | Tree::Retired => SPACE_BITS,
+        Tree::Space => SPACE_BITS,
     }
 }
 
@@ -115,7 +115,7 @@ pub fn add_used_below<P: BytesMut + ?Sized>(node: &mut P, child: u64, delta: i64
 pub fn used<P: Bytes + ?Sized>(tree: Tree, leaf: &P, unit: u64) -> bool {
     match tree {
         Tree::Map => map_entry(leaf, unit) != FREE,
-        Tree::Space | Tree::Retired => space_bit(leaf, unit),
+        Tree::Space => space_bit(leaf, unit),
     }
 }
 

@@ -215,9 +215,7 @@ mod plain {
         let a = db.atoll();
         let root = drive(&io, || {
             crate::storage::atoll::btree::Tree::create_versioned(
-                &io,
                 a.pool(),
-                a.store(),
                 crate::storage::atoll::page::SizeClass::new(0).unwrap(),
             )
         })

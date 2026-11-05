@@ -1,7 +1,7 @@
 //! B+-trees (DESIGN.md §13).
 //!
 //! - [`node`]: the slotted node layout.
-//! - [`record`]: the log records of node changes, applied the same way when made and replayed.
+//! - [`record`]: the change one step makes to one node.
 //! - [`value`]: values too large for a node, in blob pages.
 //!
 //! **Latching** is optimistic lock coupling (LeanStore, ICDE 2018 §IV-F). A descent fixes each
@@ -17,11 +17,11 @@
 //! leaf keeps its right neighbour the same way, and a scan follows that hint only when the frame
 //! it names still holds the neighbour, checked by the neighbour's tree, level and lower fence.
 //!
-//! **Atomicity.** A structure change is one log group: the new node's image, the split node's
-//! truncation, the parent's new entry, and the adoption of the new page, or the merged node's
-//! image, the parent's removed entry and the abandonment of the emptied node. A crash keeps all of
-//! it or none ([`super::log::Log::append_group`]); a page allocated for a change the crash undid
-//! is freed by recovery ([`super::store`]'s provisional pages).
+//! **Atomicity.** A structure change is made inside the store's change gate
+//! ([`PageStore::change`]): the new node built, the split node truncated, the parent's new entry,
+//! or the merged node, the parent's removed entry and the emptied node freed. A checkpoint's cut
+//! closes the gate, so it finds each structure change whole or not begun, and a crash recovers
+//! the tree a checkpoint wrote (DESIGN.md §10).
 //!
 //! **The root** never moves, so the root page names the tree. When it splits, its contents move to
 //! a new child and the root becomes an inner node over it, which then splits like any child. When
@@ -41,17 +41,16 @@ pub use drain::{Drain, Drained};
 mod tests;
 
 use super::buffer::{BufferPool, Exclusive, Optimistic};
-use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn, TxnTail};
 use super::page::{self, PageId, SizeClass};
 use super::shared::{Bytes, BytesMut};
-use super::store::{PageStore, StoreRecord};
+use super::store::PageStore;
 use crate::io::{Completion, IO};
 use crate::sync::atomic::{AtomicU32, Ordering};
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
 use node::{Layout, Limits, View};
-use record::{Change, Compensation, Record, COMPENSATION};
+use record::{Change, Record};
 use value::{Read, ValueRead, ValueRef, ValueWrite};
 
 fn yield_now<T>() -> Result<IOResult<T>> {
@@ -139,9 +138,6 @@ impl Near {
     }
 }
 
-/// Log space admitted for a change; none for a temporary tree.
-pub struct Grant(Option<Admitted>);
-
 pub struct Tree {
     io: Arc<dyn IO>,
     pool: Arc<BufferPool>,
@@ -181,133 +177,44 @@ pub enum Outcome {
 
 impl Tree {
     /// A new, empty tree whose nodes are of `class`: its root page, which names it.
-    pub fn create(
-        io: &Arc<dyn IO>,
-        pool: &Arc<BufferPool>,
-        store: &Arc<PageStore>,
-        class: SizeClass,
-    ) -> Result<IOResult<PageId>> {
-        check_budget(store.log(), class, Limits::of(class))?;
-        Self::create_in_at(io, pool, store, class, false, None, false)
+    pub fn create(pool: &Arc<BufferPool>, class: SizeClass) -> Result<IOResult<PageId>> {
+        Self::create_in_at(pool, class, false, None, false)
     }
 
     /// [`create`](Self::create), a versioned tree's: its root a reserving leaf
     /// ([`node::RESERVE`]).
-    pub fn create_versioned(
-        io: &Arc<dyn IO>,
-        pool: &Arc<BufferPool>,
-        store: &Arc<PageStore>,
-        class: SizeClass,
-    ) -> Result<IOResult<PageId>> {
-        check_budget(store.log(), class, Limits::of(class))?;
-        Self::create_in_at(io, pool, store, class, false, None, true)
+    pub fn create_versioned(pool: &Arc<BufferPool>, class: SizeClass) -> Result<IOResult<PageId>> {
+        Self::create_in_at(pool, class, false, None, true)
     }
 
     /// A new, empty temporary tree (DESIGN.md §6.4), whose nodes and values are temporary pages:
-    /// nothing it does is logged, and it does not outlive the process.
-    pub fn create_temporary(
-        io: &Arc<dyn IO>,
-        pool: &Arc<BufferPool>,
-        store: &Arc<PageStore>,
-        class: SizeClass,
-    ) -> Result<IOResult<PageId>> {
-        Self::create_in_at(io, pool, store, class, true, None, false)
+    /// no checkpoint writes it, and it does not outlive the process.
+    pub fn create_temporary(pool: &Arc<BufferPool>, class: SizeClass) -> Result<IOResult<PageId>> {
+        Self::create_in_at(pool, class, true, None, false)
     }
 
     /// A new, empty versioned tree at `root`, which must be free: replay's creation of a tree at
     /// the root its change names, made by a transaction (audit 17).
-    pub fn create_at(
-        io: &Arc<dyn IO>,
-        pool: &Arc<BufferPool>,
-        store: &Arc<PageStore>,
-        root: PageId,
-    ) -> Result<IOResult<PageId>> {
-        check_budget(store.log(), root.class(), Limits::of(root.class()))?;
-        Self::create_in_at(io, pool, store, root.class(), false, Some(root), true)
+    pub fn create_at(pool: &Arc<BufferPool>, root: PageId) -> Result<IOResult<PageId>> {
+        Self::create_in_at(pool, root.class(), false, Some(root), true)
     }
 
     fn create_in_at(
-        io: &Arc<dyn IO>,
         pool: &Arc<BufferPool>,
-        store: &Arc<PageStore>,
         class: SizeClass,
         temporary: bool,
         at: Option<PageId>,
         versioned: bool,
     ) -> Result<IOResult<PageId>> {
-        let adopt_len = PageStore::group_record_len(1);
-        let init_len = framed_len(8 + 4 + class.size());
-        let mut grant = if temporary {
-            Grant(None)
-        } else {
-            Grant(Some(done!(store.log().admit(init_len + adopt_len))))
-        };
         let mut page = match (temporary, at) {
             (true, _) => done!(pool.allocate_temporary(class)),
             (false, Some(root)) => done!(pool.allocate_at(root)),
             (false, None) => done!(pool.allocate(class)),
         };
         let pid = page.pid();
-        let image = empty_root(&mut page, versioned);
-        let tree = Self::open(io.clone(), pool.clone(), store.clone(), pid);
-        let lsns = tree.log_batch(
-            &mut grant,
-            &[Record {
-                pid,
-                change: Change::Init { image: &image },
-            }],
-            &[StoreRecord::Adopt { pids: vec![pid] }],
-        );
-        page.changed(lsns[0]);
+        empty_root(&mut page, versioned);
+        page.changed();
         Ok(IOResult::Done(pid))
-    }
-
-    /// A new, empty versioned tree whose nodes are of `class`, made in a transaction: one group of the
-    /// transaction's record of `kind`, whose payload is the root and then `extra`, the root's image
-    /// and the root's adoption, so no crash leaves the root adopted with no chain naming it.
-    /// Returns the root and where the group starts.
-    pub fn create_logged(
-        pool: &Arc<BufferPool>,
-        store: &Arc<PageStore>,
-        class: SizeClass,
-        tail: &TxnTail,
-        kind: Kind,
-        extra: &[u8],
-    ) -> Result<IOResult<(PageId, GroupStart)>> {
-        check_budget(store.log(), class, Limits::of(class))?;
-        let lead_len = framed_len(8 + extra.len());
-        let adopt_len = PageStore::group_record_len(1);
-        let init_len = framed_len(8 + 4 + class.size());
-        let mut admitted = done!(store.log().admit(lead_len + init_len + adopt_len));
-        let mut page = done!(pool.allocate(class));
-        let pid = page.pid();
-        let image = empty_root(&mut page, true);
-        let lead = [&pid.raw().to_le_bytes()[..], extra].concat();
-        let init = Record {
-            pid,
-            change: Change::Init { image: &image },
-        };
-        let init_header = Header {
-            kind: init.kind(),
-            flags: 0,
-            txn: 0,
-            prev: None,
-        };
-        let init = init.encode();
-        let adopt = StoreRecord::Adopt { pids: vec![pid] };
-        let (adopt_header, adopt_payload) = PageStore::group_record(&adopt);
-        let pieces: [[&[u8]; 1]; 3] = [[&lead], [&init], [&adopt_payload]];
-        let records = [
-            (tail.header(kind), &pieces[0][..]),
-            (init_header, &pieces[1][..]),
-            (adopt_header, &pieces[2][..]),
-        ];
-        let (start, lsns) = store
-            .log()
-            .append_group_with(&mut admitted, &records, |at| tail.reserved(at));
-        store.grouped(&adopt, start.get(), lsns[2]);
-        page.changed(lsns[1]);
-        Ok(IOResult::Done((pid, start)))
     }
 
     /// The tree whose root is `root`.
@@ -360,7 +267,6 @@ impl Tree {
         near: Near,
         settled: &dyn Fn(&[u8]) -> bool,
     ) -> Result<IOResult<usize>> {
-        let mut grant: Option<(Grant, u64)> = None;
         loop {
             let looked = done!(self.look(key, near));
             let leaf = looked.leaf;
@@ -387,12 +293,6 @@ impl Tree {
             if keys.is_empty() {
                 return Ok(IOResult::Done(0));
             }
-            let len = framed_len(8 + keys.len());
-            if grant.as_ref().is_none_or(|(_, l)| *l < len) {
-                // A grant too small goes back before a larger one is taken.
-                drop(grant.take());
-                grant = Some((done!(self.admit(len)), len));
-            }
             // Latched at the version the judgment read: the keys are still there, reserving.
             let Some(mut ex) = leaf.upgrade() else {
                 continue;
@@ -404,9 +304,7 @@ impl Tree {
             };
             record.apply(&mut ex.page_mut())?;
             let given = reserved - View::new(ex.page()).reserved();
-            let (mut admitted, _) = grant.take().expect("admitted");
-            let (_, lsn) = self.log_one(&mut admitted, None, &record);
-            ex.changed(lsn);
+            ex.changed();
             return Ok(IOResult::Done(given));
         }
     }
@@ -424,22 +322,6 @@ impl Tree {
         self.root.is_temporary()
     }
 
-    /// The log the tree's changes go to; `None` for a temporary tree.
-    fn journal(&self) -> Option<&Arc<Log>> {
-        (!self.temporary()).then(|| self.store.log())
-    }
-
-    /// Admits `len` bytes of log for a change; a temporary tree needs none.
-    fn admit(&self, len: u64) -> Result<IOResult<Grant>> {
-        Ok(match self.journal() {
-            Some(log) => match log.admit(len)? {
-                IOResult::Done(a) => IOResult::Done(Grant(Some(a))),
-                IOResult::IO(io) => IOResult::IO(io),
-            },
-            None => IOResult::Done(Grant(None)),
-        })
-    }
-
     /// A new node page, of the tree's kind.
     fn allocate(&self) -> Result<IOResult<Exclusive<'_>>> {
         if self.temporary() {
@@ -451,136 +333,6 @@ impl Tree {
 
     fn class(&self) -> SizeClass {
         self.root.class()
-    }
-
-    /// Bytes of log a structure change takes at most: two node images, two records carrying a
-    /// key, and the adoption or abandonment of one page.
-    fn smo_len(&self) -> u64 {
-        smo_len(self.class(), self.limits)
-    }
-
-    /// Appends the records of one change: alone, or as a group when there are several. Returns
-    /// the LSNs of the node records, in order. A temporary tree appends nothing: its node changes
-    /// get temporary LSNs, and its pages need no adoption.
-    fn log_batch(
-        &self,
-        grant: &mut Grant,
-        nodes: &[Record<'_>],
-        store: &[StoreRecord],
-    ) -> Vec<Lsn> {
-        self.log_as(grant, None, nodes, store).1
-    }
-
-    /// As [`log_batch`](Self::log_batch), with the first node record in transaction `txn`, its
-    /// group entered in the writer registry as it is reserved. Returns where the records start
-    /// too; `None` in a temporary tree.
-    fn log_as(
-        &self,
-        grant: &mut Grant,
-        txn: Option<&TxnTail>,
-        nodes: &[Record<'_>],
-        store: &[StoreRecord],
-    ) -> (Option<GroupStart>, Vec<Lsn>) {
-        let (start, lsns, _) = self.log_marked(grant, txn, nodes, store, &[]);
-        (start, lsns)
-    }
-
-    /// As [`log_as`](Self::log_as) for one node record alone, its pieces copied straight into
-    /// the log: nothing is assembled on the way. Returns where it starts and its LSN.
-    fn log_one(
-        &self,
-        grant: &mut Grant,
-        txn: Option<&TxnTail>,
-        record: &Record<'_>,
-    ) -> (Option<GroupStart>, Lsn) {
-        let Some(admitted) = &mut grant.0 else {
-            return (None, self.pool.temporary_lsn());
-        };
-        let header = match txn {
-            Some(t) => t.header(record.kind()),
-            None => Header {
-                kind: record.kind(),
-                flags: 0,
-                txn: 0,
-                prev: None,
-            },
-        };
-        // A transaction's group enters the writer registry before its copy completes.
-        let reserved = |at: GroupStart| {
-            if let Some(t) = txn {
-                t.reserved(at);
-            }
-        };
-        let log = self.store.log();
-        let (start, lsn) =
-            record.with_pieces(|pieces| log.append_with(admitted, &header, pieces, reserved));
-        (Some(start), lsn)
-    }
-
-    /// As [`log_as`](Self::log_as), with the records of retired marks ([`PageStore::marks`])
-    /// after the rest; returns too where they start and end, to change the marks with.
-    fn log_marked(
-        &self,
-        grant: &mut Grant,
-        txn: Option<&TxnTail>,
-        nodes: &[Record<'_>],
-        store: &[StoreRecord],
-        marks: &[(Header, Vec<u8>)],
-    ) -> (Option<GroupStart>, Vec<Lsn>, Option<(Lsn, Lsn)>) {
-        let Some(admitted) = &mut grant.0 else {
-            assert!(marks.is_empty(), "a temporary tree retires nothing");
-            return (
-                None,
-                nodes.iter().map(|_| self.pool.temporary_lsn()).collect(),
-                None,
-            );
-        };
-        let mut payloads: Vec<(Header, Vec<u8>)> = nodes
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let header = match txn.filter(|_| i == 0) {
-                    Some(t) => t.header(r.kind()),
-                    None => Header {
-                        kind: r.kind(),
-                        flags: 0,
-                        txn: 0,
-                        prev: None,
-                    },
-                };
-                (header, r.encode())
-            })
-            .collect();
-        payloads.extend(store.iter().map(PageStore::group_record));
-        payloads.extend(marks.iter().cloned());
-        let pieces: Vec<[&[u8]; 1]> = payloads.iter().map(|(_, p)| [p.as_slice()]).collect();
-        let records: Vec<(Header, &[&[u8]])> = payloads
-            .iter()
-            .zip(&pieces)
-            .map(|((h, _), p)| (*h, &p[..]))
-            .collect();
-        let log = self.store.log();
-        // A transaction's group enters the writer registry before its copy completes.
-        let reserved = |at: GroupStart| {
-            if let Some(t) = txn {
-                t.reserved(at);
-            }
-        };
-        let (start, lsns) = if records.len() == 1 {
-            let (start, lsn) = log.append_with(admitted, &records[0].0, records[0].1, reserved);
-            (start, vec![lsn])
-        } else {
-            log.append_group_with(admitted, &records, reserved)
-        };
-        for (s, &lsn) in store.iter().zip(&lsns[nodes.len()..]) {
-            self.store.grouped(s, start.get(), lsn);
-        }
-        // The marks start where the record before them ends, which a node's always is.
-        let marked = (!marks.is_empty()).then(|| {
-            let first = nodes.len() + store.len();
-            (lsns[first - 1], *lsns.last().expect("a record"))
-        });
-        (Some(start), lsns[..nodes.len()].to_vec(), marked)
     }
 
     // ---------------------------------------------------------------- descending
@@ -953,7 +705,7 @@ impl Tree {
                     self.store.clone(),
                 )
             });
-            step!(write.step(&self.pool, self.journal()));
+            step!(write.step(&self.pool, self.temporary()));
         }
         // As the leaf stores it: the entry itself, or its head and the reference to a value out
         // of line.
@@ -970,8 +722,9 @@ impl Tree {
             }
             None => &op.entry,
         };
-        let adopt = op.write.as_ref().map(|w| w.pages()).unwrap_or_default();
         let replaced = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
+        // The pages of the value replaced: another's version's stay, retired, since a snapshot
+        // may still read it; one only this statement wrote goes.
         let (abandon, retire) = if op.retire_old {
             (Vec::new(), replaced)
         } else {
@@ -982,42 +735,6 @@ impl Tree {
             .as_ref()
             .and_then(|(_, pages)| pages.clone())
             .unwrap_or_default();
-        // Marks change in the group, under latches taken once the leaf's is held.
-        let marks = if retire.is_empty() && reinstate.is_empty() {
-            None
-        } else {
-            assert!(
-                self.journal().is_some(),
-                "a temporary tree retires and reinstates nothing"
-            );
-            Some(step!(self.store.marks(&retire, &reinstate)))
-        };
-        let mark_records = marks.as_ref().map(|m| m.records()).unwrap_or_default();
-        let marks_len: u64 = mark_records
-            .iter()
-            .map(|(_, payload)| framed_len(payload.len()))
-            .sum();
-        // What a transaction's update logs to undo it: the entry its statement found, borrowed.
-        let found: Option<(&[u8], bool)> = match &op.found {
-            Some(found) => found.as_ref().map(|(b, o)| (b.as_slice(), *o)),
-            None => present.as_ref().map(|(b, o)| (b.as_slice(), *o)),
-        };
-        // A transaction's change names the tree, and an update of one the value's length and
-        // the entry undoing it puts back.
-        let undo = match (&op.compensation, &op.txn, &present) {
-            (Some(_), ..) => COMPENSATION,
-            (None, Some(_), Some(_)) => 8 + 4 + 1 + found.map_or(0, |(b, _)| b.len()),
-            (None, Some(_), None) => 8,
-            (None, None, _) => 0,
-        };
-        let len = framed_len(8 + 3 + op.key.len() + stored.len() + undo)
-            + store_len(&adopt)
-            + store_len(&abandon)
-            + marks_len;
-        if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
-            op.admitted = None;
-            op.admitted = Some((step!(self.admit(len)), len));
-        }
         // Latched at the version the look read, so the leaf is as the look found it: still
         // covering the key, which is at `pos` or goes there, with the entry `present`.
         let Some(mut ex) = leaf.upgrade() else {
@@ -1049,14 +766,10 @@ impl Tree {
         let free = v.free().ok_or_else(|| corrupt_node(ex.pid()))?;
         if free < need && op.settle && v.reserved() > 0 {
             drop(ex);
-            op.admitted = None;
             return Ok(Some(IOResult::Done(Outcome::Full)));
         }
         if free < need {
             drop(ex);
-            // A split admits its own log space; holding this meanwhile could leave too
-            // little of the log buffer for it.
-            op.admitted = None;
             step!(self.make_room(&op.key, 0, need));
             return Ok(None);
         }
@@ -1065,109 +778,30 @@ impl Tree {
             drop(ex);
             return Ok(Some(IOResult::Done(Outcome::Changed)));
         }
-        let locked = match &marks {
-            Some(m) => match m.lock(&self.store) {
-                Some(locked) => Some(locked),
-                // Held, or grown since: let the leaf go, and make the marks again.
-                None => {
-                    drop(ex);
-                    return yield_now().map(Some);
-                }
-            },
-            None => None,
-        };
-        let in_txn = op.txn.is_some();
-        let change = match (now, op.compensation) {
-            (Some(_), Some(of)) => Change::Restore {
+        let change = match now {
+            Some(_) => Change::Update {
                 key: &op.key,
                 value: stored,
                 out_of_line,
-                of,
             },
-            (None, Some(_)) => {
-                drop(ex);
-                return Err(LimboError::InternalError(
-                    "a compensation put back a key it found no entry of".into(),
-                ));
-            }
-            // A transaction's first change of the key, its value inline before and after and
-            // as long: the head, and the bytes that differ, changed in place. What undoes it is
-            // the entry it replaced, which is what its statement found.
-            (Some((old, false)), None)
-                if in_txn
-                    && op.found.is_none()
-                    && !out_of_line
-                    && self.head > 0
-                    && old.len() == stored.len() =>
-            {
-                let h = self.head;
-                let (was, is) = (&old[h..], &stored[h..]);
-                let same = was.iter().zip(is).take_while(|(a, b)| a == b).count();
-                let tail = was[same..]
-                    .iter()
-                    .rev()
-                    .zip(is[same..].iter().rev())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                let differ = same..was.len() - tail;
-                Change::Patch {
-                    key: &op.key,
-                    head: &stored[..h],
-                    at: same,
-                    bytes: &is[differ.clone()],
-                    root: self.root,
-                    old_head: &old[..h],
-                    old_bytes: &was[differ],
-                }
-            }
-            (Some(_), None) => Change::Update {
+            None => Change::Insert {
                 key: &op.key,
                 value: stored,
                 out_of_line,
-                undo: in_txn.then_some((self.root, found)),
-            },
-            (None, None) => Change::Insert {
-                key: &op.key,
-                value: stored,
-                out_of_line,
-                undo: in_txn.then_some(self.root),
             },
         };
-        let record = Record { pid, change };
-        record.apply_at(&mut ex.page_mut(), Some((pos, exact)))?;
-        let mut store = Vec::new();
-        if !adopt.is_empty() {
-            store.push(StoreRecord::Adopt { pids: adopt });
-        }
-        if !abandon.is_empty() {
-            store.push(StoreRecord::Abandon {
-                pids: abandon.clone(),
-            });
-        }
-        let (mut admitted, _) = op.admitted.take().expect("admitted");
-        let (group, lsn) = if store.is_empty() && mark_records.is_empty() {
-            self.log_one(&mut admitted, op.txn.as_ref(), &record)
-        } else {
-            let (group, lsns, marked) = self.log_marked(
-                &mut admitted,
-                op.txn.as_ref(),
-                &[record],
-                &store,
-                &mark_records,
-            );
-            if let (Some(locked), Some((start, end))) = (locked, marked) {
-                locked.commit(&self.store, start, end);
-            }
-            (group, lsns[0])
-        };
-        op.group = group.filter(|_| op.txn.is_some());
-        ex.changed(lsn);
-        op.lsn = lsn;
+        Record { pid, change }.apply_at(&mut ex.page_mut(), Some((pos, exact)))?;
+        ex.changed();
         drop(ex);
+        for &p in &retire {
+            self.store.retire(p);
+        }
+        for &p in &reinstate {
+            self.store.reinstate(p);
+        }
         if let Some(w) = op.write.as_mut() {
             w.adopted();
         }
-        // Pages retired stay: a snapshot may still read the version they hold.
         if !abandon.is_empty() {
             self.free_abandoned(abandon)?;
         }
@@ -1206,14 +840,6 @@ impl Tree {
             if !done!(op.old_pages(&self.pool, self.head, &present, &|| leaf.validate())) {
                 continue;
             }
-            let mut abandon = op.old.as_ref().map(|o| o.1.clone()).unwrap_or_default();
-            abandon.extend(&op.also);
-            let unit = op.compensation.map_or(0, |_| COMPENSATION);
-            let len = framed_len(8 + unit + op.key.len()) + store_len(&abandon);
-            if op.admitted.as_ref().is_none_or(|(_, l)| *l < len) {
-                op.admitted = None;
-                op.admitted = Some((done!(self.admit(len)), len));
-            }
             let Some(mut ex) = leaf.upgrade() else {
                 return yield_now();
             };
@@ -1224,25 +850,12 @@ impl Tree {
                 drop(ex);
                 continue;
             }
-            let change = match op.compensation {
-                Some(of) => Change::Unput { key: &op.key, of },
-                None => Change::Remove { key: &op.key },
-            };
-            let record = Record {
+            Record {
                 pid: ex.pid(),
-                change,
-            };
-            record.apply(&mut ex.page_mut())?;
-            let store = if abandon.is_empty() {
-                Vec::new()
-            } else {
-                vec![StoreRecord::Abandon { pids: abandon }]
-            };
-            let (mut admitted, _) = op.admitted.take().expect("admitted");
-            let (group, lsns) = self.log_as(&mut admitted, op.txn.as_ref(), &[record], &store);
-            op.group = group.filter(|_| op.txn.is_some());
-            ex.changed(lsns[0]);
-            op.lsn = lsns[0];
+                change: Change::Remove { key: &op.key },
+            }
+            .apply(&mut ex.page_mut())?;
+            ex.changed();
             let underfull = self.underfull(&View::new(ex.page()));
             drop(ex);
             if let Some((_, old)) = op.old.take() {
@@ -1292,7 +905,10 @@ impl Tree {
     fn split(&self, key: &[u8], level: u8, need: usize) -> Result<IOResult<Split>> {
         #[cfg(test)]
         SPLITS.with(|n| n.set(n.get() + 1));
-        let mut admitted = done!(self.admit(self.smo_len()));
+        // The split lies wholly before a checkpoint's cut or wholly after it.
+        let Some(_change) = self.store.change() else {
+            return yield_now();
+        };
         let (node, parent) = match self.descend(key, level, Route::At)? {
             Found::Node { node, parent } => (node, parent),
             // The node to split merged away: the caller looks again.
@@ -1301,7 +917,7 @@ impl Tree {
             Found::Io(io) => return Ok(IOResult::IO(io)),
         };
         let Some((parent, pos)) = parent else {
-            return self.grow(node, need, &mut admitted);
+            return self.grow(node, need);
         };
         let Some(mut p) = parent.upgrade() else {
             return yield_now();
@@ -1383,7 +999,6 @@ impl Tree {
         if !node::append_from(&mut page, &nv, right(keep)) {
             return Err(corrupt_node(n.pid()));
         }
-        let image = node::image(r.page());
         let split = Record {
             pid: n.pid(),
             change: Change::Split {
@@ -1402,21 +1017,10 @@ impl Tree {
             },
         };
         branch.apply(&mut p.page_mut())?;
-        let init = Record {
-            pid: r.pid(),
-            change: Change::Init { image: &image },
-        };
-        let lsns = self.log_batch(
-            &mut admitted,
-            &[init, split, branch],
-            &[StoreRecord::Adopt {
-                pids: vec![r.pid()],
-            }],
-        );
-        r.changed(lsns[0]);
-        n.changed(lsns[1]);
-        p.changed(lsns[2]);
-        // Hints the records leave at 0.
+        r.changed();
+        n.changed();
+        p.changed();
+        // Hints the changes leave at 0.
         if level == 0 {
             node::set_next_hint(&mut n.page_mut(), r.hint());
         }
@@ -1428,12 +1032,7 @@ impl Tree {
 
     /// Makes room in the root, which cannot move: its contents go to a new child, and it becomes
     /// an inner node over that child alone, which the next split splits like any other.
-    fn grow(
-        &self,
-        root: Optimistic<'_>,
-        need: usize,
-        admitted: &mut Grant,
-    ) -> Result<IOResult<Split>> {
+    fn grow(&self, root: Optimistic<'_>, need: usize) -> Result<IOResult<Split>> {
         let Some(mut root) = root.upgrade() else {
             return yield_now();
         };
@@ -1458,25 +1057,8 @@ impl Tree {
             },
             [],
         );
-        let root_image = node::image(root.page());
-        let lsns = self.log_batch(
-            admitted,
-            &[
-                Record {
-                    pid: child.pid(),
-                    change: Change::Init { image: &image },
-                },
-                Record {
-                    pid: self.root,
-                    change: Change::Init { image: &root_image },
-                },
-            ],
-            &[StoreRecord::Adopt {
-                pids: vec![child.pid()],
-            }],
-        );
-        child.changed(lsns[0]);
-        root.changed(lsns[1]);
+        child.changed();
+        root.changed();
         Ok(IOResult::Done(Split::Again))
     }
 
@@ -1484,7 +1066,10 @@ impl Tree {
     /// fit; then its parent, if that is left underfull, and the root, if left with one child.
     /// `merging` holds the level still to look at, `None` once done.
     fn merge(&self, key: &[u8], level: u8, merging: &mut Option<u8>) -> Result<IOResult<()>> {
-        let mut admitted = done!(self.admit(self.smo_len()));
+        // The merge lies wholly before a checkpoint's cut or wholly after it.
+        let Some(_change) = self.store.change() else {
+            return yield_now();
+        };
         let (node, parent) = match self.descend(key, level, Route::At)? {
             Found::Node {
                 node,
@@ -1518,7 +1103,7 @@ impl Tree {
             // The parent has this child alone: the root then shrinks, and any other parent
             // merges at its own level.
             if parent.pid() == self.root {
-                return self.shrink(parent, node, merging, &mut admitted);
+                return self.shrink(parent, node, merging);
             }
             *merging = Some(level + 1);
             return Ok(IOResult::Done(()));
@@ -1530,7 +1115,6 @@ impl Tree {
                 pos,
                 level,
                 (left_pos, left, left_hint, right, right_hint),
-                &mut admitted
             )) {
                 Some(next) => {
                     *merging = next;
@@ -1553,7 +1137,6 @@ impl Tree {
         pos: usize,
         level: u8,
         (left_pos, left, left_hint, right, right_hint): (usize, PageId, u32, PageId, u32),
-        admitted: &mut Grant,
     ) -> Result<IOResult<Option<Option<u8>>>> {
         let fix = |pid: PageId, hint: u32| -> Result<IOResult<Optimistic<'_>>> {
             if pid == node.pid() {
@@ -1658,27 +1241,13 @@ impl Tree {
             page.write(page::HEADER_SIZE, &merged[page::HEADER_SIZE..]);
             page::set_kind(&mut page, page::kind(merged.as_slice()));
         });
-        let image = node::image(r.page());
         let remove = Record {
             pid: p.pid(),
             change: Change::Remove { key: &sep },
         };
         remove.apply(&mut p.page_mut())?;
-        let lsns = self.log_batch(
-            admitted,
-            &[
-                Record {
-                    pid: r.pid(),
-                    change: Change::Init { image: &image },
-                },
-                remove,
-            ],
-            &[StoreRecord::Abandon {
-                pids: vec![l.pid()],
-            }],
-        );
-        r.changed(lsns[0]);
-        p.changed(lsns[1]);
+        r.changed();
+        p.changed();
         let at = View::new(p.page()).search(&sep).unwrap().0;
         node::set_child_hint(&mut p.page_mut(), at, r.hint());
         let pv = View::new(p.page());
@@ -1706,7 +1275,6 @@ impl Tree {
         parent: Optimistic<'_>,
         child: Optimistic<'_>,
         merging: &mut Option<u8>,
-        admitted: &mut Grant,
     ) -> Result<IOResult<()>> {
         if parent.pid() != self.root {
             *merging = None;
@@ -1721,17 +1289,7 @@ impl Tree {
         }
         let image = node::image(child.page());
         node::apply_image(&mut root.page_mut(), &image).ok_or_else(|| corrupt_node(child.pid()))?;
-        let lsns = self.log_batch(
-            admitted,
-            &[Record {
-                pid: self.root,
-                change: Change::Init { image: &image },
-            }],
-            &[StoreRecord::Abandon {
-                pids: vec![child.pid()],
-            }],
-        );
-        root.changed(lsns[0]);
+        root.changed();
         child.abandon();
         drop(root);
         let freed = child.pid();
@@ -2102,23 +1660,9 @@ fn look<P: Bytes + ?Sized>(v: View<'_, P>, key: &[u8]) -> Option<Look> {
     Some(Some(Some(v.value(pos)?)))
 }
 
-fn store_len(pids: &[PageId]) -> u64 {
-    if pids.is_empty() {
-        0
-    } else {
-        PageStore::group_record_len(pids.len())
-    }
-}
-
-fn smo_len(class: SizeClass, limits: Limits) -> u64 {
-    2 * framed_len(8 + 4 + class.size())
-        + 2 * framed_len(8 + 16 + limits.max_key)
-        + store_len(&[PageId::from_raw(0)])
-}
-
 /// Builds an empty root, a leaf naming itself and reserving if `versioned`, on the newly
 /// allocated `page`; returns its image.
-fn empty_root(page: &mut Exclusive<'_>, versioned: bool) -> Vec<u8> {
+fn empty_root(page: &mut Exclusive<'_>, versioned: bool) {
     let pid = page.pid();
     node::build(
         &mut page.page_mut(),
@@ -2132,19 +1676,6 @@ fn empty_root(page: &mut Exclusive<'_>, versioned: bool) -> Vec<u8> {
         },
         [],
     );
-    node::image(page.page())
-}
-
-fn check_budget(log: &Log, class: SizeClass, limits: Limits) -> Result<()> {
-    let need = smo_len(class, limits);
-    if need > log.buffer_bytes() {
-        return Err(LimboError::InternalError(format!(
-            "B-tree nodes of {} bytes need {need} bytes of log per split, more than the {} byte log buffer",
-            class.size(),
-            log.buffer_bytes()
-        )));
-    }
-    Ok(())
 }
 
 /// Where to split the node `v` of `count` entries at `level`, whose upper fence is infinite if
@@ -2354,22 +1885,12 @@ pub struct Put {
     write: Option<ValueWrite>,
     /// The out-of-line value being replaced: its reference and pages.
     old: Option<(Vec<u8>, Vec<PageId>)>,
-    admitted: Option<(Grant, u64)>,
-    lsn: Lsn,
     /// The entry the put expects to replace: its stored value and whether out of line, or `None`
     /// for an absent key.
     expected: Option<Option<(Vec<u8>, bool)>>,
-    /// The transaction the change belongs to, and where its group starts once logged.
-    txn: Option<TxnTail>,
-    group: Option<GroupStart>,
-    /// What the change puts back, as a compensation record.
-    compensation: Option<Compensation>,
     /// The pages of the out-of-line value it replaces are retired, not abandoned: kept while a
     /// snapshot may read that version (DESIGN.md §6.5).
     retire_old: bool,
-    /// What a transaction's update logs to undo it, when not the entry it replaces: the entry its
-    /// statement found, or `None` for none (DESIGN.md §12, step 5).
-    found: Option<Option<(Vec<u8>, bool)>>,
     /// The out-of-line value it puts back as it stands, by its reference, with its pages once
     /// learned: retired, and reinstated by the change.
     restoring: Option<(ValueRef, Option<Vec<PageId>>)>,
@@ -2422,14 +1943,8 @@ impl Put {
             mode,
             write: None,
             old: None,
-            admitted: None,
-            lsn: 0,
             expected: None,
-            txn: None,
-            group: None,
-            compensation: None,
             retire_old: false,
-            found: None,
             restoring: None,
             near: Near::NONE,
             reserve_over: None,
@@ -2497,9 +2012,10 @@ impl Put {
         self
     }
 
-    /// Logs `found`, the entry the transaction's statement found, as what undoes the change.
-    pub fn undoing(mut self, found: Option<&Stored>) -> Self {
-        self.found = Some(found.map(leaf_entry));
+    /// Frees the pages of the out-of-line value it replaces: a version only its own statement
+    /// wrote, which no one reads.
+    pub fn abandoning(mut self) -> Self {
+        self.retire_old = false;
         self
     }
 
@@ -2514,31 +2030,6 @@ impl Put {
     pub fn expecting_entry(mut self, entry: Option<(&[u8], bool)>) -> Self {
         self.expected = Some(entry.map(|(b, out)| (b.to_vec(), out)));
         self
-    }
-
-    /// Logs the change as `tail`'s transaction's, after its previous group, with what undoes it.
-    pub fn in_transaction(mut self, tail: TxnTail) -> Self {
-        self.txn = Some(tail);
-        self
-    }
-
-    /// Where the transaction's group holding the change starts, once logged in a transaction.
-    pub fn group(&self) -> Option<GroupStart> {
-        self.group
-    }
-
-    /// Logs the change as `tail`'s compensation `of` (DESIGN.md §11.5), a key's entry put back
-    /// over the one there, which [`expecting`](Self::expecting) names.
-    pub fn compensating(mut self, tail: TxnTail, of: Compensation) -> Self {
-        self.txn = Some(tail);
-        self.compensation = Some(of);
-        self
-    }
-
-    /// Where the change's record ends, once made; 0 if nothing changed. The change is durable
-    /// once the log is durable up to here.
-    pub fn lsn(&self) -> Lsn {
-        self.lsn
     }
 
     /// Learns the pages of the out-of-line value `present` holds, if it holds one; false if they
@@ -2585,17 +2076,11 @@ fn old_pages(
 pub struct Remove {
     key: Vec<u8>,
     old: Option<(Vec<u8>, Vec<PageId>)>,
-    admitted: Option<(Grant, u64)>,
     /// The level of a merge still to try after the removal.
     merging: Option<u8>,
-    lsn: Lsn,
     /// The entry the removal expects: its stored value and whether out of line.
     expected: Option<(Vec<u8>, bool)>,
-    /// The transaction the removal belongs to, and where its group starts once logged.
-    txn: Option<TxnTail>,
-    group: Option<GroupStart>,
-    compensation: Option<Compensation>,
-    /// Pages abandoned in the removal's group, and freed after it.
+    /// Pages abandoned with the entry, and freed after it.
     also: Vec<PageId>,
 }
 
@@ -2609,45 +2094,23 @@ impl Remove {
         Self {
             key: key.to_vec(),
             old: None,
-            admitted: None,
             merging: None,
-            lsn: 0,
             expected: None,
-            txn: None,
-            group: None,
-            compensation: None,
             also: Vec::new(),
         }
     }
 
-    /// Abandons `pids` in the removal's group and frees them after it: pages what the entry named
-    /// leaves behind, gone with it.
+    /// Frees `pids` after the removal: pages what the entry named leaves behind, gone with it.
     pub fn abandoning(mut self, pids: Vec<PageId>) -> Self {
         self.also = pids;
         self
     }
 
-    /// Logs the removal as `tail`'s compensation `of` (DESIGN.md §11.5), of a key that had no
-    /// entry. Removes nothing, and reports false, unless the key's entry is `entry`, as
-    /// [`Tree::stored`] read it.
-    pub fn compensating(mut self, tail: TxnTail, of: Compensation, entry: &Stored) -> Self {
-        self.expected = Some(match &entry.value {
-            StoredValue::Inline(v) => ([entry.head.as_slice(), v].concat(), false),
-            StoredValue::OutOfLine(r) => ([entry.head.as_slice(), &r.encode()].concat(), true),
-        });
-        self.txn = Some(tail);
-        self.compensation = Some(of);
+    /// Removes nothing, and reports false, unless the key's entry is `entry`, as [`Tree::stored`]
+    /// read it.
+    pub fn expecting(mut self, entry: &Stored) -> Self {
+        self.expected = Some(leaf_entry(entry));
         self
-    }
-
-    /// Where the transaction's group holding the removal starts, once logged in a transaction.
-    pub fn group(&self) -> Option<GroupStart> {
-        self.group
-    }
-
-    /// Where the removal's record ends, once made; 0 if the key was absent.
-    pub fn lsn(&self) -> Lsn {
-        self.lsn
     }
 
     fn old_pages(

@@ -29,7 +29,6 @@ pub(crate) fn config() -> AtollConfig {
         },
         buffer: BufferConfig {
             budget: MIN_BUDGET,
-            checkpoint_shards: 8,
             writeback_bytes: WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
@@ -201,9 +200,9 @@ fn catalog_rows_are_versioned_and_ids_are_drawn_above_them() {
     assert_eq!(row(&db, &io, id), None, "a deleted row");
     assert!(db.draw_tree_id() > rolled, "an id drawn again while open");
     drop(db);
-    // After a restart the next id is above every id a row held, the deleted one's included, whose
-    // tombstone the leaf keeps; the rolled-back one's id, which nothing durable names, may be
-    // drawn again.
+    // After a restart the next id is above every id a row holds. Replay removes a deleted row
+    // outright, there being no snapshot left to read it, so the deleted row's id, like the
+    // rolled-back one's, is named by nothing durable and is drawn again.
     let db = AtollDb::open(io.clone(), BASE, config()).unwrap();
-    assert_eq!(db.draw_tree_id(), id + 1);
+    assert_eq!(db.draw_tree_id(), id);
 }

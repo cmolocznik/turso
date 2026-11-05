@@ -25,10 +25,6 @@ pub struct TempPages {
     base: String,
     classes: [Class; CLASS_COUNT],
     files: [SetOnce<Arc<dyn File>>; CLASS_COUNT],
-    /// The next change's LSN. Nothing is logged, so these only order a page's changes and tell
-    /// its frame dirty. They start at 1: 0 is a page never changed. Relaxed: only each one's
-    /// uniqueness matters.
-    lsn: AtomicU64,
     epochs: Arc<Epochs>,
     /// Numbers freed and not yet reusable: a step that could hold one may still run.
     retired: Retired<PageId>,
@@ -62,7 +58,6 @@ impl TempPages {
             base: base.to_string(),
             classes: Default::default(),
             files: Default::default(),
-            lsn: AtomicU64::new(1),
             epochs,
             retired: Retired::default(),
         })
@@ -119,11 +114,6 @@ impl TempPages {
             );
         }
         out
-    }
-
-    /// The LSN to stamp the next change to a temporary page with.
-    pub fn next_lsn(&self) -> u64 {
-        self.lsn.fetch_add(1, Ordering::Relaxed)
     }
 
     fn file(&self, class: SizeClass) -> Result<Arc<dyn File>> {

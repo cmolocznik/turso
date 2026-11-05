@@ -11,10 +11,11 @@
 //! - **Every page a tree reaches** is reached once, is allocated (looked up by its own entry, so a
 //!   page under a count of zero is still found), and is not retired.
 //! - **Every page allocated** is reached, retired (a version a snapshot may still read, §6.5), or
-//!   provisional or orphaned (an operation's): one that is none of these is never used.
+//!   orphaned (named by nothing, its free waiting for the checkpointer): one that is none of these
+//!   is never used.
 //! - **Every copy** sits in a slot free space marks in use, no two pages share a slot, and every
 //!   slot in use holds a copy.
-//! - **Every count** above the leaves of the page table, free space and the retired marks agrees
+//! - **Every count** above the leaves of the page table and free space agrees
 //!   with what is in use below it.
 //!
 //! Temporary pages (version indexes, §6.4) are not the page store's and are not counted.
@@ -201,11 +202,10 @@ impl AtollDb {
     /// Accounts for every page and slot of every class against what the trees reached.
     fn account(&self, reached: &BTreeMap<PageId, Reach>, findings: &mut Findings) -> Result<()> {
         let store = self.atoll().store();
-        let held: BTreeSet<PageId> = store
-            .provisional_pages()
-            .into_iter()
-            .chain(store.orphans())
-            .collect();
+        let held: BTreeSet<PageId> = store.orphans().into_iter().collect();
+        // A slot whose copy a newer one replaced stays in use until the checkpoint that replaced
+        // it is durable.
+        let deferred = store.deferred_slots();
         for c in 0..CLASS_COUNT {
             let class = SizeClass::new(c).expect("a class");
             let census = |tree| -> Result<Census> {
@@ -213,19 +213,17 @@ impl AtollDb {
                 drive(self.io(), || store.census(&mut op))?;
                 Ok(op)
             };
-            let (map, space, retired) = (
-                census(Radix::Map)?,
-                census(Radix::Space)?,
-                census(Radix::Retired)?,
-            );
-            for miscount in [&map, &space, &retired]
-                .into_iter()
-                .flat_map(|t| t.miscounts())
-            {
+            let (map, space) = (census(Radix::Map)?, census(Radix::Space)?);
+            for miscount in [&map, &space].into_iter().flat_map(|t| t.miscounts()) {
                 findings.add(miscount);
             }
             let allocated: HashMap<u64, u64> = map.units.iter().copied().collect();
-            let retired: BTreeSet<u64> = retired.units.iter().map(|&(u, _)| u).collect();
+            let retired: BTreeSet<u64> = map
+                .units
+                .iter()
+                .map(|&(u, _)| u)
+                .filter(|&u| store.retired(PageId::new(class, u)))
+                .collect();
             let in_use: BTreeSet<u64> = space.units.iter().map(|&(u, _)| u).collect();
             let page = |number: u64| PageId::new(class, number);
             // Every page a tree reaches of this class.
@@ -271,7 +269,7 @@ impl AtollDb {
                 }
             }
             for slot in in_use {
-                if !slots.contains_key(&slot) {
+                if !slots.contains_key(&slot) && !deferred.contains(&(class, slot)) {
                     findings.add(format!(
                         "slot {slot} of class {c} is in use and holds no page's copy"
                     ));

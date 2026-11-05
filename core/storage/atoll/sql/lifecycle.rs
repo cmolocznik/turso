@@ -9,7 +9,7 @@
 //!   row at a new tree created in the transaction, and lists the old root as Destroy does.
 //! - **Draining a dropped tree** waits until no snapshot can see it. While the database runs that
 //!   needs the oldest snapshot, which garbage collection brings (DESIGN.md §18). At open it holds
-//!   for every row on the list, since recovery undid the losers', so opening drains both lists.
+//!   for every row on the list, since no snapshot survives a crash, so opening drains both lists.
 //!
 //! [`Transactions::create_tree`]: crate::storage::atoll::txn::Transactions::create_tree
 

@@ -1,10 +1,13 @@
 use super::*;
 use crate::io::{MemoryIO, IO};
+use crate::storage::atoll::btree::{Mode, Put, Tree};
 use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::LogConfig;
+use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
+use crate::storage::atoll::txn::versioned::Versions;
 use crate::sync::Mutex;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -13,8 +16,6 @@ use std::collections::HashMap;
 const BASE: &str = "/db/txn";
 
 /// A record a test transaction writes, standing for a change.
-const WRITE: Kind = Kind::new(100).unwrap();
-
 fn log_config() -> LogConfig {
     LogConfig {
         segment_bytes: 1 << 20,
@@ -34,13 +35,24 @@ fn open(io: &Arc<dyn IO>, slots: usize) -> Atoll {
         },
         buffer: BufferConfig {
             budget: MIN_BUDGET,
-            checkpoint_shards: 8,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
         txn: TxnConfig { slots },
     };
-    Atoll::open(io.clone(), BASE, config).unwrap()
+    let db = Atoll::open(io.clone(), BASE, config).unwrap();
+    if drive(io, || db.store().entry(root())).unwrap() == FREE {
+        let made = drive(io, || Tree::create(db.pool(), root().class())).unwrap();
+        assert_eq!(made, root(), "the first page a new database allocates");
+        // In a checkpoint before any write names it, as a database's system trees are.
+        checkpoint(io, &db);
+    }
+    db
+}
+
+/// The plain tree the tests' transactions write to.
+fn root() -> PageId {
+    PageId::new(SizeClass::new(0).unwrap(), 0)
 }
 
 fn begin(io: &Arc<dyn IO>, db: &Atoll, isolation: Isolation) -> Txn {
@@ -56,13 +68,14 @@ fn begin(io: &Arc<dyn IO>, db: &Atoll, isolation: Isolation) -> Txn {
     out.unwrap()
 }
 
-/// Logs a record for `txn`, as a change would; returns its LSN.
-fn write(io: &Arc<dyn IO>, db: &Atoll, txn: &mut Txn) -> Lsn {
-    let log = db.log();
-    let mut admitted = drive(io, || log.admit(framed_len(8))).unwrap();
-    let start = txn.start().to_le_bytes();
-    db.transactions()
-        .append(txn, &mut admitted, WRITE, &[&start])
+/// A change of `txn`'s own: its start, put into the tests' plain tree, as a SQL write to a plain
+/// tree is made and noted.
+fn write(io: &Arc<dyn IO>, db: &Atoll, txn: &mut Txn) {
+    let key = txn.start().to_be_bytes();
+    let tree = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), root());
+    let mut put = Put::new(&key, vec![1], Mode::Upsert);
+    drive(io, || tree.put(&mut put)).unwrap();
+    txn.changed(|s, c| c.plain_put(s, root(), &key, &[1]));
 }
 
 fn commit(io: &Arc<dyn IO>, db: &Atoll, txn: Txn) -> Option<Ts> {
@@ -230,10 +243,7 @@ fn a_transaction_sees_its_own_writes_at_once_and_others_once_committed() {
         !txns.visible(&mut snapshot, slot, start),
         "snapshot isolation"
     );
-    assert!(
-        txns.visible(&mut committed, slot, start),
-        "read committed"
-    );
+    assert!(txns.visible(&mut committed, slot, start), "read committed");
     let mut later = begin(&io, &db, Isolation::Snapshot);
     txns.statement(&mut later).unwrap();
     assert!(txns.visible(&mut later, slot, start));
@@ -249,16 +259,20 @@ fn a_commit_logs_its_timestamp_and_a_read_only_one_logs_nothing() {
     assert_eq!(db.log().end(), end, "a read-only commit logged");
     let mut txn = begin(&io, &db, Isolation::Snapshot);
     let start = txn.start();
-    let written = write(&io, &db, &mut txn);
-    let group = txn.tail().expect("a group written");
+    write(&io, &db, &mut txn);
+    assert_eq!(db.log().end(), end, "a change logged before its commit");
     let ts = commit(&io, &db, txn).unwrap();
     assert!(ts > start);
     assert!(db.log().durable() >= db.log().end(), "done before durable");
-    let mut reader = Log::reader(io.clone(), BASE, &log_config(), written);
+    let mut reader = Log::reader(io.clone(), BASE, &log_config(), end);
     let r = reader.next_record().unwrap().expect("the Commit record");
     assert_eq!(r.header.kind, COMMIT);
-    assert_eq!((r.header.txn, r.header.prev), (start, Some(group)));
+    assert_eq!(r.header.txn, start);
     assert_eq!(commit_ts(&r.payload), Some(ts));
+    assert!(
+        reader.next_record().unwrap().is_none(),
+        "a record past the Commit"
+    );
 }
 
 #[test]
@@ -295,17 +309,9 @@ fn the_clock_restarts_above_every_timestamp_and_what_was_written_reads_committed
             versions.push((txn.slot(), txn.start()));
             last = commit(&io, &db, txn).unwrap();
             if i == 10 || (checkpoint_last && i == 19) {
-                let ticket = db.checkpointer().request_full();
-                drive(&io, || db.checkpointer().step_full(ticket)).unwrap();
+                checkpoint(&io, &db);
             }
         }
-        // A transaction that wrote and never ended: its id is logged, and no new one may reuse
-        // it.
-        let mut open_one = begin(&io, &db, Isolation::Snapshot);
-        write(&io, &db, &mut open_one);
-        drive(&io, || db.log().wait_durable(db.log().end())).unwrap();
-        let last = last.max(open_one.start());
-        std::mem::forget(open_one);
         drop(db);
         let db = open(&io, 4);
         assert!(db.recovered_end().is_some());
@@ -322,69 +328,145 @@ fn the_clock_restarts_above_every_timestamp_and_what_was_written_reads_committed
     }
 }
 
-/// A full checkpoint, done; returns the superblock it leaves in charge.
-fn checkpoint(io: &Arc<dyn IO>, db: &Atoll) -> crate::storage::atoll::control::Superblock {
+/// A full checkpoint, done.
+fn checkpoint(io: &Arc<dyn IO>, db: &Atoll) {
+    let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), 1);
     let ticket = db.checkpointer().request_full();
-    drive(io, || db.checkpointer().step_full(ticket)).unwrap();
-    db.checkpointer().superblock()
+    drive(io, || {
+        db.checkpointer()
+            .step_full(ticket, db.transactions(), &versions)
+    })
+    .unwrap();
 }
 
-/// Commits transactions of 32 KiB records until `bytes` of log are appended.
-fn fill(io: &Arc<dyn IO>, db: &Atoll, bytes: u64) {
-    let filler = vec![7u8; 32 << 10];
-    let end = db.log().end() + bytes;
-    while db.log().end() < end {
-        let mut txn = begin(io, db, Isolation::Snapshot);
-        let mut admitted = drive(io, || db.log().admit(framed_len(filler.len()))).unwrap();
-        db.transactions()
-            .append(&mut txn, &mut admitted, WRITE, &[&filler]);
-        commit(io, db, txn);
+/// A cut's snapshot is the clock as the cut read it. A transaction that commits after, which may
+/// change pages the cut's walk has passed, lies above it, even where the horizon covers that commit
+/// before the cut returns: a commit drawn earlier and published late held the cut waiting.
+#[test]
+fn a_cuts_snapshot_is_the_clock_it_read_never_a_commit_drawn_after() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 4);
+    let txns = db.transactions();
+    let held = begin(&io, &db, Isolation::Snapshot);
+    let drawn = txns.horizon.draw(held.slot(), &txns.clock);
+    let mut cut = Cut::default();
+    assert!(
+        matches!(txns.cut(&mut cut).unwrap(), IOResult::IO(_)),
+        "the cut waits for the commit drawn before it"
+    );
+    let mut t = begin(&io, &db, Isolation::Snapshot);
+    txns.statement(&mut t).unwrap();
+    write(&io, &db, &mut t);
+    let mut commit = Commit::new(t);
+    assert!(
+        matches!(txns.commit(&mut commit).unwrap(), IOResult::IO(_)),
+        "a commit above one unpublished waits for it"
+    );
+    txns.horizon.published(held.slot(), &txns.clock);
+    let ts = drive(&io, || txns.commit(&mut commit))
+        .unwrap()
+        .expect("a commit timestamp");
+    let (_, c) = drive(&io, || txns.cut(&mut cut)).unwrap();
+    assert!(
+        txns.horizon.at() >= ts,
+        "the horizon covers the later commit"
+    );
+    assert!(
+        drawn <= c && c < ts,
+        "the cut's snapshot {c}, drawn {drawn} before it and {ts} after"
+    );
+    txns.abort(held);
+}
+
+/// Commits, some long enough to spill parts ahead of their Commit, run beside checkpoints' cuts
+/// (audit 18): every part and Commit of a commit above a cut's C lies at or after its L, and every
+/// Commit before L is at or below C.
+fn a_cut_divides_the_log_by_commit_timestamp(writers: usize, commits: usize, cuts: usize) {
+    use crate::storage::atoll::log::Log;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Arc::new(open(&io, writers + 1));
+    let spill = log_config().chunk_bytes as usize + 1;
+    let handles: Vec<_> = (0..writers)
+        .map(|w| {
+            let (io, db) = (io.clone(), db.clone());
+            crate::thread::spawn(move || {
+                for i in 0..commits {
+                    let mut t = begin(&io, &db, Isolation::Snapshot);
+                    db.transactions().statement(&mut t).unwrap();
+                    write(&io, &db, &mut t);
+                    let len = if (w + i) % 2 == 0 { spill } else { 8 };
+                    let key = (i as u64).to_be_bytes();
+                    t.changed(|s, c| c.plain_put(s, root(), &key, &vec![w as u8; len]));
+                    commit(&io, &db, t);
+                }
+            })
+        })
+        .collect();
+    let mut taken = Vec::new();
+    for _ in 0..cuts {
+        let mut op = Cut::default();
+        let mut out = None;
+        drive(&io, || {
+            out = Some(match db.transactions().cut(&mut op)? {
+                IOResult::Done(at) => at,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            });
+            Ok(IOResult::Done(()))
+        })
+        .unwrap();
+        taken.push(out.unwrap());
+        crate::thread::yield_now();
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    // Per transaction, where its first part or its Commit starts, where its Commit starts, and
+    // its timestamp.
+    let mut commits_seen: HashMap<Ts, (Lsn, Option<(Lsn, Ts)>)> = HashMap::new();
+    let mut reader = Log::reader(io.clone(), BASE, &log_config(), 0);
+    while let Some(r) = reader.next_record().unwrap() {
+        if r.header.kind == SPILL {
+            let start = u64::from_le_bytes(r.payload[..8].try_into().unwrap());
+            commits_seen.entry(start).or_insert((r.start, None));
+        } else if r.header.kind == COMMIT {
+            let ts = commit_ts(&r.payload).unwrap();
+            commits_seen
+                .entry(r.header.txn)
+                .or_insert((r.start, None))
+                .1 = Some((r.start, ts));
+        }
+    }
+    assert_eq!(commits_seen.len(), writers * commits);
+    let spilled = commits_seen
+        .values()
+        .filter(|(first, c)| Some(*first) != c.map(|c| c.0));
+    assert!(spilled.count() > 0, "no commit spilled a part");
+    for &(l, c) in &taken {
+        for (start, &(first, commit)) in &commits_seen {
+            let (at, ts) = commit.expect("a Commit");
+            if ts > c {
+                assert!(
+                    first >= l,
+                    "commit {start} at {ts}, above {c}, has a part at {first}, before {l}"
+                );
+            }
+            if at < l {
+                assert!(ts <= c, "commit {start} before {l} at {ts}, above {c}");
+            }
+        }
     }
 }
 
 #[test]
-fn a_writer_keeps_its_log_across_checkpoints_until_it_commits() {
-    use crate::storage::atoll::log::{decode_table, Writer};
-    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = open(&io, 4);
-    let mut long = begin(&io, &db, Isolation::Snapshot);
-    write(&io, &db, &mut long);
-    let first = long.tail().unwrap();
-    let segment = log_config().segment_bytes;
-    // Three segments' worth committed by others, checkpointed after each.
-    for _ in 0..3 {
-        fill(&io, &db, segment);
-        checkpoint(&io, &db);
-    }
-    let sb = checkpoint(&io, &db);
-    assert!(
-        sb.redo >= first.get() + 2 * segment,
-        "the redo point {} never passed the writer's segment",
-        sb.redo
+fn a_cut_divides_the_log_by_commit_timestamp_on_threads() {
+    a_cut_divides_the_log_by_commit_timestamp(4, 40, 200);
+}
+
+#[cfg(shuttle)]
+#[test]
+fn a_cut_divides_the_log_by_commit_timestamp_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || a_cut_divides_the_log_by_commit_timestamp(2, 2, 2),
+        300,
     );
-    let table = Log::read_group(io.clone(), BASE, &log_config(), sb.writers.expect("a table"))
-        .unwrap();
-    assert_eq!(
-        decode_table(&table[0].payload).unwrap(),
-        vec![Writer {
-            txn: long.start(),
-            first,
-            last: first
-        }]
-    );
-    let group = Log::read_group(io.clone(), BASE, &log_config(), first)
-        .expect("the writer's first group deleted while it may need undo");
-    assert_eq!(group[0].header.txn, long.start());
-    let held = db.checkpointer().retention().expect("retention reported");
-    assert_eq!((held.writer.txn, held.bytes), (long.start(), sb.redo - first.get()));
-    // Once it commits, the next checkpoint that moves the redo point lets its log go.
-    commit(&io, &db, long);
-    fill(&io, &db, segment);
-    let sb = checkpoint(&io, &db);
-    assert_eq!(sb.writers, None, "a table listing no one");
-    assert!(
-        Log::read_group(io.clone(), BASE, &log_config(), first).is_err(),
-        "the committed writer's segment kept"
-    );
-    assert_eq!(db.checkpointer().retention(), None);
 }

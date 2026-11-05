@@ -15,22 +15,22 @@
 //!   has been, and is acknowledged once the horizon covers it, waiting only on committers still
 //!   publishing a lower timestamp: so a snapshot taken after the acknowledgement sees it, and no
 //!   reader waits ([`horizon`]).
-//! - **A transaction's records** carry its start timestamp as the transaction's id and chain to its
-//!   previous group by where that group starts, so its records are found from its last one. Its
-//!   slot's cell in the writer registry holds its first and last groups from its first group's
-//!   reservation to its Commit's ([`super::log::Writers`]).
+//! - **A transaction's records** are its commit's alone (audit 17): its changes, kept by key until
+//!   then, go out in parts ahead of its Commit when they outgrow a log chunk, each carrying its
+//!   start timestamp as the transaction's id. Nothing a transaction does before its commit reaches
+//!   the log, and one that ends without committing leaves none.
 //! - **The write gate** ([`gate`]): a transaction takes it shared to write and exclusive to write
 //!   the schema, and every end of the transaction releases it, before its slot is freed. A database
 //!   whose writers must hold it ([`Transactions::require_gate`]) refuses a commit that wrote
 //!   without it.
-//! - **Creating a tree** is a change of the transaction's: the root's creation record leads the
-//!   group that makes the root ([`Transactions::create_tree`]). Undoing it, by a rollback or in
-//!   recovery, puts the root on a plain list, after every later change to the tree is undone, and
-//!   frees nothing: the transaction's trees on the list are freed once it has ended.
+//! - **Creating a tree** is a change of the transaction's ([`Transactions::create_tree`]): no
+//!   checkpoint maps the tree until one's snapshot sees the creation. Undoing it, by a rollback,
+//!   puts the root on a plain list, after every later change to the tree is undone, and frees
+//!   nothing: the transaction's trees on the list are freed once it has ended.
 
 use self::sync::{fence, AtomicU64, Ordering};
 use super::btree::Tree;
-use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn, TxnTail, Writers};
+use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn};
 use super::page::{PageId, SizeClass};
 use super::segmented::Segmented;
 use super::stack::Stack;
@@ -53,6 +53,7 @@ mod sync {
 mod ends;
 mod gate;
 mod horizon;
+mod snapshots;
 use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
 pub use gate::Taken;
@@ -66,14 +67,6 @@ pub type Statement = u32;
 /// A commit's record: its timestamp.
 pub const COMMIT: Kind = Kind::new(16).unwrap();
 
-/// The record of a transaction that ended without committing, with no undo left: every change it
-/// made put back. Empty.
-pub const END: Kind = Kind::new(19).unwrap();
-
-/// A tree's creation in a transaction: the root, then the root of the plain list its undo puts it
-/// on, each 8 bytes little-endian. It leads the group that makes the root.
-pub const CREATE: Kind = Kind::new(25).unwrap();
-
 /// A part of a committing transaction's changes too long to ride in its Commit record (audit 17):
 /// the transaction's start and where the part begins in its changes, each 8 bytes little-endian,
 /// then the part. It names no transaction in its header, so it is in no transaction's chain:
@@ -83,6 +76,16 @@ pub const SPILL: Kind = Kind::new(28).unwrap();
 /// Changes made outside any transaction and published at once (audit 17), such as a sequence's
 /// value (DESIGN.md §17, R8): changes as a transaction's are written ([`changes`]).
 pub const RUN: Kind = Kind::new(29).unwrap();
+
+/// In a slot's reserved position: its commit is taking room in the log, where not yet known.
+const RESERVING: u64 = u64::MAX;
+
+/// A checkpoint's cut under way ([`Transactions::cut`]).
+#[derive(Debug, Default)]
+pub struct Cut {
+    /// The log position replay starts from, and the clock the horizon must reach.
+    at: Option<(Lsn, Ts)>,
+}
 
 /// The root a creation record names, and the list its undo puts it on.
 pub fn creation(payload: &[u8]) -> Option<(PageId, PageId)> {
@@ -265,9 +268,17 @@ pub struct Transactions {
     /// Per slot, the start of the transaction it runs; 0 for none. Each written by its slot's
     /// transactions alone, so on a line of its own.
     running: Box<[CachePadded<AtomicU64>]>,
+    /// Per slot, a timestamp at or below the snapshot its transaction reads ([`snapshots`]). Read
+    /// by a checkpoint judging what every running snapshot sees, so each on a line of its own.
+    snapshots: Box<[CachePadded<AtomicU64>]>,
+    /// Per slot, where the commit under way first took room in the log for its changes (a
+    /// spilled part or its Commit), plus one; [`RESERVING`] while it takes it; 0 for none. Read by
+    /// a checkpoint's cut ([`Transactions::cut`]), so each on a line of its own.
+    reserved: Box<[CachePadded<AtomicU64>]>,
     horizon: Horizon,
-    /// The transactions that have logged a group and not yet their Commit or End.
-    writers: Arc<Writers>,
+    /// The snapshot of the checkpoint under way, `Ts::MAX` for none: no reserve a version it reads
+    /// needs is given back while it runs.
+    checkpoint_at: AtomicU64,
     /// A bit per slot, set while it is free.
     free: Box<[AtomicU64]>,
     /// Waiting for a free slot, woken to look again whenever one is freed.
@@ -324,8 +335,6 @@ pub struct Txn {
     command: Statement,
     /// Per slot, the start of its last transaction committed before the snapshot, once looked up.
     seen: Vec<Option<Ts>>,
-    /// Where the transaction's last group starts; `None` while it has written nothing.
-    tail: Option<GroupStart>,
     /// Where the log stood at the snapshot: what a read-only commit waits to be durable.
     log_at: Lsn,
     /// The trees the transaction created and holds, oldest first.
@@ -341,7 +350,7 @@ pub struct Txn {
     /// drain.
     snapped: bool,
     /// Whether its database requires writers to hold the write gate
-    /// ([`Transactions::require_gate`]): then it logs only under a hold.
+    /// ([`Transactions::require_gate`]): then it changes anything only under a hold.
     gated: bool,
     /// Its first and last entries in its slot's version arena, once it has one: what a rollback
     /// walks back (DESIGN.md §11.5).
@@ -371,37 +380,20 @@ impl Txn {
         self.command = command;
     }
 
-    /// The header of the transaction's next record of `kind`.
+    /// The header of the transaction's record of `kind`.
     pub fn header(&self, kind: Kind) -> Header {
         Header {
             kind,
             flags: 0,
             txn: self.start,
-            prev: self.tail,
+            prev: None,
         }
     }
 
-    /// Notes the transaction's group appended at `start`.
-    pub fn logged(&mut self, start: GroupStart) {
-        assert!(
-            !self.gated
-                || matches!(
-                    self.hold,
-                    Hold::Shared | Hold::Exclusive { .. } | Hold::Pending { shared: true, .. }
-                ),
-            "a write without the write gate"
-        );
-        debug_assert!(self.tail.is_none_or(|t| t < start));
-        self.tail = Some(start);
-    }
-
-    /// Where the transaction's last group starts.
-    pub fn tail(&self) -> Option<GroupStart> {
-        self.tail
-    }
-
+    /// Whether it holds a change: its commit publishes them, and enters it in its slot's commit
+    /// log, which judges every version it wrote committed.
     pub fn wrote(&self) -> bool {
-        self.tail.is_some()
+        !self.changes.is_empty()
     }
 
     /// The trees the transaction created and holds, oldest first.
@@ -416,6 +408,14 @@ impl Txn {
 
     /// Notes a change its current statement made, by key.
     pub fn changed(&mut self, note: impl FnOnce(Statement, &mut changes::Changes)) {
+        assert!(
+            !self.gated
+                || matches!(
+                    self.hold,
+                    Hold::Shared | Hold::Exclusive { .. } | Hold::Pending { shared: true, .. }
+                ),
+            "a write without the write gate"
+        );
         note(self.command, &mut self.changes);
     }
 
@@ -455,7 +455,6 @@ impl Txn {
 pub struct Abort {
     txn: Option<Txn>,
     undo: Rollback,
-    admitted: Option<Admitted>,
     abandoned: Vec<PageId>,
 }
 
@@ -464,13 +463,12 @@ impl Abort {
         Self {
             txn: Some(txn),
             undo: Rollback::after(0),
-            admitted: None,
             abandoned: Vec::new(),
         }
     }
 
     /// Once the rollback is done, the trees whose creation it or an earlier statement rollback
-    /// undid: each on its list, its transaction's End appended before them.
+    /// undid: each on its list.
     pub fn abandoned(&self) -> &[PageId] {
         &self.abandoned
     }
@@ -517,14 +515,8 @@ impl Commit {
 }
 
 impl Transactions {
-    /// `config.slots` slots over `clock`, every version already in the database committed, the
-    /// writers entered in `writers`.
-    pub fn new(
-        config: &TxnConfig,
-        clock: Arc<Clock>,
-        log: Arc<Log>,
-        writers: Arc<Writers>,
-    ) -> Self {
+    /// `config.slots` slots over `clock`, every version already in the database committed.
+    pub fn new(config: &TxnConfig, clock: Arc<Clock>, log: Arc<Log>) -> Self {
         assert!(
             (1..=u16::MAX as usize + 1).contains(&config.slots),
             "{} transaction slots",
@@ -539,8 +531,14 @@ impl Transactions {
             running: (0..config.slots)
                 .map(|_| CachePadded::new(AtomicU64::new(0)))
                 .collect(),
+            snapshots: (0..config.slots)
+                .map(|_| CachePadded::new(AtomicU64::new(snapshots::NONE)))
+                .collect(),
+            reserved: (0..config.slots)
+                .map(|_| CachePadded::new(AtomicU64::new(0)))
+                .collect(),
             horizon: Horizon::new(config.slots, base),
-            writers,
+            checkpoint_at: AtomicU64::new(Ts::MAX),
             free: (0..words)
                 .map(|w| {
                     let bits = (config.slots - w * 64).min(64);
@@ -573,31 +571,6 @@ impl Transactions {
 
     pub fn clock(&self) -> &Arc<Clock> {
         &self.clock
-    }
-
-    /// What `txn`'s next change is logged as: its group enters the writer registry as it is
-    /// reserved.
-    pub fn tail(&self, txn: &Txn) -> TxnTail {
-        TxnTail::new(txn.start, txn.tail, self.writers.clone(), txn.slot)
-    }
-
-    /// Appends a record of `txn`'s own of `kind`, outside any tree, within `admitted`'s room, and
-    /// returns its LSN.
-    pub fn append(
-        &self,
-        txn: &mut Txn,
-        admitted: &mut Admitted,
-        kind: Kind,
-        payload: &[&[u8]],
-    ) -> Lsn {
-        let (writers, slot, id) = (&self.writers, txn.slot, txn.start);
-        let (start, lsn) = self
-            .log
-            .append_with(admitted, &txn.header(kind), payload, |at| {
-                writers.reserved(slot, id, at)
-            });
-        txn.logged(start);
-        lsn
     }
 
     /// A free slot, taken.
@@ -640,7 +613,7 @@ impl Transactions {
     /// Takes the snapshot of `txn`, begun without one ([`begin_slot_in`](Self::begin_slot_in)).
     pub fn take_snapshot(&self, txn: &mut Txn) {
         assert!(!txn.snapped, "a second snapshot of one transaction");
-        txn.snapshot = self.horizon.at();
+        txn.snapshot = snapshots::take(&self.snapshots[txn.slot as usize], || self.horizon.at());
         txn.seen.fill(None);
         txn.log_at = self.log.end();
         txn.snapped = true;
@@ -679,7 +652,6 @@ impl Transactions {
             snapshot: 0,
             command: 0,
             seen: vec![None; self.slots.len()],
-            tail: None,
             log_at: 0,
             created: Vec::new(),
             abandoned: Vec::new(),
@@ -815,9 +787,10 @@ impl Transactions {
         txn.hold = Hold::None;
     }
 
-    /// Creates an empty tree of `class` in `txn`'s current statement, its root's creation record
-    /// leading the group that makes it. A rollback past the statement, or recovery's undo of the
-    /// transaction, puts the root on the plain tree `list`, keyed by its big-endian bytes. Step it
+    /// Creates an empty tree of `class` in `txn`'s current statement: its creation is one of the
+    /// transaction's changes, which its commit publishes (audit 17), and no checkpoint maps the
+    /// tree until one's snapshot sees the creation (audit 18, review 8). A rollback past the
+    /// statement puts the root on the plain tree `list`, keyed by its big-endian bytes. Step it
     /// until done.
     pub fn create_tree(
         &self,
@@ -827,16 +800,13 @@ impl Transactions {
         list: PageId,
     ) -> Result<IOResult<PageId>> {
         assert!(txn.command > 0, "a tree created before the first statement");
-        let tail = self.tail(txn);
         let (pool, store) = versions.pool_and_store();
-        let made =
-            Tree::create_logged(pool, store, class, &tail, CREATE, &list.raw().to_le_bytes())?;
-        let (root, start) = match made {
-            IOResult::Done(made) => made,
+        let root = match Tree::create_versioned(pool, class)? {
+            IOResult::Done(root) => root,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        txn.logged(start);
-        txn.changes.create(txn.command, root, list);
+        store.created(root, txn.slot, txn.start);
+        txn.changed(|statement, changes| changes.create(statement, root, list));
         txn.created.push(Created {
             statement: txn.command,
             root,
@@ -874,6 +844,7 @@ impl Transactions {
         })?;
         if txn.isolation == Isolation::ReadCommitted && txn.command > 1 {
             txn.snapshot = self.horizon.at();
+            snapshots::rise(&self.snapshots[txn.slot as usize], txn.snapshot);
             txn.seen.fill(None);
             txn.log_at = self.log.end();
         }
@@ -894,10 +865,94 @@ impl Transactions {
         start <= last
     }
 
+    /// `slot`'s commit is about to take room in the log, unless it already took some.
+    fn reserving(&self, slot: u16) {
+        let mark = &self.reserved[slot as usize];
+        if mark.load(Ordering::Relaxed) == 0 {
+            mark.store(RESERVING, Ordering::SeqCst);
+        }
+    }
+
+    /// `slot`'s commit took room in the log at `at`: its first, unless it took some before.
+    fn reserved_at(&self, slot: u16, at: GroupStart) {
+        let mark = &self.reserved[slot as usize];
+        if mark.load(Ordering::Relaxed) == RESERVING {
+            mark.store(at.get() + 1, Ordering::SeqCst);
+        }
+    }
+
+    /// A checkpoint's cut (audit 18): `(L, C)`, every commit at or below `C` published, every
+    /// Commit before `L` with a timestamp at or below `C`, and every part and Commit of a commit
+    /// above `C` at or after `L`. Replay from `L` of the commits above `C` then brings a state as
+    /// of `C` up to the log's end. Step it until done.
+    ///
+    /// `L` is the log's end, or where an earlier commit under way took its first room. A commit
+    /// marks its slot before it takes room and replaces the mark with the position as it takes
+    /// it, nothing between, so the cut meeting a mark waits for its position. `C` is the clock as
+    /// it stands then, and the horizon is waited for up to it: a commit before `L` was not under
+    /// way, so it drew its timestamp before; a commit drawing later was under way, its position at
+    /// or past its mark, or took room after the end was read. A commit at or below `C` drew its
+    /// timestamp after its last change, so every change it made is in the pages the cut finds
+    /// next; one the horizon covers past `C` may still be changing pages, and is not `C`'s.
+    pub fn cut(&self, op: &mut Cut) -> Result<IOResult<(Lsn, Ts)>> {
+        let (l, n) = match op.at {
+            Some(at) => at,
+            None => {
+                let mut l = self.log.end();
+                for mark in self.reserved.iter() {
+                    match mark.load(Ordering::SeqCst) {
+                        0 => {}
+                        RESERVING => {
+                            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
+                        }
+                        at => l = l.min(at - 1),
+                    }
+                }
+                *op.at.insert((l, self.clock.now()))
+            }
+        };
+        if let Some(wait) = self.horizon.wait(n, &self.clock) {
+            return Ok(IOResult::IO(IOCompletions(wait)));
+        }
+        Ok(IOResult::Done((l, n)))
+    }
+
+    /// The clock now: above every timestamp drawn so far.
+    pub fn clock_now(&self) -> Ts {
+        self.clock.now()
+    }
+
+    /// Whether the slot's transaction that started at `start` committed at or below `at`.
+    pub fn committed_by(&self, slot: u16, start: Ts, at: Ts) -> bool {
+        self.slots
+            .get(slot as usize)
+            .is_some_and(|log| start <= log.last_at(at))
+    }
+
+    /// The checkpoint cut at `c` is under way: what its snapshot reads keeps its room.
+    pub fn hold_checkpoint(&self, c: Ts) {
+        self.checkpoint_at.store(c, Ordering::SeqCst);
+    }
+
+    /// The checkpoint under way is done.
+    pub fn release_checkpoint(&self) {
+        self.checkpoint_at.store(Ts::MAX, Ordering::SeqCst);
+    }
+
+    /// At or below every snapshot running now or taken from now on, the horizon being at or above
+    /// `at`: what a checkpoint cut at `at` judges a versioned leaf's image by ([`versioned::AsOf`]).
+    pub fn oldest_snapshot(&self, at: Ts) -> Ts {
+        snapshots::oldest(self.snapshots.iter().map(|s| &**s), at)
+    }
+
     /// Whether every snapshot taken from now on sees the version written by the slot's transaction
-    /// that started at `start`: no checkpoint needs any version below it.
+    /// that started at `start`, and so does the checkpoint under way: no checkpoint needs any
+    /// version below it.
     pub fn seen_from_now(&self, slot: u16, start: Ts) -> bool {
-        let at = self.horizon.at();
+        let at = self
+            .horizon
+            .at()
+            .min(self.checkpoint_at.load(Ordering::SeqCst));
         self.slots
             .get(slot as usize)
             .is_some_and(|log| start <= log.last_at(at))
@@ -928,7 +983,8 @@ impl Transactions {
                         txn: 0,
                         prev: None,
                     };
-                    self.log.append(
+                    self.reserving(txn.slot);
+                    self.log.append_with(
                         &mut admitted,
                         &header,
                         &[
@@ -936,6 +992,7 @@ impl Transactions {
                             &(op.spilled as u64).to_le_bytes(),
                             &bytes[op.spilled..op.spilled + n],
                         ],
+                        |at| self.reserved_at(txn.slot, at),
                     );
                     op.spilled += n;
                 }
@@ -959,9 +1016,8 @@ impl Transactions {
                 None => txn.log_at,
                 Some(mut admitted) => {
                     let ts = self.horizon.draw(txn.slot, &self.clock);
-                    // Leaves the registry as its room is reserved: a checkpoint whose redo point
-                    // passes the Commit never lists it as needing undo.
-                    let (writers, slot, id) = (&self.writers, txn.slot, txn.start);
+                    self.reserving(txn.slot);
+                    let slot = txn.slot;
                     let bytes = txn.changes.bytes();
                     let from = op.spilled;
                     let (_, lsn) = self.log.append_with(
@@ -973,7 +1029,7 @@ impl Transactions {
                             &(from as u64).to_le_bytes(),
                             &bytes[from..],
                         ],
-                        |_| writers.finished(slot, id),
+                        |at| self.reserved_at(slot, at),
                     );
                     self.slots[txn.slot as usize].push(txn.start, ts);
                     self.horizon.published(txn.slot, &self.clock);
@@ -1012,9 +1068,9 @@ impl Transactions {
         self.release(txn.slot);
     }
 
-    /// Rolls `op`'s transaction back whole (DESIGN.md §11.5): every change it made put back, its
-    /// End appended, and its slot freed with no commit pair. Nothing waits for the log to be
-    /// durable: a rollback a crash loses is undone again by recovery. Step it until done.
+    /// Rolls `op`'s transaction back whole (DESIGN.md §11.5): every change it made put back, and its
+    /// slot freed with no commit pair. It logs nothing: the log holds nothing of a transaction
+    /// before its commit (audit 17). Step it until done.
     pub fn rollback(&self, versions: &Versions, op: &mut Abort) -> Result<IOResult<()>> {
         let txn = op
             .txn
@@ -1022,21 +1078,6 @@ impl Transactions {
             .expect("a rollback stepped after it was done");
         if let IOResult::IO(io) = rollback::undo(self, versions, txn, &mut op.undo)? {
             return Ok(IOResult::IO(io));
-        }
-        if txn.wrote() {
-            if op.admitted.is_none() {
-                op.admitted = Some(match self.log.admit(framed_len(0))? {
-                    IOResult::Done(a) => a,
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                });
-            }
-            let mut admitted = op.admitted.take().expect("admitted");
-            // Leaves the registry as its room is reserved, as a Commit does.
-            let (writers, slot, id) = (&self.writers, txn.slot, txn.start);
-            self.log
-                .append_with(&mut admitted, &txn.header(END), &[], |_| {
-                    writers.finished(slot, id)
-                });
         }
         let mut txn = op.txn.take().expect("a transaction");
         op.abandoned = std::mem::take(&mut txn.abandoned);
@@ -1105,6 +1146,9 @@ impl Transactions {
     }
 
     fn release(&self, slot: u16) {
+        // A commit's parts and Commit are in the log and published, or it failed with the log.
+        self.reserved[slot as usize].store(0, Ordering::SeqCst);
+        snapshots::vacate(&self.snapshots[slot as usize]);
         ends::vacate(&self.running[slot as usize], &self.owner[slot as usize]);
         self.free[slot as usize / 64].fetch_or(1 << (slot % 64), Ordering::AcqRel);
         // Pairs with the fence of a waiter: either this finds it, or it finds the slot.

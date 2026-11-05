@@ -3,8 +3,9 @@
 //!
 //! ```text
 //! magic: u64 | version: u32 | reserved: u32 | seq: u64 | redo: u64 | segment_bytes: u64 |
-//! file_bytes: u64 | database_id: [u8; 16] | heights: [[u8; CLASS_COUNT]; 3] | clock: u64 |
-//! writers: u64 | continuations: u64 | (ended: u64, resumed: u64) * continuations | zeros |
+//! file_bytes: u64 | database_id: [u8; 16] | heights: [[u8; CLASS_COUNT]; 2] | clock: u64 |
+//! snapshot: u64 | checkpoint: u64 | continuations: u64 | (ended: u64, resumed: u64) *
+//! continuations | zeros |
 //! crc32c: u32
 //! ```
 //!
@@ -18,7 +19,7 @@
 //! file, a SQLite database among them, is refused and never written.
 
 use super::aligned::AlignedBlock;
-use super::log::{GroupStart, Lsn};
+use super::log::Lsn;
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
 use super::whole;
@@ -33,28 +34,30 @@ const VERSION: u32 = 1;
 const SIZE: usize = 4096;
 const HEIGHTS: usize = 64;
 const CLOCK: usize = HEIGHTS + TREES * CLASS_COUNT;
-const WRITERS: usize = CLOCK + 8;
-const CONTINUATIONS: usize = WRITERS + 8;
+const SNAPSHOT: usize = CLOCK + 8;
+const CHECKPOINT: usize = SNAPSHOT + 8;
+const CONTINUATIONS: usize = CHECKPOINT + 8;
 /// Continuations a superblock holds: all that fit between their count and the checksum.
 pub const MAX_CONTINUATIONS: usize = (SIZE - 4 - CONTINUATIONS - 8) / 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Superblock {
+    /// Every superblock written is one past the one before.
     pub seq: u64,
-    /// Where recovery starts reading the log.
+    /// Where recovery starts reading the log: every commit before it is at or below `snapshot`.
     pub redo: Lsn,
     pub segment_bytes: u64,
     pub file_bytes: u64,
     pub database_id: [u8; 16],
-    /// Levels of the page table (`[0]`), free space (`[1]`) and retired marks (`[2]`) of each
-    /// size class.
+    /// Levels of the page table (`[0]`) and free space (`[1]`) of each size class, at the cut.
     pub heights: [[u8; CLASS_COUNT]; TREES],
-    /// The transaction clock when the superblock was written: above every timestamp of a change
-    /// logged before the redo point.
+    /// The transaction clock at the cut: above every timestamp of a commit before the redo point.
     pub clock: u64,
-    /// Where the writer table of the checkpoint that wrote this starts in the log (DESIGN.md
-    /// §10): the writers that may still need undo by the log before `redo`. `None` for none.
-    pub writers: Option<GroupStart>,
+    /// The snapshot the checkpoint's pages are as of: every commit at or below it is in them, and
+    /// replay applies only those above it.
+    pub snapshot: u64,
+    /// The checkpoint in charge (audit 18): the metadata is the copies numbered at or below it.
+    pub checkpoint: u64,
     /// Where the log goes on past a gap, in order: it ended at `.0`, and goes on at `.1`. A
     /// recovery reopens the log past where it ends, at the next block, and records the gap here,
     /// durably, before it appends anything: a recovery that crashes and starts again from this
@@ -77,7 +80,8 @@ impl Superblock {
             out[at..at + CLASS_COUNT].copy_from_slice(heights);
         }
         out[CLOCK..CLOCK + 8].copy_from_slice(&self.clock.to_le_bytes());
-        out[WRITERS..WRITERS + 8].copy_from_slice(&GroupStart::encode(self.writers).to_le_bytes());
+        out[SNAPSHOT..SNAPSHOT + 8].copy_from_slice(&self.snapshot.to_le_bytes());
+        out[CHECKPOINT..CHECKPOINT + 8].copy_from_slice(&self.checkpoint.to_le_bytes());
         assert!(
             self.continuations.len() <= MAX_CONTINUATIONS,
             "{} continuations",
@@ -127,12 +131,6 @@ impl Superblock {
                 )))
             }
         };
-        let writers = GroupStart::decode(word(WRITERS)).ok_or_else(|| {
-            LimboError::Corrupt(format!(
-                "a superblock names its writer table at {}, where no group starts",
-                word(WRITERS)
-            ))
-        })?;
         let mut heights = [[0u8; CLASS_COUNT]; TREES];
         for (t, heights) in heights.iter_mut().enumerate() {
             let at = HEIGHTS + t * CLASS_COUNT;
@@ -146,7 +144,8 @@ impl Superblock {
             database_id: bytes[48..64].try_into().unwrap(),
             heights,
             clock: word(CLOCK),
-            writers,
+            snapshot: word(SNAPSHOT),
+            checkpoint: word(CHECKPOINT),
             continuations,
         }))
     }
@@ -357,27 +356,12 @@ mod tests {
             segment_bytes: 1 << 28,
             file_bytes: 1 << 40,
             database_id: [9; 16],
-            heights: [[2; CLASS_COUNT], [1; CLASS_COUNT], [3; CLASS_COUNT]],
+            heights: [[2; CLASS_COUNT], [1; CLASS_COUNT]],
             clock: 1 << 40,
-            writers: Some(GroupStart::at(0)),
+            snapshot: (1 << 40) - 7,
+            checkpoint: 5,
             continuations: vec![(20_000, 20_480), (40_100, 40_960)],
         }
-    }
-
-    #[test]
-    fn a_superblock_tells_a_writer_table_at_zero_from_none_and_refuses_one_off_the_grid() {
-        for writers in [None, Some(GroupStart::at(0)), Some(GroupStart::at(1 << 20))] {
-            let sb = Superblock {
-                writers,
-                ..superblock(3)
-            };
-            assert_eq!(Superblock::decode(&sb.encode()).unwrap(), Some(sb));
-        }
-        let mut bytes = superblock(3).encode();
-        bytes[WRITERS..WRITERS + 8].copy_from_slice(&8u64.to_le_bytes());
-        let crc = crc32c::crc32c(&bytes[..SIZE - 4]);
-        bytes[SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
-        assert!(Superblock::decode(&bytes).is_err());
     }
 
     #[test]
@@ -391,7 +375,8 @@ mod tests {
             24,
             HEIGHTS,
             CLOCK,
-            WRITERS,
+            SNAPSHOT,
+            CHECKPOINT,
             CONTINUATIONS,
             CONTINUATIONS + 8,
             SIZE - 1,

@@ -224,7 +224,7 @@ impl Arenas {
                     }
                     w.put_u32(LAST, end as u32);
                     w.put_u32(END, (end + len) as u32);
-                    ex.changed_temporary();
+                    ex.changed();
                     let ptr = Ptr::new(pid, end);
                     txn.replaced = Some(match txn.replaced {
                         Some((first, _)) => (first, ptr),
@@ -241,7 +241,7 @@ impl Arenas {
             w.put_u64(PREV, prev);
             w.put_u32(LAST, 0);
             w.put_u32(END, ENTRIES as u32);
-            ex.changed_temporary();
+            ex.changed();
             cell.store(ex.pid().raw() + 1, Ordering::Relaxed);
         }
     }

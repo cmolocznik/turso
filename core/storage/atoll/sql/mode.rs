@@ -761,11 +761,15 @@ impl ConnTxn {
     pub fn begin_reading(&self, wants: Begin, reads: &[u64]) -> Result<IOResult<()>> {
         let txns = self.db.atoll().transactions();
         if let Begin::Write { .. } = wants {
-            // A writing statement steps the checkpointer first, holding no latch, while a pass
-            // is due or under way: commits are not its only trigger, so long transactions are
-            // checkpointed too (DESIGN.md §17, §11). Its IO is not waited for: the pass goes on
-            // at the next step, whoever takes it.
-            self.db.atoll().checkpointer().step_due().map(|_| ())?;
+            // A writing statement steps the checkpointer first, holding no latch, while a
+            // checkpoint is due or under way: commits are not its only trigger, so long
+            // transactions are checkpointed too (DESIGN.md §17, §11). Its IO is not waited for:
+            // the checkpoint goes on at the next step, whoever takes it.
+            self.db
+                .atoll()
+                .checkpointer()
+                .step_due(txns, self.db.versions())
+                .map(|_| ())?;
         }
         let mut guard = self.cell.lock();
         if guard.is_none() {
@@ -1215,20 +1219,25 @@ pub struct RetireOp {
     counted: Option<u64>,
 }
 
-/// A full checkpoint (DESIGN.md §17, §11): every shard written back and the redo point moved as
-/// far as it goes, for `PRAGMA wal_checkpoint` and `Connection::checkpoint`. Driven to its end
-/// here, as a WAL checkpoint of the whole log is.
+/// A full checkpoint (DESIGN.md §17, §11): one begun now, done, for `PRAGMA wal_checkpoint` and
+/// `Connection::checkpoint`. Driven to its end here, as a WAL checkpoint of the whole log is.
 pub fn full_checkpoint(db: &AtollDb) -> Result<()> {
     let checkpointer = db.atoll().checkpointer();
     let ticket = checkpointer.request_full();
-    drive(db.io(), || checkpointer.step_full(ticket))
+    let txns = db.atoll().transactions();
+    drive(db.io(), || {
+        checkpointer.step_full(ticket, txns, db.versions())
+    })
 }
 
-/// Steps the checkpointer, which does whatever is due: a pass once its share of the log budget has
-/// been appended, and moving the redo point after one. Its IO is not waited for: the pass goes on
-/// at the next step, whoever takes it.
+/// Steps the checkpointer, which does whatever is due: a checkpoint once its share of the log
+/// budget has been appended. Its IO is not waited for: the checkpoint goes on at the next step,
+/// whoever takes it.
 fn nudge_checkpoint(db: &AtollDb) -> Result<()> {
-    db.atoll().checkpointer().step().map(|_| ())
+    db.atoll()
+        .checkpointer()
+        .step(db.atoll().transactions(), db.versions())
+        .map(|_| ())
 }
 
 /// CreateBtree's state across IO.
@@ -1325,7 +1334,12 @@ impl Ending {
                     };
                 }
                 Step::Checkpoint(ticket) => {
-                    done!(self.db.atoll().checkpointer().step_full(*ticket));
+                    let txns = self.db.atoll().transactions();
+                    done!(self.db.atoll().checkpointer().step_full(
+                        *ticket,
+                        txns,
+                        self.db.versions()
+                    ));
                     self.step = Step::Done;
                 }
                 Step::Done => return Ok(IOResult::Done(())),

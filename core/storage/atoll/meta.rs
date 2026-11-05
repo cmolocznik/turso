@@ -4,13 +4,17 @@
 //! cache of their own rather than the buffer pool, because a buffer miss needs the page table.
 //!
 //! **Two places per page.** A metadata page has two places side by side at a position its index
-//! fixes. It is always written to the place that does not hold its newest durable copy, so a torn
-//! write leaves that copy whole, and a read takes both places and keeps the newest whole copy.
-//! Metadata therefore needs no free space of its own and no parent pointing at it.
+//! fixes. Each copy carries the number of the checkpoint that wrote it in its header's `seq`, where
+//! a data page carries its change count. A checkpoint writes to the place that does not hold the copy of the checkpoint in
+//! charge, so a torn write leaves that copy whole, and a read takes the newest whole copy not past
+//! the checkpoint in charge, so a copy a checkpoint wrote before a crash cut it short is passed
+//! over. Metadata therefore needs no free space of its own and no parent pointing at it.
 //!
-//! **Logged first.** Every change is logged before it is made, and a page is written only once the
-//! log is durable up to its LSN. A page with no whole copy has never had a change before the last
-//! checkpoint's redo point, so recovery starts it from zeros and replays its changes.
+//! **Written by checkpoints, as of their cut** (audit 18). Changes are made in memory, unlogged,
+//! and only a checkpoint writes a page. Between a checkpoint's cut and the end of its writes, a
+//! page's first change copies the page first, so the checkpoint writes it as it stood at the cut,
+//! with the checkpoint's own edits ([`MetaCache::edit`]). A page a checkpoint cut short may have
+//! written is passed over on reading and rewritten by the next ([`MetaCache::owe`]).
 //!
 //! **Latching** is the buffer pool's (CONCURRENCY.md §5): a change holds the page's versioned
 //! latch, taken without waiting, and a reader takes nothing and validates the version after it
@@ -18,19 +22,17 @@
 //!
 //! **No lock.** The cache keeps a cell per page, in an array per file that grows to the highest
 //! page reached ([`Segmented`]). A page found is pinned, and only a page no pin holds is evicted
-//! ([`pins`](super::pins)). A dirty page holds a pin of its own, and a floor among the dirty pages
-//! tagged with its id, until it is written; a load or a write in flight holds one too: so a page
-//! evicted is clean and idle. Whether a page is dirty is a bit of its count of changes, which a
-//! write that lands clears by compare-and-swap, so it clears it only if no change came since its
-//! copy.
+//! ([`pins`](super::pins)). A dirty page holds a pin of its own, and is listed among the dirty
+//! pages, until it is written; a load or a write in flight holds one too, and a checkpoint holds
+//! the pages it writes until it is in charge: so a page evicted is clean and idle. Whether a page
+//! is dirty is a bit of its count of changes, which a write that lands clears by compare-and-swap,
+//! so it clears it only if no change came since its copy.
 
 use self::sync::AtomicU64;
 use super::aligned::AlignedBlock;
 use super::buffer::cell::{CompletionCell, Retiring};
 use super::epoch::Epochs;
-use super::floors::{Floor, Floors};
 use super::latch::{Held, VersionedLatch};
-use super::log::{Log, Lsn};
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT, MIN_PAGE_SIZE};
 use super::pins::{Cells, PinCell, Pinnable, Pinned, Pins};
@@ -64,12 +66,10 @@ pub enum Tree {
     Map,
     /// Free space: which slots are in use.
     Space,
-    /// Retired marks: which pages hold a version a snapshot may still read (DESIGN.md §6.5).
-    Retired,
 }
 
 /// Metadata trees per size class.
-pub const TREES: usize = 3;
+pub const TREES: usize = 2;
 
 /// A metadata page: its tree, the size class it describes, its level (0 for leaves) and its
 /// index within the level.
@@ -103,13 +103,21 @@ impl MetaId {
         PageId::new(SizeClass::new(0).expect("class 0"), number)
     }
 
+    /// The id whose [`pid`](Self::pid) is `pid`, if it is one.
+    pub fn of_pid(pid: PageId) -> Option<Self> {
+        let number = pid.number();
+        (pid.class().index() == 0
+            && number & META_BIT != 0
+            && (number >> TREE_SHIFT & 3) < TREES as u64)
+            .then(|| Self::from_number(number))
+    }
+
     /// The id whose [`pid`](Self::pid) has `number`.
     fn from_number(number: u64) -> Self {
         Self {
             tree: match number >> TREE_SHIFT & 3 {
                 0 => Tree::Map,
                 1 => Tree::Space,
-                2 => Tree::Retired,
                 _ => unreachable!("the cache tags only ids it made"),
             },
             class: SizeClass::new((number >> CLASS_SHIFT & 0xf) as usize).expect("a size class"),
@@ -136,7 +144,6 @@ fn path(base: &str, (tree, class, level): FileKey) -> String {
     let tree = match tree {
         Tree::Map => "map",
         Tree::Space => "free",
-        Tree::Retired => "retired",
     };
     format!("{base}.{tree}{}.{level}", class.index())
 }
@@ -151,19 +158,16 @@ const FAILED: u8 = 2;
 /// In a page's count of changes: a change not yet on disk.
 const DIRTY: u64 = 1;
 
-/// Whether a page has a change not yet on disk, and its floor among the dirty pages while it has.
+/// Whether a page has a change not yet on disk.
 #[derive(Default)]
 struct Dirt {
     /// Twice the changes made, plus [`DIRTY`] while one is not on disk.
     changes: AtomicU64,
-    /// The page's floor plus one: set as it turns dirty.
-    floor: AtomicU64,
 }
 
 impl Dirt {
-    /// Counts a change whose record starts at `start`, made by the only change under way:
-    /// whether the page turned dirty, its floor then held among `dirty`, tagged `tag`.
-    fn changed(&self, dirty: &Floors, start: Lsn, tag: u64) -> bool {
+    /// Counts a change made by the only change under way: whether the page turned dirty.
+    fn changed(&self) -> bool {
         // A write landing meanwhile may clear the dirty bit: this change then sets it again.
         let mut was = self.changes.load(Ordering::Relaxed);
         while let Err(now) = self.changes.compare_exchange_weak(
@@ -174,12 +178,7 @@ impl Dirt {
         ) {
             was = now;
         }
-        if was & DIRTY != 0 {
-            return false;
-        }
-        let floor = dirty.hold_tagged(start, tag);
-        self.floor.store(floor.into_slot() + 1, Ordering::Release);
-        true
+        was & DIRTY == 0
     }
 
     /// The count a copy of the page taken now, while no change is under way, carries.
@@ -187,21 +186,12 @@ impl Dirt {
         self.changes.load(Ordering::Acquire)
     }
 
-    /// A write of the copy taken at `count` landed: whether the page is clean now, unless a
-    /// change came since the copy, its floor then released. Writes of a page land one at a time.
-    fn written(&self, dirty: &Floors, count: u64) -> bool {
-        // Read before the exchange: only a page turning dirty sets it, and none turns dirty
-        // before the exchange below succeeds.
-        let floor = self.floor.load(Ordering::Acquire);
-        if self
-            .changes
+    /// A write of the copy taken at `count` landed: whether the page is clean now, which it is
+    /// unless a change came since the copy. Writes of a page land one at a time.
+    fn written(&self, count: u64) -> bool {
+        self.changes
             .compare_exchange(count, count & !DIRTY, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
-        dirty.release(Floor::from_slot(floor - 1));
-        true
+            .is_ok()
     }
 }
 
@@ -215,8 +205,18 @@ pub struct MetaFrame {
     status: AtomicU8,
     failure: SetOnce<CompletionError>,
     dirt: Dirt,
-    /// The place holding the newest durable copy, plus one; 0 if the page has none.
+    /// The place holding the copy of the checkpoint in charge, plus one; 0 if the page has none.
     durable_side: AtomicU8,
+    /// The checkpoint that last wrote the page, and the place it wrote plus one: the page's
+    /// durable place once that checkpoint is in charge ([`MetaCache::checkpointed`]).
+    written_for: AtomicU64,
+    written_side: AtomicU8,
+    /// The checkpoint whose cut is in effect, 0 for none: shared with the cache.
+    cutting: Arc<crate::sync::atomic::AtomicU64>,
+    /// The page as it stood at the cut of checkpoint `cut_for`, kept by its first change since,
+    /// or by that checkpoint's own edit of the cut alone.
+    cut: Mutex<Option<Box<[u8]>>>,
+    cut_for: crate::sync::atomic::AtomicU64,
     /// The write in flight, if any.
     writing: CompletionCell,
     /// Completed once a page loading is loaded.
@@ -233,7 +233,7 @@ impl Pinnable for MetaFrame {
 }
 
 impl MetaFrame {
-    fn new(id: MetaId) -> Self {
+    fn new(id: MetaId, cutting: Arc<crate::sync::atomic::AtomicU64>) -> Self {
         Self {
             id,
             latch: VersionedLatch::default(),
@@ -243,14 +243,57 @@ impl MetaFrame {
             failure: SetOnce::default(),
             dirt: Dirt::default(),
             durable_side: AtomicU8::new(0),
+            written_for: AtomicU64::new(0),
+            written_side: AtomicU8::new(0),
+            cutting,
+            cut: Mutex::new(None),
+            cut_for: crate::sync::atomic::AtomicU64::new(0),
             writing: CompletionCell::default(),
             loaded: CompletionCell::default(),
+        }
+    }
+
+    /// The page's bytes, copied, under a latch held or with no change under way.
+    fn copy_bytes(&self) -> Box<[u8]> {
+        let mut out = vec![0u8; META_PAGE].into_boxed_slice();
+        self.bytes.copy_to(0, &mut out);
+        out
+    }
+
+    /// Keeps the page as it stands, under its latch held exclusively, as it stood at the cut in
+    /// effect, unless it is kept already: what that checkpoint writes of it.
+    fn keep_cut(&self) {
+        let n = self.cutting.load(Ordering::Acquire);
+        if n != 0 && self.cut_for.load(Ordering::Acquire) != n {
+            *self.cut.lock() = Some(self.copy_bytes());
+            self.cut_for.store(n, Ordering::Release);
         }
     }
 
     fn fail(&self, e: CompletionError) {
         self.failure.set(e);
         self.status.store(FAILED, Ordering::Release);
+    }
+
+    /// Reads the page as it stood at checkpoint `n`'s cut: `cut` over the copy kept by its first
+    /// change since, or `live` over the page as it stands where none was; `None` while a change
+    /// holds the latch.
+    pub fn read_cut<R>(
+        &self,
+        n: u64,
+        live: impl Fn(&Shared) -> R,
+        cut: impl Fn(&[u8]) -> R,
+    ) -> Option<R> {
+        loop {
+            let version = self.latch.optimistic()?;
+            let out = match self.cut.lock().as_deref() {
+                Some(bytes) if self.cut_for.load(Ordering::Acquire) == n => cut(bytes),
+                _ => live(&self.bytes),
+            };
+            if self.latch.validate(version) {
+                return Some(out);
+            }
+        }
     }
 
     /// Reads the page without a lock: `None` while a change holds the latch, else what `f`
@@ -266,64 +309,38 @@ impl MetaFrame {
         }
     }
 
-    /// Latches the page for a change, or `None` while a change holds it. The change's record is
-    /// appended while the latch is held, so changes reach a page in the order of their records.
+    /// Latches the page for a change, or `None` while a change holds it. Between a checkpoint's
+    /// cut and the end of its writes, the page is first kept as it stood at the cut.
     pub fn try_lock(&self) -> Option<MetaHold<'_>> {
-        Held::try_take(&self.latch).map(|hold| MetaHold {
-            frame: self,
-            // SAFETY: the hold has the latch exclusively, and keeps it while the writer lives.
-            page: unsafe { self.bytes.writer() },
-            hold,
+        Held::try_take(&self.latch).map(|hold| {
+            self.keep_cut();
+            MetaHold {
+                frame: self,
+                // SAFETY: the hold has the latch exclusively, and keeps it while the writer lives.
+                page: unsafe { self.bytes.writer() },
+                hold,
+            }
         })
     }
 
-    /// Notes a change, whose record starts at `start`, made under the latch, which is still held
-    /// and so the only change under way.
-    fn changed(&self, cache: &MetaCache, start: Lsn) {
-        if self
-            .dirt
-            .changed(&cache.dirty, start, self.id.pid().number())
-        {
+    /// Notes a change made under the latch, which is still held and so the only change under way.
+    fn changed(&self, cache: &MetaCache) {
+        if self.dirt.changed() {
             // Kept in the cache until it is written. The change's own holder has it pinned, so it
             // is not evicted meanwhile.
             self.pins.repin();
+            cache.dirty.push(self.id);
         }
     }
 
-    /// A write of the copy taken at `count`, stamped `lsn`, landed.
-    fn written(&self, cache: &MetaCache, count: u64, lsn: Lsn) {
-        if self.dirt.written(&cache.dirty, count) {
-            // Left clean, the page is what was written, unless a change has come since: one under
-            // way holds the latch, and one done counted itself.
-            debug_assert!(
-                self.read(|b| page::lsn(b)).is_none_or(|now| now == lsn)
-                    || self.dirt.count() != count & !DIRTY,
-                "{:?} left clean behind a change not on disk",
-                self.id
-            );
-            self.pins.unpin();
+    /// A write of the copy taken at `count` landed, or of the page as it stood at the cut for
+    /// `None`: a change came since then.
+    fn written(&self, cache: &MetaCache, count: Option<u64>) {
+        match count {
+            Some(count) if self.dirt.written(count) => self.pins.unpin(),
+            // A change since the copy: the next checkpoint writes the page again.
+            _ => cache.dirty.push(self.id),
         }
-    }
-
-    /// Applies a logged change during recovery unless the page already holds it: whether it was
-    /// applied, or `None` while a change holds the latch.
-    pub fn redo(
-        &self,
-        cache: &MetaCache,
-        start: Lsn,
-        lsn: Lsn,
-        f: impl FnOnce(&mut Writer<'_>),
-    ) -> Option<bool> {
-        let mut hold = self.try_lock()?;
-        let page = hold.page();
-        if page::lsn(page) >= lsn {
-            hold.release_unchanged();
-            return Some(false);
-        }
-        f(page);
-        page::set_lsn(page, lsn);
-        hold.commit(cache, start);
-        Some(true)
     }
 }
 
@@ -339,11 +356,19 @@ impl<'a> MetaHold<'a> {
         &mut self.page
     }
 
-    /// Releases the latch after a change whose record starts at `start`, noting the page dirty
-    /// first. Noted after the release, a later change could be noted before it and stand as the
-    /// page's oldest, and a checkpoint's redo point would pass this one unwritten.
-    pub fn commit(self, cache: &MetaCache, start: Lsn) {
-        self.frame.changed(cache, start);
+    /// Releases the latch after a change, noting the page dirty first.
+    pub fn commit(self, cache: &MetaCache) {
+        self.frame.changed(cache);
+    }
+
+    /// Runs `f` on the page as it stood at the cut in effect, kept when the hold was taken: what
+    /// that checkpoint writes of it. `None` with no cut in effect.
+    pub fn with_cut<R>(&mut self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        let n = self.frame.cutting.load(Ordering::Acquire);
+        if n == 0 || self.frame.cut_for.load(Ordering::Acquire) != n {
+            return None;
+        }
+        self.frame.cut.lock().as_mut().map(|bytes| f(bytes))
     }
 
     /// Releases the latch keeping the version, for a hold under which nothing was written.
@@ -373,17 +398,27 @@ pub struct MetaCache {
     /// Pages in the order they came in, for eviction: owned by the eviction under way, and only
     /// ever tried, so an eviction that finds another under way leaves the work to it.
     order: Mutex<VecDeque<MetaId>>,
-    /// Dirty pages, tagged with their ids, at where their oldest unwritten change's record
-    /// starts.
-    dirty: Floors,
+    /// Pages turned dirty, each once until a checkpoint takes it.
+    dirty: Stack<MetaId>,
     retiring: Retiring,
-    /// While recovering, a page with no whole copy reads as zeros; afterwards it is corruption,
-    /// unless it was never written at all.
-    recovering: AtomicBool,
+    /// The checkpoint in charge: a copy written by a later one is passed over.
+    in_charge: crate::sync::atomic::AtomicU64,
+    /// The checkpoint whose cut is in effect, 0 for none, shared with every frame.
+    cutting: Arc<crate::sync::atomic::AtomicU64>,
+    /// Pages a checkpoint cut short by a crash may have written, as recovery found them in the
+    /// log: their bytes past a copy in charge may be torn, which is no corruption.
+    torn_ok: AtomicBool,
 }
 
 impl MetaCache {
-    pub fn new(io: Arc<dyn IO>, base: &str, budget: usize, epochs: Arc<Epochs>) -> Self {
+    /// The cache of the metadata as checkpoint `in_charge` left it.
+    pub fn new(
+        io: Arc<dyn IO>,
+        base: &str,
+        budget: usize,
+        epochs: Arc<Epochs>,
+        in_charge: u64,
+    ) -> Self {
         Self {
             io,
             base: base.to_string(),
@@ -394,15 +429,18 @@ impl MetaCache {
             cells: Cells::new(epochs.clone()),
             arrivals: Stack::default(),
             order: Mutex::new(VecDeque::new()),
-            dirty: Floors::new(epochs.clone()),
+            dirty: Stack::default(),
             retiring: Retiring::new(epochs.clone()),
             epochs,
-            recovering: AtomicBool::new(false),
+            in_charge: crate::sync::atomic::AtomicU64::new(in_charge),
+            cutting: Arc::new(crate::sync::atomic::AtomicU64::new(0)),
+            torn_ok: AtomicBool::new(false),
         }
     }
 
-    pub fn set_recovering(&self, recovering: bool) {
-        self.recovering.store(recovering, Ordering::Release);
+    /// The checkpoint in charge.
+    pub fn in_charge(&self) -> u64 {
+        self.in_charge.load(Ordering::Acquire)
     }
 
     /// The hold a completion keeps on the cache, weak: the completion waits in the cache's own
@@ -438,7 +476,7 @@ impl MetaCache {
                 break frame;
             }
             drop(step);
-            let fresh = Pinned::new(MetaFrame::new(id));
+            let fresh = Pinned::new(MetaFrame::new(id, self.cutting.clone()));
             if cell.put(&fresh, &self.cells) {
                 self.arrivals.push(id);
                 self.load(&fresh)?;
@@ -462,13 +500,6 @@ impl MetaCache {
                 )))
             }
         }
-    }
-
-    /// The page `id`, if it is in memory, held.
-    fn cached(&self, id: MetaId) -> Option<MetaRef> {
-        let cell = self.files[id.file_index()].frames.get(id.index)?;
-        let step = self.epochs.enter();
-        cell.get(&step, &self.cells)
     }
 
     /// Every page in `ids`, once all are in memory.
@@ -505,7 +536,7 @@ impl MetaCache {
         frame.loaded.put(loaded.clone());
         let target = frame.clone();
         let me = self.held();
-        let recovering = self.recovering.load(Ordering::Acquire);
+        let (ceiling, torn_ok) = (self.in_charge(), self.torn_ok.load(Ordering::Acquire));
         let held = block.clone();
         let c = Completion::new_read(block.region(0, 2 * META_PAGE), move |res| {
             // Gone, the cache has no one left to wait on the page.
@@ -515,16 +546,18 @@ impl MetaCache {
                     // SAFETY: the read filled the block, which nothing else uses.
                     let both = unsafe { std::slice::from_raw_parts(held.as_ptr(), 2 * META_PAGE) };
                     let n = n.max(0) as usize;
-                    choose_copy(id, both, n, recovering)
+                    choose_copy(id, both, n, ceiling, torn_ok)
                 }
                 Err(e) => Err(e),
             };
-            // The page before its status: a page found ready reads whole.
+            // The page before its status: a page found ready reads whole. Loaded, not changed:
+            // no cut is kept of it.
             if let Ok((Some(bytes), _)) = &outcome {
-                let mut hold = target
-                    .try_lock()
-                    .expect("a page loading is latched by no one");
-                hold.page().write(0, bytes);
+                let hold =
+                    Held::try_take(&target.latch).expect("a page loading is latched by no one");
+                // SAFETY: the hold has the latch exclusively while the writer lives.
+                unsafe { target.bytes.writer() }.write(0, bytes);
+                drop(hold);
             }
             match outcome {
                 Ok((_, side)) => {
@@ -574,47 +607,68 @@ impl MetaCache {
         }
     }
 
-    /// Where the log record of the oldest change on a page not yet on disk starts.
-    pub fn oldest_unwritten(&self) -> Option<Lsn> {
-        self.dirty.least()
+    // ---------------------------------------------------------------- checkpoints
+
+    /// The cut of checkpoint `n`: from now until [`end_cut`](Self::end_cut), a page's first
+    /// change keeps the page as it stood, for `n` to write. Returns the pages dirty at the cut.
+    pub fn begin_cut(&self, n: u64) -> Vec<MetaId> {
+        assert!(
+            n > self.in_charge(),
+            "checkpoint {n} cut after {}",
+            self.in_charge()
+        );
+        self.cutting.store(n, Ordering::SeqCst);
+        let mut ids = self.dirty.take_all();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
-    /// Writes every page dirty before `before` and waits for it, waiting first for the log to be
-    /// durable up to each page's LSN.
-    pub fn write_dirty(self: &Arc<Self>, log: &Arc<Log>, before: Lsn) -> Result<IOResult<()>> {
-        let mut wait = None;
-        for number in self.dirty.tagged_below(before) {
-            // A dirty page is held in the cache until written; one gone was written meanwhile.
-            let Some(frame) = self.cached(MetaId::from_number(number)) else {
-                continue;
-            };
-            if let Some(c) = self.write(&frame, log)? {
-                wait.get_or_insert(c);
-            }
+    /// Checkpoint `n`'s edit of `frame`: `f` applied to the page as it stood at the cut, and to
+    /// the page as it stands too unless `cut_only`. `None` while a change holds the latch.
+    pub fn edit(
+        &self,
+        frame: &MetaFrame,
+        n: u64,
+        cut_only: bool,
+        f: impl Fn(&mut [u8]),
+    ) -> Option<()> {
+        debug_assert_eq!(self.cutting.load(Ordering::Acquire), n);
+        let hold = Held::try_take(&frame.latch)?;
+        if cut_only && frame.cut_for.load(Ordering::Acquire) != n {
+            *frame.cut.lock() = Some(frame.copy_bytes());
+            frame.cut_for.store(n, Ordering::Release);
         }
-        match wait {
-            Some(c) => Ok(IOResult::IO(IOCompletions(c))),
-            None => Ok(IOResult::Done(())),
+        if frame.cut_for.load(Ordering::Acquire) == n {
+            f(frame.cut.lock().as_mut().expect("a page kept at the cut"));
         }
+        if !cut_only {
+            let mut page = vec![0u8; META_PAGE];
+            frame.bytes.copy_to(0, &mut page);
+            f(&mut page);
+            // SAFETY: the hold has the latch exclusively while the writer lives.
+            unsafe { frame.bytes.writer() }.write(0, &page);
+        }
+        // The page as it stands differs from what `n` writes of it: written again by the next.
+        frame.changed(self);
+        drop(hold);
+        Some(())
     }
 
-    /// Starts writing `frame` if it is dirty; returns what to wait for, or `None` once it is
-    /// clean.
-    fn write(self: &Arc<Self>, frame: &MetaRef, log: &Arc<Log>) -> Result<Option<Completion>> {
-        // Copied without the latch. A change is counted before its latch is released, so the
-        // count read between the version and its check is the copy's: a change the copy misses
-        // is counted after it, and the page stays dirty.
-        let Some(version) = frame.latch.optimistic() else {
-            return Ok(Some(Completion::new_yield()));
-        };
-        let changes = frame.dirt.count();
-        let copy = Arc::new(AlignedBlock::zeroed(META_PAGE));
-        // SAFETY: a fresh block of the page's size, which nothing else reaches yet.
-        frame.bytes.copy_to(0, unsafe {
-            std::slice::from_raw_parts_mut(copy.as_ptr(), META_PAGE)
-        });
-        if !frame.latch.validate(version) {
-            return Ok(Some(Completion::new_yield()));
+    /// Marks `frame` owed a write: a checkpoint cut short may have written its other place, which
+    /// the next checkpoint, taking the same number, must write over (audit 18, review 2).
+    pub fn owe(&self, frame: &MetaFrame) -> Option<()> {
+        let hold = Held::try_take(&frame.latch)?;
+        frame.changed(self);
+        drop(hold);
+        Some(())
+    }
+
+    /// Starts writing `frame`, for checkpoint `n`, as it stood at the cut, to the place not
+    /// holding the copy in charge; returns what to wait for, or `None` once written or clean.
+    pub fn write_for(self: &Arc<Self>, frame: &MetaRef, n: u64) -> Result<Option<Completion>> {
+        if frame.written_for.load(Ordering::Acquire) == n {
+            return Ok(None);
         }
         {
             let step = self.epochs.enter();
@@ -622,20 +676,27 @@ impl MetaCache {
                 return Ok(Some(c));
             }
         }
-        if changes & DIRTY == 0 {
-            return Ok(None);
-        }
-        // SAFETY: the copy is ours alone.
-        let lsn = page::lsn(unsafe { std::slice::from_raw_parts(copy.as_ptr(), META_PAGE) });
-        if log.durable() < lsn {
-            return match log.wait_durable(lsn)? {
-                IOResult::Done(()) => self.write(frame, log),
-                IOResult::IO(IOCompletions(c)) => Ok(Some(c)),
+        // The page as it stood at the cut, or as it stands: no change came since the cut, and a
+        // change under way would keep it first. A change after the copy counts itself.
+        let copy = Arc::new(AlignedBlock::zeroed(META_PAGE));
+        // SAFETY: a fresh block of the page's size, which nothing else reaches yet.
+        let out = unsafe { std::slice::from_raw_parts_mut(copy.as_ptr(), META_PAGE) };
+        let count = if frame.cut_for.load(Ordering::Acquire) == n {
+            out.copy_from_slice(frame.cut.lock().as_ref().expect("a page kept at the cut"));
+            None
+        } else {
+            let Some(version) = frame.latch.optimistic() else {
+                return Ok(Some(Completion::new_yield()));
             };
-        }
+            let count = frame.dirt.count();
+            frame.bytes.copy_to(0, out);
+            if !frame.latch.validate(version) || frame.cut_for.load(Ordering::Acquire) == n {
+                return Ok(Some(Completion::new_yield()));
+            }
+            Some(count)
+        };
         let writing = Completion::new_wait();
         if !frame.writing.try_put(writing.clone()) {
-            // Another write of the page started meanwhile.
             let step = self.epochs.enter();
             return Ok(Some(
                 frame
@@ -644,15 +705,12 @@ impl MetaCache {
                     .unwrap_or_else(Completion::new_yield),
             ));
         }
-        // Read once the write before it ended, so it is the newest durable copy's place, which
-        // this write leaves alone.
         let side: u8 = match frame.durable_side.load(Ordering::Acquire) {
             0 => 0,
             d => 2 - d,
         };
-        // SAFETY: the copy is ours alone.
-        let sealed = unsafe { std::slice::from_raw_parts_mut(copy.as_ptr(), META_PAGE) };
-        page::seal(sealed, frame.id.pid());
+        page::set_seq(out, n);
+        page::seal(out, frame.id.pid());
         let file = match self.file(frame.id) {
             Ok(file) => file,
             Err(e) => {
@@ -673,8 +731,9 @@ impl MetaCache {
             // Gone, the cache has no one left to wait on the write.
             let Some(me) = me.upgrade() else { return };
             if res.is_ok() {
-                target.durable_side.store(side + 1, Ordering::Release);
-                target.written(&me, changes, lsn);
+                target.written_side.store(side + 1, Ordering::Release);
+                target.written_for.store(n, Ordering::Release);
+                target.written(&me, count);
             }
             if let Some(c) = target.writing.take(&me.retiring) {
                 match res {
@@ -693,8 +752,8 @@ impl MetaCache {
             let res = whole(META_PAGE, res);
             match res {
                 Ok(()) if !durable => {
-                    // Durable only once synced: until then the other place keeps the newest
-                    // durable copy, and the next write still goes here.
+                    // Durable only once synced: until then the copy in charge is the one that
+                    // counts.
                     let Some(sync_file) = sync_file.upgrade() else {
                         return finish(Err(CompletionError::Aborted));
                     };
@@ -721,38 +780,79 @@ impl MetaCache {
         }
         Ok(Some(writing))
     }
+
+    /// The checkpoint whose cut is in effect, 0 for none.
+    pub fn cutting(&self) -> u64 {
+        self.cutting.load(Ordering::Acquire)
+    }
+
+    /// Checkpoint `n` has written every page it writes: changes no longer keep a page first, and
+    /// what was kept goes.
+    pub fn end_cut(&self, n: u64, frames: &[MetaRef]) {
+        debug_assert_eq!(self.cutting.load(Ordering::Acquire), n);
+        self.cutting.store(0, Ordering::SeqCst);
+        for f in frames {
+            if f.cut_for.load(Ordering::Acquire) == n {
+                *f.cut.lock() = None;
+            }
+        }
+    }
+
+    /// Checkpoint `n` is in charge, its superblock durable: each page it wrote has its durable
+    /// copy where it wrote it.
+    pub fn checkpointed(&self, n: u64, frames: &[MetaRef]) {
+        for f in frames {
+            if f.written_for.load(Ordering::Acquire) == n {
+                f.durable_side
+                    .store(f.written_side.load(Ordering::Acquire), Ordering::Release);
+            }
+        }
+        self.in_charge.store(n, Ordering::Release);
+    }
+
+    /// While a recovery reads the pages a checkpoint cut short may have written: their other place
+    /// may hold a torn copy, which is no corruption.
+    pub fn set_torn_ok(&self, ok: bool) {
+        self.torn_ok.store(ok, Ordering::Release);
+    }
 }
 
-/// The newest whole copy among a page's two places, and which place it is in: `(None, None)` for
-/// a page never written.
+/// The newest whole copy among a page's two places not past checkpoint `ceiling`, and which place
+/// it is in: `(None, None)` for a page no checkpoint up to it wrote. A whole copy past the ceiling
+/// is a checkpoint's that a crash cut short, and counts as none. Bytes that hold no whole copy,
+/// beside no copy that counts, are corruption, unless `torn_ok`: such a checkpoint may have torn
+/// them.
 #[allow(clippy::type_complexity)]
 fn choose_copy(
     id: MetaId,
     both: &[u8],
     read: usize,
-    recovering: bool,
+    ceiling: u64,
+    torn_ok: bool,
 ) -> std::result::Result<(Option<Vec<u8>>, Option<u8>), CompletionError> {
     let pid = id.pid();
     let mut best: Option<(u64, u8)> = None;
+    let mut torn = false;
     for side in 0..2u8 {
         let at = side as usize * META_PAGE;
         if read < at + META_PAGE {
             continue;
         }
         let copy = &both[at..at + META_PAGE];
-        if page::verify(copy, pid) {
-            let lsn = page::lsn(copy);
-            if best.is_none_or(|(l, _)| lsn > l) {
-                best = Some((lsn, side));
-            }
+        if !page::verify(copy, pid) {
+            torn |= copy.iter().any(|&b| b != 0);
+            continue;
+        }
+        let n = page::seq(copy);
+        if n <= ceiling && best.is_none_or(|(b, _)| n > b) {
+            best = Some((n, side));
         }
     }
     if let Some((_, side)) = best {
         let at = side as usize * META_PAGE;
         return Ok((Some(both[at..at + META_PAGE].to_vec()), Some(side)));
     }
-    let written = both[..read.min(both.len())].iter().any(|&b| b != 0);
-    if written && !recovering {
+    if torn && !torn_ok {
         return Err(CompletionError::PageCodecError {
             page_idx: id.pid().raw() as usize,
         });
@@ -779,29 +879,27 @@ mod loom_tests {
     use super::*;
     use loom::thread;
 
-    /// A write of a dirty page lands as a change comes: the page ends dirty, with one floor
-    /// held, at the oldest change not on disk; and once written again, clean, with none.
+    /// A write of a dirty page lands as a change comes: the page ends dirty exactly when the change
+    /// came after the copy, and once written again, clean.
     #[test]
     fn a_change_as_a_write_lands_leaves_the_page_dirty_once() {
         let mut model = loom::model::Builder::new();
         model.preemption_bound = Some(3);
         model.check(|| {
-            let dirty = Arc::new(Floors::new(Arc::new(Epochs::new())));
             let dirt = Arc::new(Dirt::default());
-            assert!(dirt.changed(&dirty, 10, 1));
+            assert!(dirt.changed());
             let copied = dirt.count();
             let write = {
-                let (dirty, dirt) = (dirty.clone(), dirt.clone());
-                thread::spawn(move || dirt.written(&dirty, copied))
+                let dirt = dirt.clone();
+                thread::spawn(move || dirt.written(copied))
             };
-            let turned = dirt.changed(&dirty, 20, 1);
+            let turned = dirt.changed();
             let cleaned = write.join().unwrap();
             // Cleaned first, the change turned it dirty again; changed first, the write kept it.
             assert_eq!(turned, cleaned);
-            assert_eq!(dirty.least(), Some(if cleaned { 20 } else { 10 }));
-            assert_eq!(dirty.tagged_below(u64::MAX), vec![1]);
-            assert!(dirt.written(&dirty, dirt.count()));
-            assert_eq!(dirty.least(), None);
+            assert!(dirt.count() & DIRTY != 0);
+            assert!(dirt.written(dirt.count()));
+            assert!(dirt.count() & DIRTY == 0);
         });
     }
 }

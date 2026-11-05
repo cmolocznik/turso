@@ -40,7 +40,6 @@ fn open(slots: usize) -> Db {
         },
         buffer: BufferConfig {
             budget: MIN_BUDGET,
-            checkpoint_shards: 8,
             writeback_bytes: WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
@@ -48,7 +47,7 @@ fn open(slots: usize) -> Db {
     };
     let db = Atoll::open(io.clone(), "/db/gate", config).unwrap();
     let root = drive(&io, || {
-        Tree::create_versioned(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())
+        Tree::create_versioned(db.pool(), SizeClass::new(0).unwrap())
     })
     .unwrap();
     let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), slots);

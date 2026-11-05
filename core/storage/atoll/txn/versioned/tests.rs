@@ -45,7 +45,6 @@ fn open_with(slots: usize) -> Db {
         },
         buffer: BufferConfig {
             budget: MIN_BUDGET,
-            checkpoint_shards: 8,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
         },
         log_budget: Some(512 << 10),
@@ -55,7 +54,7 @@ fn open_with(slots: usize) -> Db {
     let mut root = None;
     drive(&io, || {
         root = Some(
-            match Tree::create_versioned(&io, db.pool(), db.store(), SizeClass::new(0).unwrap())? {
+            match Tree::create_versioned(db.pool(), SizeClass::new(0).unwrap())? {
                 IOResult::Done(r) => r,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             },
@@ -120,7 +119,7 @@ impl Db {
     }
 
     fn retired(&self, pid: PageId) -> bool {
-        run(&self.io, || self.db.store().retired(pid))
+        self.db.store().retired(pid)
     }
 
     /// Whether `pid` is free, or handed over to be freed.
@@ -223,6 +222,43 @@ fn a_snapshot_reads_the_versions_committed_before_it_through_the_chain() {
     assert_eq!(db.get(&mut old, "new"), None);
 }
 
+/// A checkpoint's image of a versioned leaf stands for the leaf only where every reader reads
+/// the two alike. A snapshot older than the checkpoint's, still reading the version below the
+/// leaf's, keeps the leaf owed: evicted, the leaf reads back as it was, never as the image, whose
+/// versions are all settled. Once that snapshot ends, the next checkpoint's image stands for it.
+#[test]
+fn a_leaf_an_older_snapshot_reads_below_is_taken_for_an_image_only_once_it_ends() {
+    let db = open();
+    let mut w = db.begin(Isolation::Snapshot);
+    assert_eq!(db.put(&mut w, "k", "v1", Mode::Insert), DONE_INSERTED);
+    db.commit(w);
+    let mut old = db.begin(Isolation::Snapshot);
+    assert_eq!(db.get(&mut old, "k").as_deref(), Some("v1"));
+    let mut w = db.begin(Isolation::Snapshot);
+    assert_eq!(db.put(&mut w, "k", "v2", Mode::Update), DONE_UPDATED);
+    db.commit(w);
+    let cp = db.db.checkpointer();
+    let ticket = cp.request_full();
+    drive(&db.io, || cp.step_full(ticket, db.txns(), &db.versions)).unwrap();
+    let pool = db.db.pool();
+    let mut sweep = pool.sweep();
+    drive(&db.io, || sweep.step(pool)).unwrap();
+    assert!(pool.evict_clean(db.tree.root()), "the leaf left its frame");
+    assert_eq!(
+        db.get(&mut old, "k").as_deref(),
+        Some("v1"),
+        "the older snapshot's version"
+    );
+    db.commit(old);
+    let ticket = cp.request_full();
+    drive(&db.io, || cp.step_full(ticket, db.txns(), &db.versions)).unwrap();
+    assert!(
+        db.db.store().swap_slot(db.tree.root()).is_none(),
+        "the leaf kept its swap copy"
+    );
+    assert!(pool.evict_clean(db.tree.root()), "the leaf settled, clean");
+}
+
 #[test]
 fn a_statement_reads_its_own_writes_as_soon_as_it_makes_them() {
     let db = open();
@@ -297,46 +333,6 @@ fn a_writer_waits_for_an_open_writer_and_conflicts_with_a_later_commit() {
     assert_eq!(db.get(&mut later, "k").as_deref(), Some("c"));
 }
 
-#[test]
-fn a_transactions_records_chain_and_carry_their_tree() {
-    let db = open();
-    let mut w = db.begin(Isolation::Snapshot);
-    let mut groups = Vec::new();
-    for key in ["a", "b", "c"] {
-        db.put(&mut w, key, "v", Mode::Insert);
-        groups.push(w.tail().unwrap());
-    }
-    db.txns().statement(&mut w).unwrap();
-    db.put(&mut w, "a", "w", Mode::Update);
-    groups.push(w.tail().unwrap());
-    let start = w.start();
-    db.commit(w);
-    let mut reader = crate::storage::atoll::log::Log::reader(
-        db.io.clone(),
-        BASE,
-        &LogConfig {
-            segment_bytes: 1 << 20,
-            buffer_bytes: 256 << 10,
-            chunk_bytes: 16 << 10,
-            writes_in_flight: 3,
-            direct: true,
-        },
-        0,
-    );
-    let mut chain = Vec::new();
-    while let Some(r) = reader.next_record().unwrap() {
-        if r.header.txn == start {
-            chain.push((r.header.prev, r.group));
-        }
-    }
-    let mut prev = None;
-    for (i, &(p, group)) in chain.iter().enumerate().take(4) {
-        assert_eq!((p, group), (prev, groups[i].get()), "record {i}");
-        prev = Some(groups[i]);
-    }
-    assert_eq!(chain.len(), 5, "four changes and the commit");
-}
-
 impl Db {
     fn rollback(&self, txn: Txn) {
         let mut op = crate::storage::atoll::txn::Abort::new(txn);
@@ -368,9 +364,8 @@ impl Db {
         });
     }
 
-    /// The kinds and statements of `start`'s records, in log order.
-    fn chain(&self, start: Ts) -> Vec<(Kind, Option<Statement>)> {
-        use crate::storage::atoll::btree::record::{Change, Record};
+    /// The kinds of `start`'s records, in log order.
+    fn records(&self, start: Ts) -> Vec<Kind> {
         drive(&self.io, || self.db.log().wait_durable(self.db.log().end())).unwrap();
         let mut reader = crate::storage::atoll::log::Log::reader(
             self.io.clone(),
@@ -386,17 +381,9 @@ impl Db {
         );
         let mut out = Vec::new();
         while let Some(r) = reader.next_record().unwrap() {
-            if r.header.txn != start {
-                continue;
+            if r.header.txn == start {
+                out.push(r.header.kind);
             }
-            let statement = match Record::decode(r.header.kind, &r.payload).unwrap() {
-                Some(Record {
-                    change: Change::Restore { of, .. } | Change::Unput { of, .. },
-                    ..
-                }) => Some(of.statement),
-                _ => None,
-            };
-            out.push((r.header.kind, statement));
         }
         out
     }
@@ -406,12 +393,7 @@ impl Db {
 /// index of each class.
 fn second_tree(db: &Db) -> VersionedTree {
     let root = run(&db.io, || {
-        Tree::create_versioned(
-            &db.io,
-            db.db.pool(),
-            db.db.store(),
-            SizeClass::new(1).unwrap(),
-        )
+        Tree::create_versioned(db.db.pool(), SizeClass::new(1).unwrap())
     });
     VersionedTree::open(
         db.io.clone(),
@@ -422,9 +404,7 @@ fn second_tree(db: &Db) -> VersionedTree {
 }
 
 #[test]
-fn a_rollback_puts_back_every_key_newest_statement_first_and_frees_its_slot() {
-    use crate::storage::atoll::btree::record::{RESTORE, UNPUT};
-    use crate::storage::atoll::txn::END;
+fn a_rollback_puts_back_every_key_logs_nothing_and_frees_its_slot() {
     let db = open();
     let other = second_tree(&db);
     let mut setup = db.begin(Isolation::Snapshot);
@@ -464,15 +444,12 @@ fn a_rollback_puts_back_every_key_newest_statement_first_and_frees_its_slot() {
     // Nothing of it left in a leaf: a key it inserted has no entry at all.
     assert_eq!(run(&db.io, || db.tree.tree().stored(b"x")), None);
     assert_eq!(run(&db.io, || other.tree().stored(b"p")), None);
-    // One compensation per key each statement changed, newest statement first across both
-    // trees, then End.
-    let chain = db.chain(start);
-    let compensations: Vec<Statement> = chain.iter().filter_map(|(_, s)| *s).collect();
-    assert_eq!(compensations, vec![3, 3, 2, 2, 2, 1, 1, 1, 1], "{chain:?}");
-    let unputs = chain.iter().filter(|(k, _)| *k == UNPUT).count();
-    let restores = chain.iter().filter(|(k, _)| *k == RESTORE).count();
-    assert_eq!((restores, unputs), (7, 2), "x and p had no entry before");
-    assert_eq!(chain.last().map(|(k, _)| *k), Some(END));
+    // The log holds nothing of a transaction before its commit, and a rollback adds nothing.
+    assert_eq!(
+        db.records(start),
+        Vec::new(),
+        "the rolled back transaction's records"
+    );
     // Its slot is free: all four can begin.
     let all: Vec<Txn> = (0..4).map(|_| db.begin(Isolation::Snapshot)).collect();
     for txn in all {
@@ -481,7 +458,7 @@ fn a_rollback_puts_back_every_key_newest_statement_first_and_frees_its_slot() {
 }
 
 #[test]
-fn a_statement_that_changed_a_key_again_and_again_is_put_back_once_to_what_it_found() {
+fn a_statement_that_changed_a_key_again_and_again_is_put_back_to_what_it_found() {
     let db = open();
     let mut setup = db.begin(Isolation::Snapshot);
     db.put(&mut setup, "k", "v0", Mode::Insert);
@@ -493,8 +470,11 @@ fn a_statement_that_changed_a_key_again_and_again_is_put_back_once_to_what_it_fo
     let start = t.start();
     db.rollback(t);
     assert_eq!(db.read_in(&db.tree, "k").as_deref(), Some("v0"));
-    let compensations: Vec<Statement> = db.chain(start).iter().filter_map(|(_, s)| *s).collect();
-    assert_eq!(compensations, vec![1]);
+    assert_eq!(
+        db.records(start),
+        Vec::new(),
+        "the rolled back transaction's records"
+    );
 }
 
 #[test]
@@ -1379,8 +1359,7 @@ fn a_write_names_the_leaf_it_reached_and_the_next_one_starts_there() {
 }
 
 #[test]
-fn deletes_and_changes_in_place_log_patches_and_keep_what_snapshots_read() {
-    use crate::storage::atoll::btree::record::{Change, Record, TXN_PATCH};
+fn deletes_and_changes_in_place_keep_what_snapshots_read() {
     let db = open();
     let mut setup = db.begin(Isolation::Snapshot);
     db.put(&mut setup, "d", "value-AAAA", Mode::Insert);
@@ -1400,49 +1379,6 @@ fn deletes_and_changes_in_place_log_patches_and_keep_what_snapshots_read() {
     let head = Version::decode(&stored.head).unwrap();
     assert!(head.deleted);
     assert_eq!(stored.value, StoredValue::Inline(b"value-AAAA".to_vec()));
-    // Both logged as patches: the delete with no bytes, the change with the two that differ.
-    let kinds: Vec<Kind> = db.chain(t.start()).into_iter().map(|(k, _)| k).collect();
-    assert_eq!(kinds, vec![TXN_PATCH, TXN_PATCH]);
-    drive(&db.io, || db.db.log().wait_durable(db.db.log().end())).unwrap();
-    let mut reader = crate::storage::atoll::log::Log::reader(
-        db.io.clone(),
-        BASE,
-        &LogConfig {
-            segment_bytes: 1 << 20,
-            buffer_bytes: 256 << 10,
-            chunk_bytes: 16 << 10,
-            writes_in_flight: 3,
-            direct: true,
-        },
-        0,
-    );
-    let mut patches = Vec::new();
-    while let Some(r) = reader.next_record().unwrap() {
-        if r.header.txn != t.start() {
-            continue;
-        }
-        if let Some(Record {
-            change:
-                Change::Patch {
-                    key,
-                    at,
-                    bytes,
-                    old_bytes,
-                    ..
-                },
-            ..
-        }) = Record::decode(r.header.kind, &r.payload).unwrap()
-        {
-            patches.push((key.to_vec(), at, bytes.to_vec(), old_bytes.to_vec()));
-        }
-    }
-    assert_eq!(
-        patches,
-        vec![
-            (b"d".to_vec(), 10, vec![], vec![]),
-            (b"u".to_vec(), 7, b"BB".to_vec(), b"AA".to_vec()),
-        ]
-    );
     // The snapshot from before reads what both replaced; the transaction reads its own.
     assert_eq!(db.get(&mut before, "d").as_deref(), Some("value-AAAA"));
     assert_eq!(db.get(&mut before, "u").as_deref(), Some("value-AAAA"));
@@ -1919,7 +1855,7 @@ fn a_step_takes_entries_copied_ahead_only_while_they_are_what_its_statement_read
     db.commit(setup);
     let mut t = db.begin(Isolation::Snapshot);
     let mut c = VersionedCursor::new();
-    let mut to = |t: &mut Txn, c: &mut VersionedCursor, at, forward| db.move_to(t, c, at, forward);
+    let to = |t: &mut Txn, c: &mut VersionedCursor, at, forward| db.move_to(t, c, at, forward);
     assert_eq!(
         to(&mut t, &mut c, Some(("", Seek::Ge)), true).as_deref(),
         Some("k00")

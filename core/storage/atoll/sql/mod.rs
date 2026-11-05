@@ -79,8 +79,9 @@ impl AtollDb {
         let atoll = Atoll::open(io.clone(), path, config)?;
         // Turso's SQL writes only under the write gate (DESIGN.md §17), its open's own included.
         atoll.transactions().require_gate();
+        let mut made = false;
         drive(&io, || {
-            ensure_system_trees(&io, atoll.pool(), atoll.store())
+            ensure_system_trees(atoll.pool(), atoll.store(), &mut made)
         })?;
         let versions = Versions::new(
             io.clone(),
@@ -88,6 +89,16 @@ impl AtollDb {
             atoll.store().clone(),
             slots,
         );
+        // System trees made, for a database made from nothing or one a crash left before its first
+        // checkpoint, are in a checkpoint before any write is admitted: replay finds every tree it
+        // writes (audit 18, review 9).
+        if made {
+            let checkpointer = atoll.checkpointer();
+            let ticket = checkpointer.request_full();
+            drive(&io, || {
+                checkpointer.step_full(ticket, atoll.transactions(), &versions)
+            })?;
+        }
         let catalog = Catalog::open(io.clone(), atoll.pool().clone(), atoll.store().clone());
         let header = Header::open(io.clone(), atoll.pool().clone(), atoll.store().clone());
         let dropped = VersionedTree::open(

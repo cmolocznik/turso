@@ -1,53 +1,24 @@
-//! Checkpoint passes over shards of frames (DESIGN.md §10; Haubenschild et al., SIGMOD 2020,
-//! §3.4).
+//! Writing back every dirty page at once, for tests: what eviction does to the pages it chooses,
+//! done to all of them, so a test can drive the writeback machinery where it wants it.
 //!
-//! The pool's frames are split into shards by position. Each shard has a position: every change
-//! to a page in its frames that is not yet in a written copy has its log record start at or after
-//! it. Recovery may start replaying at the lowest position of any shard.
-//!
-//! A pass over a shard records where the log ends, then makes sure that every change logged
-//! before that is in a written copy: a page clean when looked at is done; a dirty one is written,
-//! its copy taken under a latch taken after the end was recorded; one already being written, or
-//! written out of its frame, is looked at again once its write lands. A change's record is
-//! appended under the page's latch, so a change logged before the end is in the page by the time
-//! a later latch is granted. Once the pass is done, the shard's position is that end.
-//!
-//! A page never moves to another frame, and so never to another shard: memory moves between size
-//! classes only by evicting.
+//! A sweep looks at every frame: a page clean when looked at is done; a dirty one is written, its
+//! copy taken under a latch; one already being written, or written out of its frame, is looked at
+//! again once its write lands.
 
 use super::super::latch::Held;
-use super::super::log::Lsn;
 use super::frame::{OUTGOING, RESIDENT, WRITING};
 use super::BufferPool;
 use crate::io::Completion;
 use crate::storage::atoll::page::{PageId, SizeClass, CLASS_COUNT};
-use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::Result;
-use std::ops::Range;
-
-pub(super) struct Shard {
-    position: AtomicU64,
-}
-
-impl Shard {
-    pub(super) fn new(position: Lsn) -> Self {
-        Self {
-            position: AtomicU64::new(position),
-        }
-    }
-
-    pub(super) fn position(&self) -> Lsn {
-        self.position.load(Ordering::SeqCst)
-    }
-}
 
 /// What a look at a frame found.
 enum Look {
-    /// Every change logged before the pass began is in a written copy.
     Done,
-    /// Marked writing for this pass: a page of this class.
+    /// Marked writing for this sweep: a page of this class.
     Write(SizeClass),
     /// Being written by someone else, or written out: look again once the write lands.
     Writing,
@@ -55,37 +26,23 @@ enum Look {
     Busy,
 }
 
-/// A pass over one shard; see the module docs.
-pub struct Pass {
-    shard: usize,
-    /// Where the log ended when the pass began.
-    end: Lsn,
-    frames: Range<u32>,
+/// A sweep over every frame; see the module docs.
+pub struct Sweep {
     /// The next frame to look at for the first time.
     next: u32,
     /// Frames to look at again.
     again: Vec<u32>,
-    /// The writebacks this pass started.
+    /// The writebacks this sweep started.
     ours: Vec<Completion>,
 }
 
-impl Pass {
-    pub(super) fn new(pool: &BufferPool, shard: usize) -> Self {
-        let end = pool.store.log().end();
-        let frames = pool.shard_frames(shard);
+impl Sweep {
+    pub(super) fn new() -> Self {
         Self {
-            shard,
-            end,
-            next: frames.start,
-            frames,
+            next: 0,
             again: Vec::new(),
             ours: Vec::new(),
         }
-    }
-
-    /// Where the log ended when the pass began: the shard's position once it is done.
-    pub fn end(&self) -> Lsn {
-        self.end
     }
 
     pub fn step(&mut self, pool: &Arc<BufferPool>) -> Result<IOResult<()>> {
@@ -96,8 +53,8 @@ impl Pass {
         let mut start: [Vec<u32>; CLASS_COUNT] = Default::default();
         let mut writing = false;
         let again = std::mem::take(&mut self.again);
-        let first = self.next..self.frames.end;
-        self.next = self.frames.end;
+        let first = self.next..pool.memory.grains();
+        self.next = pool.memory.grains();
         for frame in again.into_iter().chain(first) {
             match look(pool, frame) {
                 Look::Done => {}
@@ -119,22 +76,13 @@ impl Pass {
         }
         self.ours.retain(|c| !c.finished());
         pool.failed()?;
-        // Not on our writebacks' own completions: a write that lands wakes the pool's waiters,
-        // and only the next step settles it.
         if !self.ours.is_empty() || writing {
             return Ok(IOResult::IO(IOCompletions(landed)));
         }
         if !self.again.is_empty() {
             return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
         }
-        self.finish(pool);
         Ok(IOResult::Done(()))
-    }
-
-    fn finish(&self, pool: &BufferPool) {
-        pool.shards[self.shard]
-            .position
-            .store(self.end, Ordering::SeqCst);
     }
 }
 
@@ -153,7 +101,7 @@ fn look(pool: &BufferPool, frame: u32) -> Look {
     if !h.latch.validate(version) {
         return Look::Busy;
     }
-    // A temporary page is written only when it is evicted, and holds back no redo point.
+    // A temporary page is written only when it is evicted.
     if status != RESIDENT || (!dirty && !writing) || temporary {
         return Look::Done;
     }

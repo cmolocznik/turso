@@ -14,6 +14,7 @@
 use super::catalog::{key, Entry, Layout, System};
 use super::AtollDb;
 use crate::storage::atoll::btree::{Cursor, Mode, Outcome, Put, Remove, Seek, StoredValue, Tree};
+use crate::storage::atoll::txn::changes::Changes;
 use crate::storage::atoll::txn::versioned::{Get, Write, WriteOp};
 use crate::storage::atoll::txn::{Isolation, Ts, Txn};
 use crate::types::IOResult;
@@ -72,6 +73,8 @@ pub struct Create {
     value: Value,
     row: Option<WriteOp>,
     put: Option<Put>,
+    /// The value row put, published as a change of its own.
+    publishing: Option<Changes>,
 }
 
 impl Create {
@@ -81,6 +84,7 @@ impl Create {
             value,
             row: None,
             put: None,
+            publishing: None,
         }
     }
 }
@@ -90,13 +94,26 @@ pub struct Change {
     key: [u8; 16],
     /// The put of the value computed, expecting the row it was computed from, and that value.
     put: Option<(Put, Value)>,
+    /// The value put, and its publication as a change of its own.
+    publishing: Option<(Changes, Value)>,
 }
 
 impl Change {
     /// A change of the value row keyed `key` ([`value_key`]).
     pub fn new(key: [u8; 16]) -> Self {
-        Self { key, put: None }
+        Self {
+            key,
+            put: None,
+            publishing: None,
+        }
     }
+}
+
+/// A value row put outside any transaction, as the change replay applies (audit 17).
+fn value_change(key: &[u8], value: Value) -> Changes {
+    let mut changes = Changes::new();
+    changes.plain_put(0, System::Sequences.root(), key, &value.encode());
+    changes
 }
 
 impl AtollDb {
@@ -128,20 +145,23 @@ impl AtollDb {
             }
             other => return Ok(IOResult::Done(other)),
         }
-        let put = op.put.get_or_insert_with(|| {
-            Put::new(
-                &value_key(op.id, txn.start()),
-                op.value.encode(),
-                Mode::Insert,
-            )
-        });
-        match done!(self.sequences().put(put)) {
-            Outcome::Inserted => Ok(IOResult::Done(Write::Done(Outcome::Inserted))),
-            other => Err(LimboError::InternalError(format!(
-                "putting sequence {}'s value came to {other:?}",
-                op.id
-            ))),
+        if op.publishing.is_none() {
+            let key = value_key(op.id, txn.start());
+            let put = op
+                .put
+                .get_or_insert_with(|| Put::new(&key, op.value.encode(), Mode::Insert));
+            match done!(self.sequences().put(put)) {
+                Outcome::Inserted => op.publishing = Some(value_change(&key, op.value)),
+                other => {
+                    return Err(LimboError::InternalError(format!(
+                        "putting sequence {}'s value came to {other:?}",
+                        op.id
+                    )))
+                }
+            }
         }
+        done!(txns.publish_alone(op.publishing.as_ref().expect("a value row put")));
+        Ok(IOResult::Done(Write::Done(Outcome::Inserted)))
     }
 
     /// Changes a sequence's value to what `next` computes from it, outside any transaction, by a
@@ -155,6 +175,12 @@ impl AtollDb {
     ) -> Result<IOResult<Value>> {
         let tree = self.sequences();
         loop {
+            if let Some((changes, new)) = &op.publishing {
+                done!(self.atoll.transactions().publish_alone(changes));
+                let new = *new;
+                op.publishing = None;
+                return Ok(IOResult::Done(new));
+            }
             if op.put.is_none() {
                 let stored = done!(tree.stored(&op.key)).ok_or_else(|| {
                     LimboError::InternalError("a sequence with no value row".into())
@@ -172,7 +198,7 @@ impl AtollDb {
             let new = *new;
             op.put = None;
             match outcome {
-                Outcome::Updated => return Ok(IOResult::Done(new)),
+                Outcome::Updated => op.publishing = Some((value_change(&op.key, new), new)),
                 // Changed since it was read: read it again.
                 Outcome::Changed => continue,
                 other => {

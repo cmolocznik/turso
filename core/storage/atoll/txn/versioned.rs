@@ -66,6 +66,16 @@ impl Version {
     /// The key was deleted: this version says it is absent.
     pub const DELETED: u8 = 1;
 
+    /// A version every snapshot sees: written by no transaction, before every one.
+    pub const SETTLED: Version = Version {
+        slot: 0,
+        ts: 0,
+        command: 0,
+        updates: 0,
+        flags: 0,
+        prev: None,
+    };
+
     pub fn encode(&self) -> [u8; HEADER] {
         let mut out = [0u8; HEADER];
         out[0..2].copy_from_slice(&self.slot.to_le_bytes());
@@ -818,6 +828,9 @@ impl VersionedTree {
             // replaces, and its version names that entry unless the key had none.
             let (found, prev) = match newest.filter(|v| own && v.command == txn.command) {
                 Some(v) => (Some(done!(versions.below(&v))), v.prev),
+                // A key with no entry before has no version below: nothing for the arena, and a
+                // rollback removes the key ([`super::rollback`]).
+                None if leaf_entry.is_none() => (None, None),
                 None => {
                     // Its kind, then the entry as the leaf stores it, copied from the look.
                     let kind = [entry_kind(leaf_entry)];
@@ -828,7 +841,7 @@ impl VersionedTree {
                         &op.key,
                         &[&kind, entry]
                     ));
-                    (None, leaf_entry.is_some().then_some(ptr))
+                    (None, Some(ptr))
                 }
             };
             let flags = match op.deletes {
@@ -876,11 +889,17 @@ impl VersionedTree {
         }
     }
 
-    /// A write's put done: its leaf and group noted, its buffers back in `op`, and what it came to.
+    /// A write's put done: its leaf and group noted, its change noted by key, its buffers back in
+    /// `op`, and what it came to.
     fn wrote(&self, txn: &mut Txn, op: &mut WriteOp, put: Put, present: bool) -> Outcome {
         op.near = put.reached();
         txn.logged(put.group().expect("a versioned tree's change is logged"));
         op.take_back(put);
+        let root = self.root();
+        txn.changed(|statement, changes| match op.deletes {
+            true => changes.delete(statement, root, &op.key),
+            false => changes.put(statement, root, &op.key, &op.entry[HEADER..]),
+        });
         if present {
             Outcome::Updated
         } else {
@@ -932,6 +951,8 @@ impl Versions {
     }
 }
 
+mod as_of;
+pub use as_of::{AsOf, Overflow};
 mod cursor;
 pub use cursor::VersionedCursor;
 

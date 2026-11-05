@@ -197,12 +197,35 @@ impl Tree {
         Self::create_in(io, pool, store, class, true)
     }
 
+    /// A new, empty tree at `root`, which must be free: replay's creation of a tree at the root
+    /// its change names (audit 17).
+    pub fn create_at(
+        io: &Arc<dyn IO>,
+        pool: &Arc<BufferPool>,
+        store: &Arc<PageStore>,
+        root: PageId,
+    ) -> Result<IOResult<PageId>> {
+        check_budget(store.log(), root.class(), Limits::of(root.class()))?;
+        Self::create_in_at(io, pool, store, root.class(), false, Some(root))
+    }
+
     fn create_in(
         io: &Arc<dyn IO>,
         pool: &Arc<BufferPool>,
         store: &Arc<PageStore>,
         class: SizeClass,
         temporary: bool,
+    ) -> Result<IOResult<PageId>> {
+        Self::create_in_at(io, pool, store, class, temporary, None)
+    }
+
+    fn create_in_at(
+        io: &Arc<dyn IO>,
+        pool: &Arc<BufferPool>,
+        store: &Arc<PageStore>,
+        class: SizeClass,
+        temporary: bool,
+        at: Option<PageId>,
     ) -> Result<IOResult<PageId>> {
         let adopt_len = PageStore::group_record_len(1);
         let init_len = framed_len(8 + 4 + class.size());
@@ -211,10 +234,10 @@ impl Tree {
         } else {
             Grant(Some(done!(store.log().admit(init_len + adopt_len))))
         };
-        let mut page = if temporary {
-            done!(pool.allocate_temporary(class))
-        } else {
-            done!(pool.allocate(class))
+        let mut page = match (temporary, at) {
+            (true, _) => done!(pool.allocate_temporary(class)),
+            (false, Some(root)) => done!(pool.allocate_at(root)),
+            (false, None) => done!(pool.allocate(class)),
         };
         let pid = page.pid();
         let image = empty_root(&mut page);
@@ -2267,6 +2290,12 @@ impl Put {
         self.near
     }
 
+    /// Its key, and its entry as built: the head, then the value inline, or only the head once
+    /// the value went out of line.
+    pub fn key_and_entry(&self) -> (&[u8], &[u8]) {
+        (&self.key, &self.entry)
+    }
+
     /// Its key, and its entry while whole: `None` once its value went out of line, taking the
     /// entry's bytes past its head.
     pub fn into_buffers(self) -> (Vec<u8>, Option<Vec<u8>>) {
@@ -2398,6 +2427,11 @@ pub struct Remove {
 }
 
 impl Remove {
+    /// The key it removes.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
     pub fn new(key: &[u8]) -> Self {
         Self {
             key: key.to_vec(),

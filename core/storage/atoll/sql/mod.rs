@@ -50,7 +50,7 @@ pub struct AtollDb {
     stamps: self::trees::TreeStamps,
     /// Trees handed over to drain, the one being drained, and whether a drainer is at work.
     draining: Mutex<Vec<PageId>>,
-    current: Mutex<Option<(PageId, Drain)>>,
+    current: Mutex<Option<(PageId, Drain, bool)>>,
     drainer: AtomicBool,
     /// The next tree id to draw, above every id the catalog held at open and every one drawn
     /// since. Not transactional: an id a rolled-back transaction drew is not drawn again while the

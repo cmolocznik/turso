@@ -760,9 +760,14 @@ fn a_transaction_past_65535_statements_rolls_back_to_one_commits_and_recovers() 
             db.put(&mut u, (i + 1) % 2, key, &value("lost again", i));
         }
         let start = u.start();
+        // An image with every change of the transaction durable and none of its compensations:
+        // its recovery logs them all, more than the log buffer holds.
+        db.durable();
+        let before = crash_io.crash(seed);
         db.rollback(u);
         db.durable();
         let mut images = crash_io.captured();
+        images.push(before);
         images.push(crash_io.crash(seed));
         let counts: Vec<usize> = images.iter().map(|i| compensations_in(i, start)).collect();
         let all = *counts.iter().max().unwrap();

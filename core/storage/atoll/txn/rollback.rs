@@ -1,28 +1,24 @@
-//! Rolling a running transaction back (DESIGN.md §11.5), from its version arena.
+//! Rolling a running transaction back (DESIGN.md §11.5; audit 17), from its own changes.
 //!
-//! A transaction's entries lie in its slot's arena between its first and its last
-//! ([`super::arena`]), in the order its writes made them, so walked back from the last they come
-//! newest statement first. Each names a key one of its statements changed and the entry that
-//! statement replaced, or that the key had none.
-//!
-//! An entry is appended before the leaf write it is for, which may never happen: a write that
-//! found another transaction's version open, or a conflict, stops between the two. So a key is put
-//! back only once the leaf, under its latch, holds this transaction's version from that statement,
-//! naming this entry as the version below it (none, for a key that had no entry). Then the entry
-//! it replaced goes back whole, version header and all, or the key is removed if it had none, in
-//! one compensation record that names the unit it completed: the transaction, the statement, the
-//! tree and the key. Statements a key had after this one were put back before it, newest first,
-//! so the leaf holds this statement's version again unless the write never happened.
+//! A transaction's changes ([`super::changes`]) name every key its statements wrote, in order,
+//! each by the statement that wrote it, so walked back from the last they come newest statement
+//! first. A key is put back only once the leaf, under its latch, holds this transaction's version
+//! from that statement: then the version that one replaced goes back whole, version header and
+//! all, from the arena entry its header names, or the key is removed if it names none, the key
+//! having had no entry. That is one compensation record naming the unit it completed: the
+//! transaction, the statement, the tree and the key. A statement writing a key again keeps the
+//! entry its first write made, which holds what it found, so the key is put back once, at its
+//! newest change, and its earlier changes find the leaf holding another version.
 //!
 //! Nothing is removed from the arena: a reader may be following one of its entries.
 //!
 //! The trees the transaction created are one more lane, by the statement that created each: a
-//! creation is undone after every entry of its statement and later, so after every change to its
+//! creation is undone after every change of its statement and later, so after every change to its
 //! tree. Undoing one puts the root on its plain list, keyed by its big-endian bytes, with the
 //! transaction's start as the value. The put is idempotent, and the list's entries are freed only
 //! once the transaction has ended (DESIGN.md §17).
 
-use super::arena::{Entry, Ptr};
+use super::changes::Change as Changed;
 use super::versioned::{decode_entry, Version, VersionedTree, Versions, HEADER};
 use super::{creation, Statement, Transactions, Ts, Txn, CREATE};
 use crate::io::IO;
@@ -69,9 +65,9 @@ enum Working {
 /// statement after `to` created put on its list. Step it with [`undo`].
 pub struct Rollback {
     to: Statement,
-    /// The arena entry walked back to, still to put back: `None` before the walk begins, then
-    /// `Some(None)` once no entry of a statement after `to` is left.
-    at: Option<Option<(Ptr, Entry)>>,
+    /// The changes of statements after `to` still to put back, oldest first, each by its
+    /// statement and where it starts in the transaction's changes: `None` before the walk begins.
+    left: Option<Vec<(Statement, usize)>>,
     working: Option<Working>,
 }
 
@@ -80,7 +76,7 @@ impl Rollback {
     pub fn after(to: Statement) -> Self {
         Self {
             to,
-            at: None,
+            left: None,
             working: None,
         }
     }
@@ -91,11 +87,6 @@ impl Rollback {
     }
 }
 
-/// The entry at `ptr` of `txn`'s, if it is one of a statement after `to`.
-fn kept(entry: Entry, ptr: Ptr, to: Statement) -> Option<(Ptr, Entry)> {
-    (entry.statement > to).then_some((ptr, entry))
-}
-
 /// Steps `op`, rolling `txn` back as far as `op` says. Done once every key is put back and every
 /// creation undone; the transaction's tail then runs through their compensation records.
 pub fn undo(
@@ -104,12 +95,8 @@ pub fn undo(
     txn: &mut Txn,
     op: &mut Rollback,
 ) -> Result<IOResult<()>> {
-    let arenas = versions.arenas();
-    if op.at.is_none() {
-        op.at = Some(match txn.replaced {
-            Some((_, last)) => kept(done!(arenas.read(last)), last, op.to),
-            None => None,
-        });
+    if op.left.is_none() {
+        op.left = Some(txn.changes.since(op.to));
     }
     loop {
         let step = match op.working.take() {
@@ -135,13 +122,10 @@ pub fn undo(
                 }
             }
             None => {
-                let newest = op
-                    .at
-                    .as_ref()
-                    .and_then(|at| at.as_ref().map(|(_, e)| e.statement));
+                let newest = op.left.as_ref().and_then(|l| l.last()).map(|&(s, _)| s);
                 let creation = txn.created.last().filter(|c| c.statement > op.to);
                 match (newest, creation) {
-                    // An entry of the creation's statement or later first: its tree's changes are
+                    // A change of the creation's statement or later first: its tree's changes are
                     // undone before the tree is.
                     (Some(statement), Some(c)) if statement >= c.statement => Step::Look,
                     (_, Some(c)) => {
@@ -153,43 +137,65 @@ pub fn undo(
                 }
             }
         };
-        let (ptr, entry) = op
-            .at
+        let &(statement, at) = op
+            .left
             .as_ref()
-            .and_then(|at| at.as_ref())
-            .expect("an entry being put back");
-        let (ptr, statement) = (*ptr, entry.statement);
-        let tree = versions.open_tree(entry.root);
+            .and_then(|l| l.last())
+            .expect("a change being put back");
+        let (root, key) = match txn.changes.at(at) {
+            Changed::Put {
+                tree,
+                plain: false,
+                plainly: false,
+                key,
+                ..
+            }
+            | Changed::Delete {
+                tree,
+                plain: false,
+                plainly: false,
+                key,
+            } => (tree, key.to_vec()),
+            // A plain tree's change, a write made plainly and a creation are a statement's only
+            // with its own tree, which the creation's lane abandons whole.
+            _ => {
+                op.left.as_mut().expect("a walk").pop();
+                continue;
+            }
+        };
+        let tree = versions.open_tree(root);
         let next = match step {
             Step::Look => {
                 op.working = Some(Working::Entry(Step::Look));
-                let replaced = decode_entry(&entry.replaced)?;
-                // What the version the write made names below it: this entry, or none for a key
-                // that had no entry.
-                let names = replaced.as_ref().map(|_| ptr);
-                let current = done!(tree.tree().stored(&entry.key));
-                let current = current.filter(|c| {
-                    Version::decode(&c.head).is_some_and(|v| {
-                        (v.slot, v.ts, v.command, v.prev) == (txn.slot, txn.start, statement, names)
-                    })
+                let current = done!(tree.tree().stored(&key));
+                let current = current.and_then(|c| {
+                    let v = Version::decode(&c.head)?;
+                    ((v.slot, v.ts, v.command) == (txn.slot, txn.start, statement))
+                        .then_some((c, v))
                 });
                 match current {
-                    // The write the entry was put for never happened, or was put back already.
+                    // Put back already, at a later change of the statement.
                     None => Step::Next,
-                    Some(current) => {
+                    Some((current, v)) => {
+                        let replaced = match v.prev {
+                            None => None,
+                            Some(ptr) => {
+                                decode_entry(&done!(versions.arenas().read(ptr)).replaced)?
+                            }
+                        };
                         let of = Compensation {
-                            root: entry.root,
+                            root,
                             statement,
                             undid: None,
                         };
                         match &replaced {
                             // A value out of line goes back by its reference, its pages kept.
                             Some(replaced) => Step::Put(
-                                Put::restoring(&entry.key, replaced, Mode::Update)
+                                Put::restoring(&key, replaced, Mode::Update)
                                     .expecting(Some(&current))
                                     .compensating(txns.tail(txn), of),
                             ),
-                            None => Step::Remove(Remove::new(&entry.key).compensating(
+                            None => Step::Remove(Remove::new(&key).compensating(
                                 txns.tail(txn),
                                 of,
                                 &current,
@@ -222,16 +228,7 @@ pub fn undo(
                 IOResult::Done(false) => Step::Look,
             },
             Step::Next => {
-                op.working = Some(Working::Entry(Step::Next));
-                let (first, _) = txn.replaced.expect("an entry walked back to");
-                let before = match ptr == first {
-                    true => None,
-                    false => done!(arenas.before(ptr)),
-                };
-                op.at = Some(match before {
-                    Some(before) => kept(done!(arenas.read(before)), before, op.to),
-                    None => None,
-                });
+                op.left.as_mut().expect("a walk").pop();
                 op.working = None;
                 continue;
             }

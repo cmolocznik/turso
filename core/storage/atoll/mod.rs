@@ -40,6 +40,7 @@ pub mod prefix;
 pub mod radix;
 mod recovery;
 pub mod redo;
+pub mod replay;
 pub mod segmented;
 pub mod shared;
 pub mod solo;

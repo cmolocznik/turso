@@ -17,6 +17,7 @@ use super::catalog::{Catalog, Entry, System};
 use super::AtollDb;
 use crate::storage::atoll::btree::{Cursor, Drain, Drained, Mode, Outcome, Seek, Tree};
 use crate::storage::atoll::page::{PageId, SizeClass};
+use crate::storage::atoll::txn::changes::Changes;
 use crate::storage::atoll::txn::versioned::{Get, Write, WriteOp};
 use crate::storage::atoll::txn::Txn;
 use crate::sync::atomic::Ordering;
@@ -164,15 +165,24 @@ impl AtollDb {
                 let Some(root) = self.draining.lock().pop() else {
                     return Ok(IOResult::Done(()));
                 };
-                *current = Some((root, Drain::new(&root.raw().to_be_bytes())));
+                *current = Some((root, Drain::new(&root.raw().to_be_bytes()), false));
             }
-            let (root, op) = current.as_mut().expect("a tree being drained");
+            let (root, op, gone) = current.as_mut().expect("a tree being drained");
             let root = *root;
-            if done!(self.open_plain(root).drain(&list, op)) == Drained::Gone {
-                *current = None;
-                self.rowids.forget(root);
-                self.stamps.forget(root);
+            if !*gone {
+                if done!(self.open_plain(root).drain(&list, op)) == Drained::More {
+                    continue;
+                }
+                *gone = true;
             }
+            // Gone: published as a change of its own before the root can be taken again
+            // (audit 17).
+            let mut drained = Changes::new();
+            drained.drained(root, System::Abandoned.root());
+            done!(self.atoll.transactions().publish_alone(&drained));
+            *current = None;
+            self.rowids.forget(root);
+            self.stamps.forget(root);
         }
     }
 
@@ -197,6 +207,11 @@ impl AtollDb {
                 let tree = self.open_plain(root);
                 let mut op = Drain::new(&key);
                 while super::drive(&self.io, || tree.drain(&list, &mut op))? == Drained::More {}
+                let mut drained = Changes::new();
+                drained.drained(root, system.root());
+                super::drive(&self.io, || {
+                    self.atoll.transactions().publish_alone(&drained)
+                })?;
                 self.rowids.forget(root);
             }
         }

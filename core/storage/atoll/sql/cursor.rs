@@ -948,8 +948,23 @@ impl AtollCursor {
         };
         match &self.writing {
             Some(Writing::Versioned(op, _)) => self.reached = op.reached(),
-            Some(Writing::PlainPut(put, _)) => self.reached = put.reached(),
-            _ => {}
+            Some(Writing::PlainPut(put, _)) => {
+                self.reached = put.reached();
+                // A plain write is its statement's change by key like any other: replay puts it
+                // in the tree as a committed version.
+                if matches!(write, Write::Done(Outcome::Inserted | Outcome::Updated)) {
+                    let root = self.tree.root();
+                    let (key, entry) = put.key_and_entry();
+                    txn.changed(|s, c| c.put_plainly(s, root, key, &entry[HEADER..]));
+                }
+            }
+            Some(Writing::PlainRemove(remove)) => {
+                if write == Write::Done(Outcome::Updated) {
+                    let root = self.tree.root();
+                    txn.changed(|s, c| c.delete_plainly(s, root, remove.key()));
+                }
+            }
+            None => {}
         }
         if let Write::Wait(_) = write {
             // Kept: stepped again once the writer has ended.

@@ -74,6 +74,16 @@ pub const END: Kind = Kind::new(19).unwrap();
 /// on, each 8 bytes little-endian. It leads the group that makes the root.
 pub const CREATE: Kind = Kind::new(25).unwrap();
 
+/// A part of a committing transaction's changes too long to ride in its Commit record (audit 17):
+/// the transaction's start and where the part begins in its changes, each 8 bytes little-endian,
+/// then the part. It names no transaction in its header, so it is in no transaction's chain:
+/// undo never reads it, and a transaction with no Commit after it is never replayed.
+pub const SPILL: Kind = Kind::new(28).unwrap();
+
+/// Changes made outside any transaction and published at once (audit 17), such as a sequence's
+/// value (DESIGN.md §17, R8): changes as a transaction's are written ([`changes`]).
+pub const RUN: Kind = Kind::new(29).unwrap();
+
 /// The root a creation record names, and the list its undo puts it on.
 pub fn creation(payload: &[u8]) -> Option<(PageId, PageId)> {
     let word = |at: usize| {
@@ -98,7 +108,32 @@ pub struct Created {
 
 /// The commit timestamp a Commit record's payload carries.
 pub fn commit_ts(payload: &[u8]) -> Option<Ts> {
-    payload.try_into().ok().map(u64::from_le_bytes)
+    payload
+        .get(..8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+}
+
+/// What a Commit record's payload carries past its timestamp (audit 17): the length of the
+/// transaction's changes, where the part this record holds begins, and that part, the rest having
+/// gone before in [`SPILL`] records.
+pub fn commit_changes(payload: &[u8]) -> Option<(u64, u64, &[u8])> {
+    let word = |at: usize| {
+        payload
+            .get(at..at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    };
+    let (total, from) = (word(8)?, word(16)?);
+    let part = &payload[24..];
+    (from.checked_add(part.len() as u64) == Some(total)).then_some((total, from, part))
+}
+
+/// Where the part of `len` bytes of changes that rides in the Commit record begins, the rest going
+/// before in parts of at most `part` bytes: the last part, never empty unless the changes are.
+fn commit_part_from(len: usize, part: usize) -> usize {
+    match len {
+        0 => 0,
+        _ => (len - 1) / part * part,
+    }
 }
 
 /// Drawn from by every commit and read by every begin, so on a line of its own.
@@ -311,6 +346,8 @@ pub struct Txn {
     /// Its first and last entries in its slot's version arena, once it has one: what a rollback
     /// walks back (DESIGN.md §11.5).
     replaced: Option<(arena::Ptr, arena::Ptr)>,
+    /// Its changes by key, which its commit publishes (audit 17).
+    changes: changes::Changes,
 }
 
 impl Txn {
@@ -370,6 +407,16 @@ impl Txn {
     /// The trees the transaction created and holds, oldest first.
     pub fn created(&self) -> &[Created] {
         &self.created
+    }
+
+    /// Its changes by key, as its commit publishes them.
+    pub fn changes(&self) -> &changes::Changes {
+        &self.changes
+    }
+
+    /// Notes a change its current statement made, by key.
+    pub fn changed(&mut self, note: impl FnOnce(Statement, &mut changes::Changes)) {
+        note(self.command, &mut self.changes);
     }
 
     /// The trees whose creation was undone so far.
@@ -433,6 +480,8 @@ impl Abort {
 pub struct Commit {
     txn: Option<Txn>,
     admitted: Option<Admitted>,
+    /// How much of the transaction's changes has gone to the log ahead of its Commit.
+    spilled: usize,
     ts: Option<Ts>,
     durable: Lsn,
     abandoned: Vec<PageId>,
@@ -444,6 +493,7 @@ impl Commit {
         Self {
             txn: Some(txn),
             admitted: None,
+            spilled: 0,
             ts: None,
             durable: 0,
             abandoned: Vec::new(),
@@ -638,6 +688,7 @@ impl Transactions {
             snapped: false,
             gated: self.gated.load(std::sync::atomic::Ordering::Acquire),
             replaced: None,
+            changes: changes::Changes::new(),
         }))
     }
 
@@ -785,12 +836,31 @@ impl Transactions {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
         txn.logged(start);
+        txn.changes.create(txn.command, root, list);
         txn.created.push(Created {
             statement: txn.command,
             root,
             list,
         });
         Ok(IOResult::Done(root))
+    }
+
+    /// Publishes `changes`, made outside any transaction, in one [`RUN`] record (audit 17). Done
+    /// once it is appended; durable with the log. Step it until done.
+    pub fn publish_alone(&self, changes: &changes::Changes) -> Result<IOResult<()>> {
+        let bytes = changes.bytes();
+        let mut admitted = match self.log.admit(framed_len(bytes.len()))? {
+            IOResult::Done(a) => a,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        let header = Header {
+            kind: RUN,
+            flags: 0,
+            txn: 0,
+            prev: None,
+        };
+        self.log.append(&mut admitted, &header, &[bytes]);
+        Ok(IOResult::Done(()))
     }
 
     /// Starts `txn`'s next statement. It sees what the transaction's earlier statements wrote, and
@@ -831,11 +901,42 @@ impl Transactions {
     /// for a transaction that wrote nothing.
     pub fn commit(&self, op: &mut Commit) -> Result<IOResult<Option<Ts>>> {
         if let Some(txn) = &op.txn {
-            if txn.wrote() && op.admitted.is_none() {
-                op.admitted = Some(match self.log.admit(framed_len(8))? {
-                    IOResult::Done(a) => a,
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                });
+            if txn.wrote() {
+                // The changes go out in parts no longer than a chunk, the largest single write,
+                // the last in the Commit record.
+                let bytes = txn.changes.bytes();
+                let part = self.log.chunk_bytes() as usize;
+                let from = commit_part_from(bytes.len(), part);
+                while op.spilled < from {
+                    let n = part.min(from - op.spilled);
+                    let mut admitted = match self.log.admit(framed_len(16 + n))? {
+                        IOResult::Done(a) => a,
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    };
+                    let header = Header {
+                        kind: SPILL,
+                        flags: 0,
+                        txn: 0,
+                        prev: None,
+                    };
+                    self.log.append(
+                        &mut admitted,
+                        &header,
+                        &[
+                            &txn.start.to_le_bytes(),
+                            &(op.spilled as u64).to_le_bytes(),
+                            &bytes[op.spilled..op.spilled + n],
+                        ],
+                    );
+                    op.spilled += n;
+                }
+                if op.admitted.is_none() {
+                    op.admitted =
+                        Some(match self.log.admit(framed_len(24 + bytes.len() - from))? {
+                            IOResult::Done(a) => a,
+                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        });
+                }
             }
             let mut txn = op.txn.take().expect("a transaction");
             op.abandoned = std::mem::take(&mut txn.abandoned);
@@ -852,10 +953,17 @@ impl Transactions {
                     // Leaves the registry as its room is reserved: a checkpoint whose redo point
                     // passes the Commit never lists it as needing undo.
                     let (writers, slot, id) = (&self.writers, txn.slot, txn.start);
+                    let bytes = txn.changes.bytes();
+                    let from = op.spilled;
                     let (_, lsn) = self.log.append_with(
                         &mut admitted,
                         &txn.header(COMMIT),
-                        &[&ts.to_le_bytes()],
+                        &[
+                            &ts.to_le_bytes(),
+                            &(bytes.len() as u64).to_le_bytes(),
+                            &(from as u64).to_le_bytes(),
+                            &bytes[from..],
+                        ],
                         |_| writers.finished(slot, id),
                     );
                     self.slots[txn.slot as usize].push(txn.start, ts);
@@ -946,6 +1054,7 @@ impl Transactions {
         if let IOResult::IO(io) = rollback::undo(self, versions, txn, op)? {
             return Ok(IOResult::IO(io));
         }
+        txn.changes.back_to(op.to());
         // Its keys are put back with the transaction still running: whoever waited on it judges
         // them again.
         self.ends[txn.slot as usize].wake();
@@ -999,6 +1108,7 @@ impl Transactions {
 }
 
 pub mod arena;
+pub mod changes;
 pub mod rollback;
 pub mod versioned;
 

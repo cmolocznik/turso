@@ -814,8 +814,8 @@ fn a_probes_tombstone_answers_absent_only_where_the_statement_sees_it() {
 }
 
 /// Inserts through a cursor build each row in buffers the cursor hands round, from its write to
-/// the row it shows and back: past its first rows, an insert that splits no node allocates
-/// nothing.
+/// the row it shows and back: past its first rows, an insert that splits no node allocates only
+/// when its transaction's own log grows, which doubles.
 #[test]
 fn an_insert_that_splits_nothing_allocates_nothing() {
     use crate::storage::atoll::btree::SPLITS;
@@ -831,12 +831,15 @@ fn an_insert_that_splits_nothing_allocates_nothing() {
     for r in 0..10 {
         written(&mut c, &db.io, &table_key(r, &records[r as usize]));
     }
-    let (mut plain, mut allocating) = (0, Vec::new());
+    let room = || cell.lock().as_ref().unwrap().changes().capacity();
+    let (mut plain, mut allocating, mut grew) = (0, Vec::new(), 0);
     for r in 10..rows {
-        let (splits, before) = (SPLITS.with(|n| n.get()), allocations());
+        let (splits, before, had) = (SPLITS.with(|n| n.get()), allocations(), room());
         written(&mut c, &db.io, &table_key(r, &records[r as usize]));
         let made = allocations() - before;
-        if SPLITS.with(|n| n.get()) == splits {
+        let growing = room() > had;
+        grew += growing as usize;
+        if SPLITS.with(|n| n.get()) == splits && !growing {
             plain += 1;
             if made > 0 {
                 allocating.push((r, made));
@@ -844,6 +847,7 @@ fn an_insert_that_splits_nothing_allocates_nothing() {
         }
     }
     assert!(plain > rows / 2, "{plain} inserts split nothing");
+    assert!(grew > 0, "the transaction's log never grew");
     assert!(
         allocating.is_empty(),
         "inserts that split nothing and allocated: {allocating:?}"

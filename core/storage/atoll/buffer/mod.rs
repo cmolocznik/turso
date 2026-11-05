@@ -813,6 +813,28 @@ impl BufferPool {
         Ok(IOResult::Done(self.install(frame, pid, step)))
     }
 
+    /// Page `pid`, which must be free, taken and fixed exclusively as a new page
+    /// ([`PageStore::allocate_at`]).
+    pub fn allocate_at(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Exclusive<'_>>> {
+        let step = self.store.epochs().enter();
+        let frame = match self.claim(pid.class(), Purpose::New)? {
+            IOResult::Done(f) => f,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        match self.store.allocate_at(pid) {
+            Ok(IOResult::Done(())) => {}
+            Ok(IOResult::IO(io)) => {
+                self.free_frame(pid.class(), frame, self.take_free_latch(frame));
+                return Ok(IOResult::IO(io));
+            }
+            Err(e) => {
+                self.free_frame(pid.class(), frame, self.take_free_latch(frame));
+                return Err(e);
+            }
+        }
+        Ok(IOResult::Done(self.install(frame, pid, step)))
+    }
+
     /// A new temporary page of `class` (DESIGN.md §6.4), all zeros, fixed exclusively. Its
     /// changes are never logged: stamp them with [`temporary_lsn`](Self::temporary_lsn).
     pub fn allocate_temporary(

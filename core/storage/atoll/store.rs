@@ -360,6 +360,9 @@ pub struct PageStore {
     freed_numbers: Retired<PageId>,
     /// The same numbers, by class, which no allocation may take.
     unreusable: [GrowBits; CLASS_COUNT],
+    /// Numbers kept for replay's tree creations, by class: no allocation takes one, and only
+    /// [`allocate_at`](Self::allocate_at) does (audit 17).
+    reserved: [GrowBits; CLASS_COUNT],
 }
 
 /// A slot freed, on its way to the eraser.
@@ -462,6 +465,7 @@ impl PageStore {
             epochs,
             freed_numbers: Retired::default(),
             unreusable: Default::default(),
+            reserved: Default::default(),
         })
     }
 
@@ -755,6 +759,78 @@ impl PageStore {
             locked.commit(&self.meta, start, lsn);
             self.made_provisional(pid, start);
             return Ok(IOResult::Done(pid));
+        }
+    }
+
+    /// Keeps the numbers of `pids` from every allocation but [`allocate_at`](Self::allocate_at):
+    /// the roots replay will make trees at, so that no node replay splits off takes one first
+    /// (audit 17). [`release_reserved`](Self::release_reserved) gives them back.
+    pub fn reserve(&self, pids: impl IntoIterator<Item = PageId>) {
+        for pid in pids {
+            self.reserved[pid.class().index()].set(pid.number());
+        }
+    }
+
+    /// Gives back every number [`reserve`](Self::reserve) kept.
+    pub fn release_reserved(&self) {
+        for bits in &self.reserved {
+            for n in bits.ones() {
+                bits.clear(n);
+            }
+        }
+    }
+
+    /// Takes page `pid`, which must be free, as [`allocate`](Self::allocate) takes the lowest free
+    /// number: replay's creation of a tree at the root its change names (audit 17). The page
+    /// table grows to reach the number if it must. Step it until done.
+    pub fn allocate_at(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
+        assert!(!pid.is_temporary(), "{pid:?} taken from the page table");
+        for p in self.freed_numbers.reclaim(&self.epochs) {
+            self.unreusable[p.class().index()].clear(p.number());
+        }
+        let class = pid.class();
+        let number = pid.number();
+        let record_len = StoreRecord::New { pid }.framed_len();
+        let mut admitted = match self.log().admit(record_len)? {
+            IOResult::Done(a) => a,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        loop {
+            let height = self.height(Tree::Map, class);
+            if number >= radix::capacity(Tree::Map, height) {
+                match self.grow(Tree::Map, class)? {
+                    IOResult::Done(()) => continue,
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                }
+            }
+            let ids = radix::path(Tree::Map, class, height, number);
+            let frames = match self.meta.get_all(&ids)? {
+                IOResult::Done(f) => f,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            let Some(mut locked) = Locked::new(&frames) else {
+                return Ok(busy());
+            };
+            if self.height(Tree::Map, class) != height {
+                continue;
+            }
+            if radix::map_entry(locked.page_of(ids[0]), number) != FREE
+                || self.unreusable[class.index()].get(number)
+            {
+                return Err(LimboError::InternalError(format!(
+                    "{pid:?} is taken, so no tree can be made there"
+                )));
+            }
+            let heights = [
+                height,
+                self.height(Tree::Space, class),
+                self.height(Tree::Retired, class),
+            ];
+            let (start, lsn) = self.append(&mut admitted, &StoreRecord::New { pid }, heights);
+            set_map(&mut locked, Tree::Map, number, FREE, ALLOCATED);
+            locked.commit(&self.meta, start, lsn);
+            self.made_provisional(pid, start);
+            return Ok(IOResult::Done(()));
         }
     }
 
@@ -1133,7 +1209,10 @@ impl PageStore {
                             at = u + 1;
                             continue;
                         }
-                        if tree == Tree::Map && self.unreusable[class.index()].get(u) {
+                        if tree == Tree::Map
+                            && (self.unreusable[class.index()].get(u)
+                                || self.reserved[class.index()].get(u))
+                        {
                             at = u + 1;
                             continue;
                         }

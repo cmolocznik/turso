@@ -115,6 +115,12 @@ pub struct Entry {
     pub replaced: Vec<u8>,
 }
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Entries appended on this thread, for tests to count what a write appends.
+    pub(crate) static APPENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Every slot's arena.
 pub struct Arenas {
     pool: Arc<BufferPool>,
@@ -188,6 +194,8 @@ impl Arenas {
             key.len(),
         );
         let cell = &self.pages[txn.slot as usize];
+        #[cfg(test)]
+        APPENDS.with(|n| n.set(n.get() + 1));
         loop {
             // Relaxed: the slot's transaction's own word.
             let current = cell

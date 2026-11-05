@@ -1503,6 +1503,9 @@ impl Connection {
                     Ok(inner) => *state = ReparseSchemaState::Building(Box::new(inner)),
                     Err(e) => {
                         let _ = atoll.unpin();
+                        if !atoll.is_open() {
+                            self.set_tx_state(TransactionState::None);
+                        }
                         return Err(e.into());
                     }
                 }
@@ -1510,6 +1513,10 @@ impl Connection {
             let out = self.drive_reparse_building(state);
             if !matches!(out, Ok(IOResult::IO(_))) {
                 let unpinned = atoll.unpin();
+                // The transaction it began and ended, which its statements read in.
+                if !atoll.is_open() {
+                    self.set_tx_state(TransactionState::None);
+                }
                 if out.is_ok() {
                     unpinned?;
                 }

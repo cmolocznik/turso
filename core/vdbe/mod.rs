@@ -1283,6 +1283,9 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// In Atoll mode, the statement number a failure of this statement rolls back to (R18).
     pub(crate) atoll_statement: Option<crate::storage::atoll::txn::Statement>,
+    /// Whether this statement's Transaction opcode left a take of Atoll's write gate waiting,
+    /// which it gives up if it stops waiting (R15).
+    pub(crate) atoll_taking: bool,
     /// In Atoll mode, a CreateBtree under way (DESIGN.md §17).
     pub(crate) atoll_create: Option<crate::storage::atoll::sql::mode::CreateOp>,
     /// In Atoll mode, a Destroy or ClearBtree under way (DESIGN.md §17).
@@ -1410,6 +1413,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             atoll_statement: None,
+            atoll_taking: false,
             atoll_create: None,
             atoll_retire: None,
             is_active_write: false,
@@ -1595,6 +1599,7 @@ impl ProgramState {
         }
         self.uses_subjournal = false;
         self.atoll_statement = None;
+        self.atoll_taking = false;
         self.atoll_create = None;
         self.atoll_retire = None;
         self.is_active_write = false;
@@ -2311,6 +2316,10 @@ pub struct PreparedProgram {
     /// Whether the statement writes the main database's schema: in Atoll mode it then takes the
     /// write gate exclusive (DESIGN.md §17, R23).
     pub writes_schema: bool,
+    /// The trees of the main database a schema writer reads rows of, sqlite_schema aside: in a
+    /// transaction with a snapshot, a commit that raised one's stamp past it fails its take of the
+    /// gate with BusySnapshot (DESIGN.md §17, §3, defect 4).
+    pub schema_reads: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -3337,12 +3346,18 @@ impl Program {
         return_if_io!(self.end_attached_write_txns(connection, rollback, false));
         self.end_attached_read_txns(connection);
         program_state.commit_state = CommitState::Ready;
+        let atoll = connection.atoll().expect("Atoll mode");
+        // A halt that ended nothing, the transaction held by a schema reparse, leaves it open for
+        // the statements reading in it: the connection's state says so.
+        if atoll.is_open() {
+            connection.set_tx_state(TransactionState::Read);
+            return Ok(IOResult::Done(()));
+        }
         connection.set_tx_state(TransactionState::None);
         // A writer ends the shared autocommit transaction at its own halt, as SQLite's does,
         // while sibling statements still read (DESIGN.md §17, §3): they go on in a read
         // transaction begun now, which sees what the writer left and ends with the last of them.
         if connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
-            let atoll = connection.atoll().expect("Atoll mode");
             let io = connection.db.io.clone();
             crate::storage::atoll::drive(&io, || {
                 atoll.begin(crate::storage::atoll::sql::mode::Begin::Read)
@@ -3988,6 +4003,13 @@ impl Program {
                         }
                     }
                 }
+            }
+        }
+        // A statement that stops waiting for Atoll's write gate gives up the take it left pending
+        // (R15), so its connection's next statement never runs behind it.
+        if std::mem::take(&mut state.atoll_taking) {
+            if let Some(atoll) = self.connection.atoll() {
+                atoll.give_up();
             }
         }
         // Errors from nested statements are handled by the parent statement.

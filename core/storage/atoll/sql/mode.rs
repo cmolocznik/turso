@@ -33,7 +33,7 @@ use crate::storage::atoll::db::AtollConfig;
 use crate::storage::atoll::drive;
 use crate::storage::atoll::page::PageId;
 use crate::storage::atoll::txn::versioned::{Get, Write, WriteOp};
-use crate::storage::atoll::txn::{Abort, Blocker, Commit, Isolation, Statement, Taken, Txn};
+use crate::storage::atoll::txn::{Abort, Blocker, Commit, Hold, Isolation, Statement, Taken, Txn};
 use crate::storage::btree::{BTreeKey, CursorTrait};
 use crate::storage::database::DatabaseStorage;
 use crate::storage::database::IOContext;
@@ -46,6 +46,7 @@ use crate::types::{
 };
 use crate::vdbe::Register;
 use crate::{Buffer, CompletionError, LimboError, Result, Value};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 
 macro_rules! done {
@@ -308,6 +309,9 @@ pub struct ConnTxn {
     pin_began: AtomicBool,
     /// What its statements changed in each tree, which a cursor positioned before reads again.
     changes: Arc<TreeChanges>,
+    /// The stamps of the trees the open transaction wrote, raised to its commit timestamp once it
+    /// is published (DESIGN.md §17, §3, defect 4).
+    stamped: Arc<Mutex<HashMap<PageId, super::trees::Stamp>>>,
 }
 
 /// Slots the trees a connection changes fall into: a cursor whose tree shares a slot with
@@ -423,6 +427,7 @@ impl ConnTxn {
             pinned: AtomicBool::new(false),
             pin_began: AtomicBool::new(false),
             changes: Arc::new(TreeChanges::new()),
+            stamped: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -527,6 +532,15 @@ impl ConnTxn {
     /// §6). Behind another's take it comes back with the completion to wait on; stepping it again
     /// goes on. A take the gate lost to a victim's clearing is `Busy`.
     pub fn begin(&self, wants: Begin) -> Result<IOResult<()>> {
+        self.begin_reading(wants, &[])
+    }
+
+    /// [`begin`](Self::begin) for a schema writer that reads rows of the trees `reads` names: in a
+    /// transaction that already has a snapshot, a commit that raised one's stamp past it fails the
+    /// take with `BusySnapshot`, checked before it marks itself pending and again once it holds
+    /// the gate (DESIGN.md §17, §3, defect 4). Its build or rewrite would read the tree at that
+    /// snapshot and miss the rows committed since, as no write conflict tells.
+    pub fn begin_reading(&self, wants: Begin, reads: &[u64]) -> Result<IOResult<()>> {
         let txns = self.db.atoll().transactions();
         if let Begin::Write { .. } = wants {
             // A writing statement nudges the checkpointer first, holding no latch: commits are
@@ -549,6 +563,13 @@ impl ConnTxn {
         }
         let txn = guard.as_mut().expect("a transaction");
         if let Begin::Write { schema } = wants {
+            let checks = schema && !reads.is_empty() && txn.snapped();
+            if checks
+                && !matches!(txn.hold(), Hold::Pending { .. } | Hold::Exclusive { .. })
+                && self.read_since_snapshot(txn, reads)?
+            {
+                return Err(LimboError::BusySnapshot);
+            }
             let mut taking = self.taking.lock();
             let c = match taking.take() {
                 Some(c) if !c.finished() => c,
@@ -568,7 +589,12 @@ impl ConnTxn {
                 }
             };
             match taken {
-                Taken::Done => {}
+                Taken::Done => {
+                    if checks && self.read_since_snapshot(txn, reads)? {
+                        txns.hand_back_exclusive(txn);
+                        return Err(LimboError::BusySnapshot);
+                    }
+                }
                 Taken::Lost => {
                     drop(taking);
                     self.end_if_fresh(&mut guard);
@@ -586,6 +612,23 @@ impl ConnTxn {
             txns.take_snapshot(txn);
         }
         Ok(IOResult::Done(()))
+    }
+
+    /// Whether a commit raised the stamp of a tree `reads` names past `txn`'s snapshot: the tree
+    /// as the catalog names it at the transaction's view, one created since unnamed and skipped.
+    fn read_since_snapshot(&self, txn: &mut Txn, reads: &[u64]) -> Result<bool> {
+        let db = &self.db;
+        for id in reads {
+            let mut get = Get::new(&catalog::key(*id));
+            let entry = drive(db.io(), || {
+                db.catalog()
+                    .get(db.atoll().transactions(), db.versions(), txn, &mut get)
+            })?;
+            if entry.is_some_and(|e| db.stamps().written_since(e.root, txn.snapshot())) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Ends a transaction a failed begin left with nothing done: no snapshot, or no write.
@@ -649,10 +692,13 @@ impl ConnTxn {
         let txn = self.cell.lock().take()?;
         self.changes.destroyed.lock().clear();
         let written = std::mem::take(&mut *self.written.lock());
+        let stamped: Vec<_> = std::mem::take(&mut *self.stamped.lock())
+            .into_values()
+            .collect();
         *self.setting.lock() = None;
         *self.taking.lock() = None;
         Some(if commit {
-            Ending::commit(self.db.clone(), txn, written)
+            Ending::commit(self.db.clone(), txn, written, stamped)
         } else {
             self.changes.rolled_back();
             Ending::rollback(self.db.clone(), txn)
@@ -933,12 +979,20 @@ enum Step {
 }
 
 impl Ending {
-    fn commit(db: Arc<AtollDb>, txn: Txn, written: Vec<(Statement, Field, u32)>) -> Self {
+    /// Commits `txn`: once it is published, its header fields `written` and the stamps of the
+    /// trees it wrote are raised to its commit timestamp, before it releases the write gate.
+    fn commit(
+        db: Arc<AtollDb>,
+        txn: Txn,
+        written: Vec<(Statement, Field, u32)>,
+        stamped: Vec<super::trees::Stamp>,
+    ) -> Self {
         let published = db.clone();
         let commit = Commit::new(txn).on_published(move |ts| {
             for (_, field, value) in written {
                 published.header().publish(field, ts, value);
             }
+            super::trees::TreeStamps::raise(&stamped, ts);
         });
         Self {
             db,
@@ -1057,6 +1111,8 @@ pub struct SqlCursor {
     rebinding: Option<Option<Vec<u8>>>,
     /// Opened on a tree its statement had destroyed: it reads as empty, and refuses writes.
     vacant: bool,
+    /// Its connection's transaction's written-tree stamps.
+    stamped: Arc<Mutex<HashMap<PageId, super::trees::Stamp>>>,
 }
 
 /// A count's progress: at a row, rows counted before it; or moving past one.
@@ -1087,6 +1143,7 @@ impl SqlCursor {
             seen: ct.changes.epoch(),
             rebinding: None,
             vacant: false,
+            stamped: ct.stamped.clone(),
         }
     }
 
@@ -1230,6 +1287,14 @@ impl SqlCursor {
                     // The cursor's own change: it stands where its write left it.
                     self.changes.wrote(self.id);
                     self.positioned();
+                    if let Some(open) = self.open.as_ref() {
+                        let root = open.root();
+                        let db = &self.db;
+                        self.stamped
+                            .lock()
+                            .entry(root)
+                            .or_insert_with(|| db.stamps().stamp(root));
+                    }
                     return Ok(IOResult::Done(()));
                 }
                 Judged::Park(c) => return Ok(park(&self.parks, c)?),

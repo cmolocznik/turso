@@ -4783,10 +4783,26 @@ pub fn op_transaction_inner(
                         } else {
                             Begin::Read
                         };
-                        if let IOResult::IO(io) = atoll.begin(wants)? {
-                            return Ok(state.suspend_on_io(io));
+                        // Whether this statement begins the Atoll transaction, whatever the
+                        // connection's state says: in autocommit, it ends it at its halt.
+                        let begins = !atoll.is_open();
+                        // A take of the write gate left waiting, parked or Busy, is this
+                        // statement's until it is taken or given up (R15).
+                        match atoll.begin_reading(wants, &program.schema_reads) {
+                            Ok(IOResult::Done(())) => state.atoll_taking = false,
+                            Ok(IOResult::IO(io)) => {
+                                state.atoll_taking = true;
+                                return Ok(state.suspend_on_io(io));
+                            }
+                            Err(e) => {
+                                state.atoll_taking = matches!(e, LimboError::Busy);
+                                return Err(e.into());
+                            }
                         }
-                        if updated && current_state.no_btree_tx_open() && conn.get_auto_commit() {
+                        if updated
+                            && (begins || current_state.no_btree_tx_open())
+                            && conn.get_auto_commit()
+                        {
                             state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                         }
                         if statement_writes_db && state.atoll_statement.is_none() {

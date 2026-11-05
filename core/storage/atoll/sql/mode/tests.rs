@@ -1053,3 +1053,215 @@ fn two_opens_of_a_path_share_one_instance() {
     let second = open(&io, "/db/shared-instance");
     assert!(Arc::ptr_eq(&first, &second));
 }
+
+/// A statement that stops waiting for its exclusive take of the gate, as one dropped after Busy
+/// does, gives the take up (R15): its connection's next write takes the gate shared and writes,
+/// never behind its own abandoned take.
+#[test]
+fn a_ddl_dropped_after_busy_gives_up_its_take_and_its_connection_writes_through_the_gate() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/given-up");
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("CREATE TABLE t (x)").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("INSERT INTO t VALUES (1)").unwrap();
+    b.execute("PRAGMA busy_timeout = 0").unwrap();
+    let err = b.execute("CREATE TABLE u (y)").unwrap_err();
+    assert!(matches!(err, crate::LimboError::Busy), "{err:?}");
+    b.execute("INSERT INTO t VALUES (2)").unwrap();
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&a, "SELECT x FROM t ORDER BY x"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+    b.execute("CREATE TABLE u (y)").unwrap();
+}
+
+/// A value `nextval` drew stays drawn whatever follows: a checkpoint, a transaction that writes
+/// and rolls back, another connection's draws and a schema reparse after its DDL (DESIGN.md §17,
+/// R8).
+#[test]
+fn a_drawn_sequence_value_stays_drawn_whatever_follows() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/seq-drawn");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (x)").unwrap();
+    conn.execute("CREATE SEQUENCE s START 1 INCREMENT 5 MINVALUE 1 MAXVALUE 41 CYCLE")
+        .unwrap();
+    let draw = |conn: &Arc<Connection>| rows(conn, "SELECT nextval('s')");
+    assert_eq!(draw(&conn), vec![vec![Value::from_i64(1)]]);
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(draw(&conn), vec![vec![Value::from_i64(6)]]);
+    // Another connection's DDL: this one reads the schema again, its sequences among it.
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(draw(&other), vec![vec![Value::from_i64(11)]]);
+    other.execute("CREATE TABLE u (y)").unwrap();
+    assert_eq!(draw(&conn), vec![vec![Value::from_i64(16)]]);
+    assert_eq!(draw(&other), vec![vec![Value::from_i64(21)]]);
+}
+
+/// A DROP SEQUENCE that meets Busy, behind another connection's open write, drops nothing: the
+/// sequence draws on from where it stood (DESIGN.md §17, R8).
+#[test]
+fn a_drop_sequence_that_met_busy_leaves_the_sequence_drawing_on() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/seq-busy-drop");
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("CREATE TABLE t (x)").unwrap();
+    a.execute("CREATE SEQUENCE s START 1 INCREMENT 5 MINVALUE 1 MAXVALUE 41 CYCLE")
+        .unwrap();
+    assert_eq!(
+        rows(&a, "SELECT nextval('s')"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    a.execute("BEGIN").unwrap();
+    a.execute("INSERT INTO t VALUES (1)").unwrap();
+    b.execute("PRAGMA busy_timeout = 0").unwrap();
+    let err = b.execute("DROP SEQUENCE s").unwrap_err();
+    assert!(matches!(err, crate::LimboError::Busy), "{err:?}");
+    a.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        rows(&a, "SELECT nextval('s')"),
+        vec![vec![Value::from_i64(6)]]
+    );
+}
+
+/// A writing statement that waited behind another connection's DDL finds the schema changed when
+/// it takes the gate, and is prepared again, its schema read again in a view the reparse pins; the
+/// transaction it then begins in autocommit commits at its halt (DESIGN.md §17, §6): a value it
+/// drew is drawn by nobody again.
+#[test]
+fn a_write_reprepared_after_waiting_behind_ddl_commits_at_its_halt() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/reprepared-write");
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("CREATE SEQUENCE s START 1 INCREMENT 5").unwrap();
+    a.execute("PRAGMA busy_timeout = 0").unwrap();
+    let mut draw = a.prepare("SELECT nextval('s')").unwrap();
+    b.execute("BEGIN").unwrap();
+    b.execute("CREATE TABLE z (x)").unwrap();
+    assert!(matches!(
+        draw.step(),
+        Ok(crate::StepResult::Busy) | Err(crate::LimboError::Busy)
+    ));
+    b.execute("COMMIT").unwrap();
+    let mut drawn = Vec::new();
+    while let Some(row) = next_row(&mut draw) {
+        drawn.push(row);
+    }
+    assert_eq!(drawn, vec![vec![Value::from_i64(1)]]);
+    drop(draw);
+    assert!(
+        !a.atoll().unwrap().is_open(),
+        "the reprepared statement's transaction ended at its halt"
+    );
+    assert_eq!(
+        rows(&b, "SELECT nextval('s')"),
+        vec![vec![Value::from_i64(6)]]
+    );
+}
+
+/// A writing statement in autocommit that begins the Atoll transaction ends it at its halt, even
+/// where the connection's state still read a transaction open, as a schema reparse once left it.
+#[test]
+fn an_autocommit_write_that_begins_the_transaction_commits_it_at_its_halt() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/stale-state");
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("CREATE TABLE t (x)").unwrap();
+    assert!(!a.atoll().unwrap().is_open());
+    a.set_tx_state(crate::connection::TransactionState::Read);
+    a.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(
+        !a.atoll().unwrap().is_open(),
+        "the insert's transaction ended at its halt"
+    );
+    assert_eq!(rows(&b, "SELECT x FROM t"), vec![vec![Value::from_i64(1)]]);
+}
+
+/// A schema writer that reads rows of a tree, in a transaction whose snapshot a commit to that
+/// tree has passed, fails with BusySnapshot before it takes the gate (DESIGN.md §17, §3, defect
+/// 4): its index build would read the table at that snapshot and miss the rows committed since.
+/// It does not wait behind a writer to find out. Begun again, it builds them all.
+#[test]
+fn a_schema_write_from_a_stale_snapshot_is_busy_snapshot() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/stale-ddl");
+    let (a, b, c) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("CREATE TABLE t (x)").unwrap();
+    a.execute("CREATE TABLE u (y)").unwrap();
+    a.execute("INSERT INTO t VALUES (1)").unwrap();
+    a.execute("PRAGMA busy_timeout = 0").unwrap();
+    a.execute("BEGIN").unwrap();
+    assert_eq!(rows(&a, "SELECT x FROM t"), vec![vec![Value::from_i64(1)]]);
+    b.execute("INSERT INTO t VALUES (2)").unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO u VALUES (1)").unwrap();
+    let err = a.execute("CREATE INDEX i ON t (x)").unwrap_err();
+    assert!(matches!(err, crate::LimboError::BusySnapshot), "{err:?}");
+    c.execute("COMMIT").unwrap();
+    a.execute("ROLLBACK").unwrap();
+    a.execute("CREATE INDEX i ON t (x)").unwrap();
+    assert_eq!(rows(&a, "PRAGMA integrity_check"), vec![vec![text("ok")]]);
+    assert_eq!(
+        rows(&b, "SELECT x FROM t INDEXED BY i WHERE x > 0 ORDER BY x"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+/// A commit that lands while a schema writer drains the gate, to a tree the writer reads, fails it
+/// with BusySnapshot once it holds the gate (DESIGN.md §17, §3, defect 4): checked before it was
+/// pending, the stamp had not moved yet.
+#[test]
+fn a_commit_during_a_schema_writers_drain_fails_it_once_held() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/stale-during-drain");
+    let (a, c) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("CREATE TABLE t (x)").unwrap();
+    a.execute("INSERT INTO t VALUES (1)").unwrap();
+    a.execute("PRAGMA busy_timeout = 0").unwrap();
+    a.execute("BEGIN").unwrap();
+    assert_eq!(rows(&a, "SELECT x FROM t"), vec![vec![Value::from_i64(1)]]);
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO t VALUES (2)").unwrap();
+    let mut index = a.prepare("CREATE INDEX i ON t (x)").unwrap();
+    assert!(matches!(
+        index.step(),
+        Ok(crate::StepResult::Busy) | Err(crate::LimboError::Busy)
+    ));
+    c.execute("COMMIT").unwrap();
+    let err = loop {
+        match index.step() {
+            Ok(crate::StepResult::IO) => index._io().step().unwrap(),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => break e,
+        }
+    };
+    assert!(matches!(err, crate::LimboError::BusySnapshot), "{err:?}");
+    drop(index);
+    a.execute("ROLLBACK").unwrap();
+    a.execute("CREATE INDEX i ON t (x)").unwrap();
+    assert_eq!(rows(&a, "PRAGMA integrity_check"), vec![vec![text("ok")]]);
+}

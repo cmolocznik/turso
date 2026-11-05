@@ -206,7 +206,8 @@ fn an_upgrader_drains_the_other_holders_but_not_itself() {
 }
 
 /// A pending take that did not drain stays pending, holding its place: new shared takers wait
-/// behind it until it is given up, which wakes them (R15).
+/// behind it until it is given up, which wakes them (R15). Its own taker cannot take the gate
+/// shared under it, which would wait behind itself: that is refused by name.
 #[test]
 fn a_pending_take_holds_its_place_until_given_up() {
     let db = open(4);
@@ -221,6 +222,11 @@ fn a_pending_take_holds_its_place_until_given_up() {
         matches!(db.exclusive(&mut e).0, Taken::Holders(_)),
         "still pending"
     );
+    let err = db
+        .txns()
+        .take_shared(&mut e, &Completion::new_wait())
+        .unwrap_err();
+    assert!(err.to_string().contains("own pending exclusive"), "{err}");
     db.txns().give_up(&mut e);
     assert_eq!(e.hold(), Hold::None);
     assert!(c.finished(), "a give-up woke nobody");

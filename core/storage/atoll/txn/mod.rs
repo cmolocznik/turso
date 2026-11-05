@@ -632,8 +632,17 @@ impl Transactions {
     /// A transaction whose snapshot is older than the schema timestamp fails with
     /// `SchemaConflict`.
     pub fn take_shared(&self, txn: &mut Txn, c: &Completion) -> Result<Taken> {
-        if txn.hold != Hold::None {
-            return Ok(Taken::Done);
+        match txn.hold {
+            Hold::None => {}
+            // Its own exclusive take, pending with no shared hold under it: a shared take would
+            // wait behind it forever. The statement that made it gives it up when it stops
+            // waiting (R15), before another writes.
+            Hold::Pending { shared: false, .. } => {
+                return Err(LimboError::InternalError(
+                    "a shared take behind the transaction's own pending exclusive take".into(),
+                ))
+            }
+            _ => return Ok(Taken::Done),
         }
         let taken = self.gate.take_shared(txn.slot, txn.start, c);
         if taken == Taken::Done {
@@ -681,6 +690,15 @@ impl Transactions {
             return Err(LimboError::SchemaConflict);
         }
         Ok(Taken::Done)
+    }
+
+    /// Hands back `txn`'s exclusive hold, its schema write refused before it wrote anything,
+    /// waking whoever waits behind it; a shared hold it had before stays.
+    pub fn hand_back_exclusive(&self, txn: &mut Txn) {
+        if let Hold::Exclusive { word, shared } = txn.hold {
+            self.gate.release_exclusive(word, None);
+            txn.hold = if shared { Hold::Shared } else { Hold::None };
+        }
     }
 
     /// Gives up `txn`'s pending exclusive take, waking whoever waits behind it; a shared hold it

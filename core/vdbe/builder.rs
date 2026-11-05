@@ -2537,6 +2537,24 @@ impl ProgramBuilder {
             } => *db == crate::MAIN_DB_ID,
             _ => false,
         });
+        // The trees a schema writer reads rows of, sqlite_schema aside (DESIGN.md §17, §3, defect 4).
+        let mut schema_reads: Vec<u64> = if writes_schema {
+            self.insns
+                .iter()
+                .filter_map(|(insn, _)| match insn {
+                    Insn::OpenRead { root_page, db, .. } if *db == crate::MAIN_DB_ID => {
+                        u64::try_from(*root_page).ok().filter(|id| {
+                            *id != crate::storage::atoll::sql::catalog::SCHEMA_ID && *id > 0
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        schema_reads.sort_unstable();
+        schema_reads.dedup();
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2567,6 +2585,7 @@ impl ProgramBuilder {
             write_databases: self.write_databases,
             read_databases: self.read_databases,
             writes_schema,
+            schema_reads,
         };
         Ok(prepared)
     }

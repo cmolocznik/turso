@@ -1940,3 +1940,624 @@ fn a_crash_anywhere_in_sql_recovers_a_prefix_of_its_commits() {
         );
     }
 }
+
+/// Two connections with foreign keys on, over a parent `p` and a child `c` made by `schema`, with
+/// parent 1 in place.
+fn fk_pair(path: &str, schema: &[&str]) -> (Arc<Connection>, Arc<Connection>) {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, path);
+    let (a, b) = (
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    );
+    a.execute("PRAGMA foreign_keys = ON").unwrap();
+    b.execute("PRAGMA foreign_keys = ON").unwrap();
+    for sql in schema {
+        a.execute(sql).unwrap();
+    }
+    (a, b)
+}
+
+/// Every child row whose parent is missing, over the tables the foreign-key tests make: `c` and
+/// `d` naming `p` by `pid` (its rowid) or `pk` (its UNIQUE `k`). Turso has no PRAGMA
+/// foreign_key_check: an unknown pragma reads as no rows, whatever is there.
+fn orphans(conn: &Arc<Connection>) -> Vec<Vec<Value>> {
+    let mut found = Vec::new();
+    for (child, column, parent) in [("c", "pid", "id"), ("c", "pk", "k"), ("d", "pid", "id")] {
+        let has = rows(conn, &format!("PRAGMA table_info({child})"))
+            .iter()
+            .any(|r| r.get(1) == Some(&text(column)));
+        if has {
+            found.extend(rows(
+                conn,
+                &format!(
+                    "SELECT '{child}', id FROM {child} WHERE {column} IS NOT NULL AND NOT EXISTS \
+                     (SELECT 1 FROM p WHERE p.{parent} = {child}.{column})"
+                ),
+            ));
+        }
+    }
+    found
+}
+
+/// A parent deleted while another transaction holds a child of it open waits for that child's
+/// writer, and conflicts once it commits, so the child never outlives its parent (R10): the delete
+/// writes first and then probes the children every version the snapshot cannot see, through a
+/// scan of the child table, which has no index on its key. Without the probe both commit and the
+/// child is an orphan.
+#[test]
+fn a_parent_delete_waits_for_a_child_held_open_and_then_conflicts() {
+    for (path, index) in [
+        ("/db/fk-scan", None),
+        ("/db/fk-index", Some("CREATE INDEX c_pid ON c(pid)")),
+    ] {
+        let mut schema = vec![
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+            "INSERT INTO p VALUES (1), (2)",
+        ];
+        schema.extend(index);
+        let (a, b) = fk_pair(path, &schema);
+        a.execute("BEGIN").unwrap();
+        a.execute("INSERT INTO c VALUES (1, 1)").unwrap();
+        b.execute("BEGIN").unwrap();
+        b.execute("DELETE FROM p WHERE id = 2").unwrap();
+        let mut delete = b.prepare("DELETE FROM p WHERE id = 1").unwrap();
+        assert!(
+            matches!(step_until_busy(&mut delete), Ok(crate::StepResult::Busy)),
+            "{path}: the delete went on past a child held open"
+        );
+        a.execute("COMMIT").unwrap();
+        let err = step_until_busy(&mut delete).unwrap_err();
+        assert!(
+            matches!(err, crate::LimboError::WriteWriteConflict),
+            "{path}: {err}"
+        );
+        drop(delete);
+        assert!(
+            b.get_auto_commit(),
+            "{path}: the conflict rolled the transaction back"
+        );
+        assert_eq!(orphans(&b), Vec::<Vec<Value>>::new(), "{path}");
+        assert_eq!(
+            rows(&b, "SELECT id FROM p ORDER BY id"),
+            vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
+            "{path}: the rolled-back transaction's other delete went with it"
+        );
+    }
+}
+
+/// A child inserted while another transaction holds its parent's delete open waits for that
+/// writer, and conflicts once it commits (R10): the insert writes first and then probes the
+/// parent key's versions the snapshot cannot see, here by rowid and through a UNIQUE index.
+#[test]
+fn a_child_insert_waits_for_its_parents_delete_held_open_and_then_conflicts() {
+    for (path, schema, insert) in [
+        (
+            "/db/fk-child-rowid",
+            [
+                "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+                "INSERT INTO p VALUES (1)",
+            ],
+            "INSERT INTO c VALUES (1, 1)",
+        ),
+        (
+            "/db/fk-child-unique",
+            [
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT UNIQUE)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, pk TEXT REFERENCES p(k))",
+                "INSERT INTO p VALUES (1, 'one')",
+            ],
+            "INSERT INTO c VALUES (1, 'one')",
+        ),
+    ] {
+        let (a, b) = fk_pair(path, &schema);
+        a.execute("BEGIN").unwrap();
+        a.execute("DELETE FROM p WHERE id = 1").unwrap();
+        b.execute("BEGIN").unwrap();
+        let mut child = b.prepare(insert).unwrap();
+        assert!(
+            matches!(step_until_busy(&mut child), Ok(crate::StepResult::Busy)),
+            "{path}: the child went in past its parent's delete held open"
+        );
+        a.execute("COMMIT").unwrap();
+        let err = step_until_busy(&mut child).unwrap_err();
+        assert!(
+            matches!(err, crate::LimboError::WriteWriteConflict),
+            "{path}: {err}"
+        );
+        drop(child);
+        assert!(b.get_auto_commit(), "{path}");
+        assert_eq!(orphans(&b), Vec::<Vec<Value>>::new(), "{path}");
+        assert_eq!(
+            rows(&b, "SELECT count(*) FROM c"),
+            vec![vec![Value::from_i64(0)]],
+            "{path}"
+        );
+    }
+}
+
+/// `held` runs in `a`'s open transaction and `blocked` then in `b`'s: `blocked` comes back `Busy`
+/// on `a`'s open version, and `WriteWriteConflict` once `a` commits, which rolls `b` back; no
+/// child is left without its parent.
+fn fk_race(path: &str, schema: &[&str], held: &[&str], blocked: &str) {
+    let (a, b) = fk_pair(path, schema);
+    a.execute("BEGIN").unwrap();
+    for sql in held {
+        a.execute(sql).unwrap();
+    }
+    b.execute("BEGIN").unwrap();
+    let mut stmt = b.prepare(blocked).unwrap();
+    assert!(
+        matches!(step_until_busy(&mut stmt), Ok(crate::StepResult::Busy)),
+        "{path}: {blocked} went on past {held:?} held open"
+    );
+    a.execute("COMMIT").unwrap();
+    let err = step_until_busy(&mut stmt).unwrap_err();
+    assert!(
+        matches!(err, crate::LimboError::WriteWriteConflict),
+        "{path}: {err}"
+    );
+    drop(stmt);
+    assert!(
+        b.get_auto_commit(),
+        "{path}: the conflict rolled the transaction back"
+    );
+    assert_eq!(orphans(&b), Vec::<Vec<Value>>::new(), "{path}");
+}
+
+/// `held` runs in `a`'s open transaction and `other` then in `b`'s, at once: nothing of `a`'s is
+/// one it guards against.
+fn fk_no_wait(path: &str, schema: &[&str], held: &[&str], other: &str) {
+    let (a, b) = fk_pair(path, schema);
+    a.execute("BEGIN").unwrap();
+    for sql in held {
+        a.execute(sql).unwrap();
+    }
+    b.execute("BEGIN").unwrap();
+    let mut stmt = b.prepare(other).unwrap();
+    assert!(
+        matches!(step_until_busy(&mut stmt), Ok(crate::StepResult::Done)),
+        "{path}: {other} waited on {held:?}"
+    );
+    drop(stmt);
+    b.execute("COMMIT").unwrap();
+    a.execute("COMMIT").unwrap();
+    assert_eq!(orphans(&b), Vec::<Vec<Value>>::new(), "{path}");
+}
+
+const FK_ROWID_PARENT: [&str; 3] = [
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, note TEXT)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+    "INSERT INTO p VALUES (1, 'x'), (2, 'y')",
+];
+
+const FK_UNIQUE_PARENT: [&str; 3] = [
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT UNIQUE, note TEXT)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pk TEXT REFERENCES p(k))",
+    "INSERT INTO p VALUES (1, 'one', 'x'), (2, 'two', 'y')",
+];
+
+/// A parent key removed every way a statement removes one owes its guard (R10): ON DELETE
+/// CASCADE and SET NULL, whose actions read the children the snapshot sees, an UPDATE or an
+/// UPSERT of the key, and a REPLACE that puts back a row with another key, each with or without
+/// an index on the child's key.
+#[test]
+fn every_way_of_removing_a_parent_key_waits_for_a_child_held_open() {
+    let cascade = [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, note TEXT)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO p VALUES (1, 'x')",
+    ];
+    let set_null = [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, note TEXT)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL)",
+        "INSERT INTO p VALUES (1, 'x')",
+    ];
+    let index = "CREATE INDEX c_pid ON c(pid)";
+    let held = ["INSERT INTO c VALUES (1, 1)"];
+    for (path, schema, blocked) in [
+        ("/db/fk-cascade", &cascade, "DELETE FROM p WHERE id = 1"),
+        ("/db/fk-set-null", &set_null, "DELETE FROM p WHERE id = 1"),
+        (
+            "/db/fk-update-rowid",
+            &FK_ROWID_PARENT,
+            "UPDATE p SET id = 10 WHERE id = 1",
+        ),
+    ] {
+        fk_race(path, schema, &held, blocked);
+        let mut indexed = schema.to_vec();
+        indexed.push(index);
+        fk_race(&format!("{path}-index"), &indexed, &held, blocked);
+    }
+    let held = ["INSERT INTO c VALUES (1, 'one')"];
+    for (path, blocked) in [
+        ("/db/fk-update-key", "UPDATE p SET k = 'uno' WHERE id = 1"),
+        (
+            "/db/fk-upsert-key",
+            "INSERT INTO p VALUES (1, 'other', 'z') ON CONFLICT(id) DO UPDATE SET k = 'uno'",
+        ),
+        (
+            "/db/fk-replace-key",
+            "INSERT OR REPLACE INTO p VALUES (1, 'uno', 'z')",
+        ),
+    ] {
+        fk_race(path, &FK_UNIQUE_PARENT, &held, blocked);
+        let mut indexed = FK_UNIQUE_PARENT.to_vec();
+        indexed.push("CREATE INDEX c_pk ON c(pk)");
+        fk_race(&format!("{path}-index"), &indexed, &held, blocked);
+    }
+}
+
+/// What leaves a parent's key in place owes nothing, and neither does a key no child names (R10,
+/// key-share): a child goes in beside a non-key update of its parent held open, and a non-key
+/// update, a REPLACE that puts the same key back, an UPDATE that sets the key to itself, or a
+/// delete of another parent goes on beside a child held open, with or without an index on the
+/// child's key.
+#[test]
+fn what_leaves_a_parent_key_in_place_does_not_wait() {
+    fk_no_wait(
+        "/db/fk-share-child",
+        &FK_ROWID_PARENT,
+        &["UPDATE p SET note = 'z' WHERE id = 1"],
+        "INSERT INTO c VALUES (1, 1)",
+    );
+    fk_no_wait(
+        "/db/fk-share-child-unique",
+        &FK_UNIQUE_PARENT,
+        &["UPDATE p SET note = 'z' WHERE id = 1"],
+        "INSERT INTO c VALUES (1, 'one')",
+    );
+    for indexed in [false, true] {
+        let mut rowid = FK_ROWID_PARENT.to_vec();
+        let mut unique = FK_UNIQUE_PARENT.to_vec();
+        if indexed {
+            rowid.push("CREATE INDEX c_pid ON c(pid)");
+            unique.push("CREATE INDEX c_pk ON c(pk)");
+        }
+        let held = ["INSERT INTO c VALUES (1, 1)"];
+        for (n, other) in [
+            "UPDATE p SET note = 'z' WHERE id = 1",
+            "INSERT OR REPLACE INTO p VALUES (1, 'z')",
+            "UPDATE p SET id = 1 WHERE id = 1",
+            "DELETE FROM p WHERE id = 2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fk_no_wait(
+                &format!("/db/fk-share-rowid-{indexed}-{n}"),
+                &rowid,
+                &held,
+                other,
+            );
+        }
+        let held = ["INSERT INTO c VALUES (1, 'one')"];
+        for (n, other) in [
+            "UPDATE p SET note = 'z' WHERE id = 1",
+            "INSERT OR REPLACE INTO p VALUES (1, 'one', 'z')",
+            "UPDATE p SET k = 'one' WHERE id = 1",
+            "DELETE FROM p WHERE id = 2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fk_no_wait(
+                &format!("/db/fk-share-unique-{indexed}-{n}"),
+                &unique,
+                &held,
+                other,
+            );
+        }
+    }
+}
+
+/// A key held only by a version between the newest and the one the snapshot sees is judged too
+/// (R10, audit 4): a rollback of the newest would bring it back. On the parent side, a child
+/// committed after the snapshot whose delete is held open makes the parent's delete conflict;
+/// on the child side, a parent delete committed after the snapshot under a re-insert held open
+/// makes the child's insert conflict. Neither waits for the open writer: the version below it
+/// already decides.
+#[test]
+fn a_key_held_only_by_a_version_below_the_newest_is_judged() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/fk-between");
+    let conns: Vec<_> = (0..3)
+        .map(|_| {
+            let c = db.connect(ConnectOpts::new()).unwrap();
+            c.execute("PRAGMA foreign_keys = ON").unwrap();
+            c
+        })
+        .collect();
+    let (t1, t2, t3) = (&conns[0], &conns[1], &conns[2]);
+    for sql in FK_ROWID_PARENT {
+        t1.execute(sql).unwrap();
+    }
+    // The parent side.
+    t1.execute("BEGIN").unwrap();
+    rows(t1, "SELECT count(*) FROM p");
+    t2.execute("INSERT INTO c VALUES (5, 1)").unwrap();
+    t3.execute("BEGIN").unwrap();
+    t3.execute("DELETE FROM c WHERE id = 5").unwrap();
+    let err = t1.execute("DELETE FROM p WHERE id = 1").unwrap_err();
+    assert!(
+        matches!(err, crate::LimboError::WriteWriteConflict),
+        "{err}"
+    );
+    assert!(t1.get_auto_commit());
+    t3.execute("ROLLBACK").unwrap();
+    assert_eq!(orphans(t1), Vec::<Vec<Value>>::new());
+    t1.execute("DELETE FROM c").unwrap();
+    // The child side.
+    t1.execute("BEGIN").unwrap();
+    rows(t1, "SELECT count(*) FROM p");
+    t2.execute("DELETE FROM p WHERE id = 1").unwrap();
+    t3.execute("BEGIN").unwrap();
+    t3.execute("INSERT INTO p VALUES (1, 'back')").unwrap();
+    let err = t1.execute("INSERT INTO c VALUES (6, 1)").unwrap_err();
+    assert!(
+        matches!(err, crate::LimboError::WriteWriteConflict),
+        "{err}"
+    );
+    assert!(t1.get_auto_commit());
+    t3.execute("ROLLBACK").unwrap();
+    assert_eq!(orphans(t1), Vec::<Vec<Value>>::new());
+    assert_eq!(
+        rows(t1, "SELECT count(*) FROM c"),
+        vec![vec![Value::from_i64(0)]]
+    );
+}
+
+/// A deferred foreign key is guarded at statement time like an immediate one (R10): its count is
+/// checked at commit, but the write and its guard happen now.
+#[test]
+fn a_deferred_foreign_key_is_guarded_at_its_statement() {
+    let schema = [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, \
+         pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+        "INSERT INTO p VALUES (1)",
+    ];
+    fk_race(
+        "/db/fk-deferred-child",
+        &schema,
+        &["DELETE FROM p WHERE id = 1"],
+        "INSERT INTO c VALUES (1, 1)",
+    );
+    fk_race(
+        "/db/fk-deferred-parent",
+        &schema,
+        &["INSERT INTO c VALUES (1, 1)"],
+        "DELETE FROM p WHERE id = 1",
+    );
+}
+
+/// A child key written every way a statement writes one owes its guard (R10): an UPDATE of the
+/// key, an UPSERT that sets it, a multi-row insert, a trigger's insert, and ON DELETE SET
+/// DEFAULT's action, which points the children of a deleted parent at another one. The trigger and
+/// the action run as subprograms, which carry the guards with them.
+#[test]
+fn every_way_of_writing_a_child_key_waits_for_its_parents_delete_held_open() {
+    let schema = [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER DEFAULT 2 \
+         REFERENCES p(id) ON DELETE SET DEFAULT)",
+        "CREATE TABLE log(x INTEGER)",
+        "CREATE TRIGGER log_child AFTER INSERT ON log BEGIN INSERT INTO c VALUES (NEW.x, 2); END",
+        "INSERT INTO p VALUES (1), (2), (3)",
+        "INSERT INTO c VALUES (9, 1)",
+    ];
+    let held = ["DELETE FROM p WHERE id = 2"];
+    for (path, blocked) in [
+        ("/db/fk-child-update", "UPDATE c SET pid = 2 WHERE id = 9"),
+        (
+            "/db/fk-child-upsert",
+            "INSERT INTO c VALUES (9, 3) ON CONFLICT(id) DO UPDATE SET pid = 2",
+        ),
+        (
+            "/db/fk-child-multirow",
+            "INSERT INTO c VALUES (10, 3), (11, 2)",
+        ),
+        ("/db/fk-child-trigger", "INSERT INTO log VALUES (12)"),
+        ("/db/fk-child-set-default", "DELETE FROM p WHERE id = 1"),
+    ] {
+        fk_race(path, &schema, &held, blocked);
+    }
+}
+
+/// An explicit transaction capturing its changes commits: its COMMIT writes the capture's commit
+/// record without becoming a write statement itself, which COMMIT refuses to run beside.
+#[test]
+fn a_captured_explicit_transaction_commits() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/cdc-commit");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id,custom_cdc')")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 1").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT count(*) FROM custom_cdc"),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
+/// Twelve connections race parent deletes, inserts and key changes against child inserts,
+/// re-points and deletes, two statements a transaction, over a child with no index on its key and
+/// one with (R10): a conflict, a deadlock or a failed constraint rolls its transaction back, and no
+/// snapshot a checker takes all through the run, nor the end, shows a child without its parent.
+/// Without the guards the two sides of a race both commit; a parent put back later can heal the
+/// orphan, which is why the checker reads while they run.
+#[test]
+fn twelve_writers_racing_parents_and_children_leave_no_orphan() {
+    const THREADS: usize = 12;
+    const ROUNDS: usize = 40;
+    const PARENTS: i64 = 4;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/fk-stress");
+    let setup = db.connect(ConnectOpts::new()).unwrap();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    for sql in [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, note INTEGER)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+        "CREATE TABLE d(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+        "CREATE INDEX d_pid ON d(pid)",
+    ] {
+        setup.execute(sql).unwrap();
+    }
+    for id in 1..=PARENTS {
+        setup
+            .execute(format!("INSERT INTO p VALUES ({id}, 0)"))
+            .unwrap();
+    }
+    let start = Arc::new(std::sync::Barrier::new(THREADS + 1));
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let checker = {
+        let (db, start, running) = (db.clone(), start.clone(), running.clone());
+        std::thread::spawn(move || {
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            // Its begins wait for a slot behind the writers' (R13).
+            conn.set_busy_timeout(std::time::Duration::from_secs(30));
+            start.wait();
+            let (mut checks, mut seen) = (0usize, Vec::new());
+            while running.load(std::sync::atomic::Ordering::Acquire) {
+                let found = orphans(&conn);
+                checks += 1;
+                if !found.is_empty() && seen.is_empty() {
+                    seen = found;
+                }
+            }
+            (checks, seen)
+        })
+    };
+    let threads: Vec<_> = (0..THREADS)
+        .map(|who| {
+            let (db, start) = (db.clone(), start.clone());
+            std::thread::spawn(move || {
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                conn.execute("PRAGMA foreign_keys = ON").unwrap();
+                conn.set_busy_timeout(std::time::Duration::from_secs(30));
+                let mut state = who as u64 * 2654435761 + 7;
+                let mut next = |n: i64| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % n as u64) as i64 + 1
+                };
+                start.wait();
+                let mut ended = [0usize; 4];
+                for round in 0..ROUNDS as i64 {
+                    let mut op = |n: i64| -> Vec<String> {
+                        let t = if next(2) == 1 { "c" } else { "d" };
+                        let (k, k2) = (next(PARENTS), next(PARENTS));
+                        let uid = (who as i64 * ROUNDS as i64 + round) * 2 + n;
+                        match next(6) {
+                            1 | 2 => vec![format!("INSERT INTO {t} VALUES ({uid}, {k})")],
+                            // A parent purged: its children the snapshot sees, then itself.
+                            3 => vec![
+                                format!("DELETE FROM c WHERE pid = {k}"),
+                                format!("DELETE FROM d WHERE pid = {k}"),
+                                format!("DELETE FROM p WHERE id = {k}"),
+                            ],
+                            4 => vec![format!("INSERT OR IGNORE INTO p VALUES ({k}, 0)")],
+                            5 => vec![format!("UPDATE {t} SET pid = {k} WHERE pid = {k2}")],
+                            _ => vec![format!("UPDATE OR IGNORE p SET id = {k2} WHERE id = {k}")],
+                        }
+                    };
+                    let statements: Vec<String> = op(0).into_iter().chain(op(1)).collect();
+                    conn.execute("BEGIN").unwrap();
+                    let done = statements
+                        .iter()
+                        .try_for_each(|sql| conn.execute(sql))
+                        .and_then(|_| conn.execute("COMMIT"));
+                    let slot = match done {
+                        Ok(()) => 0,
+                        Err(crate::LimboError::WriteWriteConflict) => 1,
+                        Err(crate::LimboError::Deadlock) => 2,
+                        Err(
+                            crate::LimboError::Constraint(_)
+                            | crate::LimboError::ConstraintViolation(_)
+                            | crate::LimboError::ForeignKeyConstraint(_),
+                        ) => 3,
+                        Err(e) => panic!("thread {who}: {statements:?}: {e}"),
+                    };
+                    ended[slot] += 1;
+                    if !conn.get_auto_commit() {
+                        conn.execute("ROLLBACK").unwrap();
+                    }
+                }
+                ended
+            })
+        })
+        .collect();
+    let mut ended = [0usize; 4];
+    for t in threads {
+        for (sum, n) in ended.iter_mut().zip(t.join().unwrap()) {
+            *sum += n;
+        }
+    }
+    running.store(false, std::sync::atomic::Ordering::Release);
+    let (checks, seen) = checker.join().unwrap();
+    eprintln!(
+        "fk stress: {} committed, {} conflicts, {} deadlocks, {} constraint failures; {checks} \
+         checks",
+        ended[0], ended[1], ended[2], ended[3]
+    );
+    assert_eq!(
+        seen,
+        Vec::<Vec<Value>>::new(),
+        "a snapshot showed an orphan"
+    );
+    assert!(
+        checks > 1,
+        "the checker read no snapshot while the writers ran"
+    );
+    assert_eq!(orphans(&setup), Vec::<Vec<Value>>::new());
+    assert!(ended[0] > 0, "nothing committed");
+    assert!(ended[1] + ended[2] > 0, "no race was met");
+}
+
+/// The orphan check the foreign-key tests read sees an orphan: one written with foreign keys off,
+/// on a child with no index on its key and on one with.
+#[test]
+fn the_orphan_check_reports_an_orphan() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/fk-orphan-control");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    for sql in [
+        "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+        "CREATE TABLE d(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))",
+        "CREATE INDEX d_pid ON d(pid)",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO c VALUES (1, 1), (2, 7)",
+        "INSERT INTO d VALUES (1, 8)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_eq!(orphans(&conn).len(), 2, "{:?}", orphans(&conn));
+}
+
+/// An UPDATE that assigns no child key of a foreign key whose parent has no UNIQUE key goes on, as
+/// in SQLite: the mismatch is an error only where the key is used, and the guards resolve no
+/// foreign key the counters do not, a self-reference's included.
+#[test]
+fn an_update_of_another_column_ignores_a_mismatched_foreign_key() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/fk-mismatch-other-column");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x))")
+        .unwrap();
+    conn.execute("INSERT INTO c VALUES (1, 1, NULL)").unwrap();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("UPDATE c SET id = 7").unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT id, x, y FROM c"),
+        vec![vec![Value::from_i64(7), Value::from_i64(1), Value::Null]]
+    );
+}

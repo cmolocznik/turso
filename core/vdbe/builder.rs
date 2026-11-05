@@ -313,6 +313,9 @@ pub struct ProgramBuilder {
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
     mvcc_enabled: bool,
+    /// Whether the main database is an Atoll database, set once at translation time from the
+    /// connection: its writes owe foreign-key guards (R10).
+    atoll: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
@@ -834,6 +837,7 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             mvcc_enabled,
+            atoll: false,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -1088,6 +1092,21 @@ impl ProgramBuilder {
 
     pub fn set_mvcc_enabled(&mut self, enabled: bool) {
         self.mvcc_enabled = enabled;
+    }
+
+    /// Whether the main database is an Atoll database. See `Self::atoll`.
+    pub const fn is_atoll(&self) -> bool {
+        self.atoll
+    }
+
+    pub fn set_atoll(&mut self, atoll: bool) {
+        self.atoll = atoll;
+    }
+
+    /// Whether a write into `database_id` owes its foreign-key guards (R10): only an Atoll
+    /// database's do, and only main is ever one.
+    pub fn owes_fk_guards(&self, database_id: usize) -> bool {
+        self.atoll && database_id == crate::MAIN_DB_ID
     }
 
     /// Whether this program has already emitted a call to a trigger or FK action

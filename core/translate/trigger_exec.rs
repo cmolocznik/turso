@@ -603,6 +603,7 @@ fn execute_trigger_commands(
         trigger.clone(),
         program.is_mvcc_enabled(),
     );
+    subprogram_builder.set_atoll(program.is_atoll());
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
     // propagate it to the subprogram so that nested trigger firing will also use it.
     if let Some(override_conflict) = ctx.override_conflict {

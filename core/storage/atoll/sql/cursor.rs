@@ -25,8 +25,10 @@ use super::key;
 use super::AtollDb;
 use crate::error::{ConstraintKind, ConstraintViolation};
 use crate::numeric::Numeric;
-use crate::storage::atoll::btree::{Mode, Outcome, Put, Remove, Seek};
-use crate::storage::atoll::txn::versioned::{VersionedCursor, VersionedTree, Write, WriteOp};
+use crate::storage::atoll::btree::{Cursor, Mode, Outcome, Put, Remove, Seek};
+use crate::storage::atoll::txn::versioned::{
+    Guard, GuardOp, Guarded, VersionedCursor, VersionedTree, Write, WriteOp,
+};
 use crate::storage::atoll::txn::Txn;
 use crate::storage::btree::BTreeKey;
 use crate::sync::{Arc, Mutex};
@@ -80,6 +82,32 @@ pub struct AtollCursor {
     left: Option<Vec<u8>>,
     /// The key a [`refresh`](Self::refresh) seeks, kept across IO.
     refreshing: Option<Vec<u8>>,
+    /// A foreign-key guard under way, kept across IO and waits.
+    guarding: Option<Guarding>,
+    /// Whether rewinds and moves on walk the versions the statement does not see, each holding
+    /// its key, as rows (R10, [`VersionedTree::unseen_first`]).
+    unseen: bool,
+}
+
+/// What a foreign-key guard judges the keys of (R10).
+pub enum GuardKey<'a> {
+    /// Every key of the tree.
+    All,
+    /// A rowid table's row.
+    Rowid(i64),
+    /// The keys whose first columns are these values.
+    Columns(&'a ImmutableRecord),
+}
+
+/// A foreign-key guard of every key that starts with a prefix (R10).
+struct Guarding {
+    prefix: Vec<u8>,
+    guarded: Guarded,
+    /// Over the tree's entries, each by its newest version, whatever the snapshot sees.
+    entries: Cursor,
+    sought: bool,
+    /// The guard of the key `entries` is at, under way.
+    op: Option<GuardOp>,
 }
 
 enum Writing {
@@ -150,7 +178,55 @@ impl AtollCursor {
             inserted: None,
             left: None,
             refreshing: None,
+            guarding: None,
+            unseen: false,
         }
+    }
+
+    /// From now on the cursor rewinds and moves on over the versions its statement does not see
+    /// that hold their key, as rows, newest first within a key (R10).
+    pub fn walk_unseen(&mut self) {
+        self.unseen = true;
+    }
+
+    /// What the unseen version the cursor rests on comes to for a foreign-key guard whose scan
+    /// matched it (R10): a wait while its writer is open, a conflict once it has committed, and
+    /// nothing once it was rolled back, its undo having put back the version below it, which the
+    /// walk reaches next.
+    pub fn unseen_hit(&self) -> Guard {
+        let Some(v) = self.cursor.unseen() else {
+            return Guard::Clear;
+        };
+        match self.db.atoll().transactions().writer(v.slot, v.ts) {
+            crate::storage::atoll::txn::Writer::Open => {
+                Guard::Wait(crate::storage::atoll::txn::Blocker {
+                    slot: v.slot,
+                    start: v.ts,
+                })
+            }
+            crate::storage::atoll::txn::Writer::Committed => Guard::Conflict,
+            crate::storage::atoll::txn::Writer::Gone => Guard::Clear,
+        }
+    }
+
+    fn step_unseen(&mut self, first: bool) -> Result<IOResult<()>> {
+        let mut guard = self.txn.lock();
+        let txn = guard.as_mut().ok_or_else(outside)?;
+        let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
+        let moved = if first {
+            self.tree
+                .unseen_first(txns, versions, txn, &mut self.cursor)?
+        } else {
+            self.tree
+                .unseen_next(txns, versions, txn, &mut self.cursor)?
+        };
+        if let IOResult::IO(io) = moved {
+            return Ok(IOResult::IO(io));
+        }
+        self.record = None;
+        self.null_row = false;
+        self.left = None;
+        Ok(IOResult::Done(()))
     }
 
     /// From now on the cursor's writes are plain: its tree was created by the transaction's
@@ -204,6 +280,9 @@ impl AtollCursor {
 
     /// Moves to the first row.
     pub fn rewind(&mut self) -> Result<IOResult<()>> {
+        if self.unseen {
+            return self.step_unseen(true);
+        }
         done!(self.step(Move::Seek(&[], Seek::Ge)));
         Ok(IOResult::Done(()))
     }
@@ -220,6 +299,9 @@ impl AtollCursor {
 
     /// Moves to the next row: from an entry found gone, the one after it, where it already stands.
     pub fn next(&mut self) -> Result<IOResult<()>> {
+        if self.unseen {
+            return self.step_unseen(false);
+        }
         if self.left.take().is_some() {
             self.record = None;
             return Ok(IOResult::Done(()));
@@ -581,7 +663,102 @@ impl AtollCursor {
         self.insert(key)
     }
 
-    /// Deletes the row or index entry the cursor is at. Step it until done.
+    /// The keys a foreign-key guard of `key` judges start with this (R10): a table's rowid key, or
+    /// the encoded columns of an index or WITHOUT ROWID table, as a seek on them encodes them;
+    /// empty for every key. A tree of another encoding refuses it, naming REINDEX, as it refuses a
+    /// seek, so a guard never misses a key.
+    pub fn guard_prefix(&self, key: &GuardKey<'_>) -> Result<Vec<u8>> {
+        match key {
+            GuardKey::All => Ok(Vec::new()),
+            GuardKey::Rowid(rowid) => {
+                if self.entry.layout != Layout::Table {
+                    return Err(LimboError::InternalError(format!(
+                        "a rowid guard of tree {}, which is no rowid table",
+                        self.id
+                    )));
+                }
+                Ok(key::rowid(*rowid).to_vec())
+            }
+            GuardKey::Columns(record) => {
+                if !self.current {
+                    return Err(LimboError::InternalError(format!(
+                        "tree {} holds keys of another encoding, which a foreign-key guard cannot \
+                         read: REINDEX it",
+                        self.id
+                    )));
+                }
+                let info = self.index.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "a column guard of tree {}, which has no key columns",
+                        self.id
+                    ))
+                })?;
+                let values = record.iter()?.collect::<Result<Vec<ValueRef<'_>>>>()?;
+                if values.len() > info.key_info.len() {
+                    return Err(LimboError::InternalError(format!(
+                        "a guard of {} columns over a key of {}",
+                        values.len(),
+                        info.key_info.len()
+                    )));
+                }
+                let mut prefix = Vec::new();
+                key::encode(values.into_iter(), &info.key_info, &mut prefix)?;
+                Ok(prefix)
+            }
+        }
+    }
+
+    /// Guards, after its transaction wrote, every key of the tree that starts with `prefix`, the
+    /// tree's every key for an empty one (R10, [`VersionedTree::guard`]): what the first key
+    /// judged comes to, or [`Guard::Clear`] once none is. A wait keeps the guard at its key, which
+    /// stepping it again judges afresh. Step it until done.
+    pub fn guard(&mut self, prefix: &[u8], guarded: Guarded) -> Result<IOResult<Guard>> {
+        let mut lock = self.txn.lock();
+        let txn = lock.as_mut().ok_or_else(outside)?;
+        let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
+        let g = self.guarding.get_or_insert_with(|| Guarding {
+            prefix: prefix.to_vec(),
+            guarded,
+            entries: Cursor::new(),
+            sought: false,
+            op: None,
+        });
+        loop {
+            if let Some(op) = g.op.as_mut() {
+                match done!(self.tree.guard(txns, versions, txn, op)) {
+                    Guard::Clear => g.op = None,
+                    Guard::Wait(blocker) => {
+                        op.again();
+                        return Ok(IOResult::Done(Guard::Wait(blocker)));
+                    }
+                    Guard::Conflict => {
+                        self.guarding = None;
+                        return Ok(IOResult::Done(Guard::Conflict));
+                    }
+                }
+            }
+            let found = if g.sought {
+                done!(self.tree.tree().next(&mut g.entries))
+            } else {
+                let found = done!(self.tree.tree().seek(&mut g.entries, &g.prefix, Seek::Ge));
+                g.sought = true;
+                found
+            };
+            let at = found
+                .then(|| g.entries.key().zip(g.entries.value()))
+                .flatten()
+                .filter(|(key, _)| key.starts_with(&g.prefix));
+            let Some((key, value)) = at else {
+                self.guarding = None;
+                return Ok(IOResult::Done(Guard::Clear));
+            };
+            let head = value
+                .get(..crate::storage::atoll::txn::versioned::HEADER)
+                .unwrap_or(&[]);
+            g.op = Some(GuardOp::from_head(key, head, g.guarded)?);
+        }
+    }
+
     /// Drops a write that came back `Write::Wait`, which wrote nothing, so that the cursor's next
     /// write starts afresh.
     pub fn abandon_write(&mut self) {
@@ -589,6 +766,7 @@ impl AtollCursor {
         self.inserted = None;
     }
 
+    /// Deletes the row or index entry the cursor is at. Step it until done.
     pub fn delete(&mut self) -> Result<IOResult<Write>> {
         if self.writing.is_none() {
             let k = self

@@ -324,6 +324,68 @@ pub enum Probe {
     Conflict,
 }
 
+/// Which versions a foreign-key guard waits for or conflicts on, of those its snapshot cannot
+/// see (R10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guarded {
+    /// Versions absent of the key: a child's guard on its parent's key, which a tombstone or a key
+    /// change could leave without it.
+    Absent,
+    /// Versions holding the key: a removed parent key's guard on the children, one of which could
+    /// still name it.
+    Present,
+}
+
+/// What a guard of one key found among its versions the snapshot cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guard {
+    /// None of them is one it judges.
+    Clear,
+    /// The first it judges is another transaction's, still open: wait for it to end and guard
+    /// again ([`Transactions::wait_end`]).
+    Wait(Blocker),
+    /// The first it judges was committed after the snapshot.
+    Conflict,
+}
+
+/// A guard of one key under way: step it with [`VersionedTree::guard`] until done.
+pub struct GuardOp {
+    key: Vec<u8>,
+    guarded: Guarded,
+    /// The version judged next: the newest, read from the leaf when `None`.
+    at: Option<Version>,
+    /// Whether `at` is the newest.
+    newest: bool,
+    /// A newest version found gone: rolled back since it was read, unless it is still there.
+    gone: Option<Version>,
+}
+
+impl GuardOp {
+    pub fn new(key: &[u8], guarded: Guarded) -> Self {
+        Self {
+            key: key.to_vec(),
+            guarded,
+            at: None,
+            newest: true,
+            gone: None,
+        }
+    }
+
+    /// The guard of `key`, whose newest version a read of its leaf found to be `head`.
+    pub fn from_head(key: &[u8], head: &[u8], guarded: Guarded) -> Result<Self> {
+        let mut op = Self::new(key, guarded);
+        op.at = Some(Version::decode(head).ok_or_else(corrupt_header)?);
+        Ok(op)
+    }
+
+    /// Judges the key again from its newest version, as after a wait on one of its writers.
+    pub fn again(&mut self) {
+        self.at = None;
+        self.newest = true;
+        self.gone = None;
+    }
+}
+
 /// A read of one key's value as a transaction's statement sees it: step it with
 /// [`VersionedTree::get`] until done.
 pub struct Get {
@@ -414,7 +476,6 @@ impl VersionedTree {
         &self.tree
     }
 
-    /// The longest key: the tree's, and what its version index keys hold.
     /// Probes `key` on a write path, judged by its newest version as a write would judge it: a
     /// version another transaction holds open is waited for, and under snapshot isolation one
     /// committed after the snapshot is a conflict. Step it until done.
@@ -465,6 +526,84 @@ impl VersionedTree {
         }
     }
 
+    /// Guards `op`'s key after `txn` wrote (R10): its versions the snapshot cannot see are judged
+    /// newest first, down to the one it sees, as a rollback of each could bring back the one
+    /// below it. The first that says what `op` guards against waits while its writer is open, and
+    /// is a conflict once it has committed; the others are passed over, and so is every version
+    /// the snapshot sees, its own included. Step it until done.
+    pub fn guard(
+        &self,
+        txns: &Transactions,
+        versions: &Versions,
+        txn: &mut Txn,
+        op: &mut GuardOp,
+    ) -> Result<IOResult<Guard>> {
+        loop {
+            let v = match op.at {
+                Some(v) => v,
+                None => {
+                    let stored = done!(self.tree.stored(&op.key));
+                    let Some(stored) = stored else {
+                        return Ok(IOResult::Done(Guard::Clear));
+                    };
+                    let v = Version::decode(&stored.head).ok_or_else(corrupt_header)?;
+                    op.at = Some(v);
+                    op.newest = true;
+                    v
+                }
+            };
+            if txns.visible(txn, v.slot, v.ts) {
+                return Ok(IOResult::Done(Guard::Clear));
+            }
+            let holds = !v.deleted();
+            if holds == (op.guarded == Guarded::Present) {
+                match txns.writer(v.slot, v.ts) {
+                    Writer::Open => {
+                        return Ok(IOResult::Done(Guard::Wait(Blocker {
+                            slot: v.slot,
+                            start: v.ts,
+                        })))
+                    }
+                    Writer::Committed => return Ok(IOResult::Done(Guard::Conflict)),
+                    // Rolled back since it was read: its undo put back the entry below it.
+                    Writer::Gone if op.newest && op.gone != Some(v) => {
+                        op.gone = Some(v);
+                        op.at = None;
+                        continue;
+                    }
+                    Writer::Gone => {
+                        return Err(LimboError::Corrupt(format!(
+                            "the version {v:?} of a key a guard judges is gone, and its writer \
+                             neither committed nor is open"
+                        )))
+                    }
+                }
+            }
+            if v.first() {
+                return Ok(IOResult::Done(Guard::Clear));
+            }
+            let index = done!(versions.index(v.slot, self.tree.root().class()));
+            let mut lookup = Lookup::new(&index_key(v.ts, v.command, self.root(), &op.key));
+            let Some(entry) = done!(index.lookup(&mut lookup)) else {
+                return Err(LimboError::Corrupt(format!(
+                    "the version {v:?} of a key replaced nothing in its version index"
+                )));
+            };
+            // The key had no entry before: the snapshot reads it absent.
+            let Some(earlier) = decode_entry(&entry)? else {
+                return Ok(IOResult::Done(Guard::Clear));
+            };
+            let e = Version::decode(&earlier.head).ok_or_else(corrupt_header)?;
+            if e == v {
+                return Err(LimboError::Corrupt(format!(
+                    "the version {v:?} replaced itself in its version index"
+                )));
+            }
+            op.at = Some(e);
+            op.newest = false;
+        }
+    }
+
     /// The plain put of `key` by `txn`'s current statement into a tree that statement created:
     /// no other transaction can see the tree, so the entry needs no earlier version and no index
     /// entry, and an undo of the creation frees the tree whole (DESIGN.md §17). Every write the
@@ -481,6 +620,7 @@ impl VersionedTree {
         Put::with_head(key, head.to_vec(), value, mode)
     }
 
+    /// The longest key: the tree's, and what its version index keys hold.
     pub fn max_key(&self) -> usize {
         let index = Versions::index_class(self.tree.root().class());
         let index_max =

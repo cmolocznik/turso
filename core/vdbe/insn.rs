@@ -2389,6 +2389,35 @@ pub enum Insn {
         version: crate::CdcVersion,
         cdc_mode: String,
     },
+
+    /// Atoll mode's foreign-key guard (R10), after the statement wrote a child row or removed a
+    /// parent key: in the tree `cursor_id` reads, every key the `num_regs` registers from
+    /// `start_reg` begin (a table's rowid, or an index's first columns; every key for none) is
+    /// judged at each version its snapshot cannot see, newest first, and the first that
+    /// `guarded` names waits for its writer while that is open, and is a write conflict once it
+    /// has committed. It counts nothing: the probe before the write counted what the snapshot
+    /// sees.
+    FkGuard {
+        cursor_id: CursorID,
+        start_reg: usize,
+        num_regs: usize,
+        guarded: crate::storage::atoll::txn::versioned::Guarded,
+    },
+
+    /// Atoll mode's walk for a foreign-key guard of a child table with no index on its key
+    /// (R10): from now on the Atoll cursor `cursor_id` rewinds and moves on over the versions its
+    /// statement does not see that hold their key, as rows, so the scan compares each as the probe
+    /// compares a row.
+    FkUnseen {
+        cursor_id: CursorID,
+    },
+
+    /// Atoll mode's foreign-key guard of the unseen version `cursor_id` rests on, which the scan
+    /// matched (R10): it waits for its writer while that is open, and is a write conflict once it
+    /// has committed.
+    FkGuardRow {
+        cursor_id: CursorID,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2639,6 +2668,9 @@ impl InsnVariants {
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
+            InsnVariants::FkGuard => execute::op_fk_guard,
+            InsnVariants::FkUnseen => execute::op_fk_unseen,
+            InsnVariants::FkGuardRow => execute::op_fk_guard_row,
         }
     }
 }

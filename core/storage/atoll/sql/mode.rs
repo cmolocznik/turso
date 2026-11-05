@@ -18,7 +18,7 @@
 //! on another transaction. Writes wait on other transactions, so they come back to the VDBE.
 
 use super::catalog::{self, Catalog, Entry, Layout, System, SCHEMA_ID};
-use super::cursor::{AtollCursor, TxnCell};
+use super::cursor::{AtollCursor, GuardKey, TxnCell};
 use super::header::{Field, Header};
 use super::key;
 use super::lifecycle::Destroy;
@@ -33,7 +33,7 @@ use crate::storage::atoll::control::{self, Found};
 use crate::storage::atoll::db::AtollConfig;
 use crate::storage::atoll::drive;
 use crate::storage::atoll::page::PageId;
-use crate::storage::atoll::txn::versioned::{Get, Write, WriteOp};
+use crate::storage::atoll::txn::versioned::{Get, Guard, Guarded, Write, WriteOp};
 use crate::storage::atoll::txn::{Abort, Blocker, Commit, Hold, Isolation, Statement, Taken, Txn};
 use crate::storage::btree::{BTreeKey, CursorTrait};
 use crate::storage::database::DatabaseStorage;
@@ -1328,6 +1328,8 @@ pub struct SqlCursor {
     vacant: bool,
     /// Its connection's transaction's written-tree stamps.
     stamped: Arc<Mutex<HashMap<PageId, super::trees::Stamp>>>,
+    /// Whether it walks the versions its statement does not see (R10, FkUnseen).
+    unseen: bool,
 }
 
 /// A count's progress: at a row, rows counted before it; or moving past one.
@@ -1360,6 +1362,38 @@ impl SqlCursor {
             rebinding: None,
             vacant: false,
             stamped: ct.stamped.clone(),
+            unseen: false,
+        }
+    }
+
+    /// From now on the cursor rewinds and moves on over the versions its statement does not see
+    /// that hold their key, as rows (FkUnseen): the scan of R10's guard of a child table with no
+    /// index on its foreign key, which compares each as the probe compares a row.
+    pub fn walk_unseen(&mut self) {
+        self.unseen = true;
+        if let Some(open) = self.open.as_mut() {
+            open.walk_unseen();
+        }
+    }
+
+    /// The guard's judgment of the unseen version the cursor rests on, which its scan matched
+    /// (FkGuardRow): a wait on its writer as a write's, on the same edge, while that is open, and
+    /// `WriteWriteConflict` once it has committed.
+    pub fn unseen_hit(&mut self) -> IOResultOr<()> {
+        if self.vacant {
+            return Ok(IOResult::Done(()));
+        }
+        loop {
+            let w = match self.resolve()?.unseen_hit() {
+                Guard::Clear => Write::Done(crate::storage::atoll::btree::Outcome::Unchanged),
+                Guard::Wait(blocker) => Write::Wait(blocker),
+                Guard::Conflict => Write::Conflict,
+            };
+            match self.waiting.judge(&self.db, &self.waits, w)? {
+                Judged::Done => return Ok(IOResult::Done(())),
+                Judged::Park(c) => return Ok(self.waiting.wait(&self.waits, c)?),
+                Judged::Again => {}
+            }
         }
     }
 
@@ -1507,6 +1541,9 @@ impl SqlCursor {
             if plain {
                 cursor.write_plainly();
             }
+            if self.unseen {
+                cursor.walk_unseen();
+            }
             cursor.set_null_flag(self.null_row);
             self.open = Some(cursor);
         }
@@ -1550,6 +1587,34 @@ impl SqlCursor {
                     }
                     return Ok(IOResult::Done(()));
                 }
+                Judged::Park(c) => return Ok(self.waiting.wait(&self.waits, c)?),
+                Judged::Again => {}
+            }
+        }
+    }
+
+    /// R10's foreign-key guard, after its statement wrote a child row or removed a parent key
+    /// (FkGuard): every key of the tree that `key` names is judged at each of its versions the
+    /// snapshot cannot see, newest first, and the first that `guarded` names waits for its
+    /// writer as a write does, on the same edge, while that writer is open, and is
+    /// `WriteWriteConflict` once it has committed. A tree its statement destroyed has no keys.
+    pub fn guard(&mut self, key: GuardKey<'_>, guarded: Guarded) -> IOResultOr<()> {
+        if self.vacant {
+            return Ok(IOResult::Done(()));
+        }
+        loop {
+            let cursor = self.resolve()?;
+            let prefix = cursor.guard_prefix(&key)?;
+            let w = match cursor.guard(&prefix, guarded)? {
+                IOResult::Done(Guard::Clear) => {
+                    Write::Done(crate::storage::atoll::btree::Outcome::Unchanged)
+                }
+                IOResult::Done(Guard::Wait(blocker)) => Write::Wait(blocker),
+                IOResult::Done(Guard::Conflict) => Write::Conflict,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            match self.waiting.judge(&self.db, &self.waits, w)? {
+                Judged::Done => return Ok(IOResult::Done(())),
                 Judged::Park(c) => return Ok(self.waiting.wait(&self.waits, c)?),
                 Judged::Again => {}
             }

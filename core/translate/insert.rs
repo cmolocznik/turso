@@ -26,10 +26,10 @@ use crate::{
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
-            emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
-            fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
-            open_read_table, table_scan_match_any, ForeignKeyActions,
+            build_index_affinity_string, child_index_for_fk, emit_fk_child_guards,
+            emit_fk_restrict_halt, emit_fk_violation, emit_guarded_fk_decrement,
+            emit_skip_if_any_null, fk_constraint_info, index_probe, index_scan_match_any,
+            open_read_index, open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -904,6 +904,7 @@ pub fn translate_insert(
         effective_on_conflict: ctx.on_conflict,
         connection,
         table_references: &mut table_references,
+        put_back: (insertion.first_col_register(), insertion.key_register()),
     };
 
     // Populate register-to-affinity map so partial index WHERE clauses get
@@ -1001,6 +1002,28 @@ pub fn translate_insert(
         table_name: btree_table.name.clone(),
     });
     emit_remember_written_rowid(program, &ctx, insertion.key_register());
+    if has_fks && program.owes_fk_guards(namespace.database_id) {
+        // Atoll mode: the new row's parents guarded, now that it is written (R10).
+        let fk_layout = btree_table.column_layout()?;
+        let fks = resolver.with_schema(namespace.database_id, |s| {
+            s.resolved_fks_for_child(namespace.id, &btree_table.name, None)
+        })?;
+        let (first, key) = (insertion.first_col_register(), insertion.key_register());
+        emit_fk_child_guards(
+            program,
+            resolver,
+            &btree_table,
+            &fks,
+            &|pos| {
+                if btree_table.columns()[pos].is_rowid_alias() {
+                    key
+                } else {
+                    fk_layout.to_register(first, pos)
+                }
+            },
+            namespace.database_id,
+        )?;
+    }
 
     // CDC must capture the row right after the INSERT updated the table, before any AFTER
     // trigger or FK action this INSERT fires can write further CDC rows of their own.
@@ -3110,6 +3133,7 @@ fn emit_pk_uniqueness_check(
                 preflight.connection,
                 ctx,
                 preflight.table_references,
+                preflight.put_back,
             )?;
             program.emit_insn(Insn::Goto {
                 target_pc: make_record_label,
@@ -3342,6 +3366,7 @@ fn emit_unique_index_check(
                 preflight.connection,
                 ctx,
                 preflight.table_references,
+                preflight.put_back,
             )?;
             program.emit_insn(Insn::Goto { target_pc: ok });
         } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
@@ -3659,6 +3684,9 @@ struct PreflightCtx<'a, 'b> {
     connection: &'a Arc<Connection>,
     /// Table references for expression evaluation
     table_references: &'b mut TableReferences,
+    /// The row a REPLACE puts back: its first column's register and its rowid's, against which
+    /// a deleted row's parent keys are compared for their foreign-key guards (R10).
+    put_back: (usize, usize),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3849,6 +3877,7 @@ fn emit_replace_delete_conflicting_row(
     connection: &Arc<Connection>,
     ctx: &mut InsertEmitCtx,
     table_references: &mut TableReferences,
+    put_back: (usize, usize),
 ) -> Result<()> {
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
@@ -3866,6 +3895,7 @@ fn emit_replace_delete_conflicting_row(
             ctx.cursor_id,
             ctx.conflict_rowid_reg,
             None,
+            Some(put_back),
             ctx.namespace,
         )?;
         if resolver.with_schema(ctx.namespace.database_id, |s| {
@@ -4382,6 +4412,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 &pref,
                 new_pk_start,
                 new_row_rowid,
+                false,
                 database_id,
                 resolver,
                 |p| {

@@ -695,6 +695,7 @@ fn emit_delete_row_common(
                     main_table_cursor_id,
                     rowid_reg,
                     None,
+                    None,
                     delete_namespace,
                 )?
             } else {

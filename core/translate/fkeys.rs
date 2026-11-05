@@ -20,6 +20,8 @@ use crate::{
 };
 use std::{cell::RefCell, num::NonZero, num::NonZeroUsize, rc::Rc};
 
+use crate::storage::atoll::txn::versioned::Guarded;
+
 /// Tracks foreign-key action programs that are currently being compiled.
 ///
 /// This is needed when generated foreign-key action SQL reaches the same
@@ -498,11 +500,16 @@ pub(super) fn emit_skip_if_any_null(
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
 /// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
 /// its old child key is being updated away by the same statement.
+/// With `unseen`, the scan reads the versions of the child table the snapshot cannot see, each
+/// holding its key, and a match is guarded rather than counted (R10's parent-side guard of a
+/// child with no index on its foreign key): FkGuardRow ahead of `on_match`.
+#[allow(clippy::too_many_arguments)]
 pub fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     fk_ref: &ResolvedFkRef,
     parent_key_start: usize,
     self_exclude_rowid: Option<usize>,
+    unseen: bool,
     database_id: usize,
     resolver: &Resolver,
     mut on_match: F,
@@ -527,6 +534,9 @@ where
         .any(|&pos| child_tbl.columns()[pos].is_virtual_generated());
 
     let ccur = open_read_table(program, child_tbl, database_id);
+    if unseen {
+        program.emit_insn(Insn::FkUnseen { cursor_id: ccur });
+    }
     let done = program.allocate_label();
     program.emit_insn(Insn::Rewind {
         cursor_id: ccur,
@@ -608,9 +618,15 @@ where
             flags: CmpInsFlags::default(),
             collation: CollationSeq::for_internal_values(),
         });
+        if unseen {
+            program.emit_insn(Insn::FkGuardRow { cursor_id: ccur });
+        }
         on_match(program)?;
         program.preassign_label_to_next_insn(skip);
     } else {
+        if unseen {
+            program.emit_insn(Insn::FkGuardRow { cursor_id: ccur });
+        }
         on_match(program)?;
     }
 
@@ -1037,6 +1053,7 @@ fn emit_fk_parent_key_probe(
             fk_ref,
             parent_key_start,
             self_exclude_rowid,
+            false,
             database_id,
             resolver,
             on_match,
@@ -1600,6 +1617,7 @@ fn emit_fk_delete_parent_existence_check_single(
             } else {
                 None
             },
+            false,
             database_id,
             resolver,
             |p| {
@@ -1609,6 +1627,252 @@ fn emit_fk_delete_parent_existence_check_single(
         )?;
     }
     program.preassign_label_to_next_insn(skip_check);
+    Ok(())
+}
+
+/// Atoll mode's child-side foreign-key guards (R10), emitted after the write of a child row:
+/// for each of `fks` whose child columns the new row holds all non-NULL (`reg_of` gives each
+/// column's register), the parent's key is guarded against versions absent of it, the snapshot
+/// cannot see, in the parent table by rowid or through its UNIQUE index, the key built as the
+/// probe before the write builds it. The probe counted what the snapshot sees; the guard waits for
+/// or conflicts with what it cannot, so of a child written and a parent key removed at once, one
+/// sees the other.
+pub fn emit_fk_child_guards(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    child_tbl: &BTreeTable,
+    fks: &[ResolvedFkRef],
+    reg_of: &dyn Fn(usize) -> usize,
+    database_id: usize,
+) -> Result<()> {
+    if !program.owes_fk_guards(database_id) {
+        return Ok(());
+    }
+    for fk_ref in fks {
+        let skip = program.allocate_label();
+        let mut regs = Vec::with_capacity(fk_ref.fk.child_columns.len());
+        for cname in &fk_ref.fk.child_columns {
+            let (pos, _) = child_tbl.get_column(cname).ok_or_else(|| {
+                LimboError::InternalError(format!("foreign-key column {cname} missing"))
+            })?;
+            let reg = reg_of(pos);
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: skip,
+            });
+            regs.push(reg);
+        }
+        let parent_tbl = resolver
+            .with_schema(database_id, |s| {
+                s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
+            })
+            .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+        if fk_ref.parent_uses_rowid {
+            let pcur = open_read_table(program, &parent_tbl, database_id);
+            let rowid = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: regs[0],
+                dst_reg: rowid,
+                extra_amount: 0,
+            });
+            // A key that is not an integer names no parent row: the probe counted it.
+            let close = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: rowid,
+                target_pc: Some(close),
+            });
+            program.emit_insn(Insn::FkGuard {
+                cursor_id: pcur,
+                start_reg: rowid,
+                num_regs: 1,
+                guarded: Guarded::Absent,
+            });
+            program.preassign_label_to_next_insn(close);
+            program.emit_insn(Insn::Close { cursor_id: pcur });
+        } else {
+            let idx = fk_ref
+                .parent_unique_index
+                .as_ref()
+                .ok_or_else(|| LimboError::InternalError("parent unique index required".into()))?;
+            let icur = open_read_index(program, idx, database_id);
+            let n = regs.len();
+            let start = program.alloc_registers(n);
+            for (i, &reg) in regs.iter().enumerate() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: reg,
+                    dst_reg: start + i,
+                    extra_amount: 0,
+                });
+            }
+            if let Some(count) = NonZeroUsize::new(n) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: start,
+                    count,
+                    affinities: build_index_affinity_string(idx, &parent_tbl),
+                });
+            }
+            program.emit_insn(Insn::FkGuard {
+                cursor_id: icur,
+                start_reg: start,
+                num_regs: n,
+                guarded: Guarded::Absent,
+            });
+            program.emit_insn(Insn::Close { cursor_id: icur });
+        }
+        program.preassign_label_to_next_insn(skip);
+    }
+    Ok(())
+}
+
+/// Atoll mode's parent-side foreign-key guard (R10), emitted after a parent key was removed, its
+/// row deleted or its key changed: the children of the old key, in the `fk_ref.parent_cols.len()`
+/// registers from `key_start` in the foreign key's parent-column order as stored, are guarded
+/// against versions holding it the snapshot cannot see, through the child's index on the foreign
+/// key as the probe before the write reads it, or, with none, by the probe's own scan of the child
+/// table over every version the snapshot cannot see.
+pub fn emit_fk_parent_guard(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    fk_ref: &ResolvedFkRef,
+    key_start: usize,
+    database_id: usize,
+) -> Result<()> {
+    if !program.owes_fk_guards(database_id) {
+        return Ok(());
+    }
+    let n = fk_ref.parent_cols.len();
+    let skip = program.allocate_label();
+    emit_skip_if_any_null(program, key_start, n, skip);
+    match child_index_for_fk(resolver, database_id, fk_ref) {
+        Some(idx) => {
+            let icur = open_read_index(program, &idx, database_id);
+            let probe = copy_with_affinity(program, key_start, n, &idx, &fk_ref.child_table);
+            program.emit_insn(Insn::FkGuard {
+                cursor_id: icur,
+                start_reg: probe,
+                num_regs: n,
+                guarded: Guarded::Present,
+            });
+            program.emit_insn(Insn::Close { cursor_id: icur });
+        }
+        // The probe's own scan over the versions the snapshot cannot see: a version matches the
+        // key as a row the probe reads would.
+        None => {
+            table_scan_match_any(
+                program,
+                fk_ref,
+                key_start,
+                None,
+                true,
+                database_id,
+                resolver,
+                |_| Ok(()),
+            )?;
+        }
+    }
+    program.preassign_label_to_next_insn(skip);
+    Ok(())
+}
+
+/// Atoll mode's guards of the parent keys an UPDATE may change (R10), read before the row is
+/// rewritten: each affected foreign key's old key from `cursor_id`'s row, owed only when the new
+/// row (`new_start` under `layout`, its rowid in `new_rowid_reg`) changes it. Fire them after the
+/// rewrite with [`emit_fk_parent_guards`].
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_fk_parent_key_change_guards(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    parent_bt: &BTreeTable,
+    affected: &[ResolvedFkRef],
+    cursor_id: usize,
+    old_rowid_reg: usize,
+    new_start: usize,
+    new_rowid_reg: usize,
+    layout: &ColumnLayout,
+    database_id: usize,
+) -> Result<Vec<ParentKeyGuard>> {
+    let mut guards = Vec::new();
+    if !program.owes_fk_guards(database_id) {
+        return Ok(guards);
+    }
+    for fk_ref in affected {
+        let parent_cols: &[String] = &fk_ref.parent_cols;
+        let ncols = parent_cols.len();
+        let key_start = program.alloc_registers(ncols);
+        build_parent_key(
+            program,
+            parent_bt,
+            parent_cols,
+            cursor_id,
+            old_rowid_reg,
+            key_start,
+            resolver,
+        )?;
+        let new_key_start = program.alloc_registers(ncols);
+        copy_key_from_values(
+            program,
+            parent_bt,
+            parent_cols,
+            new_start,
+            layout,
+            new_rowid_reg,
+            new_key_start,
+        )?;
+        let owed = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: owed,
+        });
+        let (same, changed) = (program.allocate_label(), program.allocate_label());
+        emit_key_change_check(
+            program,
+            key_start,
+            new_key_start,
+            &fk_ref.parent_collations,
+            same,
+            changed,
+        );
+        program.preassign_label_to_next_insn(same);
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: owed,
+        });
+        program.preassign_label_to_next_insn(changed);
+        guards.push(ParentKeyGuard {
+            fk_ref: fk_ref.clone(),
+            key_start,
+            owed: Some(owed),
+        });
+    }
+    Ok(guards)
+}
+
+/// Fires the parent-key guards a write owes once it is done (R10), each one whose key the write
+/// removed.
+pub fn emit_fk_parent_guards(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    guards: Vec<ParentKeyGuard>,
+    database_id: usize,
+) -> Result<()> {
+    for guard in guards {
+        let skip = program.allocate_label();
+        if let Some(owed) = guard.owed {
+            program.emit_insn(Insn::IfNot {
+                reg: owed,
+                target_pc: skip,
+                jump_if_null: true,
+            });
+        }
+        emit_fk_parent_guard(
+            program,
+            resolver,
+            &guard.fk_ref,
+            guard.key_start,
+            database_id,
+        )?;
+        program.preassign_label_to_next_insn(skip);
+    }
     Ok(())
 }
 
@@ -1888,6 +2152,7 @@ fn emit_fk_action_subprogram(
             FK_SUBPROGRAM_OPTS,
             program.is_mvcc_enabled(),
         );
+        subprogram_builder.set_atoll(program.is_atoll());
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
         translate_inner(
@@ -2261,11 +2526,27 @@ pub struct PreparedFkDeleteAction {
     ctx: FkActionContext,
 }
 
-pub struct ForeignKeyActions<T>(Vec<T>);
+pub struct ForeignKeyActions<T> {
+    actions: Vec<T>,
+    /// Atoll mode's guards of the parent keys the delete removes (R10), fired after it.
+    guards: Vec<ParentKeyGuard>,
+}
+
+/// A parent key a write may remove, read into registers before it, to guard after it (R10).
+pub struct ParentKeyGuard {
+    fk_ref: ResolvedFkRef,
+    key_start: usize,
+    /// For a REPLACE: a register set to 0 when the row put back holds the same key, which then
+    /// leaves no child without its parent.
+    owed: Option<usize>,
+}
 
 impl<T> Default for ForeignKeyActions<T> {
     fn default() -> Self {
-        Self(Vec::new())
+        Self {
+            actions: Vec::new(),
+            guards: Vec::new(),
+        }
     }
 }
 
@@ -2279,6 +2560,11 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
     /// When present, an immediate `ON DELETE NO ACTION` check is skipped if the
     /// row being inserted right after the implicit delete restores the same
     /// parent key, because that delete cannot leave any child orphaned.
+    ///
+    /// `put_back`, for any REPLACE, is the row it puts back (its first column's
+    /// register and its rowid's): Atoll mode's foreign-key guard of a parent key
+    /// is owed only when that row changes it (R10).
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_fk_delete_actions(
         program: &mut ProgramBuilder,
         resolver: &mut Resolver,
@@ -2286,6 +2572,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         parent_cursor_id: usize,
         parent_rowid_reg: usize,
         replace_new_parent_regs: Option<(usize, usize)>,
+        put_back: Option<(usize, usize)>,
         namespace: NamespaceRef,
     ) -> Result<ForeignKeyActions<PreparedFkDeleteAction>> {
         let database_id = namespace.database_id;
@@ -2296,6 +2583,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
             .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
         let mut prepared = Vec::new();
+        let mut guards = Vec::new();
 
         for fk_ref in resolver.with_schema(database_id, |s| {
             s.resolved_fks_referencing(namespace.id, parent_table_name)
@@ -2313,6 +2601,56 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                 key_regs_start,
                 resolver,
             )?;
+            if program.owes_fk_guards(database_id) {
+                // As stored: an action below decodes `key_regs_start` in place.
+                let key_start = program.alloc_registers(ncols);
+                program.emit_insn(Insn::Copy {
+                    src_reg: key_regs_start,
+                    dst_reg: key_start,
+                    extra_amount: ncols - 1,
+                });
+                let owed = match put_back {
+                    Some((replace_values_start, replace_rowid_reg)) => {
+                        let owed = program.alloc_register();
+                        program.emit_insn(Insn::Integer {
+                            value: 1,
+                            dest: owed,
+                        });
+                        let new_key_start = program.alloc_registers(ncols);
+                        copy_key_from_values(
+                            program,
+                            &parent_bt,
+                            parent_cols,
+                            replace_values_start,
+                            &ColumnLayout::from_btree(&parent_bt)?,
+                            replace_rowid_reg,
+                            new_key_start,
+                        )?;
+                        let (same, changed) = (program.allocate_label(), program.allocate_label());
+                        emit_key_change_check(
+                            program,
+                            key_start,
+                            new_key_start,
+                            &fk_ref.parent_collations,
+                            same,
+                            changed,
+                        );
+                        program.preassign_label_to_next_insn(same);
+                        program.emit_insn(Insn::Integer {
+                            value: 0,
+                            dest: owed,
+                        });
+                        program.preassign_label_to_next_insn(changed);
+                        Some(owed)
+                    }
+                    None => None,
+                };
+                guards.push(ParentKeyGuard {
+                    fk_ref: fk_ref.clone(),
+                    key_start,
+                    owed,
+                });
+            }
 
             match fk_ref.fk.on_delete {
                 RefAct::NoAction => {
@@ -2398,7 +2736,10 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
             }
         }
 
-        Ok(ForeignKeyActions(prepared))
+        Ok(ForeignKeyActions {
+            actions: prepared,
+            guards,
+        })
     }
 
     /// Phase 2 of FK delete actions: fire CASCADE/SetNull/SetDefault sub-programs.
@@ -2410,10 +2751,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         connection: &Arc<Connection>,
         database_id: usize,
     ) -> Result<()> {
-        let prepared = self.0;
-        if prepared.is_empty() {
-            return Ok(());
-        }
+        let (prepared, guards) = (self.actions, self.guards);
         for action in prepared {
             match action.fk_ref.fk.on_delete {
                 RefAct::Cascade => {
@@ -2449,8 +2787,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                 _ => unreachable!(),
             }
         }
-
-        Ok(())
+        emit_fk_parent_guards(program, resolver, guards, database_id)
     }
 }
 
@@ -2740,6 +3077,7 @@ pub fn emit_fk_drop_table_check(
             fk_ref,
             parent_key_start,
             None,
+            false,
             database_id,
             resolver,
             |p| {

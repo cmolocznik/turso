@@ -33,9 +33,10 @@ use crate::{
             NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
-            affected_parent_fks_for_update, emit_fk_child_update_counters,
-            emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
-            fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
+            affected_parent_fks_for_update, emit_fk_child_guards, emit_fk_child_update_counters,
+            emit_fk_parent_deferred_new_key_probes, emit_fk_parent_guards,
+            emit_fk_update_parent_actions, fire_fk_update_actions,
+            prepare_fk_parent_key_change_guards, stabilize_new_row_for_fk, ForeignKeyActions,
             ParentKeyNewProbeMode,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
@@ -706,6 +707,7 @@ fn emit_replace_delete<'a>(
                 table_name,
                 target_table_cursor_id,
                 conflicting_rowid_reg,
+                new_row_registers,
                 new_row_registers,
                 update_namespace,
             )?
@@ -2350,6 +2352,52 @@ fn emit_update_insns<'a>(
         }
     }
 
+    // Atoll mode's foreign-key guards (R10), fired once the row is rewritten: the old parent keys
+    // the new row changes, read here while the cursor still has the old row, and the parents of
+    // the child keys it assigns.
+    let (mut fk_parent_guards, fk_child_guards) = match target_table.table.btree() {
+        Some(table_btree)
+            if connection.foreign_keys_enabled() && program.owes_fk_guards(update_database_id) =>
+        {
+            let parent = prepare_fk_parent_key_change_guards(
+                program,
+                &t_ctx.resolver,
+                &table_btree,
+                &affected_parent_fks,
+                target_table_cursor_id,
+                beg,
+                start,
+                effective_rowid_reg,
+                &layout,
+                update_database_id,
+            )?;
+            // Resolved only where the update assigns a child key, as the counters resolve them: a
+            // foreign key whose parent has no UNIQUE key errors only when it is used.
+            let assigns_child_key = table_btree
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.child_key_assigned(&table_btree, &affected_columns));
+            let child: Vec<_> = if assigns_child_key {
+                t_ctx
+                    .resolver
+                    .with_schema(update_database_id, |s| {
+                        s.resolved_fks_for_child(
+                            update_namespace.id,
+                            table_name,
+                            Some(&affected_columns),
+                        )
+                    })?
+                    .into_iter()
+                    .filter(|fk| fk.child_key_changed(&affected_columns, &table_btree))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (parent, child)
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
+
     // ---- Phase 2: Delete old index entries ----
     // All constraint checks passed. Now safe to mutate indexes.
     for (index, ctx) in indexes_to_update.iter().zip(idx_phase_ctxs.iter()) {
@@ -2509,6 +2557,26 @@ fn emit_update_insns<'a>(
                 },
                 table_name: target_table.identifier.clone(),
             });
+            emit_fk_child_guards(
+                program,
+                &t_ctx.resolver,
+                table,
+                &fk_child_guards,
+                &|pos| {
+                    if table.columns()[pos].is_rowid_alias() {
+                        effective_rowid_reg
+                    } else {
+                        layout.to_register(start, pos)
+                    }
+                },
+                update_database_id,
+            )?;
+            emit_fk_parent_guards(
+                program,
+                &t_ctx.resolver,
+                std::mem::take(&mut fk_parent_guards),
+                update_database_id,
+            )?;
 
             // CDC must capture the row exactly as written by this UPDATE, before any FK
             // action or AFTER trigger this UPDATE fires can write further CDC rows of

@@ -2912,6 +2912,42 @@ pub fn insn_to_row(
             0,
             format!("ensure turso_cdc_version({cdc_table_name}, {version}); set cdc={cdc_mode}"),
         ),
+        Insn::FkGuard {
+            cursor_id,
+            start_reg,
+            num_regs,
+            guarded,
+        } => (
+            "FkGuard",
+            *cursor_id as i64,
+            *start_reg as i64,
+            *num_regs as i64,
+            Value::build_text(""),
+            0,
+            format!(
+                "guard key=r[{}..{}] against {guarded:?} versions",
+                start_reg,
+                start_reg + num_regs
+            ),
+        ),
+        Insn::FkUnseen { cursor_id } => (
+            "FkUnseen",
+            *cursor_id as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            "walk the versions the snapshot cannot see".to_string(),
+        ),
+        Insn::FkGuardRow { cursor_id } => (
+            "FkGuardRow",
+            *cursor_id as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            "guard the unseen version".to_string(),
+        ),
     }
 }
 

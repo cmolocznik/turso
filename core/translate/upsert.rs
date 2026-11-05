@@ -14,8 +14,9 @@ use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, 
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
-    affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
-    fire_fk_update_actions, ParentKeyNewProbeMode,
+    affected_parent_fks_for_update, emit_fk_child_guards, emit_fk_child_update_counters,
+    emit_fk_parent_guards, emit_fk_update_parent_actions, fire_fk_update_actions,
+    prepare_fk_parent_key_change_guards, ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{
     emit_remember_written_rowid, format_unique_violation_desc, InsertEmitCtx,
@@ -1036,9 +1037,41 @@ pub fn emit_upsert(
     } else {
         None
     };
+    // Atoll mode's foreign-key guards (R10), fired once the row is rewritten.
+    let mut fk_parent_guards = Vec::new();
+    let mut fk_child_guards = Vec::new();
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled() {
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            if program.owes_fk_guards(upsert_database_id) {
+                fk_parent_guards = prepare_fk_parent_key_change_guards(
+                    program,
+                    resolver,
+                    &bt,
+                    &affected_parent_fks,
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
+                    new_start,
+                    rowid_new_reg,
+                    &layout,
+                    upsert_database_id,
+                )?;
+                let rowid_alias_if_changed = rowid_alias_idx.filter(|_| rowid_changed);
+                let affected_cols = bt.columns_affected_by_update(
+                    directly_changed_cols.iter().chain(rowid_alias_if_changed),
+                )?;
+                fk_child_guards = resolver
+                    .with_schema(upsert_database_id, |s| {
+                        s.resolved_fks_for_child(
+                            ctx.namespace.id,
+                            bt.name.as_str(),
+                            Some(&affected_cols),
+                        )
+                    })?
+                    .into_iter()
+                    .filter(|fk| fk.child_key_changed(&affected_cols, &bt))
+                    .collect();
+            }
 
             // Child-side checks
             if resolver.with_schema(upsert_database_id, |s| {
@@ -1528,6 +1561,24 @@ pub fn emit_upsert(
         ctx,
         new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
     );
+    if let Some(bt) = table.btree() {
+        let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+        emit_fk_child_guards(
+            program,
+            resolver,
+            &bt,
+            &fk_child_guards,
+            &|pos| {
+                if bt.columns()[pos].is_rowid_alias() {
+                    rowid_new_reg
+                } else {
+                    layout.to_register(new_start, pos)
+                }
+            },
+            upsert_database_id,
+        )?;
+        emit_fk_parent_guards(program, resolver, fk_parent_guards, upsert_database_id)?;
+    }
 
     // CDC must capture the row right after the write above, before any FK action or AFTER
     // trigger this UPSERT fires can write further CDC rows of their own.

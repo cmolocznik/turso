@@ -22135,3 +22135,93 @@ mod tests {
         );
     }
 }
+
+/// FkGuard (R10): the foreign-key guard of an Atoll cursor's tree after its statement's write.
+/// Only a statement on an Atoll database emits it.
+pub fn op_fk_guard(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::storage::atoll::sql::cursor::GuardKey;
+    load_insn!(
+        FkGuard {
+            cursor_id,
+            start_reg,
+            num_regs,
+            guarded,
+        },
+        insn
+    );
+    let table = matches!(program.cursor_ref[*cursor_id].1, CursorType::BTreeTable(_));
+    let record;
+    let key = if *num_regs == 0 {
+        GuardKey::All
+    } else if table {
+        match state.registers[*start_reg].get_value() {
+            Value::Numeric(Numeric::Integer(rowid)) => GuardKey::Rowid(*rowid),
+            other => {
+                return Err(LimboError::InternalError(format!(
+                    "FkGuard: a rowid that is no integer: {other:?}"
+                ))
+                .into())
+            }
+        }
+    } else {
+        record = ImmutableRecord::from_registers(
+            &state.registers[*start_reg..*start_reg + *num_regs],
+            *num_regs,
+        )?;
+        GuardKey::Columns(&record)
+    };
+    let c = state.get_cursor(*cursor_id);
+    let c = (c.as_btree_mut() as &mut dyn Any)
+        .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
+        .ok_or_else(|| {
+            LimboError::InternalError("FkGuard on a cursor that is not Atoll's".into())
+        })?;
+    return_if_io!(state, c.guard(key, *guarded));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// The Atoll cursor an FkUnseen or FkGuardRow names.
+fn fk_walk_cursor<'a>(
+    state: &'a mut ProgramState,
+    cursor_id: usize,
+) -> Result<&'a mut crate::storage::atoll::sql::mode::SqlCursor> {
+    let c = state.get_cursor(cursor_id);
+    (c.as_btree_mut() as &mut dyn Any)
+        .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
+        .ok_or_else(|| {
+            LimboError::InternalError("a foreign-key walk on a cursor that is not Atoll's".into())
+        })
+}
+
+/// FkUnseen (R10): the Atoll cursor walks the versions its statement does not see.
+pub fn op_fk_unseen(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(FkUnseen { cursor_id }, insn);
+    fk_walk_cursor(state, *cursor_id)?.walk_unseen();
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// FkGuardRow (R10): the guard of the unseen version the Atoll cursor rests on.
+pub fn op_fk_guard_row(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(FkGuardRow { cursor_id }, insn);
+    let c = fk_walk_cursor(state, *cursor_id)?;
+    return_if_io!(state, c.unseen_hit());
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}

@@ -1330,8 +1330,13 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
-    if let Some(atoll) = program.connection.atoll_for_db(*db) {
-        let cursor = open_atoll_cursor(atoll, &pager, *root_page, cursor_type)?;
+    // A view's delta cursor reads the transaction's captured changes, never a tree.
+    if let (Some(atoll), false) = (
+        program.connection.atoll_for_db(*db),
+        matches!(cursor_type, CursorType::ViewDelta { .. }),
+    ) {
+        let cursor =
+            open_atoll_cursor(atoll, &program.connection, &pager, *root_page, cursor_type)?;
         state
             .cursors
             .get_mut(*cursor_id)
@@ -14467,22 +14472,23 @@ fn atoll_tree_id(root: i64) -> Result<u64> {
 }
 
 /// An Atoll-mode cursor over tree `root` (DESIGN.md §17), for OpenRead and OpenWrite: a rowid
-/// table's or an index's. A WITHOUT ROWID table and a materialized view are refused by name.
+/// table's, an index's, a WITHOUT ROWID table's, keyed as an index on its primary key (R29), or a
+/// materialized view's, whose rows are a rowid table's read through the view's cursor, which adds
+/// the transaction's own changes to them.
 fn open_atoll_cursor(
     atoll: &crate::storage::atoll::sql::mode::ConnTxn,
+    connection: &Arc<Connection>,
     pager: &Arc<Pager>,
     root: i64,
     cursor_type: &CursorType,
 ) -> Result<Cursor> {
     let index = match cursor_type {
         CursorType::BTreeTable(table) if table.has_rowid => None,
-        CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
-        CursorType::BTreeTable(_) => {
-            return Err(LimboError::ParseError(
-                "WITHOUT ROWID tables are refused in Atoll mode until their arm is built"
-                    .to_string(),
-            ))
+        CursorType::BTreeTable(table) => {
+            Some(Arc::new(IndexInfo::new_from_without_rowid_table(table)?))
         }
+        CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
+        CursorType::MaterializedView(..) => None,
         _ => {
             return Err(LimboError::ParseError(
                 "this cursor is refused in Atoll mode until its arm is built".to_string(),
@@ -14490,10 +14496,20 @@ fn open_atoll_cursor(
         }
     };
     let root = atoll_tree_id(root)?;
-    Ok(Cursor::new_btree_dyn(Box::new(
+    let cursor = Box::new(
         crate::storage::atoll::sql::mode::SqlCursor::new(atoll, pager.clone(), root, index)
             .opened()?,
-    )))
+    );
+    Ok(Cursor::new_btree_dyn(match cursor_type {
+        CursorType::MaterializedView(..) => {
+            Box::new(crate::incremental::cursor::MaterializedViewCursor::new(
+                cursor,
+                pager.clone(),
+                connection.clone(),
+            ))
+        }
+        _ => cursor,
+    }))
 }
 
 pub fn op_open_write(
@@ -14562,7 +14578,8 @@ pub fn op_open_write(
             Some(Some(Cursor::Dyn(cursor, ..))) if cursor.root_page() == root_page
         );
         if !reuse {
-            let cursor = open_atoll_cursor(atoll, &pager, root_page, cursor_type)?;
+            let cursor =
+                open_atoll_cursor(atoll, &program.connection, &pager, root_page, cursor_type)?;
             state
                 .cursors
                 .get_mut(*cursor_id)
@@ -20188,17 +20205,6 @@ fn op_journal_mode_inner(
 
                 // Parse the new mode. If unknown or unsupported, silently return
                 // current mode (matches SQLite behavior).
-                if program.connection.atoll_for_db(*db).is_some()
-                    && journal_mode::JournalMode::from_str(mode_str.as_str()).ok()
-                        != Some(prev_mode)
-                {
-                    // Atoll mode: Atoll's log is the database's journal (DESIGN.md §17).
-                    return Err(LimboError::InvalidArgument(
-                        "an Atoll database keeps Atoll's log: its journal mode cannot change"
-                            .to_string(),
-                    )
-                    .into());
-                }
                 let new_mode = match journal_mode::JournalMode::from_str(mode_str.as_str()) {
                     Ok(mode) if mode.supported() => mode,
                     _ => {
@@ -20208,6 +20214,14 @@ fn op_journal_mode_inner(
                         return Ok(InsnFunctionStepResult::Step);
                     }
                 };
+                if program.connection.atoll_for_db(*db).is_some() && new_mode != prev_mode {
+                    // Atoll mode: Atoll's log is the database's journal (DESIGN.md §17).
+                    return Err(LimboError::InvalidArgument(
+                        "an Atoll database keeps Atoll's log: its journal mode cannot change"
+                            .to_string(),
+                    )
+                    .into());
+                }
 
                 // If same mode, just return
                 if prev_mode == new_mode {

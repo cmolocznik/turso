@@ -2924,6 +2924,10 @@ impl Connection {
     /// `VACUUM INTO` uses it for the output database even in WAL mode.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
         self.next_page_size.store(size, Ordering::SeqCst);
+        // The pager first: it creates the temp database on first use, so whether temp is
+        // initialized is read from temp itself, never from main, which a temp database not yet
+        // created reads as.
+        let pager = self.get_pager_from_database_index(&database_id)?;
         if self.get_source_database(database_id).initialized() {
             return Ok(());
         }
@@ -2931,7 +2935,6 @@ impl Connection {
             return Ok(());
         };
 
-        let pager = self.get_pager_from_database_index(&database_id)?;
         pager.set_initial_page_size(size)?;
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new

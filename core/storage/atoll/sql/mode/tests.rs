@@ -4,7 +4,7 @@
 use crate::io::{MemoryIO, OpenFlags, IO};
 use crate::storage::atoll::sql::catalog::tests::config;
 use crate::sync::Arc;
-use crate::{ConnectOpts, Connection, Database, OpenOptions, SqliteDialect, Value};
+use crate::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, SqliteDialect, Value};
 
 /// Each test opens its own path: the registry keys databases by their file across IOs.
 fn open(io: &Arc<dyn IO>, path: &str) -> Arc<Database> {
@@ -710,7 +710,8 @@ fn a_reparse_reads_the_schema_and_its_sequences_in_one_view() {
 }
 
 /// Atoll's log is the database's journal: reading the journal mode or setting the one it has
-/// works, and changing it is refused by name.
+/// works, a mode name Turso does not know or does not run reads the mode, as SQLite's does, and
+/// changing it to one Turso runs is refused by name.
 #[test]
 fn the_journal_mode_cannot_change() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -724,10 +725,17 @@ fn the_journal_mode_cannot_change() {
     };
     conn.execute(format!("PRAGMA journal_mode = {}", current.as_str()))
         .unwrap();
-    let other = if current.as_str().eq_ignore_ascii_case("delete") {
+    for name in ["nonexistent", "delete"] {
+        assert_eq!(
+            rows(&conn, &format!("PRAGMA journal_mode = {name}")),
+            mode,
+            "{name}"
+        );
+    }
+    let other = if current.as_str().eq_ignore_ascii_case("mvcc") {
         "wal"
     } else {
-        "delete"
+        "mvcc"
     };
     let err = conn
         .execute(format!("PRAGMA journal_mode = {other}"))
@@ -988,6 +996,207 @@ fn a_scan_reads_the_row_under_it_as_a_rollback_to_left_it() {
             vec![text("a"), Value::from_i64(2)],
         ]
     );
+}
+
+/// A cursor an outer statement opened before its trigger cleared the cursor's table, a DELETE of
+/// every row, reaches the tree the Clear made at its next seek, rowid or write, as SQLite's cursor
+/// does the emptied b-tree (DESIGN.md §17, §3): its seek reads the trigger's row, its NewRowid
+/// draws from the new tree's counter and its write lands in the new tree, where the old tree's
+/// gave a row the trigger had deleted and lost the write.
+#[test]
+fn a_cursor_opened_before_a_trigger_cleared_its_table_seeks_draws_and_writes_in_the_new_tree() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/cleared-by-trigger");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let int = Value::from_i64;
+    // A seek: the UPDATE's second row is the one its trigger put back.
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("INSERT INTO u VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    conn.execute("CREATE TABLE log(o, n)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER au AFTER UPDATE ON u BEGIN \
+         INSERT INTO log VALUES (old.x, new.x); DELETE FROM u; INSERT INTO u VALUES (2, 'q'); END",
+    )
+    .unwrap();
+    conn.execute("UPDATE u SET x = x || '!' WHERE id IN (1, 2)")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT o, n FROM log ORDER BY rowid"),
+        vec![vec![text("a"), text("a!")], vec![text("q"), text("q!")]],
+        "the seek after the Clear"
+    );
+    assert_eq!(
+        rows(&conn, "SELECT id, x FROM u"),
+        vec![vec![int(2), text("q")]]
+    );
+    // A NewRowid and its insert: each row drawn from the tree its trigger just emptied.
+    conn.execute("CREATE TABLE v(x)").unwrap();
+    conn.execute("INSERT INTO v VALUES ('a'), ('b'), ('c')")
+        .unwrap();
+    conn.execute("CREATE TRIGGER bi BEFORE INSERT ON v BEGIN DELETE FROM v; END")
+        .unwrap();
+    conn.execute("INSERT INTO v(x) VALUES ('p'), ('q')")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT rowid, x FROM v"),
+        vec![vec![int(1), text("q")]],
+        "the NewRowid and insert after the Clear"
+    );
+    // A write at the rowid the statement found: sqlite_sequence's row for t, put back where it
+    // stood though the trigger emptied the table and wrote another row there.
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v)")
+        .unwrap();
+    conn.execute("INSERT INTO t(v) VALUES ('seed')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER ti BEFORE INSERT ON t BEGIN \
+         DELETE FROM sqlite_sequence; INSERT INTO sqlite_sequence VALUES ('zz', 1); END",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t(v) VALUES ('a')").unwrap();
+    conn.execute("INSERT INTO t(v) VALUES ('b'), ('c')")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![int(1), text("seed")],
+            vec![int(2), text("a")],
+            vec![int(3), text("b")],
+            vec![int(4), text("c")],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid"
+        ),
+        vec![vec![int(1), text("t"), int(4)]],
+        "the write at a key after the Clear"
+    );
+}
+
+/// A WITHOUT ROWID table is keyed on its primary key, as an index is (R29), with the row as the
+/// value: its rows read in key order, a descending key column's included, whatever order they went
+/// in; a lookup by the key finds its row; a second row with a key already there is a constraint
+/// error; and the rows read the same after a reopen. Its key columns come first, as Turso's
+/// WITHOUT ROWID rows read right only then, in WAL mode too: another order reads them with the
+/// other columns' affinities.
+#[test]
+fn a_without_rowid_table_is_keyed_on_its_primary_key() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let open = || {
+        Database::open(
+            io.clone(),
+            "/db/without-rowid",
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .atoll(config())
+                .db_opts(DatabaseOpts::default().with_without_rowid(true)),
+        )
+        .unwrap()
+    };
+    let in_key_order = |conn: &Arc<Connection>| {
+        assert_eq!(
+            rows(conn, "SELECT a, b, c FROM w"),
+            vec![
+                vec![text("a"), Value::from_i64(2), text("r")],
+                vec![text("y"), Value::from_i64(2), text("q")],
+                vec![text("x"), Value::from_i64(1), text("p")],
+                vec![text("z"), Value::from_i64(0), text("s")],
+            ]
+        );
+    };
+    {
+        let db = open();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE w(b INTEGER, a TEXT, c, PRIMARY KEY (b DESC, a)) WITHOUT ROWID")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO w VALUES (1, 'x', 'p'), (2, 'y', 'q'), (2, 'a', 'r'), (0, 'z', 's')",
+        )
+        .unwrap();
+        in_key_order(&conn);
+        assert_eq!(
+            rows(&conn, "SELECT c FROM w WHERE b = 2 AND a = 'y'"),
+            vec![vec![text("q")]]
+        );
+        let err = conn
+            .execute("INSERT INTO w VALUES (1, 'x', 'again')")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "{err}"
+        );
+        in_key_order(&conn);
+        conn.close().unwrap();
+    }
+    let db = open();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    in_key_order(&conn);
+}
+
+/// A materialized view over an Atoll table keeps its rows in an Atoll tree, read through the view's
+/// cursor: it follows the table's inserts, updates and deletes, a transaction reads its own changes
+/// to it, a trigger reading it inside the statement that changes the table reads that statement's
+/// earlier rows, a rollback leaves it as it stood, and it reads the same after a reopen and goes on
+/// following the table.
+#[test]
+fn a_materialized_view_follows_its_table_through_a_rollback_and_a_reopen() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let open = || {
+        Database::open(
+            io.clone(),
+            "/db/matview",
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .atoll(config())
+                .db_opts(DatabaseOpts::default().with_views(true)),
+        )
+        .unwrap()
+    };
+    let counts = |conn: &Arc<Connection>| rows(conn, "SELECT g, c FROM v ORDER BY g");
+    let row = |g: &str, c: i64| vec![text(g), Value::from_i64(c)];
+    {
+        let db = open();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(g, n)").unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 5)")
+            .unwrap();
+        conn.execute("CREATE MATERIALIZED VIEW v AS SELECT g, count(*) AS c FROM t GROUP BY g")
+            .unwrap();
+        assert_eq!(counts(&conn), vec![row("a", 2), row("b", 1)]);
+        conn.execute("UPDATE t SET g = 'b' WHERE n = 2").unwrap();
+        conn.execute("DELETE FROM t WHERE n = 1").unwrap();
+        assert_eq!(counts(&conn), vec![row("b", 2)]);
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES ('c', 7)").unwrap();
+        assert_eq!(
+            counts(&conn),
+            vec![row("b", 2), row("c", 1)],
+            "its own change"
+        );
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(counts(&conn), vec![row("b", 2)]);
+        conn.execute("CREATE TABLE seen(g, c)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+             INSERT INTO seen SELECT g, c FROM v WHERE g = new.g; END",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES ('d', 1), ('d', 2)")
+            .unwrap();
+        assert_eq!(
+            rows(&conn, "SELECT g, c FROM seen ORDER BY rowid"),
+            vec![row("d", 1), row("d", 2)],
+            "the view read inside the statement"
+        );
+        assert_eq!(counts(&conn), vec![row("b", 2), row("d", 2)]);
+        conn.close().unwrap();
+    }
+    let db = open();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(counts(&conn), vec![row("b", 2), row("d", 2)]);
+    conn.execute("INSERT INTO t VALUES ('a', 4)").unwrap();
+    assert_eq!(counts(&conn), vec![row("a", 1), row("b", 2), row("d", 2)]);
 }
 
 /// A statement that destroys a tree, then opens a cursor on it, reads the tree as empty, as
@@ -1264,4 +1473,101 @@ fn a_commit_during_a_schema_writers_drain_fails_it_once_held() {
     a.execute("ROLLBACK").unwrap();
     a.execute("CREATE INDEX i ON t (x)").unwrap();
     assert_eq!(rows(&a, "PRAGMA integrity_check"), vec![vec![text("ok")]]);
+}
+
+/// The rows of `t` as `conn` reads them.
+fn table_state(conn: &Arc<Connection>) -> std::collections::BTreeMap<i64, String> {
+    rows(conn, "SELECT k, v FROM t ORDER BY k")
+        .into_iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::Numeric(crate::Numeric::Integer(k)), Value::Text(v)) => {
+                (*k, v.as_str().to_string())
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// A crash anywhere in a SQL workload leaves a database that opens and holds exactly the
+/// transactions committed before it (DESIGN.md §17, §12): an image taken while transactions write
+/// and commit recovers to the state after some prefix of them, never part of one; one taken once a
+/// COMMIT has returned holds every transaction committed by then, and nothing after; and each
+/// passes the integrity check. Images fall at every second operation, so they land inside
+/// transactions, commits and the checkpoints that follow them.
+#[test]
+fn a_crash_anywhere_in_sql_recovers_a_prefix_of_its_commits() {
+    use crate::io::crash::CrashIO;
+    use std::collections::{BTreeMap, BTreeSet};
+    const TRANSACTIONS: i64 = 30;
+    for seed in 0..2u64 {
+        let path = format!("/db/sql-crash-{seed}");
+        let crash = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let db = open(&io, &path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        let mut model: BTreeMap<i64, String> = BTreeMap::new();
+        let mut states = vec![model.clone()];
+        let mut acked = Vec::new();
+        crash.capture(|_| false, 2, seed);
+        for j in 1..=TRANSACTIONS {
+            let filler = "x".repeat(300);
+            conn.execute("BEGIN").unwrap();
+            conn.execute(format!("INSERT INTO t VALUES ({j}, 'v{j}-{filler}')"))
+                .unwrap();
+            model.insert(j, format!("v{j}-{filler}"));
+            if j > 2 {
+                conn.execute(format!("UPDATE t SET v = 'u{j}' WHERE k = {}", j / 2))
+                    .unwrap();
+                if let Some(v) = model.get_mut(&(j / 2)) {
+                    *v = format!("u{j}");
+                }
+            }
+            if j > 4 && j % 3 == 0 {
+                conn.execute(format!("DELETE FROM t WHERE k = {}", j - 4))
+                    .unwrap();
+                model.remove(&(j - 4));
+            }
+            conn.execute("COMMIT").unwrap();
+            states.push(model.clone());
+            acked.push((crash.crash(seed * 1000 + j as u64), j as usize));
+        }
+        let images = crash.captured();
+        drop(conn);
+        drop(db);
+        let recover = |image: CrashIO, label: &str| {
+            let io: Arc<dyn IO> = Arc::new(image);
+            let db = open(&io, &path);
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let state = table_state(&conn);
+            assert_eq!(
+                rows(&conn, "PRAGMA integrity_check"),
+                vec![vec![text("ok")]],
+                "{label}"
+            );
+            state
+        };
+        for (image, j) in acked {
+            let label = format!("seed {seed}, after commit {j}");
+            assert_eq!(recover(image, &label), states[j], "{label}");
+        }
+        assert!(images.len() > 20, "seed {seed}: {} images", images.len());
+        let mut reached = BTreeSet::new();
+        for (i, image) in images.into_iter().enumerate() {
+            let label = format!("seed {seed}, image {i}");
+            let state = recover(image, &label);
+            let prefix = states.iter().position(|s| *s == state);
+            assert!(
+                prefix.is_some(),
+                "{label}: no prefix of the commits: {state:?}"
+            );
+            reached.extend(prefix);
+        }
+        assert!(
+            reached.len() > TRANSACTIONS as usize / 2,
+            "seed {seed}: images fell after only {} distinct prefixes",
+            reached.len()
+        );
+    }
 }

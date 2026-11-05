@@ -630,3 +630,32 @@ fn a_group_reads_whole_from_where_it_starts_and_nowhere_else() {
     let past = GroupStart::at(log.end().next_multiple_of(ALIGN));
     assert!(Log::read_group(io.clone(), BASE, &small(), past).is_err());
 }
+
+/// A segment of many chunks is zero-filled one write after another on an IO whose writes complete
+/// inside their submission, as a memory IO's do, within a small stack: no write's completion runs
+/// inside another's, so the fill costs no frame per chunk. 1,024 chunks nested a frame chain each
+/// would need well past the 256 KiB stack, the fill's chain taking more than 256 bytes a chunk.
+#[test]
+fn a_segment_of_many_chunks_fills_on_a_small_stack_when_writes_complete_inline() {
+    std::thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(|| {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let config = LogConfig {
+                segment_bytes: 4 << 20,
+                buffer_bytes: 64 << 10,
+                chunk_bytes: 4 << 10,
+                writes_in_flight: 3,
+                direct: false,
+            };
+            let log = Log::open(io.clone(), BASE, config, 0).unwrap();
+            let p = payload(0, 0);
+            let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+            let lsn = log.append(&mut admitted, &header(0), &[&p]);
+            drop(admitted);
+            drive(&io, || log.wait_durable(lsn)).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

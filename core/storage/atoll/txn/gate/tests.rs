@@ -310,11 +310,14 @@ fn a_write_without_the_gate_is_refused_at_commit() {
 
 /// Writers and exclusive takers on many threads, each waiting on what the gate names and taking
 /// again once woken: no writer is ever inside while an exclusive holder is, every thread
-/// finishes, and the gate is left free.
+/// finishes, and the gate is left free. The gate is held shared until a take has waited, so
+/// every run waits at least once, whatever the threads' timing.
 fn writers_and_exclusive_takers_all_finish(threads: usize, rounds: usize) -> usize {
-    let db = Arc::new(open(threads + 1));
+    let db = Arc::new(open(threads + 2));
     let inside = Arc::new(AtomicUsize::new(0));
     let waits = Arc::new(AtomicUsize::new(0));
+    let mut holder = db.begin_slot();
+    assert_eq!(db.shared(&mut holder).0, Taken::Done);
     let park = |c: &Completion, waits: &AtomicUsize| {
         waits.fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -372,6 +375,16 @@ fn writers_and_exclusive_takers_all_finish(threads: usize, rounds: usize) -> usi
             })
         })
         .collect();
+    // An exclusive taker finds the holder in the way and waits: then the holder lets go.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while waits.load(crate::sync::atomic::Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no take waited on the holder"
+        );
+        crate::thread::yield_now();
+    }
+    db.commit(holder);
     for w in workers {
         w.join().unwrap();
     }

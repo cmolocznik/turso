@@ -1163,7 +1163,8 @@ impl SqlCursor {
         }
         if let Some(key) = self.rebinding.clone() {
             if let Some(key) = key {
-                done!(self.resolve()?.refresh(Some(key)));
+                // Resolved without letting go: the rebinding is this catch-up's, under way.
+                done!(self.resolved()?.refresh(Some(key)));
             }
             self.rebinding = None;
         } else if behind != Behind::Nothing {
@@ -1174,6 +1175,23 @@ impl SqlCursor {
         self.seen = epoch;
         self.has_record = !self.is_empty();
         Ok(IOResult::Done(()))
+    }
+
+    /// Lets go of the cursor's tree if a Clear replaced it since the cursor took its position, so
+    /// it resolves the catalog row again and reaches the new tree (DESIGN.md §17, §3). Every step
+    /// that reaches the tree resolves it: one that positions the cursor itself, or writes at a key,
+    /// needs nothing more, and one that moves from its position caught up first, rebinding it at
+    /// its key.
+    fn bound(&mut self) {
+        if self.changes.since(self.id, self.seen) != Behind::Cleared {
+            return;
+        }
+        if let Some(open) = self.open.take() {
+            self.null_row = open.get_null_flag();
+        }
+        self.rebinding = None;
+        self.has_record = false;
+        self.seen = self.changes.epoch();
     }
 
     /// The cursor's position is current with its connection's changes.
@@ -1220,8 +1238,15 @@ impl SqlCursor {
     }
 
     /// The tree's catalog row as the transaction's current statement reads it, and a cursor over
-    /// it, writing plainly where the current statement created the tree.
+    /// it, writing plainly where the current statement created the tree: the tree a Clear made, if
+    /// one replaced the tree since the cursor took its position.
     fn resolve(&mut self) -> Result<&mut AtollCursor> {
+        self.bound();
+        self.resolved()
+    }
+
+    /// The cursor over the tree it holds, or over the tree its catalog row names if it holds none.
+    fn resolved(&mut self) -> Result<&mut AtollCursor> {
         if self.vacant {
             return Err(LimboError::InternalError(format!(
                 "a write into tree {}, which its statement destroyed",

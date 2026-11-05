@@ -12,7 +12,7 @@ use crate::numeric::format_float;
 use crate::numeric::nonnan::NonNan;
 use crate::numeric::Numeric;
 use crate::pseudo::PseudoCursor;
-use crate::schema::Index;
+use crate::schema::{BTreeTable, Index};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::sqlite3_ondisk::{
     read_integer, read_value, read_value_serial_type, read_varint, varint_len, write_varint,
@@ -2622,6 +2622,21 @@ impl IndexInfo {
 
     pub fn new_from_index(index: &Index) -> Result<Self, TryReserveError> {
         Self::new_from_index_in(index, TursoAllocator)
+    }
+
+    /// The key of a WITHOUT ROWID table: its primary key's columns, unique, with no rowid.
+    pub fn new_from_without_rowid_table(table: &BTreeTable) -> Result<Self, TryReserveError> {
+        let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
+            let (_, column) = table
+                .get_column(col_name)
+                .expect("WITHOUT ROWID primary key column should exist");
+            KeyInfo {
+                sort_order: *order,
+                collation: column.collation(),
+                nulls_order: None,
+            }
+        });
+        Self::new(key_info, false, table.primary_key_columns.len(), true)
     }
 
     pub fn new_from_index_in<A: ConcurrentAllocator>(

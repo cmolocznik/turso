@@ -119,11 +119,28 @@ fn draws_start_at_1_follow_the_largest_rise_past_explicit_rowids_and_end_at_max(
     assert_eq!(other.seeded().draw(), Some(-4));
 }
 
+/// A counter seeded from an empty tree holds no rowid: an explicit rowid raised past first, however
+/// low, is its largest, so it draws one above it, as SQLite's next rowid after a largest of -1 is
+/// 0; `i64::MIN` raised past is a rowid too.
+#[test]
+fn an_empty_trees_counter_draws_one_above_an_explicit_rowid_however_low() {
+    let db = open();
+    let counter = db.seeded();
+    counter.inserted(-1);
+    assert_eq!(counter.draw(), Some(0));
+    assert_eq!(counter.draw(), Some(1));
+    let other = open();
+    let counter = other.seeded();
+    counter.inserted(i64::MIN);
+    assert_eq!(counter.draw(), Some(i64::MIN + 1));
+}
+
 /// Twelve threads draw and raise at once: every rowid drawn is drawn once, and each is above every
 /// explicit rowid raised before it was drawn by the same thread.
 fn draws_from_many_threads_never_repeat(threads: usize, each: usize) {
     let counter = Arc::new(Counter {
         last: AtomicI64::new(i64::MIN),
+        holds: AtomicBool::new(false),
         seeded: AtomicBool::new(false),
     });
     // Seeded by two threads at once, from different largest keys: the larger stands.
@@ -132,7 +149,7 @@ fn draws_from_many_threads_never_repeat(threads: usize, each: usize) {
         .map(|largest| {
             let c = counter.clone();
             crate::thread::spawn(move || {
-                c.last.fetch_max(largest, Ordering::AcqRel);
+                c.raise(largest);
                 c.seeded.store(true, Ordering::Release);
             })
         })

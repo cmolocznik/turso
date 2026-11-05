@@ -58,7 +58,7 @@ use super::solo::{Claim, Solo};
 use super::stack::Stack;
 use super::{whole, whole_write};
 use crate::io::{Completion, CompletionGroup, IO};
-use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
@@ -802,34 +802,70 @@ impl Log {
         }
     }
     /// Writes zeros into segment `number` from `at`, one write after another, then syncs it and
-    /// its directory.
-    fn zero_fill(self: &Arc<Self>, number: u64, at: u64) {
+    /// its directory. A write whose completion runs inside its own submission, as a memory IO's
+    /// does, lets this loop go on to the next; one completed later resumes the fill from its
+    /// completion. Either way no write's completion runs inside another's, so a segment of many
+    /// chunks costs no frame per chunk.
+    fn zero_fill(self: &Arc<Self>, number: u64, mut at: u64) {
+        /// The submission has not returned, nor the completion run.
+        const SUBMITTING: u8 = 0;
+        /// The completion ran inside the submission: the loop goes on.
+        const INLINE: u8 = 1;
+        /// The submission returned with the write in flight: the completion goes on.
+        const IN_FLIGHT: u8 = 2;
+        /// The write failed: nobody goes on.
+        const FAILED: u8 = 3;
         let file = self.segments.file(number);
-        if at == self.segments.size {
+        loop {
+            if at == self.segments.size {
+                let me = self.held();
+                let c = Completion::new_sync(move |res| {
+                    let Some(me) = me.upgrade() else { return };
+                    match res {
+                        Ok(_) => me.prepared(number),
+                        Err(e) => me.fail(e),
+                    }
+                });
+                if let Err(e) = file.sync_data(c) {
+                    self.fail(io_failure(&e));
+                }
+                return;
+            }
+            let len = (self.segments.size - at).min(self.zeros.len() as u64);
+            let state = Arc::new(AtomicU8::new(SUBMITTING));
+            let seen = state.clone();
             let me = self.held();
-            let c = Completion::new_sync(move |res| {
+            let c = Completion::new_write(move |res| {
                 let Some(me) = me.upgrade() else { return };
-                match res {
-                    Ok(_) => me.prepared(number),
-                    Err(e) => me.fail(e),
+                match whole(len as usize, res) {
+                    Ok(()) => {
+                        if seen
+                            .compare_exchange(
+                                SUBMITTING,
+                                INLINE,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                        {
+                            me.zero_fill(number, at + len);
+                        }
+                    }
+                    Err(e) => {
+                        seen.store(FAILED, Ordering::Release);
+                        me.fail(e);
+                    }
                 }
             });
-            if let Err(e) = file.sync_data(c) {
+            if let Err(e) = file.pwrite(at, self.zeros.region(0, len as usize), c) {
                 self.fail(io_failure(&e));
+                return;
             }
-            return;
-        }
-        let len = (self.segments.size - at).min(self.zeros.len() as u64);
-        let me = self.held();
-        let c = Completion::new_write(move |res| {
-            let Some(me) = me.upgrade() else { return };
-            match whole(len as usize, res) {
-                Ok(()) => me.zero_fill(number, at + len),
-                Err(e) => me.fail(e),
+            match state.compare_exchange(SUBMITTING, IN_FLIGHT, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Err(INLINE) => at += len,
+                _ => return,
             }
-        });
-        if let Err(e) = file.pwrite(at, self.zeros.region(0, len as usize), c) {
-            self.fail(io_failure(&e));
         }
     }
 

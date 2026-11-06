@@ -2202,8 +2202,10 @@ only submit and record; the synchronous work they did is run by the callers that
   ownership, and only then wakes the admitters, looks for the next segment (taking the word again to
   start it if needed) and flushes, in today's order. Taking the word is no lock: no step waits for
   it, nothing synchronous runs under a lock of the log's, and every wake comes after the word is let
-  go. The directory is synced only from owed, which only the data sync's landing sets, so no caller
-  runs the continuation ahead of the sync it depends on.
+  go. For a fresh file the directory is synced only from owed, which only the data sync's landing
+  sets, so no caller runs the continuation ahead of the sync it depends on; a spare is the one
+  exception, since its file is whole and synced already (section 7.4), so its rename leaves only the
+  directory sync.
 - **Callbacks only submit and record**: the next zero-fill write, the next sync, the landed and
   durable positions. Where today's callback would start a preparation (its flush meets padding
   waiting for a segment) it moves the word from done to needed; where today's `prepared` would run,
@@ -2219,6 +2221,16 @@ only submit and record; the synchronous work they did is run by the callers that
   word let go (the stacks are lock-free). A move to in flight or done wakes no one: nothing has
   become runnable. There are at most two such moves per segment prepared, so these wakes are
   bounded by the segments the log prepares.
+- **A wake that puts waits back looks again.** The durable position's wake (`log/waits.rs`) takes
+  every wait off the stack, finishes those whose mark is reached and puts the others back, so for a
+  moment the others are on no stack: a move or a failure whose take runs then would miss them.
+  Putting a wait back is a registration, and it ends as one does: after putting waits back, across a
+  sequentially consistent fence, the wake reads the log's failure and the word, and the position as
+  today. A failure, it takes the stack again and fails every wait on it; a word needed or owed, it
+  takes the stack again and finishes every wait on it, for a retry; a position raised meanwhile, it
+  goes round again as today. The mover and the failure store, then fence, then take, so either their
+  take finds a wait put back or the wake reads what they stored. The admitters' wake puts nothing
+  back (every admitter comes back), and a mover's or a failure's take finishes everything it takes.
 - **A call**, `admit` or `wait_durable`, in order: registers its wait; flushes; takes and runs a
   step it finds runnable, in its own frame; then reads again: `admit` its room, `wait_durable` the
   durable position, either the log's failure. A caller whose own flush or step moved the word, and
@@ -2228,8 +2240,12 @@ only submit and record; the synchronous work they did is run by the callers that
   not yet started) wakes it when the dependency becomes runnable, and its next call runs the step.
   Close's first step (22.12) is such a caller.
 - **The log's failure** finishes every wait with the failure, as today; a caller that comes back
-  reads it and returns the error. The word stays where the failure found it: a failed log starts
-  and finishes nothing.
+  reads it and returns the error. Once the log has failed no preparation step begins work: a
+  caller reads the failure after it takes the word, and a starter or finisher whose synchronous call
+  (a create, an allocation, a rename, the directory sync) was running when another request failed
+  reads it again when the call returns, before it submits or publishes; seeing it, the step lets the
+  word go where it stands and does nothing more. A publication that races a failure landing after
+  that read is harmless: a failed log plans no write and admits nothing.
 
 That is today's foreground `prepare_ahead` path made the only path. The preparer task replaces the
 adapter (22.9 item 2): it then runs both steps, a move to needed or owed notifies it instead of
@@ -2773,8 +2789,12 @@ compose, the real `Completion`, latch and backends included where named.
    has landed; a completion finished with the word still taken or a log lock held). A spare
    renamed; a memory IO that delivers the whole fill and its sync inside the starter's first
    submission (mutant: the word set in flight after that submission, so the sync's landing finds
-   it still taken and is lost). The census of callers fails on a call site that does not call
-   again.
+   it still taken and is lost). A durable wake holding a waiter off the stack while a move to
+   needed, and in another schedule to owed, takes the stacks, and while a failure takes them
+   (mutant: the wake putting the waiter back and looking only at the position, which leaves it
+   parked). Another request's failure injected during a starter's create and during a finisher's
+   directory sync: nothing is submitted after, and every waiter gets the error. The census of
+   callers fails on a call site that does not call again.
 7. **Close loses nothing and waits for nothing it stopped**: at every step boundary; with the
    checkpoint waiting on admission and the preparer queued with nothing submitted (mutant: close
    waiting for every task's completion to finish); with a write submitted, delivered by the kernel

@@ -11,10 +11,13 @@ use crate::storage::atoll::btree::{
     Check, Drain, Drained, Lookup, Mode, Put, Remove, Tree, HOLD_SHRINK, MERGES_REFUSED,
     SHRINKS_HELD, SHRINKS_REFUSED, SPLITS_REFUSED,
 };
-use crate::storage::atoll::buffer::{BufferConfig, BufferPool, WRITEBACK_BYTES};
+use crate::storage::atoll::buffer::{
+    default_kept_bytes, BufferConfig, BufferPool, LentUse, FRAME_SHORTS, MIN_BUDGET, MIN_DB_BUDGET,
+    WRITEBACK_BYTES,
+};
 use crate::storage::atoll::checkpoint::WRITE_BYTES;
 use crate::storage::atoll::db::{Atoll, AtollConfig};
-use crate::storage::atoll::log::LogConfig;
+use crate::storage::atoll::log::{ring_bytes, LogConfig};
 use crate::storage::atoll::meta::MetaRef;
 use crate::storage::atoll::page::{PageId, SizeClass, MAX_PAGE_SIZE};
 use crate::storage::atoll::radix::FREE;
@@ -81,8 +84,17 @@ fn value(k: u64, round: u8) -> Vec<u8> {
 /// what nothing advances would wait forever. Each return images a page, lands a write, ends the
 /// cut or yields to the latch a test lets go at the first refusal, so a million is past any of
 /// these tests' work. A failed IO the change waited on is its own failure, as the VDBE takes it.
-fn within<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult<T>>) -> T {
-    for _ in 0..1 << 20 {
+fn within<T>(io: &Arc<dyn IO>, op: impl FnMut() -> Result<IOResult<T>>) -> T {
+    within_returns(io, 1 << 20, op)
+}
+
+/// [`within`], failing after `returns` returns.
+fn within_returns<T>(
+    io: &Arc<dyn IO>,
+    returns: usize,
+    mut op: impl FnMut() -> Result<IOResult<T>>,
+) -> T {
+    for _ in 0..returns {
         match op().unwrap() {
             IOResult::Done(v) => return v,
             IOResult::IO(IOCompletions(c)) => {
@@ -101,7 +113,21 @@ fn within<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult<T>>) -> T
             }
         }
     }
-    panic!("no progress in a million steps");
+    panic!("no progress in {returns} returns");
+}
+
+/// Runs `test` on a thread of its own, failing if it is not done within a minute: a change that
+/// retries within one call, never returning, is caught only so.
+fn within_a_minute(test: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        test();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => runner.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("not done within a minute"),
+    }
 }
 
 struct Db {
@@ -489,6 +515,107 @@ fn a_change_that_asked_for_no_room_fails_the_invariant_check() {
         let mut page = within(&db.io, || db.pool().fix_exclusive(pid, None));
         page.page_mut();
     }
+}
+
+/// The copies a cut keeps are in frames the pool lends (one memory), and the room's bytes are
+/// theirs; the checkpoint writes its images of node pages from lent frames too. Once the cut ends,
+/// the pool lends nothing but the log's ring, which it lends for as long as the log is open.
+#[test]
+fn kept_copies_and_images_live_in_frames_the_pool_lends_and_go_back_once_written() {
+    let db = Db::memory();
+    let orphan = drive(&db.io, || {
+        Tree::create(db.pool(), SizeClass::new(0).unwrap())
+    })
+    .unwrap();
+    let ring = ring_bytes(&config().log);
+    assert_eq!(db.pool().lent_stats().log.0, ring, "the log's ring");
+    let (tree, _) = db.owed_tree();
+    let frame = db.orphan_leaf(orphan);
+    let hold = frame.try_lock().expect("the leaf is free");
+    let ticket = db.take_cut();
+    for i in (0..KEYS).step_by(STRIDE).take(20) {
+        db.put(&tree, 2 * i, value(2 * i, 3));
+    }
+    let (kept, lent) = (db.pool().kept_stats(), db.pool().lent_stats());
+    assert!(kept.used > 0, "no copy kept: {kept:?}");
+    assert_eq!(lent.kept.0, kept.used, "the copies' frames: {lent:?}");
+    hold.release_unchanged();
+    db.finish(ticket);
+    drop(frame);
+    let lent = db.pool().lent_stats();
+    assert_eq!(
+        (lent.kept.0, lent.image.0, lent.log.0),
+        (0, 0, ring),
+        "lent once the cut ended: {lent:?}"
+    );
+    assert_eq!(
+        db.pool().lent_frame_bytes(),
+        ring,
+        "frames still lent once the cut ended"
+    );
+    assert!(
+        lent.image.1 > 0,
+        "no image written from a lent frame: {lent:?}"
+    );
+}
+
+/// A change whose copy finds no frame free without an eviction is turned down as one past the
+/// room is: it lets go of its latches, takes a frame holding nothing, which may evict a page, and
+/// goes on with it.
+#[test]
+fn a_copy_that_finds_no_free_frame_takes_one_holding_nothing_and_goes_on() {
+    within_a_minute(|| {
+        let db = Db::memory();
+        let orphan = drive(&db.io, || {
+            Tree::create(db.pool(), SizeClass::new(0).unwrap())
+        })
+        .unwrap();
+        let (tree, _) = db.owed_tree();
+        let frame = db.orphan_leaf(orphan);
+        let hold = frame.try_lock().expect("the leaf is free");
+        let ticket = db.take_cut();
+        // Every free frame of the class lent, and the rest of the region with them.
+        let mut taken = Vec::new();
+        while let Some(block) = db.pool().try_lend(node_class(), LentUse::Image) {
+            taken.push(block);
+        }
+        assert!(!taken.is_empty(), "no frame free to take");
+        let shorts = FRAME_SHORTS.with(|n| n.get());
+        // Done within a few returns: the change turned down, the frame it takes (an eviction's write
+        // at most), and the change again. A thousand is far past that.
+        let mut put = Put::new(&key(0), value(0, 3), Mode::Upsert);
+        within_returns(&db.io, 1 << 10, || tree.put(&mut put));
+        assert!(
+            FRAME_SHORTS.with(|n| n.get()) > shorts,
+            "the copy found a frame free"
+        );
+        assert_eq!(db.get(&tree, 0), Some(value(0, 3)), "the change went in");
+        let kept = db.pool().kept_stats();
+        assert!(kept.used > 0 && kept.peak <= kept.limit, "{kept:?}");
+        drop(taken);
+        hold.release_unchanged();
+        db.finish(ticket);
+        drop(frame);
+    });
+}
+
+/// The room of the smallest database is an eighth of its budget: the copies take its frames, so
+/// no floor of a page of the largest class takes most of a small pool.
+#[test]
+fn the_room_of_the_smallest_database_is_an_eighth_of_its_budget() {
+    assert_eq!(default_kept_bytes(MIN_DB_BUDGET), MIN_DB_BUDGET / 8);
+}
+
+/// A budget whose smallest pool does not fit beside the log's ring, which the pool lends for as
+/// long as the log is open, is refused when the database opens.
+#[test]
+fn a_budget_too_small_for_the_smallest_pool_beside_the_logs_ring_is_refused_at_open() {
+    let mut small = config();
+    small.buffer.budget = MIN_BUDGET;
+    let err = Atoll::open(Arc::new(MemoryIO::new()), BASE, small)
+        .err()
+        .expect("opened");
+    assert!(err.to_string().contains("log's ring"), "{err}");
 }
 
 /// Every page of the tree written to its swap copy and evicted after the cut, still owed: read

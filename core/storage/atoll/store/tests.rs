@@ -3,31 +3,32 @@
 
 use super::*;
 use crate::io::MemoryIO;
-use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
+use crate::storage::atoll::buffer::{min_budget_beside, BufferConfig};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
-use crate::storage::atoll::log::LogConfig;
+use crate::storage::atoll::log::{ring_bytes, LogConfig};
 use crate::storage::atoll::testing::drive;
 use crate::storage::atoll::txn::versioned::Versions;
 
 const BASE: &str = "/db/store";
 
 fn config() -> AtollConfig {
+    let log = LogConfig {
+        segment_bytes: 256 << 10,
+        buffer_bytes: 64 << 10,
+        chunk_bytes: 16 << 10,
+        writes_in_flight: 3,
+        direct: true,
+    };
     AtollConfig {
-        log: LogConfig {
-            segment_bytes: 256 << 10,
-            buffer_bytes: 64 << 10,
-            chunk_bytes: 16 << 10,
-            writes_in_flight: 3,
-            direct: true,
+        buffer: BufferConfig {
+            budget: min_budget_beside(ring_bytes(&log)),
+            writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
+            kept_bytes: None,
         },
+        log,
         store: StoreConfig {
             file_bytes: 64 << 10,
             meta_pages: 64,
-        },
-        buffer: BufferConfig {
-            budget: MIN_BUDGET,
-            writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
-            kept_bytes: None,
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,

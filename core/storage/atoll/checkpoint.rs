@@ -33,9 +33,9 @@
 use super::aligned::AlignedBlock;
 use super::arc_cell::{ArcCell, Releasing};
 use super::blob;
-use super::btree::node::View;
+use super::btree::node::{self, View};
 use super::btree::value::{self, ValueRef};
-use super::buffer::{BufferPool, CutScan, Relief, Source};
+use super::buffer::{BufferPool, CutScan, LentUse, Relief, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
@@ -906,10 +906,29 @@ impl Run {
                 Source::Kept(_) => 0,
             };
             let (mut image, settles) = imaging.image.expect("built");
+            // The write buffer of a node page is a frame lent from the pool, given back once the
+            // write lands. A value page's, of a class a small pool holds one frame of, is not.
+            let lent = pid.class().index() <= node::MAX_CLASS;
+            let block = match lent {
+                false => IOResult::Done(AlignedBlock::zeroed(pid.class().size())),
+                true => cp.pool.lend(pid.class(), LentUse::Image)?,
+            };
+            let block = match block {
+                IOResult::Done(b) => b,
+                IOResult::IO(io) => {
+                    // The image stays built.
+                    self.imaging = Some(Imaging {
+                        image: Some((image, settles)),
+                        ..imaging
+                    });
+                    return Ok(IOResult::IO(io));
+                }
+            };
             let slot = match cp.store.take_copy_slot(pid.class())? {
                 IOResult::Done(s) => s,
                 IOResult::IO(io) => {
-                    // The image stays built: the page is imaged again from its source.
+                    // The image stays built; its frame goes back meanwhile.
+                    drop(block);
                     self.imaging = Some(Imaging {
                         image: Some((image, settles)),
                         ..imaging
@@ -918,7 +937,7 @@ impl Run {
                 }
             };
             page::seal(&mut image[..], pid);
-            let block = Arc::new(AlignedBlock::zeroed(image.len()));
+            let block = Arc::new(block);
             let buffer = block.region(0, image.len());
             buffer.as_mut_slice().copy_from_slice(&image);
             // The most it holds: the source, the image and every write buffer, this one's too.

@@ -1,7 +1,7 @@
 use super::*;
 use crate::io::{MemoryIO, IO};
 use crate::storage::atoll::btree::{Mode, Put, Tree};
-use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
+use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::radix::FREE;
@@ -33,7 +33,7 @@ fn open(io: &Arc<dyn IO>, slots: usize) -> Atoll {
             meta_pages: 1 << 10,
         },
         buffer: BufferConfig {
-            budget: MIN_BUDGET,
+            budget: MIN_DB_BUDGET,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
             kept_bytes: None,
         },

@@ -50,7 +50,10 @@ pub use record::{
 };
 
 use super::aligned::AlignedBlock;
+use super::buffer::{BufferPool, LentUse};
+use super::drive;
 use super::once::SetOnce;
+use super::page::SizeClass;
 use super::prefix::Prefix;
 use super::solo::{Claim, Solo};
 use super::stack::Stack;
@@ -65,14 +68,30 @@ use room::{Pad, Room};
 use segment::Segments;
 use waits::Waits;
 
+/// The chunks of the ring of `config`: room for the admitted bytes, a padded block per write in
+/// flight, and the chunk being flushed while the next fills.
+fn ring_slots(config: &LogConfig) -> usize {
+    let slack = config.writes_in_flight as u64 * BLOCK + 2 * config.chunk_bytes;
+    (config.buffer_bytes + slack).div_ceil(config.chunk_bytes) as usize
+}
+
+/// Bytes of the pool's frames the ring of `config` takes, each chunk in a frame of the class
+/// that fits it.
+pub fn ring_bytes(config: &LogConfig) -> usize {
+    let frame = SizeClass::fitting(config.chunk_bytes as usize).map_or(0, SizeClass::size);
+    ring_slots(config) * frame
+}
+
 #[derive(Debug, Clone)]
 pub struct LogConfig {
     /// Bytes per segment file, a multiple of [`BLOCK`]. At the 1 GB/s log rate Umbra measured
     /// (Freitag et al., VLDB 2022 §4), the default of 256 MiB lasts a quarter of a second.
     pub segment_bytes: u64,
     /// Bytes appended and not yet durable, past which new operations wait to be admitted. The
-    /// default of 32 MiB is 32 ms of log at 1 GB/s, far longer than a group commit takes, so
-    /// operations wait here only while the device stalls.
+    /// default is what the device may be writing at once, `writes_in_flight` chunks: the ring
+    /// holds them and the chunk filling while they land, in frames of the engine's one memory,
+    /// so every byte more is a byte less of cache. A stall longer than those writes take makes
+    /// appenders wait for the device, as a full page cache makes WAL's writers wait.
     pub buffer_bytes: u64,
     /// The ring's chunk size, a multiple of [`BLOCK`]: the largest single write, and the most a
     /// slow copier holds back a flush by.
@@ -88,7 +107,7 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             segment_bytes: 256 << 20,
-            buffer_bytes: 32 << 20,
+            buffer_bytes: 4 * (256 << 10),
             chunk_bytes: 256 << 10,
             writes_in_flight: 4,
             direct: cfg!(target_os = "linux"),
@@ -169,6 +188,37 @@ impl Log {
     /// starting before `end` stops there: the caller must not acknowledge anything appended until
     /// a checkpoint whose redo point is at or past [`Log::end`] is durable.
     pub fn open(io: Arc<dyn IO>, base: &str, config: LogConfig, end: Lsn) -> Result<Arc<Self>> {
+        Self::open_with(io, base, config, end, |len| Ok(AlignedBlock::zeroed(len)))
+    }
+
+    /// [`open`](Self::open), its ring's chunks in frames `pool` lends for as long as the log is
+    /// open, so the log's memory is the pool's (one memory, Clay's ruling of 2026-11-05).
+    pub fn open_in(
+        io: Arc<dyn IO>,
+        base: &str,
+        config: LogConfig,
+        end: Lsn,
+        pool: &Arc<BufferPool>,
+    ) -> Result<Arc<Self>> {
+        let lend_io = io.clone();
+        Self::open_with(io, base, config, end, |len| {
+            let class = SizeClass::fitting(len).ok_or_else(|| {
+                LimboError::InternalError(format!("a log chunk of {len} bytes fits no page class"))
+            })?;
+            let mut block = drive(&lend_io, || pool.lend(class, LentUse::Log))?;
+            // Zeroed as the heap's are: the log pads with what a chunk holds.
+            block.bytes_mut().fill(0);
+            Ok(block)
+        })
+    }
+
+    fn open_with(
+        io: Arc<dyn IO>,
+        base: &str,
+        config: LogConfig,
+        end: Lsn,
+        mut chunk: impl FnMut(usize) -> Result<AlignedBlock>,
+    ) -> Result<Arc<Self>> {
         assert!(
             config.segment_bytes.is_multiple_of(BLOCK)
                 && config.chunk_bytes.is_multiple_of(BLOCK)
@@ -186,17 +236,16 @@ impl Log {
         let start = Self::resumes_at(end);
         let current = segments.number(start);
         let durable_writes = Self::open_segments(&io, &segments, end, start)?;
-        // Room for the admitted bytes, a padded block per write in flight, and the chunk being
-        // flushed while the next fills.
-        let slack = config.writes_in_flight as u64 * BLOCK + 2 * config.chunk_bytes;
-        let slots = (config.buffer_bytes + slack).div_ceil(config.chunk_bytes) as usize;
+        let slots = ring_slots(&config);
         let span = slots as u64 * config.chunk_bytes;
         let ring = (0..slots)
-            .map(|_| Slot {
-                block: Arc::new(AlignedBlock::zeroed(config.chunk_bytes as usize)),
-                copied: AtomicU64::new(0),
+            .map(|_| {
+                Ok(Slot {
+                    block: Arc::new(chunk(config.chunk_bytes as usize)?),
+                    copied: AtomicU64::new(0),
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let log = Arc::new(Self {
             io,
             durable_writes,

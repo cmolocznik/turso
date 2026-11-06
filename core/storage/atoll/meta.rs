@@ -855,6 +855,11 @@ impl MetaCache {
         self.cutting.load(Ordering::Acquire)
     }
 
+    /// Pages in the cache, held or not: their bytes are beyond the frames.
+    pub fn resident(&self) -> usize {
+        self.cells.count()
+    }
+
     /// Bytes of the pages kept as a cut found them, now and at most.
     pub fn cut_stats(&self) -> (usize, usize) {
         self.cut_bytes.stats()

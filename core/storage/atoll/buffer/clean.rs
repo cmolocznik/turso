@@ -245,9 +245,10 @@ impl Writeback {
                 // The frame keeps its page, which may change while it is written: a copy, whole
                 // once nothing was written under the latch while it was taken.
                 debug_assert_eq!(h.status(), RESIDENT);
-                // Room in the writeback buffer, which only writes in flight hold: each gives its
-                // room back as it lands, and wakes the pool. Until then the rest wait unsubmitted.
-                let Some(mut copy) = pool.staging.lease(size) else {
+                // A block for the copy, within the bytes the copies in flight may take: each gives
+                // its share back as it lands, and wakes the pool. Until then the rest wait
+                // unsubmitted.
+                let Some(mut copy) = pool.staging.lease(self.class) else {
                     return None;
                 };
                 let Some(version) = h.latch.optimistic() else {

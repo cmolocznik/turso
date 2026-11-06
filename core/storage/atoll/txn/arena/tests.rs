@@ -1,6 +1,6 @@
 use super::*;
 use crate::io::{MemoryIO, IO};
-use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
+use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET, WRITEBACK_BYTES};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::store::StoreConfig;
@@ -80,7 +80,7 @@ fn expect(io: &Arc<dyn IO>, arenas: &Arenas, ptr: Ptr, n: u64, statement: Statem
 /// first in order, the first having none before it; the transaction knows its first and last.
 #[test]
 fn entries_read_back_and_walk_back_across_pages() {
-    let (io, db) = open(MIN_BUDGET);
+    let (io, db) = open(MIN_DB_BUDGET);
     let arenas = Arenas::new(db.pool().clone(), 4);
     let mut txn = begin(&io, &db);
     let mut ptrs = Vec::new();
@@ -111,7 +111,7 @@ fn entries_read_back_and_walk_back_across_pages() {
 /// alone.
 #[test]
 fn slots_keep_arenas_of_their_own() {
-    let (io, db) = open(MIN_BUDGET);
+    let (io, db) = open(MIN_DB_BUDGET);
     let arenas = Arenas::new(db.pool().clone(), 4);
     let mut a = begin(&io, &db);
     let mut b = begin(&io, &db);
@@ -145,7 +145,7 @@ fn slots_keep_arenas_of_their_own() {
 fn entries_read_whole_while_their_page_is_appended_to() {
     const ENTRIES: u64 = 3_000;
     const AHEAD: u64 = 8;
-    let (io, db) = open(MIN_BUDGET);
+    let (io, db) = open(MIN_DB_BUDGET);
     let arenas = Arc::new(Arenas::new(db.pool().clone(), 4));
     let mut txn = begin(&io, &db);
     let statement = txn.command();
@@ -190,7 +190,7 @@ fn entries_read_whole_while_their_page_is_appended_to() {
 /// whole, and the walk back crosses them.
 #[test]
 fn evicted_pages_read_back_whole() {
-    let (io, db) = open(MIN_BUDGET);
+    let (io, db) = open(MIN_DB_BUDGET);
     let arenas = Arenas::new(db.pool().clone(), 4);
     let mut txn = begin(&io, &db);
     let statement = txn.command();
@@ -198,7 +198,7 @@ fn evicted_pages_read_back_whole() {
     let mut bytes = 0;
     let mut n = 0u64;
     // Twice the pool's memory of entries.
-    while bytes < 2 * MIN_BUDGET {
+    while bytes < 2 * MIN_DB_BUDGET {
         let (key, replaced) = entry(n);
         bytes += key.len() + replaced.len();
         ptrs.push(append(&io, &arenas, &mut txn, n));

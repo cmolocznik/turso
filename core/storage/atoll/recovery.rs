@@ -124,7 +124,7 @@ pub fn recover(
     // Reopening zeroes everything a crash left from `restart` on, durably. The gap is recorded
     // only then, and before anything is appended: a reader that follows it finds nothing past it
     // but what this recovery appends, never records the crash left there.
-    let log = Log::open(io.clone(), base, config.log.clone(), end)?;
+    let log = Log::open_in(io.clone(), base, config.log.clone(), end, &pool)?;
     assert_eq!(log.end(), restart, "the log reopened elsewhere");
     let mut in_charge = superblock;
     if restart > end {

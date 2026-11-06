@@ -197,6 +197,45 @@ fn pages_keep_their_contents_through_eviction_writeback_and_moves_between_classe
     }
 }
 
+/// Eviction writes a dirty page out of its frame (one memory): pages changed at random, twice
+/// what the pool holds, are written to their swap copies and evicted with no copy made of any to
+/// write from, and read back as changed. A writeback's record for tests goes once it ends.
+#[test]
+fn eviction_writes_dirty_pages_out_of_their_frames_with_no_copy() {
+    for b in backends() {
+        let pool = open(&b, MIN_BUDGET);
+        let mut model = Model {
+            io: &b.io,
+            pool: &pool,
+            pages: Vec::new(),
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        for _ in 0..600 {
+            model.allocate(class(3));
+        }
+        model.churn(&mut rng, 2000);
+        assert!(
+            pool.swap_written() > 0,
+            "{}: no page written to a swap copy",
+            b.name
+        );
+        assert_eq!(
+            pool.staging.copies(),
+            0,
+            "{}: a copy made to write a page from",
+            b.name
+        );
+        model.check_all();
+        let mut sweep = pool.sweep();
+        drive(&b.io, || sweep.step(&pool)).unwrap();
+        assert!(
+            pool.stepped.lock().is_empty(),
+            "{}: records of writebacks that ended",
+            b.name
+        );
+    }
+}
+
 #[test]
 fn concurrent_fixes_lose_no_change() {
     const THREADS: usize = 4;

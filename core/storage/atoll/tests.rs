@@ -4,7 +4,7 @@
 
 use super::aligned::AlignedBlock;
 use super::btree::{Mode, Tree};
-use super::buffer::{BufferConfig, MIN_BUDGET};
+use super::buffer::{BufferConfig, MIN_DB_BUDGET};
 use super::control::{self, Control, MAX_CONTINUATIONS};
 use super::db::{Atoll, AtollConfig, Opening};
 use super::log::{Log, LogConfig, Lsn, BLOCK};
@@ -38,7 +38,7 @@ fn config() -> AtollConfig {
             meta_pages: 1 << 10,
         },
         buffer: BufferConfig {
-            budget: MIN_BUDGET,
+            budget: MIN_DB_BUDGET,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
             kept_bytes: None,
         },
@@ -500,7 +500,7 @@ fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Opti
         // Twice the pool of them: a pool's worth at least is written out, and the tree's pages
         // leave memory.
         let temp = class(5);
-        for v in 0..2 * MIN_BUDGET / temp.size() {
+        for v in 0..2 * MIN_DB_BUDGET / temp.size() {
             let mut page = drive_for(io, left, || db.db.pool().allocate_temporary(temp))?;
             page.page_mut().put_u64(HEADER_SIZE, v as u64);
             page.changed();

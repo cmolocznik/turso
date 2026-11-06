@@ -3,7 +3,7 @@ use crate::io::{Completion, MemoryIO};
 use crate::storage::atoll::btree::node;
 use crate::storage::atoll::btree::value;
 use crate::storage::atoll::btree::Seek;
-use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
+use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{Kind, LogConfig};
 use crate::storage::atoll::page::{self, SizeClass};
@@ -32,7 +32,7 @@ fn open() -> Db {
 fn open_with(slots: usize) -> Db {
     open_sized(
         slots,
-        MIN_BUDGET,
+        MIN_DB_BUDGET,
         SizeClass::new(0).unwrap(),
         Some(512 << 10),
     )

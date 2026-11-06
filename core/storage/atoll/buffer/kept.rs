@@ -9,6 +9,7 @@
 //! each ([`MAX_CLASS`](super::super::btree::node::MAX_CLASS)), and a change asks for three at
 //! most, so every request fits the smallest limit, one page of the largest class.
 
+use super::super::aligned::AlignedBlock;
 use super::super::epoch::Epochs;
 use super::cell::{CompletionCell, Retiring};
 use crate::io::{Completion, IO};
@@ -21,13 +22,17 @@ use std::ops::Deref;
 /// ruling's initial choice, not a measured optimum).
 pub const KEPT_CAP: usize = 256 << 20;
 
-/// The default limit for a frame budget of `budget` bytes: an eighth of it, at most
-/// [`KEPT_CAP`], and never under one page of the largest class, so a change of one such page
-/// always fits.
+/// The most one change asks for: only node pages are kept, at most
+/// [`MAX_CLASS`](super::super::btree::node::MAX_CLASS), and a merge asks for three.
+pub const LARGEST_REQUEST: usize =
+    3 * (super::super::page::MIN_PAGE_SIZE << super::super::btree::node::MAX_CLASS);
+
+/// The default limit for a budget of `budget` bytes: an eighth of it, at most [`KEPT_CAP`], and
+/// never under [`LARGEST_REQUEST`], so every change's request fits. The copies take frames of the
+/// budget, so the floor is no larger than a request (the ruling's floor of one page of the
+/// largest class predates the copies living in the frames, and was most of a small pool).
 pub fn default_limit(budget: usize) -> usize {
-    (budget / 8)
-        .min(KEPT_CAP)
-        .max(super::super::page::MAX_PAGE_SIZE)
+    (budget / 8).min(KEPT_CAP).max(LARGEST_REQUEST)
 }
 
 /// What the room has held and how often it refused, since the pool opened.
@@ -148,6 +153,11 @@ impl KeptRoom {
         self.wake();
     }
 
+    /// Gives back `bytes` charged for copies that were not made after all.
+    pub fn uncharge(&self, bytes: usize) {
+        self.release(bytes);
+    }
+
     fn release(&self, bytes: usize) {
         let before = self.used.fetch_sub(bytes, Ordering::AcqRel);
         debug_assert!(before >= bytes, "a kept copy released twice");
@@ -187,17 +197,18 @@ impl KeptRoom {
     }
 }
 
-/// A page as a cut found it, charged to the room until its bytes are dropped.
+/// A page as a cut found it, in a frame lent for it, charged to the room until the copy drops
+/// and gives the frame back.
 pub struct KeptCopy {
-    bytes: Box<[u8]>,
+    block: AlignedBlock,
     room: Arc<KeptRoom>,
 }
 
 impl KeptCopy {
-    /// `bytes`, already charged to `room`.
-    pub fn charged(bytes: Box<[u8]>, room: &Arc<KeptRoom>) -> Self {
+    /// `block`'s copy, already charged to `room`.
+    pub fn charged(block: AlignedBlock, room: &Arc<KeptRoom>) -> Self {
         Self {
-            bytes,
+            block,
             room: room.clone(),
         }
     }
@@ -207,13 +218,13 @@ impl Deref for KeptCopy {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        &self.bytes
+        self.block.bytes()
     }
 }
 
 impl Drop for KeptCopy {
     fn drop(&mut self) {
-        self.room.release(self.bytes.len());
+        self.room.release(self.block.len());
     }
 }
 

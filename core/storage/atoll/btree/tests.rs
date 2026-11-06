@@ -1,7 +1,7 @@
 use super::*;
 use crate::io::crash::CrashIO;
 use crate::io::MemoryIO;
-use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET};
+use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig, Opening};
 use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::page::CLASS_COUNT;
@@ -250,7 +250,7 @@ fn a_temporary_tree_holds_what_a_sorted_map_holds() {
 
 fn holds_what_a_sorted_map_holds(temporary: bool) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = open(&io, MIN_BUDGET, 1);
+    let db = open(&io, MIN_DB_BUDGET, 1);
     let run = drive_runner(&io);
     let tree = create(&io, &db, &run, temporary);
     let max = tree.limits().max_key;
@@ -364,7 +364,7 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
         // What the checkpoint wrote is the tree, whole, with nothing else in use.
         let root = tree.root();
         drop((tree, db));
-        let db = open(&io, MIN_BUDGET, 1);
+        let db = open(&io, MIN_DB_BUDGET, 1);
         let tree = tree_of(&io, &db, root);
         assert!(scan(&tree, &run, true).is_empty(), "reopened");
         let stats = check_whole(&tree, &db, &run, "reopened");
@@ -592,7 +592,7 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
         let crash_io = Arc::new(CrashIO::new(seed));
         crash_io.set_durable_writes(durable_writes);
         let io: Arc<dyn IO> = crash_io.clone();
-        let db = open(&io, MIN_BUDGET, 1);
+        let db = open(&io, MIN_DB_BUDGET, 1);
         let at_cut: RefCell<AtCut> = RefCell::new(BTreeMap::new());
         let model: RefCell<BTreeMap<Vec<u8>, Vec<u8>>> = RefCell::new(BTreeMap::new());
         let acknowledged = Cell::new(0u64);
@@ -607,7 +607,7 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
             let threads = 1 + (crash_seed % 3) as usize;
             let crashed: Arc<dyn IO> = Arc::new(crash_io.crash(crash_seed));
             let label = format!("seed {seed}/{crash_seed}, {threads} threads");
-            let recovered = open(&crashed, MIN_BUDGET, threads);
+            let recovered = open(&crashed, MIN_DB_BUDGET, threads);
             // Recovery ends with a full checkpoint of its own, one past the one in charge.
             let in_charge = recovered.checkpointer().superblock().checkpoint - 1;
             in_charge_seen.borrow_mut().insert(in_charge);
@@ -638,7 +638,7 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
             drop(recovered);
             // What recovery left recovers again to the same state.
             verify(
-                &open(&crashed, MIN_BUDGET, 1),
+                &open(&crashed, MIN_DB_BUDGET, 1),
                 &format!("{label}, reopened"),
             );
             checks.set(checks.get() + 1);
@@ -742,7 +742,7 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut_with_writes_then_syncs(
 fn a_leaf_a_caller_reached_answers_only_the_keys_between_its_fences() {
     use std::ops::Bound::{Excluded, Included, Unbounded};
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = open(&io, MIN_BUDGET, 1);
+    let db = open(&io, MIN_DB_BUDGET, 1);
     let run = drive_runner(&io);
     let tree = create(&io, &db, &run, false);
     let key = |n: u64| format!("k{n:05}").into_bytes();
@@ -887,7 +887,7 @@ fn a_leaf_a_caller_reached_answers_only_the_keys_between_its_fences() {
 fn a_scan_refuses_a_value_out_of_line_its_page_no_longer_names_rather_than_step_past_it() {
     use crate::storage::atoll::page::HEADER_SIZE;
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = open(&io, MIN_BUDGET, 1);
+    let db = open(&io, MIN_DB_BUDGET, 1);
     let run = drive_runner(&io);
     let tree = create(&io, &db, &run, false);
     for (key, len) in [(&b"k0"[..], 10), (b"k1", 2_000), (b"k2", 10)] {
@@ -920,7 +920,7 @@ fn a_scan_refuses_a_value_out_of_line_its_page_no_longer_names_rather_than_step_
 #[test]
 fn a_kept_look_is_given_back_only_while_its_leaf_is_unchanged() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = open(&io, MIN_BUDGET, 1);
+    let db = open(&io, MIN_DB_BUDGET, 1);
     let run = drive_runner(&io);
     let tree = create(&io, &db, &run, false);
     let put = |key: &[u8], value: &[u8]| {
@@ -956,7 +956,7 @@ fn a_kept_look_is_given_back_only_while_its_leaf_is_unchanged() {
 #[test]
 fn a_put_expecting_an_entry_changes_nothing_when_the_entry_differs() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = open(&io, MIN_BUDGET, 1);
+    let db = open(&io, MIN_DB_BUDGET, 1);
     let run = drive_runner(&io);
     let tree = create(&io, &db, &run, false).with_head(4);
     let put = |value: &[u8], expected: Option<&Stored>| {
@@ -986,7 +986,7 @@ fn a_put_expecting_an_entry_changes_nothing_when_the_entry_differs() {
 /// its key's, and the tree ends holding what the writers left and checks whole.
 fn concurrent_tree(seed: u64, ops: u64) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Arc::new(open(&io, MIN_BUDGET, 1));
+    let db = Arc::new(open(&io, MIN_DB_BUDGET, 1));
     let run = drive_runner(&io);
     let root = run_to(&run, || Tree::create(db.pool(), class(0)));
     let tree = Arc::new(tree_of(&io, &db, root));
@@ -1075,7 +1075,7 @@ fn a_tree_recovered_on_threads_at_once_reads_back_whole(threads: usize, keys: u6
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let value = |k: u64| stamp(&k.to_be_bytes(), k, 40 + (k % 7) as usize * 30);
     let root = {
-        let db = open(&io, MIN_BUDGET, 1);
+        let db = open(&io, MIN_DB_BUDGET, 1);
         let run = drive_runner(&io);
         let tree = create(&io, &db, &run, false);
         for k in 0..keys {
@@ -1085,7 +1085,7 @@ fn a_tree_recovered_on_threads_at_once_reads_back_whole(threads: usize, keys: u6
         checkpoint(&db, &run);
         tree.root()
     };
-    let opening = Arc::new(Opening::new(io.clone(), BASE, config(MIN_BUDGET)).unwrap());
+    let opening = Arc::new(Opening::new(io.clone(), BASE, config(MIN_DB_BUDGET)).unwrap());
     let others: Vec<_> = (1..threads)
         .map(|_| {
             let opening = opening.clone();

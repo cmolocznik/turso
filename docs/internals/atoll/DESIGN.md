@@ -255,7 +255,11 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
 
 ### 7.2 Filling the log in parallel
 
-- **Reserving.** The log buffer is a ring of aligned chunks. An appender reserves space with one
+- **Reserving.** The log buffer is a ring of aligned chunks, each a frame the pool lends for as
+  long as the log is open (section 9.1). By default it admits what the device may be writing at
+  once, `writes_in_flight` chunks, and holds the chunk filling while those land: a stall longer
+  than they take makes appenders wait for the device, as a full page cache makes WAL's writers
+  wait, and every byte more would be a byte less of cache. An appender reserves space with one
   atomic add on the insert position and copies its record in, in parallel with other appenders.
 - **Knowing what is complete.** Each appender announces, in a small array, where its copy in
   progress starts. It does so before reserving, with sequentially consistent ordering. A flusher
@@ -376,6 +380,19 @@ Built in `core/storage/atoll/buffer`.
   into 2 MiB batches, a whole number to a huge page, and each batch is lent to one size class at
   a time: 512 frames of 4 KiB, down to one of 2 MiB. A 4 MiB or 8 MiB frame takes an aligned run
   of 2 or 4 batches from a buddy allocator.
+- **One memory** (Clay's ruling of 2026-11-05). The region is the engine's memory: what does not
+  cache a page is lent from it (`buffer/lent.rs`), a frame at a time, for a copy a checkpoint's
+  cut keeps (section 10), a checkpoint's image of a node page until its write lands, and a chunk
+  of the log's ring for as long as the log is open. A lent frame holds no page and is in no hash
+  chain, so nothing evicts or moves it, a hint to it fails, and a batch holding one drains only
+  once it is given back. Only a quiet frame is lent, as its holder writes it plainly; it goes back
+  when its block drops, from whatever thread or IO callback drops it. Beside the region are what
+  is fixed per process (code, stacks, connection and statement state), what scales with the
+  region (the headers and the hash table), and three working memories, each bounded where it
+  arises: the image of a value page being written and the copy it is made from (two pages of its
+  class), the metadata pages a cut keeps (section 10, item 11), and a transaction's changes, held
+  until its commit writes them to the log. Not built: a value page's image written from its frame,
+  metadata pages in lent frames, and a transaction's changes past a chunk in temporary pages.
 - **Frame ids.** A frame is named by the 4 KiB grain it starts at, as a `u32`, so one pool holds
   at most 16 TiB. The id names the same memory whichever class holds it.
 - **Never unmapped.** A freed frame is reused as it is. Memory moves between classes a whole batch
@@ -393,7 +410,7 @@ Built in `core/storage/atoll/buffer`.
 - **Headers.** Frame headers sit in their own array, one per 4 KiB, which is never unmapped, so a
   hint however stale always reads a header. Each header holds:
   - the versioned latch, whose version also rises on eviction;
-  - the page id and the frame's state (free, loading, resident);
+  - the page id and the frame's state (free, loading, resident, being written out, lent);
   - the page's change count, the count its newest copy written holds (a swap copy or its
     checkpoint copy), and the count its checkpoint copy holds. The page is clean, and may be
     dropped, while the first two agree, and owed an image while the first and third differ
@@ -406,7 +423,10 @@ Built in `core/storage/atoll/buffer`.
   That is 104 bytes per 4 KiB frame, 2.5%.
 - **Cost of memory.** Untouched memory costs nothing: the region, the headers and the hash table
   take physical memory only when used.
-- **Minimum.** A pool is at least 10 MiB: one 8 MiB frame and one batch beside it.
+- **Minimum.** A pool is at least 10 MiB: one 8 MiB frame and one batch beside it. A database's
+  budget holds that beside its log's ring, in whole batches, as a batch lent to the ring's class
+  holds no other class's pages: 12 MiB for any ring of one batch, as every ring of chunks up to
+  256 KiB with the default writes in flight is. A smaller one is refused at open.
 
 ### 9.2 Finding a page
 
@@ -453,8 +473,8 @@ WATT (Vöhringer and Leis, PVLDB 2023; LeanStore 2024 §2.2), with the paper's t
   the most recent access alone damped by 0.1. Changes count again, weighted by 4;
 - the epoch advances each time a quarter of the pool is evicted;
 - eviction takes the least value among 8 sampled frames as its threshold, then looks at 64 more:
-  clean ones at or below it are evicted, and dirty ones are written back, then evicted if still
-  clean.
+  clean ones at or below it are evicted, and dirty ones are written out of their frames, then
+  evicted (section 9.5).
 
 The paper divides by `now - t`, which is zero within the current epoch. Here elapsed time counts
 the current epoch as one, so pages used this epoch still rank by how often.
@@ -483,17 +503,19 @@ frame goes stale.
 
 ### 9.5 Writing back
 
-- A writeback, eviction's, takes dirty frames of one class and marks them writing, so they are
-  neither evicted nor dropped meanwhile. Each takes a fresh swap slot (section 6.3), and on landing
+- A writeback takes dirty frames of one class and marks them writing, so they are neither evicted
+  nor dropped meanwhile. Each takes a fresh swap slot (section 6.3), and on landing
   the slot is named the page's swap copy, the one it replaces given up. A swap copy is never made
   durable: it only lets the frame go.
 - A page written out of its frame (a draining batch, an eviction) is held by its write-out until
-  the write lands, so it is sealed in its frame and written from there: no copy.
-- A page that stays in its frame may change while it is written, so it is copied optimistically,
-  checked against its latch, and the copy is written; a page changed while its copy is in flight
-  stays dirty. Copies are made in one ring of fixed size allocated with the pool (`writeback_bytes`,
-  at least the largest page, two of it by default), leased per write and given back as it lands.
-  Its size bounds such writes in flight, and so the cleaner's share of the device; a writeback
+  the write lands, so it is sealed in its frame and written from there: no copy, and no memory
+  beside the frame. Whoever wants the page meanwhile waits on the write, as on a read. Eviction
+  writes a dirty page out (one memory): a copy to write from would take a frame of its own, which
+  a full pool has none of to spare.
+- Only a test's sweep writes a page that stays in its frame, which may change while it is
+  written: it is copied optimistically into a block of its own, checked against its latch, and the
+  copy is written; a page changed while its copy is in flight stays dirty. The copies in flight
+  stay within `writeback_bytes` (at least the largest page, two of it by default); a writeback
   finding no room submits no more until writes land.
 - A write's completion only records that it landed and wakes the pool's waiters; the frame's new
   state is settled the next time the writeback is stepped.
@@ -530,8 +552,8 @@ A checkpoint (audit 18) writes every page owed an image as of one snapshot `C`, 
 the same cut, and a superblock naming them, so recovery replays the log from the cut's position
 `L`, applying only the commits above `C` (section 12). Pages are never logged. Built in
 `core/storage/atoll/checkpoint.rs`, the pool's part in `buffer/mod.rs` (the cut, the copy hook,
-settling) and `buffer/kept.rs` (the room for kept copies), the store's in `store.rs` (the cut's
-metadata edits, the frees that wait for a checkpoint).
+settling), `buffer/kept.rs` (the room for kept copies) and `buffer/lent.rs` (their frames), the
+store's in `store.rs` (the cut's metadata edits, the frees that wait for a checkpoint).
 
 1. **Owed and clean are two facts.** A frame counts its changes. It is clean while a slot holds
    exactly its bytes, its swap copy or its checkpoint copy, and only a clean frame may be dropped.
@@ -553,12 +575,17 @@ metadata edits, the frees that wait for a checkpoint).
    which every reader checks, nor the checkpoint's own free of an orphan its cut left out.
 
    **The room for kept copies** (Clay's ruling of 2026-11-05) bounds the copies of data pages;
-   the metadata's are accounted apart (item 11). The copies are charged to a room of
-   `max(P, min(B/8, 256 MiB))` bytes, P the largest page and B the frame budget, an initial choice
-   that `kept_bytes` overrides; a charge is given back only when its copy's bytes are dropped,
-   wherever they then are. A change latches every page it will change and asks for room for the
+   the metadata's are accounted apart (item 11). Each copy is in a frame the pool lends (section
+   9.1), charged to a room of `max(R, min(B/8, 256 MiB))` bytes, B the budget and R the largest
+   request a change makes, three node pages of 64 KiB, an initial choice that `kept_bytes`
+   overrides. The ruling's floor was a page of the largest class, P; it was set while the copies
+   lived beside the frames, and with them in the frames it would be most of a small pool. A charge
+   is given back only when its copy drops and gives its frame back, wherever it then is. A change latches every page it will change and asks for room for the
    copies they need before its first edit, all or none; an edit of a page the cut owes that asked
-   for none fails an invariant check rather than copy past the limit. Only node pages are kept,
+   for none fails an invariant check rather than copy past the limit. A request that finds no frame
+   of its class free without an eviction is turned down as one past the room is: the change lets
+   go of what it holds, takes a frame holding nothing, which may evict a page, and goes on with
+   it. Only node pages are kept,
    64 KiB at most, and a change asks for three at most, so every request fits. Refused, it lets go
    of its latches and the change gate, and the writer steps the checkpoint itself, as an embedded
    database may have one connection and no other thread, until the room takes what it asked for,
@@ -599,17 +626,17 @@ metadata edits, the frees that wait for a checkpoint).
     until the database is opened again and recovers from the one in charge. Its cut ends and its
     copies are dropped; a writer that was stepping it for room goes on, as commits do, and the
     failure is told to whoever steps checkpoints next. A write that lands short is a failure.
-11. **Memory beyond the frames**, each amount accounted, so a total-memory setting can later divide
-    one allowance among them: the room for kept copies; the checkpoint's working memory, one page
-    imaged at a time (its source read live, its image and its write buffer, three pages of the
-    largest class at most) and image write buffers in flight within `checkpoint_write_bytes`, one
-    such page by default, beside the 32 writes, so a large page's writes go fewer at once (32 small
-    writes keep a device busy up to pages of 256 KiB; a larger write is itself several of the
-    device's commands); and the metadata pages kept as a cut found them, outside the room. No one
-    waits for those, so the checkpoint always reaches the writes that drop them; they are a page
-    each, kept once a cut, so they grow with the metadata, which nothing here bounds. Each is
-    reported with its peak, with the refusals, the time writers waited and the longest wait, and
-    the checkpoint's pages, bytes and stepping time.
+11. **Memory**, in the one region (section 9.1) or beside it, each amount accounted: the kept
+    copies and the images of node pages in lent frames; the image write buffers in flight within
+    `checkpoint_write_bytes`, one page of the largest class by default, beside the 32 writes, so a
+    large page's writes go fewer at once (32 small writes keep a device busy up to pages of
+    256 KiB; a larger write is itself several of the device's commands); the page being imaged,
+    one at a time, read live and built into its image beside the region (two pages of its class
+    at most); and the metadata pages kept as a cut found them, outside the room. No one waits for
+    those, so the checkpoint always reaches the writes that drop them; they are a page each, kept
+    once a cut, so they grow with the metadata, which nothing here bounds. Each is reported with
+    its peak (the bytes lent by use among them), with the refusals, the time writers waited and
+    the longest wait, and the checkpoint's pages, bytes and stepping time.
 
 ## 11. Transactions and versions
 

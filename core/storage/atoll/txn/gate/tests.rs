@@ -7,7 +7,7 @@ use super::super::{Abort, Commit, Hold, Isolation, Transactions, TxnConfig};
 use super::*;
 use crate::io::{MemoryIO, IO};
 use crate::storage::atoll::btree::{Mode, Tree};
-use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
+use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET, WRITEBACK_BYTES};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::page::SizeClass;
@@ -39,7 +39,7 @@ fn open(slots: usize) -> Db {
             meta_pages: 1 << 10,
         },
         buffer: BufferConfig {
-            budget: MIN_BUDGET,
+            budget: MIN_DB_BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
         },

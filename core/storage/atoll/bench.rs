@@ -7,11 +7,11 @@
 //! cargo test --release -p turso_core --lib storage::atoll::bench -- --ignored --nocapture --test-threads 1
 //! ```
 
-use super::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
+use super::buffer::{min_budget_beside, BufferConfig, WRITEBACK_BYTES};
 use super::db::{Atoll, AtollConfig};
 use super::drive;
 use super::epoch::{Epochs, Retired};
-use super::log::LogConfig;
+use super::log::{ring_bytes, LogConfig};
 use super::stack::FreeList;
 use super::store::StoreConfig;
 use super::txn::{Commit, Isolation, TxnConfig};
@@ -133,23 +133,24 @@ fn free_list_pop_and_push() {
 fn commits() {
     report("commit", |threads| {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let log = LogConfig {
+            segment_bytes: 64 << 20,
+            buffer_bytes: 4 << 20,
+            chunk_bytes: 64 << 10,
+            writes_in_flight: 4,
+            direct: true,
+        };
         let config = AtollConfig {
-            log: LogConfig {
-                segment_bytes: 64 << 20,
-                buffer_bytes: 4 << 20,
-                chunk_bytes: 64 << 10,
-                writes_in_flight: 4,
-                direct: true,
-            },
             store: StoreConfig {
                 file_bytes: 1 << 30,
                 meta_pages: 1 << 10,
             },
             buffer: BufferConfig {
-                budget: MIN_BUDGET,
+                budget: min_budget_beside(ring_bytes(&log)),
                 writeback_bytes: WRITEBACK_BYTES,
                 kept_bytes: None,
             },
+            log,
             log_budget: None,
             checkpoint_write_bytes: None,
             txn: TxnConfig {
@@ -631,10 +632,11 @@ fn sustained() {
         .prepare("INSERT INTO t (id, data) VALUES (?1, ?2)")
         .unwrap();
     let loading = Instant::now();
-    for chunk in (0..rows).collect::<Vec<_>>().chunks(1000) {
+    // In ranges, not a list of the ids: a list of 4 million is 32 MiB of the capped memory.
+    for start in (0..rows).step_by(1000) {
         begin.run_ignore_rows().unwrap();
         begin.reset().unwrap();
-        for &id in chunk {
+        for id in start..(start + 1000).min(rows) {
             insert
                 .bind_at(NonZero::<usize>::MIN, Value::from_i64(id as i64))
                 .unwrap();
@@ -824,9 +826,12 @@ fn sustained() {
                 }
                 if let Some(a) = &atoll {
                     let kept = a.atoll().pool().kept_stats();
+                    let lent = a.atoll().pool().lent_stats();
                     line += &format!(
                         " ckpt_pages {} ckpt_MB {:.1} swap_MB {:.1} log_MB {:.1} kept_peak_MB {:.1} \
-                         refusals {} waited_ms {:.1} longest_wait_ms {:.1} temp_MB {:.1}",
+                         refusals {} waited_ms {:.1} longest_wait_ms {:.1} temp_MB {:.1} \
+                         meta_MB {:.1} meta_cut_MB {:.1} lent_peak_MB kept {:.1} image {:.1} log \
+                         {:.1}",
                         now.checkpoint_pages - was.checkpoint_pages,
                         mb(now.checkpoint_bytes - was.checkpoint_bytes),
                         mb(now.swap - was.swap),
@@ -836,7 +841,13 @@ fn sustained() {
                         (now.waited_ns - was.waited_ns) as f64 / 1e6,
                         kept.longest_wait_ns as f64 / 1e6,
                         mb(a.atoll().pool().temporary_bytes()),
+                        mb((a.atoll().store().meta().resident() * super::meta::META_PAGE) as u64),
+                        mb(a.atoll().store().meta().cut_stats().0 as u64),
+                        mb(lent.kept.1 as u64),
+                        mb(lent.image.1 as u64),
+                        mb(lent.log.1 as u64),
                     );
+                    a.atoll().pool().reset_lent_peaks();
                     a.atoll().pool().reset_kept_peaks();
                 }
                 println!("{line}");

@@ -15,6 +15,9 @@ pub const RESIDENT: u8 = 2;
 /// The page is being written out of the frame, which the write-out holds exclusively until the
 /// write ends.
 pub const OUTGOING: u8 = 3;
+/// The frame is lent beside the page table ([`super::lent`]): it holds no page, and its holder
+/// gives it back.
+pub const LENT: u8 = 4;
 
 /// A copy of the page is being written back.
 pub const WRITING: u8 = 1;

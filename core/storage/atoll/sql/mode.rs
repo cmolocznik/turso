@@ -28,7 +28,7 @@ use super::AtollDb;
 use crate::io::FileSyncType;
 use crate::io::{Completion, OpenFlags, IO};
 use crate::storage::atoll::btree::{Mode, Near, Outcome};
-use crate::storage::atoll::buffer::MIN_BUDGET;
+use crate::storage::atoll::buffer::MIN_DB_BUDGET;
 use crate::storage::atoll::control::{self, Found};
 use crate::storage::atoll::db::AtollConfig;
 use crate::storage::atoll::drive;
@@ -111,12 +111,12 @@ fn holds_anything(io: &Arc<dyn IO>, path: &str) -> Result<bool> {
 }
 
 /// The configuration an Atoll database opens with: the caller's, or for one opened without the
-/// option, Turso's default page cache, 2000 KiB (`cache_size` −2000), raised to the smallest pool
-/// Atoll takes (R26).
+/// option, Turso's default page cache, 2000 KiB (`cache_size` −2000), raised to the smallest
+/// budget a database takes, the pool with its log's ring (R26).
 pub fn config_for(option: Option<&AtollConfig>) -> AtollConfig {
     option
         .cloned()
-        .unwrap_or_else(|| AtollConfig::with_budget(MIN_BUDGET.max(2_048_000)))
+        .unwrap_or_else(|| AtollConfig::with_budget(MIN_DB_BUDGET.max(2_048_000)))
 }
 
 fn refused() -> LimboError {

@@ -4,7 +4,7 @@
 use super::*;
 use crate::io::crash::CrashIO;
 use crate::io::MemoryIO;
-use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
+use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET, WRITEBACK_BYTES};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::page::CLASS_COUNT;
@@ -29,7 +29,7 @@ fn config(chunk_bytes: u64) -> AtollConfig {
             meta_pages: 1 << 10,
         },
         buffer: BufferConfig {
-            budget: MIN_BUDGET,
+            budget: MIN_DB_BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
         },

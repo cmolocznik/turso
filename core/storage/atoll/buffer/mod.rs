@@ -34,6 +34,7 @@ pub(super) mod cell;
 mod clean;
 mod frame;
 mod kept;
+mod lent;
 mod memory;
 mod source;
 mod staging;
@@ -47,9 +48,22 @@ mod watt;
 mod tests;
 
 pub use kept::{default_limit as default_kept_bytes, KeptCopy, KeptStats, KEPT_CAP};
+pub use lent::{LentStats, Use as LentUse};
 pub use memory::MIN_BUDGET;
+
+/// The smallest budget a database takes whose log's ring fits one batch, as every ring of
+/// chunks up to 256 KiB with the default writes in flight does: [`MIN_BUDGET`] and that batch.
+pub const MIN_DB_BUDGET: usize = MIN_BUDGET + memory::BATCH;
+
+/// The smallest budget a pool takes when `lent` bytes of it are lent for as long as it is open
+/// (the log's ring): [`MIN_BUDGET`] beside them, in whole batches, since a batch lent to a class
+/// for them holds no other class's pages.
+pub fn min_budget_beside(lent: usize) -> usize {
+    MIN_BUDGET + lent.next_multiple_of(memory::BATCH)
+}
 pub use source::{LocalSource, Located, PageSource, ReadDone};
 
+use super::aligned::AlignedBlock;
 use super::blob;
 use super::epoch::Step;
 use super::latch::{Held, VersionedLatch};
@@ -61,9 +75,10 @@ use super::store::PageStore;
 use cell::{CompletionCell, Retiring};
 use clean::{Progress, Writeback};
 use frame::{
-    FrameHeader, ABANDONED, EVICT_AFTER, FREE, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
+    FrameHeader, ABANDONED, EVICT_AFTER, FREE, LENT, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
 };
 use kept::KeptRoom;
+use lent::Lends;
 use memory::{Memory, Take, Zeroed};
 use table::Table;
 use temp::TempPages;
@@ -205,21 +220,24 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct BufferConfig {
-    /// Bytes of memory for frames, at least [`MIN_BUDGET`]. Frame headers take 2% more and the
-    /// hash table 0.2%, and none of it takes physical memory until used.
+    /// Bytes of the engine's memory, at least [`MIN_BUDGET`]: the frames that cache pages and
+    /// every frame lent beside them ([`lent`]) for kept copies, checkpoint images of node pages
+    /// and the log's ring. Frame headers take 2% more and the hash table 0.2%, and none of
+    /// it takes physical memory until used.
     pub budget: usize,
-    /// Bytes of the writeback buffer ([`staging`]): what copies of pages written back while they
-    /// stay in their frames are made in, and so a bound on such writes in flight. At least the
-    /// largest page.
+    /// Bytes the copies of pages written back while they stay in their frames ([`staging`]) may
+    /// take in flight: only a sweep makes them, as eviction writes a page out of its frame. At
+    /// least the largest page.
     pub writeback_bytes: usize,
     /// Bytes of the copies a checkpoint's cut keeps of pages changed before it images them
-    /// ([`kept`]), beyond the frames: `None` for [`default_kept_bytes`] of the budget. At least
+    /// ([`kept`]), each in a lent frame: `None` for [`default_kept_bytes`] of the budget. At least
     /// the largest page.
     pub kept_bytes: Option<usize>,
 }
 
-/// The default writeback buffer: two of the largest page, so a write of one never waits behind
-/// another, which is far more than the 32 to 128 small writes in flight that keep a device busy.
+/// The default bytes of a sweep's copies in flight: two of the largest page, so a write of one
+/// never waits behind another, which is far more than the 32 to 128 small writes in flight that
+/// keep a device busy.
 pub const WRITEBACK_BYTES: usize = 2 * page::MAX_PAGE_SIZE;
 
 impl BufferConfig {
@@ -292,6 +310,8 @@ pub struct BufferPool {
     /// Pages that checkpoint found owed, kept as they stood by their first change or free since
     /// (the copy hook, audit 18).
     kept: Mutex<HashMap<PageId, KeptCopy>>,
+    /// The frames lent beside the page table, and what for.
+    lends: Arc<Lends>,
     /// The room the copies are charged to ([`kept`]).
     room: Arc<KeptRoom>,
     /// What a writer refused room drives: the checkpoint, once the database is open.
@@ -300,10 +320,29 @@ pub struct BufferPool {
     /// pending.
     cut_owed: Mutex<HashSet<PageId>>,
     temp: Arc<TempPages>,
-    /// Each queued writeback's state after its last step, by address, for a test that stalled to
-    /// show while another thread steps it.
+    /// Each queued writeback's state after its last step, by its number, for a test that stalled
+    /// to show while another thread steps it.
     #[cfg(test)]
     stepped: Mutex<HashMap<u64, String>>,
+}
+
+/// Why a request for kept copies was turned down.
+enum Turned {
+    /// The room is full.
+    Room,
+    /// No frame of the class is free without an eviction.
+    Frame(SizeClass),
+}
+
+crate::thread::thread_local! {
+    /// Frames lent to this thread for kept copies while it held no latch, after a request found
+    /// none free: its next request takes them first.
+    static SPARES: std::cell::RefCell<Vec<AlignedBlock>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The class this thread's last request found no free frame of, if that turned it down.
+    static SHORT: std::cell::Cell<Option<SizeClass>> = const { std::cell::Cell::new(None) };
+    /// Requests turned down for a frame on this thread, for tests to see one reach a wait.
+    #[cfg(test)]
+    pub(crate) static FRAME_SHORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// What a claimed frame is for.
@@ -351,11 +390,10 @@ impl BufferPool {
         let kept_bytes = config
             .kept_bytes
             .unwrap_or_else(|| kept::default_limit(config.budget));
-        if kept_bytes < page::MAX_PAGE_SIZE {
+        if kept_bytes < kept::LARGEST_REQUEST {
             return Err(LimboError::InternalError(format!(
-                "a room of {kept_bytes} bytes for kept copies holds no copy of the largest page, \
-                 {} bytes",
-                page::MAX_PAGE_SIZE
+                "a room of {kept_bytes} bytes for kept copies holds no change's request, {} bytes",
+                kept::LARGEST_REQUEST
             )));
         }
         let memory = Memory::new(config.budget)?;
@@ -370,9 +408,10 @@ impl BufferPool {
             )));
         }
         let grains = memory.grains();
+        let lends = Arc::new(Lends::new(memory.region.clone()));
         let epoch_bytes =
             (memory.batches as u64 * memory::BATCH as u64) / watt::EPOCHS_PER_TURNOVER as u64;
-        Ok(Arc::new(Self {
+        let pool = Arc::new(Self {
             frames: Arc::new(Frames {
                 headers: Zeroed::new(grains as usize)?,
                 given_up: Zeroed::new(grains as usize)?,
@@ -394,6 +433,7 @@ impl BufferPool {
             failure: SetOnce::default(),
             cutting: AtomicU64::new(0),
             kept: Mutex::new(HashMap::new()),
+            lends,
             room: KeptRoom::new(kept_bytes, store.epochs().clone(), store.io().clone()),
             relief: SetOnce::default(),
             cut_owed: Mutex::new(HashSet::new()),
@@ -405,7 +445,9 @@ impl BufferPool {
             store,
             #[cfg(test)]
             stepped: Mutex::new(HashMap::new()),
-        }))
+        });
+        pool.lends.set_pool(&pool);
+        Ok(pool)
     }
 
     fn header(&self, frame: u32) -> &FrameHeader {
@@ -953,7 +995,7 @@ impl BufferPool {
             if !wait_out_a_cut {
                 // An orphan the checkpoint left out: no image of its cut names it.
                 self.left_out_of_cut(frame, pid);
-            } else if !self.try_keep(&[&page]) {
+            } else if self.try_keep(&[&page]).is_err() {
                 // A checkpoint cut before the free still writes the page as it stood: with no
                 // room for a copy, it is handed to the checkpointer as it stands, unchanged since
                 // the cut, and the next checkpoint frees it. A free never waits.
@@ -1395,7 +1437,7 @@ impl BufferPool {
     }
 
     /// One WATT round: evicts the clean pages among a sample whose value is at most the
-    /// threshold, and starts writing back the dirty ones.
+    /// threshold, and starts writing the dirty ones out of their frames.
     fn evict_round(self: &Arc<Self>, class: SizeClass) -> Result<()> {
         let Some(threshold) = self.threshold(class) else {
             return Ok(());
@@ -1406,24 +1448,28 @@ impl BufferPool {
             .sample(class, watt::CANDIDATES, &mut rand::rng());
         candidates.sort_unstable();
         candidates.dedup();
-        let mut dirty = Vec::new();
+        let mut outgoing = Vec::new();
         for frame in candidates {
             let h = self.header(frame);
             if h.tracker.value(now) > threshold {
                 continue;
             }
-            let Some(hold) = self.latch_to_evict(class, frame, || &h.latch) else {
+            let latch = || FrameLatch {
+                frames: self.frames.clone(),
+                frame,
+            };
+            let Some(hold) = self.latch_to_evict(class, frame, latch) else {
                 continue;
             };
             if h.dirty() {
-                h.flags.fetch_or(WRITING | EVICT_AFTER, Ordering::AcqRel);
-                drop(hold);
-                dirty.push(frame);
+                // Written out of its frame, then gone: a copy to write from would take a frame of
+                // its own, which a full pool has none of to spare (one memory).
+                outgoing.push(self.start_write_out(hold));
             } else {
                 self.evict(class, frame, hold);
             }
         }
-        self.write_back(class, dirty, true);
+        self.write_out(class, outgoing);
         Ok(())
     }
 
@@ -1653,6 +1699,10 @@ impl BufferPool {
                 }
             }
             Progress::Done => {
+                // Kept only while queued: a record per writeback ever stepped would grow without
+                // bound in a long test run.
+                #[cfg(test)]
+                self.stepped.lock().remove(&wb.id);
                 self.queued.fetch_sub(1, Ordering::AcqRel);
                 self.signal_released();
             }
@@ -1747,6 +1797,84 @@ impl BufferPool {
         self.signal_released();
     }
 
+    // ---------------------------------------------------------------- lending
+
+    /// A quiet free frame of `class`, lent for `what`, if one is free or the region has memory
+    /// for the class: never an eviction or a wait, so it may be taken under latches.
+    pub(crate) fn try_lend(
+        self: &Arc<Self>,
+        class: SizeClass,
+        what: LentUse,
+    ) -> Option<AlignedBlock> {
+        match self.take_or_grow(class, Purpose::Read) {
+            Got::Frame(frame) => Some(self.lend_frame(frame, class, what)),
+            Got::Quieting(_) | Got::None => None,
+        }
+    }
+
+    /// A quiet frame of `class`, lent for `what`, making room for it if need be. Step it until
+    /// done, holding no latch.
+    pub(crate) fn lend(
+        self: &Arc<Self>,
+        class: SizeClass,
+        what: LentUse,
+    ) -> Result<IOResult<AlignedBlock>> {
+        let frame = match self.claim(class, Purpose::Read)? {
+            IOResult::Done(frame) => frame,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        Ok(IOResult::Done(self.lend_frame(frame, class, what)))
+    }
+
+    /// `frame`, free and quiet, lent for `what`: a hint to the page it last held fails, as its
+    /// latch's version rises.
+    fn lend_frame(self: &Arc<Self>, frame: u32, class: SizeClass, what: LentUse) -> AlignedBlock {
+        let h = self.header(frame);
+        let hold = self.take_free_latch(frame);
+        h.pid.store(NO_PAGE, Ordering::Release);
+        h.flags.store(0, Ordering::Release);
+        h.status.store(LENT, Ordering::Release);
+        drop(hold);
+        let token = self.lends.lent(frame, class, what);
+        let ptr =
+            std::ptr::NonNull::new(self.memory.region.ptr(frame)).expect("the region's memory");
+        // SAFETY: a frame of the region, which the lender keeps mapped; frames are aligned to
+        // 4 KiB; and a LENT frame is no one else's until its block gives it back.
+        unsafe { AlignedBlock::lent(ptr, class.size(), self.lends.clone(), token) }
+    }
+
+    /// A lent frame given back: free again.
+    fn take_back(&self, class: SizeClass, frame: u32) {
+        debug_assert_eq!(
+            self.header(frame).status(),
+            LENT,
+            "frame {frame} given back twice"
+        );
+        // A lent frame's latch is no one's.
+        let hold = self.take_free_latch(frame);
+        self.free_frame(class, frame, hold);
+    }
+
+    /// The bytes lent beside the page table, by use, now and at most.
+    pub fn lent_stats(&self) -> LentStats {
+        self.lends.stats()
+    }
+
+    /// Starts the peaks of the bytes lent again from what is lent now, for a measurement.
+    pub fn reset_lent_peaks(&self) {
+        self.lends.reset_peaks();
+    }
+
+    /// Bytes of the frames whose header reads LENT, for a test to tell that a frame lent and given
+    /// back is free again, as the counts alone do not.
+    #[cfg(test)]
+    pub fn lent_frame_bytes(&self) -> usize {
+        (0..self.memory.grains())
+            .filter(|&f| self.header(f).status() == LENT)
+            .map(|f| self.memory.class_of(f).size())
+            .sum()
+    }
+
     // ---------------------------------------------------------------- checkpoints
 
     /// Checks that the page in `frame`, `pid`, latched exclusively, owes the cut in effect no
@@ -1783,13 +1911,13 @@ impl BufferPool {
             && page::kind(self.bytes(frame, pid.class())) != blob::KIND
     }
 
-    /// Copies `pid`, in `frame` latched exclusively, for the cut in effect, its room charged.
-    fn copy_for_cut(&self, frame: u32, pid: PageId) {
-        let mut bytes = vec![0u8; pid.class().size()].into_boxed_slice();
-        self.bytes(frame, pid.class()).copy_to(0, &mut bytes);
+    /// Copies `pid`, in `frame` latched exclusively, into `block` for the cut in effect, its room
+    /// charged.
+    fn copy_for_cut(&self, frame: u32, pid: PageId, mut block: AlignedBlock) {
+        self.bytes(frame, pid.class()).copy_to(0, block.bytes_mut());
         self.kept
             .lock()
-            .insert(pid, KeptCopy::charged(bytes, &self.room));
+            .insert(pid, KeptCopy::charged(block, &self.room));
         self.cut_owed.lock().remove(&pid);
         self.header(frame).pending.store(0, Ordering::Release);
     }
@@ -1799,34 +1927,70 @@ impl BufferPool {
     /// room or none. Refused, the change lets go of every latch it holds and of the change gate,
     /// then waits ([`wait_for_room`](Self::wait_for_room)) and starts again: nothing yields once
     /// a change has begun.
-    pub fn keep(&self, pages: &[&Exclusive<'_>]) -> bool {
-        if self.try_keep(pages) {
-            self.room.admitted();
-            return true;
+    pub fn keep(self: &Arc<Self>, pages: &[&Exclusive<'_>]) -> bool {
+        match self.try_keep(pages) {
+            Ok(()) => {
+                self.room.admitted();
+                true
+            }
+            Err(Turned::Room) => {
+                let n = self.cutting.load(Ordering::Acquire);
+                self.room.refused(self.owed_bytes(pages, n));
+                false
+            }
+            Err(Turned::Frame(class)) => {
+                #[cfg(test)]
+                FRAME_SHORTS.with(|n| n.set(n.get() + 1));
+                SHORT.with(|short| short.set(Some(class)));
+                false
+            }
         }
-        let n = self.cutting.load(Ordering::Acquire);
-        self.room.refused(self.owed_bytes(pages, n));
-        false
     }
 
-    fn try_keep(&self, pages: &[&Exclusive<'_>]) -> bool {
+    fn try_keep(self: &Arc<Self>, pages: &[&Exclusive<'_>]) -> std::result::Result<(), Turned> {
         let n = self.cutting.load(Ordering::Acquire);
         if n == 0 {
-            return true;
+            return Ok(());
         }
         let bytes = self.owed_bytes(pages, n);
         if bytes == 0 {
-            return true;
+            return Ok(());
         }
         if !self.room.charge(bytes) {
-            return false;
+            return Err(Turned::Room);
         }
-        for p in pages {
-            if self.owes_copy(p.frame, p.pid, n) {
-                self.copy_for_cut(p.frame, p.pid);
+        // A frame for each copy, every one or none, before any is made: a frame that would take
+        // an eviction is not waited for under the latches.
+        let mut owed = Vec::with_capacity(pages.len());
+        for (i, p) in pages.iter().enumerate() {
+            if pages[..i].iter().any(|q| q.frame == p.frame) || !self.owes_copy(p.frame, p.pid, n) {
+                continue;
+            }
+            match self.spare_or_lend(p.pid.class()) {
+                Some(block) => owed.push((p.frame, p.pid, block)),
+                None => {
+                    drop(owed);
+                    self.room.uncharge(bytes);
+                    return Err(Turned::Frame(p.pid.class()));
+                }
             }
         }
-        true
+        for (frame, pid, block) in owed {
+            self.copy_for_cut(frame, pid, block);
+        }
+        // A frame lent ahead and not taken goes back.
+        SPARES.with(|spares| spares.borrow_mut().clear());
+        Ok(())
+    }
+
+    /// A frame of `class` for a kept copy: one this thread was lent while it waited, or a free one.
+    fn spare_or_lend(self: &Arc<Self>, class: SizeClass) -> Option<AlignedBlock> {
+        let spare = SPARES.with(|spares| {
+            let mut spares = spares.borrow_mut();
+            let at = spares.iter().position(|b| b.len() == class.size())?;
+            Some(spares.swap_remove(at))
+        });
+        spare.or_else(|| self.try_lend(class, LentUse::Kept))
     }
 
     /// Bytes the copies of `pages` for checkpoint `n` take, each page counted once.
@@ -1848,7 +2012,19 @@ impl BufferPool {
     /// the checkpoint whose cut is in effect until its images give room back, or waits for
     /// whoever is stepping it. An embedded database may have one connection and no other thread,
     /// so the writer waiting is the one to step it. Done to start the change again at once.
-    pub fn wait_for_room(&self) -> Result<IOResult<()>> {
+    pub fn wait_for_room(self: &Arc<Self>) -> Result<IOResult<()>> {
+        if let Some(class) = SHORT.with(|short| short.take()) {
+            // Turned down for a free frame, not for room: one lent now, holding nothing, which the
+            // change takes when it starts again. While it is being made, the change starting
+            // again finds the room as it did.
+            return Ok(match self.lend(class, LentUse::Kept)? {
+                IOResult::Done(block) => {
+                    SPARES.with(|spares| spares.borrow_mut().push(block));
+                    IOResult::Done(())
+                }
+                IOResult::IO(io) => IOResult::IO(io),
+            });
+        }
         // Taken first, so a release or a stepper leaving after the look below finishes it.
         let wait = self.room.wait();
         if self.cutting.load(Ordering::Acquire) == 0 {

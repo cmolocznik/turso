@@ -43,23 +43,25 @@ impl AtollConfig {
     }
 
     /// A small database's configuration, for suites and tools that open many: the sizes every
-    /// test of Atoll's SQL layer runs on, 1 MiB log segments, the smallest pool Atoll takes and a
-    /// 512 KiB log budget, with the default transaction slots, so connections the suites hold at
-    /// once never wait for one.
+    /// test of Atoll's SQL layer runs on, 1 MiB log segments, the smallest pool Atoll takes with
+    /// its log's ring and a 512 KiB log budget, with the default transaction slots, so
+    /// connections the suites hold at once never wait for one.
     pub fn small() -> Self {
+        let log = LogConfig {
+            segment_bytes: 1 << 20,
+            buffer_bytes: 256 << 10,
+            chunk_bytes: 16 << 10,
+            writes_in_flight: 3,
+            ..LogConfig::default()
+        };
+        let budget = super::buffer::min_budget_beside(super::log::ring_bytes(&log));
         Self {
-            log: LogConfig {
-                segment_bytes: 1 << 20,
-                buffer_bytes: 256 << 10,
-                chunk_bytes: 16 << 10,
-                writes_in_flight: 3,
-                ..LogConfig::default()
-            },
+            log,
             store: StoreConfig {
                 file_bytes: 1 << 30,
                 meta_pages: 1 << 10,
             },
-            buffer: BufferConfig::with_budget(super::buffer::MIN_BUDGET),
+            buffer: BufferConfig::with_budget(budget),
             log_budget: Some(512 << 10),
             checkpoint_write_bytes: None,
             txn: TxnConfig::default(),
@@ -152,6 +154,17 @@ enum How {
 
 impl Opening {
     pub fn new(io: Arc<dyn IO>, base: &str, mut config: AtollConfig) -> Result<Self> {
+        // The log's ring is lent from the pool for as long as it is open: the smallest pool is
+        // the budget beside it.
+        let ring = super::log::ring_bytes(&config.log);
+        let need = super::buffer::min_budget_beside(ring);
+        if config.buffer.budget < need {
+            return Err(LimboError::InternalError(format!(
+                "a budget of {} bytes holds the log's ring of {ring} bytes and not the smallest \
+                 pool beside it: {need} bytes at least",
+                config.buffer.budget
+            )));
+        }
         let (control, superblock) = Control::open(io.clone(), base)?;
         let Some(superblock) = superblock else {
             return Self::create(io, base, config, control);
@@ -198,7 +211,6 @@ impl Opening {
             checkpoint: 0,
             continuations: Vec::new(),
         };
-        let log = Log::open(io.clone(), base, config.log.clone(), 0)?;
         let store = PageStore::open(
             io.clone(),
             base,
@@ -212,6 +224,8 @@ impl Opening {
             Arc::new(LocalSource::new(store.clone())),
             store.clone(),
         )?;
+        // Its ring in frames the pool lends: the pool first.
+        let log = Log::open_in(io.clone(), base, config.log.clone(), 0, &pool)?;
         let txns = Transactions::new(&config.txn, Arc::new(Clock::after(0)), log.clone());
         let checkpointer = Checkpointer::new(
             pool.clone(),

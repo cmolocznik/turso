@@ -6,7 +6,7 @@ use crate::io::crash::CrashIO;
 use crate::io::IO;
 use crate::storage::atoll::btree::Tree;
 use crate::storage::atoll::btree::{value, Check, Cursor, Seek};
-use crate::storage::atoll::buffer::{BufferConfig, MIN_BUDGET, WRITEBACK_BYTES};
+use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET, WRITEBACK_BYTES};
 use crate::storage::atoll::control::Superblock;
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::drive;
@@ -42,7 +42,7 @@ fn config() -> AtollConfig {
             meta_pages: 1 << 10,
         },
         buffer: BufferConfig {
-            budget: MIN_BUDGET,
+            budget: MIN_DB_BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
         },

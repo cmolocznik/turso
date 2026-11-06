@@ -512,7 +512,7 @@ mod tests {
             let err = super::super::db::Atoll::open(
                 io.clone(),
                 path,
-                super::super::db::AtollConfig::with_budget(super::super::buffer::MIN_BUDGET),
+                super::super::db::AtollConfig::small(),
             )
             .err()
             .unwrap_or_else(|| panic!("{path} opened as a database"));

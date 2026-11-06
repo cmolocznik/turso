@@ -580,7 +580,7 @@ impl Log {
     /// The CRC of the record copied into the ring from `start` to `end`, as [`record::crc`] takes
     /// it: its position, then its bytes.
     fn crc_in(&self, start: Lsn, end: Lsn) -> u32 {
-        let mut crc = crc32c::crc32c(&start.to_le_bytes());
+        let mut crc = super::crc::of(&start.to_le_bytes());
         let mut at = start;
         while at < end {
             let (slot, offset) = self.slot(at);
@@ -588,7 +588,7 @@ impl Log {
             // SAFETY: inside the chunk, in bytes this appender reserved alone and has copied in;
             // no write reads them before the copy is counted.
             let bytes = unsafe { std::slice::from_raw_parts(slot.block.as_ptr().add(offset), n) };
-            crc = crc32c::crc32c_append(crc, bytes);
+            crc = super::crc::append(crc, bytes);
             at += n as u64;
         }
         crc

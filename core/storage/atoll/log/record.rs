@@ -163,10 +163,10 @@ pub fn header_bytes(header: &Header, place: Place, payload_len: usize) -> [u8; H
 
 /// The CRC of a record starting at `start`.
 pub fn crc(start: Lsn, header: &[u8; HEADER], payload: &[&[u8]]) -> u32 {
-    let mut crc = crc32c::crc32c(&start.to_le_bytes());
-    crc = crc32c::crc32c_append(crc, header);
+    let mut crc = super::super::crc::of(&start.to_le_bytes());
+    crc = super::super::crc::append(crc, header);
     for piece in payload {
-        crc = crc32c::crc32c_append(crc, piece);
+        crc = super::super::crc::append(crc, piece);
     }
     crc
 }

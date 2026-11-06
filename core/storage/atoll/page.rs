@@ -149,10 +149,10 @@ pub fn set_kind<P: BytesMut + ?Sized>(page: &mut P, kind: PageKind) {
 
 fn checksum<P: Bytes + ?Sized>(page: &P) -> u32 {
     let mut crc = 0;
-    page.pieces(0..CHECKSUM.start, |b| crc = crc32c::crc32c_append(crc, b));
-    crc = crc32c::crc32c_append(crc, &[0; 4]);
+    page.pieces(0..CHECKSUM.start, |b| crc = super::crc::append(crc, b));
+    crc = super::crc::append(crc, &[0; 4]);
     page.pieces(CHECKSUM.end..page.len(), |b| {
-        crc = crc32c::crc32c_append(crc, b)
+        crc = super::crc::append(crc, b)
     });
     crc
 }

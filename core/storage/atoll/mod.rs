@@ -27,6 +27,7 @@ pub mod btree;
 pub mod buffer;
 pub mod checkpoint;
 pub mod control;
+pub mod crc;
 pub mod db;
 pub mod epoch;
 pub mod floors;

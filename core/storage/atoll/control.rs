@@ -94,7 +94,7 @@ impl Superblock {
             out[at..at + 8].copy_from_slice(&ended.to_le_bytes());
             out[at + 8..at + 16].copy_from_slice(&resumed.to_le_bytes());
         }
-        let crc = crc32c::crc32c(&out[..SIZE - 4]);
+        let crc = super::crc::of(&out[..SIZE - 4]);
         out[SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
         out
     }
@@ -103,7 +103,7 @@ impl Superblock {
     /// of a version this build does not read.
     fn decode(bytes: &[u8]) -> Result<Option<Self>> {
         let crc = u32::from_le_bytes(bytes[SIZE - 4..SIZE].try_into().unwrap());
-        if crc != crc32c::crc32c(&bytes[..SIZE - 4])
+        if crc != super::crc::of(&bytes[..SIZE - 4])
             || u64::from_le_bytes(bytes[0..8].try_into().unwrap()) != MAGIC
         {
             return Ok(None);
@@ -324,7 +324,7 @@ fn io_failure(e: &LimboError) -> CompletionError {
 
 #[cfg(test)]
 fn seal(bytes: &mut [u8]) {
-    let crc = crc32c::crc32c(&bytes[..SIZE - 4]);
+    let crc = super::crc::of(&bytes[..SIZE - 4]);
     bytes[SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
 }
 

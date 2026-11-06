@@ -1921,6 +1921,24 @@ impl CursorTrait for SqlCursor {
         }
     }
 
+    /// The row's bytes as its cursor holds them while nothing of its connection changed since it
+    /// took its position: a Column read builds no record.
+    #[inline]
+    fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        if self.changes.epoch() == self.seen
+            && self.open.as_ref().is_some_and(|o| o.lends_payload())
+        {
+            return Ok(IOResult::Done(self.open.as_ref().and_then(|o| o.payload())));
+        }
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
+        Ok(match self.record()? {
+            IOResult::Done(record) => IOResult::Done(record.map(ImmutableRecord::get_payload)),
+            IOResult::IO(io) => IOResult::IO(io),
+        })
+    }
+
     #[inline]
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
         if self.changes.epoch() != self.seen {

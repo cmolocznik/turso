@@ -378,6 +378,7 @@ impl Txn {
     #[cfg(all(test, not(shuttle), not(atoll_loom)))]
     pub(crate) fn skip_to(&mut self, command: Statement) {
         self.command = command;
+        self.changes.moved();
     }
 
     /// The header of the transaction's record of `kind`.
@@ -615,6 +616,7 @@ impl Transactions {
         assert!(!txn.snapped, "a second snapshot of one transaction");
         txn.snapshot = snapshots::take(&self.snapshots[txn.slot as usize], || self.horizon.at());
         txn.seen.fill(None);
+        txn.changes.moved();
         txn.log_at = self.log.end();
         txn.snapped = true;
     }
@@ -842,6 +844,7 @@ impl Transactions {
                 Statement::MAX
             ))
         })?;
+        txn.changes.moved();
         if txn.isolation == Isolation::ReadCommitted && txn.command > 1 {
             txn.snapshot = self.horizon.at();
             snapshots::rise(&self.snapshots[txn.slot as usize], txn.snapshot);

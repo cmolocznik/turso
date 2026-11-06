@@ -23,6 +23,7 @@ use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
 use crate::storage::atoll::btree::{Cursor, Kept, Near, Seek, StoredValue};
 use crate::types::IOResult;
 use crate::{LimboError, Result};
+use std::sync::Arc;
 
 macro_rules! done {
     ($e:expr) => {
@@ -54,6 +55,21 @@ pub struct VersionedCursor {
     /// Its transaction's count of changes as its last move began: the entries the plain cursor
     /// copied ahead are as the statement reads them only while it is unchanged.
     edits: u64,
+    /// The plain cursor's batch judged at once, under the transaction's lock: forward steps take
+    /// the rows it found with no lock while the transaction's view and the batch stay the same.
+    judged: Judged,
+}
+
+/// Which entries of a batch, by slot from `from`, are rows a statement shows as they lie (the
+/// newest version, seen, no tombstone), judged at the transaction's view `view` (read where
+/// `of` is) for the batch counted `batch`.
+#[derive(Default)]
+struct Judged {
+    from: usize,
+    rows: Vec<bool>,
+    batch: u64,
+    view: u64,
+    of: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Where the value of the row a cursor rests on is.
@@ -145,6 +161,7 @@ impl VersionedCursor {
             value: Value::InEntry,
             body: Vec::new(),
             edits: 0,
+            judged: Judged::default(),
         }
     }
 
@@ -162,6 +179,12 @@ impl VersionedCursor {
         (self.cursor.key()? == key)
             .then(|| self.cursor.kept())
             .flatten()
+    }
+
+    /// Whether the row's value is where [`value`](Self::value) reads it: in the entry, or read, and
+    /// not lent.
+    pub fn value_held(&self) -> bool {
+        matches!(self.value, Value::InEntry | Value::Read)
     }
 
     /// Whether the row's value is out of line and not read yet: [`VersionedTree::load`] reads it.
@@ -344,8 +367,11 @@ impl VersionedTree {
             || cursor.unseen.is_some()
             || !matches!(cursor.entry, Shown::Plain)
             || txn.changes().edits() != cursor.edits
-            || !cursor.cursor.next_batched()
         {
+            return None;
+        }
+        Self::judge(txns, txn, cursor);
+        if !cursor.cursor.next_batched() {
             return None;
         }
         let value = cursor.cursor.value().expect("an entry");
@@ -367,6 +393,74 @@ impl VersionedTree {
             cursor.value = Value::Unread(reference);
         }
         Some(Ok(()))
+    }
+
+    /// Judges the plain cursor's batch, unless judged at this batch and view: which of its entries
+    /// are rows the statement shows as they lie.
+    fn judge(txns: &Transactions, txn: &mut Txn, cursor: &mut VersionedCursor) {
+        let (view, of) = txn.changes().view();
+        let j = &mut cursor.judged;
+        let batch = cursor.cursor.batch_seq();
+        if j.batch == batch && j.view == view && j.of.as_ref().is_some_and(|o| Arc::ptr_eq(o, of)) {
+            return;
+        }
+        if !j.of.as_ref().is_some_and(|o| Arc::ptr_eq(o, of)) {
+            j.of = Some(of.clone());
+        }
+        j.rows.clear();
+        j.batch = batch;
+        j.view = view;
+        let Some((from, left)) = cursor.cursor.batch_ahead() else {
+            return;
+        };
+        j.from = from;
+        for pos in from..from + left {
+            let row = cursor
+                .cursor
+                .batch_value(pos)
+                .and_then(|v| Version::decode(v.get(..HEADER)?))
+                .is_some_and(|v| !v.deleted && txns.visible(txn, v.slot, v.ts));
+            j.rows.push(row);
+        }
+    }
+
+    /// [`next_batched`](Self::next_batched) with no lock: the next entry of the batch where its
+    /// judgment holds, at the same batch and the transaction's view unchanged, and found it a row
+    /// the statement shows. Whether it took one.
+    #[inline]
+    pub fn next_judged(&self, cursor: &mut VersionedCursor) -> bool {
+        if cursor.moving.is_some()
+            || cursor.unseen.is_some()
+            || !matches!(cursor.entry, Shown::Plain)
+        {
+            return false;
+        }
+        let j = &cursor.judged;
+        let Some(of) = &j.of else {
+            return false;
+        };
+        if j.batch != cursor.cursor.batch_seq()
+            || of.load(std::sync::atomic::Ordering::Relaxed) != j.view
+        {
+            return false;
+        }
+        let Some((pos, _)) = cursor.cursor.batch_ahead() else {
+            return false;
+        };
+        if !pos
+            .checked_sub(j.from)
+            .and_then(|i| j.rows.get(i))
+            .copied()
+            .unwrap_or(false)
+            || !cursor.cursor.next_batched()
+        {
+            return false;
+        }
+        cursor.value = Value::InEntry;
+        if let Some(reference) = self.tree().unread_reference(&cursor.cursor) {
+            cursor.value = Value::Unread(reference);
+        }
+        true
     }
 
     /// Runs the move under way until the plain cursor rests on a row the statement sees, or on

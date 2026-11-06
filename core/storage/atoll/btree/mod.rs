@@ -2277,6 +2277,8 @@ struct Batch {
     /// to its end, one again after a batch is dropped before it is: entries copied and never
     /// taken are at most those taken. A leaf holds what one copies.
     ahead: usize,
+    /// Batches filled, counted: one judged at one count is this batch while the count holds.
+    seq: u64,
 }
 
 impl Batch {
@@ -2308,6 +2310,7 @@ impl Batch {
             return Some(());
         }
         v.copy_entries(slots.clone(), &mut self.page)?;
+        self.seq += 1;
         let prefix = View::new(&self.page).prefix_range()?;
         self.key.clear();
         self.key.extend_from_slice(&self.page[prefix]);
@@ -2394,6 +2397,24 @@ impl Cursor {
             exact: true,
             present: Some((value.to_vec(), self.unread)),
         })
+    }
+
+    /// The batch filled last, by count ([`next_batched`](Self::next_batched) takes its entries).
+    pub fn batch_seq(&self) -> u64 {
+        self.batch.seq
+    }
+
+    /// The slot of the next entry a forward step's batch holds, and how many it holds from there.
+    #[inline]
+    pub fn batch_ahead(&self) -> Option<(usize, usize)> {
+        let b = &self.batch;
+        (b.left > 0 && b.forward && self.pending.is_none()).then_some((b.next, b.left))
+    }
+
+    /// The value of the batch's entry at slot `pos`, as its leaf holds it.
+    pub fn batch_value(&self, pos: usize) -> Option<&[u8]> {
+        let (_, value, _) = View::new(&self.batch.page).entry_runs(pos)?;
+        self.batch.page.get(value)
     }
 
     /// Takes the next entry of a forward step's batch, with no move pending: whether there was one.

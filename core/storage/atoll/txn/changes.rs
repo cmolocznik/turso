@@ -78,6 +78,10 @@ pub struct Changes {
     marks: Vec<(Statement, usize)>,
     /// Every change made and every rollback to a mark, counted: it only rises.
     edits: u64,
+    /// The transaction's view moved: every change, rollback, statement and snapshot, counted, and
+    /// read without the transaction's lock by a cursor that judged rows at one count.
+    views: u64,
+    view: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Changes {
@@ -155,6 +159,7 @@ impl Changes {
             self.marks.push((statement, self.bytes.len()));
         }
         self.edits += 1;
+        self.moved();
         self.bytes.reserve(HEAD + key.len() + value_len);
         self.bytes.push(kind);
         self.bytes
@@ -172,6 +177,7 @@ impl Changes {
     /// transaction for 0.
     pub fn back_to(&mut self, statement: Statement) {
         self.edits += 1;
+        self.moved();
         let keep = self.marks.partition_point(|&(s, _)| s <= statement);
         if let Some(&(_, at)) = self.marks.get(keep) {
             self.bytes.truncate(at);
@@ -187,6 +193,18 @@ impl Changes {
     /// nothing between.
     pub fn edits(&self) -> u64 {
         self.edits
+    }
+
+    /// The transaction's view moved on: a change, a rollback, a statement or a snapshot.
+    pub fn moved(&mut self) {
+        self.views += 1;
+        self.view
+            .store(self.views, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The count of the view's moves, and where it is read without the transaction's lock.
+    pub fn view(&self) -> (u64, &std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        (self.views, &self.view)
     }
 
     /// The bytes it holds room for: what it grows past only by allocating.

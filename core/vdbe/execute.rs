@@ -2139,6 +2139,23 @@ fn op_column_fetch(
             let content_reg = pseudo.content_reg();
             return op_column_fetch_pseudo(state, content_reg, column, dest);
         }
+        Some(Cursor::Dyn(cursor, ..)) => {
+            // As `op_column_fetch_other` reads a b-tree cursor behind a trait object: no row for
+            // a null row or none, else the column decoded from the record, here in place.
+            let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+                state.registers[dest].set_null();
+                return Ok(InsnFunctionStepResult::Step);
+            };
+            match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest])
+            {
+                Some(result) => result?,
+                None => {
+                    branches::mark_unlikely();
+                    apply_column_default(default, &mut state.registers[dest])?;
+                }
+            }
+            return Ok(InsnFunctionStepResult::Step);
+        }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
     let Some((payload, payload_size)) = return_if_io!(state, cursor.payload_fetch()) else {

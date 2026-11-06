@@ -455,6 +455,11 @@ impl AtollCursor {
             self.record.forget(&mut self.cursor);
             return Ok(IOResult::Done(()));
         }
+        if self.tree.next_judged(&mut self.cursor) {
+            self.record.forget(&mut self.cursor);
+            self.null_row = false;
+            return Ok(IOResult::Done(()));
+        }
         let batched = {
             let mut guard = self.txn.lock();
             let txn = guard.as_mut().ok_or_else(outside)?;
@@ -548,6 +553,23 @@ impl AtollCursor {
         done!(self.tree.load(&mut self.cursor));
         let record = self.record_now()?.expect("a row");
         Ok(IOResult::Done(Some(last_rowid(record)?)))
+    }
+
+    /// Whether the row's record is where the cursor holds it, for [`payload`](Self::payload): no
+    /// row, or the value in the entry or read, and not lent to a record.
+    #[inline]
+    pub fn lends_payload(&self) -> bool {
+        self.is_empty() || self.cursor.value_held()
+    }
+
+    /// The row's record bytes where the cursor holds them, with no record built; `None` for no
+    /// row. Only where [`lends_payload`](Self::lends_payload).
+    #[inline]
+    pub fn payload(&self) -> Option<&[u8]> {
+        if self.is_empty() {
+            return None;
+        }
+        self.cursor.value()
     }
 
     /// The row's record. Step it until done.

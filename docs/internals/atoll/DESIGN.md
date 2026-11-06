@@ -2177,10 +2177,13 @@ only submit and record; the synchronous work they did is run by the callers that
   completion to bring it back without reporting anything false. Today's branch in `wait_durable`
   that returns `Done` for a completion found finished after its flush goes: the call reads the
   durable position instead. Admission completions already mean this (admitters are woken to try
-  again). Every caller calls again after its IO: the checkpoint's `done!`, a transaction's
-  admissions and commit, rollback, a stream's append and its durability, and `drive` (opening,
-  recovery, a database's drop). A census test lists every call site of `admit` and `wait_durable`,
-  the facade's included, with how it calls again, and fails on one it does not list.
+  again). Every caller calls again after its IO finishes without an error: the checkpoint's `done!`,
+  a transaction's admissions and commit, rollback, a stream's append and its durability, and `drive`
+  (opening, recovery, a database's drop). One whose IO finishes with an error may return that error
+  at once, as `drive` does; it is the log's failure, which every waiter is told. No caller takes a
+  completion finished without an error as room or durability. A census test lists every call site of
+  `admit` and `wait_durable`, the facade's included, with how it calls again and what it does with
+  an error, and fails on one it does not list.
 - **The preparation's word**, one beside the log, says where the segment being prepared stands:
   *done* (none under way); *needed* (a segment must be prepared and nobody has started it); *in
   flight* (its zero-fill writes or its data sync are submitted); *owed* (its data sync landed: the

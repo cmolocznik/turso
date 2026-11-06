@@ -1854,6 +1854,44 @@ impl CursorTrait for SqlCursor {
         self.moved(out)
     }
 
+    /// A forward step with nothing of its connection's changed since the cursor took its
+    /// position goes straight to its open cursor: nothing to catch up with or resolve again.
+    #[inline]
+    fn next_row(&mut self) -> crate::storage::btree::CursorStep {
+        use crate::storage::btree::CursorStep;
+        if !self.vacant && self.rebinding.is_none() && self.changes.epoch() == self.seen {
+            if let Some(open) = self.open.as_mut() {
+                if open.get_null_flag() {
+                    open.set_null_flag(false);
+                    return CursorStep::Empty;
+                }
+                return match open.next() {
+                    Ok(IOResult::Done(())) => {
+                        self.has_record = !open.is_empty();
+                        if self.has_record {
+                            CursorStep::Row
+                        } else {
+                            CursorStep::Empty
+                        }
+                    }
+                    Ok(IOResult::IO(io)) => CursorStep::IO(io),
+                    Err(e) => CursorStep::Error(Box::new(e)),
+                };
+            }
+        }
+        let was_null_row = self.get_null_flag();
+        self.set_null_flag(false);
+        if was_null_row {
+            return CursorStep::Empty;
+        }
+        match self.next() {
+            Ok(IOResult::IO(io)) => CursorStep::IO(io),
+            Err(err) => CursorStep::Error(err),
+            Ok(IOResult::Done(())) if self.is_empty() => CursorStep::Empty,
+            Ok(IOResult::Done(())) => CursorStep::Row,
+        }
+    }
+
     fn next(&mut self) -> IOResultOr<()> {
         if self.vacant {
             return Ok(IOResult::Done(()));

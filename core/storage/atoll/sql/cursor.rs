@@ -453,6 +453,21 @@ impl AtollCursor {
             self.record.forget(&mut self.cursor);
             return Ok(IOResult::Done(()));
         }
+        let batched = {
+            let mut guard = self.txn.lock();
+            let txn = guard.as_mut().ok_or_else(outside)?;
+            self.tree
+                .next_batched(self.db.atoll().transactions(), txn, &mut self.cursor)
+        };
+        match batched {
+            Some(Ok(())) => {
+                self.record.forget(&mut self.cursor);
+                self.null_row = false;
+                return Ok(IOResult::Done(()));
+            }
+            Some(Err(e)) => return Err(e),
+            None => {}
+        }
         done!(self.step(Move::Next));
         Ok(IOResult::Done(()))
     }

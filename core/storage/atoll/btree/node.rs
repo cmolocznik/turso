@@ -402,34 +402,56 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         Some(())
     }
 
-    /// The entries at `slots`, in that order, each appended to `out` whole, key then value, and
-    /// handed to `each` with its slot, where its key and its value end in `out` and whether the
-    /// value is out of line: the prefix read from the page once, each key and value in one copy.
-    pub fn append_entries(
-        &self,
-        slots: impl Iterator<Item = usize>,
-        out: &mut Vec<u8>,
-        mut each: impl FnMut(usize, usize, usize, bool),
-    ) -> Option<()> {
-        let prefix = self.prefix_run()?;
-        let mut first = None;
+    /// Copies into `out`, the node's length, what entries `slots` need at their own offsets: the
+    /// header, the lower fence, the slots and their entries, so a [`View`] of `out` reads those
+    /// entries, their prefix, and nothing else, as the node holds them. Half the slots or more
+    /// copy the slots and the data whole.
+    pub fn copy_entries(&self, slots: std::ops::Range<usize>, out: &mut Vec<u8>) -> Option<()> {
+        let count = self.count()?;
+        if slots.end > count {
+            return None;
+        }
+        let len = self.0.len();
+        if out.len() != len {
+            out.clear();
+            out.resize(len, 0);
+        }
+        if let Some(l) = self.fence_run(LOWER, LOWER_INFINITE)? {
+            self.0.copy_to(l.off, &mut out[l.off..l.off + l.len]);
+        }
+        if 2 * slots.len() >= count {
+            self.0.copy_to(0, &mut out[..SLOTS + count * SLOT]);
+            let data = self.data_start()?;
+            self.0.copy_to(data, &mut out[data..]);
+            return Some(());
+        }
+        self.0.copy_to(0, &mut out[..SLOTS]);
+        let (a, b) = (SLOTS + slots.start * SLOT, SLOTS + slots.end * SLOT);
+        self.0.copy_to(a, &mut out[a..b]);
         for i in slots {
-            let s = self.slot(i)?;
-            let at = out.len();
-            match first {
-                None => {
-                    out.resize(at + prefix.len, 0);
-                    self.0.copy_to(prefix.off, &mut out[at..]);
-                    first = Some(at);
-                }
-                Some(from) => out.extend_from_within(from..from + prefix.len),
-            }
-            let key = out.len();
-            out.resize(key + s.key_len + s.value_len, 0);
-            self.0.copy_to(s.off, &mut out[key..]);
-            each(i, key + s.key_len, out.len(), s.out_of_line);
+            let s = self.slot_of(i, count)?;
+            let end = s.off + s.key_len + s.value_len;
+            self.0.copy_to(s.off, &mut out[s.off..end]);
         }
         Some(())
+    }
+
+    /// Where entry `i`'s key past the prefix and its value lie, and whether the value is out of
+    /// line.
+    #[inline]
+    pub fn entry_runs(
+        &self,
+        i: usize,
+    ) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>, bool)> {
+        let s = self.slot(i)?;
+        let key = s.off..s.off + s.key_len;
+        Some((key.clone(), key.end..key.end + s.value_len, s.out_of_line))
+    }
+
+    /// Where the bytes every key in the node starts with lie.
+    pub fn prefix_range(&self) -> Option<std::ops::Range<usize>> {
+        let r = self.prefix_run()?;
+        Some(r.off..r.off + r.len)
     }
 
     /// The first `out.len()` bytes of entry `i`'s value, into `out`.

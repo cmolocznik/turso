@@ -321,6 +321,46 @@ impl VersionedTree {
         self.settle(txns, versions, txn, cursor)
     }
 
+    /// The next row of a forward scan from the plain cursor's batch, while the statement has
+    /// changed nothing since the batch was read and the cursor rests on a newest version: `None`
+    /// where the batch has no entry left, or where the entry it takes is not the row the
+    /// statement sees, the move then under way for [`next`](Self::next) to finish.
+    #[inline]
+    pub fn next_batched(
+        &self,
+        txns: &Transactions,
+        txn: &mut Txn,
+        cursor: &mut VersionedCursor,
+    ) -> Option<Result<()>> {
+        if cursor.moving.is_some()
+            || cursor.unseen.is_some()
+            || !matches!(cursor.entry, Shown::Plain)
+            || txn.changes().edits() != cursor.edits
+            || !cursor.cursor.next_batched()
+        {
+            return None;
+        }
+        let value = cursor.cursor.value().expect("an entry");
+        let Some(v) = Version::decode(value.get(..HEADER).unwrap_or(&[])) else {
+            return Some(Err(corrupt_header()));
+        };
+        cursor.value = Value::InEntry;
+        if !txns.visible(txn, v.slot, v.ts) {
+            let key = cursor.cursor.key().expect("an entry").to_vec();
+            cursor.chain = Some((key, Chain::from(v)));
+            cursor.moving = Some(Move::Step { forward: true });
+            return None;
+        }
+        if v.deleted {
+            cursor.moving = Some(Move::Step { forward: true });
+            return None;
+        }
+        if let Some(reference) = self.tree().unread_reference(&cursor.cursor) {
+            cursor.value = Value::Unread(reference);
+        }
+        Some(Ok(()))
+    }
+
     /// Runs the move under way until the plain cursor rests on a row the statement sees, or on
     /// none.
     fn settle(

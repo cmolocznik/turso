@@ -492,7 +492,7 @@ impl Tree {
 
     /// The reference of `cursor`'s entry, whose value is out of line and unread.
     pub fn unread_reference(&self, cursor: &Cursor) -> Option<ValueRef> {
-        let (_, value) = cursor.entry.as_ref().filter(|_| cursor.unread)?;
+        let value = cursor.value().filter(|_| cursor.unread)?;
         Some(self.split_reference(value)?.1)
     }
 
@@ -1426,6 +1426,7 @@ impl Tree {
                         let mut value = std::mem::take(head);
                         value.extend_from_slice(&v);
                         cursor.entry = Some((std::mem::take(key), value));
+                        cursor.batched = false;
                         cursor.unread = false;
                         cursor.reading = None;
                         cursor.held = None;
@@ -1486,13 +1487,7 @@ impl Tree {
             };
             // Into the buffers of the entry before, or kept ones.
             cursor.unread = false;
-            let (mut key, mut value) = match cursor.entry.take() {
-                Some(buffers) => buffers,
-                None => (
-                    std::mem::take(&mut cursor.spare.0),
-                    std::mem::take(&mut cursor.spare.1),
-                ),
-            };
+            let (mut key, mut value) = cursor.buffers();
             let batch = (cursor.lazy && cursor.stepping).then_some(&mut cursor.batch);
             let read = leaf.read(|p| {
                 scan_leaf(
@@ -1562,6 +1557,7 @@ impl Tree {
                 Scan::End => {
                     cursor.reading = None;
                     cursor.entry = None;
+                    cursor.batched = false;
                     cursor.unread = false;
                     cursor.spare.2 = target;
                     cursor.leaf = None;
@@ -2251,6 +2247,8 @@ pub struct Cursor {
     /// The run of a lazy cursor's step, when a step lands on its first entry.
     stepping: bool,
     batch: Batch,
+    /// Whether the entry is the batch's last taken, its key and value read there.
+    batched: bool,
 }
 
 /// The entries past a lazy cursor's in the direction of the step that found it, copied from its
@@ -2260,11 +2258,16 @@ pub struct Cursor {
 /// sees was in the leaf as read, and a version written since is one it does not see.
 #[derive(Default)]
 struct Batch {
-    /// The entries' keys and values, back to back.
-    bytes: Vec<u8>,
-    entries: Vec<Batched>,
-    /// The entry the next step takes.
+    /// The leaf's bytes the entries need, at their own offsets ([`View::copy_entries`]).
+    page: Vec<u8>,
+    /// The key of the entry taken: the leaf's prefix, its first `prefix` bytes, then its suffix.
+    key: Vec<u8>,
+    prefix: usize,
+    /// Where the value of the entry taken lies in `page`.
+    value: std::ops::Range<usize>,
+    /// The slot the next step takes, and how many are left to take.
     next: usize,
+    left: usize,
     forward: bool,
     /// How many entries past its landing a step copies: one at first, doubled by each batch taken
     /// to its end, one again after a batch is dropped before it is: entries copied and never
@@ -2272,25 +2275,13 @@ struct Batch {
     ahead: usize,
 }
 
-/// A batched entry: where its key and value end in the batch's bytes, each starting where the one
-/// before ends, whether the value is out of line, and its slot in the leaf.
-#[derive(Clone, Copy)]
-struct Batched {
-    key_end: usize,
-    value_end: usize,
-    out_of_line: bool,
-    pos: usize,
-}
-
 impl Batch {
-    /// Drops the entries, before or after they are taken.
+    /// Drops the entries, before or after they are taken. The entry taken last stays readable.
     fn drop_entries(&mut self) {
-        if self.next < self.entries.len() {
+        if self.left > 0 {
             self.ahead = 1;
         }
-        self.bytes.clear();
-        self.entries.clear();
-        self.next = 0;
+        self.left = 0;
     }
 
     /// Copies up to `ahead` entries of leaf `v` past slot `p` in the direction `forward`.
@@ -2304,20 +2295,21 @@ impl Batch {
         self.drop_entries();
         self.forward = forward;
         let n = self.ahead.max(1);
-        let (bytes, entries) = (&mut self.bytes, &mut self.entries);
-        let mut each = |pos, key_end, value_end, out_of_line| {
-            entries.push(Batched {
-                key_end,
-                value_end,
-                out_of_line,
-                pos,
-            })
-        };
-        if forward {
-            v.append_entries((p + 1..count).take(n), bytes, &mut each)?;
+        let slots = if forward {
+            p + 1..count.min((p + 1).saturating_add(n))
         } else {
-            v.append_entries((0..p).rev().take(n), bytes, &mut each)?;
+            p.saturating_sub(n)..p
+        };
+        if slots.is_empty() {
+            return Some(());
         }
+        v.copy_entries(slots.clone(), &mut self.page)?;
+        let prefix = View::new(&self.page).prefix_range()?;
+        self.key.clear();
+        self.key.extend_from_slice(&self.page[prefix]);
+        self.prefix = self.key.len();
+        self.next = if forward { slots.start } else { slots.end - 1 };
+        self.left = slots.len();
         Some(())
     }
 }
@@ -2349,35 +2341,44 @@ impl Cursor {
     }
 
     /// Takes the next batched entry in the direction `forward` as the entry: whether there was one.
+    #[inline]
     fn from_batch(&mut self, forward: bool) -> bool {
         let b = &mut self.batch;
-        if b.next >= b.entries.len() || b.forward != forward {
+        if b.left == 0 || b.forward != forward {
             return false;
         }
-        let e = b.entries[b.next];
-        let start = match b.next {
-            0 => 0,
-            n => b.entries[n - 1].value_end,
+        let pos = b.next;
+        let Some((key, value, out_of_line)) = View::new(&b.page).entry_runs(pos) else {
+            b.drop_entries();
+            return false;
         };
-        let (key, value) = self.entry.get_or_insert_with(|| {
-            (
-                std::mem::take(&mut self.spare.0),
-                std::mem::take(&mut self.spare.1),
-            )
-        });
-        key.clear();
-        key.extend_from_slice(&b.bytes[start..e.key_end]);
-        value.clear();
-        value.extend_from_slice(&b.bytes[e.key_end..e.value_end]);
-        self.unread = e.out_of_line;
-        self.at = Some(e.pos);
+        b.key.truncate(b.prefix);
+        b.key.extend_from_slice(&b.page[key]);
+        b.value = value;
+        b.left -= 1;
+        if b.left == 0 {
+            b.ahead = b.ahead.max(1).saturating_mul(2);
+        } else if forward {
+            b.next += 1;
+        } else {
+            b.next -= 1;
+        }
+        if let Some(buffers) = self.entry.take() {
+            self.spare.0 = buffers.0;
+            self.spare.1 = buffers.1;
+        }
+        self.batched = true;
+        self.unread = out_of_line;
+        self.at = Some(pos);
         self.reading = None;
         self.held = None;
-        b.next += 1;
-        if b.next == b.entries.len() {
-            b.ahead = b.ahead.max(1).saturating_mul(2);
-        }
         true
+    }
+
+    /// Takes the next entry of a forward step's batch, with no move pending: whether there was one.
+    #[inline]
+    pub fn next_batched(&mut self) -> bool {
+        self.pending.is_none() && self.from_batch(true)
     }
 
     /// Whether the entry's value is out of line and unread: its value is the head and the
@@ -2389,13 +2390,7 @@ impl Cursor {
     /// Stands at `key`, with no leaf to step from and its value unread: the next move seeks from
     /// the key, as from an entry a seek found there, trying `near` first.
     pub fn place(&mut self, key: &[u8], near: Near) {
-        let (mut k, mut v) = match self.entry.take() {
-            Some(buffers) => buffers,
-            None => (
-                std::mem::take(&mut self.spare.0),
-                std::mem::take(&mut self.spare.1),
-            ),
-        };
+        let (mut k, mut v) = self.buffers();
         k.clear();
         k.extend_from_slice(key);
         v.clear();
@@ -2424,22 +2419,43 @@ impl Cursor {
     /// Sets the move past the entry, `Gt` or `Lt`, pending: false with no entry. The target is
     /// the entry's key, copied into a kept buffer.
     fn step(&mut self, seek: Seek) -> bool {
-        let Some((key, _)) = &self.entry else {
+        let mut target = std::mem::take(&mut self.spare.2);
+        let Some(key) = self.key() else {
+            self.spare.2 = target;
             return false;
         };
-        let mut target = std::mem::take(&mut self.spare.2);
         target.clear();
         target.extend_from_slice(key);
         self.pending = Some((seek, target));
         true
     }
 
+    #[inline]
     pub fn key(&self) -> Option<&[u8]> {
+        if self.batched {
+            return Some(&self.batch.key);
+        }
         self.entry.as_ref().map(|(k, _)| k.as_slice())
     }
 
+    #[inline]
     pub fn value(&self) -> Option<&[u8]> {
+        if self.batched {
+            return Some(&self.batch.page[self.batch.value.clone()]);
+        }
         self.entry.as_ref().map(|(_, v)| v.as_slice())
+    }
+
+    /// The entry's buffers, the batch's entry left: the last entry's, or kept ones.
+    fn buffers(&mut self) -> (Vec<u8>, Vec<u8>) {
+        self.batched = false;
+        match self.entry.take() {
+            Some(buffers) => buffers,
+            None => (
+                std::mem::take(&mut self.spare.0),
+                std::mem::take(&mut self.spare.1),
+            ),
+        }
     }
 }
 

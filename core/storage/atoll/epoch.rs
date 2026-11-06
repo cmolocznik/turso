@@ -369,10 +369,17 @@ impl Epochs {
 
     /// Runs `f` on the calling thread's entry for this instance, joining the registry on its
     /// first step here. The table changes only then; every other step reads it.
+    #[inline]
     fn with_entry<R>(&self, f: impl FnOnce(&Entry) -> R) -> R {
         ENTRIES.with(|entries| {
-            let found = entries.borrow().iter().position(|e| e.id == self.id);
-            let i = found.unwrap_or_else(|| self.register(entries));
+            // One borrow on the path every step takes: the entry already there.
+            {
+                let held = entries.borrow();
+                if let Some(e) = held.iter().find(|e| e.id == self.id) {
+                    return f(e);
+                }
+            }
+            let i = self.register(entries);
             f(&entries.borrow()[i])
         })
     }

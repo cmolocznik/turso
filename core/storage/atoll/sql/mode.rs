@@ -47,7 +47,8 @@ use crate::types::{
 };
 use crate::vdbe::Register;
 use crate::{Buffer, CompletionError, LimboError, Result, Value};
-use std::collections::HashMap;
+// Tree ids and pages, hashed for the maps a statement reads at each open: no attacker picks them.
+use rustc_hash::FxHashMap as HashMap;
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
@@ -607,8 +608,8 @@ impl ConnTxn {
             pinned: AtomicBool::new(false),
             pin_began: AtomicBool::new(false),
             changes: Arc::new(TreeChanges::new()),
-            stamped: Arc::new(Mutex::new(HashMap::new())),
-            known: Arc::new(Mutex::new(HashMap::new())),
+            stamped: Arc::new(Mutex::new(HashMap::default())),
+            known: Arc::new(Mutex::new(HashMap::default())),
             fields: Mutex::new([None; 7]),
         }
     }

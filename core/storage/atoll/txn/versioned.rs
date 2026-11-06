@@ -561,7 +561,8 @@ impl VersionedTree {
                 *kept = Some(looked.keep());
                 return Ok(IOResult::Done(Probe::Absent));
             };
-            if v.slot != txn.slot || v.ts != txn.start {
+            // A version the snapshot sees was committed before it: nothing more to judge.
+            if (v.slot != txn.slot || v.ts != txn.start) && !txns.visible(txn, v.slot, v.ts) {
                 match txns.writer(v.slot, v.ts) {
                     Writer::Open => {
                         let blocker = Blocker {
@@ -581,8 +582,7 @@ impl VersionedTree {
                         )))
                     }
                     Writer::Committed => {
-                        if txn.isolation == Isolation::Snapshot && !txns.visible(txn, v.slot, v.ts)
-                        {
+                        if txn.isolation == Isolation::Snapshot {
                             return Ok(IOResult::Done(Probe::Conflict));
                         }
                     }
@@ -855,9 +855,12 @@ impl VersionedTree {
                 ),
             };
             let own = newest.is_some_and(|v| v.slot == txn.slot && v.ts == txn.start);
-            if let Some(v) = newest.filter(|_| !own) {
-                #[cfg(test)]
+            // A version the snapshot sees was committed before it: nothing more to judge.
+            #[cfg(test)]
+            if newest.is_some() && !own {
                 versions.stop_here();
+            }
+            if let Some(v) = newest.filter(|v| !own && !txns.visible(txn, v.slot, v.ts)) {
                 match txns.writer(v.slot, v.ts) {
                     Writer::Open => {
                         let blocker = Blocker {
@@ -878,8 +881,7 @@ impl VersionedTree {
                         )))
                     }
                     Writer::Committed => {
-                        if txn.isolation == Isolation::Snapshot && !txns.visible(txn, v.slot, v.ts)
-                        {
+                        if txn.isolation == Isolation::Snapshot {
                             return Ok(IOResult::Done(Write::Conflict));
                         }
                     }

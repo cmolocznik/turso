@@ -13,6 +13,12 @@
 //! its place in it ([`Place`]). Recovery replays a group only once it has read all of it; a crash
 //! that leaves part of one ends the log at the group's start.
 //!
+//! **In place.** A record built in a block of its own, a transaction's chunk of changes (DESIGN.md
+//! §11.4.1), is published where it lies ([`Log::publish`]): room is taken at the next block
+//! boundary, the rest of the block before it padded in the ring, and the block handed to the log.
+//! The flusher writes it from the block, never through the ring, and the write holds the block
+//! until it lands; the ring's chunks over those positions are counted as copied and left alone.
+//!
 //! **Flushing.** The flusher writes the complete prefix of the log in whole [`BLOCK`]s, straight
 //! from the chunks. When someone waits on a record in a block that is not full and nothing more is
 //! coming, the block is padded to its end; the next flush starts in a fresh block, so bytes
@@ -68,6 +74,12 @@ use room::{Pad, Room};
 use segment::Segments;
 use waits::Waits;
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Bytes copied into the ring on this thread: what a measurement counts per operation.
+    pub(crate) static COPIED_IN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// The chunks of the ring of `config`: room for the admitted bytes, a padded block per write in
 /// flight, and the chunk being flushed while the next fills.
 fn ring_slots(config: &LogConfig) -> usize {
@@ -115,6 +127,13 @@ impl Default for LogConfig {
     }
 }
 
+/// A record published in place: where it lies, in whole blocks, and the block it is written from.
+struct Extent {
+    start: Lsn,
+    end: Lsn,
+    block: Arc<AlignedBlock>,
+}
+
 struct Slot {
     block: Arc<AlignedBlock>,
     /// Bytes copied into this slot over all the chunks it has held.
@@ -154,6 +173,10 @@ pub struct Log {
     failed: AtomicBool,
     failure: SetOnce<CompletionError>,
     zeros: Arc<AlignedBlock>,
+    /// Records published in place and not yet all submitted to be written, by where they lie.
+    extents: crate::sync::Mutex<std::collections::VecDeque<Extent>>,
+    /// How many: a flush with none looks at no lock.
+    extent_count: AtomicUsize,
 }
 
 /// Space an operation may append into, taken from [`Log::admit`]; what it does not use goes back
@@ -264,6 +287,8 @@ impl Log {
             failed: AtomicBool::new(false),
             failure: SetOnce::default(),
             zeros: Arc::new(AlignedBlock::zeroed(config.chunk_bytes as usize)),
+            extents: crate::sync::Mutex::new(std::collections::VecDeque::new()),
+            extent_count: AtomicUsize::new(0),
             segments,
             config,
         });
@@ -428,6 +453,99 @@ impl Log {
         (GroupStart::at(start), lsn)
     }
 
+    /// Publishes in place the record whose payload, `payload_len` bytes, lies in `block` past
+    /// [`record::HEADER`]'s room (DESIGN.md §11.4.1), within `admitted`'s room, which must hold its framed
+    /// length in whole blocks and a block more. It takes room at the next block boundary, pads the
+    /// rest of the block before it in the ring, writes the record's header, CRC and padding to
+    /// its last block's end into `block`, and hands `block` to the log, which writes it from there
+    /// and lets it go once its write lands. `reserved` is handed where the record starts as
+    /// [`append_with`](Self::append_with) hands it. Returns where it starts and its LSN.
+    pub fn publish(
+        self: &Arc<Self>,
+        admitted: &mut Admitted,
+        header: &Header,
+        mut block: AlignedBlock,
+        payload_len: usize,
+        reserved: impl FnOnce(GroupStart),
+    ) -> (GroupStart, Lsn) {
+        assert!(
+            payload_len <= MAX_PAYLOAD,
+            "a {payload_len} byte log record"
+        );
+        let len = framed_len(payload_len);
+        let whole = len.next_multiple_of(BLOCK);
+        assert!(
+            whole as usize <= block.len(),
+            "a record of {len} bytes in a block of {}",
+            block.len()
+        );
+        let (gap, start) = self.room.reserve_aligned(whole);
+        assert!(
+            start - gap + whole <= admitted.left,
+            "{} bytes published with {} bytes admitted",
+            start - gap + whole,
+            admitted.left
+        );
+        admitted.left -= start - gap + whole;
+        reserved(GroupStart::at(start));
+        if gap < start {
+            self.copy_in(gap, &record::padding(gap));
+            self.count_copied(gap, start);
+        }
+        let bytes = block.bytes_mut();
+        let head = record::header_bytes(header, Place::ALONE, payload_len);
+        bytes[..record::HEADER].copy_from_slice(&head);
+        let body = record::HEADER + payload_len;
+        let crc = super::crc::append(super::crc::of(&start.to_le_bytes()), &bytes[..body]);
+        bytes[body..body + 4].copy_from_slice(&crc.to_le_bytes());
+        bytes[body + 4..len as usize].fill(0);
+        if len < whole {
+            let padding = record::padding(start + len);
+            bytes[len as usize..whole as usize].copy_from_slice(&padding);
+        }
+        // In the queue before its bytes count as copied: a flusher that finds them copied finds
+        // it there.
+        {
+            let mut extents = self.extents.lock();
+            let at = extents.partition_point(|e| e.start < start);
+            extents.insert(
+                at,
+                Extent {
+                    start,
+                    end: start + whole,
+                    block: Arc::new(block),
+                },
+            );
+            self.extent_count.fetch_add(1, Ordering::Release);
+        }
+        self.count_copied(start, start + whole);
+        // Written at once, so its block goes back as soon as it can.
+        self.flush();
+        (GroupStart::at(start), start + len)
+    }
+
+    /// The record published in place that ends past `at`, the first by where it lies.
+    fn extent_from(&self, at: Lsn) -> Option<(Lsn, Lsn, Arc<AlignedBlock>)> {
+        if self.extent_count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let extents = self.extents.lock();
+        extents
+            .iter()
+            .find(|e| e.end > at)
+            .map(|e| (e.start, e.end, e.block.clone()))
+    }
+
+    /// Lets go of every record published in place that lies wholly before `at`: its writes are
+    /// submitted, and they hold its block.
+    fn extents_written_to(&self, at: Lsn) {
+        let mut extents = self.extents.lock();
+        while extents.front().is_some_and(|e| e.end <= at) {
+            extents.pop_front();
+            self.extent_count.fetch_sub(1, Ordering::Release);
+        }
+    }
+
     /// Appends `records` as one group: contiguous in the log, and replayed by recovery all
     /// together or not at all, so a change spanning several pages survives a crash whole or not
     /// at all. Returns where the group starts and each record's LSN. As with
@@ -563,6 +681,8 @@ impl Log {
 
     /// Copies `bytes` into the ring from `at`; returns where they end.
     fn copy_in(&self, mut at: Lsn, mut bytes: &[u8]) -> Lsn {
+        #[cfg(test)]
+        COPIED_IN.with(|n| n.set(n.get() + bytes.len() as u64));
         while !bytes.is_empty() {
             let (slot, offset) = self.slot(at);
             let n = bytes.len().min(self.config.chunk_bytes as usize - offset);
@@ -660,8 +780,8 @@ impl Log {
         while let Some(turn) = self.flushes.turn() {
             let (writes, unprepared) = self.plan_writes();
             drop(turn);
-            for (start, end) in writes {
-                self.submit_write(start, end);
+            for (start, end, block) in writes {
+                self.submit_write(start, end, block);
             }
             if unprepared {
                 self.prepare_ahead();
@@ -671,7 +791,7 @@ impl Log {
 
     /// The writes to start, from where the last ended, and whether padding waits for a segment:
     /// for the flush under way.
-    fn plan_writes(&self) -> (Vec<(Lsn, Lsn)>, bool) {
+    fn plan_writes(&self) -> (Vec<(Lsn, Lsn, Option<(Arc<AlignedBlock>, usize)>)>, bool) {
         let mut writes = Vec::new();
         if self.failed.load(Ordering::Acquire) {
             return (writes, false);
@@ -706,15 +826,34 @@ impl Log {
                         break;
                     }
                 }
-            } else if !someone_waits && end - start < self.config.chunk_bytes {
+            }
+            // A record published in place is written from its block, at once: it is one write
+            // already, and its block goes back once it lands. The ring's writes stop at its start.
+            let extent = self.extent_from(start);
+            let in_place = extent.as_ref().is_some_and(|&(s, ..)| s <= start);
+            if !someone_waits && !in_place && end - start < self.config.chunk_bytes {
                 // Nobody waits: let a chunk's worth gather.
                 break;
             }
             let chunk_end = (start / self.config.chunk_bytes + 1) * self.config.chunk_bytes;
             let segment_end = self.segments.start(self.segments.number(start) + 1);
-            let write_end = end.min(chunk_end).min(segment_end);
+            let (write_end, from) = match extent {
+                Some((s, e, block)) if s <= start => {
+                    let write_end = end.min(e).min(segment_end);
+                    if write_end == e {
+                        self.extents_written_to(e);
+                    }
+                    (write_end, Some((block, s)))
+                }
+                Some((s, ..)) => (end.min(chunk_end).min(segment_end).min(s), None),
+                None => (end.min(chunk_end).min(segment_end), None),
+            };
             self.in_flight.fetch_add(1, Ordering::AcqRel);
-            writes.push((start, write_end));
+            writes.push((
+                start,
+                write_end,
+                from.map(|(block, s)| (block, (start - s) as usize)),
+            ));
             start = write_end;
         }
         self.submitted.store(start, Ordering::Relaxed);
@@ -729,11 +868,23 @@ impl Log {
         Arc::downgrade(self)
     }
 
-    fn submit_write(self: &Arc<Self>, start: Lsn, end: Lsn) {
+    /// Writes `[start, end)`: from a record published in place, its block and where in it
+    /// `start` lies, or from the ring.
+    fn submit_write(
+        self: &Arc<Self>,
+        start: Lsn,
+        end: Lsn,
+        from: Option<(Arc<AlignedBlock>, usize)>,
+    ) {
         let segment = self.segments.number(start);
         let file = self.segments.file(segment);
-        let (slot, offset) = self.slot(start);
-        let buffer = slot.block.region(offset, (end - start) as usize);
+        let buffer = match from {
+            Some((block, offset)) => block.region(offset, (end - start) as usize),
+            None => {
+                let (slot, offset) = self.slot(start);
+                slot.block.region(offset, (end - start) as usize)
+            }
+        };
         let me = self.held();
         let len = end - start;
         let c = Completion::new_write(move |res| {
@@ -985,6 +1136,20 @@ impl Log {
             Arc::new(Segments::new(io, base, config.segment_bytes, config.direct)),
             start,
         )
+    }
+
+    /// The record that starts at `at`, outside any group, read back from its segment: a part of a
+    /// running transaction's changes, for its rollback. The log must be durable past it.
+    pub fn read_record(&self, at: GroupStart) -> Result<OwnedRecord> {
+        let mut records =
+            LogReader::group_at(self.io.clone(), Arc::new(self.segments.fresh()), at)?;
+        match (records.pop(), records.is_empty()) {
+            (Some(r), true) if !r.place.grouped() => Ok(r),
+            _ => Err(LimboError::Corrupt(format!(
+                "a record read back at {} is in a group",
+                at.get()
+            ))),
+        }
     }
 
     /// The group of this database's log that starts at `at`, read whole and checked: what a

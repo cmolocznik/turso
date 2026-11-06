@@ -1075,12 +1075,17 @@ impl Memory {
 
     /// The batch of `class`, not draining, with the fewest frames taken, to drain for `to`: one
     /// whose aligned run of `to`'s order lies inside the region, which a short last run may not.
-    pub fn emptiest(&self, class: SizeClass, to: SizeClass) -> Option<u32> {
+    pub fn emptiest(
+        &self,
+        class: SizeClass,
+        to: SizeClass,
+        drainable: impl Fn(u32) -> bool,
+    ) -> Option<u32> {
         let run = 1u32 << order(to);
         self.index(class)
             .live
             .ones()
-            .filter(|&b| (b & !(run - 1)) + run <= self.batches)
+            .filter(|&b| (b & !(run - 1)) + run <= self.batches && drainable(b))
             .min_by_key(|&b| self.state(b).taken())
     }
 
@@ -1229,7 +1234,7 @@ mod tests {
                     // Every class, the one runs are reserved for too: a run made whole is drained
                     // again as its reservation clears.
                     let from = classes[round % classes.len()];
-                    if let Some(batch) = m.emptiest(from, class(0)) {
+                    if let Some(batch) = m.emptiest(from, class(0), |_| true) {
                         m.drain_for(from, batch, class(0));
                     }
                     if round % 4 == 0 {
@@ -1428,9 +1433,10 @@ mod tests {
             .collect();
         let last = *frames.iter().find(|&&f| f / GRAINS == 4).unwrap();
         m.put(class(9), last);
-        assert_eq!(m.emptiest(class(9), class(9)), Some(4));
+        assert_eq!(m.emptiest(class(9), class(9), |_| true), Some(4));
         assert!(
-            m.emptiest(class(9), class(10)).is_some_and(|b| b < 4),
+            m.emptiest(class(9), class(10), |_| true)
+                .is_some_and(|b| b < 4),
             "a drain for 4 MiB frames chose a batch with no aligned run of two"
         );
     }

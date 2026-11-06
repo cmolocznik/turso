@@ -1321,9 +1321,14 @@ impl Ending {
                     // and once more for what is appended while a pass runs (DESIGN.md §10, §17,
                     // §11), the end waits for a full checkpoint: a pass is due per budget share
                     // appended, so one bulk statement would otherwise leave the redo point behind
-                    // until as much again is written.
+                    // until as much again is written. Not when the first part of a transaction
+                    // still running holds the redo point there (DESIGN.md §11.4.1): no checkpoint
+                    // could bring it nearer.
                     let checkpointer = self.db.atoll().checkpointer();
-                    self.step = if checkpointer.lag() > 2 * checkpointer.budget() {
+                    let over = 2 * checkpointer.budget();
+                    self.step = if checkpointer.lag() > over
+                        && checkpointer.lag_to(txns.held_from()) > over
+                    {
                         Step::Checkpoint(checkpointer.request_full())
                     } else {
                         nudge_checkpoint(&self.db)?;

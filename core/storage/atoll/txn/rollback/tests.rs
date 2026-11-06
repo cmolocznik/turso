@@ -851,3 +851,52 @@ fn a_crash_after_a_settle_recovers_the_writes_that_took_its_room() {
     assert_eq!(recovered.state(&keys), expected);
     recovered.check_whole("recovered");
 }
+
+/// A transaction spills each chunk its changes fill while it runs (DESIGN.md §11.4.1), never
+/// holding more than the chunk it fills and the one it spilled last; a checkpoint cut meanwhile
+/// keeps the log from its first part. A crash before its commit recovers none of its changes, and
+/// one after recovers all of them, the parts read from before the cut.
+#[test]
+fn a_transaction_spills_as_it_goes_and_a_checkpoint_between_keeps_its_parts() {
+    let crash_io = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let db = Db::create(io);
+    let keys: Vec<String> = (0..120).map(|i| format!("k{i:03}")).collect();
+    committed(&db, &keys[..20]);
+    let before = db.state(&keys);
+    let chunk = config().log.chunk_bytes as usize;
+    let mut t = db.begin();
+    let mut most = 0;
+    for (i, key) in keys.iter().enumerate() {
+        db.put(&mut t, i % 2, key, &value("spilled", i));
+        most = most.max(t.changes().capacity());
+    }
+    let first = t
+        .changes()
+        .parts()
+        .first()
+        .copied()
+        .expect("a part spilled before the commit");
+    assert!(most <= 2 * chunk, "{most} bytes of chunks held");
+    let superblock = db.checkpoint();
+    assert!(
+        superblock.redo <= first.at.get(),
+        "the redo point {} past the first part at {}",
+        superblock.redo,
+        first.at.get()
+    );
+    db.durable();
+    let uncommitted = crash_io.crash(1);
+    db.commit(t);
+    db.durable();
+    let after = db.state(&keys);
+    let committed = crash_io.crash(2);
+    for (image, want, label) in [
+        (uncommitted, &before, "before the commit"),
+        (committed, &after, "after it"),
+    ] {
+        let recovered = Db::recover(Arc::new(image), db.roots());
+        assert_eq!(&recovered.state(&keys), want, "{label}");
+        recovered.check_whole(label);
+    }
+}

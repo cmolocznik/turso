@@ -457,7 +457,9 @@ fn paths() {
 /// statements. Each phase runs, since the next reads its rows; `ATOLL_BENCH=sql-<phase>` times one
 /// alone, as [`paths`] times its cases, under the same `ATOLL_BENCH_ROWS` and perf fifo pair. With
 /// `ATOLL_BENCH_SEQ` set, every phase goes in key order, as rowids a table assigns are inserted.
-/// `ATOLL_BENCH_VALUE` sets the values' length (100 bytes; at least 44).
+/// `ATOLL_BENCH_VALUE` sets the values' length (100 bytes; at least 44), `ATOLL_BENCH_TXN` the rows
+/// a writing transaction holds. Beside its time, a phase prints per row the allocations made, the
+/// bytes copied into the log's ring and the bytes of changes encoded.
 ///
 /// ```text
 /// cargo test --release -p turso_core --lib storage::atoll::bench::sql -- --ignored --nocapture
@@ -489,6 +491,7 @@ fn sql() {
     };
     let length: usize = std::env::var("ATOLL_BENCH_VALUE").map_or(100, |v| v.parse().unwrap());
     assert!(length >= 44, "values of {length} bytes");
+    let txn_rows: usize = std::env::var("ATOLL_BENCH_TXN").map_or(TXN_ROWS, |t| t.parse().unwrap());
     let value = Value::build_text("v".repeat(length));
     let changed = Value::build_text(format!("{}abcd{}", "v".repeat(40), "v".repeat(length - 44)));
     let (mut begin, mut commit) = (
@@ -506,6 +509,7 @@ fn sql() {
         if timed {
             perf_control("enable");
         }
+        let counted = counts();
         let began = Instant::now();
         if reads && sql.contains("?1") {
             // A lookup per row, in the order rows went in.
@@ -520,7 +524,7 @@ fn sql() {
             stmt.run_ignore_rows().unwrap();
             stmt.reset().unwrap();
         }
-        for chunk in shuffled.chunks(TXN_ROWS).filter(|_| !reads) {
+        for chunk in shuffled.chunks(txn_rows).filter(|_| !reads) {
             begin.run_ignore_rows().unwrap();
             begin.reset().unwrap();
             for &n in chunk {
@@ -539,7 +543,17 @@ fn sql() {
         let ns = began.elapsed().as_nanos() as f64 / rows as f64;
         if timed {
             perf_control("disable");
-            println!("bench sql-{name} {journal} ops {rows} ns/op {ns:.0}");
+            let per = |n: u64| n as f64 / rows as f64;
+            let held = super::txn::changes::HELD.with(|n| n.get());
+            let (allocs, ring, redo) = counts();
+            println!(
+                "bench sql-{name} {journal} ops {rows} ns/op {ns:.0} allocs/op {:.2} ring/op {:.1} \
+                 redo/op {:.1} held_kb {}",
+                per(allocs - counted.0),
+                per(ring - counted.1),
+                per(redo - counted.2),
+                held >> 10
+            );
         }
         if reads {
             commit.run_ignore_rows().unwrap();
@@ -585,7 +599,8 @@ fn sql() {
 /// ```
 ///
 /// `ATOLL_BENCH_POOL` (bytes, 256 MiB), `ATOLL_BENCH_ROWS` (4,000,000), `ATOLL_BENCH_VALUE` (bytes,
-/// 200) and `ATOLL_BENCH_PHASE` (seconds, 30) change the sizes.
+/// 200), `ATOLL_BENCH_PHASE` (seconds, 30) and `ATOLL_BENCH_TXN` (rows a transaction of the timed
+/// phases, [`TXN_ROWS`]) change the sizes.
 #[test]
 #[ignore]
 fn sustained() {
@@ -600,6 +615,7 @@ fn sustained() {
     let rows = env("ATOLL_BENCH_ROWS", 4_000_000);
     let length = env("ATOLL_BENCH_VALUE", 200) as usize;
     let phase_secs = env("ATOLL_BENCH_PHASE", 30);
+    let txn_rows = env("ATOLL_BENCH_TXN", TXN_ROWS as u64);
     let wal = std::env::var_os("ATOLL_BENCH_WAL").is_some();
     let journal = if wal { "wal" } else { "atoll" };
     let path = format!("{dir}/sustained-{journal}-{}.db", std::process::id());
@@ -771,7 +787,7 @@ fn sustained() {
             let txn = Instant::now();
             begin.run_ignore_rows().unwrap();
             begin.reset().unwrap();
-            for _ in 0..TXN_ROWS {
+            for _ in 0..txn_rows {
                 let id = next_id();
                 update
                     .bind_at(NonZero::<usize>::MIN, Value::from_i64(id as i64))
@@ -785,7 +801,7 @@ fn sustained() {
             let committing = Instant::now();
             commit.run_ignore_rows().unwrap();
             commit.reset().unwrap();
-            window.2 += TXN_ROWS as u64;
+            window.2 += txn_rows;
             window.3.push(txn.elapsed().as_micros() as u64);
             window.4.push(committing.elapsed().as_micros() as u64);
             let secs = window.0.elapsed().as_secs_f64();
@@ -925,6 +941,17 @@ fn sustained() {
 
 /// Rows per transaction in [`paths`]'s versioned inserts, as the SQL throughput benchmark writes.
 const TXN_ROWS: usize = 100;
+
+/// On this thread so far: allocations, bytes copied into the log's ring, and bytes of changes
+/// encoded into transactions' buffers. Starts the most memory a transaction's buffer held again.
+fn counts() -> (u64, u64, u64) {
+    super::txn::changes::HELD.with(|n| n.set(0));
+    (
+        super::testing::allocations(),
+        super::log::COPIED_IN.with(|n| n.get()),
+        super::txn::changes::ENCODED.with(|n| n.get()),
+    )
+}
 
 /// Tells the profiler named by `ATOLL_PERF_CTL` and `ATOLL_PERF_ACK` (a `perf --control` fifo pair)
 /// to `enable` or `disable`, and waits for its answer: it records the timed phase alone.

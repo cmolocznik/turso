@@ -1067,6 +1067,13 @@ impl AtollCursor {
         let mut guard = self.txn.lock();
         let txn = guard.as_mut().ok_or_else(outside)?;
         let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
+        // A chunk of changes a plain write filled goes to the log before the next changes
+        // anything (DESIGN.md §11.4.1).
+        if txn.changes().has_sealed() {
+            if let IOResult::IO(io) = txns.spill(txn)? {
+                return Ok(IOResult::IO(io));
+            }
+        }
         let (written, mode) = match self.writing.as_mut().expect("a write") {
             Writing::Versioned(op, mode) => (self.tree.write(txns, versions, txn, op)?, *mode),
             Writing::PlainPut(put, mode) => (

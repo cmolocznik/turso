@@ -245,22 +245,19 @@ fn crashes_recover_every_commit_acknowledged_with_writes_then_syncs() {
 #[test]
 fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_past_it() {
     // Commits each flushed on their own, so each starts a block, nothing else appended between;
-    // every other one changes a little more than a log chunk holds, so a part goes first and its
-    // Commit, holding the little left, starts inside a block and ends inside it.
+    // every other one follows an empty run published with no wait, so its Commit starts inside a
+    // block and ends inside it.
     let crash_io = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash_io.clone();
     let db = Db::create(io);
     let root = db.tree.root();
-    let chunk = config().log.chunk_bytes as usize;
-    let written = |i: usize| {
-        let mut v = value(i * 5 + 1);
-        if i % 2 == 1 {
-            v.resize(chunk, b'.');
-        }
-        v
-    };
+    let written = |i: usize| value(i * 5 + 1);
     let mut ends = Vec::new();
     for i in 0..32 {
+        if i % 2 == 1 {
+            let run = super::txn::changes::Changes::new();
+            drive(&db.io, || db.db.transactions().publish_alone(&run)).unwrap();
+        }
         db.put(&format!("k{i:02}"), &written(i));
         ends.push((format!("k{i:02}"), written(i), db.db.log().end()));
     }

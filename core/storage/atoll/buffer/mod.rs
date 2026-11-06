@@ -75,7 +75,8 @@ use super::store::PageStore;
 use cell::{CompletionCell, Retiring};
 use clean::{Progress, Writeback};
 use frame::{
-    FrameHeader, ABANDONED, EVICT_AFTER, FREE, LENT, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
+    FrameHeader, ABANDONED, EVICT_AFTER, FOR_GOOD, FREE, LENT, LOADING, NO_PAGE, OUTGOING,
+    RESIDENT, WRITING,
 };
 use kept::KeptRoom;
 use lent::Lends;
@@ -1356,7 +1357,9 @@ impl BufferPool {
         let colder = SizeClass::all()
             .filter(|&c| c != class)
             .filter_map(|c| {
-                let batch = self.memory.emptiest(c, class)?;
+                let batch = self
+                    .memory
+                    .emptiest(c, class, |b| self.drainable(class, b))?;
                 let (held, in_use, per_byte) = self.drain_cost(class, batch, horizon);
                 Some((c, batch, held, in_use, per_byte))
             })
@@ -1379,6 +1382,19 @@ impl BufferPool {
             }
             _ => self.evict_round(class),
         }
+    }
+
+    /// Whether the memory around `batch` for `class` can be drained: no frame of it is lent for
+    /// good ([`FOR_GOOD`]), which would never come back to free it. Measured: the log's ring, 19
+    /// frames lent at open, made the batch holding it the emptiest of its class, and a claim of
+    /// another class drained it and waited for good.
+    fn drainable(&self, class: SizeClass, batch: u32) -> bool {
+        let count = 1u32 << memory::order(class);
+        let start = batch & !(count - 1);
+        self.memory.taken_in(start, count).into_iter().all(|frame| {
+            let h = self.header(frame);
+            !(h.status() == LENT && h.flags.load(Ordering::Acquire) & FOR_GOOD != 0)
+        })
     }
 
     /// What draining the memory around `batch` for `class` gives up: how many of its pages a step
@@ -1832,7 +1848,8 @@ impl BufferPool {
         let h = self.header(frame);
         let hold = self.take_free_latch(frame);
         h.pid.store(NO_PAGE, Ordering::Release);
-        h.flags.store(0, Ordering::Release);
+        let flags = if what == LentUse::Log { FOR_GOOD } else { 0 };
+        h.flags.store(flags, Ordering::Release);
         h.status.store(LENT, Ordering::Release);
         drop(hold);
         let token = self.lends.lent(frame, class, what);

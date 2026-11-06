@@ -129,6 +129,74 @@ fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order_
     );
 }
 
+/// Writers append records into the ring and publish others in place from blocks of their own
+/// (DESIGN.md §11.4.1), some waited on, through a log small enough to wait for room and cross
+/// chunks and segments: every record reads back once, each writer's in its order, an in-place
+/// record's payload whole, and every in-place record starts on a block boundary.
+fn records_published_in_place_read_back_among_the_rings(io: Arc<dyn IO>, writers: u64, each: u64) {
+    let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
+    let handles: Vec<_> = (0..writers)
+        .map(|writer| {
+            let (io, log) = (io.clone(), log.clone());
+            crate::thread::spawn(move || {
+                for seq in 0..each {
+                    let mut p = payload(writer, seq);
+                    let lsn = if seq % 3 == 1 {
+                        // Its payload past a block, up to a chunk less the framing.
+                        p.resize(4096 + ((seq * 977) % 3000) as usize, (seq % 251) as u8);
+                        let mut block = AlignedBlock::zeroed(small().chunk_bytes as usize);
+                        block.bytes_mut()[record::HEADER..record::HEADER + p.len()]
+                            .copy_from_slice(&p);
+                        let room = framed_len(p.len()).next_multiple_of(BLOCK) + BLOCK;
+                        let mut admitted = drive(&io, || log.admit(room)).unwrap();
+                        let (at, lsn) =
+                            log.publish(&mut admitted, &header(writer), block, p.len(), |_| {});
+                        assert!(at.get().is_multiple_of(BLOCK), "in place at {}", at.get());
+                        lsn
+                    } else {
+                        let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+                        log.append(&mut admitted, &header(writer), &[&p])
+                    };
+                    if seq % 7 == 0 {
+                        drive(&io, || log.wait_durable(lsn)).unwrap();
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    drive(&io, || log.wait_durable(log.end())).unwrap();
+    let (records, _) = read_all(io, 0);
+    assert_eq!(records.len() as u64, writers * each);
+    let mut next = vec![0u64; writers as usize];
+    let mut in_place = 0;
+    for r in &records {
+        let writer = r.header.txn;
+        let seq = u64::from_le_bytes(r.payload[8..16].try_into().unwrap());
+        assert_eq!(seq, next[writer as usize], "writer {writer} out of order");
+        let mut want = payload(writer, seq);
+        if seq % 3 == 1 {
+            want.resize(4096 + ((seq * 977) % 3000) as usize, (seq % 251) as u8);
+            assert!(r.start.is_multiple_of(BLOCK), "in place at {}", r.start);
+            in_place += 1;
+        }
+        assert_eq!(r.payload, want, "writer {writer} record {seq}");
+        next[writer as usize] += 1;
+    }
+    assert!(in_place > 0);
+}
+
+#[cfg(not(shuttle))]
+#[test]
+fn records_published_in_place_read_back_among_the_rings_on_threads() {
+    let (writers, each) = if cfg!(miri) { (2, 20) } else { (6, 120) };
+    for io in threaded_backends(11) {
+        records_published_in_place_read_back_among_the_rings(io, writers, each);
+    }
+}
+
 /// A log dropped while its writes are in flight is freed at once: they wait in the log's own IO,
 /// so a completion that held the log would keep it, its ring and its files alive until the IO
 /// next steps, and for good once nothing does.

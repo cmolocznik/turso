@@ -662,7 +662,8 @@ fn begins_collect_the_arenas_so_a_writers_replaced_values_do_not_pile_up() {
 
 /// A long explicit transaction appending twenty times the log budget before it commits: each of
 /// its writing statements steps the checkpointer, so the redo point follows the log while it runs,
-/// not only at its commit (§11).
+/// not only at its commit (§11), as far as the transaction's first part spilled, which holds it
+/// until the commit (§11.4.1); after the commit it follows the log's end again.
 #[test]
 fn a_long_transactions_statements_step_the_checkpointer_before_its_commit() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -677,10 +678,24 @@ fn a_long_transactions_statements_step_the_checkpointer_before_its_commit() {
         conn.execute(format!("INSERT INTO t (b) VALUES (zeroblob({row}))"))
             .unwrap();
     }
-    let lag = db.atoll.as_ref().unwrap().atoll().checkpointer().lag();
-    eprintln!("before the long transaction's commit, lag {lag}");
-    assert!(lag <= 2 * budget, "the redo point trails by {lag} bytes");
+    let atoll = db.atoll.as_ref().unwrap().atoll();
+    let held = atoll.transactions().held_from();
+    assert!(
+        held < atoll.log().end(),
+        "the long transaction spilled nothing"
+    );
+    let lag = atoll.checkpointer().lag_to(held);
+    eprintln!("before the long transaction's commit, lag {lag} to its first part");
+    assert!(
+        lag <= 2 * budget,
+        "the redo point trails the transaction's first part by {lag} bytes"
+    );
     conn.execute("COMMIT").unwrap();
+    let lag = atoll.checkpointer().lag();
+    assert!(
+        lag <= 2 * budget,
+        "after the commit, the redo point trails by {lag} bytes"
+    );
 }
 
 /// Named savepoints: ROLLBACK TO puts back what was written since and keeps the savepoint,

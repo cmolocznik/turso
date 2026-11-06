@@ -144,6 +144,25 @@ impl Room {
         self.ends.insert.fetch_add(len, Ordering::SeqCst)
     }
 
+    /// Takes `len` of the bytes granted at the next block boundary past the end: returns where
+    /// the end stood, and where the bytes start. The bytes between are the caller's to pad. The
+    /// reach stays.
+    pub(super) fn reserve_aligned(&self, len: u64) -> (u64, u64) {
+        let mut at = self.ends.insert.load(Ordering::SeqCst);
+        loop {
+            let start = at.next_multiple_of(super::BLOCK);
+            match self.ends.insert.compare_exchange_weak(
+                at,
+                start + len,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return (at, start),
+                Err(now) => at = now,
+            }
+        }
+    }
+
     /// Moves the end from `at` to the end of its block, for padding, unless someone reserved past
     /// `at` meanwhile or it would push the records granted past the prepared segments.
     pub(super) fn pad(&self, at: u64) -> Pad {

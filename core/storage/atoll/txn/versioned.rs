@@ -803,6 +803,11 @@ impl VersionedTree {
             "a key of {} bytes",
             op.key.len()
         );
+        // The chunk of changes the last write filled goes to the log before this one changes
+        // anything (DESIGN.md §11.4.1).
+        if txn.changes.has_sealed() {
+            done!(txns.spill(txn));
+        }
         // A version found gone: rolled back since it was read, unless it is still there.
         let mut gone = None;
         // The look a put just built goes in from, once.

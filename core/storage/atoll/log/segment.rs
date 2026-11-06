@@ -56,6 +56,11 @@ impl Segments {
         }
     }
 
+    /// Another set over the same files, with handles of its own: for a reader beside the log.
+    pub fn fresh(&self) -> Self {
+        Self::new(self.io.clone(), &self.base, self.size, self.direct)
+    }
+
     pub fn number(&self, lsn: u64) -> u64 {
         lsn / self.size
     }

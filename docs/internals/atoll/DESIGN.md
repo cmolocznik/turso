@@ -243,12 +243,12 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
   position, its header and its payload, so a record read at another position, a torn record, or
   bytes a crash left behind never read as valid.
 - **LSN.** A record's LSN is the position just past its end.
-- **What is logged** is what recovery replays (audit 17): a transaction's changes by key, kept in
-  memory until its commit and published then, in parts ahead of its Commit when they outgrow a log
-  chunk (`SPILL`), the last part in the Commit with its timestamp (`COMMIT`); changes made outside
-  any transaction, such as a sequence's or a drain's, in a run of their own (`RUN`); a
-  checkpoint's metadata intent (section 10). Nothing of a transaction reaches the log before its
-  commit, and a rollback logs nothing. No page change is logged: a checkpoint writes the pages as
+- **What is logged** is what recovery replays (audit 17): a transaction's changes by key, in
+  parts published as its chunks fill, while it runs (`SPILL`, section 11.4.1), the last part in the
+  Commit with its timestamp (`COMMIT`); changes made outside any transaction, such as a sequence's
+  or a drain's, in a run of their own (`RUN`); a checkpoint's metadata intent (section 10). A
+  transaction rolled back leaves its parts with no Commit, never replayed, and its rollback logs
+  nothing. No page change is logged: a checkpoint writes the pages as
   of its snapshot, and recovery replays the changes past it (section 12).
 - **Not built yet:** the record header still carries `prev` and a group's index and size, which
   nothing writes since page records went; they go with the log's next format change.
@@ -265,6 +265,11 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
   progress starts. It does so before reserving, with sequentially consistent ordering. A flusher
   reads the insert position and then the array, so it sees every copy still running below that
   position. It writes only the prefix every appender has finished.
+- **In place.** A record built in a block of its own, a transaction's chunk of changes (section
+  11.4.1), takes room at the next block boundary, the rest of the block before it padded in the
+  ring, and the block is handed to the log: the flusher writes it from the block, never through the
+  ring, and the write holds the block until it lands. The ring's chunks over those positions count
+  it as copied and are left alone.
 - **Never blocking mid-change.** Space is never waited for in the middle of a change. An operation
   waits, if it must, before its first latch, until the unflushed bytes are below the buffer's size.
 
@@ -385,14 +390,18 @@ Built in `core/storage/atoll/buffer`.
   cut keeps (section 10), a checkpoint's image of a node page until its write lands, and a chunk
   of the log's ring for as long as the log is open. A lent frame holds no page and is in no hash
   chain, so nothing evicts or moves it, a hint to it fails, and a batch holding one drains only
-  once it is given back. Only a quiet frame is lent, as its holder writes it plainly; it goes back
+  once it is given back. A frame of the log's ring is marked lent for good, and a batch holding
+  one is never chosen to drain: the ring's batch is the emptiest of its class, and a drain of it
+  waits for good (measured: a long transaction's commit, needing frames of another class for its
+  checkpoint's images, stalled there). Only a quiet frame is lent, as its holder writes it plainly; it goes back
   when its block drops, from whatever thread or IO callback drops it. Beside the region are what
   is fixed per process (code, stacks, connection and statement state), what scales with the
   region (the headers and the hash table), and three working memories, each bounded where it
   arises: the image of a value page being written and the copy it is made from (two pages of its
-  class), the metadata pages a cut keeps (section 10, item 11), and a transaction's changes, held
-  until its commit writes them to the log. Not built: a value page's image written from its frame,
-  metadata pages in lent frames, and a transaction's changes past a chunk in temporary pages.
+  class), the metadata pages a cut keeps (section 10, item 11), and the chunks of transactions'
+  changes (section 11.4.1), a chunk per slot that has written, those a transaction fills before its
+  next write, and the log's buffer's worth on their way to the device. Not built: a value page's
+  image written from its frame, and metadata pages in lent frames.
 - **Frame ids.** A frame is named by the 4 KiB grain it starts at, as a `u32`, so one pool holds
   at most 16 TiB. The id names the same memory whichever class holds it.
 - **Never unmapped.** A freed frame is reused as it is. Memory moves between classes a whole batch
@@ -493,7 +502,8 @@ drain some batch, perhaps one in use: it takes the batch with the fewest pages a
 the fewest in use, then the least value. Draining a page the requesting step holds, the other page
 of its operation, would only send that page's next fix to drain the memory back. Steps that ended
 since the global epoch last rose look under way too, so the mark errs toward keeping a page.
-Sampling and the choice skip batches already draining. Value per byte is
+Sampling and the choice skip batches already draining, and batches holding a frame lent for good.
+Value per byte is
 GreedyDual-Size's rule with every miss costing the same (Cao and Irani, 1997). A class of 4 or
 8 MiB pages reserves an aligned run, and the batches in it drain into it as they empty. One drain is
 in progress at a time.
@@ -959,9 +969,9 @@ where it stood at its snapshot.
 
 **Changes by key** (audit 17). A transaction keeps its changes by key as it makes them
 (`txn/changes.rs`): each put and delete with its tree and statement, each tree it creates, with
-plain stores into a buffer of its own. A statement rolled back drops its changes. The Commit
-record carries them after its timestamp; what does not fit one log chunk goes ahead of it in Spill
-records, each carrying the transaction's start. Changes made outside any transaction, a sequence's
+plain stores into chunks of its own (section 11.4.1). A statement rolled back drops its changes.
+Each chunk filled goes to the log as it fills, in a Spill record carrying the transaction's start;
+the Commit record carries the last after its timestamp. Changes made outside any transaction, a sequence's
 value and a tree drained, go out at once in Run records. Replaying the bodies in log order through
 the trees (`replay.rs`) rebuilds every tree: the replay oracle checks it against the database that
 published them, and recovery replays them past the checkpoint in charge (section 12).
@@ -969,12 +979,86 @@ published them, and recovery replays them past the checkpoint in charge (section
 Step 1's latch comes with garbage collection (section 20). Until then a commit marks its slot
 without it.
 
+#### 11.4.1 The redo buffer (Clay's scope of 2026-11-06)
+
+The changes are encoded once, into chunks of the log's chunk size, the largest single write, so a
+full chunk goes to the device in one write. Measured before this design (200,000 rows of 100
+bytes, transactions of 100 rows): the change buffer's appends cost 1.7% of an insert's
+instructions (about 240 a row: the encoding's per-field growth checks, and the buffer's
+reallocations as it doubles), the commit 1.2% (about 160, almost all the CRC), the flush 0.6%.
+This removes part of the ordered-write gap to WAL, not all of it: splits and version management
+stay as they are.
+
+- **Chunks.** A chunk is heap memory, aligned for direct IO, of one size for the database, lent
+  from a free list the database keeps and given back to it by whoever drops it last: the
+  transaction, or the log once its write from it has landed. It is not a frame of the pool: lent
+  from a pool sized to its minimum, the chunks idle slots keep took the frames a checkpoint's images
+  wait for, and the checkpoint never ended (measured: 3 runs in 8 of the SQL tests hung or fell
+  behind). A change starts in a chunk only if
+  its head and key fit in what is left of it, so the key of every change is whole in one chunk; a
+  value longer than what is left runs on into the next chunks. A chunk keeps room at its front for
+  the header of the record it becomes and at its back for the record's CRC and the padding to its
+  block's end, so it is published where it lies.
+- **No growth, no allocation per transaction.** Each slot keeps its changes buffer from
+  transaction to transaction, a chunk and its lists' room with it: a transaction that fits in the
+  chunk allocates nothing and touches nothing shared for its buffer. A chunk filled is sealed, and
+  the next taken from the free list. The free list keeps as many chunks as the log's buffer holds
+  unflushed, and one more; the heap so holds a chunk per slot that has written, those a transaction
+  fills before its next write, and the log's buffer's worth.
+- **Spilled as they fill.** A sealed chunk is published at once, while its transaction runs, as a
+  `SPILL` record of the transaction's start, the position in its changes where the part begins,
+  and the part. Published means: room reserved at the next block boundary, the rest of the block
+  before it padded, the record's header and CRC written into the chunk, and the chunk handed to
+  the log. The flusher writes it from the chunk itself, never through the ring; the chunk goes
+  back to the pool when its write has landed. If the log cannot admit it without waiting, it waits
+  in the chunk until the next write begins (before any latch) or the commit, either of which may
+  wait. A transaction so holds one chunk, plus any filled by one change longer than a chunk.
+- **The commit** copies what is in the slot's chunk into its Commit record in the ring, a copy of
+  at most one chunk; commits smaller than a block share blocks there, as group commit needs. The
+  Commit record carries the commit timestamp and where its part begins.
+- **No position held while a transaction is still writing.** A chunk takes its room in the log
+  only once it is full, with every byte of it written: its record is complete when its room is
+  taken, so nothing an idle transaction holds leaves a hole that keeps later commits from being
+  durable.
+
+Three obligations come with publishing parts before the commit:
+
+1. **A checkpoint keeps the parts of a transaction that commits after its cut.** A slot is marked
+   with where its transaction's first part lies when that part takes room (as a commit's first
+   part was before), and the mark stays until the transaction ends. The cut's redo point is at or
+   below every mark, so recovery reads every part of a transaction that commits past the cut, and
+   the segments holding them stay. A transaction open long after spilling so holds the log back,
+   as an open transaction holds a WAL; the end of a transaction waits for a full checkpoint only
+   when one could bring the redo point within twice the budget, never because a mark holds it.
+2. **A savepoint rollback leaves out what it discarded, even on disk.** Every part carries the
+   position in the transaction's changes where it begins. A rollback to a statement whose changes
+   begin before what has been spilled continues from that position: the next part, or the Commit,
+   begins there. Recovery joins parts by position, each part cutting what was joined at its own
+   start before adding to it, and refuses a part that would leave a gap. Bytes spilled past a
+   rollback point are so overwritten or cut off by the Commit's part, and never replayed; the parts
+   of a transaction rolled back whole have no Commit and are never applied. The rollback reads back
+   the changes it puts back: from the chunks in memory, and the spilled parts from the log, once
+   the log is durable up to them, one part at a time, newest first.
+3. **An acknowledged commit has every part durable.** A transaction's parts are published before
+   its Commit takes room, so they lie before it in the log, and the log is durable as a prefix: a
+   commit acknowledged once the log is durable up to its Commit has every part durable. A chunk
+   handed to the log is the log's until the write from it lands; the write holds it, so even a log
+   dropped mid-write leaves it alive until the device is done with it.
+
+Redo only does not remove what live snapshots and rollback read: versions keep the old values they
+replace in the version arenas (section 11.2).
+
+**Not built yet:** the commit still copies its last chunk into the ring, however full; publishing
+a full last chunk in place, as a part is, waits on its measurement.
+
 ### 11.5 Rollback and garbage collection
 
 Rollback is built in `txn/rollback.rs` and `txn/mod.rs`, except three parts, which come with
 garbage collection (section 20): the timestamp and cutoff of the end's steps 1 to 3, the
 re-recording of a tombstone put back, and the background rollback of a transaction abandoned open.
-Until then the end frees the slot at once. Garbage collection itself is the next part of step 7 (section 20).
+Until then the end frees the slot at once. Of garbage collection, the version indexes' drop by range
+is built (`txn/arena.rs`, below); the todo lists, retired references, tombstones and commit-log pairs
+are not built yet.
 
 - **Rollback.** A running transaction rolls back from its own changes by key (audit 17), which
   name every key its statements wrote, in order, each by its statement, so walked back they come
@@ -1087,7 +1171,14 @@ Until then the end frees the slot at once. Garbage collection itself is the next
     - One that loses that race to a restoration reads the item again.
     - A page it already freed stays freed: its slot-owned progress is the authority. It merges that
       progress into the item at the new revision rather than freeing the page again.
-  - **Version indexes** are dropped by range, without reading the entries.
+  - **Version indexes** are dropped by range, without reading the entries. Built: each slot's
+    arena pages go oldest first, a page once every snapshot (the checkpoint's cut among them) sees
+    the transaction that last appended to it (each page records that transaction's start), never
+    the page the slot appends to. A begin takes the step, for the slot it took and the next slot in
+    turn, freeing twice as many pages at most as the slot took since its last step; the slot's own
+    transaction appends meanwhile only to its last page, so the collection needs no more of the
+    slot than its claim. A rolled-back transaction's pages go once a later transaction of the slot
+    is seen; the extension below, through the slot's latest rollback, is not built.
     - The range takes every entry whose `ts` is at or below the slot's last committed start that the
       oldest snapshot sees.
     - It extends through the start of the slot's latest rollback, once every published snapshot is

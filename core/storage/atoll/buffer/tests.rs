@@ -540,6 +540,45 @@ fn a_drain_chosen_before_its_batch_changed_class_leaves_the_new_class_alone() {
     }
 }
 
+/// A batch holding a frame lent for good, as the log's ring is, is never drained for another
+/// class: the frame never comes back, so the drain would wait for good. Measured before this: a
+/// long transaction's commit, needing frames of another class for its checkpoint's images,
+/// drained the ring's batch, the emptiest of its class, and stalled.
+#[test]
+fn a_batch_holding_a_frame_lent_for_good_is_never_drained() {
+    for b in backends() {
+        let pool = open(&b, MIN_BUDGET);
+        let ring = drive(&b.io, || pool.lend(class(2), LentUse::Log)).unwrap();
+        let lent = (0..pool.memory.grains())
+            .find(|&f| pool.header(f).status() == LENT)
+            .expect("the frame lent");
+        let batch = lent / memory::GRAINS;
+        assert_eq!(
+            pool.memory.emptiest(class(2), class(0), |_| true),
+            Some(batch),
+            "{}: the emptiest batch of its class",
+            b.name
+        );
+        assert!(!pool.drainable(class(0), batch), "{}", b.name);
+        assert_eq!(
+            pool.memory
+                .emptiest(class(2), class(0), |b| pool.drainable(class(0), b)),
+            None,
+            "{}: a batch to drain chosen past the frame lent for good",
+            b.name
+        );
+        drop(ring);
+        assert!(pool.drainable(class(0), batch), "{}: given back", b.name);
+        let image = drive(&b.io, || pool.lend(class(2), LentUse::Image)).unwrap();
+        assert!(
+            pool.drainable(class(0), batch),
+            "{}: a frame lent for a while holds no batch",
+            b.name
+        );
+        drop(image);
+    }
+}
+
 #[test]
 fn temporary_pages_go_to_their_files_and_never_to_a_checkpoint() {
     for b in backends() {

@@ -3,8 +3,11 @@
 //! trees by key.
 //!
 //! [`Gather`] reads the log's records and hands over each body of changes once it is whole: a
-//! Commit's, joined to the parts it spilled ahead of it, or a run's. A transaction whose Commit
-//! never came leaves its parts behind, never applied.
+//! Commit's, joined to the parts it spilled ahead of it, or a run's. A part, or the Commit, begins
+//! where it says in the transaction's changes, and cuts what was joined before it there: a
+//! statement rolled back after its changes were spilled leaves them behind it, and the changes
+//! after it begin where they began (DESIGN.md §11.4.1). A transaction whose Commit never came
+//! leaves its parts behind, never applied.
 //!
 //! [`Apply`] applies a body: a put sets the key's value as a settled version
 //! ([`Version::SETTLED`]), or plainly in a plain tree; a delete removes the key; a creation makes
@@ -60,28 +63,23 @@ impl Gather {
                 word(8).ok_or_else(|| corrupt("part with no offset"))?,
             );
             let parts = self.spilled.entry(start).or_default();
-            if parts.len() as u64 != from {
-                return Err(corrupt(&format!(
-                    "part at {from} of transaction {start}, whose parts so far end at {}",
-                    parts.len()
-                )));
-            }
-            parts.extend_from_slice(&payload[16..]);
+            join(parts, from, &payload[16..]).map_err(|end| {
+                corrupt(&format!(
+                    "part at {from} of transaction {start}, whose parts so far end at {end}"
+                ))
+            })?;
             return Ok(None);
         }
         if kind == COMMIT {
-            let (total, from, part) =
+            let (from, part) =
                 commit_changes(payload).ok_or_else(|| corrupt("commit's changes"))?;
             let mut body = self.spilled.remove(&txn).unwrap_or_default();
-            if body.len() as u64 != from {
-                return Err(corrupt(&format!(
+            join(&mut body, from, part).map_err(|end| {
+                corrupt(&format!(
                     "commit of transaction {txn} whose part begins at {from}, after parts ending \
-                     at {}",
-                    body.len()
-                )));
-            }
-            body.extend_from_slice(part);
-            debug_assert_eq!(body.len() as u64, total);
+                     at {end}"
+                ))
+            })?;
             let ts = super::txn::commit_ts(payload).ok_or_else(|| corrupt("commit's timestamp"))?;
             return Ok(Some((Some(ts), body)));
         }
@@ -95,6 +93,18 @@ impl Gather {
     pub fn unfinished(&self) -> usize {
         self.spilled.len()
     }
+}
+
+/// Joins `part`, which begins at `from` in a transaction's changes, to those joined so far:
+/// cutting them at `from`, past which a statement rolled back. `Err` with where they end if `from`
+/// is past it, a gap.
+fn join(body: &mut Vec<u8>, from: u64, part: &[u8]) -> std::result::Result<(), usize> {
+    if from > body.len() as u64 {
+        return Err(body.len());
+    }
+    body.truncate(from as usize);
+    body.extend_from_slice(part);
+    Ok(())
 }
 
 /// Applies bodies of changes to the trees.

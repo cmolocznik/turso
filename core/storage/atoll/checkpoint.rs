@@ -538,6 +538,12 @@ impl Checkpointer {
         self.log.end().saturating_sub(self.superblock().redo)
     }
 
+    /// How far the redo point in charge trails `at`, in bytes: the most a checkpoint could take
+    /// off it while the log is held back there.
+    pub fn lag_to(&self, at: Lsn) -> u64 {
+        at.saturating_sub(self.superblock().redo)
+    }
+
     /// The superblock in charge.
     pub fn superblock(&self) -> Superblock {
         let step = self.releasing.epochs().enter();

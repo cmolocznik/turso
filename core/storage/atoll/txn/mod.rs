@@ -30,7 +30,7 @@
 
 use self::sync::{fence, AtomicU64, Ordering};
 use super::btree::Tree;
-use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn};
+use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn, BLOCK};
 use super::page::{PageId, SizeClass};
 use super::segmented::Segmented;
 use super::stack::Stack;
@@ -67,10 +67,10 @@ pub type Statement = u32;
 /// A commit's record: its timestamp.
 pub const COMMIT: Kind = Kind::new(16).unwrap();
 
-/// A part of a committing transaction's changes too long to ride in its Commit record (audit 17):
-/// the transaction's start and where the part begins in its changes, each 8 bytes little-endian,
-/// then the part. It names no transaction in its header, so it is in no transaction's chain:
-/// undo never reads it, and a transaction with no Commit after it is never replayed.
+/// A part of a transaction's changes published before its Commit, a chunk once it filled (audit
+/// 17, DESIGN.md §11.4.1): the transaction's start and where the part begins in its changes, each 8
+/// bytes little-endian, then the part. It names no transaction in its header, so it is in no
+/// transaction's chain, and a transaction with no Commit after it is never replayed.
 pub const SPILL: Kind = Kind::new(28).unwrap();
 
 /// Changes made outside any transaction and published at once (audit 17), such as a sequence's
@@ -116,27 +116,12 @@ pub fn commit_ts(payload: &[u8]) -> Option<Ts> {
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
-/// What a Commit record's payload carries past its timestamp (audit 17): the length of the
-/// transaction's changes, where the part this record holds begins, and that part, the rest having
-/// gone before in [`SPILL`] records.
-pub fn commit_changes(payload: &[u8]) -> Option<(u64, u64, &[u8])> {
-    let word = |at: usize| {
-        payload
-            .get(at..at + 8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-    };
-    let (total, from) = (word(8)?, word(16)?);
-    let part = &payload[24..];
-    (from.checked_add(part.len() as u64) == Some(total)).then_some((total, from, part))
-}
-
-/// Where the part of `len` bytes of changes that rides in the Commit record begins, the rest going
-/// before in parts of at most `part` bytes: the last part, never empty unless the changes are.
-fn commit_part_from(len: usize, part: usize) -> usize {
-    match len {
-        0 => 0,
-        _ => (len - 1) / part * part,
-    }
+/// What a Commit record's payload carries past its timestamp (audit 17, DESIGN.md §11.4.1): where
+/// the part it holds begins in the transaction's changes, and that part, the rest having gone
+/// before in [`SPILL`] records.
+pub fn commit_changes(payload: &[u8]) -> Option<(u64, &[u8])> {
+    let from = u64::from_le_bytes(payload.get(8..16)?.try_into().unwrap());
+    Some((from, &payload[16..]))
 }
 
 /// Drawn from by every commit and read by every begin, so on a line of its own.
@@ -290,6 +275,35 @@ pub struct Transactions {
     gate: gate::Gate,
     /// Whether every transaction that writes must hold the gate.
     gated: std::sync::atomic::AtomicBool,
+    /// Per slot, the changes buffer its transactions keep from one to the next, with a chunk's
+    /// memory (DESIGN.md §11.4.1).
+    kept: Box<[Kept]>,
+    /// Bytes of a chunk of changes: the log's chunk, the largest single write, or less where the
+    /// log's buffer could not admit one with the block before it padded.
+    redo_chunk: usize,
+}
+
+/// A slot's changes buffer between its transactions: read and written only by the slot's
+/// transaction, at its begin and at its end before the slot is freed, which orders one
+/// transaction's end before the next one's begin.
+struct Kept(std::cell::UnsafeCell<Option<changes::Changes>>);
+
+// SAFETY: as its doc says, one slot's transaction at a time reaches it, the slot's freeing and
+// taking ordering the hand-over.
+unsafe impl Sync for Kept {}
+
+impl Kept {
+    /// # Safety
+    /// The caller holds the slot.
+    unsafe fn take(&self) -> Option<changes::Changes> {
+        (*self.0.get()).take()
+    }
+
+    /// # Safety
+    /// The caller holds the slot.
+    unsafe fn put(&self, kept: changes::Changes) {
+        *self.0.get() = Some(kept);
+    }
 }
 
 /// What a transaction holds of the write gate.
@@ -479,8 +493,6 @@ impl Abort {
 pub struct Commit {
     txn: Option<Txn>,
     admitted: Option<Admitted>,
-    /// How much of the transaction's changes has gone to the log ahead of its Commit.
-    spilled: usize,
     ts: Option<Ts>,
     durable: Lsn,
     abandoned: Vec<PageId>,
@@ -492,7 +504,6 @@ impl Commit {
         Self {
             txn: Some(txn),
             admitted: None,
-            spilled: 0,
             ts: None,
             durable: 0,
             abandoned: Vec::new(),
@@ -525,6 +536,16 @@ impl Transactions {
         );
         let base = clock.now();
         let words = config.slots.div_ceil(64);
+        let redo_chunk = {
+            let most = log.chunk_bytes().min(log.buffer_bytes() - BLOCK);
+            (most - most % BLOCK) as usize
+        };
+        // Free chunks kept: as many as the log's buffer holds unflushed, which a transaction
+        // spilling as fast as the device takes them cycles through, and one more.
+        let chunks = changes::Chunks::new(
+            redo_chunk,
+            (log.buffer_bytes() as usize).div_ceil(redo_chunk) + 1,
+        );
         Self {
             slots: (0..config.slots)
                 .map(|_| CachePadded::new(CommitLog::new(base)))
@@ -559,9 +580,74 @@ impl Transactions {
                 .collect(),
             gate: gate::Gate::new(config.slots),
             gated: std::sync::atomic::AtomicBool::new(false),
+            kept: (0..config.slots)
+                .map(|_| {
+                    Kept(std::cell::UnsafeCell::new(Some(
+                        changes::Changes::in_chunks(Some(chunks.clone()), redo_chunk, None),
+                    )))
+                })
+                .collect(),
+            redo_chunk,
             clock,
             log,
         }
+    }
+
+    /// Gives `changes`, of the transaction ending in `slot`, to the slot's next transaction,
+    /// before the slot is freed.
+    fn keep(&self, slot: u16, mut changes: changes::Changes) {
+        changes.recycle();
+        // SAFETY: the transaction ending holds the slot until it is freed.
+        unsafe { self.kept[slot as usize].put(changes) };
+    }
+
+    /// Spills `txn`'s sealed chunks of changes to the log (DESIGN.md §11.4.1): each a [`SPILL`]
+    /// record, its slot marked with where its first part lies. Step it until done, holding no
+    /// latch.
+    pub fn spill(&self, txn: &mut Txn) -> Result<IOResult<()>> {
+        while let Some(len) = txn.changes.sealed_len() {
+            // Its record in whole blocks, and the rest of the block before it.
+            let room = framed_len(16 + len).next_multiple_of(BLOCK) + BLOCK;
+            let mut admitted = match self.log.admit(room)? {
+                IOResult::Done(a) => a,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            let (from, len, first, mut block) = txn.changes.take_sealed();
+            let words = &mut block.bytes_mut()[changes::FRONT - 16..changes::FRONT];
+            words[..8].copy_from_slice(&txn.start.to_le_bytes());
+            words[8..].copy_from_slice(&from.to_le_bytes());
+            let header = Header {
+                kind: SPILL,
+                flags: 0,
+                txn: 0,
+                prev: None,
+            };
+            self.reserving(txn.slot);
+            let (at, lsn) = self
+                .log
+                .publish(&mut admitted, &header, block, 16 + len, |at| {
+                    self.reserved_at(txn.slot, at)
+                });
+            txn.changes.spilled(changes::Part {
+                from,
+                len: len as u64,
+                first,
+                at,
+                lsn,
+            });
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Where the log is held back for the parts of transactions still running: the first part's
+    /// record of each, at most; the log's end if none.
+    pub fn held_from(&self) -> Lsn {
+        self.reserved
+            .iter()
+            .map(|mark| mark.load(Ordering::SeqCst))
+            .filter(|&at| at != 0 && at != RESERVING)
+            .map(|at| at - 1)
+            .fold(self.log.end(), Lsn::min)
     }
 
     /// From now on, every transaction that writes must hold the write gate: a commit of one that
@@ -662,7 +748,9 @@ impl Transactions {
             snapped: false,
             gated: self.gated.load(std::sync::atomic::Ordering::Acquire),
             replaced: None,
-            changes: changes::Changes::new(),
+            // SAFETY: the slot was just taken.
+            changes: unsafe { self.kept[slot as usize].take() }
+                .unwrap_or_else(|| changes::Changes::in_chunks(None, self.redo_chunk, None)),
         }))
     }
 
@@ -990,44 +1078,18 @@ impl Transactions {
     /// log is durable up to where it stood at its snapshot. Returns the commit timestamp, `None`
     /// for a transaction that wrote nothing.
     pub fn commit(&self, op: &mut Commit) -> Result<IOResult<Option<Ts>>> {
-        if let Some(txn) = &op.txn {
+        if let Some(txn) = op.txn.as_mut() {
             if txn.wrote() {
-                // The changes go out in parts no longer than a chunk, the largest single write,
-                // the last in the Commit record.
-                let bytes = txn.changes.bytes();
-                let part = self.log.chunk_bytes() as usize;
-                let from = commit_part_from(bytes.len(), part);
-                while op.spilled < from {
-                    let n = part.min(from - op.spilled);
-                    let mut admitted = match self.log.admit(framed_len(16 + n))? {
-                        IOResult::Done(a) => a,
-                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                    };
-                    let header = Header {
-                        kind: SPILL,
-                        flags: 0,
-                        txn: 0,
-                        prev: None,
-                    };
-                    self.reserving(txn.slot);
-                    self.log.append_with(
-                        &mut admitted,
-                        &header,
-                        &[
-                            &txn.start.to_le_bytes(),
-                            &(op.spilled as u64).to_le_bytes(),
-                            &bytes[op.spilled..op.spilled + n],
-                        ],
-                        |at| self.reserved_at(txn.slot, at),
-                    );
-                    op.spilled += n;
+                // Every chunk filled goes out first, in parts; the last, in the Commit record.
+                if let IOResult::IO(io) = self.spill(txn)? {
+                    return Ok(IOResult::IO(io));
                 }
                 if op.admitted.is_none() {
-                    op.admitted =
-                        Some(match self.log.admit(framed_len(24 + bytes.len() - from))? {
-                            IOResult::Done(a) => a,
-                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                        });
+                    let (_, tail) = txn.changes.tail();
+                    op.admitted = Some(match self.log.admit(framed_len(16 + tail.len()))? {
+                        IOResult::Done(a) => a,
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    });
                 }
             }
             let mut txn = op.txn.take().expect("a transaction");
@@ -1044,17 +1106,11 @@ impl Transactions {
                     let ts = self.horizon.draw(txn.slot, &self.clock);
                     self.reserving(txn.slot);
                     let slot = txn.slot;
-                    let bytes = txn.changes.bytes();
-                    let from = op.spilled;
+                    let (from, tail) = txn.changes.tail();
                     let (_, lsn) = self.log.append_with(
                         &mut admitted,
                         &txn.header(COMMIT),
-                        &[
-                            &ts.to_le_bytes(),
-                            &(bytes.len() as u64).to_le_bytes(),
-                            &(from as u64).to_le_bytes(),
-                            &bytes[from..],
-                        ],
+                        &[&ts.to_le_bytes(), &from.to_le_bytes(), tail],
                         |at| self.reserved_at(slot, at),
                     );
                     self.slots[txn.slot as usize].push(txn.start, ts);
@@ -1070,6 +1126,7 @@ impl Transactions {
             }
             let schema = op.ts.filter(|_| txn.wrote_schema);
             self.release_hold(&mut txn, schema);
+            self.keep(txn.slot, txn.changes);
             self.release(txn.slot);
         }
         if let Some(ts) = op.ts {
@@ -1091,6 +1148,7 @@ impl Transactions {
             "aborting a transaction that wrote: roll it back"
         );
         self.release_hold(&mut txn, None);
+        self.keep(txn.slot, txn.changes);
         self.release(txn.slot);
     }
 
@@ -1110,6 +1168,7 @@ impl Transactions {
         // Every version it wrote is gone: the slot's next transaction may commit, and writers
         // behind the gate may go on.
         self.release_hold(&mut txn, None);
+        self.keep(txn.slot, txn.changes);
         self.release(txn.slot);
         Ok(IOResult::Done(()))
     }

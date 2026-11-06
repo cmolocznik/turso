@@ -2,6 +2,7 @@
 //! changes and every later one's, and bytes that do not hold a change together read as corrupt.
 
 use super::*;
+use crate::storage::atoll::log::GroupStart;
 use crate::storage::atoll::page::SizeClass;
 
 fn tree(n: u64) -> PageId {
@@ -137,4 +138,81 @@ fn bytes_that_hold_no_change_together_read_as_corrupt() {
     let mut drain = whole.clone();
     drain[0] = DRAIN;
     assert_eq!(one(&drain), vec![false], "a drain with a key");
+}
+
+/// In chunks, a value runs on across chunks while every change's head and key lie whole in one;
+/// the changes are found again from any chunk or part where they start; a rollback into what was
+/// spilled cuts the parts there, and the next chunk begins there.
+#[test]
+fn chunks_hold_heads_whole_and_a_rollback_into_a_part_cuts_it() {
+    let chunk = 4096;
+    let mut c = Changes::in_chunks(None, chunk, None);
+    let mut made = Vec::new();
+    let mut statement = 1;
+    for i in 0..40u32 {
+        if i % 10 == 0 {
+            statement += 1;
+        }
+        let value = vec![
+            i as u8;
+            if i % 7 == 3 {
+                9000
+            } else {
+                100 + i as usize * 13
+            }
+        ];
+        made.push((c.len(), statement, i.to_be_bytes().to_vec()));
+        c.put(statement, tree(1), &i.to_be_bytes(), &value);
+        // Spilled as a transaction's write does, each chunk sealed by the change before.
+        while c.has_sealed() {
+            let at = GroupStart::at((c.parts().len() as u64 + 1) * 4096);
+            let (from, len, first, _block) = c.take_sealed();
+            c.spilled(Part {
+                from,
+                len: len as u64,
+                first,
+                at,
+                lsn: at.get() + 1,
+            });
+        }
+        assert!(
+            c.capacity() <= 2 * chunk,
+            "{} bytes of chunks held",
+            c.capacity()
+        );
+    }
+    assert!(c.parts().len() > 10, "{} parts", c.parts().len());
+    // Every change found where it starts, from the chunk in memory and the parts spilled, as the
+    // parts' bytes would be read back.
+    let mut found = Vec::new();
+    let tail = c.chunk(0);
+    found.extend(starts(tail.2, tail.0, tail.1, 0).unwrap());
+    assert_eq!(c.sources_back(0).len(), c.parts().len() + 1);
+    for &(at, s, ref key) in &made {
+        assert_eq!(c.statement_at(at), s);
+        if at >= tail.0 {
+            assert_eq!(c.keyed_at(at).unwrap().key, &key[..]);
+        }
+    }
+    let (in_memory, _) = made.iter().partition::<Vec<_>, _>(|m| m.0 >= tail.0);
+    assert_eq!(found, in_memory.iter().map(|m| m.0).collect::<Vec<_>>());
+    // Back to statement 3: statement 4's changes and every later one's go, those spilled cut off.
+    let from = c.begin_after(3).unwrap();
+    assert_eq!(from, made[20].0);
+    c.back_to(3);
+    assert_eq!(c.len(), from);
+    assert!(c
+        .parts()
+        .iter()
+        .all(|p| p.from < from && p.from + p.len <= from));
+    let last = c.parts().last().unwrap();
+    assert_eq!(
+        last.from + last.len,
+        from,
+        "the parts end where statement 4 began"
+    );
+    assert_eq!(c.tail(), (from, &[][..]), "the next chunk begins there");
+    c.put(5, tree(1), b"after", b"v");
+    assert_eq!(c.tail().0, from);
+    assert_eq!(c.statement_at(from), 5);
 }

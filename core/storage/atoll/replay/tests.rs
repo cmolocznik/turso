@@ -172,8 +172,11 @@ fn replaying_the_published_changes_rebuilds_every_tree() {
     let mut reader = Log::reader(io.clone(), path, &keeping_the_log().log, 0);
     let mut gather = Gather::new();
     let (mut bodies, mut spilled) = (Vec::new(), 0);
-    // Per transaction, its parts so far: a commit spills only what its record cannot hold.
-    let chunk = keeping_the_log().log.chunk_bytes as usize;
+    // Per transaction, its parts so far: a transaction spills each chunk it fills, at least as
+    // many as its changes need past the one its Commit carries.
+    let chunk = keeping_the_log().log.chunk_bytes as usize
+        - crate::storage::atoll::txn::changes::FRONT
+        - crate::storage::atoll::txn::changes::BACK;
     let mut parts = std::collections::HashMap::<u64, usize>::new();
     while let Some(r) = reader.next_record().unwrap() {
         if r.header.kind == SPILL {
@@ -187,9 +190,8 @@ fn replaying_the_published_changes_rebuilds_every_tree() {
         {
             if r.header.kind == COMMIT {
                 let n = parts.remove(&r.header.txn).unwrap_or(0);
-                assert_eq!(
-                    n,
-                    body.len().div_ceil(chunk) - 1,
+                assert!(
+                    n + 1 >= body.len().div_ceil(chunk),
                     "a commit of {} bytes spilled {n} parts",
                     body.len()
                 );
@@ -241,10 +243,11 @@ fn replaying_the_published_changes_rebuilds_every_tree() {
     assert_eq!(trees(&replayed), held, "the trees each holds");
 }
 
-/// A transaction's spilled parts are joined in order with its Commit's, refused out of order, and
-/// left behind with no Commit; a run is its own body; a record of another kind is none.
+/// A transaction's spilled parts are joined in order with its Commit's, each cutting what was
+/// joined at its own start, refused past a gap, and left behind with no Commit; a run is its own
+/// body; a record of another kind is none.
 #[test]
-fn parts_are_joined_in_order_and_refused_out_of_it() {
+fn parts_are_joined_by_position_and_refused_past_a_gap() {
     let mut changes = Changes::new();
     let root = PageId::new(SizeClass::new(0).unwrap(), 9);
     changes.put(1, root, b"k", &[7; 100]);
@@ -253,15 +256,8 @@ fn parts_are_joined_in_order_and_refused_out_of_it() {
     let spill = |start: u64, from: u64, part: &[u8]| {
         [&start.to_le_bytes()[..], &from.to_le_bytes(), part].concat()
     };
-    let commit = |from: u64, part: &[u8]| {
-        [
-            &5u64.to_le_bytes()[..],
-            &(bytes.len() as u64).to_le_bytes(),
-            &from.to_le_bytes(),
-            part,
-        ]
-        .concat()
-    };
+    let commit =
+        |from: u64, part: &[u8]| [&5u64.to_le_bytes()[..], &from.to_le_bytes(), part].concat();
     let mut g = Gather::new();
     assert_eq!(g.record(SPILL, 0, &spill(3, 0, a)).unwrap(), None);
     assert_eq!(g.unfinished(), 1);
@@ -275,11 +271,22 @@ fn parts_are_joined_in_order_and_refused_out_of_it() {
         g.record(SPILL, 0, &spill(4, 8, a)).is_err(),
         "a part past a gap"
     );
+    // A statement rolled back after its part was spilled: what follows begins where it began.
     let mut g = Gather::new();
     g.record(SPILL, 0, &spill(4, 0, a)).unwrap();
-    assert!(
-        g.record(COMMIT, 4, &commit(0, &bytes)).is_err(),
-        "a commit over its parts"
+    g.record(SPILL, 0, &spill(4, a.len() as u64, &[9; 30]))
+        .unwrap();
+    assert_eq!(
+        g.record(COMMIT, 4, &commit(a.len() as u64, b)).unwrap(),
+        Some((Some(5), bytes.clone())),
+        "the rolled-back part cut by the Commit's"
+    );
+    let mut g = Gather::new();
+    g.record(SPILL, 0, &spill(6, 0, &[9; 40])).unwrap();
+    assert_eq!(
+        g.record(COMMIT, 6, &commit(0, &bytes)).unwrap(),
+        Some((Some(5), bytes.clone())),
+        "a Commit beginning at 0 over a part rolled back"
     );
     assert_eq!(
         g.record(RUN, 0, &bytes).unwrap(),

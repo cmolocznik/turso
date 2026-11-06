@@ -26,6 +26,9 @@ pub const EVICT_AFTER: u8 = 2;
 /// The page was unlinked from what referred to it and is about to be freed: hints to it are not
 /// followed.
 pub const ABANDONED: u8 = 4;
+/// A LENT frame lent for as long as its holder lives, as the log's ring is: drained for another
+/// class, its batch would wait for it for good.
+pub const FOR_GOOD: u8 = 8;
 
 /// `pid` of a frame holding no page; no page id has every bit set.
 pub const NO_PAGE: u64 = u64::MAX;

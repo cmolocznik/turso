@@ -5,8 +5,11 @@
 //! first. A key is put back only once the leaf, under its latch, holds this transaction's version
 //! from that statement: then the version that one replaced goes back whole, version header and
 //! all, from the arena entry its header names, or the key is removed if it names none, the key
-//! having had no entry. Nothing is logged: what a rollback undoes never reached the log, a
-//! transaction's changes being published at its commit. A statement writing a key again keeps the
+//! having had no entry. Nothing is logged: the changes undone are cut from the transaction's, and
+//! what of them was spilled already is cut from it by the next part or the Commit, which begins
+//! where they began (DESIGN.md §11.4.1). The changes are read back newest first, from the chunks in
+//! memory and then from the parts spilled, each read back from the log once it is durable past
+//! the part. A statement writing a key again keeps the
 //! entry its first write made, which holds what it found, so the key is put back once, at its
 //! newest change, and its earlier changes find the leaf holding another version.
 //!
@@ -18,7 +21,7 @@
 //! transaction's start as the value. The put is idempotent, and the list's entries are freed only
 //! once the transaction has ended (DESIGN.md §17).
 
-use super::changes::Change as Changed;
+use super::changes::{starts, Keyed, Source};
 use super::versioned::{decode_entry, restored_reserve, Version, Versions};
 use super::{Statement, Transactions, Ts, Txn};
 use crate::storage::atoll::btree::{Mode, Outcome, Put, Remove};
@@ -57,9 +60,15 @@ enum Working {
 /// statement after `to` created put on its list. Step it with [`undo`].
 pub struct Rollback {
     to: Statement,
-    /// The changes of statements after `to` still to put back, oldest first, each by its
-    /// statement and where it starts in the transaction's changes: `None` before the walk begins.
-    left: Option<Vec<(Statement, usize)>>,
+    /// Where the changes to put back begin; `None` before the walk begins.
+    from: Option<u64>,
+    /// Where those not yet walked are read back from, oldest first.
+    sources: Vec<Source>,
+    /// The changes of the source being walked still to put back, oldest first, by where each
+    /// starts in the transaction's changes.
+    left: Vec<u64>,
+    /// The part being walked, read back from the log: where it begins, and its bytes.
+    read: Option<(u64, Vec<u8>)>,
     working: Option<Working>,
 }
 
@@ -68,7 +77,10 @@ impl Rollback {
     pub fn after(to: Statement) -> Self {
         Self {
             to,
-            left: None,
+            from: None,
+            sources: Vec::new(),
+            left: Vec::new(),
+            read: None,
             working: None,
         }
     }
@@ -87,8 +99,11 @@ pub fn undo(
     txn: &mut Txn,
     op: &mut Rollback,
 ) -> Result<IOResult<()>> {
-    if op.left.is_none() {
-        op.left = Some(txn.changes.since(op.to));
+    if op.from.is_none() {
+        let from = txn.changes.begin_after(op.to).unwrap_or(txn.changes.len());
+        op.from = Some(from);
+        op.sources = txn.changes.sources_back(from);
+        op.sources.reverse();
     }
     loop {
         let step = match op.working.take() {
@@ -114,7 +129,8 @@ pub fn undo(
                 }
             }
             None => {
-                let newest = op.left.as_ref().and_then(|l| l.last()).map(|&(s, _)| s);
+                done!(walk_on(txns, txn, op));
+                let newest = op.left.last().map(|&at| txn.changes.statement_at(at));
                 let creation = txn.created.last().filter(|c| c.statement > op.to);
                 match (newest, creation) {
                     // A change of the creation's statement or later first: its tree's changes are
@@ -129,29 +145,23 @@ pub fn undo(
                 }
             }
         };
-        let &(statement, at) = op
-            .left
-            .as_ref()
-            .and_then(|l| l.last())
-            .expect("a change being put back");
-        let (root, key) = match txn.changes.at(at) {
-            Changed::Put {
+        let at = *op.left.last().expect("a change being put back");
+        let statement = txn.changes.statement_at(at);
+        let keyed = match &op.read {
+            Some((base, bytes)) => Keyed::decode(&bytes[(at - base) as usize..])?,
+            None => txn.changes.keyed_at(at)?,
+        };
+        let (root, key) = match keyed {
+            Keyed {
+                by_key: true,
                 tree,
-                plain: false,
-                plainly: false,
                 key,
                 ..
-            }
-            | Changed::Delete {
-                tree,
-                plain: false,
-                plainly: false,
-                key,
             } => (tree, key.to_vec()),
             // A plain tree's change, a write made plainly and a creation are a statement's only
             // with its own tree, which the creation's lane abandons whole.
             _ => {
-                op.left.as_mut().expect("a walk").pop();
+                op.left.pop();
                 continue;
             }
         };
@@ -207,13 +217,62 @@ pub fn undo(
                 IOResult::Done(false) => Step::Look,
             },
             Step::Next => {
-                op.left.as_mut().expect("a walk").pop();
+                op.left.pop();
                 op.working = None;
                 continue;
             }
         };
         op.working = Some(Working::Entry(next));
     }
+}
+
+/// Once the changes of the source being walked are all put back, reads the next source's: a chunk
+/// in memory, or a part read back from the log once it is durable past it. Done with `op.left`
+/// holding some, or with every source walked.
+fn walk_on(txns: &Transactions, txn: &Txn, op: &mut Rollback) -> Result<IOResult<()>> {
+    let from = op.from.expect("a walk begun");
+    while op.left.is_empty() {
+        let Some(&source) = op.sources.last() else {
+            op.read = None;
+            return Ok(IOResult::Done(()));
+        };
+        match source {
+            Source::Memory(i) => {
+                let (base, first, bytes) = txn.changes.chunk(i);
+                op.left = starts(bytes, base, first, from)?;
+                op.read = None;
+            }
+            Source::Spilled(part) => {
+                done!(txns.log.wait_durable(part.lsn));
+                let record = txns.log.read_record(part.at)?;
+                let payload = &record.payload;
+                let word = |at: usize| {
+                    payload
+                        .get(at..at + 8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                };
+                let bytes = payload.get(16..16 + part.len as usize);
+                let (Some(start), Some(begins), Some(bytes)) = (word(0), word(8), bytes) else {
+                    return Err(LimboError::Corrupt(format!(
+                        "transaction {}'s part at {} read back short",
+                        txn.start,
+                        part.at.get()
+                    )));
+                };
+                if record.header.kind != super::SPILL || start != txn.start || begins != part.from {
+                    return Err(LimboError::Corrupt(format!(
+                        "transaction {}'s part at {} read back as another's",
+                        txn.start,
+                        part.at.get()
+                    )));
+                }
+                op.left = starts(bytes, part.from, part.first, from)?;
+                op.read = Some((part.from, bytes.to_vec()));
+            }
+        }
+        op.sources.pop();
+    }
+    Ok(IOResult::Done(()))
 }
 
 /// The put of the tree rooted at `root`, created by the transaction that started at `start`, on

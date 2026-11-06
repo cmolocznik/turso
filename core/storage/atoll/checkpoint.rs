@@ -49,6 +49,7 @@ use crate::sync::{Arc, Mutex, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::ops::{Deref, DerefMut};
 
 #[cfg(test)]
 crate::thread::thread_local! {
@@ -57,6 +58,10 @@ crate::thread::thread_local! {
     /// Steps of the checkpoint state taken on this thread, other than the checkpointing thread's,
     /// for tests to tell writers that did checkpoint work.
     pub(crate) static WRITER_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Wakes of the checkpointing thread asked on this thread, and of them those asked while the
+    /// checkpoint's state was held, for tests to tell every hold wakes it once let go.
+    pub(crate) static DRIVER_WAKES: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 /// The record naming the metadata pages a checkpoint is about to write: its number, then each
@@ -196,16 +201,33 @@ impl Relief for CheckpointRelief {
 
 /// The checkpointer held idle ([`Checkpointer::hold`]): writers waiting for room try again when
 /// it is let go.
-struct HeldIdle<'a, G> {
-    _state: G,
-    pool: &'a BufferPool,
+/// The checkpoint's state, held ([`Checkpointer::try_hold`]): every holder takes it so. Letting it
+/// go wakes whoever the hold kept waiting, a writer waiting for room and the checkpointing thread,
+/// which parks when it finds the state held. The state goes first: woken while it is still held,
+/// the thread would find it held, park again, and nothing would wake it.
+struct StateHold<'a, G: DerefMut<Target = State>> {
+    state: Option<G>,
     checkpointer: &'a Checkpointer,
 }
 
-impl<G> Drop for HeldIdle<'_, G> {
+impl<G: DerefMut<Target = State>> Deref for StateHold<'_, G> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        self.state.as_deref().expect("the state held")
+    }
+}
+
+impl<G: DerefMut<Target = State>> DerefMut for StateHold<'_, G> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.state.as_deref_mut().expect("the state held")
+    }
+}
+
+impl<G: DerefMut<Target = State>> Drop for StateHold<'_, G> {
     fn drop(&mut self) {
-        self.pool.wake_room();
-        self.checkpointer.wake_driver();
+        drop(self.state.take());
+        self.checkpointer.left();
     }
 }
 
@@ -410,6 +432,14 @@ impl Checkpointer {
         self.wake_driver();
     }
 
+    /// The state, if no one holds it: let go, it wakes whoever waits on it.
+    fn try_hold(&self) -> Option<StateHold<'_, impl DerefMut<Target = State> + '_>> {
+        self.state.try_lock().map(|state| StateHold {
+            state: Some(state),
+            checkpointer: self,
+        })
+    }
+
     /// Whether the database's checkpointing thread runs.
     fn driven(&self) -> bool {
         self.driven.load(Ordering::Acquire)
@@ -423,6 +453,12 @@ impl Checkpointer {
 
     /// Wakes the checkpointing thread, from any other thread: a checkpoint may be due.
     fn wake_driver(&self) {
+        #[cfg(test)]
+        DRIVER_WAKES.with(|w| {
+            let (asked, held) = w.get();
+            let now_held = u64::from(self.state.try_lock().is_none());
+            w.set((asked + 1, held + now_held));
+        });
         if !self.driven() {
             return;
         }
@@ -458,12 +494,9 @@ impl Checkpointer {
         }
         let _ended = Ended(self);
         while !self.stop.load(Ordering::Acquire) {
-            let stepped = self.state.try_lock().map(|mut state| {
-                let out = self.stepping(&mut state, txns, Until::Done);
-                drop(state);
-                self.left();
-                out
-            });
+            let stepped = self
+                .try_hold()
+                .map(|mut state| self.stepping(&mut state, txns, Until::Done));
             match stepped {
                 Some(Ok(IOResult::IO(IOCompletions(c)))) => {
                     if let Err(e) = io.wait_for_completion(c) {
@@ -515,10 +548,9 @@ impl Checkpointer {
             self.wake_driver();
             return None;
         }
-        let mut state = self.state.try_lock()?;
+        let mut state = self.try_hold()?;
         let out = self.stepping(&mut state, txns, Until::Room);
         drop(state);
-        self.left();
         Some(match out {
             Err(e) => {
                 tracing::warn!("a checkpoint a writer stepped for room failed: {e}");
@@ -557,12 +589,11 @@ impl Checkpointer {
             self.wake_driver();
             return Ok(IOResult::Done(()));
         }
-        let Some(mut state) = self.state.try_lock() else {
+        let Some(mut state) = self.try_hold() else {
             return Ok(IOResult::Done(()));
         };
         let out = self.stepping(&mut state, txns, Until::Done);
         drop(state);
-        self.left();
         out
     }
 
@@ -585,17 +616,13 @@ impl Checkpointer {
     /// Holds the checkpointer idle, if no one is stepping it: no checkpoint runs until the hold is
     /// dropped, so the page store holds still for an integrity check (DESIGN.md §17, §12; R36).
     pub fn hold(&self) -> Option<impl Sized + '_> {
-        self.state.try_lock().map(|state| HeldIdle {
-            _state: state,
-            pool: &self.pool,
-            checkpointer: self,
-        })
+        self.try_hold()
     }
 
     /// The checkpoint under way whose cut is taken, if any: what it writes is as of that cut.
     #[cfg(test)]
     pub(crate) fn cut_taken(&self) -> Option<u64> {
-        let state = self.state.try_lock()?;
+        let state = self.try_hold()?;
         let run = state.run.as_ref()?;
         (!matches!(run.phase, Phase::Gate | Phase::Cut)).then_some(run.n)
     }
@@ -619,14 +646,13 @@ impl Checkpointer {
         if self.driven() && !self.on_driver() {
             return self.wait_full(ticket);
         }
-        let Some(mut state) = self.state.try_lock() else {
+        let Some(mut state) = self.try_hold() else {
             return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
         };
         let stepped =
             (state.full_done < ticket).then(|| self.stepping(&mut state, txns, Until::Done));
         let done = state.full_done >= ticket;
         drop(state);
-        self.left();
         if let Some(IOResult::IO(io)) = stepped.transpose()? {
             return Ok(IOResult::IO(io));
         }

@@ -728,6 +728,27 @@ fn with_a_checkpointing_thread_a_writer_refused_room_waits_for_the_room_it_frees
     db.assert_holds(&db.tree(root), &model, "the tree as the cut found it");
 }
 
+/// Every hold of the checkpoint's state, a test's probe included, wakes the checkpointing thread
+/// once it has let the state go. The thread parks when it finds the state held: a hold let go with
+/// no wake, or one that wakes it while still held, leaves it parked with a checkpoint due, as the
+/// threaded test above met when its probe for the cut took the state ("the checkpointing thread
+/// took no cut").
+#[test]
+fn every_hold_of_the_checkpoints_state_wakes_the_thread_once_let_go() {
+    use crate::storage::atoll::checkpoint::DRIVER_WAKES;
+    let db = Db::memory();
+    let cp = db.db.checkpointer();
+    let (asked, held) = DRIVER_WAKES.with(|w| w.get());
+    drop(cp.hold().expect("the state free"));
+    assert_eq!(cp.cut_taken(), None);
+    let (now_asked, now_held) = DRIVER_WAKES.with(|w| w.get());
+    assert_eq!(
+        (now_asked - asked, now_held - held),
+        (2, 0),
+        "wakes asked by two holds let go, and of them asked with the state still held"
+    );
+}
+
 /// A checkpoint failing on the checkpointing thread is told to a transaction's end waiting on it
 /// for a full one, which then fails rather than waits for good.
 #[test]

@@ -2187,16 +2187,23 @@ only submit and record; the synchronous work they did is run by the callers that
   directory sync, the prepared end's publication, the admitters' wake, the look for the next
   segment and the flush padding waited on are owed). Starting a preparation (a spare's rename, a
   file's create and allocation) and finishing one (the directory sync) are synchronous file calls,
-  so only a caller runs them. A caller that finds the word needed or owed, or done with less than
-  a segment prepared ahead of what is admitted, takes it by compare-and-swap, so one caller runs
-  each step and any other goes on. A starter makes the segment; a spare then needs only its
-  directory synced, so the starter goes straight on to finishing it; for a fresh file it sets the
-  word in flight before it submits the first zero-fill write, since on an inline backend the whole
-  fill and its sync can land inside that submission. A finisher syncs the directory, publishes the
-  prepared end, sets the word done and lets it go, wakes the admitters, looks for the next segment
-  (starting it if needed) and flushes, in today's order. The directory is synced only from owed,
-  which only the data sync's landing sets, so no caller runs the continuation ahead of the sync it
-  depends on.
+  so only a caller runs them. The word replaces today's preparation claim (`solo.rs`'s `Claim`, held
+  from the start through `prepared`), and it says who owns the preparation at each point. A caller
+  that finds the word needed or owed, or done with less than a segment prepared ahead of what is
+  admitted, takes it by compare-and-swap into a taken state, *starting* from done or needed,
+  *finishing* from owed, so one caller owns each step and any other goes on; in flight is owned by
+  the preparation's requests, never by a caller, so no second preparation starts while one is under
+  way. A starter makes the segment; a spare then needs only its directory synced, so the starter
+  moves the word straight from starting to finishing and runs that too; for a fresh file it moves
+  the word from starting to in flight before it submits the first zero-fill write, which hands the
+  preparation to the requests (on an inline backend the whole fill and its sync can land inside that
+  submission). The data sync's callback hands it on, from in flight to owed. A finisher syncs the
+  directory, publishes the prepared end, moves the word from finishing to done, which ends its
+  ownership, and only then wakes the admitters, looks for the next segment (taking the word again to
+  start it if needed) and flushes, in today's order. Taking the word is no lock: no step waits for
+  it, nothing synchronous runs under a lock of the log's, and every wake comes after the word is let
+  go. The directory is synced only from owed, which only the data sync's landing sets, so no caller
+  runs the continuation ahead of the sync it depends on.
 - **Callbacks only submit and record**: the next zero-fill write, the next sync, the landed and
   durable positions. Where today's callback would start a preparation (its flush meets padding
   waiting for a segment) it moves the word from done to needed; where today's `prepared` would run,
@@ -2221,7 +2228,8 @@ only submit and record; the synchronous work they did is run by the callers that
   not yet started) wakes it when the dependency becomes runnable, and its next call runs the step.
   Close's first step (22.12) is such a caller.
 - **The log's failure** finishes every wait with the failure, as today; a caller that comes back
-  reads it and returns the error.
+  reads it and returns the error. The word stays where the failure found it: a failed log starts
+  and finishes nothing.
 
 That is today's foreground `prepare_ahead` path made the only path. The preparer task replaces the
 adapter (22.9 item 2): it then runs both steps, a move to needed or owed notifies it instead of

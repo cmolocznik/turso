@@ -1671,6 +1671,114 @@ work says which parts are done.
     - leases for remote snapshots, and followers' own graveyards (sections 11.1, 11.2);
     - optimistic and forwarded writes.
 11. **Raft.**
+12. **Streams** (section 21): partitioned batch append and read, recovery, and whole-segment
+    retention; then transactions with streams, and consumer and producer state.
+
+## 21. Streams (Clay's spec of 2026-11-06)
+
+A stream is a kind of storage beside the trees: immutable batches of messages appended to the
+partitions of a stream, whose bytes as appended are their permanent copy. The trees keep what
+changes around them: stream definitions, each partition's segment catalog, consumer positions and
+their ownership epochs, producers' sequence numbers, a queue's delivery state, and the tables a
+consumer updates. A message is never inserted into a tree, never versioned, and never rewritten by
+a checkpoint.
+
+### 21.1 A partition is a log of its own
+
+Each partition is a log as section 7 builds it, under a base of its own
+(`{db}.stream.{stream}.{partition}`): segment files prepared ahead and written whole, durable writes,
+padding per flush, readers by position, and failure as there. Its records are batches, of one kind,
+`BATCH`. The payload path is the producer's batch, to its final place in a segment, to a consumer's
+lease of it, and the payload is written once.
+
+- **Batch framing.** A batch's payload is read from disk as it is sent to a consumer, so storage
+  and transport share one framing:
+
+  ```text
+  base offset: u64 | count: u32 | flags: u32 | first time: u64 | last time: u64 |
+  producer: u64 | sequence: u64 | ends: count × u32 | messages
+  ```
+
+  `ends` gives each message's end within the messages, so one is found without a scan. The record's
+  CRC (section 7.1) covers the batch; a torn batch ends the partition's log as a torn record ends
+  the log. Times are the producer's, in microseconds; `producer` and `sequence` let a retry be told
+  from a new batch (section 21.6).
+- **Built where it is written.** A producer builds a batch in a chunk the stream lends
+  (`append_batch(partition, batch)`), framed with room for the record's header and CRC, as a
+  transaction's chunk is (section 11.4.1). A batch of at least a block is published in place: the
+  log writes it from the chunk, and the chunk goes back once its write lands. A smaller one is copied
+  into the partition's ring, so small batches share blocks.
+- **Offsets are assigned at publication, in order per partition.** Publishing takes the
+  partition's lock, writes the next offset into the batch as its base, takes the batch's room in the
+  log, and lets go: offsets rise with log position, and none is held by a batch not yet published.
+  The lock is taken once a batch. The append is done once the partition's log is durable past the
+  batch, and answers its offsets.
+
+### 21.2 Reading
+
+`read_batch(partition, offset, bytes)` answers a lease of whole batches, from the one holding
+`offset`, up to `bytes` (at least the one): one buffer the stream lends, filled by one read of the
+segment, and one reference for the whole lease, never one a message. A message past the end, or
+before what is retained, is answered as such. To find the batch, each segment has a sparse index of
+base offset and time to log position, an entry a chunk of log, so a lookup reads at most a chunk
+past its entry: the active segment's in memory, built as batches are published; a completed
+segment's written beside it when it completes, and read when a read needs it. A live consumer reads
+at the partition's durable end and never holds a database snapshot.
+
+### 21.3 Memory
+
+A stream's chunks and read buffers come from a budget of its own, given when the database opens,
+from the heap as transactions' chunks do, and not from the pool's frames: a large ingest or a
+replay waits for its budget, as an appender past the log's buffer waits, and never takes the trees'
+cache. A partition holds its ring, its active segment's index and a bounded number of completed
+segments' indexes read for reads: retained history costs no memory.
+
+### 21.4 Retention
+
+Each partition keeps its history by a policy of its own, by age or by size, apart from the
+recovery log, whose segments the checkpoint releases (section 10). A whole completed segment is
+released once the catalog records the partition's first retained offset past it durably, no lease
+reads it, and no transaction yet to be recovered names an extent in it (section 21.6). A read
+before the first retained offset is answered as expired.
+
+### 21.5 Recovery
+
+A partition reopens from what its files hold: its segments, read from the catalog's first retained
+segment, and each whole batch read in order, its offsets following the last. The log ends at the
+first torn or missing batch, and appending resumes at the next block, the gap between recorded in
+the partition's catalog so a reader passes it, as the superblock records the log's (section 7.4).
+
+### 21.6 With transactions
+
+The step after the first, designed here so the first leaves room for it:
+
+- **One transaction, tables and streams.** `begin; check ownership and position; update tables;
+  append; advance position; commit`. The batch is written to its partition before the commit, as a
+  prepared extent with no offset, and the transaction's redo carries a reference to it (partition,
+  log position, length), not its bytes.
+- **The commit decision waits for the batch.** The Commit is made durable only once the partition's
+  log is durable past the prepared extent, so recovery never accepts a commit whose batch is
+  missing. That is a durability dependency: batching and pipelining hide it, and its latency is
+  measured.
+- **Offsets at publication.** At the commit, the partition assigns the extent its offsets, in
+  publication order, by a small record in its log naming the extent; readers see the batch from
+  then. A transaction that never commits leaves an extent no record names, which readers never see
+  and retention releases with its segment.
+- **Catalog before redo goes.** Before a checkpoint releases the redo that names an extent, the
+  catalog records the extent's offsets and commit, so recovery finds it without that redo.
+- **Consumers.** A consumer group's position and its ownership epoch are rows of a tree, advanced
+  in the transaction that processes what it read. A retried transaction then has no duplicate
+  effect inside the database; an effect outside it (a payment, a request) needs its own idempotence.
+- **Producers.** A producer's last sequence per partition is a row: a batch whose sequence is not
+  past it is a retry, answered with the offsets it got.
+- **Queues.** A work queue shares the payload storage and adds claims, delivery timeouts, and
+  acknowledgements out of order, as rows; reclaiming waits for what is unacknowledged.
+
+**Order.** First: partitioned batch append and read, recovery, and whole-segment retention. Then
+transactions with streams, and consumer and producer state. Replication, failover and Kafka's
+protocol are layers above.
+
+**Not built yet:** all of section 21.
 
 ## References
 

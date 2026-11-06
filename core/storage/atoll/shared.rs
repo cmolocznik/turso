@@ -516,17 +516,92 @@ impl BytesMut for Writer<'_> {
         }
         let (from, words) = ((at + head) / WORD, rest.len() / WORD);
         let src = rest.as_ptr();
-        for (k, word) in self.0.words[from..from + words].iter().enumerate() {
+        let to = &self.0.words[from..from + words];
+        let mut quads = to.chunks_exact(4);
+        let mut k = 0;
+        for q in &mut quads {
+            // SAFETY: `k + 4 <= words`, so the 32 bytes at `k * WORD` lie in `rest`.
+            let w = unsafe { src.add(k * WORD).cast::<[u64; 4]>().read_unaligned() };
+            q[0].store(w[0], Ordering::Relaxed);
+            q[1].store(w[1], Ordering::Relaxed);
+            q[2].store(w[2], Ordering::Relaxed);
+            q[3].store(w[3], Ordering::Relaxed);
+            k += 4;
+        }
+        for word in quads.remainder() {
             // SAFETY: `k < words`, so the 8 bytes at `k * WORD` lie in `rest`.
             word.store(
                 unsafe { src.add(k * WORD).cast::<u64>().read_unaligned() },
                 Ordering::Relaxed,
             );
+            k += 1;
         }
         let tail = &rest[words * WORD..];
         if !tail.is_empty() {
             self.splice((end - tail.len()) / WORD, 0, tail);
         }
+    }
+
+    /// Whole words stored at once, the part words at either end spliced.
+    fn fill(&mut self, range: Range<usize>, v: u8) {
+        assert!(range.end <= self.len(), "{range:?} past {}", self.len());
+        let first = range.start.next_multiple_of(WORD).min(range.end);
+        let last = (range.end / WORD * WORD).max(first);
+        let part = [v; WORD];
+        if first > range.start {
+            self.write(range.start, &part[..first - range.start]);
+        }
+        let word = u64::from_ne_bytes(part);
+        for w in &self.0.words[first / WORD..last / WORD] {
+            w.store(word, Ordering::Relaxed);
+        }
+        if range.end > last {
+            self.write(last, &part[..range.end - last]);
+        }
+    }
+
+    /// Bytes moved a word at a time where the source and the destination lie alike in their
+    /// words, in the direction an overlap needs; else through a buffer, as the default does.
+    fn copy_within(&mut self, src: Range<usize>, dest: usize) {
+        let len = src.len();
+        assert!(src.end <= self.len() && dest + len <= self.len());
+        if len < 2 * WORD || src.start % WORD != dest % WORD {
+            let mut chunk = [0u8; 256];
+            let mut moved = 0;
+            while moved < len {
+                let n = chunk.len().min(len - moved);
+                let from = if dest > src.start {
+                    src.start + len - moved - n
+                } else {
+                    src.start + moved
+                };
+                self.copy_to(from, &mut chunk[..n]);
+                self.write(dest + (from - src.start), &chunk[..n]);
+                moved += n;
+            }
+            return;
+        }
+        // The part word at each end, then the whole words between, each read before the one it
+        // lands on is written.
+        let head = (WORD - src.start % WORD) % WORD;
+        let tail = (src.start + len) % WORD;
+        let words = (len - head - tail) / WORD;
+        let (s, d) = ((src.start + head) / WORD, (dest + head) / WORD);
+        let mut ends = [[0u8; WORD]; 2];
+        self.copy_to(src.start, &mut ends[0][..head]);
+        self.copy_to(src.end - tail, &mut ends[1][..tail]);
+        let all = &self.0.words;
+        if d < s {
+            for k in 0..words {
+                all[d + k].store(all[s + k].load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        } else {
+            for k in (0..words).rev() {
+                all[d + k].store(all[s + k].load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+        self.write(dest, &ends[0][..head]);
+        self.write(dest + len - tail, &ends[1][..tail]);
     }
 }
 

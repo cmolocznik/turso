@@ -476,6 +476,53 @@ struct KnownRow {
     changes: u64,
 }
 
+impl KnownRow {
+    /// Whether it holds for `txn` now.
+    fn holds(&self, txn: &Txn, changes: u64) -> bool {
+        self.txn == (txn.slot(), txn.start()) && self.changes == changes
+    }
+}
+
+/// Tree `id`'s catalog row as `txn`'s current statement reads it, the one a cursor of the
+/// connection read while it holds, and the leaf the last cursor over the tree stood at.
+fn row_in(
+    db: &Arc<AtollDb>,
+    known: &Mutex<HashMap<u64, Known>>,
+    id: u64,
+    txn: &mut Txn,
+) -> Result<(KnownRow, Near)> {
+    let changes = db.catalog().changes();
+    let (held, near) = match known.lock().get(&id) {
+        Some(k) => (k.row.filter(|r| r.holds(txn, changes)), k.near),
+        None => (None, Near::NONE),
+    };
+    if let Some(row) = held {
+        return Ok((row, near));
+    }
+    #[cfg(test)]
+    CATALOG_READS.with(|r| r.borrow_mut().push(id));
+    let mut get = Get::new(&catalog::key(id));
+    let entry = drive(db.io(), || {
+        db.catalog()
+            .get(db.atoll().transactions(), db.versions(), txn, &mut get)
+    })?
+    .ok_or_else(|| LimboError::InternalError(format!("no tree {id} in the catalog")))?;
+    let row = KnownRow {
+        entry,
+        txn: (txn.slot(), txn.start()),
+        changes,
+    };
+    known.lock().entry(id).or_default().row = Some(row);
+    Ok((row, near))
+}
+
+/// Whether `txn`'s current statement created the tree `entry` names.
+fn created_now(txn: &Txn, entry: Entry) -> bool {
+    txn.created()
+        .iter()
+        .any(|c| c.root == entry.root && c.statement == txn.command())
+}
+
 /// Slots the trees a connection changes fall into: a cursor whose tree shares a slot with
 /// another the connection changed reads its entry again for nothing, which costs a seek and never
 /// a wrong read; 256 keep any two trees apart but for one in 256, at 4 KiB a connection.
@@ -1412,6 +1459,9 @@ pub struct SqlCursor {
     unseen: bool,
     /// What its connection's cursors learned of the trees.
     known: Arc<Mutex<HashMap<u64, Known>>>,
+    /// The catalog row of its tree it last went by, which holds as the connection's [`Known`]
+    /// row does: its statement's next execution takes it up with no lookup.
+    row: Option<KnownRow>,
 }
 
 /// A cursor leaves the leaf it stood at to the next over its tree.
@@ -1455,6 +1505,7 @@ impl SqlCursor {
             stamped: ct.stamped.clone(),
             unseen: false,
             known: ct.known.clone(),
+            row: None,
         }
     }
 
@@ -1620,18 +1671,28 @@ impl SqlCursor {
         self.has_record = false;
         self.no_wait = false;
         self.seen = self.changes.epoch();
-        let destroyed = {
-            let guard = self.cell.lock();
-            let txn = guard.as_ref().ok_or_else(outside)?;
-            self.changes.destroyed_in(self.id, txn.command())
+        let row = {
+            let mut guard = self.cell.lock();
+            let txn = guard.as_mut().ok_or_else(outside)?;
+            if self.changes.destroyed_in(self.id, txn.command()) {
+                None
+            } else {
+                let changes = self.db.catalog().changes();
+                let row = match self.row.filter(|r| r.holds(txn, changes)) {
+                    Some(row) => row,
+                    None => row_in(&self.db, &self.known, self.id, txn)?.0,
+                };
+                Some((row, created_now(txn, row.entry)))
+            }
         };
-        if destroyed {
+        let Some((row, plain)) = row else {
             self.open = None;
             self.vacant = true;
             return Ok(true);
-        }
+        };
+        self.row = Some(row);
         self.vacant = false;
-        let (entry, plain, _) = self.entry_now()?;
+        let entry = row.entry;
         match self.open.as_mut() {
             Some(cursor) if cursor.entry() == entry => {
                 cursor.reuse(self.index.clone(), plain);
@@ -1676,42 +1737,8 @@ impl SqlCursor {
     fn entry_now(&self) -> Result<(Entry, bool, Near)> {
         let mut guard = self.cell.lock();
         let txn = guard.as_mut().ok_or_else(outside)?;
-        let db = &self.db;
-        let (identity, changes) = ((txn.slot(), txn.start()), db.catalog().changes());
-        let (known, near) = match self.known.lock().get(&self.id) {
-            Some(k) => (
-                k.row.filter(|r| r.txn == identity && r.changes == changes),
-                k.near,
-            ),
-            None => (None, Near::NONE),
-        };
-        let entry = match known {
-            Some(row) => row.entry,
-            None => {
-                #[cfg(test)]
-                CATALOG_READS.with(|r| r.borrow_mut().push(self.id));
-                let mut get = Get::new(&catalog::key(self.id));
-                let entry = drive(db.io(), || {
-                    db.catalog()
-                        .get(db.atoll().transactions(), db.versions(), txn, &mut get)
-                })?
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!("no tree {} in the catalog", self.id))
-                })?;
-                let row = KnownRow {
-                    entry,
-                    txn: identity,
-                    changes,
-                };
-                self.known.lock().entry(self.id).or_default().row = Some(row);
-                entry
-            }
-        };
-        let plain = txn
-            .created()
-            .iter()
-            .any(|c| c.root == entry.root && c.statement == txn.command());
-        Ok((entry, plain, near))
+        let (row, near) = row_in(&self.db, &self.known, self.id, txn)?;
+        Ok((row.entry, created_now(txn, row.entry), near))
     }
 
     /// The cursor over the tree it holds, or over the tree its catalog row names if it holds none.

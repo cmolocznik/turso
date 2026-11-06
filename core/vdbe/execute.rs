@@ -4683,7 +4683,7 @@ pub fn op_transaction_inner(
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
-                let conn = program.connection.clone();
+                let conn = &program.connection;
                 let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly.into());
@@ -4873,13 +4873,8 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
-                            match begin_fresh_mvcc_tx(
-                                mv_store,
-                                &pager,
-                                &effective_mode,
-                                &conn,
-                                None,
-                            ) {
+                            match begin_fresh_mvcc_tx(mv_store, &pager, &effective_mode, conn, None)
+                            {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     conn.start_mv_lineage(*db, mv_store.read_snapshot(tx_id)?);
@@ -4903,7 +4898,7 @@ pub fn op_transaction_inner(
                                     &pager,
                                     tx_mode,
                                     Some(tx_id),
-                                    &conn,
+                                    conn,
                                     None,
                                     CheckpointReadLockState::NotHeld,
                                 )?;
@@ -4976,7 +4971,7 @@ pub fn op_transaction_inner(
                                 mv_store,
                                 &pager,
                                 &fresh_mode,
-                                &conn,
+                                conn,
                                 expected_schema_generation,
                             ) {
                                 Ok(tx_id) => {
@@ -5022,7 +5017,7 @@ pub fn op_transaction_inner(
                                     &pager,
                                     &actual_tx_mode,
                                     Some(tx_id),
-                                    &conn,
+                                    conn,
                                     None,
                                     CheckpointReadLockState::NotHeld,
                                 ) {
@@ -5163,7 +5158,7 @@ pub fn op_transaction_inner(
             // 3b. For attached databases, begin the write transaction after
             // begin_read_tx has already completed in the Start state.
             OpTransactionState::AttachedBeginWriteTx => {
-                let conn = program.connection.clone();
+                let conn = &program.connection;
                 let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
                     return Ok(state.suspend_on_io(io));
@@ -14600,7 +14595,7 @@ pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    main_pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         OpenWrite {
@@ -14614,8 +14609,10 @@ pub fn op_open_write(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
-    let pager = program.get_pager_from_database_index(db)?;
-    let mv_store = program.connection.mv_store_for_db(*db);
+    // The opcode's own pager and the statement's cached store, as OpenRead takes them: no
+    // ArcSwap load of either per execution.
+    let pager = pager_for_db(program, main_pager, *db)?;
+    let mv_store = mv_store_for_db(program, state, *db);
     state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {

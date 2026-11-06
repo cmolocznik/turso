@@ -1562,14 +1562,20 @@ impl ProgramState {
         }
         self.last_compare = None;
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
-        self.ended_coroutine.clear();
-        self.once.clear();
+        if !self.ended_coroutine.is_empty() {
+            self.ended_coroutine.clear();
+        }
+        if !self.once.is_empty() {
+            self.once.clear();
+        }
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
         self.release_parked_checkpoint();
         self.checkpoint_park_deadline = None;
         self.checkpoint_wait_spent = false;
-        self.explicit_checkpoint_guard = None;
+        if self.explicit_checkpoint_guard.is_some() {
+            self.explicit_checkpoint_guard = None;
+        }
         self.explicit_checkpoint_goal = None;
         self.current_time = None;
         #[cfg(feature = "json")]
@@ -1579,20 +1585,30 @@ impl ProgramState {
         // has yielded I/O. Waiting for that I/O does not step the nested
         // CheckpointStateMachine again, so release its checkpoint lock before
         // replacing commit_state with Ready.
-        self.commit_state.cleanup_mvcc_checkpoint_state();
+        if !matches!(self.commit_state, CommitState::Ready) {
+            self.commit_state.cleanup_mvcc_checkpoint_state();
+            self.commit_state = CommitState::Ready;
+        }
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
-        self.commit_state = CommitState::Ready;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
         // (we handle that on every code path inside
         // `op_sequence_commit_inner_tx`) so dropping the state machine
         // here only releases its references.
-        self.sequence_inner_commit = None;
-        self.op_vacuum_state = VacuumOpState::None;
+        if self.sequence_inner_commit.is_some() {
+            self.sequence_inner_commit = None;
+        }
+        if !matches!(self.op_vacuum_state, VacuumOpState::None) {
+            self.op_vacuum_state = VacuumOpState::None;
+        }
         self.view_delta_state = ViewDeltaApplyState::NotStarted;
-        self.populate_matviews_state = None;
-        self.optimize_steps = None;
+        if self.populate_matviews_state.is_some() {
+            self.populate_matviews_state = None;
+        }
+        if self.optimize_steps.is_some() {
+            self.optimize_steps = None;
+        }
         self.lock_wait_over = false;
         self.sleep_for = None;
         self.auto_txn_cleanup = TxnCleanup::None;
@@ -1615,23 +1631,39 @@ impl ProgramState {
         self.uses_subjournal = false;
         self.atoll_statement = None;
         self.atoll_taking = false;
-        self.atoll_create = None;
-        self.atoll_retire = None;
+        if self.atoll_create.is_some() {
+            self.atoll_create = None;
+        }
+        if self.atoll_retire.is_some() {
+            self.atoll_retire = None;
+        }
         self.is_active_write = false;
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
-        self.distinct_key_values.clear();
-        self.attached_savepoint_pagers.clear();
+        if !self.distinct_key_values.is_empty() {
+            self.distinct_key_values.clear();
+        }
+        if !self.attached_savepoint_pagers.is_empty() {
+            self.attached_savepoint_pagers.clear();
+        }
         *self.n_change.get_mut() = 0;
         *self.n_total_change.get_mut() = 0;
         // reset has exclusive access, so no lock or atomic store is needed.
         self.explain_state.get_mut().clear();
-        self.pending_fail_error = None;
-        self.pending_fail_prepare_error = None;
+        if self.pending_fail_error.is_some() {
+            self.pending_fail_error = None;
+        }
+        if self.pending_fail_prepare_error.is_some() {
+            self.pending_fail_prepare_error = None;
+        }
         self.halt_in_progress = false;
-        self.pending_cdc_info = None;
-        self.subprogram_stmt_cache.clear();
+        if self.pending_cdc_info.is_some() {
+            self.pending_cdc_info = None;
+        }
+        if !self.subprogram_stmt_cache.is_empty() {
+            self.subprogram_stmt_cache.clear();
+        }
         self.pending_fresh_tx = None;
     }
 
@@ -1733,6 +1765,20 @@ impl ProgramState {
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
             || (connection.get_auto_commit() && attached_txn_open())
+    }
+
+    /// Whether the statement ran to its end holding nothing an abort releases: no operation,
+    /// commit, VACUUM, write-gate take, subjournal or fresh MVCC transaction under way, and the
+    /// cleanup decision cleared, as the dispatch loop clears it at Done.
+    pub(crate) fn ended_owing_nothing(&self) -> bool {
+        matches!(self.execution_state, ProgramExecutionState::Done)
+            && matches!(self.active_op_state.state, ActiveOpState::None)
+            && matches!(self.commit_state, CommitState::Ready)
+            && matches!(self.op_vacuum_state, VacuumOpState::None)
+            && self.auto_txn_cleanup == TxnCleanup::None
+            && !self.atoll_taking
+            && !self.uses_subjournal
+            && self.pending_fresh_tx.is_none()
     }
 
     /// Whether this statement's commit is under way: a commit state machine it started, its own
@@ -3904,6 +3950,19 @@ impl Program {
         state.checkpoint_wait_spent = false;
         state.explicit_checkpoint_guard = None;
         state.explicit_checkpoint_goal = None;
+        // A statement that ran to its end, as every reset after a clean step finds it, owes
+        // nothing below: none of the states the cleanups release is set, it is not running, and
+        // with no error and no cleanup decision the transaction is ended only where
+        // `ProgramState::can_autocommit_now` finds one to end with the cleanup cleared and no
+        // commit under way, an attached transaction left open in autocommit.
+        if err.is_none()
+            && state.ended_owing_nothing()
+            && (!self.connection.get_auto_commit()
+                || !self.connection.has_non_main_pagers.load(Ordering::Acquire))
+        {
+            state.close_virtual_table_cursors();
+            return Ok(());
+        }
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
         // pager checkpoint state or reset drops the opcode state.

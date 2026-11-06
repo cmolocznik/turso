@@ -61,6 +61,7 @@ fn open_sized(slots: usize, budget: usize, class: SizeClass, log_budget: Option<
         },
         log_budget,
         checkpoint_write_bytes: None,
+        checkpointing: crate::storage::atoll::checkpoint::Checkpointing::Writers,
         txn: TxnConfig { slots },
     };
     let db = Atoll::open(io.clone(), BASE, config).unwrap();

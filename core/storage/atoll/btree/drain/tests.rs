@@ -35,6 +35,7 @@ fn config(chunk_bytes: u64) -> AtollConfig {
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,
+        checkpointing: crate::storage::atoll::checkpoint::Checkpointing::Writers,
         txn: Default::default(),
     }
 }

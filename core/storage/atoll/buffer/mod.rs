@@ -2046,6 +2046,18 @@ impl BufferPool {
         self.room.wake();
     }
 
+    /// Whether room for kept copies is given back by another thread: the database's
+    /// checkpointing thread, while it runs.
+    pub fn room_freed_elsewhere(&self, elsewhere: bool) {
+        self.room.freed_elsewhere(elsewhere);
+    }
+
+    /// Waits for room handed out that block until another thread gives it back.
+    #[cfg(test)]
+    pub fn blocking_room_waits(&self) -> u64 {
+        self.room.blocking_waits()
+    }
+
     /// Whether the room takes the largest request it refused since it last admitted one: a
     /// refused writer stepping the checkpoint stops then.
     pub fn room_takes_refused(&self) -> bool {

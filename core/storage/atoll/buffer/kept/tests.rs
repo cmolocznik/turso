@@ -5,6 +5,7 @@
 //! cut found it.
 
 use crate::io::crash::{CrashIO, Faults};
+use crate::io::Completion;
 use crate::io::{MemoryIO, IO};
 use crate::storage::atoll::btree::node::MAX_CLASS;
 use crate::storage::atoll::btree::{
@@ -15,7 +16,7 @@ use crate::storage::atoll::buffer::{
     default_kept_bytes, BufferConfig, BufferPool, LentUse, FRAME_SHORTS, MIN_BUDGET, MIN_DB_BUDGET,
     WRITEBACK_BYTES,
 };
-use crate::storage::atoll::checkpoint::WRITE_BYTES;
+use crate::storage::atoll::checkpoint::{Checkpointing, WRITER_STEPS, WRITE_BYTES};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{ring_bytes, LogConfig};
 use crate::storage::atoll::meta::MetaRef;
@@ -61,6 +62,7 @@ fn config() -> AtollConfig {
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,
+        checkpointing: crate::storage::atoll::checkpoint::Checkpointing::Writers,
         txn: Default::default(),
     }
 }
@@ -92,11 +94,27 @@ fn within<T>(io: &Arc<dyn IO>, op: impl FnMut() -> Result<IOResult<T>>) -> T {
 fn within_returns<T>(
     io: &Arc<dyn IO>,
     returns: usize,
+    op: impl FnMut() -> Result<IOResult<T>>,
+) -> T {
+    within_waiting(io, returns, || {}, op)
+}
+
+/// [`within_returns`], calling `before_wait` at each return before it waits: where a test lets go
+/// of what a wait on another thread needs.
+fn within_waiting<T>(
+    io: &Arc<dyn IO>,
+    returns: usize,
+    mut before_wait: impl FnMut(),
     mut op: impl FnMut() -> Result<IOResult<T>>,
 ) -> T {
     for _ in 0..returns {
-        match op().unwrap() {
+        let out = op().unwrap();
+        if let IOResult::IO(_) = &out {
+            before_wait();
+        }
+        match out {
             IOResult::Done(v) => return v,
+            IOResult::IO(IOCompletions(c)) if c.is_remote_wait() => remote(&c),
             IOResult::IO(IOCompletions(c)) => {
                 // Every IO these tests start ends within that many steps of the IO: one each for
                 // the checkpoint's 32 writes and the log's 3. A wait still unfinished past it
@@ -114,6 +132,22 @@ fn within_returns<T>(
         }
     }
     panic!("no progress in {returns} returns");
+}
+
+/// Waits for `c`, which another thread finishes (the checkpointing thread), a minute at most:
+/// what it waits for is the thread's images of a few pages in memory, far shorter.
+fn remote(c: &Completion) {
+    let began = std::time::Instant::now();
+    while !c.finished() {
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(60),
+            "a wait the checkpointing thread never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if let Some(e) = c.get_error() {
+        panic!("the change met a failed IO: {e}");
+    }
 }
 
 /// Runs `test` on a thread of its own, failing if it is not done within a minute: a change that
@@ -148,7 +182,22 @@ impl Db {
     }
 
     fn on(io: Arc<dyn IO>, crash: Option<Arc<CrashIO>>) -> Self {
-        let db = Atoll::open(io.clone(), BASE, config()).unwrap();
+        Self::with(io, crash, config())
+    }
+
+    /// With a checkpointing thread stepping the checkpoints, on IO that completes only as it is
+    /// stepped.
+    fn threaded() -> Self {
+        let crash = Arc::new(CrashIO::new(0));
+        let config = AtollConfig {
+            checkpointing: Checkpointing::Thread,
+            ..config()
+        };
+        Self::with(crash.clone(), Some(crash), config)
+    }
+
+    fn with(io: Arc<dyn IO>, crash: Option<Arc<CrashIO>>, config: AtollConfig) -> Self {
+        let db = Atoll::open(io.clone(), BASE, config).unwrap();
         Self { io, crash, db }
     }
 
@@ -156,6 +205,18 @@ impl Db {
         let Self { io, crash, db } = self;
         drop(db);
         Self::on(io, crash)
+    }
+
+    /// Waits, a minute at most, for the checkpointing thread to reach a cut.
+    fn cut_by_the_thread(&self) {
+        let began = std::time::Instant::now();
+        while self.db.checkpointer().cut_taken().is_none() {
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(60),
+                "the checkpointing thread took no cut"
+            );
+            std::thread::yield_now();
+        }
     }
 
     fn pool(&self) -> &Arc<BufferPool> {
@@ -204,7 +265,7 @@ impl Db {
 
     fn finish(&self, ticket: u64) {
         let cp = self.db.checkpointer();
-        drive(&self.io, || cp.step_full(ticket, self.db.transactions())).unwrap();
+        within(&self.io, || cp.step_full(ticket, self.db.transactions()));
     }
 
     /// The page-table leaf of `orphan`, a page handed to the checkpointer: latched, it holds the
@@ -616,6 +677,105 @@ fn a_budget_too_small_for_the_smallest_pool_beside_the_logs_ring_is_refused_at_o
         .err()
         .expect("opened");
     assert!(err.to_string().contains("log's ring"), "{err}");
+}
+
+/// With a checkpointing thread, a writer refused room does none of the checkpoint's work: it
+/// lets go of what it holds and waits for the room the thread frees, its kept copies imaged
+/// first; and the thread writes the tree as its cut found it, which the database reopened holds.
+#[test]
+fn with_a_checkpointing_thread_a_writer_refused_room_waits_for_the_room_it_frees() {
+    let db = Db::threaded();
+    let orphan = drive(&db.io, || {
+        Tree::create(db.pool(), SizeClass::new(0).unwrap())
+    })
+    .unwrap();
+    let (tree, model) = db.owed_tree();
+    let frame = db.orphan_leaf(orphan);
+    let mut hold = Some(frame.try_lock().expect("the leaf is free"));
+    let ticket = db.db.checkpointer().request_full();
+    db.cut_by_the_thread();
+    let steps = WRITER_STEPS.with(|n| n.get());
+    for i in 0..KEYS {
+        let k = 2 * i + 1;
+        let mut put = Put::new(&key(k), value(k, 2), Mode::Insert);
+        // The leaf the thread waits on let go once a writer waits for room the thread frees.
+        let let_go = || {
+            if db.pool().kept_stats().refusals > 0 {
+                if let Some(h) = hold.take() {
+                    h.release_unchanged();
+                }
+            }
+        };
+        within_waiting(&db.io, 1 << 20, let_go, || tree.put(&mut put));
+    }
+    assert!(hold.is_none(), "no insert was refused room");
+    assert_eq!(
+        WRITER_STEPS.with(|n| n.get()),
+        steps,
+        "a writer stepped the checkpoint"
+    );
+    assert!(
+        db.pool().blocking_room_waits() > 0,
+        "a refused writer stepped its IO waiting for room"
+    );
+    assert_within_room(db.pool(), node_class().size());
+    db.finish(ticket);
+    drop(hold);
+    drop(frame);
+    let root = tree.root();
+    drop(tree);
+    let db = db.reopen();
+    db.assert_holds(&db.tree(root), &model, "the tree as the cut found it");
+}
+
+/// A checkpoint failing on the checkpointing thread is told to a transaction's end waiting on it
+/// for a full one, which then fails rather than waits for good.
+#[test]
+fn a_checkpoint_failing_on_the_thread_is_told_to_whoever_waits_for_it() {
+    let db = Db::threaded();
+    let crash = db.crash.clone().unwrap();
+    let (_tree, _) = db.owed_tree();
+    // The writes of the tree's pages fail; the log's never do.
+    crash.set_faults_on(Some(&format!("{BASE}.c{}.0", node_class().index())));
+    crash.set_faults(Faults {
+        write: 1.0,
+        ..Faults::default()
+    });
+    let cp = db.db.checkpointer();
+    let ticket = cp.request_full();
+    let began = std::time::Instant::now();
+    let failed = loop {
+        match cp.step_full(ticket, db.db.transactions()) {
+            Err(e) => break e,
+            Ok(IOResult::Done(())) => {
+                panic!("a full checkpoint done with every image write failing")
+            }
+            Ok(IOResult::IO(IOCompletions(c))) => {
+                assert!(
+                    c.is_remote_wait(),
+                    "a writer given IO of the checkpoint's to step"
+                );
+                remote(&c);
+            }
+        }
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(60),
+            "no failure told"
+        );
+    };
+    assert!(failed.to_string().contains("failed"), "{failed}");
+}
+
+/// A closed database ends and joins its checkpointing thread: the thread holds nothing of it.
+#[test]
+fn a_closed_database_ends_and_joins_its_checkpointing_thread() {
+    let db = Db::threaded();
+    let held = Arc::downgrade(db.db.checkpointer_arc());
+    drop(db);
+    assert!(
+        held.upgrade().is_none(),
+        "the checkpointing thread holds the checkpointer"
+    );
 }
 
 /// Every page of the tree written to its swap copy and evicted after the cut, still owed: read

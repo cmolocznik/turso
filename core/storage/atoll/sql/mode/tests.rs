@@ -2,18 +2,54 @@
 //! end to end.
 
 use crate::io::{MemoryIO, OpenFlags, IO};
+use crate::storage::atoll::checkpoint::{Checkpointing, WRITER_STEPS};
 use crate::storage::atoll::sql::catalog::tests::config;
 use crate::sync::Arc;
 use crate::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, SqliteDialect, Value};
 
 /// Each test opens its own path: the registry keys databases by their file across IOs.
 fn open(io: &Arc<dyn IO>, path: &str) -> Arc<Database> {
+    open_with(io, path, config())
+}
+
+fn open_with(
+    io: &Arc<dyn IO>,
+    path: &str,
+    config: crate::storage::atoll::db::AtollConfig,
+) -> Arc<Database> {
     Database::open(
         io.clone(),
         path,
-        OpenOptions::new(Arc::new(SqliteDialect)).atoll(config()),
+        OpenOptions::new(Arc::new(SqliteDialect)).atoll(config),
     )
     .unwrap()
+}
+
+/// [`config`] with a checkpointing thread.
+fn threaded() -> crate::storage::atoll::db::AtollConfig {
+    crate::storage::atoll::db::AtollConfig {
+        checkpointing: Checkpointing::Thread,
+        ..config()
+    }
+}
+
+/// Runs `test` on a thread of its own, failing if it is not done within a minute: what it waits
+/// on is the checkpointing thread's work on a database in memory, far shorter, and a wait nothing
+/// ends would otherwise hang the run.
+fn within_a_minute(test: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        test();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(()) => runner.join().unwrap(),
+        // The test panicked: its own message is the failure.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => runner.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("a wait on the checkpointing thread never ended")
+        }
+    }
 }
 
 fn rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
@@ -515,6 +551,80 @@ fn a_bulk_statements_commit_brings_the_redo_point_within_twice_the_budget() {
         rows(&conn, "SELECT count(*) FROM t"),
         vec![vec![Value::from_i64((20 * budget / row) as i64)]]
     );
+}
+
+/// With a checkpointing thread, statements and commits do no checkpoint work, and a statement
+/// that finds one due wakes the thread to do it: small commits appending one and a half times the
+/// log budget, short of the twice past which a transaction's end waits for a full checkpoint, see
+/// a checkpoint done all the same, the thread's.
+#[test]
+fn with_a_checkpointing_thread_a_due_checkpoint_is_the_threads_woken_by_a_statement() {
+    within_a_minute(|| {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_with(&io, "/db/thread-commits", threaded());
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+            .unwrap();
+        let budget = config().log_budget.expect("a log budget");
+        let row = 8 << 10;
+        let atoll = db.atoll.as_ref().unwrap().atoll();
+        let (steps, first, fulls) = (
+            WRITER_STEPS.with(|n| n.get()),
+            atoll.checkpointer().superblock().checkpoint,
+            atoll.checkpointer().fulls_requested(),
+        );
+        for _ in 0..3 * budget / (2 * row) {
+            conn.execute(format!("INSERT INTO t (b) VALUES (zeroblob({row}))"))
+                .unwrap();
+        }
+        assert_eq!(
+            WRITER_STEPS.with(|n| n.get()),
+            steps,
+            "a writer stepped the checkpoint"
+        );
+        assert_eq!(
+            atoll.checkpointer().fulls_requested(),
+            fulls,
+            "a transaction's end asked for a full checkpoint"
+        );
+        while atoll.checkpointer().superblock().checkpoint == first {
+            std::thread::yield_now();
+        }
+    });
+}
+
+/// With a checkpointing thread, one bulk statement appending twenty times the log budget: its
+/// commit waits for the thread's full checkpoint, doing none of it, and the redo point trails by
+/// no more than twice the budget after it.
+#[test]
+fn with_a_checkpointing_thread_a_bulk_commit_waits_for_its_full_checkpoint() {
+    within_a_minute(|| {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_with(&io, "/db/thread-bulk", threaded());
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+            .unwrap();
+        let budget = config().log_budget.expect("a log budget");
+        let row = 8 << 10;
+        let steps = WRITER_STEPS.with(|n| n.get());
+        conn.execute(format!(
+            "INSERT INTO t (b) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+             WHERE i < {}) SELECT zeroblob({row}) FROM n",
+            20 * budget / row
+        ))
+        .unwrap();
+        assert_eq!(
+            WRITER_STEPS.with(|n| n.get()),
+            steps,
+            "a writer stepped the checkpoint"
+        );
+        let lag = db.atoll.as_ref().unwrap().atoll().checkpointer().lag();
+        assert!(lag <= 2 * budget, "the redo point trails by {lag} bytes");
+        assert_eq!(
+            rows(&conn, "SELECT count(*) FROM t"),
+            vec![vec![Value::from_i64((20 * budget / row) as i64)]]
+        );
+    });
 }
 
 /// A long explicit transaction appending twenty times the log budget before it commits: each of

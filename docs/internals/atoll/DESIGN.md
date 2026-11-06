@@ -574,27 +574,28 @@ store's in `store.rs` (the cut's metadata edits, the frees that wait for a check
    cut that found it unwritten names it, and its change keeps nothing; nor does a child hint's,
    which every reader checks, nor the checkpoint's own free of an orphan its cut left out.
 
-   **The room for kept copies** (Clay's ruling of 2026-11-05) bounds the copies of data pages;
-   the metadata's are accounted apart (item 11). Each copy is in a frame the pool lends (section
-   9.1), charged to a room of `max(R, min(B/8, 256 MiB))` bytes, B the budget and R the largest
-   request a change makes, three node pages of 64 KiB, an initial choice that `kept_bytes`
-   overrides. The ruling's floor was a page of the largest class, P; it was set while the copies
-   lived beside the frames, and with them in the frames it would be most of a small pool. A charge
-   is given back only when its copy drops and gives its frame back, wherever it then is. A change latches every page it will change and asks for room for the
-   copies they need before its first edit, all or none; an edit of a page the cut owes that asked
-   for none fails an invariant check rather than copy past the limit. A request that finds no frame
-   of its class free without an eviction is turned down as one past the room is: the change lets
-   go of what it holds, takes a frame holding nothing, which may evict a page, and goes on with
-   it. Only node pages are kept,
-   64 KiB at most, and a change asks for three at most, so every request fits. Refused, it lets go
-   of its latches and the change gate, and the writer steps the checkpoint itself, as an embedded
-   database may have one connection and no other thread, until the room takes what it asked for,
-   and no further. While a writer waits, the checkpoint images kept copies first. How many images
-   that takes is not bounded by the request: with pages of several sizes, or other writers taking
-   the room given back, it can take more; the time writers wait is measured, the longest wait with
-   it. While someone else steps the checkpoint, the writer waits on the room, woken by every copy
-   given back and by every stepper leaving. A free never waits: with no room, the page goes to the
-   checkpointer unchanged since the cut, imaged as it stands, and the next checkpoint frees it.
+   **The room for kept copies** (Clay's ruling of 2026-11-05) bounds the copies of data pages; the
+   metadata's are accounted apart (item 11). Each copy is in a frame the pool lends (section 9.1),
+   charged to a room of `max(R, min(B/8, 256 MiB))` bytes, B the budget and R the largest request a
+   change makes, three node pages of 64 KiB, an initial choice that `kept_bytes` overrides. The
+   ruling's floor was a page of the largest class, P; it was set while the copies lived beside the
+   frames, and with them in the frames it would be most of a small pool. A charge is given back only
+   when its copy drops and gives its frame back, wherever it then is. A change latches every page it
+   will change and asks for room for the copies they need before its first edit, all or none; an
+   edit of a page the cut owes that asked for none fails an invariant check rather than copy past
+   the limit. A request that finds no frame of its class free without an eviction is turned down as
+   one past the room is: the change lets go of what it holds, takes a frame holding nothing, which
+   may evict a page, and goes on with it. Only node pages are kept, 64 KiB at most, and a change
+   asks for three at most, so every request fits. Refused, it lets go of its latches and the change
+   gate, and the writer steps the checkpoint itself (or, with the checkpointing thread, waits for
+   the room it frees: item 9), as an embedded database may have one connection and no other thread,
+   until the room takes what it asked for, and no further. While a writer waits, the checkpoint
+   images kept copies first. How many images that takes is not bounded by the request: with pages of
+   several sizes, or other writers taking the room given back, it can take more; the time writers
+   wait is measured, the longest wait with it. While someone else steps the checkpoint, the writer
+   waits on the room, woken by every copy given back and by every stepper leaving. A free never
+   waits: with no room, the page goes to the checkpointer unchanged since the cut, imaged as it
+   stands, and the next checkpoint frees it.
 4. **Images.** Each pending node page is written to a fresh slot: a versioned leaf as `C` reads it
    (each key at the version `C` sees, settled, deleted keys gone), any other as it stood at the
    cut. A node of a tree set aside is left out. Then each pending value page is written if an
@@ -619,8 +620,20 @@ store's in `store.rs` (the cut's metadata edits, the frees that wait for a check
    forgotten, the log before `L` released, and `C` let go.
 9. **When.** A checkpoint begins once half the log budget has been appended since the last began,
    or when a full one is asked for. The log budget is how much log recovery may have to replay; by
-   default 0.4 times the pool, the ratio of Haubenschild's example. A writing statement steps the
-   checkpointer only once one is due (section 17).
+   default 0.4 times the pool, the ratio of Haubenschild's example.
+
+   **Who** (Clay's ruling of 2026-11-05: off the commit path). Where the platform has threads, a
+   thread of the database's own steps every checkpoint (`Checkpointing::Thread`), waiting on its
+   writes so they go as fast as the device takes them, and parks while none is due. A writing
+   statement and a transaction's end only wake it once one is due, doing none of its work; a
+   writer refused room for kept copies waits for the room the thread frees. Past twice the log
+   budget behind the log's end, a transaction's end waits for a full checkpoint, as it always
+   has, but the thread does it. The database starts the thread once open and ends and joins it
+   when it closes; should the thread end otherwise, writers step checkpoints again. With
+   `Checkpointing::Writers`, for a platform without threads or a test that steps checkpoints
+   itself, a writing statement steps the checkpointer only once one is due (section 17), a
+   refused writer steps it itself, and a transaction's end past twice the budget does the full
+   checkpoint itself.
 10. **Failure.** A checkpoint that cannot finish leaves the one in charge in charge. What it marked
     imaged, and the page table entries it named as they stand, are not undone, so none runs again
     until the database is opened again and recovers from the one in charge. Its cut ends and its
@@ -1052,7 +1065,7 @@ Until then the end frees the slot at once. Garbage collection itself is the next
   - **Work per step.** A step does at most one log chunk of records, and visits or drops at most one
     leaf of entries. Frees resume per page, so a large value spans steps.
     - Background passes are driven by a maintenance driver the embedder provides, a thread or its
-      connections, as checkpoints are. Atoll starts no threads, so without a driver nothing is
+      connections. Atoll starts no thread for them, so without a driver nothing is
       collected.
     - Twice the rate garbage arrives is the driver's pacing target, not a guarantee.
   - **What is guaranteed.** Fair, repeated, bounded visits eventually drain a finite eligible
@@ -1139,7 +1152,7 @@ whose system trees an open makes writes a checkpoint before any write (section 1
 No analysis of losers, no undo, no compensation, no page LSN: nothing of a transaction reaches the
 log before its commit (section 11.4), and no page change is logged at all.
 
-**Threads.** Turso core starts no threads. Any number of threads may call `Opening::work`: one
+**Threads.** Recovery starts no threads. Any number of threads may call `Opening::work`: one
 recovers while the rest wait for it.
 
 Recovery reads at most the log budget, plus what was appended while the last checkpoint ran, twice.
@@ -1420,8 +1433,9 @@ submission or later from `IO::step`. Therefore:
   again.
 - **Shared state** is atomics and short critical sections.
 - **Background work** (page cleaning, checkpoints, garbage collection, segment preparation, uploads)
-  is stepped like any operation. Connections drive it, or threads the embedder provides; Turso core
-  starts no threads.
+  is stepped like any operation. Connections drive it, or threads the embedder provides. The one
+  thread Atoll starts is a database's checkpointing thread, where the platform has threads (Clay's
+  ruling of 2026-11-05, section 10 item 9).
 
 ## 19. Proving it
 

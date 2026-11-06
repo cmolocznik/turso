@@ -153,6 +153,7 @@ fn commits() {
             log,
             log_budget: None,
             checkpoint_write_bytes: None,
+            checkpointing: crate::storage::atoll::checkpoint::Checkpointing::Writers,
             txn: TxnConfig {
                 slots: threads.max(TxnConfig::default().slots),
             },
@@ -969,6 +970,7 @@ fn bench_config() -> AtollConfig {
         },
         log_budget: None,
         checkpoint_write_bytes: None,
+        checkpointing: crate::storage::atoll::checkpoint::Checkpointing::Writers,
         txn: TxnConfig::default(),
     }
 }

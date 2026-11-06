@@ -95,7 +95,18 @@ impl CompletionCell {
 
     /// The unfinished completion in the cell, or a new one put there if it holds none or a
     /// finished one: for a cell anyone may fill, whose completion anyone may finish.
-    pub fn current(&self, _step: &Step, retiring: &Retiring) -> Completion {
+    pub fn current(&self, step: &Step, retiring: &Retiring) -> Completion {
+        self.current_with(step, retiring, Completion::new_wait)
+    }
+
+    /// [`current`](Self::current), a new one made by `fresh`: a wait another thread finishes,
+    /// which a synchronous waiter blocks on rather than stepping its IO.
+    pub fn current_with(
+        &self,
+        _step: &Step,
+        retiring: &Retiring,
+        fresh: fn() -> Completion,
+    ) -> Completion {
         loop {
             let raw = self.0.load(Ordering::Acquire);
             if !raw.is_null() {
@@ -105,7 +116,7 @@ impl CompletionCell {
                     return c;
                 }
             }
-            let fresh = Completion::new_wait();
+            let fresh = fresh();
             let fresh_raw = fresh.clone().into_raw().cast_mut();
             match self
                 .0

@@ -2,7 +2,7 @@
 //! recovered from what a crash left.
 
 use super::buffer::{BufferConfig, BufferPool, LocalSource};
-use super::checkpoint::{CheckpointRelief, Checkpointer, WRITE_BYTES};
+use super::checkpoint::{CheckpointRelief, Checkpointer, Checkpointing, WRITE_BYTES};
 use super::control::{Control, Superblock};
 use super::log::{Log, LogConfig, Lsn};
 use super::meta::TREES;
@@ -26,6 +26,8 @@ pub struct AtollConfig {
     /// Bytes of a checkpoint's image writes in flight, beside its 32: `None` for
     /// [`WRITE_BYTES`], one page of the largest class. Less is taken as that.
     pub checkpoint_write_bytes: Option<usize>,
+    /// Who steps the checkpoints: a thread of the database's own, or its writers.
+    pub checkpointing: Checkpointing,
     pub txn: TxnConfig,
 }
 
@@ -38,6 +40,7 @@ impl AtollConfig {
             buffer: BufferConfig::with_budget(budget),
             log_budget: None,
             checkpoint_write_bytes: None,
+            checkpointing: Checkpointing::default_for_platform(),
             txn: TxnConfig::default(),
         }
     }
@@ -64,6 +67,7 @@ impl AtollConfig {
             buffer: BufferConfig::with_budget(budget),
             log_budget: Some(512 << 10),
             checkpoint_write_bytes: None,
+            checkpointing: Checkpointing::Writers,
             txn: TxnConfig::default(),
         }
     }
@@ -87,6 +91,20 @@ pub struct Atoll {
     pool: Arc<BufferPool>,
     checkpointer: Arc<Checkpointer>,
     txns: Arc<Transactions>,
+    /// The checkpointing thread ([`Checkpointing::Thread`]), ended and joined when the database
+    /// closes.
+    driver: Option<crate::thread::JoinHandle<()>>,
+}
+
+impl Drop for Atoll {
+    fn drop(&mut self) {
+        if let Some(driver) = self.driver.take() {
+            self.checkpointer.stop_driver();
+            if driver.join().is_err() {
+                tracing::error!("the checkpointing thread panicked");
+            }
+        }
+    }
 }
 
 impl Atoll {
@@ -127,6 +145,12 @@ impl Atoll {
     pub fn checkpointer(&self) -> &Checkpointer {
         &self.checkpointer
     }
+
+    /// The checkpointer as the checkpointing thread holds it, for a test to tell it let go.
+    #[cfg(test)]
+    pub(crate) fn checkpointer_arc(&self) -> &Arc<Checkpointer> {
+        &self.checkpointer
+    }
 }
 
 /// Opening a database, which recovery may make long. Any number of threads may call
@@ -136,6 +160,8 @@ pub struct Opening {
     store: Arc<PageStore>,
     superblock: Superblock,
     how: Mutex<How>,
+    io: Arc<dyn IO>,
+    checkpointing: Checkpointing,
 }
 
 enum How {
@@ -182,6 +208,8 @@ impl Opening {
         Ok(Self {
             store,
             superblock,
+            io: io.clone(),
+            checkpointing: config.checkpointing,
             how: Mutex::new(How::Recovering {
                 io,
                 base: base.to_string(),
@@ -239,6 +267,8 @@ impl Opening {
         Ok(Self {
             store,
             superblock,
+            io,
+            checkpointing: config.checkpointing,
             how: Mutex::new(How::Created(Box::new(Recovered {
                 log,
                 pool,
@@ -295,8 +325,27 @@ impl Opening {
             ..
         } = *r;
         let (checkpointer, txns) = (Arc::new(checkpointer), Arc::new(txns));
-        // A writer refused room for kept copies steps the checkpoint itself.
+        // A writer refused room for kept copies steps the checkpoint itself, or with a thread
+        // stepping checkpoints waits for the room it frees.
         pool.set_relief(Arc::new(CheckpointRelief::new(&checkpointer, &txns)));
+        let driver = match self.checkpointing {
+            Checkpointing::Writers => None,
+            Checkpointing::Thread => {
+                let (cp, txns, io) = (checkpointer.clone(), txns.clone(), self.io.clone());
+                let handle = crate::thread::Builder::new()
+                    .name("atoll-checkpoint".into())
+                    .spawn(move || cp.drive(&io, &txns))
+                    .map_err(|e| {
+                        LimboError::InternalError(format!(
+                            "the checkpointing thread did not start: {e}"
+                        ))
+                    })?;
+                // Named before the database is handed out: from then on no writer steps a
+                // checkpoint.
+                checkpointer.attach_driver(handle.thread().clone());
+                Some(handle)
+            }
+        };
         Ok(Atoll {
             database_id: self.superblock.database_id,
             recovered_end,
@@ -305,6 +354,7 @@ impl Opening {
             store: self.store,
             pool,
             checkpointer,
+            driver,
         })
     }
 }

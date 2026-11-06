@@ -28,6 +28,7 @@ fn open(budget: usize) -> (Arc<dyn IO>, Atoll) {
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,
+        checkpointing: crate::storage::atoll::checkpoint::Checkpointing::Writers,
         txn: TxnConfig { slots: 4 },
     };
     let db = Atoll::open(io.clone(), "/db/arena", config).unwrap();

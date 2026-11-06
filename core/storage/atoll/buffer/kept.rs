@@ -60,6 +60,11 @@ pub struct KeptRoom {
     pressing: AtomicUsize,
     /// Finished whenever room is given back, if anyone waits for it.
     freed: CompletionCell,
+    /// Whether another thread gives it back ([`freed_elsewhere`](Self::freed_elsewhere)).
+    freed_elsewhere: crate::sync::atomic::AtomicBool,
+    /// Waits handed out that block until another thread gives room back, for tests.
+    #[cfg(test)]
+    blocking_waits: AtomicU64,
     retiring: Retiring,
     epochs: Arc<Epochs>,
     io: Arc<dyn IO>,
@@ -81,6 +86,9 @@ impl KeptRoom {
             longest_wait_ns: AtomicU64::new(0),
             pressing: AtomicUsize::new(0),
             freed: CompletionCell::default(),
+            freed_elsewhere: crate::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            blocking_waits: AtomicU64::new(0),
             retiring: Retiring::new(epochs.clone()),
             epochs,
             io,
@@ -167,7 +175,27 @@ impl KeptRoom {
     /// Done when room is next given back or the checkpoint's stepper leaves: what a refused
     /// writer that could not step the checkpoint waits on.
     pub fn wait(&self) -> Completion {
-        self.freed.current(&self.epochs.enter(), &self.retiring)
+        let fresh = if self.freed_elsewhere.load(Ordering::Acquire) {
+            #[cfg(test)]
+            self.blocking_waits.fetch_add(1, Ordering::Relaxed);
+            Completion::new_remote_wait
+        } else {
+            Completion::new_wait
+        };
+        self.freed
+            .current_with(&self.epochs.enter(), &self.retiring, fresh)
+    }
+
+    /// Whether room is given back by another thread, the checkpointing thread's images: a writer
+    /// waiting for it then blocks rather than stepping its IO.
+    /// Waits handed out so far that block until another thread gives room back.
+    #[cfg(test)]
+    pub fn blocking_waits(&self) -> u64 {
+        self.blocking_waits.load(Ordering::Relaxed)
+    }
+
+    pub fn freed_elsewhere(&self, elsewhere: bool) {
+        self.freed_elsewhere.store(elsewhere, Ordering::Release);
     }
 
     /// Wakes whoever waits for room.

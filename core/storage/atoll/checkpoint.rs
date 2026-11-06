@@ -44,7 +44,7 @@ use super::store::PageStore;
 use super::txn::versioned::AsOf;
 use super::txn::{Cut, Transactions, Ts};
 use crate::io::Completion;
-use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
@@ -54,6 +54,9 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 crate::thread::thread_local! {
     /// Writing statements' steps that found nothing due, on this thread.
     pub(crate) static STEPS_PASSED_OVER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Steps of the checkpoint state taken on this thread, other than the checkpointing thread's,
+    /// for tests to tell writers that did checkpoint work.
+    pub(crate) static WRITER_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The record naming the metadata pages a checkpoint is about to write: its number, then each
@@ -119,6 +122,44 @@ pub struct Checkpointer {
     /// Bytes of image writes kept in flight, at most, beside [`WRITES`] of them.
     write_bytes: usize,
     counters: Counters,
+    /// The database's checkpointing thread, while it runs ([`Checkpointing::Thread`]): writers
+    /// then only wake it. Unset, and set again to none once it ends, writers step checkpoints.
+    driver: Mutex<Option<crate::thread::Thread>>,
+    /// Whether `driver` names one, read by every writer's step without the lock.
+    driven: AtomicBool,
+    /// Told to the thread when the database closes.
+    stop: AtomicBool,
+    /// Full checkpoints done, and whether one failed, as the state last recorded them, for a
+    /// transaction's end waiting on the thread without taking the state.
+    full_done: AtomicU64,
+    failure: Mutex<Option<String>>,
+    /// The ends of transactions waiting on the thread for a full checkpoint, woken as each
+    /// checkpoint ends, fails, or the thread does.
+    waiters: Mutex<Vec<Completion>>,
+}
+
+/// Who steps the checkpoints (Clay's ruling of 2026-11-05: off the commit path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpointing {
+    /// A thread of the database's own, which keeps the checkpoint's writes going as fast as the
+    /// device takes them. A writing statement and a transaction's end only wake it; a writer
+    /// refused room for kept copies waits for the room it frees; and past twice the log budget a
+    /// transaction's end waits for its full checkpoint, doing none of it.
+    Thread,
+    /// The writers, each statement and transaction's end stepping a checkpoint that is due: for a
+    /// platform without threads, or a test that steps checkpoints itself.
+    Writers,
+}
+
+impl Checkpointing {
+    /// A thread where the platform has threads.
+    pub const fn default_for_platform() -> Self {
+        if cfg!(any(target_family = "wasm", shuttle, atoll_loom)) {
+            Self::Writers
+        } else {
+            Self::Thread
+        }
+    }
 }
 
 /// How far a step goes.
@@ -158,11 +199,13 @@ impl Relief for CheckpointRelief {
 struct HeldIdle<'a, G> {
     _state: G,
     pool: &'a BufferPool,
+    checkpointer: &'a Checkpointer,
 }
 
 impl<G> Drop for HeldIdle<'_, G> {
     fn drop(&mut self) {
         self.pool.wake_room();
+        self.checkpointer.wake_driver();
     }
 }
 
@@ -293,6 +336,12 @@ impl Checkpointer {
             }),
             write_bytes: write_bytes.max(page::MAX_PAGE_SIZE),
             counters: Counters::default(),
+            driver: Mutex::new(None),
+            driven: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            full_done: AtomicU64::new(0),
+            failure: Mutex::new(None),
+            waiters: Mutex::new(Vec::new()),
         }
     }
 
@@ -318,19 +367,140 @@ impl Checkpointer {
     ) -> Result<IOResult<()>> {
         let clock = self.store.io();
         let began = clock.current_time_monotonic();
+        #[cfg(test)]
+        if !self.on_driver() {
+            WRITER_STEPS.with(|n| n.set(n.get() + 1));
+        }
         let out = state.step(self, txns, until);
         let took = clock.current_time_monotonic().duration_since(began);
         self.counters.stepping_ns.fetch_add(
             u64::try_from(took.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        self.recorded(state);
         out
     }
 
+    /// What the state records of full checkpoints and failure, published for a transaction's end
+    /// waiting on the thread, which is woken if either moved.
+    fn recorded(&self, state: &State) {
+        let failed = state.failed.is_some();
+        let before = self.full_done.swap(state.full_done, Ordering::AcqRel);
+        if failed {
+            let mut failure = self.failure.lock();
+            if failure.is_none() {
+                *failure = state.failed.clone();
+            }
+        }
+        if before != state.full_done || failed {
+            self.wake_waiters();
+        }
+    }
+
+    fn wake_waiters(&self) {
+        for c in std::mem::take(&mut *self.waiters.lock()) {
+            c.complete(0);
+        }
+    }
+
     /// The state let go: a writer waiting for room tries again, finding the room given back, or
-    /// steps the checkpoint on itself.
+    /// steps the checkpoint on itself; the thread, if it found the state taken, steps it now.
     fn left(&self) {
         self.pool.wake_room();
+        self.wake_driver();
+    }
+
+    /// Whether the database's checkpointing thread runs.
+    fn driven(&self) -> bool {
+        self.driven.load(Ordering::Acquire)
+    }
+
+    /// Whether this is the checkpointing thread.
+    fn on_driver(&self) -> bool {
+        let id = crate::thread::current().id();
+        self.driver.lock().as_ref().is_some_and(|t| t.id() == id)
+    }
+
+    /// Wakes the checkpointing thread, from any other thread: a checkpoint may be due.
+    fn wake_driver(&self) {
+        if !self.driven() {
+            return;
+        }
+        let driver = self.driver.lock().clone();
+        if let Some(t) = driver {
+            if t.id() != crate::thread::current().id() {
+                t.unpark();
+            }
+        }
+    }
+
+    /// The database's checkpointing thread ([`Checkpointing::Thread`]), named before it first
+    /// runs, so no writer steps a checkpoint once the database is open.
+    pub(crate) fn attach_driver(&self, thread: crate::thread::Thread) {
+        *self.driver.lock() = Some(thread);
+        self.pool.room_freed_elsewhere(true);
+        self.driven.store(true, Ordering::Release);
+    }
+
+    /// The checkpointing thread's work, until the database closes: steps whatever is due, waiting
+    /// on its writes, so they go as fast as the device takes them, and parks while nothing is.
+    /// Once it ends, however it ends, writers step checkpoints again and no waiter is left.
+    pub(crate) fn drive(&self, io: &Arc<dyn crate::io::IO>, txns: &Transactions) {
+        struct Ended<'a>(&'a Checkpointer);
+        impl Drop for Ended<'_> {
+            fn drop(&mut self) {
+                self.0.driven.store(false, Ordering::Release);
+                *self.0.driver.lock() = None;
+                self.0.pool.room_freed_elsewhere(false);
+                self.0.wake_waiters();
+                self.0.pool.wake_room();
+            }
+        }
+        let _ended = Ended(self);
+        while !self.stop.load(Ordering::Acquire) {
+            let stepped = self.state.try_lock().map(|mut state| {
+                let out = self.stepping(&mut state, txns, Until::Done);
+                drop(state);
+                self.left();
+                out
+            });
+            match stepped {
+                Some(Ok(IOResult::IO(IOCompletions(c)))) => {
+                    if let Err(e) = io.wait_for_completion(c) {
+                        tracing::warn!("the checkpoint's wait failed: {e}");
+                    }
+                }
+                // Nothing due, a failure that stops every checkpoint until the database is opened
+                // again (told to whoever waits), or the state taken by another, who wakes it on
+                // letting go.
+                Some(Ok(IOResult::Done(()))) | Some(Err(_)) | None => crate::thread::park(),
+            }
+        }
+    }
+
+    /// Tells the checkpointing thread to end, at its next step: the database closes.
+    pub(crate) fn stop_driver(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake_driver();
+    }
+
+    /// A transaction's end waiting for full checkpoint `ticket`, which the thread does: done once
+    /// it is, a failure once one has failed, else a wait the thread finishes.
+    fn wait_full(&self, ticket: u64) -> Result<IOResult<()>> {
+        let mut waiters = self.waiters.lock();
+        if let Some(failed) = self.failure.lock().as_ref() {
+            return Err(LimboError::InternalError(format!(
+                "a checkpoint failed ({failed}): none runs until the database is opened again"
+            )));
+        }
+        if self.full_done.load(Ordering::Acquire) >= ticket {
+            return Ok(IOResult::Done(()));
+        }
+        let c = Completion::new_remote_wait();
+        waiters.push(c.clone());
+        drop(waiters);
+        self.wake_driver();
+        Ok(IOResult::IO(IOCompletions(c)))
     }
 
     /// For a writer refused room for kept copies, holding nothing: steps the checkpoint under way
@@ -339,6 +509,12 @@ impl Checkpointer {
     /// checkpoint that fails meanwhile is abandoned, its cut ended and its copies dropped, and
     /// tells its failure to whoever steps checkpoints next: the writer goes on, as commits do.
     pub fn relieve(&self, txns: &Transactions) -> Option<Result<IOResult<()>>> {
+        // The thread's to step, kept copies first while a writer waits: the writer waits for the
+        // room it frees.
+        if self.driven() && !self.on_driver() {
+            self.wake_driver();
+            return None;
+        }
         let mut state = self.state.try_lock()?;
         let out = self.stepping(&mut state, txns, Until::Room);
         drop(state);
@@ -371,6 +547,10 @@ impl Checkpointer {
     /// Does whatever is due: a checkpoint once its share of the log has been appended, going on
     /// with one under way. Done once nothing more is due now, or while someone else steps it.
     pub fn step(&self, txns: &Transactions) -> Result<IOResult<()>> {
+        if self.driven() && !self.on_driver() {
+            self.wake_driver();
+            return Ok(IOResult::Done(()));
+        }
         let Some(mut state) = self.state.try_lock() else {
             return Ok(IOResult::Done(()));
         };
@@ -402,6 +582,7 @@ impl Checkpointer {
         self.state.try_lock().map(|state| HeldIdle {
             _state: state,
             pool: &self.pool,
+            checkpointer: self,
         })
     }
 
@@ -415,12 +596,23 @@ impl Checkpointer {
 
     /// Asks for a full checkpoint: one begun after the ask, done. Step it with
     /// [`step_full`](Self::step_full).
+    /// Full checkpoints asked for so far, for a test to tell one was.
+    #[cfg(test)]
+    pub(crate) fn fulls_requested(&self) -> u64 {
+        self.full_wanted.load(Ordering::Acquire)
+    }
+
     pub fn request_full(&self) -> u64 {
-        self.full_wanted.fetch_add(1, Ordering::AcqRel) + 1
+        let ticket = self.full_wanted.fetch_add(1, Ordering::AcqRel) + 1;
+        self.wake_driver();
+        ticket
     }
 
     /// Done once the full checkpoint `ticket` names is done.
     pub fn step_full(&self, ticket: u64, txns: &Transactions) -> Result<IOResult<()>> {
+        if self.driven() && !self.on_driver() {
+            return self.wait_full(ticket);
+        }
         let Some(mut state) = self.state.try_lock() else {
             return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
         };

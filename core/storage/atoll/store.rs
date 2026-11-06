@@ -112,6 +112,9 @@ pub struct PageStore {
     growing: Mutex<()>,
     /// Where each class's next slot search starts: a hint.
     cursors: [AtomicU64; CLASS_COUNT],
+    /// Where each class's next page number search starts: a hint, past the last number taken or
+    /// at the lowest made reusable since.
+    numbers: [AtomicU64; CLASS_COUNT],
     epochs: Arc<Epochs>,
     /// The checkpoint the changes made now belong to: the one after the checkpoint in charge, or
     /// after the one cut and not yet in charge.
@@ -205,6 +208,7 @@ impl PageStore {
             heights: heights.map(|h| h.map(|l| AtomicU8::new(l.max(1)))),
             growing: Mutex::new(()),
             cursors: Default::default(),
+            numbers: Default::default(),
             epochs,
             epoch: AtomicU64::new(in_charge + 1),
             swap: (0..SWAP_SHARDS)
@@ -502,6 +506,8 @@ impl PageStore {
     fn reclaim_numbers(&self) {
         for pid in self.freed_numbers.reclaim(&self.epochs) {
             self.unreusable[pid.class().index()].clear(pid.number());
+            // The lowest free number first: the search goes back to it.
+            self.numbers[pid.class().index()].fetch_min(pid.number(), Ordering::Relaxed);
         }
     }
 
@@ -509,7 +515,9 @@ impl PageStore {
     pub fn allocate(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<PageId>> {
         self.reclaim_numbers();
         loop {
-            let number = match self.find_free(Tree::Map, class, 0, false)? {
+            // Next fit: from past the last number taken, round to the start.
+            let from = self.numbers[class.index()].load(Ordering::Relaxed);
+            let number = match self.find_free(Tree::Map, class, from, false)? {
                 IOResult::Done(Some(n)) => n,
                 IOResult::Done(None) => match self.grow(Tree::Map, class)? {
                     IOResult::Done(()) => continue,
@@ -518,7 +526,10 @@ impl PageStore {
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
             match self.take_number(PageId::new(class, number))? {
-                IOResult::Done(true) => return Ok(IOResult::Done(PageId::new(class, number))),
+                IOResult::Done(true) => {
+                    self.numbers[class.index()].store(number + 1, Ordering::Relaxed);
+                    return Ok(IOResult::Done(PageId::new(class, number)));
+                }
                 // Taken, or the tree grew, since the search: look again.
                 IOResult::Done(false) => continue,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),

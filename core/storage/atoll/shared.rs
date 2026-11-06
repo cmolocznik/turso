@@ -312,13 +312,27 @@ impl Bytes for Shared {
         let (from, words) = ((at + head) / WORD, rest.len() / WORD);
         let words_of = &self.words[from..from + words];
         let dst = rest.as_mut_ptr();
-        for (k, word) in words_of.iter().enumerate() {
+        let mut quads = words_of.chunks_exact(4);
+        let mut k = 0;
+        for q in &mut quads {
+            let w = [
+                q[0].load(Ordering::Relaxed),
+                q[1].load(Ordering::Relaxed),
+                q[2].load(Ordering::Relaxed),
+                q[3].load(Ordering::Relaxed),
+            ];
+            // SAFETY: `k + 4 <= words`, so the 32 bytes at `k * WORD` lie in `rest`.
+            unsafe { dst.add(k * WORD).cast::<[u64; 4]>().write_unaligned(w) };
+            k += 4;
+        }
+        for word in quads.remainder() {
             // SAFETY: `k < words`, so the 8 bytes at `k * WORD` lie in `rest`.
             unsafe {
                 dst.add(k * WORD)
                     .cast::<u64>()
                     .write_unaligned(word.load(Ordering::Relaxed))
             };
+            k += 1;
         }
         let tail = &mut rest[words * WORD..];
         if !tail.is_empty() {

@@ -854,6 +854,7 @@ impl Transactions {
     /// Whether the version written by the transaction that started at `start` in `slot` is visible
     /// to `txn`'s current statement. Every version of `txn` itself is, its current statement's
     /// included, as Turso's VDBE expects of a cursor (DESIGN.md §11.1).
+    #[inline]
     pub fn visible(&self, txn: &mut Txn, slot: u16, start: Ts) -> bool {
         debug_assert!(txn.snapped, "a read before the transaction's snapshot");
         if slot == txn.slot && start == txn.start {

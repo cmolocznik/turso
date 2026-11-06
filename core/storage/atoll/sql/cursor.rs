@@ -157,7 +157,9 @@ impl Record {
                 None => {
                     let value = cursor.value().expect("a row");
                     let buf = self.buf.take().unwrap_or_else(RecordBuf::alloc);
-                    ImmutableRecord::copy_payload(value, buf)?
+                    let mut record = ImmutableRecord::from_buf(buf);
+                    record.start_serialization(value)?;
+                    record
                 }
             };
             self.read = Some(record);
@@ -526,13 +528,19 @@ impl AtollCursor {
     }
 
     /// The row's rowid: a table's key, or an index record's last column where the index has one.
+    #[inline]
     pub fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
-        if self.is_empty() {
+        if self.null_row || self.left.is_some() {
             return Ok(IOResult::Done(None));
         }
         if self.entry.layout == Layout::Table {
-            let key = self.cursor.key().expect("a row");
-            return Ok(IOResult::Done(Some(key::rowid_of(key)?)));
+            return match self.cursor.key() {
+                Some(key) => Ok(IOResult::Done(Some(key::rowid_of(key)?))),
+                None => Ok(IOResult::Done(None)),
+            };
+        }
+        if self.is_empty() {
+            return Ok(IOResult::Done(None));
         }
         if !self.index.as_ref().is_some_and(|i| i.has_rowid) {
             return Ok(IOResult::Done(None));
@@ -856,7 +864,11 @@ impl AtollCursor {
                     self.id
                 )));
             }
-            let kept = self.kept.take().filter(|_| self.probed == k);
+            let kept = self
+                .kept
+                .take()
+                .filter(|_| self.probed == k)
+                .or_else(|| self.cursor.kept_at(&k));
             self.writing = Some(if self.plain {
                 let guard = self.txn.lock();
                 let txn = guard.as_ref().ok_or_else(outside)?;
@@ -1016,8 +1028,11 @@ impl AtollCursor {
                 self.spare = (k, entry);
                 Writing::PlainRemove(remove)
             } else {
+                let kept = self.cursor.kept_at(&k);
                 Writing::Versioned(
-                    WriteOp::delete_into(k, entry).near(self.cursor.near()),
+                    WriteOp::delete_into(k, entry)
+                        .near(self.cursor.near())
+                        .kept(kept),
                     Mode::Update,
                 )
             });

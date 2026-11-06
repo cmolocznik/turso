@@ -1910,16 +1910,22 @@ impl CursorTrait for SqlCursor {
         self.moved(out)
     }
 
+    #[inline]
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
-        crate::return_if_io!(self.caught_up());
+        if self.changes.epoch() != self.seen {
+            crate::return_if_io!(self.caught_up());
+        }
         match self.open.as_mut() {
             Some(c) => Ok(c.rowid()?),
             None => Ok(IOResult::Done(None)),
         }
     }
 
+    #[inline]
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
-        crate::return_if_io!(self.caught_up());
+        if self.changes.epoch() != self.seen {
+            crate::return_if_io!(self.caught_up());
+        }
         match self.open.as_mut() {
             Some(c) => Ok(c.record()?),
             None => Ok(IOResult::Done(None)),

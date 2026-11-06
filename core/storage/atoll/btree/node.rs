@@ -540,14 +540,23 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         let (mut lo, mut hi) = (0, count);
         if count > HINT_COUNT * 2 {
             let dist = count / (HINT_COUNT + 1);
-            let mut pos = 0;
-            while pos < HINT_COUNT && self.hint(pos) < key_head {
-                pos += 1;
-            }
-            let mut pos2 = pos;
-            while pos2 < HINT_COUNT && self.hint(pos2) == key_head {
-                pos2 += 1;
-            }
+            // The first hint at or above the head, and the first above it: the hints rise with
+            // the slots they sample, so two binary searches find them.
+            let first = |above: bool| {
+                let (mut lo, mut hi) = (0, HINT_COUNT);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let h = self.hint(mid);
+                    if h < key_head || above && h == key_head {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            };
+            let pos = first(false);
+            let pos2 = first(true);
             lo = pos * dist;
             if pos2 < HINT_COUNT {
                 hi = ((pos2 + 1) * dist).min(count);

@@ -20,7 +20,7 @@
 
 use super::{corrupt_header, Chain, Transactions, Txn, Version, VersionedTree, Versions, HEADER};
 use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
-use crate::storage::atoll::btree::{Cursor, Near, Seek, StoredValue};
+use crate::storage::atoll::btree::{Cursor, Kept, Near, Seek, StoredValue};
 use crate::types::IOResult;
 use crate::{LimboError, Result};
 
@@ -154,6 +154,14 @@ impl VersionedCursor {
             Shown::Plain => self.cursor.key(),
             Shown::Held(k, _, _) | Shown::Apart(k) => Some(k),
         }
+    }
+
+    /// Its leaf's look at `key`, where the plain cursor rests on that key's entry as its leaf
+    /// holds it: what a write of the key it stands at goes in from.
+    pub fn kept_at(&self, key: &[u8]) -> Option<Kept> {
+        (self.cursor.key()? == key)
+            .then(|| self.cursor.kept())
+            .flatten()
     }
 
     /// Whether the row's value is out of line and not read yet: [`VersionedTree::load`] reads it.

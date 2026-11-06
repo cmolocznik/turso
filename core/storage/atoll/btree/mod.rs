@@ -491,8 +491,12 @@ impl Tree {
     }
 
     /// The reference of `cursor`'s entry, whose value is out of line and unread.
+    #[inline]
     pub fn unread_reference(&self, cursor: &Cursor) -> Option<ValueRef> {
-        let value = cursor.value().filter(|_| cursor.unread)?;
+        if !cursor.unread {
+            return None;
+        }
+        let value = cursor.value()?;
         Some(self.split_reference(value)?.1)
     }
 
@@ -2373,6 +2377,23 @@ impl Cursor {
         self.reading = None;
         self.held = None;
         true
+    }
+
+    /// The entry it rests on as a look at its leaf would keep it ([`Looked::keep`]): while the
+    /// entry is as its leaf holds it, read there at its slot. A write of its key redeems it while
+    /// the leaf is unchanged, reaching no leaf again.
+    pub fn kept(&self) -> Option<Kept> {
+        let (pid, hint, version) = self.leaf?;
+        let pos = self.at?;
+        let value = self.value()?;
+        Some(Kept {
+            pid,
+            hint,
+            version,
+            pos,
+            exact: true,
+            present: Some((value.to_vec(), self.unread)),
+        })
     }
 
     /// Takes the next entry of a forward step's batch, with no move pending: whether there was one.

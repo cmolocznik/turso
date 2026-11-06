@@ -348,11 +348,13 @@ len: u32 | kind: u8 | flags: u8 | index: u8 | size: u8 | txn: u64 | prev: u64 | 
 Any failed log write or sync makes the log refuse further appends and fails every waiter. The
 database accepts no writes until it restarts and recovers.
 
-A panic in Atoll ends the process (section 22.11). A thread that panics holding a latch, or
-between applying a change and recording what the change leaves to collect (a todo item, section
-11.5), can leave the log, a page and a slot's todo list out of step, and nothing in the process may
-read them after that. Every build Turso ships already aborts on a panic (`panic = "abort"`); where
-a build unwinds, every entry into Atoll carries an abort guard that an unwind cannot pass. Recovery
+A panic in Atoll ends the process (section 22.11), before anything it left half made can be read.
+A thread that panics holding a latch, or between applying a change and recording what the change
+leaves to collect (a todo item, section 11.5), can leave the log, a page and a slot's todo list out
+of step, and nothing in the process may read them after that. Every build Turso ships already
+aborts on a panic (`panic = "abort"`); where a build unwinds, every guard that releases shared state
+aborts before releasing it, and every entry into Atoll carries an abort guard that an unwind cannot
+pass. Recovery
 at the next open then frees every page still marked retired and removes every tombstone left behind
 (section 12), which also covers a rollback that could not finish.
 
@@ -1691,7 +1693,7 @@ work says which parts are done.
 12. **Streams** (section 21): a partition's batch append and read, recovery, and whole-segment
     retention (built: `stream.rs`); then segment index files, the stream's memory budget, the
     catalog in trees, transactions with streams, and consumer and producer state.
-13. **The executor** (section 22): designed on 2026-11-06 and revised after four audits, not
+13. **The executor** (section 22): designed on 2026-11-06 and revised after five audits, not
     built but for `StateHold`; its own order of work is 22.16.
 
 ## 21. Streams (Clay's spec of 2026-11-06)
@@ -1817,7 +1819,7 @@ of every segment retained); the stream's own memory budget (chunks come from a f
 the log's buffer, and a read copies each batch into a heap buffer of its own); the catalog in trees,
 and streams of several partitions; leases that read with no copy; and section 21.6.
 
-## 22. The executor (designed 2026-11-06, revised after four audits; not built)
+## 22. The executor (designed 2026-11-06, revised after five audits; not built)
 
 Every background job of a database runs as a task on one executor of the database's own, which
 owns their scheduling and every wake. A job says what it waits on and whose work that wait needs;
@@ -1903,8 +1905,9 @@ apart. An **executor target** is a task's header or a parked runner's thread: wa
 exchange, a link into the run queue under its mutex, or an unpark, which takes no lock but the
 queue's, runs no code of anyone else's and cannot panic. An **arbitrary waker** is a
 `std::task::Waker` from outside the executor (an embedder's future, a foreground thread's wait); it
-may run code. Executor lists hold executor targets only; arbitrary wakers are held only by
-completions.
+may run code. Signal and contender lists hold executor targets only; arbitrary wakers are held by
+completions, and by the external runners' nodes of the idle list, which are woken only after every
+executor mutex is released (22.3).
 
 1. **A completion.** `Completion::set_waker` registers before it tests whether the completion
    finished. Finishing is as today (`core/io/completions.rs`): the completion's callback runs
@@ -1998,8 +2001,8 @@ completions.
   claim, close or class change can see one without the other. Moves among `Idle`, `Running`,
   `Running|Notified` and `Done` are compare-exchanges and need no mutex.
   - **Wake**: from `Running`, a compare-exchange to `Running|Notified`. From `Idle`: under the
-    mutex, `Idle` to `Queued` and link into the list of the task's class (22.4), take an idle
-    runner off its list (below) and unpark it. From any other state, nothing.
+    mutex, `Idle` to `Queued` and link into the list of the task's class (22.4), and take an idle
+    runner's node off its list (below). From any other state, nothing.
   - **Claim**: under the mutex, unlink the head of the highest non-empty class and move it
     `Queued` to `Running`; the move acquires everything the previous runner published.
   - **End of a step**, from the word the runner last read: `Done` to `Done` whether or not
@@ -2017,12 +2020,33 @@ completions.
     an old waker can never wake a new task; 22.13 bounds the headers alive.
 - **The run queue** is one intrusive FIFO list per class, linked through the headers, so it has no
   capacity to exhaust, allocates nothing, and holds each task at most once.
-- **An idle runner registers under the same mutex**: one that finds every list empty links its own
-  node into the idle runners (every runner brings one, a caller running the executor included:
-  22.13), releases the mutex, then waits (22.5). Since a link takes an idle runner off
-  that list under the mutex, no link misses a runner that registered, and an unpark that lands
-  before the park returns it at once. The runner the link took is unparked under the mutex: an
-  executor target (22.2).
+- **Idle runners.** A runner that finds every list empty links its own node into the idle runners
+  under the queue mutex, releases it, then waits (22.5). Every runner brings one node, provisioned
+  with it (22.13). A node is internal (a worker's or a blocking caller's thread, parked) or
+  external (an embedder thread's `run_one`, or a cooperative caller polling an executor completion:
+  22.7), carrying the arbitrary `Waker` its runner last registered. A link takes at most one idle
+  node off the list under the mutex. An internal node's thread is unparked there, an executor
+  target (22.2); an unpark that lands before the park returns it at once.
+- **An external node is never woken under an executor mutex.** A link that takes one moves it,
+  still under the queue mutex, onto the executor's to-wake list, intrusive through the node itself
+  (a node is on at most one list), and adds one to the count of nodes moved by the outermost
+  operation it belongs to. Every outermost operation that can link (a task's `Waker::wake`, a
+  notify, a release, a ticket taken or dropped, the end of a step, close) ends, after releasing
+  every executor mutex it took, with a drain of at most as many nodes as it moved: under the queue
+  mutex it pops one node, takes the `Waker` out of it (`Option::take`) and marks it off every
+  list, releases the mutex, invokes the `Waker`, and repeats until its count is spent or the list
+  is empty. A nested call (a link inside a notify) moves but never drains. The list never holds
+  more nodes than the unspent counts of the operations still to drain, because a drain stops only
+  with its count spent or the list empty; so every node moved is invoked by some drain, and each
+  drain's work is bounded by its own moves, however often a host re-registers and is moved again.
+  After the pop the drainer holds only the `Waker`, so a runner may cancel and free its node at any
+  time: a cancel unlinks the node, under the queue mutex, from whichever list holds it, and the
+  count that covered it is spent on another node or forfeits at an empty list.
+- **Lock order**: a signal's or a guarded state's contender mutex, then the queue's. Nothing takes a
+  signal or contender mutex while holding the queue's: removing a task closes it under the queue
+  mutex, releases it, then takes it off its signal and contender lists. A caller that already
+  holds the queue mutex wakes through the queue-locked form of the link, never through the general
+  wake.
 
 ### 22.4 Classes and demand
 
@@ -2099,12 +2123,28 @@ says which owner that is:
     lists every callback Turso and Atoll construct, with what it does. Today's control and metadata
     callbacks, which submit the next sync, are of this kind; the log's segment preparation is not:
     its `prepared` callback syncs the segments' directory, looks for the next segment (which may
-    create and allocate a file) and retries the flush, synchronously. It leaves the callback when
-    the preparer becomes a task (22.9 item 2), and the ring becomes the default only after that
-    (22.16).
-  - **A callback that panics on the delivery thread ends the process**: each callback runs in a
-    frame (22.11). The thread cannot hand a panic to anyone, and a ring left without its deliverer
-    would strand every waiter on it.
+    create and allocate a file) and retries the flush, synchronously. From 22.16 step 3, before the
+    delivery thread is built, an interim adapter moves that work out of the callback: the log's
+    callbacks only submit the next request and record what landed, then wake the admitters and the
+    durable waiters; the synchronous rest (the directory sync, the next segment's create, allocate
+    or rename, the prepared end's publication, and the flush that padding waited on) runs in the
+    thread of whoever next calls into admission or durability, a woken admitter's retry of `admit`
+    or a durable waiter's of `wait_durable`, inline in its own frame before it looks at room again,
+    in today's order: file synced, directory synced, prepared end published, admission woken, flush
+    retried. With nobody waiting, the next admission or flush runs it. That is today's foreground
+    `prepare_ahead` path made the only path. The preparer task replaces the adapter (22.9 item 2),
+    and the ring becomes the default only after that (22.16).
+  - **A callback that panics on the delivery thread ends the process**: each delivery runs in a
+    frame (22.11), from the callback through the result's publication and the wakes to the
+    request's retirement. The thread cannot hand a panic to anyone, and a ring left without its
+    deliverer would strand every waiter on it.
+  - **The thread never returns on an error.** An error of one request is that request's result,
+    delivered through its completion. An error of the ring itself, from its kernel wait or from
+    moving queued requests in, is retried where the kernel says it may be (an interrupted wait; a
+    busy or full completion queue, which the thread drains first and then retries); any other
+    (a ring the kernel no longer recognizes, a fault in its memory) leaves accepted requests the
+    thread can no longer deliver or retire, so it ends the process with the error printed (22.11),
+    rather than return and leave every waiter and close waiting on requests nobody will deliver.
   - **Its lifetime.** The thread holds the ring's shared state, never the handles the embedder
     holds. It runs while any handle to the ring (the IO and its files) lives or any request is
     outstanding; the last handle's drop writes the ring's eventfd, whose standing poll ends the
@@ -2119,12 +2159,23 @@ says which owner that is:
   backend's own clock has not reached a request (the simulator's latency): stepping advances that
   clock, and its CPU is the simulator's time model. A backend that cannot say how many are queued
   (a VFS) is stepped while anyone waits on one of its requests; its readiness is its own contract.
+  A request's error is delivered through its completion; an error of the stepping itself (an
+  extension's `run_once`, the completion port's) means the backend cannot account for what it
+  accepted, and ends the process as the ring's does.
 
 **Retirement is not finishing.** A request is retired when its backend lets go of it and of every
 buffer it reads into or writes from, after its callback has returned. A request owns those buffers
 until then, through references the backend holds; a completion finished early (a cancel aborts the
 completion before the kernel has given the request back) does not end that ownership.
 
+- **A completion's ownership has three states**: not submitted, accepted, retired. It is not
+  submitted from its creation until a submission accepts it; a submission that accepts nothing
+  leaves it not submitted. Only an accepted completion is owned by a backend; a not submitted one
+  owns no buffer of a backend's, and `IO::wait_retired` returns at once for it. A group (a
+  `CompletionGroup`) is waited child by child, so a child added and never accepted (the sorter
+  adds a child before its read is submitted) does not hold the group's drain. A drain is made by
+  the owner of what it drains after it has stopped submitting to it: no request can be accepted
+  after the drain looked at it.
 - **Every backend reports retirement** separately from finishing, through the completion: inline
   at the submission's return, pumped when its step has delivered it, the ring when the request's
   own entry has been delivered. A submission either returns an error having accepted nothing, or
@@ -2214,9 +2265,11 @@ One loop takes the next task by class and steps it (22.3). Four runners call it:
   executor completion: a blocking wait on it acts as a runner (22.5) until it finishes, claiming
   queued tasks by class and, on a pumped backend, stepping it between task steps (22.5), and with
   none queued parking among the idle runners and on the completion; a cooperative poll of it runs
-  one task step and, on a pumped backend, one IO step, then, unfinished, registers on the
-  completion and the executor's idle list, wakes its own waker if anything is still queued, and
-  returns `Pending`, so its host has control back after each unit and polls again. Neither enters
+  one task step and, on a pumped backend, one IO step, then, unfinished, registers its `Waker` on
+  the completion and on its external node in the idle runners (22.3), wakes its own waker if
+  anything is still queued, and returns `Pending`, so its host has control back after each unit and
+  polls again when one of those wakes it: the completion finishing, or a task linked while its node
+  is idle. Neither enters
   the executor from inside a step or a waker. Either runs only as much as today's
   `Checkpointing::Writers` makes a writer run. The
   waiter's ticket (22.4) makes what it waits for, and what that waits for, the first claimed.
@@ -2227,12 +2280,12 @@ One loop takes the next task by class and steps it (22.3). Four runners call it:
   runner. With workers, waiters only wait: the workers run what they need, and connections never run
   background work. Callers' background work advances only while connections call: a task queued with
   no caller waiting on it stays queued until one comes, which the queue's ages report (22.14).
-- **Embedder**: threads the embedder provides (section 18) call `run_one`, which steps one task,
-  or with none to claim registers the embedder's waker among the idle runners and returns, so a
-  link wakes it. Requests are delivered by their owners (22.5), so the embedder drives no IO but a
-  pumped backend's, which it steps as a worker would. `run_one` is safe from any number of threads,
-  is never entered from inside a step or a waker (asserted), and close waits for every call in
-  progress to return.
+- **Embedder**: threads the embedder provides (section 18) call `run_one`, which steps one task, or
+  with none to claim registers the embedder's waker on its external node among the idle runners and
+  returns, so a link wakes it, after the executor's mutexes are released (22.3). Requests are
+  delivered by their owners (22.5), so the embedder drives no IO but a pumped backend's, which it
+  steps as a worker would. `run_one` is safe from any number of threads, is never entered from
+  inside a step or a waker (asserted), and close waits for every call in progress to return.
 - **Deterministic**: for the simulator and replayed schedules: one runner on the same queue, strict
   by class and first in first out within one, over the simulator's seeded IO. The seed decides when
   requests complete and when callers come; the queue decides the rest. Replay is claimed over
@@ -2375,29 +2428,63 @@ The executor changes who runs each transition, never its order or its meaning:
 
 ### 22.11 Failure
 
-- **A task's error** is its job's (22.9, 22.10).
-- **A panic in Atoll ends the process**, and the next open recovers (section 12): nothing in the
-  process can read what it left half made, because nothing in the process runs after it. Every
-  build Turso ships already does this on any panic: its release profile sets `panic = "abort"`,
-  and the official and library release profiles inherit it. Keeping a database alive in a process
-  that unwinds needed poisoned guards held forever, failure epilogues owed across threads, rules for
-  panics inside an unwind, a close for state nobody may touch, and poison that survives eviction;
-  each audit of those found a further case. One rule replaces them for the builds that unwind
-  (tests, and embedders whose own profile unwinds).
-- **Every entry is a frame with an armed abort guard**, defused only on the frame's normal return,
-  so an unwind out of the frame aborts whatever the thread, the nesting of unwinds, or a
-  `catch_unwind` around it; no check of `std::thread::panicking()` decides it. The entries: each
-  step of a statement on an Atoll database; each method of Atoll's facade (`AtollDb`, `Atoll`, a
-  stream partition); a runner's step and `run_one`; each callback, dispatched by any backend
-  (22.5); opening, recovery and close. Below the facade Atoll's types are crate-private, so code
-  outside `turso_core` reaches Atoll only through a frame; a census test lists the facade's methods
-  and fails on one without its frame. Tests inside the crate that call Atoll's internals directly
-  (the `should_panic` tests of debug assertions) run without frames, as today, and a test that
-  means to panic through a frame runs in a child process.
-- **Atoll catches no unwind.** No `catch_unwind` in `core/storage/atoll` outside tests, so no
-  Atoll code goes on after a panic below it.
-- **Section 7.5** now says a panic ends the process. A panic is a defect in Atoll; recovery is the
+- **A task's error** is its job's (22.9, 22.10). An ordinary error (a `Result::Err`, busy, a
+  deadlock, an IO error delivered through a request) stays an ordinary result everywhere: nothing
+  below turns one into an abort.
+- **A panic in Atoll ends the process, before anything it left half made can be read**, and the
+  next open recovers (section 12). The whole process ends, other databases in it and on its ring
+  included: this is not isolation per database. Every build Turso ships already does this on any
+  panic: its release profile sets `panic = "abort"`, and the official and library release profiles
+  inherit it. Those are the workspace's profiles; an application that builds Turso as a dependency
+  decides its own panic strategy, so for builds that unwind (tests, and such applications) the
+  rules below give the same outcome. Keeping a database alive in a process that unwinds needed
+  poisoned guards held forever, failure epilogues owed across threads, rules for panics inside an
+  unwind, a close for state nobody may touch, and poison that survives eviction; each audit of
+  those found a further case. These rules replace them.
+- **The guard is the boundary.** Every destructor that lets shared state go, publishes it, cleans
+  it up or wakes anyone for it aborts first, before doing any of that, when its thread is
+  unwinding (`std::thread::panicking()`): a page latch held exclusive (and the wrappers that clean
+  up or publish before their latch is released: a frame being loaded, a page being written out),
+  the release paths that hand a latch back unchanged, the checkpoint's state, the write gate and
+  the change gate, metadata frames held for editing, a log reservation (whose drop gives back room
+  and wakes admitters), and the maintenance gate. So in an unwinding build no other thread can see
+  a latch free, a gate open, room given back or a contender woken between the panic and the end
+  of the process; a native abort build never unwinds at all. A census test lists every type in
+  Atoll with such a destructor and fails on one without the check.
+- **The check is exact because no Atoll frame is entered while its thread unwinds.** Every entry
+  into Atoll is a frame (below), and a frame entered while `std::thread::panicking()` is true (an
+  application's unwind dropping a connection with an Atoll transaction open, a statement holding
+  Atoll state, or the last handle of an Atoll database) aborts at once, before it takes anything.
+  A drop with nothing to hand Atoll (no transaction open, no Atoll state) does not enter it. So
+  any unwind a guard sees began inside the frame that took the guard, and a guard dropped during
+  an unwind is always one a panic is passing through.
+- **Frames, for a panic that holds no guard.** A panic between two guards (a change applied and
+  logged under its latch, the latch let go, and the panic before what the change leaves to collect
+  is recorded, section 7.5) leaves state out of step without any guard held. Every entry runs its
+  whole body through one helper, `atoll_frame(|| ...)`, whose armed abort guard is defused only
+  after the closure has returned, so the closure's arguments, captures and locals are all dropped
+  inside the frame; a `Result::Err` returns normally and defuses it. The entries: each step of a
+  statement on an Atoll database; each method of Atoll's facade (`AtollDb`, `Atoll`, a stream
+  partition), its `Drop` included, whose fields are held so that they are dropped inside the frame
+  (the facade owns its state through one inner value its `Drop` takes and drops inside the frame); a
+  runner's step and `run_one`; each delivery on any backend, from the callback through the result's
+  publication and the wakes to the request's retirement (22.5); opening, recovery and close.
+- **The facade returns no Atoll code to run later.** What it returns is plain data, or a value
+  whose every method, `Drop` included, is itself a facade entry (a stream read's iterator is one:
+  each `next` runs in a frame). Below the facade Atoll's types are crate-private. A census test
+  lists the facade's types, methods and trait implementations and fails on any without its frame.
+  Tests inside the crate that call Atoll's internals directly (the `should_panic` tests of debug
+  assertions) run without frames, as today; a test that means to panic through a frame runs in a
+  child process.
+- **Atoll catches no unwind.** No `catch_unwind` in `core/storage/atoll` outside tests.
+- **Errors that end the process besides panics**: the ring's delivery thread meeting an error
+  it cannot retry (22.5), and a pumped backend whose own stepping fails rather than a request of
+  it. Either has lost the means to retire what it accepted; returning would strand every waiter
+  on it and break close's promise. Each is stated where it arises and is no silent abort.
+- **Section 7.5** says a panic ends the process. A panic is a defect in Atoll; recovery is the
   path crash tests already prove, and the process's supervisor or embedder decides what runs next.
+  An application whose panic unwinds through live Atoll state (a test that fails while holding a
+  connection mid-transaction) ends with an abort, after its panic message has been printed.
 
 ### 22.12 Close
 
@@ -2410,8 +2497,8 @@ ran while the executor still ran. Nothing the executor or a waker holds keeps th
    runs: a flush may need a segment the preparer has yet to make. Every record a statement wrote is
    before that end; a record a job appends after it (a checkpoint's intent) belongs to work step 3
    abandons, which recovery treats as a crash would. A failure (a failed log, section 7.5) ends the
-   wait at once, since the log fails every durable waiter; it is logged and returned to an explicit
-   close.
+   wait at once, since the log fails every durable waiter; it is kept, close goes on through every
+   later step, and the failure is logged and returned to an explicit close only after step 5.
 2. **Closing published**: no task is claimed or linked again, and every step in progress ends; its
    runner sees closing and leaves.
 3. **Logical waits abandoned**: each task is closed, and its job's abandonment runs on the closing
@@ -2449,10 +2536,11 @@ A panic during close ends the process (22.11).
   their removal: a request in flight (one per request) or a logical completion a removed task
   waited on (one per such wait). Lists are woken under their own mutex and never detached (22.2),
   so no list being woken holds a header past its removal.
-- **The run queue and the idle runners** are intrusive lists: each runner (worker, embedder thread,
-  or caller running the executor) brings its own node, provisioned with it (a caller's with its
-  connection), and takes it off when it stops waiting, is cancelled or drops. No capacity, no
-  allocation (22.3).
+- **The run queue, the idle runners and the to-wake list** are intrusive lists: each runner
+  (worker, embedder thread, or caller running the executor) brings its own node, provisioned with
+  it (a caller's with its connection; a connection runs one wait at a time), and takes it off when
+  it stops waiting, is cancelled or drops. No capacity, no allocation. A drain wakes at most the
+  nodes its own operation moved (22.3).
 - **Signal and contender lists**: one fixed array each, of one entry per task that may watch it or
   per declared taker (22.2). A notify or a release wakes at most that array, however often they
   come.
@@ -2507,7 +2595,9 @@ compose, the real `Completion`, latch and backends included where named.
    against a link (mutant: link without taking an idle runner); a guarded state's release and its
    contenders, including a taker that succeeds on its retry and removes itself, and a stale
    contender woken late; wait-any over three signals, each source notified alone; a task removed
-   while it is listed. Shuttle: workers, wakes and releases with real `std::task::Waker`s.
+   while it is listed, closed under the queue mutex and unlisted after it (mutant: the queue mutex
+   held while taking a signal's, a deadlock loom reports). Shuttle: workers, wakes and releases with
+   real `std::task::Waker`s.
 2. **One owner, one queue entry.** Loom over the actual queue, not the word alone: `Queued` exactly
    while linked, nothing terminal linked, no link after close, one runner per task; claims, named
    claims of `Idle` and `Queued` tasks, ends, class moves and close racing wakes (mutants: the
@@ -2558,8 +2648,15 @@ compose, the real `Completion`, latch and backends included where named.
    never a refused submission that was accepted), a vectored write whose first part is accepted
    and second refused (its accepted part owned and retired, its error reported); every blocking
    caller of 22.5 run through `IO::wait`; cancelled requests in the write-ahead log, the pager and
-   the sorter drained to retirement (mutant: drained to finishing, the buffer still the kernel's);
-   injected setup, thread and registration refusals.
+   the sorter drained to retirement (mutant: drained to finishing, the buffer still the kernel's),
+   the sorter's group with a child added and its read refused, and a child never submitted (mutant:
+   the drain waiting for retirement from a request nobody accepted); an error of the ring itself
+   injected into the delivery thread with accepted requests outstanding (mutant: the thread
+   returning, its requests then never delivered); a pumped backend's own step failing; injected
+   setup, thread and registration refusals. From step 3, the log's callbacks with the interim
+   adapter: a fresh segment needed with an admitter waiting, and with none until later, file and
+   directory synced before the prepared end is published (mutant: the owed work left in the
+   callback, caught by the census).
 7. **Close loses nothing and waits for nothing it stopped**: at every step boundary; with the
    checkpoint waiting on admission and the preparer queued with nothing submitted (mutant: close
    waiting for every task's completion to finish); with a write submitted, delivered by the kernel
@@ -2574,20 +2671,30 @@ compose, the real `Completion`, latch and backends included where named.
    write (mutant: close returning before retirement, the old write then landing over the new). A
    clean close with a sequence's and a drain's records and no later commit, reopened: the records
    are there (mutant: no final flush, or the flush after the preparer stopped). A failed log during
-   close's flush ends the wait with its error (mutant: the flush waiting on a log that failed).
+   close's flush ends the wait with its error, and close still retires every request before it
+   returns that error (mutants: the flush waiting on a log that failed; close returning at its
+   first error).
 8. **Releases.** (a) A compile-fail test that the guarded state has no other accessor. (b) A release
    lets go, then wakes contenders only (mutants: wake before release; no wake; a holder woken by
    its own release). (c) The checkpoint's waiters, completions with arbitrary wakers, are woken with
    no lock held, and a waker that waits for a full checkpoint again does not block (mutant: the
    waiters' mutex held through the loop).
-9. **A panic ends the process.** Each in a child process the test spawns, the parent then reopening
-   the database and comparing it with the model: a panic inside a statement's step, a facade
-   method, a runner's step, `run_one`, a callback on the delivery thread, a pumped step, opening,
-   recovery and close; an embedder's waker that panics; a panic inside Atoll called from a `Drop`
-   that runs during another unwind, under a `catch_unwind` in that `Drop`. Each child must end by
-   abort, never return or exit normally (mutants: a frame that decides by
-   `std::thread::panicking()`, which the nested case passes through; a frame missing from one
-   facade method, caught by the census; a `catch_unwind` inside Atoll).
+9. **A panic ends the process before anything it left can be read.** Each in a child process the
+   test spawns, with the real latch and guards, the parent then reopening the database and
+   comparing it with the model. The child ends by abort, and an observer thread in it, which
+   records to a file and syncs whatever it sees, has seen nothing between the panic and the abort:
+   no latch the panicking thread held free, no gate open, no room given back, no contender woken
+   (mutant: an abort only at the outer frame, which lets the inner guards go first; a wrapper that
+   cleans up before its latch's check). Cases: a panic inside a statement's step, a facade method
+   and its `Drop` (a field whose drop panics), a facade iterator's `next`, a runner's step,
+   `run_one`, a delivery on the ring (in the callback, and in a waker after it), a pumped step,
+   opening, recovery and close; a panic in a local dropped after the frame's last statement, and in
+   an argument or capture; an embedder's waker that panics; an application's unwind dropping a
+   connection with an Atoll transaction open, which aborts on entry (mutant: the entry let through,
+   its guards then unable to tell the old unwind from a new one). A `Result::Err` through every
+   frame returns normally (mutant: a frame that aborts on an error). The census tests fail on a
+   destructor that releases shared state without the check, and on a facade type, method or trait
+   implementation without its frame. A `catch_unwind` inside Atoll fails a census too.
 10. **A quiet backlog drains.** Inline and background collection racing with no begin after
     (mutant: a claim lost read as nothing to do); a page linked into a slot that already had credit
     (mutant: woken only when credit rises from zero); each part of the cutoff changing alone, with
@@ -2603,40 +2710,49 @@ compose, the real `Completion`, latch and backends included where named.
     of steps. In callers mode: a fresh segment needed at a checkpoint's intent and at a writer's
     admission with no worker and no later statement (mutant: a waiter that returns the executor's
     completion without running the queue); two callers each running the task the other waits on; a
-    cooperative poll returning to its host after one unit and polled again only when woken (mutant:
-    a poll that runs the queue empty); a caller cancelled while its node is idle. A 12-way stress of
-    the workers, reported apart from replays.
+    cooperative poll returning to its host after one unit and polled again only when its `Waker`
+    is invoked (mutant: a poll that runs the queue empty); a sleeping host whose only work is a
+    prerequisite queued by a physical completion, with no worker: the host's `Waker` is invoked by a
+    drain after every executor mutex was released (mutants: the host's node treated as a thread and
+    unparked; its `Waker` invoked inside the signal or queue mutex; a nested drain); several links
+    in one notify moving several nodes, each invoked once; one node re-registered and moved again
+    without end, each operation draining at most what it moved (mutant: drain until empty); a cancel
+    racing a pop (mutant: the `Waker` reached through the node after the mutex); a caller cancelled
+    while its node is idle. A 12-way stress of the workers, reported apart from replays.
 
 ### 22.16 Order of work
 
 1. **`StateHold` (built, a92a1d667), then its amendments**: `Guarded` with the state reachable only
    through it, contenders woken under their mutex instead of the thread, `wake_waiters` waking its
    completions with no lock held; proof 8.
-2. **Frames** (22.11): the facade with crate-private types behind it, an armed abort guard on every
-   entry and its census, no `catch_unwind` in Atoll, section 7.5's new rule; proof 9. Before the
-   delivery thread, whose callbacks it frames, and before any job moves.
-3. **Delivering the IO**: retirement reported apart from finishing, submissions that accept or
-   refuse whole (a vectored write's accepted parts included), `IO::wait_retired` and the drains on
-   it, and Atoll's count; the ring's delivery thread as the one drainer, with its callbacks'
-   rules and census, its frames, overflow and lifetime; pumped ownership and one step per task step;
-   the three kinds of waiter, with every blocking caller of 22.5 on `IO::wait`; proof 6. The ring
-   stays opt-in.
+2. **The panic boundary** (22.11): the check in every destructor that releases shared state, with
+   its census; `atoll_frame` on every entry, an entry made while unwinding aborting; the facade with
+   crate-private types behind it, returning no Atoll code to run later, with its census; no
+   `catch_unwind` in Atoll; section 7.5's new rule; proof 9. Before the delivery thread, whose
+   deliveries it frames, and before any job moves.
+3. **Delivering the IO**: the log's interim adapter first, so no callback does file work from
+   this step on; a completion's three ownership states and retirement reported apart from
+   finishing, submissions that accept or refuse whole (a vectored write's accepted parts included),
+   `IO::wait_retired` and the drains on it, and Atoll's count; the ring's delivery thread as the one
+   drainer, with its callbacks' rules and census, its frames, its errors, overflow and lifetime;
+   pumped ownership, one step per task step, and a failing step; the three kinds of waiter, with
+   every blocking caller of 22.5 on `IO::wait`; proof 6. The ring stays opt-in.
 4. **The checkpoint's units** on today's driver: cursors per phase and inside an image, the dirty
    set walked in order, the intent record's size checked first, a flush turn per step, one unit per
    step on every backend, the flight set kept full and released at retirement; proof 3; the
    sustained run against before.
-5. **Profile on the ring**, still opt-in (22.8), of step 4's checkpoint.
+5. **Profile on the ring**, still opt-in (22.8), of step 4's checkpoint, with the interim adapter.
 6. **The executor's core**: headers and words, the run queue and intrusive idle nodes, signals,
    threshold signals and their handshake, contenders, levels with the counter-checked clear,
-   tickets and the order of jobs, executor completions with the callers' blocking and bounded
-   cooperative rules, close with its final flush, logical abandonment and physical drain, the four
-   runners; proofs 1, 2, 4, 5, 7 and 12's callers cases on test jobs, no real job moved.
+   tickets and the order of jobs, the lock order, external nodes with the to-wake list and its
+   budgeted drains, executor completions with the callers' blocking and bounded cooperative rules,
+   close with its final flush, logical abandonment and physical drain, the four runners; proofs 1,
+   2, 4, 5, 7 and 12's callers and external-host cases on test jobs, no real job moved.
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run
    against step 4's, and the profile again.
-8. **The segment preparers**, every open log, the callback chain removed in the same change; the
-   callers' fresh-segment cases of proof 12 first. This removes the last callback that does file
-   work.
+8. **The segment preparers**, every open log, replacing the interim adapter and the callback chain
+   in the same change; the callers' fresh-segment cases of proof 12 first.
 9. **io_uring as the default**: the census of callbacks clean, its fallbacks, the report, explicit
    choices kept, and the validation and latency measurement of 22.6, run over Turso's own suites as
    well as Atoll's, since the default reaches every database; then the default.
@@ -2670,6 +2786,9 @@ compose, the real `Completion`, latch and backends included where named.
   against reopening. Every build Turso ships aborts on a panic already; the machinery served only
   builds that unwind, and each audit of it found a further case (a panic inside an unwind, an
   epilogue taken by another thread, poison lost when a frame was evicted). One abort replaces it.
+- **An abort only at the entry frame** (the fourth revision): in a build that unwinds, the inner
+  guards are let go before the frame is reached, and another thread can read and commit what the
+  panic left; the guard that releases is where the abort has to be.
 - **Frozen rounds for the deterministic runner**, which stepped a round's tasks before a higher
   class linked meanwhile: one queue discipline for every runner keeps one oracle for proofs 4 and 5.
 - **A thread per job**: one wake protocol per job, the situation this replaces.

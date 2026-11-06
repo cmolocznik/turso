@@ -50,7 +50,7 @@ mod room;
 mod segment;
 mod waits;
 
-pub use reader::{LogReader, OwnedRecord};
+pub use reader::{LogReader, OwnedRecord, Rereader};
 pub use record::{
     framed_len, GroupStart, Header, Kind, Lsn, Place, ALIGN, BLOCK, MAX_PAYLOAD, NO_GROUP,
 };
@@ -1135,6 +1135,14 @@ impl Log {
             io.clone(),
             Arc::new(Segments::new(io, base, config.segment_bytes, config.direct)),
             start,
+        )
+    }
+
+    /// A reader of this database's log's records back by where they start, for recovery.
+    pub fn rereader(io: Arc<dyn IO>, base: &str, config: &LogConfig) -> Rereader {
+        Rereader::new(
+            io.clone(),
+            Segments::new(io, base, config.segment_bytes, config.direct),
         )
     }
 

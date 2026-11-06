@@ -24,7 +24,7 @@ use super::log::{framed_len, Admitted, Header, Kind, Log, LogConfig, Lsn, BLOCK}
 use super::txn::changes::Chunks;
 use super::whole_write;
 use crate::io::{Completion, File, OpenFlags, IO};
-use crate::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex, RwLock};
 use crate::types::IOResult;
 use crate::{LimboError, Result};
 
@@ -293,6 +293,9 @@ pub struct Partition {
     chunks: Arc<Chunks>,
     file: Arc<dyn File>,
     state: Mutex<State>,
+    /// Held shared by each read for as long as it reads, and exclusively while segments let go
+    /// are deleted or kept as spares: a read never meets a segment gone or reused under it.
+    segments: RwLock<()>,
 }
 
 impl Partition {
@@ -306,7 +309,17 @@ impl Partition {
             OpenFlags::Create | OpenFlags::Direct,
             false,
         )?;
-        let mut kept = read_kept(&io, &file)?.unwrap_or_default();
+        let mut kept = match read_kept(&io, &file)? {
+            Some(kept) => kept,
+            // A new partition: its first copy is in charge, durable with the file's name, before
+            // a batch can be appended, so a torn update of either copy leaves the other.
+            None => {
+                let kept = Kept::default();
+                write_kept(&io, &file, &kept)?;
+                io.sync_directory(&super::store::directory(base))?;
+                kept
+            }
+        };
         let mut reader =
             Log::reader(io.clone(), base, &config, kept.first_at).following(&kept.gaps);
         let (mut next, mut index, mut index_from) = (kept.first, Vec::new(), 0);
@@ -360,6 +373,7 @@ impl Partition {
             log,
             chunks,
             file,
+            segments: RwLock::new(()),
             state: Mutex::new(State {
                 next,
                 index,
@@ -446,6 +460,8 @@ impl Partition {
     /// Whole batches from the one holding `offset`, up to `bytes` of payload but at least that
     /// one, of what is durable (DESIGN.md §21.2): none if `offset` is past them.
     pub fn read(&self, offset: u64, bytes: usize) -> Result<Read> {
+        // Before the state is read: retention past it waits to delete what this read reads.
+        let _segments = self.segments.read();
         let (start, gaps, next) = {
             let state = self.state.lock();
             if offset < state.kept.first {
@@ -492,7 +508,8 @@ impl Partition {
 
     /// Lets go of every whole segment before the batch holding `offset` (DESIGN.md §21.4): the
     /// first offset retained, that batch's, recorded durably first, and the segments then
-    /// deleted. Reads hold copies of what they read, so none holds a segment.
+    /// deleted, once every read that read the state before is done. A read hands back copies, so
+    /// none holds a segment past its return.
     pub fn retain_from(&self, offset: u64) -> Result<()> {
         let mut state = self.state.lock();
         if offset <= state.kept.first {
@@ -534,6 +551,8 @@ impl Partition {
         state.kept = kept;
         state.index.retain(|&(_, at)| at >= first_at);
         drop(state);
+        // Reads that read the state before this one hold what it lets go until they are done.
+        let _segments = self.segments.write();
         self.log.release_before(first_at)
     }
 
@@ -568,6 +587,9 @@ fn read_kept(io: &Arc<dyn IO>, file: &Arc<dyn File>) -> Result<Option<Kept>> {
         .max_by_key(|k| k.seq);
     match newest {
         Some(kept) => Ok(Some(kept)),
+        // The first copy torn: a creation a crash cut short, before any batch could be appended.
+        // Every later write goes to the other copy first, the file then two copies long.
+        None if len <= KEPT_SIZE => Ok(None),
         None => Err(LimboError::Corrupt(
             "a stream partition's own file holds no whole copy".into(),
         )),

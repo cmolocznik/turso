@@ -624,10 +624,13 @@ impl Changes {
             + self.spare.as_ref().map_or(0, AlignedBlock::len)
     }
 
-    /// The bytes of memory it holds: its chunks', and its list of parts spilled, which grows by
-    /// one part per chunk spilled.
+    /// The bytes of memory it holds: its chunks', its list of parts spilled, which grows by one
+    /// part per chunk spilled, and its statements' marks, one per statement that changed
+    /// anything.
     pub fn memory(&self) -> usize {
-        self.capacity() + self.parts.capacity() * std::mem::size_of::<Part>()
+        self.capacity()
+            + self.parts.capacity() * std::mem::size_of::<Part>()
+            + self.marks.capacity() * std::mem::size_of::<(Statement, u64)>()
     }
 
     /// Whether a sealed chunk waits to be spilled ([`sealed`](Self::sealed)).
@@ -677,9 +680,9 @@ impl Changes {
         &self.parts
     }
 
-    /// Readies it for its slot's next transaction, keeping its memory: a chunk's, its lists'
-    /// room, and its view's counter, which only rises, so a cursor of the transaction over never
-    /// finds its count again.
+    /// Readies it for its slot's next transaction, keeping its memory: a chunk's, its lists' room
+    /// up to a chunk's bytes each, and its view's counter, which only rises, so a cursor of the
+    /// transaction over never finds its count again.
     pub fn recycle(&mut self) {
         if self.spare.is_none() {
             self.spare = self.chunks.pop().map(|c| c.block);
@@ -688,6 +691,12 @@ impl Changes {
         self.chunks.clear();
         self.parts.clear();
         self.marks.clear();
+        // As the slot keeps one chunk, each list keeps a chunk's bytes of room at most: more was a
+        // larger transaction's, given back rather than held for the next.
+        self.parts
+            .shrink_to(self.chunk_bytes / std::mem::size_of::<Part>());
+        self.marks
+            .shrink_to(self.chunk_bytes / std::mem::size_of::<(Statement, u64)>());
         self.end = 0;
         self.moved();
     }
@@ -771,6 +780,15 @@ pub fn starts(bytes: &[u8], base: u64, first: u64, from: u64) -> Result<Vec<u64>
     Ok(out)
 }
 
+/// The bytes of the change `bytes` starts with, as its head gives them: `None` if the head is cut
+/// short.
+pub fn change_len(bytes: &[u8]) -> Option<usize> {
+    let head = bytes.get(..HEAD)?;
+    let key_len = u16::from_le_bytes([head[1], head[2]]) as usize;
+    let value_len = u32::from_le_bytes(head[3..7].try_into().unwrap()) as usize;
+    Some(HEAD + key_len + value_len)
+}
+
 /// The changes `bytes` holds back to back, oldest first, each `Corrupt` where the bytes do not
 /// hold one together.
 pub struct Decode<'a> {
@@ -796,18 +814,18 @@ impl<'a> Iterator for Decode<'a> {
         }
         let corrupt = |why: &str| LimboError::Corrupt(format!("a published change {why}"));
         let b = self.bytes;
-        let Some(head) = b.get(..HEAD) else {
+        let Some(len) = change_len(b) else {
             self.failed = true;
             return Some(Err(corrupt("is cut short in its head")));
         };
-        let kind = head[0];
-        let key_len = u16::from_le_bytes([head[1], head[2]]) as usize;
-        let value_len = u32::from_le_bytes(head[3..7].try_into().unwrap()) as usize;
-        let tree = PageId::from_raw(u64::from_le_bytes(head[7..15].try_into().unwrap()));
-        let Some(rest) = b.get(HEAD..HEAD + key_len + value_len) else {
+        let Some(rest) = b.get(HEAD..len) else {
             self.failed = true;
             return Some(Err(corrupt("is cut short in its key or value")));
         };
+        let kind = b[0];
+        let key_len = u16::from_le_bytes([b[1], b[2]]) as usize;
+        let value_len = rest.len() - key_len;
+        let tree = PageId::from_raw(u64::from_le_bytes(b[7..15].try_into().unwrap()));
         let (key, value) = rest.split_at(key_len);
         let (plain, plainly) = (kind & PLAIN != 0, kind & PLAINLY != 0);
         let change = match kind & !(PLAIN | PLAINLY) {
@@ -839,7 +857,7 @@ impl<'a> Iterator for Decode<'a> {
                 ))));
             }
         };
-        self.bytes = &b[HEAD + key_len + value_len..];
+        self.bytes = &b[len..];
         Some(Ok(change))
     }
 }

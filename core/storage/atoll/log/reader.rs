@@ -8,7 +8,7 @@
 //! record that does not continue the group being read ends it the same way; that is what a crash
 //! leaves when the log restarted past part of a group and later records follow.
 
-use super::record::{self, GroupStart, Header, Lsn, Parsed, Place, BLOCK};
+use super::record::{self, framed_len, GroupStart, Header, Lsn, Parsed, Place, BLOCK};
 use super::segment::Segments;
 use crate::io::{Completion, IO};
 use crate::storage::atoll::aligned::AlignedBlock;
@@ -293,5 +293,80 @@ impl LogReader {
             }
         }
         Ok(true)
+    }
+}
+
+/// Reads back records a reader of the log found, each by where it starts and its payload's length:
+/// in one read of exactly the blocks it lies in, into a buffer kept from one record to the next,
+/// each segment's file opened once. Recovery reads a transaction's spilled parts back so at its
+/// Commit, holding one part at a time.
+pub struct Rereader {
+    io: Arc<dyn IO>,
+    segments: Segments,
+    /// The blocks read last, from the start of the one the record starts in. Grown to a power of
+    /// two past the largest record read: as few reallocations as doublings, under twice its size.
+    buffer: Arc<AlignedBlock>,
+    /// Bytes read so far.
+    read: u64,
+}
+
+impl Rereader {
+    pub(super) fn new(io: Arc<dyn IO>, segments: Segments) -> Self {
+        Self {
+            io,
+            segments,
+            buffer: Arc::new(AlignedBlock::zeroed(BLOCK as usize)),
+            read: 0,
+        }
+    }
+
+    /// The payload of the record outside any group that starts at `at`, `len` bytes long, checked
+    /// as a reader of the log checks it.
+    pub fn payload(&mut self, at: Lsn, len: usize) -> Result<&[u8]> {
+        let corrupt = |what: String| LimboError::Corrupt(format!("the record at {at} {what}"));
+        let from = at - at % BLOCK;
+        let want = ((at + framed_len(len)).next_multiple_of(BLOCK) - from) as usize;
+        if self.buffer.len() < want {
+            self.buffer = Arc::new(AlignedBlock::zeroed(want.next_power_of_two()));
+        }
+        let mut done = 0;
+        while done < want {
+            let pos = from + done as u64;
+            let number = self.segments.number(pos);
+            let file = self
+                .segments
+                .open(number)?
+                .ok_or_else(|| corrupt("reads back from a missing segment".into()))?;
+            let len = ((self.segments.start(number + 1) - pos) as usize).min(want - done);
+            let got = Arc::new(AtomicU64::new(0));
+            let out = got.clone();
+            let c = Completion::new_read(self.buffer.region(done, len), move |res| match res {
+                Ok((_, n)) => {
+                    out.store(n.max(0) as u64, Ordering::Release);
+                    None
+                }
+                Err(e) => Some(e),
+            });
+            let c = file.pread(pos - self.segments.start(number), c)?;
+            self.io.wait_for_completion(c)?;
+            let n = got.load(Ordering::Acquire) as usize;
+            self.read += n as u64;
+            if n < len {
+                return Err(corrupt(format!("reads back short of its {len} bytes")));
+            }
+            done += len;
+        }
+        let bytes = &self.buffer.bytes()[(at - from) as usize..want];
+        match record::parse(at, bytes) {
+            Parsed::Record(r) if r.payload.len() == len && !r.place.grouped() => Ok(r.payload),
+            _ => Err(corrupt(format!(
+                "reads back as no record of {len} bytes outside a group"
+            ))),
+        }
+    }
+
+    /// Bytes read so far.
+    pub fn read(&self) -> u64 {
+        self.read
     }
 }

@@ -1249,7 +1249,8 @@ fn busy<T>() -> IOResult<T> {
     IOResult::IO(IOCompletions(Completion::new_yield()))
 }
 
-fn directory(base: &str) -> String {
+/// The directory the files named from `base` are in.
+pub(super) fn directory(base: &str) -> String {
     std::path::Path::new(base)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())

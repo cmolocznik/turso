@@ -231,3 +231,152 @@ fn whole_segments_before_the_first_retained_batch_are_let_go() {
     append(&io, &p, 6000, 6100, 10);
     assert_eq!(p.next_offset(), 6100);
 }
+
+/// A crash at any point of a partition's own file's writes, from its creation to the first
+/// letting go of history, leaves a partition that opens with every batch appended before the crash
+/// (audit 2026-11-06): its first copy is written whole before any batch, so a torn update of one
+/// copy leaves the other, and a creation the crash cut short opens as new.
+#[test]
+fn a_crash_during_the_first_metadata_writes_leaves_a_partition_that_opens() {
+    let own = |path: &str| path.ends_with(".stream");
+    let mut images_checked = 0;
+    for seed in 0..20 {
+        // Creation cut short: nothing appended yet, and the partition opens empty.
+        let crash_io = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash_io.clone();
+        crash_io.capture(own, 1, seed);
+        let p = Partition::open(io.clone(), BASE, config()).unwrap();
+        for image in crash_io.captured() {
+            let io: Arc<dyn IO> = Arc::new(image);
+            let p = Partition::open(io.clone(), BASE, config()).unwrap();
+            assert_eq!(p.next_offset(), 0, "seed {seed}");
+            append(&io, &p, 0, 5, 2);
+            assert_eq!(read_all(&p, 0, 1 << 16).len(), 5, "seed {seed}");
+            images_checked += 1;
+        }
+        // The first letting go cut short: every message from 40 on, each durable once appended,
+        // reads back.
+        append(&io, &p, 0, 60, 1);
+        crash_io.capture(own, 1, seed);
+        p.retain_from(40).unwrap();
+        for image in crash_io.captured() {
+            let io: Arc<dyn IO> = Arc::new(image);
+            let p = Partition::open(io.clone(), BASE, config()).unwrap();
+            let read = read_all(&p, 40, 1 << 16);
+            assert_eq!(
+                read.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+                (40..60).collect::<Vec<_>>(),
+                "seed {seed}"
+            );
+            images_checked += 1;
+        }
+    }
+    assert!(images_checked >= 40, "{images_checked} images");
+}
+
+/// An IO that holds the first open of the log's first segment until let go: a read paused after it
+/// read the partition's state and before it reached the segment.
+struct PausingOpen {
+    inner: MemoryIO,
+    pause: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+impl crate::io::Clock for PausingOpen {
+    fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for PausingOpen {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        if path.ends_with(".log.0000000000000000") {
+            if let Some((entered, resume)) = self.pause.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                resume.recv().unwrap();
+            }
+        }
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        self.inner.rename_file(from, to)
+    }
+
+    fn sync_directory(&self, path: &str) -> Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn step(&self) -> Result<()> {
+        self.inner.step()
+    }
+}
+
+/// A read that read the partition's state before history was let go reads every batch it found
+/// there (audit 2026-11-06): the segments it reads are deleted only once it is done, never under
+/// it as if the stream ended; a read after it is answered as expired.
+#[test]
+fn a_read_under_way_keeps_the_segments_retention_lets_go_until_it_is_done() {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
+    let backing = Arc::new(PausingOpen {
+        inner: MemoryIO::new(),
+        pause: std::sync::Mutex::new(None),
+    });
+    let io: Arc<dyn IO> = backing.clone();
+    let config = LogConfig {
+        segment_bytes: 64 << 10,
+        ..config()
+    };
+    let p = Partition::open(io.clone(), BASE, config).unwrap();
+    append(&io, &p, 0, 60, 1);
+    assert!(
+        p.log().end() > 2 * (64 << 10),
+        "the batches span segments past the first"
+    );
+    let (entered, entered_rx) = channel();
+    let (resume_tx, resume) = channel();
+    *backing.pause.lock().unwrap() = Some((entered, resume));
+    let reader = std::thread::spawn({
+        let p = p.clone();
+        move || p.read(0, usize::MAX).unwrap()
+    });
+    entered_rx.recv().unwrap();
+    let (retained_tx, retained) = channel();
+    let retention = std::thread::spawn({
+        let p = p.clone();
+        move || {
+            p.retain_from(40).unwrap();
+            retained_tx.send(()).unwrap();
+        }
+    });
+    // Retention lets go of nothing the paused read holds: it waits for the read.
+    assert_eq!(
+        retained.recv_timeout(Duration::from_millis(500)),
+        Err(RecvTimeoutError::Timeout),
+        "retention deleted segments under a read"
+    );
+    resume_tx.send(()).unwrap();
+    let Read::Batches(batches) = reader.join().unwrap() else {
+        panic!("the read expired");
+    };
+    let offsets: Vec<u64> = batches
+        .iter()
+        .flat_map(|b| b.messages().map(|(o, _)| o).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(offsets, (0..60).collect::<Vec<_>>());
+    retention.join().unwrap();
+    assert_eq!(p.first_offset(), 40);
+    assert!(matches!(
+        p.read(0, usize::MAX).unwrap(),
+        Read::Expired { first: 40 }
+    ));
+    assert_eq!(read_all(&p, 40, 1 << 16).len(), 20);
+}

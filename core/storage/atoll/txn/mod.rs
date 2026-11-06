@@ -976,7 +976,10 @@ impl Transactions {
     /// A checkpoint's cut (audit 18): `(L, C)`, every commit at or below `C` published, every
     /// Commit before `L` with a timestamp at or below `C`, and every part and Commit of a commit
     /// above `C` at or after `L`. Replay from `L` of the commits above `C` then brings a state as
-    /// of `C` up to the log's end. Step it until done.
+    /// of `C` up to the log's end. A commit at or below `C` may have parts before `L` and its
+    /// Commit past it: one that cleared its mark before the scan below reached its slot, its
+    /// timestamp drawn before the clock is read. Replay skips it whatever it finds of it
+    /// ([`Gather`](super::replay::Gather)). Step it until done.
     ///
     /// `L` is the log's end, or where an earlier commit under way took its first room. A commit
     /// marks its slot before it takes room and replaces the mark with the position as it takes

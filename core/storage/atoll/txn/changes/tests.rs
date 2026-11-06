@@ -216,3 +216,40 @@ fn chunks_hold_heads_whole_and_a_rollback_into_a_part_cuts_it() {
     assert_eq!(c.tail().0, from);
     assert_eq!(c.statement_at(from), 5);
 }
+
+/// Its memory counts every statement's mark beside its chunks and parts, and its slot's next
+/// transaction inherits no more room for them than a chunk's (audit 2026-11-06).
+#[test]
+fn memory_counts_statement_marks_and_a_recycle_gives_back_a_large_transactions() {
+    let chunk = 4096;
+    let mut c = Changes::in_chunks(None, chunk, None);
+    let mark = std::mem::size_of::<(Statement, u64)>();
+    let statements = 20_000u32;
+    for s in 1..=statements {
+        c.put(s, tree(1), &s.to_be_bytes(), b"v");
+        while c.has_sealed() {
+            let at = GroupStart::at((c.parts().len() as u64 + 1) * 4096);
+            let (from, len, first, _block) = c.take_sealed();
+            c.spilled(Part {
+                from,
+                len: len as u64,
+                first,
+                at,
+                lsn: at.get() + 1,
+            });
+        }
+    }
+    let marks = statements as usize * mark;
+    assert!(
+        c.memory() >= c.capacity() + marks,
+        "{} bytes counted for {marks} bytes of marks and {} of chunks",
+        c.memory(),
+        c.capacity()
+    );
+    c.recycle();
+    assert!(
+        c.memory() <= 3 * chunk,
+        "{} bytes kept for the next transaction",
+        c.memory()
+    );
+}

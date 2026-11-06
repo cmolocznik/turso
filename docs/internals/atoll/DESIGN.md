@@ -1030,6 +1030,11 @@ Three obligations come with publishing parts before the commit:
    the segments holding them stay. A transaction open long after spilling so holds the log back,
    as an open transaction holds a WAL; the end of a transaction waits for a full checkpoint only
    when one could bring the redo point within twice the budget, never because a mark holds it.
+   A transaction that clears its mark before the cut's scan reaches its slot drew its timestamp
+   before the cut reads the clock: at or below `C`, its parts may lie before the redo point and
+   its Commit past it. Recovery skips it whatever it finds of it, keeps nothing of a transaction
+   whose first part it never read, and refuses a commit above `C` missing a part (audit
+   2026-11-06).
 2. **A savepoint rollback leaves out what it discarded, even on disk.** Every part carries the
    position in the transaction's changes where it begins. A rollback to a statement whose changes
    begin before what has been spilled continues from that position: the next part, or the Commit,
@@ -1231,7 +1236,11 @@ whose system trees an open makes writes a checkpoint before any write (section 1
    (section 7.4) are followed. If reopening past the end would leave a gap the superblock has no
    room for, recovery fails here, before it changes anything.
 3. **Replay**, in log order: every committed body whose commit timestamp is above `C`, joined from
-   its parts, and every run (`Apply`). A body at or below `C` is in the checkpoint's pages already.
+   its parts, and every run (`Apply`). A body at or below `C` is in the checkpoint's pages already,
+   and is skipped even with its first parts before `L` (section 11.4.1, obligation 1). Until its
+   Commit, a transaction's parts are kept as where they lie, never their bytes, joined at their end
+   or cut by a rollback by halving; at its Commit each is read back alone, in one read of exactly
+   the blocks it lies in, so recovery holds one part and one change at a time, as a writer does.
    A put lands settled, since no snapshot survives a crash; a delete removes its key; a drain of a
    tree the replay made, or the mapping held, frees it whole.
 4. **Record the gap.** If the log reopens past its end, it is zeroed from there durably and the gap
@@ -1740,8 +1749,8 @@ segments' indexes read for reads: retained history costs no memory.
 Each partition keeps its history by a policy of its own, by age or by size, apart from the
 recovery log, whose segments the checkpoint releases (section 10). A whole completed segment is
 released once the catalog records the partition's first retained offset past it durably, no lease
-reads it, and no transaction yet to be recovered names an extent in it (section 21.6). A read
-before the first retained offset is answered as expired.
+or read under way reads it, and no transaction yet to be recovered names an extent in it (section
+21.6). A read before the first retained offset is answered as expired.
 
 ### 21.5 Recovery
 
@@ -1783,10 +1792,15 @@ protocol are layers above.
 **Built** (`stream.rs`): a partition's batch append, in place or through the ring, its offsets
 assigned at publication and done once durable; reads of whole batches by offset from a sparse index;
 recovery from the partition's files, the gaps a recovery leaves recorded in its own file; retention
-of whole segments by offset. Measured (200,000 messages of 100 bytes, its log in memory, each append
-waited on): appending 663 instructions a message in batches of 100, 606 in batches of 1,000, 1,280
-in batches of 10, whose batches go through the ring; reading 121, 106 and 275. A SQL insert of the
-same row costs 13,858.
+of whole segments by offset. The own file holds two copies, each update written over the one not in
+charge: a new partition writes its first durably, its name too, before it takes a batch, so a torn
+update always leaves the other (a file of one copy with none whole is a creation a crash cut short,
+before any batch). A read holds the partition's segments for as long as it reads: retention that
+moved the first offset deletes the segments only once the reads that read the state before it are
+done, never under one, which would read as the stream's end. Measured (200,000 messages of 100
+bytes, its log in memory, each append waited on): appending 663 instructions a message in batches
+of 100, 606 in batches of 1,000, 1,280 in batches of 10, whose batches go through the ring; reading
+121, 106 and 275. A SQL insert of the same row costs 13,858.
 
 **Not built yet:** completed segments' index files (the sparse index is in memory, an entry a chunk
 of every segment retained); the stream's own memory budget (chunks come from a free list bounded by

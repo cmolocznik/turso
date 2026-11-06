@@ -27,7 +27,7 @@ use super::page::PageId;
 use super::radix::FREE;
 use super::replay::{Apply, Gather};
 use super::store::PageStore;
-use super::txn::changes::{Change, Decode};
+use super::txn::changes::Change;
 use super::txn::{self, Clock, Transactions};
 use crate::io::IO;
 use crate::sync::Arc;
@@ -104,13 +104,15 @@ pub fn recover(
     let mut apply = Apply::new(io.clone(), pool.clone(), store.clone()).opened_with(opened);
     let mut reader = Log::reader(io.clone(), base, &config.log, superblock.redo)
         .following(&superblock.continuations);
-    let mut gather = Gather::new();
+    let mut gather = Gather::new(superblock.snapshot);
+    let mut parts = Log::rereader(io.clone(), base, &config.log);
     while let Some(r) = reader.next_record()? {
-        let Some((ts, body)) = gather.record(r.header.kind, r.header.txn, &r.payload)? else {
+        let Some((ts, body)) = gather.record(r.header.kind, r.header.txn, r.start, &r.payload)?
+        else {
             continue;
         };
         if ts.is_none_or(|ts| ts > superblock.snapshot) {
-            apply.apply(&body)?;
+            apply.apply(&body, &mut parts)?;
         }
     }
     store.release_reserved();
@@ -163,7 +165,8 @@ fn scan(io: &Arc<dyn IO>, base: &str, config: &LogConfig, superblock: &Superbloc
     };
     let mut reader =
         Log::reader(io.clone(), base, config, superblock.redo).following(&superblock.continuations);
-    let mut gather = Gather::new();
+    let mut gather = Gather::new(superblock.snapshot);
+    let mut parts = Log::rereader(io.clone(), base, config);
     while let Some(r) = reader.next_record()? {
         // A record's transaction is named by its start timestamp, and a spilled part's too.
         out.clock = out.clock.max(r.header.txn);
@@ -176,7 +179,8 @@ fn scan(io: &Arc<dyn IO>, base: &str, config: &LogConfig, superblock: &Superbloc
             out.intents.extend(decode_intent(&r.payload)?);
             continue;
         }
-        let Some((ts, body)) = gather.record(r.header.kind, r.header.txn, &r.payload)? else {
+        let Some((ts, body)) = gather.record(r.header.kind, r.header.txn, r.start, &r.payload)?
+        else {
             continue;
         };
         if let Some(ts) = ts {
@@ -185,15 +189,16 @@ fn scan(io: &Arc<dyn IO>, base: &str, config: &LogConfig, superblock: &Superbloc
                 continue;
             }
         }
-        for change in Decode::new(&body) {
-            match change? {
+        body.changes(&mut parts, &mut |change| {
+            match change {
                 Change::Create { root, .. } => out.created.push(root),
                 Change::Drain { root, .. } => {
                     out.drained.insert(root);
                 }
                 _ => {}
             }
-        }
+            Ok(())
+        })?;
     }
     out.end = reader.position();
     Ok(out)

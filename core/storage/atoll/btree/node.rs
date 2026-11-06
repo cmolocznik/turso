@@ -215,6 +215,28 @@ impl<P: ?Sized> Copy for View<'_, P> {}
 /// A fence read out of a node: a key, or infinite.
 pub type Fence = Option<Vec<u8>>;
 
+/// [`View::entry_runs`] of entry `i` of a node in plain bytes holding `count` entries: its key past
+/// the prefix and its value, where they lie, and whether the value is out of line, each field of
+/// its slot read once.
+#[inline]
+pub fn entry_runs_in(
+    page: &[u8],
+    i: usize,
+    count: usize,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>, bool)> {
+    if i >= count {
+        return None;
+    }
+    let at = SLOTS + i * SLOT;
+    let s = page.get(at..at + 6)?;
+    let off = u16::from_le_bytes([s[0], s[1]]) as usize;
+    let key_len = u16::from_le_bytes([s[2], s[3]]) as usize;
+    let lengths = u16::from_le_bytes([s[4], s[5]]);
+    let key_end = off + key_len;
+    let end = key_end + (lengths & !OUT_OF_LINE) as usize;
+    (end <= page.len()).then_some((off..key_end, key_end..end, lengths & OUT_OF_LINE != 0))
+}
+
 impl<'a, P: Bytes + ?Sized> View<'a, P> {
     pub fn new(page: &'a P) -> Self {
         Self(page)

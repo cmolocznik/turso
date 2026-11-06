@@ -169,6 +169,7 @@ impl Record {
 
     /// Forgets the record read at the row: lent bytes go back to `cursor`, a copy's allocation is
     /// kept for the next.
+    #[inline]
     fn forget(&mut self, cursor: &mut VersionedCursor) {
         let Some(record) = self.read.take() else {
             return;

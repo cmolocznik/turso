@@ -1460,6 +1460,7 @@ impl Tree {
             });
             // One slot along from the entry, in the leaf it was read from.
             let at = cursor.at.filter(|_| cached.is_some());
+            let onto = std::mem::take(&mut cursor.onto) && cached.is_some() && seek == Seek::Gt;
             let leaf = match &cached {
                 // The leaf of the last entry is as it was: no descent.
                 Some(leaf) => leaf.clone(),
@@ -1500,6 +1501,7 @@ impl Tree {
                     &target,
                     cached.is_some(),
                     at,
+                    onto,
                     &mut key,
                     &mut value,
                     batch,
@@ -1603,6 +1605,7 @@ impl Tree {
                         });
                         if neighbour == Some(true) {
                             cursor.leaf = Some((pid, hint, n.version()));
+                            cursor.onto = true;
                         }
                     }
                     cursor.pending = Some((Seek::Gt, fence));
@@ -2253,6 +2256,9 @@ pub struct Cursor {
     batch: Batch,
     /// Whether the entry is the batch's last taken, its key and value read there.
     batched: bool,
+    /// The leaf is the right neighbour of the last, its lower fence the target: the step lands on
+    /// its first slot, with no search.
+    onto: bool,
 }
 
 /// The entries past a lazy cursor's in the direction of the step that found it, copied from its
@@ -2279,6 +2285,8 @@ struct Batch {
     ahead: usize,
     /// Batches filled, counted: one judged at one count is this batch while the count holds.
     seq: u64,
+    /// The entries the leaf copied holds.
+    count: usize,
 }
 
 impl Batch {
@@ -2311,6 +2319,7 @@ impl Batch {
         }
         v.copy_entries(slots.clone(), &mut self.page)?;
         self.seq += 1;
+        self.count = count;
         let prefix = View::new(&self.page).prefix_range()?;
         self.key.clear();
         self.key.extend_from_slice(&self.page[prefix]);
@@ -2355,7 +2364,7 @@ impl Cursor {
             return false;
         }
         let pos = b.next;
-        let Some((key, value, out_of_line)) = View::new(&b.page).entry_runs(pos) else {
+        let Some((key, value, out_of_line)) = node::entry_runs_in(&b.page, pos, b.count) else {
             b.drop_entries();
             return false;
         };
@@ -2413,7 +2422,7 @@ impl Cursor {
 
     /// The value of the batch's entry at slot `pos`, as its leaf holds it.
     pub fn batch_value(&self, pos: usize) -> Option<&[u8]> {
-        let (_, value, _) = View::new(&self.batch.page).entry_runs(pos)?;
+        let (_, value, _) = node::entry_runs_in(&self.batch.page, pos, self.batch.count)?;
         self.batch.page.get(value)
     }
 
@@ -2529,6 +2538,7 @@ fn scan_leaf<P: Bytes + ?Sized>(
     target: &[u8],
     cached: bool,
     at: Option<usize>,
+    onto: bool,
     key: &mut Vec<u8>,
     value: &mut Vec<u8>,
     batch: Option<&mut Batch>,
@@ -2540,6 +2550,8 @@ fn scan_leaf<P: Bytes + ?Sized>(
     let pos = match (at, seek) {
         (Some(p), Seek::Gt) => Some(p + 1),
         (Some(p), Seek::Lt) => p.checked_sub(1),
+        // Every key of the right neighbour lies above its lower fence, the target.
+        (None, Seek::Gt) if onto => Some(0),
         _ => {
             if cached && !(v.covers(target)? || seek == Seek::Gt && v.lower_is(target)?) {
                 return Some(Scan::Stale);

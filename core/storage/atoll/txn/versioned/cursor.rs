@@ -165,6 +165,7 @@ impl VersionedCursor {
         }
     }
 
+    #[inline]
     pub fn key(&self) -> Option<&[u8]> {
         match &self.entry {
             Shown::None => None,

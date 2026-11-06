@@ -942,6 +942,84 @@ fn sustained() {
 /// Rows per transaction in [`paths`]'s versioned inserts, as the SQL throughput benchmark writes.
 const TXN_ROWS: usize = 100;
 
+/// A stream partition's ingest and read (DESIGN.md §21), its log in memory: `ATOLL_BENCH_ROWS`
+/// messages (200,000) of `ATOLL_BENCH_VALUE` bytes (100), appended in batches of
+/// `ATOLL_BENCH_TXN` (100) each waited on, then read back whole in leases of 1 MiB.
+/// `ATOLL_BENCH=stream-append` or `stream-read` times one alone, under the perf fifo pair as
+/// [`sql`]'s phases are. Prints per message the time, allocations and bytes copied into the ring.
+///
+/// ```text
+/// cargo test --release -p turso_core --lib storage::atoll::bench::stream -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn stream() {
+    use super::stream::{Append, Partition, Read};
+    let rows: u64 = std::env::var("ATOLL_BENCH_ROWS").map_or(200_000, |r| r.parse().unwrap());
+    let length: usize = std::env::var("ATOLL_BENCH_VALUE").map_or(100, |v| v.parse().unwrap());
+    let per: u64 = std::env::var("ATOLL_BENCH_TXN").map_or(TXN_ROWS as u64, |t| t.parse().unwrap());
+    let only = std::env::var("ATOLL_BENCH").ok();
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let p = Partition::open(io.clone(), "/db/stream-bench", bench_config().log).unwrap();
+    let message = vec![b'v'; length];
+    let timed = |name: &str| {
+        only.as_deref()
+            .is_none_or(|o| o == format!("stream-{name}"))
+    };
+    let report = |name: &str, began: Instant, counted: (u64, u64, u64)| {
+        let ns = began.elapsed().as_nanos() as f64 / rows as f64;
+        let (allocs, ring, _) = counts();
+        let per = |n: u64| n as f64 / rows as f64;
+        println!(
+            "bench stream-{name} ops {rows} ns/op {ns:.0} allocs/op {:.2} ring/op {:.1}",
+            per(allocs - counted.0),
+            per(ring - counted.1)
+        );
+    };
+    let (on, counted, began) = (timed("append"), counts(), Instant::now());
+    if on {
+        perf_control("enable");
+    }
+    let mut i = 0;
+    while i < rows {
+        let mut batch = p.batch();
+        let mut n = 0;
+        while i < rows && n < per && batch.push(&message, i) {
+            i += 1;
+            n += 1;
+        }
+        let mut op = Append::new(batch);
+        drive(&io, || p.append(&mut op)).unwrap();
+    }
+    if on {
+        perf_control("disable");
+        report("append", began, counted);
+    }
+    let (on, counted, began) = (timed("read"), counts(), Instant::now());
+    if on {
+        perf_control("enable");
+    }
+    let (mut at, mut read) = (0, 0u64);
+    while at < rows {
+        let Read::Batches(batches) = p.read(at, 1 << 20).unwrap() else {
+            panic!("expired")
+        };
+        for b in &batches {
+            for (offset, m) in b.messages() {
+                if offset >= at {
+                    read += m.len() as u64;
+                    at = offset + 1;
+                }
+            }
+        }
+    }
+    if on {
+        perf_control("disable");
+        report("read", began, counted);
+    }
+    assert_eq!(read, rows * length as u64);
+}
+
 /// On this thread so far: allocations, bytes copied into the log's ring, and bytes of changes
 /// encoded into transactions' buffers. Starts the most memory a transaction's buffer held again.
 fn counts() -> (u64, u64, u64) {

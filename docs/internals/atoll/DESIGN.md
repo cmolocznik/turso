@@ -1671,8 +1671,9 @@ work says which parts are done.
     - leases for remote snapshots, and followers' own graveyards (sections 11.1, 11.2);
     - optimistic and forwarded writes.
 11. **Raft.**
-12. **Streams** (section 21): partitioned batch append and read, recovery, and whole-segment
-    retention; then transactions with streams, and consumer and producer state.
+12. **Streams** (section 21): a partition's batch append and read, recovery, and whole-segment
+    retention (built: `stream.rs`); then segment index files, the stream's memory budget, the
+    catalog in trees, transactions with streams, and consumer and producer state.
 
 ## 21. Streams (Clay's spec of 2026-11-06)
 
@@ -1696,10 +1697,11 @@ lease of it, and the payload is written once.
 
   ```text
   base offset: u64 | count: u32 | flags: u32 | first time: u64 | last time: u64 |
-  producer: u64 | sequence: u64 | ends: count × u32 | messages
+  producer: u64 | sequence: u64 | messages | ends: count × u32
   ```
 
-  `ends` gives each message's end within the messages, so one is found without a scan. The record's
+  `ends` gives each message's end within the messages, so one is found without a scan; it follows
+  them, so a batch is built in one pass, its count known only at its end. The record's
   CRC (section 7.1) covers the batch; a torn batch ends the partition's log as a torn record ends
   the log. Times are the producer's, in microseconds; `producer` and `sequence` let a retry be told
   from a new batch (section 21.6).
@@ -1778,7 +1780,18 @@ The step after the first, designed here so the first leaves room for it:
 transactions with streams, and consumer and producer state. Replication, failover and Kafka's
 protocol are layers above.
 
-**Not built yet:** all of section 21.
+**Built** (`stream.rs`): a partition's batch append, in place or through the ring, its offsets
+assigned at publication and done once durable; reads of whole batches by offset from a sparse index;
+recovery from the partition's files, the gaps a recovery leaves recorded in its own file; retention
+of whole segments by offset. Measured (200,000 messages of 100 bytes, its log in memory, each append
+waited on): appending 663 instructions a message in batches of 100, 606 in batches of 1,000, 1,280
+in batches of 10, whose batches go through the ring; reading 121, 106 and 275. A SQL insert of the
+same row costs 13,858.
+
+**Not built yet:** completed segments' index files (the sparse index is in memory, an entry a chunk
+of every segment retained); the stream's own memory budget (chunks come from a free list bounded by
+the log's buffer, and a read copies each batch into a heap buffer of its own); the catalog in trees,
+and streams of several partitions; leases that read with no copy; and section 21.6.
 
 ## References
 

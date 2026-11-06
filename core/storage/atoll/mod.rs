@@ -47,6 +47,7 @@ pub mod solo;
 pub mod sql;
 pub mod stack;
 pub mod store;
+pub mod stream;
 pub mod txn;
 
 #[cfg(all(test, not(atoll_loom), not(shuttle), not(miri)))]

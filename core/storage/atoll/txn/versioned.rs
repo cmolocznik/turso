@@ -209,6 +209,17 @@ impl Versions {
         &self.arenas
     }
 
+    /// A step of the arenas' collection (DESIGN.md §11.5): frees the oldest arena pages of `slot`
+    /// while every snapshot, the checkpoint's cut among them, sees the transaction that last
+    /// appended to each, short of the slot's last, at twice the rate the slot took pages; how many
+    /// it freed. A begin takes this step for its own slot and for another, so the work goes as
+    /// transactions begin.
+    pub fn collect(&self, txns: &Transactions, slot: u16) -> Result<IOResult<u64>> {
+        let at = txns.collect_cutoff();
+        self.arenas
+            .collect(slot, |start| txns.ended_by(slot, start, at))
+    }
+
     /// The plain tree rooted at `root`.
     pub(super) fn open_plain(&self, root: PageId) -> Tree {
         Tree::open(self.io.clone(), self.pool.clone(), self.store.clone(), root)

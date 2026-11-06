@@ -776,8 +776,10 @@ impl ConnTxn {
             };
             match begun {
                 IOResult::Done(txn) => {
+                    let slot = txn.slot();
                     *guard = Some(txn);
                     self.begin_wait.lock().over()?;
+                    self.db.collect_after_begin(slot)?;
                 }
                 // No slot is free (R13): no one transaction is in the way, so no edge.
                 IOResult::IO(IOCompletions(c)) => {

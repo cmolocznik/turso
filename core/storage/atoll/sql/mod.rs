@@ -56,6 +56,8 @@ pub struct AtollDb {
     /// since. Not transactional: an id a rolled-back transaction drew is not drawn again while the
     /// database is open, and may be after a restart, when nothing durable names it.
     next_id: AtomicU64,
+    /// The slot a begin next collects beside its own, in turn.
+    collect_next: std::sync::atomic::AtomicUsize,
 }
 
 /// A database closed cleanly leaves its log durable to its end: the writes no commit flushed, a
@@ -118,6 +120,7 @@ impl AtollDb {
             current: Mutex::new(None),
             drainer: AtomicBool::new(false),
             next_id: AtomicU64::new(0),
+            collect_next: std::sync::atomic::AtomicUsize::new(0),
         };
         db.drain_lists()?;
         db.drop_unnamed_sequences()?;
@@ -198,6 +201,21 @@ impl AtollDb {
 
     pub fn versions(&self) -> &Versions {
         &self.versions
+    }
+
+    /// A begin's step of the version arenas' collection (DESIGN.md §11.5): a page of the slot it
+    /// took and one of the next slot in turn. Nothing waits: a step that would read a page in
+    /// starts the read and leaves the page to the next begin.
+    pub(crate) fn collect_after_begin(&self, slot: u16) -> Result<()> {
+        let txns = self.atoll.transactions();
+        let other = self
+            .collect_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % txns.slot_count();
+        for s in [slot, other as u16] {
+            let _freed = self.versions.collect(txns, s)?;
+        }
+        Ok(())
     }
 
     pub fn catalog(&self) -> &Catalog {

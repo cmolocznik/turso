@@ -2013,3 +2013,184 @@ fn a_step_takes_entries_copied_ahead_only_while_they_are_what_its_statement_read
     );
     db.commit(t);
 }
+
+/// Every arena page a collection frees now, slot by slot, until a pass frees none.
+fn collect_all(db: &Db) -> u64 {
+    let mut freed = 0;
+    loop {
+        let mut pass = 0;
+        for slot in 0..db.txns().slot_count() as u16 {
+            pass += run(&db.io, || db.versions.collect(db.txns(), slot));
+        }
+        if pass == 0 {
+            return freed;
+        }
+        freed += pass;
+    }
+}
+
+/// Rounds of updates of every key, each round a transaction, each update replacing a value that
+/// stays in its leaf (600 bytes in 4 KiB nodes), so the arena keeps it whole: pages enough to
+/// collect.
+fn churn(db: &Db, rounds: usize) {
+    for round in 0..rounds {
+        let mut w = db.begin(Isolation::Snapshot);
+        for k in 0..32 {
+            let value = padded(&format!("r{round}"), 600);
+            assert_eq!(
+                db.put(&mut w, &format!("k{k}"), &value, Mode::Update),
+                DONE_UPDATED
+            );
+        }
+        db.commit(w);
+    }
+}
+
+fn seeded(db: &Db) {
+    let mut w = db.begin(Isolation::Snapshot);
+    for k in 0..32 {
+        db.put(&mut w, &format!("k{k}"), &padded("r", 600), Mode::Insert);
+    }
+    db.commit(w);
+}
+
+/// The version arenas are collected by range (DESIGN.md §11.5): while an older snapshot runs, no
+/// page its versions lie in goes, and it reads them; once it ends, every slot's pages but the one
+/// it appends to go.
+#[test]
+fn arena_pages_an_older_snapshot_reads_stay_and_the_rest_go_once_it_ends() {
+    let db = open();
+    seeded(&db);
+    let mut old = db.begin(Isolation::Snapshot);
+    assert_eq!(db.get(&mut old, "k0"), Some(padded("r", 600)));
+    churn(&db, 40);
+    let held = db.db.pool().temporary_bytes();
+    assert!(
+        held > (db.txns().slot_count() * crate::storage::atoll::txn::arena::CLASS.size()) as u64,
+        "too few arena pages to collect: {held} bytes"
+    );
+    assert_eq!(
+        collect_all(&db),
+        0,
+        "a page the older snapshot reads was freed"
+    );
+    for k in 0..32 {
+        assert_eq!(
+            db.get(&mut old, &format!("k{k}")),
+            Some(padded("r", 600)),
+            "k{k}"
+        );
+    }
+    db.commit(old);
+    assert!(
+        collect_all(&db) > 0,
+        "nothing freed once the snapshot ended"
+    );
+    let left = db.db.pool().temporary_bytes();
+    assert!(
+        left <= (db.txns().slot_count() * crate::storage::atoll::txn::arena::CLASS.size()) as u64,
+        "{left} bytes of arena pages left beside each slot's last"
+    );
+    let mut fresh = db.begin(Isolation::Snapshot);
+    assert_eq!(db.get(&mut fresh, "k31"), Some(padded("r39", 600)));
+}
+
+/// A checkpoint's cut is among the snapshots: the arena pages its image reads stay until it is
+/// done.
+#[test]
+fn arena_pages_a_checkpoints_cut_reads_stay_until_it_is_done() {
+    let db = open();
+    seeded(&db);
+    let mut at = db.begin(Isolation::Snapshot);
+    assert!(db.get(&mut at, "k0").is_some());
+    let c = at.snapshot();
+    db.commit(at);
+    db.txns().hold_checkpoint(c);
+    churn(&db, 40);
+    assert_eq!(collect_all(&db), 0, "a page the cut reads was freed");
+    db.txns().release_checkpoint();
+    assert!(
+        collect_all(&db) > 0,
+        "nothing freed once the checkpoint was done"
+    );
+}
+
+/// Readers read every version of their snapshots, never one rolled back, while transactions
+/// commit and roll back and collectors free the arena pages no snapshot needs any more.
+fn versions_are_read_while_arenas_are_collected(rounds: usize) {
+    const KEYS: [&str; 4] = ["k0", "k1", "k2", "k3"];
+    let db = Arc::new(open());
+    let mut setup = db.begin(Isolation::Snapshot);
+    for k in KEYS {
+        db.put(&mut setup, k, &padded("c", 900), Mode::Insert);
+    }
+    db.commit(setup);
+    let done = Arc::new(crate::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let db = db.clone();
+        crate::thread::spawn(move || {
+            for i in 0..rounds {
+                let mut t = db.begin(Isolation::ReadCommitted);
+                for k in KEYS {
+                    put_waiting(&db, &mut t, k, &padded(&format!("u{i}"), 900));
+                }
+                if i % 3 == 2 {
+                    db.rollback(t);
+                } else {
+                    db.commit(t);
+                }
+            }
+        })
+    };
+    let reader = {
+        let db = db.clone();
+        crate::thread::spawn(move || {
+            for _ in 0..rounds {
+                let mut t = db.begin(Isolation::Snapshot);
+                let first = KEYS.map(|k| db.get(&mut t, k));
+                db.txns().statement(&mut t).unwrap();
+                let again = KEYS.map(|k| db.get(&mut t, k));
+                assert_eq!(first, again, "a snapshot read two values of a key");
+                for v in &first {
+                    let v = v.as_deref().expect("every key").trim_end_matches('.');
+                    let round = v.strip_prefix('u').and_then(|r| r.parse::<usize>().ok());
+                    assert!(v == "c" || round.is_some_and(|r| r % 3 != 2), "read {v}");
+                }
+                db.commit(t);
+            }
+        })
+    };
+    // Two collectors, as two begins collect one slot: its claim lets one at a time free.
+    let collectors: Vec<_> = (0..2)
+        .map(|_| {
+            let (db, done) = (db.clone(), done.clone());
+            crate::thread::spawn(move || {
+                while !done.load(crate::sync::atomic::Ordering::Acquire) {
+                    collect_all(&db);
+                    crate::thread::yield_now();
+                }
+            })
+        })
+        .collect();
+    for t in [writer, reader] {
+        t.join().unwrap();
+    }
+    done.store(true, crate::sync::atomic::Ordering::Release);
+    for c in collectors {
+        c.join().unwrap();
+    }
+}
+
+#[test]
+fn versions_are_read_while_arenas_are_collected_on_threads() {
+    versions_are_read_while_arenas_are_collected(300);
+}
+
+#[cfg(shuttle)]
+#[test]
+fn versions_are_read_while_arenas_are_collected_in_shuttle_schedules() {
+    crate::storage::atoll::testing::schedules(
+        || versions_are_read_while_arenas_are_collected(3),
+        300,
+    );
+}

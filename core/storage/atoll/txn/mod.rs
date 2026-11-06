@@ -945,6 +945,28 @@ impl Transactions {
         snapshots::oldest(self.snapshots.iter().map(|s| &**s), at)
     }
 
+    /// At or below every snapshot running now or taken from now on, and the cut of the checkpoint
+    /// under way: an arena entry whose transaction committed at or below it is followed by no one
+    /// (DESIGN.md §11.5).
+    /// The slots transactions run in.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn collect_cutoff(&self) -> Ts {
+        self.oldest_snapshot(self.horizon.at())
+            .min(self.checkpoint_at.load(Ordering::SeqCst))
+    }
+
+    /// Whether the slot's transaction that started at `start` committed at or below `at`, or
+    /// ended before one that did: every snapshot at or above `at` sees what it wrote, or nothing
+    /// names what it appended.
+    pub fn ended_by(&self, slot: u16, start: Ts, at: Ts) -> bool {
+        self.slots
+            .get(slot as usize)
+            .is_some_and(|log| start <= log.last_at(at))
+    }
+
     /// Whether every snapshot taken from now on sees the version written by the slot's transaction
     /// that started at `start`, and so does the checkpoint under way: no checkpoint needs any
     /// version below it.

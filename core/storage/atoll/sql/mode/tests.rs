@@ -4,6 +4,7 @@
 use crate::io::{MemoryIO, OpenFlags, IO};
 use crate::storage::atoll::checkpoint::{Checkpointing, WRITER_STEPS};
 use crate::storage::atoll::sql::catalog::tests::config;
+use crate::storage::atoll::txn::arena::PAGES_TAKEN;
 use crate::sync::Arc;
 use crate::{ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, SqliteDialect, Value};
 
@@ -625,6 +626,38 @@ fn with_a_checkpointing_thread_a_bulk_commit_waits_for_its_full_checkpoint() {
             vec![vec![Value::from_i64((20 * budget / row) as i64)]]
         );
     });
+}
+
+/// Each begin collects the version arenas (DESIGN.md §11.5): a writer updating its rows again and
+/// again, no older snapshot running, leaves its slot no page but the one it appends to once the
+/// next begin has collected, where without collection every update's replaced value would stay.
+#[test]
+fn begins_collect_the_arenas_so_a_writers_replaced_values_do_not_pile_up() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/collected");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t (b) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+         WHERE i < 64) SELECT zeroblob(200) FROM n",
+    )
+    .unwrap();
+    let page = crate::storage::atoll::txn::arena::CLASS.size() as u64;
+    let pool = db.atoll.as_ref().unwrap().atoll().pool().clone();
+    let taken = PAGES_TAKEN.with(|n| n.get());
+    for _ in 0..200 {
+        conn.execute("UPDATE t SET b = randomblob(200)").unwrap();
+    }
+    let taken = PAGES_TAKEN.with(|n| n.get()) - taken;
+    assert!(taken > 4, "the updates took {taken} arena pages");
+    // A begin of its own, which collects what the last update's transaction left.
+    assert_eq!(
+        rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(64)]]
+    );
+    let left = pool.temporary_bytes();
+    assert!(left <= page, "{left} bytes of arena pages left");
 }
 
 /// A long explicit transaction appending twenty times the log budget before it commits: each of

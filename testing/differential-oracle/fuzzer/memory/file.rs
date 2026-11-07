@@ -68,7 +68,7 @@ impl File for MemorySimFile {
             }
             read_len as i32
         };
-        c.complete(buf_size);
+        c.deliver(Ok(buf_size));
         Ok(c)
     }
 
@@ -79,7 +79,7 @@ impl File for MemorySimFile {
         c: Completion,
     ) -> Result<Completion> {
         let written = self.write_buf(buffer.as_slice(), pos as usize);
-        c.complete(written as i32);
+        c.deliver(Ok(written as i32));
         Ok(c)
     }
 
@@ -90,7 +90,7 @@ impl File for MemorySimFile {
         c: Completion,
     ) -> Result<Completion> {
         if buffers.is_empty() {
-            c.complete(0);
+            c.deliver(Ok(0));
             return Ok(c);
         }
 
@@ -103,13 +103,13 @@ impl File for MemorySimFile {
             total_written += written;
         }
 
-        c.complete(total_written as i32);
+        c.deliver(Ok(total_written as i32));
         Ok(c)
     }
 
     fn sync(&self, c: Completion, _sync_type: turso_core::io::FileSyncType) -> Result<Completion> {
         // No-op for in-memory files
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 
@@ -119,7 +119,7 @@ impl File for MemorySimFile {
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         self.buffer.borrow_mut().truncate(len as usize);
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 }

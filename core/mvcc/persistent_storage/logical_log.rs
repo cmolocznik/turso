@@ -4855,7 +4855,7 @@ mod tests {
             if n > 0 {
                 read.buf().as_mut_slice()[..n].copy_from_slice(&self.data[pos..pos + n]);
             }
-            c.complete(n as i32);
+            c.deliver(Ok(n as i32));
             true
         }
     }
@@ -4868,6 +4868,7 @@ mod tests {
             Ok(())
         }
         fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            c.accept();
             self.pending.lock().unwrap().push_back((pos, c.clone()));
             Ok(c)
         }
@@ -4920,10 +4921,10 @@ mod tests {
                     .fail_header_write
                     .load(std::sync::atomic::Ordering::SeqCst)
             {
-                c.error(crate::CompletionError::IOError(
+                c.deliver(Err(crate::CompletionError::IOError(
                     std::io::ErrorKind::Other,
                     "injected header write failure",
-                ));
+                )));
                 return Ok(c);
             }
             self.inner.pwrite(pos, buffer, c)

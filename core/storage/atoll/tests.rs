@@ -434,6 +434,12 @@ fn a_checkpoint_that_fails_leaves_the_one_in_charge_and_none_runs_until_the_data
     reopened.checkpoint();
 }
 
+crate::thread::thread_local! {
+    /// Whether the steps [`drive_for`] or [`settle`] were given ran out with a request still owned
+    /// by the backend: what dropping the database then leaves for its close to retire.
+    static OWNED_AT_RUN_OUT: Cell<bool> = const { Cell::new(false) };
+}
+
 /// [`drive`] while `left` holds IO steps, each step spending one, shared across calls: `None` once
 /// they run out, with what the operation submitted still in flight. A yield spends one too, so
 /// they always run out.
@@ -447,6 +453,11 @@ fn drive_for<T>(
             IOResult::Done(v) => return Some(v),
             IOResult::IO(IOCompletions(c)) => loop {
                 if left.get() == 0 {
+                    let owned = c
+                        .requests(&mut std::collections::HashSet::new())
+                        .iter()
+                        .any(|r| r.is_owned());
+                    OWNED_AT_RUN_OUT.with(|o| o.set(owned));
                     return None;
                 }
                 left.set(left.get() - 1);
@@ -463,6 +474,7 @@ fn drive_for<T>(
 fn settle(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Option<()> {
     while crash.in_flight() > 0 {
         if left.get() == 0 {
+            OWNED_AT_RUN_OUT.with(|o| o.set(true));
             return None;
         }
         left.set(left.get() - 1);
@@ -530,10 +542,11 @@ fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Opti
     Some(())
 }
 
-/// A database dropped with its IO in flight leaves nothing holding the IO: every completion it
-/// hands the IO waits in it, so one that held its owner, or a file it syncs, strongly would keep
-/// the IO and all it holds alive for good once nothing steps it. Dropped after every number of IO
-/// steps through every kind of IO it submits, with and without durable writes.
+/// A database dropped with its IO in flight retires every request on its files before the drop
+/// returns (DESIGN.md 22.12, step 4), and leaves nothing holding the IO: a completion that held
+/// its owner, or a file it syncs, strongly would keep the IO and all it holds alive for good.
+/// Dropped after every number of IO steps through every kind of IO it submits, with and without
+/// durable writes.
 #[test]
 fn a_database_dropped_with_io_in_flight_leaves_nothing_holding_its_io() {
     for durable_writes in [true, false] {
@@ -543,7 +556,13 @@ fn a_database_dropped_with_io_in_flight_leaves_nothing_holding_its_io() {
             crash.set_durable_writes(durable_writes);
             let io: Arc<dyn IO> = crash.clone();
             let finished = every_kind_of_io(&crash, &io, &Cell::new(steps)).is_some();
-            dropped_in_flight += usize::from(crash.in_flight() > 0);
+            dropped_in_flight += usize::from(OWNED_AT_RUN_OUT.with(|o| o.replace(false)));
+            assert_eq!(
+                crash.in_flight(),
+                0,
+                "dropped after {steps} IO steps (durable writes: {durable_writes}): a request \
+                 outlived the database's close"
+            );
             drop(io);
             assert_eq!(
                 (Arc::strong_count(&crash), crash.other_handles()),

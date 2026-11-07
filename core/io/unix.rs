@@ -333,7 +333,7 @@ impl File for UnixFile {
         } else {
             trace!("pread n: {}", result);
             // Read succeeded immediately
-            c.complete(result as i32);
+            c.deliver(Ok(result as i32));
             Ok(c)
         }
     }
@@ -379,7 +379,7 @@ impl File for UnixFile {
             trace!("pwrite iteration: wrote {written}, total {total_written}/{total_size}");
         }
         trace!("pwrite complete: wrote {total_written} bytes");
-        c.complete(total_written as i32);
+        c.deliver(Ok(total_written as i32));
         Ok(c)
     }
 
@@ -448,7 +448,7 @@ impl File for UnixFile {
             trace!("pwritev iteration: wrote {written}, total {total_written}/{total_size}");
         }
         trace!("pwritev complete: wrote {total_written} bytes");
-        c.complete(total_written as i32);
+        c.deliver(Ok(total_written as i32));
         Ok(c)
     }
 
@@ -484,7 +484,7 @@ impl File for UnixFile {
             #[cfg(not(target_vendor = "apple"))]
             trace!("fsync");
 
-            c.complete(0);
+            c.deliver(Ok(0));
             Ok(c)
         }
     }
@@ -496,7 +496,7 @@ impl File for UnixFile {
             return Err(io_error(std::io::Error::last_os_error(), "fdatasync"));
         }
         trace!("fdatasync");
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 
@@ -537,7 +537,7 @@ impl File for UnixFile {
             }
         }
         trace!("pwrite_durable complete: wrote {written} bytes");
-        c.complete(written as i32);
+        c.deliver(Ok(written as i32));
         Ok(c)
     }
 
@@ -575,7 +575,7 @@ impl File for UnixFile {
         match result {
             Ok(()) => {
                 trace!("file truncated to len=({})", len);
-                c.complete(0);
+                c.deliver(Ok(0));
                 Ok(c)
             }
             Err(e) => Err(io_error(e, "truncate")),

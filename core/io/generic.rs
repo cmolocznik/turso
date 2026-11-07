@@ -80,7 +80,7 @@ impl File for GenericFile {
             let buf = buf.as_mut_slice();
             file.read(buf).map_err(|e| io_error(e, "pread"))? as i32
         };
-        c.complete(nr);
+        c.deliver(Ok(nr));
         Ok(c)
     }
 
@@ -90,7 +90,7 @@ impl File for GenericFile {
         file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pwrite"))?;
         let buf = buffer.as_slice();
         file.write_all(buf).map_err(|e| io_error(e, "pwrite"))?;
-        c.complete(buffer.len() as i32);
+        c.deliver(Ok(buffer.len() as i32));
         Ok(c)
     }
 
@@ -98,7 +98,7 @@ impl File for GenericFile {
     fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         let file = self.file.write();
         file.sync_all().map_err(|e| io_error(e, "sync"))?;
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 
@@ -106,7 +106,7 @@ impl File for GenericFile {
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let file = self.file.write();
         file.set_len(len).map_err(|e| io_error(e, "truncate"))?;
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 

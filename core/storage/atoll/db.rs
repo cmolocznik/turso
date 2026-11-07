@@ -8,6 +8,7 @@ use super::log::{Log, LogConfig};
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
 use super::recovery::{self, Recovered};
+use super::requests::{Counted, Requests};
 use super::store::{PageStore, StoreConfig};
 use super::txn::{Clock, Transactions, TxnConfig};
 use crate::io::IO;
@@ -101,6 +102,9 @@ pub(in crate::storage::atoll) struct Atoll {
     /// The checkpointing thread ([`Checkpointing::Thread`]), ended and joined when the database
     /// closes.
     driver: Option<crate::thread::JoinHandle<()>>,
+    /// The IO every file of the database was opened through, counting its requests.
+    io: Arc<dyn IO>,
+    requests: Arc<Requests>,
 }
 
 impl Drop for Atoll {
@@ -112,6 +116,8 @@ impl Drop for Atoll {
                 tracing::error!("the checkpointing thread panicked");
             }
         }
+        // No request on the database's files outlives it (DESIGN.md 22.12, step 4).
+        self.requests.drain(&*self.io);
     }
 }
 
@@ -164,7 +170,10 @@ pub(in crate::storage::atoll) struct Opening {
     store: Arc<PageStore>,
     superblock: Superblock,
     how: Mutex<How>,
+    /// The embedder's IO wrapped to count the requests on the database's files: every file is
+    /// opened through it, from the first.
     io: Arc<dyn IO>,
+    requests: Arc<Requests>,
     checkpointing: Checkpointing,
 }
 
@@ -184,6 +193,8 @@ enum How {
 
 impl Opening {
     pub fn new(io: Arc<dyn IO>, base: &str, mut config: AtollConfig) -> Result<Self> {
+        let requests = Arc::new(Requests::default());
+        let io: Arc<dyn IO> = Arc::new(Counted::new(io, requests.clone()));
         // The log's ring is lent from the pool for as long as it is open: the smallest pool is
         // the budget beside it.
         let ring = super::log::ring_bytes(&config.log);
@@ -197,7 +208,7 @@ impl Opening {
         }
         let (control, superblock) = Control::open(io.clone(), base)?;
         let Some(superblock) = superblock else {
-            return Self::create(io, base, config, control);
+            return Self::create(io, requests, base, config, control);
         };
         // What the database was created with holds, whatever this configuration says.
         config.log.segment_bytes = superblock.segment_bytes;
@@ -213,6 +224,7 @@ impl Opening {
             store,
             superblock,
             io: io.clone(),
+            requests,
             checkpointing: config.checkpointing,
             how: Mutex::new(How::Recovering {
                 io,
@@ -225,7 +237,13 @@ impl Opening {
 
     /// A database made from nothing: its first superblock names checkpoint 0, no page and no log,
     /// written before anything is appended, so a log with no superblock is no database yet.
-    fn create(io: Arc<dyn IO>, base: &str, config: AtollConfig, control: Control) -> Result<Self> {
+    fn create(
+        io: Arc<dyn IO>,
+        requests: Arc<Requests>,
+        base: &str,
+        config: AtollConfig,
+        control: Control,
+    ) -> Result<Self> {
         // From the IO, so a simulation that seeds it creates the same database every time.
         let mut database_id = [0u8; 16];
         for half in database_id.chunks_exact_mut(8) {
@@ -272,6 +290,7 @@ impl Opening {
             store,
             superblock,
             io,
+            requests,
             checkpointing: config.checkpointing,
             how: Mutex::new(How::Created(Box::new(Recovered {
                 log,
@@ -359,6 +378,8 @@ impl Opening {
             pool,
             checkpointer,
             driver,
+            io: self.io,
+            requests: self.requests,
         })
     }
 }

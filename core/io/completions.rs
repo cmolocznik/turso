@@ -3,8 +3,8 @@ use core::fmt::{self, Debug};
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, OnceLock,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        Arc, OnceLock, Weak,
     },
     task::{Poll, Waker},
 };
@@ -45,11 +45,23 @@ impl Future for Completion {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ContextInner {
     /// A waker for each task waiting on the completion. Finishing the completion wakes them all.
     wakers: SmallVec<[Waker; 1]>,
+    /// What runs once the request is retired, registered while a backend owns it
+    /// ([`Completion::on_retired`]).
+    on_retired: Vec<Box<dyn FnOnce() + Send>>,
     // TODO: add abort signal
+}
+
+impl Debug for ContextInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContextInner")
+            .field("wakers", &self.wakers.len())
+            .field("on_retired", &self.on_retired.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +73,7 @@ impl ContextInner {
     pub fn new() -> Self {
         Self {
             wakers: SmallVec::new(),
+            on_retired: Vec::new(),
         }
     }
 
@@ -106,8 +119,21 @@ impl Context {
     }
 }
 
+/// A request's ownership (DESIGN.md 22.5): not submitted until a backend takes it; accepted while a
+/// backend holds it and every buffer it reads into or writes from, whoever finishes it meanwhile (a
+/// cancel finishes a request the kernel still holds); retired once the backend has let both go,
+/// after its callback returned. A group's is the aggregate of the requests beneath it.
+const NOT_SUBMITTED: u8 = 0;
+const ACCEPTED: u8 = 1;
+const RETIRED: u8 = 2;
+/// Beside [`ACCEPTED`]: something waits for the retirement ([`Completion::on_retired`]), so
+/// whoever ends the ownership takes the waits.
+const OBSERVED: u8 = 4;
+
 pub(super) struct CompletionInner {
     completion_type: CompletionType,
+    /// For a request, [`NOT_SUBMITTED`], [`ACCEPTED`] (with [`OBSERVED`]) or [`RETIRED`].
+    ownership: AtomicU8,
     /// None means we completed successfully
     // Thread safe with OnceLock
     pub(super) result: crate::sync::OnceLock<Option<CompletionError>>,
@@ -164,6 +190,7 @@ impl CompletionGroup {
     {
         let inner = Arc::new(GroupCompletionInner {
             outstanding: AtomicUsize::new(1),
+            members: Mutex::new(Vec::new()),
             complete: Box::new(callback),
             result: OnceLock::new(),
         });
@@ -182,6 +209,10 @@ impl CompletionGroup {
     /// so the link has to be there before the child can finish.
     pub fn add(&mut self, c: &Completion) {
         self.completions.push(c.clone());
+        self.inner
+            .members
+            .lock()
+            .push(Arc::downgrade(c.get_inner()));
         self.inner.outstanding.fetch_add(1, Ordering::SeqCst);
         let mut parent = c.get_inner().parent.lock();
         turso_assert!(parent.is_none(), "completion can only be linked once");
@@ -240,6 +271,10 @@ impl fmt::Debug for GroupCompletion {
 struct GroupCompletionInner {
     /// Number of completions that need to finish
     outstanding: AtomicUsize,
+    /// Every completion added, held weakly: the group's ownership is theirs, and a strong hold
+    /// would keep a child's buffers past its retirement and, with the child's link to its group,
+    /// make a cycle. A child gone is owned by no one.
+    members: Mutex<Vec<Weak<CompletionInner>>>,
     /// Callback to invoke when all completions finish
     complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
     /// Cached result after all completions finish
@@ -286,6 +321,7 @@ impl CompletionInner {
     fn new(completion_type: CompletionType) -> Self {
         Self {
             completion_type,
+            ownership: AtomicU8::new(NOT_SUBMITTED),
             result: OnceLock::new(),
             context: Context::new(),
             parent: Mutex::new(None),
@@ -546,6 +582,158 @@ impl Completion {
 
     pub fn abort(&self) {
         self.error(CompletionError::Aborted);
+    }
+
+    /// Whether this is a request a backend carries out (a read, a write, a sync, a truncation),
+    /// rather than a group or a wait.
+    fn is_request(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            matches!(
+                inner.completion_type,
+                CompletionType::Read(_)
+                    | CompletionType::Write(_)
+                    | CompletionType::Sync(_)
+                    | CompletionType::Truncate(_)
+            )
+        })
+    }
+
+    /// A backend takes the request: from now until [`retire`](Self::retire) it owns the request
+    /// and every buffer the request reads into or writes from, whoever finishes it meanwhile. A
+    /// backend that holds a request past its submission's return accepts it before returning; one
+    /// that hands an accepted request on to another leaves it accepted, for the one that delivers
+    /// it to retire.
+    pub fn accept(&self) {
+        turso_assert!(self.is_request(), "only a request is submitted");
+        let ownership = &self.get_inner().ownership;
+        if let Err(was) =
+            ownership.compare_exchange(NOT_SUBMITTED, ACCEPTED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            turso_assert!(was & ACCEPTED != 0, "a retired request submitted again");
+        }
+    }
+
+    /// A submission that accepted the request gives it back whole, its callback not run: nothing
+    /// owns it, as before it was submitted.
+    pub fn refuse(&self) {
+        turso_assert!(!self.finished(), "a request refused after it was delivered");
+        let was = self
+            .get_inner()
+            .ownership
+            .swap(NOT_SUBMITTED, Ordering::AcqRel);
+        turso_assert!(
+            was & ACCEPTED != 0,
+            "a request refused that was not accepted"
+        );
+        if was & OBSERVED != 0 {
+            self.let_go_observers();
+        }
+    }
+
+    /// The backend that delivered the request lets it go, and every buffer with it, after its
+    /// callback returned: inline at the submission's return, a queueing backend once it delivered
+    /// it. What waited for the retirement runs now.
+    pub fn retire(&self) {
+        turso_assert!(self.is_request(), "only a request is retired");
+        turso_assert!(
+            self.finished(),
+            "a request retired before its callback returned"
+        );
+        let was = self.get_inner().ownership.swap(RETIRED, Ordering::AcqRel);
+        turso_assert!(was != RETIRED, "a request retired twice");
+        if was & OBSERVED != 0 {
+            self.let_go_observers();
+        }
+    }
+
+    /// Delivers the request's result, running its callback, and retires it: a backend's delivery.
+    pub fn deliver(&self, result: Result<i32, CompletionError>) {
+        self.callback(result);
+        self.retire();
+    }
+
+    /// Carries this request out through another, the one `submit` submits, whose callback
+    /// finishes this one: a layer between a caller and a backend that reads into a buffer of its
+    /// own, or checks what it read, before it finishes the caller's request. This request is
+    /// accepted before the submission, given back with it if it is refused, and retired once the
+    /// other retires, so a wait for its retirement waits for the backend's.
+    pub fn carry(
+        &self,
+        submit: impl FnOnce() -> crate::Result<Completion>,
+    ) -> crate::Result<Completion> {
+        self.accept();
+        match submit() {
+            Ok(inner) => {
+                let me = self.clone();
+                inner.on_retired(move || me.retire());
+                Ok(inner)
+            }
+            Err(e) => {
+                self.refuse();
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether a backend owns the request: accepted and not yet retired.
+    pub fn is_owned(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.ownership.load(Ordering::Acquire) & ACCEPTED != 0)
+    }
+
+    /// Runs `f` once no backend owns the request: now, if none does (never submitted, given back,
+    /// or retired), or as the backend that owns it lets it go.
+    pub fn on_retired(&self, f: impl FnOnce() + Send + 'static) {
+        let inner = self.get_inner();
+        let mut context = inner.context.inner.lock();
+        let mut state = inner.ownership.load(Ordering::Acquire);
+        while state & ACCEPTED != 0 {
+            match inner.ownership.compare_exchange(
+                state,
+                state | OBSERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    context.on_retired.push(Box::new(f));
+                    return;
+                }
+                Err(now) => state = now,
+            }
+        }
+        drop(context);
+        f();
+    }
+
+    /// Takes what waited for the retirement, under the lock its registrations hold, and runs it
+    /// once the lock is free.
+    fn let_go_observers(&self) {
+        let observers = std::mem::take(&mut self.get_inner().context.inner.lock().on_retired);
+        for f in observers {
+            f();
+        }
+    }
+
+    /// Every request this completion stands for, each once across calls sharing `seen`: itself,
+    /// or for a group every request beneath it, its nested groups walked down whatever their own
+    /// completions' state. A member gone is owned by no one, and left out.
+    pub fn requests(&self, seen: &mut std::collections::HashSet<usize>) -> Vec<Completion> {
+        let mut found = Vec::new();
+        let mut walk: Vec<Arc<CompletionInner>> = self.inner.iter().cloned().collect();
+        while let Some(inner) = walk.pop() {
+            if !seen.insert(Arc::as_ptr(&inner) as usize) {
+                continue;
+            }
+            match &inner.completion_type {
+                CompletionType::Group(group) => {
+                    walk.extend(group.inner.members.lock().iter().filter_map(Weak::upgrade));
+                }
+                CompletionType::Yield | CompletionType::Remote => {}
+                _ => found.push(Completion { inner: Some(inner) }),
+            }
+        }
+        found
     }
 
     fn callback(&self, result: Result<i32, CompletionError>) {

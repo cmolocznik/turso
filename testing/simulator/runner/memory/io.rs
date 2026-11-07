@@ -154,7 +154,7 @@ impl Operation {
                     .borrow()
                     .buffer
                     .read(offset, buffer.as_mut_slice());
-                completion.complete(bytes_read as i32);
+                completion.deliver(Ok(bytes_read as i32));
             }
             OperationType::Write {
                 buffer,
@@ -162,7 +162,7 @@ impl Operation {
                 offset,
             } => {
                 let buf_size = self.file.borrow_mut().write(offset, buffer.as_slice());
-                completion.complete(buf_size as i32);
+                completion.deliver(Ok(buf_size as i32));
             }
             OperationType::WriteV {
                 buffers,
@@ -177,18 +177,18 @@ impl Operation {
                     written + buf_size
                 });
                 drop(file);
-                completion.complete(written as i32);
+                completion.deliver(Ok(written as i32));
             }
             OperationType::Sync {
                 completion,
                 snapshot,
             } => {
                 self.file.borrow_mut().sync_completed(snapshot);
-                completion.complete(0);
+                completion.deliver(Ok(0));
             }
             OperationType::Truncate { completion, len } => {
                 self.file.borrow_mut().resize(len);
-                completion.complete(0);
+                completion.deliver(Ok(0));
             }
         }
     }
@@ -333,6 +333,8 @@ impl SimIO for MemorySimIO {
             } else {
                 assert!(completion.failed());
             }
+            // Lost with the power: the IO lets it go.
+            completion.retire();
         }
         assert!(
             self.callbacks.lock().is_empty() && self.timeouts.lock().is_empty(),
@@ -434,6 +436,8 @@ impl IO for MemorySimIO {
                     completion.failed(),
                     "queued file operation completed without running its operation"
                 );
+                // Cancelled while queued: the IO lets it go.
+                completion.retire();
                 continue;
             }
 
@@ -441,7 +445,7 @@ impl IO for MemorySimIO {
                 if callback.fault {
                     // Inject the fault by aborting the completion
                     tracing::error!("Fault injection: aborting completion");
-                    completion.abort();
+                    completion.deliver(Err(CompletionError::Aborted));
                     continue;
                 }
                 callback.do_operation();

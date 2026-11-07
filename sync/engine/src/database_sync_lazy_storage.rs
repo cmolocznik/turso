@@ -496,7 +496,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                 .clean_file_size
                 .load(std::sync::atomic::Ordering::SeqCst)
         {
-            c.complete(0);
+            c.deliver(Ok(0));
             return Ok(c);
         }
 
@@ -586,10 +586,24 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                 Ok::<(), errors::Error>(())
             }
         });
+        // The read is this storage's until the generator ends (DESIGN.md 22.5): it fills the
+        // caller's buffer from wherever it fetches the page, and lets the request go at its end,
+        // failed there if the generator ended without delivering it.
+        c.accept();
+        let held = c.clone();
         self.sync_engine_io.add_io_callback(Box::new(move || {
             match generator.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(_) => false,
-                genawaiter::GeneratorState::Complete(_) => true,
+                genawaiter::GeneratorState::Complete(_) => {
+                    if !held.finished() {
+                        held.error(turso_core::CompletionError::IOError(
+                            std::io::ErrorKind::Other,
+                            "partial sync page read",
+                        ));
+                    }
+                    held.retire();
+                    true
+                }
             }
         }));
         Ok(c)
@@ -627,6 +641,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         }
         let end_pos = start_pos + buffer_size as u64;
         let clean_file_size = self.clean_file_size.clone();
+        let outer = c.clone();
         let nc = Completion::new_write(move |result| match result {
             Ok(code) => {
                 c.complete(code);
@@ -634,7 +649,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             }
             Err(err) => c.error(err),
         });
-        self.clean_file.pwrite(start_pos, buffer, nc)
+        outer.carry(|| self.clean_file.pwrite(start_pos, buffer, nc))
     }
 
     fn write_pages(
@@ -665,6 +680,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             dirty_file.punch_hole(start_pos as usize, buffers_size)?;
         }
         let clean_file_size = self.clean_file_size.clone();
+        let outer = c.clone();
         let nc = Completion::new_write(move |result| match result {
             Ok(code) => {
                 c.complete(code);
@@ -672,7 +688,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             }
             Err(err) => c.error(err),
         });
-        self.clean_file.pwritev(start_pos, buffers, nc)
+        outer.carry(|| self.clean_file.pwritev(start_pos, buffers, nc))
     }
 
     fn sync(
@@ -709,6 +725,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         }
 
         let clean_file_size = self.clean_file_size.clone();
+        let outer = c.clone();
         let nc = Completion::new_trunc(move |result| match result {
             Ok(code) => {
                 clean_file_size.store(len as u64, std::sync::atomic::Ordering::SeqCst);
@@ -716,6 +733,6 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             }
             Err(err) => c.error(err),
         });
-        self.clean_file.truncate(len as u64, nc)
+        outer.carry(|| self.clean_file.truncate(len as u64, nc))
     }
 }

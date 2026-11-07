@@ -6817,6 +6817,7 @@ pub mod test {
         }
 
         fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            c.accept();
             self.pending_reads.lock().push((pos, c.clone()));
             Ok(c)
         }

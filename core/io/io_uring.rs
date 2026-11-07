@@ -114,13 +114,11 @@ impl RingState {
         }
     }
 
-    /// SAFETY: caller must guarantee no other `SubmissionQueue` exists for
-    /// `ring` (i.e. caller holds the `RingState` Mutex).
-    unsafe fn submit_entry(
-        &mut self,
-        ring: &io_uring::IoUring,
-        entry: &io_uring::squeue::Entry,
-    ) -> Result<()> {
+    /// Queues `entry`, in the submission queue or past it in the overflow, and enters what is
+    /// queued: the request is accepted once queued, whatever entering it comes to (DESIGN.md
+    /// 22.5). SAFETY: caller must guarantee no other `SubmissionQueue` exists for `ring` (i.e.
+    /// caller holds the `RingState` Mutex).
+    unsafe fn submit_entry(&mut self, ring: &io_uring::IoUring, entry: &io_uring::squeue::Entry) {
         trace!("submit_entry({:?})", entry);
         self.flush_overflow(ring);
         let pushed = {
@@ -132,8 +130,7 @@ impl RingState {
         } else {
             self.overflow.push_back(entry.clone());
         }
-        ring.submit().map_err(|e| io_error(e, "io_uring_submit"))?;
-        Ok(())
+        enter(ring);
     }
 
     /// SAFETY: same contract as `submit_entry`.
@@ -141,7 +138,7 @@ impl RingState {
         &mut self,
         ring: &io_uring::IoUring,
         entry: &io_uring::squeue::Entry,
-    ) -> Result<()> {
+    ) {
         let pushed = {
             let mut sq = ring.submission_shared();
             sq.push(entry).is_ok()
@@ -151,9 +148,30 @@ impl RingState {
         } else {
             self.pending_ops += 1;
         }
-        ring.submit().map_err(|e| io_error(e, "io_uring_submit"))?;
-        Ok(())
+        enter(ring);
     }
+}
+
+/// Enters the requests queued in the submission queue into the kernel. Entries already queued are
+/// accepted requests: a refusal the kernel says may pass (interrupted, out of resources, a full
+/// completion queue) leaves them queued for the next entry, which the next submission or wait
+/// makes. Any other means the ring can no longer deliver or retire what it accepted, and ends the
+/// process (DESIGN.md 22.11): returning would leave every waiter on those requests waiting.
+fn enter(ring: &io_uring::IoUring) {
+    if let Err(e) = ring.submit() {
+        match e.raw_os_error() {
+            Some(libc::EINTR | libc::EAGAIN | libc::EBUSY) => {}
+            _ => ring_lost(&e, "io_uring_enter"),
+        }
+    }
+}
+
+/// Ends the process: the ring cannot deliver or retire the requests it accepted.
+fn ring_lost(e: &std::io::Error, during: &str) -> ! {
+    eprintln!(
+        "io_uring: {during} failed ({e}): the ring can no longer deliver the requests it accepted"
+    );
+    std::process::abort()
 }
 
 /// preallocated vec of iovec arrays to avoid allocations during writev operations
@@ -339,12 +357,7 @@ impl RingState {
 
     /// Submit or resubmit a writev operation. SAFETY: caller must hold the
     /// `RingState` Mutex (so no other `SubmissionQueue` exists for `ring`).
-    unsafe fn submit_writev(
-        &mut self,
-        ring: &io_uring::IoUring,
-        key: u64,
-        mut st: WritevState,
-    ) -> Result<()> {
+    unsafe fn submit_writev(&mut self, ring: &io_uring::IoUring, key: u64, mut st: WritevState) {
         st.free_last_iov(&mut self.iov_pool);
 
         let mut iov_allocation = self.iov_pool.acquire().unwrap_or_else(|| {
@@ -439,7 +452,7 @@ impl RingState {
                     written,
                     remaining
                 );
-                self.submit_writev(ring, user_data, state)?;
+                self.submit_writev(ring, user_data, state);
                 // Progress wake: the future is parked on the parent
                 // completion's waker, but `complete()` only fires on the
                 // final chunk. Without this, intermediate-chunk completions
@@ -497,7 +510,7 @@ impl IO for UringIO {
                 .build()
                 .user_data(CANCEL_TAG);
             // SAFETY: holding `state` Mutex.
-            unsafe { state.submit_cancel_urgent(&self.ring, &e)? };
+            unsafe { state.submit_cancel_urgent(&self.ring, &e) };
         }
         Ok(())
     }
@@ -604,10 +617,7 @@ impl UringIO {
         let mut finished = Vec::new();
         let taken = self.take_cqes(&mut finished);
         for (user_data, result) in finished {
-            match result {
-                Ok(n) => completion_from_key(user_data).complete(n),
-                Err(e) => completion_from_key(user_data).error(e),
-            }
+            completion_from_key(user_data).deliver(result);
         }
         taken
     }
@@ -792,9 +802,10 @@ impl File for UringFile {
                     .user_data(get_key(c.clone()))
             }
         };
+        c.accept();
         let mut state = self.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.ring, &read_e)? };
+        unsafe { state.submit_entry(&self.ring, &read_e) };
         Ok(c)
     }
 
@@ -831,9 +842,10 @@ impl File for UringFile {
         // buffers the SQE holds a raw pointer; without this the Arc would drop
         // here and the kernel could read freed memory.
         c.keep_write_buffer_alive(buffer);
+        c.accept();
         let mut state = self.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.ring, &write)? };
+        unsafe { state.submit_entry(&self.ring, &write) };
         Ok(c)
     }
 
@@ -843,9 +855,10 @@ impl File for UringFile {
         let sync = io_uring::opcode::Fsync::new(fd)
             .build()
             .user_data(get_key(c.clone()));
+        c.accept();
         let mut state = self.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.ring, &sync)? };
+        unsafe { state.submit_entry(&self.ring, &sync) };
         Ok(c)
     }
 
@@ -856,9 +869,10 @@ impl File for UringFile {
             .flags(io_uring::types::FsyncFlags::DATASYNC)
             .build()
             .user_data(get_key(c.clone()));
+        c.accept();
         let mut state = self.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.ring, &sync)? };
+        unsafe { state.submit_entry(&self.ring, &sync) };
         Ok(c)
     }
 
@@ -899,9 +913,10 @@ impl File for UringFile {
         };
         // The SQE holds a raw pointer into the buffer until the completion is processed.
         c.keep_write_buffer_alive(buffer);
+        c.accept();
         let mut state = self.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.ring, &write)? };
+        unsafe { state.submit_entry(&self.ring, &write) };
         Ok(c)
     }
 
@@ -918,9 +933,10 @@ impl File for UringFile {
         tracing::trace!("pwritev(pos = {}, bufs.len() = {})", pos, bufs.len());
 
         let wstate = WritevState::new(self, pos, bufs);
+        c.accept();
         let mut state = self.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_writev(&self.ring, get_key(c.clone()), wstate)? };
+        unsafe { state.submit_writev(&self.ring, get_key(c.clone()), wstate) };
         Ok(c)
     }
 
@@ -952,16 +968,17 @@ impl File for UringFile {
             let truncate = io_uring::opcode::Ftruncate::new(fd, len)
                 .build()
                 .user_data(get_key(c.clone()));
+            c.accept();
             let mut state = self.state.lock();
             // SAFETY: holding `state` Mutex.
-            unsafe { state.submit_entry(&self.ring, &truncate)? };
+            unsafe { state.submit_entry(&self.ring, &truncate) };
             Ok(c)
         } else {
             let result = self.file.set_len(len);
             match result {
                 Ok(()) => {
                     trace!("file truncated to len=({})", len);
-                    c.complete(0);
+                    c.deliver(Ok(0));
                     Ok(c)
                 }
                 Err(e) => Err(io_error(e, "truncate")),
@@ -1016,6 +1033,26 @@ mod tests {
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(UringIO::new);
+    }
+
+    /// A cancel finishes a request the kernel still holds: the request stays owned, with its
+    /// buffer, until a step takes its entry, and a drain waits for that (DESIGN.md 22.5).
+    #[test]
+    fn a_cancelled_read_is_owned_until_its_entry_is_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+        let io = UringIO::new().unwrap();
+        let file = io
+            .open_file(path.to_str().unwrap(), OpenFlags::None, false)
+            .unwrap();
+        let c = Completion::new_read(Arc::new(crate::Buffer::new_temporary(4096)), |_| None);
+        let c = file.pread(0, c).unwrap();
+        io.cancel(std::slice::from_ref(&c)).unwrap();
+        assert!(c.finished(), "the cancel did not finish it");
+        assert!(c.is_owned(), "let go before the kernel gave it back");
+        io.drain_completions(std::slice::from_ref(&c)).unwrap();
+        assert!(!c.is_owned(), "drained while the kernel still holds it");
     }
 
     #[test]

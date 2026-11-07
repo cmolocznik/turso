@@ -135,8 +135,15 @@ impl IO for QueuedIo {
         self.step_one().map(|_| ())
     }
 
+    /// Steps until no request beneath `completions` is owned: a cancelled request still queued
+    /// is owned until its step lets it go (DESIGN.md 22.5).
     fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
-        while completions.iter().any(|c| !c.finished()) {
+        let mut seen = std::collections::HashSet::new();
+        let requests: Vec<Completion> = completions
+            .iter()
+            .flat_map(|c| c.requests(&mut seen))
+            .collect();
+        while requests.iter().any(Completion::is_owned) {
             if self.step_one()?.is_none() {
                 break;
             }
@@ -195,14 +202,26 @@ impl QueuedFile {
             }
         };
 
+        // Queued, the request is this IO's until its step delivers it: the injected fault here, or
+        // the inner file's own delivery, which a refusal there turns into the request's error.
+        completion.accept();
         let queued_completion = completion.clone();
         let queued_action: Box<dyn FnOnce() -> turso_core::Result<()> + Send> = if fault_this_op {
             Box::new(move || {
-                queued_completion.error(CompletionError::IOError(ErrorKind::Other, "queued_io"));
+                queued_completion
+                    .deliver(Err(CompletionError::IOError(ErrorKind::Other, "queued_io")));
                 Ok(())
             })
         } else {
-            Box::new(action)
+            Box::new(move || {
+                if let Err(e) = action() {
+                    queued_completion.deliver(Err(match e {
+                        turso_core::LimboError::CompletionError(e) => e,
+                        _ => CompletionError::IOError(ErrorKind::Other, "queued_io refused"),
+                    }));
+                }
+                Ok(())
+            })
         };
 
         self.state.pending.lock().unwrap().push_back(QueuedIoOp {

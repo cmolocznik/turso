@@ -51,6 +51,7 @@ mod prefix;
 mod radix;
 mod recovery;
 mod replay;
+mod requests;
 mod segmented;
 mod shared;
 mod solo;

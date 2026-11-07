@@ -343,10 +343,7 @@ impl CrashIO {
             (op, outcome)
         };
         let outer = DELIVERING.with(|d| d.replace(true));
-        match outcome {
-            Ok(n) => op.completion.complete(n),
-            Err(e) => op.completion.error(e),
-        }
+        op.completion.deliver(outcome);
         DELIVERING.with(|d| d.set(outer));
     }
 
@@ -364,6 +361,7 @@ impl CrashIO {
             },
             kind => kind,
         };
+        completion.accept();
         state.in_flight.push(Op {
             path: path.to_string(),
             file: file.clone(),

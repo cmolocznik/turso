@@ -302,7 +302,7 @@ impl File for WindowsFile {
             if issued == FALSE {
                 let error = unsafe { GetLastError() };
                 if error == ERROR_HANDLE_EOF {
-                    c.complete(0);
+                    c.deliver(Ok(0));
                     return Ok(c);
                 }
                 if error != ERROR_IO_PENDING {
@@ -318,7 +318,7 @@ impl File for WindowsFile {
                 if ok == FALSE {
                     let err = unsafe { GetLastError() };
                     if err == ERROR_HANDLE_EOF {
-                        c.complete(0);
+                        c.deliver(Ok(0));
                         return Ok(c);
                     }
                     return Err(last_os_error("pread GetOverlappedResult"));
@@ -326,7 +326,7 @@ impl File for WindowsFile {
             }
 
             trace!("pread n: {}", bytes_read);
-            c.complete(bytes_read as i32);
+            c.deliver(Ok(bytes_read as i32));
             Ok(c)
         })
     }
@@ -353,7 +353,7 @@ impl File for WindowsFile {
         }
 
         trace!("pwrite complete: wrote {total_written} bytes");
-        c.complete(total_written as i32);
+        c.deliver(Ok(total_written as i32));
         Ok(c)
     }
 
@@ -365,7 +365,7 @@ impl File for WindowsFile {
         c: Completion,
     ) -> Result<Completion> {
         if buffers.is_empty() {
-            c.complete(0);
+            c.deliver(Ok(0));
             return Ok(c);
         }
         if buffers.len() == 1 {
@@ -398,7 +398,7 @@ impl File for WindowsFile {
         }
 
         trace!("pwritev complete: wrote {total_written}/{total_size} bytes");
-        c.complete(total_written as i32);
+        c.deliver(Ok(total_written as i32));
         Ok(c)
     }
 
@@ -409,7 +409,7 @@ impl File for WindowsFile {
             return Err(last_os_error("sync"));
         }
         trace!("FlushFileBuffers");
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 
@@ -430,7 +430,7 @@ impl File for WindowsFile {
             return Err(last_os_error("truncate"));
         }
         trace!("file truncated to len=({})", len);
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 

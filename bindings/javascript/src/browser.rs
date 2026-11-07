@@ -64,10 +64,12 @@ impl Opfs {
             let mut completions = self.inner.completions.borrow_mut();
             completions.remove(&completion_no).unwrap()
         };
-        completion.complete(result);
+        completion.deliver(Ok(result));
     }
 
+    /// Holds `c` until JavaScript completes it: OPFS owns the request until then.
     fn register_completion(&self, c: Completion) -> u32 {
+        c.accept();
         let inner = &self.inner;
         *inner.completion_no.borrow_mut() += 1;
         let completion_no = *inner.completion_no.borrow();
@@ -188,7 +190,7 @@ impl File for OpfsFile {
         let buffer = buffer.as_mut_slice();
         if web_worker {
             let result = unsafe { read(handle, buffer.as_mut_ptr(), buffer.len(), pos as i32) };
-            c.complete(result as i32);
+            c.deliver(Ok(result as i32));
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe {
@@ -224,7 +226,7 @@ impl File for OpfsFile {
         let buffer = buffer.as_slice();
         if web_worker {
             let result = unsafe { write(handle, buffer.as_ptr(), buffer.len(), pos as i32) };
-            c.complete(result as i32);
+            c.deliver(Ok(result as i32));
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe {
@@ -250,7 +252,7 @@ impl File for OpfsFile {
         let handle = self.handle;
         if web_worker {
             let result = unsafe { sync(handle) };
-            c.complete(result as i32);
+            c.deliver(Ok(result as i32));
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe { sync_async(handle, completion_no) };
@@ -273,7 +275,7 @@ impl File for OpfsFile {
         let handle = self.handle;
         if web_worker {
             let result = unsafe { truncate(handle, len as usize) };
-            c.complete(result as i32);
+            c.deliver(Ok(result as i32));
         } else {
             let completion_no = self.opfs.register_completion(c.clone());
             unsafe { truncate_async(handle, len as usize, completion_no) };

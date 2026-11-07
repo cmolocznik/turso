@@ -397,21 +397,26 @@ impl IO for WindowsIOCP {
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         for cmpl in completions {
             trace!("cancelling {}", get_unique_key_from_completion(cmpl).addr());
-            let mut succeeded = false;
-            if let Some(IoContext {
-                file_handle,
-                io_packet,
-            }) = self.instance.pop_io_context_from_completion(cmpl)
-            {
-                unsafe {
-                    if CancelIoEx(file_handle, &raw const io_packet.overlapped) == TRUE {
-                        // if succeeded the abort will be performed once cancel completed
-                        succeeded = true;
-                    } else {
-                        trace!("CancelIoEx failed:{}.. Ignored", GetLastError());
-                    };
-                }
-            }
+            // The request stays tracked: its packet still arrives, and step reaps it, which
+            // retires it.
+            let succeeded = self
+                .instance
+                .with_io_context(
+                    cmpl,
+                    |IoContext {
+                         file_handle,
+                         io_packet,
+                     }| unsafe {
+                        if CancelIoEx(*file_handle, &raw const io_packet.overlapped) == TRUE {
+                            // if succeeded the abort will be performed once cancel completed
+                            true
+                        } else {
+                            trace!("CancelIoEx failed:{}.. Ignored", GetLastError());
+                            false
+                        }
+                    },
+                )
+                .unwrap_or(false);
 
             if !succeeded {
                 cmpl.abort();
@@ -578,6 +583,17 @@ impl InnerWindowsIOCP {
         Some((completion, kind))
     }
 
+    /// Runs `f` on the context of `completion`'s request while it is tracked, under the table's
+    /// lock: the packet's reaping, which takes the context, waits for `f`.
+    fn with_io_context<T>(
+        &self,
+        completion: &Completion,
+        f: impl FnOnce(&IoContext) -> T,
+    ) -> Option<T> {
+        let key = get_unique_key_from_completion(completion);
+        self.tracked_io_packets.lock().get(&key).map(f)
+    }
+
     fn pop_io_context_from_completion(&self, completion: &Completion) -> Option<IoContext> {
         let key = get_unique_key_from_completion(completion);
         if let Some((key, context)) = self.tracked_io_packets.lock().remove_entry(&key) {
@@ -638,18 +654,16 @@ impl InnerWindowsIOCP {
                     "completion {} completed",
                     get_unique_key_from_completion(&completion).addr()
                 );
-                completion.complete(
-                    bytes_received
-                        .try_into()
-                        .map_err(|_| GetIOCPPacketError::InvalidIO)?,
-                );
+                completion.deliver(Ok(bytes_received
+                    .try_into()
+                    .map_err(|_| GetIOCPPacketError::InvalidIO)?));
             }
             (FALSE, ERROR_OPERATION_ABORTED) => {
                 trace!(
                     "completion {} cancelled",
                     get_unique_key_from_completion(&completion).addr()
                 );
-                completion.abort();
+                completion.deliver(Err(CompletionError::Aborted));
             }
             (FALSE, error_code) => {
                 let error = match error_code {
@@ -666,10 +680,10 @@ impl InnerWindowsIOCP {
                     get_unique_key_from_completion(&completion).addr()
                 );
 
-                completion.error(CompletionError::IOError(
+                completion.deliver(Err(CompletionError::IOError(
                     error.kind(),
                     "io-error-completion",
-                ));
+                )));
             }
             (_, _) => unreachable!(),
         }
@@ -869,10 +883,13 @@ impl WindowsFile {
 
         let overlapped_ptr = Arc::into_raw(packet_io.clone()) as *mut OVERLAPPED;
 
+        // Accepted before the operation starts: its packet may be reaped at once.
+        completion.accept();
         if !self
             .parent_io
             .map_completion_to_io_packet(self.file_handle, packet_io)
         {
+            completion.refuse();
             return Err(LimboError::InternalError(
                 "Cannot map the completion to I/O Packet".into(),
             ));
@@ -884,6 +901,7 @@ impl WindowsFile {
             if result == FALSE && error != ERROR_IO_PENDING {
                 let io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
                 let _ = self.parent_io.forget_io_packet(io_packet);
+                completion.refuse();
                 return Err(get_generic_limboerror_from_last_os_err());
             }
         }
@@ -994,7 +1012,7 @@ impl File for WindowsFile {
                 return Err(get_generic_limboerror_from_last_os_err());
             }
         };
-        completion.complete(0);
+        completion.deliver(Ok(0));
         Ok(completion)
     }
 
@@ -1024,7 +1042,7 @@ impl File for WindowsFile {
                 return Err(get_generic_limboerror_from_last_os_err());
             }
         }
-        completion.complete(0);
+        completion.deliver(Ok(0));
         Ok(completion)
     }
 

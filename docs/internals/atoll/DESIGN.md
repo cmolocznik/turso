@@ -2305,6 +2305,31 @@ completion before the kernel has given the request back) does not end that owner
   goes on. Close waits for the count (22.12).
 - A callback reaches job state only through a weak reference or what its completion owns.
 
+(Built, step 3b: a request's ownership is a word on its completion (`io/completions.rs`), moved by
+`accept`, `refuse` and `retire`, and `on_retired` runs what waits for the retirement once no backend
+owns the request. Every backend's delivery is `deliver`, which runs the callback and then retires:
+an inline backend inside the submission, so the request is let go as the submission returns; a
+queueing backend (the ring, `CrashIO`, the yielding memory IO, a VFS, the completion port, the
+simulator's delayed files and memory IO, the integration tests' queued IO, OPFS) accepts at its
+queue and retires at its delivery, and
+retires a request it drops undelivered (a cancel's leftover, a power loss). A layer that queues a
+request and then hands it to another backend leaves it accepted, and the one that delivers it
+retires it. A layer that carries a caller's request out through one of its own (a page transform's
+read, the partial-sync storage's writes) accepts the caller's before submitting and retires it when
+its own retires (`Completion::carry`). A group keeps weak links to what it lists, so its aggregate is
+walked without holding a child's buffers, a member gone counts as owned by no one, and a drain meets
+each request once. The trait's default vectored write submits its buffers as parts that carry the
+write: refused at its first part it accepted nothing; refused at a later one it stops there, is
+accepted, and carries the refusal as its error once its accepted parts have finished, owned until they
+retire; a part that fails finishes the write with its error. On the ring a request is accepted once
+queued; a refusal to enter it the kernel says may pass leaves it queued for the next entry, and any
+other ends the process, the ring's rule of 22.11 applied at the submission until the delivery thread
+holds the ring's waits. `IO::wait_retired` and `drain_completions` step until no request beneath what
+they were given is owned. Atoll's count is `requests.rs`: a database opens every file through an IO
+that wraps its embedder's and counts each request on them, and the database's last drop waits for
+the count before it returns (22.12, step 4); a census holds the wrapper to forwarding every method of
+the traits it implements.)
+
 **Who waits how.** Every caller that waits for IO is one of three kinds:
 
 - **Blocking**: it holds its thread until the completion finishes, through `IO::wait(c)`. An

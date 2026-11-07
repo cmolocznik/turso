@@ -295,7 +295,7 @@ impl File for MemoryFile {
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         tracing::debug!("pread(path={}): pos={}", self.path, pos);
         let n = self.store.read_into(pos, c.as_read().buf());
-        c.complete(n);
+        c.deliver(Ok(n));
         Ok(c)
     }
 
@@ -307,14 +307,14 @@ impl File for MemoryFile {
             buffer.len()
         );
         let n = self.store.write_at(pos, buffer.as_slice());
-        c.complete(n as i32);
+        c.deliver(Ok(n as i32));
         Ok(c)
     }
 
     fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         tracing::debug!("sync(path={})", self.path);
         // no-op
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 
@@ -330,7 +330,7 @@ impl File for MemoryFile {
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         tracing::debug!("truncate(path={}): len={}", self.path, len);
         self.store.truncate(len);
-        c.complete(0);
+        c.deliver(Ok(0));
         Ok(c)
     }
 
@@ -342,7 +342,7 @@ impl File for MemoryFile {
             buffers.iter().map(|x| x.len()).collect::<Vec<_>>()
         );
         let n = self.store.writev(pos, &buffers);
-        c.complete(n);
+        c.deliver(Ok(n));
         Ok(c)
     }
 

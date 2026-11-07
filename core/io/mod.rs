@@ -3,7 +3,7 @@ use crate::storage::buffer_pool::ArenaBuffer;
 use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::sync::Arc;
 use crate::turso_assert;
-use crate::{BufferPool, Result};
+use crate::{BufferPool, CompletionError, LimboError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use rand::{Rng, RngCore};
@@ -65,6 +65,8 @@ pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
 mod completions;
+#[cfg(test)]
+mod retire_tests;
 pub use clock::Clock;
 pub use completions::*;
 
@@ -187,43 +189,47 @@ pub trait File: Send + Sync {
             "allocate is not supported for the given IO implementation".into(),
         ))
     }
+    /// Writes `buffers` one after another from `pos`. This default writes each buffer as a part of
+    /// its own: the submission accepts or refuses `c` whole (DESIGN.md 22.5). Refused at its first
+    /// part, it accepted nothing; refused at a later one, it stops there and `c` carries the
+    /// refusal as its error, owned until the parts already accepted retire.
     fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
-        use crate::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
-            c.complete(0);
+            c.deliver(Ok(0));
             return Ok(c);
         }
         if buffers.len() == 1 {
             return self.pwrite(pos, buffers[0].clone(), c);
         }
-        // naive default implementation can be overridden on backends where it makes sense to
+        let parts = Arc::new(Parts::new(c.clone()));
         let mut pos = pos;
-        let outstanding = Arc::new(AtomicUsize::new(buffers.len()));
-        let total_written = Arc::new(AtomicUsize::new(0));
-
-        for buf in buffers {
-            let len = buf.len();
-            let child_c = {
-                let c_main = c.clone();
-                let outstanding = outstanding.clone();
-                let total_written = total_written.clone();
-                Completion::new_write(move |n| {
-                    if let Ok(n) = n {
-                        // accumulate bytes actually reported by the backend
-                        total_written.fetch_add(n as usize, Ordering::SeqCst);
-                        if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
-                            // last one finished
-                            c_main.complete(total_written.load(Ordering::Acquire) as i32);
-                        }
-                    }
-                })
+        for (i, buf) in buffers.into_iter().enumerate() {
+            let len = buf.len() as u64;
+            parts.begin();
+            let part = {
+                let parts = parts.clone();
+                Completion::new_write(move |res| parts.finished(res))
             };
-            if let Err(e) = self.pwrite(pos, buf.clone(), child_c) {
-                c.abort();
-                return Err(e);
+            match self.pwrite(pos, buf, part) {
+                Ok(part) => {
+                    if i == 0 {
+                        c.accept();
+                    }
+                    let parts = parts.clone();
+                    part.on_retired(move || parts.retired());
+                }
+                Err(e) if i == 0 => return Err(e),
+                Err(e) => {
+                    parts.refused(match e {
+                        LimboError::CompletionError(e) => e,
+                        _ => CompletionError::IOError(std::io::ErrorKind::Other, "pwritev"),
+                    });
+                    break;
+                }
             }
-            pos += len as u64;
+            pos += len;
         }
+        parts.submitted();
         Ok(c)
     }
     fn size(&self) -> Result<u64>;
@@ -462,7 +468,7 @@ impl File for DiskTempFile {
         match self.created.get() {
             Some(created) => created.file.sync(c, sync_type),
             None => {
-                c.complete(0);
+                c.deliver(Ok(0));
                 Ok(c)
             }
         }
@@ -638,21 +644,27 @@ pub trait IO: Clock + Send + Sync {
         Ok(())
     }
 
-    /// Drive the IO backend until each completion in `completions` is
-    /// `finished()`. Used after `cancel()` (so cancelled ops actually
-    /// release their buffers before the caller returns) and after a
-    /// single `pwrite`/`pwritev`/`sync` that the caller wants to await
-    /// synchronously.
-    ///
-    /// Unlike a global "drain the ring" barrier, this only waits on the
-    /// completions the caller passes in. Other threads can keep
-    /// submitting concurrently — their work doesn't extend or interfere
-    /// with this call. `Completion::finished()` is monotonic
-    /// (`OnceLock`-backed), so the loop will terminate as soon as every
-    /// caller-owned completion has had its CQE processed.
+    /// Waits until no backend owns `c`: for a request, until it is retired, or at once if it was
+    /// never accepted; for a group, until every request beneath it is (DESIGN.md 22.5). A
+    /// cancelled request is finished at once and still owned until its backend lets it go, with
+    /// the buffers it reads into or writes from: retirement, not finishing, says they are free.
+    /// The caller is the owner of what it waits for, and has stopped submitting to it.
+    fn wait_retired(&self, c: &Completion) -> Result<()> {
+        self.drain_completions(std::slice::from_ref(c))
+    }
+
+    /// [`wait_retired`](Self::wait_retired) on each of `completions`, each request beneath them
+    /// counted once. Used after `cancel()`, so cancelled requests have given back their buffers
+    /// before the caller goes on. Only the completions passed are waited for: other threads keep
+    /// submitting meanwhile.
     fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
-        while completions.iter().any(|c| !c.finished()) {
-            self.step()?;
+        let mut seen = std::collections::HashSet::new();
+        for c in completions {
+            for request in c.requests(&mut seen) {
+                while request.is_owned() {
+                    self.step()?;
+                }
+            }
         }
         Ok(())
     }
@@ -714,6 +726,86 @@ pub trait IO: Clock + Send + Sync {
                 "failed to get file identity for '{path}': {e}"
             ))
         })
+    }
+}
+
+/// The parts of a write [`File::pwritev`]'s default makes one buffer at a time, and the write they
+/// carry out. Each count holds the submitter's token until every part is submitted, so the
+/// parent neither finishes nor retires while parts are still being added. The parent finishes
+/// once every part has, with the first error or the bytes written, and retires once every part
+/// has: a part finishes before it retires, and the finishing token goes first.
+struct Parts {
+    parent: Completion,
+    unfinished: crate::sync::atomic::AtomicUsize,
+    owned: crate::sync::atomic::AtomicUsize,
+    written: crate::sync::atomic::AtomicUsize,
+    error: std::sync::OnceLock<CompletionError>,
+}
+
+impl Parts {
+    fn new(parent: Completion) -> Self {
+        use crate::sync::atomic::AtomicUsize;
+        Self {
+            parent,
+            unfinished: AtomicUsize::new(1),
+            owned: AtomicUsize::new(1),
+            written: AtomicUsize::new(0),
+            error: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A part about to be submitted.
+    fn begin(&self) {
+        use crate::sync::atomic::Ordering;
+        self.unfinished.fetch_add(1, Ordering::AcqRel);
+        self.owned.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A part's callback.
+    fn finished(&self, res: std::result::Result<i32, CompletionError>) {
+        use crate::sync::atomic::Ordering;
+        match res {
+            Ok(n) => {
+                self.written.fetch_add(n as usize, Ordering::AcqRel);
+            }
+            Err(e) => {
+                let _ = self.error.set(e);
+            }
+        }
+        self.one_finished();
+    }
+
+    fn one_finished(&self) {
+        use crate::sync::atomic::Ordering;
+        if self.unfinished.fetch_sub(1, Ordering::AcqRel) == 1 {
+            match self.error.get() {
+                Some(e) => self.parent.error(*e),
+                None => self
+                    .parent
+                    .complete(self.written.load(Ordering::Acquire) as i32),
+            }
+        }
+    }
+
+    /// A part retired, or let go by its backend.
+    fn retired(&self) {
+        use crate::sync::atomic::Ordering;
+        if self.owned.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.parent.retire();
+        }
+    }
+
+    /// A part refused whole: it never runs, and the parent carries the refusal.
+    fn refused(&self, e: CompletionError) {
+        let _ = self.error.set(e);
+        self.one_finished();
+        self.retired();
+    }
+
+    /// Every part is submitted: the submitter's tokens go, the finishing one first.
+    fn submitted(&self) {
+        self.one_finished();
+        self.retired();
     }
 }
 

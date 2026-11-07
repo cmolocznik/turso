@@ -46,8 +46,11 @@ pub(crate) struct SimulatorFile {
 
 type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<turso_core::Completion>>;
 
+/// A request held back until `time`, accepted at its submission: this file owns it until `op`
+/// hands it to the inner file, and delivers it itself if the inner file refuses it.
 pub struct DelayedIo {
     pub time: turso_core::WallClockInstant,
+    pub completion: turso_core::Completion,
     pub op: IoOperation,
 }
 
@@ -112,7 +115,15 @@ impl SimulatorFile {
     pub fn run_queued_io(&self, now: turso_core::WallClockInstant) -> Result<()> {
         let mut queued_io = self.queued_io.borrow_mut();
         for io in queued_io.extract_if(.., |item| item.time <= now) {
-            let _c = (io.op)(self)?;
+            if let Err(e) = (io.op)(self) {
+                io.completion.deliver(Err(match e {
+                    turso_core::LimboError::CompletionError(e) => e,
+                    _ => turso_core::CompletionError::IOError(
+                        std::io::ErrorKind::Other,
+                        "delayed submission refused",
+                    ),
+                }));
+            }
         }
         Ok(())
     }
@@ -149,9 +160,12 @@ impl File for SimulatorFile {
         if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(move |file: &SimulatorFile| file.inner.pread(pos, cloned_c));
-            self.queued_io
-                .borrow_mut()
-                .push(DelayedIo { time: latency, op });
+            c.accept();
+            self.queued_io.borrow_mut().push(DelayedIo {
+                time: latency,
+                completion: c.clone(),
+                op,
+            });
             Ok(c)
         } else {
             self.inner.pread(pos, c)
@@ -175,9 +189,12 @@ impl File for SimulatorFile {
         if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(move |file: &SimulatorFile| file.inner.pwrite(pos, buffer, cloned_c));
-            self.queued_io
-                .borrow_mut()
-                .push(DelayedIo { time: latency, op });
+            c.accept();
+            self.queued_io.borrow_mut().push(DelayedIo {
+                time: latency,
+                completion: c.clone(),
+                op,
+            });
             Ok(c)
         } else {
             self.inner.pwrite(pos, buffer, c)
@@ -204,9 +221,12 @@ impl File for SimulatorFile {
                 *file.sync_completion.borrow_mut() = Some(c.clone());
                 Ok(c)
             });
-            self.queued_io
-                .borrow_mut()
-                .push(DelayedIo { time: latency, op });
+            c.accept();
+            self.queued_io.borrow_mut().push(DelayedIo {
+                time: latency,
+                completion: c.clone(),
+                op,
+            });
             c
         } else {
             let c = self.inner.sync(c, sync_type)?;
@@ -234,9 +254,12 @@ impl File for SimulatorFile {
             let cloned_c = c.clone();
             let op =
                 Box::new(move |file: &SimulatorFile| file.inner.pwritev(pos, buffers, cloned_c));
-            self.queued_io
-                .borrow_mut()
-                .push(DelayedIo { time: latency, op });
+            c.accept();
+            self.queued_io.borrow_mut().push(DelayedIo {
+                time: latency,
+                completion: c.clone(),
+                op,
+            });
             Ok(c)
         } else {
             let c = self.inner.pwritev(pos, buffers, c)?;
@@ -257,9 +280,12 @@ impl File for SimulatorFile {
         let c = if let Some(latency) = self.generate_latency_duration() {
             let cloned_c = c.clone();
             let op = Box::new(move |file: &SimulatorFile| file.inner.truncate(len, cloned_c));
-            self.queued_io
-                .borrow_mut()
-                .push(DelayedIo { time: latency, op });
+            c.accept();
+            self.queued_io.borrow_mut().push(DelayedIo {
+                time: latency,
+                completion: c.clone(),
+                op,
+            });
             c
         } else {
             self.inner.truncate(len, c)?

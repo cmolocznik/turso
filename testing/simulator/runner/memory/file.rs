@@ -179,6 +179,8 @@ impl MemorySimFile {
             }
         }
 
+        // Queued: the IO owns the request until a step delivers it.
+        op.get_completion().accept();
         self.callbacks.lock().push(Operation {
             time: self.generate_latency(),
             op,
@@ -234,7 +236,7 @@ impl File for MemorySimFile {
     ) -> Result<Completion> {
         self.ensure_open()?;
         if buffers.is_empty() {
-            c.complete(0);
+            c.deliver(Ok(0));
             return Ok(c);
         }
         if buffers.len() == 1 {

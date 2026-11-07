@@ -115,7 +115,7 @@ impl IO for MemoryYieldIO {
             std::mem::take(&mut *pending)
         };
         for Deferred { completion, result } in drained {
-            completion.complete(result);
+            completion.deliver(Ok(result));
         }
         Ok(())
     }
@@ -133,6 +133,7 @@ impl MemoryYieldFile {
     /// Defer `c` so it is signalled on the next `IO::step`, leaving it
     /// `finished() == false` for now and forcing the caller to yield.
     fn defer(&self, c: &Completion, result: i32) {
+        c.accept();
         self.pending.lock().push_back(Deferred {
             completion: c.clone(),
             result,

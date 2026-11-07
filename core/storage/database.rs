@@ -170,7 +170,7 @@ impl DatabaseStorage for DatabaseFile {
                 let page_codec = ctx.clone();
                 // TODO(v): support in-place codec decoding to avoid this extra page buffer.
                 let read_buffer = Arc::new(Buffer::new_temporary(r.buf_arc().len()));
-                let original_c = c;
+                let original_c = c.clone();
                 let codec_context =
                     PageCodecContext::from_page_idx(page_idx, PageLocation::Database)?;
                 let decode_complete =
@@ -229,7 +229,7 @@ impl DatabaseStorage for DatabaseFile {
                         }
                     });
                 let wrapped_completion = Completion::new_read(read_buffer, decode_complete);
-                self.file.pread(pos, wrapped_completion)
+                c.carry(|| self.file.pread(pos, wrapped_completion))
             }
             PageTransform::Checksum(ctx) => {
                 let checksum_ctx = ctx.clone();
@@ -270,7 +270,7 @@ impl DatabaseStorage for DatabaseFile {
                     });
 
                 let wrapped_completion = Completion::new_read(read_buffer, verify_complete);
-                self.file.pread(pos, wrapped_completion)
+                c.carry(|| self.file.pread(pos, wrapped_completion))
             }
             PageTransform::None => self.file.pread(pos, c),
         }
@@ -430,6 +430,36 @@ mod page_codec_tests {
         }
     }
 
+    /// A page read through a transform carries the caller's completion through the read it
+    /// submits: the caller's request is owned until that read retires, so a drain of it, or of a
+    /// group listing it, waits for the backend to let the page's buffer go (DESIGN.md 22.5).
+    #[test]
+    fn a_transformed_page_read_is_owned_until_the_read_beneath_it_retires() {
+        let io = crate::io::crash::CrashIO::new(9);
+        let db_file = DatabaseFile {
+            file: io
+                .open_file("/db/p", crate::io::OpenFlags::Create, false)
+                .unwrap(),
+        };
+        let original = Completion::new_read(Arc::new(Buffer::new_temporary(4096)), |_| None);
+        let mut group = crate::io::CompletionGroup::new(|_| {});
+        group.add(&original);
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_page_codec(Arc::new(XorPageCodec(0xa5)));
+        let wrapped = db_file.read_page(1, &io_ctx, original.clone()).unwrap();
+        assert!(!wrapped.ptr_eq(&original), "no transform: nothing carried");
+        let group = group.build();
+        io.cancel(std::slice::from_ref(&original)).unwrap();
+        assert!(original.finished());
+        assert!(
+            original.is_owned(),
+            "the caller's read let go while the read beneath it is the backend's"
+        );
+        io.wait_retired(&group).unwrap();
+        assert!(!original.is_owned() && !wrapped.is_owned());
+        assert_eq!(io.in_flight(), 0);
+    }
+
     #[derive(Debug)]
     struct FailOnEncodePageCodec {
         fail_page_no: u32,
@@ -537,20 +567,20 @@ mod page_codec_tests {
 
         fn pread(&self, _pos: u64, c: Completion) -> Result<Completion> {
             match self.read_result {
-                Ok(bytes_read) => c.complete(bytes_read),
-                Err(err) => c.error(err),
+                Ok(bytes_read) => c.deliver(Ok(bytes_read)),
+                Err(err) => c.deliver(Err(err)),
             }
             Ok(c)
         }
 
         fn pwrite(&self, _pos: u64, _buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
             self.writes_submitted.fetch_add(1, Ordering::Relaxed);
-            c.complete(0);
+            c.deliver(Ok(0));
             Ok(c)
         }
 
         fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
-            c.complete(0);
+            c.deliver(Ok(0));
             Ok(c)
         }
 
@@ -559,7 +589,7 @@ mod page_codec_tests {
         }
 
         fn truncate(&self, _len: u64, c: Completion) -> Result<Completion> {
-            c.complete(0);
+            c.deliver(Ok(0));
             Ok(c)
         }
     }
@@ -809,19 +839,19 @@ mod tests {
 
         fn pread(&self, _pos: u64, c: Completion) -> Result<Completion> {
             match self.read_result {
-                Ok(bytes_read) => c.complete(bytes_read),
-                Err(err) => c.error(err),
+                Ok(bytes_read) => c.deliver(Ok(bytes_read)),
+                Err(err) => c.deliver(Err(err)),
             }
             Ok(c)
         }
 
         fn pwrite(&self, _pos: u64, _buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
-            c.complete(0);
+            c.deliver(Ok(0));
             Ok(c)
         }
 
         fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
-            c.complete(0);
+            c.deliver(Ok(0));
             Ok(c)
         }
 
@@ -830,7 +860,7 @@ mod tests {
         }
 
         fn truncate(&self, _len: u64, c: Completion) -> Result<Completion> {
-            c.complete(0);
+            c.deliver(Ok(0));
             Ok(c)
         }
     }

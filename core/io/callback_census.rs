@@ -1,13 +1,15 @@
 //! The census of every callback Turso and Atoll construct (DESIGN.md 22.5): on the ring a callback
-//! runs on the delivery thread, which never waits and never makes a synchronous file call, since
-//! nothing else would deliver what it waits for and every delivery behind it would wait on the
-//! file system. Each callback is listed with what it does; one not listed, or one listed and gone,
-//! fails, and so does one whose own code waits or calls the file system synchronously. What a
-//! callback calls further is the delivery thread's to refuse at run time
-//! (`refuse_on_delivery_thread`), and `CrashIO` records any synchronous file call a delivered
-//! callback makes.
+//! runs on the delivery thread, which never makes a call that can wait, since nothing else would
+//! deliver what it waits for and every delivery behind it would wait too. Each callback is listed
+//! with what it does; one not listed, or one listed and gone, fails, and so does one whose own code
+//! makes a call the delivery thread refuses (`delivery_matrix.rs` rules every method of `File` and
+//! `IO`) or a file system call of the standard library's. What a callback calls further is the
+//! delivery thread's to refuse at run time (`refuse_on_delivery_thread`), and `CrashIO` records any
+//! synchronous file call a delivered callback makes.
 
 use crate::source_test::{code_of, rust_sources, without_test_modules};
+
+use super::delivery_matrix;
 
 /// Every callback constructed outside tests: its file below `core`, the function it is built in,
 /// its constructor, and what it does. One function may build several of a kind; each is a row.
@@ -529,20 +531,64 @@ const CONSTRUCTORS: &[(&str, &str)] = &[
 ];
 
 /// What a callback's own code may not call: a wait, or a synchronous file call.
+/// Calls a callback never makes beyond the methods `delivery_matrix.rs` refuses: a completion's own
+/// wait; a pumped backend's step, which would re-enter the step delivering the callback; and the
+/// standard library's file system calls.
 const REFUSED: &[&str] = &[
-    "wait_for_completion(",
-    "drain_completions(",
-    "wait_retired(",
     "block_on(",
     ".step()",
-    "sync_directory(",
-    "open_file(",
-    "remove_file(",
-    "rename_file(",
-    ".allocate(",
+    "std::fs::",
     "set_len(",
     "sync_all(",
+    "sync_data()",
+    "metadata(",
 ];
+
+/// A callback's call of a refused method's name on something that is no file and no IO, by the
+/// file and function the callback is built in, the call with its receiver, and what it is. The scan
+/// reads names, not types: each such call is ruled here, and a row the scan no longer meets fails.
+const NOT_REFUSED: &[(&str, &str, &str, &str)] = &[(
+    "storage/atoll/store.rs",
+    "read_slot_into",
+    "class.size(",
+    "a page class's size, a constant of the class",
+)];
+
+/// The calls of `code` the delivery thread refuses: each of [`REFUSED`], and each method
+/// `delivery_matrix.rs` refuses, called as a method or through a path, named with the identifier
+/// just before it (empty where an expression ends there).
+fn refused_calls(code: &str) -> Vec<String> {
+    let mut calls: Vec<String> = REFUSED
+        .iter()
+        .filter(|call| code.contains(*call))
+        .map(|call| call.to_string())
+        .collect();
+    for method in delivery_matrix::refused() {
+        for separator in [".", "::"] {
+            let spelling = format!("{separator}{method}(");
+            for (at, _) in code.match_indices(&spelling) {
+                let before = &code[..at];
+                let receiver = before
+                    .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .map_or(before, |i| &before[i + 1..]);
+                calls.push(format!("{receiver}{spelling}"));
+            }
+        }
+    }
+    calls
+}
+
+#[test]
+fn the_scan_finds_a_refused_method_however_it_is_called() {
+    // An expression ends before the call: no identifier names the receiver.
+    assert_eq!(refused_calls("me.segments.file(number).size()"), [".size("]);
+    assert_eq!(refused_calls("File::size(&*file)"), ["File::size("]);
+    assert_eq!(
+        refused_calls("io.sleep(d); f.lock_file(true)"),
+        ["f.lock_file(", "io.sleep("]
+    );
+    assert!(refused_calls("class.page_size(); x.sizes()").is_empty());
+}
 
 /// A file a census reads no callback from: tests, and the census's own helpers.
 fn is_test_file(relative: &str) -> bool {
@@ -616,10 +662,11 @@ fn callback_code<'a>(function: &'a str, arguments: &'a str) -> String {
 }
 
 #[test]
-fn every_callback_is_listed_and_none_waits_or_calls_the_file_system() {
+fn every_callback_is_listed_and_none_makes_a_call_the_delivery_thread_refuses() {
     let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut found = Vec::new();
     let mut refused = Vec::new();
+    let mut met = vec![false; NOT_REFUSED.len()];
     for path in rust_sources(core) {
         let relative = path.strip_prefix(core).unwrap().display().to_string();
         if is_test_file(&relative) {
@@ -636,9 +683,15 @@ fn every_callback_is_listed_and_none_waits_or_calls_the_file_system() {
                     .collect();
                 let arguments = to_close(&code, at + constructor.len());
                 let own = callback_code(&code[fn_at..], arguments);
-                for call in REFUSED {
-                    if own.contains(call) {
-                        refused.push(format!("{relative}: {function}'s callback calls {call}"));
+                for call in refused_calls(&own) {
+                    let ruled = NOT_REFUSED.iter().position(|(f, func, c, _)| {
+                        *f == relative && *func == function && *c == call
+                    });
+                    match ruled {
+                        Some(row) => met[row] = true,
+                        None => {
+                            refused.push(format!("{relative}: {function}'s callback calls {call}"))
+                        }
                     }
                 }
                 found.push((relative.clone(), function, kind.to_string()));
@@ -666,4 +719,13 @@ fn every_callback_is_listed_and_none_waits_or_calls_the_file_system() {
         "a callback not listed with what it does, or one listed that is gone"
     );
     assert!(refused.is_empty(), "{refused:#?}");
+    let stale: Vec<_> = NOT_REFUSED
+        .iter()
+        .zip(&met)
+        .filter(|(_, met)| !**met)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "a call ruled no file's the scan no longer meets: {stale:#?}"
+    );
 }

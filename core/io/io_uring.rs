@@ -38,10 +38,6 @@ const IOVEC_POOL_SIZE: usize = 64;
 /// IOV_MAX is typically 1024
 const MAX_IOVEC_ENTRIES: usize = CKPT_BATCH_PAGES;
 
-/// Completions the delivery thread takes in one pass: one completion queue's worth, twice the
-/// submission queue, as the kernel sizes it by default.
-const CQ_BATCH: usize = 2 * ENTRIES as usize;
-
 /// One memory arena for DB pages and another for WAL frames
 const ARENA_COUNT: usize = 2;
 
@@ -80,6 +76,9 @@ struct Shared {
     requests: AtomicUsize,
     /// Written by the last handle's drop: its standing poll ends the delivery thread's wait.
     eventfd: OwnedFd,
+    /// The completion queue entries a pass of the delivery thread visits at most: the queue's own
+    /// size, as the kernel set it (twice the submission queue by default).
+    pass: usize,
     /// An error number the delivery thread's next wait returns instead of waiting, for a test.
     #[cfg(test)]
     injected_wait: std::sync::atomic::AtomicI32,
@@ -225,10 +224,9 @@ fn enter(ring: &io_uring::IoUring) {
 
 /// Ends the process: the ring cannot deliver or retire the requests it accepted.
 fn ring_lost(e: &std::io::Error, during: &str) -> ! {
-    eprintln!(
+    super::fatal(format_args!(
         "io_uring: {during} failed ({e}): the ring can no longer deliver the requests it accepted"
-    );
-    std::process::abort()
+    ))
 }
 
 /// preallocated vec of iovec arrays to avoid allocations during writev operations
@@ -272,6 +270,31 @@ impl UringIO {
     /// A ring of `entries` submission entries, its delivery thread started. If the thread or its
     /// eventfd cannot be set up, the ring is torn down whole and the error says so.
     fn with_entries(entries: u32) -> Result<Self> {
+        let shared = Shared::new(entries)?;
+        let io = Self {
+            shared: Handle::new(&shared),
+        };
+        #[cfg(test)]
+        tests::refuse(tests::Setup::Thread)?;
+        // A thread of the std library's, never a model's: it waits in the kernel, outside any
+        // schedule a model explores.
+        std::thread::Builder::new()
+            .name("turso-io-uring".into())
+            .spawn(move || deliver(shared))
+            .map_err(|e| {
+                LimboError::IoBackendUnavailable(format!(
+                    "io_uring: the delivery thread did not start: {e}"
+                ))
+            })?;
+        debug!("Using IO backend 'io-uring'");
+        Ok(io)
+    }
+}
+
+impl Shared {
+    /// A ring of `entries` submission entries, its buffers registered and its eventfd's poll
+    /// armed, with no thread delivering yet.
+    fn new(entries: u32) -> Result<Arc<Self>> {
         #[cfg(test)]
         tests::refuse(tests::Setup::Ring)?;
         let ring = io_uring::IoUring::new(entries).map_err(explain_setup_failure)?;
@@ -307,6 +330,7 @@ impl UringIO {
         }
         // SAFETY: `fd` is a fresh descriptor nothing else owns.
         let eventfd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let pass = ring.params().cq_entries() as usize;
         let shared = Arc::new(Shared {
             ring,
             state: Mutex::new(RingState {
@@ -319,6 +343,7 @@ impl UringIO {
             handles: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
             eventfd,
+            pass,
             #[cfg(test)]
             injected_wait: std::sync::atomic::AtomicI32::new(0),
         });
@@ -327,23 +352,7 @@ impl UringIO {
             // SAFETY: holding `state` Mutex.
             unsafe { state.arm_eventfd(&shared.ring, &shared.eventfd) };
         }
-        let io = Self {
-            shared: Handle::new(&shared),
-        };
-        #[cfg(test)]
-        tests::refuse(tests::Setup::Thread)?;
-        // A thread of the std library's, never a model's: it waits in the kernel, outside any
-        // schedule a model explores.
-        std::thread::Builder::new()
-            .name("turso-io-uring".into())
-            .spawn(move || deliver(shared))
-            .map_err(|e| {
-                LimboError::IoBackendUnavailable(format!(
-                    "io_uring: the delivery thread did not start: {e}"
-                ))
-            })?;
-        debug!("Using IO backend 'io-uring'");
-        Ok(io)
+        Ok(shared)
     }
 }
 
@@ -513,28 +522,31 @@ impl RingState {
         self.submit_entry(ring, &entry)
     }
 
-    /// Handle a writev CQE: resubmits the rest of a partial write, or returns how the whole
-    /// write ended, for its callback to run once the lock is released. SAFETY: caller must hold
-    /// the `RingState` Mutex.
+    /// Handle a writev CQE: resubmits the rest of a partial write and says so, for its progress
+    /// wake, or says how the whole write ended, for its delivery; either runs once the lock is
+    /// released. SAFETY: caller must hold the `RingState` Mutex.
     unsafe fn handle_writev_completion(
         &mut self,
         ring: &io_uring::IoUring,
         mut state: WritevState,
         user_data: u64,
         result: i32,
-    ) -> Option<std::result::Result<i32, CompletionError>> {
+    ) -> Taken {
         if result < 0 {
             let err = std::io::Error::from_raw_os_error(-result);
             tracing::error!("writev failed (user_data: {}): {}", user_data, err);
             state.free_last_iov(&mut self.iov_pool);
-            return Some(Err(CompletionError::IOError(err.kind(), "pwritev")));
+            return Taken::Ended(
+                user_data,
+                Err(CompletionError::IOError(err.kind(), "pwritev")),
+            );
         }
 
         let written = result;
 
         if written == 0 && state.remaining() > 0 {
             state.free_last_iov(&mut self.iov_pool);
-            return Some(Err(CompletionError::ShortWrite));
+            return Taken::Ended(user_data, Err(CompletionError::ShortWrite));
         }
         state.advance(written as u64);
 
@@ -545,7 +557,7 @@ impl RingState {
                     state.total_written
                 );
                 state.free_last_iov(&mut self.iov_pool);
-                return Some(Ok(state.total_written as i32));
+                Taken::Ended(user_data, Ok(state.total_written as i32))
             }
             remaining => {
                 tracing::trace!(
@@ -555,16 +567,21 @@ impl RingState {
                     remaining
                 );
                 self.submit_writev(ring, user_data, state);
-                // Progress wake: the future is parked on the parent
-                // completion's waker, but `complete()` only fires on the
-                // final chunk. Without this, intermediate-chunk completions
-                // never wake the future, the resubmitted chunks pile up,
-                // and the task deadlocks.
-                wake_user_data(user_data);
+                Taken::Progress(user_data)
             }
         }
-        None
     }
+}
+
+/// An entry of the completion queue, taken under the ring's mutex and acted on once it is let go
+/// (DESIGN.md 22.5).
+enum Taken {
+    /// A request ended with this result: its delivery.
+    Ended(u64, std::result::Result<i32, CompletionError>),
+    /// A partial write's rest was resubmitted: a progress wake for whoever waits on the write,
+    /// whose own completion fires only on the last part. Without it, a future parked on the
+    /// write is never polled while the parts complete.
+    Progress(u64),
 }
 
 impl IO for UringIO {
@@ -605,10 +622,16 @@ impl IO for UringIO {
         common::sync_directory(path)
     }
 
+    /// Aborts each of `completions`, then asks the kernel to cancel each. The aborts run their
+    /// callbacks with the ring's mutex let go, since a callback may submit its next request, which
+    /// takes the mutex (DESIGN.md 22.5); each request stays the kernel's, with its buffer, until the
+    /// delivery thread delivers its entry.
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
-        let mut state = self.shared.state.lock();
         for c in completions {
             c.abort();
+        }
+        let mut state = self.shared.state.lock();
+        for c in completions {
             // dont want to leak the refcount bump with `get_key`/into_raw here, so we use as_ptr
             let e = io_uring::opcode::AsyncCancel::new(Arc::as_ptr(c.get_inner()) as u64)
                 .build()
@@ -685,14 +708,16 @@ impl IO for UringIO {
 
 /// The delivery thread (DESIGN.md 22.5): the one thread that waits in the kernel. Before each wait it
 /// moves what queued past a full submission queue into the kernel; it waits for one completion,
-/// takes at most one completion queue of entries under the mutex, resubmitting the rest of a
-/// partial write there, lets the mutex go, delivers each, and waits again. It ends once no handle
+/// visits at most one completion queue of entries under the mutex, resubmitting the rest of a
+/// partial write there, lets the mutex go, delivers each ended request and wakes each partial
+/// write's waiter in the order taken, and waits again: entries left in the queue end that wait at
+/// once. It ends once no handle
 /// lives and no request is outstanding. A delivery that panics ends the process: nothing else
 /// would deliver the ring's requests, so returning would strand every waiter on them.
 fn deliver(shared: Arc<Shared>) {
     super::DELIVERING.with(|d| d.set(true));
     let _frame = DeliveryFrame;
-    let mut batch = Vec::with_capacity(CQ_BATCH);
+    let mut batch = Vec::with_capacity(shared.pass);
     loop {
         {
             let mut state = shared.state.lock();
@@ -722,9 +747,16 @@ fn deliver(shared: Arc<Shared>) {
             }
         }
         shared.take_batch(&mut batch);
-        for (key, result) in batch.drain(..) {
-            completion_from_key(key).deliver(result);
-            shared.requests.fetch_sub(1, Ordering::AcqRel);
+        for taken in batch.drain(..) {
+            match taken {
+                Taken::Ended(key, result) => {
+                    completion_from_key(key).deliver(result);
+                    shared.requests.fetch_sub(1, Ordering::AcqRel);
+                }
+                // SAFETY: the kernel's reference is still held: the write's own delivery, the
+                // only thing that lets it go, is made by this thread after this entry.
+                Taken::Progress(key) => unsafe { wake_user_data(key) },
+            }
         }
     }
 }
@@ -742,19 +774,33 @@ impl Drop for DeliveryFrame {
 }
 
 impl Shared {
-    /// Takes at most a completion queue of entries, under the mutex: a partial write's rest is
-    /// resubmitted here, the eventfd's poll rearmed, a cancel's own entry skipped; every other
-    /// entry ends a request, added to `batch` for its delivery once the mutex is let go.
-    fn take_batch(&self, batch: &mut Vec<(u64, std::result::Result<i32, CompletionError>)>) {
+    /// Takes the completion queue's entries under the mutex, at most [`Shared::pass`] of them.
+    fn take_batch(&self, batch: &mut Vec<Taken>) {
         let mut state = self.state.lock();
-        while batch.len() < CQ_BATCH {
-            // SAFETY: holding `state` Mutex; no other CompletionQueue exists.
+        self.take(&mut state, batch, || {
+            // SAFETY: the caller holds `state`'s Mutex; no other CompletionQueue exists, and
+            // this one is gone before the entry is handled.
             let mut cq = unsafe { self.ring.completion_shared() };
-            let Some(cqe) = cq.next() else {
+            cq.next().map(|cqe| (cqe.user_data(), cqe.result()))
+        });
+    }
+
+    /// Visits at most [`Shared::pass`] entries of `next`, whatever each is: a partial write's
+    /// rest is resubmitted here and its progress wake added to `batch`, the eventfd's poll rearmed,
+    /// a cancel's own entry skipped; every other entry ends a request, added to `batch` for its
+    /// delivery once the mutex is let go. A resubmission or a rearmed poll the kernel completes at
+    /// once adds an entry to the queue this pass is reading, so only counting every entry bounds
+    /// how long the pass holds the mutex; what is left is the next pass's.
+    fn take(
+        &self,
+        state: &mut RingState,
+        batch: &mut Vec<Taken>,
+        mut next: impl FnMut() -> Option<(u64, i32)>,
+    ) {
+        for _ in 0..self.pass {
+            let Some((user_data, result)) = next() else {
                 return;
             };
-            drop(cq);
-            let user_data = cqe.user_data();
             match user_data {
                 CANCEL_TAG => continue,
                 EVENTFD_TAG => {
@@ -768,22 +814,18 @@ impl Shared {
                 }
                 _ => {}
             }
-            let result = cqe.result();
             turso_assert!(
                 user_data != 0,
                 "user_data must not be zero, we dont submit linked timeouts that would cause this"
             );
             if let Some(wstate) = state.writev_states.remove(&user_data) {
                 // SAFETY: still holding `state` Mutex.
-                let ended = unsafe {
+                batch.push(unsafe {
                     state.handle_writev_completion(&self.ring, wstate, user_data, result)
-                };
-                if let Some(ended) = ended {
-                    batch.push((user_data, ended));
-                }
+                });
                 continue;
             }
-            batch.push((
+            batch.push(Taken::Ended(
                 user_data,
                 if result < 0 {
                     let err = std::io::Error::from_raw_os_error(-result);
@@ -826,8 +868,10 @@ fn completion_from_key(key: u64) -> Completion {
 /// its parent group, if any) without consuming the kernel's `Arc::into_raw`
 /// reference. Used to fire a progress wake when an operation is resubmitted
 /// (e.g., a writev split across chunks) so the future re-polls and continues
-/// draining the CQ.
-fn wake_user_data(key: u64) {
+/// draining the CQ. Called with the ring's mutex let go: a waker may submit.
+///
+/// SAFETY: the kernel's reference for `key` is still held.
+unsafe fn wake_user_data(key: u64) {
     let ptr = key as *const CompletionInner;
     // SAFETY: kernel owns one strong ref via the Arc::into_raw'd `key`. We
     // re-materialize the Arc to clone it, then re-leak the original so the
@@ -859,6 +903,7 @@ crate::assert::assert_send_sync!(UringFile);
 
 impl File for UringFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
+        super::refuse_on_delivery_thread("a file's lock");
         let fd = self.file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
         // or the process exits or after an explicit unlock.
@@ -1065,6 +1110,7 @@ impl File for UringFile {
     }
 
     fn size(&self) -> Result<u64> {
+        super::refuse_on_delivery_thread("a file's size");
         Ok(self
             .file
             .metadata()
@@ -1118,6 +1164,7 @@ impl File for UringFile {
         exclusive: bool,
         kind: SharedWalLockKind,
     ) -> Result<()> {
+        super::refuse_on_delivery_thread("a shared WAL byte's lock");
         unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, true, kind).map(|_| ())
     }
 
@@ -1127,6 +1174,7 @@ impl File for UringFile {
         exclusive: bool,
         kind: SharedWalLockKind,
     ) -> Result<bool> {
+        super::refuse_on_delivery_thread("a shared WAL byte's lock");
         unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, false, kind)
     }
 
@@ -1135,12 +1183,14 @@ impl File for UringFile {
     }
 
     fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        super::refuse_on_delivery_thread("a shared WAL file's resize");
         self.file
             .set_len(len)
             .map_err(|err| io_error(err, "resize shared WAL coordination file"))
     }
 
     fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        super::refuse_on_delivery_thread("a shared WAL file's map");
         unix_shared_wal_map(offset, len, self.file.as_raw_fd())
     }
 }
@@ -1529,10 +1579,11 @@ mod tests {
     /// What ends the process in a child test: the delivery thread asked to wait, or to make a
     /// synchronous file call, from a callback; and an error of the ring itself with a request
     /// outstanding. Each child waits a bounded time for the request, then exits on its own,
-    /// which the parent reads as the thread having gone on.
+    /// which the parent reads as the thread having gone on. The process ending is asserted alone;
+    /// what it said, `cause`, only where standard error can carry it.
     fn ends_the_process(
         test: &str,
-        cause: &str,
+        cause: Option<&str>,
         act: impl FnOnce(&UringIO, &Arc<dyn File>, &tempfile::TempDir),
     ) {
         let Some(ended) = crate::child_test::in_child(test, || {
@@ -1551,18 +1602,20 @@ mod tests {
             ended.code, ended.stderr
         );
         assert!(!ended.hung, "{test}: hung");
-        assert!(
-            ended.stderr.contains(cause),
-            "{test}: ended, but not for {cause:?}: {}",
-            ended.stderr
-        );
+        if let Some(cause) = cause {
+            assert!(
+                ended.stderr.contains(cause),
+                "{test}: ended, but not for {cause:?}: {}",
+                ended.stderr
+            );
+        }
     }
 
     #[test]
     fn a_callback_that_waits_ends_the_process() {
         ends_the_process(
             "io::io_uring::tests::a_callback_that_waits_ends_the_process",
-            "a wait for a completion on the ring's delivery thread",
+            Some("a wait for a completion on the ring's delivery thread"),
             |_, file, _| {
                 // Any IO's wait: what is refused is waiting on the delivery thread.
                 let io: &'static UringIO = Box::leak(Box::new(UringIO::new().unwrap()));
@@ -1581,7 +1634,7 @@ mod tests {
     fn a_callback_that_syncs_a_directory_ends_the_process() {
         ends_the_process(
             "io::io_uring::tests::a_callback_that_syncs_a_directory_ends_the_process",
-            "a directory sync on the ring's delivery thread",
+            Some("a directory sync on the ring's delivery thread"),
             |_, file, dir| {
                 let io: &'static UringIO = Box::leak(Box::new(UringIO::new().unwrap()));
                 let path = dir.path().to_str().unwrap().to_string();
@@ -1599,7 +1652,7 @@ mod tests {
     fn an_error_of_the_ring_itself_ends_the_process() {
         ends_the_process(
             "io::io_uring::tests::an_error_of_the_ring_itself_ends_the_process",
-            "the ring can no longer deliver the requests it accepted",
+            Some("the ring can no longer deliver the requests it accepted"),
             |io, file, _| {
                 io.shared
                     .injected_wait
@@ -1616,6 +1669,394 @@ mod tests {
                 }
             },
         );
+    }
+
+    /// The same with another thread holding standard error, as any print does, while it waits for
+    /// a read the dead ring will never deliver: the error is written without the lock and the
+    /// process ends (mutant: the message printed through the lock, which waits on its holder for
+    /// ever).
+    #[test]
+    fn an_error_of_the_ring_ends_the_process_while_another_thread_holds_stderr() {
+        ends_the_process(
+            "io::io_uring::tests::an_error_of_the_ring_ends_the_process_while_another_thread_holds_stderr",
+            Some("the ring can no longer deliver the requests it accepted"),
+            |io, file, _| {
+                io.shared
+                    .injected_wait
+                    .store(libc::EBADF, Ordering::Release);
+                // Held to the child's end: were it let go when this returns, a print waiting on
+                // it would go through and the abort would still come.
+                std::mem::forget(std::io::stderr().lock());
+                let (tx, rx) = mpsc::channel();
+                drop(file.pread(0, read_telling(&tx)).unwrap());
+                let _ = rx.recv_timeout(BOUND);
+                drop(file.pread(0, read_telling(&tx)).unwrap());
+                if rx.recv_timeout(BOUND).is_ok() {
+                    std::process::exit(0);
+                }
+            },
+        );
+    }
+
+    /// The same with standard error a full pipe whose reader has stopped reading: the message
+    /// finds no room and the process ends all the same (DESIGN.md 22.11; mutant: the message
+    /// written by a write that waits for room, which never comes).
+    #[test]
+    fn an_error_of_the_ring_ends_the_process_with_stderr_a_full_pipe() {
+        ends_the_process(
+            "io::io_uring::tests::an_error_of_the_ring_ends_the_process_with_stderr_a_full_pipe",
+            None,
+            |io, file, _| {
+                crate::io::retire_tests::stderr_a_full_pipe();
+                io.shared
+                    .injected_wait
+                    .store(libc::EBADF, Ordering::Release);
+                let (tx, rx) = mpsc::channel();
+                drop(file.pread(0, read_telling(&tx)).unwrap());
+                let _ = rx.recv_timeout(BOUND);
+                drop(file.pread(0, read_telling(&tx)).unwrap());
+                if rx.recv_timeout(BOUND).is_ok() {
+                    std::process::exit(0);
+                }
+            },
+        );
+    }
+
+    /// A FIFO in `dir`, opened on `io`: a read from it stays the kernel's until something is
+    /// written to it.
+    fn fifo_of(dir: &tempfile::TempDir, io: &UringIO) -> (std::path::PathBuf, Arc<dyn File>) {
+        let fifo = dir.path().join("fifo");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a plain mkfifo(3) on a fresh path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let file = io
+            .open_file(fifo.to_str().unwrap(), OpenFlags::NoLock, false)
+            .unwrap();
+        (fifo, file)
+    }
+
+    /// A cancelled request's callback runs with the ring's mutex let go: one that submits its next
+    /// request, as any callback may, gets the mutex (DESIGN.md 22.5; mutant: the abort run under
+    /// the mutex, where that submission waits for ever on the mutex its own thread holds).
+    #[test]
+    fn a_cancelled_requests_callback_may_submit_its_next_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(UringIO::new().unwrap());
+        let file = file_of(&dir, &io, 512);
+        let (_, pipe) = fifo_of(&dir, &io);
+        let (tx, rx) = mpsc::channel();
+        let c = Completion::new_read(Arc::new(crate::Buffer::new_temporary(1)), move |_| {
+            drop(file.pread(0, read_telling(&tx)).unwrap());
+            None
+        });
+        let c = pipe.pread(0, c).unwrap();
+        let canceller = {
+            let (io, c) = (io.clone(), c.clone());
+            std::thread::spawn(move || io.cancel(&[c]))
+        };
+        assert_eq!(
+            rx.recv_timeout(BOUND),
+            Ok(512),
+            "the cancelled read's callback could not submit its next read"
+        );
+        canceller.join().unwrap().unwrap();
+        // The kernel's cancel ends the read, and its entry retires it.
+        io.drain_completions(std::slice::from_ref(&c)).unwrap();
+    }
+
+    /// A partial write's progress wake runs with the ring's mutex let go: a waker that submits a
+    /// request, as an executor's may, gets the mutex (DESIGN.md 22.5; mutant: the wake made under
+    /// the mutex, where that submission waits for ever on the mutex the delivery thread holds).
+    /// The write is two pages to a FIFO with room for one, so the kernel ends its first part short
+    /// and the ring resubmits the rest, which stays the kernel's until the test reads.
+    #[test]
+    fn a_partial_writes_progress_wake_may_submit() {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(UringIO::new().unwrap());
+        let file = file_of(&dir, &io, 512);
+        let (fifo, pipe) = fifo_of(&dir, &io);
+        let nonblocking = |write: bool| {
+            std::fs::OpenOptions::new()
+                .read(!write)
+                .write(write)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap()
+        };
+        let mut reader = nonblocking(false);
+        // Filled to its last page, then one page read back: room for one page.
+        let mut filler = nonblocking(true);
+        let page = [0u8; 4096];
+        while filler.write(&page).is_ok() {}
+        let mut back = [0u8; 4096];
+        assert_eq!(reader.read(&mut back).unwrap(), page.len());
+
+        struct SubmitOnWake {
+            file: Arc<dyn File>,
+            tx: std::sync::Mutex<Option<mpsc::Sender<i32>>>,
+        }
+        impl std::task::Wake for SubmitOnWake {
+            fn wake(self: Arc<Self>) {
+                if let Some(tx) = self.tx.lock().unwrap().take() {
+                    drop(self.file.pread(0, read_telling(&tx)).unwrap());
+                }
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let w = Completion::new_write(|_| {});
+        w.set_waker(&std::task::Waker::from(Arc::new(SubmitOnWake {
+            file,
+            tx: std::sync::Mutex::new(Some(tx)),
+        })));
+        let parts = (0..2)
+            .map(|_| Arc::new(crate::Buffer::new_temporary(page.len())))
+            .collect();
+        let w = pipe.pwritev(0, parts, w).unwrap();
+        assert_eq!(
+            rx.recv_timeout(BOUND),
+            Ok(512),
+            "the progress wake's submission never ran"
+        );
+        assert!(!w.finished(), "the write ended whole: no part was short");
+        // Read the FIFO out until the rest is written.
+        let since = std::time::Instant::now();
+        while !w.finished() {
+            assert!(
+                since.elapsed() < BOUND,
+                "the write's rest was never written"
+            );
+            let _ = reader.read(&mut back);
+        }
+        assert!(w.succeeded());
+    }
+
+    /// A pass visits at most a completion queue's worth of entries, whatever each is: a cancel's
+    /// own, the eventfd's, a partial write's part (DESIGN.md 22.5; mutant: only the entries that
+    /// end a request counted, so a queue the pass keeps refilling, as a part's resubmission or a
+    /// rearmed poll the kernel completes at once does, holds the mutex for as long as it is
+    /// refilled). The ring here has no delivery thread; its entries come from a source that keeps
+    /// coming, and what the pass submits stays queued.
+    #[test]
+    fn a_pass_visits_at_most_a_completion_queues_worth_of_entries() {
+        let shared = Shared::new(4).unwrap();
+        assert_eq!(shared.pass, shared.ring.params().cq_entries() as usize);
+        // Never delivered here: the write's state is all the pass reads of it.
+        let key = 0x1000;
+        let part = Arc::new(crate::Buffer::new_temporary(4096));
+        let mut state = shared.state.lock();
+        state.writev_states.insert(
+            key,
+            WritevState {
+                file_id: io_uring::types::Fd(-1),
+                file_pos: 0,
+                current_buffer_idx: 0,
+                current_buffer_offset: 0,
+                total_written: 0,
+                total_len: part.len(),
+                bufs: vec![part],
+                last_iov_allocation: None,
+            },
+        );
+        ENTER_HELD.with(|h| h.set(true));
+        let kinds = [CANCEL_TAG, EVENTFD_TAG, key];
+        let mut visited = 0;
+        let mut batch = Vec::new();
+        shared.take(&mut state, &mut batch, || {
+            let entry = (visited < 100 * shared.pass).then(|| (kinds[visited % kinds.len()], 1));
+            visited += 1;
+            entry
+        });
+        ENTER_HELD.with(|h| h.set(false));
+        assert_eq!(
+            visited, shared.pass,
+            "a pass visited {visited} entries, a queue holding {}",
+            shared.pass
+        );
+        assert_eq!(
+            batch.len(),
+            shared.pass / kinds.len(),
+            "the parts visited were not each a progress wake"
+        );
+    }
+
+    /// Every method of the ring's IO and files, called on a thread marked as the delivery thread,
+    /// is refused or allowed as `delivery_matrix.rs` rules: a refused one ends in the refusal, an
+    /// allowed one returns (DESIGN.md 22.5; mutant: a refused method's refusal removed). Each
+    /// call that could wait is made where it would not: on a finished request, for no time.
+    #[test]
+    fn each_method_on_the_delivery_thread_is_refused_or_allowed_as_ruled() {
+        use crate::io::delivery_matrix::{Rule, FILE, IO as IO_METHODS};
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        let io = Arc::new(UringIO::new().unwrap());
+        let file = file_of(&dir, &io, 4096);
+        let opcode_truncates = io.shared.caps.ftruncate;
+        let mut wrong = Vec::new();
+        for (kind, ruled) in [("File", FILE), ("IO", IO_METHODS)] {
+            for &(method, rule) in ruled {
+                let (io, file, dir) = (io.clone(), file.clone(), dir.clone());
+                let outcome = std::thread::spawn(move || {
+                    crate::io::DELIVERING.with(|d| d.set(true));
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        call(method, &io, &file, &dir)
+                    }))
+                    .map_err(|p| {
+                        p.downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_default()
+                    })
+                })
+                .join()
+                .unwrap();
+                let refused = match rule {
+                    Rule::Refused => true,
+                    Rule::Allowed(_) => false,
+                    Rule::SubmittedOrRefused => !opcode_truncates,
+                };
+                let as_ruled = match &outcome {
+                    Ok(()) => !refused,
+                    Err(said) => refused && said.contains("on the ring's delivery thread"),
+                };
+                if !as_ruled {
+                    wrong.push(format!("{kind}::{method} ({rule:?}): {outcome:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Calls `method` on the ring's IO or `file`, as cheaply as it can be called.
+    fn call(method: &str, io: &Arc<UringIO>, file: &Arc<dyn File>, dir: &tempfile::TempDir) {
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let page = || Arc::new(crate::Buffer::new_temporary(4096));
+        let write = || Completion::new_write(|_| {});
+        // A request finished and never submitted: a wait on it, were it not refused, returns.
+        let finished = || {
+            let c = Completion::new_write(|_| {});
+            c.complete(0);
+            c
+        };
+        let kind = SharedWalLockKind::ProcessScopedFcntl;
+        // The byte past the file's end each shared WAL call takes: a lock beyond the end is legal.
+        let byte = 1 << 20;
+        match method {
+            "lock_file" => {
+                let _ = file.lock_file(true);
+            }
+            "unlock_file" => {
+                let _ = file.unlock_file();
+            }
+            "pread" => {
+                let _ = file.pread(0, Completion::new_read(page(), |_| None));
+            }
+            "pwrite" => {
+                let _ = file.pwrite(0, page(), write());
+            }
+            "sync" => {
+                let _ = file.sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync);
+            }
+            "sync_data" => {
+                let _ = file.sync_data(Completion::new_sync(|_| {}));
+            }
+            "supports_durable_writes" => {
+                let _ = file.supports_durable_writes();
+            }
+            "pwrite_durable" => {
+                let _ = file.pwrite_durable(0, page(), write());
+            }
+            "allocate" => {
+                let _ = file.allocate(0, 4096);
+            }
+            "pwritev" => {
+                let _ = file.pwritev(0, vec![page()], write());
+            }
+            "size" => {
+                let _ = file.size();
+            }
+            "truncate" => {
+                let _ = file.truncate(4096, Completion::new_trunc(|_| {}));
+            }
+            "has_hole" => {
+                let _ = file.has_hole(0, 4096);
+            }
+            "punch_hole" => {
+                let _ = file.punch_hole(0, 4096);
+            }
+            "shared_wal_lock_byte" => {
+                let _ = file.shared_wal_lock_byte(byte, false, kind);
+            }
+            "shared_wal_try_lock_byte" => {
+                let _ = file.shared_wal_try_lock_byte(byte, false, kind);
+            }
+            "shared_wal_probe_exclusive_byte" => {
+                let _ = file.shared_wal_probe_exclusive_byte(byte, kind);
+            }
+            "shared_wal_probe_exclusive_while_shared_byte" => {
+                let _ = file.shared_wal_probe_exclusive_while_shared_byte(byte, kind);
+            }
+            "shared_wal_unlock_byte" => {
+                let _ = file.shared_wal_unlock_byte(byte, kind);
+            }
+            "shared_wal_set_len" => {
+                let _ = file.shared_wal_set_len(4096);
+            }
+            "shared_wal_map" => {
+                let _ = file.shared_wal_map(0, 4096);
+            }
+            "open_file" => {
+                let _ = io.open_file(&path("opened"), OpenFlags::Create, false);
+            }
+            "open_shared_wal_file" => {
+                let _ = io.open_shared_wal_file(&path("shared"));
+            }
+            "remove_file" => {
+                let _ = io.remove_file(&path("absent"));
+            }
+            "sync_directory" => {
+                let _ = io.sync_directory(&path(""));
+            }
+            "rename_file" => {
+                let _ = io.rename_file(&path("absent"), &path("renamed"));
+            }
+            "supports_shared_wal_coordination" => {
+                let _ = io.supports_shared_wal_coordination();
+            }
+            "step" => {
+                let _ = io.step();
+            }
+            "cancel" => {
+                let _ = io.cancel(&[finished()]);
+            }
+            "wait_retired" => {
+                let _ = io.wait_retired(&finished());
+            }
+            "drain_completions" => {
+                let _ = io.drain_completions(&[finished()]);
+            }
+            "wait_for_completion" => {
+                let _ = io.wait_for_completion(finished());
+            }
+            "generate_random_number" => {
+                let _ = io.generate_random_number();
+            }
+            "fill_bytes" => io.fill_bytes(&mut [0u8; 8]),
+            "get_memory_io" => {
+                let _ = io.get_memory_io();
+            }
+            "register_fixed_buffer" => {
+                // Kept for the ring's life: the kernel holds the buffer once registered.
+                let arena: &'static mut [u8] = Box::leak(vec![0u8; 4096].into_boxed_slice());
+                let _ = io.register_fixed_buffer(NonNull::new(arena.as_mut_ptr()).unwrap(), 4096);
+            }
+            "yield_now" => io.yield_now(),
+            "sleep" => io.sleep(Duration::ZERO),
+            "file_id" => {
+                let _ = io.file_id(&path("absent"));
+            }
+            _ => panic!("no call for {method}"),
+        }
     }
 
     #[test]

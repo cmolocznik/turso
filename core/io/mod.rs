@@ -57,13 +57,14 @@ crate::thread::thread_local! {
     static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Ends the thread with a panic if it is a ring's delivery thread, which never waits and never makes
-/// a synchronous file call: nothing else would deliver what it waits for, and every delivery behind
-/// it waits on the file system (DESIGN.md 22.5). A panic there ends the process.
+/// Ends the thread with a panic if it is a ring's delivery thread, which never makes a call that can
+/// wait: nothing else would deliver what it waits for, and every delivery behind it would wait on
+/// the file system, on another holder of a lock, or on time (DESIGN.md 22.5; the calls ruled are
+/// listed in `delivery_matrix.rs`). A panic there ends the process.
 pub(crate) fn refuse_on_delivery_thread(what: &str) {
     assert!(
         !DELIVERING.with(|d| d.get()),
-        "{what} on the ring's delivery thread, which never waits nor makes a synchronous file call"
+        "{what} on the ring's delivery thread, which never makes a call that can wait"
     );
 }
 
@@ -72,11 +73,107 @@ pub(crate) fn refuse_on_delivery_thread(what: &str) {
 /// deliver or retire what it accepted, so its waiters can neither wait on, since nothing would
 /// deliver, nor return, since the backend may still own the buffers they lent it.
 pub(crate) fn stepping_failed(e: &crate::LimboError, during: &str) -> ! {
-    eprintln!(
+    fatal(format_args!(
         "{during}: the IO's step failed ({e}): it can no longer deliver or retire the requests it accepted"
-    );
+    ))
+}
+
+/// The most a fatal message writes: `PIPE_BUF` on Linux, the largest write a pipe takes whole or
+/// not at all, so a message written without waiting is never torn or interleaved with another.
+const FATAL_MESSAGE: usize = 4096;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const _: () = assert!(FATAL_MESSAGE == libc::PIPE_BUF);
+
+/// Ends the process (DESIGN.md 22.11), and nothing but the abort is needed for it to end: `message`
+/// is formatted into a buffer on the stack, cut at [`FATAL_MESSAGE`] bytes, and told on standard
+/// error only by a write that cannot wait ([`tell_without_waiting`]). So neither a thread holding
+/// the standard error stream's lock (every print takes it) while it waits on this one, nor a reader
+/// that has stopped reading, can keep the process from ending. A message no such write can carry
+/// stays in this frame's buffer, which a core dump keeps.
+pub(crate) fn fatal(message: std::fmt::Arguments<'_>) -> ! {
+    let mut buf = [0u8; FATAL_MESSAGE];
+    let len = {
+        let mut cursor = std::io::Cursor::new(&mut buf[..FATAL_MESSAGE - 1]);
+        let _ = std::io::Write::write_fmt(&mut cursor, message);
+        cursor.position() as usize
+    };
+    buf[len] = b'\n';
+    tell_without_waiting(&buf[..=len]);
     std::process::abort()
 }
+
+/// Writes `bytes` to standard error where the write cannot wait, by what standard error is: a
+/// regular file has no reader to wait for; a socket is sent to without waiting; a pipe, FIFO or
+/// terminal is written, on Linux, through an open file description of its own, opened nonblocking,
+/// so the description the host shares with other processes keeps its flags, and a write finding no
+/// room writes nothing. Anything else, or a standard error closed or open only for reading, is not
+/// written.
+#[cfg(unix)]
+fn tell_without_waiting(bytes: &[u8]) {
+    // SAFETY: fstat and fcntl on descriptor 2 into a zeroed stat buffer they only fill; every
+    // write takes `bytes`, valid for its length, and the descriptor opened here is closed here.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(2, &mut st) != 0 {
+            return;
+        }
+        let flags = libc::fcntl(2, libc::F_GETFL);
+        if flags < 0 || flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return;
+        }
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                libc::write(2, bytes.as_ptr().cast(), bytes.len());
+            }
+            libc::S_IFSOCK => {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let flags = libc::MSG_DONTWAIT;
+                libc::send(2, bytes.as_ptr().cast(), bytes.len(), flags);
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::S_IFIFO | libc::S_IFCHR => {
+                let fd = libc::open(
+                    c"/proc/self/fd/2".as_ptr(),
+                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+                );
+                if fd >= 0 {
+                    libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                    libc::close(fd);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Writes `bytes` to standard error where it is a disk file, which has no reader to wait for. A
+/// pipe or console holds a write for as long as its reader does not read, and neither has a write
+/// that cannot wait short of changing a mode its other holders share, so neither is written.
+#[cfg(windows)]
+fn tell_without_waiting(bytes: &[u8]) {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, WriteFile, FILE_TYPE_DISK};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    // SAFETY: the handle is the process's standard error, `bytes` is valid for its length, and
+    // `written` outlives the call.
+    unsafe {
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if GetFileType(handle) == FILE_TYPE_DISK {
+            let mut written = 0;
+            WriteFile(
+                handle,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn tell_without_waiting(_bytes: &[u8]) {}
 
 #[cfg(any(test, feature = "io_crash"))]
 pub mod crash;
@@ -93,6 +190,8 @@ mod callback_census;
 pub mod clock;
 mod common;
 mod completions;
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod delivery_matrix;
 #[cfg(any(
     test,
     all(target_os = "windows", feature = "experimental_win_iocp", not(miri))
@@ -751,6 +850,7 @@ pub trait IO: Clock + Send + Sync {
     /// Sleep for the specified duration.
     /// Used for progressive backoff in contended lock acquisition.
     fn sleep(&self, duration: std::time::Duration) {
+        refuse_on_delivery_thread("a sleep");
         crate::thread::sleep(duration);
     }
 
@@ -758,6 +858,7 @@ pub trait IO: Clock + Send + Sync {
     /// Default uses OS-level metadata; non-filesystem backends override
     /// with synthetic hash-based identity.
     fn file_id(&self, path: &str) -> Result<FileId> {
+        refuse_on_delivery_thread("a file's identity");
         get_file_id(path).map_err(|e| {
             crate::LimboError::InternalError(format!(
                 "failed to get file identity for '{path}': {e}"

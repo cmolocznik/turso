@@ -2124,19 +2124,28 @@ says which owner that is:
 - **The ring** (io_uring): **a delivery thread of the ring's own** is the one thread that waits in
   the kernel. Before each wait it moves requests queued past a full submission queue (the ring's
   overflow) into the kernel, so no accepted request is left outside it; it waits for one
-  completion, takes at most one completion queue of entries (1,024, twice the 512-entry submission
-  queue, the kernel's default) into a fixed buffer under the ring's mutex, handling a partial
-  write's resubmission there as today, releases the mutex, delivers each entry, and waits again. The
-  mutex is held only to touch the queues, never across the kernel wait or a callback. Every request
+  completion, visits at most one completion queue of entries (its size as the kernel set it: 1,024,
+  twice the 512-entry submission queue, by default) under the ring's mutex, every entry counted (a
+  cancel's own, the eventfd's and a partial write's part as much as one that ends a request, since
+  a part's resubmission or a rearmed poll the kernel completes at once refills the queue being read),
+  handling a partial write's resubmission there as today, into a fixed buffer; it releases the mutex,
+  delivers each ended request and makes each partial write's progress wake, in the order taken, and
+  waits again. The mutex is held only to touch the queues, never across the kernel wait, a callback
+  or a wake: a cancel's aborts run their callbacks with it let go, and its kernel cancels are queued
+  after. Every request
   submitted to the ring, by any thread, is delivered by it, so a synchronous waiter, a cooperative
   future, an executor runner and a request nobody waits for are all delivered alike, with no
   leadership to hand over and no waiter that must step the ring. Only the delivery thread takes
   entries from the completion queue, into its one buffer: no other thread delivers ring requests,
   so there is one dispatch route and one batch in delivery at a time.
   - **Callbacks on the delivery thread are short and never wait**: they may submit requests, but
-    never wait for one and never make a synchronous file call (a sync, a directory sync, a create,
-    an allocation). `IO::wait`, `IO::wait_retired`, a blocking remote wait and close refuse on the
-    delivery thread (asserted), since nothing else would deliver what they wait for. A census test
+    never make a call that can wait: for a request, on the file system (a sync, a directory sync, a
+    create, an allocation, a file's size), on another holder of a lock, or on time. Every method of
+    `File` and `IO` is ruled for the delivery thread, refused or allowed for a stated reason (a
+    submission, which is queued and never waited for; a lock's release, which waits for no other
+    holder and which a file's drop makes wherever the drop lands; a call that touches no file), and
+    a refused one ends the process there (asserted). `IO::wait`, `IO::wait_retired`, a blocking
+    remote wait and close are among them, since nothing else would deliver what they wait for. A census test
     lists every callback Turso and Atoll construct, with what it does. Today's control and metadata
     callbacks, which submit the next sync, are of this kind; the log's segment preparation is not:
     its `prepared` callback syncs the segments' directory, looks for the next segment (which may
@@ -2151,7 +2160,8 @@ says which owner that is:
     moving queued requests in, is retried where the kernel says it may be (an interrupted wait; a
     busy or full completion queue, which the thread drains first and then retries); any other
     (a ring the kernel no longer recognizes, a fault in its memory) leaves accepted requests the
-    thread can no longer deliver or retire, so it ends the process with the error printed (22.11),
+    thread can no longer deliver or retire, so it ends the process (22.11), the error told on standard
+    error where a write cannot wait,
     rather than return and leave every waiter and close waiting on requests nobody will deliver.
   - **Its lifetime.** The thread holds the ring's shared state, never the handles the embedder
     holds. It runs while any handle to the ring (the IO and its files) lives or any request is
@@ -2365,7 +2375,27 @@ it may own their buffers. A VFS submission the extension refuses takes back the 
 dropped callback held. The completion port refuses a read or write whose byte count an `i32`
 cannot carry before it accepts it, and delivers every packet it consumes, a count or error code it
 cannot convert as the request's error. The concurrent simulator's files accept each request as
-they queue it and deliver and retire it at the step.)
+they queue it, and its step takes the queue out and delivers and retires each, so a callback's own
+submission queues for the next step. A fatal path (`fatal`: the ring lost, a step that failed) needs
+nothing but the abort to end the process: its message is formatted into a buffer on the stack and
+told only by a write that cannot wait, through no lock, so neither a thread holding standard error
+while it waits on the failing one nor a reader that stopped reading can keep the process from
+ending. Standard error is written as it is: a regular file plainly, having no reader to wait for; a
+socket with a send that does not wait; on Linux a pipe, FIFO or terminal through a nonblocking open
+file description of its own, so the one the host shares keeps its flags; anything else not at all.
+
+(Corrected after the audit of step 3c: a cancel aborts its requests, running their callbacks, with
+the ring's mutex let go, then queues the kernel's cancels under it, so a callback may submit its next
+request as any callback may. A partial write's progress wake leaves the mutex too: the pass returns
+it as an entry, made after the mutex is let go and before the write's own delivery, which only the
+delivery thread makes, so the kernel's reference it reads is still held. A pass visits at most the
+ring's completion queue size of entries, every entry counted, and the next wait returns at once for
+what it left. `delivery_matrix.rs` rules every method of `File` and `IO` for the delivery thread, a
+census failing on a method added to either trait unruled: a file's size and lock, every shared WAL
+call but its release, a sleep and a file's identity are refused there now, as the waits and the file
+system's calls were; a test calls each method on a thread marked as the delivery thread and holds the
+ring to the rulings, and the callback census refuses a callback that calls a refused method, by a
+method call or a path.)
 
 **Who waits how.** Every caller that waits for IO is one of three kinds:
 

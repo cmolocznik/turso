@@ -417,13 +417,128 @@ fn a_failed_step_under(test: &str, during: &str, wait: fn(&CrashIO, &Completion)
         return;
     };
     assert!(
-        ended.aborted
-            && ended
-                .stderr
-                .contains(&format!("{during}: the IO's step failed")),
-        "a failed step under {during} did not end the process: {:?} {}",
+        ended.aborted && !ended.hung,
+        "a failed step under {during} did not end the process: hung {}, code {:?}: {}",
+        ended.hung,
         ended.code,
         ended.stderr
+    );
+    told(&ended, &format!("{during}: the IO's step failed"));
+}
+
+/// Where standard error, a pipe in a child test, can be written without waiting (Linux), the
+/// process that ended said why: its message is the diagnostic, never what ends the process.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+pub(crate) fn told(ended: &crate::child_test::Ended, message: &str) {
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        assert!(
+            ended.stderr.contains(message),
+            "ended without saying {message:?}: {}",
+            ended.stderr
+        );
+    }
+}
+
+/// Makes this process's standard error what a host's is whose reader has stopped reading: a
+/// blocking pipe with no room, where a write waits for ever. The pipe's read end stays open and
+/// unread, so a write neither fails nor raises SIGPIPE. Proved full: a nonblocking write of one byte
+/// finds no room.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(shuttle, atoll_loom, miri))
+))]
+pub(crate) fn stderr_a_full_pipe() {
+    let mut fds = [0; 2];
+    // SAFETY: pipe(2) into a two-descriptor array; fcntl, write and dup2 on the descriptors it
+    // made, writing from live buffers.
+    unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        let [read_end, write_end] = fds;
+        let flags = libc::fcntl(write_end, libc::F_GETFL);
+        assert_eq!(
+            libc::fcntl(write_end, libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0
+        );
+        let page = [0u8; 4096];
+        while libc::write(write_end, page.as_ptr().cast(), page.len()) > 0 {}
+        let byte = [0u8; 1];
+        while libc::write(write_end, byte.as_ptr().cast(), 1) > 0 {}
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN),
+            "the pipe was not filled"
+        );
+        assert_eq!(libc::fcntl(write_end, libc::F_SETFL, flags), 0);
+        assert_eq!(libc::dup2(write_end, 2), 2);
+        libc::close(write_end);
+        // Never read and never closed: the child ends with it.
+        let _ = read_end;
+    }
+}
+
+/// A step that fails ends the process while another thread holds standard error and waits for the
+/// failing one, as a host that prints and then joins its workers does: the message is written
+/// without the lock (DESIGN.md 22.11; mutant: the message printed through the lock, which waits on
+/// its holder while the holder waits on it, so the child never ends).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_step_that_fails_ends_the_process_while_another_thread_holds_stderr() {
+    let Some(ended) = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_step_that_fails_ends_the_process_while_another_thread_holds_stderr"
+        ),
+        || {
+            let io = Arc::new(CrashIO::new(7));
+            let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+            let c = file.pread(0, read(512)).unwrap();
+            failing_steps(&io);
+            let _stderr = std::io::stderr().lock();
+            let waiter = std::thread::spawn(move || io.wait_for_completion(c));
+            let _ = waiter.join();
+        },
+    ) else {
+        return;
+    };
+    assert!(
+        ended.aborted && !ended.hung,
+        "the failed step did not end the process: hung {}, code {:?}",
+        ended.hung,
+        ended.code
+    );
+    told(&ended, "a wait for a completion: the IO's step failed");
+}
+
+/// A step that fails ends the process with standard error a full pipe whose reader has stopped
+/// reading: the message finds no room and is dropped, and the process ends all the same (DESIGN.md
+/// 22.11; mutant: the message written by a write that waits for room, which never comes).
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(shuttle, atoll_loom, miri))
+))]
+#[test]
+fn a_step_that_fails_ends_the_process_with_stderr_a_full_pipe() {
+    let Some(ended) = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_step_that_fails_ends_the_process_with_stderr_a_full_pipe"
+        ),
+        || {
+            let io = CrashIO::new(8);
+            let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+            let c = file.pread(0, read(512)).unwrap();
+            failing_steps(&io);
+            stderr_a_full_pipe();
+            let _ = io.wait_for_completion(c);
+        },
+    ) else {
+        return;
+    };
+    assert!(
+        ended.aborted && !ended.hung,
+        "the failed step did not end the process: hung {}, code {:?}",
+        ended.hung,
+        ended.code
     );
 }
 

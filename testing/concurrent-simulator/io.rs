@@ -185,12 +185,12 @@ impl IO for SimulatorIO {
     }
 
     fn step(&self) -> Result<()> {
-        // Complete any pending IO operations
-        let mut pending = self.pending.lock().unwrap();
-        for pc in pending.drain(..) {
+        // Complete any pending IO operations, the queue taken out first: a completion's callback
+        // may submit IO of its own, as the real IOs allow, which queues for the next step.
+        let ready = std::mem::take(&mut *self.pending.lock().unwrap());
+        for pc in ready {
             pc.completion.deliver(Ok(pc.result));
         }
-        drop(pending);
 
         // Advance simulated time by 1ms per step
         self.time.fetch_add(1000, Ordering::Relaxed);
@@ -563,5 +563,54 @@ mod tests {
         io.drain_completions(std::slice::from_ref(&read)).unwrap();
         assert!(!read.is_owned(), "drained while still queued");
         assert!(io.pending.lock().unwrap().is_empty());
+    }
+
+    /// A callback may submit a request of its own, as the real IOs allow: the step that delivers
+    /// the first does so with the queue let go, and the next step delivers the second (mutant: the
+    /// queue's lock held across the callbacks, so the second submission waits on it for ever).
+    #[test]
+    fn a_callback_that_submits_a_request_queues_it_for_the_next_step() {
+        let directory = tempfile::tempdir().unwrap();
+        let io = Arc::new(SimulatorIO::new(
+            false,
+            ChaCha8Rng::seed_from_u64(3),
+            IOFaultConfig::default(),
+        ));
+        let path = directory.path().join("chain.db");
+        let file = io
+            .open_file(path.to_str().unwrap(), OpenFlags::default(), false)
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stepper = {
+            let (io, file) = (io.clone(), file.clone());
+            std::thread::spawn(move || {
+                let child = Arc::new(Mutex::new(None));
+                let parent = {
+                    let (file, child) = (file.clone(), child.clone());
+                    Completion::new_sync(move |_| {
+                        let c = file
+                            .sync(
+                                Completion::new_sync(|_| {}),
+                                turso_core::io::FileSyncType::Fsync,
+                            )
+                            .unwrap();
+                        *child.lock().unwrap() = Some(c);
+                    })
+                };
+                let parent = file
+                    .sync(parent, turso_core::io::FileSyncType::Fsync)
+                    .unwrap();
+                io.step().unwrap();
+                io.step().unwrap();
+                let child = child.lock().unwrap().take().unwrap();
+                let _ = tx.send((parent.succeeded(), child.succeeded(), child.is_owned()));
+            })
+        };
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok((true, true, false)),
+            "a callback's submission waited on the step that delivered it"
+        );
+        stepper.join().unwrap();
     }
 }

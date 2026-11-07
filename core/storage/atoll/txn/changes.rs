@@ -136,7 +136,7 @@ impl<'a> Keyed<'a> {
 pub struct Chunks {
     bytes: usize,
     /// Chunks given back, by address, for the next taken.
-    free: crate::sync::Mutex<Vec<usize>>,
+    free: crate::storage::atoll::locks::Mutex<Vec<usize>>,
     /// The most kept free.
     keep: usize,
 }
@@ -150,7 +150,7 @@ impl Chunks {
         );
         Arc::new(Self {
             bytes,
-            free: crate::sync::Mutex::new(Vec::with_capacity(keep)),
+            free: crate::storage::atoll::locks::Mutex::new(Vec::with_capacity(keep)),
             keep,
         })
     }
@@ -202,6 +202,7 @@ impl Lender for Chunks {
 
 impl Drop for Chunks {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         let layout = self.layout();
         for p in self.free.lock().drain(..) {
             // SAFETY: as in `give_back`.

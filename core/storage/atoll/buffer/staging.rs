@@ -45,6 +45,7 @@ impl Leased {
 
 impl Drop for Leased {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         self.staging
             .in_flight
             .fetch_sub(self.block.len(), Ordering::AcqRel);

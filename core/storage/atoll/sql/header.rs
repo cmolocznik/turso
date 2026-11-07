@@ -9,11 +9,12 @@ use super::catalog::System;
 use crate::io::IO;
 use crate::storage::atoll::btree::Mode;
 use crate::storage::atoll::buffer::BufferPool;
+use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::store::PageStore;
 use crate::storage::atoll::txn::versioned::{Get, VersionedTree, Versions, Write, WriteOp};
 use crate::storage::atoll::txn::{Transactions, Ts, Txn};
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::types::IOResult;
 use crate::{LimboError, Result};
 

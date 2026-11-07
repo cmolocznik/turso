@@ -26,8 +26,8 @@ use std::collections::HashSet;
 /// The engine's primitives, or loom's.
 #[cfg(not(atoll_loom))]
 mod sync {
+    pub(super) use crate::storage::atoll::locks::Mutex;
     pub(super) use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-    pub(super) use crate::sync::Mutex;
 
     pub(super) fn lock<T>(m: &Mutex<T>) -> impl std::ops::DerefMut<Target = T> + '_ {
         m.lock()

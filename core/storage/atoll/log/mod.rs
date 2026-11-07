@@ -174,7 +174,7 @@ pub struct Log {
     failure: SetOnce<CompletionError>,
     zeros: Arc<AlignedBlock>,
     /// Records published in place and not yet all submitted to be written, by where they lie.
-    extents: crate::sync::Mutex<std::collections::VecDeque<Extent>>,
+    extents: crate::storage::atoll::locks::Mutex<std::collections::VecDeque<Extent>>,
     /// How many: a flush with none looks at no lock.
     extent_count: AtomicUsize,
 }
@@ -188,6 +188,7 @@ pub struct Admitted {
 
 impl Drop for Admitted {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         if self.left > 0 {
             self.log.room.give_back(self.left);
             self.log.wake_admitters();
@@ -287,7 +288,7 @@ impl Log {
             failed: AtomicBool::new(false),
             failure: SetOnce::default(),
             zeros: Arc::new(AlignedBlock::zeroed(config.chunk_bytes as usize)),
-            extents: crate::sync::Mutex::new(std::collections::VecDeque::new()),
+            extents: crate::storage::atoll::locks::Mutex::new(std::collections::VecDeque::new()),
             extent_count: AtomicUsize::new(0),
             segments,
             config,

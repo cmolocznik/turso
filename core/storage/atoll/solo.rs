@@ -35,6 +35,7 @@ pub struct Turn<'a>(&'a Solo);
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         self.0.busy.store(false, Ordering::Release);
         // Pairs with the fence of a request: either the next turn is taken for it, or it takes
         // the turn itself.

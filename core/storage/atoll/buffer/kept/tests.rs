@@ -558,24 +558,45 @@ fn a_roots_shrink_past_the_room_steps_the_checkpoint_itself_and_finishes_within_
 }
 
 /// A change of a page the cut owes that asked for no room first fails the invariant check: a
-/// copy made then would pass the room's limit.
+/// copy made then would pass the room's limit. The check fires with the page held exclusive and a
+/// metadata hold alive, so the panic passes their guards and ends the process (DESIGN.md 22.11):
+/// it runs in a child process.
+#[cfg(all(unix, not(miri)))]
 #[test]
-#[should_panic(expected = "with no room asked for its copy")]
 fn a_change_that_asked_for_no_room_fails_the_invariant_check() {
-    let db = Db::memory();
-    let orphan = drive(&db.io, || {
-        Tree::create(db.pool(), SizeClass::new(0).unwrap())
-    })
-    .unwrap();
-    let (tree, _) = db.owed_tree();
-    let frame = db.orphan_leaf(orphan);
-    let _hold = frame.try_lock().expect("the leaf is free");
-    db.take_cut();
-    // Every leaf is owed: the first one changed fails.
-    for pid in db.pages(&tree) {
-        let mut page = within(&db.io, || db.pool().fix_exclusive(pid, None));
-        page.page_mut();
-    }
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_change_that_asked_for_no_room_fails_the_invariant_check"
+        ),
+        || {
+            let db = Db::memory();
+            let orphan = drive(&db.io, || {
+                Tree::create(db.pool(), SizeClass::new(0).unwrap())
+            })
+            .unwrap();
+            let (tree, _) = db.owed_tree();
+            let frame = db.orphan_leaf(orphan);
+            let _hold = frame.try_lock().expect("the leaf is free");
+            db.take_cut();
+            // Every leaf is owed: the first one changed fails.
+            for pid in db.pages(&tree) {
+                let mut page = within(&db.io, || db.pool().fix_exclusive(pid, None));
+                page.page_mut();
+            }
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert!(
+        ended.aborted,
+        "the child did not abort: {:?}\n{}",
+        ended.code, ended.stderr
+    );
+    assert!(
+        ended.stderr.contains("with no room asked for its copy"),
+        "{}",
+        ended.stderr
+    );
 }
 
 /// The copies a cut keeps are in frames the pool lends (one memory), and the room's bytes are
@@ -769,12 +790,12 @@ fn a_waiter_woken_for_a_full_checkpoint_may_wait_again_from_its_wake() {
     struct Again {
         cp: Arc<crate::storage::atoll::checkpoint::Checkpointer>,
         ticket: u64,
-        told: std::sync::Mutex<mpsc::Sender<bool>>,
+        told: crate::storage::atoll::locks::Mutex<mpsc::Sender<bool>>,
     }
     impl Wake for Again {
         fn wake(self: std::sync::Arc<Self>) {
             let waited = self.cp.wait_full_on_the_thread(self.ticket).is_ok();
-            let _ = self.told.lock().unwrap().send(waited);
+            let _ = self.told.lock().send(waited);
         }
     }
     let db = Db::threaded();
@@ -788,7 +809,7 @@ fn a_waiter_woken_for_a_full_checkpoint_may_wait_again_from_its_wake() {
     c.set_waker(&Waker::from(std::sync::Arc::new(Again {
         cp: cp.clone(),
         ticket: ticket + 1,
-        told: std::sync::Mutex::new(told),
+        told: crate::storage::atoll::locks::Mutex::new(told),
     })));
     drop(held);
     match woke.recv_timeout(std::time::Duration::from_secs(60)) {

@@ -33,10 +33,11 @@ use std::ptr;
 /// The engine's primitives, or loom's, which model the weaker memory orderings shuttle cannot.
 #[cfg(not(atoll_loom))]
 mod sync {
+    pub(super) use crate::storage::atoll::locks::Mutex;
     pub(super) use crate::sync::atomic::{
         fence, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering,
     };
-    pub(super) use crate::sync::{Arc, Mutex};
+    pub(super) use crate::sync::Arc;
 
     /// A plain field one thread writes and publishes to others; under loom, loom's checked cell.
     pub(super) struct Plain<T>(std::cell::UnsafeCell<T>);

@@ -2562,6 +2562,12 @@ The executor changes who runs each transition, never its order or its meaning:
   `Arc` guards) and any further re-export count as the types they name, and no wrapper method (a
   `try_lock`, a mapped or `Arc` guard, a read or write guard, a condition variable's wait) hands out
   the unchecked guard beneath.
+  (Built: `unwind.rs`, `locks.rs` and their censuses. The destructor census lists the 41 destructors
+  in Atoll: 22 checking, one of them written once for the three lock guards, and 19 that let go only
+  what they own or keep memory alive without guarding a change, each with its reason. The lock
+  census is `clippy::disallowed_types`, denied in Atoll by `core/clippy.toml`, which resolves a path
+  or re-export to the type it names, and a test that scans Atoll's source, including for the aliases
+  of a lock the rest of the crate defines.)
 - **The check is exact because no Atoll frame is entered while its thread unwinds.** Every entry
   into Atoll is a frame (below), and a frame entered while `std::thread::panicking()` is true (an
   application's unwind dropping a connection with an Atoll transaction open, a statement holding
@@ -2886,7 +2892,9 @@ compose, the real `Completion`, latch and backends included where named.
    made while unwinding aborting; the facade with crate-private types behind it, returning no Atoll
    code to run later, with its census; no `catch_unwind` in Atoll; the tests that panic past a
    checked guard moved to child processes, with their census; section 7.5's new rule; proof 9.
-   Before the delivery thread, whose deliveries it frames, and before any job moves.
+   Before the delivery thread, whose deliveries it frames, and before any job moves. The checks, the
+   locks, their censuses and the tests in child processes are built; the frames and the facade are
+   not.
 3. **Delivering the IO**: the log's interim adapter first, with its preparation word, completions
    that mean call again and the census of their callers, so no callback does file work from this
    step on; a completion's three ownership states and a group's aggregate over its physical requests

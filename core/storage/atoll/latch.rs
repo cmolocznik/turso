@@ -146,6 +146,7 @@ impl<L: Deref<Target = VersionedLatch>> Held<L> {
 
 impl<L: Deref<Target = VersionedLatch>> Drop for Held<L> {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         self.0.unlock_exclusive();
     }
 }
@@ -192,17 +193,62 @@ mod tests {
         drop(Held::try_take_at(&latch, now).unwrap());
     }
 
+    /// A panic while the latch is held ends the process before the latch is let go (DESIGN.md
+    /// 22.11). In a child process an observer thread watches the latch held by another thread,
+    /// which then panics: the child must end by abort, and the observer, recording what it sees to
+    /// a synced file, must never have found the latch free. Were the guard to let it go, the
+    /// holder's thread would end, the observer would find the latch free, and the child would exit.
+    #[cfg(all(unix, not(miri)))]
     #[test]
-    fn a_panic_while_holding_releases_the_latch() {
-        let latch = VersionedLatch::default();
-        let panicked = std::panic::catch_unwind(|| {
-            let _hold = Held::try_take(&latch).unwrap();
-            panic!("a holder failed");
-        });
-        assert!(panicked.is_err());
+    fn a_panic_while_holding_the_latch_ends_the_process_before_it_is_let_go() {
+        use crate::storage::atoll::testing::{in_child, record, recorded};
+        use crate::sync::Arc;
+        let ended = in_child(
+            concat!(
+                module_path!(),
+                "::a_panic_while_holding_the_latch_ends_the_process_before_it_is_let_go"
+            ),
+            || {
+                let latch = Arc::new(VersionedLatch::default());
+                let (held, watched) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+                let holder = {
+                    let latch = latch.clone();
+                    let (held, watched) = (held.0, watched.1);
+                    std::thread::spawn(move || {
+                        let _hold = Held::try_take(latch).unwrap();
+                        held.send(()).unwrap();
+                        watched.recv().unwrap();
+                        panic!("a holder failed");
+                    })
+                };
+                held.1.recv().unwrap();
+                let observer = std::thread::spawn(move || {
+                    record("seen", "watching");
+                    watched.0.send(()).unwrap();
+                    while latch.optimistic().is_none() {
+                        std::thread::yield_now();
+                    }
+                    record("seen", "free");
+                });
+                let _ = holder.join();
+                observer.join().unwrap();
+            },
+        );
+        let Some(ended) = ended else { return };
+        let seen = recorded(&ended, "seen");
         assert!(
-            latch.optimistic().is_some(),
-            "the panic left the latch held"
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(ended.stderr.contains("a holder failed"), "{}", ended.stderr);
+        assert!(
+            seen.contains("watching"),
+            "the observer never ran: {seen:?}"
+        );
+        assert!(
+            !seen.contains("free"),
+            "the observer found the latch free: {seen:?}"
         );
     }
 }

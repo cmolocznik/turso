@@ -252,6 +252,7 @@ impl Deref for KeptCopy {
 
 impl Drop for KeptCopy {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         self.room.release(self.block.len());
     }
 }

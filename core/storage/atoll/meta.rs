@@ -41,8 +41,9 @@ use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::Stack;
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
+use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex, Weak};
+use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::collections::VecDeque;
@@ -247,6 +248,7 @@ impl std::ops::DerefMut for CutCopy {
 
 impl Drop for CutCopy {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         self.of.used.fetch_sub(self.bytes.len(), Ordering::AcqRel);
     }
 }

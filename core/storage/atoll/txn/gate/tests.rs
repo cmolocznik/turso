@@ -300,14 +300,35 @@ fn every_end_releases_the_gate() {
     assert!(db.free(), "the abort of a pending take");
 }
 
-/// A gated database refuses the commit of a transaction that wrote without the gate.
+/// A gated database refuses the commit of a transaction that wrote without the gate. The refusal
+/// panics past guards of shared state, which end the process (DESIGN.md 22.11): it runs in a child
+/// process.
+#[cfg(all(unix, not(miri)))]
 #[test]
-#[should_panic(expected = "without the write gate")]
 fn a_write_without_the_gate_is_refused_at_commit() {
-    let db = open(4);
-    let mut t = db.begin();
-    db.put(&mut t, "k", "v");
-    db.commit(t);
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_write_without_the_gate_is_refused_at_commit"
+        ),
+        || {
+            let db = open(4);
+            let mut t = db.begin();
+            db.put(&mut t, "k", "v");
+            db.commit(t);
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert!(
+        ended.aborted,
+        "the child did not abort: {:?}\n{}",
+        ended.code, ended.stderr
+    );
+    assert!(
+        ended.stderr.contains("without the write gate"),
+        "{}",
+        ended.stderr
+    );
 }
 
 /// Writers and exclusive takers on many threads, each waiting on what the gate names and taking

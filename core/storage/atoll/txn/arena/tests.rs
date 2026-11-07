@@ -150,7 +150,9 @@ fn entries_read_whole_while_their_page_is_appended_to() {
     let arenas = Arc::new(Arenas::new(db.pool().clone(), 4));
     let mut txn = begin(&io, &db);
     let statement = txn.command();
-    let published = Arc::new(std::sync::Mutex::new(Vec::<(Ptr, u64)>::new()));
+    let published = Arc::new(crate::storage::atoll::locks::Mutex::new(
+        Vec::<(Ptr, u64)>::new(),
+    ));
     // The newest entry the reader has read, plus one.
     let read_to = Arc::new(crate::sync::atomic::AtomicU64::new(0));
     let reader = {
@@ -163,7 +165,7 @@ fn entries_read_whole_while_their_page_is_appended_to() {
         std::thread::spawn(move || {
             let mut reads = 0u64;
             while read_to.load(Ordering::Acquire) < ENTRIES {
-                let seen: Vec<(Ptr, u64)> = published.lock().unwrap().clone();
+                let seen: Vec<(Ptr, u64)> = published.lock().clone();
                 for &(ptr, n) in seen.iter().rev().take(AHEAD as usize) {
                     expect(&io, &arenas, ptr, n, statement);
                     reads += 1;
@@ -178,7 +180,7 @@ fn entries_read_whole_while_their_page_is_appended_to() {
             std::thread::yield_now();
         }
         let ptr = append(&io, &arenas, &mut txn, n);
-        published.lock().unwrap().push((ptr, n));
+        published.lock().push((ptr, n));
     }
     let reads = reader.join().unwrap();
     // To read up to the last entry with the writer at most `AHEAD` past it, the reader read at

@@ -32,6 +32,7 @@ use crate::storage::atoll::buffer::MIN_DB_BUDGET;
 use crate::storage::atoll::control::{self, Found};
 use crate::storage::atoll::db::AtollConfig;
 use crate::storage::atoll::drive;
+use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::page::PageId;
 use crate::storage::atoll::txn::versioned::{Get, Guard, Guarded, Write, WriteOp};
 use crate::storage::atoll::txn::{Abort, Blocker, Commit, Hold, Isolation, Statement, Taken, Txn};
@@ -41,7 +42,7 @@ use crate::storage::database::IOContext;
 use crate::storage::pager::{Pager, SavepointResult};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::types::{
     IOCompletions, IOResult, IOResultOr, ImmutableRecord, IndexInfo, SeekKey, SeekOp, SeekResult,
 };
@@ -279,6 +280,7 @@ impl Waits {
 
 impl Drop for Waits {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         self.end_group();
         if let Some(seat) = self.seat.lock().take() {
             graph().unseat(seat);
@@ -392,6 +394,7 @@ impl Waiting {
 
 impl Drop for Waiting {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         let _ = self.over();
     }
 }
@@ -1414,6 +1417,7 @@ impl std::fmt::Debug for Ending {
 
 impl Drop for Ending {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         if matches!(self.step, Step::Done) {
             return;
         }
@@ -1467,6 +1471,7 @@ pub struct SqlCursor {
 /// A cursor leaves the leaf it stood at to the next over its tree.
 impl Drop for SqlCursor {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         if let Some(cursor) = &self.open {
             self.known.lock().entry(self.id).or_default().near = cursor.near();
         }

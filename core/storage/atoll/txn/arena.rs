@@ -335,6 +335,7 @@ impl Arenas {
         struct Claim<'a>(&'a AtomicBool);
         impl Drop for Claim<'_> {
             fn drop(&mut self) {
+                crate::storage::atoll::unwind::abort_if_unwinding();
                 self.0.store(false, Ordering::Release);
             }
         }

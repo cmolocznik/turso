@@ -24,7 +24,8 @@ use super::log::{framed_len, Admitted, Header, Kind, Log, LogConfig, Lsn, BLOCK}
 use super::txn::changes::Chunks;
 use super::whole_write;
 use crate::io::{Completion, File, OpenFlags, IO};
-use crate::sync::{Arc, Mutex, RwLock};
+use crate::storage::atoll::locks::{Mutex, RwLock};
+use crate::sync::Arc;
 use crate::types::IOResult;
 use crate::{LimboError, Result};
 

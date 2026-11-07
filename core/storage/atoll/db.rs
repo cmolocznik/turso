@@ -11,7 +11,8 @@ use super::recovery::{self, Recovered};
 use super::store::{PageStore, StoreConfig};
 use super::txn::{Clock, Transactions, TxnConfig};
 use crate::io::IO;
-use crate::sync::{Arc, Mutex};
+use crate::storage::atoll::locks::Mutex;
+use crate::sync::Arc;
 use crate::{LimboError, Result};
 
 #[derive(Debug, Clone)]
@@ -98,6 +99,7 @@ pub struct Atoll {
 
 impl Drop for Atoll {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         if let Some(driver) = self.driver.take() {
             self.checkpointer.stop_driver();
             if driver.join().is_err() {

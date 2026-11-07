@@ -85,8 +85,8 @@ use table::Table;
 use temp::TempPages;
 
 use crate::io::{Buffer, Completion};
+use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use crate::sync::Mutex;
 use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
@@ -169,6 +169,7 @@ impl Loading {
 
 impl Drop for Loading {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         if let (Some(hold), Some(pool)) = (self.hold.take(), self.pool.upgrade()) {
             pool.unload(self.pid, hold, None);
         }
@@ -211,6 +212,7 @@ impl Outgoing {
 
 impl Drop for Outgoing {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         if let Some(hold) = self.hold.take() {
             let frames = hold.latch().frames.clone();
             frames.kept(hold);

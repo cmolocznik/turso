@@ -33,8 +33,9 @@ use super::page::PageId;
 use super::txn::versioned::{Get, VersionedTree, Versions, Write};
 use super::txn::{Commit, Isolation, Taken};
 use crate::io::IO;
+use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::{LimboError, Result};
 
 /// An Atoll database as Turso's SQL layer uses it.
@@ -64,6 +65,7 @@ pub struct AtollDb {
 /// sequence's or a drain's, survive the close (DESIGN.md §17, R8).
 impl Drop for AtollDb {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         let log = self.atoll.log().clone();
         let end = log.end();
         if let Err(e) = drive(&self.io, || log.wait_durable(end)) {

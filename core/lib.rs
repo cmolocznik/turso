@@ -11,6 +11,8 @@
     )
 )]
 #![recursion_limit = "256"]
+// Denied in Atoll alone (`storage/atoll/mod.rs`), whose locks are its own.
+#![allow(clippy::disallowed_types)]
 
 pub mod alloc;
 pub mod busy;

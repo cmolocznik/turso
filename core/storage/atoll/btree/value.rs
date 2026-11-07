@@ -222,6 +222,7 @@ impl ValueWrite {
 
 impl Drop for ValueWrite {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         if !self.adopted {
             for &(pid, _) in &self.pages {
                 self.store.orphaned(pid);

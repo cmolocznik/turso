@@ -80,13 +80,13 @@ fn a_commit_that_wrote_raises_its_trees_stamps_while_it_holds_the_gate() {
     let mut w = db.begin();
     db.write(&mut w, &x);
     // Another transaction tries the gate from inside the hook: the committer still holds it.
-    let other = Arc::new(std::sync::Mutex::new(Some(db.begin())));
+    let other = Arc::new(crate::storage::atoll::locks::Mutex::new(Some(db.begin())));
     let calls = Arc::new(AtomicUsize::new(0));
     let (held, counted, dbi) = (other.clone(), calls.clone(), db.db.clone());
     db.commit(w, &[&x], move |_| {
         counted.fetch_add(1, Ordering::SeqCst);
         let txns = dbi.atoll().transactions();
-        let mut guard = held.lock().unwrap();
+        let mut guard = held.lock();
         let t = guard.as_mut().unwrap();
         let c = Completion::new_wait();
         let taken = txns.take_exclusive(t, &c).unwrap();
@@ -99,7 +99,7 @@ fn a_commit_that_wrote_raises_its_trees_stamps_while_it_holds_the_gate() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(db.db.stamps().written_since(x.root(), before.snapshot()));
     assert!(!db.db.stamps().written_since(y.root(), before.snapshot()));
-    txns.abort(other.lock().unwrap().take().unwrap());
+    txns.abort(other.lock().take().unwrap());
     let ran = Arc::new(AtomicUsize::new(0));
     let r = ran.clone();
     db.commit(db.begin(), &[&y], move |_| {
@@ -169,16 +169,37 @@ fn a_drained_tree_forgets_its_stamp() {
 }
 
 /// A database Turso's SQL opens requires the write gate of every writer, judged at the write: a
-/// statement that missed its take fails where its cause is, not at the commit.
+/// statement that missed its take fails where its cause is, not at the commit. The refusal panics
+/// past guards of shared state, which end the process (DESIGN.md 22.11): it runs in a child
+/// process.
+#[cfg(all(unix, not(miri)))]
 #[test]
-#[should_panic(expected = "a write without the write gate")]
 fn a_write_without_the_gate_fails_at_the_write() {
-    let db = Db::open();
-    let tree = db.tree();
-    let mut t = db.begin();
-    let txns = db.db.atoll().transactions();
-    let mut op = WriteOp::put(b"k", b"v".to_vec(), Mode::Upsert);
-    let _ = drive(&db.io, || {
-        tree.write(txns, db.db.versions(), &mut t, &mut op)
-    });
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_write_without_the_gate_fails_at_the_write"
+        ),
+        || {
+            let db = Db::open();
+            let tree = db.tree();
+            let mut t = db.begin();
+            let txns = db.db.atoll().transactions();
+            let mut op = WriteOp::put(b"k", b"v".to_vec(), Mode::Upsert);
+            let _ = drive(&db.io, || {
+                tree.write(txns, db.db.versions(), &mut t, &mut op)
+            });
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert!(
+        ended.aborted,
+        "the child did not abort: {:?}\n{}",
+        ended.code, ended.stderr
+    );
+    assert!(
+        ended.stderr.contains("a write without the write gate"),
+        "{}",
+        ended.stderr
+    );
 }

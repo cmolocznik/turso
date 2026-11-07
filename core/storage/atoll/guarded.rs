@@ -9,7 +9,7 @@
 //! contender and empties the list: a contender woken while the state was still held would find it
 //! held, wait again, and nothing would wake it. Nobody but a contender is woken.
 
-use crate::sync::{Mutex, MutexGuard};
+use super::locks::{Mutex, MutexGuard};
 use crate::thread::Thread;
 use std::ops::{Deref, DerefMut};
 
@@ -111,6 +111,7 @@ impl<T> DerefMut for Hold<'_, T> {
 
 impl<T> Drop for Hold<'_, T> {
     fn drop(&mut self) {
+        super::unwind::abort_if_unwinding();
         drop(self.state.take());
         // Unparking runs no code of anyone's and takes no lock, so it is done under the mutex.
         for t in self.guarded.contenders.lock().iter_mut() {
@@ -129,14 +130,15 @@ mod tests {
     use std::time::Duration;
 
     /// The state is reachable only through the guard: a crate built from this module, with
-    /// stand-ins for the crate's `sync` and `thread`, compiles when it takes the state through
-    /// `try_hold` and is refused, with the private field named, when it reaches for the field.
+    /// stand-ins for Atoll's `locks` and `unwind` and the crate's `thread`, compiles when it takes
+    /// the state through `try_hold` and is refused, with the private field named, when it reaches
+    /// for it.
     #[test]
     fn the_state_is_reachable_only_through_the_guard() {
         let module = concat!(env!("CARGO_MANIFEST_DIR"), "/storage/atoll/guarded.rs");
         let crate_root = |body: &str| {
             format!(
-                "mod sync {{\n\
+                "mod locks {{\n\
                      pub struct Mutex<T>(std::sync::Mutex<T>);\n\
                      pub type MutexGuard<'a, T> = std::sync::MutexGuard<'a, T>;\n\
                      impl<T> Mutex<T> {{\n\
@@ -146,6 +148,7 @@ mod tests {
                      }}\n\
                  }}\n\
                  mod thread {{ pub use std::thread::*; }}\n\
+                 mod unwind {{ pub fn abort_if_unwinding() {{}} }}\n\
                  #[path = {module:?}]\n\
                  mod guarded;\n\
                  pub fn take(g: &guarded::Guarded<u32>) -> u32 {{ {body} }}\n"
@@ -257,6 +260,70 @@ mod tests {
         );
         drop(hold);
         other.join().unwrap();
+    }
+}
+
+#[cfg(all(test, unix, not(any(shuttle, atoll_loom, miri))))]
+mod child_tests {
+    use super::*;
+    use crate::storage::atoll::testing::{in_child, record, recorded};
+    use std::sync::Arc;
+
+    /// A panic while a guarded state is held ends the process before it is let go or anyone
+    /// waiting for it is woken (DESIGN.md 22.11, proof 9). In a child process a contender parks
+    /// on the held state and its holder panics: the child must end by abort, and the contender,
+    /// recording what it sees to a synced file, must never have been woken to take the state.
+    #[test]
+    fn a_panic_while_holding_a_guarded_state_ends_the_process_before_a_contender_wakes() {
+        let ended = in_child(
+            concat!(
+                module_path!(),
+                "::a_panic_while_holding_a_guarded_state_ends_the_process_before_a_contender_wakes"
+            ),
+            || {
+                let guarded = Arc::new(Guarded::new(0u32));
+                let (held, parked) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+                let holder = {
+                    let guarded = guarded.clone();
+                    let (held, parked) = (held.0, parked.1);
+                    std::thread::spawn(move || {
+                        let mut state = guarded.try_hold().expect("free");
+                        *state = 1;
+                        held.send(()).unwrap();
+                        parked.recv().unwrap();
+                        panic!("a holder failed");
+                    })
+                };
+                held.1.recv().unwrap();
+                let contender = std::thread::spawn(move || {
+                    let me = std::thread::current();
+                    record("seen", "contending");
+                    let state = loop {
+                        if let Some(state) = guarded.hold_or_contend(&me) {
+                            break state;
+                        }
+                        let _ = parked.0.send(());
+                        std::thread::park();
+                    };
+                    record("seen", &format!("woken {}", *state));
+                });
+                let _ = holder.join();
+                contender.join().unwrap();
+            },
+        );
+        let Some(ended) = ended else { return };
+        let seen = recorded(&ended, "seen");
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(ended.stderr.contains("a holder failed"), "{}", ended.stderr);
+        assert!(
+            seen.contains("contending"),
+            "the contender never ran: {seen:?}"
+        );
+        assert!(!seen.contains("woken"), "the contender was woken: {seen:?}");
     }
 }
 

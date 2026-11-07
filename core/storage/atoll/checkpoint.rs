@@ -45,8 +45,9 @@ use super::store::PageStore;
 use super::txn::versioned::AsOf;
 use super::txn::{Cut, Transactions, Ts};
 use crate::io::Completion;
+use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex, Weak};
+use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -222,6 +223,7 @@ impl DerefMut for StateHold<'_> {
 
 impl Drop for StateHold<'_> {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         drop(self.hold.take());
         self.checkpointer.pool.wake_room();
     }
@@ -502,6 +504,7 @@ impl Checkpointer {
         struct Ended<'a>(&'a Checkpointer);
         impl Drop for Ended<'_> {
             fn drop(&mut self) {
+                crate::storage::atoll::unwind::abort_if_unwinding();
                 self.0.driven.store(false, Ordering::Release);
                 *self.0.driver.lock() = None;
                 self.0.pool.room_freed_elsewhere(false);

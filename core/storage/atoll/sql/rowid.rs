@@ -15,9 +15,10 @@
 
 use super::key;
 use crate::storage::atoll::btree::{Cursor, Seek, Tree};
+use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::page::PageId;
 use crate::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::types::IOResult;
 use crate::Result;
 use std::collections::HashMap;

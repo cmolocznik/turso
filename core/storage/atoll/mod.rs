@@ -19,6 +19,10 @@
 //! Every IO goes through Turso's [`crate::io::IO`] and returns its completion, so this runs under
 //! the VDBE's `IOResult` stepping on every backend: io_uring, the syscall backend and memory.
 
+// Every lock in Atoll is one of its own (`locks`); the lint resolves each path to the type it
+// names (`core/clippy.toml`).
+#![deny(clippy::disallowed_types)]
+
 pub mod aligned;
 pub mod arc_cell;
 pub mod bits;
@@ -33,6 +37,7 @@ pub mod epoch;
 pub mod floors;
 pub(crate) mod guarded;
 pub mod latch;
+pub(crate) mod locks;
 pub mod log;
 pub mod meta;
 pub mod once;
@@ -50,6 +55,7 @@ pub mod stack;
 pub mod store;
 pub mod stream;
 pub mod txn;
+pub(crate) mod unwind;
 
 #[cfg(all(test, not(atoll_loom), not(shuttle), not(miri)))]
 mod bench;

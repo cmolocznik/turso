@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 /// Holders named by hand: a blocker's group while the test says it runs.
 #[derive(Default)]
-struct Fake(std::sync::Mutex<HashMap<(u16, Ts), GroupId>>);
+struct Fake(crate::storage::atoll::locks::Mutex<HashMap<(u16, Ts), GroupId>>);
 
 impl Fake {
     fn runs(&self, slot: u16, group: GroupId) -> Blocker {
@@ -16,29 +16,19 @@ impl Fake {
             slot,
             start: 100 + slot as Ts,
         };
-        self.0
-            .lock()
-            .unwrap()
-            .insert((blocker.slot, blocker.start), group);
+        self.0.lock().insert((blocker.slot, blocker.start), group);
         blocker
     }
 
     #[cfg(not(atoll_loom))]
     fn ends(&self, blocker: Blocker) {
-        self.0
-            .lock()
-            .unwrap()
-            .remove(&(blocker.slot, blocker.start));
+        self.0.lock().remove(&(blocker.slot, blocker.start));
     }
 }
 
 impl Holders for Fake {
     fn holder(&self, blocker: Blocker) -> Option<GroupId> {
-        self.0
-            .lock()
-            .unwrap()
-            .get(&(blocker.slot, blocker.start))
-            .copied()
+        self.0.lock().get(&(blocker.slot, blocker.start)).copied()
     }
 }
 

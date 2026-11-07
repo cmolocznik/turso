@@ -26,12 +26,13 @@ use super::AtollDb;
 use crate::error::{ConstraintKind, ConstraintViolation};
 use crate::numeric::Numeric;
 use crate::storage::atoll::btree::{Cursor, Kept, Mode, Near, Outcome, Put, Remove, Seek};
+use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::txn::versioned::{
     Guard, GuardOp, Guarded, VersionedCursor, VersionedTree, Write, WriteOp, HEADER,
 };
 use crate::storage::atoll::txn::Txn;
 use crate::storage::btree::BTreeKey;
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::types::{
     IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey, SeekOp, SeekResult, ValueBlob,
     ValueRef,

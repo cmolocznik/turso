@@ -46,8 +46,9 @@ use super::segmented::Segmented;
 use super::shared::Writer;
 use super::whole_write;
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
+use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -178,6 +179,7 @@ pub struct Change<'a> {
 
 impl Drop for Change<'_> {
     fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         self.gate.fetch_sub(1, Ordering::SeqCst);
     }
 }

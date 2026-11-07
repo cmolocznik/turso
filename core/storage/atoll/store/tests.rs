@@ -105,7 +105,7 @@ impl Db {
             pid.class().size(),
         ));
         let into = block.region(0, pid.class().size());
-        let read = Arc::new(crate::sync::Mutex::new(None));
+        let read = Arc::new(crate::storage::atoll::locks::Mutex::new(None));
         let landed = read.clone();
         let c = self
             .store()

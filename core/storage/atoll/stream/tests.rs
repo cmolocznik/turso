@@ -278,7 +278,9 @@ fn a_crash_during_the_first_metadata_writes_leaves_a_partition_that_opens() {
 /// read the partition's state and before it reached the segment.
 struct PausingOpen {
     inner: MemoryIO,
-    pause: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    pause: crate::storage::atoll::locks::Mutex<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    >,
 }
 
 impl crate::io::Clock for PausingOpen {
@@ -294,7 +296,7 @@ impl crate::io::Clock for PausingOpen {
 impl IO for PausingOpen {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         if path.ends_with(".log.0000000000000000") {
-            if let Some((entered, resume)) = self.pause.lock().unwrap().take() {
+            if let Some((entered, resume)) = self.pause.lock().take() {
                 entered.send(()).unwrap();
                 resume.recv().unwrap();
             }
@@ -328,7 +330,7 @@ fn a_read_under_way_keeps_the_segments_retention_lets_go_until_it_is_done() {
     use std::time::Duration;
     let backing = Arc::new(PausingOpen {
         inner: MemoryIO::new(),
-        pause: std::sync::Mutex::new(None),
+        pause: crate::storage::atoll::locks::Mutex::new(None),
     });
     let io: Arc<dyn IO> = backing.clone();
     let config = LogConfig {
@@ -343,7 +345,7 @@ fn a_read_under_way_keeps_the_segments_retention_lets_go_until_it_is_done() {
     );
     let (entered, entered_rx) = channel();
     let (resume_tx, resume) = channel();
-    *backing.pause.lock().unwrap() = Some((entered, resume));
+    *backing.pause.lock() = Some((entered, resume));
     let reader = std::thread::spawn({
         let p = p.clone();
         move || p.read(0, usize::MAX).unwrap()

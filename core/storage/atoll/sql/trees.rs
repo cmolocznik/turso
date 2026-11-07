@@ -8,10 +8,11 @@
 //! forgotten when a tree is freed or dropped, so the map is bounded by the live trees; after a
 //! restart every snapshot is above the clock's base, so an empty map is exact.
 
+use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::page::PageId;
 use crate::storage::atoll::txn::Ts;
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::Arc;
 use std::collections::HashMap;
 
 /// A tree's stamp: the newest commit timestamp that wrote it.

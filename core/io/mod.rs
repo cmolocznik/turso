@@ -67,6 +67,17 @@ pub(crate) fn refuse_on_delivery_thread(what: &str) {
     );
 }
 
+/// Ends the process for an error of a backend's stepping itself, not of a request, which the
+/// request's completion carries (DESIGN.md 22.5, 22.11): a backend whose step fails can no longer
+/// deliver or retire what it accepted, so its waiters can neither wait on, since nothing would
+/// deliver, nor return, since the backend may still own the buffers they lent it.
+pub(crate) fn stepping_failed(e: &crate::LimboError, during: &str) -> ! {
+    eprintln!(
+        "{during}: the IO's step failed ({e}): it can no longer deliver or retire the requests it accepted"
+    );
+    std::process::abort()
+}
+
 #[cfg(any(test, feature = "io_crash"))]
 pub mod crash;
 mod memory;
@@ -82,6 +93,11 @@ mod callback_census;
 pub mod clock;
 mod common;
 mod completions;
+#[cfg(any(
+    test,
+    all(target_os = "windows", feature = "experimental_win_iocp", not(miri))
+))]
+mod iocp_packet;
 #[cfg(test)]
 mod retire_tests;
 pub use clock::Clock;
@@ -680,7 +696,9 @@ pub trait IO: Clock + Send + Sync {
         for c in completions {
             for request in c.requests(&mut seen) {
                 while request.is_owned() {
-                    self.step()?;
+                    if let Err(e) = self.step() {
+                        stepping_failed(&e, "a wait for retirement");
+                    }
                 }
             }
         }
@@ -693,8 +711,8 @@ pub trait IO: Clock + Send + Sync {
             if c.is_remote_wait() {
                 // Another thread completes it, not this backend's step.
                 c.block_on();
-            } else {
-                self.step()?
+            } else if let Err(e) = self.step() {
+                stepping_failed(&e, "a wait for a completion");
             }
         }
         if let Some(inner) = &c.inner {

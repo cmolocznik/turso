@@ -74,6 +74,8 @@ struct State {
     /// Run as each synchronous file call begins, outside the state's lock: a test's stand-in for
     /// another request failing while the call runs.
     file_work_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
+    /// Run as each step begins: an error it returns is the step's, which then delivers nothing.
+    step_hook: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
 
 crate::thread::thread_local! {
@@ -189,6 +191,7 @@ impl CrashIO {
                 captures: None,
                 file_work_in_callbacks: Vec::new(),
                 file_work_hook: None,
+                step_hook: None,
             })),
         }
     }
@@ -211,6 +214,12 @@ impl CrashIO {
         if let Some(hook) = hook {
             hook(what);
         }
+    }
+
+    /// Runs `hook` as each step begins, with no lock held; an error it returns is the step's own
+    /// (the stepping failed, not a request), and that step delivers nothing. `None` stops it.
+    pub fn on_step(&self, hook: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>) {
+        self.state.lock().step_hook = hook;
     }
 
     pub fn set_faults(&self, faults: Faults) {
@@ -740,6 +749,10 @@ impl IO for CrashIO {
     }
 
     fn step(&self) -> Result<()> {
+        let hook = self.state.lock().step_hook.clone();
+        if let Some(hook) = hook {
+            hook()?;
+        }
         self.complete_one();
         Ok(())
     }

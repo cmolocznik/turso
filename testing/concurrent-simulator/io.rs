@@ -188,7 +188,7 @@ impl IO for SimulatorIO {
         // Complete any pending IO operations
         let mut pending = self.pending.lock().unwrap();
         for pc in pending.drain(..) {
-            pc.completion.complete(pc.result);
+            pc.completion.deliver(Ok(pc.result));
         }
         drop(pending);
 
@@ -339,6 +339,19 @@ impl SimulatorFile {
     }
 }
 
+impl SimulatorFile {
+    /// Queues `c` for the next step, which delivers it with `result`: accepted first, so the IO
+    /// owns it from its submission until that step delivers and retires it, a cancelled one too
+    /// (DESIGN.md 22.5).
+    fn queue(&self, c: &Completion, result: i32) {
+        c.accept();
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result,
+        });
+    }
+}
+
 impl Drop for SimulatorFile {
     fn drop(&mut self) {}
 }
@@ -360,10 +373,7 @@ impl File for SimulatorFile {
         } else {
             0
         };
-        self.pending.lock().unwrap().push(PendingCompletion {
-            completion: c.clone(),
-            result,
-        });
+        self.queue(&c, result);
         Ok(c)
     }
 
@@ -391,10 +401,7 @@ impl File for SimulatorFile {
         } else {
             0
         };
-        self.pending.lock().unwrap().push(PendingCompletion {
-            completion: c.clone(),
-            result,
-        });
+        self.queue(&c, result);
         Ok(c)
     }
 
@@ -434,19 +441,13 @@ impl File for SimulatorFile {
             }
         }
 
-        self.pending.lock().unwrap().push(PendingCompletion {
-            completion: c.clone(),
-            result: total_written as i32,
-        });
+        self.queue(&c, total_written as i32);
         Ok(c)
     }
 
     fn sync(&self, c: Completion, _sync_type: turso_core::io::FileSyncType) -> Result<Completion> {
         // No-op for memory files
-        self.pending.lock().unwrap().push(PendingCompletion {
-            completion: c.clone(),
-            result: 0,
-        });
+        self.queue(&c, 0);
         Ok(c)
     }
 
@@ -455,10 +456,7 @@ impl File for SimulatorFile {
         *size = len as usize;
         let mut sizes = self.file_sizes.lock().unwrap();
         sizes.insert(self.path.clone(), len);
-        self.pending.lock().unwrap().push(PendingCompletion {
-            completion: c.clone(),
-            result: 0,
-        });
+        self.queue(&c, 0);
         Ok(c)
     }
 
@@ -526,5 +524,44 @@ mod tests {
             };
             assert_eq!(std::fs::read(output.path().join(name)).unwrap(), bytes);
         }
+    }
+
+    /// A request is the IO's from its submission until the step that delivers it, a cancelled
+    /// one too, so a drain waits for that step (DESIGN.md 22.5; mutant: queued without being
+    /// accepted, which a drain and Atoll's count read as owned by no one).
+    #[test]
+    fn a_request_is_owned_from_its_submission_until_the_step_that_delivers_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let io = SimulatorIO::new(
+            false,
+            ChaCha8Rng::seed_from_u64(2),
+            IOFaultConfig::default(),
+        );
+        let path = directory.path().join("owned.db");
+        let file = io
+            .open_file(path.to_str().unwrap(), OpenFlags::default(), false)
+            .unwrap();
+        let synced = file
+            .sync(
+                Completion::new_sync(|_| {}),
+                turso_core::io::FileSyncType::Fsync,
+            )
+            .unwrap();
+        assert!(synced.is_owned() && !synced.finished());
+        io.step().unwrap();
+        assert!(synced.succeeded() && !synced.is_owned());
+
+        let buffer = Arc::new(turso_core::Buffer::new_temporary(512));
+        let read = file
+            .pread(0, Completion::new_read(buffer, |_| None))
+            .unwrap();
+        io.cancel(std::slice::from_ref(&read)).unwrap();
+        assert!(
+            read.finished() && read.is_owned(),
+            "a cancelled request still queued is not the IO's"
+        );
+        io.drain_completions(std::slice::from_ref(&read)).unwrap();
+        assert!(!read.is_owned(), "drained while still queued");
+        assert!(io.pending.lock().unwrap().is_empty());
     }
 }

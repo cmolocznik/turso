@@ -190,7 +190,7 @@ impl CompletionGroup {
     {
         let inner = Arc::new(GroupCompletionInner {
             outstanding: AtomicUsize::new(1),
-            members: Mutex::new(Vec::new()),
+            members: Arc::new(Members::default()),
             complete: Box::new(callback),
             result: OnceLock::new(),
         });
@@ -209,10 +209,11 @@ impl CompletionGroup {
     /// so the link has to be there before the child can finish.
     pub fn add(&mut self, c: &Completion) {
         self.completions.push(c.clone());
-        self.inner
-            .members
-            .lock()
-            .push(Arc::downgrade(c.get_inner()));
+        let member = match &c.get_inner().completion_type {
+            CompletionType::Group(group) => Member::Group(group.inner.members.clone()),
+            _ => Member::Request(Arc::downgrade(c.get_inner())),
+        };
+        self.inner.members.0.lock().push(member);
         self.inner.outstanding.fetch_add(1, Ordering::SeqCst);
         let mut parent = c.get_inner().parent.lock();
         turso_assert!(parent.is_none(), "completion can only be linked once");
@@ -271,14 +272,27 @@ impl fmt::Debug for GroupCompletion {
 struct GroupCompletionInner {
     /// Number of completions that need to finish
     outstanding: AtomicUsize,
-    /// Every completion added, held weakly: the group's ownership is theirs, and a strong hold
-    /// would keep a child's buffers past its retirement and, with the child's link to its group,
-    /// make a cycle. A child gone is owned by no one.
-    members: Mutex<Vec<Weak<CompletionInner>>>,
+    /// What the group lists, which its ownership is the aggregate of.
+    members: Arc<Members>,
     /// Callback to invoke when all completions finish
     complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
     /// Cached result after all completions finish
     result: OnceLock<Option<CompletionError>>,
+}
+
+/// What a group lists, walked down to the requests beneath it (DESIGN.md 22.5). A request is held
+/// weakly: a backend that owns one holds it, so a request gone is owned by no one, and a strong hold
+/// would keep its buffers past its retirement. A group is no backend's, so a request beneath it can
+/// be owned after every handle to the group is gone (its last request cancelled, its parent's
+/// link to it dropped as it finished): a group's list is held strongly, never the group's
+/// completion. Lists point only down and hold no completion, so they keep no buffer and make no
+/// cycle.
+#[derive(Default)]
+struct Members(Mutex<Vec<Member>>);
+
+enum Member {
+    Request(Weak<CompletionInner>),
+    Group(Arc<Members>),
 }
 
 impl GroupCompletion {
@@ -718,20 +732,40 @@ impl Completion {
 
     /// Every request this completion stands for, each once across calls sharing `seen`: itself,
     /// or for a group every request beneath it, its nested groups walked down whatever their own
-    /// completions' state. A member gone is owned by no one, and left out.
+    /// completions' state and whether anyone still holds them ([`Members`]). A request gone is
+    /// owned by no one, and left out. Everything walked existed before the walk began (a drain
+    /// is made after its caller stopped submitting), so no address in `seen` is reused meanwhile.
     pub fn requests(&self, seen: &mut std::collections::HashSet<usize>) -> Vec<Completion> {
         let mut found = Vec::new();
-        let mut walk: Vec<Arc<CompletionInner>> = self.inner.iter().cloned().collect();
-        while let Some(inner) = walk.pop() {
-            if !seen.insert(Arc::as_ptr(&inner) as usize) {
+        let mut lists = Vec::new();
+        let mut request = |inner: Arc<CompletionInner>, found: &mut Vec<Completion>| {
+            if !matches!(
+                inner.completion_type,
+                CompletionType::Yield | CompletionType::Remote
+            ) && seen.insert(Arc::as_ptr(&inner) as usize)
+            {
+                found.push(Completion { inner: Some(inner) });
+            }
+        };
+        match self.inner.as_ref().map(|inner| &inner.completion_type) {
+            Some(CompletionType::Group(group)) => lists.push(group.inner.members.clone()),
+            Some(_) => request(self.get_inner().clone(), &mut found),
+            None => {}
+        }
+        let mut walked = std::collections::HashSet::new();
+        while let Some(list) = lists.pop() {
+            if !walked.insert(Arc::as_ptr(&list) as usize) {
                 continue;
             }
-            match &inner.completion_type {
-                CompletionType::Group(group) => {
-                    walk.extend(group.inner.members.lock().iter().filter_map(Weak::upgrade));
+            for member in list.0.lock().iter() {
+                match member {
+                    Member::Group(list) => lists.push(list.clone()),
+                    Member::Request(weak) => {
+                        if let Some(inner) = weak.upgrade() {
+                            request(inner, &mut found);
+                        }
+                    }
                 }
-                CompletionType::Yield | CompletionType::Remote => {}
-                _ => found.push(Completion { inner: Some(inner) }),
             }
         }
         found

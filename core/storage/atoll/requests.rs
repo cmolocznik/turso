@@ -52,15 +52,16 @@ impl Requests {
 
     /// Close's wait for its requests (DESIGN.md 22.12, step 4): steps `io` until every request
     /// counted has retired. Every backend retires every request it accepted (the kernel answers
-    /// each, a pumped backend delivers each when stepped), so the wait ends; an IO error while
-    /// stepping is logged and the wait goes on.
+    /// each, a pumped backend delivers each when stepped), so the wait ends. A step that fails has
+    /// lost the means to retire them, and ends the process (22.11): close can neither wait on nor
+    /// return while the backend may still own its requests' buffers.
     pub(super) fn drain(&self, io: &dyn IO) {
         // Close waits: never on a ring's delivery thread, the one that would deliver what it waits
         // for (DESIGN.md 22.5).
         crate::io::refuse_on_delivery_thread("a database's close");
         while self.outstanding() > 0 {
             if let Err(e) = io.step() {
-                tracing::error!("closing: stepping the IO for requests still owned: {e}");
+                crate::io::stepping_failed(&e, "a database's close");
             }
         }
     }

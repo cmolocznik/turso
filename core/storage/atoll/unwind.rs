@@ -299,6 +299,11 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "requests/tests.rs",
+            "a_step_that_fails_while_close_waits_ends_the_process",
+            "child",
+        ),
+        (
             "unwind.rs",
             "a_panic_in_an_entry_ends_the_process_at_its_edge",
             "child",

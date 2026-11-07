@@ -215,3 +215,54 @@ fn the_counting_io_and_its_files_forward_every_method() {
         );
     }
 }
+
+/// A step hook that fails the first step and, should anyone step again, ends the child with code
+/// 0 and says so: one failed step is enough for the rule, so a second is the defect.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn failing_steps(crash: &CrashIO) {
+    let failed = Arc::new(AtomicBool::new(false));
+    crash.on_step(Some(Arc::new(move || {
+        if failed.swap(true, Ordering::SeqCst) {
+            eprintln!("stepped again after a failed step");
+            std::process::exit(0);
+        }
+        Err(crate::LimboError::InternalError(
+            "the backend's stepping failed".into(),
+        ))
+    })));
+}
+
+/// A step that fails while close waits for a request ends the process (DESIGN.md 22.11, 22.12):
+/// the backend has lost the means to retire it, so close can neither wait on nor return while the
+/// request's buffer may still be the backend's (mutant: the failure logged and the wait gone on).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_step_that_fails_while_close_waits_ends_the_process() {
+    let Some(ended) = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_step_that_fails_while_close_waits_ends_the_process"
+        ),
+        || {
+            let crash = Arc::new(CrashIO::new(4));
+            let (io, requests) = counted(crash.clone());
+            let file = io.open_file("/db/r", OpenFlags::Create, false).unwrap();
+            let c = file.pread(0, read(512)).unwrap();
+            assert!(c.is_owned());
+            failing_steps(&crash);
+            requests.drain(&*io);
+            eprintln!("close returned with the request still owned");
+        },
+    ) else {
+        return;
+    };
+    assert!(
+        ended.aborted
+            && ended
+                .stderr
+                .contains("a database's close: the IO's step failed"),
+        "the failed step did not end the process: {:?} {}",
+        ended.code,
+        ended.stderr
+    );
+}

@@ -52,7 +52,11 @@ impl IO for VfsMod {
         let vfs = unsafe { &*self.ctx };
         let result = unsafe { (vfs.run_once)(vfs.vfs) };
         if !result.is_ok() {
-            return Err(LimboError::ExtensionError(result.to_string()));
+            // The extension can no longer deliver what it accepted (DESIGN.md 22.5).
+            super::stepping_failed(
+                &LimboError::ExtensionError(result.to_string()),
+                "an extension VFS's run_once",
+            );
         }
         Ok(())
     }
@@ -96,10 +100,17 @@ unsafe extern "C" fn callback_fn(result: i32, ctx: SendPtr) {
 /// drops its callback unrun.
 fn submit(c: &Completion, call: impl FnOnce(IOCallback) -> ResultCode, what: &str) -> Result<()> {
     c.accept();
+    // The callback's own reference, which `callback_fn` takes back when it runs.
+    let raw = Arc::into_raw(c.get_inner().clone());
     let cb = IOCallback::new(callback_fn, unsafe {
-        NonNull::new_unchecked(Arc::into_raw(c.get_inner().clone()) as *mut c_void)
+        NonNull::new_unchecked(raw as *mut c_void)
     });
     if call(cb).is_error() {
+        // The extension dropped the callback unrun, which releases nothing: its reference is
+        // taken back here, once, or the request and its buffers would never be freed.
+        // SAFETY: `raw` came from `Arc::into_raw` above, and a refusing extension never runs the
+        // callback that would take it back.
+        drop(unsafe { Arc::from_raw(raw) });
         c.refuse();
         return Err(LimboError::ExtensionError(format!("{what} failed")));
     }
@@ -210,5 +221,70 @@ impl Drop for VfsMod {
         unsafe {
             let _ = Box::from_raw(self.ctx as *mut VfsImpl);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read() -> (Completion, crate::sync::Weak<Buffer>) {
+        let buffer = Arc::new(Buffer::new_temporary(512));
+        let weak = Arc::downgrade(&buffer);
+        (Completion::new_read(buffer, |_| None), weak)
+    }
+
+    /// Whether the request and its buffer are both freed once the caller lets the request go.
+    fn freed(c: Completion, buffer: crate::sync::Weak<Buffer>) -> bool {
+        let inner = Arc::downgrade(c.get_inner());
+        drop(c);
+        inner.upgrade().is_none() && buffer.upgrade().is_none()
+    }
+
+    /// A refusal gives back the reference the dropped callback held, so the request and its buffer
+    /// are freed once the caller lets them go (mutant: the reference left with the callback, which
+    /// keeps both for ever).
+    #[test]
+    fn a_refused_request_gives_back_the_reference_its_callback_held() {
+        let (c, buffer) = read();
+        // The callback is dropped unrun as the closure returns.
+        let refused = submit(&c, |_cb| ResultCode::Error, "pread");
+        assert!(refused.is_err() && !c.is_owned() && !c.finished());
+        assert!(freed(c, buffer), "the refused request was never freed");
+    }
+
+    /// A request delivered inside its submission, and one delivered after it, are each freed once
+    /// their callback has run: the callback takes its reference back once.
+    #[test]
+    fn an_accepted_request_is_freed_once_its_callback_has_run() {
+        let (c, buffer) = read();
+        submit(
+            &c,
+            |cb| {
+                unsafe { (cb.callback)(512, cb.ctx) };
+                ResultCode::OK
+            },
+            "pread",
+        )
+        .unwrap();
+        assert!(c.finished() && !c.is_owned());
+        assert!(freed(c, buffer), "the inline request was never freed");
+
+        let (c, buffer) = read();
+        let mut held = None;
+        submit(
+            &c,
+            |cb| {
+                held = Some(cb);
+                ResultCode::OK
+            },
+            "pread",
+        )
+        .unwrap();
+        assert!(c.is_owned() && !c.finished());
+        let cb = held.take().unwrap();
+        unsafe { (cb.callback)(512, cb.ctx) };
+        assert!(c.finished() && !c.is_owned());
+        assert!(freed(c, buffer), "the deferred request was never freed");
     }
 }

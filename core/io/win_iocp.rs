@@ -47,7 +47,7 @@ use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
+use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
 
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
@@ -212,6 +212,11 @@ fn get_generic_limboerror_from_os_err(err: u32) -> LimboError {
         LimboError::InternalError(format!("Windows Error: [{err}]{string}"))
     }
 }
+
+const _: () = assert!(
+    super::iocp_packet::ERROR_HANDLE_EOF == ERROR_HANDLE_EOF
+        && super::iocp_packet::ERROR_OPERATION_ABORTED == ERROR_OPERATION_ABORTED
+);
 
 #[inline]
 fn get_limboerror_from_std_error(err: impl Error) -> LimboError {
@@ -432,8 +437,12 @@ impl IO for WindowsIOCP {
 
         while self.instance.has_tracked_io() {
             match self.instance.process_packet_from_iocp(IOCP_STEP_TIMEOUT_MS) {
+                // The port's own error: it can no longer deliver what it accepted (DESIGN.md 22.5).
                 Err(GetIOCPPacketError::SystemError(code)) => {
-                    return Err(get_generic_limboerror_from_os_err(code));
+                    super::stepping_failed(
+                        &get_generic_limboerror_from_os_err(code),
+                        "the completion port's step",
+                    );
                 }
                 // Empty is a timeout: re-check the table and keep waiting.
                 // InvalidIO still untracked the packet, so the loop makes
@@ -648,45 +657,14 @@ impl InnerWindowsIOCP {
         }
 
         let completion = data.0.ok_or(GetIOCPPacketError::InvalidIO)?;
-        match (result, error) {
-            (TRUE, _) => {
-                trace!(
-                    "completion {} completed",
-                    get_unique_key_from_completion(&completion).addr()
-                );
-                completion.deliver(Ok(bytes_received
-                    .try_into()
-                    .map_err(|_| GetIOCPPacketError::InvalidIO)?));
-            }
-            (FALSE, ERROR_OPERATION_ABORTED) => {
-                trace!(
-                    "completion {} cancelled",
-                    get_unique_key_from_completion(&completion).addr()
-                );
-                completion.deliver(Err(CompletionError::Aborted));
-            }
-            (FALSE, error_code) => {
-                let error = match error_code {
-                    ERROR_HANDLE_EOF => {
-                        io::Error::new(io::ErrorKind::UnexpectedEof, "Reading past the EOF point")
-                    }
-                    code => io::Error::from_raw_os_error(
-                        code.try_into().map_err(|_| GetIOCPPacketError::InvalidIO)?,
-                    ),
-                };
-
-                trace!(
-                    "completion {} errored {error}",
-                    get_unique_key_from_completion(&completion).addr()
-                );
-
-                completion.deliver(Err(CompletionError::IOError(
-                    error.kind(),
-                    "io-error-completion",
-                )));
-            }
-            (_, _) => unreachable!(),
-        }
+        // The packet is consumed: whatever it says, its request is delivered and retired here,
+        // and nothing below returns before that (DESIGN.md 22.5).
+        let delivered = super::iocp_packet::packet_result(result != FALSE, error, bytes_received);
+        trace!(
+            "completion {} delivered: {delivered:?}",
+            get_unique_key_from_completion(&completion).addr()
+        );
+        completion.deliver(delivered);
         Ok(())
     }
 
@@ -948,10 +926,7 @@ impl File for WindowsFile {
         let read_completion = completion.as_read();
         let read_buffer = read_completion.buf();
         let read_buffer_ptr = read_buffer.as_mut_ptr();
-        let read_buffer_len = read_buffer
-            .len()
-            .try_into()
-            .map_err(get_limboerror_from_std_error)?;
+        let read_buffer_len = super::iocp_packet::request_len(read_buffer.len())?;
 
         self.async_iocp_operation(position, completion, IoKind::Read, |overlapped| unsafe {
             ReadFile(
@@ -978,10 +953,7 @@ impl File for WindowsFile {
         );
 
         let buffer_ptr = buffer.as_ptr();
-        let buffer_len = buffer
-            .len()
-            .try_into()
-            .map_err(get_limboerror_from_std_error)?;
+        let buffer_len = super::iocp_packet::request_len(buffer.len())?;
 
         self.async_iocp_operation(
             position,

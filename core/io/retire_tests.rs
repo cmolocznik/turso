@@ -68,6 +68,50 @@ fn a_drain_walks_a_group_down_to_every_request_beneath_it() {
     assert_eq!(io.in_flight(), 0);
 }
 
+/// A drain from the outermost group reaches a request two groups down after every handle to the
+/// groups between is gone: the cancel finishes them and drops each one's link to its group, and
+/// the request is still the backend's (mutant: a group holding the groups it lists as weakly as
+/// its requests, so the walk finds nothing beneath them).
+#[test]
+fn a_drain_reaches_a_request_beneath_groups_nobody_holds() {
+    let io = CrashIO::new(5);
+    let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+    let w = write();
+    let mut inner = CompletionGroup::new(|_| {});
+    inner.add(&w);
+    drop(file.pwrite(0, buffer(512), w.clone()).unwrap());
+    let inner = inner.build();
+    let mut middle = CompletionGroup::new(|_| {});
+    middle.add(&inner);
+    let middle = middle.build();
+    let mut outer = CompletionGroup::new(|_| {});
+    outer.add(&middle);
+    let outer = outer.build();
+    let (inner_gone, middle_gone) = (
+        Arc::downgrade(inner.get_inner()),
+        Arc::downgrade(middle.get_inner()),
+    );
+    drop((inner, middle));
+    io.cancel(std::slice::from_ref(&w)).unwrap();
+    assert!(outer.finished() && w.is_owned());
+    assert!(
+        inner_gone.upgrade().is_none() && middle_gone.upgrade().is_none(),
+        "a group between is still held, so the test reaches nothing it means to"
+    );
+    let mut seen = std::collections::HashSet::new();
+    assert_eq!(
+        outer.requests(&mut seen).len(),
+        1,
+        "the walk lost the write beneath the groups nobody holds"
+    );
+    io.wait_retired(&outer).unwrap();
+    assert!(
+        !w.is_owned(),
+        "the drain returned with the write beneath it still owned"
+    );
+    assert_eq!(io.in_flight(), 0);
+}
+
 /// A request added to a group and never accepted (its submission refused, or never made) holds
 /// no drain: no backend owns it (mutant: the drain waiting for a retirement nobody will make).
 #[test]
@@ -340,4 +384,76 @@ fn an_inline_request_is_retired_when_its_submission_returns() {
         .pwritev(0, vec![buffer(512), buffer(512)], write())
         .unwrap();
     assert!(c.finished() && !c.is_owned());
+}
+
+/// A step hook that fails the first step and, should anyone step again, ends the child with code
+/// 0 and says so: one failed step is enough for the rule, so a second is the defect.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn failing_steps(io: &CrashIO) {
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    io.on_step(Some(Arc::new(move || {
+        if failed.swap(true, Ordering::SeqCst) {
+            eprintln!("stepped again after a failed step");
+            std::process::exit(0);
+        }
+        Err(crate::LimboError::InternalError(
+            "the backend's stepping failed".into(),
+        ))
+    })));
+}
+
+/// Runs `wait` on a read a CrashIO accepted, in a child whose steps fail, and asserts the child
+/// ended by abort naming `during`.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+fn a_failed_step_under(test: &str, during: &str, wait: fn(&CrashIO, &Completion) -> Result<()>) {
+    let Some(ended) = crate::child_test::in_child(test, || {
+        let io = CrashIO::new(6);
+        let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+        let c = file.pread(0, read(512)).unwrap();
+        failing_steps(&io);
+        let returned = wait(&io, &c);
+        eprintln!("the wait returned {returned:?}, owned: {}", c.is_owned());
+    }) else {
+        return;
+    };
+    assert!(
+        ended.aborted
+            && ended
+                .stderr
+                .contains(&format!("{during}: the IO's step failed")),
+        "a failed step under {during} did not end the process: {:?} {}",
+        ended.code,
+        ended.stderr
+    );
+}
+
+/// A step that fails under a wait for finishing ends the process (DESIGN.md 22.5): the backend
+/// cannot deliver what it accepted, so the wait can neither go on nor return while the backend may
+/// own the request's buffer (mutant: the error returned to the waiter, or the step tried again).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_step_that_fails_under_a_wait_for_finishing_ends_the_process() {
+    a_failed_step_under(
+        concat!(
+            module_path!(),
+            "::a_step_that_fails_under_a_wait_for_finishing_ends_the_process"
+        ),
+        "a wait for a completion",
+        |io, c| io.wait_for_completion(c.clone()),
+    );
+}
+
+/// The same under a wait for retirement (mutant: the error returned to the drainer, whose caller
+/// then frees what the backend may still own).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_step_that_fails_under_a_wait_for_retirement_ends_the_process() {
+    a_failed_step_under(
+        concat!(
+            module_path!(),
+            "::a_step_that_fails_under_a_wait_for_retirement_ends_the_process"
+        ),
+        "a wait for retirement",
+        |io, c| io.drain_completions(std::slice::from_ref(c)),
+    );
 }

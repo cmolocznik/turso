@@ -2292,8 +2292,10 @@ completion before the kernel has given the request back) does not end that owner
   at the submission's return, pumped when its step has delivered it, the ring when the request's
   own entry has been delivered. A submission either returns an error having accepted nothing, or
   accepts the request and returns success: a ring entry queued but not yet in the kernel is
-  accepted, and a later failure to enter it is the request's own error, delivered through its
-  completion (today `submit_entry` can queue an entry and still return an error).
+  accepted (today `submit_entry` can queue an entry and still return an error). A later refusal to
+  enter it that the kernel says may pass leaves it queued for the next entry; any other is an error
+  of the ring itself, which ends the process (22.11), since the ring can no longer account for what
+  it accepted.
 - **`IO::wait_retired(c)`** waits for retirement as `IO::wait` waits for finishing, with the same
   parking. `IO::drain_completions`, whose promise is that cancelled requests have given back their
   buffers, waits for retirement, so the write-ahead log's cancelled checkpoint reads, the pager's
@@ -2316,9 +2318,11 @@ retires a request it drops undelivered (a cancel's leftover, a power loss). A la
 request and then hands it to another backend leaves it accepted, and the one that delivers it
 retires it. A layer that carries a caller's request out through one of its own (a page transform's
 read, the partial-sync storage's writes) accepts the caller's before submitting and retires it when
-its own retires (`Completion::carry`). A group keeps weak links to what it lists, so its aggregate is
-walked without holding a child's buffers, a member gone counts as owned by no one, and a drain meets
-each request once. The trait's default vectored write submits its buffers as parts that carry the
+its own retires (`Completion::carry`). A group keeps a list of what it lists: each request weakly,
+since the backend that owns one holds it and a request gone is owned by no one, and each nested
+group's own list strongly, never the group's completion, since a request can still be owned after
+every handle to the groups above it is gone; so the walk reaches it without holding a child's
+buffers, and a drain meets each request once. The trait's default vectored write submits its buffers as parts that carry the
 write: refused at its first part it accepted nothing; refused at a later one it stops there, is
 accepted, and carries the refusal as its error once its accepted parts have finished, owned until they
 retire; a part that fails finishes the write with its error. On the ring a request is accepted once
@@ -2352,6 +2356,16 @@ the file system; what a callback calls further is refused at run time. The ring'
 the IO tests is gone: a thread waiting in the kernel is outside any schedule shuttle explores. Until
 step 3d puts every blocking caller on `IO::wait`, a caller that loops on `step` spins on the ring
 while the thread delivers.)
+
+(Corrected after the audit of step 3b: an error of a backend's stepping itself, not of a request,
+ends the process wherever it is met (`stepping_failed`): in the trait's waits and drains, in
+Atoll's close, in an extension VFS's `run_once` and in the completion port's own error, since the
+backend can no longer retire what it accepted and its waiters can neither wait on nor return while
+it may own their buffers. A VFS submission the extension refuses takes back the reference its
+dropped callback held. The completion port refuses a read or write whose byte count an `i32`
+cannot carry before it accepts it, and delivers every packet it consumes, a count or error code it
+cannot convert as the request's error. The concurrent simulator's files accept each request as
+they queue it and deliver and retire it at the step.)
 
 **Who waits how.** Every caller that waits for IO is one of three kinds:
 
@@ -2860,8 +2874,8 @@ compose, the real `Completion`, latch and backends included where named.
    (mutant: one step, then park); a waiting preparer's write queued while other tasks stay ready
    forever (mutant: stepping only with nothing to claim); two runners stepping it while one
    delivers; the simulator's delayed requests. Every backend: partial writes, errors, a submission
-   that queues and then fails to enter (delivered as the request's error, never a refused submission
-   that was accepted), a vectored write whose first part is accepted and second refused (its
+   that queues and then fails to enter (left queued for the next entry where the kernel says the
+   refusal may pass, ending the process otherwise; never a refused submission that was accepted), a vectored write whose first part is accepted and second refused (its
    accepted part owned and retired, its error reported); every blocking caller of 22.5 run through
    `IO::wait`; cancelled requests in the write-ahead log, the pager and the sorter drained to
    retirement (mutant: drained to finishing, the buffer still the kernel's), the sorter's group with

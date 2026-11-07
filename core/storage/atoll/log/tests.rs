@@ -809,3 +809,360 @@ fn a_segment_of_many_chunks_fills_on_a_small_stack_when_writes_complete_inline()
         .join()
         .unwrap();
 }
+
+/// The log's callbacks only submit and record (DESIGN.md 22.5): every synchronous file call its
+/// preparation makes (a create, an allocation, a spare's rename, a directory sync) runs in a
+/// caller, never in a callback a step delivers. Over many segments, fresh and spares alike.
+#[test]
+fn no_callback_of_the_log_does_file_work() {
+    let config = small();
+    let segment = config.segment_bytes;
+    let filler = vec![7u8; 996];
+    assert_eq!(framed_len(filler.len()), 1024);
+    for seed in 0..4 {
+        let crash = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
+        let mut released = 0;
+        while log.end() < 8 * segment {
+            let mut admitted = drive(&io, || log.admit(1024)).unwrap();
+            let lsn = log.append(&mut admitted, &header(0), &[&filler]);
+            drop(admitted);
+            if lsn % (segment / 4) < 1024 {
+                drive(&io, || log.wait_durable(lsn)).unwrap();
+                // Two segments behind: those before come back as spares for the next ones.
+                if lsn >= released + 3 * segment {
+                    released = lsn - 2 * segment;
+                    log.release_before(released).unwrap();
+                }
+            }
+        }
+        drive(&io, || log.wait_durable(log.end())).unwrap();
+        assert!(
+            log.end() >= 8 * segment,
+            "seed {seed}: the log prepared too little"
+        );
+        let calls = crash.file_work_in_callbacks();
+        assert!(calls.is_empty(), "seed {seed}: callbacks made {calls:?}");
+    }
+}
+
+/// A caller parked while the next segment's preparation is in flight, the padding it waits on
+/// waiting for that segment, is woken by the step that lands the segment's data sync, as the
+/// directory sync becomes owed; its next call runs it, and its record becomes durable.
+#[test]
+fn a_caller_parked_on_a_segment_in_flight_is_woken_when_its_step_is_owed() {
+    let config = small();
+    let segment = config.segment_bytes;
+    let filler = vec![7u8; 996];
+    let resume = segment - 3 * BLOCK;
+    for seed in 0..8 {
+        let crash = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
+        while log.end() < resume {
+            let mut admitted = drive(&io, || log.admit(1024)).unwrap();
+            log.append(&mut admitted, &header(0), &[&filler]);
+        }
+        drive(&io, || log.wait_durable(resume)).unwrap();
+        // The next segment this log prepared goes, so that the log opened next prepares a fresh
+        // one rather than making a spare of it.
+        let next = log.segments.path(1);
+        drop(log);
+        io.remove_file(&next).unwrap();
+        // Reopened there: only its first segment is prepared.
+        let log = Log::open(io.clone(), BASE, config.clone(), resume).unwrap();
+        let record = vec![1u8; 36];
+        // Less than a segment is prepared ahead, so this admission starts preparing the next:
+        // its zero fill is in flight until the IO is stepped.
+        let mut admitted = drive(&io, || log.admit(framed_len(record.len()))).unwrap();
+        let lsn = log.append(&mut admitted, &header(1), &[&record]);
+        drop(admitted);
+        assert_eq!(
+            log.room.prepared_end(),
+            segment,
+            "seed {seed}: the next segment prepared at once"
+        );
+        // Room granted to the prepared end, as an admission may be, leaves none to pad the
+        // record's block with: the padding waits for the segment in flight.
+        let rest = segment - 8 - log.room.reach();
+        assert!(log.room.grant(rest, true));
+        let held = Admitted {
+            log: log.clone(),
+            left: rest,
+        };
+        let IOResult::IO(IOCompletions(c)) = log.wait_durable(lsn).unwrap() else {
+            panic!("seed {seed}: durable while its padding waits for a segment in flight");
+        };
+        assert!(!c.finished(), "seed {seed}: woken before anything landed");
+        // A step delivers one request: the one that lands the segment's data sync, moving the
+        // word to owed, wakes the parked caller itself, nothing else having become durable.
+        while !log.preparation.wants_a_caller() {
+            assert!(
+                crash.in_flight() > 0,
+                "seed {seed}: nothing left in flight and no step owed"
+            );
+            assert!(!c.finished(), "seed {seed}: woken before its step was owed");
+            io.step().unwrap();
+        }
+        assert!(
+            c.finished(),
+            "seed {seed}: the parked caller was not woken when its step became owed"
+        );
+        assert!(c.get_error().is_none(), "seed {seed}: woken with an error");
+        assert!(log.durable() < lsn, "seed {seed}: durable before the step ran");
+        drive(&io, || log.wait_durable(lsn)).unwrap();
+        assert!(log.durable() >= lsn, "seed {seed}");
+        drop(held);
+        let calls = crash.file_work_in_callbacks();
+        assert!(calls.is_empty(), "seed {seed}: callbacks made {calls:?}");
+    }
+}
+
+/// A log opened three blocks before its first segment's end, with a record appended and room
+/// granted past it straight from the room, as no caller does, so that padding the record's block
+/// waits for the next segment while no step has begun preparing it: the state a flush meets only
+/// if no caller ran a step since less than a segment was prepared ahead. Returns the log, the
+/// record's LSN and the room still held.
+fn padding_with_no_preparation(io: &Arc<dyn IO>) -> (Arc<Log>, Lsn, Admitted) {
+    let config = small();
+    let segment = config.segment_bytes;
+    let filler = vec![7u8; 996];
+    let resume = segment - 3 * BLOCK;
+    let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
+    while log.end() < resume {
+        let mut admitted = drive(io, || log.admit(1024)).unwrap();
+        log.append(&mut admitted, &header(0), &[&filler]);
+    }
+    drive(io, || log.wait_durable(resume)).unwrap();
+    drop(log);
+    let log = Log::open(io.clone(), BASE, config, resume).unwrap();
+    let record = vec![1u8; 36];
+    let len = framed_len(record.len());
+    assert!(log.room.grant(len, true));
+    let mut admitted = Admitted {
+        log: log.clone(),
+        left: len,
+    };
+    let lsn = log.append(&mut admitted, &header(1), &[&record]);
+    let rest = segment - 8 - log.room.reach();
+    assert!(log.room.grant(rest, true));
+    assert!(!log.preparation.wants_a_caller(), "a step already runnable");
+    let held = Admitted {
+        log: log.clone(),
+        left: rest,
+    };
+    (log, lsn, held)
+}
+
+/// A flush that meets padding waiting for a segment nobody prepares moves the word to needed and
+/// wakes every waiter, durable and admission alike, whatever its mark: the step is a caller's,
+/// and each comes back to call again. A caller then runs it, and the record becomes durable.
+#[test]
+fn a_flush_meeting_padding_nobody_prepares_needs_a_step_and_wakes_every_waiter() {
+    for seed in 0..4 {
+        let crash = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let (log, lsn, held) = padding_with_no_preparation(&io);
+        log.wanted.fetch_max(lsn, Ordering::SeqCst);
+        let durable = log
+            .durable_waits
+            .wait(lsn, || log.durable())
+            .expect("not durable yet");
+        let admission = Completion::new_wait();
+        room::wait_on(&log.admitters, admission.clone());
+        // What a write's callback runs once it lands.
+        log.flush();
+        assert!(
+            log.preparation.wants_a_caller(),
+            "seed {seed}: no step needed"
+        );
+        assert!(
+            durable.finished() && admission.finished(),
+            "seed {seed}: a waiter not woken: durable {} admission {}",
+            durable.finished(),
+            admission.finished()
+        );
+        assert!(durable.get_error().is_none() && admission.get_error().is_none());
+        drive(&io, || log.wait_durable(lsn)).unwrap();
+        assert!(log.durable() >= lsn, "seed {seed}");
+        drop(held);
+        let calls = crash.file_work_in_callbacks();
+        assert!(calls.is_empty(), "seed {seed}: callbacks made {calls:?}");
+    }
+}
+
+/// A completion from `wait_durable` means only call again: a caller whose own flush moves the
+/// word, finishing its own completion, is told to call again, never that the log is durable,
+/// while the step it then started is still in flight.
+#[test]
+fn a_finished_completion_is_no_report_of_durability() {
+    for seed in 0..4 {
+        let crash = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let (log, lsn, held) = padding_with_no_preparation(&io);
+        match log.wait_durable(lsn).unwrap() {
+            IOResult::Done(()) => panic!(
+                "seed {seed}: reported durable to {lsn} with the log durable to {}",
+                log.durable()
+            ),
+            IOResult::IO(IOCompletions(c)) => assert!(
+                c.finished(),
+                "seed {seed}: its own move should have finished its completion"
+            ),
+        }
+        drive(&io, || log.wait_durable(lsn)).unwrap();
+        assert!(log.durable() >= lsn, "seed {seed}");
+        drop(held);
+    }
+}
+
+/// Every call of [`Log::admit`] and [`Log::wait_durable`] in Atoll outside its tests, the
+/// facade's included: its file, the function it is in, the call, how it calls again once the
+/// completion it got finishes without an error, and what it does with an error (DESIGN.md 22.5).
+/// A completion from either means only: call again.
+#[cfg(not(any(shuttle, atoll_loom)))]
+const CALLERS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "stream.rs",
+        "append",
+        "admit",
+        "returns the IO; its caller steps the append again",
+        "returns it",
+    ),
+    (
+        "stream.rs",
+        "append",
+        "wait_durable",
+        "returns the IO; its caller steps the append again",
+        "returns it",
+    ),
+    (
+        "checkpoint.rs",
+        "step",
+        "admit",
+        "done!: returns the IO; whoever steps the checkpoint steps it again",
+        "returns it: the checkpoint fails",
+    ),
+    (
+        "checkpoint.rs",
+        "step",
+        "wait_durable",
+        "done!: returns the IO; whoever steps the checkpoint steps it again (the intent record)",
+        "returns it: the checkpoint fails",
+    ),
+    (
+        "checkpoint.rs",
+        "step",
+        "wait_durable",
+        "done!: returns the IO; whoever steps the checkpoint steps it again (the log's end)",
+        "returns it: the checkpoint fails",
+    ),
+    (
+        "txn/rollback.rs",
+        "walk_on",
+        "wait_durable",
+        "done!: returns the IO; the rollback's stepper steps it again",
+        "returns it: the rollback fails",
+    ),
+    (
+        "txn/mod.rs",
+        "spill",
+        "admit",
+        "returns the IO; the statement steps the spill again",
+        "returns it",
+    ),
+    (
+        "txn/mod.rs",
+        "publish_alone",
+        "admit",
+        "returns the IO; its caller steps it again until done",
+        "returns it",
+    ),
+    (
+        "txn/mod.rs",
+        "commit",
+        "admit",
+        "returns the IO; the commit is stepped again",
+        "returns it: the commit fails",
+    ),
+    (
+        "txn/mod.rs",
+        "commit",
+        "wait_durable",
+        "returns the IO; the commit is stepped again",
+        "returns it: the commit fails",
+    ),
+    (
+        "sql/mod.rs",
+        "drop",
+        "wait_durable",
+        "drive: called again until done",
+        "logged: the database is closing",
+    ),
+];
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn every_caller_of_admit_and_wait_durable_calls_again() {
+    use crate::storage::atoll::testing::{atoll_dir, atoll_sources, code_of};
+    let dir = atoll_dir();
+    let mut found = Vec::new();
+    for path in atoll_sources() {
+        let file = path.strip_prefix(&dir).unwrap().display().to_string();
+        let test_only = file.ends_with("tests.rs")
+            || file.contains("/tests/")
+            || ["bench.rs", "testing.rs"].contains(&file.as_str());
+        if test_only {
+            continue;
+        }
+        let code = code_of(&std::fs::read_to_string(&path).unwrap());
+        let code = code.split("mod tests {").next().unwrap();
+        for call in ["admit", "wait_durable"] {
+            for (at, _) in code.match_indices(&format!(".{call}(")) {
+                let caller: String = code[..at]
+                    .rfind("fn ")
+                    .map(|i| {
+                        code[i + 3..]
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                found.push((file.clone(), caller, call.to_string()));
+            }
+        }
+    }
+    let mut listed: Vec<(String, String, String)> = CALLERS
+        .iter()
+        .map(|(f, c, call, _, _)| (f.to_string(), c.to_string(), call.to_string()))
+        .collect();
+    found.sort();
+    listed.sort();
+    assert!(found.len() >= 11, "the census found {found:?}");
+    assert_eq!(
+        found, listed,
+        "a call of admit or wait_durable not listed with how it calls again, or one listed that \
+         is gone"
+    );
+}
+
+/// Once the log has failed no preparation step begins work: a caller that takes the word reads
+/// the failure and lets it go where it stands, and creates no segment.
+#[test]
+fn a_failed_log_begins_no_preparation_step() {
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let (log, _, held) = padding_with_no_preparation(&io);
+    assert!(log.short_of_segments(), "no step would run");
+    log.fail(CompletionError::Aborted);
+    // What a caller does past its own reads of the failure, which a failure landing after them
+    // races: take the word and run the step.
+    log.steps();
+    let next = log.segments.path(1);
+    assert!(
+        io.open_file(&next, OpenFlags::None, false).is_err(),
+        "a failed log created its next segment"
+    );
+    drop(held);
+}

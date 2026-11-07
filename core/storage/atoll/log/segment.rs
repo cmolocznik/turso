@@ -69,7 +69,7 @@ impl Segments {
         number * self.size
     }
 
-    fn path(&self, number: u64) -> String {
+    pub(super) fn path(&self, number: u64) -> String {
         format!("{}.log.{number:016x}", self.base)
     }
 

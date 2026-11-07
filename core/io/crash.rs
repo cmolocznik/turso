@@ -20,6 +20,11 @@
 //! multiple of [`DIRECT_IO_ALIGNMENT`], as Linux does.
 //!
 //! Every choice comes from a seeded generator, so a run and its crashes repeat exactly.
+//!
+//! It also records every synchronous file call (an open, a removal, a rename, a directory sync, an
+//! allocation) made from inside a callback its [`IO::step`] delivers
+//! ([`CrashIO::file_work_in_callbacks`]): a callback that waits on the file system would hold up
+//! every delivery behind it on a backend with one deliverer.
 
 use super::{Buffer, Completion, File, FileId, FileSyncType, OpenFlags, DIRECT_IO_ALIGNMENT, IO};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
@@ -64,6 +69,13 @@ struct State {
     /// Operations completed.
     completed: u64,
     captures: Option<Captures>,
+    /// The synchronous file calls made from inside a delivered callback, in order.
+    file_work_in_callbacks: Vec<&'static str>,
+}
+
+crate::thread::thread_local! {
+    /// Set on this thread while a step delivers a callback.
+    static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Crash images taken while operations complete, armed by [`CrashIO::capture`].
@@ -172,8 +184,15 @@ impl CrashIO {
                 writes: BTreeMap::new(),
                 completed: 0,
                 captures: None,
+                file_work_in_callbacks: Vec::new(),
             })),
         }
+    }
+
+    /// The synchronous file calls made so far from inside a callback a step delivered, each by
+    /// what it was.
+    pub fn file_work_in_callbacks(&self) -> Vec<&'static str> {
+        self.state.lock().file_work_in_callbacks.clone()
     }
 
     pub fn set_faults(&self, faults: Faults) {
@@ -323,10 +342,12 @@ impl CrashIO {
             }
             (op, outcome)
         };
+        let outer = DELIVERING.with(|d| d.replace(true));
         match outcome {
             Ok(n) => op.completion.complete(n),
             Err(e) => op.completion.error(e),
         }
+        DELIVERING.with(|d| d.set(outer));
     }
 
     fn submit(
@@ -354,6 +375,13 @@ impl CrashIO {
 }
 
 impl State {
+    /// Records a synchronous file call made from inside a delivered callback.
+    fn note_file_work(&mut self, what: &'static str) {
+        if DELIVERING.with(|d| d.get()) {
+            self.file_work_in_callbacks.push(what);
+        }
+    }
+
     /// Takes a crash image into the armed captures.
     fn capture(&mut self) {
         let Some(c) = &self.captures else { return };
@@ -592,6 +620,7 @@ impl Clock for CrashIO {
 impl IO for CrashIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut state = self.state.lock();
+        state.note_file_work("open");
         let data = match state.paths.get_mut(path) {
             Some(entry) if entry.exists => entry.data.clone(),
             _ if !flags.contains(OpenFlags::Create) => {
@@ -628,6 +657,7 @@ impl IO for CrashIO {
 
     fn remove_file(&self, path: &str) -> Result<()> {
         let mut state = self.state.lock();
+        state.note_file_work("remove");
         match state.paths.get_mut(path) {
             Some(entry) if entry.exists => {
                 entry.exists = false;
@@ -645,6 +675,7 @@ impl IO for CrashIO {
     /// exactly one survives.
     fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
         let mut state = self.state.lock();
+        state.note_file_work("rename");
         let data = match state.paths.get_mut(from) {
             Some(entry) if entry.exists => {
                 entry.exists = false;
@@ -677,6 +708,7 @@ impl IO for CrashIO {
 
     fn sync_directory(&self, dir: &str) -> Result<()> {
         let mut state = self.state.lock();
+        state.note_file_work("directory sync");
         state.paths.retain(|path, entry| {
             if Path::new(path).parent() != Some(Path::new(dir)) {
                 return true;
@@ -769,6 +801,7 @@ impl File for CrashFile {
 
     fn allocate(&self, pos: u64, len: u64) -> Result<()> {
         let mut state = self.io.state.lock();
+        state.note_file_work("allocate");
         let seq = state.seq();
         let mut data = self.data.lock();
         let end = (pos + len) as usize;

@@ -2260,6 +2260,13 @@ adapter (22.9 item 2): it then runs both steps, a move to needed or owed notifie
 waking the waiters, and the waiters are woken by their marks and by room, still calling again. The
 ring becomes the default only after that (22.16).
 
+(Built, step 3a: the word is `log/preparation.rs` and replaces the preparation's claim; the wake
+that puts waits back looks again at the failure and the word (`log/waits.rs`); a census test lists
+the eleven calls of `admit` and `wait_durable` outside tests with how each calls again and what it
+does with an error. `CrashIO` records every synchronous file call made from inside a callback its
+step delivers, and none is made over eight segments, fresh and spares. Loom models the word's
+handshake with a waiter and the look after a put-back.)
+
 **Retirement is not finishing.** A request is retired when its backend lets go of it and of every
 buffer it reads into or writes from, after its callback has returned. A request owns those buffers
 until then, through references the backend holds; a completion finished early (a cancel aborts the

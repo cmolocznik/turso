@@ -30,11 +30,20 @@
 //! same whether the backend completes inside a submission or later from `IO::step`.
 //!
 //! **No lock.** Admission and padding take room by compare-and-swap of one word ([`room`]). The
-//! writes landed raise a position past them in any order ([`Prefix`]). A flush, a sync and a
-//! segment's preparation each run one at a time ([`solo`](super::solo)): whoever finds one under
-//! way leaves it the work, and it looks again before it stops, so no request goes unanswered.
-//! Those waiting to be admitted or for the log to be durable wait on take-all stacks ([`waits`]),
-//! looking again once they are on them, so a waker either finds them or they see what it did.
+//! writes landed raise a position past them in any order ([`Prefix`]). A flush and a sync each run
+//! one at a time ([`solo`](super::solo)): whoever finds one under way leaves it the work, and it
+//! looks again before it stops, so no request goes unanswered. Those waiting to be admitted or for
+//! the log to be durable wait on take-all stacks ([`waits`]), looking again once they are on them,
+//! so a waker either finds them or they see what it did.
+//!
+//! **Preparing a segment** (DESIGN.md 22.5) is owned through a word of its own ([`preparation`]).
+//! Its synchronous steps (a create, an allocation, a rename, a directory sync) run only in a caller
+//! of [`Log::admit`] or [`Log::wait_durable`], never in a callback: a callback only submits and
+//! records, moving the word to *needed* where a flush meets padding waiting for a segment and to
+//! *owed* where the segment's data sync lands, and each such move wakes every waiter to call again.
+//! So a completion either call returns means only: call again. Room is reported only by `admit`
+//! returning it, durability only by `wait_durable` returning `Done`, and the log's failure only by
+//! either returning it.
 //!
 //! **Segments.** The log is cut into segment files ([`segment`]). A segment is written full of
 //! zeros and synced, with its directory, before any record goes into it, so a later write changes
@@ -44,6 +53,7 @@
 //! **Failure.** A failed write or sync means nothing about the bytes in flight can be trusted: the
 //! log refuses every append after it and fails everyone waiting.
 
+mod preparation;
 mod reader;
 mod record;
 mod room;
@@ -68,9 +78,10 @@ use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use crossbeam_utils::CachePadded;
+use preparation::{Step, Word};
 use room::{Pad, Room};
 use segment::Segments;
-use waits::Waits;
+use waits::{Look, Waits};
 
 #[cfg(test)]
 crate::thread::thread_local! {
@@ -161,8 +172,8 @@ pub struct Log {
     flushes: CachePadded<Solo>,
     /// The sync in flight, without durable writes.
     sync: CachePadded<Claim>,
-    /// The preparation of a segment under way.
-    preparation: CachePadded<Claim>,
+    /// Where the preparation of the next segment stands, and who owns it.
+    preparation: CachePadded<Word>,
     /// Waiting for the log to be durable to a mark. Pushed onto by every commit that waits, so on a
     /// line of its own.
     durable_waits: CachePadded<Waits>,
@@ -394,21 +405,23 @@ impl Log {
             left: bytes,
         };
         if self.room.grant(bytes, true) {
-            self.prepare_ahead();
+            self.steps();
             return Ok(IOResult::Done(admitted()));
         }
+        // A call: it registers, flushes, runs a step it finds runnable, then reads again. The
+        // completion it returns means only that it should be called again. One left behind is
+        // finished by the next wake, for no one.
         let c = Completion::new_wait();
-        // A completion left behind is completed by the next wake, for no one.
         room::wait_on(&self.admitters, c.clone());
+        self.flush();
+        self.steps();
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
         if self.room.grant(bytes, true) {
-            self.prepare_ahead();
+            self.steps();
             return Ok(IOResult::Done(admitted()));
         }
-        self.prepare_ahead();
-        self.flush();
         Ok(IOResult::IO(IOCompletions(c)))
     }
 
@@ -632,7 +645,9 @@ impl Log {
         end
     }
 
-    /// Done once everything before `lsn` is durable; until then, the completion to wait on.
+    /// Done once everything before `lsn` is durable, read from the durable position; until then,
+    /// a completion that means only: call again. A call registers its wait, flushes, runs a step
+    /// it finds runnable, then reads the position again.
     pub fn wait_durable(self: &Arc<Self>, lsn: Lsn) -> Result<IOResult<()>> {
         if self.durable() >= lsn {
             return Ok(IOResult::Done(()));
@@ -644,15 +659,13 @@ impl Log {
         let Some(c) = self.durable_waits.wait(lsn, || self.durable()) else {
             return Ok(IOResult::Done(()));
         };
+        self.flush();
+        self.steps();
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
-        self.flush();
-        if c.finished() {
-            return match c.get_error() {
-                Some(e) => Err(LimboError::CompletionError(e)),
-                None => Ok(IOResult::Done(())),
-            };
+        if self.durable() >= lsn {
+            return Ok(IOResult::Done(()));
         }
         Ok(IOResult::IO(IOCompletions(c)))
     }
@@ -786,8 +799,10 @@ impl Log {
             for (start, end, block) in writes {
                 self.submit_write(start, end, block);
             }
-            if unprepared {
-                self.prepare_ahead();
+            // Padding waits for a segment nobody prepares: the step is a caller's, and every
+            // waiter comes back to run it.
+            if unprepared && self.preparation.need() {
+                self.wake_all();
             }
         }
     }
@@ -985,7 +1000,26 @@ impl Log {
 
     /// Wakes those waiting for the durable position raised, and those waiting to be admitted.
     fn wake(&self) {
-        self.durable_waits.wake(|| self.durable());
+        self.durable_waits.wake(|| self.durable(), || self.look());
+        self.wake_admitters();
+    }
+
+    /// What finishes every durable wait, read by a wake that put waits back: the log's failure,
+    /// or a preparation step a caller must run.
+    fn look(&self) -> Look {
+        if let Some(e) = self.failure() {
+            return Look::Fail(e);
+        }
+        if self.preparation.wants_a_caller() {
+            return Look::Retry;
+        }
+        Look::Stay
+    }
+
+    /// Wakes every waiter, durable and admission alike, to call again: a preparation step became
+    /// runnable. After the move the caller stored, across the fence each take passes.
+    fn wake_all(&self) {
+        self.durable_waits.wake_all();
         self.wake_admitters();
     }
 
@@ -994,42 +1028,113 @@ impl Log {
         room::wake(&self.admitters, |c| c.complete(0));
     }
 
-    /// Starts preparing the next segment when less than one is left ahead of what is admitted.
-    /// One preparation runs at a time ([`Claim`]): whoever finds one under way leaves it the work,
-    /// and it looks again when it ends.
-    fn prepare_ahead(self: &Arc<Self>) {
-        let needed = |log: &Self| {
-            log.room.prepared_end().saturating_sub(log.room.reach()) <= log.segments.size
-        };
-        // Read alone first, so an admission that needs no segment writes nothing shared: one
-        // whose grant makes the need finds it here, and a holder letting go looks again.
-        if !needed(self) {
-            return;
+    /// Whether less than a segment is prepared ahead of what is admitted.
+    fn short_of_segments(&self) -> bool {
+        self.room.prepared_end().saturating_sub(self.room.reach()) <= self.segments.size
+    }
+
+    /// Runs every preparation step a caller may: finishing a segment owed, starting one needed, or
+    /// one when less than a segment is prepared ahead of what is admitted. A step taken here is
+    /// this caller's alone; one under way elsewhere, or in flight, is left. Only callers run them,
+    /// never a callback: each is a synchronous file call. A finished step looks for the next, then
+    /// flushes, since padding may have waited for the segment.
+    fn steps(self: &Arc<Self>) {
+        let mut stepped = false;
+        while let Some(step) = self.preparation.take(|| self.short_of_segments()) {
+            // A failed log begins no preparation work.
+            if self.failure().is_some() {
+                self.preparation.let_go(step);
+                break;
+            }
+            let went_on = match step {
+                Step::Start => self.start_preparing(),
+                Step::Finish => self.finish_preparing(),
+            };
+            if !went_on {
+                break;
+            }
+            stepped = true;
         }
-        while self.preparation.take() {
-            if needed(self) {
-                let number = self.segments.number(self.room.prepared_end());
-                // A spare is whole already: renamed, it is ready once its directory is synced.
-                match self.segments.reuse(number) {
-                    Ok(Some(_)) => return self.prepared(number),
-                    Ok(None) => {}
-                    Err(e) => return self.fail(io_failure(&e)),
-                }
-                let file = match self.segments.create(number) {
-                    Ok(file) => file,
-                    Err(e) => return self.fail(io_failure(&e)),
-                };
-                let _ = file.allocate(0, self.segments.size);
-                return self.zero_fill(number, 0);
-            }
-            self.preparation.release();
-            if !needed(self) {
-                return;
-            }
+        if stepped {
+            self.flush();
         }
     }
-    /// Writes zeros into segment `number` from `at`, one write after another, then syncs it and
-    /// its directory. A write whose completion runs inside its own submission, as a memory IO's
+
+    /// Starts preparing the segment past the prepared end, the step this caller took: a spare
+    /// renamed into place, whose directory sync it then runs too, or a fresh file created,
+    /// allocated and handed to its zero-fill writes. Whether the preparation went on: a failure,
+    /// its own or one read after its synchronous calls, lets the word go where it stands.
+    fn start_preparing(self: &Arc<Self>) -> bool {
+        let number = self.segments.number(self.room.prepared_end());
+        // A spare is whole already: renamed, it is ready once its directory is synced.
+        match self.segments.reuse(number) {
+            Ok(Some(_)) => {
+                if self.failure().is_some() {
+                    self.preparation.let_go(Step::Start);
+                    return false;
+                }
+                self.preparation.start_to_finish();
+                return self.finish_preparing();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.preparation.let_go(Step::Start);
+                self.fail(io_failure(&e));
+                return false;
+            }
+        }
+        let file = match self.segments.create(number) {
+            Ok(file) => file,
+            Err(e) => {
+                self.preparation.let_go(Step::Start);
+                self.fail(io_failure(&e));
+                return false;
+            }
+        };
+        let _ = file.allocate(0, self.segments.size);
+        if self.failure().is_some() {
+            self.preparation.let_go(Step::Start);
+            return false;
+        }
+        // From here the preparation is its requests': on a backend that completes inside the
+        // submission the whole fill and its sync land here, moving the word on to owed.
+        self.preparation.hand_to_requests();
+        self.zero_fill(number, 0);
+        true
+    }
+
+    /// Finishes the preparation owed, the step this caller took: syncs the segments' directory,
+    /// publishes the prepared end and lets the word go done, then wakes the admitters. Whether it
+    /// went on, as [`start_preparing`](Self::start_preparing) says.
+    fn finish_preparing(self: &Arc<Self>) -> bool {
+        let number = self.segments.number(self.room.prepared_end());
+        if let Err(e) = self.io.sync_directory(&self.segments.directory()) {
+            self.preparation.let_go(Step::Finish);
+            self.fail(io_failure(&e));
+            return false;
+        }
+        // Read again once the synchronous call returns: a request may have failed meanwhile.
+        if self.failure().is_some() {
+            self.preparation.let_go(Step::Finish);
+            return false;
+        }
+        self.room.set_prepared_end(self.segments.start(number + 1));
+        self.preparation.done();
+        self.wake_admitters();
+        true
+    }
+
+    /// The data sync of the segment being prepared landed, in its callback: the directory sync and
+    /// the rest are owed to a caller, and every waiter comes back to run them.
+    fn data_synced(&self) {
+        self.preparation.owe();
+        self.wake_all();
+    }
+
+    /// Writes zeros into segment `number` from `at`, one write after another, then syncs its
+    /// data; the sync's landing leaves the directory sync owed to a caller
+    /// ([`data_synced`](Self::data_synced)). A write's callback submits the next and does nothing
+    /// synchronous. A write whose completion runs inside its own submission, as a memory IO's
     /// does, lets this loop go on to the next; one completed later resumes the fill from its
     /// completion. Either way no write's completion runs inside another's, so a segment of many
     /// chunks costs no frame per chunk.
@@ -1049,7 +1154,7 @@ impl Log {
                 let c = Completion::new_sync(move |res| {
                     let Some(me) = me.upgrade() else { return };
                     match res {
-                        Ok(_) => me.prepared(number),
+                        Ok(_) => me.data_synced(),
                         Err(e) => me.fail(e),
                     }
                 });
@@ -1094,18 +1199,6 @@ impl Log {
                 _ => return,
             }
         }
-    }
-
-    fn prepared(self: &Arc<Self>, number: u64) {
-        if let Err(e) = self.io.sync_directory(&self.segments.directory()) {
-            return self.fail(io_failure(&e));
-        }
-        self.room.set_prepared_end(self.segments.start(number + 1));
-        self.preparation.release();
-        self.wake_admitters();
-        self.prepare_ahead();
-        // A flush may be waiting to pad until this segment was ready.
-        self.flush();
     }
 
     /// Whether the bytes in flight reached the disk is unknown: nothing may follow them, and

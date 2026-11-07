@@ -506,6 +506,7 @@ impl Completion {
                 self.0.unpark();
             }
         }
+        super::refuse_on_delivery_thread("a blocking wait");
         if self.finished() {
             return;
         }

@@ -2330,6 +2330,29 @@ that wraps its embedder's and counts each request on them, and the database's la
 the count before it returns (22.12, step 4); a census holds the wrapper to forwarding every method of
 the traits it implements.)
 
+(Built, step 3c: the ring's state is shared by its handles, the IO and its files, and by its
+delivery thread, `turso-io-uring`, which holds no handle. Before each wait it moves the overflow
+into the submission queue under the mutex; it waits for one completion; under the mutex it takes at
+most a completion queue's worth (1,024 for the 512-entry ring), resubmitting a partial write's rest,
+rearming its eventfd's poll and skipping a cancel's own entry; with the mutex let go it delivers each
+and lets its count go. Its whole life is a frame whose drop ends the process if it unwinds. A wait
+the kernel interrupts is waited again; a busy or full completion queue is drained, then waited
+again; any other error of the ring ends the process with the error printed. The last handle's drop
+writes the eventfd, whose standing poll ends the wait, and the thread ends once no handle lives and
+no request is counted; nothing joins it, so a last handle dropped inside a callback lets it end
+after its batch. A refusal of the ring, its buffers' registration, the eventfd or the thread fails
+the open whole and says which. `step` does nothing on the ring; `IO::wait_for_completion` parks on
+the completion and `drain_completions` until each request retires. On the delivery thread
+`refuse_on_delivery_thread` refuses every IO's wait and drain, a blocking remote wait, Atoll's
+close, and on the ring a file's open, removal, rename, directory sync, allocation, hole punch and a
+truncation without the ring's opcode; a refusal there is a panic, which ends the process. The census
+(`io/callback_census.rs`) lists the 90 callbacks Turso and Atoll construct outside tests, each with
+what it does, and refuses one whose own code (its arguments, or the binding they name) waits or calls
+the file system; what a callback calls further is refused at run time. The ring's shuttle variant of
+the IO tests is gone: a thread waiting in the kernel is outside any schedule shuttle explores. Until
+step 3d puts every blocking caller on `IO::wait`, a caller that loops on `step` spins on the ring
+while the thread delivers.)
+
 **Who waits how.** Every caller that waits for IO is one of three kinds:
 
 - **Blocking**: it holds its thread until the completion finishes, through `IO::wait(c)`. An

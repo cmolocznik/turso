@@ -52,6 +52,21 @@ cfg_block! {
     }
 }
 
+crate::thread::thread_local! {
+    /// Set on a ring's delivery thread for its whole life (DESIGN.md 22.5).
+    static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ends the thread with a panic if it is a ring's delivery thread, which never waits and never makes
+/// a synchronous file call: nothing else would deliver what it waits for, and every delivery behind
+/// it waits on the file system (DESIGN.md 22.5). A panic there ends the process.
+pub(crate) fn refuse_on_delivery_thread(what: &str) {
+    assert!(
+        !DELIVERING.with(|d| d.get()),
+        "{what} on the ring's delivery thread, which never waits nor makes a synchronous file call"
+    );
+}
+
 #[cfg(any(test, feature = "io_crash"))]
 pub mod crash;
 mod memory;
@@ -62,6 +77,8 @@ mod vfs;
 pub use memory::MemoryIO;
 #[cfg(feature = "io_memory_yield")]
 pub use memory_yield::MemoryYieldIO;
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod callback_census;
 pub mod clock;
 mod common;
 mod completions;
@@ -658,6 +675,7 @@ pub trait IO: Clock + Send + Sync {
     /// before the caller goes on. Only the completions passed are waited for: other threads keep
     /// submitting meanwhile.
     fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+        refuse_on_delivery_thread("a wait for retirement");
         let mut seen = std::collections::HashSet::new();
         for c in completions {
             for request in c.requests(&mut seen) {
@@ -670,6 +688,7 @@ pub trait IO: Clock + Send + Sync {
     }
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
+        refuse_on_delivery_thread("a wait for a completion");
         while !c.finished() {
             if c.is_remote_wait() {
                 // Another thread completes it, not this backend's step.
@@ -1432,30 +1451,6 @@ mod shuttle_tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
-    struct UringIOFactory {
-        temp_dir: tempfile::TempDir,
-    }
-
-    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
-    impl UringIOFactory {
-        fn new() -> Self {
-            Self {
-                temp_dir: tempfile::tempdir().unwrap(),
-            }
-        }
-    }
-
-    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
-    impl IOFactory for UringIOFactory {
-        fn create(&self) -> Arc<dyn IO> {
-            Arc::new(UringIO::new().unwrap())
-        }
-        fn temp_dir(&self) -> PathBuf {
-            self.temp_dir.path().to_path_buf()
-        }
-    }
-
     #[cfg(all(
         target_os = "windows",
         feature = "experimental_win_iocp",
@@ -1496,7 +1491,7 @@ mod shuttle_tests {
     }
 
     /// Macro to generate shuttle tests for all IO implementations.
-    /// Creates a test for MemoryIO, and conditionally for PlatformIO and UringIO.
+    /// Creates a test for MemoryIO, and conditionally for PlatformIO.
     macro_rules! shuttle_io_test {
         ($test_name:ident, $test_impl:ident) => {
             pastey::paste! {
@@ -1511,11 +1506,8 @@ mod shuttle_tests {
                     shuttle::check_random(|| $test_impl(PlatformIOFactory::new()), 1000);
                 }
 
-                #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
-                #[test]
-                fn [<shuttle_ $test_name _uring>]() {
-                    shuttle::check_random(|| $test_impl(UringIOFactory::new()), 1000);
-                }
+                // No ring variant: the ring's requests are delivered by a thread of its own, which
+                // waits in the kernel, outside any schedule the model explores.
 
                 #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", feature = "fs", not(miri)))]
                 #[test]

@@ -55,6 +55,9 @@ impl Requests {
     /// each, a pumped backend delivers each when stepped), so the wait ends; an IO error while
     /// stepping is logged and the wait goes on.
     pub(super) fn drain(&self, io: &dyn IO) {
+        // Close waits: never on a ring's delivery thread, the one that would deliver what it waits
+        // for (DESIGN.md 22.5).
+        crate::io::refuse_on_delivery_thread("a database's close");
         while self.outstanding() > 0 {
             if let Err(e) = io.step() {
                 tracing::error!("closing: stepping the IO for requests still owned: {e}");

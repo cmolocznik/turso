@@ -50,6 +50,10 @@ pub mod vector;
 
 #[cfg(feature = "cli_only")]
 pub(crate) mod btree_dump;
+#[cfg(test)]
+pub(crate) mod child_test;
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(crate) mod source_test;
 pub(crate) mod sync;
 pub(crate) mod thread;
 

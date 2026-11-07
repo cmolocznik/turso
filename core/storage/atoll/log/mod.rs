@@ -405,8 +405,7 @@ impl Log {
             left: bytes,
         };
         if self.room.grant(bytes, true) {
-            self.steps();
-            return Ok(IOResult::Done(admitted()));
+            return self.hand_over(admitted());
         }
         // A call: it registers, flushes, runs a step it finds runnable, then reads again. The
         // completion it returns means only that it should be called again. One left behind is
@@ -419,10 +418,20 @@ impl Log {
             return Err(LimboError::CompletionError(e));
         }
         if self.room.grant(bytes, true) {
-            self.steps();
-            return Ok(IOResult::Done(admitted()));
+            return self.hand_over(admitted());
         }
         Ok(IOResult::IO(IOCompletions(c)))
+    }
+
+    /// Runs the steps a caller may once room is granted, then reads the log's failure again, a
+    /// step's own included: a failed log hands over no room, and what was granted goes back.
+    fn hand_over(self: &Arc<Self>, admitted: Admitted) -> Result<IOResult<Admitted>> {
+        self.steps();
+        if let Some(e) = self.failure() {
+            drop(admitted);
+            return Err(LimboError::CompletionError(e));
+        }
+        Ok(IOResult::Done(admitted))
     }
 
     /// Whether anyone waits to be admitted or for the log to be durable: an append then flushes.
@@ -1091,6 +1100,11 @@ impl Log {
                 return false;
             }
         };
+        // Read again once each synchronous call returns: a request may have failed meanwhile.
+        if self.failure().is_some() {
+            self.preparation.let_go(Step::Start);
+            return false;
+        }
         let _ = file.allocate(0, self.segments.size);
         if self.failure().is_some() {
             self.preparation.let_go(Step::Start);

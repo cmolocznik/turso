@@ -71,6 +71,9 @@ struct State {
     captures: Option<Captures>,
     /// The synchronous file calls made from inside a delivered callback, in order.
     file_work_in_callbacks: Vec<&'static str>,
+    /// Run as each synchronous file call begins, outside the state's lock: a test's stand-in for
+    /// another request failing while the call runs.
+    file_work_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 crate::thread::thread_local! {
@@ -185,6 +188,7 @@ impl CrashIO {
                 completed: 0,
                 captures: None,
                 file_work_in_callbacks: Vec::new(),
+                file_work_hook: None,
             })),
         }
     }
@@ -193,6 +197,20 @@ impl CrashIO {
     /// what it was.
     pub fn file_work_in_callbacks(&self) -> Vec<&'static str> {
         self.state.lock().file_work_in_callbacks.clone()
+    }
+
+    /// Runs `hook` with what each synchronous file call is (an open, a removal, a rename, a
+    /// directory sync, an allocation) as it begins; `None` stops it.
+    pub fn on_file_work(&self, hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>) {
+        self.state.lock().file_work_hook = hook;
+    }
+
+    /// The hook of [`on_file_work`](Self::on_file_work), run with no lock held.
+    fn file_work(&self, what: &'static str) {
+        let hook = self.state.lock().file_work_hook.clone();
+        if let Some(hook) = hook {
+            hook(what);
+        }
     }
 
     pub fn set_faults(&self, faults: Faults) {
@@ -617,6 +635,7 @@ impl Clock for CrashIO {
 
 impl IO for CrashIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
+        self.file_work("open");
         let mut state = self.state.lock();
         state.note_file_work("open");
         let data = match state.paths.get_mut(path) {
@@ -654,6 +673,7 @@ impl IO for CrashIO {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
+        self.file_work("remove");
         let mut state = self.state.lock();
         state.note_file_work("remove");
         match state.paths.get_mut(path) {
@@ -672,6 +692,7 @@ impl IO for CrashIO {
     /// before then may leave either, both or neither: stricter than a real file system, where
     /// exactly one survives.
     fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        self.file_work("rename");
         let mut state = self.state.lock();
         state.note_file_work("rename");
         let data = match state.paths.get_mut(from) {
@@ -705,6 +726,7 @@ impl IO for CrashIO {
     }
 
     fn sync_directory(&self, dir: &str) -> Result<()> {
+        self.file_work("directory sync");
         let mut state = self.state.lock();
         state.note_file_work("directory sync");
         state.paths.retain(|path, entry| {
@@ -798,6 +820,7 @@ impl File for CrashFile {
     }
 
     fn allocate(&self, pos: u64, len: u64) -> Result<()> {
+        self.io.file_work("allocate");
         let mut state = self.io.state.lock();
         state.note_file_work("allocate");
         let seq = state.seq();

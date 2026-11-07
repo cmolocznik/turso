@@ -910,7 +910,10 @@ fn a_caller_parked_on_a_segment_in_flight_is_woken_when_its_step_is_owed() {
             "seed {seed}: the parked caller was not woken when its step became owed"
         );
         assert!(c.get_error().is_none(), "seed {seed}: woken with an error");
-        assert!(log.durable() < lsn, "seed {seed}: durable before the step ran");
+        assert!(
+            log.durable() < lsn,
+            "seed {seed}: durable before the step ran"
+        );
         drive(&io, || log.wait_durable(lsn)).unwrap();
         assert!(log.durable() >= lsn, "seed {seed}");
         drop(held);
@@ -919,12 +922,10 @@ fn a_caller_parked_on_a_segment_in_flight_is_woken_when_its_step_is_owed() {
     }
 }
 
-/// A log opened three blocks before its first segment's end, with a record appended and room
-/// granted past it straight from the room, as no caller does, so that padding the record's block
-/// waits for the next segment while no step has begun preparing it: the state a flush meets only
-/// if no caller ran a step since less than a segment was prepared ahead. Returns the log, the
-/// record's LSN and the room still held.
-fn padding_with_no_preparation(io: &Arc<dyn IO>) -> (Arc<Log>, Lsn, Admitted) {
+/// A log opened three blocks before its first segment's end, nothing granted, less than a segment
+/// prepared ahead: the next caller to run steps prepares the next segment. With `fresh_next`, the
+/// next segment the log before it prepared is gone, so it is created fresh, not made of a spare.
+fn reopened_short(io: &Arc<dyn IO>, fresh_next: bool) -> Arc<Log> {
     let config = small();
     let segment = config.segment_bytes;
     let filler = vec![7u8; 996];
@@ -935,8 +936,22 @@ fn padding_with_no_preparation(io: &Arc<dyn IO>) -> (Arc<Log>, Lsn, Admitted) {
         log.append(&mut admitted, &header(0), &[&filler]);
     }
     drive(io, || log.wait_durable(resume)).unwrap();
+    let next = log.segments.path(1);
     drop(log);
-    let log = Log::open(io.clone(), BASE, config, resume).unwrap();
+    if fresh_next {
+        let _ = io.remove_file(&next);
+    }
+    Log::open(io.clone(), BASE, config, resume).unwrap()
+}
+
+/// A log opened three blocks before its first segment's end, with a record appended and room
+/// granted past it straight from the room, as no caller does, so that padding the record's block
+/// waits for the next segment while no step has begun preparing it: the state a flush meets only
+/// if no caller ran a step since less than a segment was prepared ahead. Returns the log, the
+/// record's LSN and the room still held.
+fn padding_with_no_preparation(io: &Arc<dyn IO>, fresh_next: bool) -> (Arc<Log>, Lsn, Admitted) {
+    let segment = small().segment_bytes;
+    let log = reopened_short(io, fresh_next);
     let record = vec![1u8; 36];
     let len = framed_len(record.len());
     assert!(log.room.grant(len, true));
@@ -955,6 +970,94 @@ fn padding_with_no_preparation(io: &Arc<dyn IO>) -> (Arc<Log>, Lsn, Admitted) {
     (log, lsn, held)
 }
 
+/// A hook that fails `log` as the synchronous file call `at` begins: another request failing
+/// while that call runs.
+fn failing_at(log: &Arc<Log>, at: &'static str) -> Option<Arc<dyn Fn(&'static str) + Send + Sync>> {
+    let log = Arc::downgrade(log);
+    Some(Arc::new(move |what| {
+        if what == at {
+            if let Some(log) = log.upgrade() {
+                log.fail(CompletionError::Aborted);
+            }
+        }
+    }))
+}
+
+/// Another request's failure published while a starter's create runs: the starter reads it as
+/// the create returns and lets the word go, allocating nothing and submitting nothing, and every
+/// waiter gets the error.
+#[test]
+fn a_failure_during_a_starters_create_stops_the_preparation() {
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let (log, lsn, held) = padding_with_no_preparation(&io, true);
+    log.wanted.fetch_max(lsn, Ordering::SeqCst);
+    let durable = log
+        .durable_waits
+        .wait(lsn, || log.durable())
+        .expect("not durable yet");
+    let in_flight = crash.in_flight();
+    crash.on_file_work(failing_at(&log, "open"));
+    log.steps();
+    crash.on_file_work(None);
+    let created = io
+        .open_file(&log.segments.path(1), OpenFlags::None, false)
+        .expect("the starter's create ran");
+    assert_eq!(created.size().unwrap(), 0, "allocated after the failure");
+    assert_eq!(crash.in_flight(), in_flight, "submitted after the failure");
+    assert!(log.preparation.wants_a_caller(), "the word not let go");
+    assert_eq!(durable.get_error(), Some(CompletionError::Aborted));
+    drop(held);
+}
+
+/// Another request's failure published while a finisher's directory sync runs: the finisher reads
+/// it as the sync returns and lets the word go, publishing no prepared end, and every waiter gets
+/// the error.
+#[test]
+fn a_failure_during_a_finishers_directory_sync_publishes_nothing() {
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    // The next segment from a spare: its starter goes straight on to finish it.
+    let (log, lsn, held) = padding_with_no_preparation(&io, false);
+    log.wanted.fetch_max(lsn, Ordering::SeqCst);
+    let durable = log
+        .durable_waits
+        .wait(lsn, || log.durable())
+        .expect("not durable yet");
+    let prepared = log.room.prepared_end();
+    crash.on_file_work(failing_at(&log, "directory sync"));
+    log.steps();
+    crash.on_file_work(None);
+    assert_eq!(
+        log.room.prepared_end(),
+        prepared,
+        "published after the failure"
+    );
+    assert!(log.preparation.wants_a_caller(), "the word not let go");
+    assert_eq!(durable.get_error(), Some(CompletionError::Aborted));
+    drop(held);
+}
+
+/// An admission whose room is granted at once, and whose own step meets a failure, returns the
+/// failure, never the room, and gives the room back.
+#[test]
+fn an_admission_whose_step_fails_the_log_returns_the_failure_and_gives_its_room_back() {
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let log = reopened_short(&io, true);
+    assert!(log.short_of_segments(), "no step would run");
+    let reach = log.room.reach();
+    crash.on_file_work(failing_at(&log, "open"));
+    let admitted = log.admit(64);
+    crash.on_file_work(None);
+    match admitted {
+        Err(LimboError::CompletionError(CompletionError::Aborted)) => {}
+        Ok(IOResult::Done(_)) => panic!("room handed over from a failed log"),
+        other => panic!("not the failure: {:?}", other.map(|_| ())),
+    }
+    assert_eq!(log.room.reach(), reach, "the room granted not given back");
+}
+
 /// A flush that meets padding waiting for a segment nobody prepares moves the word to needed and
 /// wakes every waiter, durable and admission alike, whatever its mark: the step is a caller's,
 /// and each comes back to call again. A caller then runs it, and the record becomes durable.
@@ -963,7 +1066,7 @@ fn a_flush_meeting_padding_nobody_prepares_needs_a_step_and_wakes_every_waiter()
     for seed in 0..4 {
         let crash = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash.clone();
-        let (log, lsn, held) = padding_with_no_preparation(&io);
+        let (log, lsn, held) = padding_with_no_preparation(&io, false);
         log.wanted.fetch_max(lsn, Ordering::SeqCst);
         let durable = log
             .durable_waits
@@ -1000,7 +1103,7 @@ fn a_finished_completion_is_no_report_of_durability() {
     for seed in 0..4 {
         let crash = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash.clone();
-        let (log, lsn, held) = padding_with_no_preparation(&io);
+        let (log, lsn, held) = padding_with_no_preparation(&io, false);
         match log.wait_durable(lsn).unwrap() {
             IOResult::Done(()) => panic!(
                 "seed {seed}: reported durable to {lsn} with the log durable to {}",
@@ -1153,7 +1256,7 @@ fn every_caller_of_admit_and_wait_durable_calls_again() {
 fn a_failed_log_begins_no_preparation_step() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
-    let (log, _, held) = padding_with_no_preparation(&io);
+    let (log, _, held) = padding_with_no_preparation(&io, false);
     assert!(log.short_of_segments(), "no step would run");
     log.fail(CompletionError::Aborted);
     // What a caller does past its own reads of the failure, which a failure landing after them

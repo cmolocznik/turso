@@ -93,31 +93,6 @@ impl Floors {
             .min()
             .map(|v| v - 1)
     }
-
-    /// The tags of the floors held below `bound`. Like [`least`](Self::least), it reads every
-    /// floor held throughout the scan.
-    pub fn tagged_below(&self, bound: u64) -> Vec<u64> {
-        (0..self.used.load(Ordering::Acquire))
-            .filter_map(|i| self.slots.get(i))
-            .filter(|s| {
-                let v = s.floor.load(Ordering::Acquire);
-                v != 0 && v - 1 < bound
-            })
-            .map(|s| s.tag.load(Ordering::Relaxed))
-            .collect()
-    }
-}
-
-impl Floor {
-    /// The floor as its slot, to keep in a word.
-    pub fn into_slot(self) -> u64 {
-        self.slot
-    }
-
-    /// The floor kept as `slot` by [`into_slot`](Self::into_slot).
-    pub fn from_slot(slot: u64) -> Self {
-        Self { slot }
-    }
 }
 
 #[cfg(all(test, not(atoll_loom)))]

@@ -458,18 +458,6 @@ impl<'a, P: Bytes + ?Sized> View<'a, P> {
         Some(())
     }
 
-    /// Where entry `i`'s key past the prefix and its value lie, and whether the value is out of
-    /// line.
-    #[inline]
-    pub fn entry_runs(
-        &self,
-        i: usize,
-    ) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>, bool)> {
-        let s = self.slot(i)?;
-        let key = s.off..s.off + s.key_len;
-        Some((key.clone(), key.end..key.end + s.value_len, s.out_of_line))
-    }
-
     /// Where the bytes every key in the node starts with lie.
     pub fn prefix_range(&self) -> Option<std::ops::Range<usize>> {
         let r = self.prefix_run()?;
@@ -709,6 +697,7 @@ pub struct Entry {
 }
 
 impl Entry {
+    #[cfg(test)]
     pub fn child(key: Vec<u8>, child: PageId, hint: u32) -> Self {
         Self {
             key,
@@ -917,6 +906,7 @@ pub fn insert<P: BytesMut + ?Sized>(
 /// Changes entry `pos`'s inline value in place: `head` over its start, and `bytes` at `at` past
 /// the head. False if the value is out of line or too short to hold them, or if in a reserving
 /// leaf the head's reserve does not fit.
+#[cfg(test)]
 pub fn patch<P: BytesMut + ?Sized>(
     page: &mut P,
     pos: usize,

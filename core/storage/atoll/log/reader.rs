@@ -366,6 +366,7 @@ impl Rereader {
     }
 
     /// Bytes read so far.
+    #[cfg(test)]
     pub fn read(&self) -> u64 {
         self.read
     }

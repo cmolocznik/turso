@@ -40,8 +40,6 @@ pub struct Recovered {
     pub pool: Arc<BufferPool>,
     pub checkpointer: Checkpointer,
     pub txns: Transactions,
-    /// Where the log ended when recovery read it.
-    pub end: Lsn,
 }
 
 /// What the first pass over the log found.
@@ -153,7 +151,6 @@ pub fn recover(
         pool,
         checkpointer,
         txns,
-        end,
     })
 }
 

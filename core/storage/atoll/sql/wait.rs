@@ -149,10 +149,6 @@ pub struct WaitRecord {
 }
 
 impl WaitRecord {
-    pub fn group(&self) -> GroupId {
-        self.group
-    }
-
     pub fn flagged(&self) -> bool {
         self.state.load(Ordering::Acquire) == FLAGGED
     }
@@ -275,13 +271,6 @@ impl WaitGraph {
         }
     }
 
-    /// [`end`](Self::end) for the group `id` of `seat`, without the graph's lock.
-    pub fn end_seated(&self, seat: &Seat, id: GroupId) {
-        if seat.node.generation.load(Ordering::Acquire) == generation_of(id) {
-            Self::end_on(&seat.node, id);
-        }
-    }
-
     fn end_on(node: &Node, id: GroupId) {
         if node
             .generation
@@ -307,12 +296,14 @@ impl WaitGraph {
     }
 
     /// Whether group `id` was chosen as a victim: it rolls back at its next step.
+    #[cfg(test)]
     pub fn doomed(&self, id: GroupId) -> bool {
         self.live(id)
             .is_some_and(|n| n.doomed.load(Ordering::Acquire))
     }
 
     /// Notes that group `id` took (`held`) or gave up a gate exclusive.
+    #[cfg(test)]
     pub fn exclusive(&self, id: GroupId, held: bool) {
         if let Some(node) = self.live(id) {
             if held {

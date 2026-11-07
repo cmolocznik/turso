@@ -142,23 +142,6 @@ pub fn child_with_room<P: Bytes + ?Sized>(
     (from_child..FANOUT).find(|&c| used_below(node, c) < room)
 }
 
-/// The first unit at or after `from` in this leaf that is in use, if any.
-pub fn used_in_leaf<P: Bytes + ?Sized>(
-    tree: Tree,
-    leaf: &P,
-    leaf_index: u64,
-    from: u64,
-) -> Option<u64> {
-    let first = leaf_index * leaf_units(tree);
-    let start = from.clamp(first, first + leaf_units(tree));
-    (start..first + leaf_units(tree)).find(|&u| used(tree, leaf, u))
-}
-
-/// The first child at or after `from_child` of a node with a unit in use below it.
-pub fn child_in_use<P: Bytes + ?Sized>(node: &P, from_child: u64) -> Option<u64> {
-    (from_child..FANOUT).find(|&c| used_below(node, c) > 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

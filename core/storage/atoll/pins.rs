@@ -139,6 +139,7 @@ impl<T> Cells<T> {
         self.count.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub fn epochs(&self) -> &Arc<Epochs> {
         &self.epochs
     }

@@ -20,7 +20,7 @@ use crate::{
 };
 use std::{cell::RefCell, num::NonZero, num::NonZeroUsize, rc::Rc};
 
-use crate::storage::atoll::txn::versioned::Guarded;
+use crate::storage::atoll::sql::mode::Guarded;
 
 /// Tracks foreign-key action programs that are currently being compiled.
 ///

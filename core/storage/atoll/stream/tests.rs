@@ -116,7 +116,7 @@ fn producers_at_once_take_offsets_in_log_order() {
                     let mut i = 0;
                     while i < each {
                         let mut batch = p.batch();
-                        batch.from_producer(w, seq);
+                        batch.set_producer(w, seq);
                         let mut n = 0;
                         while i < each && n < 1 + (i % 9) && batch.push(&message(w << 32 | i), i) {
                             i += 1;

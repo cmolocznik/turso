@@ -11,17 +11,17 @@
 //! - [`trees`]: per-tree commit stamps, for `BusySnapshot`.
 //! - [`wait`]: the wait graph, over every transaction group of the process.
 
-pub mod catalog;
-pub mod cursor;
-pub mod header;
-pub mod integrity;
-pub mod key;
-pub mod lifecycle;
+pub(in crate::storage::atoll) mod catalog;
+pub(in crate::storage::atoll) mod cursor;
+pub(in crate::storage::atoll) mod header;
+pub(in crate::storage::atoll) mod integrity;
+pub(in crate::storage::atoll) mod key;
+pub(in crate::storage::atoll) mod lifecycle;
 pub mod mode;
-pub mod rowid;
-pub mod sequence;
-pub mod trees;
-pub mod wait;
+pub(in crate::storage::atoll) mod rowid;
+pub(in crate::storage::atoll) mod sequence;
+pub(in crate::storage::atoll) mod trees;
+pub(in crate::storage::atoll) mod wait;
 
 use self::catalog::{ensure_system_trees, key, Catalog, Entry, Layout, System, SCHEMA_ID};
 use self::header::{Field, Header};
@@ -59,13 +59,15 @@ pub struct AtollDb {
     next_id: AtomicU64,
     /// The slot a begin next collects beside its own, in turn.
     collect_next: std::sync::atomic::AtomicUsize,
+    /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 /// A database closed cleanly leaves its log durable to its end: the writes no commit flushed, a
 /// sequence's or a drain's, survive the close (DESIGN.md §17, R8).
 impl Drop for AtollDb {
+    #[turso_macros::atoll_entry]
     fn drop(&mut self) {
-        crate::storage::atoll::unwind::abort_if_unwinding();
         let log = self.atoll.log().clone();
         let end = log.end();
         if let Err(e) = drive(&self.io, || log.wait_durable(end)) {
@@ -78,6 +80,7 @@ impl AtollDb {
     /// Opens the database at `path`, creating it, and its system trees, if it does not exist,
     /// completing a creation a crash cut short, and draining every tree on the abandoned and
     /// dropped lists.
+    #[turso_macros::atoll_entry]
     pub fn open(io: Arc<dyn IO>, path: &str, config: AtollConfig) -> Result<Self> {
         let slots = config.txn.slots;
         let atoll = Atoll::open(io.clone(), path, config)?;
@@ -123,6 +126,7 @@ impl AtollDb {
             drainer: AtomicBool::new(false),
             next_id: AtomicU64::new(0),
             collect_next: std::sync::atomic::AtomicUsize::new(0),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         };
         db.drain_lists()?;
         db.drop_unnamed_sequences()?;
@@ -193,22 +197,22 @@ impl AtollDb {
         Ok(())
     }
 
-    pub fn io(&self) -> &Arc<dyn IO> {
+    pub(in crate::storage::atoll) fn io(&self) -> &Arc<dyn IO> {
         &self.io
     }
 
-    pub fn atoll(&self) -> &Atoll {
+    pub(in crate::storage::atoll) fn atoll(&self) -> &Atoll {
         &self.atoll
     }
 
-    pub fn versions(&self) -> &Versions {
+    pub(in crate::storage::atoll) fn versions(&self) -> &Versions {
         &self.versions
     }
 
     /// A begin's step of the version arenas' collection (DESIGN.md §11.5): a page of the slot it
     /// took and one of the next slot in turn. Nothing waits: a step that would read a page in
     /// starts the read and leaves the page to the next begin.
-    pub(crate) fn collect_after_begin(&self, slot: u16) -> Result<()> {
+    pub(in crate::storage::atoll) fn collect_after_begin(&self, slot: u16) -> Result<()> {
         let txns = self.atoll.transactions();
         let other = self
             .collect_next
@@ -220,28 +224,24 @@ impl AtollDb {
         Ok(())
     }
 
-    pub fn catalog(&self) -> &Catalog {
+    pub(in crate::storage::atoll) fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    pub fn header(&self) -> &Header {
+    pub(in crate::storage::atoll) fn header(&self) -> &Header {
         &self.header
     }
 
-    pub fn rowids(&self) -> &Rowids {
+    pub(in crate::storage::atoll) fn rowids(&self) -> &Rowids {
         &self.rowids
     }
 
-    pub fn dropped(&self) -> &VersionedTree {
-        &self.dropped
-    }
-
-    pub fn stamps(&self) -> &self::trees::TreeStamps {
+    pub(in crate::storage::atoll) fn stamps(&self) -> &self::trees::TreeStamps {
         &self.stamps
     }
 
     /// A new tree id, never drawn before while the database has been open.
-    pub fn draw_tree_id(&self) -> u64 {
+    pub(in crate::storage::atoll) fn draw_tree_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 }

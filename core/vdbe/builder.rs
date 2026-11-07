@@ -2574,7 +2574,7 @@ impl ProgramBuilder {
                 .filter_map(|(insn, _)| match insn {
                     Insn::OpenRead { root_page, db, .. } if *db == crate::MAIN_DB_ID => {
                         u64::try_from(*root_page).ok().filter(|id| {
-                            *id != crate::storage::atoll::sql::catalog::SCHEMA_ID && *id > 0
+                            *id != crate::storage::atoll::sql::mode::SCHEMA_ID && *id > 0
                         })
                     }
                     _ => None,

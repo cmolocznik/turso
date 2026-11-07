@@ -51,9 +51,7 @@ mod segment;
 mod waits;
 
 pub use reader::{LogReader, OwnedRecord, Rereader};
-pub use record::{
-    framed_len, GroupStart, Header, Kind, Lsn, Place, ALIGN, BLOCK, MAX_PAYLOAD, NO_GROUP,
-};
+pub use record::{framed_len, GroupStart, Header, Kind, Lsn, Place, BLOCK, MAX_PAYLOAD};
 
 use super::aligned::AlignedBlock;
 use super::buffer::{BufferPool, LentUse};
@@ -211,6 +209,7 @@ impl Log {
     /// the log again. The bytes between `end` and that boundary stay unreadable, so a reader
     /// starting before `end` stops there: the caller must not acknowledge anything appended until
     /// a checkpoint whose redo point is at or past [`Log::end`] is durable.
+    #[cfg(test)]
     pub fn open(io: Arc<dyn IO>, base: &str, config: LogConfig, end: Lsn) -> Result<Arc<Self>> {
         Self::open_with(io, base, config, end, |len| Ok(AlignedBlock::zeroed(len)))
     }
@@ -372,6 +371,7 @@ impl Log {
         self.room.durable()
     }
 
+    #[cfg(test)]
     pub fn durable_writes(&self) -> bool {
         self.durable_writes
     }
@@ -551,6 +551,7 @@ impl Log {
     /// together or not at all, so a change spanning several pages survives a crash whole or not
     /// at all. Returns where the group starts and each record's LSN. As with
     /// [`append`](Self::append), the caller holds the latch of every page the records change.
+    #[cfg(test)]
     pub fn append_group(
         self: &Arc<Self>,
         admitted: &mut Admitted,
@@ -562,6 +563,7 @@ impl Log {
 
     /// [`append_group`](Self::append_group), handing `reserved` where the group starts as
     /// [`append_with`](Self::append_with) does.
+    #[cfg(test)]
     pub fn append_group_with(
         self: &Arc<Self>,
         admitted: &mut Admitted,
@@ -1163,6 +1165,7 @@ impl Log {
 
     /// The group of this database's log that starts at `at`, read whole and checked: what a
     /// transaction's chain, or a superblock, names.
+    #[cfg(test)]
     pub fn read_group(
         io: Arc<dyn IO>,
         base: &str,

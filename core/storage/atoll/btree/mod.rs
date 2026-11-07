@@ -143,6 +143,7 @@ impl Near {
     }
 
     /// The leaf's page.
+    #[cfg(test)]
     pub fn page(self) -> Option<PageId> {
         self.0.map(|(pid, _)| pid)
     }
@@ -199,6 +200,7 @@ impl Tree {
 
     /// A new, empty temporary tree (DESIGN.md §6.4), whose nodes and values are temporary pages:
     /// no checkpoint writes it, and it does not outlive the process.
+    #[cfg(test)]
     pub fn create_temporary(pool: &Arc<BufferPool>, class: SizeClass) -> Result<IOResult<PageId>> {
         Self::create_in_at(pool, class, true, None, false)
     }
@@ -252,10 +254,6 @@ impl Tree {
         self.head = head;
         self.limits = self.limits.with_head(head);
         self
-    }
-
-    pub fn head(&self) -> usize {
-        self.head
     }
 
     /// The tree as a versioned tree's, whose leaves reserve: its head is a version header.
@@ -2054,6 +2052,7 @@ impl Put {
     }
 
     /// Tries `near` before a descent.
+    #[cfg(test)]
     pub fn near(mut self, near: Near) -> Self {
         self.near = near;
         self
@@ -2430,12 +2429,6 @@ impl Cursor {
     #[inline]
     pub fn next_batched(&mut self) -> bool {
         self.pending.is_none() && self.from_batch(true)
-    }
-
-    /// Whether the entry's value is out of line and unread: its value is the head and the
-    /// reference, as the leaf holds them.
-    pub fn unread(&self) -> bool {
-        self.unread
     }
 
     /// Stands at `key`, with no leaf to step from and its value unread: the next move seeks from

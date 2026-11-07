@@ -137,7 +137,7 @@ impl Db {
     /// What a crash left, recovered.
     fn recover(io: Arc<dyn IO>, roots: Roots) -> Self {
         let db = Atoll::open(io.clone(), BASE, config()).unwrap();
-        assert!(db.recovered_end().is_some(), "no recovery");
+        assert!(db.recovered(), "no recovery");
         Self::with(io, db, roots)
     }
 

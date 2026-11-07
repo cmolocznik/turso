@@ -13,8 +13,7 @@ use crate::storage::atoll::btree::{
     SHRINKS_HELD, SHRINKS_REFUSED, SPLITS_REFUSED,
 };
 use crate::storage::atoll::buffer::{
-    default_kept_bytes, BufferConfig, BufferPool, LentUse, FRAME_SHORTS, MIN_BUDGET, MIN_DB_BUDGET,
-    WRITEBACK_BYTES,
+    BufferConfig, BufferPool, LentUse, FRAME_SHORTS, MIN_BUDGET, MIN_DB_BUDGET, WRITEBACK_BYTES,
 };
 use crate::storage::atoll::checkpoint::{Checkpointing, WRITER_STEPS, WRITE_BYTES};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
@@ -561,7 +560,7 @@ fn a_roots_shrink_past_the_room_steps_the_checkpoint_itself_and_finishes_within_
 /// copy made then would pass the room's limit. The check fires with the page held exclusive and a
 /// metadata hold alive, so the panic passes their guards and ends the process (DESIGN.md 22.11):
 /// it runs in a child process.
-#[cfg(all(unix, not(miri)))]
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn a_change_that_asked_for_no_room_fails_the_invariant_check() {
     let ended = crate::storage::atoll::testing::in_child(
@@ -685,7 +684,7 @@ fn a_copy_that_finds_no_free_frame_takes_one_holding_nothing_and_goes_on() {
 /// no floor of a page of the largest class takes most of a small pool.
 #[test]
 fn the_room_of_the_smallest_database_is_an_eighth_of_its_budget() {
-    assert_eq!(default_kept_bytes(MIN_DB_BUDGET), MIN_DB_BUDGET / 8);
+    assert_eq!(super::default_limit(MIN_DB_BUDGET), MIN_DB_BUDGET / 8);
 }
 
 /// A budget whose smallest pool does not fit beside the log's ring, which the pool lends for as
@@ -821,6 +820,50 @@ fn a_waiter_woken_for_a_full_checkpoint_may_wait_again_from_its_wake() {
         }
     }
     drop(cp);
+}
+
+/// The ends of transactions waiting for a full checkpoint are woken once the checkpoint's state
+/// is let go: a waker that takes the state, from inside its wake on the checkpointing thread,
+/// finds it free.
+#[test]
+fn a_waiter_woken_for_a_full_checkpoint_may_take_the_checkpoint_state_from_its_wake() {
+    use std::sync::mpsc;
+    use std::task::{Wake, Waker};
+    struct Takes {
+        cp: Arc<crate::storage::atoll::checkpoint::Checkpointer>,
+        told: crate::storage::atoll::locks::Mutex<mpsc::Sender<bool>>,
+    }
+    impl Wake for Takes {
+        fn wake(self: std::sync::Arc<Self>) {
+            let took = self.cp.hold().is_some();
+            let _ = self.told.lock().send(took);
+        }
+    }
+    let db = Db::threaded();
+    let cp = db.db.checkpointer_arc().clone();
+    let held = cp.hold().expect("the state free");
+    let ticket = cp.request_full();
+    let IOResult::IO(IOCompletions(c)) = cp.step_full(ticket, db.db.transactions()).unwrap() else {
+        panic!("a full checkpoint done while its state was held");
+    };
+    let (told, woke) = mpsc::channel();
+    c.set_waker(&Waker::from(std::sync::Arc::new(Takes {
+        cp: cp.clone(),
+        told: crate::storage::atoll::locks::Mutex::new(told),
+    })));
+    drop(held);
+    // The database closes before any assertion: a panic while it is open would end the process at
+    // its close, an entry made while unwinding, rather than fail this test.
+    let Ok(took) = woke.recv_timeout(std::time::Duration::from_secs(60)) else {
+        // The checkpointing thread is stuck in the wake: closing would wait for it forever.
+        std::mem::forget((cp, db));
+        panic!("the waiter was never woken");
+    };
+    drop((cp, db));
+    assert!(
+        took,
+        "the waker found the checkpoint's state held: it was woken under the hold"
+    );
 }
 
 /// A checkpoint failing on the checkpointing thread is told to a transaction's end waiting on it

@@ -77,7 +77,7 @@ impl Batch {
 
     /// Names the batch's producer and its sequence there, by which a retry is told from a new
     /// batch.
-    pub fn from_producer(&mut self, producer: u64, sequence: u64) {
+    pub fn set_producer(&mut self, producer: u64, sequence: u64) {
         self.producer = producer;
         self.sequence = sequence;
     }
@@ -140,11 +140,6 @@ impl ReadBatch {
 
     pub fn count(&self) -> u32 {
         u32::from_le_bytes(self.payload[8..12].try_into().unwrap())
-    }
-
-    /// The times of its first and last messages.
-    pub fn times(&self) -> (u64, u64) {
-        (self.word(16), self.word(24))
     }
 
     /// Its producer and the producer's sequence.

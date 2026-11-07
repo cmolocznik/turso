@@ -58,7 +58,7 @@ mod tests;
 
 pub enum PageRead {
     /// A whole copy of the page.
-    Valid(Arc<Buffer>),
+    Valid,
     /// The page has no copy on disk, or its slot does not hold a whole copy of it.
     Invalid,
     Failed(CompletionError),
@@ -382,7 +382,7 @@ impl PageStore {
                 Ok((_, n)) => {
                     let whole = n as usize == class.size() && page::verify(keep.as_slice(), pid);
                     done(if whole {
-                        PageRead::Valid(keep.clone())
+                        PageRead::Valid
                     } else {
                         PageRead::Invalid
                     });

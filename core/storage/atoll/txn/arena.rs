@@ -217,6 +217,7 @@ impl Arenas {
     /// Appends to `txn`'s slot's arena what the write of `key` in the tree rooted at `root` by
     /// `txn`'s current statement replaces, `replaced` as a version index entry encodes it.
     /// Returns where the entry lies. Step it until done; an IO handed back appended nothing.
+    #[cfg(test)]
     pub fn append(
         &self,
         txn: &mut Txn,
@@ -374,12 +375,14 @@ impl Arenas {
     }
 
     /// The entry at `ptr`, and where its page's entry before it starts, 0 for none.
+    #[cfg(test)]
     fn read_with_before(&self, ptr: Ptr) -> Result<IOResult<(Entry, usize)>> {
         read_with_before(&self.pool, ptr)
     }
 
     /// The entry before `ptr` in its slot's arena, `None` at the arena's first. Step it until
     /// done.
+    #[cfg(test)]
     pub fn before(&self, ptr: Ptr) -> Result<IOResult<Option<Ptr>>> {
         let (_, before) = done!(self.read_with_before(ptr));
         if before != 0 {

@@ -122,11 +122,6 @@ impl Body {
         Ok(())
     }
 
-    /// Whether it holds no change.
-    pub fn is_empty(&self) -> bool {
-        self.parts.is_empty() && self.tail.is_empty()
-    }
-
     /// A body whose changes are `bytes`, held whole: a run's.
     pub fn whole(bytes: Vec<u8>) -> Self {
         Self {
@@ -136,6 +131,7 @@ impl Body {
     }
 
     /// Bytes of its changes.
+    #[cfg(test)]
     pub fn len(&self) -> u64 {
         self.parts.iter().map(|p| p.len).sum::<u64>() + self.tail.len() as u64
     }
@@ -284,6 +280,7 @@ impl Gather {
     }
 
     /// The transactions whose parts are kept with no Commit read yet.
+    #[cfg(test)]
     pub fn unfinished(&self) -> usize {
         self.spilled.len()
     }

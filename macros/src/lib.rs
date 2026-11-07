@@ -81,6 +81,7 @@
 //! | `turso_assert_sometimes_less_than_or_equal!` | `assert_sometimes!` | Never | Observational `left <= right` |
 
 extern crate proc_macro;
+mod atoll_entry;
 mod atomic_enum;
 mod codspeed;
 mod ext;
@@ -707,6 +708,13 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {
     trace_stack_impl::trace_stack_attribute(attr, input)
+}
+
+/// An entry into Atoll: its body runs in a frame that ends the process if a panic unwinds out of
+/// it, or if it is entered while one does (docs/internals/atoll/DESIGN.md 22.11).
+#[proc_macro_attribute]
+pub fn atoll_entry(attr: TokenStream, input: TokenStream) -> TokenStream {
+    atoll_entry::atoll_entry(attr, input)
 }
 
 /// Wrap a function body in an allocation-site scope.

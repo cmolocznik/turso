@@ -207,6 +207,7 @@ pub struct CutBytes {
 
 impl CutBytes {
     /// Bytes held now, and the most held.
+    #[cfg(test)]
     pub fn stats(&self) -> (usize, usize) {
         (
             self.used.load(Ordering::Acquire),
@@ -695,37 +696,6 @@ impl MetaCache {
         ids
     }
 
-    /// Checkpoint `n`'s edit of `frame`: `f` applied to the page as it stood at the cut, and to
-    /// the page as it stands too unless `cut_only`. `None` while a change holds the latch.
-    pub fn edit(
-        &self,
-        frame: &MetaFrame,
-        n: u64,
-        cut_only: bool,
-        f: impl Fn(&mut [u8]),
-    ) -> Option<()> {
-        debug_assert_eq!(self.cutting.load(Ordering::Acquire), n);
-        let hold = Held::try_take(&frame.latch)?;
-        if cut_only && frame.cut_for.load(Ordering::Acquire) != n {
-            *frame.cut.lock() = Some(CutCopy::new(frame.copy_bytes(), &self.cut_bytes));
-            frame.cut_for.store(n, Ordering::Release);
-        }
-        if frame.cut_for.load(Ordering::Acquire) == n {
-            f(frame.cut.lock().as_mut().expect("a page kept at the cut"));
-        }
-        if !cut_only {
-            let mut page = vec![0u8; META_PAGE];
-            frame.bytes.copy_to(0, &mut page);
-            f(&mut page);
-            // SAFETY: the hold has the latch exclusively while the writer lives.
-            unsafe { frame.bytes.writer() }.write(0, &page);
-        }
-        // The page as it stands differs from what `n` writes of it: written again by the next.
-        frame.changed(self);
-        drop(hold);
-        Some(())
-    }
-
     /// Marks `frame` owed a write: a checkpoint cut short may have written its other place, which
     /// the next checkpoint, taking the same number, must write over (audit 18, review 2).
     pub fn owe(&self, frame: &MetaFrame) -> Option<()> {
@@ -858,11 +828,13 @@ impl MetaCache {
     }
 
     /// Pages in the cache, held or not: their bytes are beyond the frames.
+    #[cfg(test)]
     pub fn resident(&self) -> usize {
         self.cells.count()
     }
 
     /// Bytes of the pages kept as a cut found them, now and at most.
+    #[cfg(test)]
     pub fn cut_stats(&self) -> (usize, usize) {
         self.cut_bytes.stats()
     }

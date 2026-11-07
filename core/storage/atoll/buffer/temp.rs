@@ -68,6 +68,7 @@ impl TempPages {
     }
 
     /// Bytes of the temporary pages allocated and not freed.
+    #[cfg(test)]
     pub fn live_bytes(&self) -> u64 {
         self.live.load(Ordering::Relaxed)
     }

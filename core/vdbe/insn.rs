@@ -2401,7 +2401,7 @@ pub enum Insn {
         cursor_id: CursorID,
         start_reg: usize,
         num_regs: usize,
-        guarded: crate::storage::atoll::txn::versioned::Guarded,
+        guarded: crate::storage::atoll::sql::mode::Guarded,
     },
 
     /// Atoll mode's walk for a foreign-key guard of a child table with no index on its key

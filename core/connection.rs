@@ -3225,7 +3225,7 @@ impl Connection {
                 schema_did_change: true
             }
         );
-        if let Some(ending) = atoll.end(false) {
+        if let Some(mut ending) = atoll.end(false) {
             if let Err(e) = ending.finish() {
                 tracing::error!("rolling back an Atoll transaction failed: {e}");
             }

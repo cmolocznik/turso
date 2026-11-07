@@ -137,6 +137,7 @@ impl<L: Deref<Target = VersionedLatch>> Held<L> {
     /// Releases a hold under which nothing was written, keeping the version, so readers are not
     /// sent back for nothing.
     pub fn release_unchanged(self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
         let this = ManuallyDrop::new(self);
         // SAFETY: `this` is never used or dropped again; the latch reference is dropped here.
         let latch = unsafe { std::ptr::read(&this.0) };
@@ -198,44 +199,87 @@ mod tests {
     /// which then panics: the child must end by abort, and the observer, recording what it sees to
     /// a synced file, must never have found the latch free. Were the guard to let it go, the
     /// holder's thread would end, the observer would find the latch free, and the child would exit.
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
     #[test]
     fn a_panic_while_holding_the_latch_ends_the_process_before_it_is_let_go() {
-        use crate::storage::atoll::testing::{in_child, record, recorded};
-        use crate::sync::Arc;
-        let ended = in_child(
+        let ended = crate::storage::atoll::testing::in_child(
             concat!(
                 module_path!(),
                 "::a_panic_while_holding_the_latch_ends_the_process_before_it_is_let_go"
             ),
-            || {
-                let latch = Arc::new(VersionedLatch::default());
-                let (held, watched) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
-                let holder = {
-                    let latch = latch.clone();
-                    let (held, watched) = (held.0, watched.1);
-                    std::thread::spawn(move || {
-                        let _hold = Held::try_take(latch).unwrap();
-                        held.send(()).unwrap();
-                        watched.recv().unwrap();
-                        panic!("a holder failed");
-                    })
-                };
-                held.1.recv().unwrap();
-                let observer = std::thread::spawn(move || {
-                    record("seen", "watching");
-                    watched.0.send(()).unwrap();
-                    while latch.optimistic().is_none() {
-                        std::thread::yield_now();
-                    }
-                    record("seen", "free");
-                });
-                let _ = holder.join();
-                observer.join().unwrap();
-            },
+            || holder_panics(false),
         );
+        ended_before_the_latch_was_free(ended);
+    }
+
+    /// The same, the hold handed back unchanged by a destructor the panic runs: a release other
+    /// than the hold's own drop checks too.
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+    #[test]
+    fn a_hold_handed_back_unchanged_while_unwinding_ends_the_process_before_it_is_let_go() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_hold_handed_back_unchanged_while_unwinding_ends_the_process_before_it_is_let_go"
+            ),
+            || holder_panics(true),
+        );
+        ended_before_the_latch_was_free(ended);
+    }
+
+    /// A test's holder that hands its hold back unchanged from its drop.
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+    struct HandsBack(Option<Held<crate::sync::Arc<VersionedLatch>>>);
+
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+    impl Drop for HandsBack {
+        fn drop(&mut self) {
+            if let Some(hold) = self.0.take() {
+                hold.release_unchanged();
+            }
+        }
+    }
+
+    /// In the child: a thread takes the latch, holding it as itself or through [`HandsBack`], and
+    /// panics once an observer watches the latch; the observer records whether it ever reads free.
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+    fn holder_panics(hands_back: bool) {
+        use crate::storage::atoll::testing::record;
+        use crate::sync::Arc;
+        let latch = Arc::new(VersionedLatch::default());
+        let (held, watched) = (std::sync::mpsc::channel(), std::sync::mpsc::channel());
+        let holder = {
+            let latch = latch.clone();
+            let (held, watched) = (held.0, watched.1);
+            std::thread::spawn(move || {
+                let hold = Held::try_take(latch).unwrap();
+                let _hold = if hands_back {
+                    (None, Some(HandsBack(Some(hold))))
+                } else {
+                    (Some(hold), None)
+                };
+                held.send(()).unwrap();
+                watched.recv().unwrap();
+                panic!("a holder failed");
+            })
+        };
+        held.1.recv().unwrap();
+        let observer = std::thread::spawn(move || {
+            record("seen", "watching");
+            watched.0.send(()).unwrap();
+            while latch.optimistic().is_none() {
+                std::thread::yield_now();
+            }
+            record("seen", "free");
+        });
+        let _ = holder.join();
+        observer.join().unwrap();
+    }
+
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+    fn ended_before_the_latch_was_free(ended: Option<crate::storage::atoll::testing::Ended>) {
         let Some(ended) = ended else { return };
-        let seen = recorded(&ended, "seen");
+        let seen = crate::storage::atoll::testing::recorded(&ended, "seen");
         assert!(
             ended.aborted,
             "the child did not abort: {:?}\n{}",

@@ -53,10 +53,12 @@ impl TreeStamps {
         self.map.lock().remove(&root);
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.lock().len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

@@ -1694,7 +1694,7 @@ work says which parts are done.
     retention (built: `stream.rs`); then segment index files, the stream's memory budget, the
     catalog in trees, transactions with streams, and consumer and producer state.
 13. **The executor** (section 22): designed on 2026-11-06 and revised after seven audits; built
-    through step 1 of its own order of work, 22.16.
+    through step 2 of its own order of work, 22.16.
 
 ## 21. Streams (Clay's spec of 2026-11-06)
 
@@ -1988,7 +1988,9 @@ registers a waker on a completion while it holds an executor mutex.
    - The checkpoint's state, an integrity check's hold of it, and the maintenance gate (22.9 item 3)
      are guarded states. The checkpoint's `wake_waiters`, whose waiters are completions with
      arbitrary wakers, takes the list into a local and completes it with no lock held (the guard
-     once taken in a `for` loop's expression lived for the loop).
+     once taken in a `for` loop's expression lived for the loop). A step that moves what they wait
+     for only marks its hold of the state as owing them a wake; the hold wakes them as it is let go,
+     after the state, so a waker may take the state itself.
 - **No timers** (section 7.3). Every wait is a completion, a signal or a guarded state. Pacing,
   where a job has one, counts arrivals (22.9 item 3). Foreground timeouts (a busy timeout) and
   future leases keep their own clocks; they are not the executor's. A simulator's delayed IO
@@ -2555,19 +2557,26 @@ The executor changes who runs each transition, never its order or its meaning:
   of the process; a native abort build never unwinds at all. Every lock that protects Atoll's
   shared state is one of Atoll's own: its latches and gates, and its wrappers of parking_lot's and
   std's mutexes, read-write locks and condition variables, the executor's queue, signal and
-  contender mutexes included, each of whose guards makes the same check before it releases. A
-  census test lists every type in Atoll with such a destructor and fails on one without the check,
-  and on any parking_lot or std lock type used in `core/storage/atoll` outside the wrapper module.
-  It resolves types, not spellings: `crate::sync`'s re-exports (its `Mutex` and `RwLock` and their
-  `Arc` guards) and any further re-export count as the types they name, and no wrapper method (a
-  `try_lock`, a mapped or `Arc` guard, a read or write guard, a condition variable's wait) hands out
-  the unchecked guard beneath.
-  (Built: `unwind.rs`, `locks.rs` and their censuses. The destructor census lists the 41 destructors
-  in Atoll: 22 checking, one of them written once for the three lock guards, and 19 that let go only
-  what they own or keep memory alive without guarding a change, each with its reason. The lock
-  census is `clippy::disallowed_types`, denied in Atoll by `core/clippy.toml`, which resolves a path
-  or re-export to the type it names, and a test that scans Atoll's source, including for the aliases
-  of a lock the rest of the crate defines.)
+  contender mutexes included, each of whose guards makes the same check before it releases. The
+  abort itself takes no lock and writes nothing first: a write to stderr takes its lock, which
+  another thread may hold while it waits for the panicking one, and the process would never end. A
+  census test lists every type in Atoll with such a destructor and fails on one without the check.
+  A second lists every function that calls a release primitive (each `unlock*` of the latch, the
+  drop of a lock's inner guard) and fails on one that does not check first, so a release other than
+  a destructor, a latch handed back unchanged among them, checks too. No method of a lock wrapper
+  (a `try_lock`, a read or write guard, a trait's method such as formatting) reaches the lock
+  beneath but to wrap the guard it takes at once in a checked one, by a census of `locks.rs`:
+  formatting a lock's value takes the checked guard. Two mechanisms keep every other lock out of
+  Atoll. `clippy::disallowed_types`, denied in Atoll by `core/clippy.toml`, resolves a path to the
+  item it names: a name brought in, `crate::sync`'s re-exports among them, to the lock it names, but
+  a type alias to the alias, known by the path that defines it. So the file lists the lock and guard
+  types of parking_lot and std and every alias of one that Atoll could name, and a test that follows
+  aliases of aliases and names brought in under new ones, to a fixpoint, fails on one not listed. A
+  second test scans Atoll's source for the spellings.
+  (Built: `unwind.rs`, `locks.rs` and their censuses, with a child-process test of each check: a
+  panic under a latch, a hold handed back unchanged while unwinding, a panic under a lock, a lock's
+  value whose formatting panics, a guarded state, and the abort while another thread holds stderr
+  and waits for the panicking one.)
 - **The check is exact because no Atoll frame is entered while its thread unwinds.** Every entry
   into Atoll is a frame (below), and a frame entered while `std::thread::panicking()` is true (an
   application's unwind dropping a connection with an Atoll transaction open, a statement holding
@@ -2577,24 +2586,45 @@ The executor changes who runs each transition, never its order or its meaning:
   an unwind is always one a panic is passing through.
 - **Frames, for a panic that holds no guard.** A panic between two guards (a change applied and
   logged under its latch, the latch let go, and the panic before what the change leaves to collect
-  is recorded, section 7.5) leaves state out of step without any guard held. Every entry is
-  written with one macro, `atoll_entry!`, which makes its body `atoll_frame(move || ...)`: an armed
-  abort guard defused only after the closure has returned. Closure capture follows use, so the
-  macro opens the closure by rebinding every parameter the method owns by value, `self` included
-  (`let a = a;`), whether the body uses it, only borrows it or ignores it; every owned parameter,
-  capture and local is then dropped inside the frame. A parameter taken by reference is the
-  caller's, dropped in the caller's code after the call. A `Result::Err` returns normally and
-  defuses the guard. The entries: each step of a
-  statement on an Atoll database; each method of Atoll's facade (`AtollDb`, `Atoll`, a stream
-  partition), its `Drop` included, whose fields are held so that they are dropped inside the frame
-  (the facade owns its state through one inner value its `Drop` takes and drops inside the frame); a
-  runner's step and `run_one`; each delivery on any backend, from the callback through the result's
-  publication and the wakes to the request's retirement (22.5); opening, recovery and close.
-- **The facade returns no Atoll code to run later.** What it returns is plain data, or a value
-  whose every method, `Drop` included, is itself a facade entry (a stream read's iterator is one:
-  each `next` runs in a frame). Below the facade Atoll's types are crate-private. A census test
-  lists the facade's types, methods and trait implementations and fails on any not written with
-  `atoll_entry!`.
+  is recorded, section 7.5) leaves state out of step without any guard held. Every entry carries
+  `#[turso_macros::atoll_entry]`, which opens its body with `let __atoll_frame =
+  unwind::Frame::enter();`: entering aborts if the thread already unwinds, and the frame, a guard
+  dropped last, aborts if a panic unwinds out of the body. The attribute moves every parameter the
+  method owns by value into a local declared after the frame, bound by the parameter's own pattern
+  (`_` and `mut` included), whether the body uses it, only borrows it or ignores it, so it drops
+  inside the frame; the body's value is bound to a local too, so the temporaries of its last
+  expression drop inside it. The names it adds are hygienic, so no parameter of the method can
+  shadow one or be shadowed by one. A receiver taken by value would drop after the frame, and an
+  `async fn`'s future owns its parameters before the frame is entered; both are refused when the
+  code compiles. A parameter taken by reference is the caller's, dropped in the caller's
+  code after the call. `return`, `?` and an ordinary error keep their meaning. A facade type that
+  owns Atoll state drops it inside a frame: its `Drop` is an entry, and its last field is an
+  `unwind::FrameEnd`, which, dropped after every other field, aborts if one of their drops panicked.
+  The entries: every method, trait method and destructor of the facade (`AtollDb`'s `open` and
+  `Drop`; `ConnTxn`; `SqlCursor`; the operations the VDBE holds across steps, `Ending`, `CreateOp`
+  and `RetireOp`; `RefusingStorage`) and its functions (`probe`, `config_for`, `tree_id`,
+  `full_checkpoint`, `drive`), through which alone a statement's step reaches Atoll; the
+  checkpointing thread's loop; and, as the executor is built, a runner's step and `run_one`, and
+  each delivery on any backend, from the callback through the result's publication and the wakes to
+  the request's retirement (22.5). Opening and recovery are `AtollDb::open`, close its `Drop`.
+  `Atoll` and a stream partition are reached from no code outside Atoll yet, so they are not facade:
+  a stream partition becomes one with its first caller outside Atoll. Until its consumer, the
+  stream catalog, is built, `stream` is compiled for tests alone, as is `floors` until the
+  collector: a production build carries only what production calls, and an item whose only callers
+  are tests is compiled for tests alone.
+- **The facade returns no Atoll code to run later.** What it returns is plain data or a facade value
+  (a `SqlCursor`, an `Ending`, the `AtollDb` whose accessors of Atoll's parts are `pub(in
+  crate::storage::atoll)`, as are the facade types' other internals, so code elsewhere in the crate
+  cannot reach them). Below the facade every module is Atoll's own: its root makes none public but
+  `db` and `sql`, and `sql` none but `mode`, so the compiler refuses a path from outside into any
+  other, however it is spelled or grouped. The plain data defined elsewhere in Atoll that the facade
+  passes (`Statement`, `Guarded`, `GuardKey`, `SCHEMA_ID`) is brought into `sql::mode` and named
+  there. A census test reads those modules' files: every item in them open to code outside Atoll
+  (`pub`, `pub(crate)`, a path above Atoll) is a facade type, plain data, a function that is an
+  entry, or a name of one brought in; every such method of a facade type, every trait method and
+  destructor of one is an entry; a facade type owning Atoll state has its frame's end as its last
+  field; and no signature, open field or variant there names a type of Atoll's but the facade's and
+  plain data, so nothing the facade hands out reaches Atoll's internals.
   Tests inside the crate that call Atoll's internals directly run without frames, as today. A
   guard's check does not depend on a frame, so a test whose panic unwinds past a checked guard ends
   the process: it runs in a child process and expects the abort before the guard lets go. Today's
@@ -2826,32 +2856,39 @@ compose, the real `Completion`, latch and backends included where named.
    first error).
 8. **Releases.** (a) A compile-fail test that the guarded state has no other accessor. (b) A release
    lets go, then wakes contenders only (mutants: wake before release; no wake; a holder woken by
-   its own release). (c) The checkpoint's waiters, completions with arbitrary wakers, are woken with
-   no lock held, and a waker that waits for a full checkpoint again does not block (mutant: the
-   waiters' mutex held through the loop).
+   its own release, whether it held at its second try or at its first while still listed from an
+   earlier call). (c) The checkpoint's waiters, completions with arbitrary wakers, are woken with
+   no lock held: a waker that waits for a full checkpoint again does not block (mutant: the
+   waiters' mutex held through the loop), and one that takes the checkpoint's state finds it free
+   (mutant: the waiters woken by the step, under the state's hold).
 9. **A panic ends the process before anything it left can be read.** Each in a child process the
-   test spawns, with the real latch and guards, the parent then reopening the database and
-   comparing it with the model. The child ends by abort, and an observer thread in it, which
-   records to a file and syncs whatever it sees, has seen nothing between the panic and the abort:
-   no latch the panicking thread held free, no gate open, no room given back, no contender woken
-   (mutant: an abort only at the outer frame, which lets the inner guards go first; a wrapper that
-   cleans up before its latch's check). Cases: a panic inside a statement's step, a facade method
-   and its `Drop` (a field whose drop panics), a facade iterator's `next`, a runner's step,
-   `run_one`, a delivery on the ring (in the callback, and in a waker after it), a pumped step,
-   opening, recovery and close; a panic in a local dropped after the frame's last statement, in a
-   capture, and in an owned parameter the body ignores (mutant: the plain `move ||` spelling, whose
-   closure does not capture an ignored parameter, so it drops after the frame) and one it only
-   borrows (a positive control: a `move` closure captures a parameter it borrows), with a borrowed
-   `&T` whose drop runs in the caller after the call, outside the rule; a panic past a checked guard
-   in a test without a frame (mutant: the check made only inside a frame); a panic holding one of
-   the executor's own mutexes and a parking_lot lock wrapped by Atoll (mutant: a raw parking_lot
-   guard, which lets the state go before the abort); an embedder's waker that panics; an
-   application's unwind dropping a connection with an Atoll transaction open, which aborts on entry
-   (mutant: the entry let through, its guards then unable to tell the old unwind from a new one). A
-   `Result::Err` through every frame returns normally (mutant: a frame that aborts on an error). The
-   census tests fail on a destructor that releases shared state without the check, and on a facade
-   type, method or trait implementation without its frame. A `catch_unwind` inside Atoll fails a
-   census too.
+   test spawns, with the real latch and guards, the parent then reopening the database and comparing
+   it with the model. The child ends by abort, and an observer thread in it, which records to a file
+   and syncs whatever it sees, has seen nothing between the panic and the abort: no latch the
+   panicking thread held free, no gate open, no room given back, no contender woken (mutant: an
+   abort only at the outer frame, which lets the inner guards go first; a wrapper that cleans up
+   before its latch's check). Cases: a panic inside a statement's step, a facade method and its
+   `Drop` (a field whose drop panics), a facade iterator's `next`, a runner's step, `run_one`, a
+   delivery on the ring (in the callback, and in a waker after it), a pumped step, opening, recovery
+   and close; a panic in a local dropped after the frame's last statement, in a capture, and in an
+   owned parameter the body ignores (mutant: the attribute leaving a `_` parameter unbound, so it
+   drops after the frame) and one it only borrows, and one beside a parameter named as the attribute
+   names its own (mutant: names that are not hygienic, so the parameter is never moved), with a borrowed `&T` whose drop runs in the
+   caller after the call, outside the rule; a panic past a checked guard in a test without a frame
+   (mutant: the check made only inside a frame); a panic holding one of the executor's own mutexes
+   and a parking_lot lock wrapped by Atoll (mutant: a raw parking_lot guard, which lets the state go
+   before the abort); a latch handed back unchanged while unwinding (mutant: the release without the
+   check); a lock's value whose formatting panics (mutant: formatting through the raw lock); the
+   abort while another thread holds stderr and joins the panicking one (mutant: a message written
+   before the abort, which waits on stderr for ever); an embedder's waker that panics; an application's unwind dropping a connection
+   with an Atoll transaction open, which aborts on entry (mutant: the entry let through, its guards
+   then unable to tell the old unwind from a new one). A `Result::Err` through every frame returns
+   normally (mutant: a frame that aborts on an error). The census tests fail on a destructor that
+   releases shared state without the check, on a release path without it, on a wrapper method that
+   reaches its raw lock, on an alias of a lock, at any depth, missing from the lint's list, and on a
+   facade type, method (`pub(crate)` ones included) or trait implementation without its frame, or a
+   facade signature handing out an Atoll type. A path from outside into one of Atoll's own modules
+   does not compile. A `catch_unwind` inside Atoll fails a census too.
 10. **A quiet backlog drains.** Inline and background collection racing with no begin after
     (mutant: a claim lost read as nothing to do); a page linked into a slot that already had credit
     (mutant: woken only when credit rises from zero); each part of the cutoff changing alone, with
@@ -2886,15 +2923,13 @@ compose, the real `Completion`, latch and backends included where named.
 
 1. **`StateHold` (built, a92a1d667), then its amendments (built)**: `Guarded` with the state
    reachable only through it, contenders woken under their mutex instead of the thread,
-   `wake_waiters` waking its completions with no lock held; proof 8.
+   `wake_waiters` waking its completions with no lock held, the state let go first; proof 8.
 2. **The panic boundary** (22.11): the check in every destructor that releases shared state, every
-   lock in Atoll on its own wrappers, with their census; `atoll_entry!` on every entry, an entry
-   made while unwinding aborting; the facade with crate-private types behind it, returning no Atoll
-   code to run later, with its census; no `catch_unwind` in Atoll; the tests that panic past a
+   lock in Atoll on its own wrappers, with their census; `#[atoll_entry]` on every entry, an entry
+   made while unwinding aborting; the facade, every other module Atoll's own behind it, returning no
+   Atoll code to run later, with its census; no `catch_unwind` in Atoll; the tests that panic past a
    checked guard moved to child processes, with their census; section 7.5's new rule; proof 9.
-   Before the delivery thread, whose deliveries it frames, and before any job moves. The checks, the
-   locks, their censuses and the tests in child processes are built; the frames and the facade are
-   not.
+   Before the delivery thread, whose deliveries it frames, and before any job moves. Built.
 3. **Delivering the IO**: the log's interim adapter first, with its preparation word, completions
    that mean call again and the census of their callers, so no callback does file work from this
    step on; a completion's three ownership states and a group's aggregate over its physical requests

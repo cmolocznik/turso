@@ -17,8 +17,8 @@
 //! Reads (the header, the catalog) are driven to their end here: a read waits only on IO, never
 //! on another transaction. Writes wait on other transactions, so they come back to the VDBE.
 
-use super::catalog::{self, Catalog, Entry, Layout, System, SCHEMA_ID};
-use super::cursor::{AtollCursor, GuardKey, TxnCell};
+use super::catalog::{self, Catalog, Entry, Layout, System};
+use super::cursor::{AtollCursor, TxnCell};
 use super::header::{Field, Header};
 use super::key;
 use super::lifecycle::Destroy;
@@ -32,10 +32,15 @@ use crate::storage::atoll::buffer::MIN_DB_BUDGET;
 use crate::storage::atoll::control::{self, Found};
 use crate::storage::atoll::db::AtollConfig;
 use crate::storage::atoll::drive;
+// Plain data the facade passes in or out, defined where Atoll uses it and named through here.
+pub(crate) use super::catalog::SCHEMA_ID;
+pub(crate) use super::cursor::GuardKey;
+pub(crate) use crate::storage::atoll::txn::versioned::Guarded;
+pub(crate) use crate::storage::atoll::txn::Statement;
 use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::page::PageId;
-use crate::storage::atoll::txn::versioned::{Get, Guard, Guarded, Write, WriteOp};
-use crate::storage::atoll::txn::{Abort, Blocker, Commit, Hold, Isolation, Statement, Taken, Txn};
+use crate::storage::atoll::txn::versioned::{Get, Guard, Write, WriteOp};
+use crate::storage::atoll::txn::{Abort, Blocker, Commit, Hold, Isolation, Taken, Txn};
 use crate::storage::btree::{BTreeKey, CursorTrait};
 use crate::storage::database::DatabaseStorage;
 use crate::storage::database::IOContext;
@@ -78,6 +83,7 @@ pub enum Probed {
 /// What the file at `path` holds, read through a descriptor that takes no lock and is closed
 /// before this returns. The caller probes only while no database of the path is open in the
 /// process: closing a descriptor drops every lock the process holds on the file (R17).
+#[turso_macros::atoll_entry]
 pub fn probe(io: &Arc<dyn IO>, path: &str) -> Result<Probed> {
     let file = match io.open_file(path, OpenFlags::ReadOnly, false) {
         Ok(file) => file,
@@ -115,6 +121,7 @@ fn holds_anything(io: &Arc<dyn IO>, path: &str) -> Result<bool> {
 /// The configuration an Atoll database opens with: the caller's, or for one opened without the
 /// option, Turso's default page cache, 2000 KiB (`cache_size` −2000), raised to the smallest
 /// budget a database takes, the pool with its log's ring (R26).
+#[turso_macros::atoll_entry]
 pub fn config_for(option: Option<&AtollConfig>) -> AtollConfig {
     option
         .cloned()
@@ -135,10 +142,12 @@ fn refused() -> LimboError {
 pub struct RefusingStorage;
 
 impl DatabaseStorage for RefusingStorage {
+    #[turso_macros::atoll_entry]
     fn read_header(&self, _c: Completion) -> Result<Completion> {
         Err(refused())
     }
 
+    #[turso_macros::atoll_entry]
     fn read_page(
         &self,
         _page_idx: usize,
@@ -148,6 +157,7 @@ impl DatabaseStorage for RefusingStorage {
         Err(refused())
     }
 
+    #[turso_macros::atoll_entry]
     fn write_page(
         &self,
         _page_idx: usize,
@@ -158,6 +168,7 @@ impl DatabaseStorage for RefusingStorage {
         Err(refused())
     }
 
+    #[turso_macros::atoll_entry]
     fn write_pages(
         &self,
         _first_page_idx: usize,
@@ -169,14 +180,17 @@ impl DatabaseStorage for RefusingStorage {
         Err(refused())
     }
 
+    #[turso_macros::atoll_entry]
     fn sync(&self, _c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         Err(refused())
     }
 
+    #[turso_macros::atoll_entry]
     fn size(&self) -> Result<u64> {
         Ok(PAGE as u64)
     }
 
+    #[turso_macros::atoll_entry]
     fn truncate(&self, _len: usize, _c: Completion) -> Result<Completion> {
         Err(refused())
     }
@@ -419,7 +433,7 @@ pub enum Begin {
 /// fields it wrote, by statement.
 pub struct ConnTxn {
     db: Arc<AtollDb>,
-    pub cell: TxnCell,
+    pub(in crate::storage::atoll) cell: TxnCell,
     /// Each header field written: the statement that wrote it and its word.
     written: Mutex<Vec<(Statement, Field, u32)>>,
     /// A header write under way, kept across IO and waits.
@@ -447,6 +461,8 @@ pub struct ConnTxn {
     /// and the header's changes when it read it. Its own while the header counts no change, as a
     /// catalog row is ([`Known`]).
     fields: Mutex<[Option<(u32, (u16, u64), u64)>; 7]>,
+    /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 /// What a connection's cursors learned of one tree: its catalog row as a transaction read it, and
@@ -537,7 +553,7 @@ const CHANGE_SLOTS: usize = 256;
 /// replaced is bound to the new tree. Each change takes the next epoch; a slot keeps, per tree
 /// falling into it, the epoch of its last row change and of its last Clear. A Destroy changes
 /// nothing a cursor reads: it stays on the tree it opened (R22).
-pub struct TreeChanges {
+pub(in crate::storage::atoll) struct TreeChanges {
     epoch: AtomicU64,
     /// The epoch of the last rollback of statements, which may have changed any tree.
     rolled_back: AtomicU64,
@@ -619,6 +635,7 @@ impl TreeChanges {
 
 /// The Atoll tree id Turso holds as a root page (DESIGN.md §17): ids are positive, from 1,
 /// `sqlite_schema`.
+#[turso_macros::atoll_entry]
 pub fn tree_id(root: i64) -> Result<u64> {
     u64::try_from(root)
         .ok()
@@ -639,12 +656,14 @@ impl ConnTxn {
     /// The page arm of `PRAGMA integrity_check`, in the transaction's current statement, which
     /// holds the write gate exclusive (DESIGN.md §17, §12, R36): what it found wrong, at most
     /// `max` of it.
+    #[turso_macros::atoll_entry]
     pub fn check_pages(&self, max: usize) -> Result<Vec<String>> {
         let mut guard = self.cell.lock();
         let txn = guard.as_mut().ok_or_else(outside)?;
         self.db.check_pages(txn, max)
     }
 
+    #[turso_macros::atoll_entry]
     pub fn new(db: Arc<AtollDb>) -> Self {
         Self {
             db,
@@ -661,6 +680,7 @@ impl ConnTxn {
             stamped: Arc::new(Mutex::new(HashMap::default())),
             known: Arc::new(Mutex::new(HashMap::default())),
             fields: Mutex::new([None; 7]),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
 
@@ -668,6 +688,7 @@ impl ConnTxn {
     /// and `sqlite_schema` are read in one view, and so is every row the reparse reads after them,
     /// its nested statements' among them, which begin no transaction of their own (DESIGN.md §17,
     /// §6). The statements it runs read in it and do not end it; [`unpin`](Self::unpin) does.
+    #[turso_macros::atoll_entry]
     pub fn pin(&self) -> Result<()> {
         if self.pinned.swap(true, Ordering::AcqRel) {
             return Err(LimboError::InternalError(
@@ -683,6 +704,7 @@ impl ConnTxn {
 
     /// Lets go of the reparse's transaction: ended here if the reparse began it; one the caller
     /// had open before goes on.
+    #[turso_macros::atoll_entry]
     pub fn unpin(&self) -> Result<()> {
         if !self.pinned.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -691,13 +713,14 @@ impl ConnTxn {
             return Ok(());
         }
         match self.end(true) {
-            Some(ending) => ending.finish(),
+            Some(mut ending) => ending.finish(),
             None => Ok(()),
         }
     }
 
     /// SAVEPOINT: records where the transaction stands, at no statement when none has begun, as a
     /// deferred transaction's first read begins it.
+    #[turso_macros::atoll_entry]
     pub fn open_savepoint(&self, name: String, starts_transaction: bool, deferred_fk: isize) {
         let at = self.cell.lock().as_ref().map_or(0, Txn::command);
         self.savepoints.lock().push(Savepoint {
@@ -710,6 +733,7 @@ impl ConnTxn {
 
     /// RELEASE: forgets the newest savepoint of `name` and every one after it; releasing the
     /// outermost, when it began the transaction, commits it.
+    #[turso_macros::atoll_entry]
     pub fn release_savepoint(&self, name: &str) -> SavepointResult {
         let mut savepoints = self.savepoints.lock();
         let Some(i) = savepoints.iter().rposition(|s| s.name == name) else {
@@ -727,6 +751,7 @@ impl ConnTxn {
     /// ROLLBACK TO: rolls the transaction back to where the newest savepoint of `name` stood,
     /// which stays, and forgets every one after it. Returns the deferred foreign-key count to
     /// restore, `None` with no such savepoint.
+    #[turso_macros::atoll_entry]
     pub fn rollback_to_savepoint(&self, name: &str) -> Result<Option<isize>> {
         let (at, deferred_fk) = {
             let mut savepoints = self.savepoints.lock();
@@ -742,12 +767,14 @@ impl ConnTxn {
 
     /// From now on waits park until what is in the way ends, for the PostgreSQL frontend, whose
     /// waits are unbounded (R2, R34).
+    #[turso_macros::atoll_entry]
     pub fn park_waits(&self) {
         self.waits.bound.store(UNBOUNDED, Ordering::Release);
     }
 
     /// Bounds each wait by the client's busy timeout: it parks until then, and then comes back
     /// `Busy`; with none it comes back `Busy` at once, its edge still in the wait graph (R34).
+    #[turso_macros::atoll_entry]
     pub fn bound_waits(&self, timeout: Duration) {
         let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(UNBOUNDED - 1);
         self.waits
@@ -757,20 +784,24 @@ impl ConnTxn {
 
     /// Whether the last wait came back `Busy` having waited its bound: the busy handler then
     /// does not wait again. Taken: a second call reads false.
+    #[turso_macros::atoll_entry]
     pub fn take_wait_spent(&self) -> bool {
         self.waits.spent.swap(false, Ordering::AcqRel)
     }
 
+    #[turso_macros::atoll_entry]
     pub fn db(&self) -> &Arc<AtollDb> {
         &self.db
     }
 
     /// Whether a transaction is open.
+    #[turso_macros::atoll_entry]
     pub fn is_open(&self) -> bool {
         self.cell.lock().is_some()
     }
 
     /// Whether the open transaction has written.
+    #[turso_macros::atoll_entry]
     pub fn wrote(&self) -> bool {
         self.cell.lock().as_ref().is_some_and(Txn::wrote)
     }
@@ -778,6 +809,7 @@ impl ConnTxn {
     /// A cursor over the tree whose id Turso holds as the root page `root`, opened as OpenRead and
     /// OpenWrite open one: an index's or a WITHOUT ROWID table's with `index`, a rowid table's
     /// without.
+    #[turso_macros::atoll_entry]
     pub fn open_cursor(
         &self,
         pager: Arc<Pager>,
@@ -787,7 +819,22 @@ impl ConnTxn {
         SqlCursor::new(self, pager, tree_id(root)?, index).opened()
     }
 
+    /// [`open_cursor`](Self::open_cursor) for an index method's backing tree, whose writes fail
+    /// at once on another writer's key instead of waiting for it ([`SqlCursor::no_wait`]).
+    #[turso_macros::atoll_entry]
+    pub fn open_cursor_no_wait(
+        &self,
+        pager: Arc<Pager>,
+        root: i64,
+        index: Option<Arc<IndexInfo>>,
+    ) -> Result<SqlCursor> {
+        Ok(SqlCursor::new(self, pager, tree_id(root)?, index)
+            .opened()?
+            .no_wait())
+    }
+
     /// The snapshot timestamp of the open transaction's current statement, once it has one.
+    #[turso_macros::atoll_entry]
     pub fn snapshot(&self) -> Option<u64> {
         self.cell
             .lock()
@@ -800,6 +847,7 @@ impl ConnTxn {
     /// the write gate: shared, or exclusive for a statement writing the schema (DESIGN.md §17,
     /// §6). Behind another's take it comes back with the completion to wait on; stepping it again
     /// goes on. A take the gate lost to a victim's clearing is `Busy`.
+    #[turso_macros::atoll_entry]
     pub fn begin(&self, wants: Begin) -> Result<IOResult<()>> {
         self.begin_reading(wants, &[])
     }
@@ -809,6 +857,7 @@ impl ConnTxn {
     /// take with `BusySnapshot`, checked before it marks itself pending and again once it holds
     /// the gate (DESIGN.md §17, §3, defect 4). Its build or rewrite would read the tree at that
     /// snapshot and miss the rows committed since, as no write conflict tells.
+    #[turso_macros::atoll_entry]
     pub fn begin_reading(&self, wants: Begin, reads: &[u64]) -> Result<IOResult<()>> {
         let txns = self.db.atoll().transactions();
         if let Begin::Write { .. } = wants {
@@ -960,6 +1009,7 @@ impl ConnTxn {
     }
 
     /// Gives up a pending exclusive take, as a statement that stops waiting for it does (R15).
+    #[turso_macros::atoll_entry]
     pub fn give_up(&self) {
         if let Some(txn) = self.cell.lock().as_mut() {
             self.db.atoll().transactions().give_up(txn);
@@ -970,6 +1020,7 @@ impl ConnTxn {
 
     /// Starts the Atoll statement of a statement that writes: returns the number to roll back
     /// to if it fails (R18).
+    #[turso_macros::atoll_entry]
     pub fn start_statement(&self) -> Result<Statement> {
         let mut guard = self.cell.lock();
         let txn = guard.as_mut().ok_or_else(outside)?;
@@ -981,6 +1032,7 @@ impl ConnTxn {
     /// Rolls the open transaction back to where it stood after statement `n`, driven to its end
     /// here, at the synchronous sites that roll a statement back (R19), and forgets the header
     /// fields written since.
+    #[turso_macros::atoll_entry]
     pub fn rollback_statement(&self, n: Statement) -> Result<()> {
         let mut guard = self.cell.lock();
         let Some(txn) = guard.as_mut() else {
@@ -1005,6 +1057,7 @@ impl ConnTxn {
 
     /// The ending of the open transaction: its commit, or its rollback. `None` with none open, or
     /// while a schema reparse holds it.
+    #[turso_macros::atoll_entry]
     pub fn end(&self, commit: bool) -> Option<Ending> {
         if self.pinned.load(Ordering::Acquire) {
             return None;
@@ -1029,6 +1082,7 @@ impl ConnTxn {
     }
 
     /// The schema cookie: at the transaction's view, or committed outside one.
+    #[turso_macros::atoll_entry]
     pub fn schema_cookie(&self) -> Result<u32> {
         self.field(Field::SchemaCookie)
     }
@@ -1066,6 +1120,7 @@ impl ConnTxn {
     /// holds no pages: what reads them walks the pager's pages. `PRAGMA page_count` reads the page
     /// store ([`pages`](Self::pages)); `freelist_count` stays 0, which is so, Atoll keeping no free
     /// list in its files, a freed slot being erased and taken again.
+    #[turso_macros::atoll_entry]
     pub fn header(&self) -> Result<DatabaseHeader> {
         let mut words = [0u32; 7];
         for field in Field::ALL {
@@ -1077,6 +1132,7 @@ impl ConnTxn {
     /// The pages the page store holds in use (DESIGN.md §17, §12), every class's in node-size
     /// units, rounded up, as `PRAGMA page_count` reports them; past `u32::MAX`, the most a header
     /// word holds.
+    #[turso_macros::atoll_entry]
     pub fn pages(&self) -> Result<u32> {
         let store = self.db.atoll().store();
         let mut bytes: u64 = 0;
@@ -1092,6 +1148,7 @@ impl ConnTxn {
     /// current statement. Each field written is recorded for the commit to publish. A write behind
     /// another transaction comes back to wait; applying `f` again goes on, the fields already
     /// written reading as written.
+    #[turso_macros::atoll_entry]
     pub fn set_header<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> Result<IOResult<T>> {
         loop {
             let before = self.header()?;
@@ -1145,6 +1202,7 @@ impl ConnTxn {
     /// or pointed at a new, empty tree, and its old root listed as dropped, in the current
     /// statement. Step it with the same `op` until done; a Clear returns the rows the tree held at
     /// the view, which its statement counts as changed.
+    #[turso_macros::atoll_entry]
     pub fn retire_tree(
         &self,
         op: &mut Option<RetireOp>,
@@ -1155,6 +1213,7 @@ impl ConnTxn {
             destroy: Destroy::new(id),
             waiting: Waiting::default(),
             counted: None,
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         });
         if clear && op.counted.is_none() {
             op.counted = Some(self.count_rows(id)?);
@@ -1218,11 +1277,13 @@ impl ConnTxn {
     /// statement and writes its catalog row, an index's (or a WITHOUT ROWID table's, R29) or a
     /// table's. Step it with the same `op` until done; returns the tree id, which Turso calls the
     /// root page.
+    #[turso_macros::atoll_entry]
     pub fn create_btree(&self, op: &mut Option<CreateOp>, index: bool) -> Result<IOResult<u64>> {
         let op = op.get_or_insert_with(|| CreateOp {
             id: self.db.draw_tree_id(),
             root: None,
             write: None,
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         });
         let mut guard = self.cell.lock();
         let txn = guard.as_mut().ok_or_else(outside)?;
@@ -1266,10 +1327,13 @@ pub struct RetireOp {
     waiting: Waiting,
     /// For a Clear, the rows the tree held at the view.
     counted: Option<u64>,
+    /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 /// A full checkpoint (DESIGN.md §17, §11): one begun now, done, for `PRAGMA wal_checkpoint` and
 /// `Connection::checkpoint`. Driven to its end here, as a WAL checkpoint of the whole log is.
+#[turso_macros::atoll_entry]
 pub fn full_checkpoint(db: &AtollDb) -> Result<()> {
     let checkpointer = db.atoll().checkpointer();
     let ticket = checkpointer.request_full();
@@ -1292,6 +1356,27 @@ pub struct CreateOp {
     id: u64,
     root: Option<PageId>,
     write: Option<WriteOp>,
+    /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
+}
+
+/// A connection's transaction state dropped: inside a frame (DESIGN.md 22.11), its fields after
+/// it, the last ending it.
+impl Drop for ConnTxn {
+    #[turso_macros::atoll_entry]
+    fn drop(&mut self) {}
+}
+
+/// An operation's state the VDBE held, dropped inside a frame (DESIGN.md 22.11).
+impl Drop for CreateOp {
+    #[turso_macros::atoll_entry]
+    fn drop(&mut self) {}
+}
+
+/// An operation's state the VDBE held, dropped inside a frame (DESIGN.md 22.11).
+impl Drop for RetireOp {
+    #[turso_macros::atoll_entry]
+    fn drop(&mut self) {}
 }
 
 fn outside() -> LimboError {
@@ -1303,6 +1388,8 @@ fn outside() -> LimboError {
 pub struct Ending {
     db: Arc<AtollDb>,
     step: Step,
+    /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 enum Step {
@@ -1333,6 +1420,7 @@ impl Ending {
         Self {
             db,
             step: Step::Commit(commit),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
 
@@ -1342,14 +1430,17 @@ impl Ending {
             return Self {
                 db,
                 step: Step::Drain,
+                _frame: crate::storage::atoll::unwind::FrameEnd::default(),
             };
         }
         Self {
             db,
             step: Step::Rollback(Abort::new(txn)),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
 
+    #[turso_macros::atoll_entry]
     pub fn step(&mut self) -> Result<IOResult<()>> {
         let txns = self.db.atoll().transactions();
         loop {
@@ -1396,13 +1487,15 @@ impl Ending {
     }
 
     /// Drives the ending to its end, for the synchronous sites that end a transaction.
-    pub fn finish(mut self) -> Result<()> {
+    #[turso_macros::atoll_entry]
+    pub fn finish(&mut self) -> Result<()> {
         let io = self.db.io().clone();
         drive(&io, || self.step())
     }
 }
 
 impl std::fmt::Debug for Ending {
+    #[turso_macros::atoll_entry]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let step = match self.step {
             Step::Commit(_) => "committing",
@@ -1416,8 +1509,8 @@ impl std::fmt::Debug for Ending {
 }
 
 impl Drop for Ending {
+    #[turso_macros::atoll_entry]
     fn drop(&mut self) {
-        crate::storage::atoll::unwind::abort_if_unwinding();
         if matches!(self.step, Step::Done) {
             return;
         }
@@ -1466,12 +1559,14 @@ pub struct SqlCursor {
     /// The catalog row of its tree it last went by, which holds as the connection's [`Known`]
     /// row does: its statement's next execution takes it up with no lookup.
     row: Option<KnownRow>,
+    /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 /// A cursor leaves the leaf it stood at to the next over its tree.
 impl Drop for SqlCursor {
+    #[turso_macros::atoll_entry]
     fn drop(&mut self) {
-        crate::storage::atoll::unwind::abort_if_unwinding();
         if let Some(cursor) = &self.open {
             self.known.lock().entry(self.id).or_default().near = cursor.near();
         }
@@ -1488,6 +1583,7 @@ enum Counting {
 impl SqlCursor {
     /// A cursor over tree `id` in `ct`'s transaction. `index` describes an index's or WITHOUT
     /// ROWID table's keys.
+    #[turso_macros::atoll_entry]
     pub fn new(ct: &ConnTxn, pager: Arc<Pager>, id: u64, index: Option<Arc<IndexInfo>>) -> Self {
         Self {
             db: ct.db.clone(),
@@ -1511,6 +1607,7 @@ impl SqlCursor {
             unseen: false,
             known: ct.known.clone(),
             row: None,
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
 
@@ -1520,6 +1617,7 @@ impl SqlCursor {
     /// after the snapshot is `WriteWriteConflict`, which an autocommit statement restarts on. Done,
     /// the newest version is one the snapshot sees, or there is none, so the read that follows
     /// answers as it would have.
+    #[turso_macros::atoll_entry]
     pub fn probe(&mut self, key: GuardKey<'_>) -> IOResultOr<()> {
         use crate::storage::atoll::txn::versioned::Probe;
         if self.vacant {
@@ -1547,6 +1645,7 @@ impl SqlCursor {
     /// From now on the cursor rewinds and moves on over the versions its statement does not see
     /// that hold their key, as rows (FkUnseen): the scan of R10's guard of a child table with no
     /// index on its foreign key, which compares each as the probe compares a row.
+    #[turso_macros::atoll_entry]
     pub fn walk_unseen(&mut self) {
         self.unseen = true;
         if let Some(open) = self.open.as_mut() {
@@ -1557,6 +1656,7 @@ impl SqlCursor {
     /// The guard's judgment of the unseen version the cursor rests on, which its scan matched
     /// (FkGuardRow): a wait on its writer as a write's, on the same edge, while that is open, and
     /// `WriteWriteConflict` once it has committed.
+    #[turso_macros::atoll_entry]
     pub fn unseen_hit(&mut self) -> IOResultOr<()> {
         if self.vacant {
             return Ok(IOResult::Done(()));
@@ -1630,7 +1730,7 @@ impl SqlCursor {
     /// The cursor, whose writes meeting another transaction's open version fail at once with
     /// `WriteWriteConflict`, changing nothing, as MVCC's do: an index method's, written against
     /// that contract (DESIGN.md §17, §3.1).
-    pub fn no_wait(mut self) -> Self {
+    pub(in crate::storage::atoll) fn no_wait(mut self) -> Self {
         self.no_wait = true;
         self
     }
@@ -1652,6 +1752,7 @@ impl SqlCursor {
     /// NewRowid (DESIGN.md §17, §8, R30): one above the largest rowid the tree's counter drew,
     /// seeded or raised past; `None` once `i64::MAX` is taken, when the caller probes random
     /// rowids.
+    #[turso_macros::atoll_entry]
     pub fn new_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
         Ok(IOResult::Done(done!(self.counter()).draw()))
     }
@@ -1661,6 +1762,7 @@ impl SqlCursor {
     /// row, its buffers and its last look with it, where the catalog row the statement reads is
     /// the one it was over; else it resolves afresh. `false` for a cursor of another connection,
     /// which the caller drops.
+    #[turso_macros::atoll_entry]
     pub fn reopened(
         &mut self,
         ct: &ConnTxn,
@@ -1715,7 +1817,7 @@ impl SqlCursor {
     /// statement leaves it on the tree it opened (R22). One opened on a tree its statement had
     /// destroyed is vacant: it reads as empty, as SQLite's cursor on a freed root does, and a
     /// write through it fails.
-    pub fn opened(mut self) -> Result<Self> {
+    pub(in crate::storage::atoll) fn opened(mut self) -> Result<Self> {
         let destroyed = {
             let guard = self.cell.lock();
             let txn = guard.as_ref().ok_or_else(outside)?;
@@ -1825,6 +1927,7 @@ impl SqlCursor {
     /// snapshot cannot see, newest first, and the first that `guarded` names waits for its
     /// writer as a write does, on the same edge, while that writer is open, and is
     /// `WriteWriteConflict` once it has committed. A tree its statement destroyed has no keys.
+    #[turso_macros::atoll_entry]
     pub fn guard(&mut self, key: GuardKey<'_>, guarded: Guarded) -> IOResultOr<()> {
         if self.vacant {
             return Ok(IOResult::Done(()));
@@ -1869,6 +1972,7 @@ impl CursorTrait for SqlCursor {
     /// Parked at its statement's reset for the next execution's open of its tree
     /// ([`SqlCursor::reopened`]): what it waited on let go, the leaf it stood at left to the
     /// connection's other cursors over the tree, as a drop leaves it.
+    #[turso_macros::atoll_entry]
     fn park(&mut self) -> bool {
         self.waiting = Waiting::default();
         self.seeding = None;
@@ -1884,6 +1988,7 @@ impl CursorTrait for SqlCursor {
         true
     }
 
+    #[turso_macros::atoll_entry]
     fn last(&mut self) -> IOResultOr<()> {
         if self.vacant {
             return Ok(IOResult::Done(()));
@@ -1895,6 +2000,7 @@ impl CursorTrait for SqlCursor {
     /// A forward step with nothing of its connection's changed since the cursor took its
     /// position goes straight to its open cursor: nothing to catch up with or resolve again.
     #[inline]
+    #[turso_macros::atoll_entry]
     fn next_row(&mut self) -> crate::storage::btree::CursorStep {
         use crate::storage::btree::CursorStep;
         if !self.vacant && self.rebinding.is_none() && self.changes.epoch() == self.seen {
@@ -1930,6 +2036,7 @@ impl CursorTrait for SqlCursor {
         }
     }
 
+    #[turso_macros::atoll_entry]
     fn next(&mut self) -> IOResultOr<()> {
         if self.vacant {
             return Ok(IOResult::Done(()));
@@ -1939,6 +2046,7 @@ impl CursorTrait for SqlCursor {
         self.moved(out)
     }
 
+    #[turso_macros::atoll_entry]
     fn prev(&mut self) -> IOResultOr<()> {
         if self.vacant {
             return Ok(IOResult::Done(()));
@@ -1949,6 +2057,7 @@ impl CursorTrait for SqlCursor {
     }
 
     #[inline]
+    #[turso_macros::atoll_entry]
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
         if self.changes.epoch() != self.seen {
             crate::return_if_io!(self.caught_up());
@@ -1962,6 +2071,7 @@ impl CursorTrait for SqlCursor {
     /// The row's bytes as its cursor holds them while nothing of its connection changed since it
     /// took its position: a Column read builds no record.
     #[inline]
+    #[turso_macros::atoll_entry]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
         if self.changes.epoch() == self.seen
             && self.open.as_ref().is_some_and(|o| o.lends_payload())
@@ -1978,6 +2088,7 @@ impl CursorTrait for SqlCursor {
     }
 
     #[inline]
+    #[turso_macros::atoll_entry]
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
         if self.changes.epoch() != self.seen {
             crate::return_if_io!(self.caught_up());
@@ -1988,6 +2099,7 @@ impl CursorTrait for SqlCursor {
         }
     }
 
+    #[turso_macros::atoll_entry]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
         if self.vacant {
             return Ok(IOResult::Done(SeekResult::NotFound));
@@ -2000,11 +2112,13 @@ impl CursorTrait for SqlCursor {
         Ok(out)
     }
 
+    #[turso_macros::atoll_entry]
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
         let record = ImmutableRecord::from_registers(registers, registers.len())?;
         self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
     }
 
+    #[turso_macros::atoll_entry]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         // A row's rowid, drawn or explicit, raises its table's counter past it: seeded first, so
         // it never hides the tree's larger keys from the seed (R30).
@@ -2022,11 +2136,13 @@ impl CursorTrait for SqlCursor {
         Ok(IOResult::Done(()))
     }
 
+    #[turso_macros::atoll_entry]
     fn delete(&mut self) -> IOResultOr<()> {
         crate::return_if_io!(self.caught_up());
         self.wrote(true, None)
     }
 
+    #[turso_macros::atoll_entry]
     fn set_null_flag(&mut self, flag: bool) {
         match self.open.as_mut() {
             Some(c) => c.set_null_flag(flag),
@@ -2034,6 +2150,7 @@ impl CursorTrait for SqlCursor {
         }
     }
 
+    #[turso_macros::atoll_entry]
     fn get_null_flag(&self) -> bool {
         match self.open.as_ref() {
             Some(c) => c.get_null_flag(),
@@ -2041,6 +2158,7 @@ impl CursorTrait for SqlCursor {
         }
     }
 
+    #[turso_macros::atoll_entry]
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         let Value::Numeric(crate::numeric::Numeric::Integer(rowid)) = key else {
             return Err(Box::new(LimboError::InternalError(format!(
@@ -2054,14 +2172,17 @@ impl CursorTrait for SqlCursor {
         Ok(IOResult::Done(matches!(found, SeekResult::Found)))
     }
 
+    #[turso_macros::atoll_entry]
     fn clear_btree(&mut self) -> IOResultOr<u64> {
         Err(self.refused("clearing a tree"))
     }
 
+    #[turso_macros::atoll_entry]
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
         Err(self.refused("destroying a tree"))
     }
 
+    #[turso_macros::atoll_entry]
     fn count(&mut self) -> IOResultOr<usize> {
         // A move IO cut short is stepped again before any other: the cursor resumes it, so a
         // rewind after it would land where it went, not at the first row.
@@ -2086,14 +2207,17 @@ impl CursorTrait for SqlCursor {
         }
     }
 
+    #[turso_macros::atoll_entry]
     fn is_empty(&self) -> bool {
         self.open.as_deref().is_none_or(AtollCursor::is_empty)
     }
 
+    #[turso_macros::atoll_entry]
     fn root_page(&self) -> i64 {
         self.id as i64
     }
 
+    #[turso_macros::atoll_entry]
     fn rewind(&mut self) -> IOResultOr<()> {
         if self.vacant {
             return Ok(IOResult::Done(()));
@@ -2102,46 +2226,56 @@ impl CursorTrait for SqlCursor {
         self.moved(out)
     }
 
+    #[turso_macros::atoll_entry]
     fn has_record(&self) -> bool {
         self.has_record
     }
 
+    #[turso_macros::atoll_entry]
     fn set_has_record(&mut self, has_record: bool) {
         self.has_record = has_record;
     }
 
+    #[turso_macros::atoll_entry]
     fn index_info(&self) -> Option<&Arc<IndexInfo>> {
         self.index.as_ref()
     }
 
+    #[turso_macros::atoll_entry]
     fn seek_end(&mut self) -> IOResultOr<()> {
         Ok(IOResult::Done(()))
     }
 
+    #[turso_macros::atoll_entry]
     fn seek_to_last(&mut self) -> IOResultOr<()> {
         self.last()
     }
 
+    #[turso_macros::atoll_entry]
     fn invalidate_record(&mut self) {
         if let Some(c) = self.open.as_mut() {
             c.invalidate_record();
         }
     }
 
+    #[turso_macros::atoll_entry]
     fn has_rowid(&self) -> bool {
         self.index.as_ref().is_none_or(|i| i.has_rowid)
     }
 
+    #[turso_macros::atoll_entry]
     fn get_pager(&self) -> Arc<Pager> {
         self.pager.clone()
     }
 
+    #[turso_macros::atoll_entry]
     fn get_skip_advance(&self) -> bool {
         false
     }
 
     /// The tree was cleared under the cursor: it resolves its catalog row again at its next step,
     /// reading the new tree.
+    #[turso_macros::atoll_entry]
     fn invalidate_btree_cache(&mut self) {
         self.open = None;
         self.has_record = false;

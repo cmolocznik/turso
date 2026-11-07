@@ -6770,7 +6770,7 @@ mod tests {
                     Arc::new(MemoryIO::new()),
                     "ivf-rq-top-ten-atoll.db",
                     OpenOptions::new(Arc::new(SqliteDialect))
-                        .atoll(crate::storage::atoll::sql::catalog::tests::config())
+                        .atoll(crate::storage::atoll::db::AtollConfig::sql_tests())
                         .db_opts(DatabaseOpts::new().with_index_method(true)),
                 )
                 .unwrap()
@@ -7006,7 +7006,7 @@ mod tests {
     /// [`database`] in Atoll mode.
     fn atoll_database(name: &str) -> (Arc<crate::Database>, Arc<crate::Connection>) {
         use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenOptions, SqliteDialect};
-        let options = OpenOptions::new(Arc::new(SqliteDialect)).atoll(crate::storage::atoll::sql::catalog::tests::config()).db_opts(DatabaseOpts::new().with_index_method(true));
+        let options = OpenOptions::new(Arc::new(SqliteDialect)).atoll(crate::storage::atoll::db::AtollConfig::sql_tests()).db_opts(DatabaseOpts::new().with_index_method(true));
         let db = Database::open(Arc::new(MemoryIO::new()), name, options).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)").unwrap();

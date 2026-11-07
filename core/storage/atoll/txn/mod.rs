@@ -87,18 +87,6 @@ pub struct Cut {
     at: Option<(Lsn, Ts)>,
 }
 
-/// The root a creation record names, and the list its undo puts it on.
-pub fn creation(payload: &[u8]) -> Option<(PageId, PageId)> {
-    let word = |at: usize| {
-        payload
-            .get(at..at + 8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-    };
-    let (root, list) = (PageId::from_raw(word(0)?), PageId::from_raw(word(8)?));
-    let valid = |p: PageId| SizeClass::new(p.class().index()).is_some() && !p.is_temporary();
-    (payload.len() == 16 && valid(root) && valid(list)).then_some((root, list))
-}
-
 /// A tree a transaction created and still holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Created {
@@ -656,6 +644,7 @@ impl Transactions {
         self.gated.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(test)]
     pub fn clock(&self) -> &Arc<Clock> {
         &self.clock
     }

@@ -27,10 +27,6 @@ const WORD: usize = 8;
 pub trait Bytes {
     fn len(&self) -> usize;
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Copies the bytes at `at` into `out`.
     fn copy_to(&self, at: usize, out: &mut [u8]);
 
@@ -239,6 +235,7 @@ impl Shared {
     }
 
     /// A writer of bytes no one else can reach.
+    #[cfg(test)]
     pub fn owned(&mut self) -> Writer<'_> {
         Writer(self)
     }
@@ -406,6 +403,7 @@ impl Writer<'_> {
     }
 
     /// The bytes it writes, to read.
+    #[cfg(test)]
     pub fn shared(&self) -> &Shared {
         self.0
     }

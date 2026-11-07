@@ -316,7 +316,7 @@ fn the_clock_restarts_above_every_timestamp_and_what_was_written_reads_committed
         }
         drop(db);
         let db = open(&io, 4);
-        assert!(db.recovered_end().is_some());
+        assert!(db.recovered());
         let mut txn = begin(&io, &db, Isolation::Snapshot);
         assert!(
             txn.start() > last,

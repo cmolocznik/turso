@@ -101,7 +101,7 @@ impl LocalLocated {
         let pid = self.pid;
         let c = self.store.read_slot_into(pid, slot, into, move |read| {
             done(match read {
-                PageRead::Valid(_) => Ok(()),
+                PageRead::Valid => Ok(()),
                 PageRead::Invalid => Err(CompletionError::CorruptPage { page: pid.raw() }),
                 PageRead::Failed(e) => Err(e),
             })

@@ -105,13 +105,14 @@ impl Db {
             pid.class().size(),
         ));
         let into = block.region(0, pid.class().size());
+        let copy = into.clone();
         let read = Arc::new(crate::storage::atoll::locks::Mutex::new(None));
         let landed = read.clone();
         let c = self
             .store()
             .read_slot_into(pid, slot, into, move |r| {
                 *landed.lock() = Some(match r {
-                    PageRead::Valid(b) => Some(page::seq(b.as_slice())),
+                    PageRead::Valid => Some(page::seq(copy.as_slice())),
                     _ => None,
                 });
             })

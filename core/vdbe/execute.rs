@@ -14386,7 +14386,7 @@ pub fn op_no_conflict(
                 // another transaction is deleting waits for it, and one committed past the
                 // snapshot conflicts; then the seek finds what the snapshot sees.
                 if program.connection.atoll().is_some() {
-                    use crate::storage::atoll::sql::cursor::GuardKey;
+                    use crate::storage::atoll::sql::mode::GuardKey;
                     let record = match &record_source {
                         RecordSource::Packed { record_reg } => {
                             match &state.registers[*record_reg] {
@@ -22329,8 +22329,8 @@ impl AtollKey {
         )?))
     }
 
-    fn as_key(&self) -> crate::storage::atoll::sql::cursor::GuardKey<'_> {
-        use crate::storage::atoll::sql::cursor::GuardKey;
+    fn as_key(&self) -> crate::storage::atoll::sql::mode::GuardKey<'_> {
+        use crate::storage::atoll::sql::mode::GuardKey;
         match self {
             Self::All => GuardKey::All,
             Self::Rowid(rowid) => GuardKey::Rowid(*rowid),

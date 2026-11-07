@@ -124,7 +124,7 @@ fn a_creation_a_crash_cut_short_completes_at_the_same_pages() {
         for (i, image) in images.into_iter().enumerate() {
             let image: Arc<dyn IO> = Arc::new(image);
             let db = AtollDb::open(image.clone(), BASE, config()).unwrap();
-            if db.atoll().recovered_end().is_some() {
+            if db.atoll().recovered() {
                 partial += 1;
             } else {
                 fresh += 1;

@@ -303,7 +303,7 @@ fn every_end_releases_the_gate() {
 /// A gated database refuses the commit of a transaction that wrote without the gate. The refusal
 /// panics past guards of shared state, which end the process (DESIGN.md 22.11): it runs in a child
 /// process.
-#[cfg(all(unix, not(miri)))]
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn a_write_without_the_gate_is_refused_at_commit() {
     let ended = crate::storage::atoll::testing::in_child(

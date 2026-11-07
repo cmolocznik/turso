@@ -23,39 +23,44 @@
 // names (`core/clippy.toml`).
 #![deny(clippy::disallowed_types)]
 
-pub mod aligned;
-pub mod arc_cell;
-pub mod bits;
-pub mod blob;
-pub mod btree;
-pub mod buffer;
-pub mod checkpoint;
-pub mod control;
-pub mod crc;
+mod aligned;
+mod arc_cell;
+mod bits;
+mod blob;
+mod btree;
+mod buffer;
+mod checkpoint;
+mod control;
+mod crc;
 pub mod db;
-pub mod epoch;
-pub mod floors;
-pub(crate) mod guarded;
-pub mod latch;
-pub(crate) mod locks;
-pub mod log;
-pub mod meta;
-pub mod once;
-pub mod page;
-pub mod pins;
-pub mod prefix;
-pub mod radix;
+mod epoch;
+// A production build carries only what production calls: an item whose only callers are tests
+// is compiled for tests alone, and so are `floors` and `stream`, whose consumers (the collector,
+// the stream catalog) are not built.
+#[cfg(test)]
+mod floors;
+mod guarded;
+mod latch;
+mod locks;
+mod log;
+mod meta;
+mod once;
+mod page;
+mod pins;
+mod prefix;
+mod radix;
 mod recovery;
-pub mod replay;
-pub mod segmented;
-pub mod shared;
-pub mod solo;
+mod replay;
+mod segmented;
+mod shared;
+mod solo;
 pub mod sql;
-pub mod stack;
-pub mod store;
-pub mod stream;
-pub mod txn;
-pub(crate) mod unwind;
+mod stack;
+mod store;
+#[cfg(test)]
+mod stream;
+mod txn;
+mod unwind;
 
 #[cfg(all(test, not(atoll_loom), not(shuttle), not(miri)))]
 mod bench;
@@ -71,7 +76,7 @@ use crate::{CompletionError, Result};
 
 /// How a write of `len` bytes ended: one that landed short failed. A write's completion counts a
 /// short write as done, so every write checks its count with this.
-pub(crate) fn whole(
+pub(in crate::storage::atoll) fn whole(
     len: usize,
     res: std::result::Result<i32, CompletionError>,
 ) -> std::result::Result<(), CompletionError> {
@@ -84,7 +89,7 @@ pub(crate) fn whole(
 
 /// A completion to hand a write of `len` bytes, and one to wait on: it ends when the write does,
 /// failed if the write failed or landed short.
-pub(crate) fn whole_write(len: usize) -> (Completion, Completion) {
+pub(in crate::storage::atoll) fn whole_write(len: usize) -> (Completion, Completion) {
     let ended = Completion::new_wait();
     let done = ended.clone();
     let write = Completion::new_write(move |res| match whole(len, res) {
@@ -96,6 +101,7 @@ pub(crate) fn whole_write(len: usize) -> (Completion, Completion) {
 
 /// Runs `op` until it is done, waiting on each completion it hands back: for opening a database,
 /// whose caller waits for it anyway.
+#[turso_macros::atoll_entry]
 pub(crate) fn drive<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
     loop {
         match op()? {

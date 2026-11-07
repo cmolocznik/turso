@@ -4,8 +4,8 @@
 //! The state is a private field here, and [`Guarded::try_hold`] and [`Guarded::hold_or_contend`]
 //! are the only ways to it, so no other code can take it without the guard (a test compiles the
 //! attempt and expects it refused). A taker that finds the state held may register as a contender
-//! and try again; if it then holds the state it takes its registration back, so a holder is never
-//! a contender of its own hold. Letting a hold go lets the state go first, then wakes every
+//! and try again; whenever a contending taker holds the state, at its first try or its second, it
+//! takes back any registration of its own, so a holder is never a contender of its own hold. Letting a hold go lets the state go first, then wakes every
 //! contender and empties the list: a contender woken while the state was still held would find it
 //! held, wait again, and nothing would wake it. Nobody but a contender is woken.
 
@@ -18,6 +18,11 @@ std::thread_local! {
     /// Run by this thread's next [`Guarded::hold_or_contend`] between the try that found the state
     /// held and its registration: a test lets the state go there.
     static BEFORE_CONTENDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Run by this thread's next [`Hold`] let go between letting the state go and waking its
+    /// contenders: a test takes the state there.
+    static BEFORE_WAKING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -58,7 +63,7 @@ impl<T> Guarded<T> {
     /// in between either finds `me` listed or is seen let go.
     pub fn hold_or_contend(&self, me: &Thread) -> Option<Hold<'_, T>> {
         if let Some(held) = self.try_hold() {
-            return Some(held);
+            return Some(self.withdrawn(held, me));
         }
         #[cfg(test)]
         if let Some(between) = BEFORE_CONTENDING.with(|b| b.borrow_mut().take()) {
@@ -75,13 +80,19 @@ impl<T> Guarded<T> {
             }
         }
         let held = self.try_hold()?;
-        // Held now: its own letting go must not wake it.
+        Some(self.withdrawn(held, me))
+    }
+
+    /// `held`, with any registration of `me`'s taken back: its own letting go must not wake it.
+    /// A contender may hold at its first try while still listed from an earlier call: woken by
+    /// another's letting go, or for no reason, before the holder it waited for woke anyone.
+    fn withdrawn<'a>(&'a self, held: Hold<'a, T>, me: &Thread) -> Hold<'a, T> {
         for t in self.contenders.lock().iter_mut() {
             if t.as_ref().is_some_and(|t| t.id() == me.id()) {
                 *t = None;
             }
         }
-        Some(held)
+        held
     }
 
     /// Whether `who` waits for the state.
@@ -113,6 +124,10 @@ impl<T> Drop for Hold<'_, T> {
     fn drop(&mut self) {
         super::unwind::abort_if_unwinding();
         drop(self.state.take());
+        #[cfg(test)]
+        if let Some(between) = BEFORE_WAKING.with(|b| b.borrow_mut().take()) {
+            between();
+        }
         // Unparking runs no code of anyone's and takes no lock, so it is done under the mutex.
         for t in self.guarded.contenders.lock().iter_mut() {
             if let Some(t) = t.take() {
@@ -260,6 +275,35 @@ mod tests {
         );
         drop(hold);
         other.join().unwrap();
+    }
+
+    /// A contender still listed from an earlier call that takes the state at its first try,
+    /// after the holder it waited for let the state go but before that holder woke anyone, takes
+    /// its registration back too: its own letting go wakes nobody, itself included.
+    #[test]
+    fn a_contender_that_holds_at_its_first_try_is_listed_no_more() {
+        let guarded = Arc::new(Guarded::new(0u32));
+        let me = std::thread::current();
+        let first = guarded.try_hold().expect("free");
+        assert!(guarded.hold_or_contend(&me).is_none(), "held, so listed");
+        assert!(guarded.contends(&me));
+        let listed = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (seen, g, taker) = (listed.clone(), guarded.clone(), me.clone());
+        BEFORE_WAKING.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                let hold = g
+                    .hold_or_contend(&taker)
+                    .expect("let go, so taken at the first try");
+                seen.set(Some(g.contends(&taker)));
+                drop(hold);
+            }))
+        });
+        drop(first);
+        assert_eq!(
+            listed.get(),
+            Some(false),
+            "the holder is still listed, so its own letting go wakes it"
+        );
     }
 }
 

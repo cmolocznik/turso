@@ -26,14 +26,6 @@ impl<T> Baton<T> {
         // SAFETY: from a box put here, and the swap made this thread its only holder.
         (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
     }
-
-    /// Puts the value held back, for the next to take: by its holder, or whoever it hands it to.
-    pub fn put(&self, value: T) {
-        let old = self
-            .0
-            .swap(Box::into_raw(Box::new(value)), Ordering::AcqRel);
-        assert!(old.is_null(), "a value put back while another was there");
-    }
 }
 
 impl<T> Drop for Baton<T> {

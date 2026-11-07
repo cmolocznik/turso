@@ -1286,7 +1286,7 @@ pub struct ProgramState {
     fk_immediate_violation: Option<LimboError>,
     uses_subjournal: bool,
     /// In Atoll mode, the statement number a failure of this statement rolls back to (R18).
-    pub(crate) atoll_statement: Option<crate::storage::atoll::txn::Statement>,
+    pub(crate) atoll_statement: Option<crate::storage::atoll::sql::mode::Statement>,
     /// Whether this statement's Transaction opcode left a take of Atoll's write gate waiting,
     /// which it gives up if it stops waiting (R15).
     pub(crate) atoll_taking: bool,

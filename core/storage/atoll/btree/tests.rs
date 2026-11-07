@@ -1101,7 +1101,7 @@ fn a_tree_recovered_on_threads_at_once_reads_back_whole(threads: usize, keys: u6
         .expect("the opening, every thread done")
         .finish()
         .unwrap();
-    assert!(db.recovered_end().is_some(), "the open did not recover");
+    assert!(db.recovered(), "the open did not recover");
     let run = drive_runner(&io);
     let tree = tree_of(&io, &db, root);
     for k in 0..keys {

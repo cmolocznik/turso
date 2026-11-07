@@ -198,13 +198,18 @@ impl Relief for CheckpointRelief {
     }
 }
 
-/// The checkpoint's state, held ([`Checkpointer::try_hold`]): every holder takes it so. Letting it
-/// go wakes its contenders ([`Hold`]), then the writers waiting for room: a writer refused room
-/// waits on the room, and one whose relief found the state held steps the checkpoint itself once
-/// it is let go.
+/// The checkpoint's state, held ([`Checkpointer::try_hold`]): every holder takes it so, and steps
+/// it only so ([`Checkpointer::stepping`]). Letting it go wakes its contenders ([`Hold`]), then the
+/// transactions' ends waiting for a full checkpoint, if a step under it moved what they wait for,
+/// then the writers waiting for room: a writer refused room waits on the room, and one whose
+/// relief found the state held steps the checkpoint itself once it is let go. Each is woken with
+/// the state let go, so a waker that takes it finds it free.
 struct StateHold<'a> {
     hold: Option<Hold<'a, State>>,
     checkpointer: &'a Checkpointer,
+    /// A step under this hold moved a full checkpoint's count or failed: its waiters are owed a
+    /// wake.
+    waiters_owed: bool,
 }
 
 impl Deref for StateHold<'_> {
@@ -225,6 +230,9 @@ impl Drop for StateHold<'_> {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
         drop(self.hold.take());
+        if self.waiters_owed {
+            self.checkpointer.wake_waiters();
+        }
         self.checkpointer.pool.wake_room();
     }
 }
@@ -366,6 +374,7 @@ impl Checkpointer {
     }
 
     /// What its working memory has held, and its work.
+    #[cfg(test)]
     pub fn stats(&self) -> CheckpointStats {
         let c = &self.counters;
         CheckpointStats {
@@ -377,11 +386,11 @@ impl Checkpointer {
         }
     }
 
-    /// Steps the state, timed. Whoever steps it wakes any writer waiting for room once it has
-    /// let the state go ([`StateHold`]).
+    /// Steps the state, timed. Whoever steps it wakes any waiter for a full checkpoint, and any
+    /// writer waiting for room, once it has let the state go ([`StateHold`]).
     fn stepping(
         &self,
-        state: &mut State,
+        state: &mut StateHold<'_>,
         txns: &Transactions,
         until: Until,
     ) -> Result<IOResult<()>> {
@@ -397,13 +406,14 @@ impl Checkpointer {
             u64::try_from(took.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        self.recorded(state);
+        let moved = self.recorded(state);
+        state.waiters_owed |= moved;
         out
     }
 
     /// What the state records of full checkpoints and failure, published for a transaction's end
-    /// waiting on the thread, which is woken if either moved.
-    fn recorded(&self, state: &State) {
+    /// waiting on the thread: whether either moved, which owes the waiters a wake.
+    fn recorded(&self, state: &State) -> bool {
         let failed = state.failed.is_some();
         let before = self.full_done.swap(state.full_done, Ordering::AcqRel);
         if failed {
@@ -412,9 +422,7 @@ impl Checkpointer {
                 *failure = state.failed.clone();
             }
         }
-        if before != state.full_done || failed {
-            self.wake_waiters();
-        }
+        before != state.full_done || failed
     }
 
     /// Completes the waiters taken off the list, with no lock held: a waiter's waker may run code,
@@ -431,6 +439,7 @@ impl Checkpointer {
         self.state.try_hold().map(|hold| StateHold {
             hold: Some(hold),
             checkpointer: self,
+            waiters_owed: false,
         })
     }
 
@@ -442,6 +451,7 @@ impl Checkpointer {
             .map(|hold| StateHold {
                 hold: Some(hold),
                 checkpointer: self,
+                waiters_owed: false,
             })
     }
 
@@ -500,6 +510,7 @@ impl Checkpointer {
     /// The checkpointing thread's work, until the database closes: steps whatever is due, waiting
     /// on its writes, so they go as fast as the device takes them, and parks while nothing is.
     /// Once it ends, however it ends, writers step checkpoints again and no waiter is left.
+    #[turso_macros::atoll_entry]
     pub(crate) fn drive(&self, io: &Arc<dyn crate::io::IO>, txns: &Transactions) {
         struct Ended<'a>(&'a Checkpointer);
         impl Drop for Ended<'_> {
@@ -635,6 +646,7 @@ impl Checkpointer {
 
     /// Holds the checkpointer idle, if no one is stepping it: no checkpoint runs until the hold is
     /// dropped, so the page store holds still for an integrity check (DESIGN.md §17, §12; R36).
+    #[cfg(test)]
     pub fn hold(&self) -> Option<impl Sized + '_> {
         self.try_hold()
     }

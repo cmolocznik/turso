@@ -1,3 +1,4 @@
+use super::record::ALIGN;
 use super::*;
 use crate::io::crash::{CrashIO, Faults};
 use crate::io::{Completion, MemoryIO, OpenFlags, IO};

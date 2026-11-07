@@ -4,7 +4,7 @@
 use super::buffer::{BufferConfig, BufferPool, LocalSource};
 use super::checkpoint::{CheckpointRelief, Checkpointer, Checkpointing, WRITE_BYTES};
 use super::control::{Control, Superblock};
-use super::log::{Log, LogConfig, Lsn};
+use super::log::{Log, LogConfig};
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
 use super::recovery::{self, Recovered};
@@ -50,6 +50,12 @@ impl AtollConfig {
     /// test of Atoll's SQL layer runs on, 1 MiB log segments, the smallest pool Atoll takes with
     /// its log's ring and a 512 KiB log budget, with the default transaction slots, so
     /// connections the suites hold at once never wait for one.
+    /// The configuration every test of the SQL layer's trees runs with.
+    #[cfg(test)]
+    pub fn sql_tests() -> Self {
+        super::sql::catalog::tests::config()
+    }
+
     pub fn small() -> Self {
         let log = LogConfig {
             segment_bytes: 1 << 20,
@@ -84,9 +90,9 @@ impl AtollConfig {
     }
 }
 
-pub struct Atoll {
-    database_id: [u8; 16],
-    recovered_end: Option<Lsn>,
+pub(in crate::storage::atoll) struct Atoll {
+    #[cfg(test)]
+    recovered: bool,
     log: Arc<Log>,
     store: Arc<PageStore>,
     pool: Arc<BufferPool>,
@@ -118,14 +124,10 @@ impl Atoll {
         opening.finish()
     }
 
-    pub fn database_id(&self) -> [u8; 16] {
-        self.database_id
-    }
-
-    /// Where recovery found the log's valid records end, if this open recovered: the state it
-    /// recovered is the log's up to there.
-    pub fn recovered_end(&self) -> Option<Lsn> {
-        self.recovered_end
+    /// Whether this open recovered a database a run before it left.
+    #[cfg(test)]
+    pub fn recovered(&self) -> bool {
+        self.recovered
     }
 
     pub fn log(&self) -> &Arc<Log> {
@@ -158,7 +160,7 @@ impl Atoll {
 /// Opening a database, which recovery may make long. Any number of threads may call
 /// [`work`](Self::work) at once: one recovers while the rest wait for it; once every call has
 /// returned, [`finish`](Self::finish) gives the database.
-pub struct Opening {
+pub(in crate::storage::atoll) struct Opening {
     store: Arc<PageStore>,
     superblock: Superblock,
     how: Mutex<How>,
@@ -276,7 +278,6 @@ impl Opening {
                 pool,
                 checkpointer,
                 txns,
-                end: 0,
             }))),
         })
     }
@@ -310,9 +311,10 @@ impl Opening {
 
     pub fn finish(self) -> Result<Atoll> {
         let how = std::mem::replace(&mut *self.how.lock(), How::Taken);
-        let (recovered_end, r) = match how {
-            How::Created(r) => (None, r),
-            How::Recovered(r) => (Some(r.end), r),
+        #[cfg(test)]
+        let recovered = matches!(how, How::Recovered(_));
+        let r = match how {
+            How::Created(r) | How::Recovered(r) => r,
             How::Recovering { .. } | How::Taken => {
                 return Err(LimboError::InternalError(
                     "finishing an open before recovery is done".into(),
@@ -349,8 +351,8 @@ impl Opening {
             }
         };
         Ok(Atoll {
-            database_id: self.superblock.database_id,
-            recovered_end,
+            #[cfg(test)]
+            recovered,
             txns,
             log,
             store: self.store,

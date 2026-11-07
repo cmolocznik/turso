@@ -172,7 +172,7 @@ fn a_drained_tree_forgets_its_stamp() {
 /// statement that missed its take fails where its cause is, not at the commit. The refusal panics
 /// past guards of shared state, which end the process (DESIGN.md 22.11): it runs in a child
 /// process.
-#[cfg(all(unix, not(miri)))]
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn a_write_without_the_gate_fails_at_the_write() {
     let ended = crate::storage::atoll::testing::in_child(

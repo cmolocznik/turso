@@ -142,10 +142,6 @@ impl ValueWrite {
         }
     }
 
-    pub fn pages(&self) -> Vec<PageId> {
-        self.pages.iter().map(|p| p.0).collect()
-    }
-
     /// The put of the reference in a leaf took the pages.
     pub fn adopted(&mut self) {
         self.adopted = true;

@@ -205,6 +205,7 @@ impl KeptRoom {
         }
     }
 
+    #[cfg(test)]
     pub fn stats(&self) -> KeptStats {
         KeptStats {
             limit: self.limit,
@@ -218,6 +219,7 @@ impl KeptRoom {
 
     /// Starts the peak again from what is held now, and the longest wait from none, for a
     /// measurement.
+    #[cfg(test)]
     pub fn reset_peaks(&self) {
         self.peak
             .store(self.used.load(Ordering::Acquire), Ordering::Release);

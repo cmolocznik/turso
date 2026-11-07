@@ -386,10 +386,6 @@ impl AtollCursor {
         self.cursor.near()
     }
 
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
     /// Forgets the record read at the row, to read it again.
     pub fn invalidate_record(&mut self) {
         self.record.forget(&mut self.cursor);
@@ -403,10 +399,6 @@ impl AtollCursor {
     /// The tree as plain records, for its rowid counter's seed.
     pub fn plain_tree(&self) -> &crate::storage::atoll::btree::Tree {
         self.tree.tree()
-    }
-
-    pub fn index_info(&self) -> Option<&Arc<IndexInfo>> {
-        self.index.as_ref()
     }
 
     fn step(&mut self, to: Move<'_>) -> Result<IOResult<bool>> {

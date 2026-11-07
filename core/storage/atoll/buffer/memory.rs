@@ -1143,6 +1143,7 @@ impl Memory {
         out
     }
 
+    #[cfg(test)]
     pub fn held(&self) -> [usize; CLASS_COUNT] {
         let mut out = [0; CLASS_COUNT];
         for class in SizeClass::all() {

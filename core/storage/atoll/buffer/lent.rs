@@ -30,6 +30,7 @@ pub enum Use {
 const USES: usize = 3;
 
 impl Use {
+    #[cfg(test)]
     const ALL: [Use; USES] = [Use::Kept, Use::Image, Use::Log];
 
     fn index(self) -> usize {
@@ -43,13 +44,6 @@ pub struct LentStats {
     pub kept: (usize, usize),
     pub image: (usize, usize),
     pub log: (usize, usize),
-}
-
-impl LentStats {
-    /// Bytes lent now, every use together.
-    pub fn now(&self) -> usize {
-        self.kept.0 + self.image.0 + self.log.0
-    }
 }
 
 pub(super) struct Lends {
@@ -84,6 +78,7 @@ impl Lends {
         frame as u64 | (class.index() as u64) << 32 | (i as u64) << 40
     }
 
+    #[cfg(test)]
     pub(super) fn stats(&self) -> LentStats {
         let at = |what: Use| {
             (
@@ -99,6 +94,7 @@ impl Lends {
     }
 
     /// Starts each peak again from what is lent now, for a measurement.
+    #[cfg(test)]
     pub(super) fn reset_peaks(&self) {
         for what in Use::ALL {
             let i = what.index();

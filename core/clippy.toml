@@ -1,12 +1,28 @@
 # Lock types Atoll may not name: every lock in `storage/atoll` is one of its own, whose guards end
 # the process before they let go on a thread that unwinds (docs/internals/atoll/DESIGN.md 22.11).
-# The lint is denied in Atoll's module and allowed in the rest of the crate.
+# The lint is denied in Atoll's module and allowed in the rest of the crate. It resolves a path to
+# the item it names: a name brought in to the lock it names, but a type alias to the alias, by the
+# path that defines it. So each alias of a lock that Atoll could name is listed here too; a test in
+# `storage/atoll/locks.rs` finds them all, aliases of aliases included, and fails on one missing.
 disallowed-types = [
     { path = "parking_lot::Mutex", reason = "use storage::atoll::locks::Mutex" },
     { path = "parking_lot::RwLock", reason = "use storage::atoll::locks::RwLock" },
     { path = "parking_lot::Condvar", reason = "Atoll has no condition variable of its own" },
     { path = "parking_lot::ReentrantMutex", reason = "use storage::atoll::locks::Mutex" },
+    { path = "parking_lot::MutexGuard", reason = "use storage::atoll::locks::Mutex" },
+    { path = "parking_lot::ArcMutexGuard", reason = "use storage::atoll::locks::Mutex" },
+    { path = "parking_lot::ReentrantMutexGuard", reason = "use storage::atoll::locks::Mutex" },
+    { path = "parking_lot::RwLockReadGuard", reason = "use storage::atoll::locks::RwLock" },
+    { path = "parking_lot::RwLockWriteGuard", reason = "use storage::atoll::locks::RwLock" },
     { path = "std::sync::Mutex", reason = "use storage::atoll::locks::Mutex" },
     { path = "std::sync::RwLock", reason = "use storage::atoll::locks::RwLock" },
     { path = "std::sync::Condvar", reason = "Atoll has no condition variable of its own" },
+    { path = "std::sync::MutexGuard", reason = "use storage::atoll::locks::Mutex" },
+    { path = "std::sync::RwLockReadGuard", reason = "use storage::atoll::locks::RwLock" },
+    { path = "std::sync::RwLockWriteGuard", reason = "use storage::atoll::locks::RwLock" },
+    { path = "turso_core::sync::std_adapter::ArcMutexGuard", reason = "an alias of a lock's guard; use storage::atoll::locks::Mutex" },
+    { path = "turso_core::mvcc::database::RowVersions", reason = "an alias of a lock: MVCC's row versions" },
+    { path = "turso_core::mvcc::database::IndexRowsMap", reason = "an alias over RowVersions, a lock" },
+    { path = "turso_core::mvcc::cursor::MvccEntry", reason = "an alias over RowVersions, a lock" },
+    { path = "turso_core::mvcc::cursor::MvccIterator", reason = "an alias over MvccEntry, over a lock" },
 ]

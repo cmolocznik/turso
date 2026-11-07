@@ -47,8 +47,12 @@ mod watt;
 #[cfg(test)]
 mod tests;
 
-pub use kept::{default_limit as default_kept_bytes, KeptCopy, KeptStats, KEPT_CAP};
-pub use lent::{LentStats, Use as LentUse};
+pub use kept::KeptCopy;
+#[cfg(test)]
+pub use kept::KeptStats;
+#[cfg(test)]
+pub use lent::LentStats;
+pub use lent::Use as LentUse;
 pub use memory::MIN_BUDGET;
 
 /// The smallest budget a database takes whose log's ring fits one batch, as every ring of
@@ -68,7 +72,9 @@ use super::blob;
 use super::epoch::Step;
 use super::latch::{Held, VersionedLatch};
 use super::once::SetOnce;
-use super::page::{self, PageId, SizeClass, CLASS_COUNT};
+#[cfg(test)]
+use super::page::CLASS_COUNT;
+use super::page::{self, PageId, SizeClass};
 use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::Stack;
 use super::store::PageStore;
@@ -233,7 +239,7 @@ pub struct BufferConfig {
     /// least the largest page.
     pub writeback_bytes: usize,
     /// Bytes of the copies a checkpoint's cut keeps of pages changed before it images them
-    /// ([`kept`]), each in a lent frame: `None` for [`default_kept_bytes`] of the budget. At least
+    /// ([`kept`]), each in a lent frame: `None` for [`kept::default_limit`] of the budget. At least
     /// the largest page.
     pub kept_bytes: Option<usize>,
 }
@@ -473,6 +479,7 @@ impl BufferPool {
     }
 
     /// Bytes each size class holds.
+    #[cfg(test)]
     pub fn held(&self) -> [usize; CLASS_COUNT] {
         self.memory.held()
     }
@@ -1117,37 +1124,6 @@ impl BufferPool {
 
     // ---------------------------------------------------------------- prefetching
 
-    /// Starts reading those of `pids` that are not in memory, without waiting for anything:
-    /// pages whose location needs a read first, and pages for which no frame is free at once,
-    /// are skipped. A later fix finds each page resident or being read.
-    pub fn prefetch(self: &Arc<Self>, pids: &[PageId]) -> Result<()> {
-        let _step = self.store.epochs().enter();
-        self.failed()?;
-        for &pid in pids {
-            if self.table.find(&self.frames.headers, pid.raw()).is_some() {
-                continue;
-            }
-            let located = match self.locate(pid)? {
-                IOResult::Done(l) => l,
-                IOResult::IO(_) => continue,
-            };
-            let class = pid.class();
-            let frame = match self.take_or_grow(class, Purpose::Read) {
-                Got::Frame(f) => f,
-                Got::Quieting(_) => continue,
-                Got::None => {
-                    self.evict_round(class)?;
-                    match self.take_or_grow(class, Purpose::Read) {
-                        Got::Frame(f) => f,
-                        Got::Quieting(_) | Got::None => return Ok(()),
-                    }
-                }
-            };
-            drop(self.load(pid, frame, located)?);
-        }
-        Ok(())
-    }
-
     // ---------------------------------------------------------------- frames
 
     fn take_or_grow(&self, class: SizeClass, purpose: Purpose) -> Got {
@@ -1642,6 +1618,7 @@ impl BufferPool {
     // ---------------------------------------------------------------- writing back
 
     /// Queues the writeback of `frames`, already marked WRITING.
+    #[cfg(test)]
     fn write_back(
         &self,
         class: SizeClass,
@@ -1875,11 +1852,13 @@ impl BufferPool {
     }
 
     /// The bytes lent beside the page table, by use, now and at most.
+    #[cfg(test)]
     pub fn lent_stats(&self) -> LentStats {
         self.lends.stats()
     }
 
     /// Starts the peaks of the bytes lent again from what is lent now, for a measurement.
+    #[cfg(test)]
     pub fn reset_lent_peaks(&self) {
         self.lends.reset_peaks();
     }
@@ -2097,23 +2076,27 @@ impl BufferPool {
     }
 
     /// What the room for kept copies has held, and refused.
+    #[cfg(test)]
     pub fn kept_stats(&self) -> KeptStats {
         self.room.stats()
     }
 
     /// Bytes of swap copies written since the pool opened.
+    #[cfg(test)]
     pub fn swap_written(&self) -> u64 {
         self.swap_written.load(Ordering::Relaxed)
     }
 
     /// Bytes of the temporary pages held: the versions the arenas keep, beside any temporary
     /// tree's.
+    #[cfg(test)]
     pub fn temporary_bytes(&self) -> u64 {
         self.temp.live_bytes()
     }
 
     /// The pages owed an image now, resident or in their swap copies alone: the work the next
     /// checkpoint has. A walk over every frame, for a report.
+    #[cfg(test)]
     pub fn owed_pages(&self) -> usize {
         let mut owed: HashSet<PageId> = self.store.swap_pages().into_iter().collect();
         for frame in 0..self.memory.grains() {
@@ -2128,6 +2111,7 @@ impl BufferPool {
 
     /// Starts the kept copies' peak again from what is held now, and their longest wait from
     /// none, for a measurement.
+    #[cfg(test)]
     pub fn reset_kept_peaks(&self) {
         self.room.reset_peaks();
     }

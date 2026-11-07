@@ -1176,23 +1176,74 @@ impl turso_core::IO for StepFailsOnce {
     }
 }
 
+/// A failed step of the IO ends the process (docs/internals/atoll/DESIGN.md 22.5, 22.11): the
+/// backend can no longer deliver or retire the read it accepted, so `wal_get_frame` can neither
+/// wait for the read nor return while the read may still write into the frame it lent, which a
+/// caller may free once it returns. The test runs in a child process of this test binary; the
+/// parent reads how it ended.
+#[cfg(unix)]
 #[test]
-fn wal_get_frame_does_not_write_into_buffer_after_it_returns_error() {
-    let io = Arc::new(StepFailsOnce {
-        io: crate::queued_io::QueuedIo::new(),
-        fail_next_step: false.into(),
-    });
-    let db =
-        turso_core::Database::open_file(io.clone(), "repro.db", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
-    conn.execute("CREATE TABLE t(x)").unwrap();
-    let mut frame = [0u8; 24 + 4096];
-    io.fail_next_step
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(conn.wal_get_frame(1, &mut frame).is_err());
-    io.io.step_one().unwrap();
-    assert!(
-        frame.iter().all(|&byte| byte == 0),
-        "the read wrote into the buffer after wal_get_frame returned"
+fn wal_get_frame_under_a_failed_step_ends_the_process() {
+    use std::os::unix::process::ExitStatusExt as _;
+    /// Set in the child: it runs the body.
+    const CHILD: &str = "TURSO_WAL_GET_FRAME_CHILD";
+    /// SIGABRT, the signal `abort` raises: 6 on every unix this crate builds for.
+    const SIGABRT: i32 = 6;
+    /// How long the child may run before it counts as hung: the body takes milliseconds, and a
+    /// failed step that waits, rather than ending the process, never ends.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+    if std::env::var_os(CHILD).is_some() {
+        let io = Arc::new(StepFailsOnce {
+            io: crate::queued_io::QueuedIo::new(),
+            fail_next_step: false.into(),
+        });
+        let db = turso_core::Database::open_file(io.clone(), "repro.db", Arc::new(SqliteDialect))
+            .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        let mut frame = [0u8; 24 + 4096];
+        io.fail_next_step
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let returned = conn.wal_get_frame(1, &mut frame);
+        eprintln!("wal_get_frame returned {returned:?} after a failed step");
+        std::process::exit(0);
+    }
+    let test = concat!(
+        module_path!(),
+        "::wal_get_frame_under_a_failed_step_ends_the_process"
     );
+    // The harness names a test without its crate.
+    let test = test.split_once("::").unwrap().1;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads", "1"])
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let since = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if since.elapsed() > BOUND {
+            child.kill().unwrap();
+            panic!("the child had not ended after {BOUND:?}: the failed step waited");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(SIGABRT),
+        "the failed step did not end the process ({status:?}): {stderr}"
+    );
+    // Where standard error, a pipe here, can be written without waiting, the abort says why.
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        assert!(
+            stderr.contains("the IO's step failed"),
+            "ended without saying why: {stderr}"
+        );
+    }
 }

@@ -2160,8 +2160,7 @@ says which owner that is:
     moving queued requests in, is retried where the kernel says it may be (an interrupted wait; a
     busy or full completion queue, which the thread drains first and then retries); any other
     (a ring the kernel no longer recognizes, a fault in its memory) leaves accepted requests the
-    thread can no longer deliver or retire, so it ends the process (22.11), the error told on standard
-    error where a write cannot wait,
+    thread can no longer deliver or retire, so it ends the process (22.11), writing nothing first,
     rather than return and leave every waiter and close waiting on requests nobody will deliver.
   - **Its lifetime.** The thread holds the ring's shared state, never the handles the embedder
     holds. It runs while any handle to the ring (the IO and its files) lives or any request is
@@ -2376,13 +2375,11 @@ dropped callback held. The completion port refuses a read or write whose byte co
 cannot carry before it accepts it, and delivers every packet it consumes, a count or error code it
 cannot convert as the request's error. The concurrent simulator's files accept each request as
 they queue it, and its step takes the queue out and delivers and retires each, so a callback's own
-submission queues for the next step. A fatal path (`fatal`: the ring lost, a step that failed) needs
-nothing but the abort to end the process: its message is formatted into a buffer on the stack and
-told only by a write that cannot wait, through no lock, so neither a thread holding standard error
-while it waits on the failing one nor a reader that stopped reading can keep the process from
-ending. Standard error is written as it is: a regular file plainly, having no reader to wait for; a
-socket with a send that does not wait; on Linux a pipe, FIFO or terminal through a nonblocking open
-file description of its own, so the one the host shares keeps its flags; anything else not at all.
+submission queues for the next step. A fatal path (`fatal`: the ring lost, a step that failed) is the
+abort and nothing before it: no formatting, no look at standard error and no write, since each can
+wait, on a lock another thread holds while it waits on the failing one, on a reader that stopped
+reading, or on a file system that does not answer (a regular file's write and its `fstat` both wait
+on a stalled FUSE server). The site is kept in a static a core dump shows.
 
 (Corrected after the audit of step 3c: a cancel aborts its requests, running their callbacks, with
 the ring's mutex let go, then queues the kernel's cancels under it, so a callback may submit its next

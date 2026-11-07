@@ -217,16 +217,15 @@ fn enter(ring: &io_uring::IoUring) {
     if let Err(e) = ring.submit() {
         match e.raw_os_error() {
             Some(libc::EINTR | libc::EAGAIN | libc::EBUSY) => {}
-            _ => ring_lost(&e, "io_uring_enter"),
+            _ => ring_lost("io_uring: io_uring_enter failed"),
         }
     }
 }
 
-/// Ends the process: the ring cannot deliver or retire the requests it accepted.
-fn ring_lost(e: &std::io::Error, during: &str) -> ! {
-    super::fatal(format_args!(
-        "io_uring: {during} failed ({e}): the ring can no longer deliver the requests it accepted"
-    ))
+/// Ends the process: the ring cannot deliver or retire the requests it accepted. `during` names
+/// the call that failed.
+fn ring_lost(during: &'static str) -> ! {
+    super::fatal(during)
 }
 
 /// preallocated vec of iovec arrays to avoid allocations during writev operations
@@ -719,7 +718,7 @@ fn deliver(shared: Arc<Shared>) {
                 // A full completion queue, or no room to enter what is queued: what is complete
                 // is taken below, and the wait is tried again.
                 Some(libc::EBUSY | libc::EAGAIN) => {}
-                _ => ring_lost(&e, "io_uring_enter, the delivery thread's wait"),
+                _ => ring_lost("io_uring: the delivery thread's wait failed"),
             }
         }
         shared.take_batch(&mut batch);
@@ -1792,7 +1791,7 @@ mod tests {
     fn an_error_of_the_ring_itself_ends_the_process() {
         ends_the_process(
             "io::io_uring::tests::an_error_of_the_ring_itself_ends_the_process",
-            Some("the ring can no longer deliver the requests it accepted"),
+            None,
             |io, file, _| {
                 io.shared
                     .injected_wait
@@ -1812,14 +1811,14 @@ mod tests {
     }
 
     /// The same with another thread holding standard error, as any print does, while it waits for
-    /// a read the dead ring will never deliver: the error is written without the lock and the
-    /// process ends (mutant: the message printed through the lock, which waits on its holder for
+    /// a read the dead ring will never deliver: nothing is written before the abort, and the
+    /// process ends (mutant: a message printed through the lock, which waits on its holder for
     /// ever).
     #[test]
     fn an_error_of_the_ring_ends_the_process_while_another_thread_holds_stderr() {
         ends_the_process(
             "io::io_uring::tests::an_error_of_the_ring_ends_the_process_while_another_thread_holds_stderr",
-            Some("the ring can no longer deliver the requests it accepted"),
+            None,
             |io, file, _| {
                 io.shared
                     .injected_wait
@@ -1838,9 +1837,9 @@ mod tests {
         );
     }
 
-    /// The same with standard error a full pipe whose reader has stopped reading: the message
-    /// finds no room and the process ends all the same (DESIGN.md 22.11; mutant: the message
-    /// written by a write that waits for room, which never comes).
+    /// The same with standard error a full pipe whose reader has stopped reading: nothing is
+    /// written before the abort, and the process ends all the same (DESIGN.md 22.11; mutant: a
+    /// message written to standard error by a write that waits for room, which never comes).
     #[test]
     fn an_error_of_the_ring_ends_the_process_with_stderr_a_full_pipe() {
         ends_the_process(

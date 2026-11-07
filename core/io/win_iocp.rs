@@ -438,11 +438,8 @@ impl IO for WindowsIOCP {
         while self.instance.has_tracked_io() {
             match self.instance.process_packet_from_iocp(IOCP_STEP_TIMEOUT_MS) {
                 // The port's own error: it can no longer deliver what it accepted (DESIGN.md 22.5).
-                Err(GetIOCPPacketError::SystemError(code)) => {
-                    super::stepping_failed(
-                        &get_generic_limboerror_from_os_err(code),
-                        "the completion port's step",
-                    );
+                Err(GetIOCPPacketError::SystemError(_)) => {
+                    super::stepping_failed("the completion port's step");
                 }
                 // Empty is a timeout: re-check the table and keep waiting.
                 // InvalidIO still untracked the packet, so the loop makes

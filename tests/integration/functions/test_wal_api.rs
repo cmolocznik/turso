@@ -1239,11 +1239,4 @@ fn wal_get_frame_under_a_failed_step_ends_the_process() {
         Some(SIGABRT),
         "the failed step did not end the process ({status:?}): {stderr}"
     );
-    // Where standard error, a pipe here, can be written without waiting, the abort says why.
-    if cfg!(any(target_os = "linux", target_os = "android")) {
-        assert!(
-            stderr.contains("the IO's step failed"),
-            "ended without saying why: {stderr}"
-        );
-    }
 }

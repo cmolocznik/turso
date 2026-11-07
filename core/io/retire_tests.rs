@@ -403,7 +403,7 @@ fn failing_steps(io: &CrashIO) {
 }
 
 /// Runs `wait` on a read a CrashIO accepted, in a child whose steps fail, and asserts the child
-/// ended by abort naming `during`.
+/// ended by abort, in the wait `during` names.
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 fn a_failed_step_under(test: &str, during: &str, wait: fn(&CrashIO, &Completion) -> Result<()>) {
     let Some(ended) = crate::child_test::in_child(test, || {
@@ -423,20 +423,6 @@ fn a_failed_step_under(test: &str, during: &str, wait: fn(&CrashIO, &Completion)
         ended.code,
         ended.stderr
     );
-    told(&ended, &format!("{during}: the IO's step failed"));
-}
-
-/// Where standard error, a pipe in a child test, can be written without waiting (Linux), the
-/// process that ended said why: its message is the diagnostic, never what ends the process.
-#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
-pub(crate) fn told(ended: &crate::child_test::Ended, message: &str) {
-    if cfg!(any(target_os = "linux", target_os = "android")) {
-        assert!(
-            ended.stderr.contains(message),
-            "ended without saying {message:?}: {}",
-            ended.stderr
-        );
-    }
 }
 
 /// Makes this process's standard error what a host's is whose reader has stopped reading: a
@@ -477,8 +463,8 @@ pub(crate) fn stderr_a_full_pipe() {
 }
 
 /// A step that fails ends the process while another thread holds standard error and waits for the
-/// failing one, as a host that prints and then joins its workers does: the message is written
-/// without the lock (DESIGN.md 22.11; mutant: the message printed through the lock, which waits on
+/// failing one, as a host that prints and then joins its workers does: nothing is written before the
+/// abort (DESIGN.md 22.11; mutant: a message printed through the lock, which waits on
 /// its holder while the holder waits on it, so the child never ends).
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
@@ -506,12 +492,12 @@ fn a_step_that_fails_ends_the_process_while_another_thread_holds_stderr() {
         ended.hung,
         ended.code
     );
-    told(&ended, "a wait for a completion: the IO's step failed");
 }
 
 /// A step that fails ends the process with standard error a full pipe whose reader has stopped
-/// reading: the message finds no room and is dropped, and the process ends all the same (DESIGN.md
-/// 22.11; mutant: the message written by a write that waits for room, which never comes).
+/// reading: nothing is written before the abort, and the process ends all the same (DESIGN.md
+/// 22.11; mutant: a message written to standard error by a write that waits for room, which never
+/// comes).
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     not(any(shuttle, atoll_loom, miri))

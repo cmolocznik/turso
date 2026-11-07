@@ -257,13 +257,9 @@ fn a_step_that_fails_while_close_waits_ends_the_process() {
         return;
     };
     assert!(
-        ended.aborted
-            && ended
-                .stderr
-                .contains("a database's close: the IO's step failed"),
+        ended.aborted,
         "the failed step did not end the process: {:?} {}",
-        ended.code,
-        ended.stderr
+        ended.code, ended.stderr
     );
 }
 

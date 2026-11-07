@@ -53,10 +53,7 @@ impl IO for VfsMod {
         let result = unsafe { (vfs.run_once)(vfs.vfs) };
         if !result.is_ok() {
             // The extension can no longer deliver what it accepted (DESIGN.md 22.5).
-            super::stepping_failed(
-                &LimboError::ExtensionError(result.to_string()),
-                "an extension VFS's run_once",
-            );
+            super::stepping_failed("an extension VFS's run_once");
         }
         Ok(())
     }

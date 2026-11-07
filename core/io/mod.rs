@@ -71,109 +71,31 @@ pub(crate) fn refuse_on_delivery_thread(what: &str) {
 /// Ends the process for an error of a backend's stepping itself, not of a request, which the
 /// request's completion carries (DESIGN.md 22.5, 22.11): a backend whose step fails can no longer
 /// deliver or retire what it accepted, so its waiters can neither wait on, since nothing would
-/// deliver, nor return, since the backend may still own the buffers they lent it.
-pub(crate) fn stepping_failed(e: &crate::LimboError, during: &str) -> ! {
-    fatal(format_args!(
-        "{during}: the IO's step failed ({e}): it can no longer deliver or retire the requests it accepted"
-    ))
+/// deliver, nor return, since the backend may still own the buffers they lent it. `during` names
+/// the wait it ended in.
+pub(crate) fn stepping_failed(during: &'static str) -> ! {
+    fatal(during)
 }
 
-/// The most a fatal message writes: `PIPE_BUF` on Linux, the largest write a pipe takes whole or
-/// not at all, so a message written without waiting is never torn or interleaved with another.
-const FATAL_MESSAGE: usize = 4096;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const _: () = assert!(FATAL_MESSAGE == libc::PIPE_BUF);
+/// The site of the process's [`fatal`] end, kept for a core dump to show: written just before the
+/// abort and read by nothing while the process runs.
+static FATAL_SITE: std::sync::atomic::AtomicPtr<u8> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static FATAL_SITE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Ends the process (DESIGN.md 22.11), and nothing but the abort is needed for it to end: `message`
-/// is formatted into a buffer on the stack, cut at [`FATAL_MESSAGE`] bytes, and told on standard
-/// error only by a write that cannot wait ([`tell_without_waiting`]). So neither a thread holding
-/// the standard error stream's lock (every print takes it) while it waits on this one, nor a reader
-/// that has stopped reading, can keep the process from ending. A message no such write can carry
-/// stays in this frame's buffer, which a core dump keeps.
-pub(crate) fn fatal(message: std::fmt::Arguments<'_>) -> ! {
-    let mut buf = [0u8; FATAL_MESSAGE];
-    let len = {
-        let mut cursor = std::io::Cursor::new(&mut buf[..FATAL_MESSAGE - 1]);
-        let _ = std::io::Write::write_fmt(&mut cursor, message);
-        cursor.position() as usize
-    };
-    buf[len] = b'\n';
-    tell_without_waiting(&buf[..=len]);
+/// Ends the process at once (DESIGN.md 22.11). Nothing is formatted, probed or written first: each
+/// can wait, on a lock another thread holds while it waits on this one, on a reader that has
+/// stopped reading, or on a file system that does not answer, and the process must end whatever
+/// standard error is. `site` is kept where a core dump shows it, and the error in its caller's
+/// frame.
+pub(crate) fn fatal(site: &'static str) -> ! {
+    FATAL_SITE_LEN.store(site.len(), std::sync::atomic::Ordering::Relaxed);
+    FATAL_SITE.store(
+        site.as_ptr().cast_mut(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     std::process::abort()
 }
-
-/// Writes `bytes` to standard error where the write cannot wait, by what standard error is: a
-/// regular file has no reader to wait for; a socket is sent to without waiting; a pipe, FIFO or
-/// terminal is written, on Linux, through an open file description of its own, opened nonblocking,
-/// so the description the host shares with other processes keeps its flags, and a write finding no
-/// room writes nothing. Anything else, or a standard error closed or open only for reading, is not
-/// written.
-#[cfg(unix)]
-fn tell_without_waiting(bytes: &[u8]) {
-    // SAFETY: fstat and fcntl on descriptor 2 into a zeroed stat buffer they only fill; every
-    // write takes `bytes`, valid for its length, and the descriptor opened here is closed here.
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(2, &mut st) != 0 {
-            return;
-        }
-        let flags = libc::fcntl(2, libc::F_GETFL);
-        if flags < 0 || flags & libc::O_ACCMODE == libc::O_RDONLY {
-            return;
-        }
-        match st.st_mode & libc::S_IFMT {
-            libc::S_IFREG => {
-                libc::write(2, bytes.as_ptr().cast(), bytes.len());
-            }
-            libc::S_IFSOCK => {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                let flags = libc::MSG_DONTWAIT;
-                libc::send(2, bytes.as_ptr().cast(), bytes.len(), flags);
-            }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            libc::S_IFIFO | libc::S_IFCHR => {
-                let fd = libc::open(
-                    c"/proc/self/fd/2".as_ptr(),
-                    libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
-                );
-                if fd >= 0 {
-                    libc::write(fd, bytes.as_ptr().cast(), bytes.len());
-                    libc::close(fd);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Writes `bytes` to standard error where it is a disk file, which has no reader to wait for. A
-/// pipe or console holds a write for as long as its reader does not read, and neither has a write
-/// that cannot wait short of changing a mode its other holders share, so neither is written.
-#[cfg(windows)]
-fn tell_without_waiting(bytes: &[u8]) {
-    use windows_sys::Win32::Storage::FileSystem::{GetFileType, WriteFile, FILE_TYPE_DISK};
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
-    // SAFETY: the handle is the process's standard error, `bytes` is valid for its length, and
-    // `written` outlives the call.
-    unsafe {
-        let handle = GetStdHandle(STD_ERROR_HANDLE);
-        if GetFileType(handle) == FILE_TYPE_DISK {
-            let mut written = 0;
-            WriteFile(
-                handle,
-                bytes.as_ptr(),
-                bytes.len() as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            );
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn tell_without_waiting(_bytes: &[u8]) {}
 
 #[cfg(any(test, feature = "io_crash"))]
 pub mod crash;
@@ -812,8 +734,8 @@ pub trait IO: Clock + Send + Sync {
             return;
         }
         while !c.finished() {
-            if let Err(e) = self.step() {
-                stepping_failed(&e, "a wait for a completion");
+            if self.step().is_err() {
+                stepping_failed("a wait for a completion");
             }
             if !c.finished() {
                 // A step delivers only what was submitted, and what `c` waits on may be another
@@ -849,8 +771,8 @@ pub trait IO: Clock + Send + Sync {
             for request in c.requests(&mut seen) {
                 if pumped {
                     while request.is_owned() {
-                        if let Err(e) = self.step() {
-                            stepping_failed(&e, "a wait for retirement");
+                        if self.step().is_err() {
+                            stepping_failed("a wait for retirement");
                         }
                     }
                 } else if request.is_owned() {

@@ -83,8 +83,8 @@ impl Requests {
         crate::io::refuse_on_delivery_thread("a database's close");
         if io.delivery() == Delivery::Pumped {
             while self.outstanding() > 0 {
-                if let Err(e) = io.step() {
-                    crate::io::stepping_failed(&e, "a database's close");
+                if io.step().is_err() {
+                    crate::io::stepping_failed("a database's close");
                 }
             }
             return;

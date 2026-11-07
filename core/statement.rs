@@ -847,18 +847,19 @@ impl Statement {
         result
     }
 
-    /// Advances what the statement waits for once it stepped to IO: the IO backend, or, when it
-    /// is parked on a wait another thread completes (an Atoll wait on another transaction), the
-    /// calling thread blocks until that thread completes it, rather than spinning on an IO step
-    /// with nothing to do.
-    fn step_io(&self) -> Result<()> {
-        if let Some(io) = &self.state.io_completions {
-            if io.0.is_remote_wait() && !io.0.finished() {
-                io.0.block_on();
-                return Ok(());
+    /// Waits, blocking the calling thread, for what the statement stepped to IO on (DESIGN.md
+    /// 22.5): its pending completion, through [`crate::io::IO::wait`], which parks until the
+    /// ring's delivery thread or another thread finishes it and steps a pumped backend until it
+    /// does. Its result is the statement's to read at its next step. A step that left no
+    /// completion (a yield) gets one step of the IO, as a pump.
+    pub fn wait_io(&self) -> Result<()> {
+        match &self.state.io_completions {
+            Some(io) => {
+                self.pager.io.wait(&io.0);
+                Ok(())
             }
+            None => self.pager.io.step(),
         }
-        self.pager.io.step()
     }
 
     /// Runs the statement to completion, discarding rows. A busy wait sleeps out each delay the
@@ -868,7 +869,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.step_io()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -885,7 +886,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.step_io()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
@@ -907,7 +908,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.step_io()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_io()?,
                 vdbe::StepResult::Sleep { duration } => self.pager.io.sleep(duration),
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
@@ -991,7 +992,7 @@ impl Statement {
                 vdbe::StepResult::Done => break None,
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
-                    self.step_io()?;
+                    self.wait_io()?;
                     post_io_func()?;
                 }
                 vdbe::StepResult::Sleep { duration } => {
@@ -1626,18 +1627,10 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::IO) => {
-                            // halt() is re-entered until it finishes; the
-                            // IO loop runs once per attempt, as before the
-                            // completion was parked in the state.
-                            drop(self.state.take_suspended_io());
-                            if let Err(e) = self.pager.io.step() {
-                                capture_reset_error(
-                                    &mut reset_error,
-                                    e,
-                                    "Error committing during statement reset",
-                                );
-                                break;
-                            }
+                            // halt() is re-entered once what it waits for
+                            // has finished; its result is halt's to read.
+                            let io = self.state.take_suspended_io();
+                            self.pager.io.wait(&io.0);
                         }
                         Err(e) => {
                             capture_reset_error(

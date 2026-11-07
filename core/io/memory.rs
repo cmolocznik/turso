@@ -87,6 +87,11 @@ impl IO for MemoryIO {
         Ok(())
     }
 
+    /// Every request is delivered inside its submission.
+    fn delivery(&self) -> super::Delivery {
+        super::Delivery::Inline
+    }
+
     fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
         let mut files = self.files.lock();
         let file = files

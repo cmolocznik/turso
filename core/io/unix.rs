@@ -82,6 +82,11 @@ impl IO for UnixIO {
     fn step(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Every request is delivered inside its submission.
+    fn delivery(&self) -> super::Delivery {
+        super::Delivery::Inline
+    }
 }
 
 pub struct UnixFile {

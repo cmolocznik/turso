@@ -647,34 +647,10 @@ impl IO for UringIO {
         Ok(())
     }
 
-    /// Parks until `c` finishes, the delivery thread waking this thread.
-    fn wait_for_completion(&self, c: Completion) -> Result<()> {
-        super::refuse_on_delivery_thread("a wait for a completion");
-        c.block_on();
-        match c.get_error() {
-            Some(e) => Err(e.into()),
-            None => Ok(()),
-        }
-    }
-
-    /// Parks until no request beneath `completions` is owned, the delivery thread waking this
-    /// thread as each retires.
-    fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
-        super::refuse_on_delivery_thread("a wait for retirement");
-        let mut seen = std::collections::HashSet::new();
-        for c in completions {
-            for request in c.requests(&mut seen) {
-                if !request.is_owned() {
-                    continue;
-                }
-                let thread = crate::thread::current();
-                request.on_retired(move || thread.unpark());
-                while request.is_owned() {
-                    crate::thread::park();
-                }
-            }
-        }
-        Ok(())
+    /// The delivery thread delivers every request: a waiter parks until it has, and the trait's
+    /// waits do that for this answer.
+    fn delivery(&self) -> super::Delivery {
+        super::Delivery::Thread
     }
 
     fn register_fixed_buffer(&self, ptr: std::ptr::NonNull<u8>, len: usize) -> Result<u32> {
@@ -1273,21 +1249,13 @@ mod tests {
 
     /// A request finished by its owner while the kernel still holds it (as a cancel finishes one)
     /// stays owned, with its buffer, until the delivery thread delivers its entry, and a drain parks
-    /// until then (DESIGN.md 22.5). The read is from an empty pipe, so the kernel holds it until the
-    /// test writes to the pipe: nothing else can end it.
+    /// until then, taking no step (DESIGN.md 22.5). The read is from an empty pipe, so the kernel
+    /// holds it until the test writes to the pipe: nothing else can end it.
     #[test]
     fn a_request_finished_while_the_kernel_holds_it_is_owned_until_delivered() {
         let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("fifo");
-        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        // SAFETY: a plain mkfifo(3) on a fresh path.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        let io = Arc::new(UringIO::new().unwrap());
-        let pipe = io
-            .open_file(fifo.to_str().unwrap(), OpenFlags::NoLock, false)
-            .unwrap();
-        let c = Completion::new_read(Arc::new(crate::Buffer::new_temporary(1)), |_| None);
-        let c = pipe.pread(0, c).unwrap();
+        let io = crate::io::wait_tests::StepCounting::new(Arc::new(UringIO::new().unwrap()));
+        let (c, fifo) = held_read(&dir, &*io);
         c.abort();
         assert!(c.finished());
         assert!(c.is_owned(), "let go while the kernel holds it");
@@ -1306,14 +1274,10 @@ mod tests {
             !drained.load(Ordering::Acquire),
             "the drain returned while the kernel holds the read"
         );
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&fifo)
-            .unwrap()
-            .write_all(b"x")
-            .unwrap();
+        write_to(&fifo);
         drainer.join().unwrap();
         assert!(!c.is_owned());
+        assert_eq!(io.steps(), 0, "the drain stepped the ring");
     }
 
     /// A request nobody waits on is delivered all the same: the delivery thread delivers every
@@ -1377,6 +1341,182 @@ mod tests {
         for w in waiters {
             w.join().unwrap();
         }
+    }
+
+    /// A read from an empty pipe on `io`, which the kernel holds until [`write_to`] writes to the
+    /// pipe: nothing else can end it.
+    fn held_read(dir: &tempfile::TempDir, io: &dyn IO) -> (Completion, std::path::PathBuf) {
+        let fifo = dir.path().join("fifo");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a plain mkfifo(3) on a fresh path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let pipe = io
+            .open_file(fifo.to_str().unwrap(), OpenFlags::NoLock, false)
+            .unwrap();
+        let c = Completion::new_read(Arc::new(crate::Buffer::new_temporary(1)), |_| None);
+        (pipe.pread(0, c).unwrap(), fifo)
+    }
+
+    /// Ends a [`held_read`].
+    fn write_to(fifo: &std::path::Path) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(fifo)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+    }
+
+    /// A blocking waiter on the ring parks and the delivery thread wakes it: a request nobody
+    /// waits for delivered first, then the waiter's own, held by the kernel for a while, with no
+    /// caller after it; the wait takes no step (DESIGN.md 22.5; mutant: the ring taken for a
+    /// pumped backend, whose waiter steps while the kernel holds its read).
+    #[test]
+    fn a_waiter_parks_on_the_ring_and_takes_no_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = Arc::new(UringIO::new().unwrap());
+        let file = file_of(&dir, &ring, 512);
+        let io = crate::io::wait_tests::StepCounting::new(ring);
+        let (tx, rx) = mpsc::channel();
+        drop(file.pread(0, read_telling(&tx)).unwrap());
+        assert_eq!(rx.recv_timeout(BOUND), Ok(512));
+        let (c, fifo) = held_read(&dir, &*io);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let (io, c) = (io.clone(), c.clone());
+            std::thread::spawn(move || {
+                io.wait(&c);
+                let _ = done_tx.send(());
+            })
+        };
+        // Long enough for the waiter to start and park, which takes microseconds.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "the wait returned while the kernel holds the read"
+        );
+        write_to(&fifo);
+        assert_eq!(
+            done_rx.recv_timeout(BOUND),
+            Ok(()),
+            "the waiter was not woken"
+        );
+        waiter.join().unwrap();
+        assert!(c.succeeded());
+        assert_eq!(io.steps(), 0, "the waiter stepped the ring");
+    }
+
+    /// A waker that unparks the thread that made it.
+    fn unparking() -> std::task::Waker {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        std::task::Waker::from(Arc::new(Unpark(std::thread::current())))
+    }
+
+    /// A cooperative waiter on the ring is woken by the delivery thread: polled once, pending, it
+    /// parks until its waker fires, with a request nobody waits for delivered first and no caller
+    /// after it, and no step taken (DESIGN.md 22.5).
+    #[test]
+    fn a_cooperative_waiter_on_the_ring_is_woken_by_the_delivery_thread() {
+        use std::future::Future as _;
+        let dir = tempfile::tempdir().unwrap();
+        let ring = Arc::new(UringIO::new().unwrap());
+        let file = file_of(&dir, &ring, 512);
+        let io = crate::io::wait_tests::StepCounting::new(ring);
+        let (tx, rx) = mpsc::channel();
+        drop(file.pread(0, read_telling(&tx)).unwrap());
+        assert_eq!(rx.recv_timeout(BOUND), Ok(512));
+        let (c, fifo) = held_read(&dir, &*io);
+        let waker = unparking();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut wait = std::pin::pin!(crate::types::IOCompletions(c.clone()).wait_async(&*io));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        write_to(&fifo);
+        let since = std::time::Instant::now();
+        loop {
+            if wait.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+            assert!(since.elapsed() < BOUND, "the poller was never woken");
+            std::thread::park_timeout(BOUND);
+        }
+        assert!(c.succeeded());
+        assert_eq!(io.steps(), 0, "the cooperative waiter stepped the ring");
+    }
+
+    /// A non-blocking embedder's statement on the ring is woken by the delivery thread: each step
+    /// that reports IO is stepped again only once the waker it was given fires, and the embedder
+    /// takes no step of the IO (DESIGN.md 22.5).
+    #[test]
+    fn a_nonblocking_embedder_on_the_ring_is_woken_by_the_delivery_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = crate::io::wait_tests::StepCounting::new(Arc::new(UringIO::new().unwrap()));
+        let path = dir.path().join("embedder.db");
+        let db = crate::Database::open_file(
+            io.clone(),
+            path.to_str().unwrap(),
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)")
+            .unwrap();
+        let steps_before = io.steps();
+        let waker = unparking();
+        let mut stmt = conn
+            .prepare("INSERT INTO t VALUES (1, zeroblob(65536))")
+            .unwrap();
+        let since = std::time::Instant::now();
+        let mut waits = 0;
+        loop {
+            match stmt.step_with_waker(&waker).unwrap() {
+                crate::StepResult::Done => break,
+                crate::StepResult::IO | crate::StepResult::Yield => {
+                    waits += 1;
+                    assert!(since.elapsed() < BOUND, "the embedder was never woken");
+                    std::thread::park_timeout(BOUND);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(
+            waits > 0,
+            "the statement never waited on the ring, so the test saw nothing"
+        );
+        assert_eq!(io.steps(), steps_before, "the embedder stepped the ring");
+    }
+
+    /// Statements on the ring take no step: each blocking wait of theirs parks until the delivery
+    /// thread delivers what it waits for (mutant: the statement's wait stepping the IO in a loop,
+    /// as before).
+    #[test]
+    fn statements_on_the_ring_take_no_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = crate::io::wait_tests::StepCounting::new(Arc::new(UringIO::new().unwrap()));
+        let path = dir.path().join("ring.db");
+        let db = crate::Database::open_file(
+            io.clone(),
+            path.to_str().unwrap(),
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y BLOB)")
+            .unwrap();
+        for i in 0..64 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, zeroblob(4096))"))
+                .unwrap();
+        }
+        let mut stmt = conn
+            .prepare("SELECT count(*), sum(length(y)) FROM t")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(io.steps(), 0, "a statement stepped the ring");
     }
 
     /// Requests queued past a full submission queue are moved into the kernel by the delivery
@@ -2026,6 +2166,10 @@ mod tests {
             "step" => {
                 let _ = io.step();
             }
+            "delivery" => {
+                let _ = io.delivery();
+            }
+            "wait" => io.wait(&finished()),
             "cancel" => {
                 let _ = io.cancel(&[finished()]);
             }

@@ -67,6 +67,7 @@ pub(crate) const IO: &[(&str, Rule)] = &[
     ("sync_directory", Refused),
     ("rename_file", Refused),
     ("supports_shared_wal_coordination", Allowed(NO_CALL)),
+    ("delivery", Allowed(NO_CALL)),
     (
         "step",
         Allowed("nothing to do on the ring: its delivery thread delivers"),
@@ -78,6 +79,7 @@ pub(crate) const IO: &[(&str, Rule)] = &[
              kernel's cancels, never waited for",
         ),
     ),
+    ("wait", Refused),
     ("wait_retired", Refused),
     ("drain_completions", Refused),
     ("wait_for_completion", Refused),

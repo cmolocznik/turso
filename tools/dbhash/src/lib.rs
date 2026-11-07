@@ -127,7 +127,9 @@ fn get_table_names(
                 let name = row.get_value(0).to_text().expect("table name must be text");
                 names.push(name.to_string());
             }
-            StepResult::IO | StepResult::Sleep { .. } => io.step()?,
+            StepResult::IO => stmt.wait_io()?,
+            // Stepping the IO would spin until the busy timeout passed.
+            StepResult::Sleep { duration } => io.sleep(duration),
             StepResult::Yield => continue,
             StepResult::Done => break,
             StepResult::Busy | StepResult::Interrupt => {
@@ -163,7 +165,9 @@ fn hash_rows(
                     hasher.update(&buf);
                 }
             }
-            StepResult::IO | StepResult::Sleep { .. } => io.step()?,
+            StepResult::IO => stmt.wait_io()?,
+            // Stepping the IO would spin until the busy timeout passed.
+            StepResult::Sleep { duration } => io.sleep(duration),
             StepResult::Yield => continue,
             StepResult::Done => break,
             StepResult::Busy | StepResult::Interrupt => {

@@ -205,6 +205,11 @@ impl IO for WindowsIO {
     fn step(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Every request is delivered inside its submission.
+    fn delivery(&self) -> super::Delivery {
+        super::Delivery::Inline
+    }
 }
 
 impl Clock for WindowsIO {

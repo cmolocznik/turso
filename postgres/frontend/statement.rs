@@ -421,9 +421,9 @@ impl Statement {
             match self.step()? {
                 StepResult::Done => return Ok(()),
                 StepResult::Row => callback(self.row().expect("row should be present"))?,
-                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                    self._io().step()?
-                }
+                StepResult::IO | StepResult::Yield => self.inner.wait_io()?,
+                // Stepping the IO would spin until the busy timeout passed.
+                StepResult::Sleep { duration } => self._io().sleep(duration),
                 StepResult::Interrupt => return Err(LimboError::Interrupt.into()),
                 StepResult::Busy => return Err(LimboError::Busy.into()),
             }
@@ -479,9 +479,15 @@ impl Statement {
             match self.step()? {
                 StepResult::Done => return Ok(None),
                 StepResult::Row => return Ok(Some(self.row().expect("row should be present"))),
-                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                StepResult::IO | StepResult::Yield => {
                     pre_io()?;
-                    self._io().step()?;
+                    self.inner.wait_io()?;
+                    post_io()?;
+                }
+                // Stepping the IO would spin until the busy timeout passed.
+                StepResult::Sleep { duration } => {
+                    pre_io()?;
+                    self._io().sleep(duration);
                     post_io()?;
                 }
                 StepResult::Interrupt => return Err(LimboError::Interrupt.into()),

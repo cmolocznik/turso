@@ -11,22 +11,36 @@
 
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{
-    Buffer, Completion, File, FileId, FileSyncType, MemoryIO, OpenFlags, SharedWalLockKind,
-    SharedWalMappedRegion, IO,
+    Buffer, Completion, Delivery, File, FileId, FileSyncType, MemoryIO, OpenFlags,
+    SharedWalLockKind, SharedWalMappedRegion, IO,
 };
+use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::Result;
 use std::ptr::NonNull;
 
 /// The requests on a database's files submitted and not retired.
-#[derive(Default)]
-pub(super) struct Requests(AtomicUsize);
+pub(super) struct Requests {
+    count: AtomicUsize,
+    /// The thread close parks while it waits for the count on a backend that needs no step, woken
+    /// by the retirement that brings the count to zero.
+    closer: Mutex<Option<crate::thread::Thread>>,
+}
+
+impl Default for Requests {
+    fn default() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            closer: Mutex::new(None),
+        }
+    }
+}
 
 impl Requests {
     /// Counts the request `submit` submits for as long as its backend owns it.
     fn submit(self: &Arc<Self>, submit: impl FnOnce() -> Result<Completion>) -> Result<Completion> {
-        self.0.fetch_add(1, Ordering::AcqRel);
+        self.count.fetch_add(1, Ordering::AcqRel);
         match submit() {
             Ok(c) => {
                 let me = self.clone();
@@ -41,29 +55,45 @@ impl Requests {
     }
 
     fn retired(&self) {
-        let was = self.0.fetch_sub(1, Ordering::AcqRel);
+        let was = self.count.fetch_sub(1, Ordering::AcqRel);
         assert!(was > 0, "a request uncounted twice");
+        if was == 1 {
+            // Close reads the count after it names itself, under this lock, so it either reads
+            // zero or is woken here.
+            if let Some(closer) = &*self.closer.lock() {
+                closer.unpark();
+            }
+        }
     }
 
     /// The requests submitted and not retired.
     pub(super) fn outstanding(&self) -> usize {
-        self.0.load(Ordering::Acquire)
+        self.count.load(Ordering::Acquire)
     }
 
-    /// Close's wait for its requests (DESIGN.md 22.12, step 4): steps `io` until every request
-    /// counted has retired. Every backend retires every request it accepted (the kernel answers
-    /// each, a pumped backend delivers each when stepped), so the wait ends. A step that fails has
-    /// lost the means to retire them, and ends the process (22.11): close can neither wait on nor
-    /// return while the backend may still own its requests' buffers.
+    /// Close's wait for its requests (DESIGN.md 22.12, step 4), until every request counted has
+    /// retired: it steps a pumped backend, and parks on any other until the retirement that brings
+    /// the count to zero wakes it (22.5). Every backend retires every request it accepted (the
+    /// kernel answers each, a pumped backend delivers each when stepped), so the wait ends. A step
+    /// that fails has lost the means to retire them, and ends the process (22.11): close can
+    /// neither wait on nor return while the backend may still own its requests' buffers.
     pub(super) fn drain(&self, io: &dyn IO) {
         // Close waits: never on a ring's delivery thread, the one that would deliver what it waits
         // for (DESIGN.md 22.5).
         crate::io::refuse_on_delivery_thread("a database's close");
-        while self.outstanding() > 0 {
-            if let Err(e) = io.step() {
-                crate::io::stepping_failed(&e, "a database's close");
+        if io.delivery() == Delivery::Pumped {
+            while self.outstanding() > 0 {
+                if let Err(e) = io.step() {
+                    crate::io::stepping_failed(&e, "a database's close");
+                }
             }
+            return;
         }
+        *self.closer.lock() = Some(crate::thread::current());
+        while self.outstanding() > 0 {
+            crate::thread::park();
+        }
+        *self.closer.lock() = None;
     }
 }
 
@@ -125,6 +155,14 @@ impl IO for Counted {
 
     fn step(&self) -> Result<()> {
         self.io.step()
+    }
+
+    fn delivery(&self) -> crate::io::Delivery {
+        self.io.delivery()
+    }
+
+    fn wait(&self, c: &Completion) {
+        self.io.wait(c)
     }
 
     fn cancel(&self, c: &[Completion]) -> Result<()> {

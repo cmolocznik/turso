@@ -2397,6 +2397,26 @@ system's calls were; a test calls each method on a thread marked as the delivery
 ring to the rulings, and the callback census refuses a callback that calls a refused method, by a
 method call or a path.)
 
+(Built, step 3d: `IO::delivery` says who delivers a backend's requests: `Inline` (`UnixIO`, the
+Windows and generic IO, `MemoryIO`), `Thread` (the ring) or `Pumped`, the default, right for any
+backend that does not say. `IO::wait(c)` parks on the completion for a wait another thread
+completes or a backend that is not pumped, and steps a pumped one until `c` finishes, yielding the
+processor between steps that leave it unfinished (what `c` waits on may be another thread's to
+submit, as a log admission's room is), a failed step ending the process; it returns nothing, the completion's result being its owner's to read.
+`wait_for_completion` is that wait and then the completion's error, and `drain_completions` parks
+on each request's retirement where the backend is not pumped; the ring's own overrides of both are
+gone, and the delivery thread's rulings hold `IO::wait` refused there and `IO::delivery` allowed. The
+blocking callers wait through it: `Statement::wait_io` under the `run_*` helpers, the
+reset's halt loop, the incremental blob's steps, Atoll's `drive` and its checkpointing thread, the
+SDK kit's synchronous step, the PostgreSQL frontend's two blocking loops and `tools/dbhash`; a busy
+wait in those loops sleeps rather than steps. Atoll's close steps a pumped backend until its count
+is zero and parks on any other until the retirement that brings it there wakes it. A cooperative
+poll steps a pumped backend alone. A census lists every IO step outside tests by the function that
+takes it: the hosts' pumps, a yield's one turn, a cooperative poll's, the counting IO's forward and
+close's wait on a pumped backend. A pumped backend's ownership is 3b's: accepted at its queue,
+retired at the step that delivers it. How many requests a pumped backend holds is read only by the
+runners' rule of one step per task step, so it is built with them, in step 6.)
+
 **Who waits how.** Every caller that waits for IO is one of three kinds:
 
 - **Blocking**: it holds its thread until the completion finishes, through `IO::wait(c)`. An

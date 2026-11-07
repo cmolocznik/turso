@@ -266,3 +266,55 @@ fn a_step_that_fails_while_close_waits_ends_the_process() {
         ended.stderr
     );
 }
+
+/// Close parks on a backend that needs no step until the retirement that brings the count to zero
+/// wakes it (DESIGN.md 22.5, 22.12): on the ring, with a read the kernel holds until the test
+/// writes to its pipe, close waits without a step and returns once the read is delivered (mutants:
+/// close stepping a backend that needs none; the last retirement waking no one).
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[test]
+fn close_parks_on_the_ring_until_its_last_request_retires() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let ring =
+        crate::io::wait_tests::StepCounting::new(Arc::new(crate::io::UringIO::new().unwrap()));
+    let (io, requests) = counted(ring.clone());
+    let fifo = dir.path().join("fifo");
+    let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a plain mkfifo(3) on a fresh path.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let pipe = io
+        .open_file(fifo.to_str().unwrap(), OpenFlags::NoLock, false)
+        .unwrap();
+    let c = pipe.pread(0, read(1)).unwrap();
+    assert_eq!(requests.outstanding(), 1);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let closer = {
+        let (requests, io) = (requests.clone(), io.clone());
+        std::thread::spawn(move || {
+            requests.drain(&*io);
+            let _ = tx.send(());
+        })
+    };
+    // Long enough for close to start and park, which takes microseconds.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        rx.try_recv().is_err(),
+        "close returned while the kernel holds a read"
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(()),
+        "close was not woken by its last request's retirement"
+    );
+    closer.join().unwrap();
+    assert!(!c.is_owned());
+    assert_eq!(requests.outstanding(), 0);
+    assert_eq!(ring.steps(), 0, "close stepped the ring");
+}

@@ -3684,7 +3684,9 @@ impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
     ) -> std::task::Poll<Self::Output> {
         let completion = std::pin::pin!(&mut self.as_mut().completion);
         match completion.poll(cx) {
-            Poll::Pending => {
+            // A pumped backend delivers only when stepped; on any other the delivery owner wakes
+            // the poller (DESIGN.md 22.5).
+            Poll::Pending if self.io.delivery() == crate::io::Delivery::Pumped => {
                 self.io.step()?;
                 Poll::Pending
             }

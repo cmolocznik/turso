@@ -1557,7 +1557,7 @@ fn step_inner(
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
-                    stmt._io().step()?;
+                    stmt.wait_io()?;
                     continue;
                 }
             }

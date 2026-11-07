@@ -199,6 +199,10 @@ mod delivery_matrix;
 mod iocp_packet;
 #[cfg(test)]
 mod retire_tests;
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod step_census;
+#[cfg(test)]
+pub(crate) mod wait_tests;
 pub use clock::Clock;
 pub use completions::*;
 
@@ -739,6 +743,21 @@ impl Default for OpenFlags {
     }
 }
 
+/// Who delivers a backend's requests, which says how a blocking caller waits for one (DESIGN.md
+/// 22.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Every request inside its submission: none is left to deliver once its submission returns.
+    /// What a caller still waits for, another thread finishes, and the caller parks until it does.
+    Inline,
+    /// A thread of the backend's own delivers every request (the ring's): a caller parks until it
+    /// does, and stepping does nothing.
+    Thread,
+    /// A request is delivered only inside `step`: a caller steps the backend until what it waits
+    /// for finishes.
+    Pumped,
+}
+
 pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
@@ -771,6 +790,39 @@ pub trait IO: Clock + Send + Sync {
         Ok(())
     }
 
+    /// Who delivers this backend's requests. A backend that does not say is pumped, which is
+    /// right for any backend: a waiter steps it until what it waits for finishes.
+    fn delivery(&self) -> Delivery {
+        Delivery::Pumped
+    }
+
+    /// Blocks the calling thread until `c` finishes (DESIGN.md 22.5): a wait another thread
+    /// completes, or a request of a backend that delivers inline or on a thread of its own, parks
+    /// until it is finished; a pumped backend is stepped until it is, the processor yielded between
+    /// steps that leave it unfinished, since what it waits on may be another thread's to submit.
+    /// Its result is its owner's to read. A step that fails ends the process, the backend having
+    /// lost what it accepted.
+    fn wait(&self, c: &Completion) {
+        refuse_on_delivery_thread("a wait for a completion");
+        if c.finished() {
+            return;
+        }
+        if c.is_remote_wait() || self.delivery() != Delivery::Pumped {
+            c.block_on();
+            return;
+        }
+        while !c.finished() {
+            if let Err(e) = self.step() {
+                stepping_failed(&e, "a wait for a completion");
+            }
+            if !c.finished() {
+                // A step delivers only what was submitted, and what `c` waits on may be another
+                // thread's to submit or finish: give it the processor rather than spin.
+                crate::thread::yield_now();
+            }
+        }
+    }
+
     fn cancel(&self, c: &[Completion]) -> Result<()> {
         c.iter().for_each(|c| c.abort());
         Ok(())
@@ -791,12 +843,22 @@ pub trait IO: Clock + Send + Sync {
     /// submitting meanwhile.
     fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
         refuse_on_delivery_thread("a wait for retirement");
+        let pumped = self.delivery() == Delivery::Pumped;
         let mut seen = std::collections::HashSet::new();
         for c in completions {
             for request in c.requests(&mut seen) {
-                while request.is_owned() {
-                    if let Err(e) = self.step() {
-                        stepping_failed(&e, "a wait for retirement");
+                if pumped {
+                    while request.is_owned() {
+                        if let Err(e) = self.step() {
+                            stepping_failed(&e, "a wait for retirement");
+                        }
+                    }
+                } else if request.is_owned() {
+                    // Whoever delivers it, on another thread, lets it go and wakes this one.
+                    let thread = crate::thread::current();
+                    request.on_retired(move || thread.unpark());
+                    while request.is_owned() {
+                        crate::thread::park();
                     }
                 }
             }
@@ -804,22 +866,13 @@ pub trait IO: Clock + Send + Sync {
         Ok(())
     }
 
+    /// [`wait`](Self::wait), then `c`'s own result.
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
-        refuse_on_delivery_thread("a wait for a completion");
-        while !c.finished() {
-            if c.is_remote_wait() {
-                // Another thread completes it, not this backend's step.
-                c.block_on();
-            } else if let Err(e) = self.step() {
-                stepping_failed(&e, "a wait for a completion");
-            }
+        self.wait(&c);
+        match c.get_error() {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
         }
-        if let Some(inner) = &c.inner {
-            if let Some(Some(err)) = inner.result.get().copied() {
-                return Err(err.into());
-            }
-        }
-        Ok(())
     }
 
     fn generate_random_number(&self) -> i64 {

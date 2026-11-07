@@ -728,25 +728,78 @@ fn with_a_checkpointing_thread_a_writer_refused_room_waits_for_the_room_it_frees
     db.assert_holds(&db.tree(root), &model, "the tree as the cut found it");
 }
 
-/// Every hold of the checkpoint's state, a test's probe included, wakes the checkpointing thread
-/// once it has let the state go. The thread parks when it finds the state held: a hold let go with
-/// no wake, or one that wakes it while still held, leaves it parked with a checkpoint due, as the
-/// threaded test above met when its probe for the cut took the state ("the checkpointing thread
-/// took no cut").
+/// The checkpointing thread, finding the state held, waits as its contender, and the hold let go
+/// wakes it: a full checkpoint asked for while the state was held is done once it is let go, with
+/// nothing else waking the thread meanwhile (a transaction's end waiting for it would). A thread
+/// that parks without registering, or a hold let go with no wake, leaves it parked with the
+/// checkpoint due, as the threaded test above met when its probe for the cut took the state ("the
+/// checkpointing thread took no cut").
 #[test]
-fn every_hold_of_the_checkpoints_state_wakes_the_thread_once_let_go() {
-    use crate::storage::atoll::checkpoint::DRIVER_WAKES;
-    let db = Db::memory();
+fn a_hold_let_go_wakes_the_checkpointing_thread_that_found_the_state_held() {
+    let db = Db::threaded();
     let cp = db.db.checkpointer();
-    let (asked, held) = DRIVER_WAKES.with(|w| w.get());
-    drop(cp.hold().expect("the state free"));
-    assert_eq!(cp.cut_taken(), None);
-    let (now_asked, now_held) = DRIVER_WAKES.with(|w| w.get());
-    assert_eq!(
-        (now_asked - asked, now_held - held),
-        (2, 0),
-        "wakes asked by two holds let go, and of them asked with the state still held"
-    );
+    let held = cp.hold().expect("the state free");
+    let ticket = cp.request_full();
+    let began = std::time::Instant::now();
+    while !cp.driver_contends() {
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(60),
+            "the checkpointing thread never waited for the state"
+        );
+        std::thread::yield_now();
+    }
+    drop(held);
+    let began = std::time::Instant::now();
+    while cp.fulls_done() < ticket {
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(60),
+            "the checkpointing thread was left parked after the state was let go"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The ends of transactions waiting for a full checkpoint are woken with no lock held: a waiter
+/// whose waker waits for the next full checkpoint again, from inside its wake on the
+/// checkpointing thread, is not blocked by the lock the wake would otherwise still hold.
+#[test]
+fn a_waiter_woken_for_a_full_checkpoint_may_wait_again_from_its_wake() {
+    use std::sync::mpsc;
+    use std::task::{Wake, Waker};
+    struct Again {
+        cp: Arc<crate::storage::atoll::checkpoint::Checkpointer>,
+        ticket: u64,
+        told: std::sync::Mutex<mpsc::Sender<bool>>,
+    }
+    impl Wake for Again {
+        fn wake(self: std::sync::Arc<Self>) {
+            let waited = self.cp.wait_full_on_the_thread(self.ticket).is_ok();
+            let _ = self.told.lock().unwrap().send(waited);
+        }
+    }
+    let db = Db::threaded();
+    let cp = db.db.checkpointer_arc().clone();
+    let held = cp.hold().expect("the state free");
+    let ticket = cp.request_full();
+    let IOResult::IO(IOCompletions(c)) = cp.step_full(ticket, db.db.transactions()).unwrap() else {
+        panic!("a full checkpoint done while its state was held");
+    };
+    let (told, woke) = mpsc::channel();
+    c.set_waker(&Waker::from(std::sync::Arc::new(Again {
+        cp: cp.clone(),
+        ticket: ticket + 1,
+        told: std::sync::Mutex::new(told),
+    })));
+    drop(held);
+    match woke.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(waited) => assert!(waited, "the wait again failed"),
+        Err(_) => {
+            // The checkpointing thread is stuck in the wake: closing would wait for it forever.
+            std::mem::forget(db);
+            panic!("a waker waiting again from its wake was blocked");
+        }
+    }
+    drop(cp);
 }
 
 /// A checkpoint failing on the checkpointing thread is told to a transaction's end waiting on it

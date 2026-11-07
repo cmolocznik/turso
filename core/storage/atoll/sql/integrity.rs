@@ -77,13 +77,7 @@ impl AtollDb {
             found: Vec::new(),
         };
         super::mode::full_checkpoint(self)?;
-        let checkpointer = self.atoll().checkpointer();
-        let _held = loop {
-            if let Some(held) = checkpointer.hold() {
-                break held;
-            }
-            crate::thread::yield_now();
-        };
+        let _held = self.atoll().checkpointer().hold_waiting();
         let reached = self.reached(txn, &mut findings)?;
         if !findings.full() {
             self.account(&reached, &mut findings)?;

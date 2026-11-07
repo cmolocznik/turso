@@ -1693,8 +1693,8 @@ work says which parts are done.
 12. **Streams** (section 21): a partition's batch append and read, recovery, and whole-segment
     retention (built: `stream.rs`); then segment index files, the stream's memory budget, the
     catalog in trees, transactions with streams, and consumer and producer state.
-13. **The executor** (section 22): designed on 2026-11-06 and revised after seven audits, not
-    built but for `StateHold`; its own order of work is 22.16.
+13. **The executor** (section 22): designed on 2026-11-06 and revised after seven audits; built
+    through step 1 of its own order of work, 22.16.
 
 ## 21. Streams (Clay's spec of 2026-11-06)
 
@@ -1971,21 +1971,24 @@ registers a waker on a completion while it holds an executor mutex.
    different types.)
    - **The state is reachable only through the guard.** `T` is a private field of `Guarded`'s
      module and `try_hold` its one accessor, so taking it any other way does not compile.
-     (`StateHold` today wraps a mutex the rest of `checkpoint.rs` can still reach: 22.16 step 1
-     closes that.)
+     (Built: `guarded.rs`, whose test compiles a reach for the field and expects it refused.)
    - **Only a contender is woken.** A taker that finds the state held may register as a contender
      and then tries again; if it now holds the state, it removes its own registration. A holder is
      never a contender of its own hold, so a task letting go of state it took wakes nobody but those
      who wanted it: a task that finds nothing to do cannot wake itself and requeue forever.
      Contenders are executor targets (the checkpoint's task, and an integrity check's parked
-     thread), kept in a fixed array sized by the takers that may contend (one task, and at most one
-     integrity check per connection).
+     thread), kept in a fixed array sized by the takers that may contend: two, the checkpoint and
+     one integrity check, which holds the write gate exclusive, so no second runs beside it. Until
+     the checkpoint becomes a task (22.16 step 7) its contender is the checkpointing thread, parked,
+     and the checkpointer's hold, let go, also wakes the writers waiting for room: under
+     `Checkpointing::Writers` a writer refused room whose relief found the state held steps the
+     checkpoint itself once it is let go.
    - **A release** lets the state go, then takes the contenders' mutex, wakes each contender and
      empties the list. The lock order is the state, then its contenders' mutex, then the queue's.
    - The checkpoint's state, an integrity check's hold of it, and the maintenance gate (22.9 item 3)
      are guarded states. The checkpoint's `wake_waiters`, whose waiters are completions with
-     arbitrary wakers, holds its waiters' mutex while it completes them today (the guard taken in a
-     `for` loop's expression lives for the loop); it takes the list into a local first.
+     arbitrary wakers, takes the list into a local and completes it with no lock held (the guard
+     once taken in a `for` loop's expression lived for the loop).
 - **No timers** (section 7.3). Every wait is a completion, a signal or a guarded state. Pacing,
   where a job has one, counts arrivals (22.9 item 3). Foreground timeouts (a busy timeout) and
   future leases keep their own clocks; they are not the executor's. A simulator's delayed IO
@@ -2875,9 +2878,9 @@ compose, the real `Completion`, latch and backends included where named.
 
 ### 22.16 Order of work
 
-1. **`StateHold` (built, a92a1d667), then its amendments**: `Guarded` with the state reachable only
-   through it, contenders woken under their mutex instead of the thread, `wake_waiters` waking its
-   completions with no lock held; proof 8.
+1. **`StateHold` (built, a92a1d667), then its amendments (built)**: `Guarded` with the state
+   reachable only through it, contenders woken under their mutex instead of the thread,
+   `wake_waiters` waking its completions with no lock held; proof 8.
 2. **The panic boundary** (22.11): the check in every destructor that releases shared state, every
    lock in Atoll on its own wrappers, with their census; `atoll_entry!` on every entry, an entry
    made while unwinding aborting; the facade with crate-private types behind it, returning no Atoll

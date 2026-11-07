@@ -37,6 +37,7 @@ use super::btree::node::{self, View};
 use super::btree::value::{self, ValueRef};
 use super::buffer::{BufferPool, CutScan, LentUse, Relief, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
+use super::guarded::{Guarded, Hold};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
@@ -58,10 +59,6 @@ crate::thread::thread_local! {
     /// Steps of the checkpoint state taken on this thread, other than the checkpointing thread's,
     /// for tests to tell writers that did checkpoint work.
     pub(crate) static WRITER_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Wakes of the checkpointing thread asked on this thread, and of them those asked while the
-    /// checkpoint's state was held, for tests to tell every hold wakes it once let go.
-    pub(crate) static DRIVER_WAKES: std::cell::Cell<(u64, u64)> =
-        const { std::cell::Cell::new((0, 0)) };
 }
 
 /// The record naming the metadata pages a checkpoint is about to write: its number, then each
@@ -122,8 +119,9 @@ pub struct Checkpointer {
     /// The superblock in charge, as the checkpoint stepping it last wrote it, for anyone to read.
     published: ArcCell<Superblock>,
     releasing: Releasing<Superblock>,
-    /// Owned by whoever steps the checkpoints, and only ever tried.
-    state: Mutex<State>,
+    /// Owned by whoever steps the checkpoints, and only ever tried: the checkpointing thread and an
+    /// integrity check wait for it as contenders, woken once it is let go.
+    state: Guarded<State>,
     /// Bytes of image writes kept in flight, at most, beside [`WRITES`] of them.
     write_bytes: usize,
     counters: Counters,
@@ -199,35 +197,33 @@ impl Relief for CheckpointRelief {
     }
 }
 
-/// The checkpointer held idle ([`Checkpointer::hold`]): writers waiting for room try again when
-/// it is let go.
 /// The checkpoint's state, held ([`Checkpointer::try_hold`]): every holder takes it so. Letting it
-/// go wakes whoever the hold kept waiting, a writer waiting for room and the checkpointing thread,
-/// which parks when it finds the state held. The state goes first: woken while it is still held,
-/// the thread would find it held, park again, and nothing would wake it.
-struct StateHold<'a, G: DerefMut<Target = State>> {
-    state: Option<G>,
+/// go wakes its contenders ([`Hold`]), then the writers waiting for room: a writer refused room
+/// waits on the room, and one whose relief found the state held steps the checkpoint itself once
+/// it is let go.
+struct StateHold<'a> {
+    hold: Option<Hold<'a, State>>,
     checkpointer: &'a Checkpointer,
 }
 
-impl<G: DerefMut<Target = State>> Deref for StateHold<'_, G> {
+impl Deref for StateHold<'_> {
     type Target = State;
 
     fn deref(&self) -> &State {
-        self.state.as_deref().expect("the state held")
+        self.hold.as_deref().expect("the state held")
     }
 }
 
-impl<G: DerefMut<Target = State>> DerefMut for StateHold<'_, G> {
+impl DerefMut for StateHold<'_> {
     fn deref_mut(&mut self) -> &mut State {
-        self.state.as_deref_mut().expect("the state held")
+        self.hold.as_deref_mut().expect("the state held")
     }
 }
 
-impl<G: DerefMut<Target = State>> Drop for StateHold<'_, G> {
+impl Drop for StateHold<'_> {
     fn drop(&mut self) {
-        drop(self.state.take());
-        self.checkpointer.left();
+        drop(self.hold.take());
+        self.checkpointer.pool.wake_room();
     }
 }
 
@@ -350,7 +346,7 @@ impl Checkpointer {
             began_at,
             published: ArcCell::new(Arc::new(superblock.clone())),
             releasing,
-            state: Mutex::new(State {
+            state: Guarded::new(State {
                 superblock,
                 run: None,
                 full_done: 0,
@@ -380,7 +376,7 @@ impl Checkpointer {
     }
 
     /// Steps the state, timed. Whoever steps it wakes any writer waiting for room once it has
-    /// let the state go ([`left`](Self::left)).
+    /// let the state go ([`StateHold`]).
     fn stepping(
         &self,
         state: &mut State,
@@ -419,25 +415,32 @@ impl Checkpointer {
         }
     }
 
+    /// Completes the waiters taken off the list, with no lock held: a waiter's waker may run code,
+    /// and one that waits for a full checkpoint again takes the list's lock.
     fn wake_waiters(&self) {
-        for c in std::mem::take(&mut *self.waiters.lock()) {
+        let waiters = std::mem::take(&mut *self.waiters.lock());
+        for c in waiters {
             c.complete(0);
         }
     }
 
-    /// The state let go: a writer waiting for room tries again, finding the room given back, or
-    /// steps the checkpoint on itself; the thread, if it found the state taken, steps it now.
-    fn left(&self) {
-        self.pool.wake_room();
-        self.wake_driver();
-    }
-
     /// The state, if no one holds it: let go, it wakes whoever waits on it.
-    fn try_hold(&self) -> Option<StateHold<'_, impl DerefMut<Target = State> + '_>> {
-        self.state.try_lock().map(|state| StateHold {
-            state: Some(state),
+    fn try_hold(&self) -> Option<StateHold<'_>> {
+        self.state.try_hold().map(|hold| StateHold {
+            hold: Some(hold),
             checkpointer: self,
         })
+    }
+
+    /// The state, if no one holds it; else this thread is its contender, unparked once it is let
+    /// go, and parks.
+    fn hold_or_contend(&self) -> Option<StateHold<'_>> {
+        self.state
+            .hold_or_contend(&crate::thread::current())
+            .map(|hold| StateHold {
+                hold: Some(hold),
+                checkpointer: self,
+            })
     }
 
     /// Whether the database's checkpointing thread runs.
@@ -451,14 +454,28 @@ impl Checkpointer {
         self.driver.lock().as_ref().is_some_and(|t| t.id() == id)
     }
 
+    /// Full checkpoints done, as the state last recorded them: read without waking anyone.
+    #[cfg(test)]
+    pub(crate) fn fulls_done(&self) -> u64 {
+        self.full_done.load(Ordering::Acquire)
+    }
+
+    /// Whether the checkpointing thread waits for the state as its contender.
+    #[cfg(test)]
+    pub(crate) fn driver_contends(&self) -> bool {
+        let driver = self.driver.lock().clone();
+        driver.is_some_and(|t| self.state.contends(&t))
+    }
+
+    /// A transaction's end's wait for full checkpoint `ticket`, as the thread does it: for a
+    /// test's waker to wait again from inside its wake.
+    #[cfg(test)]
+    pub(crate) fn wait_full_on_the_thread(&self, ticket: u64) -> Result<IOResult<()>> {
+        self.wait_full(ticket)
+    }
+
     /// Wakes the checkpointing thread, from any other thread: a checkpoint may be due.
     fn wake_driver(&self) {
-        #[cfg(test)]
-        DRIVER_WAKES.with(|w| {
-            let (asked, held) = w.get();
-            let now_held = u64::from(self.state.try_lock().is_none());
-            w.set((asked + 1, held + now_held));
-        });
         if !self.driven() {
             return;
         }
@@ -495,7 +512,7 @@ impl Checkpointer {
         let _ended = Ended(self);
         while !self.stop.load(Ordering::Acquire) {
             let stepped = self
-                .try_hold()
+                .hold_or_contend()
                 .map(|mut state| self.stepping(&mut state, txns, Until::Done));
             match stepped {
                 Some(Ok(IOResult::IO(IOCompletions(c)))) => {
@@ -504,8 +521,8 @@ impl Checkpointer {
                     }
                 }
                 // Nothing due, a failure that stops every checkpoint until the database is opened
-                // again (told to whoever waits), or the state taken by another, who wakes it on
-                // letting go.
+                // again (told to whoever waits), or the state taken by another: the thread is its
+                // contender, woken once it is let go.
                 Some(Ok(IOResult::Done(()))) | Some(Err(_)) | None => crate::thread::park(),
             }
         }
@@ -617,6 +634,17 @@ impl Checkpointer {
     /// dropped, so the page store holds still for an integrity check (DESIGN.md §17, §12; R36).
     pub fn hold(&self) -> Option<impl Sized + '_> {
         self.try_hold()
+    }
+
+    /// [`hold`](Self::hold), waiting while someone steps the checkpointer: parked as the state's
+    /// contender, woken once it is let go.
+    pub fn hold_waiting(&self) -> impl Sized + '_ {
+        loop {
+            if let Some(held) = self.hold_or_contend() {
+                return held;
+            }
+            crate::thread::park();
+        }
     }
 
     /// The checkpoint under way whose cut is taken, if any: what it writes is as of that cut.

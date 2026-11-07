@@ -31,6 +31,7 @@ pub mod crc;
 pub mod db;
 pub mod epoch;
 pub mod floors;
+pub(crate) mod guarded;
 pub mod latch;
 pub mod log;
 pub mod meta;

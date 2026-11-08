@@ -858,7 +858,10 @@ impl Statement {
                 self.pager.io.wait(&io.0);
                 Ok(())
             }
-            None => self.pager.io.step(),
+            None => match self.pager.io.step() {
+                Ok(()) => Ok(()),
+                Err(_error) => crate::io::stepping_failed("a statement's yield pump"),
+            },
         }
     }
 

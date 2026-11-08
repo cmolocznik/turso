@@ -393,9 +393,10 @@ fn failing_steps(io: &CrashIO) {
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     io.on_step(Some(Arc::new(move || {
         if failed.swap(true, Ordering::SeqCst) {
-            eprintln!("stepped again after a failed step");
+            crate::child_test::record("backend-step", "retried");
             std::process::exit(0);
         }
+        crate::child_test::record("backend-step", "failed");
         Err(crate::LimboError::InternalError(
             "the backend's stepping failed".into(),
         ))
@@ -556,5 +557,90 @@ fn a_step_that_fails_under_a_wait_for_retirement_ends_the_process() {
         ),
         "a wait for retirement",
         |io, c| io.drain_completions(std::slice::from_ref(c)),
+    );
+}
+
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_backend_step_failure_ends_an_async_wait() {
+    let Some(ended) = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_backend_step_failure_ends_an_async_wait"
+        ),
+        || {
+            use std::future::Future;
+            let io = CrashIO::new(9);
+            let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+            let request = file.pread(0, read(512)).unwrap();
+            assert!(request.is_owned() && !request.finished());
+            failing_steps(&io);
+            let mut future = std::pin::pin!(crate::types::IOCompletions(request).wait_async(&io));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            crate::child_test::record("target", "ready");
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            stderr_a_full_pipe();
+            let _ = future.as_mut().poll(&mut context);
+            crate::child_test::record("target", "returned");
+            std::process::exit(0);
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(
+        crate::child_test::recorded(&ended, "backend-step"),
+        "failed\n"
+    );
+    assert_eq!(crate::child_test::recorded(&ended, "target"), "ready\n");
+    assert!(
+        ended.aborted && !ended.hung,
+        "the async wait did not abort: hung {}, code {:?}",
+        ended.hung,
+        ended.code
+    );
+}
+
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_backend_step_failure_ends_a_statements_yield_pump() {
+    let Some(ended) = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_backend_step_failure_ends_a_statements_yield_pump"
+        ),
+        || {
+            let io = Arc::new(CrashIO::new(10));
+            let db = crate::Database::open(
+                io.clone(),
+                "/db/main",
+                crate::OpenOptions::new(Arc::new(crate::SqliteDialect)),
+            )
+            .unwrap();
+            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+            let statement = conn.prepare("SELECT 1").unwrap();
+            let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+            let request = file.pread(0, read(512)).unwrap();
+            assert!(request.is_owned() && !request.finished());
+            failing_steps(&io);
+            crate::child_test::record("target", "ready");
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            stderr_a_full_pipe();
+            let _ = statement.wait_io();
+            crate::child_test::record("target", "returned");
+            std::process::exit(0);
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(
+        crate::child_test::recorded(&ended, "backend-step"),
+        "failed\n"
+    );
+    assert_eq!(crate::child_test::recorded(&ended, "target"), "ready\n");
+    assert!(
+        ended.aborted && !ended.hung,
+        "the statement's pump did not abort: hung {}, code {:?}",
+        ended.hung,
+        ended.code
     );
 }

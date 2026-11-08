@@ -3687,7 +3687,9 @@ impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
             // A pumped backend delivers only when stepped; on any other the delivery owner wakes
             // the poller (DESIGN.md 22.5).
             Poll::Pending if self.io.delivery() == crate::io::Delivery::Pumped => {
-                self.io.step()?;
+                if let Err(_error) = self.io.step() {
+                    crate::io::stepping_failed("an async wait for a completion");
+                }
                 if !self.completion.finished() {
                     cx.waker().wake_by_ref();
                 }

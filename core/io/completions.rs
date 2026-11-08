@@ -524,10 +524,13 @@ impl Completion {
         if self.finished() {
             return;
         }
-        self.set_waker(&Waker::from(std::sync::Arc::new(Unpark(
-            crate::thread::current(),
-        ))));
-        while !self.finished() {
+        let waker = Waker::from(std::sync::Arc::new(Unpark(crate::thread::current())));
+        loop {
+            // A progress wake consumes the waker before the completion finishes.
+            self.set_waker(&waker);
+            if self.finished() {
+                return;
+            }
             crate::thread::park();
         }
     }
@@ -1645,6 +1648,34 @@ mod tests {
                 );
             },
             None,
+        );
+    }
+
+    /// A group can wake a waiter before its last child finishes. After that progress wake,
+    /// blocking again must register a waker for the final completion.
+    #[cfg(shuttle)]
+    #[test]
+    fn shuttle_blocking_group_wait_registers_again_after_a_progress_wake() {
+        shuttle::check_random_with_seed(
+            || {
+                let first = Completion::new_sync(|_| {});
+                let last = Completion::new_sync(|_| {});
+                let mut group = CompletionGroup::new(|_| {});
+                group.add(&first);
+                group.add(&last);
+                let group = group.build();
+                let waiter = {
+                    let group = group.clone();
+                    crate::thread::spawn(move || group.block_on())
+                };
+                first.complete(0);
+                crate::thread::yield_now();
+                last.complete(0);
+                waiter.join().unwrap();
+                assert!(group.succeeded());
+            },
+            0,
+            1000,
         );
     }
 

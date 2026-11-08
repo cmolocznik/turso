@@ -3688,6 +3688,9 @@ impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
             // the poller (DESIGN.md 22.5).
             Poll::Pending if self.io.delivery() == crate::io::Delivery::Pumped => {
                 self.io.step()?;
+                if !self.completion.finished() {
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Pending
             }
             res => res,

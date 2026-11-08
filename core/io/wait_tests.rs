@@ -114,6 +114,59 @@ fn a_pumped_wait_steps_past_a_request_queued_ahead_until_its_own_is_delivered() 
     assert_eq!(io.in_flight(), 0);
 }
 
+#[test]
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn a_pumped_async_wait_requests_another_poll_until_its_request_finishes() {
+    use crate::types::IOCompletions;
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let backend = Arc::new(CrashIO::new(1));
+    let io = StepCounting::new(backend.clone());
+    let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+    let mine = read(512);
+    let ahead = {
+        let (file, mine) = (file.clone(), mine.clone());
+        Completion::new_read(Arc::new(Buffer::new_temporary(512)), move |_| {
+            drop(file.pread(0, mine.clone()).unwrap());
+            None
+        })
+    };
+    let ahead = file.pread(0, ahead).unwrap();
+    let wakes = std::sync::Arc::new(Wakes(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(IOCompletions(mine.clone()).wait_async(&*io));
+    for poll in 1..=4 {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => {
+                result.unwrap();
+                assert!(ahead.finished() && mine.finished());
+                assert_eq!(backend.in_flight(), 0);
+                assert_eq!(io.steps(), 2);
+                return;
+            }
+            Poll::Pending => assert!(
+                wakes.0.swap(0, Ordering::SeqCst) > 0,
+                "poll {poll} left a request queued with nobody to poll its waiter again"
+            ),
+        }
+    }
+    panic!("the async wait did not finish within four polls");
+}
+
 /// On a backend that delivers inline, what a caller still waits for another thread finishes:
 /// the waiter parks until it does and never steps (mutant: the backend taken for pumped, which
 /// steps a backend with nothing to deliver for as long as the other thread takes).

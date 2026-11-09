@@ -4594,7 +4594,8 @@ impl<A: ConcurrentAllocator> RootBindings<A> {
     pub fn insert(&self, table_id: MVTableId, entry: RootEntry) {
         let _door = self.door.lock();
         self.bind(table_id, entry);
-        debug_assert!(self.index_is_exact());
+        #[cfg(debug_assertions)]
+        assert!(self.index_is_exact());
     }
 
     /// As [`Self::insert`], reporting an allocation failure with both maps unchanged.
@@ -4617,7 +4618,8 @@ impl<A: ConcurrentAllocator> RootBindings<A> {
             return Err(err);
         }
         self.unindex_replaced(table_id, previous, entry.root_page);
-        debug_assert!(self.index_is_exact());
+        #[cfg(debug_assertions)]
+        assert!(self.index_is_exact());
         Ok(())
     }
 
@@ -4628,14 +4630,16 @@ impl<A: ConcurrentAllocator> RootBindings<A> {
                 self.by_root.remove(&(root, *table_id));
             }
         }
-        debug_assert!(self.index_is_exact());
+        #[cfg(debug_assertions)]
+        assert!(self.index_is_exact());
     }
 
     pub fn clear(&self) {
         let _door = self.door.lock();
         self.entries.clear();
         self.by_root.clear();
-        debug_assert!(self.index_is_exact());
+        #[cfg(debug_assertions)]
+        assert!(self.index_is_exact());
     }
 
     /// The table ids with a binding on `root_page`, live or retired, in table-id order.

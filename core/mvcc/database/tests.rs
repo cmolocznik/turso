@@ -3,6 +3,7 @@ use crate::SqliteDialect;
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
+use crate::alloc::DynAllocator;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
 use crate::database::remove_file_from_database_registry;
 use crate::io::{PlatformIO, IO};
@@ -25712,4 +25713,141 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
     <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
         TursoAllocator,
     )
+}
+
+/// The resolution the root-page reverse index replaced: walk every binding.
+fn owner_by_scan(
+    store: &MvStore<MvccClock, DynAllocator>,
+    root: u64,
+    ts: u64,
+) -> Option<MVTableId> {
+    store
+        .table_id_to_rootpage
+        .iter()
+        .filter(|entry| {
+            let e = entry.value();
+            e.root_page == Some(root) && (e.is_live() || ts < e.end)
+        })
+        .min_by_key(|entry| entry.value().end)
+        .map(|entry| *entry.key())
+}
+
+/// The reverse index answers exactly what a walk over the bindings answers, for every page and
+/// snapshot, after random bind / reuse / retire / reclaim / remove / replace / clear sequences.
+#[test]
+fn root_page_reverse_index_equals_the_scan_after_random_binding_churn() {
+    use crate::mvcc::database::WalPos;
+    const PAGES: u64 = 12;
+    const TABLES: i64 = 40;
+    let mut compared = 0usize;
+    let mut resolved = 0usize;
+    for seed in 0..64u64 {
+        let db = MvccTestDb::new();
+        let store = &db.mvcc_store;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut clock = 10u64;
+        for _ in 0..300 {
+            clock += rng.random_range(1..5);
+            let table = MVTableId::from(-rng.random_range(100..100 + TABLES));
+            let page = rng.random_range(2..2 + PAGES);
+            match rng.random_range(0..8) {
+                0 => store.insert_table_id_to_rootpage(table, Some(page)),
+                1 => store.insert_table_id_to_rootpage(table, None),
+                2 => store.record_rootpage_alloc(table, page, clock, WalPos::STAGED),
+                3 => store.retire_rootpage(table, clock),
+                4 => {
+                    let lwm = clock.saturating_sub(rng.random_range(0..30));
+                    store.gc_rootpage_entries(lwm);
+                }
+                5 => store.remove_table_id_to_rootpage(&table),
+                6 => store.publish_rootpage_visible(table, WalPos::ORIGIN),
+                _ => {
+                    if rng.random_range(0..40) == 0 {
+                        store.table_id_to_rootpage.clear();
+                    }
+                }
+            }
+            assert!(
+                store.table_id_to_rootpage.index_matches_bindings(),
+                "seed {seed}: the reverse index drifted from the bindings"
+            );
+            for root in 2..2 + PAGES {
+                for ts in [0, clock / 2, clock, clock + 1, u64::MAX] {
+                    let by_index = store.try_get_table_id_from_root_page_at(root as i64, ts);
+                    assert_eq!(
+                        by_index,
+                        owner_by_scan(store, root, ts),
+                        "seed {seed}: page {root} at {ts}"
+                    );
+                    compared += 1;
+                    resolved += usize::from(by_index.is_some());
+                }
+            }
+        }
+    }
+    assert!(
+        compared > 100_000,
+        "the churn must compare many resolutions: {compared}"
+    );
+    assert!(
+        resolved * 20 > compared,
+        "the churn must resolve a real share of them: {resolved} of {compared}"
+    );
+}
+
+/// A page freed and handed to a new table keeps its older owner visible to older snapshots and
+/// resolves the newer owner after, and the claim retires an owner left live by a raced drop.
+#[test]
+fn root_page_reuse_resolves_each_owner_at_its_own_snapshots() {
+    use crate::mvcc::database::WalPos;
+    let db = MvccTestDb::new();
+    let store = &db.mvcc_store;
+    let (first, second, third) = (
+        MVTableId::from(-10_i64),
+        MVTableId::from(-20_i64),
+        MVTableId::from(-30_i64),
+    );
+    store.record_rootpage_alloc(first, 7, 100, WalPos::ORIGIN);
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, 150),
+        Some(first)
+    );
+    store.retire_rootpage(first, 200);
+    store.record_rootpage_alloc(second, 7, 200, WalPos::ORIGIN);
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, 150),
+        Some(first)
+    );
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, 200),
+        Some(second)
+    );
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, u64::MAX),
+        Some(second)
+    );
+    // The page is claimed again while the second owner is still marked live: the claim retires it.
+    store.record_rootpage_alloc(third, 7, 300, WalPos::ORIGIN);
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, 250),
+        Some(second)
+    );
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(7, u64::MAX),
+        Some(third)
+    );
+    // A table moved to another page leaves the first page.
+    store.insert_table_id_to_rootpage(third, Some(9));
+    assert_eq!(
+        store.try_get_table_id_from_root_page_at(9, u64::MAX),
+        Some(third)
+    );
+    assert_eq!(store.try_get_table_id_from_root_page_at(7, u64::MAX), None);
+    // Reclaiming the retired owners drops them from the page.
+    assert_eq!(store.gc_rootpage_entries(u64::MAX - 1), 2);
+    assert_eq!(
+        store.table_id_to_rootpage.owners_of(7),
+        Vec::<MVTableId>::new()
+    );
+    assert!(store.table_id_to_rootpage.index_matches_bindings());
 }

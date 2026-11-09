@@ -177,6 +177,10 @@ pub type IndexRowsMap<A = TursoAllocator> =
     SkipMap<Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
 
 impl MVTableId {
+    /// The bounds of the id order, for range probes that name no particular id.
+    const MIN: Self = Self(i64::MIN);
+    const MAX: Self = Self(i64::MAX);
+
     pub fn new(value: i64) -> Self {
         turso_assert_less_than!(value, 0, "MVCC table IDs are always negative");
         Self(value)
@@ -4548,6 +4552,155 @@ impl RootEntry {
     }
 }
 
+/// The versioned `table_id -> root_page` bindings and their reverse index `root_page -> table ids`.
+///
+/// The reverse index exists so that resolving a cursor's root page to its table id costs a probe
+/// of the page's owners (one live owner plus any retired earlier owners) instead of a walk over
+/// every table and index. Both maps are private and every mutation goes through the methods
+/// here, which hold `door` and change the two together, so the index cannot drift from the
+/// bindings. Readers take no lock: they read candidates from the index and re-read each
+/// candidate's binding from `entries`, so a reader racing a mutation resolves against either the
+/// state before or the state after it, exactly as a walk over `entries` did.
+#[derive(Debug)]
+pub struct RootBindings<A: ConcurrentAllocator = TursoAllocator> {
+    entries: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
+    /// One `(root_page, table_id)` key for every binding whose `root_page` is `Some`.
+    by_root: SkipMap<(u64, MVTableId), (), BasicComparator, A>,
+    /// Serializes mutations so the two maps change as one unit.
+    door: Mutex<()>,
+}
+
+impl<A: ConcurrentAllocator> RootBindings<A> {
+    fn new_in(alloc: A) -> Self {
+        Self {
+            entries: SkipMap::new_in(alloc.clone()),
+            by_root: SkipMap::new_in(alloc),
+            door: Mutex::new(()),
+        }
+    }
+
+    pub fn get(
+        &self,
+        table_id: &MVTableId,
+    ) -> Option<Entry<'_, MVTableId, RootEntry, BasicComparator, A>> {
+        self.entries.get(table_id)
+    }
+
+    pub fn iter(&self) -> crate::skiplist::map::Iter<'_, MVTableId, RootEntry, BasicComparator, A> {
+        self.entries.iter()
+    }
+
+    /// Bind `table_id` to `entry`, replacing any earlier binding of `table_id`.
+    pub fn insert(&self, table_id: MVTableId, entry: RootEntry) {
+        let _door = self.door.lock();
+        self.bind(table_id, entry);
+        debug_assert!(self.index_is_exact());
+    }
+
+    /// As [`Self::insert`], reporting an allocation failure with both maps unchanged.
+    pub fn try_insert(&self, table_id: MVTableId, entry: RootEntry) -> Result<(), TryReserveError> {
+        let _door = self.door.lock();
+        let added = match entry.root_page {
+            Some(root) => {
+                self.by_root.try_insert((root, table_id), ())?;
+                true
+            }
+            None => false,
+        };
+        let previous = self.entries.get(&table_id).map(|e| *e.value());
+        if let Err(err) = self.entries.try_insert(table_id, entry) {
+            if added && previous.and_then(|p| p.root_page) != entry.root_page {
+                if let Some(root) = entry.root_page {
+                    self.by_root.remove(&(root, table_id));
+                }
+            }
+            return Err(err);
+        }
+        self.unindex_replaced(table_id, previous, entry.root_page);
+        debug_assert!(self.index_is_exact());
+        Ok(())
+    }
+
+    pub fn remove(&self, table_id: &MVTableId) {
+        let _door = self.door.lock();
+        if let Some(removed) = self.entries.remove(table_id) {
+            if let Some(root) = removed.value().root_page {
+                self.by_root.remove(&(root, *table_id));
+            }
+        }
+        debug_assert!(self.index_is_exact());
+    }
+
+    pub fn clear(&self) {
+        let _door = self.door.lock();
+        self.entries.clear();
+        self.by_root.clear();
+        debug_assert!(self.index_is_exact());
+    }
+
+    /// The table ids with a binding on `root_page`, live or retired, in table-id order.
+    pub fn owners_of(&self, root_page: u64) -> Vec<MVTableId> {
+        self.by_root
+            .range((root_page, MVTableId::MIN)..=(root_page, MVTableId::MAX))
+            .map(|e| e.key().1)
+            .collect()
+    }
+
+    /// The table id owning `root_page` at `snapshot_ts`: among the bindings on the page that are
+    /// live or end after the snapshot, the one that ends first (ties by table id).
+    pub fn owner_at(&self, root_page: u64, snapshot_ts: u64) -> Option<MVTableId> {
+        self.by_root
+            .range((root_page, MVTableId::MIN)..=(root_page, MVTableId::MAX))
+            .filter_map(|candidate| {
+                let table_id = candidate.key().1;
+                let binding = self.entries.get(&table_id)?;
+                let binding = binding.value();
+                (binding.root_page == Some(root_page)
+                    && (binding.is_live() || snapshot_ts < binding.end))
+                    .then_some((binding.end, table_id))
+            })
+            .min()
+            .map(|(_, table_id)| table_id)
+    }
+
+    fn bind(&self, table_id: MVTableId, entry: RootEntry) {
+        let previous = self.entries.get(&table_id).map(|e| *e.value());
+        if let Some(root) = entry.root_page {
+            self.by_root.insert((root, table_id), ());
+        }
+        self.entries.insert(table_id, entry);
+        self.unindex_replaced(table_id, previous, entry.root_page);
+    }
+
+    fn unindex_replaced(&self, table_id: MVTableId, previous: Option<RootEntry>, now: Option<u64>) {
+        if let Some(old_root) = previous.and_then(|p| p.root_page) {
+            if Some(old_root) != now {
+                self.by_root.remove(&(old_root, table_id));
+            }
+        }
+    }
+
+    /// Whether the reverse index holds exactly one key per binding with a root page. The caller
+    /// holds `door` or has no concurrent mutator.
+    #[cfg(any(test, debug_assertions))]
+    fn index_is_exact(&self) -> bool {
+        let mut expected: Vec<(u64, MVTableId)> = self
+            .entries
+            .iter()
+            .filter_map(|e| e.value().root_page.map(|root| (root, *e.key())))
+            .collect();
+        expected.sort();
+        let held: Vec<(u64, MVTableId)> = self.by_root.iter().map(|e| *e.key()).collect();
+        expected == held
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_matches_bindings(&self) -> bool {
+        let _door = self.door.lock();
+        self.index_is_exact()
+    }
+}
+
 /// SkipMap / GC counters for debugging (see [`MvStore::debug_gc_snapshot`]).
 /// Test-only harness data, not part of the public MVCC API.
 #[cfg(test)]
@@ -4587,7 +4740,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// been checkpointed yet have no real root page assigned yet.
     ///
     /// Versioned root bindings; passive checkpoints update these at publish, not during collection.
-    pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
+    pub table_id_to_rootpage: RootBindings<A>,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
@@ -4845,7 +4998,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         experimental_mvcc_passive_checkpoint: bool,
     ) -> Result<Self> {
         let logical_log_alloc = DynAllocator::new(alloc.clone());
-        let table_id_to_rootpage = SkipMap::new_in(alloc.clone());
+        let table_id_to_rootpage = RootBindings::new_in(alloc.clone());
         // table id 1 / root page 1 is always sqlite_schema.
         table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)))?;
         Ok(Self {
@@ -5110,15 +5263,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // Not checkpointed table - table ID and root_page are both the same negative value
             return Some(root_page.into());
         }
-        let root_page = root_page as u64;
         self.table_id_to_rootpage
-            .iter()
-            .filter(|entry| {
-                let e = entry.value();
-                e.root_page == Some(root_page) && (e.is_live() || snapshot_ts < e.end)
-            })
-            .min_by_key(|entry| entry.value().end)
-            .map(|entry| *entry.key())
+            .owner_at(root_page as u64, snapshot_ts)
     }
 
     /// Snapshot timestamp (`begin_ts`) of the given transaction, or `u64::MAX` if it is not
@@ -5216,12 +5362,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // else two live bindings resolve to one page (integrity_check: referenced twice).
         let stale: Vec<(MVTableId, RootEntry)> = self
             .table_id_to_rootpage
-            .iter()
-            .filter(|entry| {
-                let e = entry.value();
-                e.is_live() && e.root_page == Some(root_page) && *entry.key() != table_id
+            .owners_of(root_page)
+            .into_iter()
+            .filter(|key| *key != table_id)
+            .filter_map(|key| {
+                let binding = self.table_id_to_rootpage.get(&key)?;
+                let binding = *binding.value();
+                (binding.is_live() && binding.root_page == Some(root_page))
+                    .then_some((key, binding))
             })
-            .map(|entry| (*entry.key(), *entry.value()))
             .collect();
         for (key, mut entry) in stale {
             entry.end = begin_ts;

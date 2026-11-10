@@ -575,6 +575,10 @@ impl Shared {
             Ok(Step::WaitOn(target, c)) => {
                 // Before any mutex: a refusal passing one ends the process (22.11).
                 assert!(
+                    Weak::ptr_eq(&header.shared, &target.0.shared),
+                    "a wait naming a job of another executor (22.4)"
+                );
+                assert!(
                     header.rank < target.0.rank,
                     "a wait naming a job not after its own (22.4)"
                 );
@@ -991,6 +995,10 @@ impl Executor {
     /// out of its list; idle, it runs for its claimer's own reason; running, done or closed, it is
     /// left. Whether it was stepped.
     pub(crate) fn run_named(&self, task: &TaskRef) -> bool {
+        assert!(
+            std::ptr::eq(task.0.shared.as_ptr(), Arc::as_ptr(&self.shared)),
+            "a task claimed by name on another executor"
+        );
         self.shared.run_named(&task.0)
     }
 

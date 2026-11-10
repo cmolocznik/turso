@@ -145,6 +145,12 @@ impl Signal {
         lock(&self.listed).tasks.len()
     }
 
+    /// How many tasks are declared to watch the signal.
+    #[cfg(test)]
+    pub(super) fn declared(&self) -> usize {
+        lock(&self.listed).declared
+    }
+
     /// How many tasks the list has room for.
     #[cfg(test)]
     pub(super) fn room(&self) -> usize {

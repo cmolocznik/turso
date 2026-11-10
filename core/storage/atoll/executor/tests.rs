@@ -911,6 +911,134 @@ mod native {
         assert!(!task.is_done(), "closed, not done");
     }
 
+    /// Holds the executor that runs it and a signal it was declared to watch, drops the executor
+    /// during its step and is then done; says so when its job is dropped.
+    struct DropsItsExecutorWatching {
+        executor: Arc<Lock<Option<Executor>>>,
+        gone: mpsc::Sender<()>,
+    }
+
+    impl Task for DropsItsExecutorWatching {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let ex = self.executor.lock().take();
+            drop(ex);
+            Ok(Step::Done)
+        }
+    }
+
+    impl Drop for DropsItsExecutorWatching {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            let _ = self.gone.send(());
+        }
+    }
+
+    /// An executor dropped by its own worker's step, the task then done: close takes the task off
+    /// the signal it declared, and the step's end on the closed task leaves it no second time
+    /// (22.12; the auditor's #4207 case; mutant: close leaving the declared tasks).
+    #[test]
+    fn an_executor_dropped_by_its_own_step_leaves_each_declared_signal_once() {
+        let slot = Arc::new(Lock::new(None));
+        let signal = Arc::new(Signal::default());
+        let (gone_tx, gone_rx) = mpsc::channel();
+        *slot.lock() = Some(executor(1));
+        slot.lock().as_ref().unwrap().spawn_watching(
+            Class::Due,
+            Box::new(DropsItsExecutorWatching {
+                executor: slot.clone(),
+                gone: gone_tx,
+            }),
+            &[&signal],
+        );
+        let gone = gone_rx.recv_timeout(BOUND).is_ok();
+        let counts = (signal.declared(), signal.listed());
+        assert!(gone, "the task's job dropped once its step ended");
+        assert_eq!(
+            counts,
+            (0, 0),
+            "(declared, listed) once the executor closed"
+        );
+    }
+
+    /// A wait names a job of its own executor only: one naming another's ends the process before
+    /// any mutex (22.4, 22.11; the auditor's P2-E4-O1; mutant: the check gone, which links the
+    /// foreign job into this executor's queue).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_wait_naming_a_job_of_another_executor_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_wait_naming_a_job_of_another_executor_ends_the_process"
+            ),
+            || {
+                let (a, b) = (executor(0), executor(0));
+                let log = Arc::new(Lock::new(Vec::new()));
+                let target = b.spawn_ranked(Class::Maintenance, 1, recorded("job", 0, &log), &[]);
+                a.spawn_ranked(
+                    Class::Due,
+                    0,
+                    Box::new(WaitsOnJob {
+                        on: Some(target),
+                        log,
+                    }),
+                    &[],
+                );
+                a.run_one();
+                a.close();
+                b.close();
+            },
+        );
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(
+            ended
+                .stderr
+                .contains("a wait naming a job of another executor"),
+            "{}",
+            ended.stderr
+        );
+    }
+
+    /// A task is claimed by name only on its own executor: a claim on another ends the process
+    /// before any mutex (22.7, 22.11; mutant: the check gone, which claims it out of a queue it
+    /// is not in).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_named_claim_on_another_executor_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_named_claim_on_another_executor_ends_the_process"
+            ),
+            || {
+                let (a, b) = (executor(0), executor(0));
+                let log = Arc::new(Lock::new(Vec::new()));
+                let task = b.spawn(Class::Due, recorded("t", 0, &log));
+                a.run_named(&task);
+                a.close();
+                b.close();
+            },
+        );
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(
+            ended
+                .stderr
+                .contains("a task claimed by name on another executor"),
+            "{}",
+            ended.stderr
+        );
+    }
+
     /// Records, when it is dropped, whether the executor's table of jobs was free to take: 1 when
     /// it was held, 2 when it was free.
     struct ProbesTheTable {

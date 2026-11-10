@@ -5314,7 +5314,9 @@ compose, the real `Completion`, latch and backends included where named.
    and the second read, each list keeping room for its declared tasks and a step naming an
    undeclared signal refused; demand by class, a writer's ticket and a logical wait's ticket on the
    job it waits on, moved with the waiter's class and given back when its wait ends, jobs ranked so
-   a wait names only a later one, a trigger's level with the counter-checked clear; dropping the
+   a wait names only a later one of its own executor (a wait or a named claim naming another
+   executor's task is refused before any mutex, the auditor's P2-E4-O1), a trigger's level with
+   the counter-checked clear; dropping the
    executor closes it, and jobs are dropped after the table's mutex; named claims (22.7), a queued
    task unlinked, an idle one claimed straight to running, a running one left; runner nodes, a
    worker's thread or an embedder runner's waker, the to-wake list, and each operation's drain

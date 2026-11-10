@@ -1872,6 +1872,82 @@ mod native {
         ended_refused(ended);
     }
 
+    /// Waits on `signal` until `value` reaches `threshold`: wants it, then looks, and is done once
+    /// it has.
+    struct AwaitsThreshold {
+        signal: Arc<Signal>,
+        value: Arc<std::sync::atomic::AtomicU64>,
+        threshold: u64,
+    }
+
+    impl Task for AwaitsThreshold {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let read = self.signal.read();
+            self.signal.want(self.threshold);
+            if self.value.load(O::Acquire) >= self.threshold {
+                return Ok(Step::Done);
+            }
+            Ok(Step::Idle(Watched::of(&[(&self.signal, read)])))
+        }
+    }
+
+    /// A producer's change.
+    fn publish(value: &std::sync::atomic::AtomicU64, signal: &Signal, to: u64) {
+        value.store(to, O::Release);
+        if signal.wanted().is_some_and(|least| to >= least) {
+            signal.notify();
+        }
+    }
+
+    /// A threshold signal wakes its waiting tasks only once the value reached the least threshold
+    /// wanted, and a notify resets that threshold (22.2; mutants: a want that keeps the last
+    /// threshold, not the least; a notify that leaves the threshold standing).
+    #[test]
+    fn a_threshold_signal_wakes_once_the_least_threshold_wanted_is_reached() {
+        let ex = executor(0);
+        let signal = Arc::new(Signal::default());
+        let value = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tasks = [3, 5].map(|threshold| {
+            ex.spawn_watching(
+                Class::Due,
+                Box::new(AwaitsThreshold {
+                    signal: signal.clone(),
+                    value: value.clone(),
+                    threshold,
+                }),
+                &[&signal],
+            )
+        });
+        let looked = [ex.run_one(), ex.run_one(), ex.run_one()];
+        let least = signal.wanted();
+        publish(&value, &signal, 2);
+        let below = ex.run_one();
+        publish(&value, &signal, 3);
+        let reset = signal.wanted();
+        let woken = [ex.run_one(), ex.run_one(), ex.run_one()];
+        let after = (signal.wanted(), tasks.each_ref().map(TaskRef::is_done));
+        publish(&value, &signal, 5);
+        while ex.run_one() {}
+        let done = tasks.each_ref().map(TaskRef::is_done);
+        ex.close();
+        assert_eq!(looked, [true, true, false], "both looked, both wait");
+        assert_eq!(least, Some(3), "the least threshold wanted");
+        assert!(!below, "woken below every threshold");
+        assert_eq!(reset, None, "a notify leaves a threshold standing");
+        assert_eq!(
+            woken,
+            [true, true, false],
+            "both woken at the least threshold"
+        );
+        // The first wanted 3 before it found 3 reached: a want stands until the next notify.
+        assert_eq!(
+            after,
+            (Some(3), [true, false]),
+            "(threshold wanted, done) once both looked again"
+        );
+        assert_eq!(done, [true, true]);
+    }
+
     /// Steps once: enters the executor through `runner`.
     struct EntersAgain {
         runner: Arc<Lock<Option<Runner>>>,
@@ -2043,6 +2119,60 @@ mod loom_tests {
             notifier.join().unwrap();
             assert_eq!(h.state.load(Ordering::Acquire), QUEUED);
             assert_eq!(links(&shared, &h), 1);
+        });
+    }
+
+    /// Waits on `signal` until `value` reaches one.
+    struct AwaitsOne {
+        signal: Arc<Signal>,
+        value: Arc<loom::sync::atomic::AtomicU64>,
+    }
+
+    impl Task for AwaitsOne {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let read = self.signal.read();
+            self.signal.want(1);
+            if self.value.load(Ordering::Relaxed) >= 1 {
+                return Ok(Step::Done);
+            }
+            Ok(Step::Idle(Watched::of(&[(&self.signal, read)])))
+        }
+    }
+
+    /// A producer publishing a value racing a task wanting it: once both are through, the task
+    /// is done or queued to run, never waiting on a value already reached (22.2, the threshold
+    /// handshake between two fences; mutants: the producer's fence gone; the task's fence gone).
+    #[test]
+    fn a_threshold_reached_while_a_task_wants_it_is_never_missed() {
+        use loom::sync::atomic::AtomicU64;
+        loom::model(|| {
+            let ex = Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap();
+            let signal = Arc::new(Signal::default());
+            let value = Arc::new(AtomicU64::new(0));
+            let task = ex.spawn_watching(
+                Class::Due,
+                Box::new(AwaitsOne {
+                    signal: signal.clone(),
+                    value: value.clone(),
+                }),
+                &[&signal],
+            );
+            let producer = {
+                let (signal, value) = (signal.clone(), value.clone());
+                thread::spawn(move || {
+                    value.store(1, Ordering::Relaxed);
+                    if signal.wanted().is_some_and(|least| least <= 1) {
+                        signal.notify();
+                    }
+                })
+            };
+            let looked = ex.run_one();
+            producer.join().unwrap();
+            while ex.run_one() {}
+            let done = task.is_done();
+            ex.close();
+            assert!(looked);
+            assert!(done, "a task left waiting on a value already reached");
         });
     }
 

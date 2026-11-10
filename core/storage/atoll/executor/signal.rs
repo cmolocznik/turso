@@ -9,15 +9,22 @@
 //! look and the registration, and the task is queued at once. A notify the second read missed took
 //! the mutex after the registration let it go, so it finds the task listed. "Moved" is inequality:
 //! the counter would have to come all the way round between the two reads to hide a notify.
+//!
+//! A threshold signal carries one more word, the least threshold among the tasks waiting on it
+//! (22.2): a task stores its threshold under the mutex ([`Signal::want`]), fences, then computes
+//! the value whole and runs again if it already reached it; a producer publishes its change,
+//! fences ([`Signal::wanted`]), loads the threshold, and notifies once its value reached it.
+//! Between the two fences one side always sees the other. A notify empties the list and resets the
+//! word to none.
 
-use self::sync::{lock, AtomicU64, Mutex, Ordering};
+use self::sync::{fence, lock, AtomicU64, Mutex, Ordering};
 use super::{wake_nested, Header, Shared};
 use std::sync::{Arc, OnceLock, Weak};
 
 #[cfg(not(atoll_loom))]
 mod sync {
     pub(super) use crate::storage::atoll::locks::{Mutex, MutexGuard};
-    pub(super) use crate::sync::atomic::{AtomicU64, Ordering};
+    pub(super) use crate::sync::atomic::{fence, AtomicU64, Ordering};
     pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         m.lock()
     }
@@ -25,7 +32,7 @@ mod sync {
 
 #[cfg(atoll_loom)]
 mod sync {
-    pub(super) use loom::sync::atomic::{AtomicU64, Ordering};
+    pub(super) use loom::sync::atomic::{fence, AtomicU64, Ordering};
     pub(super) use loom::sync::{Mutex, MutexGuard};
     pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         m.lock().unwrap()
@@ -39,10 +46,16 @@ pub(crate) const WATCHED: usize = 3;
 pub(crate) struct Signal {
     count: AtomicU64,
     listed: Mutex<Listed>,
+    /// The least threshold a task waiting on the signal wants, or [`NONE`]: lowered under the
+    /// mutex by [`want`](Signal::want), reset under it by a notify.
+    threshold: AtomicU64,
     /// The executor whose tasks register here, set by the first: a signal serves one, whose
     /// drain invokes the external runners a notify's wakes moved.
     owner: OnceLock<Weak<Shared>>,
 }
+
+/// No task wants a threshold.
+const NONE: u64 = u64::MAX;
 
 /// The tasks registered, each at most once, and how many tasks are declared to watch the signal:
 /// the list keeps room for every one of them, so registering and notifying allocate nothing.
@@ -59,6 +72,7 @@ impl Default for Signal {
                 tasks: Vec::new(),
                 declared: 0,
             }),
+            threshold: AtomicU64::new(NONE),
             owner: OnceLock::new(),
         }
     }
@@ -88,6 +102,8 @@ impl Signal {
     pub(super) fn wake_listed(&self) {
         let moved: usize = {
             let mut listed = lock(&self.listed);
+            // Every task waiting goes, and with it every threshold it wanted.
+            self.threshold.store(NONE, Ordering::Relaxed);
             listed
                 .tasks
                 .drain(..)
@@ -99,6 +115,31 @@ impl Signal {
                 shared.drain(moved);
             }
         }
+    }
+
+    /// A task about to look wants to run once the value reached `threshold` (22.2): stored under
+    /// the mutex, the least wanted kept, then a sequentially consistent fence, after which the
+    /// task computes the value whole and runs again itself if it already reached it. A producer
+    /// whose fence came after this one loads the threshold.
+    pub(crate) fn want(&self, threshold: u64) {
+        assert!(threshold != NONE, "a threshold no value reaches");
+        {
+            let _listed = lock(&self.listed);
+            if threshold < self.threshold.load(Ordering::Relaxed) {
+                self.threshold.store(threshold, Ordering::Relaxed);
+            }
+        }
+        fence(Ordering::SeqCst);
+    }
+
+    /// For a producer that has published its change: a sequentially consistent fence, then the
+    /// least threshold a waiting task wants, if any. The producer then computes the value whole
+    /// and notifies once it reached that threshold; a task whose fence came after this one
+    /// computes a value that includes the change.
+    pub(crate) fn wanted(&self) -> Option<u64> {
+        fence(Ordering::SeqCst);
+        let threshold = self.threshold.load(Ordering::Relaxed);
+        (threshold != NONE).then_some(threshold)
     }
 
     /// One more task may watch the signal: the list makes room for every task declared.

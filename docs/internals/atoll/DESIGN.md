@@ -5338,8 +5338,10 @@ compose, the real `Completion`, latch and backends included where named.
    (`Executor::wait_async`) runs one task step and one IO step per poll, rests its node or asks to
    be polled again while work is queued. The lists are deques given room for every task and every
    node when each is created, so no link or move allocates (counted: 3,072 steps and 2,304
-   external wakes, none allocating); intrusive links wait for a measured need. Not built yet:
-   threshold signals, the jobs' logical waits made executor completions (with the jobs, 22.16
+   external wakes, none allocating); intrusive links wait for a measured need. Threshold signals: a signal's
+   least threshold wanted, lowered under its mutex and fenced by the task before it computes the
+   value, fenced and loaded by a producer after its publication, reset by a notify. Not built yet:
+   the jobs' logical waits made executor completions (with the jobs, 22.16
    steps 7 to 10), close's five phases, removal with a subject beyond a task's own end.)
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run

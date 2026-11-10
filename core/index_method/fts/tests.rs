@@ -1316,7 +1316,7 @@ fn drive<T>(io: &Arc<dyn crate::IO>, mut step: impl FnMut() -> IOResultOr<T>) ->
 }
 
 /// The bytes of every row of the FTS index `docs_fts`'s backing store, read in a transaction.
-fn backing_bytes(
+pub(super) fn backing_bytes(
     conn: &Arc<Connection>,
     io: &Arc<dyn crate::IO>,
 ) -> std::collections::HashSet<Vec<u8>> {

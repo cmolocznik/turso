@@ -457,6 +457,9 @@ pub enum FtsFunc {
     /// fts_match(col1, col2, ..., query): returns true if document matches query
     /// Used in WHERE clause for filtering rows by FTS match
     Match,
+    /// fts_filtered_score(col1, col2, ..., query, filter): the FTS score among
+    /// the documents a JSON filter admits, every statistic counted over them
+    FilteredScore,
     /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
     /// Wraps matching query terms in the text with before_tag and after_tag markers
     Highlight,
@@ -472,7 +475,7 @@ impl FtsFunc {
         match self {
             Self::Highlight => &[4],
             // Score and Match take variable columns + query
-            Self::Score | Self::Match => &[-1],
+            Self::Score | Self::Match | Self::FilteredScore => &[-1],
         }
     }
 }
@@ -483,6 +486,7 @@ impl Display for FtsFunc {
         let str = match self {
             Self::Score => "fts_score",
             Self::Match => "fts_match",
+            Self::FilteredScore => "fts_filtered_score",
             Self::Highlight => "fts_highlight",
         };
         write!(f, "{str}")

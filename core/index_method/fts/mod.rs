@@ -66,6 +66,7 @@ use turso_parser::ast::{self, Select, SortOrder};
 use uncased::UncasedStr;
 
 mod directory;
+mod filter;
 mod format;
 mod rows;
 
@@ -196,6 +197,98 @@ static NEXT_FTS_IDENTITY_BASE: AtomicU64 = AtomicU64::new(1);
 /// Distinguishes cursor instances within a process so a cursor can recognize
 /// its own claim on the per-index writer slot across re-entrant calls.
 static NEXT_FTS_CURSOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// The Tantivy version the FTS index method runs, for an embedder that
+/// implements its own tokenizer against it (see [register_tokenizer]).
+pub use tantivy;
+
+/// Tokenizers an embedder registered for the whole process, by name.
+static REGISTERED_TOKENIZERS: std::sync::OnceLock<Mutex<HashMap<String, TextAnalyzer>>> =
+    std::sync::OnceLock::new();
+
+fn registered_tokenizers() -> &'static Mutex<HashMap<String, TextAnalyzer>> {
+    REGISTERED_TOKENIZERS.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// Register a named tokenizer for every FTS index of this process.
+///
+/// An index names its tokenizers in its persisted `WITH` clause (`tokenizer`,
+/// `tokenizers`, `json_tokenizer`), so the name must carry the analyzer's
+/// identity: a changed analyzer is a new name, and an index built under the
+/// old one refuses to open until the old name is registered again or the
+/// index is rebuilt. Register before opening a database whose schema names
+/// the tokenizer: attaching an index whose tokenizer is not registered is an
+/// error. A name is registered once and never shadows a built-in.
+pub fn register_tokenizer(name: &str, analyzer: TextAnalyzer) -> Result<()> {
+    if name.is_empty() || SUPPORTED_TOKENIZERS.contains(&name) {
+        return Err(LimboError::InvalidArgument(format!(
+            "FTS tokenizer name '{name}' is empty or names a built-in tokenizer"
+        )));
+    }
+    let mut registered = registered_tokenizers().lock();
+    if registered.contains_key(name) {
+        return Err(LimboError::InvalidArgument(format!(
+            "FTS tokenizer '{name}' is already registered"
+        )));
+    }
+    registered.insert(name.to_string(), analyzer);
+    Ok(())
+}
+
+fn tokenizer_known(name: &str) -> bool {
+    SUPPORTED_TOKENIZERS.contains(&name) || registered_tokenizers().lock().contains_key(name)
+}
+
+fn registered_tokenizer(name: &str) -> Option<TextAnalyzer> {
+    registered_tokenizers().lock().get(name).cloned()
+}
+
+/// What an index column is to the FTS index method.
+#[derive(Debug, Clone, Copy)]
+enum ColumnRole {
+    /// Tokenized text (or JSON) searched by queries: its position in
+    /// `indexed_fields`.
+    Text(usize),
+    /// An integer column stored as an optional i64 fast field that filters
+    /// a query (`filter_fields`).
+    Filter(Field),
+    /// The event intervals column (`interval_field`): a BLOB of packed
+    /// little-endian `(from, to)` i64 pairs, stored as a bytes fast field.
+    Intervals(Field),
+}
+
+/// Most event intervals one document may carry.
+pub const FTS_MAX_INTERVALS: usize = 16;
+
+/// Check a packed intervals value: whole `(from, to)` pairs, at most
+/// [FTS_MAX_INTERVALS], each starting before it ends. `i64::MIN` is an open
+/// start and `i64::MAX` an open end.
+fn validate_intervals(bytes: &[u8]) -> Result<()> {
+    if bytes.len() % 16 != 0 || bytes.len() / 16 > FTS_MAX_INTERVALS {
+        return Err(LimboError::Constraint(format!(
+            "FTS intervals must be at most {FTS_MAX_INTERVALS} packed (from, to) i64 pairs, got {} bytes",
+            bytes.len()
+        )));
+    }
+    for (from, to) in intervals_of(bytes) {
+        if from >= to {
+            return Err(LimboError::Constraint(
+                "FTS interval must start before it ends".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn intervals_of(bytes: &[u8]) -> impl Iterator<Item = (i64, i64)> + '_ {
+    bytes.chunks_exact(16).map(|pair| {
+        let (from, to) = pair.split_at(8);
+        (
+            i64::from_le_bytes(from.try_into().expect("8 bytes")),
+            i64::from_le_bytes(to.try_into().expect("8 bytes")),
+        )
+    })
+}
 
 const ROWID_FIELD: &str = "rowid";
 /// Fast fields that hold each document's identity. The index assigns it
@@ -639,8 +732,16 @@ pub struct FtsIndexAttachment {
     /// Tantivy fields for the document identity
     identity_hi_field: Field,
     identity_lo_field: Field,
-    /// Schema fields for each indexed column
+    /// Schema fields for each searched (text or JSON) column
     indexed_fields: Vec<(IndexColumn, Field)>,
+    /// What each index column is, in index column order
+    roles: Vec<ColumnRole>,
+    /// The filter columns' fast fields, by column name
+    filter_fields: Vec<(String, Field)>,
+    /// The event intervals column's fast field
+    interval_field: Option<Field>,
+    /// Every tokenizer name this index uses
+    tokenizer_names: Vec<String>,
     /// Parsed query patterns for FTS queries
     patterns: Vec<Select>,
     /// Weights for each field in FTS scoring, from the WITH clause.
@@ -669,6 +770,9 @@ pub const SUPPORTED_WITH_KEYS: &[&str] = &[
     "max_gram",
     "json_fields",
     "json_tokenizer",
+    "tokenizers",
+    "filter_fields",
+    "interval_field",
 ];
 
 /// Ngram window used when `min_gram`/`max_gram` are not given.
@@ -725,9 +829,9 @@ impl FtsIndexAttachment {
             .unwrap_or_else(|| "default".to_string());
 
         // Validate tokenizer name
-        if !SUPPORTED_TOKENIZERS.contains(&tokenizer_name.as_str()) {
+        if !tokenizer_known(&tokenizer_name) {
             return Err(LimboError::ParseError(format!(
-                "unsupported FTS tokenizer '{}'. Supported tokenizers: {}",
+                "unsupported FTS tokenizer '{}'. Supported tokenizers: {}, or one registered with register_tokenizer",
                 tokenizer_name,
                 SUPPORTED_TOKENIZERS.join(", ")
             )));
@@ -753,10 +857,76 @@ impl FtsIndexAttachment {
                 ))
             }
         };
-        if !SUPPORTED_TOKENIZERS.contains(&json_tokenizer) {
+        if !tokenizer_known(json_tokenizer) {
             return Err(LimboError::ParseError(format!(
                 "unsupported FTS json_tokenizer '{json_tokenizer}'"
             )));
+        }
+        let filter_columns: Vec<String> = parse_column_list(
+            parameters.get(UncasedStr::new("filter_fields")).copied(),
+            &cfg.columns,
+            "filter_fields",
+        )?;
+        let interval_columns = parse_column_list(
+            parameters.get(UncasedStr::new("interval_field")).copied(),
+            &cfg.columns,
+            "interval_field",
+        )?;
+        if interval_columns.len() > 1 {
+            return Err(LimboError::ParseError(
+                "FTS interval_field names one column".into(),
+            ));
+        }
+        let interval_column = interval_columns.into_iter().next();
+        let column_tokenizers = parse_column_tokenizers(
+            parameters.get(UncasedStr::new("tokenizers")).copied(),
+            &cfg.columns,
+        )?;
+        let is_value_column = |name: &str| {
+            filter_columns.iter().any(|c| c == name) || interval_column.as_deref() == Some(name)
+        };
+        for name in &filter_columns {
+            if interval_column.as_deref() == Some(name.as_str())
+                || json_columns.contains(name)
+                || column_tokenizers.contains_key(name)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "FTS column '{name}' cannot be both a filter and a searched column"
+                )));
+            }
+        }
+        if let Some(name) = &interval_column {
+            if json_columns.contains(name) || column_tokenizers.contains_key(name) {
+                return Err(LimboError::ParseError(format!(
+                    "FTS column '{name}' cannot be both the interval field and a searched column"
+                )));
+            }
+        }
+        // Searched columns come first: a query's selected fields are numbered
+        // by their position among the index columns.
+        let first_value = cfg.columns.iter().position(|c| is_value_column(&c.name));
+        if let Some(first_value) = first_value {
+            if first_value == 0 {
+                return Err(LimboError::ParseError(
+                    "an FTS index needs at least one searched column before its filter columns"
+                        .into(),
+                ));
+            }
+            if cfg.columns[first_value..]
+                .iter()
+                .any(|c| !is_value_column(&c.name))
+            {
+                return Err(LimboError::ParseError(
+                    "FTS searched columns must come before the filter and interval columns".into(),
+                ));
+            }
+        }
+        for tokenizer in column_tokenizers.values() {
+            if !tokenizer_known(tokenizer) {
+                return Err(LimboError::ParseError(format!(
+                    "unsupported FTS tokenizer '{tokenizer}' in tokenizers: it is neither built in nor registered"
+                )));
+            }
         }
 
         // Parse the ngram window: WITH (tokenizer = 'ngram', min_gram = 1, max_gram = 3)
@@ -834,13 +1004,36 @@ impl FtsIndexAttachment {
             schema_builder.add_u64_field(IDENTITY_LO_FIELD, tantivy::schema::FAST);
 
         let mut indexed_fields = Vec::with_capacity(cfg.columns.len());
+        let mut roles = Vec::with_capacity(cfg.columns.len());
+        let mut filter_fields = Vec::new();
+        let mut interval_field = None;
+        let mut tokenizer_names: Vec<String> = vec![tokenizer_name.clone()];
+        if !json_columns.is_empty() {
+            tokenizer_names.push(json_tokenizer.to_string());
+        }
         for col in &cfg.columns {
+            if filter_columns.contains(&col.name) {
+                let field = schema_builder.add_i64_field(&col.name, tantivy::schema::FAST);
+                filter_fields.push((col.name.clone(), field));
+                roles.push(ColumnRole::Filter(field));
+                continue;
+            }
+            if interval_column.as_deref() == Some(col.name.as_str()) {
+                let field = schema_builder.add_bytes_field(&col.name, tantivy::schema::FAST);
+                interval_field = Some(field);
+                roles.push(ColumnRole::Intervals(field));
+                continue;
+            }
             let is_json = json_columns.contains(&col.name);
             let tokenizer = if is_json {
                 json_tokenizer
+            } else if let Some(tokenizer) = column_tokenizers.get(&col.name) {
+                tokenizer_names.push(tokenizer.clone());
+                tokenizer.as_str()
             } else {
                 &tokenizer_name
             };
+            roles.push(ColumnRole::Text(indexed_fields.len()));
             let indexing = TextFieldIndexing::default()
                 .set_tokenizer(tokenizer)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions);
@@ -865,6 +1058,7 @@ impl FtsIndexAttachment {
         let cols = cfg
             .columns
             .iter()
+            .filter(|c| !is_value_column(&c.name))
             .map(|c| crate::util::quote_identifier(&c.name))
             .collect::<Vec<_>>()
             .join(", ");
@@ -894,6 +1088,11 @@ impl FtsIndexAttachment {
         let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
         // Pattern 6: match (no LIMIT)
         let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
+        // Pattern 7: score over the documents a filter admits, every BM25
+        // statistic counted over that set.
+        let filtered_score = format!(
+            "SELECT fts_filtered_score({cols}, ?1, ?2) as score FROM {table} ORDER BY score DESC LIMIT ?"
+        );
         let patterns = parse_patterns(&[
             &score_pattern,          // 0
             &combined_ordered_limit, // 1
@@ -902,7 +1101,10 @@ impl FtsIndexAttachment {
             &combined,               // 4
             &match_limit,            // 5
             &match_pattern,          // 6
+            &filtered_score,         // 7
         ])?;
+        tokenizer_names.sort();
+        tokenizer_names.dedup();
         Ok(Self {
             cfg,
             schema,
@@ -910,6 +1112,10 @@ impl FtsIndexAttachment {
             identity_hi_field,
             identity_lo_field,
             indexed_fields,
+            roles,
+            filter_fields,
+            interval_field,
+            tokenizer_names,
             patterns,
             field_weights,
             ngram_window,
@@ -948,6 +1154,79 @@ fn parse_json_fields(value: Option<&Value>, columns: &[IndexColumn]) -> Result<H
     Ok(names)
 }
 
+/// A comma-separated list of index columns from a WITH value; empty when the
+/// key is absent.
+fn parse_column_list(
+    value: Option<&Value>,
+    columns: &[IndexColumn],
+    key: &str,
+) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    let Some(value) = value else {
+        return Ok(names);
+    };
+    let Value::Text(value) = value else {
+        return Err(LimboError::ParseError(format!(
+            "FTS {key} must be a comma-separated list of indexed columns"
+        )));
+    };
+    let value = value.as_str().trim_matches(|c| c == '\'' || c == '"');
+    for name in value.split(',').map(str::trim) {
+        let column = columns
+            .iter()
+            .find(|col| col.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| LimboError::ParseError(format!("unknown FTS {key} column '{name}'")))?;
+        if names.contains(&column.name) {
+            return Err(LimboError::ParseError(format!(
+                "duplicate FTS {key} column '{name}'"
+            )));
+        }
+        names.push(column.name.clone());
+    }
+    Ok(names)
+}
+
+/// `tokenizers = 'col=name,col2=name2'`: a tokenizer for each named column.
+fn parse_column_tokenizers(
+    value: Option<&Value>,
+    columns: &[IndexColumn],
+) -> Result<HashMap<String, String>> {
+    let mut tokenizers = HashMap::default();
+    let Some(value) = value else {
+        return Ok(tokenizers);
+    };
+    let Value::Text(value) = value else {
+        return Err(LimboError::ParseError(
+            "FTS tokenizers must be text of the form 'column=tokenizer,...'".into(),
+        ));
+    };
+    let value = value.as_str().trim_matches(|c| c == '\'' || c == '"');
+    for entry in value.split(',').map(str::trim) {
+        let (name, tokenizer) = entry.split_once('=').ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "FTS tokenizers entry '{entry}' is not column=tokenizer"
+            ))
+        })?;
+        let (name, tokenizer) = (name.trim(), tokenizer.trim());
+        let column = columns
+            .iter()
+            .find(|col| col.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("unknown FTS tokenizers column '{name}'"))
+            })?;
+        if tokenizer.is_empty()
+            || tokenizers
+                .insert(column.name.clone(), tokenizer.to_string())
+                .is_some()
+        {
+            return Err(LimboError::ParseError(format!(
+                "FTS tokenizers names column '{name}' twice or with no tokenizer"
+            )));
+        }
+    }
+    Ok(tokenizers)
+}
+
 impl IndexMethodAttachment for FtsIndexAttachment {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
@@ -982,9 +1261,13 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         let ast::Expr::FunctionCall { name, args, .. } = result.as_mut() else {
             return Some(result);
         };
-        if !name.as_str().eq_ignore_ascii_case("fts_score") {
+        let trailing = if name.as_str().eq_ignore_ascii_case("fts_score") {
+            1
+        } else if name.as_str().eq_ignore_ascii_case("fts_filtered_score") {
+            2
+        } else {
             return Some(result);
-        }
+        };
         let ast::Expr::Literal(ast::Literal::String(fields)) =
             parameters.get(&crate::util::FTS_FIELD_PARAMETER)?
         else {
@@ -994,7 +1277,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         for field in fields.trim_matches('\'').split(',') {
             selected.push(args.get(field.parse::<usize>().ok()?)?.clone());
         }
-        selected.push(args.last()?.clone());
+        selected.extend(args[args.len().checked_sub(trailing)?..].iter().cloned());
         *args = selected;
         Some(result)
     }
@@ -1039,6 +1322,74 @@ const FTS_PATTERN_COMBINED_LIMIT: i64 = 3;
 const FTS_PATTERN_COMBINED: i64 = 4;
 pub(crate) const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
 pub(crate) const FTS_PATTERN_MATCH: i64 = 6;
+pub(crate) const FTS_PATTERN_FILTERED_SCORE: i64 = 7;
+
+/// One hit of a filtered query; ordered by score, then by the earlier
+/// document, so the heap's minimum is the hit a better one displaces.
+#[derive(Debug, Clone, Copy)]
+struct FilteredHit {
+    score: f32,
+    segment_ord: u32,
+    doc: tantivy::DocId,
+}
+
+impl PartialEq for FilteredHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for FilteredHit {}
+
+impl PartialOrd for FilteredHit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FilteredHit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then((other.segment_ord, other.doc).cmp(&(self.segment_ord, self.doc)))
+    }
+}
+
+/// Parse a query string within the length and nesting bounds that keep
+/// Tantivy's recursive parser linear and off the stack's edge.
+fn parse_bounded_query(
+    parser: &tantivy::query::QueryParser,
+    query_str: &str,
+) -> Result<Box<dyn Query>> {
+    if query_str.len() > FTS_MAX_QUERY_BYTES {
+        return Err(LimboError::InternalError(format!(
+            "FTS query is too long ({} bytes; the limit is {FTS_MAX_QUERY_BYTES})",
+            query_str.len()
+        )));
+    }
+    let mut depth = 0usize;
+    for byte in query_str.bytes() {
+        match byte {
+            b'(' => {
+                depth += 1;
+                if depth > FTS_MAX_QUERY_NESTING {
+                    return Err(LimboError::InternalError(format!(
+                        "FTS query nests deeper than {FTS_MAX_QUERY_NESTING} parentheses"
+                    )));
+                }
+            }
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let (query, parse_errors) = parser.parse_query_lenient(query_str);
+    if let Some(error) = parse_errors.first() {
+        return Err(LimboError::InternalError(format!(
+            "FTS parse error: {error:?}"
+        )));
+    }
+    Ok(query)
+}
 
 fn bounded_query_limit(limit: Option<i64>, live_docs: u64) -> usize {
     let live_docs = usize::try_from(live_docs).unwrap_or(usize::MAX);
@@ -1208,6 +1559,14 @@ pub struct FtsCursor {
     /// (min_gram, max_gram) window for the ngram tokenizer
     ngram_window: (usize, usize),
     indexed_fields: Vec<(IndexColumn, Field)>,
+    /// What each index column is, in index column order
+    roles: Vec<ColumnRole>,
+    /// The filter columns' fast fields, by column name
+    filter_fields: Vec<(String, Field)>,
+    /// The event intervals column's fast field
+    interval_field: Option<Field>,
+    /// Every tokenizer name this index uses
+    tokenizer_names: Vec<String>,
     /// The user-visible index name, for error messages.
     index_name: String,
     store: FtsStore,
@@ -1303,6 +1662,10 @@ impl FtsCursor {
             identity_lo_field: attachment.identity_lo_field,
             ngram_window: attachment.ngram_window,
             indexed_fields,
+            roles: attachment.roles.clone(),
+            filter_fields: attachment.filter_fields.clone(),
+            interval_field: attachment.interval_field,
+            tokenizer_names: attachment.tokenizer_names.clone(),
             index_name: attachment.cfg.index_name.clone(),
             store,
             default_fields,
@@ -1444,6 +1807,169 @@ impl FtsCursor {
                 .build();
             tokenizers.register("ngram", analyzer);
         }
+        // The attachment refused an unregistered name, and registration
+        // never removes one, so every name it holds resolves here.
+        for name in &self.tokenizer_names {
+            if let Some(analyzer) = registered_tokenizer(name) {
+                tokenizers.register(name, analyzer);
+            }
+        }
+    }
+
+    /// The parser over the fields a query selected (a comma-separated list
+    /// of positions among the index's searched columns).
+    fn selected_parser(&self, fields: &str) -> Result<Arc<tantivy::query::QueryParser>> {
+        let selected_fields = fields
+            .split(',')
+            .map(|field| {
+                field
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.default_fields.get(i).copied())
+                    .ok_or_else(|| {
+                        LimboError::InternalError("FTS query_start: invalid field".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if selected_fields.len() == self.default_fields.len() {
+            return Ok(Arc::clone(
+                self.cached_parser
+                    .as_ref()
+                    .expect("parser built with the searcher"),
+            ));
+        }
+        let mut parser = tantivy::query::QueryParser::for_index(
+            self.index.as_ref().expect("index built with the searcher"),
+            selected_fields,
+        );
+        for &(field, boost) in &self.field_boosts {
+            parser.set_field_boost(field, boost);
+        }
+        Ok(Arc::new(parser))
+    }
+
+    /// `fts_filtered_score(cols, ?1 query, ?2 filter) ... LIMIT ?3`: the top
+    /// documents among those the filter admits, scored by BM25 with every
+    /// statistic counted over exactly the admitted set.
+    fn query_filtered(&mut self, values: &[Register]) -> Result<bool> {
+        // values: [pattern, query, filter, limit, fields]
+        if values.len() != 5 {
+            return Err(LimboError::InternalError(format!(
+                "FTS filtered query: expected 5 values, got {}",
+                values.len()
+            )));
+        }
+        let query_str = match values[1].get_value() {
+            Value::Null => return Ok(false),
+            Value::Text(text) => text.as_str().to_string(),
+            other => other.to_string(),
+        };
+        let filter_text = match values[2].get_value() {
+            Value::Text(text) => text.as_str().to_string(),
+            _ => {
+                return Err(LimboError::InvalidArgument(
+                    "FTS filter must be JSON text".into(),
+                ))
+            }
+        };
+        let limit = match values[3].get_value() {
+            Value::Numeric(crate::numeric::Numeric::Integer(i)) => *i,
+            _ => return Err(LimboError::Constraint("datatype mismatch (19)".to_string())),
+        };
+        let fields = match values[4].get_value() {
+            Value::Text(fields) => fields.as_str().to_string(),
+            _ => {
+                return Err(LimboError::InternalError(
+                    "FTS query_start: missing indexed fields".into(),
+                ))
+            }
+        };
+        let filter = filter::Filter::parse(
+            &filter_text,
+            &self.filter_fields,
+            self.interval_field.is_some(),
+        )?;
+        let parser = self.selected_parser(&fields)?;
+        let query = parse_bounded_query(&parser, &query_str)?;
+        let searcher = self
+            .searcher
+            .as_ref()
+            .expect("FTS searcher initialized by query_start");
+        let interval_column = self
+            .interval_field
+            .map(|field| self.schema.get_field_name(field).to_string());
+        let readers = searcher.segment_readers();
+        let admitted = readers
+            .iter()
+            .map(|reader| filter::admitted(&filter, reader, interval_column.as_deref()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut terms = Vec::new();
+        query.query_terms(&mut |term, _| {
+            if !terms.contains(term) {
+                terms.push(term.clone());
+            }
+        });
+        let statistics =
+            filter::FilteredStatistics::count(readers, &admitted, &self.default_fields, &terms)?;
+        let limit = bounded_query_limit(Some(limit), statistics.documents);
+        if limit == 0 {
+            return Ok(false);
+        }
+        let weight = query
+            .weight(EnableScoring::enabled_from_statistics_provider(
+                &statistics,
+                searcher,
+            ))
+            .map_err(|e| LimboError::InternalError(format!("FTS query weight error: {e}")))?;
+        // A min-heap of the best `limit` (score, segment, doc), with the
+        // lowest kept score as the threshold the scorers prune by.
+        let mut best: std::collections::BinaryHeap<std::cmp::Reverse<FilteredHit>> =
+            std::collections::BinaryHeap::with_capacity(limit + 1);
+        for (segment_ord, (reader, bits)) in readers.iter().zip(&admitted).enumerate() {
+            if bits.count() == 0 {
+                continue;
+            }
+            let threshold = if best.len() == limit {
+                best.peek().map_or(f32::MIN, |hit| hit.0.score)
+            } else {
+                f32::MIN
+            };
+            weight
+                .for_each_pruning(threshold, reader, &mut |doc, score| {
+                    if bits.contains(doc) {
+                        best.push(std::cmp::Reverse(FilteredHit {
+                            score,
+                            segment_ord: segment_ord as u32,
+                            doc,
+                        }));
+                        if best.len() > limit {
+                            best.pop();
+                        }
+                    }
+                    if best.len() == limit {
+                        best.peek().map_or(f32::MIN, |hit| hit.0.score)
+                    } else {
+                        f32::MIN
+                    }
+                })
+                .map_err(|e| LimboError::InternalError(format!("FTS search error: {e}")))?;
+        }
+        self.current_hits.clear();
+        for std::cmp::Reverse(hit) in best {
+            let rowid = self.rowid_readers[hit.segment_ord as usize]
+                .first(hit.doc)
+                .ok_or_else(|| {
+                    LimboError::InternalError("FTS: rowid fast field missing value".into())
+                })?;
+            self.current_hits
+                .push((hit.score, DocAddress::new(hit.segment_ord, hit.doc), rowid));
+        }
+        self.current_hits.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.2.cmp(&b.2))
+        });
+        Ok(!self.current_hits.is_empty())
     }
 
     fn build_query_parser(&self, index: &Index) -> Arc<tantivy::query::QueryParser> {
@@ -3130,7 +3656,42 @@ impl IndexMethodCursor for FtsCursor {
         let mut doc = TantivyDocument::default();
         doc.add_i64(self.rowid_field, rowid);
 
-        for ((col, field), reg) in self.indexed_fields.iter().zip(&values[..values.len() - 1]) {
+        for (role, reg) in self.roles.iter().zip(&values[..values.len() - 1]) {
+            let (col, field) = match *role {
+                ColumnRole::Text(i) => &self.indexed_fields[i],
+                ColumnRole::Filter(field) => {
+                    match reg.get_value() {
+                        Value::Numeric(crate::numeric::Numeric::Integer(v)) => {
+                            doc.add_i64(field, *v)
+                        }
+                        Value::Null => {}
+                        _ => {
+                            return Err(LimboError::Constraint(
+                                "FTS filter column must hold an integer or NULL".into(),
+                            )
+                            .into())
+                        }
+                    }
+                    continue;
+                }
+                ColumnRole::Intervals(field) => {
+                    match reg.get_value() {
+                        Value::Blob(bytes) => {
+                            let bytes: &[u8] = bytes.as_ref();
+                            validate_intervals(bytes)?;
+                            doc.add_bytes(field, bytes);
+                        }
+                        Value::Null => {}
+                        _ => {
+                            return Err(LimboError::Constraint(
+                                "FTS interval column must hold a BLOB or NULL".into(),
+                            )
+                            .into())
+                        }
+                    }
+                    continue;
+                }
+            };
             if matches!(
                 self.schema.get_field_entry(*field).field_type(),
                 FieldType::JsonObject(_)
@@ -3232,6 +3793,9 @@ impl IndexMethodCursor for FtsCursor {
             _ => FTS_PATTERN_SCORE,
         };
         self.current_pattern = pattern_idx;
+        if pattern_idx == FTS_PATTERN_FILTERED_SCORE {
+            return Ok(IOResult::Done(self.query_filtered(values)?));
+        }
 
         // Determine the optional SQL LIMIT captured by the selected pattern.
         let limit_raw = match pattern_idx {
@@ -3537,7 +4101,8 @@ impl IndexMethodCursor for FtsCursor {
             | FTS_PATTERN_COMBINED
             | FTS_PATTERN_COMBINED_LIMIT
             | FTS_PATTERN_COMBINED_ORDERED
-            | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
+            | FTS_PATTERN_COMBINED_ORDERED_LIMIT
+            | FTS_PATTERN_FILTERED_SCORE => {
                 // For fts_score and combined patterns, return the actual score
                 let score = if let Some(stream) = &self.streaming_hits {
                     stream.current.map(|(score, _)| score).ok_or_else(|| {
@@ -3812,6 +4377,11 @@ impl IndexMethodCursor for FtsCursor {
                 .arguments
                 .get(1)
                 .and_then(Self::constant_integer_expression)
+        } else if context.pattern_idx as i64 == FTS_PATTERN_FILTERED_SCORE {
+            context
+                .arguments
+                .get(2)
+                .and_then(Self::constant_integer_expression)
         } else {
             None
         };
@@ -3825,7 +4395,10 @@ impl IndexMethodCursor for FtsCursor {
 
         let globally_ranked = matches!(
             context.pattern_idx as i64,
-            FTS_PATTERN_SCORE | FTS_PATTERN_COMBINED_ORDERED_LIMIT | FTS_PATTERN_COMBINED_ORDERED
+            FTS_PATTERN_SCORE
+                | FTS_PATTERN_COMBINED_ORDERED_LIMIT
+                | FTS_PATTERN_COMBINED_ORDERED
+                | FTS_PATTERN_FILTERED_SCORE
         );
         let streaming_limit = matches!(
             context.pattern_idx as i64,
@@ -3958,5 +4531,7 @@ fn add_json_value(
     Ok(())
 }
 
+#[cfg(test)]
+mod filtered_tests;
 #[cfg(test)]
 mod tests;

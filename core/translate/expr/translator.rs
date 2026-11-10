@@ -2167,6 +2167,16 @@ fn translate_function_call_expr(
             args,
             target_register,
             name.as_str(),
+            1,
+        ),
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        Func::Fts(FtsFunc::FilteredScore) => translate_fts_score(
+            program,
+            referenced_tables,
+            args,
+            target_register,
+            name.as_str(),
+            2,
         ),
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         Func::Fts(FtsFunc::Match) => {
@@ -3341,8 +3351,9 @@ fn translate_fts_score(
     args: &[Box<ast::Expr>],
     target_register: usize,
     name: &str,
+    trailing: usize,
 ) -> Result<usize> {
-    let indexed_columns = args.len().checked_sub(1).filter(|&n| n > 0);
+    let indexed_columns = args.len().checked_sub(trailing).filter(|&n| n > 0);
     let selected_index = indexed_columns.and_then(|n| {
         let ast::Expr::Column { table, .. } = args[0].as_ref() else {
             return None;
@@ -3354,8 +3365,10 @@ fn translate_fts_score(
                     if query.index.index_method.as_ref().is_some_and(|method| {
                         method.definition().method_name
                             == crate::index_method::fts::FTS_INDEX_METHOD_NAME
-                    }) && query.arguments.first().is_some_and(|indexed_query| {
-                        exprs_are_equivalent(indexed_query, args.last().unwrap())
+                    }) && args[n..].iter().enumerate().all(|(i, arg)| {
+                        query.arguments.get(i).is_some_and(|indexed| {
+                            exprs_are_equivalent(indexed, arg)
+                        })
                     }) && {
                         let fields = query.index.columns.iter().enumerate()
                             .filter(|(_, indexed)| args[..n].iter().any(|arg| {

@@ -1482,6 +1482,29 @@ the one rebuild due was made in the first round, when the index first held about
 that round 1,298 to 1,572 writes were left to redo while the rebuild waited and was made, against 0
 to 9 in each later round.
 
+### FTS filtered scoring, filter columns and embedder tokenizers (`fts_filtered_score`)
+2026-11-11, branch `fts-cognition` on `b235afd8f`. `core/index_method/fts/mod.rs`,
+`core/index_method/fts/filter.rs`, `core/index_method/fts/filtered_tests.rs`; the function in
+`core/function.rs`, `core/dialect/sqlite/mod.rs`, `core/util.rs`,
+`core/translate/expr/translator.rs` and `core/vdbe/execute.rs`.
+WorkReef cognition ranks words over only the memories a recall is admitted to, with every BM25
+statistic counted over that set (Clay, 2026-11-11: "yes tantivy route in our fork is the
+ruling"). An FTS index takes integer filter columns (`filter_fields`, optional i64 fast fields)
+and one packed event-interval column (`interval_field`, a BLOB of at most 16 little-endian
+`(from, to)` pairs, a bytes fast field), each column its own tokenizer (`tokenizers`), and
+tokenizers an embedder registers by name for the process (`register_tokenizer`; `tantivy` is
+re-exported for it). `SELECT rowid, fts_filtered_score(cols, ?1 query, ?2 filter) AS score FROM t
+ORDER BY score DESC LIMIT ?3` evaluates the JSON filter (`all`, `any`, `in`, `range`, `null`,
+`within`) per segment into a document set, counts the document count, the field-norm token
+totals and every query term's document frequency over it, and takes the top documents with
+Tantivy's pruning scorers under those statistics. Searched columns come before filter columns;
+a filtered function with no FTS index is an error. Proof: `filtered_tests.rs` — the top documents
+equal an exact BM25 oracle over the admitted set on random corpora in WAL and MVCC (deletes,
+updates that move a document's filter values, OPTIMIZE merges), statistics follow the filter,
+concurrent writers, a rollback and a merge, refused filters and columns, a registered tokenizer,
+and OPTIMIZE INDEX after a DELETE leaving none of the erased document's segment rows in the store
+or the file under `secure_delete`.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

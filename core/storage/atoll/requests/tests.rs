@@ -117,6 +117,33 @@ fn a_refused_submission_is_uncounted_at_once() {
     assert!(!c.is_owned() && !c.finished());
 }
 
+/// Close seals the count once no request is left: a request submitted after it returns is
+/// refused, never submitted, whatever submits it (the auditor's P2-EX-C3: a job dropped after the
+/// drain); one submitted before it is accepted and waited for.
+#[test]
+fn a_request_submitted_after_close_is_refused_and_one_before_it_is_waited_for() {
+    let crash = Arc::new(CrashIO::new(5));
+    let (io, requests) = counted(crash.clone());
+    let file = io
+        .open_file("/db/sealed", OpenFlags::Create, false)
+        .unwrap();
+    let before = file.pread(0, read(512));
+    let accepted = before.is_ok() && requests.outstanding() == 1;
+    requests.drain(&*io);
+    let drained = (requests.outstanding(), crash.in_flight());
+    let after = read(512);
+    let refused = file.pread(0, after.clone()).is_err();
+    let left = (requests.outstanding(), crash.in_flight());
+    // A second close finds it sealed and empty.
+    requests.drain(&*io);
+    drop((before, file, io));
+    assert!(accepted, "the request before close was not counted");
+    assert_eq!(drained, (0, 0), "close returned with a request owned");
+    assert!(refused, "a request after close was accepted");
+    assert_eq!(left, (0, 0), "the refused request was counted or submitted");
+    assert!(!after.is_owned() && !after.finished());
+}
+
 /// A database closes only once every request on its files has retired (DESIGN.md 22.12, step
 /// 4): its log's writes still in flight on a pumped backend when its last handle goes are
 /// delivered by the close, and nothing is left for the backend to land later.

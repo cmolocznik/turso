@@ -2700,6 +2700,231 @@ mod native {
         assert_eq!(of(&events, "running"), ["stepped", "dropped"]);
     }
 
+    /// Holds its drop until told, then submits a counted write and says whether it was accepted.
+    struct WritesAsItDrops {
+        entered: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+        file: Arc<dyn crate::io::File>,
+        wrote: mpsc::Sender<Option<Completion>>,
+    }
+
+    impl Task for WritesAsItDrops {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            Ok(Step::Done)
+        }
+    }
+
+    impl Drop for WritesAsItDrops {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            let _ = self.entered.send(());
+            let _ = self.go.recv_timeout(BOUND);
+            let buffer = Arc::new(crate::io::Buffer::new_temporary(512));
+            let wrote = self
+                .file
+                .pwrite(0, buffer, Completion::new_write(|_| {}))
+                .ok();
+            let _ = self.wrote.send(wrote);
+        }
+    }
+
+    /// A removal letting its task's job go holds close until that drop has ended, so a request
+    /// the drop submits is counted before close's drain and retired by it: close never returns
+    /// with a removal's job still dropping (22.12; the auditor's P2-EX-C3 probe, its pause a race
+    /// point; mutants: the remover uncounted, its count ended before the drop).
+    #[test]
+    fn close_waits_for_a_removals_job_drop_and_what_it_submits() {
+        let requests = Arc::new(Requests::default());
+        let crash = Arc::new(CrashIO::new(51));
+        let io: Arc<dyn crate::io::IO> = Arc::new(Counted::new(crash.clone(), requests.clone()));
+        let file = io
+            .open_file("/executor/remove-close", OpenFlags::Create, false)
+            .unwrap();
+        let ex = Executor::new(io.clone(), 0).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (wrote_tx, wrote_rx) = mpsc::channel();
+        let task = ex.spawn(
+            Class::Due,
+            Box::new(WritesAsItDrops {
+                entered: entered_tx,
+                go: go_rx,
+                file,
+                wrote: wrote_tx,
+            }),
+        );
+        let remover = std::thread::spawn(move || task.remove());
+        let entered = entered_rx.recv_timeout(BOUND).is_ok();
+        let (closing_tx, closing_rx) = mpsc::channel();
+        let closer = {
+            let requests = requests.clone();
+            std::thread::spawn(move || {
+                let waits = closing_tx.clone();
+                crate::race::at("executor.close_waits", move || {
+                    let _ = waits.send("waits");
+                });
+                let durable = Completion::new_wait();
+                durable.complete(0);
+                let closed = ex.close_after(&durable, &requests).is_ok();
+                let _ = closing_tx.send("returned");
+                closed
+            })
+        };
+        // Close waits for the removal, or has returned past it.
+        let first = closing_rx.recv_timeout(BOUND).ok();
+        let _ = go_tx.send(());
+        let wrote = wrote_rx.recv_timeout(BOUND).ok().flatten();
+        remover.join().unwrap();
+        let closed = closer.join().unwrap();
+        let after_close = (requests.outstanding(), crash.in_flight());
+        let accepted = wrote.is_some();
+        if let Some(c) = &wrote {
+            io.wait(c);
+        }
+        drop((wrote, io, requests, crash));
+        assert!(entered, "the removal never dropped the job");
+        assert_eq!(
+            first,
+            Some("waits"),
+            "close returned while a removal's job was still dropping"
+        );
+        assert!(closed);
+        assert!(
+            accepted,
+            "the drop's request was refused: close had sealed past it"
+        );
+        assert_eq!(
+            after_close,
+            (0, 0),
+            "close returned with the drop's request still owned"
+        );
+    }
+
+    /// Pauses its step until told.
+    struct PausesItsStep {
+        entered: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+    }
+
+    impl Task for PausesItsStep {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let _ = self.entered.send(());
+            let _ = self.go.recv_timeout(BOUND);
+            Ok(Step::Done)
+        }
+    }
+
+    /// A step a caller's named claim takes holds close until it ends, as an external runner's
+    /// does: no step is in progress once close has passed (22.12 step 2; mutant: the named claim
+    /// uncounted).
+    #[test]
+    fn close_waits_for_a_named_claims_step() {
+        let ex = executor(0);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let task = ex.spawn(
+            Class::Due,
+            Box::new(PausesItsStep {
+                entered: entered_tx,
+                go: go_rx,
+            }),
+        );
+        let claimer = std::thread::spawn(move || task.run_once());
+        let entered = entered_rx.recv_timeout(BOUND).is_ok();
+        let (closing_tx, closing_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let waits = closing_tx.clone();
+            crate::race::at("executor.close_waits", move || {
+                let _ = waits.send("waits");
+            });
+            ex.close();
+            let _ = closing_tx.send("returned");
+        });
+        let first = closing_rx.recv_timeout(BOUND).ok();
+        let _ = go_tx.send(());
+        let claimed = claimer.join().ok();
+        let closed = closer.join().is_ok();
+        assert!(entered, "the named claim never stepped the task");
+        assert_eq!(
+            first,
+            Some("waits"),
+            "close returned while a named claim's step was in progress"
+        );
+        assert_eq!(claimed, Some(true));
+        assert!(closed);
+    }
+
+    /// Removes another task in its step.
+    struct RemovesTheOther {
+        other: Arc<Lock<Option<TaskRef>>>,
+    }
+
+    impl Task for RemovesTheOther {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let other = self.other.lock().take();
+            if let Some(other) = other {
+                other.remove();
+            }
+            Ok(Step::Done)
+        }
+    }
+
+    /// Never stepped; drops the executor that runs it as its job goes.
+    struct DropsTheExecutorAsItGoes {
+        executor: Arc<Lock<Option<Executor>>>,
+    }
+
+    impl Task for DropsTheExecutorAsItGoes {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            Ok(Step::Idle(Watched::of(&[])))
+        }
+    }
+
+    impl Drop for DropsTheExecutorAsItGoes {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            let ex = self.executor.lock().take();
+            drop(ex);
+        }
+    }
+
+    /// An external call's step removing another task whose job drops the executor: the close it
+    /// makes counts both of this thread's calls as its own, the claim and the removal, and returns
+    /// (22.12; mutant: only the innermost call counted, so close waits for itself for ever).
+    #[test]
+    fn a_close_from_a_removal_inside_an_external_call_does_not_wait_for_itself() {
+        let slot = Arc::new(Lock::new(Some(executor(0))));
+        let (other, remover) = {
+            let held = slot.lock();
+            let ex = held.as_ref().unwrap();
+            let other = ex.spawn(
+                Class::Due,
+                Box::new(DropsTheExecutorAsItGoes {
+                    executor: slot.clone(),
+                }),
+            );
+            let cell = Arc::new(Lock::new(Some(other)));
+            let remover = ex.spawn(Class::Due, Box::new(RemovesTheOther { other: cell }));
+            (Arc::downgrade(&ex.shared), remover)
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let claimed = remover.run_once();
+            let _ = done_tx.send(claimed);
+        });
+        let claimed = done_rx.recv_timeout(BOUND).ok();
+        if claimed.is_some() {
+            caller.join().unwrap();
+        }
+        let closed = slot.lock().is_none() && other.upgrade().is_none();
+        assert_eq!(
+            claimed,
+            Some(true),
+            "the close made from inside the removal waited for its own calls"
+        );
+        assert!(closed, "the executor was not closed and dropped");
+    }
+
     /// A task removed from inside its own step lets its job go as that step ends (22.3).
     #[test]
     fn a_task_removing_itself_in_its_step_goes_as_the_step_ends() {

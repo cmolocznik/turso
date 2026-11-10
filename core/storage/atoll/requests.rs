@@ -7,7 +7,8 @@
 //! still holds counts until the kernel gives it back. A request a callback submits is counted
 //! inside that callback, before the request whose callback it is retires, so the count does not
 //! pass through zero while a chain of requests goes on. Close waits for the count to reach zero
-//! ([`Requests::drain`]), so no request lands on a file after close returns.
+//! ([`Requests::drain`]) and seals it there, so no request lands on a file after close returns:
+//! one submitted after is refused, whatever submits it.
 
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{
@@ -19,10 +20,11 @@ use crate::sync::Arc;
 use crate::Result;
 use std::ptr::NonNull;
 
-/// The requests on a database's files submitted and not retired, in one word with close's mark:
-/// bit 0 says close waits on the word ([`CLOSING`]), and the rest count the requests ([`ONE`]
-/// each). Every change is one atomic step on the word, so a change made while close waits wakes
-/// it.
+/// The requests on a database's files submitted and not retired, in one word with close's marks:
+/// bit 0 says close waits on the word ([`CLOSING`]), bit 1 that close found it at zero and sealed
+/// it ([`SEALED`]), and the rest count the requests ([`ONE`] each). Every change is one atomic
+/// step on the word, so a change made while close waits wakes it, and a submission either counts
+/// before the seal, which close then waits for, or reads it and is refused.
 pub(super) struct Requests {
     word: AtomicU64,
     /// The thread close waits on, set before it marks the word.
@@ -31,11 +33,13 @@ pub(super) struct Requests {
 
 /// Close waits on the word.
 const CLOSING: u64 = 1;
+/// Close has found no request left: none is accepted again.
+const SEALED: u64 = 1 << 1;
 /// One request submitted and not retired.
-const ONE: u64 = 1 << 1;
+const ONE: u64 = 1 << 2;
 /// The requests submitted and not retired, out of a word.
 fn outstanding_in(word: u64) -> u64 {
-    word >> 1
+    word >> 2
 }
 
 impl Default for Requests {
@@ -48,13 +52,20 @@ impl Default for Requests {
 }
 
 impl Requests {
-    /// Counts the request `submit` submits for as long as its backend owns it.
+    /// Counts the request `submit` submits for as long as its backend owns it; refused, never
+    /// submitted, once close has sealed the count.
     fn submit(
         self: &Arc<Self>,
         physical: Completion,
         submit: impl FnOnce() -> Result<Completion>,
     ) -> Result<Completion> {
-        self.word.fetch_add(ONE, Ordering::AcqRel);
+        if self.word.fetch_add(ONE, Ordering::AcqRel) & SEALED != 0 {
+            // A close looking again meanwhile saw it counted, and looks once more.
+            self.changed(self.word.fetch_sub(ONE, Ordering::AcqRel));
+            return Err(crate::LimboError::InternalError(
+                "a request on a file of a closed database".to_string(),
+            ));
+        }
         // Counted and not yet the backend's: a close that looks now finds the backend empty and
         // parks, and the submission wakes it (`IO::try_step`).
         crate::race::point("requests.counted");
@@ -117,7 +128,20 @@ impl Requests {
         let place = crate::io::ReadyPlace::default();
         let ready = crate::io::unparking(me.clone());
         let mut registered = false;
-        while outstanding_in(self.word.load(Ordering::SeqCst)) > 0 {
+        loop {
+            let word = self.word.load(Ordering::SeqCst);
+            // At zero, sealed in the same step that ends the wait: a submission counted since the
+            // read fails the exchange and is waited for.
+            if outstanding_in(word) == 0 {
+                if self
+                    .word
+                    .compare_exchange(word, SEALED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+                continue;
+            }
             if !pumped {
                 crate::storage::atoll::park::thread();
                 continue;
@@ -138,7 +162,6 @@ impl Requests {
         if registered {
             io.withdraw(place.key());
         }
-        self.word.fetch_and(!CLOSING, Ordering::SeqCst);
     }
 }
 

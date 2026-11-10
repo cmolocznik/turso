@@ -4020,11 +4020,12 @@ registers a waker on a completion while it holds an executor mutex.
 2. **A signal**: "something a task watches changed". A 64-bit counter and one list of the tasks
    registered on it, under the signal's own mutex.
    - **Notify**: publish the change (the job's own state, by a release store or under its own
-     lock), then increment the counter with release ordering, then, under the mutex, wake each
-     listed task and empty the list. The tasks are executor targets, so they are woken under the
-     mutex; the lock order is a signal's mutex, then the queue's, and the queue's mutex never takes
-     a signal's. A notify's work is at most its list, one entry per task that can watch the signal,
-     however often notifies arrive.
+     lock), then, under the mutex, increment the counter with release ordering (a threshold signal
+     resetting its threshold first, in the same hold), wake each listed task and empty the list.
+     The tasks are executor targets, so they are woken under the mutex; the lock order is a
+     signal's mutex, then the queue's, and the queue's mutex never takes a signal's. A notify's
+     work is at most its list, one entry per task that can watch the signal, however often
+     notifies arrive.
    - **Wait**: a task reads each counter with acquire ordering, then checks its condition. Unmet,
      it returns `Idle` with each signal and the count it read. For each, the executor takes the
      mutex, adds the task unless it is already listed, releases the mutex, and reads the counter
@@ -5007,7 +5008,14 @@ ran while the executor still ran. Nothing the executor or a waker holds keeps th
    Until the preparers exist (22.16 step 8), close's wait is a `wait_durable` caller like any
    other: it comes back and runs an owed preparation step itself (22.5).
 2. **Closing published**: no task is claimed or linked again, and every step in progress ends; its
-   runner sees closing and leaves.
+   runner sees closing and leaves. A worker's steps end with it, joined; every other step (an
+   embedder's, a caller's wait running the executor, a named claim) and every removal letting its
+   task's job go is counted among the calls close waits for, under the same hold of the queue's
+   mutex that claimed the task or read closing not yet published, until it ends: for a removal,
+   until the job's drop has ended, so a request the drop submits is counted before step 4 looks
+   (the auditor's P2-EX-C3). The calls of the closing thread itself are its own and never waited
+   for: a step, or a removal inside one, whose drop of the last handle closed the executor, each
+   counted among them however they nest.
 3. **Logical waits abandoned**: each task is closed, and its job's abandonment runs on the closing
    thread, outside any step: a checkpoint under way is abandoned as a failed one is (its cut, gate
    and protection released), a segment not yet published as prepared is left for the next open to
@@ -5022,8 +5030,11 @@ ran while the executor still ran. Nothing the executor or a waker holds keeps th
    device that never answers holds close as it holds any write. A request cancelled or abandoned by
    a statement long gone counts until its backend lets it go, so no write lands on a file after
    close returns, and a database opened again in the same process cannot have its pages
-   overwritten by the one before. A job's continuation submits nothing once closing is published;
-   a backend's own work on a request (the rest of a partial write, a cancel) goes on until the
+   overwritten by the one before. The wait ends by sealing the count in the same atomic step that
+   reads it at zero: a request submitted after it is refused, never submitted, whatever submits it
+   (a job dropped in step 5, a file handle kept past close), and one counted before it fails the
+   seal and is waited for. A job's continuation submits nothing once closing is published; a
+   backend's own work on a request (the rest of a partial write, a cancel) goes on until the
    request retires.
 5. **State dropped, runners joined**: every job's state is dropped, every worker joined, and every
    embedder call in progress has returned. Jobs are dropped after the table's mutex is let go,

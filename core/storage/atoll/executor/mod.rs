@@ -303,39 +303,43 @@ crate::thread::thread_local! {
     /// Whether this thread is inside a task's step or a waker a drain invokes, where no runner
     /// may enter the executor (22.7).
     static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The executor this thread is stepping a task of for an external call ([`Runner::run_one`]),
-    /// by the address of its shared part, or zero: a close of that executor made from inside that
-    /// step does not wait for it.
-    static CALLING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The executors this thread is counted in by a call in progress ([`Calling`]), innermost
+    /// last, by the address of each one's shared part: a close of one made from inside those
+    /// calls does not wait for them.
+    static CALLING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(atoll_loom)]
 loom::thread_local! {
     static INSIDE: std::cell::Cell<bool> = std::cell::Cell::new(false);
-    static CALLING: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static CALLING: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::new());
 }
 
-/// An external call stepping a task, counted in the queue until it ends: close waits for every
-/// one but the calling thread's own (22.7).
+/// A call into an executor counted in its queue until it ends, close waiting for every one but
+/// the closing thread's own (22.7, 22.12): an external call stepping a task, or a removal letting
+/// its task's job go.
 struct Calling<'a> {
     shared: &'a Shared,
-    /// The thread's marker before this call, given back at its end.
-    previous: usize,
 }
 
 impl<'a> Calling<'a> {
     /// Counts a call whose claim the caller made under the queue's mutex, `queue` that guard.
     fn enter(shared: &'a Shared, queue: &mut Queue) -> Self {
         queue.calls += 1;
-        let previous = CALLING.with(|calling| calling.replace(std::ptr::from_ref(shared) as usize));
-        Self { shared, previous }
+        CALLING.with(|calling| calling.borrow_mut().push(shared.address()));
+        Self { shared }
     }
 }
 
 impl Drop for Calling<'_> {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        CALLING.with(|calling| calling.set(self.previous));
+        let ended = CALLING.with(|calling| calling.borrow_mut().pop());
+        assert_eq!(
+            ended,
+            Some(self.shared.address()),
+            "calls into executors ended out of order"
+        );
         let closer = {
             let mut queue = lock(&self.shared.queue);
             queue.calls -= 1;
@@ -629,20 +633,37 @@ struct Shared {
 }
 
 impl Shared {
-    /// Claims the next task and steps it once; whether there was one.
-    fn run_one(self: &Arc<Self>) -> bool {
-        let Some(header) = lock(&self.queue).claim() else {
-            return false;
+    /// The address that names this executor among a thread's calls ([`Calling`]).
+    fn address(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Claims the next task and steps it once; whether there was one. A step a worker takes is
+    /// joined by close; any other, `counted`, is among the calls close waits for, counted under
+    /// the claim's own hold of the queue's mutex (22.12 step 2).
+    fn run_one(self: &Arc<Self>, counted: bool) -> bool {
+        let (header, _call) = {
+            let mut queue = lock(&self.queue);
+            let Some(header) = queue.claim() else {
+                return false;
+            };
+            let call = counted.then(|| Calling::enter(self, &mut queue));
+            (header, call)
         };
         self.step(header);
         true
     }
 
-    /// Claims `header` by name and steps it once; whether it was claimed.
+    /// Claims `header` by name and steps it once, a call close waits for, counted under the
+    /// claim's own hold of the queue's mutex (22.12 step 2); whether it was claimed.
     fn run_named(self: &Arc<Self>, header: &Arc<Header>) -> bool {
-        if !lock(&self.queue).claim_named(header) {
-            return false;
-        }
+        let _call = {
+            let mut queue = lock(&self.queue);
+            if !queue.claim_named(header) {
+                return false;
+            }
+            Calling::enter(self, &mut queue)
+        };
         self.step(header.clone());
         true
     }
@@ -658,7 +679,7 @@ impl Shared {
         let mut registered = false;
         let node = lock(&self.queue).add_node(Node::Thread(me.clone()));
         while !c.finished() {
-            let stepped = self.run_one();
+            let stepped = self.run_one(true);
             if pumped {
                 match self.io.try_step(place.key(), &ready) {
                     Err(_) => crate::io::stepping_failed("a wait on executor work"),
@@ -919,7 +940,7 @@ fn work(shared: &Arc<Shared>) {
         if shared.closed.load(Ordering::Acquire) {
             break;
         }
-        let stepped = shared.run_one();
+        let stepped = shared.run_one(false);
         if pumped {
             match shared.io.try_step(place.key(), &ready) {
                 Err(_) => crate::io::stepping_failed("an executor's worker"),
@@ -1150,7 +1171,7 @@ impl TaskRef {
         let Some(shared) = self.0.shared.upgrade() else {
             return;
         };
-        let ours = {
+        let counted = {
             let mut queue = lock(&shared.queue);
             if queue.closing {
                 return;
@@ -1179,10 +1200,12 @@ impl TaskRef {
                 let at = list.iter().position(|h| Arc::ptr_eq(h, &self.0));
                 list.remove(at.expect("a queued task linked in no list"));
             }
-            state & RUNNING == 0
+            // A running task's end lets its job go when it finds the task closed. Otherwise the
+            // job is this call's to let go, counted under the mutex that read close not begun,
+            // until its drop has ended: close waits for it as for any call.
+            (state & RUNNING == 0).then(|| Calling::enter(&shared, &mut queue))
         };
-        // A running task's end lets its job go when it finds the task closed.
-        if ours {
+        if let Some(_counted) = counted {
             shared.release_closed(&self.0);
         }
     }
@@ -1390,7 +1413,7 @@ impl Executor {
     #[turso_macros::atoll_entry]
     pub(crate) fn run_one(&self) -> bool {
         refuse_entry_from_inside();
-        self.shared.run_one()
+        self.shared.run_one(true)
     }
 
     /// Claims `task` by name and steps it once, on the calling thread (22.7): queued, it is taken
@@ -1507,10 +1530,11 @@ impl Executor {
             // A worker that panicked ended the process (22.11): a join returns its loop's end.
             let _ = worker.join();
         }
-        // Every external call's step ends before the jobs go, but this thread's own, when its
-        // step dropped the executor: no call starts once closing is published.
-        let mine = Arc::as_ptr(&self.shared) as usize;
-        let own = usize::from(CALLING.with(std::cell::Cell::get) == mine);
+        // Every call ends before the jobs go, an external call's step and a removal's job drop, but
+        // this thread's own, when one of them dropped the executor: no call starts once closing is
+        // published.
+        let mine = self.shared.address();
+        let own = CALLING.with(|calling| calling.borrow().iter().filter(|&&c| c == mine).count());
         loop {
             {
                 let mut queue = lock(&self.shared.queue);
@@ -1519,6 +1543,7 @@ impl Executor {
                 }
                 queue.closer = Some(crate::thread::current());
             }
+            crate::race::point("executor.close_waits");
             // Unparked by a call's end, or spuriously: either way it looks again.
             crate::storage::atoll::park::thread();
         }

@@ -25851,3 +25851,88 @@ fn root_page_reuse_resolves_each_owner_at_its_own_snapshots() {
     );
     assert!(store.table_id_to_rootpage.index_matches_bindings());
 }
+
+/// What this test checks: a passive checkpoint parked after staging its page-1 header, while a
+/// schema change commits, does not publish that older header's schema cookie over the newer one;
+/// so a concurrent writer that began after the schema change commits beside the next checkpoint.
+/// Why this matters: the regressed cookie made every writer that began between the two
+/// checkpoints fail its commit with a schema conflict no schema change caused (a vector staging
+/// page after a space registration).
+#[test]
+fn passive_checkpoint_publishes_no_schema_cookie_older_than_a_schema_change_it_overlapped() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+
+    // A checkpoint parked after its pager commit, before it publishes.
+    let ckpt_conn = db.connect();
+    ckpt_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let park = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+    ckpt_conn.set_yield_injector(Some(park.clone()));
+    let mut delayed = ckpt_conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+    let io = ckpt_conn.pager.load().io.clone();
+    let mut parked = false;
+    for _ in 0..200_000 {
+        match delayed.step().unwrap() {
+            crate::StepResult::Yield | crate::StepResult::IO => {
+                if park.is_empty() {
+                    parked = true;
+                    break;
+                }
+                io.step().unwrap();
+            }
+            crate::StepResult::Done => break,
+            other => panic!("unexpected checkpoint step: {other:?}"),
+        }
+    }
+    ckpt_conn.set_yield_injector(None);
+    assert!(parked, "the checkpoint should park before publishing");
+
+    // A schema change commits while it is parked, inside a concurrent transaction.
+    let ddl = db.connect();
+    ddl.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    ddl.execute("BEGIN CONCURRENT").unwrap();
+    ddl.execute("CREATE TABLE fresh(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    ddl.execute("COMMIT").unwrap();
+    let mv_store = ddl.mv_store().as_ref().cloned().expect("an MVCC database");
+    let global_cookie = || {
+        mv_store
+            .global_header
+            .read()
+            .as_ref()
+            .map(|h| h.schema_cookie.get())
+    };
+    let schema_version = || db.db.as_ref().unwrap().schema.lock().schema_version;
+    let after_ddl = global_cookie();
+    // The checkpoint publishes: the cookie must not go back below the schema change's.
+    step_until_done(&mut delayed, &io, "parked checkpoint");
+    assert_eq!(
+        global_cookie(),
+        after_ddl,
+        "the checkpoint published another cookie than the schema change's (schema version {})",
+        schema_version()
+    );
+
+    // A writer that begins now commits beside the next checkpoint.
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO fresh VALUES (1)").unwrap();
+    let next = db.connect();
+    next.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    writer
+        .execute("COMMIT")
+        .expect("no schema changed after the writer began");
+}

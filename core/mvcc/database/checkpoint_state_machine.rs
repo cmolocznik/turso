@@ -2356,7 +2356,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 "checkpoint header was not staged before pager commit".to_string(),
             )
         })?;
-        self.mvstore.global_header.write().replace(header);
+        {
+            // The header was staged from the global one before the pager commit; a passive
+            // checkpoint runs beside writers, so a transaction may have committed MVCC-authored
+            // fields since (a schema change's cookie, a PRAGMA's user_version). Those stay as the
+            // writers left them: publishing the staged copy would hand every later transaction an
+            // older schema cookie than the schema it reads, and a writer that began under it fails
+            // its commit with a schema conflict the next publish exposes. The cookie only grows.
+            let mut global = self.mvstore.global_header.write();
+            let mut header = header;
+            if let Some(current) = global.as_ref() {
+                header.schema_cookie = current
+                    .schema_cookie
+                    .get()
+                    .max(header.schema_cookie.get())
+                    .into();
+                header.user_version = current.user_version;
+                header.application_id = current.application_id;
+                header.vacuum_mode_largest_root_page = current.vacuum_mode_largest_root_page;
+                header.incremental_vacuum_enabled = current.incremental_vacuum_enabled;
+            }
+            global.replace(header);
+        }
         crate::without_allocation_faults!(self
             .publish_checkpointed_schema_roots()
             .expect(crate::alloc::ALLOC_ERR_MSG));

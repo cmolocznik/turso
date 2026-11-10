@@ -105,8 +105,8 @@ pub(in crate::storage::atoll) struct Atoll {
     pool: Arc<BufferPool>,
     checkpointer: Arc<Checkpointer>,
     txns: Arc<Transactions>,
-    /// The executor whose one worker steps the checkpoint's task ([`Checkpointing::Thread`]),
-    /// closed with the database.
+    /// The executor of the checkpoint's task, with one worker ([`Checkpointing::Thread`]) or none,
+    /// writers claiming the task ([`Checkpointing::Writers`]); closed with the database.
     executor: Option<Executor>,
     /// The IO every file of the database was opened through, counting its requests.
     io: Arc<dyn IO>,
@@ -382,20 +382,16 @@ impl Opening {
         // A writer refused room for kept copies steps the checkpoint itself, or with a thread
         // stepping checkpoints waits for the room it frees.
         pool.set_relief(Arc::new(CheckpointRelief::new(&checkpointer, &txns)));
-        let executor = match self.checkpointing {
-            Checkpointing::Writers => None,
-            Checkpointing::Thread => {
-                let executor = Executor::new(self.io.clone(), 1)?;
-                let task = executor.spawn(
-                    Class::Maintenance,
-                    Box::new(CheckpointTask::new(checkpointer.clone(), txns.clone())),
-                );
-                // Named before the database is handed out: from then on no writer steps a
-                // checkpoint.
-                checkpointer.attach(task);
-                Some(executor)
-            }
-        };
+        // The checkpoint's task, on one worker or on none, its writers claiming it.
+        let worker = matches!(self.checkpointing, Checkpointing::Thread);
+        let executor = Executor::new(self.io.clone(), usize::from(worker))?;
+        let task = executor.spawn(
+            Class::Maintenance,
+            Box::new(CheckpointTask::new(checkpointer.clone(), txns.clone())),
+        );
+        // Named before the database is handed out: from then on only the task steps checkpoints.
+        checkpointer.attach(task, worker);
+        let executor = Some(executor);
         Ok(Atoll {
             #[cfg(test)]
             recovered,

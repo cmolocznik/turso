@@ -3833,6 +3833,7 @@ fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
     let (
         pending,
         registered,
+        shares_the_tasks_wait,
         idle_wakes,
         steady_allocations,
         steady_pending,
@@ -3853,7 +3854,13 @@ fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
         held_rx.recv().unwrap();
         let cp = atoll.checkpointer();
         let ticket = cp.request_full();
-        let cut_wait_pending = matches!(cp.step_full(ticket,atoll.transactions()).unwrap(),crate::types::IOResult::IO(ref io) if !io.finished());
+        // The writers claim the checkpoint's task: the step this claim runs waits for the held
+        // change to leave the closing gate, its own waker on that wait.
+        let cut_wait = match cp.step_full(ticket, atoll.transactions()).unwrap() {
+            crate::types::IOResult::IO(crate::types::IOCompletions(c)) if !c.finished() => Some(c),
+            _ => None,
+        };
+        let cut_wait_pending = cut_wait.is_some();
         let mut pending = 0;
         let mut wait = None;
         for waker in &wakers {
@@ -3869,6 +3876,8 @@ fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
             }
         }
         let registered = wait.as_ref().map_or(0, crate::Completion::wakers);
+        // The statement's claims step the same task, which waits on the same cut wait.
+        let shares_the_tasks_wait = matches!((&wait, &cut_wait), (Some(w), Some(c)) if w.ptr_eq(c));
         let idle_wakes = tasks
             .iter()
             .map(|t| t.0.load(std::sync::atomic::Ordering::Relaxed))
@@ -3896,6 +3905,7 @@ fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
         (
             pending,
             registered,
+            shares_the_tasks_wait,
             idle_wakes,
             steady_allocations,
             steady_pending,
@@ -3911,10 +3921,15 @@ fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
     drop(io);
     drop(wakers);
     drop(tasks);
-    eprintln!("STATEMENT_WAKERS pending={pending} registered={registered} idle_wakes={idle_wakes} steady_allocations={steady_allocations} steady_pending={steady_pending} finish_wakes={finished_wakes:?} cut_wait_pending={cut_wait_pending} checkpoint_done={checkpoint_done} statement_done={statement_done}");
+    eprintln!("STATEMENT_WAKERS pending={pending} registered={registered} shares_the_tasks_wait={shares_the_tasks_wait} idle_wakes={idle_wakes} steady_allocations={steady_allocations} steady_pending={steady_pending} finish_wakes={finished_wakes:?} cut_wait_pending={cut_wait_pending} checkpoint_done={checkpoint_done} statement_done={statement_done}");
     assert!(cut_wait_pending && pending == 32 && checkpoint_done && statement_done);
+    assert!(
+        shares_the_tasks_wait,
+        "the statement does not wait on the checkpoint task's own wait"
+    );
+    // The statement's latest waker, and the checkpoint's task.
     assert_eq!(
-        registered, 1,
+        registered, 2,
         "one live SQL statement retained obsolete Context wakers"
     );
     assert_eq!(idle_wakes, 0);

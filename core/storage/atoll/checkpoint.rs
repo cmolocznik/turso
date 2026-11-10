@@ -58,8 +58,8 @@ use std::ops::{Deref, DerefMut};
 crate::thread::thread_local! {
     /// Writing statements' steps that found nothing due, on this thread.
     pub(crate) static STEPS_PASSED_OVER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Steps of the checkpoint state taken on this thread, other than the checkpoint task's,
-    /// for tests to tell writers that did checkpoint work.
+    /// Steps of the checkpoint state taken on this thread, for tests to tell a thread that did
+    /// checkpoint work: a writer's, or the worker stepping the checkpoint's task.
     pub(crate) static WRITER_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -134,7 +134,8 @@ pub struct Checkpointer {
     /// ([`Checkpointing::Thread`]): writers then only wake it. Unset, or once the task has ended,
     /// writers step checkpoints.
     task: std::sync::OnceLock<TaskRef>,
-    /// Whether the task steps checkpoints, read by every writer's step without a lock.
+    /// Whether a worker steps the checkpoint's task, read by every writer's step without a lock;
+    /// with a task and no worker, writers claim it and step it themselves.
     driven: AtomicBool,
     /// Full checkpoints done, and whether one failed, as the state last recorded them, for a
     /// transaction's end waiting on the thread without taking the state.
@@ -152,6 +153,38 @@ pub struct Checkpointer {
 crate::thread::thread_local! {
     /// The checkpointer whose task this thread is stepping, by address, or 0.
     static STEPPING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The claim of a checkpoint's task this thread's writer is making, if any.
+    static CLAIMING: std::cell::RefCell<Claiming> = const { std::cell::RefCell::new(Claiming::No) };
+}
+
+/// A writer's claim of the checkpoint's task on this thread: made, then told by the step it runs.
+enum Claiming {
+    No,
+    Made,
+    Told(Claimed),
+}
+
+/// What a writer's claim of the checkpoint's task came to (DESIGN.md 22.7): the step it ran on its
+/// own thread tells it, so the writer meets what that step met, as a writer stepping the state
+/// does, and no other claim's step can stand in for it.
+enum Claimed {
+    /// No step: another writer's step holds the task, or the task is over.
+    Refused,
+    /// The step found the state held by another (an integrity check) and contends for it.
+    Held,
+    /// What the step came to: its wait, done, or the failure it met.
+    Stepped(Result<IOResult<()>>),
+}
+
+/// Tells a writer whose claim runs the step on this thread what the step came to; a step on a
+/// worker has no claimant to tell.
+fn tell_claimant(claimed: Claimed) {
+    CLAIMING.with(|c| {
+        let mut c = c.borrow_mut();
+        if matches!(*c, Claiming::Made) {
+            *c = Claiming::Told(claimed);
+        }
+    });
 }
 
 /// This thread steps `checkpointer`'s task until dropped.
@@ -170,12 +203,23 @@ impl Drop for Stepping {
     }
 }
 
+/// Who steps the checkpoint for a writer: the worker, which the writer only wakes; the writer
+/// itself, claiming the checkpoint's task; or, with no task (recovery, before the database is
+/// handed out) or a task that failed, the writer stepping the state.
+enum Stepper<'a> {
+    Worker,
+    Caller(&'a TaskRef),
+    Writer,
+}
+
 /// The checkpoint as its database's executor task (DESIGN.md 22.9 item 1, 22.16 step 7): a step
 /// steps the state as far as it goes before it waits on writes or finds nothing more due, holding
 /// it, or contends for it while an integrity check holds it. With nothing due it rests until a
 /// writer finding a checkpoint due or a transaction ending, a full checkpoint asked for, a writer
-/// wanting room or the state let go wakes it, as each woke the thread it replaces. A failure, told to every waiter by the state, ends it: no checkpoint runs until the
-/// database is opened again, and writers go on, as they did with a thread of the database's own.
+/// wanting room or the state let go wakes it, as each woke the thread it replaces; with no worker,
+/// the writers claim its steps themselves. A failure, told to every waiter by the state and to the
+/// writer whose claim met it, ends it: no checkpoint runs until the database is opened again, and
+/// writers go on, as they did with a thread of the database's own.
 pub(crate) struct CheckpointTask {
     cp: Arc<Checkpointer>,
     txns: Arc<Transactions>,
@@ -197,9 +241,11 @@ impl Task for CheckpointTask {
                 hold: Some(hold),
                 checkpointer: cp,
                 waiters_owed: false,
+                task: true,
             });
         let Some(mut state) = held else {
             // Its contender: the state let go wakes it.
+            tell_claimant(Claimed::Held);
             return Ok(Step::Idle(Watched::of(&[])));
         };
         let out = {
@@ -207,13 +253,16 @@ impl Task for CheckpointTask {
             cp.stepping(&mut state, &self.txns, Until::Done)
         };
         drop(state);
-        match out {
-            Ok(IOResult::IO(IOCompletions(c))) if c.finished() => Ok(Step::Again),
-            Ok(IOResult::IO(IOCompletions(c))) => Ok(Step::Wait(c)),
+        crate::race::point("checkpoint.let_go");
+        let step = match &out {
+            Ok(IOResult::IO(IOCompletions(c))) if c.finished() => Step::Again,
+            Ok(IOResult::IO(IOCompletions(c))) => Step::Wait(c.clone()),
             // Nothing due now: a wake after the look, while this step runs, queues it again.
-            Ok(IOResult::Done(())) => Ok(Step::Idle(Watched::of(&[]))),
-            Err(_) => Ok(Step::Done),
-        }
+            Ok(IOResult::Done(())) => Step::Idle(Watched::of(&[])),
+            Err(_) => Step::Done,
+        };
+        tell_claimant(Claimed::Stepped(out));
+        Ok(step)
     }
 
     /// The database closing (22.12 step 3): a checkpoint under way is abandoned as a failed one
@@ -233,13 +282,15 @@ impl Task for CheckpointTask {
 /// Who steps the checkpoints (Clay's ruling of 2026-11-05: off the commit path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checkpointing {
-    /// A thread of the database's own, which keeps the checkpoint's writes going as fast as the
-    /// device takes them. A writing statement and a transaction's end only wake it; a writer
-    /// refused room for kept copies waits for the room it frees; and past twice the log budget a
-    /// transaction's end waits for its full checkpoint, doing none of it.
+    /// A worker of the database's executor stepping the checkpoint's task, which keeps the
+    /// checkpoint's writes going as fast as the device takes them. A writing statement and a
+    /// transaction's end only wake it; a writer refused room for kept copies waits for the room it
+    /// frees; and past twice the log budget a transaction's end waits for its full checkpoint,
+    /// doing none of it.
     Thread,
-    /// The writers, each statement and transaction's end stepping a checkpoint that is due: for a
-    /// platform without threads, or a test that steps checkpoints itself.
+    /// The writers, each statement and transaction's end, a writer refused room and a wait for a
+    /// full checkpoint claiming the checkpoint's task and stepping it, one step a call (DESIGN.md
+    /// 22.7): for a platform without threads, or a test that steps checkpoints itself.
     Writers,
 }
 
@@ -300,15 +351,19 @@ impl Relief for CheckpointRelief {
 /// The checkpoint's state, held ([`Checkpointer::try_hold`]): every holder takes it so, and steps
 /// it only so ([`Checkpointer::stepping`]). Letting it go wakes its contenders ([`Hold`]), then the
 /// transactions' ends waiting for a full checkpoint, if a step under it moved what they wait for,
-/// then the writers waiting for room: a writer refused room waits on the room, and one whose
-/// relief found the state held steps the checkpoint itself once it is let go. Each is woken with
-/// the state let go, so a waker that takes it finds it free.
+/// then, where the writers step checkpoints themselves, the writers waiting on it: a writer refused
+/// room or the gate whose relief found the state held steps the checkpoint itself once it is let
+/// go. Each is woken with the state let go, so a waker that takes it finds it free. A worker
+/// stepping the task leaves its writers waiting on the room it frees and the gate it opens, and a
+/// writer's claim of the task wakes them itself once the step it claimed has ended.
 struct StateHold<'a> {
     hold: Option<Hold<'a, State>>,
     checkpointer: &'a Checkpointer,
     /// A step under this hold moved a full checkpoint's count or failed: its waiters are owed a
     /// wake.
     waiters_owed: bool,
+    /// Held by the checkpoint's own task, whose writers this let-go does not wake.
+    task: bool,
 }
 
 impl Deref for StateHold<'_> {
@@ -332,13 +387,9 @@ impl Drop for StateHold<'_> {
         if self.waiters_owed {
             self.checkpointer.wake_waiters();
         }
-        self.checkpointer.pool.wake_room();
-        // A cut left under way: a writer the gate refused, its relief having found the state
-        // held, steps it now.
-        if self.checkpointer.store.gate_closed() {
-            self.checkpointer.store.wake_gate_waiters();
+        if !self.task && !self.checkpointer.driven() {
+            self.checkpointer.wake_writers();
         }
-        self.checkpointer.released.let_go();
     }
 }
 
@@ -506,9 +557,7 @@ impl Checkpointer {
         let clock = self.store.io();
         let began = clock.current_time_monotonic();
         #[cfg(test)]
-        if !self.on_driver() {
-            WRITER_STEPS.with(|n| n.set(n.get() + 1));
-        }
+        WRITER_STEPS.with(|n| n.set(n.get() + 1));
         let out = state.step(self, txns, until);
         let took = clock.current_time_monotonic().duration_since(began);
         self.counters.stepping_ns.fetch_add(
@@ -549,6 +598,7 @@ impl Checkpointer {
             hold: Some(hold),
             checkpointer: self,
             waiters_owed: false,
+            task: false,
         })
     }
 
@@ -577,6 +627,7 @@ impl Checkpointer {
                 hold: Some(hold),
                 checkpointer: self,
                 waiters_owed: false,
+                task: false,
             })
     }
 
@@ -599,7 +650,7 @@ impl Checkpointer {
     /// Whether the checkpoint's task is over: failed, or closed.
     #[cfg(test)]
     pub(crate) fn task_done(&self) -> bool {
-        self.task.get().is_some_and(TaskRef::is_done)
+        self.task.get().is_some_and(TaskRef::is_over)
     }
 
     /// Whether the checkpoint's task waits for the state as its contender.
@@ -627,14 +678,60 @@ impl Checkpointer {
         }
     }
 
-    /// The checkpoint's task ([`Checkpointing::Thread`]), named before the database is handed
-    /// out, so no writer steps a checkpoint once it is open.
-    pub(crate) fn attach(&self, task: TaskRef) {
+    /// The checkpoint's task, named before the database is handed out: from then on only the
+    /// task steps checkpoints, on a worker (`worker`, [`Checkpointing::Thread`]), which writers
+    /// only wake, or claimed by the writers themselves ([`Checkpointing::Writers`]).
+    pub(crate) fn attach(&self, task: TaskRef, worker: bool) {
         assert!(
             self.task.set(task).is_ok(),
             "a checkpointer given a second task"
         );
-        self.driven.store(true, Ordering::Release);
+        self.driven.store(worker, Ordering::Release);
+    }
+
+    /// Who steps the checkpoint for a writer now.
+    fn stepper(&self) -> Stepper<'_> {
+        match self.task.get() {
+            Some(_) if self.driven() => Stepper::Worker,
+            // A task that failed or closed is over: the writer steps the state and meets the
+            // failure, as writers stepping checkpoints always have.
+            Some(task) if !task.is_over() => Stepper::Caller(task),
+            _ => Stepper::Writer,
+        }
+    }
+
+    /// A writer's named claim of the checkpoint's task (DESIGN.md 22.7): one step, on this
+    /// thread, unless another writer is stepping it or the task is over; what it came to. A step
+    /// that held the state has ended here, so whoever waits on the room, the gate or the state's
+    /// let-go looks again: a claim that found the task running registered its wait first, and
+    /// that step's own let-go may have come before the claim looked. A claim that stepped nothing,
+    /// or whose step only contended for the state another holds, wakes no one, itself included:
+    /// that holder's let-go does.
+    fn claim(&self, task: &TaskRef) -> Claimed {
+        CLAIMING.with(|c| *c.borrow_mut() = Claiming::Made);
+        let ran = task.run_once();
+        let claiming = CLAIMING.with(|c| std::mem::replace(&mut *c.borrow_mut(), Claiming::No));
+        if !ran {
+            return Claimed::Refused;
+        }
+        let Claiming::Told(claimed) = claiming else {
+            unreachable!("a claimed step did not tell its claimant what it came to")
+        };
+        if matches!(claimed, Claimed::Stepped(_)) {
+            self.wake_writers();
+        }
+        claimed
+    }
+
+    /// Wakes the writers waiting on the state's let-go to step the checkpoint themselves: those
+    /// refused room, those the gate refused while a cut is under way, and those waiting for a
+    /// full checkpoint.
+    fn wake_writers(&self) {
+        self.pool.wake_room();
+        if self.store.gate_closed() {
+            self.store.wake_gate_waiters();
+        }
+        self.released.let_go();
     }
 
     /// The checkpoint's task has closed: writers would step checkpoints again, and no waiter is
@@ -671,9 +768,14 @@ impl Checkpointer {
     /// is abandoned, its cut ended and its copies dropped, and tells its failure to whoever steps
     /// checkpoints next: the writer goes on, as commits do.
     pub fn relieve(&self, txns: &Transactions, retry: Retry<'_>) -> Relieved {
-        // The thread's to step, kept copies first while a writer waits: the writer waits for the
-        // room it frees.
-        if self.driven() && !self.on_driver() {
+        // The task's own step, out of room: the state is its own to let go.
+        if self.on_driver() {
+            return Relieved::Held;
+        }
+        // The worker's to step: the writer waits for the room it frees. Otherwise the writer steps
+        // the state itself only as far as its room needs, as writers always have: a claim of the
+        // task would step it as far as it goes (DESIGN.md 22.7).
+        if let Stepper::Worker = self.stepper() {
             self.wake_driver();
             return Relieved::Elsewhere;
         }
@@ -716,9 +818,17 @@ impl Checkpointer {
     /// Does whatever is due: a checkpoint once its share of the log has been appended, going on
     /// with one under way. Done once nothing more is due now, or while someone else steps it.
     pub fn step(&self, txns: &Transactions) -> Result<IOResult<()>> {
-        if self.driven() && !self.on_driver() {
-            self.wake_driver();
-            return Ok(IOResult::Done(()));
+        match self.stepper() {
+            Stepper::Worker => {
+                self.wake_driver();
+                return Ok(IOResult::Done(()));
+            }
+            Stepper::Caller(task) => match self.claim(task) {
+                Claimed::Stepped(stepped) => return stepped,
+                // Another writer or holder steps it now: nothing is owed here.
+                Claimed::Refused | Claimed::Held => return Ok(IOResult::Done(())),
+            },
+            Stepper::Writer => {}
         }
         let Some(mut state) = self.try_hold() else {
             return Ok(IOResult::Done(()));
@@ -786,8 +896,10 @@ impl Checkpointer {
 
     /// Done once the full checkpoint `ticket` names is done.
     pub fn step_full(&self, ticket: u64, txns: &Transactions) -> Result<IOResult<()>> {
-        if self.driven() && !self.on_driver() {
-            return self.wait_full(ticket);
+        match self.stepper() {
+            Stepper::Worker => return self.wait_full(ticket),
+            Stepper::Caller(task) => return self.claim_full(task, ticket),
+            Stepper::Writer => {}
         }
         let mut state = match self.hold_or_wait() {
             Ok(state) => state,
@@ -805,6 +917,36 @@ impl Checkpointer {
         } else {
             IOResult::IO(IOCompletions(Completion::new_yield()))
         })
+    }
+
+    /// [`step_full`](Self::step_full) for a writer that claims the checkpoint's task: one step
+    /// a call, done once the full checkpoint `ticket` names is. A claim another writer's step
+    /// holds waits on the state's let-go, registered before the claim, which that writer's claim
+    /// finishes once its step has ended; so does a step that found the state held by another.
+    fn claim_full(&self, task: &TaskRef, ticket: u64) -> Result<IOResult<()>> {
+        let done = |cp: &Self| cp.full_done.load(Ordering::Acquire) >= ticket;
+        if done(self) {
+            return Ok(IOResult::Done(()));
+        }
+        crate::race::point("checkpoint.claiming");
+        let released = self.released.wait();
+        match self.claim(task) {
+            Claimed::Stepped(Err(e)) => Err(e),
+            Claimed::Stepped(Ok(IOResult::IO(io))) => Ok(IOResult::IO(io)),
+            Claimed::Stepped(Ok(IOResult::Done(()))) if done(self) => Ok(IOResult::Done(())),
+            Claimed::Refused if !task.is_over() => {
+                crate::race::point("checkpoint.claim_refused");
+                Ok(IOResult::IO(IOCompletions(released)))
+            }
+            Claimed::Held => Ok(IOResult::IO(IOCompletions(released))),
+            // A step that went as far as it could short of the full checkpoint, whose next call
+            // claims the next; or the task over (failed or closed) since the writer looked, its
+            // last claim's wakes perhaps before this wait was registered, whose next call steps
+            // the state.
+            Claimed::Stepped(Ok(IOResult::Done(()))) | Claimed::Refused => {
+                Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
+            }
+        }
     }
 }
 

@@ -1138,6 +1138,227 @@ fn closing_the_checkpoints_task_abandons_the_checkpoint_under_way() {
     );
 }
 
+/// With writers claiming the checkpoint's task, a full checkpoint's waiter whose claim finds the
+/// task stepped by another writer waits on the state's let-go, and that writer's claim, once its
+/// step has ended, finishes the wait: the step's own let-go came before the waiter looked
+/// (DESIGN.md 22.7; mutant: no wake after a claim that stepped).
+#[test]
+fn a_claim_left_to_another_writers_step_is_woken_once_that_step_ends() {
+    use std::sync::mpsc;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+    let db = Db::crash();
+    let (tree, _) = db.owed_tree();
+    let cp = db.db.checkpointer_arc().clone();
+    let txns = db.db.transactions_arc().clone();
+    let ticket = cp.request_full();
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let other = {
+        let (cp, txns) = (cp.clone(), txns.clone());
+        std::thread::spawn(move || {
+            crate::race::at("checkpoint.let_go", move || {
+                paused_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            });
+            // Claims the task, and pauses with the state let go, the step not yet ended.
+            let _ = cp.step(&txns);
+        })
+    };
+    let paused = paused_rx.recv_timeout(BOUND).is_ok();
+    let wait = match cp.step_full(ticket, &txns) {
+        Ok(IOResult::IO(IOCompletions(c))) => Some(c),
+        _ => None,
+    };
+    let waiting = wait.as_ref().is_some_and(|c| !c.finished());
+    let _ = go_tx.send(());
+    let joined = other.join().is_ok();
+    let woken = wait.as_ref().is_some_and(Completion::finished);
+    // Every assertion with the database closed.
+    drop((tree, cp, txns, db));
+    assert!(joined, "the other writer panicked");
+    assert!(paused, "the other writer's step never paused");
+    assert!(
+        waiting,
+        "the waiter's claim was not left to the other writer's step"
+    );
+    assert!(
+        woken,
+        "the waiter was not woken once the other writer's step ended"
+    );
+}
+
+/// A writer's claim refused while another writer steps the checkpoint's task, that step ending
+/// before the refused claim returns: the wait the refused writer registered before its claim is
+/// woken by that step's end, so the writer is not left waiting on a let-go that came before it.
+#[test]
+fn a_claim_refused_is_woken_by_a_step_that_ends_before_the_claim_returns() {
+    use std::sync::mpsc;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+    let db = Db::crash();
+    let (tree, _) = db.owed_tree();
+    let cp = db.db.checkpointer_arc().clone();
+    let txns = db.db.transactions_arc().clone();
+    let ticket = cp.request_full();
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (ended_tx, ended_rx) = mpsc::channel::<()>();
+    let other = {
+        let (cp, txns) = (cp.clone(), txns.clone());
+        std::thread::spawn(move || {
+            crate::race::at("checkpoint.let_go", move || {
+                paused_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            });
+            // Claims the task, pauses with the state let go, then ends its step and its claim.
+            let _ = cp.step(&txns);
+            ended_tx.send(()).unwrap();
+        })
+    };
+    let paused = paused_rx.recv_timeout(BOUND).is_ok();
+    // The refused claim pauses until the other writer's step and claim have ended.
+    let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let ended = ended.clone();
+        crate::race::at("checkpoint.claim_refused", move || {
+            let _ = go_tx.send(());
+            let seen = ended_rx.recv_timeout(BOUND).is_ok();
+            ended.store(seen, std::sync::atomic::Ordering::Release);
+        });
+    }
+    let wait = match cp.step_full(ticket, &txns) {
+        Ok(IOResult::IO(IOCompletions(c))) => Some(c),
+        _ => None,
+    };
+    let joined = other.join().is_ok();
+    let woken = wait.as_ref().is_some_and(Completion::finished);
+    let refused = wait.is_some();
+    let ended = ended.load(std::sync::atomic::Ordering::Acquire);
+    // Every assertion with the database closed.
+    drop((tree, cp, txns, db));
+    assert!(joined, "the other writer panicked");
+    assert!(paused, "the other writer's step never paused");
+    assert!(
+        refused,
+        "the claim was not refused while the other writer stepped"
+    );
+    assert!(
+        ended,
+        "the other writer's step did not end while the claim was refused"
+    );
+    assert!(
+        woken,
+        "the refused claim's wait was not woken by the step that ended before it returned"
+    );
+}
+
+/// A writer about to claim the checkpoint's task, the task failing on another writer's claim
+/// before this writer's wait is registered: its claim, refused by a task that is over, does not
+/// wait on a let-go that came before it, and its next call steps the state and meets the failure.
+#[test]
+fn a_claim_refused_by_a_task_that_failed_before_its_wait_does_not_wait() {
+    use std::sync::mpsc;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+    let db = Db::crash();
+    let crash = db.crash.clone().unwrap();
+    let tree = db.create(node_class());
+    for k in 0..100 {
+        db.put(&tree, k, value(k, 0));
+    }
+    let cp = db.db.checkpointer_arc().clone();
+    let txns = db.db.transactions_arc().clone();
+    let ticket = cp.request_full();
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let other = {
+        let (cp, txns) = (cp.clone(), txns.clone());
+        std::thread::spawn(move || {
+            crate::race::at("checkpoint.claiming", move || {
+                paused_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            });
+            // Looked, found the task not over, and pauses before registering its wait.
+            let first = cp.step_full(ticket, &txns);
+            let first = match first {
+                Ok(IOResult::IO(IOCompletions(c))) => Some(c.finished()),
+                _ => None,
+            };
+            // Its next call steps the failed state.
+            let next = cp.step_full(ticket, &txns);
+            (first, next.is_err())
+        })
+    };
+    let paused = paused_rx.recv_timeout(BOUND).is_ok();
+    crash.set_faults_on(Some(&format!("{BASE}.c{}.0", node_class().index())));
+    crash.set_faults(Faults {
+        short_write: 1.0,
+        ..Faults::default()
+    });
+    let failed = loop {
+        match cp.step_full(ticket, &txns) {
+            Err(_) => break true,
+            Ok(IOResult::Done(())) => break false,
+            Ok(IOResult::IO(IOCompletions(c))) => {
+                while !c.finished() {
+                    db.io.step().unwrap();
+                }
+            }
+        }
+    };
+    crash.set_faults(Faults::default());
+    crash.set_faults_on(None);
+    let over = cp.task_done();
+    let _ = go_tx.send(());
+    let (first, next_failed) = other.join().unwrap_or((None, false));
+    // Every assertion with the database closed.
+    drop((tree, cp, txns, db));
+    assert!(paused, "the other writer never paused before its claim");
+    assert!(
+        failed && over,
+        "the checkpoint did not fail and end its task"
+    );
+    assert_eq!(
+        first,
+        Some(true),
+        "the claim refused by a task that is over waited on a let-go that came before it"
+    );
+    assert!(
+        next_failed,
+        "the writer's next call did not meet the failure"
+    );
+}
+
+/// A holder of the checkpoint's state (an integrity check) letting it go wakes the writers waiting
+/// for room where the writers step checkpoints themselves, so one whose relief found the state held
+/// steps it now; with a worker stepping the task, the writers wait on the room it frees and the
+/// let-go wakes none of them (DESIGN.md 22.2).
+#[test]
+fn a_holders_let_go_wakes_the_room_only_where_the_writers_step_checkpoints() {
+    let woken = |db: Db| {
+        let woken = {
+            let pool = db.pool();
+            let held = db.db.checkpointer().hold_waiting();
+            let wait = pool.room.waiting(pool.frames.supply.ticket());
+            let before = wait.finished();
+            drop(held);
+            (before, wait.finished())
+        };
+        drop(db);
+        woken
+    };
+    let writers = woken(Db::crash());
+    let threaded = woken(Db::threaded());
+    assert_eq!(
+        writers,
+        (false, true),
+        "the let-go left a writer whose relief found the state held waiting"
+    );
+    assert_eq!(
+        threaded,
+        (false, false),
+        "the let-go woke a writer that waits on the room the worker frees"
+    );
+}
+
 /// Every page of the tree written to its swap copy and evicted after the cut, still owed: read
 /// back, each is pending again, and a change keeps it within the room as it would have in its
 /// frame. A descent through an inner node it reads back mends the node's stale hints, which no
@@ -1294,8 +1515,8 @@ fn a_checkpoint_failing_under_a_refused_writer_gives_the_room_back_and_the_write
     let cp = db.db.checkpointer();
     let failed = loop {
         match cp.step_full(ticket, db.db.transactions()) {
-            Err(e) => break e,
-            Ok(IOResult::Done(())) => panic!("a checkpoint went on past failed writes"),
+            Err(e) => break Some(e),
+            Ok(IOResult::Done(())) => break None,
             Ok(IOResult::IO(IOCompletions(c))) => {
                 while !c.finished() {
                     db.io.step().unwrap();
@@ -1305,17 +1526,25 @@ fn a_checkpoint_failing_under_a_refused_writer_gives_the_room_back_and_the_write
     };
     crash.set_faults(Faults::default());
     crash.set_faults_on(None);
+    let stats = db.pool().kept_stats();
+    let cutting = db.pool().cutting();
+    let gate_open = db.store().change().is_some();
+    if failed.is_some() && stats.used == 0 && cutting == 0 && gate_open {
+        db.assert_holds(&tree, &model, "the tree as it stands");
+    }
+    // Every assertion with the database closed.
+    drop(hold);
+    drop((frame, tree, db));
+    let failed = failed.expect("a checkpoint went on past failed writes");
     assert!(
         failed.to_string().contains("opened again")
             || matches!(failed, LimboError::CompletionError(_)),
         "{failed}"
     );
-    let stats = db.pool().kept_stats();
     assert_eq!(stats.used, 0, "copies held past the failure: {stats:?}");
     assert!(stats.peak <= stats.limit, "{stats:?}");
-    assert_eq!(db.pool().cutting(), 0, "the pool's cut");
-    assert!(db.store().change().is_some(), "the change gate");
-    db.assert_holds(&tree, &model, "the tree as it stands");
+    assert_eq!(cutting, 0, "the pool's cut");
+    assert!(gate_open, "the change gate");
 }
 
 /// The checkpointer's own free of an orphan its cut found owed makes no copy: the cut left the
@@ -1406,22 +1635,21 @@ fn a_writer_waiting_for_room_behind_a_held_checkpointer_is_woken_when_it_is_let_
     let last = 2 * (KEYS - 1);
     let mut put = Put::new(&key(last), value(last, 3), Mode::Upsert);
     let wait = match tree.put(&mut put).unwrap() {
-        IOResult::IO(IOCompletions(c)) => c,
-        IOResult::Done(_) => panic!("a change went in past a full room"),
+        IOResult::IO(IOCompletions(c)) => Some(c),
+        IOResult::Done(_) => None,
     };
-    assert!(
-        !wait.finished(),
-        "the wait ended with the checkpointer held"
-    );
+    let held_waits = wait.as_ref().is_some_and(|c| !c.finished());
     drop(idle);
-    assert!(
-        wait.finished(),
-        "letting the checkpointer go woke no waiter"
-    );
-    within(&db.io, || tree.put(&mut put));
-    assert_within_room(db.pool(), node_class().size());
-    db.finish(ticket);
-    drop(frame);
+    let woken = wait.as_ref().is_some_and(Completion::finished);
+    if held_waits && woken {
+        within(&db.io, || tree.put(&mut put));
+        assert_within_room(db.pool(), node_class().size());
+        db.finish(ticket);
+    }
+    // Every assertion with the database closed.
+    drop((wait, frame, tree, db));
+    assert!(held_waits, "the wait ended with the checkpointer held");
+    assert!(woken, "letting the checkpointer go woke no waiter");
 }
 
 /// While a writer waits for room, the checkpoint images the kept copies first: with another
@@ -1530,8 +1758,8 @@ fn a_short_image_write_fails_the_checkpoint() {
     let ticket = cp.request_full();
     let failed = loop {
         match cp.step_full(ticket, db.db.transactions()) {
-            Err(e) => break e,
-            Ok(IOResult::Done(())) => panic!("a checkpoint went on past a short write"),
+            Err(e) => break Some(e),
+            Ok(IOResult::Done(())) => break None,
             Ok(IOResult::IO(IOCompletions(c))) => {
                 while !c.finished() {
                     db.io.step().unwrap();
@@ -1541,6 +1769,9 @@ fn a_short_image_write_fails_the_checkpoint() {
     };
     crash.set_faults(Faults::default());
     crash.set_faults_on(None);
+    // Every assertion with the database closed.
+    drop((tree, db));
+    let failed = failed.expect("a checkpoint went on past a short write");
     assert!(
         matches!(
             failed,

@@ -1156,7 +1156,8 @@ impl TaskRef {
                 return;
             }
             // Under the mutex only a step's end moves the task out of running, and only by
-            // compare-exchange: whichever exchange comes second sees the other.
+            // compare-exchange: whichever exchange comes second sees the other. So the loop runs
+            // at most once more for each move that one end makes (to idle, notified, done).
             let mut state = self.0.state.load(Ordering::Acquire);
             loop {
                 if state == DONE || state == CLOSED {
@@ -1186,6 +1187,19 @@ impl TaskRef {
         }
     }
 
+    /// Claims the task by name and steps it once, on the calling thread, on its own executor
+    /// (22.7): queued, it is unlinked and claimed; idle, it runs for the caller's own reason;
+    /// running, done or closed, it is left. Whether it was stepped. An entry, as
+    /// [`Executor::run_named`] is, and never from inside a step or a waker the executor invoked.
+    #[turso_macros::atoll_entry]
+    pub(crate) fn run_once(&self) -> bool {
+        refuse_entry_from_inside();
+        let Some(shared) = self.0.shared.upgrade() else {
+            return false;
+        };
+        shared.run_named(&self.0)
+    }
+
     /// Whether `other` names this task.
     pub(crate) fn same(&self, other: &TaskRef) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -1199,6 +1213,11 @@ impl TaskRef {
     /// Whether its job is over.
     pub(crate) fn is_done(&self) -> bool {
         self.0.state.load(Ordering::Acquire) == DONE
+    }
+
+    /// Whether it will never step again: done, or closed (removed, or its executor closing).
+    pub(crate) fn is_over(&self) -> bool {
+        matches!(self.0.state.load(Ordering::Acquire), DONE | CLOSED)
     }
 
     /// A writer's ticket on this task (22.4): its demand rises to `class` while the ticket lives,

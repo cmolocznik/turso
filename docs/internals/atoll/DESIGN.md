@@ -4080,11 +4080,12 @@ registers a waker on a completion while it holds an executor mutex.
      checkpoint's task (22.16 step 7) contends as a task, which a release queues; the contenders
      are taken off the list under its mutex and woken after it, since a task's wake takes the
      queue's mutex and invokes the external runners it moves. The checkpointer's hold, let go,
-     also wakes the writers waiting for room, under
-     `Checkpointing::Writers` only: a writer refused room whose relief found the state held steps
-     the checkpoint itself once it is let go. With the checkpoint's task no writer steps it, and
-     the room's releases alone wake those waiting: the task lets the state go after every unit
-     (step 4), and a wake at each woke a refused writer only to be refused again.
+     also wakes the writers waiting for room, under `Checkpointing::Writers` only and by a holder
+     other than the task's own step: a writer refused room whose relief found the state held steps
+     the checkpoint itself once it is let go, and a writer's claim of the task wakes them itself
+     once the step it claimed has ended. With a worker stepping the task no writer steps it, and the
+     room's releases alone wake those waiting: the task lets the state go after every unit (step
+     4), and a wake at each woke a refused writer only to be refused again.
    - **A release** lets the state go, then takes the contenders off the list under its mutex and
      wakes each after it. The lock order is the state, then its contenders' mutex; no other
      executor mutex is taken under it.
@@ -5379,10 +5380,24 @@ compose, the real `Completion`, latch and backends included where named.
    wake while it steps queues it again. A failure, told to every waiter by the
    state, ends the task; no checkpoint runs until the database is opened again, and writers go
    on, as with the thread. Closing the database closes the executor, which abandons a checkpoint
-   under way as a failed one is. Not built yet: the due trigger and its level (a transaction's end
-   wakes the task whether or not one is due, as it woke the thread, and erasure rides those
-   wakes), the room tickets, the callers replacing `Checkpointing::Writers`, close's durable end
-   and the request count through `close_after`, the sustained run and the profile.)
+   under way as a failed one is. `Checkpointing::Writers` is the same task on an executor with no
+   worker: a writing statement, a transaction's end and a wait for a full checkpoint each claim it
+   by name (`TaskRef::run_once`), one step a call, and the step tells the writer that claimed it,
+   on its own thread, what it came to: its wait, done, or the failure it met, so the writer meets
+   that failure as a writer stepping the state did. A writer refused room or the gate steps the
+   state itself only as far as its room needs, as writers always have: a claim would step the task
+   as far as it goes, more than a caller may run (22.7), until the task's steps are units and the
+   room tickets carry the demand (22.4). With no task yet (recovery), or a task that failed or
+   closed, a writer steps the state itself. A claim that finds the task stepped by another writer
+   waits on the state's let-go, registered before it claimed, and a claim whose step held the state
+   wakes the writers waiting on the room, the gate and the let-go once that step has ended, since
+   the step's own let-go may come before another writer looks; one whose step only contended for a
+   state another holds wakes no one, and that holder's let-go does. Another holder's let-go (an
+   integrity check, a writer's relief) wakes those writers only where the writers step checkpoints:
+   with a worker, they wait on the room the worker frees and the gate it opens. Not built yet: the
+   due trigger and its level (a transaction's end wakes the task whether or not one is due, as it
+   woke the thread, and erasure rides those wakes), the room tickets, close's durable end and the
+   request count through `close_after`, the sustained run and the profile.)
 8. **The segment preparers**, every open log, replacing the interim adapter and the callback chain
    in the same change; the callers' fresh-segment cases of proof 12 first. Step 4's exception, a
    unit's budget of one start and one finish, goes with the adapter.

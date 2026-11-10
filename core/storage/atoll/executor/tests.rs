@@ -1788,6 +1788,7 @@ mod native {
     /// task stepped 3,072 times by tickets, triggers, plain wakes and named claims, its runner
     /// woken 2,304 times (22.13; the auditor's probe; mutant: the task boxed again at each step).
     #[test]
+    #[cfg(not(any(shuttle, miri)))]
     fn repeated_wakes_claims_and_class_changes_allocate_nothing_once_provisioned() {
         let ex = Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap();
         let signal = Arc::new(Signal::default());
@@ -2226,12 +2227,15 @@ mod native {
     }
 
     /// A host's waker whose destructor panics once armed.
+    #[cfg(all(unix, not(any(shuttle, miri))))]
     struct PanicsWhenDropped(Arc<AtomicBool>);
 
+    #[cfg(all(unix, not(any(shuttle, miri))))]
     impl std::task::Wake for PanicsWhenDropped {
         fn wake(self: Arc<Self>) {}
     }
 
+    #[cfg(all(unix, not(any(shuttle, miri))))]
     impl Drop for PanicsWhenDropped {
         fn drop(&mut self) {
             crate::storage::atoll::unwind::abort_if_unwinding();
@@ -2242,6 +2246,7 @@ mod native {
     }
 
     /// A host's waker, armed by the flag returned, and a weak handle that counts its clones.
+    #[cfg(all(unix, not(any(shuttle, miri))))]
     fn panics_when_dropped() -> (
         std::task::Waker,
         Arc<AtomicBool>,
@@ -2254,6 +2259,7 @@ mod native {
     }
 
     /// The child aborted on `panicked`, passed up from inside a frame.
+    #[cfg(all(unix, not(any(shuttle, miri))))]
     fn ended_in_a_frame(ended: Option<crate::storage::atoll::testing::Ended>, panicked: &str) {
         let Some(ended) = ended else { return };
         assert!(

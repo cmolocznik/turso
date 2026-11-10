@@ -324,16 +324,20 @@ impl IO for PausingOpen {
         self.inner.delivery()
     }
 
-    fn try_step(&self, ready: &std::task::Waker) -> Result<crate::io::Stepped> {
-        self.inner.try_step(ready)
+    fn try_step(
+        &self,
+        key: crate::io::ReadyKey,
+        ready: &std::task::Waker,
+    ) -> Result<crate::io::Stepped> {
+        self.inner.try_step(key, ready)
     }
 
     fn says_what_a_step_found(&self) -> bool {
         self.inner.says_what_a_step_found()
     }
 
-    fn withdraw(&self, ready: &std::task::Waker) {
-        self.inner.withdraw(ready)
+    fn withdraw(&self, key: crate::io::ReadyKey) {
+        self.inner.withdraw(key)
     }
 }
 

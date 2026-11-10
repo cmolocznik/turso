@@ -4564,12 +4564,17 @@ memory IO and the concurrent simulator's IO tell; a wrapper forwards both. Outsi
 over a pumped backend that cannot tell yields between its steps, as Turso's waits always have:
 that is CPU polling, and the exceptions are named: the C extension's VFS bridge (`VfsMod`, whose
 `run_once` says nothing), the other simulators' and tests' IOs that do not forward, and any
-embedder's IO that keeps the default. A waiter registers each time it finds nothing, at most once
-per waker (`will_wake`), and the next submission takes every registration and wakes it; a waiter
-whose wait ends otherwise takes its own back (`IO::withdraw`): a wait for a result or for a
-retirement, close's drain and a worker leaving each withdraw as they end, so a backend holds
-registrations only for waits under way, never one for every wait it ever had (the auditor's
-P2-X69-2). A group's members are published once, as it is built and before its builder's token
+embedder's IO that keeps the default. A waiter registers each time it finds nothing, under a key
+of its own (`ReadyKey`), one registration per key holding the last waker given, and the next
+submission takes every registration and wakes it; a waiter whose wait ends otherwise takes its
+own back by its key (`IO::withdraw`): a wait for a result or for a retirement, an async wait
+ready or dropped, close's drain and a worker leaving each withdraw as they end, so a backend
+holds registrations only for waits under way (the auditor's P2-X69-2), and two waits sharing one
+waker, two futures of one task, each take back only theirs (#4204). An async wait takes one step
+per poll: after a delivery it asks for another poll while unfinished, and on `Empty`, registered
+with the backend as with what it waits on, it returns and is polled again when either wakes it
+(the auditor's P2-E1b-A1); its key is its completion future's own, the address of that
+future's pinned key, so the wait adds no word (a minted key is odd, an address even). A group's members are published once, as it is built and before its builder's token
 goes (that release may finish the group, and what its end runs may walk it), and every walk reads
 them with no lock: a request a walk upgrades may be the last handle to it, and its drop may run a
 callback's captures that walk the group again (the auditor's P1-GW1). A pumped wait steps while

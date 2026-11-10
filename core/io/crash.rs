@@ -78,7 +78,7 @@ struct State {
     step_hook: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     /// The waiters that found nothing to deliver ([`IO::try_step`]), each once, woken by the next
     /// submission.
-    ready: Vec<std::task::Waker>,
+    ready: super::Registrations,
 }
 
 crate::thread::thread_local! {
@@ -195,7 +195,7 @@ impl CrashIO {
                 file_work_in_callbacks: Vec::new(),
                 file_work_hook: None,
                 step_hook: None,
-                ready: Vec::new(),
+                ready: super::Registrations::default(),
             })),
         }
     }
@@ -406,9 +406,9 @@ impl CrashIO {
             kind,
             completion: completion.clone(),
         });
-        let ready = std::mem::take(&mut state.ready);
+        let ready = state.ready.take();
         drop(state);
-        for waiter in ready {
+        for (_, waiter) in ready {
             waiter.wake();
         }
         completion
@@ -780,22 +780,23 @@ impl IO for CrashIO {
     /// Looks for an operation in flight under the lock a submission takes, and registers `ready`
     /// there if there is none, so a submission after the look wakes it. One found, it is
     /// delivered as `step` delivers; one another stepper took first is progress all the same.
-    fn try_step(&self, ready: &std::task::Waker) -> Result<super::Stepped> {
+    fn try_step(&self, key: super::ReadyKey, ready: &std::task::Waker) -> Result<super::Stepped> {
         let hook = self.state.lock().step_hook.clone();
         if let Some(hook) = hook {
             hook()?;
         }
-        // Cloned before the lock is taken and dropped after it is let go, if it was not kept.
+        // Cloned before the lock is taken; what is left over dropped after it is let go.
         let mut waiter = Some(ready.clone());
-        let empty = {
+        let (empty, left) = {
             let mut state = self.state.lock();
             let empty = state.in_flight.is_empty();
-            if empty && !state.ready.iter().any(|w| w.will_wake(ready)) {
-                state.ready.extend(waiter.take());
-            }
-            empty
+            let left = match (empty, waiter.take()) {
+                (true, Some(waker)) => state.ready.register(key, waker),
+                (_, waker) => waker,
+            };
+            (empty, left)
         };
-        drop(waiter);
+        drop(left);
         if empty {
             return Ok(super::Stepped::Empty);
         }
@@ -803,13 +804,9 @@ impl IO for CrashIO {
         Ok(super::Stepped::Delivered)
     }
 
-    /// Takes `ready`'s registration out under the lock and drops it after.
-    fn withdraw(&self, ready: &std::task::Waker) {
-        let gone = {
-            let mut state = self.state.lock();
-            let at = state.ready.iter().position(|w| w.will_wake(ready));
-            at.map(|at| state.ready.swap_remove(at))
-        };
+    /// Takes `key`'s registration out under the lock and drops it after.
+    fn withdraw(&self, key: super::ReadyKey) {
+        let gone = self.state.lock().ready.withdraw(key);
         drop(gone);
     }
 

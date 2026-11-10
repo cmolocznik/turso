@@ -85,17 +85,17 @@ impl IO for StepCounting {
         self.io.step()
     }
 
-    fn try_step(&self, ready: &std::task::Waker) -> Result<Stepped> {
+    fn try_step(&self, key: crate::io::ReadyKey, ready: &std::task::Waker) -> Result<Stepped> {
         self.steps.fetch_add(1, Ordering::SeqCst);
-        self.io.try_step(ready)
+        self.io.try_step(key, ready)
     }
 
     fn says_what_a_step_found(&self) -> bool {
         self.io.says_what_a_step_found()
     }
 
-    fn withdraw(&self, ready: &std::task::Waker) {
-        self.io.withdraw(ready)
+    fn withdraw(&self, key: crate::io::ReadyKey) {
+        self.io.withdraw(key)
     }
 
     fn delivery(&self) -> Delivery {
@@ -206,6 +206,117 @@ fn a_pumped_async_wait_requests_another_poll_until_its_request_finishes() {
         }
     }
     panic!("the async wait did not finish within four polls");
+}
+
+/// Counts the wakes of an async wait's host.
+struct HostWakes(AtomicUsize);
+
+impl std::task::Wake for HostWakes {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// An async wait on a pumped backend that holds nothing registers with the backend and the
+/// completion and asks for no poll: its host polls again only once one of them wakes it. Ready or
+/// dropped, it takes its registration back (DESIGN.md 22.5; the auditor's P2-E1b-A1; mutants: an
+/// empty step that asks for another poll, a CPU spent on empty steps; a wait that leaves its
+/// registration behind).
+#[test]
+fn a_pumped_async_wait_on_an_empty_backend_is_polled_again_only_when_woken() {
+    use crate::types::IOCompletions;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let backend = Arc::new(CrashIO::new(1));
+    let wakes = std::sync::Arc::new(HostWakes(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut context = Context::from_waker(&waker);
+    let finished_elsewhere = Completion::new_wait();
+    let mut future =
+        std::pin::pin!(IOCompletions(finished_elsewhere.clone()).wait_async(&*backend));
+    let first = future.as_mut().poll(&mut context).is_pending();
+    let parked = (wakes.0.load(Ordering::SeqCst), backend.registered());
+    finished_elsewhere.complete(0);
+    let woken = wakes.0.load(Ordering::SeqCst);
+    let ready = matches!(future.as_mut().poll(&mut context), Poll::Ready(Ok(())));
+    let after_ready = backend.registered();
+    let dropped = {
+        let unfinished = Completion::new_wait();
+        let mut future = Box::pin(IOCompletions(unfinished.clone()).wait_async(&*backend));
+        let pending = future.as_mut().poll(&mut context).is_pending();
+        let held = backend.registered();
+        drop(future);
+        (pending, held, backend.registered())
+    };
+    assert!(first, "pending while unfinished");
+    assert_eq!(parked, (0, 1), "(wakes, registrations) after an empty step");
+    assert_eq!(woken, 1, "woken once by the finish");
+    assert!(ready);
+    assert_eq!(
+        after_ready, 0,
+        "a registration left behind by a wait that ended"
+    );
+    assert_eq!(
+        dropped,
+        (true, 1, 0),
+        "a registration left behind by a wait dropped"
+    );
+}
+
+/// Two async waits of one host task share its waker: each registers under its own key, so the
+/// first ending takes back its own registration alone, and a request submitted later still wakes
+/// the host for the second (DESIGN.md 22.5; the auditor's #4204 order; mutant: registrations
+/// kept one per waker, which the first wait's end takes away from the second).
+#[test]
+fn two_async_waits_sharing_a_waker_each_take_back_only_their_own_registration() {
+    use crate::types::IOCompletions;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let backend = Arc::new(CrashIO::new(1));
+    let file = backend
+        .open_file("/db/f", OpenFlags::Create, false)
+        .unwrap();
+    let wakes = std::sync::Arc::new(HostWakes(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut context = Context::from_waker(&waker);
+    let (one, two) = (Completion::new_wait(), Completion::new_wait());
+    let mut first = std::pin::pin!(IOCompletions(one.clone()).wait_async(&*backend));
+    let mut second = std::pin::pin!(IOCompletions(two.clone()).wait_async(&*backend));
+    let pending = [
+        first.as_mut().poll(&mut context).is_pending(),
+        second.as_mut().poll(&mut context).is_pending(),
+    ];
+    let both = backend.registered();
+    one.complete(0);
+    let first_done = matches!(first.as_mut().poll(&mut context), Poll::Ready(Ok(())));
+    let left = backend.registered();
+    let before = wakes.0.load(Ordering::SeqCst);
+    let request = {
+        let two = two.clone();
+        Completion::new_sync(move |_| two.complete(0))
+    };
+    let request = file.sync(request, FileSyncType::Fsync).unwrap();
+    let woken = wakes.0.load(Ordering::SeqCst) - before;
+    let mut polls = 0;
+    let second_done = loop {
+        polls += 1;
+        match second.as_mut().poll(&mut context) {
+            Poll::Ready(result) => break result.is_ok(),
+            Poll::Pending if polls < 4 => {}
+            Poll::Pending => break false,
+        }
+    };
+    assert_eq!(pending, [true, true]);
+    assert_eq!(both, 2, "one registration per wait");
+    assert!(first_done);
+    assert_eq!(left, 1, "the second wait's registration kept");
+    assert_eq!(woken, 1, "the submission woke the host for the second wait");
+    assert!(second_done && request.finished());
+    assert_eq!(backend.registered(), 0);
 }
 
 /// On a backend that delivers inline, what a caller still waits for another thread finishes:

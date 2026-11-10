@@ -114,14 +114,14 @@ impl Requests {
         // SeqCst: a change the read below misses reads the mark.
         self.word.fetch_or(CLOSING, Ordering::SeqCst);
         let pumped = io.delivery() == Delivery::Pumped;
-        let ready = crate::io::unparking(me.clone());
+        let (key, ready) = (crate::io::ReadyKey::new(), crate::io::unparking(me.clone()));
         let mut registered = false;
         while outstanding_in(self.word.load(Ordering::SeqCst)) > 0 {
             if !pumped {
                 crate::storage::atoll::park::thread();
                 continue;
             }
-            match io.try_step(&ready) {
+            match io.try_step(key, &ready) {
                 Err(_) => crate::io::stepping_failed("a database's close"),
                 Ok(Stepped::Delivered) => {}
                 // Refused at open (`refuse_a_backend_that_would_poll`).
@@ -135,7 +135,7 @@ impl Requests {
             }
         }
         if registered {
-            io.withdraw(&ready);
+            io.withdraw(key);
         }
         self.word.fetch_and(!CLOSING, Ordering::SeqCst);
     }
@@ -201,16 +201,16 @@ impl IO for Counted {
         self.io.step()
     }
 
-    fn try_step(&self, ready: &std::task::Waker) -> Result<Stepped> {
-        self.io.try_step(ready)
+    fn try_step(&self, key: crate::io::ReadyKey, ready: &std::task::Waker) -> Result<Stepped> {
+        self.io.try_step(key, ready)
     }
 
     fn says_what_a_step_found(&self) -> bool {
         self.io.says_what_a_step_found()
     }
 
-    fn withdraw(&self, ready: &std::task::Waker) {
-        self.io.withdraw(ready)
+    fn withdraw(&self, key: crate::io::ReadyKey) {
+        self.io.withdraw(key)
     }
 
     fn delivery(&self) -> crate::io::Delivery {

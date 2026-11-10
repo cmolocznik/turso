@@ -704,7 +704,7 @@ impl Shared {
 fn work(shared: &Arc<Shared>) {
     let pumped = shared.io.delivery() == Delivery::Pumped;
     let me = crate::thread::current();
-    let ready = crate::io::unparking(me.clone());
+    let (key, ready) = (crate::io::ReadyKey::new(), crate::io::unparking(me.clone()));
     let mut registered = false;
     let node = lock(&shared.queue).add_node(Node::Thread(me.clone()));
     loop {
@@ -713,7 +713,7 @@ fn work(shared: &Arc<Shared>) {
         }
         let stepped = shared.run_one();
         if pumped {
-            match shared.io.try_step(&ready) {
+            match shared.io.try_step(key, &ready) {
                 Err(_) => crate::io::stepping_failed("an executor's worker"),
                 Ok(Stepped::Delivered) => continue,
                 // Refused at creation, as Atoll refuses it at open.
@@ -747,7 +747,7 @@ fn work(shared: &Arc<Shared>) {
     let gone = lock(&shared.queue).remove_node(node);
     drop(gone);
     if registered {
-        shared.io.withdraw(&ready);
+        shared.io.withdraw(key);
     }
 }
 

@@ -77,6 +77,12 @@ impl CompletionFuture {
     pub(crate) fn completion(&self) -> &Completion {
         &self.completion
     }
+
+    /// This future's key with a pumped backend once it has been polled pending: its completion
+    /// key, the address of its pinned key field, which its drop withdraws.
+    pub(crate) fn ready_key(&self) -> Option<crate::io::ReadyKey> {
+        self.key.get().map(crate::io::ReadyKey::of_place)
+    }
 }
 
 impl Drop for CompletionFuture {

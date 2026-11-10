@@ -32,7 +32,7 @@ pub struct MemoryYieldIO {
 #[derive(Default)]
 struct Pending {
     deferred: VecDeque<Deferred>,
-    ready: Vec<std::task::Waker>,
+    ready: super::Registrations,
 }
 
 /// A completion awaiting `step()`, together with the byte count it should
@@ -129,18 +129,19 @@ impl IO for MemoryYieldIO {
 
     /// A step that finds nothing deferred registers `ready` under the queue's lock, which the
     /// next deferral takes and wakes it under.
-    fn try_step(&self, ready: &std::task::Waker) -> Result<super::Stepped> {
-        // Cloned before the lock is taken and dropped after it is let go, if it was not kept.
+    fn try_step(&self, key: super::ReadyKey, ready: &std::task::Waker) -> Result<super::Stepped> {
+        // Cloned before the lock is taken; what is left over dropped after it is let go.
         let mut waiter = Some(ready.clone());
-        let empty = {
+        let (empty, left) = {
             let mut pending = self.pending.lock();
             let empty = pending.deferred.is_empty();
-            if empty && !pending.ready.iter().any(|w| w.will_wake(ready)) {
-                pending.ready.extend(waiter.take());
-            }
-            empty
+            let left = match (empty, waiter.take()) {
+                (true, Some(waker)) => pending.ready.register(key, waker),
+                (_, waker) => waker,
+            };
+            (empty, left)
         };
-        drop(waiter);
+        drop(left);
         if empty {
             return Ok(super::Stepped::Empty);
         }
@@ -152,13 +153,9 @@ impl IO for MemoryYieldIO {
         true
     }
 
-    /// Takes `ready`'s registration out under the queue's lock and drops it after.
-    fn withdraw(&self, ready: &std::task::Waker) {
-        let gone = {
-            let mut pending = self.pending.lock();
-            let at = pending.ready.iter().position(|w| w.will_wake(ready));
-            at.map(|at| pending.ready.swap_remove(at))
-        };
+    /// Takes `key`'s registration out under the queue's lock and drops it after.
+    fn withdraw(&self, key: super::ReadyKey) {
+        let gone = self.pending.lock().ready.withdraw(key);
         drop(gone);
     }
 }
@@ -182,9 +179,9 @@ impl MemoryYieldFile {
                 completion: c.clone(),
                 result,
             });
-            std::mem::take(&mut pending.ready)
+            pending.ready.take()
         };
-        for waiter in ready {
+        for (_, waiter) in ready {
             waiter.wake();
         }
     }

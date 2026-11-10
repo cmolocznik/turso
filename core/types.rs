@@ -3678,29 +3678,53 @@ pub struct IOCompletionAsync<'a, I: ?Sized + IO> {
 impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
     type Output = Result<()>;
 
+    /// One step of a pumped backend per poll (DESIGN.md 22.5): a step that delivered asks for
+    /// another poll while the wait is unfinished; one that found nothing has registered this
+    /// wait's waker with the backend, as the completion's poll did with the completion, so the
+    /// poll returns and either wakes it. A backend that cannot say what it found is polled again
+    /// at once, as Turso's waits outside Atoll always have. On any other backend the delivery
+    /// owner wakes the poller.
     fn poll(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // SAFETY: the future owns this private field, never moves it while pinned, and its drop
-        // does not move the field. There is no Unpin implementation for the enclosing future.
-        let completion = unsafe { self.as_mut().map_unchecked_mut(|this| &mut this.completion) };
-        match completion.poll(cx) {
-            // A pumped backend delivers only when stepped; on any other the delivery owner wakes
-            // the poller (DESIGN.md 22.5).
-            Poll::Pending
-                if self.io.delivery() == crate::io::Delivery::Pumped
-                    && !self.completion.completion().is_remote_wait() =>
-            {
-                if let Err(_error) = self.io.step() {
-                    crate::io::stepping_failed("an async wait for a completion");
-                }
-                if !self.completion.completion().finished() {
+        // SAFETY: `completion` is never moved while pinned, here or by the drop, and no other
+        // field is pinned. There is no Unpin implementation for the enclosing future.
+        let this = unsafe { self.get_unchecked_mut() };
+        let completion = unsafe { std::pin::Pin::new_unchecked(&mut this.completion) };
+        let polled = completion.poll(cx);
+        if polled.is_ready()
+            || this.io.delivery() != crate::io::Delivery::Pumped
+            || this.completion.completion().is_remote_wait()
+        {
+            return polled;
+        }
+        // Polled pending, the completion's future has its key: the backend registration's too.
+        let key = this
+            .completion
+            .ready_key()
+            .expect("a pending completion future without its key");
+        match this.io.try_step(key, cx.waker()) {
+            Err(_) => crate::io::stepping_failed("an async wait for a completion"),
+            Ok(crate::io::Stepped::Empty) => {}
+            Ok(crate::io::Stepped::Delivered | crate::io::Stepped::Unsaid) => {
+                if !this.completion.completion().finished() {
                     cx.waker().wake_by_ref();
                 }
-                Poll::Pending
             }
-            res => res,
+        }
+        Poll::Pending
+    }
+}
+
+impl<I: ?Sized + IO> Drop for IOCompletionAsync<'_, I> {
+    /// Takes this wait's registration back from the backend, ready or not, if it was ever
+    /// pending on a pumped one.
+    fn drop(&mut self) {
+        if let Some(key) = self.completion.ready_key() {
+            if self.io.delivery() == crate::io::Delivery::Pumped {
+                self.io.withdraw(key);
+            }
         }
     }
 }

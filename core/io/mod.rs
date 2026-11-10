@@ -692,6 +692,77 @@ pub enum Stepped {
     Unsaid,
 }
 
+/// A waiter's key for its registration with a pumped backend (DESIGN.md 22.5), held by no other
+/// waiter while its registration may stand. A backend keeps one registration per key, with the
+/// last waker given, and a waiter takes back exactly its own by its key: two futures of one task
+/// share the task's waker, and each withdraws only what it registered. A key is either minted,
+/// odd and never given twice in a process, or the even address of a pinned future's own key,
+/// which that future withdraws before its place is reused, so the two never meet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReadyKey(std::num::NonZeroUsize);
+
+impl ReadyKey {
+    pub fn new() -> Self {
+        // A count, not a synchronization: only its uniqueness is read.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let key = NEXT.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        Self(std::num::NonZeroUsize::new(key).expect("registration keys exhausted"))
+    }
+
+    /// The key of a pinned future, from the address of its own completion key: even, as an
+    /// aligned address is.
+    pub(crate) fn of_place(key: crate::io::WakerKey) -> Self {
+        assert!(key.get() % 2 == 0, "a future's key at an odd address");
+        Self(key)
+    }
+}
+
+impl Default for ReadyKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The registrations a pumped backend holds, one per key, under the exclusion its submissions
+/// take; a submission takes them all and wakes them after it (DESIGN.md 22.5). Every waker it
+/// gives back is the caller's to drop after the exclusion.
+#[derive(Default)]
+pub struct Registrations(Vec<(ReadyKey, std::task::Waker)>);
+
+impl Registrations {
+    /// Registers `waker`, cloned before the exclusion was taken, under `key`: a key already held
+    /// keeps its waker unless this one wakes another task. What is left over.
+    pub fn register(&mut self, key: ReadyKey, waker: std::task::Waker) -> Option<std::task::Waker> {
+        match self.0.iter_mut().find(|(held, _)| *held == key) {
+            Some((_, held)) if held.will_wake(&waker) => Some(waker),
+            Some((_, held)) => Some(std::mem::replace(held, waker)),
+            None => {
+                self.0.push((key, waker));
+                None
+            }
+        }
+    }
+
+    /// Takes back `key`'s registration.
+    pub fn withdraw(&mut self, key: ReadyKey) -> Option<std::task::Waker> {
+        let at = self.0.iter().position(|(held, _)| *held == key)?;
+        Some(self.0.swap_remove(at).1)
+    }
+
+    /// Every registration, for a submission to wake after the exclusion.
+    pub fn take(&mut self) -> Vec<(ReadyKey, std::task::Waker)> {
+        std::mem::take(&mut self.0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// A waker that unparks `thread`: a blocking waiter's, for what it waits on and for the backend's
 /// next work.
 pub(crate) fn unparking(thread: crate::thread::Thread) -> std::task::Waker {
@@ -746,12 +817,12 @@ pub trait IO: Clock + Send + Sync {
     }
 
     /// One step of a pumped backend that says what it found. `Empty` only after registering
-    /// `ready` under the exclusion its submissions take, so a request submitted after the look
+    /// `ready` under `key` and the exclusion its submissions take, so a request submitted after the look
     /// wakes it: a waiter then parks until the backend holds something or what it waits on moves,
     /// and spends nothing on a backend that holds nothing for it. A backend that cannot say steps
     /// and answers `Unsaid`, and its waiters yield between steps.
-    fn try_step(&self, ready: &std::task::Waker) -> Result<Stepped> {
-        let _ = ready;
+    fn try_step(&self, key: ReadyKey, ready: &std::task::Waker) -> Result<Stepped> {
+        let _ = (key, ready);
         self.step()?;
         Ok(Stepped::Unsaid)
     }
@@ -764,12 +835,13 @@ pub trait IO: Clock + Send + Sync {
         false
     }
 
-    /// Takes back the registration a step that answered `Empty` left for `ready`, if the backend
+    /// Takes back the registration a step that answered `Empty` left under `key`, if the backend
     /// still holds it: every waiter that registered withdraws as its wait ends, so a backend holds
-    /// registrations only for waits under way, never one per wait it ever had. A backend that
-    /// registers nothing has nothing to take back.
-    fn withdraw(&self, ready: &std::task::Waker) {
-        let _ = ready;
+    /// registrations only for waits under way, never one per wait it ever had, and a waiter takes
+    /// back its own alone, whoever shares its waker. A backend that registers nothing has nothing
+    /// to take back.
+    fn withdraw(&self, key: ReadyKey) {
+        let _ = key;
     }
 
     /// Blocks the calling thread until `c` finishes (DESIGN.md 22.5): a wait another thread
@@ -788,10 +860,10 @@ pub trait IO: Clock + Send + Sync {
             c.block_on();
             return;
         }
-        let ready = unparking(crate::thread::current());
+        let (key, ready) = (ReadyKey::new(), unparking(crate::thread::current()));
         let mut registered = false;
         while !c.finished() {
-            match self.try_step(&ready) {
+            match self.try_step(key, &ready) {
                 Err(_) => stepping_failed("a wait for a completion"),
                 Ok(Stepped::Delivered) => {}
                 // What `c` waits on may be another thread's to submit or finish.
@@ -807,7 +879,7 @@ pub trait IO: Clock + Send + Sync {
             }
         }
         if registered {
-            self.withdraw(&ready);
+            self.withdraw(key);
         }
     }
 
@@ -835,15 +907,15 @@ pub trait IO: Clock + Send + Sync {
         refuse_on_delivery_thread("a wait for retirement");
         let pumped = self.delivery() == Delivery::Pumped;
         // One waker for the whole drain, taken back from the backend when the drain ends.
-        let ready = pumped.then(|| unparking(crate::thread::current()));
+        let ready = pumped.then(|| (ReadyKey::new(), unparking(crate::thread::current())));
         let mut registered = false;
         let mut seen = std::collections::HashSet::new();
         for c in completions {
             for request in c.requests(&mut seen) {
-                if let Some(ready) = &ready {
+                if let Some((key, ready)) = &ready {
                     let mut observed = false;
                     while request.is_owned() {
-                        match self.try_step(ready) {
+                        match self.try_step(*key, ready) {
                             Err(_) => stepping_failed("a wait for retirement"),
                             Ok(Stepped::Delivered) => {}
                             Ok(Stepped::Unsaid) => crate::thread::yield_now(),
@@ -872,8 +944,8 @@ pub trait IO: Clock + Send + Sync {
                 }
             }
         }
-        if let (true, Some(ready)) = (registered, &ready) {
-            self.withdraw(ready);
+        if let (true, Some((key, _))) = (registered, &ready) {
+            self.withdraw(*key);
         }
         Ok(())
     }

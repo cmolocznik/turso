@@ -387,7 +387,11 @@ mod native {
             Ok(())
         }
 
-        fn try_step(&self, _ready: &std::task::Waker) -> Result<crate::io::Stepped> {
+        fn try_step(
+            &self,
+            _key: crate::io::ReadyKey,
+            _ready: &std::task::Waker,
+        ) -> Result<crate::io::Stepped> {
             Ok(crate::io::Stepped::Empty)
         }
     }

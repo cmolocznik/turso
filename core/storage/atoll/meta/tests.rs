@@ -370,6 +370,12 @@ impl IO for TestIO {
     fn step(&self) -> Result<()> {
         self.inner.step()
     }
+    fn try_step(&self, ready: &std::task::Waker) -> Result<crate::io::Stepped> {
+        self.inner.try_step(ready)
+    }
+    fn says_what_a_step_found(&self) -> bool {
+        self.inner.says_what_a_step_found()
+    }
 }
 struct TestFile {
     file: Arc<dyn File>,

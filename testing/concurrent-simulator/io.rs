@@ -51,7 +51,7 @@ impl SimulatorIO {
             rng: Mutex::new(rng),
             fault_config,
             time: AtomicU64::new(0),
-            pending: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(Pending::default())),
         }
     }
 
@@ -194,7 +194,7 @@ impl IO for SimulatorIO {
     fn step(&self) -> Result<()> {
         // Complete any pending IO operations, the queue taken out first: a completion's callback
         // may submit IO of its own, as the real IOs allow, which queues for the next step.
-        let ready = std::mem::take(&mut *self.pending.lock().unwrap());
+        let ready = std::mem::take(&mut self.pending.lock().unwrap().completions);
         for pc in ready {
             pc.completion.deliver(Ok(pc.result));
         }
@@ -240,6 +240,32 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
+    /// A step that finds nothing queued registers `ready` under the queue's lock, which the next
+    /// submission takes and wakes it under; simulated time moves with the steps that deliver and
+    /// with the simulator's own.
+    fn try_step(&self, ready: &std::task::Waker) -> Result<turso_core::io::Stepped> {
+        // Cloned before the lock is taken and dropped after it is let go, if it was not kept.
+        let mut waiter = Some(ready.clone());
+        let empty = {
+            let mut pending = self.pending.lock().unwrap();
+            let empty = pending.completions.is_empty();
+            if empty && !pending.ready.iter().any(|w| w.will_wake(ready)) {
+                pending.ready.extend(waiter.take());
+            }
+            empty
+        };
+        drop(waiter);
+        if empty {
+            return Ok(turso_core::io::Stepped::Empty);
+        }
+        self.step()?;
+        Ok(turso_core::io::Stepped::Delivered)
+    }
+
+    fn says_what_a_step_found(&self) -> bool {
+        true
+    }
+
     fn generate_random_number(&self) -> i64 {
         let mut rng = self.rng.lock().unwrap();
         rng.next_u64() as i64
@@ -255,7 +281,16 @@ struct PendingCompletion {
     completion: Completion,
     result: i32,
 }
-type PendingQueue = Arc<Mutex<Vec<PendingCompletion>>>;
+
+/// What a step delivers, and who waits for there to be something, under one lock: a waiter
+/// registers under the exclusion a submission takes, so no submission falls between its look and
+/// its registration (`IO::try_step`).
+#[derive(Default)]
+struct Pending {
+    completions: Vec<PendingCompletion>,
+    ready: Vec<std::task::Waker>,
+}
+type PendingQueue = Arc<Mutex<Pending>>;
 
 const MAX_FILE_SIZE: usize = 1 << 33; // 8 GiB
 pub(crate) const FILE_SIZE_SOFT_LIMIT: u64 = 6 * (1 << 30); // 6 GiB (75% of MAX_FILE_SIZE)
@@ -352,10 +387,17 @@ impl SimulatorFile {
     /// (DESIGN.md 22.5).
     fn queue(&self, c: &Completion, result: i32) {
         c.accept();
-        self.pending.lock().unwrap().push(PendingCompletion {
-            completion: c.clone(),
-            result,
-        });
+        let ready = {
+            let mut pending = self.pending.lock().unwrap();
+            pending.completions.push(PendingCompletion {
+                completion: c.clone(),
+                result,
+            });
+            std::mem::take(&mut pending.ready)
+        };
+        for waiter in ready {
+            waiter.wake();
+        }
     }
 }
 
@@ -569,7 +611,7 @@ mod tests {
         );
         io.drain_completions(std::slice::from_ref(&read)).unwrap();
         assert!(!read.is_owned(), "drained while still queued");
-        assert!(io.pending.lock().unwrap().is_empty());
+        assert!(io.pending.lock().unwrap().completions.is_empty());
     }
 
     /// A callback may submit a request of its own, as the real IOs allow: the step that delivers

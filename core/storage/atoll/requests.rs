@@ -123,7 +123,10 @@ impl Requests {
             match io.try_step(&ready) {
                 Err(_) => crate::io::stepping_failed("a database's close"),
                 Ok(Stepped::Delivered) => {}
-                Ok(Stepped::Unsaid) => crate::thread::yield_now(),
+                // Refused at open (`refuse_a_backend_that_would_poll`).
+                Ok(Stepped::Unsaid) => {
+                    unreachable!("a backend that says what its steps find answered Unsaid")
+                }
                 Ok(Stepped::Empty) => crate::storage::atoll::park::thread(),
             }
         }
@@ -193,6 +196,10 @@ impl IO for Counted {
 
     fn try_step(&self, ready: &std::task::Waker) -> Result<Stepped> {
         self.io.try_step(ready)
+    }
+
+    fn says_what_a_step_found(&self) -> bool {
+        self.io.says_what_a_step_found()
     }
 
     fn delivery(&self) -> crate::io::Delivery {

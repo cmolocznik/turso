@@ -194,8 +194,23 @@ enum How {
     Taken,
 }
 
+/// Refuses a pumped backend whose steps cannot say what they found (DESIGN.md 22.5): Atoll's waits
+/// park once such a step finds nothing, and one that cannot say would leave them stepping it for
+/// ever.
+pub(super) fn refuse_a_backend_that_would_poll(io: &dyn IO) -> Result<()> {
+    if io.delivery() == crate::io::Delivery::Pumped && !io.says_what_a_step_found() {
+        return Err(LimboError::InvalidArgument(
+            "Atoll needs a pumped IO backend whose steps say what they found (IO::try_step); \
+             this one cannot, and its waits would poll it"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl Opening {
     pub fn new(io: Arc<dyn IO>, base: &str, mut config: AtollConfig) -> Result<Self> {
+        refuse_a_backend_that_would_poll(&*io)?;
         let requests = Arc::new(Requests::default());
         let io: Arc<dyn IO> = Arc::new(Counted::new(io, requests.clone()));
         // The log's ring and the image bank are lent from the pool for as long as it is open,

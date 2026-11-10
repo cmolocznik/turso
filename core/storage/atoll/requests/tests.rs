@@ -522,3 +522,19 @@ fn audit_a_returned_group_cannot_uncount_the_original_request_still_owned_by_cra
     );
     assert_eq!(after, 0);
 }
+
+/// Atoll opens over no pumped backend whose steps cannot say what they found: its waits park
+/// once a step finds nothing, and over such a backend they would step it for ever (DESIGN.md
+/// 22.5; mutant: the refusal gone, and the database opens).
+#[test]
+fn atoll_refuses_to_open_over_a_pumped_backend_whose_steps_cannot_say() {
+    let io = crate::io::wait_tests::Unsaying(Arc::new(CrashIO::new(6)));
+    let refused = Atoll::open(Arc::new(io), "/db/unsaying", AtollConfig::small());
+    let named = matches!(refused, Err(crate::LimboError::InvalidArgument(_)));
+    if let Ok(db) = refused {
+        // Opened where it must not: its close would meet the backend it refused to poll, so it is
+        // let go unclosed and the test fails on its assertion, not inside a close.
+        std::mem::forget(db);
+    }
+    assert!(named, "opened over a backend whose waits would poll it");
+}

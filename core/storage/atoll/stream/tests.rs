@@ -319,6 +319,18 @@ impl IO for PausingOpen {
     fn step(&self) -> Result<()> {
         self.inner.step()
     }
+
+    fn delivery(&self) -> crate::io::Delivery {
+        self.inner.delivery()
+    }
+
+    fn try_step(&self, ready: &std::task::Waker) -> Result<crate::io::Stepped> {
+        self.inner.try_step(ready)
+    }
+
+    fn says_what_a_step_found(&self) -> bool {
+        self.inner.says_what_a_step_found()
+    }
 }
 
 /// A read that read the partition's state before history was let go reads every batch it found

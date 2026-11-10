@@ -187,8 +187,7 @@ impl Queue {
 struct Shared {
     queue: Mutex<Queue>,
     /// Set once close begins, before it wakes the workers: each pass of a worker's loop reads it,
-    /// so a worker that never comes to park, on a backend whose steps cannot say they found
-    /// nothing, still leaves.
+    /// so a worker that never comes to park, on a backend that keeps delivering, still leaves.
     closed: AtomicBool,
     /// Every task's job, until the task is done or closed.
     jobs: Mutex<Vec<Arc<Job>>>,
@@ -304,11 +303,9 @@ fn work(shared: &Arc<Shared>) {
             match shared.io.try_step(&ready) {
                 Err(_) => crate::io::stepping_failed("an executor's worker"),
                 Ok(Stepped::Delivered) => continue,
+                // Refused at creation, as Atoll refuses it at open.
                 Ok(Stepped::Unsaid) => {
-                    if !stepped {
-                        crate::thread::yield_now();
-                    }
-                    continue;
+                    unreachable!("a backend that says what its steps find answered Unsaid")
                 }
                 Ok(Stepped::Empty) if stepped => continue,
                 Ok(Stepped::Empty) => {}
@@ -358,6 +355,7 @@ impl Executor {
     /// An executor stepping a pumped `io` between its tasks' steps, with `workers` threads of its
     /// own; none leaves the stepping to [`run_one`](Self::run_one)'s callers.
     pub(crate) fn new(io: Arc<dyn IO>, workers: usize) -> Result<Self> {
+        crate::storage::atoll::db::refuse_a_backend_that_would_poll(&*io)?;
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 lists: [VecDeque::new(), VecDeque::new(), VecDeque::new()],

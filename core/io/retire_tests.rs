@@ -488,13 +488,11 @@ fn a_pumped_wait_on_a_carried_request_for_its_retirement_only_its_carriers_finis
 /// A waiter parked on an empty pumped backend steps the request another thread submits next,
 /// whose callback finishes what it waits for: the submission wakes it (DESIGN.md 22.5; mutant:
 /// a backend that registers no waiter, or a submission that wakes none, leaves it parked).
-#[test]
-fn a_pumped_wait_on_an_empty_backend_steps_the_request_submitted_next() {
+fn a_pumped_wait_on_an_empty_backend_steps_the_request_submitted_next(backend: Arc<dyn IO>) {
     use std::sync::mpsc;
     use std::time::Duration;
     const BOUND: Duration = Duration::from_secs(20);
-    let crash = Arc::new(CrashIO::new(2));
-    let io = super::wait_tests::StepCounting::new(crash.clone());
+    let io = super::wait_tests::StepCounting::new(backend.clone());
     let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
     let waited = Completion::new_sync(|_| {});
     let (started_tx, started_rx) = mpsc::channel();
@@ -522,8 +520,8 @@ fn a_pumped_wait_on_an_empty_backend_steps_the_request_submitted_next() {
     let woke = done_rx.recv_timeout(BOUND).is_ok();
     if !woke {
         // A waiter nothing woke: step it out here so the thread ends.
-        while crash.in_flight() > 0 {
-            crash.step().unwrap();
+        while !waited.finished() {
+            backend.step().unwrap();
         }
         waiter.thread().unpark();
     }
@@ -535,6 +533,19 @@ fn a_pumped_wait_on_an_empty_backend_steps_the_request_submitted_next() {
     );
     assert!(woke, "the submission did not wake the parked waiter");
     assert!(next.finished() && !next.is_owned() && waited.finished());
+}
+
+#[test]
+fn a_pumped_wait_on_an_empty_crash_io_steps_the_request_submitted_next() {
+    a_pumped_wait_on_an_empty_backend_steps_the_request_submitted_next(Arc::new(CrashIO::new(2)));
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn a_pumped_wait_on_an_empty_yielding_memory_io_steps_the_request_submitted_next() {
+    a_pumped_wait_on_an_empty_backend_steps_the_request_submitted_next(Arc::new(
+        MemoryYieldIO::new(),
+    ));
 }
 
 /// A file whose `pwrite` refuses its `refuse_at`th call and passes the rest to a file of a

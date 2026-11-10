@@ -756,6 +756,14 @@ pub trait IO: Clock + Send + Sync {
         Ok(Stepped::Unsaid)
     }
 
+    /// Whether this backend's steps say what they found: its `try_step` answers `Delivered` or
+    /// `Empty`, never `Unsaid`. Atoll runs over a pumped backend only if it does, so none of its
+    /// waits polls (DESIGN.md 22.5); outside Atoll a wait over one that does not yields between
+    /// its steps, as Turso's waits always have.
+    fn says_what_a_step_found(&self) -> bool {
+        false
+    }
+
     /// Blocks the calling thread until `c` finishes (DESIGN.md 22.5): a wait another thread
     /// completes, or a request of a backend that delivers inline or on a thread of its own, parks
     /// until it is finished; a pumped backend is stepped while it delivers, and once it holds

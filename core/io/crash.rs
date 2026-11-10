@@ -768,6 +768,10 @@ impl IO for CrashIO {
         Ok(())
     }
 
+    fn says_what_a_step_found(&self) -> bool {
+        true
+    }
+
     /// Looks for an operation in flight under the lock a submission takes, and registers `ready`
     /// there if there is none, so a submission after the look wakes it. One found, it is
     /// delivered as `step` delivers; one another stepper took first is progress all the same.

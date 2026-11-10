@@ -76,6 +76,7 @@ pub(crate) const IO: &[(&str, Rule)] = &[
         "try_step",
         Allowed("the trait's default: a step, which does nothing on the ring, answering Unsaid"),
     ),
+    ("says_what_a_step_found", Allowed(NO_CALL)),
     (
         "cancel",
         Allowed(

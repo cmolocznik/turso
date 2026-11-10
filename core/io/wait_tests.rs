@@ -25,6 +25,34 @@ impl StepCounting {
     }
 }
 
+/// A pumped backend whose steps cannot say what they found: the trait's defaults for `try_step`
+/// and `says_what_a_step_found`, over a crash IO.
+pub(crate) struct Unsaying(pub(crate) Arc<CrashIO>);
+
+impl Clock for Unsaying {
+    fn current_time_monotonic(&self) -> clock::MonotonicInstant {
+        self.0.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> clock::WallClockInstant {
+        self.0.current_time_wall_clock()
+    }
+}
+
+impl IO for Unsaying {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        self.0.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.0.remove_file(path)
+    }
+
+    fn step(&self) -> Result<()> {
+        self.0.step()
+    }
+}
+
 impl Clock for StepCounting {
     fn current_time_monotonic(&self) -> clock::MonotonicInstant {
         self.io.current_time_monotonic()
@@ -60,6 +88,10 @@ impl IO for StepCounting {
     fn try_step(&self, ready: &std::task::Waker) -> Result<Stepped> {
         self.steps.fetch_add(1, Ordering::SeqCst);
         self.io.try_step(ready)
+    }
+
+    fn says_what_a_step_found(&self) -> bool {
+        self.io.says_what_a_step_found()
     }
 
     fn delivery(&self) -> Delivery {

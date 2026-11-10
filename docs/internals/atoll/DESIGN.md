@@ -4555,8 +4555,20 @@ SDK kit's synchronous step, the PostgreSQL frontend's two blocking loops and `to
 wait in those loops sleeps rather than steps. A pumped backend says what a step found
 (`IO::try_step`, the auditor's #4179): `Delivered`, a request delivered; `Empty`, nothing to
 deliver, after registering the waker it was handed under the exclusion its submissions take, so a
-request submitted after the look wakes it; or `Unsaid`, a backend that cannot tell, whose waiters
-yield between steps as before. A pumped wait steps while the backend delivers and parks on
+request submitted after the look wakes it; or `Unsaid`, a backend that cannot tell
+(`IO::says_what_a_step_found` false, the trait's default). Atoll opens over no pumped backend that
+cannot tell, and an executor is made over none: their waits never poll. `CrashIO`, the yielding
+memory IO and the concurrent simulator's IO tell; a wrapper forwards both. Outside Atoll, a wait
+over a pumped backend that cannot tell yields between its steps, as Turso's waits always have:
+that is CPU polling, and the exceptions are named: the C extension's VFS bridge (`VfsMod`, whose
+`run_once` says nothing), the other simulators' and tests' IOs that do not forward, and any
+embedder's IO that keeps the default. A waiter registers each time it finds nothing, at most once
+per waker (`will_wake`), and the next submission takes every registration and wakes it; a waiter
+that has gone costs at most one spurious unpark of its thread. A group's members are published once, as it is built
+and before its builder's token goes (that release may finish the group, and what its end runs may
+walk it), and every walk reads them with no lock: a request a walk upgrades may be the last handle
+to it, and its drop may run a callback's captures that walk the group again (the auditor's
+P1-GW1). A pumped wait steps while the backend delivers and parks on
 `Empty` until what it waits on moves (the finish's result for a wait for the result, the
 retirement for a wait for the retirement, a group's own finish) or the backend holds something,
 whoever submits it: a cancellation's callback still running elsewhere, a request carried through
@@ -4569,8 +4581,7 @@ takes no lock. A cooperative poll steps a pumped backend alone. A census lists e
 takes it: the hosts' pumps, a yield's one turn, a cooperative poll's, the counting IO's forwards (a step
 and a step that says what it found) and close's wait on a pumped backend. A pumped backend's ownership is 3b's: accepted at its queue,
 retired at the step that delivers it, or, where a cancellation still runs its callback then, when
-that callback returns. `CrashIO` says what each step found; the other pumped backends of tests and
-simulators answer `Unsaid` until they do. How many requests a pumped backend holds is read only by
+that callback returns. How many requests a pumped backend holds is read only by
 the runners' rule of one step per task step, so it is built with them, in step 6.)
 
 (Built, step 4: the checkpoint is stepped a unit at a time on today's drivers. `Run::step` does

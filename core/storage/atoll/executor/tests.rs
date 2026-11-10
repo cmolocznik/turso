@@ -325,19 +325,39 @@ mod native {
         assert!(!task.is_done(), "closed, not done");
     }
 
-    /// A pumped backend whose steps cannot say what they found: the trait's default `try_step`.
-    struct Unsaying(Arc<CrashIO>);
+    /// An executor runs over no pumped backend whose steps cannot say what they found: its workers
+    /// would step it for ever (DESIGN.md 22.5; mutant: the refusal gone).
+    #[test]
+    fn an_executor_refuses_a_pumped_backend_whose_steps_cannot_say() {
+        let made = Executor::new(Arc::new(Undeclared(Arc::new(CrashIO::new(4)))), 2);
+        let refused = made.is_err();
+        // Taken, its workers park for good on a backend that never wakes them; nothing closes it.
+        if let Ok(ex) = made {
+            std::mem::forget(ex);
+        }
+        assert!(
+            refused,
+            "an executor took a pumped backend whose steps cannot say"
+        );
+    }
 
-    impl crate::io::Clock for Unsaying {
+    /// A pumped backend that cannot say what its steps find, read by the refusal before any
+    /// worker steps it. Its steps run nothing and answer Empty with nothing registered, breaking
+    /// the contract on purpose: an executor that took it parks its workers for good, where one
+    /// stepping a backend that answers Unsaid would abort the process.
+    struct Undeclared(Arc<CrashIO>);
+
+    impl crate::io::Clock for Undeclared {
         fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
             self.0.current_time_monotonic()
         }
+
         fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
             self.0.current_time_wall_clock()
         }
     }
 
-    impl IO for Unsaying {
+    impl crate::io::IO for Undeclared {
         fn open_file(
             &self,
             path: &str,
@@ -346,31 +366,55 @@ mod native {
         ) -> Result<Arc<dyn crate::io::File>> {
             self.0.open_file(path, flags, direct)
         }
+
         fn remove_file(&self, path: &str) -> Result<()> {
             self.0.remove_file(path)
         }
+
         fn step(&self) -> Result<()> {
-            self.0.step()
+            Ok(())
+        }
+
+        fn try_step(&self, _ready: &std::task::Waker) -> Result<crate::io::Stepped> {
+            Ok(crate::io::Stepped::Empty)
         }
     }
 
-    /// Close joins workers on a pumped backend whose steps cannot say they found nothing, and
-    /// which so never come to park (mutant: the workers read close only where they would park,
-    /// and close waits for them for ever).
+    /// Submits a sync whose callback submits the next, until `stop`.
+    fn resubmit(file: Arc<dyn crate::io::File>, stop: Arc<AtomicBool>) {
+        let (next, again) = (file.clone(), stop.clone());
+        let c = Completion::new_sync(move |_| {
+            if !again.load(O::Acquire) {
+                resubmit(next.clone(), again.clone());
+            }
+        });
+        // Delivered and resubmitted by the callback above; nothing waits on it here.
+        drop(file.sync(c, FileSyncType::Fsync).unwrap());
+    }
+
+    /// Close joins workers whose backend never runs dry, so that they never come to park: each
+    /// pass of a worker's loop reads close (mutant: the workers read close only where they would
+    /// park, and close waits for them for ever).
     #[test]
-    fn close_joins_workers_on_a_backend_whose_steps_say_nothing() {
-        let ex = Executor::new(Arc::new(Unsaying(Arc::new(CrashIO::new(4)))), 2).unwrap();
-        // Long enough for the workers to be in their loops.
+    fn close_joins_workers_while_their_backend_keeps_delivering() {
+        let crash = Arc::new(CrashIO::new(4));
+        let ex = Executor::new(crash.clone(), 2).unwrap();
+        let file = crash.open_file("/db/f", OpenFlags::Create, false).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        resubmit(file, stop.clone());
+        // Long enough for the workers to be delivering.
         std::thread::sleep(Duration::from_millis(20));
         let (closed_tx, closed_rx) = mpsc::channel();
         std::thread::spawn(move || {
             ex.close();
             let _ = closed_tx.send(());
         });
-        assert!(
-            closed_rx.recv_timeout(BOUND).is_ok(),
-            "close never joined its workers"
-        );
+        let closed = closed_rx.recv_timeout(BOUND).is_ok();
+        stop.store(true, O::Release);
+        while crash.in_flight() > 0 {
+            crash.step().unwrap();
+        }
+        assert!(closed, "close never joined its workers");
     }
 
     /// Watches three signals: each step reads their counts, then looks at `ready`; unmet, it

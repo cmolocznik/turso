@@ -21,8 +21,18 @@ use tracing::debug;
 /// the resume path behind each yield point.
 pub struct MemoryYieldIO {
     files: Arc<Mutex<HashMap<String, Arc<MemoryYieldFile>>>>,
-    /// Completions submitted but not yet signalled, drained FIFO by `step()`.
-    pending: Arc<Mutex<VecDeque<Deferred>>>,
+    /// Completions submitted but not yet signalled, drained FIFO by `step()`, and the waiters
+    /// that found none.
+    pending: Arc<Mutex<Pending>>,
+}
+
+/// What a step delivers, and who waits for there to be something, under one lock: a waiter
+/// registers under the exclusion a submission takes, so no submission falls between its look
+/// and its registration ([`IO::try_step`]).
+#[derive(Default)]
+struct Pending {
+    deferred: VecDeque<Deferred>,
+    ready: Vec<std::task::Waker>,
 }
 
 /// A completion awaiting `step()`, together with the byte count it should
@@ -39,7 +49,7 @@ impl MemoryYieldIO {
         debug!("Using IO backend 'memory_yield'");
         Self {
             files: Arc::new(Mutex::new(HashMap::default())),
-            pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending: Arc::new(Mutex::new(Pending::default())),
         }
     }
 }
@@ -110,21 +120,43 @@ impl IO for MemoryYieldIO {
     /// this same call. Each deferred completion required at least one `step()`
     /// to finish, which means at least one yield occurred per submitted op.
     fn step(&self) -> Result<()> {
-        let drained: VecDeque<Deferred> = {
-            let mut pending = self.pending.lock();
-            std::mem::take(&mut *pending)
-        };
+        let drained: VecDeque<Deferred> = std::mem::take(&mut self.pending.lock().deferred);
         for Deferred { completion, result } in drained {
             completion.deliver(Ok(result));
         }
         Ok(())
+    }
+
+    /// A step that finds nothing deferred registers `ready` under the queue's lock, which the
+    /// next deferral takes and wakes it under.
+    fn try_step(&self, ready: &std::task::Waker) -> Result<super::Stepped> {
+        // Cloned before the lock is taken and dropped after it is let go, if it was not kept.
+        let mut waiter = Some(ready.clone());
+        let empty = {
+            let mut pending = self.pending.lock();
+            let empty = pending.deferred.is_empty();
+            if empty && !pending.ready.iter().any(|w| w.will_wake(ready)) {
+                pending.ready.extend(waiter.take());
+            }
+            empty
+        };
+        drop(waiter);
+        if empty {
+            return Ok(super::Stepped::Empty);
+        }
+        self.step()?;
+        Ok(super::Stepped::Delivered)
+    }
+
+    fn says_what_a_step_found(&self) -> bool {
+        true
     }
 }
 
 pub struct MemoryYieldFile {
     path: String,
     store: MemStore,
-    pending: Arc<Mutex<VecDeque<Deferred>>>,
+    pending: Arc<Mutex<Pending>>,
 }
 
 crate::assert::assert_sync!(MemoryYieldFile);
@@ -134,10 +166,17 @@ impl MemoryYieldFile {
     /// `finished() == false` for now and forcing the caller to yield.
     fn defer(&self, c: &Completion, result: i32) {
         c.accept();
-        self.pending.lock().push_back(Deferred {
-            completion: c.clone(),
-            result,
-        });
+        let ready = {
+            let mut pending = self.pending.lock();
+            pending.deferred.push_back(Deferred {
+                completion: c.clone(),
+                result,
+            });
+            std::mem::take(&mut pending.ready)
+        };
+        for waiter in ready {
+            waiter.wake();
+        }
     }
 }
 

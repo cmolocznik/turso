@@ -380,11 +380,6 @@ impl CompletionGroup {
             "an engine's wait added to a group: it is finished only by its maker"
         );
         self.completions.push(c.clone());
-        let member = match &c.get_inner().completion_type {
-            CompletionType::Group(group) => Member::Group(group.inner.members.clone()),
-            _ => Member::Request(Arc::downgrade(c.get_inner())),
-        };
-        self.inner.members.0.lock().push(member);
         self.inner.outstanding.fetch_add(1, Ordering::SeqCst);
         let mut parent = c.get_inner().parent.lock();
         turso_assert!(parent.is_none(), "completion can only be linked once");
@@ -420,6 +415,20 @@ impl CompletionGroup {
     /// Release the builder's token. The group finishes now if every child
     /// has already finished, or later when the last one does.
     pub fn build(self) -> Completion {
+        // Published before the token goes: its release may finish the group at once, and
+        // whatever the group's end runs may walk it.
+        let members = self
+            .completions
+            .iter()
+            .map(|c| match &c.get_inner().completion_type {
+                CompletionType::Group(group) => Member::Group(group.inner.members.clone()),
+                _ => Member::Request(Arc::downgrade(c.get_inner())),
+            })
+            .collect();
+        turso_assert!(
+            self.inner.members.0.set(members).is_ok(),
+            "a group's members published twice"
+        );
         self.completion.group_one_done(None);
         self.completion
     }
@@ -451,7 +460,10 @@ struct GroupCompletionInner {
     result: OnceLock<Option<CompletionError>>,
 }
 
-/// What a group lists, walked down to the requests beneath it (DESIGN.md 22.5). A request is held
+/// What a group lists, published once as it is built (the auditor's frozen-group-members-v1, P1-GW1)
+/// and walked down to the requests beneath it (DESIGN.md 22.5) with no lock: a request upgraded in
+/// a walk may be the last handle to it, and its drop may run a callback's captures, which may walk
+/// the group again. A request is held
 /// weakly: a backend that owns one holds it, so a request gone is owned by no one, and a strong hold
 /// would keep its buffers past its retirement. A group is no backend's, so a request beneath it can
 /// be owned after every handle to the group is gone (its last request cancelled, its parent's
@@ -459,7 +471,7 @@ struct GroupCompletionInner {
 /// completion. Lists point only down and hold no completion, so they keep no buffer and make no
 /// cycle.
 #[derive(Default)]
-struct Members(Mutex<Vec<Member>>);
+struct Members(OnceLock<Vec<Member>>);
 
 enum Member {
     Request(Weak<CompletionInner>),
@@ -1103,11 +1115,13 @@ impl Completion {
             if !walked.insert(Arc::as_ptr(&list) as usize) {
                 continue;
             }
-            for member in list.0.lock().iter() {
+            for member in list.0.get().expect("a group walked before it was built") {
                 match member {
                     Member::Group(list) => lists.push(list.clone()),
                     Member::Request(weak) => {
                         if let Some(inner) = weak.upgrade() {
+                            // The copy may be the last: its drop runs inside the walk.
+                            crate::race::point("completions.member_upgraded");
                             request(inner, &mut found);
                         }
                     }
@@ -1277,6 +1291,121 @@ mod tests {
     use crate::CompletionError;
 
     use super::*;
+
+    /// What a request's callback owns: dropped with the request, it walks the group from another
+    /// thread and says whether that walk came back while it waited.
+    struct WalksItsGroup {
+        root: Arc<std::sync::OnceLock<Completion>>,
+        returned: Arc<std::sync::atomic::AtomicBool>,
+        peer: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+        bound: std::time::Duration,
+    }
+
+    impl Drop for WalksItsGroup {
+        fn drop(&mut self) {
+            let root = self.root.get().expect("the group was built").clone();
+            let (done, finished) = std::sync::mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                let _ = root.requests(&mut std::collections::HashSet::new());
+                let _ = done.send(());
+            });
+            let came_back = finished.recv_timeout(self.bound).is_ok();
+            self.returned
+                .store(came_back, std::sync::atomic::Ordering::Release);
+            // A walk that waited is let go once this returns, and joined by the test.
+            *self.peer.lock().unwrap() = Some(peer);
+        }
+    }
+
+    /// A walk of a group's members holds no lock: a request it upgrades may be the last handle to it,
+    /// and its drop may run captures that walk the group again, here from another thread while the
+    /// first walk waits for it (the auditor's P1-GW1; mutant: the members behind a mutex, which the
+    /// capture's walk then waits on until the first walk lets it go).
+    #[test]
+    fn a_group_walk_dropping_a_requests_last_handle_lets_its_captures_walk_the_group() {
+        use std::sync::{atomic::AtomicBool, mpsc};
+        use std::time::Duration;
+        let bound = Duration::from_secs(if cfg!(miri) { 60 } else { 2 });
+        let root = Arc::new(std::sync::OnceLock::new());
+        let returned = Arc::new(AtomicBool::new(false));
+        let peer = Arc::new(std::sync::Mutex::new(None));
+        let capture = WalksItsGroup {
+            root: root.clone(),
+            returned: returned.clone(),
+            peer: peer.clone(),
+            bound,
+        };
+        let child = Completion::new_sync(move |_| {
+            std::hint::black_box(&capture);
+        });
+        let mut group = CompletionGroup::new(|_| {});
+        group.add(&child);
+        let group = group.build();
+        assert!(root.set(group.clone()).is_ok());
+        // A walk that has seen the child already drops the copy it upgrades inside the walk.
+        let mut seen = std::collections::HashSet::new();
+        drop(child.requests(&mut seen));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let scanner = {
+            let group = group.clone();
+            std::thread::spawn(move || {
+                crate::race::at("completions.member_upgraded", move || {
+                    entered_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                });
+                group.requests(&mut seen).len()
+            })
+        };
+        let reached = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        // The walk's copy is now the last handle to the child.
+        drop(child);
+        go_tx.send(()).unwrap();
+        let found = scanner.join();
+        let walked = peer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the capture walked its group")
+            .join();
+        let came_back = returned.load(std::sync::atomic::Ordering::Acquire);
+        drop((group, root));
+        assert!(reached, "the walk reached the child");
+        assert!(matches!(found, Ok(0)) && walked.is_ok());
+        assert!(
+            came_back,
+            "a capture's walk of its group waited for the walk that dropped it"
+        );
+    }
+
+    /// A group's members are published before the builder lets its token go: that release may finish
+    /// the group at once, and its callback may walk it (mutant: the token let go first, so the walk
+    /// finds no members).
+    #[test]
+    fn a_group_publishes_its_members_before_its_builder_lets_its_token_go() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        let root = Arc::new(std::sync::Mutex::new(None::<Completion>));
+        let walked = Arc::new(AtomicUsize::new(usize::MAX));
+        let mut group = {
+            let (root, walked) = (root.clone(), walked.clone());
+            CompletionGroup::new(move |_| {
+                let root = root.lock().unwrap().take().expect("the group's handle");
+                let found = root.requests(&mut std::collections::HashSet::new()).len();
+                walked.store(found, O::Release);
+            })
+        };
+        let child = Completion::new_sync(|_| {});
+        group.add(&child);
+        *root.lock().unwrap() = Some(group.completion.clone());
+        child.accept();
+        child.deliver(Ok(0));
+        let group = group.build();
+        let found = walked.load(O::Acquire);
+        let finished = group.finished();
+        drop((child, group, root));
+        assert!(finished, "the group finished at its build");
+        assert_eq!(found, 1, "the group's callback found its members");
+    }
 
     /// A request no backend owns, never submitted or already retired, runs what waits for its
     /// retirement at once, on its ownership word alone: its context's lock is held by the test

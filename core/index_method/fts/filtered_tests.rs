@@ -773,3 +773,127 @@ fn optimize_after_a_delete_leaves_none_of_the_erased_documents_segment_in_the_fi
         );
     }
 }
+
+/// Timing over real memory texts (`FTS_BENCH_TEXTS`, JSON lines with a
+/// `text`; `FTS_BENCH_QUERIES` likewise): 41 admission shapes of which 38 are
+/// admitted, 80% of documents closed, a recorded time spread over a year and
+/// event intervals on some. Prints p50/p95/p99 of the filtered top 10 and top
+/// 50, undated and dated, before and after OPTIMIZE INDEX. Run with
+/// `--ignored --nocapture` in a release build.
+#[test]
+#[ignore = "timing over a real corpus; needs FTS_BENCH_TEXTS"]
+fn bench_filtered_over_real_texts() {
+    let Ok(texts) = std::env::var("FTS_BENCH_TEXTS") else {
+        return;
+    };
+    let queries = std::env::var("FTS_BENCH_QUERIES").unwrap();
+    let limit_docs: usize = std::env::var("FTS_BENCH_DOCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
+    let read = |path: &str| -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    let words = |text: &str| -> String {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let docs: Vec<String> = read(&texts).into_iter().take(limit_docs).collect();
+    let queries: Vec<String> = read(&queries).iter().map(|q| words(q)).take(100).collect();
+    let (_dir, _db, conn) = open(true);
+    let mut rng = Rng(0x5EED);
+    let year = 365 * 24 * 3600 * 1_000_000i64;
+    let start = std::time::Instant::now();
+    for chunk in docs.chunks(128).enumerate() {
+        let (offset, chunk) = chunk;
+        let values: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let id = offset * 128 + i + 1;
+                let observed = rng.below(year as u64) as i64;
+                let ivs = if rng.below(3) == 0 {
+                    packed(&[(observed, observed + 24 * 3600 * 1_000_000)])
+                } else {
+                    "NULL".into()
+                };
+                format!(
+                    "({id}, '{}', {}, {}, {observed}, {ivs})",
+                    text.replace('\'', "''"),
+                    1 + rng.below(41),
+                    i64::from(rng.below(5) != 0)
+                )
+            })
+            .collect();
+        conn.execute(format!("INSERT INTO docs VALUES {}", values.join(",")))
+            .unwrap();
+    }
+    eprintln!("BENCH built {} docs in {:?}", docs.len(), start.elapsed());
+    let admitted: Vec<String> = (1..=38).map(|s| s.to_string()).collect();
+    let undated = format!(
+        "{{\"all\":[{{\"in\":[\"shape\",[{}]]}},{{\"range\":[\"closed\",0,1]}}]}}",
+        admitted.join(",")
+    );
+    let month_from = year - 30 * 24 * 3600 * 1_000_000;
+    let dated = format!(
+        "{{\"all\":[{{\"in\":[\"shape\",[{}]]}},{{\"range\":[\"closed\",0,1]}},{{\"any\":[{{\"range\":[\"observed\",{month_from},{year}]}},{{\"within\":[{month_from},{year}]}}]}}]}}",
+        admitted.join(",")
+    );
+    let pct = |mut v: Vec<f64>, p: f64| -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[((v.len() as f64 - 1.0) * p).round() as usize]
+    };
+    for pass in ["as-written", "optimized"] {
+        if pass == "optimized" {
+            let t = std::time::Instant::now();
+            conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            eprintln!("BENCH optimize {:?}", t.elapsed());
+        }
+        for (name, filter) in [("undated", &undated), ("dated", &dated)] {
+            for limit in [10i64, 50] {
+                // One warm-up pass, then the timed one.
+                for timed in [false, true] {
+                    let mut times = Vec::new();
+                    let mut hits = 0;
+                    for q in &queries {
+                        let t = std::time::Instant::now();
+                        let mut statement = conn
+                            .prepare("SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM docs ORDER BY score DESC LIMIT ?3")
+                            .unwrap();
+                        statement
+                            .bind_at(1.try_into().unwrap(), Value::build_text(q.clone()))
+                            .unwrap();
+                        statement
+                            .bind_at(2.try_into().unwrap(), Value::build_text(filter.clone()))
+                            .unwrap();
+                        statement
+                            .bind_at(3.try_into().unwrap(), Value::from_i64(limit))
+                            .unwrap();
+                        hits += statement.run_collect_rows().unwrap().len();
+                        times.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    if timed {
+                        eprintln!(
+                            "BENCH {pass} {name} top{limit} n={} p50={:.2}ms p95={:.2}ms p99={:.2}ms hits={hits}",
+                            times.len(),
+                            pct(times.clone(), 0.5),
+                            pct(times.clone(), 0.95),
+                            pct(times, 0.99)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

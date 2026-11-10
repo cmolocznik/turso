@@ -189,7 +189,7 @@ impl VersionedCursor {
     }
 
     /// Whether the row's value is out of line and not read yet: [`VersionedTree::load`] reads it.
-    #[cfg(test)]
+    #[inline]
     pub fn unread(&self) -> bool {
         matches!(self.value, Value::Unread(_) | Value::Reading(_))
     }

@@ -103,9 +103,9 @@ mod plain {
             assert_eq!(closing.is_err(), victim == 1, "all hold: {all_hold}");
             assert_eq!(r2.flagged(), victim == 2, "all hold: {all_hold}");
             assert!(!r0.flagged());
-            for i in 0..3 {
+            for (i, &group) in g.iter().enumerate() {
                 assert_eq!(
-                    graph.doomed(g[i]),
+                    graph.doomed(group),
                     i == victim,
                     "group {i}, all hold: {all_hold}"
                 );

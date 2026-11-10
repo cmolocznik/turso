@@ -54,6 +54,7 @@ pub(crate) mod btree_dump;
 pub(crate) mod child_test;
 #[cfg(all(test, not(any(shuttle, atoll_loom))))]
 pub(crate) mod source_test;
+pub(crate) mod race;
 pub(crate) mod sync;
 pub(crate) mod thread;
 

@@ -47,6 +47,7 @@ use super::shared::Writer;
 use super::whole_write;
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::storage::atoll::locks::Mutex;
+use crate::storage::atoll::notify::LetGo;
 use crate::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
@@ -109,8 +110,10 @@ pub struct PageStore {
     /// Levels of the page table (`[0]`) and free space (`[1]`) per class: written by the one
     /// growing a tree, and only rising.
     heights: [[AtomicU8; CLASS_COUNT]; TREES],
-    /// Owned by the one growing a tree; another grower yields.
+    /// Owned by the one growing a tree; another grower waits for its let-go ([`grown`](Self::grown)).
     growing: Mutex<()>,
+    /// What a caller that found a growth under way waits on: finished at its let-go.
+    grown: LetGo,
     /// Where each class's next slot search starts: a hint.
     cursors: [AtomicU64; CLASS_COUNT],
     /// Where each class's next page number search starts: a hint, past the last number taken or
@@ -137,6 +140,8 @@ pub struct PageStore {
     swap_freed: Retired<(SizeClass, u64)>,
     /// The erasure in progress: owned by whoever steps it, and only ever tried.
     erasure: Mutex<Eraser>,
+    /// What a caller that found the erasure under way waits on: finished at its let-go.
+    erased: LetGo,
     /// Numbers kept for replay's tree creations, by class: no allocation takes one, and only
     /// [`allocate_at`](Self::allocate_at) does (audit 17).
     reserved: [GrowBits; CLASS_COUNT],
@@ -147,6 +152,16 @@ pub struct PageStore {
     claimed: [GrowBits; CLASS_COUNT],
     /// Changes of several pages in flight, and [`CUT`] while a cut holds or wants the gate.
     gate: AtomicU64,
+    /// What a change refused by a closed gate waits on: finished when the gate reopens
+    /// (DESIGN.md 9.1.3, the change gate closed by a cut). Touched only while the gate is closed
+    /// and by the reopening.
+    reopened: Mutex<Option<crate::io::Completion>>,
+    /// What a cut closing the gate waits on while changes are inside: finished by the last to
+    /// leave with [`CUT`] set (DESIGN.md 9.1.3, the gate's close waiting for the changes under way).
+    drained: Mutex<Option<crate::io::Completion>>,
+    /// Times the last change out of a closing gate took its slow path, for a test.
+    #[cfg(test)]
+    drain_wakes: AtomicU64,
     /// Each tree a transaction created, by root, with its creator's slot and start: no
     /// checkpoint maps it before one's snapshot sees the creation (audit 18, review 8).
     creations: Mutex<HashMap<PageId, (u16, u64)>>,
@@ -174,13 +189,20 @@ struct Erasure {
 /// A change of several pages inside the change gate ([`PageStore::change`]): it leaves the gate
 /// when dropped.
 pub struct Change<'a> {
-    gate: &'a AtomicU64,
+    store: &'a PageStore,
+    /// Left on the thread that entered it: a hold W1 counts there (DESIGN.md 9.1.3).
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for Change<'_> {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        self.gate.fetch_sub(1, Ordering::SeqCst);
+        // The last change out while a cut closes the gate finishes the cut's wait; any other
+        // leaves as it came, the count it read the only test.
+        if self.store.gate.fetch_sub(1, Ordering::SeqCst) == CUT | 1 {
+            self.store.drained_out();
+        }
+        crate::storage::atoll::park::holds::lower();
     }
 }
 
@@ -209,6 +231,8 @@ impl PageStore {
             files: Default::default(),
             heights: heights.map(|h| h.map(|l| AtomicU8::new(l.max(1)))),
             growing: Mutex::new(()),
+            grown: Default::default(),
+            erased: Default::default(),
             cursors: Default::default(),
             numbers: Default::default(),
             epochs,
@@ -227,6 +251,10 @@ impl PageStore {
             retired: Default::default(),
             claimed: Default::default(),
             gate: AtomicU64::new(0),
+            reopened: Mutex::new(None),
+            drained: Mutex::new(None),
+            #[cfg(test)]
+            drain_wakes: AtomicU64::new(0),
             creations: Mutex::new(HashMap::new()),
             orphans: Mutex::new(Vec::new()),
         })
@@ -278,25 +306,88 @@ impl PageStore {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return Some(Change { gate: &self.gate }),
+                Ok(_) => {
+                    crate::storage::atoll::park::holds::raise();
+                    return Some(Change {
+                        store: self,
+                        _thread: std::marker::PhantomData,
+                    });
+                }
                 Err(now) => word = now,
             }
         }
     }
 
-    /// Closes the gate for a cut: done once no change is inside. Step it until done, then
-    /// [`open_gate`](Self::open_gate) after the cut.
+    /// Closes the gate for a cut: done once no change is inside, else the wait the last change
+    /// out finishes. Registered, then the count read again under the mutex the last change takes
+    /// it under, so a last change out before the registration is seen gone. Step it until done,
+    /// then [`open_gate`](Self::open_gate) after the cut.
     pub fn close_gate(&self) -> IOResult<()> {
         let word = self.gate.fetch_or(CUT, Ordering::SeqCst);
         if word & !CUT == 0 {
-            IOResult::Done(())
-        } else {
-            busy()
+            return IOResult::Done(());
         }
+        let mut drained = self.drained.lock();
+        if self.gate.load(Ordering::SeqCst) & !CUT == 0 {
+            return IOResult::Done(());
+        }
+        IOResult::IO(IOCompletions(
+            drained
+                .get_or_insert_with(crate::storage::atoll::notify::remote_wait)
+                .clone(),
+        ))
+    }
+
+    /// The last change has left a closing gate: the cut's wait, if it registered one, finished.
+    fn drained_out(&self) {
+        #[cfg(test)]
+        self.drain_wakes.fetch_add(1, Ordering::Relaxed);
+        let waiting = self.drained.lock().take();
+        if let Some(c) = waiting {
+            crate::storage::atoll::notify::finish(&c, Ok(0));
+        }
+    }
+
+    /// Times the last change out of a closing gate took its slow path, for a test.
+    #[cfg(test)]
+    pub fn drain_wakes(&self) -> u64 {
+        self.drain_wakes.load(Ordering::Relaxed)
     }
 
     pub fn open_gate(&self) {
         self.gate.fetch_and(!CUT, Ordering::SeqCst);
+        self.wake_gate_waiters();
+    }
+
+    /// Wakes the changes the gate refused, to look again: at its reopening, and whenever the
+    /// checkpoint's state is let go with the gate still closed, so a refused writer whose relief
+    /// found the state held steps the cut itself. Taken under the mutex a waiter registers under:
+    /// a waiter that read the gate closed, or failed to take the state, registered first.
+    pub fn wake_gate_waiters(&self) {
+        let waiting = self.reopened.lock().take();
+        if let Some(c) = waiting {
+            crate::storage::atoll::notify::finish(&c, Ok(0));
+        }
+    }
+
+    /// The wait of a change the gate refused, finished when the gate reopens; `None` if it is
+    /// open again already. Registered before the gate is read, under the mutex the reopening
+    /// takes it under, so no reopening is missed.
+    pub fn gate_wait(&self) -> Option<crate::io::Completion> {
+        let mut reopened = self.reopened.lock();
+        if self.gate.load(Ordering::SeqCst) & CUT == 0 {
+            return None;
+        }
+        Some(
+            reopened
+                .get_or_insert_with(crate::storage::atoll::notify::remote_wait)
+                .clone(),
+        )
+    }
+
+    /// Whether a cut holds or wants the gate.
+    pub fn gate_closed(&self) -> bool {
+        self.gate.load(Ordering::SeqCst) & CUT != 0
     }
 
     // ---------------------------------------------------------------- files and reads
@@ -330,11 +421,16 @@ impl PageStore {
         if pid.number() >= radix::capacity(Tree::Map, self.height(Tree::Map, class)) {
             return Ok(IOResult::Done(FREE));
         }
-        let leaf = radix::path(Tree::Map, class, 1, pid.number())[0];
+        let leaf = MetaId {
+            tree: Tree::Map,
+            class,
+            level: 0,
+            index: pid.number() / radix::MAP_ENTRIES,
+        };
         Ok(match self.meta.get(leaf)? {
             IOResult::Done(f) => match f.read(|b| radix::map_entry(b, pid.number())) {
                 Some(entry) => IOResult::Done(entry),
-                None => busy(),
+                None => IOResult::IO(IOCompletions(f.wait_while_held())),
             },
             IOResult::IO(io) => IOResult::IO(io),
         })
@@ -348,7 +444,12 @@ impl PageStore {
         if pid.number() >= radix::capacity(Tree::Map, self.height(Tree::Map, class)) {
             return Ok(IOResult::Done(None));
         }
-        let leaf = radix::path(Tree::Map, class, 1, pid.number())[0];
+        let leaf = MetaId {
+            tree: Tree::Map,
+            class,
+            level: 0,
+            index: pid.number() / radix::MAP_ENTRIES,
+        };
         Ok(match self.meta.get(leaf)? {
             IOResult::Done(f) => IOResult::Done(Some(f)),
             IOResult::IO(io) => IOResult::IO(io),
@@ -583,8 +684,9 @@ impl PageStore {
             !pid.is_temporary(),
             "the page table reached temporary numbers"
         );
-        let Some(mut locked) = Locked::new(&frames) else {
-            return Ok(busy());
+        let mut locked = match Locked::new(&frames) {
+            Ok(locked) => locked,
+            Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
         if self.height(Tree::Map, class) != height
             || radix::map_entry(locked.page_of(ids[0]), number) != FREE
@@ -620,6 +722,22 @@ impl PageStore {
     /// Drops `pid`: its number is free, reusable once the changes of this checkpoint are durable;
     /// its checkpoint copy's slot is freed then too, and its swap copy goes now. Step it until
     /// done.
+    /// Runs `f` with the latches of the map pages `pid`'s entry is reached through held, as another
+    /// change of the map holds them: for a test of what waits on them.
+    #[cfg(test)]
+    pub(super) fn with_map_latched<R>(self: &Arc<Self>, pid: PageId, f: impl FnOnce() -> R) -> R {
+        let (class, number) = (pid.class(), pid.number());
+        let ids = radix::path(Tree::Map, class, self.height(Tree::Map, class), number);
+        let frames = match self.meta.get_all(&ids).unwrap() {
+            IOResult::Done(frames) => frames,
+            IOResult::IO(_) => panic!("the map's pages are resident"),
+        };
+        let locked = Locked::new(&frames).expect("the map's latches are free");
+        let r = f();
+        locked.release_unchanged();
+        r
+    }
+
     pub fn free(self: &Arc<Self>, pid: PageId) -> Result<IOResult<()>> {
         let (class, number) = (pid.class(), pid.number());
         loop {
@@ -629,8 +747,9 @@ impl PageStore {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            let Some(mut locked) = Locked::new(&frames) else {
-                return Ok(busy());
+            let mut locked = match Locked::new(&frames) {
+                Ok(locked) => locked,
+                Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
             };
             if self.height(Tree::Map, class) != height {
                 locked.release_unchanged();
@@ -725,8 +844,9 @@ impl PageStore {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            let Some(mut locked) = Locked::new(&frames) else {
-                return Ok(busy());
+            let mut locked = match Locked::new(&frames) {
+                Ok(locked) => locked,
+                Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
             };
             if self.height(Tree::Space, class) != height {
                 locked.release_unchanged();
@@ -804,8 +924,9 @@ impl PageStore {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        let Some(mut locked) = Locked::new(&frames) else {
-            return Ok(busy());
+        let mut locked = match Locked::new(&frames) {
+            Ok(locked) => locked,
+            Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
         if self.height(Tree::Map, class) != live_map {
             locked.release_unchanged();
@@ -872,7 +993,7 @@ impl PageStore {
         );
         Ok(match read {
             Some(e) => IOResult::Done(e),
-            None => busy(),
+            None => IOResult::IO(IOCompletions(frame.wait_while_held())),
         })
     }
 
@@ -935,8 +1056,9 @@ impl PageStore {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        let Some(mut locked) = Locked::new(&frames) else {
-            return Ok(busy());
+        let mut locked = match Locked::new(&frames) {
+            Ok(locked) => locked,
+            Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
         if self.height(Tree::Space, class) != height {
             locked.release_unchanged();
@@ -973,9 +1095,11 @@ impl PageStore {
     /// may have looked it up has ended: holes punched, or zeros written where the file cannot
     /// punch them, then each file synced once; then the slots may be taken. Step it until done.
     pub fn erase_freed(&self) -> Result<IOResult<()>> {
-        let Some(mut eraser) = self.erasure.try_lock() else {
-            // Someone else is stepping it.
-            return Ok(busy());
+        // A caller that finds another erasing waits for its let-go (DESIGN.md 9.1.3, *No retry
+        // without a change*).
+        let mut eraser = match own(&self.erasure, &self.erased) {
+            Ok(owned) => owned,
+            Err(erased) => return Ok(IOResult::IO(IOCompletions(erased))),
         };
         let eraser = &mut *eraser;
         loop {
@@ -1041,9 +1165,12 @@ impl PageStore {
     /// Adds a level to `tree` of `class`, the old root the new one's first child. Step it until
     /// done.
     fn grow(self: &Arc<Self>, tree: Tree, class: SizeClass) -> Result<IOResult<()>> {
-        // Only tried, never waited for: it is ownership of the growth, held across its IO.
-        let Some(_growing) = self.growing.try_lock() else {
-            return Ok(busy());
+        // Only tried: it is ownership of the growth. A caller that finds another growing waits for
+        // its let-go (DESIGN.md 9.1.3, *No retry without a change*), registered before it tries
+        // again; the growth it waited for may be the one it needed, which the height says.
+        let _growing = match own(&self.growing, &self.grown) {
+            Ok(owned) => owned,
+            Err(grown) => return Ok(IOResult::IO(IOCompletions(grown))),
         };
         let height = self.height(tree, class);
         let old_root = radix::root(tree, class, height);
@@ -1052,8 +1179,9 @@ impl PageStore {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        let Some(mut locked) = Locked::new(&frames) else {
-            return Ok(busy());
+        let mut locked = match Locked::new(&frames) {
+            Ok(locked) => locked,
+            Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
         if self.height(tree, class) != height {
             locked.release_unchanged();
@@ -1089,7 +1217,7 @@ impl PageStore {
                 }
             }) {
                 Some(n) => IOResult::Done(n),
-                None => busy(),
+                None => IOResult::IO(IOCompletions(f.wait_while_held())),
             },
             IOResult::IO(io) => IOResult::IO(io),
         })
@@ -1132,7 +1260,7 @@ impl PageStore {
                 }
             });
             let Some((used, counts)) = read else {
-                return Ok(busy());
+                return Ok(IOResult::IO(IOCompletions(node.wait_while_held())));
             };
             stack.pop();
             op.units.extend(used);
@@ -1184,7 +1312,7 @@ impl PageStore {
                     let found = loop {
                         let Some(free) = frame.read(|b| radix::free_in_leaf(tree, b, index, at))
                         else {
-                            return Ok(busy());
+                            return Ok(IOResult::IO(IOCompletions(frame.wait_while_held())));
                         };
                         let Some(u) = free else {
                             break None;
@@ -1228,7 +1356,7 @@ impl PageStore {
                 };
                 let Some(room) = frame.read(|b| radix::child_with_room(tree, b, level, from_child))
                 else {
-                    return Ok(busy());
+                    return Ok(IOResult::IO(IOCompletions(frame.wait_while_held())));
                 };
                 match room {
                     Some(c) => {
@@ -1245,6 +1373,49 @@ impl PageStore {
             }
         }
     }
+}
+
+/// A lock only tried, held: its let-go wakes the callers that found it held.
+struct Owned<'a, T>(
+    Option<crate::storage::atoll::locks::MutexGuard<'a, T>>,
+    &'a LetGo,
+);
+
+impl<T> std::ops::Deref for Owned<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0.as_deref().expect("held until dropped")
+    }
+}
+
+impl<T> std::ops::DerefMut for Owned<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0.as_deref_mut().expect("held until dropped")
+    }
+}
+
+impl<T> Drop for Owned<'_, T> {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        drop(self.0.take());
+        self.1.let_go();
+    }
+}
+
+/// `lock`, if no one holds it; else the wait its holder's let-go finishes, registered before it
+/// is tried again.
+fn own<'a, T>(
+    lock: &'a Mutex<T>,
+    let_go: &'a LetGo,
+) -> std::result::Result<Owned<'a, T>, Completion> {
+    if let Some(held) = lock.try_lock() {
+        return Ok(Owned(Some(held), let_go));
+    }
+    let wait = let_go.wait();
+    lock.try_lock()
+        .map(|held| Owned(Some(held), let_go))
+        .ok_or(wait)
 }
 
 fn busy<T>() -> IOResult<T> {
@@ -1267,9 +1438,9 @@ struct Locked<'a> {
 }
 
 impl<'a> Locked<'a> {
-    /// Latches every page of `frames`, or `None`, holding nothing, if one is held: the caller
-    /// yields and tries again.
-    fn new(frames: &'a [MetaRef]) -> Option<Self> {
+    /// Latches every page of `frames`, or returns the held page's release signal with all
+    /// earlier holds released, so the caller waits while holding none of them.
+    fn new(frames: &'a [MetaRef]) -> std::result::Result<Self, Completion> {
         let mut order: Vec<&MetaRef> = frames.iter().collect();
         order.sort_by_key(|f| f.id);
         order.dedup_by_key(|f| f.id);
@@ -1278,13 +1449,15 @@ impl<'a> Locked<'a> {
             match f.try_lock() {
                 Some(hold) => holds.push(hold),
                 None => {
-                    // Nothing was written: readers are not sent back.
+                    let wait = f.wait_while_held();
+                    // Nothing was written: readers are not sent back. All earlier holds go
+                    // before the caller waits, and none of them can finish this frame's signal.
                     holds.into_iter().for_each(MetaHold::release_unchanged);
-                    return None;
+                    return Err(wait);
                 }
             }
         }
-        Some(Self {
+        Ok(Self {
             ids: order.iter().map(|f| f.id).collect(),
             holds,
             frames: order,
@@ -1487,8 +1660,9 @@ impl PageStore {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        let Some(mut locked) = Locked::new(&frames) else {
-            return Ok(busy());
+        let mut locked = match Locked::new(&frames) {
+            Ok(locked) => locked,
+            Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
         change(&mut locked, &ids);
         locked.commit(&self.meta);

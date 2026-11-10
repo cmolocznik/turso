@@ -721,9 +721,10 @@ pub trait IO: Clock + Send + Sync {
     /// Blocks the calling thread until `c` finishes (DESIGN.md 22.5): a wait another thread
     /// completes, or a request of a backend that delivers inline or on a thread of its own, parks
     /// until it is finished; a pumped backend is stepped until it is, the processor yielded between
-    /// steps that leave it unfinished, since what it waits on may be another thread's to submit.
-    /// Its result is its owner's to read. A step that fails ends the process, the backend having
-    /// lost what it accepted.
+    /// steps that leave it unfinished, since what it waits on may be another thread's to submit,
+    /// and the waiter parks on `c` once only finishes under way elsewhere can finish it, its
+    /// requests having left the backend. Its result is its owner's to read. A step that fails ends
+    /// the process, the backend having lost what it accepted.
     fn wait(&self, c: &Completion) {
         refuse_on_delivery_thread("a wait for a completion");
         if c.finished() {
@@ -734,6 +735,11 @@ pub trait IO: Clock + Send + Sync {
             return;
         }
         while !c.finished() {
+            if c.only_finishers_left() {
+                // A step does nothing for it: the finish publishes its result and wakes this one.
+                c.block_on();
+                return;
+            }
             if self.step().is_err() {
                 stepping_failed("a wait for a completion");
             }
@@ -753,7 +759,9 @@ pub trait IO: Clock + Send + Sync {
     /// Waits until no backend owns `c`: for a request, until it is retired, or at once if it was
     /// never accepted; for a group, until every request beneath it is (DESIGN.md 22.5). A
     /// cancelled request is finished at once and still owned until its backend lets it go, with
-    /// the buffers it reads into or writes from: retirement, not finishing, says they are free.
+    /// the buffers it reads into or writes from: retirement, not finishing, says they are free. A
+    /// request the backend let go while a finish elsewhere still runs its callback retires when
+    /// that callback returns: the waiter parks for it rather than stepping.
     /// The caller is the owner of what it waits for, and has stopped submitting to it.
     fn wait_retired(&self, c: &Completion) -> Result<()> {
         self.drain_completions(std::slice::from_ref(c))
@@ -770,8 +778,17 @@ pub trait IO: Clock + Send + Sync {
         for c in completions {
             for request in c.requests(&mut seen) {
                 if pumped {
+                    let mut registered = false;
                     while request.is_owned() {
-                        if self.step().is_err() {
+                        if request.left_its_backend() {
+                            // Only the finish under way retires it now, and wakes this one.
+                            if !registered {
+                                let thread = crate::thread::current();
+                                request.on_retired(move || thread.unpark());
+                                registered = true;
+                            }
+                            crate::thread::park();
+                        } else if self.step().is_err() {
                             stepping_failed("a wait for retirement");
                         }
                     }
@@ -988,7 +1005,45 @@ impl<'a> WriteBatch<'a> {
     }
 }
 
-pub type BufferData = Pin<Box<[u8]>>;
+pub struct BufferData(Pin<Box<std::cell::UnsafeCell<[u8]>>>);
+
+// SAFETY: this type exposes byte references shared, or mutable only through an exclusive owner
+// borrow. A raw mutable pointer grants no aliasing permission; Buffer's callers must still
+// exclude overlapping byte access. UnsafeCell preserves writable provenance, not exclusion.
+unsafe impl Sync for BufferData {}
+
+impl BufferData {
+    fn new(bytes: Vec<u8>) -> Self {
+        let bytes = Box::into_raw(bytes.into_boxed_slice());
+        // SAFETY: UnsafeCell is transparent, including the slice metadata. This consumes the
+        // allocation without copying it, and the original byte layout remains its deallocation.
+        let bytes = unsafe { Box::from_raw(bytes as *mut std::cell::UnsafeCell<[u8]>) };
+        Self(Pin::new(bytes))
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.get().len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0.get().cast::<u8>().cast_const()
+    }
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.0.get().cast::<u8>()
+    }
+}
+
+impl Debug for BufferData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: a shared byte view for this formatting borrow; no pointer is used to write.
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }.fmt(f)
+    }
+}
 
 #[derive(Clone)]
 pub enum SharedBufferData {
@@ -1136,7 +1191,7 @@ impl Drop for Buffer {
                 TEMP_BUFFER_CACHE.with(|cache| {
                     let mut cache = cache.borrow_mut();
                     // take ownership of the buffer by swapping it with a dummy
-                    let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
+                    let buffer = std::mem::replace(buf, BufferData::new(Vec::new()));
                     cache.return_buffer(buffer, underlying_len);
                 });
             }
@@ -1148,7 +1203,7 @@ impl Drop for Buffer {
 impl Buffer {
     pub fn new(data: Vec<u8>) -> Self {
         tracing::trace!("buffer::new({:?})", data);
-        Self::Heap(Pin::new(data.into_boxed_slice()))
+        Self::Heap(BufferData::new(data))
     }
 
     pub fn new_shared(data: Arc<DynBoxedSlice<u8>>) -> Self {
@@ -1171,7 +1226,7 @@ impl Buffer {
             data.len()
         );
         Self::HeapView {
-            data: Pin::new(data.into_boxed_slice()),
+            data: BufferData::new(data),
             start,
         }
     }
@@ -1198,7 +1253,7 @@ impl Buffer {
             if let Some(buffer) = cache.borrow_mut().get_buffer(size) {
                 Self::Heap(buffer)
             } else {
-                Self::Heap(Pin::new(vec![0; size].into_boxed_slice()))
+                Self::Heap(BufferData::new(vec![0; size]))
             }
         })
     }
@@ -1254,10 +1309,10 @@ impl Buffer {
     #[inline]
     pub fn as_mut_ptr(&self) -> *mut u8 {
         match self {
-            Self::Heap(buf) => buf.as_ptr() as *mut u8,
+            Self::Heap(buf) => buf.as_mut_ptr(),
             Self::Shared(_) => panic!("Buffer::Shared is immutable"),
-            Self::HeapView { data, start } => unsafe { (data.as_ptr() as *mut u8).add(*start) },
-            Self::Pooled(buf) => buf.as_ptr() as *mut u8,
+            Self::HeapView { data, start } => unsafe { data.as_mut_ptr().add(*start) },
+            Self::Pooled(buf) => buf.as_mut_ptr(),
             Self::Region(r) => r.ptr.as_ptr(),
         }
     }
@@ -1317,6 +1372,35 @@ mod buffer_tests {
         assert_eq!(buffer.len(), 3);
         assert_eq!(buffer.as_slice(), &[2, 3, 4]);
         assert_eq!(buffer.as_ptr(), shared.as_ptr());
+    }
+    #[test]
+    fn heap_and_view_mutable_pointers_keep_write_permission_without_copying() {
+        for start in [0, 8] {
+            let bytes = vec![0; 512 + start];
+            let allocation = bytes.as_ptr();
+            let buffer = if start == 0 {
+                Buffer::new(bytes)
+            } else {
+                Buffer::new_with_start(bytes, start)
+            };
+            assert_eq!(buffer.as_ptr(), unsafe { allocation.add(start) });
+            buffer.as_mut_slice().fill(71);
+            assert_eq!(buffer.len(), 512);
+            assert!(buffer.as_slice().iter().all(|&byte| byte == 71));
+            assert_eq!(buffer.as_ptr(), unsafe { allocation.add(start) });
+        }
+    }
+
+    #[test]
+    fn a_pooled_mutable_pointer_does_not_start_from_a_shared_byte_slice() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let pool = BufferPool::begin_init(&io, 64 * 1024);
+        pool.finalize_with_page_size(4096).unwrap();
+        let buffer = pool.get_page();
+        assert!(buffer.is_pooled());
+        // SAFETY: this test owns the frame and no other byte view exists while it is written.
+        unsafe { buffer.as_mut_ptr().write(53) };
+        assert_eq!(buffer.as_slice()[0], 53);
     }
 }
 

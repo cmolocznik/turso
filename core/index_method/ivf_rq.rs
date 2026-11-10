@@ -442,15 +442,9 @@ impl Ord for Ordered {
 /// Whether this CPU runs the AVX2 and FMA variants of the kernels below. Each kernel is one
 /// body, inlined into a plain and an AVX2 wrapper, with independent accumulators so it vectorizes
 /// without reassociating a float sum.
+#[cfg(target_arch = "x86_64")]
 fn wide() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
+    std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
 }
 
 macro_rules! kernel {

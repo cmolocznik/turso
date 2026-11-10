@@ -30,9 +30,9 @@
 
 use self::sync::AtomicU64;
 use super::aligned::AlignedBlock;
-use super::buffer::cell::{CompletionCell, Retiring};
+use super::buffer::cell::{Changed, CompletionCell, CompletionDomain};
 use super::epoch::Epochs;
-use super::latch::{Held, VersionedLatch};
+use super::latch::{Held, LatchRef, Look, Marked, VersionedLatch};
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT, MIN_PAGE_SIZE};
 use super::pins::{Cells, PinCell, Pinnable, Pinned, Pins};
@@ -153,8 +153,10 @@ fn path(base: &str, (tree, class, level): FileKey) -> String {
 type FileKey = (Tree, SizeClass, u8);
 
 const LOADING: u8 = 0;
-const READY: u8 = 1;
-const FAILED: u8 = 2;
+const READING: u8 = 1;
+const PUBLISHING: u8 = 2;
+const READY: u8 = 3;
+const FAILED: u8 = 4;
 
 /// In a page's count of changes: a change not yet on disk.
 const DIRTY: u64 = 1;
@@ -260,7 +262,8 @@ pub struct MetaFrame {
     /// Written only under the latch, held exclusively; read under it, or optimistically.
     bytes: Box<Shared>,
     pins: Pins,
-    /// [`LOADING`], [`READY`] or [`FAILED`], its error then in `failure`.
+    /// Preparing, reading or publishing while below [`READY`]; [`FAILED`] keeps its error in
+    /// `failure`.
     status: AtomicU8,
     failure: SetOnce<CompletionError>,
     dirt: Dirt,
@@ -279,8 +282,14 @@ pub struct MetaFrame {
     cut_for: crate::sync::atomic::AtomicU64,
     /// The write in flight, if any.
     writing: CompletionCell,
-    /// Completed once a page loading is loaded.
+    /// An accepted read, completed once its callback begins publishing the page.
     loaded: CompletionCell,
+    /// The actor preparing a read or publishing its result, completed when that phase ends.
+    load_work: CompletionCell,
+    /// The hold's release, captured before marking its latch waited.
+    released: CompletionCell,
+    /// Announcements for the release signal, valid while this frame lives.
+    release_completions: CompletionDomain,
 }
 
 /// A metadata page held in the cache.
@@ -297,6 +306,7 @@ impl MetaFrame {
         id: MetaId,
         cutting: Arc<crate::sync::atomic::AtomicU64>,
         cut_bytes: Arc<CutBytes>,
+        epochs: Arc<Epochs>,
     ) -> Self {
         Self {
             id,
@@ -315,6 +325,9 @@ impl MetaFrame {
             cut_for: crate::sync::atomic::AtomicU64::new(0),
             writing: CompletionCell::default(),
             loaded: CompletionCell::default(),
+            load_work: CompletionCell::default(),
+            released: CompletionCell::default(),
+            release_completions: CompletionDomain::new(epochs),
         }
     }
 
@@ -377,7 +390,8 @@ impl MetaFrame {
     /// Latches the page for a change, or `None` while a change holds it. Between a checkpoint's
     /// cut and the end of its writes, the page is first kept as it stood at the cut.
     pub fn try_lock(&self) -> Option<MetaHold<'_>> {
-        Held::try_take(&self.latch).map(|hold| {
+        Held::try_take(MetaLatch(self)).map(|hold| {
+            crate::race::point("meta.lock_before_keep");
             self.keep_cut();
             MetaHold {
                 frame: self,
@@ -386,6 +400,35 @@ impl MetaFrame {
                 hold,
             }
         })
+    }
+
+    /// The checkpoint the page's last landed write was for.
+    #[cfg(test)]
+    pub(crate) fn last_written_for(&self) -> u64 {
+        self.written_for.load(Ordering::Acquire)
+    }
+
+    /// Whether a writer holds this page now. A read that follows still validates its own view.
+    pub(crate) fn is_held(&self) -> bool {
+        matches!(self.latch.look(), Look::Held(_))
+    }
+
+    /// Waits for a hold found by a read or edit to end. A hold that changed before the mark
+    /// returns a yield on that change, with no wait on a signal whose producer is already gone.
+    pub(crate) fn wait_while_held(&self) -> Completion {
+        let seen = match self.latch.look() {
+            Look::Free(_) => return Completion::new_yield(),
+            Look::Held(seen) => seen,
+        };
+        let wait = self.released.current_with(
+            &self.release_completions,
+            crate::storage::atoll::notify::remote_wait,
+        );
+        crate::race::point("meta.wait_before_mark");
+        match self.latch.mark_held(seen) {
+            Marked::Waits => wait,
+            Marked::Changed => Completion::new_yield(),
+        }
     }
 
     /// Notes a change made under the latch, which is still held and so the only change under way.
@@ -409,11 +452,33 @@ impl MetaFrame {
     }
 }
 
+/// The metadata frame whose latch is taken, so every marked release finishes its signal.
+struct MetaLatch<'a>(&'a MetaFrame);
+
+impl std::ops::Deref for MetaLatch<'_> {
+    type Target = VersionedLatch;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.latch
+    }
+}
+
+impl LatchRef for MetaLatch<'_> {
+    fn release_marked<F: FnOnce()>(&self, unlock: F) {
+        // The acquired mark publishes its registration. Free the latch before taking the cell:
+        // a waiter that installs after the take must find this hold gone when it marks it.
+        unlock();
+        if let Some(wait) = self.0.released.take(&self.0.release_completions) {
+            crate::storage::atoll::notify::finish(&wait, Ok(0));
+        }
+    }
+}
+
 /// A metadata page latched for a change; released, with its version bumped, when dropped.
 pub struct MetaHold<'a> {
     frame: &'a MetaFrame,
     page: Writer<'a>,
-    hold: Held<&'a VersionedLatch>,
+    hold: Held<MetaLatch<'a>>,
 }
 
 impl<'a> MetaHold<'a> {
@@ -465,7 +530,7 @@ pub struct MetaCache {
     order: Mutex<VecDeque<MetaId>>,
     /// Pages turned dirty, each once until a checkpoint takes it.
     dirty: Stack<MetaId>,
-    retiring: Retiring,
+    completions: CompletionDomain,
     /// The checkpoint in charge: a copy written by a later one is passed over.
     in_charge: crate::sync::atomic::AtomicU64,
     /// The checkpoint whose cut is in effect, 0 for none, shared with every frame.
@@ -497,7 +562,7 @@ impl MetaCache {
             arrivals: Stack::default(),
             order: Mutex::new(VecDeque::new()),
             dirty: Stack::default(),
-            retiring: Retiring::new(epochs.clone()),
+            completions: CompletionDomain::new(epochs.clone()),
             epochs,
             in_charge: crate::sync::atomic::AtomicU64::new(in_charge),
             cutting: Arc::new(crate::sync::atomic::AtomicU64::new(0)),
@@ -548,15 +613,40 @@ impl MetaCache {
                 id,
                 self.cutting.clone(),
                 self.cut_bytes.clone(),
+                self.epochs.clone(),
             ));
             if cell.put(&fresh, &self.cells) {
                 self.arrivals.push(id);
+                crate::race::point("meta.before_load");
                 self.load(&fresh)?;
                 self.evict_over_budget();
                 break fresh;
             }
         };
-        match frame.status.load(Ordering::Acquire) {
+        let mut status = frame.status.load(Ordering::Acquire);
+        let loaded = if status < READY {
+            let seen = status;
+            crate::race::point("meta.loading_seen");
+            let wait = if seen == READING {
+                frame.loaded.current(&self.completions)
+            } else {
+                frame.load_work.current_with(
+                    &self.completions,
+                    crate::storage::atoll::notify::remote_wait,
+                )
+            };
+            crate::race::point("meta.wait_registered");
+            // Each phase is published before its signal is taken. An install after that take
+            // sees the new phase here and never waits on the signal whose producer has left.
+            status = frame.status.load(Ordering::Acquire);
+            if status < READY && status != seen {
+                return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+            }
+            Some(wait)
+        } else {
+            None
+        };
+        match status {
             READY => Ok(IOResult::Done(frame)),
             FAILED => {
                 // Forgotten, so the next to look loads it again.
@@ -564,13 +654,10 @@ impl MetaCache {
                 let e = frame.failure.get().expect("a failed page's error");
                 Err(LimboError::CompletionError(e))
             }
-            _ => {
-                let step = self.epochs.enter();
-                let loaded = frame.loaded.get(&step);
-                Ok(IOResult::IO(IOCompletions(
-                    loaded.unwrap_or_else(Completion::new_yield),
-                )))
-            }
+            LOADING | READING | PUBLISHING => Ok(IOResult::IO(IOCompletions(
+                loaded.expect("a loading page registered before its status was checked again"),
+            ))),
+            _ => unreachable!("invalid metadata frame status {status}"),
         }
     }
 
@@ -600,19 +687,21 @@ impl MetaCache {
             Ok(file) => file,
             Err(e) => {
                 frame.fail(io_failure(&e));
+                self.finish_load(frame);
                 return Err(e);
             }
         };
         let block = Arc::new(AlignedBlock::zeroed(2 * META_PAGE));
-        let loaded = Completion::new_wait();
-        frame.loaded.put(loaded.clone());
         let target = frame.clone();
         let me = self.held();
         let (ceiling, torn_ok) = (self.in_charge(), self.torn_ok.load(Ordering::Acquire));
-        let held = block.clone();
-        let c = Completion::new_read(block.region(0, 2 * META_PAGE), move |res| {
+        let into = block.region(0, 2 * META_PAGE);
+        let held = block;
+        let c = Completion::new_read(into, move |res| {
             // Gone, the cache has no one left to wait on the page.
             let me = me.upgrade()?;
+            me.read_arrived(&target);
+            crate::race::point("meta.load_publishing");
             let outcome = match res {
                 Ok((_, n)) => {
                     // SAFETY: the read filled the block, which nothing else uses.
@@ -625,8 +714,9 @@ impl MetaCache {
             // The page before its status: a page found ready reads whole. Loaded, not changed:
             // no cut is kept of it.
             if let Ok((Some(bytes), _)) = &outcome {
-                let hold =
-                    Held::try_take(&target.latch).expect("a page loading is latched by no one");
+                let hold = Held::try_take(MetaLatch(&target))
+                    .expect("a page loading is latched by no one");
+                crate::race::point("meta.load_held");
                 // SAFETY: the hold has the latch exclusively while the writer lives.
                 unsafe { target.bytes.writer() }.write(0, bytes);
                 drop(hold);
@@ -640,19 +730,49 @@ impl MetaCache {
                 }
                 Err(e) => target.fail(e),
             }
-            if let Some(c) = target.loaded.take(&me.retiring) {
-                c.complete(0);
-            }
+            me.finish_load(&target);
             None
         });
+        crate::race::point("meta.before_read_submit");
         if let Err(e) = file.pread(id.offset(), c) {
             frame.fail(io_failure(&e));
-            if let Some(c) = frame.loaded.take(&self.retiring) {
-                c.complete(0);
-            }
+            self.finish_load(frame);
             return Err(e);
         }
+        // The backend accepted the read. Its callback may already have published the page,
+        // so only the preparing phase can become a queued read.
+        if frame
+            .status
+            .compare_exchange(LOADING, READING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.finish_load_work(frame);
+        }
         Ok(())
+    }
+
+    /// The read has reached its callback: further progress is this actor's publication work.
+    fn read_arrived(&self, frame: &MetaRef) {
+        frame.status.store(PUBLISHING, Ordering::Release);
+        self.finish_read(frame);
+    }
+
+    /// A load's final status is published: both kinds of waiters look at it again.
+    fn finish_load(&self, frame: &MetaRef) {
+        self.finish_read(frame);
+        self.finish_load_work(frame);
+    }
+
+    fn finish_read(&self, frame: &MetaRef) {
+        if let Some(c) = frame.loaded.take(&self.completions) {
+            c.complete(0);
+        }
+    }
+
+    fn finish_load_work(&self, frame: &MetaRef) {
+        if let Some(c) = frame.load_work.take(&self.completions) {
+            c.complete(0);
+        }
     }
 
     /// Drops clean pages no one holds while over the budget, oldest first.
@@ -699,7 +819,8 @@ impl MetaCache {
     /// Marks `frame` owed a write: a checkpoint cut short may have written its other place, which
     /// the next checkpoint, taking the same number, must write over (audit 18, review 2).
     pub fn owe(&self, frame: &MetaFrame) -> Option<()> {
-        let hold = Held::try_take(&frame.latch)?;
+        let hold = Held::try_take(MetaLatch(frame))?;
+        crate::race::point("meta.owe_held");
         frame.changed(self);
         drop(hold);
         Some(())
@@ -711,40 +832,47 @@ impl MetaCache {
         if frame.written_for.load(Ordering::Acquire) == n {
             return Ok(None);
         }
-        {
-            let step = self.epochs.enter();
-            if let Some(c) = frame.writing.get(&step) {
-                return Ok(Some(c));
-            }
+        match frame.writing.get(&self.completions) {
+            Ok(Some(c)) => return Ok(Some(c)),
+            Err(Changed) => return Ok(Some(Completion::new_yield())),
+            Ok(None) => {}
         }
         // The page as it stood at the cut, or as it stands: no change came since the cut, and a
         // change under way would keep it first. A change after the copy counts itself.
+        // A cut copy is immutable even under a live hold. Without one, wait before allocating
+        // the image: repeated polls of the same paused hold reuse only its logical wait.
+        let version = if frame.cut_for.load(Ordering::Acquire) == n {
+            None
+        } else {
+            match frame.latch.optimistic() {
+                Some(version) => Some(version),
+                None => {
+                    crate::race::point("meta.write_found_held");
+                    return Ok(Some(frame.wait_while_held()));
+                }
+            }
+        };
         let copy = Arc::new(AlignedBlock::zeroed(META_PAGE));
         // SAFETY: a fresh block of the page's size, which nothing else reaches yet.
         let out = unsafe { std::slice::from_raw_parts_mut(copy.as_ptr(), META_PAGE) };
-        let count = if frame.cut_for.load(Ordering::Acquire) == n {
-            out.copy_from_slice(frame.cut.lock().as_ref().expect("a page kept at the cut"));
-            None
-        } else {
-            let Some(version) = frame.latch.optimistic() else {
-                return Ok(Some(Completion::new_yield()));
-            };
+        let count = if let Some(version) = version {
             let count = frame.dirt.count();
             frame.bytes.copy_to(0, out);
             if !frame.latch.validate(version) || frame.cut_for.load(Ordering::Acquire) == n {
                 return Ok(Some(Completion::new_yield()));
             }
             Some(count)
+        } else {
+            out.copy_from_slice(frame.cut.lock().as_ref().expect("a page kept at the cut"));
+            None
         };
-        let writing = Completion::new_wait();
+        let writing = crate::storage::atoll::notify::wait();
         if !frame.writing.try_put(writing.clone()) {
-            let step = self.epochs.enter();
-            return Ok(Some(
-                frame
-                    .writing
-                    .get(&step)
-                    .unwrap_or_else(Completion::new_yield),
-            ));
+            let wait = match frame.writing.get(&self.completions) {
+                Ok(Some(c)) => c,
+                Ok(None) | Err(Changed) => Completion::new_yield(),
+            };
+            return Ok(Some(wait));
         }
         let side: u8 = match frame.durable_side.load(Ordering::Acquire) {
             0 => 0,
@@ -755,7 +883,7 @@ impl MetaCache {
         let file = match self.file(frame.id) {
             Ok(file) => file,
             Err(e) => {
-                if let Some(c) = frame.writing.take(&self.retiring) {
+                if let Some(c) = frame.writing.take(&self.completions) {
                     c.error(io_failure(&e));
                 }
                 return Err(e);
@@ -776,7 +904,7 @@ impl MetaCache {
                 target.written_for.store(n, Ordering::Release);
                 target.written(&me, count);
             }
-            if let Some(c) = target.writing.take(&me.retiring) {
+            if let Some(c) = target.writing.take(&me.completions) {
                 match res {
                     Ok(()) => c.complete(0),
                     Err(e) => c.error(e),
@@ -814,7 +942,7 @@ impl MetaCache {
             file.pwrite(at, buffer, c)
         };
         if let Err(e) = submitted {
-            if let Some(c) = frame.writing.take(&self.retiring) {
+            if let Some(c) = frame.writing.take(&self.completions) {
                 c.error(io_failure(&e));
             }
             return Err(e);
@@ -956,3 +1084,6 @@ mod loom_tests {
         });
     }
 }
+
+#[cfg(all(test, not(any(atoll_loom, shuttle))))]
+mod tests;

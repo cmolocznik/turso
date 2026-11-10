@@ -222,7 +222,7 @@ fn threads_joining_at_once_take_slots_of_their_own_across_chunks() {
             .map(|_| {
                 let epochs = epochs.clone();
                 thread::spawn(move || {
-                    let slot = epochs.registry.join();
+                    let slot = epochs.registry.join().slot;
                     slot.word.store(announcing(1), Ordering::Release);
                     slot as *const Slot as usize
                 })

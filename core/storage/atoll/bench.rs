@@ -146,9 +146,15 @@ fn commits() {
                 meta_pages: 1 << 10,
             },
             buffer: BufferConfig {
-                budget: min_budget_beside(ring_bytes(&log)),
+                budget: min_budget_beside(
+                    ring_bytes(&log),
+                    crate::storage::atoll::buffer::bank_frames(
+                        crate::storage::atoll::checkpoint::WRITE_BYTES,
+                    ),
+                ),
                 writeback_bytes: WRITEBACK_BYTES,
                 kept_bytes: None,
+                lent_at_open: Default::default(),
             },
             log,
             log_budget: None,
@@ -1022,6 +1028,46 @@ fn stream() {
 
 /// On this thread so far: allocations, bytes copied into the log's ring, and bytes of changes
 /// encoded into transactions' buffers. Starts the most memory a transaction's buffer held again.
+/// An exclusive fix of a page already resident and its release, the pair a latch's release is
+/// costed on (DESIGN.md 9.1.3, the latch's release): the same page every time, its first release
+/// (marked, so the slow one) and a warm-up before the timed phase, no checkpoint and nothing else
+/// modifying the pool meanwhile, so every timed release is unmarked. `ATOLL_BENCH_PAIRS` sets the
+/// pairs (10,000,000); `ATOLL_PERF_CTL` and `ATOLL_PERF_ACK` as for [`paths`].
+///
+/// ```text
+/// cargo test --release -p turso_core --lib storage::atoll::bench::fix_pairs -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn fix_pairs() {
+    use super::page::SizeClass;
+    use crate::types::IOResult;
+    let pairs: u64 = std::env::var("ATOLL_BENCH_PAIRS").map_or(10_000_000, |r| r.parse().unwrap());
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Atoll::open(io.clone(), "/db/bench-fix", bench_config()).unwrap();
+    let pool = db.pool().clone();
+    let pid = {
+        let mut page = drive(&io, || pool.allocate(SizeClass::new(0).unwrap())).unwrap();
+        page.changed();
+        page.pid()
+    };
+    let pair = || match pool.fix_exclusive(pid, None).unwrap() {
+        IOResult::Done(page) => drop(page),
+        IOResult::IO(_) => panic!("a resident page's fix waited"),
+    };
+    for _ in 0..pairs / 10 {
+        pair();
+    }
+    perf_control("enable");
+    let began = Instant::now();
+    for _ in 0..pairs {
+        pair();
+    }
+    let ns = began.elapsed().as_nanos() as f64 / pairs as f64;
+    perf_control("disable");
+    println!("bench fix-pair ops {pairs} ns/op {ns:.2}");
+}
+
 fn counts() -> (u64, u64, u64) {
     super::txn::changes::HELD.with(|n| n.set(0));
     (
@@ -1072,6 +1118,7 @@ fn bench_config() -> AtollConfig {
             budget: 2 << 30,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget: None,
         checkpoint_write_bytes: None,

@@ -87,7 +87,8 @@ pub fn recover(
         store.meta().set_torn_ok(false);
         for frame in frames? {
             while store.meta().owe(&frame).is_none() {
-                std::hint::spin_loop();
+                let wait = frame.wait_while_held();
+                crate::storage::atoll::park::wait(io.as_ref(), &wait);
             }
         }
     }

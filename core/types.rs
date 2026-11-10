@@ -27,7 +27,7 @@ use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
 use std::task::{Poll, Waker};
@@ -3672,7 +3672,7 @@ pub struct IOCompletions(pub Completion);
 
 pub struct IOCompletionAsync<'a, I: ?Sized + IO> {
     io: &'a I,
-    completion: Completion,
+    completion: crate::io::CompletionFuture,
 }
 
 impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
@@ -3682,12 +3682,22 @@ impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let completion = std::pin::pin!(&mut self.as_mut().completion);
+        // SAFETY: the future owns this private field, never moves it while pinned, and its drop
+        // does not move the field. There is no Unpin implementation for the enclosing future.
+        let completion = unsafe { self.as_mut().map_unchecked_mut(|this| &mut this.completion) };
         match completion.poll(cx) {
             // A pumped backend delivers only when stepped; on any other the delivery owner wakes
             // the poller (DESIGN.md 22.5).
-            Poll::Pending if self.io.delivery() == crate::io::Delivery::Pumped => {
-                self.io.step()?;
+            Poll::Pending
+                if self.io.delivery() == crate::io::Delivery::Pumped
+                    && !self.completion.completion().is_remote_wait() =>
+            {
+                if let Err(_error) = self.io.step() {
+                    crate::io::stepping_failed("an async wait for a completion");
+                }
+                if !self.completion.completion().finished() {
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Pending
             }
             res => res,
@@ -3706,7 +3716,7 @@ impl IOCompletions {
     pub async fn wait_async<I: ?Sized + IO>(self, io: &I) -> Result<()> {
         IOCompletionAsync {
             io,
-            completion: self.0,
+            completion: self.0.into_future(),
         }
         .await
     }

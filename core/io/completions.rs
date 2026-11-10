@@ -1,9 +1,10 @@
 use crate::{turso_assert, turso_assert_eq};
 use core::fmt::{self, Debug};
 use std::{
-    future::Future,
+    cell::Cell,
+    future::{Future, IntoFuture},
     sync::{
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
     },
     task::{Poll, Waker},
@@ -29,29 +30,105 @@ pub struct Completion {
     pub(super) inner: Option<Arc<CompletionInner>>,
 }
 
-impl Future for Completion {
+impl IntoFuture for Completion {
+    type Output = Result<(), crate::LimboError>;
+    type IntoFuture = CompletionFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        CompletionFuture {
+            completion: self,
+            key: Cell::new(None),
+            _pinned: std::marker::PhantomPinned,
+        }
+    }
+}
+
+/// One asynchronous waiter: its latest waker is registered until the waiter is dropped.
+pub struct CompletionFuture {
+    completion: Completion,
+    key: Cell<Option<WakerKey>>,
+    // The registration's key is this field's address once the future is polled.
+    _pinned: std::marker::PhantomPinned,
+}
+
+impl Future for CompletionFuture {
     type Output = Result<(), crate::LimboError>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        self.set_waker(cx.waker());
-        if self.finished() {
-            self.wake();
-            let res = self
-                .get_error()
-                .map_or(Ok(()), |err| Err(crate::LimboError::CompletionError(err)));
-            return Poll::Ready(res);
+        let this = self.as_ref().get_ref();
+        if !this.completion.finished() {
+            let key = this.key.get().unwrap_or_else(|| {
+                let key = WakerKey::new(std::ptr::addr_of!(this.key) as usize).unwrap();
+                this.key.set(Some(key));
+                key
+            });
+            this.completion.set_keyed_waker(key, cx.waker());
+        }
+        if this.completion.finished() {
+            return Poll::Ready(this.completion.get_error().map_or(Ok(()), |error| {
+                Err(crate::LimboError::CompletionError(error))
+            }));
         }
         Poll::Pending
+    }
+}
+
+impl CompletionFuture {
+    pub(crate) fn completion(&self) -> &Completion {
+        &self.completion
+    }
+}
+
+impl Drop for CompletionFuture {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.get() {
+            self.completion.withdraw_key(key);
+        }
+    }
+}
+
+/// A key a waiter registers its waker under, unique while it is registered (the address of what
+/// owns the waker), so it withdraws exactly that registration: `Waker::will_wake` may say two
+/// wakers of one task differ, which cannot withdraw exactly. Nonzero, so an unkeyed registration
+/// costs no word of its own.
+pub type WakerKey = std::num::NonZeroUsize;
+
+/// A waker registered on a completion: keyed by a waiter that withdraws it, or not.
+struct Registered {
+    key: Option<WakerKey>,
+    waker: Waker,
+}
+
+/// Where an engine's wait hands its wakers ([`Completion::new_engine_wait`]): a plain function,
+/// stored in the completion beside its result, so a dispatch allocates nothing.
+pub type Dispatch = fn(Wakers);
+
+/// The wakers of a wait finished by [`Completion::finish_deferred`], taken and not yet woken.
+#[must_use = "a wait's wakers taken and never woken leave its waiters parked"]
+pub struct Wakers(SmallVec<[Registered; 1]>);
+
+impl Wakers {
+    pub fn wake(self) {
+        for registered in self.0 {
+            registered.waker.wake();
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
 #[derive(Default)]
 struct ContextInner {
     /// A waker for each task waiting on the completion. Finishing the completion wakes them all.
-    wakers: SmallVec<[Waker; 1]>,
+    wakers: SmallVec<[Registered; 1]>,
     /// What runs once the request is retired, registered while a backend owns it
     /// ([`Completion::on_retired`]).
     on_retired: Vec<Box<dyn FnOnce() + Send>>,
+    /// What watches the request's ownership ([`Completion::watch_ownership`]), each with whether
+    /// it was told that only a finish under way can retire the request now.
+    watches: Vec<(Arc<dyn OwnershipWatch>, bool)>,
     // TODO: add abort signal
 }
 
@@ -60,13 +137,19 @@ impl Debug for ContextInner {
         f.debug_struct("ContextInner")
             .field("wakers", &self.wakers.len())
             .field("on_retired", &self.on_retired.len())
+            .field("watches", &self.watches.len())
             .finish()
     }
 }
 
+#[derive(Debug)]
+struct ContextState {
+    inner: Mutex<ContextInner>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Context {
-    inner: Arc<Mutex<ContextInner>>,
+    inner: Arc<ContextState>,
 }
 
 impl ContextInner {
@@ -74,16 +157,47 @@ impl ContextInner {
         Self {
             wakers: SmallVec::new(),
             on_retired: Vec::new(),
+            watches: Vec::new(),
         }
     }
 
-    /// Registers `waker` unless a waker of the same task is registered already. Another task's
-    /// waker stays registered beside it, so each task waiting on the completion is woken when it
-    /// finishes, and registering wakes no task.
-    pub fn set_waker(&mut self, waker: &Waker) {
-        if !self.wakers.iter().any(|w| w.will_wake(waker)) {
-            self.wakers.push(waker.clone());
+    /// Tells each watch not yet told that only finishes elsewhere move the request now: once
+    /// each, whichever let it go first, its own backend or its carrier's.
+    fn tell_finisher_left(&mut self) {
+        for (watch, told) in self.watches.iter_mut().filter(|(_, told)| !*told) {
+            watch.finisher_left();
+            *told = true;
         }
+    }
+
+    /// Registers `waker` unless a waker of the same task is registered already, as far as
+    /// `will_wake` can tell. Another task's waker stays registered beside it, so each task waiting
+    /// on the completion is woken when it finishes, and registering wakes no task.
+    /// Takes a clone made before the lock was taken and hands it back unused, to be dropped once
+    /// the lock is let go: a waker's clone and drop never run under the lock.
+    fn set_waker(&mut self, waker: Waker) -> Option<Waker> {
+        if self
+            .wakers
+            .iter()
+            .any(|r| r.key.is_none() && r.waker.will_wake(&waker))
+        {
+            return Some(waker);
+        }
+        self.wakers.push(Registered { key: None, waker });
+        None
+    }
+
+    /// Keeps the latest `waker` under `key`: at most one registration per key, with the previous
+    /// waker dropped after the lock is released.
+    fn set_keyed_waker(&mut self, key: WakerKey, waker: Waker) -> Option<Waker> {
+        if let Some(registered) = self.wakers.iter_mut().find(|r| r.key == Some(key)) {
+            return Some(std::mem::replace(&mut registered.waker, waker));
+        }
+        self.wakers.push(Registered {
+            key: Some(key),
+            waker,
+        });
+        None
     }
 }
 
@@ -96,26 +210,75 @@ impl Default for Context {
 impl Context {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ContextInner::new())),
+            inner: Arc::new(ContextState::new()),
+        }
+    }
+
+    /// Wakes registered tasks with no lock held.
+    pub fn wake(&self) {
+        self.inner.wake();
+    }
+
+    /// Removes the registration under `key`, dropping it after releasing the lock.
+    pub fn withdraw_key(&self, key: WakerKey) {
+        self.inner.withdraw_key(key);
+    }
+
+    /// Registers `waker` beside the other tasks waiting.
+    pub fn set_waker(&self, waker: &Waker) {
+        self.inner.set_waker(waker);
+    }
+}
+
+impl ContextState {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(ContextInner::new()),
         }
     }
 
     /// Takes the wakers under the lock and wakes them once the lock is free: a waker may register
     /// again on the same completion from its wake.
-    pub fn wake(&self) {
+    fn wake(&self) {
         let wakers = std::mem::take(&mut self.inner.lock().wakers);
-        for waker in wakers {
-            waker.wake();
+        for registered in wakers {
+            registered.waker.wake();
         }
     }
 
+    /// Withdraws the waker registered under `key`, exactly. It is dropped once the lock is let
+    /// go: dropping it may run its owner's destructor, which must not run under the completion's
+    /// lock.
+    fn withdraw_key(&self, key: WakerKey) {
+        let withdrawn = {
+            let mut inner = self.inner.lock();
+            let at = inner.wakers.iter().position(|r| r.key == Some(key));
+            at.map(|i| inner.wakers.swap_remove(i))
+        };
+        drop(withdrawn);
+    }
+
     /// Registers `waker` beside the wakers of the other tasks waiting on the completion.
-    pub fn set_waker(&self, waker: &Waker) {
+    fn set_waker(&self, waker: &Waker) {
         // Shuttle cannot see the std `OnceLock` holding a completion's result, so yield here to
         // let it run a completion between a test of that result and this store.
         #[cfg(shuttle)]
         crate::thread::yield_now();
-        self.inner.lock().set_waker(waker);
+        let waker = waker.clone();
+        let unused = self.inner.lock().set_waker(waker);
+        drop(unused);
+    }
+
+    /// Registers `waker` under `key`, cloned before the lock and any unused clone dropped after.
+    fn set_keyed_waker(&self, key: WakerKey, waker: &Waker) {
+        let waker = waker.clone();
+        let unused = self.inner.lock().set_keyed_waker(key, waker);
+        drop(unused);
+    }
+
+    /// Takes every waker registered, under the lock, for a dispatch that runs them elsewhere.
+    fn take(&self) -> Wakers {
+        Wakers(std::mem::take(&mut self.inner.lock().wakers))
     }
 }
 
@@ -129,6 +292,44 @@ const RETIRED: u8 = 2;
 /// Beside [`ACCEPTED`]: something waits for the retirement ([`Completion::on_retired`]), so
 /// whoever ends the ownership takes the waits.
 const OBSERVED: u8 = 4;
+/// The request's callback, run by a finish other than its delivery (a cancellation, a carrying
+/// layer's finish), has returned.
+const CALLED: u8 = 8;
+/// What watches a request's ownership (DESIGN.md 22.5): told once if its backend, or the backend
+/// of the request carrying it ([`Completion::carry`]), lets it go while another finish still runs
+/// a callback, so that only finishes elsewhere can move it, and told when it retires. The first is told under the completion's lock, as is the taking of the watches at
+/// retirement, so a watch hears the two in that order: a count kept from them never goes below
+/// what it counted.
+pub trait OwnershipWatch: Send + Sync {
+    /// The backend let the request, or the one carrying it, go while another finish runs a
+    /// callback.
+    fn finisher_left(&self);
+    /// The request retired; `told` if [`finisher_left`](Self::finisher_left) was told first.
+    fn retired(&self, told: bool);
+}
+
+/// The backend let the request go while another finish was still running its callback. The
+/// retirement waits for both [`CALLED`] and this: whichever is set second, by the one atomic step
+/// that sets it, sees the other and retires the request, so each happens once and neither waits.
+const ENDED: u8 = 16;
+/// The request carrying this one ([`Completion::carry`]) left its backend while a finish elsewhere
+/// still runs its callback, so that only finishes elsewhere move this one now. It says who can
+/// make progress, never who holds the buffers: the retirement waits for the carrier's, as before,
+/// and this bit takes no part in it.
+const CARRIER_ENDED: u8 = 32;
+
+/// What a request carried through another ([`Completion::carry`]) learns from its carrier: that it
+/// left its backend, and its retirement, which retires the carried request in turn.
+struct Carried(Completion);
+
+impl OwnershipWatch for Carried {
+    fn finisher_left(&self) {
+        self.0.carrier_left();
+    }
+    fn retired(&self, _told: bool) {
+        self.0.retire();
+    }
+}
 
 pub(super) struct CompletionInner {
     completion_type: CompletionType,
@@ -137,7 +338,11 @@ pub(super) struct CompletionInner {
     /// None means we completed successfully
     // Thread safe with OnceLock
     pub(super) result: crate::sync::OnceLock<Option<CompletionError>>,
-    context: Context,
+    /// Taken by the one finish that runs the callback and publishes `result`. Every other finish
+    /// (a cancellation from the callback itself, from a waker it runs, or from another thread)
+    /// finds it taken and returns at once: it never waits for the callback it would re-enter.
+    finishing: AtomicBool,
+    context: ContextState,
     /// The group this completion belongs to, if any. `CompletionGroup::add`
     /// sets it before the completion is submitted, so by the time the
     /// completion finishes and its callback counts it into the group, the
@@ -146,7 +351,14 @@ pub(super) struct CompletionInner {
     /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
     /// where pwrite returns before the kernel has consumed the buffer.
     write_buffer: OnceLock<Arc<Buffer>>,
+    /// For a wait the engine makes ([`Completion::new_engine_wait`]), where its wakers go: every way
+    /// of running them (a finish, a late registration, a nudge) hands them to this function
+    /// instead of waking them in place (DESIGN.md 9.1.3). Never counted into a group. Set at
+    /// making.
+    engine: Option<Dispatch>,
 }
+
+const _: () = assert!(std::mem::align_of::<CompletionInner>() >= 2);
 
 impl fmt::Debug for CompletionInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -208,6 +420,10 @@ impl CompletionGroup {
     /// backend. The child's own callback is what counts it into the group,
     /// so the link has to be there before the child can finish.
     pub fn add(&mut self, c: &Completion) {
+        turso_assert!(
+            !c.is_engine_wait(),
+            "an engine's wait added to a group: it is finished only by its maker"
+        );
         self.completions.push(c.clone());
         let member = match &c.get_inner().completion_type {
             CompletionType::Group(group) => Member::Group(group.inner.members.clone()),
@@ -280,6 +496,23 @@ struct GroupCompletionInner {
     result: OnceLock<Option<CompletionError>>,
 }
 
+/// Whether `holds` holds for every request beneath `list`, walked newest first and stopped at the
+/// first it fails for, with no allocation: a pumped wait asks it before each step, and the newest
+/// request is the likeliest one a backend still holds. A request gone is owned by no one and a
+/// wait another thread finishes is no backend's: neither is asked. Lists point only down, so the
+/// walk ends; a list reached twice is walked twice, which changes no answer.
+fn every_request(list: &Members, holds: &impl Fn(&Completion) -> bool) -> bool {
+    list.0.lock().iter().rev().all(|member| match member {
+        Member::Group(list) => every_request(list, holds),
+        Member::Request(weak) => weak.upgrade().is_none_or(|inner| {
+            matches!(
+                inner.completion_type,
+                CompletionType::Yield | CompletionType::Remote
+            ) || holds(&Completion { inner: Some(inner) })
+        }),
+    })
+}
+
 /// What a group lists, walked down to the requests beneath it (DESIGN.md 22.5). A request is held
 /// weakly: a backend that owns one holds it, so a request gone is owned by no one, and a strong hold
 /// would keep its buffers past its retirement. A group is no backend's, so a request beneath it can
@@ -332,14 +565,25 @@ pub enum CompletionType {
 }
 
 impl CompletionInner {
+    /// Runs the wakers registered: in place for a plain completion, through its dispatch for an
+    /// engine's wait, taken under the lock either way.
+    fn run_wakers(&self) {
+        match self.engine {
+            Some(dispatch) => dispatch(self.context.take()),
+            None => self.context.wake(),
+        }
+    }
+
     fn new(completion_type: CompletionType) -> Self {
         Self {
             completion_type,
             ownership: AtomicU8::new(NOT_SUBMITTED),
             result: OnceLock::new(),
-            context: Context::new(),
+            finishing: AtomicBool::new(false),
+            context: ContextState::new(),
             parent: Mutex::new(None),
             write_buffer: OnceLock::new(),
+            engine: None,
         }
     }
 }
@@ -424,6 +668,27 @@ impl Completion {
         Self::new(CompletionType::Remote)
     }
 
+    /// A wait the engine makes, of the stepped kind ([`new_wait`]): whoever finishes or nudges it
+    /// (its maker through [`finish_deferred`](Self::finish_deferred), `complete`, `error`,
+    /// `abort`, `wake` or a late registration), its wakers go to `dispatch`, never run in place.
+    /// Never added to a group.
+    pub fn new_engine_wait(dispatch: Dispatch) -> Self {
+        Self::engine(CompletionType::Yield, dispatch)
+    }
+
+    /// A wait the engine makes and finishes itself, of the remote kind ([`new_remote_wait`]).
+    pub fn new_engine_remote_wait(dispatch: Dispatch) -> Self {
+        Self::engine(CompletionType::Remote, dispatch)
+    }
+
+    fn engine(completion_type: CompletionType, dispatch: Dispatch) -> Self {
+        let mut inner = CompletionInner::new(completion_type);
+        inner.engine = Some(dispatch);
+        Self {
+            inner: Some(Arc::new(inner)),
+        }
+    }
+
     /// Whether another thread completes this wait, so that a waiter may block on it.
     pub fn is_remote_wait(&self) -> bool {
         self.inner
@@ -436,6 +701,13 @@ impl Completion {
     pub(crate) fn into_raw(self) -> *const () {
         self.inner
             .map_or(std::ptr::null(), |inner| Arc::into_raw(inner).cast())
+    }
+
+    /// The pointer kept alive by this handle, without handing over its reference.
+    pub(crate) fn as_raw(&self) -> *const () {
+        self.inner
+            .as_ref()
+            .map_or(std::ptr::null(), |inner| Arc::as_ptr(inner).cast())
     }
 
     /// The completion behind `raw`, with the reference it held.
@@ -465,6 +737,12 @@ impl Completion {
         unsafe { Self::from_raw(raw) }
     }
 
+    /// The address of the completion's shared state: the same for every handle to one completion,
+    /// none for a yield. An identity, never dereferenced.
+    pub(crate) fn addr(&self) -> Option<usize> {
+        self.inner.as_ref().map(|inner| Arc::as_ptr(inner).addr())
+    }
+
     /// Whether `other` is this same completion, not merely an equal one.
     pub(crate) fn ptr_eq(&self, other: &Completion) -> bool {
         match (&self.inner, &other.inner) {
@@ -484,7 +762,7 @@ impl Completion {
 
     pub fn wake(&self) {
         if let Some(inner) = &self.inner {
-            inner.context.wake();
+            inner.run_wakers();
         }
     }
 
@@ -502,7 +780,7 @@ impl Completion {
             if let Some(group) = group {
                 group.wake();
             }
-            inner.context.wake();
+            inner.run_wakers();
         }
     }
 
@@ -524,12 +802,62 @@ impl Completion {
         if self.finished() {
             return;
         }
-        self.set_waker(&Waker::from(std::sync::Arc::new(Unpark(
-            crate::thread::current(),
-        ))));
-        while !self.finished() {
+        let waker = Waker::from(std::sync::Arc::new(Unpark(crate::thread::current())));
+        loop {
+            // A progress wake consumes the waker before the completion finishes.
+            self.set_waker(&waker);
+            if self.finished() {
+                return;
+            }
             crate::thread::park();
         }
+    }
+
+    /// Registers `waker` under `key` ([`WakerKey`]), at most once per key, beside the wakers of
+    /// the other tasks waiting: for a waiter that withdraws it exactly. Before testing for
+    /// completion, as [`set_waker`](Self::set_waker).
+    pub fn set_keyed_waker(&self, key: WakerKey, waker: &Waker) {
+        match &self.inner {
+            None => waker.wake_by_ref(),
+            Some(inner) => {
+                inner.context.set_keyed_waker(key, waker);
+                crate::race::point("completion.registered");
+                if self.finished() {
+                    inner.run_wakers();
+                }
+            }
+        }
+    }
+
+    /// Withdraws the waker registered under `key` from those the completion wakes as it finishes:
+    /// a subscription its waiter no longer needs.
+    pub fn withdraw_key(&self, key: WakerKey) {
+        if let Some(inner) = &self.inner {
+            inner.context.withdraw_key(key);
+        }
+    }
+
+    /// Whether the completion's registry lock is held now, for a test that a waker's clone and
+    /// drop run outside it.
+    #[cfg(test)]
+    pub fn registry_held(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.context.inner.try_lock().is_none())
+    }
+
+    /// How many wakers wait on the completion, for a test of a bound.
+    #[cfg(test)]
+    pub fn wakers(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.context.inner.lock().wakers.len())
+    }
+
+    /// How many handles share this completion: 1 when the caller's is the only one. For a holder
+    /// that keeps a handle to tell when every other has been dropped.
+    pub fn handles(&self) -> usize {
+        self.inner.as_ref().map_or(0, Arc::strong_count)
     }
 
     /// Registers the waker before testing for completion: a completion finished on another thread
@@ -539,8 +867,9 @@ impl Completion {
             None => waker.wake_by_ref(),
             Some(inner) => {
                 inner.context.set_waker(waker);
+                crate::race::point("completion.registered");
                 if self.finished() {
-                    inner.context.wake();
+                    inner.run_wakers();
                 }
             }
         }
@@ -599,6 +928,37 @@ impl Completion {
         self.error(CompletionError::Aborted);
     }
 
+    /// Whether this is a wait the engine makes and finishes itself: one
+    /// [`finish_deferred`](Self::finish_deferred) takes. Read from a mark set at making.
+    pub fn is_engine_wait(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.engine.is_some())
+    }
+
+    /// Finishes a wait the engine made ([`new_engine_wait`](Self::new_engine_wait),
+    /// [`new_engine_remote_wait`](Self::new_engine_remote_wait)): publishes `result` and hands back
+    /// its wakers without running them, for a caller that publishes several results before any
+    /// waker runs (DESIGN.md 9.1.3). Anything else (a request, a group, any other wait) is refused:
+    /// a request's callback and a group's count must run where they finish, and an engine's wait is
+    /// never in a group, which `CompletionGroup::add` refuses.
+    pub fn finish_deferred(&self, result: Result<i32, CompletionError>) -> Wakers {
+        let inner = self.get_inner();
+        turso_assert!(
+            inner.engine.is_some(),
+            "a deferred finish of a completion the engine did not make as its wait"
+        );
+        // The one finish, as `callback` claims it: a finish already under way publishes and wakes
+        // itself, so there is nothing to hand back.
+        if inner.finishing.swap(true, Ordering::AcqRel) {
+            return Wakers(SmallVec::new());
+        }
+        let published = inner.result.set(result.err()).is_ok();
+        turso_assert!(published, "a completion's result published twice");
+        crate::race::point("completion.published");
+        Wakers(std::mem::take(&mut inner.context.inner.lock().wakers))
+    }
+
     /// Whether this is a request a backend carries out (a read, a write, a sync, a truncation),
     /// rather than a group or a wait.
     fn is_request(&self) -> bool {
@@ -620,12 +980,12 @@ impl Completion {
     /// it to retire.
     pub fn accept(&self) {
         turso_assert!(self.is_request(), "only a request is submitted");
-        let ownership = &self.get_inner().ownership;
-        if let Err(was) =
-            ownership.compare_exchange(NOT_SUBMITTED, ACCEPTED, Ordering::AcqRel, Ordering::Acquire)
-        {
-            turso_assert!(was & ACCEPTED != 0, "a retired request submitted again");
-        }
+        // Kept beside the acceptance: a callback a cancellation already ran ([`CALLED`]).
+        let was = self
+            .get_inner()
+            .ownership
+            .fetch_or(ACCEPTED, Ordering::AcqRel);
+        turso_assert!(was & RETIRED == 0, "a retired request submitted again");
     }
 
     /// A submission that accepted the request gives it back whole, its callback not run: nothing
@@ -645,15 +1005,84 @@ impl Completion {
         }
     }
 
-    /// The backend that delivered the request lets it go, and every buffer with it, after its
-    /// callback returned: inline at the submission's return, a queueing backend once it delivered
-    /// it. What waited for the retirement runs now.
+    /// The backend that delivered the request lets it go, and every buffer with it: inline at the
+    /// submission's return, a queueing backend once it delivered it, a carrying layer once the
+    /// request it carried retired. The request retires once its callback has also returned: now,
+    /// or, while another finish still runs it, by that finish as it returns. What waited for the
+    /// retirement runs then.
     pub fn retire(&self) {
         turso_assert!(self.is_request(), "only a request is retired");
         turso_assert!(
-            self.finished(),
-            "a request retired before its callback returned"
+            self.get_inner().finishing.load(Ordering::Acquire),
+            "a request retired before any finish ran its callback"
         );
+        self.ended();
+    }
+
+    /// Delivers the request's result, running its callback, and retires it: a backend's delivery.
+    /// A delivery that runs the callback retires as it returns, with nothing to meet. One that
+    /// finds another finish running it (a cancellation) leaves the retirement to whichever of the
+    /// two ends second; it neither waits for that callback nor retires before it.
+    pub fn deliver(&self, result: Result<i32, CompletionError>) {
+        turso_assert!(self.is_request(), "only a request is delivered");
+        if self.run_callback(result) {
+            self.retire_now();
+        } else {
+            self.ended();
+        }
+    }
+
+    /// The backend's end of a request whose callback a finish has claimed: retires it if that
+    /// callback returned, or marks the end for its finish to retire it as it returns.
+    fn ended(&self) {
+        let inner = self.get_inner();
+        // Already returned: its finish saw no end and will not retire, so this one does.
+        if inner.ownership.load(Ordering::Acquire) & CALLED != 0 {
+            return self.retire_now();
+        }
+        let was = {
+            // Under the lock the watches register and are taken at retirement under: each hears
+            // the end before the retirement, and one registering now reads the end itself.
+            let mut context = inner.context.inner.lock();
+            let was = inner.ownership.fetch_or(ENDED, Ordering::AcqRel);
+            turso_assert!(was & (RETIRED | ENDED) == 0, "a request retired twice");
+            context.tell_finisher_left();
+            was
+        };
+        if was & CALLED != 0 {
+            self.retire_now();
+        }
+    }
+
+    /// The request carrying this one left its backend while a finish elsewhere runs its callback
+    /// ([`CARRIER_ENDED`]): its watches hear it as they hear the request's own end, once each. A
+    /// carried request's lock is taken under its carrier's, never the reverse.
+    fn carrier_left(&self) {
+        let inner = self.get_inner();
+        let mut context = inner.context.inner.lock();
+        let was = inner.ownership.fetch_or(CARRIER_ENDED, Ordering::AcqRel);
+        turso_assert!(
+            was & ACCEPTED != 0,
+            "a carried request was let go before its carrier retired"
+        );
+        context.tell_finisher_left();
+    }
+
+    /// A finish other than the delivery ran the request's callback, which returned: retires the
+    /// request if the backend already let it go, or marks the return for the backend's end.
+    fn called(&self) {
+        let was = self
+            .get_inner()
+            .ownership
+            .fetch_or(CALLED, Ordering::AcqRel);
+        if was & ENDED != 0 {
+            self.retire_now();
+        }
+    }
+
+    /// Ends the ownership, the backend's end and the callback's return both reached; what waited
+    /// for it runs.
+    fn retire_now(&self) {
         let was = self.get_inner().ownership.swap(RETIRED, Ordering::AcqRel);
         turso_assert!(was != RETIRED, "a request retired twice");
         if was & OBSERVED != 0 {
@@ -661,17 +1090,13 @@ impl Completion {
         }
     }
 
-    /// Delivers the request's result, running its callback, and retires it: a backend's delivery.
-    pub fn deliver(&self, result: Result<i32, CompletionError>) {
-        self.callback(result);
-        self.retire();
-    }
-
     /// Carries this request out through another, the one `submit` submits, whose callback
     /// finishes this one: a layer between a caller and a backend that reads into a buffer of its
     /// own, or checks what it read, before it finishes the caller's request. This request is
     /// accepted before the submission, given back with it if it is refused, and retired once the
-    /// other retires, so a wait for its retirement waits for the backend's.
+    /// other retires, so a wait for its retirement waits for the backend's. It watches the other's
+    /// ownership: once that one's backend lets it go while a finish elsewhere runs its callback,
+    /// only finishes elsewhere move this one, and a wait for it parks rather than steps.
     pub fn carry(
         &self,
         submit: impl FnOnce() -> crate::Result<Completion>,
@@ -679,8 +1104,7 @@ impl Completion {
         self.accept();
         match submit() {
             Ok(inner) => {
-                let me = self.clone();
-                inner.on_retired(move || me.retire());
+                inner.watch_ownership(Arc::new(Carried(self.clone())));
                 Ok(inner)
             }
             Err(e) => {
@@ -698,9 +1122,15 @@ impl Completion {
     }
 
     /// Runs `f` once no backend owns the request: now, if none does (never submitted, given back,
-    /// or retired), or as the backend that owns it lets it go.
+    /// or retired), or as the backend that owns it lets it go. An unowned request is read on the
+    /// ownership word alone, without its context's lock: Acquire, so `f` sees what the retirement
+    /// released.
     pub fn on_retired(&self, f: impl FnOnce() + Send + 'static) {
         let inner = self.get_inner();
+        if inner.ownership.load(Ordering::Acquire) & ACCEPTED == 0 {
+            f();
+            return;
+        }
         let mut context = inner.context.inner.lock();
         let mut state = inner.ownership.load(Ordering::Acquire);
         while state & ACCEPTED != 0 {
@@ -721,10 +1151,80 @@ impl Completion {
         f();
     }
 
+    /// Watches the request's ownership with `watch` ([`OwnershipWatch`]): told now if its backend
+    /// already let it go while its callback runs elsewhere, and at its retirement; told only of
+    /// the retirement, at once, if no backend owns it: read on the ownership word alone, as
+    /// [`on_retired`](Self::on_retired) reads it, so a request its backend delivered inline is
+    /// counted out without its context's lock.
+    pub fn watch_ownership(&self, watch: Arc<dyn OwnershipWatch>) {
+        let inner = self.get_inner();
+        if inner.ownership.load(Ordering::Acquire) & ACCEPTED == 0 {
+            watch.retired(false);
+            return;
+        }
+        let mut context = inner.context.inner.lock();
+        let mut state = inner.ownership.load(Ordering::Acquire);
+        while state & ACCEPTED != 0 {
+            match inner.ownership.compare_exchange(
+                state,
+                state | OBSERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // The end is set under this lock: read here, it is read whole.
+                    let told = state & (ENDED | CARRIER_ENDED) != 0;
+                    if told {
+                        watch.finisher_left();
+                    }
+                    context.watches.push((watch, told));
+                    return;
+                }
+                Err(now) => state = now,
+            }
+        }
+        drop(context);
+        watch.retired(false);
+    }
+
+    /// Whether the request's backend, or the backend of the request carrying it, has let it go
+    /// while it is still owned: only finishes elsewhere move it now, and stepping the backend does
+    /// nothing for it.
+    pub fn left_its_backend(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner.ownership.load(Ordering::Acquire) & (ENDED | CARRIER_ENDED) != 0
+        })
+    }
+
+    /// Whether only finishes under way elsewhere can finish this completion, its requests having
+    /// left their backends: a request its backend let go while another finish runs its callback,
+    /// or a group whose every request is finished or so let go. A waiter then parks on the
+    /// completion rather than stepping a backend that holds nothing for it (DESIGN.md 22.5).
+    pub fn only_finishers_left(&self) -> bool {
+        match self.inner.as_ref().map(|inner| &inner.completion_type) {
+            Some(CompletionType::Group(group)) => every_request(&group.inner.members, &|r| {
+                r.finished() || r.left_its_backend()
+            }),
+            Some(_) if self.is_request() => self.left_its_backend(),
+            _ => false,
+        }
+    }
+
     /// Takes what waited for the retirement, under the lock its registrations hold, and runs it
     /// once the lock is free.
     fn let_go_observers(&self) {
-        let observers = std::mem::take(&mut self.get_inner().context.inner.lock().on_retired);
+        let (observers, watches) = {
+            let mut context = self.get_inner().context.inner.lock();
+            (
+                std::mem::take(&mut context.on_retired),
+                std::mem::take(&mut context.watches),
+            )
+        };
+        // The watches first: what counts the request has let it go before anything that waited
+        // for the retirement runs and reads it.
+        for (watch, told) in watches {
+            watch.retired(told);
+        }
         for f in observers {
             f();
         }
@@ -771,11 +1271,26 @@ impl Completion {
         found
     }
 
+    /// A finish other than a backend's delivery: runs the callback if no finish has, and for a
+    /// request meets the backend's end of it ([`called`](Self::called)).
     fn callback(&self, result: Result<i32, CompletionError>) {
+        if self.run_callback(result) && self.is_request() {
+            self.called();
+        }
+    }
+
+    /// Runs the callback, publishes the result and runs the wakers, if this is the first finish:
+    /// whether it was.
+    fn run_callback(&self, result: Result<i32, CompletionError>) -> bool {
         let inner = self.get_inner();
-        let mut first = false;
-        inner.result.get_or_init(|| {
-            first = true;
+        // The first finish claims the completion and runs its callback outside any lock: a finish
+        // the callback or a waker it runs makes (a cancellation of this completion or of a group
+        // above it), or one another thread makes meanwhile, returns here without waiting. The
+        // result is published once the callback has run, so `finished` still means it ran.
+        if inner.finishing.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        {
             // Run the type-specific callback. For ReadCompletion, this returns
             // an optional error detected by the callback (e.g., short read).
             let callback_error = match &inner.completion_type {
@@ -800,17 +1315,20 @@ impl Completion {
             };
 
             // Use callback error if present, otherwise use the original IO error
-            callback_error.or_else(|| result.err())
-        });
-        // Only the call that finished this completion counts it into its
-        // group.
-        if first {
-            let parent = inner.parent.lock().take();
-            if let Some(group) = parent {
-                group.group_one_done(inner.result.get().and_then(|e| *e));
-            }
+            let published = inner
+                .result
+                .set(callback_error.or_else(|| result.err()))
+                .is_ok();
+            turso_assert!(published, "a completion's result published twice");
         }
-        inner.context.wake();
+        // Only the call that finished this completion counts it into its group.
+        let parent = inner.parent.lock().take();
+        if let Some(group) = parent {
+            group.group_one_done(inner.result.get().and_then(|e| *e));
+        }
+        crate::race::point("completion.published");
+        inner.run_wakers();
+        true
     }
 
     fn group_one_done(&self, err: Option<CompletionError>) {
@@ -914,11 +1432,131 @@ mod tests {
 
     use super::*;
 
+    /// What waits for a request's retirement.
+    #[derive(Clone, Copy, Debug)]
+    enum Observes {
+        /// A callback ([`Completion::on_retired`]).
+        Callback,
+        /// An ownership watch ([`Completion::watch_ownership`]).
+        Watch,
+    }
+
+    /// A request no backend owns, never submitted or already retired, tells what waits for its
+    /// retirement at once, on its ownership word alone: its context's lock is held by the test
+    /// throughout (the auditor's retired-observer-fast-v1, extended to the watch; mutant: the lock
+    /// taken first, and the observer waits for it).
+    fn an_unowned_request_is_observed_without_its_context(retired: bool, observes: Observes) {
+        use crate::io::wait_tests::Told;
+        use std::sync::{atomic::AtomicUsize, atomic::Ordering, mpsc};
+        use std::time::Duration;
+        // Long past the few instructions the observer takes, Miri's included.
+        let held_for = Duration::from_secs(if cfg!(miri) { 60 } else { 2 });
+        let completion = Completion::new_sync(|_| {});
+        if retired {
+            completion.accept();
+            completion.deliver(Ok(0));
+        }
+        let inner = completion.get_inner().clone();
+        let held = inner.context.inner.lock();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let told = Told::new();
+        let (entered, entry) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let thread = {
+            let (calls, told) = (calls.clone(), told.clone());
+            std::thread::spawn(move || {
+                entered.send(()).unwrap();
+                match observes {
+                    Observes::Callback => completion.on_retired(move || {
+                        calls.fetch_add(1, Ordering::AcqRel);
+                    }),
+                    Observes::Watch => completion.watch_ownership(told),
+                }
+                let _ = done.send(());
+            })
+        };
+        let began = entry.recv_timeout(Duration::from_secs(5)).is_ok();
+        let returned_while_held = finished.recv_timeout(held_for).is_ok();
+        drop(held);
+        let joined = thread.join().is_ok();
+        drop(inner);
+        assert!(
+            began && joined,
+            "{observes:?}: the observing thread did not complete"
+        );
+        assert!(
+            returned_while_held,
+            "{observes:?}: an unowned request waited for its context"
+        );
+        let seen = match observes {
+            Observes::Callback => (calls.load(Ordering::Acquire), 0, 0),
+            Observes::Watch => {
+                let (left, retired, retired_told) = told.seen();
+                (retired, left, retired_told)
+            }
+        };
+        assert_eq!(
+            seen,
+            (1, 0, 0),
+            "{observes:?}: (retirements, finishers left, retirements told) seen"
+        );
+    }
+
+    #[test]
+    fn an_observer_of_a_retired_request_does_not_wait_for_its_context() {
+        an_unowned_request_is_observed_without_its_context(true, Observes::Callback);
+    }
+
+    #[test]
+    fn an_observer_of_an_unsubmitted_request_does_not_wait_for_its_context() {
+        an_unowned_request_is_observed_without_its_context(false, Observes::Callback);
+    }
+
+    #[test]
+    fn a_watch_of_a_retired_request_does_not_wait_for_its_context() {
+        an_unowned_request_is_observed_without_its_context(true, Observes::Watch);
+    }
+
+    #[test]
+    fn a_watch_of_an_unsubmitted_request_does_not_wait_for_its_context() {
+        an_unowned_request_is_observed_without_its_context(false, Observes::Watch);
+    }
+
+    /// A carried request's watch hears that only finishes elsewhere move it once, from its
+    /// carrier, though the request later ends itself while a finish elsewhere still runs its
+    /// callback, and its retirement is told as following that (mutant: every end tells every
+    /// watch, and a count kept from them counts the request twice).
+    #[test]
+    fn a_carried_requests_watch_is_told_once_though_it_ends_after_its_carrier() {
+        let told = crate::io::wait_tests::Told::new();
+        let carried = Completion::new_sync(|_| {});
+        carried.accept();
+        carried.watch_ownership(told.clone());
+        carried.carrier_left();
+        // A finish elsewhere claims the callback and runs it; its return comes after the end.
+        assert!(
+            carried.run_callback(Ok(0)),
+            "the finish claimed the callback"
+        );
+        carried.retire();
+        assert!(carried.is_owned(), "retired before the callback returned");
+        carried.called();
+        assert!(!carried.is_owned(), "the callback's return retires it");
+        assert_eq!(
+            told.seen(),
+            (1, 1, 1),
+            "(finishers left, retirements, told) heard by the watch"
+        );
+    }
+
     #[test]
     fn group_finishes_when_child_completes_on_another_thread_during_build() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
-        for i in 0..20_000 {
+        // A thread per round. Miri checks every access and keeps every thread's state, so it runs
+        // fewer rounds, over several schedule seeds, each preempting threads mid-operation.
+        let rounds = if cfg!(miri) { 200 } else { 20_000 };
+        for i in 0..rounds {
             let child = Completion::new_write(|_| {});
             let go = Arc::new(AtomicBool::new(false));
             let (c2, go2) = (child.clone(), go.clone());
@@ -1648,6 +2286,34 @@ mod tests {
         );
     }
 
+    /// A group can wake a waiter before its last child finishes. After that progress wake,
+    /// blocking again must register a waker for the final completion.
+    #[cfg(shuttle)]
+    #[test]
+    fn shuttle_blocking_group_wait_registers_again_after_a_progress_wake() {
+        shuttle::check_random_with_seed(
+            || {
+                let first = Completion::new_sync(|_| {});
+                let last = Completion::new_sync(|_| {});
+                let mut group = CompletionGroup::new(|_| {});
+                group.add(&first);
+                group.add(&last);
+                let group = group.build();
+                let waiter = {
+                    let group = group.clone();
+                    crate::thread::spawn(move || group.block_on())
+                };
+                first.complete(0);
+                crate::thread::yield_now();
+                last.complete(0);
+                waiter.join().unwrap();
+                assert!(group.succeeded());
+            },
+            0,
+            1000,
+        );
+    }
+
     /// A waker that registers again on its completion from its wake, as polling the completion
     /// inline does, up to three times.
     struct Again {
@@ -1738,6 +2404,46 @@ mod tests {
         assert_eq!(finished, [1, 1], "finishing wakes each task once");
     }
 
+    /// A keyed registration is made at most once per key and withdrawn exactly, whatever
+    /// `will_wake` says: here a waker each clone of which owns a fresh box, a legal waker no clone
+    /// of which `will_wake` another (the auditor's probe of 2026-11-08).
+    #[test]
+    fn a_keyed_waker_is_registered_once_and_withdrawn_exactly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{RawWaker, RawWakerVTable};
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_raw);
+        fn raw() -> RawWaker {
+            LIVE.fetch_add(1, Ordering::SeqCst);
+            RawWaker::new(Box::into_raw(Box::new(0u8)) as *const (), &VTABLE)
+        }
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        unsafe fn wake(data: *const ()) {
+            // SAFETY: the vtable's own waker, owning its box.
+            unsafe { drop_raw(data) }
+        }
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop_raw(data: *const ()) {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+            // SAFETY: made by `raw` from a box this waker owns.
+            drop(unsafe { Box::from_raw(data as *mut u8) });
+        }
+        // SAFETY: the vtable keeps the RawWaker contract: each clone owns its box, dropped once.
+        let waker = unsafe { Waker::from_raw(raw()) };
+        let c = Completion::new_wait();
+        let key = WakerKey::new(7).unwrap();
+        for _ in 0..64 {
+            c.set_keyed_waker(key, &waker);
+        }
+        assert_eq!(c.wakers(), 1, "one registration for the key");
+        c.withdraw_key(key);
+        assert_eq!(c.wakers(), 0, "the key's registration withdrawn");
+        drop(waker);
+        assert_eq!(LIVE.load(Ordering::SeqCst), 0, "every clone let go");
+    }
+
     /// A completion keeps the waker of every task that registers until it wakes, then wakes each
     /// once and lets them all go, a task that stopped waiting included.
     #[test]
@@ -1772,5 +2478,27 @@ mod tests {
                 .all(|task| wakes(task) == 1 && Arc::strong_count(task) == 1),
             "finishing did not wake each waker once and let it go"
         );
+    }
+    #[cfg(not(any(loom, atoll_loom, shuttle)))]
+    #[test]
+    fn a_standalone_context_clone_keeps_its_registered_wakers() {
+        use std::task::Wake;
+        struct Calls(AtomicUsize);
+        impl Wake for Calls {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let called = Arc::new(Calls(AtomicUsize::new(0)));
+        let context = Context::new();
+        let copied = context.clone();
+        context.set_waker(&Waker::from(called.clone()));
+        drop(context);
+        let before = called.0.load(Ordering::Relaxed);
+        copied.wake();
+        drop(copied);
+        assert_eq!(before, 0);
+        assert_eq!(called.0.load(Ordering::Relaxed), 1);
+        assert_eq!(Arc::strong_count(&called), 1);
     }
 }

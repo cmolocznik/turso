@@ -147,8 +147,15 @@ impl TempPages {
         pid.temporary_number() * pid.class().size() as u64
     }
 
-    /// Reads `pid` into `into`, exactly its size: its copy, or zeros if it has none.
-    pub fn read(&self, pid: PageId, into: Arc<Buffer>, done: ReadDone) -> Result<()> {
+    /// Reads `pid` into `into`, exactly its size: its copy, or zeros if it has none. `submitting`
+    /// is called right before the file's read only, never for the zeros (source.rs).
+    pub fn read(
+        &self,
+        pid: PageId,
+        into: Arc<Buffer>,
+        done: ReadDone,
+        submitting: super::source::Submitting<'_>,
+    ) -> Result<()> {
         let class = pid.class();
         if !self.classes[class.index()]
             .written
@@ -182,7 +189,9 @@ impl TempPages {
                 }
             }
         });
-        drop(self.file(class)?.pread(Self::at(pid), c)?);
+        let file = self.file(class)?;
+        submitting();
+        drop(file.pread(Self::at(pid), c)?);
         Ok(())
     }
 

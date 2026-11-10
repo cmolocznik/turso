@@ -1,9 +1,15 @@
 //! Test support: every IO backend the storage runs on, and a driver that steps an operation's
 //! `IOResult` to the end the way the VDBE does.
 
+#[cfg(not(shuttle))]
+use super::buffer::BufferPool;
 pub(super) use super::drive;
+#[cfg(not(shuttle))]
+use super::page::PageId;
 use crate::io::IO;
 use crate::sync::Arc;
+#[cfg(not(shuttle))]
+use crate::types::IOResult;
 
 pub(super) struct Backend {
     pub name: &'static str,
@@ -65,6 +71,17 @@ pub(super) fn schedules(test: impl Fn() + Send + Sync + 'static, iterations: usi
         config.stack_size = 8 << 20;
         config
     };
+    // A failing schedule shuttle printed, replayed exactly: its encoded form, in the file this
+    // names, instead of the random and PCT schedules.
+    if let Ok(path) = std::env::var("ATOLL_SHUTTLE_REPLAY") {
+        let encoded = std::fs::read_to_string(&path).expect("the schedule's file");
+        shuttle::Runner::new(
+            shuttle::scheduler::ReplayScheduler::new_from_encoded(encoded.trim()),
+            config(),
+        )
+        .run(move || test());
+        return;
+    }
     let t = test.clone();
     shuttle::Runner::new(
         shuttle::scheduler::RandomScheduler::new(iterations),
@@ -181,3 +198,99 @@ pub(super) use crate::source_test::code_of;
 // The child-process tests' helpers are the crate's (`crate::child_test`), shared with the IO's.
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 pub(super) use crate::child_test::{in_child, record, recorded, Ended};
+
+/// A mutant's pre-clone check can stop before a freed pointer is read. Catch that test panic
+/// only in this test harness; production Atoll frames and checked guards still abort.
+pub(super) fn catch_test_panic<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+}
+
+/// Pages another thread holds exclusively, taken as this thread passes a point: the pages a
+/// step upgrades before the held one are read first, at their versions then.
+#[cfg(not(shuttle))]
+pub(super) struct HoldAt {
+    taken: std::rc::Rc<std::cell::RefCell<Option<Held>>>,
+}
+
+/// The holder's thread, the versions it read before holding, and its let-go.
+#[cfg(not(shuttle))]
+type Held = (
+    Vec<u64>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+);
+
+#[cfg(not(shuttle))]
+impl HoldAt {
+    /// At `point`, `pick` names on the holder's thread the pages to read and those to hold.
+    pub(super) fn set(
+        point: &'static str,
+        io: &Arc<dyn IO>,
+        pool: &Arc<BufferPool>,
+        pick: impl FnOnce(&Arc<dyn IO>, &Arc<BufferPool>) -> (Vec<PageId>, Vec<PageId>) + Send + 'static,
+    ) -> Self {
+        let taken = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (io, pool, slot) = (io.clone(), pool.clone(), taken.clone());
+        crate::race::at(point, move || {
+            let (held, read) = std::sync::mpsc::channel();
+            let (let_go, wait) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                let (watch, hold) = pick(&io, &pool);
+                let versions = watch
+                    .iter()
+                    .map(|&pid| {
+                        drive(&io, || pool.fix_optimistic(pid, None))
+                            .unwrap()
+                            .version()
+                    })
+                    .collect();
+                let pages: Vec<_> = hold
+                    .iter()
+                    .map(|&pid| drive(&io, || pool.fix_exclusive(pid, None)).unwrap())
+                    .collect();
+                held.send(versions).unwrap();
+                wait.recv().unwrap();
+                for page in pages {
+                    page.release_unchanged();
+                }
+            });
+            *slot.borrow_mut() = Some((read.recv().unwrap(), let_go, thread));
+        });
+        Self { taken }
+    }
+
+    /// The versions read before the holds, once the point was passed.
+    pub(super) fn versions(&self) -> Option<Vec<u64>> {
+        self.taken.borrow().as_ref().map(|t| t.0.clone())
+    }
+
+    pub(super) fn let_go(self) {
+        let (_, let_go, thread) = self.taken.borrow_mut().take().expect("the point passed");
+        let_go.send(()).unwrap();
+        thread.join().unwrap();
+    }
+}
+
+/// Steps `op` until it ends or passes `point`: what the step that passed it came to, not
+/// driven further.
+#[cfg(not(shuttle))]
+pub(super) fn step_past<T>(
+    io: &Arc<dyn IO>,
+    point: &'static str,
+    mut op: impl FnMut() -> crate::Result<IOResult<T>>,
+) -> Option<IOResult<T>> {
+    let mut passed = None;
+    drive(io, || {
+        let out = op()?;
+        if crate::race::pending(point) {
+            return Ok(match out {
+                IOResult::Done(_) => IOResult::Done(()),
+                IOResult::IO(io) => IOResult::IO(io),
+            });
+        }
+        passed = Some(out);
+        Ok(IOResult::Done(()))
+    })
+    .unwrap();
+    passed
+}

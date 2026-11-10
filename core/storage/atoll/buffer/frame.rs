@@ -26,9 +26,6 @@ pub const EVICT_AFTER: u8 = 2;
 /// The page was unlinked from what referred to it and is about to be freed: hints to it are not
 /// followed.
 pub const ABANDONED: u8 = 4;
-/// A LENT frame lent for as long as its holder lives, as the log's ring is: drained for another
-/// class, its batch would wait for it for good.
-pub const FOR_GOOD: u8 = 8;
 
 /// `pid` of a frame holding no page; no page id has every bit set.
 pub const NO_PAGE: u64 = u64::MAX;
@@ -60,12 +57,40 @@ pub struct FrameHeader {
     /// or above the epochs' horizon may be held by a step under way. Relaxed: it only prices a
     /// drain, and memory is read into again only once the epochs pass `given_up`'s stamps.
     pub held: AtomicU64,
+    /// Where the IO of the hold that reads the frame in or writes it out stands at the backend:
+    /// one past the hold's version, shifted, once its request is handed over, and that with its
+    /// low bit once it landed. Only rises, as `fetch_max`: a hold's states rise, and every later
+    /// hold's are above them, so a mark written late, after the frame changed hands, is lost. A
+    /// fix that finds the frame loading or outgoing waits on that IO, stepping it, only while it
+    /// is at the backend, and otherwise on the pool's supply, which the submission's and the
+    /// landing's events finish (DESIGN.md 9.1.3, wait kinds).
+    pub io: AtomicU64,
 }
 
 // SAFETY: every field is atomics, valid as zeros: an unlocked latch at version 0, a FREE frame.
 unsafe impl Zeroable for FrameHeader {}
 
 impl FrameHeader {
+    /// The IO of the hold taken at `version` was handed to the backend.
+    pub fn submitted_at(&self, version: u64) {
+        self.io.fetch_max(io_mark(version), Ordering::AcqRel);
+    }
+
+    /// The IO of the hold taken at `version` landed: none of it is at the backend any more.
+    pub fn landed_at(&self, version: u64) {
+        self.io.fetch_max(io_mark(version) | 1, Ordering::AcqRel);
+    }
+
+    /// Whether the IO of the hold taken at `version` was handed to the backend, landed or not.
+    pub fn handed_over(&self, version: u64) -> bool {
+        self.io.load(Ordering::Acquire) >= io_mark(version)
+    }
+
+    /// Whether the IO of the hold taken at `version` is at the backend: handed over and not landed.
+    pub fn at_backend(&self, version: u64) -> bool {
+        self.io.load(Ordering::Acquire) == io_mark(version)
+    }
+
     pub fn pid(&self) -> u64 {
         self.pid.load(Ordering::Acquire)
     }
@@ -88,6 +113,11 @@ impl FrameHeader {
     }
 }
 
+/// The IO state of the hold taken at `version`, handed over: a latch's version has 62 bits.
+fn io_mark(version: u64) -> u64 {
+    (version + 1) << 1
+}
+
 // Shuttle's and loom's atomics are larger than the hardware's.
 #[cfg(not(any(shuttle, atoll_loom)))]
-const _: () = assert!(std::mem::size_of::<FrameHeader>() == 120);
+const _: () = assert!(std::mem::size_of::<FrameHeader>() == 128);

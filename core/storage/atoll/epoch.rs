@@ -119,8 +119,19 @@ const CHUNK_SLOTS: usize = 4096 / std::mem::size_of::<Slot>();
 #[cfg(atoll_loom)]
 const CHUNK_SLOTS: usize = 2;
 
-/// Distinguishes instances in the per-thread table.
+/// Distinguishes instances in the per-thread table. Never 0, the id of the table's empty cache.
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Takes an instance id from `next`: each once, never 0. Taken to its end the count stays there,
+/// and every later take refuses rather than wrap to 0 or to an id an instance may still hold, which
+/// the per-thread table's cache would read as its own. Made once per instance, so a refused
+/// increment costs no step.
+fn take_id(next: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Relaxed: only its uniqueness matters, which the increment's atomicity gives.
+    next.fetch_update(Relaxed, Relaxed, |id| id.checked_add(1))
+        .ok()
+}
 
 /// A participant's place in an instance's registry: what it announced, and whether a thread
 /// holds it. Padded to a cache line of its own, or to the pair of lines x86_64 and aarch64 cores
@@ -131,19 +142,26 @@ struct SlotWords {
     /// [`IDLE`], or [`announcing`] an epoch, with [`WAITED`] set once a wait it holds back flags it.
     word: AtomicU64,
     taken: AtomicBool,
+    /// The waits the slot's thread registered and not yet finished, newest first (DESIGN.md
+    /// 9.1.2): pushed only by the slot's thread, taken whole by a wake, so a push is one
+    /// compare-and-swap and, lost to a take, one swap.
+    waits: AtomicPtr<Wait>,
 }
 
 /// Slots handed out in order, and the chunk after them once they are all taken.
 struct Chunk {
     /// Written once, before the chunk is linked in.
     slots: Plain<Box<[Slot]>>,
+    /// Dense completion announcements, separate from the padded page announcements.
+    completions: Plain<Box<CachePadded<[AtomicPtr<()>; CHUNK_SLOTS]>>>,
     /// Slots handed out so far, or more: a scan reads no further.
     used: AtomicUsize,
     next: AtomicPtr<Chunk>,
 }
 
-// SAFETY: `slots` is written only as the chunk is made, before any other thread can reach it;
-// everything else in it is atomic.
+// SAFETY: `slots` and `completions` are written only as the chunk is made, before any other thread
+// can reach it (each slot's and each announcement's contents are atomics); `used` and `next` are
+// atomic.
 unsafe impl Sync for Chunk {}
 unsafe impl Send for Chunk {}
 
@@ -153,13 +171,19 @@ impl Chunk {
             slots: Plain::new(
                 (0..CHUNK_SLOTS)
                     .map(|_| {
+                        // Born taken: the thread whose count handed it out owns it, and a
+                        // thread looking for a slot given back never takes it first.
                         CachePadded::new(SlotWords {
                             word: AtomicU64::new(IDLE),
-                            taken: AtomicBool::new(false),
+                            taken: AtomicBool::new(true),
+                            waits: AtomicPtr::new(ptr::null_mut()),
                         })
                     })
                     .collect(),
             ),
+            completions: Plain::new(Box::new(CachePadded::new(std::array::from_fn(|_| {
+                AtomicPtr::new(ptr::null_mut())
+            })))),
             used: AtomicUsize::new(0),
             next: AtomicPtr::new(ptr::null_mut()),
         }
@@ -179,14 +203,26 @@ impl Chunk {
         // thread reaching the chunk read with acquire; never written since.
         self.slots.with(|s| unsafe { &**s })
     }
+
+    fn completions(&self) -> &[AtomicPtr<()>] {
+        // SAFETY: initialized before this chunk is published, like `slots`.
+        self.completions.with(|words| unsafe { &***words })
+    }
 }
 
 /// Every slot of an instance: chunks that only grow, kept until the instance and every thread
 /// holding a slot in it are gone, so a slot's address stays good as long as either holds it.
 struct Registry {
     first: Chunk,
+    /// OR of joined one-based ordinals: at least their maximum and less than twice it.
+    completion_extent: CachePadded<AtomicUsize>,
     /// Cleared when the instance is dropped, so threads drop their entries for it.
     open: AtomicBool,
+}
+
+struct Joined<'a> {
+    slot: &'a Slot,
+    completion: &'a AtomicPtr<()>,
 }
 
 impl Registry {
@@ -201,33 +237,30 @@ impl Registry {
         self.chunks().flat_map(Chunk::used)
     }
 
-    /// A slot for the calling thread: one a thread that exited gave back, or a new one.
-    fn join(&self) -> &Slot {
+    /// A slot for the calling thread: one a thread that exited gave back, or a new one. One pass
+    /// over each chunk's slots handed out, a strong compare-and-swap for each given back; then one
+    /// slot from the chunk's count, which the count makes this thread's; else the next chunk,
+    /// linked by one compare-and-swap whose loser takes the winner's. Bounded by the chunks, at
+    /// most the threads (DESIGN.md 9.1.2).
+    fn join(&self) -> Joined<'_> {
         let mut chunk = &self.first;
+        let mut base = 0usize;
         loop {
-            let free = chunk.used().iter().find(|s| {
+            let free = chunk.used().iter().enumerate().find(|(_, s)| {
                 !s.taken.load(Ordering::Relaxed)
                     && s.taken
                         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                         .is_ok()
             });
-            if let Some(slot) = free {
-                return slot;
+            if let Some((i, _)) = free {
+                return self.joined(chunk, base, i);
             }
             if chunk.used.load(Ordering::Relaxed) < CHUNK_SLOTS {
                 let i = chunk.used.fetch_add(1, Ordering::AcqRel);
-                // A thread that read the count first may take the slot before this does: then
-                // look again.
-                if i < CHUNK_SLOTS
-                    && chunk
-                        .slot(i)
-                        .taken
-                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    return chunk.slot(i);
+                if i < CHUNK_SLOTS {
+                    // Born taken, and handed out by the count to this thread alone.
+                    return self.joined(chunk, base, i);
                 }
-                continue;
             }
             let mut next = chunk.next.load(Ordering::Acquire);
             if next.is_null() {
@@ -248,6 +281,21 @@ impl Registry {
             }
             // SAFETY: linked in, so freed only with the registry, which outlives `self`.
             chunk = unsafe { &*next };
+            base = base
+                .checked_add(CHUNK_SLOTS)
+                .expect("too many thread slots");
+        }
+    }
+
+    fn joined<'a>(&self, chunk: &'a Chunk, base: usize, i: usize) -> Joined<'a> {
+        let ordinal = base.checked_add(i + 1).expect("too many thread slots");
+        assert!(ordinal <= isize::MAX as usize, "too many thread slots");
+        // Even an unchanged value publishes this joiner's acquire of the chunk's link.
+        // The remover captures the bound after its fence, before reading these dense words.
+        self.completion_extent.fetch_or(ordinal, Ordering::SeqCst);
+        Joined {
+            slot: chunk.slot(i),
+            completion: &chunk.completions()[i],
         }
     }
 }
@@ -269,6 +317,75 @@ pub trait Notify: Send + Sync + 'static {
     fn notify(&self);
     /// Finished already, by this wait or whatever else it stands for.
     fn notified(&self) -> bool;
+    /// What the wait finishes, when two registrations can name one thing: waits of one identity
+    /// in a list collapse to the one with the lowest epoch (DESIGN.md 9.1.3, other waits). None
+    /// for a wait that stands only for itself.
+    fn identity(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Waits taken out of the slots' lists, owned by this list and linked through their own `next`:
+/// walked, kept and put back with no allocation. Dropped, it drops what it still holds.
+#[derive(Default)]
+struct WaitList(Option<Box<Wait>>);
+
+impl WaitList {
+    fn push(&mut self, mut wait: Box<Wait>) {
+        wait.next = self.0.take().map_or(ptr::null_mut(), Box::into_raw);
+        self.0 = Some(wait);
+    }
+
+    fn pop(&mut self) -> Option<Box<Wait>> {
+        let mut wait = self.0.take()?;
+        let next = std::mem::replace(&mut wait.next, ptr::null_mut());
+        // SAFETY: `next` came from `push`'s `Box::into_raw` of a wait this list owned, and nothing
+        // else names it.
+        self.0 = (!next.is_null()).then(|| unsafe { Box::from_raw(next) });
+        Some(wait)
+    }
+
+    /// The waits not notified already, waits of one identity collapsed to the one with the lowest
+    /// epoch (DESIGN.md 9.1.3): a completion registered again behind one old step, by a caller
+    /// that looked again or several on one thread, stands once, at the earliest epoch either
+    /// asked for, which wakes it no later than either needed. A wait dropped here is one the
+    /// survivor stands for. Quadratic in the list, which holds a slot's unfinished waits.
+    fn collapsed(mut self) -> WaitList {
+        let mut kept = WaitList::default();
+        while let Some(wait) = self.pop() {
+            if wait.notify.notified() {
+                continue;
+            }
+            let Some(id) = wait.notify.identity() else {
+                kept.push(wait);
+                continue;
+            };
+            let mut node = kept.0.as_deref_mut();
+            let mut merged = false;
+            while let Some(k) = node {
+                if k.notify.identity() == Some(id) {
+                    if wait.epoch() < k.epoch() {
+                        k.epoch = Plain::new(wait.epoch());
+                    }
+                    k.fresh |= wait.fresh;
+                    merged = true;
+                    break;
+                }
+                // SAFETY: the list owns its waits; `next` is one of them or null.
+                node = unsafe { k.next.as_mut() };
+            }
+            if !merged {
+                kept.push(wait);
+            }
+        }
+        kept
+    }
+}
+
+impl Drop for WaitList {
+    fn drop(&mut self) {
+        while self.pop().is_some() {}
+    }
 }
 
 impl Wait {
@@ -280,11 +397,17 @@ impl Wait {
 
 impl Notify for Completion {
     fn notify(&self) {
-        self.complete(0);
+        // Every wait Atoll registers in an epoch is one Atoll made (`notify::wait`), whose
+        // wakers wait for this thread's open change scope (DESIGN.md 9.1.3).
+        crate::storage::atoll::notify::finish(self, Ok(0));
     }
 
     fn notified(&self) -> bool {
         self.finished()
+    }
+
+    fn identity(&self) -> Option<usize> {
+        self.addr()
     }
 }
 
@@ -293,6 +416,9 @@ struct Wait {
     epoch: Plain<u64>,
     notify: Box<dyn Notify>,
     next: *mut Wait,
+    /// The wait `wait_for` registers, while it settles its own slot's list: whether that pass
+    /// reached it. Only the owner of the list reads or writes it.
+    fresh: bool,
 }
 
 pub struct Epochs {
@@ -300,9 +426,6 @@ pub struct Epochs {
     /// Read by every step entered, so on a line of its own: no other word's writes take it away.
     global: CachePadded<AtomicU64>,
     registry: Arc<Registry>,
-    /// The waits registered and not yet finished, newest first. Taken whole by a wake, so no
-    /// wait is ever unlinked under another thread.
-    waits: AtomicPtr<Wait>,
     /// A horizon a scan found: the lowest announcement then, or the epoch then if lower. Every
     /// step under way since announced at or above it, or cannot reach what was retired at or
     /// below it, so what is stamped at or below it may be reused without a scan. Raised by every
@@ -317,6 +440,7 @@ struct Entry {
     registry: Arc<Registry>,
     /// In `registry`, which this entry keeps.
     slot: *const Slot,
+    completion: *const AtomicPtr<()>,
     depth: Cell<u32>,
 }
 
@@ -332,19 +456,47 @@ impl Drop for Entry {
         if torn_down() {
             return;
         }
+        // A completion read clears its announcement before it can leave this thread.
+        assert!(unsafe { &*self.completion }
+            .load(Ordering::Relaxed)
+            .is_null());
         // Clear already: a step's guard cannot outlive its thread.
         self.slot().taken.store(false, Ordering::Release);
     }
 }
 
+/// A thread's entries, each boxed so its address holds while the vector grows: a step keeps its
+/// entry and leaves through it.
+#[allow(clippy::vec_box)]
+type Entries = Vec<Box<Entry>>;
+
+/// A thread's entries, one per instance it has stepped, and the one its last step used.
+struct Table {
+    entries: RefCell<Entries>,
+    /// The id of the instance this thread last stepped and its entry: the next step there, nearly
+    /// always the next one, reads it with no borrow and no search. Set only by `with_entry`, after
+    /// any change to `entries`, to an entry `entries` holds; an id is never reused, so a stale
+    /// pair is never matched.
+    last: Cell<(u64, *const Entry)>,
+}
+
+impl Table {
+    const fn new() -> Self {
+        Self {
+            entries: RefCell::new(Vec::new()),
+            last: Cell::new((0, ptr::null())),
+        }
+    }
+}
+
 #[cfg(not(atoll_loom))]
 crate::thread::thread_local! {
-    static ENTRIES: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    static ENTRIES: Table = const { Table::new() };
 }
 
 #[cfg(atoll_loom)]
 loom::thread_local! {
-    static ENTRIES: RefCell<Vec<Entry>> = RefCell::new(Vec::new());
+    static ENTRIES: Table = Table::new();
 }
 
 impl Default for Epochs {
@@ -356,32 +508,46 @@ impl Default for Epochs {
 impl Epochs {
     pub fn new() -> Self {
         Self {
-            // Relaxed: only its uniqueness matters.
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: take_id(&NEXT_ID).expect("epoch instance ids exhausted"),
             global: CachePadded::new(AtomicU64::new(0)),
             registry: Arc::new(Registry {
                 first: Chunk::new(),
+                completion_extent: CachePadded::new(AtomicUsize::new(0)),
                 open: AtomicBool::new(true),
             }),
-            waits: AtomicPtr::new(ptr::null_mut()),
             known: CachePadded::new(AtomicU64::new(0)),
         }
     }
 
     /// Runs `f` on the calling thread's entry for this instance, joining the registry on its
-    /// first step here. The table changes only then; every other step reads it.
+    /// first step here. The table changes only then; every other step reads it. Each entry is
+    /// boxed, so its address holds while the table grows: a step keeps it and leaves through it.
+    /// An entry goes only with its instance closed, so never under a step of that instance.
     #[inline]
     fn with_entry<R>(&self, f: impl FnOnce(&Entry) -> R) -> R {
-        ENTRIES.with(|entries| {
-            // One borrow on the path every step takes: the entry already there.
-            {
-                let held = entries.borrow();
-                if let Some(e) = held.iter().find(|e| e.id == self.id) {
-                    return f(e);
-                }
+        ENTRIES.with(|table| {
+            let (id, last) = table.last.get();
+            if id == self.id {
+                // SAFETY: set below to an entry the table holds, boxed; the table drops one only
+                // in `register`, after which the pair is set again before it is read.
+                return f(unsafe { &*last });
             }
-            let i = self.register(entries);
-            f(&entries.borrow()[i])
+            let found = table
+                .entries
+                .borrow()
+                .iter()
+                .find(|e| e.id == self.id)
+                .map(|e| ptr::from_ref::<Entry>(e));
+            let entry = match found {
+                Some(entry) => entry,
+                None => {
+                    let i = self.register(&table.entries);
+                    ptr::from_ref::<Entry>(&table.entries.borrow()[i])
+                }
+            };
+            table.last.set((self.id, entry));
+            // SAFETY: boxed in the table, which keeps it while this instance is open.
+            f(unsafe { &*entry })
         })
     }
 
@@ -389,24 +555,95 @@ impl Epochs {
     /// entry, and returns where. Out of line, so the lookup every step makes carries none of it.
     #[cold]
     #[inline(never)]
-    fn register(&self, entries: &RefCell<Vec<Entry>>) -> usize {
+    fn register(&self, entries: &RefCell<Entries>) -> usize {
         let mut entries = entries.borrow_mut();
         // Entries for instances dropped since go.
         // Relaxed: a stale read keeps an entry one more registration, its registry kept alive.
         entries.retain(|e| e.registry.open.load(Ordering::Relaxed));
-        let slot: *const Slot = self.registry.join();
-        entries.push(Entry {
+        let joined = self.registry.join();
+        entries.push(Box::new(Entry {
             id: self.id,
             registry: self.registry.clone(),
-            slot,
+            slot: joined.slot,
+            completion: joined.completion,
             depth: Cell::new(0),
-        });
+        }));
         entries.len() - 1
+    }
+
+    /// The calling thread's completion announcement. The TLS borrow ends before it is used.
+    pub fn completion_slot(&self) -> CompletionSlot<'_> {
+        let slot = self.with_entry(|entry| entry.completion);
+        // SAFETY: this instance and its thread entry keep the registry alive.
+        assert!(unsafe { &*slot }.load(Ordering::Relaxed).is_null());
+        CompletionSlot {
+            slot,
+            _epochs: self,
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    /// Gives each reader of `removed` at most one reference until its announcement clears.
+    /// The caller keeps the cell's removed reference alive throughout this scan.
+    pub fn protect_removed_completion(&self, removed: &Completion) {
+        let raw = removed.as_raw();
+        assert!(!raw.is_null(), "only a cell's owned reference is removed");
+        fence(Ordering::SeqCst);
+        let mut left = self.registry.completion_extent.load(Ordering::Acquire);
+        let mut chunk = &self.registry.first;
+        while left != 0 {
+            let words = &chunk.completions()[..left.min(CHUNK_SLOTS)];
+            let mut blocks = words.chunks_exact(4);
+            for block in &mut blocks {
+                let seen: [*mut (); 4] = std::array::from_fn(|i| block[i].load(Ordering::Acquire));
+                let wanted = raw.cast_mut();
+                if (seen[0] == wanted)
+                    | (seen[1] == wanted)
+                    | (seen[2] == wanted)
+                    | (seen[3] == wanted)
+                {
+                    for (slot, announced) in block.iter().zip(seen) {
+                        if announced == wanted {
+                            Self::give_removed_completion(slot, announced, removed);
+                        }
+                    }
+                }
+            }
+            for slot in blocks.remainder() {
+                let announced = slot.load(Ordering::Acquire);
+                if announced == raw.cast_mut() {
+                    Self::give_removed_completion(slot, announced, removed);
+                }
+            }
+            left = left.saturating_sub(CHUNK_SLOTS);
+            if left == 0 {
+                break;
+            }
+            // SAFETY: a published chunk lives until the registry is dropped.
+            let Some(next) = (unsafe { chunk.next.load(Ordering::Acquire).as_ref() }) else {
+                break;
+            };
+            chunk = next;
+        }
+    }
+
+    #[cold]
+    fn give_removed_completion(slot: &AtomicPtr<()>, announced: *mut (), removed: &Completion) {
+        // An owned announcement did not match the untagged pointer and already has a reference.
+        let extra = removed.clone().into_raw().cast_mut();
+        let owned = extra.map_addr(|address| address | COMPLETION_OWNED);
+        if slot
+            .compare_exchange(announced, owned, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            // SAFETY: the failed exchange did not hand this reference to the reader.
+            drop(unsafe { Completion::from_raw(extra) });
+        }
     }
 
     /// Enters a step; it ends when the guard is dropped.
     pub fn enter(&self) -> Step<'_> {
-        self.with_entry(|entry| {
+        let entry = self.with_entry(|entry| {
             if entry.depth.get() == 0 {
                 // An epoch at or above an object's stamp was loaded from the add that retired it
                 // or a later one, so this step's reads see the object unlinked: the fence below
@@ -424,25 +661,27 @@ impl Epochs {
                 fence(Ordering::SeqCst);
             }
             entry.depth.set(entry.depth.get() + 1);
+            ptr::NonNull::from(entry)
         });
+        crate::storage::atoll::park::holds::raise();
         Step {
             epochs: self,
+            entry,
             _thread: std::marker::PhantomData,
         }
     }
 
-    fn leave(&self) {
-        let word = self.with_entry(|entry| {
-            let depth = entry
-                .depth
-                .get()
-                .checked_sub(1)
-                .expect("leaving a step never entered");
-            entry.depth.set(depth);
-            // Release: a scan that reads the slot clear sees every read of the step done.
-            // Acquire: a wait that flagged the slot was pushed before it flagged it.
-            (depth == 0).then(|| entry.slot().word.swap(IDLE, Ordering::AcqRel))
-        });
+    /// Leaves a step of `entry`, the calling thread's entry the step entered through: no lookup.
+    fn leave(&self, entry: &Entry) {
+        let depth = entry
+            .depth
+            .get()
+            .checked_sub(1)
+            .expect("leaving a step never entered");
+        entry.depth.set(depth);
+        // Release: a scan that reads the slot clear sees every read of the step done.
+        // Acquire: a wait that flagged the slot was pushed before it flagged it.
+        let word = (depth == 0).then(|| entry.slot().word.swap(IDLE, Ordering::AcqRel));
         if word.is_some_and(|w| w & WAITED != 0) {
             self.wake();
         }
@@ -510,23 +749,52 @@ impl Epochs {
     /// step whose end gets it there does. False if that is so already; `notify` may then be
     /// notified, and whatever it stands for finished, all the same.
     pub fn wait_for(&self, epoch: u64, notify: impl Notify) -> bool {
-        self.push(Box::new(Wait {
+        // The slot's own list taken whole (its nodes then this thread's), the new wait added, and
+        // `wake`'s own procedure run on it (DESIGN.md 9.1.3, other waits): finished waits dropped,
+        // waits of one completion collapsed, so a slot's list holds its unfinished waits, at most
+        // one per completion, however many events finished registrations behind one old step.
+        let wait = Box::new(Wait {
             epoch: Plain::new(epoch),
             notify: Box::new(notify),
             next: ptr::null_mut(),
-        }));
-        if self.flag_holders(epoch) < epoch {
-            return true;
-        }
-        // Reached, and no step's end may come to wake it: finish it now.
-        self.wake();
-        false
+            fresh: true,
+        });
+        let done = wait.notify.notified();
+        let mut own = self.take_own_waits();
+        own.push(wait);
+        let reached = self.settle(own);
+        !(done || reached)
     }
 
-    /// Notifies `notify` once every step under way now has ended, the calling thread's own
-    /// included. False if none is.
-    pub fn grace_period(&self, notify: impl Notify) -> bool {
-        self.wait_for(self.stamp(), notify)
+    /// How many waits the calling thread's slot holds, for a test of the bound.
+    #[cfg(test)]
+    pub(crate) fn own_waits(&self) -> usize {
+        let mut own = self.take_own_waits();
+        let mut n = 0;
+        while let Some(wait) = own.pop() {
+            n += 1;
+            self.push(wait);
+        }
+        n
+    }
+
+    /// The calling thread's own slot's waits, taken whole by a swap: no other thread pushes to
+    /// the slot, and a wake that takes it meanwhile finds it empty.
+    fn take_own_waits(&self) -> WaitList {
+        let mut raw = self.with_entry(|entry| {
+            entry
+                .slot()
+                .waits
+                .swap(ptr::null_mut(), Ordering::AcqRel)
+        });
+        let mut waits = WaitList::default();
+        while !raw.is_null() {
+            // SAFETY: the list owned each wait, and the swap above handed it all over.
+            let wait = unsafe { Box::from_raw(raw) };
+            raw = linked(wait.next);
+            waits.push(wait);
+        }
+        waits
     }
 
     /// Flags the slot of every step announced below `epoch`, so that its end wakes the waits,
@@ -537,87 +805,125 @@ impl Epochs {
         fence(Ordering::SeqCst);
         let mut lowest = IDLE;
         for slot in self.registry.slots() {
-            let mut word = slot.word.load(Ordering::Relaxed);
-            while let Some(a) = announced(word).filter(|&a| a < epoch) {
-                if word & WAITED != 0 {
-                    lowest = lowest.min(a);
-                    break;
-                }
-                // Release: the step's end that reads the flag sees the wait pushed.
-                match slot.word.compare_exchange_weak(
-                    word,
-                    word | WAITED,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        lowest = lowest.min(a);
-                        break;
-                    }
-                    Err(now) => word = now,
-                }
+            let word = slot.word.load(Ordering::Relaxed);
+            if announced(word).is_none_or(|a| a >= epoch) {
+                continue;
+            }
+            // One flag, and the hold judged by the word it returns, never the one loaded (DESIGN.md
+            // 9.1.2): a step that ended meanwhile reads `IDLE`, which carries `WAITED` already and
+            // holds nothing back, and one announced at or above the epoch holds nothing back either.
+            // The flag is made even when the word loaded showed it already: that word may be an
+            // older step's, ended since, and only this read-modify-write of the latest word orders
+            // this wait's push before the end of the step it reads (the audit's two-wait Loom
+            // counterexample, 2026-11-08). Release: the step's end that reads the flag sees the
+            // wait pushed.
+            crate::race::point("epoch.flag");
+            let now = slot.word.fetch_or(WAITED, Ordering::Release);
+            if let Some(a) = announced(now).filter(|&a| a < epoch) {
+                lowest = lowest.min(a);
             }
         }
         fence(Ordering::Acquire);
         lowest
     }
 
+    /// Pushes `wait` on the calling thread's own slot's list: one compare-and-swap of the head it
+    /// read, and, lost, one swap, since the only other writer of the head is a wake taking the
+    /// whole list, which leaves it empty.
     fn push(&self, wait: Box<Wait>) {
         let raw = Box::into_raw(wait);
         let _ = raw.expose_provenance();
-        let mut head = self.waits.load(Ordering::Relaxed);
-        loop {
+        self.with_entry(|entry| {
+            let waits = &entry.slot().waits;
+            let head = waits.load(Ordering::Relaxed);
+            crate::race::point("epoch.push");
             // SAFETY: the wait is this thread's until the exchange below publishes it.
             unsafe { (*raw).next = head };
             // Acquire as well: pushed after a wake took the list, a wait's push sees the end
             // of the step that woke it.
-            match self
-                .waits
-                .compare_exchange_weak(head, raw, Ordering::AcqRel, Ordering::Relaxed)
+            if waits
+                .compare_exchange(head, raw, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
             {
-                Ok(_) => return,
-                Err(now) => head = now,
+                // SAFETY: as above.
+                unsafe { (*raw).next = ptr::null_mut() };
+                let taken = waits.swap(raw, Ordering::AcqRel);
+                debug_assert!(taken.is_null(), "a slot's waits pushed by another thread");
+            }
+        });
+    }
+
+    /// Takes every slot's waits, each list whole by a swap, into one list this thread owns.
+    fn take_waits(&self) -> WaitList {
+        let mut waits = WaitList::default();
+        for slot in self.registry.slots() {
+            let mut raw = slot.waits.swap(ptr::null_mut(), Ordering::AcqRel);
+            while !raw.is_null() {
+                // SAFETY: the list owned each wait, and the swap above handed it all over.
+                let wait = unsafe { Box::from_raw(raw) };
+                raw = linked(wait.next);
+                waits.push(wait);
             }
         }
+        waits
     }
 
     /// Notifies every wait the horizon has reached, drops those notified otherwise, and puts the
     /// rest back with their holders flagged.
     fn wake(&self) {
+        self.settle(self.take_waits());
+    }
+
+    /// `wake`'s procedure over `waits`, which this thread owns: waits notified otherwise dropped
+    /// and waits of one identity collapsed; the holders of the highest goal flagged; the waits that
+    /// flag shows reached notified, the rest pushed back to this thread's slot; and, with them
+    /// published, the highest goal's holders flagged again, the procedure repeating while the
+    /// lowest goal is at or below what that second flag returns. Only the second flag, made after
+    /// the push, sees a holder that ended while the waits were out of the lists (that end found
+    /// them empty); a decision from the first alone strands them (DESIGN.md 9.1.3, the auditor's
+    /// `pre_republish_only_check_strands_the_wait`). No node is read after it is pushed, and each
+    /// repetition follows a step's end. Whether a wait `wait_for` marked fresh was reached in the
+    /// first pass.
+    fn settle(&self, mut waits: WaitList) -> bool {
+        let mut fresh_reached = false;
+        let mut first = true;
         loop {
-            let mut raw = self.waits.swap(ptr::null_mut(), Ordering::AcqRel);
-            let mut waits = Vec::new();
-            while !raw.is_null() {
-                // SAFETY: the list owned each wait, and the swap above handed it all over.
-                let wait = unsafe { Box::from_raw(raw) };
-                raw = linked(wait.next);
-                if !wait.notify.notified() {
-                    waits.push(wait);
-                }
+            let mut kept = waits.collapsed();
+            let mut highest = None;
+            let mut walk = kept.0.as_deref();
+            while let Some(w) = walk {
+                highest = highest.max(Some(w.epoch()));
+                // SAFETY: the list owns its waits; `next` is one of them or null.
+                walk = unsafe { w.next.as_ref() };
             }
-            let Some(highest) = waits.iter().map(|w| w.epoch()).max() else {
-                return;
+            let Some(highest) = highest else {
+                return fresh_reached;
             };
             let holders = self.flag_holders(highest);
-            let (reached, left): (Vec<_>, Vec<_>) =
-                waits.into_iter().partition(|w| w.epoch() <= holders);
-            let left_epochs =
-                left.iter()
-                    .map(|w| w.epoch())
-                    .fold(None, |r: Option<(u64, u64)>, e| {
-                        Some(r.map_or((e, e), |(lo, hi)| (lo.min(e), hi.max(e))))
-                    });
-            for wait in left {
-                self.push(wait);
+            let (mut reached, mut left_epochs) = (WaitList::default(), None::<(u64, u64)>);
+            while let Some(mut wait) = kept.pop() {
+                let e = wait.epoch();
+                if e <= holders {
+                    fresh_reached |= first && wait.fresh;
+                    reached.push(wait);
+                } else {
+                    left_epochs =
+                        Some(left_epochs.map_or((e, e), |(lo, hi)| (lo.min(e), hi.max(e))));
+                    wait.fresh = false;
+                    self.push(wait);
+                }
             }
-            for wait in reached {
+            while let Some(wait) = reached.pop() {
                 wait.notify.notify();
             }
+            first = false;
             // A flagged step that ended while these were out of the list found none to wake.
             // Put back since, they see its end: look again, flagging any holder seen first now.
             match left_epochs {
-                Some((lowest, highest)) if lowest <= self.flag_holders(highest) => continue,
-                _ => return,
+                Some((lowest, highest)) if lowest <= self.flag_holders(highest) => {
+                    waits = self.take_waits();
+                }
+                _ => return fresh_reached,
             }
         }
     }
@@ -629,12 +935,7 @@ impl Drop for Epochs {
             return;
         }
         self.registry.open.store(false, Ordering::Relaxed);
-        let mut raw = self.waits.swap(ptr::null_mut(), Ordering::Acquire);
-        while !raw.is_null() {
-            // SAFETY: as in `wake`: the swap handed the whole list to this thread.
-            let wait = unsafe { Box::from_raw(raw) };
-            raw = linked(wait.next);
-        }
+        drop(self.take_waits());
     }
 }
 
@@ -642,15 +943,60 @@ impl Drop for Epochs {
 /// that thread's, so it cannot be sent to another, nor can any guard holding one.
 pub struct Step<'e> {
     epochs: &'e Epochs,
+    /// The calling thread's entry for `epochs`, boxed in its table and kept there while `epochs`
+    /// is open, which it is while this step borrows it.
+    entry: ptr::NonNull<Entry>,
     _thread: std::marker::PhantomData<*const ()>,
 }
 
-impl Drop for Step<'_> {
+const COMPLETION_OWNED: usize = 1;
+
+/// One thread's brief completion read. Clear before any transferred reference is dropped.
+pub struct CompletionSlot<'e> {
+    slot: *const AtomicPtr<()>,
+    _epochs: &'e Epochs,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl CompletionSlot<'_> {
+    /// Announce a pointer before validating it against the cell again.
+    ///
+    /// # Safety
+    /// `raw` is an untagged pointer read from a completion cell in this instance.
+    pub unsafe fn announce(&self, raw: *mut ()) {
+        // SAFETY: the instance and its thread entry keep this slot alive; only this thread
+        // writes unowned announcements to it.
+        unsafe { &*self.slot }.store(raw, Ordering::Release);
+        fence(Ordering::SeqCst);
+    }
+}
+
+impl Drop for CompletionSlot<'_> {
     fn drop(&mut self) {
         if torn_down() {
             return;
         }
-        self.epochs.leave();
+        // SAFETY: the instance and thread entry keep this slot alive. The swap clears it before
+        // a callback object's destructor can enter Atoll again, with no TLS borrow outstanding.
+        let raw = unsafe { &*self.slot }.swap(ptr::null_mut(), Ordering::AcqRel);
+        if raw.addr() & COMPLETION_OWNED != 0 {
+            let raw = raw.map_addr(|address| address & !COMPLETION_OWNED);
+            // SAFETY: the successful remover CAS handed this slot exactly this reference.
+            drop(unsafe { Completion::from_raw(raw) });
+        }
+    }
+}
+
+impl Drop for Step<'_> {
+    fn drop(&mut self) {
+        crate::storage::atoll::park::holds::lower();
+        if torn_down() {
+            return;
+        }
+        // SAFETY: the entry is boxed in this thread's table, which drops it only once its
+        // instance is closed, and `epochs` is borrowed, so open, while this step lives; the step
+        // is not Send, so this is the thread that entered.
+        self.epochs.leave(unsafe { self.entry.as_ref() });
     }
 }
 
@@ -658,7 +1004,15 @@ impl Drop for Step<'_> {
 struct Node<T> {
     stamp: Plain<u64>,
     item: T,
-    next: *mut Node<T>,
+    /// The node pushed before it, or [`unlinked`] until its push has written that.
+    next: AtomicPtr<Node<T>>,
+}
+
+/// A retired node's `next` between its push's swap and its link: address 1, which no node can
+/// have, a node being aligned to more than one byte. Never dereferenced.
+fn unlinked<T>() -> *mut Node<T> {
+    const { assert!(std::mem::align_of::<Node<T>>() > 1) };
+    ptr::without_provenance_mut(1)
 }
 
 /// An object retired and its stamp, ordered so a heap's top is the earliest stamp.
@@ -687,6 +1041,8 @@ impl<T> Ord for Stamped<T> {
 /// What the reclaim under way owns.
 struct Taken<T> {
     heap: BinaryHeap<Stamped<T>>,
+    /// A node a take reached before its push linked what follows it: the next take starts there.
+    carry: AtomicPtr<Node<T>>,
     /// Objects taken, and reclaims made, since the last scan.
     since_scan: usize,
 }
@@ -706,6 +1062,7 @@ impl<T> Default for Retired<T> {
             pushed: AtomicPtr::new(ptr::null_mut()),
             taken: Mutex::new(Taken {
                 heap: BinaryHeap::new(),
+                carry: AtomicPtr::new(ptr::null_mut()),
                 since_scan: 0,
             }),
         }
@@ -718,21 +1075,17 @@ impl<T> Retired<T> {
         let raw = Box::into_raw(Box::new(Node {
             stamp: Plain::new(epochs.stamp()),
             item,
-            next: ptr::null_mut(),
+            next: AtomicPtr::new(unlinked()),
         }));
         let _ = raw.expose_provenance();
-        let mut head = self.pushed.load(Ordering::Relaxed);
-        loop {
-            // SAFETY: the node is this thread's until the exchange below publishes it.
-            unsafe { (*raw).next = head };
-            match self
-                .pushed
-                .compare_exchange_weak(head, raw, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => return,
-                Err(now) => head = now,
-            }
-        }
+        // One swap and one store, whatever other threads do (DESIGN.md 9.1.2): a take that reaches
+        // the node before the store leaves it for the next take (`carry`), never waits on it.
+        // Release: the node's stamp and item, to the take that swaps it out.
+        let prev = self.pushed.swap(raw, Ordering::AcqRel);
+        crate::race::point("epoch.retire");
+        // SAFETY: the node is alive until a take frees it, which happens only once its link,
+        // written here, is read.
+        unsafe { (*raw).next.store(prev, Ordering::Release) };
     }
 
     /// Takes every object no step can hold any more; none while another reclaim is under way.
@@ -744,7 +1097,7 @@ impl<T> Retired<T> {
             return Vec::new();
         };
         let taken = &mut *taken;
-        taken.since_scan += 1 + self.take_pushed(&mut taken.heap);
+        taken.since_scan += 1 + self.take_pushed(taken);
         // Every object stamped at or below a horizon was unlinked before the scan that found
         // it, whenever it was retired.
         let mut horizon = epochs.known_horizon();
@@ -761,18 +1114,40 @@ impl<T> Retired<T> {
         out
     }
 
-    /// Moves every object pushed since into `heap`; returns how many.
-    fn take_pushed(&self, heap: &mut BinaryHeap<Stamped<T>>) -> usize {
-        let mut raw = self.pushed.swap(ptr::null_mut(), Ordering::Acquire);
+    /// Moves every object pushed since into the heap: those after the node the last take carried,
+    /// then those pushed since; returns how many.
+    fn take_pushed(&self, taken: &mut Taken<T>) -> usize {
+        // Relaxed: `carry` is read and written only under the reclaim's lock.
+        let carried = taken.carry.swap(ptr::null_mut(), Ordering::Relaxed);
+        let mut count = Self::take_chain(taken, carried);
+        if taken.carry.load(Ordering::Relaxed).is_null() {
+            let head = self.pushed.swap(ptr::null_mut(), Ordering::Acquire);
+            count += Self::take_chain(taken, head);
+        } else {
+            // The carried chain's end is still being linked; what was pushed since waits behind
+            // it for the next take, which then reaches it through the head.
+        }
+        count
+    }
+
+    /// Takes the chain from `raw` into the heap, stopping at a node whose push has not linked what
+    /// follows it yet, which is carried to the next take.
+    fn take_chain(taken: &mut Taken<T>, mut raw: *mut Node<T>) -> usize {
         let mut count = 0;
         while !raw.is_null() {
-            // SAFETY: published by `retire` with a release exchange, and the swap above made
-            // this thread its only holder.
+            // SAFETY: published by `retire`, and taken by the swap of the head or carried here,
+            // so this thread its only holder.
+            let next = unsafe { (*raw).next.load(Ordering::Acquire) };
+            if next == unlinked() {
+                taken.carry.store(raw, Ordering::Relaxed);
+                break;
+            }
+            // SAFETY: as above; its link is read, so its push is done with it.
             let node = unsafe { Box::from_raw(raw) };
-            raw = linked(node.next);
+            raw = linked(next);
             // SAFETY: written before the push that published the node, and only read since.
             let stamp = node.stamp.with(|s| unsafe { *s });
-            heap.push(Stamped(stamp, node.item));
+            taken.heap.push(Stamped(stamp, node.item));
             count += 1;
         }
         count
@@ -785,7 +1160,7 @@ impl<T> Retired<T> {
         T: Clone,
     {
         let mut taken = self.taken.lock();
-        self.take_pushed(&mut taken.heap);
+        self.take_pushed(&mut taken);
         taken.heap.iter().map(|s| s.1.clone()).collect()
     }
 }
@@ -795,11 +1170,22 @@ impl<T> Drop for Retired<T> {
         if torn_down() {
             return;
         }
-        let mut raw = self.pushed.swap(ptr::null_mut(), Ordering::Acquire);
-        while !raw.is_null() {
-            // SAFETY: as in `take_pushed`, with `&mut self` holding off every other thread.
-            let node = unsafe { Box::from_raw(raw) };
-            raw = linked(node.next);
+        // With `&mut self` every push is done, so every link is written.
+        let carried = self
+            .taken
+            .lock()
+            .carry
+            .swap(ptr::null_mut(), Ordering::Relaxed);
+        for head in [
+            carried,
+            self.pushed.swap(ptr::null_mut(), Ordering::Acquire),
+        ] {
+            let mut raw = head;
+            while !raw.is_null() {
+                // SAFETY: as in `take_chain`, with `&mut self` holding off every other thread.
+                let node = unsafe { Box::from_raw(raw) };
+                raw = linked(node.next.load(Ordering::Acquire));
+            }
         }
     }
 }

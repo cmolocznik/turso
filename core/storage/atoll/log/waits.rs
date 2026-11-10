@@ -45,7 +45,7 @@ impl Waits {
         if position() >= mark {
             return None;
         }
-        let c = Completion::new_wait();
+        let c = crate::storage::atoll::notify::wait();
         self.0.push((mark, c.clone()));
         fence(Ordering::SeqCst);
         (position() < mark).then_some(c)

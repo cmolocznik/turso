@@ -1,57 +1,44 @@
-//! A thread that fires each action handed to it once its instant passes. It wakes an asynchronous
-//! step that must wait out a busy handler's delay, which the engine's own wake would have polled
-//! again at once, and it ends the park of a checkpoint at its busy timeout.
+//! One thread fires deadlines. Each waiting caller owns its registration; ending the wait removes
+//! its action and releases the completion or waker without waiting for the deadline.
 
 use crate::Completion;
 use parking_lot::{Condvar, Mutex};
-use std::{cmp::Ordering, collections::BinaryHeap, sync::LazyLock, task::Waker, time::Instant};
+use std::{fmt, sync::LazyLock, task::Waker, time::Instant};
 
-/// What the timer does once an action's instant passes.
-enum Fire {
-    Wake(Waker),
-    /// Completes the completion, unless something completed it first.
-    Complete(Completion),
-}
-
-impl Fire {
-    fn fire(self) {
-        match self {
-            Fire::Wake(waker) => waker.wake(),
-            Fire::Complete(completion) => completion.complete(0),
-        }
-    }
-}
-
-/// An action and the instant it is due, ordered so that the earliest is the heap's top.
-struct Due {
+/// An armed deadline, cancelled on drop. Keep it until the wait ends.
+#[must_use = "dropping the registration cancels the deadline"]
+pub struct Timed {
+    timer: &'static Timer,
+    key: Key,
+    completion: Option<usize>,
     at: Instant,
-    fire: Fire,
 }
 
-impl PartialEq for Due {
-    fn eq(&self, other: &Self) -> bool {
-        self.at == other.at
+impl Timed {
+    #[cfg(test)]
+    pub(crate) fn registration(&self) -> (usize, u64) {
+        (self.key.slot, self.key.generation)
+    }
+
+    /// Whether this registration wakes the same completion. Checking it never takes the timer's
+    /// lock. The caller holds `completion` and checks its deadline first: before that deadline,
+    /// only dropping this unique registration can remove its action, so address reuse cannot
+    /// make a different completion compare equal.
+    pub(crate) fn is_for(&self, at: Instant, completion: &Completion) -> bool {
+        self.at == at && self.completion == completion.addr()
     }
 }
 
-impl Eq for Due {}
-
-impl PartialOrd for Due {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+impl fmt::Debug for Timed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Timed").field("key", &self.key).finish()
     }
 }
 
-impl Ord for Due {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.at.cmp(&self.at)
+impl Drop for Timed {
+    fn drop(&mut self) {
+        self.timer.cancel(self.key);
     }
-}
-
-#[derive(Default)]
-struct Timer {
-    due: Mutex<BinaryHeap<Due>>,
-    changed: Condvar,
 }
 
 /// The timer, or `None` where its thread cannot run.
@@ -72,48 +59,65 @@ pub fn runs() -> bool {
     TIMER.is_some()
 }
 
-/// Wakes `waker` once `at` has passed. False where the timer's thread cannot run.
-pub fn wake_at(at: Instant, waker: Waker) -> bool {
+/// Wakes `waker` once `at` has passed. `None` where the timer's thread cannot run.
+#[must_use = "keep the registration until the wait ends"]
+pub fn wake_at(at: Instant, waker: Waker) -> Option<Timed> {
     add(at, Fire::Wake(waker))
 }
 
-/// Completes `completion` once `at` has passed, unless something completed it first. False where
-/// the timer's thread cannot run.
-pub(crate) fn complete_at(at: Instant, completion: Completion) -> bool {
+/// Completes `completion` once `at` has passed, unless something completed it first.
+/// `None` where the timer's thread cannot run.
+#[must_use = "keep the registration until the wait ends"]
+pub(crate) fn complete_at(at: Instant, completion: Completion) -> Option<Timed> {
+    debug_assert!(completion.addr().is_some(), "a yield has no deadline wait");
     add(at, Fire::Complete(completion))
 }
 
-fn add(at: Instant, fire: Fire) -> bool {
-    let Some(timer) = *TIMER else {
-        return false;
+fn add(at: Instant, fire: Fire) -> Option<Timed> {
+    let timer = (*TIMER)?;
+    let completion = match &fire {
+        Fire::Complete(completion) => completion.addr(),
+        Fire::Wake(_) => None,
     };
-    let mut due = timer.due.lock();
-    let earliest = due.peek().is_none_or(|next| at < next.at);
-    due.push(Due { at, fire });
+    let (key, earliest) = {
+        let mut due = timer.due.lock();
+        let earliest = due.first().is_none_or(|first| at < first);
+        (due.insert(at, fire), earliest)
+    };
     if earliest {
         timer.changed.notify_one();
     }
-    true
+    Some(Timed {
+        timer,
+        key,
+        completion,
+        at,
+    })
+}
+
+/// A caller may take the timer lock while holding a connection or wait-cell lock. Actions run
+/// and are dropped after the timer lock is released; nothing takes an Atoll lock under it.
+#[derive(Default)]
+struct Timer {
+    due: Mutex<Deadlines>,
+    changed: Condvar,
 }
 
 impl Timer {
     fn run(&self) {
+        let _worker = AbortOnPanic::new();
+        let mut ready = Vec::new();
         let mut due = self.due.lock();
         loop {
             let now = Instant::now();
-            let mut ready = Vec::new();
-            while due.peek().is_some_and(|next| next.at <= now) {
-                ready.push(due.pop().expect("a due action was peeked").fire);
-            }
+            due.take_ready(now, &mut ready);
             if !ready.is_empty() {
-                // Fired outside the lock: a waker may poll its task at once, and the task hand
-                // this timer another action.
                 drop(due);
-                ready.into_iter().for_each(Fire::fire);
+                fire_ready(&mut ready);
                 due = self.due.lock();
                 continue;
             }
-            match due.peek().map(|next| next.at - now) {
+            match due.first().map(|at| at.saturating_duration_since(now)) {
                 None => self.changed.wait(&mut due),
                 Some(wait) => {
                     self.changed.wait_for(&mut due, wait);
@@ -121,4 +125,212 @@ impl Timer {
             }
         }
     }
+
+    fn cancel(&self, key: Key) {
+        let _cancel = AbortOnPanic::new();
+        let (action, earliest_changed) = {
+            let mut due = self.due.lock();
+            let first = due.first();
+            let action = due.remove(key);
+            (action, first != due.first())
+        };
+        if earliest_changed {
+            self.changed.notify_one();
+        }
+        // Completion and RawWaker drops can run code. No timer lock is held here.
+        drop(action);
+    }
 }
+
+/// A panic cannot leave the process accepting deadlines after its only timer thread died.
+/// The same fail-stop rule as an Atoll delivery applies to every action in the batch.
+fn fire_ready(ready: &mut Vec<Fire>) {
+    let _firing = AbortOnPanic::new();
+    for fire in ready.drain(..) {
+        fire.fire();
+    }
+}
+
+struct AbortOnPanic {
+    was_unwinding: bool,
+}
+
+impl AbortOnPanic {
+    fn new() -> Self {
+        Self {
+            was_unwinding: crate::thread::panicking(),
+        }
+    }
+}
+
+impl Drop for AbortOnPanic {
+    fn drop(&mut self) {
+        if !self.was_unwinding && crate::thread::panicking() {
+            crate::io::fatal("a timer action panicked");
+        }
+    }
+}
+
+/// What the timer does once an action's instant passes.
+enum Fire {
+    Wake(Waker),
+    Complete(Completion),
+}
+
+impl Fire {
+    fn fire(self) {
+        match self {
+            Fire::Wake(waker) => waker.wake(),
+            Fire::Complete(completion) => completion.complete(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Key {
+    slot: usize,
+    generation: u64,
+}
+
+/// A slot stores its heap position while armed, and its next free slot otherwise.
+struct Entry {
+    generation: u64,
+    at: Instant,
+    action: Option<Fire>,
+    position: usize,
+    next_free: Option<usize>,
+}
+
+/// An indexed min-heap. Cancellation removes the action itself, not a tombstone for a later scan.
+#[derive(Default)]
+struct Deadlines {
+    entries: Vec<Entry>,
+    heap: Vec<usize>,
+    free: Option<usize>,
+}
+
+impl Deadlines {
+    fn insert(&mut self, at: Instant, action: Fire) -> Key {
+        let slot = match self.free {
+            Some(slot) => {
+                self.free = self.entries[slot].next_free;
+                let entry = &mut self.entries[slot];
+                debug_assert!(entry.action.is_none());
+                entry.at = at;
+                entry.action = Some(action);
+                entry.position = self.heap.len();
+                entry.next_free = None;
+                slot
+            }
+            None => {
+                let slot = self.entries.len();
+                self.entries.push(Entry {
+                    generation: 0,
+                    at,
+                    action: Some(action),
+                    position: self.heap.len(),
+                    next_free: None,
+                });
+                slot
+            }
+        };
+        self.heap.push(slot);
+        self.up(self.heap.len() - 1);
+        Key {
+            slot,
+            generation: self.entries[slot].generation,
+        }
+    }
+
+    fn remove(&mut self, key: Key) -> Option<Fire> {
+        let entry = self.entries.get(key.slot)?;
+        if entry.generation != key.generation || entry.action.is_none() {
+            return None;
+        }
+        let position = entry.position;
+        let generation = entry
+            .generation
+            .checked_add(1)
+            .expect("timer slot generation exhausted");
+        let removed = self.heap.swap_remove(position);
+        debug_assert_eq!(removed, key.slot);
+        if position < self.heap.len() {
+            let moved = self.heap[position];
+            self.entries[moved].position = position;
+            if position != 0 && self.before(position, (position - 1) / 2) {
+                self.up(position);
+            } else {
+                self.down(position);
+            }
+        }
+        let entry = &mut self.entries[key.slot];
+        entry.generation = generation;
+        entry.next_free = self.free;
+        self.free = Some(key.slot);
+        entry.action.take()
+    }
+
+    fn take_ready(&mut self, now: Instant, ready: &mut Vec<Fire>) {
+        while let Some(&slot) = self.heap.first() {
+            let entry = &self.entries[slot];
+            if entry.at > now {
+                break;
+            }
+            let key = Key {
+                slot,
+                generation: entry.generation,
+            };
+            ready.push(self.remove(key).expect("the heap lists an armed slot"));
+        }
+    }
+
+    fn first(&self) -> Option<Instant> {
+        self.heap.first().map(|&slot| self.entries[slot].at)
+    }
+
+    fn up(&mut self, mut position: usize) {
+        while position != 0 {
+            let parent = (position - 1) / 2;
+            if !self.before(position, parent) {
+                break;
+            }
+            self.swap(position, parent);
+            position = parent;
+        }
+    }
+
+    fn down(&mut self, mut position: usize) {
+        loop {
+            let left = position * 2 + 1;
+            if left >= self.heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let next = if right < self.heap.len() && self.before(right, left) {
+                right
+            } else {
+                left
+            };
+            if !self.before(next, position) {
+                break;
+            }
+            self.swap(position, next);
+            position = next;
+        }
+    }
+
+    fn before(&self, a: usize, b: usize) -> bool {
+        let a = self.heap[a];
+        let b = self.heap[b];
+        (self.entries[a].at, a) < (self.entries[b].at, b)
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+        self.entries[self.heap[a]].position = a;
+        self.entries[self.heap[b]].position = b;
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -10,8 +10,6 @@
 //! most, so every request fits the smallest limit, one page of the largest class.
 
 use super::super::aligned::AlignedBlock;
-use super::super::epoch::Epochs;
-use super::cell::{CompletionCell, Retiring};
 use crate::io::{Completion, IO};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
@@ -32,8 +30,13 @@ pub const LARGEST_REQUEST: usize =
 /// budget, so the floor is no larger than a request (the ruling's floor of one page of the
 /// largest class predates the copies living in the frames, and was most of a small pool).
 pub fn default_limit(budget: usize) -> usize {
-    (budget / 8).min(KEPT_CAP).max(LARGEST_REQUEST)
+    (budget / 8).clamp(LARGEST_REQUEST, KEPT_CAP)
 }
+
+const _: () = assert!(
+    LARGEST_REQUEST <= KEPT_CAP,
+    "a change's request fits under the cap"
+);
 
 /// What the room has held and how often it refused, since the pool opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -58,15 +61,11 @@ pub struct KeptRoom {
     /// Bytes of a request refused since one was last admitted: the checkpoint images kept
     /// copies first while it is not 0.
     pressing: AtomicUsize,
-    /// Finished whenever room is given back, if anyone waits for it.
-    freed: CompletionCell,
-    /// Whether another thread gives it back ([`freed_elsewhere`](Self::freed_elsewhere)).
-    freed_elsewhere: crate::sync::atomic::AtomicBool,
-    /// Waits handed out that block until another thread gives room back, for tests.
+    /// The pool's supply: room given back and a cut ended are changes of it (DESIGN.md 9.1.3).
+    supply: Arc<super::supply::Supply>,
+    /// Waits for room handed out, each of the remote kind, for tests.
     #[cfg(test)]
     blocking_waits: AtomicU64,
-    retiring: Retiring,
-    epochs: Arc<Epochs>,
     io: Arc<dyn IO>,
 }
 
@@ -76,7 +75,7 @@ crate::thread::thread_local! {
 }
 
 impl KeptRoom {
-    pub fn new(limit: usize, epochs: Arc<Epochs>, io: Arc<dyn IO>) -> Arc<Self> {
+    pub fn new(limit: usize, supply: Arc<super::supply::Supply>, io: Arc<dyn IO>) -> Arc<Self> {
         Arc::new(Self {
             limit,
             used: AtomicUsize::new(0),
@@ -85,12 +84,9 @@ impl KeptRoom {
             waited_ns: AtomicU64::new(0),
             longest_wait_ns: AtomicU64::new(0),
             pressing: AtomicUsize::new(0),
-            freed: CompletionCell::default(),
-            freed_elsewhere: crate::sync::atomic::AtomicBool::new(false),
+            supply,
             #[cfg(test)]
             blocking_waits: AtomicU64::new(0),
-            retiring: Retiring::new(epochs.clone()),
-            epochs,
             io,
         })
     }
@@ -101,24 +97,22 @@ impl KeptRoom {
             bytes <= self.limit,
             "a request of {bytes} bytes no room holds"
         );
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            if used + bytes > self.limit {
-                return false;
-            }
-            match self.used.compare_exchange_weak(
-                used,
-                used + bytes,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.peak.fetch_max(used + bytes, Ordering::AcqRel);
-                    return true;
-                }
-                Err(now) => used = now,
-            }
+        // One strong compare-and-swap, tried once (DESIGN.md 9.1.2): lost, the change is turned
+        // down as if the room were full, and `wait_for_room`, registered on the room before it
+        // looks again, starts it again at once if room was given back meanwhile. A loss to another
+        // charge is that change's success; a loss to a release is what that look sees.
+        let used = self.used.load(Ordering::Acquire);
+        crate::race::point("kept.charge");
+        if used + bytes > self.limit
+            || self
+                .used
+                .compare_exchange(used, used + bytes, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
         }
+        self.peak.fetch_max(used + bytes, Ordering::AcqRel);
+        true
     }
 
     /// A request of `bytes` refused: the thread waits from now.
@@ -157,8 +151,10 @@ impl KeptRoom {
 
     /// The cut ended: no copy is kept, and none is wanted.
     pub fn cut_ended(&self) {
-        self.pressing.store(0, Ordering::Release);
-        self.wake();
+        self.supply.change(|event| {
+            self.pressing.store(0, Ordering::Release);
+            event.arm();
+        });
     }
 
     /// Gives back `bytes` charged for copies that were not made after all.
@@ -166,43 +162,32 @@ impl KeptRoom {
         self.release(bytes);
     }
 
+    /// Room given back (an uncharge undoes an attempt, and is a change all the same: DESIGN.md
+    /// 9.1.3, rule 5).
     fn release(&self, bytes: usize) {
-        let before = self.used.fetch_sub(bytes, Ordering::AcqRel);
-        debug_assert!(before >= bytes, "a kept copy released twice");
-        self.wake();
+        self.supply.change(|event| {
+            let before = self.used.fetch_sub(bytes, Ordering::AcqRel);
+            debug_assert!(before >= bytes, "a kept copy released twice");
+            event.arm();
+        });
     }
 
-    /// Done when room is next given back or the checkpoint's stepper leaves: what a refused
-    /// writer that could not step the checkpoint waits on.
-    pub fn wait(&self) -> Completion {
-        let fresh = if self.freed_elsewhere.load(Ordering::Acquire) {
-            #[cfg(test)]
-            self.blocking_waits.fetch_add(1, Ordering::Relaxed);
-            Completion::new_remote_wait
-        } else {
-            Completion::new_wait
-        };
-        self.freed
-            .current_with(&self.epochs.enter(), &self.retiring, fresh)
+    /// A wait for room handed out, of the remote kind: its producers are other callers' acts.
+    pub fn waiting(&self, ticket: super::supply::Ticket) -> Completion {
+        #[cfg(test)]
+        self.blocking_waits.fetch_add(1, Ordering::Relaxed);
+        ticket.remote()
     }
 
-    /// Whether room is given back by another thread, the checkpointing thread's images: a writer
-    /// waiting for it then blocks rather than stepping its IO.
     /// Waits handed out so far that block until another thread gives room back.
     #[cfg(test)]
     pub fn blocking_waits(&self) -> u64 {
         self.blocking_waits.load(Ordering::Relaxed)
     }
 
-    pub fn freed_elsewhere(&self, elsewhere: bool) {
-        self.freed_elsewhere.store(elsewhere, Ordering::Release);
-    }
-
-    /// Wakes whoever waits for room.
+    /// Whoever waits for room looks again: a stepper of the checkpoint leaving, its state let go.
     pub fn wake(&self) {
-        if let Some(c) = self.freed.take(&self.retiring) {
-            c.complete(0);
-        }
+        self.supply.change(|event| event.arm());
     }
 
     #[cfg(test)]
@@ -230,7 +215,7 @@ impl KeptRoom {
 /// A page as a cut found it, in a frame lent for it, charged to the room until the copy drops
 /// and gives the frame back.
 pub struct KeptCopy {
-    block: AlignedBlock,
+    block: std::mem::ManuallyDrop<AlignedBlock>,
     room: Arc<KeptRoom>,
 }
 
@@ -238,7 +223,7 @@ impl KeptCopy {
     /// `block`'s copy, already charged to `room`.
     pub fn charged(block: AlignedBlock, room: &Arc<KeptRoom>) -> Self {
         Self {
-            block,
+            block: std::mem::ManuallyDrop::new(block),
             room: room.clone(),
         }
     }
@@ -255,7 +240,12 @@ impl Deref for KeptCopy {
 impl Drop for KeptCopy {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        self.room.release(self.block.len());
+        let len = self.block.len();
+        // The frame first: its return is published and signals its class before the room's bytes
+        // wake a writer (DESIGN.md 9.1.1), so a writer the bytes wake finds the frame.
+        // SAFETY: dropped once, here, and never touched after.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.block) };
+        self.room.release(len);
     }
 }
 

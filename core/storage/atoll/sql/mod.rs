@@ -145,7 +145,7 @@ impl AtollDb {
         let txns = self.atoll.transactions();
         let mut txn = drive(&self.io, || txns.begin(Isolation::Snapshot))?;
         txns.statement(&mut txn)?;
-        let taken = txns.take_exclusive(&mut txn, &crate::io::Completion::new_wait())?;
+        let taken = txns.take_exclusive(&mut txn, &crate::storage::atoll::notify::wait())?;
         if taken != Taken::Done {
             return Err(LimboError::InternalError(format!(
                 "the write gate at open, with nothing else open, came to {taken:?}"
@@ -219,7 +219,9 @@ impl AtollDb {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % txns.slot_count();
         for s in [slot, other as u16] {
-            let _freed = self.versions.collect(txns, s)?;
+            // Maintenance the begin helps along, never the begin's own demand: a claim of it that
+            // finds no frame leaves the begin's owner untouched (the census's K1).
+            let _freed = crate::storage::atoll::buffer::unowned(|| self.versions.collect(txns, s))?;
         }
         Ok(())
     }

@@ -36,6 +36,7 @@ fn open(io: &Arc<dyn IO>, slots: usize) -> Atoll {
             budget: MIN_DB_BUDGET,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,
@@ -469,4 +470,307 @@ fn a_cut_divides_the_log_by_commit_timestamp_in_shuttle_schedules() {
         || a_cut_divides_the_log_by_commit_timestamp(2, 2, 2),
         300,
     );
+}
+
+// A real spill pauses after taking log space and before publishing its first position.
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn audit_a_cut_waits_for_a_reserving_spill_without_ready_retries() {
+    use crate::storage::atoll::log::Log;
+    use std::sync::{
+        atomic::{AtomicUsize as Count, Ordering as Order},
+        mpsc,
+    };
+    use std::task::{Wake, Waker};
+    struct Seen(Count);
+    impl Wake for Seen {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Order::Relaxed);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Order::Relaxed);
+        }
+    }
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Arc::new(open(&io, 4));
+    let mut txn = begin(&io, &db, Isolation::Snapshot);
+    db.transactions().statement(&mut txn).unwrap();
+    for _ in 0..2000 {
+        write(&io, &db, &mut txn);
+    }
+    let start = txn.start();
+    let sealed = txn.changes.sealed_len().is_some();
+    let (paused_tx, paused_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let (spilled_tx, spilled_rx) = mpsc::sync_channel(1);
+    let (commit_tx, commit_rx) = mpsc::sync_channel(1);
+    let worker = {
+        let io = io.clone();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            crate::race::at("txn.before_reserved_at", move || {
+                let _ = paused_tx.send(());
+                let _ = resume_rx.recv_timeout(std::time::Duration::from_secs(15));
+            });
+            if drive(&io, || db.transactions().spill(&mut txn)).is_err() {
+                db.transactions().abort(txn);
+                let _ = spilled_tx.send(false);
+                return None;
+            }
+            let _ = spilled_tx.send(true);
+            let _ = commit_rx.recv_timeout(std::time::Duration::from_secs(15));
+            commit(&io, &db, txn)
+        })
+    };
+    let paused = paused_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .is_ok();
+    let captured_log_end = db.log().end();
+    let seen = std::sync::Arc::new(Seen(Count::new(0)));
+    let waker = Waker::from(seen.clone());
+    let mut cut = Cut::default();
+    let mut other_cut = Cut::default();
+    let mut ready = 0;
+    let mut proper_kind = true;
+    let mut pending = 0;
+    let mut early_done = false;
+    let mut error = None;
+    let mut last = None;
+    if paused {
+        for _ in 0..32 {
+            match db.transactions().cut(&mut cut) {
+                Ok(IOResult::IO(IOCompletions(c))) => {
+                    c.set_waker(&waker);
+                    if !c.finished() {
+                        proper_kind &= c.is_engine_wait() && c.is_remote_wait();
+                    }
+                    let finished = c.finished();
+                    last = Some(c);
+                    if finished {
+                        ready += 1;
+                    } else {
+                        pending += 1;
+                        break;
+                    }
+                }
+                Ok(IOResult::Done(_)) => {
+                    early_done = true;
+                    break;
+                }
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    // A second cut must also decode the WAITED mark as reserving, not as an LSN.
+    let other_wait = if paused {
+        match db.transactions().cut(&mut other_cut) {
+            Ok(IOResult::IO(IOCompletions(c))) => Some(c),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let other_pending = other_wait.as_ref().is_some_and(|c| !c.finished());
+    let wakes_before = seen.0.load(Order::Relaxed);
+    let _ = resume_tx.send(());
+    let spilled = spilled_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .ok();
+    let finished_after = last.as_ref().is_some_and(Completion::finished);
+    let other_finished = other_wait.as_ref().is_some_and(Completion::finished);
+    let wakes_after = seen.0.load(Order::Relaxed);
+    let cut_result = if spilled == Some(true) {
+        drive(&io, || db.transactions().cut(&mut cut)).ok()
+    } else {
+        None
+    };
+    let other_result = if spilled == Some(true) {
+        drive(&io, || db.transactions().cut(&mut other_cut)).ok()
+    } else {
+        None
+    };
+    let _ = commit_tx.send(());
+    let committed = worker.join().ok().flatten();
+    let mut reader = Log::reader(io.clone(), BASE, &log_config(), 0);
+    let mut first_part = None;
+    while let Some(r) = reader.next_record().unwrap() {
+        if r.header.kind == SPILL && u64::from_le_bytes(r.payload[..8].try_into().unwrap()) == start
+        {
+            first_part = Some(first_part.map_or(r.start, |p: Lsn| p.min(r.start)));
+        }
+    }
+    drop(reader);
+    drop(last);
+    drop(other_wait);
+    drop(waker);
+    drop(seen);
+    drop(db);
+    drop(io);
+    println!("RESERVATION_NATIVE sealed={sealed} paused={paused} ready={ready} pending={pending} early_done={early_done} error={error:?} other_pending={other_pending} wakes_before={wakes_before} wakes_after={wakes_after} finished_after={finished_after} other_finished={other_finished} spilled={spilled:?} captured_log_end={captured_log_end} first_part={first_part:?} cut={cut_result:?} other_cut={other_result:?} committed={committed:?}");
+    assert!(
+        sealed && paused && spilled == Some(true) && error.is_none() && !early_done,
+        "real spill/cut setup and cleanup must complete"
+    );
+    assert!(
+        finished_after && other_finished,
+        "publishing a marked reservation must finish both cut waits"
+    );
+    let p = first_part.expect("real SPILL record read back from the log");
+    let (l, c) = cut_result.expect("cut done after spill publication");
+    let (other_l, other_c) = other_result.expect("second cut done after publication");
+    assert!(
+        p < captured_log_end
+            && committed.is_some_and(|t| t > c && t > other_c)
+            && l == p
+            && other_l == p,
+        "cut must retain the first part of a commit above its snapshot"
+    );
+    assert_eq!(
+        (ready, pending, wakes_before),
+        (0, 1, 0),
+        "a reserving spill must park the cut rather than hand back ready retries"
+    );
+    assert!(proper_kind, "reservation waits must be remote engine waits");
+    assert!(
+        other_pending,
+        "a second cut must wait on an already marked reservation"
+    );
+    assert!(
+        wakes_after > wakes_before,
+        "publishing the first position wakes the registered cut"
+    );
+}
+
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_reservation_published_before_the_cut_marks_it_does_not_strand_the_cut() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Arc::new(open(&io, 2));
+    let txns = db.transactions();
+    let txn = begin(&io, &db, Isolation::Snapshot);
+    let slot = txn.slot();
+    txns.reserving(slot);
+    // A unit interleaving of the mark helpers: the real SPILL test separately checks the log.
+    let publisher = db.clone();
+    crate::race::at("txn.reservation_wait", move || {
+        publisher
+            .transactions()
+            .reserved_at(slot, GroupStart::at(0));
+    });
+    let mut cut = Cut::default();
+    let result = txns.cut(&mut cut).unwrap();
+    let stranded = match &result {
+        IOResult::IO(IOCompletions(wait)) => !wait.finished(),
+        IOResult::Done(_) => false,
+    };
+    let point_taken = !crate::race::pending("txn.reservation_wait");
+    let final_cut = drive(&io, || txns.cut(&mut cut)).unwrap();
+    txns.abort(txn);
+    drop(result);
+    drop(db);
+    drop(io);
+    assert!(point_taken, "publication must run between capture and mark");
+    assert!(
+        !stranded,
+        "a cut that lost its mark returned an unfinished wait with no producer"
+    );
+    assert_eq!(
+        final_cut.0, 0,
+        "the cut reads the published position after the lost mark"
+    );
+}
+
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_later_log_part_does_not_replace_a_reservations_first_position() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 2);
+    let txns = db.transactions();
+    let txn = begin(&io, &db, Isolation::Snapshot);
+    let slot = txn.slot();
+    txns.reserving(slot);
+    txns.reserved_at(slot, GroupStart::at(0));
+    let first = txns.reserved[slot as usize].load(Ordering::SeqCst);
+    txns.reserving(slot);
+    txns.reserved_at(slot, GroupStart::at(BLOCK));
+    let later = txns.reserved[slot as usize].load(Ordering::SeqCst);
+    let domain_unused = txns.reservation_completions.get().is_none();
+    txns.abort(txn);
+    drop(db);
+    drop(io);
+    assert_eq!(decode_reservation(first), Reservation::Position(0));
+    assert_eq!(
+        later, first,
+        "a later part overwrote the first reservation position"
+    );
+    assert!(
+        domain_unused,
+        "an unmarked publication initializes no completion domain"
+    );
+}
+
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn uncontended_commits_never_initialize_reservation_completions() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 2);
+    let unused_before = db.transactions().reservation_completions.get().is_none();
+    for _ in 0..8 {
+        let mut txn = begin(&io, &db, Isolation::Snapshot);
+        db.transactions().statement(&mut txn).unwrap();
+        write(&io, &db, &mut txn);
+        commit(&io, &db, txn);
+    }
+    let unused_after = db.transactions().reservation_completions.get().is_none();
+    drop(db);
+    drop(io);
+    assert!(
+        unused_before && unused_after,
+        "uncontended commits initialized reservation completions"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn reservation_words_leave_the_flag_bits_separate_from_positions() {
+    assert_eq!(decode_reservation(0), Reservation::None);
+    assert_eq!(decode_reservation(RESERVING), Reservation::Reserving);
+    assert_eq!(decode_reservation(RESERVING_WAITED), Reservation::Reserving);
+    for at in [0, 1, BLOCK, RESERVATION_WAITED - 2] {
+        assert_eq!(
+            decode_reservation(encode_reservation(at)),
+            Reservation::Position(at)
+        );
+    }
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+#[should_panic(expected = "reservation position exhausted")]
+fn a_reservation_position_cannot_use_a_flag_bit() {
+    encode_reservation(RESERVATION_WAITED - 1);
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+#[should_panic(expected = "reservation position exhausted")]
+fn an_overflowing_reservation_position_is_refused_before_addition() {
+    encode_reservation(u64::MAX);
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+#[should_panic(expected = "invalid reservation word")]
+fn a_waited_bit_without_a_reservation_is_refused() {
+    decode_reservation(RESERVATION_WAITED);
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+#[should_panic(expected = "invalid reservation word")]
+fn a_reservation_cannot_also_have_position_bits() {
+    decode_reservation(RESERVING | 1);
 }

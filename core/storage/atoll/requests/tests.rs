@@ -2,9 +2,11 @@ use super::*;
 use crate::io::crash::CrashIO;
 use crate::io::{MemoryIO, OpenFlags, DIRECT_IO_ALIGNMENT};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
+use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::log::{framed_len, Header, Kind};
 use crate::storage::atoll::testing::drive;
 use crate::sync::atomic::AtomicBool;
+use crate::sync::atomic::AtomicUsize;
 use crate::IOResult;
 
 fn counted(io: Arc<dyn IO>) -> (Arc<dyn IO>, Arc<Requests>) {
@@ -313,4 +315,180 @@ fn close_parks_on_the_ring_until_its_last_request_retires() {
     assert!(!c.is_owned());
     assert_eq!(requests.outstanding(), 0);
     assert_eq!(ring.steps(), 0, "close stepped the ring");
+}
+
+/// Close on a pumped backend that has let a request go while a cancellation, paused on another
+/// thread, still runs its callback: close parks, stepping nothing, as only that finish can retire
+/// it; a request submitted meanwhile wakes it and it steps that one; the callback, resumed,
+/// submits a request of its own, which close steps too; close returns once all retired (audit
+/// chain-fixes-v1, P2-CF1; mutants: close stepping until the finish lands spends the pause on
+/// empty steps; close parking whatever the backend holds, or not woken by a submission, never
+/// steps the new requests).
+#[test]
+fn close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submits() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const BOUND: Duration = Duration::from_secs(20);
+    let crash = Arc::new(CrashIO::new(1));
+    let stepping = crate::io::wait_tests::StepCounting::new(crash.clone());
+    let (io, requests) = counted(stepping.clone());
+    let file = io.open_file("/db/close", OpenFlags::Create, false).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let child = Arc::new(Mutex::new(None::<Completion>));
+    let c = {
+        let (file, child) = (file.clone(), child.clone());
+        Completion::new_sync(move |res| {
+            if res.is_err() {
+                entered_tx.send(()).unwrap();
+                go_rx.lock().recv().unwrap();
+                let next = file
+                    .pwrite(
+                        0,
+                        Arc::new(Buffer::new_temporary(512)),
+                        Completion::new_write(|_| {}),
+                    )
+                    .unwrap();
+                *child.lock() = Some(next);
+            }
+        })
+    };
+    let c = file.sync(c, crate::io::FileSyncType::Fsync).unwrap();
+    let cancel = {
+        let c = c.clone();
+        std::thread::spawn(move || c.abort())
+    };
+    entered_rx
+        .recv_timeout(BOUND)
+        .expect("the cancellation entered the callback");
+    crash.step().unwrap();
+    assert!(c.left_its_backend() && c.is_owned());
+    assert_eq!(requests.outstanding(), 1);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let closer = {
+        let (requests, io) = (requests.clone(), io.clone());
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            requests.drain(&*io);
+            done_tx.send(()).unwrap();
+        })
+    };
+    started_rx.recv().unwrap();
+    // Long enough for close to reach its wait, which takes microseconds, and for a close that
+    // steps to step many times.
+    std::thread::sleep(Duration::from_millis(100));
+    let mid = (stepping.steps(), done_rx.try_recv().is_ok());
+    // A request submitted while close waits, the finish still paused: close wakes and steps it.
+    let (landed_tx, landed_rx) = mpsc::channel();
+    let other = file
+        .pwrite(
+            512,
+            Arc::new(Buffer::new_temporary(512)),
+            Completion::new_write(move |_| {
+                let _ = landed_tx.send(());
+            }),
+        )
+        .unwrap();
+    let stepped_for_it = landed_rx.recv_timeout(BOUND).is_ok();
+    go_tx.send(()).unwrap();
+    cancel.join().unwrap();
+    let ended = done_rx.recv_timeout(BOUND).is_ok();
+    if !ended {
+        // A close that never steps the callback's request: step it here so the closer returns.
+        while requests.outstanding() > 0 {
+            crash.step().unwrap();
+        }
+    }
+    closer.join().unwrap();
+    let child = child.lock().take();
+    assert_eq!(
+        mid,
+        (0, false),
+        "(steps, returned) while the finish was paused"
+    );
+    assert!(
+        stepped_for_it,
+        "close did not step a request submitted while it waited"
+    );
+    assert!(
+        !other.is_owned(),
+        "the request submitted while close waited"
+    );
+    assert!(
+        ended,
+        "close did not return once every request could retire"
+    );
+    let child = child.expect("the callback submitted its request");
+    assert!(
+        child.finished() && !child.is_owned(),
+        "the callback's request"
+    );
+    assert!(!c.is_owned(), "the cancelled request");
+    assert_eq!(requests.outstanding(), 0);
+    assert!(
+        stepping.steps() > 0,
+        "close never stepped the callback's request"
+    );
+}
+
+struct AuditGroupFile(Arc<dyn File>);
+impl File for AuditGroupFile {
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
+        self.0.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> Result<()> {
+        self.0.unlock_file()
+    }
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        let mut group = crate::io::CompletionGroup::new(|_| {});
+        group.add(&c);
+        // The group holds the request: what the submission hands back is the same one.
+        let _ = self.0.pread(pos, c)?;
+        Ok(group.build())
+    }
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        self.0.pwrite(pos, buffer, c)
+    }
+    fn sync(&self, c: Completion, ty: FileSyncType) -> Result<Completion> {
+        self.0.sync(c, ty)
+    }
+    fn size(&self) -> Result<u64> {
+        self.0.size()
+    }
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        self.0.truncate(len, c)
+    }
+}
+
+#[test]
+fn audit_a_returned_group_cannot_uncount_the_original_request_still_owned_by_crash_io() {
+    let crash = Arc::new(CrashIO::new(1));
+    let requests = Arc::new(Requests::default());
+    let backend = crash
+        .open_file("/db/group-return", OpenFlags::Create, false)
+        .unwrap();
+    let file = CountedFile {
+        file: Arc::new(AuditGroupFile(backend)),
+        requests: requests.clone(),
+    };
+    let returned = file.pread(0, read(512)).unwrap();
+    let before = (
+        requests.outstanding(),
+        crash.in_flight(),
+        returned.finished(),
+    );
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let after = requests.outstanding();
+    drop((returned, file, requests, crash));
+    println!("ORIGINAL_REQUEST_COUNT before={before:?} after={after}");
+    assert_eq!(
+        before,
+        (1, 1, false),
+        "a returned logical group hid the accepted physical request"
+    );
+    assert_eq!(after, 0);
 }

@@ -86,13 +86,20 @@ fn a_batch_emptied_as_it_drains_is_released_once() {
                 thread::spawn(move || m.put(class(0), f))
             })
             .collect();
-        m.drain_for(class(0), batch, class(1));
+        // Tried once (DESIGN.md 9.1.2): lost to a free that moved the word, it starts nothing and
+        // its caller chooses again, here once the frees are done.
+        let drained = m.drain_for(class(0), batch, class(1));
         let released = freers
             .into_iter()
             .map(|t| t.join().unwrap())
             .filter(|&r| r)
             .count();
         assert!(released <= 1, "released by {released} frees");
+        if !drained {
+            assert_eq!(released, 0, "a free released a batch no drain had started");
+            assert_eq!(m.held()[0], BATCH, "a lost drain changed the batch");
+            assert!(m.drain_for(class(0), batch, class(1)), "the drain chosen again");
+        }
         assert_eq!(m.held()[0], 0);
         assert_eq!(
             m.held()[1],

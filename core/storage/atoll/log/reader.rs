@@ -102,7 +102,10 @@ impl LogReader {
             return Err(corrupt());
         }
         let mut out = vec![first];
-        while out.last().is_some_and(|r| r.place.grouped() && !r.place.last()) {
+        while out
+            .last()
+            .is_some_and(|r| r.place.grouped() && !r.place.last())
+        {
             let r = reader.next_record()?.ok_or_else(corrupt)?;
             if r.group != at.get() {
                 return Err(corrupt());
@@ -282,7 +285,7 @@ impl LogReader {
                 Err(e) => Some(e),
             });
             let c = file.pread(at - self.segments.start(number), c)?;
-            self.io.wait_for_completion(c)?;
+            crate::storage::atoll::park::wait_for_completion(self.io.as_ref(), c)?;
             let n = got.load(Ordering::Acquire) as usize;
             // SAFETY: the read filled the first `n` bytes of the buffer, and nothing else uses it.
             let bytes = unsafe { std::slice::from_raw_parts(self.buffer.as_ptr(), n) };
@@ -348,7 +351,7 @@ impl Rereader {
                 Err(e) => Some(e),
             });
             let c = file.pread(pos - self.segments.start(number), c)?;
-            self.io.wait_for_completion(c)?;
+            crate::storage::atoll::park::wait_for_completion(self.io.as_ref(), c)?;
             let n = got.load(Ordering::Acquire) as usize;
             self.read += n as u64;
             if n < len {

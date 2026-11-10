@@ -64,8 +64,7 @@ pub use reader::{LogReader, OwnedRecord, Rereader};
 pub use record::{framed_len, GroupStart, Header, Kind, Lsn, Place, BLOCK, MAX_PAYLOAD};
 
 use super::aligned::AlignedBlock;
-use super::buffer::{BufferPool, LentUse};
-use super::drive;
+use super::buffer::BufferPool;
 use super::once::SetOnce;
 use super::page::SizeClass;
 use super::prefix::Prefix;
@@ -98,6 +97,12 @@ fn ring_slots(config: &LogConfig) -> usize {
 
 /// Bytes of the pool's frames the ring of `config` takes, each chunk in a frame of the class
 /// that fits it.
+/// The class of the ring's chunk frames and how many: what the pool lends the ring as it opens.
+pub fn ring_chunks(config: &LogConfig) -> Option<(SizeClass, u32)> {
+    let class = SizeClass::fitting(config.chunk_bytes as usize)?;
+    Some((class, ring_slots(config) as u32))
+}
+
 pub fn ring_bytes(config: &LogConfig) -> usize {
     let frame = SizeClass::fitting(config.chunk_bytes as usize).map_or(0, SizeClass::size);
     ring_slots(config) * frame
@@ -205,6 +210,10 @@ impl Drop for Admitted {
     }
 }
 
+/// Where a write's bytes come from: the block of a record published in place and where in it the
+/// write starts, or, for `None`, the ring.
+type WriteSource = Option<(Arc<AlignedBlock>, usize)>;
+
 impl Log {
     /// Where [`open`](Self::open) resumes appending to a log that ends at `end`: the next block
     /// boundary.
@@ -234,12 +243,11 @@ impl Log {
         end: Lsn,
         pool: &Arc<BufferPool>,
     ) -> Result<Arc<Self>> {
-        let lend_io = io.clone();
         Self::open_with(io, base, config, end, |len| {
             let class = SizeClass::fitting(len).ok_or_else(|| {
                 LimboError::InternalError(format!("a log chunk of {len} bytes fits no page class"))
             })?;
-            let mut block = drive(&lend_io, || pool.lend(class, LentUse::Log))?;
+            let mut block = pool.lend_ring(class)?;
             // Zeroed as the heap's are: the log pads with what a chunk holds.
             block.bytes_mut().fill(0);
             Ok(block)
@@ -337,10 +345,10 @@ impl Log {
             let len = (segments.size - at).min(zeros.len() as u64);
             let (write, zeroed) = whole_write(len as usize);
             drop(file.pwrite(at, zeros.region(0, len as usize), write)?);
-            io.wait_for_completion(zeroed)?;
+            crate::storage::atoll::park::wait_for_completion(io.as_ref(), zeroed)?;
             at += len;
         }
-        io.wait_for_completion(file.sync_data(Completion::new_sync(|_| {}))?)?;
+        crate::storage::atoll::park::wait_for_completion(io.as_ref(), file.sync_data(Completion::new_sync(|_| {}))?)?;
         io.sync_directory(&segments.directory())?;
         Ok(file.supports_durable_writes())
     }
@@ -410,7 +418,7 @@ impl Log {
         // A call: it registers, flushes, runs a step it finds runnable, then reads again. The
         // completion it returns means only that it should be called again. One left behind is
         // finished by the next wake, for no one.
-        let c = Completion::new_wait();
+        let c = crate::storage::atoll::notify::wait();
         room::wait_on(&self.admitters, c.clone());
         self.flush();
         self.steps();
@@ -818,7 +826,7 @@ impl Log {
 
     /// The writes to start, from where the last ended, and whether padding waits for a segment:
     /// for the flush under way.
-    fn plan_writes(&self) -> (Vec<(Lsn, Lsn, Option<(Arc<AlignedBlock>, usize)>)>, bool) {
+    fn plan_writes(&self) -> (Vec<(Lsn, Lsn, WriteSource)>, bool) {
         let mut writes = Vec::new();
         if self.failed.load(Ordering::Acquire) {
             return (writes, false);
@@ -897,12 +905,7 @@ impl Log {
 
     /// Writes `[start, end)`: from a record published in place, its block and where in it
     /// `start` lies, or from the ring.
-    fn submit_write(
-        self: &Arc<Self>,
-        start: Lsn,
-        end: Lsn,
-        from: Option<(Arc<AlignedBlock>, usize)>,
-    ) {
+    fn submit_write(self: &Arc<Self>, start: Lsn, end: Lsn, from: WriteSource) {
         let segment = self.segments.number(start);
         let file = self.segments.file(segment);
         let buffer = match from {

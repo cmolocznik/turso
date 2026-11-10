@@ -3,7 +3,8 @@
 //!
 //! A sweep looks at every frame: a page clean when looked at is done; a dirty one is written, its
 //! copy taken under a latch; one already being written, or written out of its frame, is looked at
-//! again once its write lands.
+//! again once its write lands; one a change holds, once that change lets it go. A frame a load or
+//! a claim holds has no dirty page in it.
 
 use super::super::latch::Held;
 use super::frame::{OUTGOING, RESIDENT, WRITING};
@@ -22,7 +23,8 @@ enum Look {
     Write(SizeClass),
     /// Being written by someone else, or written out: look again once the write lands.
     Writing,
-    /// Latched exclusively for a change or a load: look again shortly.
+    /// A resident page latched for a change, or changed while looked at: look again once the
+    /// holder lets it go.
     Busy,
 }
 
@@ -49,9 +51,11 @@ impl Sweep {
         let _step = pool.store.epochs().enter();
         pool.failed()?;
         // Waiting starts before the looks, so a write landing in between is not missed.
-        let landed = pool.released_wait();
+        let landed = pool.ticket();
         let mut start: [Vec<u32>; CLASS_COUNT] = Default::default();
         let mut writing = false;
+        // The first frame a change holds: its release is waited for when nothing else is.
+        let mut busy = None;
         let again = std::mem::take(&mut self.again);
         let first = self.next..pool.memory.grains();
         self.next = pool.memory.grains();
@@ -63,7 +67,10 @@ impl Sweep {
                     writing = true;
                     self.again.push(frame);
                 }
-                Look::Busy => self.again.push(frame),
+                Look::Busy => {
+                    busy.get_or_insert(frame);
+                    self.again.push(frame);
+                }
             }
         }
         for (frames, class) in start.into_iter().zip(SizeClass::all()) {
@@ -77,11 +84,17 @@ impl Sweep {
         self.ours.retain(|c| !c.finished());
         pool.failed()?;
         if !self.ours.is_empty() || writing {
-            return Ok(IOResult::IO(IOCompletions(landed)));
+            return Ok(IOResult::IO(IOCompletions(pool.supply_wait(landed))));
         }
-        if !self.again.is_empty() {
-            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+        if let Some(frame) = busy {
+            return Ok(IOResult::IO(IOCompletions(
+                pool.wait_for_resident_latch(frame),
+            )));
         }
+        debug_assert!(
+            self.again.is_empty(),
+            "a frame looked at again with nothing to wait for"
+        );
         Ok(IOResult::Done(()))
     }
 }
@@ -89,11 +102,12 @@ impl Sweep {
 fn look(pool: &BufferPool, frame: u32) -> Look {
     let h = pool.header(frame);
     let Some(version) = h.latch.optimistic() else {
-        // A write-out holds its frame until the write lands; anything else holds it briefly.
-        return if h.status() == OUTGOING {
-            Look::Writing
-        } else {
-            Look::Busy
+        // A write-out holds its frame until the write lands; a change holds a resident page; a
+        // load or a claim holds a frame whose page is clean, or none.
+        return match h.status() {
+            OUTGOING => Look::Writing,
+            RESIDENT => Look::Busy,
+            _ => Look::Done,
         };
     };
     let (status, dirty, writing) = (h.status(), h.dirty(), h.has(WRITING));
@@ -110,7 +124,7 @@ fn look(pool: &BufferPool, frame: u32) -> Look {
     }
     // Held at the version seen, the frame keeps the page looked at: claim it if it is still dirty
     // and unclaimed. Nothing in the page changes, so readers are not sent back.
-    let Some(hold) = Held::try_take_at(&h.latch, version) else {
+    let Some(hold) = Held::try_take_at(pool.frame_ref(frame), version) else {
         return Look::Busy;
     };
     let claimed = h.dirty() && h.flags.fetch_or(WRITING, Ordering::AcqRel) & WRITING == 0;

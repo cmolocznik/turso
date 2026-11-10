@@ -30,12 +30,14 @@
 
 use self::sync::{fence, AtomicU64, Ordering};
 use super::btree::Tree;
+use super::buffer::cell::{CompletionCell, CompletionDomain};
+use super::epoch::Epochs;
 use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn, BLOCK};
 use super::page::{PageId, SizeClass};
 use super::segmented::Segmented;
 use super::stack::Stack;
 use crate::io::Completion;
-use crate::sync::Arc;
+use crate::sync::{Arc, OnceLock};
 use crossbeam_utils::CachePadded;
 use horizon::Horizon;
 
@@ -78,7 +80,17 @@ pub const SPILL: Kind = Kind::new(28).unwrap();
 pub const RUN: Kind = Kind::new(29).unwrap();
 
 /// In a slot's reserved position: its commit is taking room in the log, where not yet known.
-const RESERVING: u64 = u64::MAX;
+const RESERVING: u64 = 1 << 63;
+/// A cut registered before marking a reservation for its publisher to wake.
+const RESERVATION_WAITED: u64 = 1 << 62;
+const RESERVING_WAITED: u64 = RESERVING | RESERVATION_WAITED;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reservation {
+    None,
+    Reserving,
+    Position(Lsn),
+}
 
 /// A checkpoint's cut under way ([`Transactions::cut`]).
 #[derive(Debug, Default)]
@@ -248,6 +260,10 @@ pub struct Transactions {
     /// spilled part or its Commit), plus one; [`RESERVING`] while it takes it; 0 for none. Read by
     /// a checkpoint's cut ([`Transactions::cut`]), so each on a line of its own.
     reserved: Box<[CachePadded<AtomicU64>]>,
+    /// Cuts waiting for a reservation's first position to be published.
+    reservation_wait: CompletionCell,
+    /// Completion announcements, made only on the first wait for a reservation.
+    reservation_completions: OnceLock<CompletionDomain>,
     horizon: Horizon,
     /// The snapshot of the checkpoint under way, `Ts::MAX` for none: no reserve a version it reads
     /// needs is given back while it runs.
@@ -547,6 +563,8 @@ impl Transactions {
             reserved: (0..config.slots)
                 .map(|_| CachePadded::new(AtomicU64::new(0)))
                 .collect(),
+            reservation_wait: CompletionCell::default(),
+            reservation_completions: OnceLock::new(),
             horizon: Horizon::new(config.slots, base),
             checkpoint_at: AtomicU64::new(Ts::MAX),
             free: (0..words)
@@ -633,8 +651,10 @@ impl Transactions {
         self.reserved
             .iter()
             .map(|mark| mark.load(Ordering::SeqCst))
-            .filter(|&at| at != 0 && at != RESERVING)
-            .map(|at| at - 1)
+            .filter_map(|word| match decode_reservation(word) {
+                Reservation::Position(at) => Some(at),
+                Reservation::None | Reservation::Reserving => None,
+            })
             .fold(self.log.end(), Lsn::min)
     }
 
@@ -702,7 +722,7 @@ impl Transactions {
         let slot = match self.take_slot() {
             Some(slot) => slot,
             None => {
-                let c = Completion::new_remote_wait();
+                let c = crate::storage::atoll::notify::remote_wait();
                 self.slot_waits.push(c.clone());
                 // Pairs with the fence of a slot freed: either it finds this waiting, or this
                 // finds the slot. A completion left behind is completed later, for no one.
@@ -949,16 +969,32 @@ impl Transactions {
     /// `slot`'s commit is about to take room in the log, unless it already took some.
     fn reserving(&self, slot: u16) {
         let mark = &self.reserved[slot as usize];
-        if mark.load(Ordering::Relaxed) == 0 {
+        if decode_reservation(mark.load(Ordering::Relaxed)) == Reservation::None {
             mark.store(RESERVING, Ordering::SeqCst);
         }
     }
 
     /// `slot`'s commit took room in the log at `at`: its first, unless it took some before.
     fn reserved_at(&self, slot: u16, at: GroupStart) {
+        crate::race::point("txn.before_reserved_at");
         let mark = &self.reserved[slot as usize];
-        if mark.load(Ordering::Relaxed) == RESERVING {
-            mark.store(at.get() + 1, Ordering::SeqCst);
+        match decode_reservation(mark.load(Ordering::Relaxed)) {
+            Reservation::Position(_) => return,
+            Reservation::Reserving => {}
+            Reservation::None => panic!("a position published without its reservation"),
+        }
+        let position = encode_reservation(at.get());
+        match mark.compare_exchange(RESERVING, position, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {}
+            Err(word) => {
+                assert_eq!(word, RESERVING_WAITED, "only a cut marks a reservation");
+                assert!(
+                    mark.compare_exchange(word, position, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok(),
+                    "the slot's publisher alone replaces its reservation"
+                );
+                self.wake_reservation_waiters();
+            }
         }
     }
 
@@ -984,12 +1020,15 @@ impl Transactions {
             None => {
                 let mut l = self.log.end();
                 for mark in self.reserved.iter() {
-                    match mark.load(Ordering::SeqCst) {
-                        0 => {}
-                        RESERVING => {
-                            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
+                    let word = mark.load(Ordering::SeqCst);
+                    match decode_reservation(word) {
+                        Reservation::None => {}
+                        Reservation::Reserving => {
+                            return Ok(IOResult::IO(IOCompletions(
+                                self.wait_for_reservation(mark, word),
+                            )))
                         }
-                        at => l = l.min(at - 1),
+                        Reservation::Position(at) => l = l.min(at),
                     }
                 }
                 *op.at.insert((l, self.clock.now()))
@@ -1222,8 +1261,45 @@ impl Transactions {
         ends::holder(&self.running[slot], &self.owner[slot], blocker.start)
     }
 
+    /// Registers before marking, so publication either finishes this wait or defeats the mark.
+    fn wait_for_reservation(&self, mark: &AtomicU64, word: u64) -> Completion {
+        let domain = self
+            .reservation_completions
+            .get_or_init(|| CompletionDomain::new(Arc::new(Epochs::new())));
+        let wait = self
+            .reservation_wait
+            .current_with(domain, crate::storage::atoll::notify::remote_wait);
+        crate::race::point("txn.reservation_wait");
+        if mark
+            .compare_exchange(
+                word,
+                word | RESERVATION_WAITED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            // The reservation changed after the look: no wait on the old signal is needed.
+            return Completion::new_yield();
+        }
+        crate::race::point("txn.reservation_marked");
+        wait
+    }
+
+    /// Publication took a marked reservation; every cut registered on this signal looks again.
+    fn wake_reservation_waiters(&self) {
+        let domain = self
+            .reservation_completions
+            .get()
+            .expect("a marked reservation has its completion domain");
+        if let Some(wait) = self.reservation_wait.take(domain) {
+            crate::storage::atoll::notify::finish(&wait, Ok(0));
+        }
+    }
+
     fn release(&self, slot: u16) {
-        // A commit's parts and Commit are in the log and published, or it failed with the log.
+        // Never reached while reserving: taking log space through publishing its position is
+        // infallible and does not yield; a panic there aborts with Admitted still alive.
         self.reserved[slot as usize].store(0, Ordering::SeqCst);
         snapshots::vacate(&self.snapshots[slot as usize]);
         ends::vacate(&self.running[slot as usize], &self.owner[slot as usize]);
@@ -1235,6 +1311,29 @@ impl Transactions {
         }
         self.ends[slot as usize].wake();
     }
+}
+
+/// The same representation is used by the cut, log retention and the slot's publisher.
+#[inline]
+fn decode_reservation(word: u64) -> Reservation {
+    match word {
+        0 => Reservation::None,
+        RESERVING | RESERVING_WAITED => Reservation::Reserving,
+        position => {
+            crate::turso_assert!(position < RESERVATION_WAITED, "invalid reservation word");
+            Reservation::Position(position - 1)
+        }
+    }
+}
+
+/// Leave the two flag bits clear; check before adding so an overflow cannot become `None`.
+#[inline]
+fn encode_reservation(at: Lsn) -> u64 {
+    crate::turso_assert!(
+        at < RESERVATION_WAITED - 1,
+        "reservation position exhausted"
+    );
+    at + 1
 }
 
 pub mod arena;

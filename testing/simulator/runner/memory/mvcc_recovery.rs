@@ -264,10 +264,10 @@ fn sim_mvcc_restart_recovery_is_idempotent() -> Result<()> {
     Ok(())
 }
 
-/// What this test checks: Startup fails closed when WAL has committed state but the MVCC log file is missing.
-/// Why this matters: In uncertain durability states, refusing to open is safer than guessing and risking data loss.
+/// A checkpoint may empty the logical log before truncating its committed WAL. Recovery must
+/// use that WAL when the log is absent and preserve every committed row.
 #[test]
-fn sim_mvcc_fail_closed_case_wal_without_log() -> Result<()> {
+fn sim_mvcc_recovers_committed_wal_without_log() -> Result<()> {
     let seed = 203;
     let io = make_io(seed, 100);
     let path = format!("sim_mvcc_fail_closed_missing_log_{seed}.db");
@@ -278,7 +278,8 @@ fn sim_mvcc_fail_closed_case_wal_without_log() -> Result<()> {
     drop(conn);
 
     remove_file_by_suffix(io.as_ref(), ".db-log")?;
-    assert_open_fails_closed(io, &path);
+    let conn = open_conn(io.clone(), &path)?;
+    assert_eq!(query_rows(&conn, io.as_ref())?, vec![(1, "a".to_string())]);
     Ok(())
 }
 

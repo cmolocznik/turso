@@ -44,8 +44,10 @@ mod latch;
 mod locks;
 mod log;
 mod meta;
+mod notify;
 mod once;
 mod page;
+mod park;
 mod pins;
 mod prefix;
 mod radix;
@@ -91,7 +93,7 @@ pub(in crate::storage::atoll) fn whole(
 /// A completion to hand a write of `len` bytes, and one to wait on: it ends when the write does,
 /// failed if the write failed or landed short.
 pub(in crate::storage::atoll) fn whole_write(len: usize) -> (Completion, Completion) {
-    let ended = Completion::new_wait();
+    let ended = crate::storage::atoll::notify::wait();
     let done = ended.clone();
     let write = Completion::new_write(move |res| match whole(len, res) {
         Ok(()) => done.complete(0),
@@ -103,16 +105,38 @@ pub(in crate::storage::atoll) fn whole_write(len: usize) -> (Completion, Complet
 /// Runs `op` until it is done, waiting on each completion it hands back through [`IO::wait`]: for
 /// opening a database, whose caller waits for it anyway.
 #[turso_macros::atoll_entry]
-pub(crate) fn drive<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
+pub(crate) fn drive<T>(io: &Arc<dyn IO>, op: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
+    drive_as(buffer::Owner::new(), io, op)
+}
+
+/// [`drive`] for an operation of connection `conn`: a facade method of the connection running it
+/// with a live transaction under its cell, which carries the connection's identity, so a shortage
+/// it meets takes the place of the connection's own suspended operation rather than waiting
+/// behind it (DESIGN.md 9.1.3, *Revoking an inactive tenure*).
+#[turso_macros::atoll_entry]
+pub(in crate::storage::atoll) fn drive_for<T>(
+    conn: &Arc<buffer::Conn>,
+    io: &Arc<dyn IO>,
+    op: impl FnMut() -> Result<IOResult<T>>,
+) -> Result<T> {
+    drive_as(buffer::Owner::of(conn.clone()), io, op)
+}
+
+fn drive_as<T>(
+    mut owner: buffer::Owner,
+    io: &Arc<dyn IO>,
+    mut op: impl FnMut() -> Result<IOResult<T>>,
+) -> Result<T> {
+    // The operation's top: a shortage it meets is reserved here, holding nothing.
     loop {
-        match op()? {
+        match owner.call(&mut op)? {
             IOResult::Done(v) => return Ok(v),
             IOResult::IO(IOCompletions(c)) => {
                 if c.finished() {
                     // A yield: give the processor to whoever holds what the operation needs.
                     crate::thread::yield_now();
                 } else {
-                    io.wait(&c);
+                    crate::storage::atoll::park::wait(io.as_ref(), &c);
                 }
                 if let Some(e) = c.get_error() {
                     return Err(crate::LimboError::CompletionError(e));

@@ -678,7 +678,16 @@ pub fn op_checkpoint(
                                 *state.checkpoint_park_deadline.get_or_insert(now + timeout)
                             });
                         if let Some(deadline) = deadline.filter(|deadline| now < *deadline) {
-                            if crate::timer::complete_at(deadline, iocompletions.0.clone()) {
+                            if !state
+                                .checkpoint_park_timer
+                                .as_ref()
+                                .is_some_and(|timed| timed.is_for(deadline, &iocompletions.0))
+                            {
+                                state.checkpoint_park_timer = None;
+                                state.checkpoint_park_timer =
+                                    crate::timer::complete_at(deadline, iocompletions.0.clone());
+                            }
+                            if state.checkpoint_park_timer.is_some() {
                                 state.parked_checkpoint = Some(ckpt_sm);
                                 return Ok(state.suspend_on_io(iocompletions));
                             }
@@ -687,17 +696,21 @@ pub fn op_checkpoint(
                         // Busy. Its completion is finished, so no list keeps it.
                         iocompletions.0.complete(0);
                         state.checkpoint_park_deadline = None;
+                        state.checkpoint_park_timer = None;
                         state.checkpoint_wait_spent = true;
                         state.explicit_checkpoint_goal = ckpt_sm.truncate_goal();
                         ckpt_sm.cleanup_after_external_io_error(LimboError::Busy)?;
                         return Err(LimboError::Busy.into());
                     }
+                    state.checkpoint_park_timer = None;
                     if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
                         ckpt_sm.cleanup_after_external_io_error(err.clone())?;
                         return Err(err.into());
                     }
                 }
                 Err(err) => {
+                    state.checkpoint_park_timer = None;
+                    state.checkpoint_park_deadline = None;
                     if matches!(err, LimboError::Busy) {
                         state.explicit_checkpoint_goal = ckpt_sm.truncate_goal();
                     }
@@ -705,6 +718,8 @@ pub fn op_checkpoint(
                 }
             }
         };
+        state.checkpoint_park_timer = None;
+        state.checkpoint_park_deadline = None;
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
         state.registers[*dest].set_int(0);
@@ -1418,7 +1433,7 @@ pub fn op_open_read(
             // for read-your-own-writes.
             let view_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor.into_dyn(),
-                pager,
+                pager.into_arc(),
                 program.connection.clone(),
             );
 
@@ -1437,14 +1452,14 @@ pub fn op_open_read(
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
                 BTreeCursor::new_table(
-                    pager,
+                    pager.into_arc(),
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
                 )
                 .into_boxed()
             } else {
                 BTreeCursor::new_without_rowid_table(
-                    pager,
+                    pager.into_arc(),
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     table.as_ref(),
                     num_columns,
@@ -1459,7 +1474,7 @@ pub fn op_open_read(
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = BTreeCursor::new_index_boxed(
-                pager,
+                pager.into_arc(),
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
@@ -4812,12 +4827,14 @@ pub fn op_transaction_inner(
                             Begin::Read
                         };
                         // Whether this statement begins the Atoll transaction, whatever the
-                        // connection's state says: in autocommit, it ends it at its halt.
-                        let begins = !atoll.is_open();
-                        // A take of the write gate left waiting, parked or Busy, is this
-                        // statement's until it is taken or given up (R15).
-                        match atoll.begin_reading(wants, &program.schema_reads) {
-                            Ok(IOResult::Done(())) => state.atoll_taking = false,
+                        // connection's state says: in autocommit, it ends it at its halt. A take
+                        // of the write gate left waiting, parked or Busy, is this statement's
+                        // until it is taken or given up (R15).
+                        let begins = match atoll.begin_reading(wants, &program.schema_reads) {
+                            Ok(IOResult::Done(began)) => {
+                                state.atoll_taking = false;
+                                began
+                            }
                             Ok(IOResult::IO(io)) => {
                                 state.atoll_taking = true;
                                 return Ok(state.suspend_on_io(io));
@@ -4826,7 +4843,7 @@ pub fn op_transaction_inner(
                                 state.atoll_taking = matches!(e, LimboError::Busy);
                                 return Err(e.into());
                             }
-                        }
+                        };
                         if updated
                             && (begins || current_state.no_btree_tx_open())
                             && conn.get_auto_commit()
@@ -5337,15 +5354,49 @@ fn mv_store_for_db(program: &Program, state: &mut ProgramState, db: usize) -> Op
 /// The pager of database `db`. Every opcode receives the main pager of the
 /// connection, so only the temp and attached databases go through the
 /// catalog and its locks.
-fn pager_for_db(program: &Program, main_pager: &Arc<Pager>, db: usize) -> Result<Arc<Pager>> {
+fn pager_for_db<'a>(
+    program: &Program,
+    main_pager: &'a Arc<Pager>,
+    db: usize,
+) -> Result<PagerFor<'a>> {
     if db == crate::MAIN_DB_ID {
         debug_assert!(
             Arc::ptr_eq(main_pager, &program.connection.pager.load()),
             "opcode pager is not the main pager of the connection"
         );
-        Ok(main_pager.clone())
+        Ok(PagerFor::Main(main_pager))
     } else {
-        program.get_pager_from_database_index(&db)
+        program
+            .get_pager_from_database_index(&db)
+            .map(PagerFor::Attached)
+    }
+}
+
+/// The pager of an opcode's database: the main one lent, as every statement on the main
+/// database uses it, with no count taken; an attached one's own.
+enum PagerFor<'a> {
+    Main(&'a Arc<Pager>),
+    Attached(Arc<Pager>),
+}
+
+impl PagerFor<'_> {
+    /// The pager to keep: a count taken only where a cursor keeps it.
+    fn into_arc(self) -> Arc<Pager> {
+        match self {
+            Self::Main(pager) => pager.clone(),
+            Self::Attached(pager) => pager,
+        }
+    }
+}
+
+impl std::ops::Deref for PagerFor<'_> {
+    type Target = Arc<Pager>;
+
+    fn deref(&self) -> &Arc<Pager> {
+        match self {
+            Self::Main(pager) => pager,
+            Self::Attached(pager) => pager,
+        }
     }
 }
 
@@ -14561,7 +14612,7 @@ fn open_atoll_cursor_in(
             if let Some(sql) = (parked.as_mut() as &mut dyn Any)
                 .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
             {
-                if sql.reopened(atoll, pager.clone(), index)? {
+                if sql.reopened(atoll, pager, index)? {
                     return Ok(Cursor::new_btree_dyn(parked));
                 }
             }
@@ -14736,7 +14787,7 @@ pub fn op_open_write(
             let num_columns = index.columns.len();
             let btree_cursor = btree_cursor_with_yield_context(
                 BTreeCursor::new_index_boxed(
-                    pager,
+                    pager.into_arc(),
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     index.as_ref(),
                     num_columns,
@@ -14775,7 +14826,7 @@ pub fn op_open_write(
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
                     btree_cursor_with_yield_context(
                         Box::new(BTreeCursor::new_without_rowid_table(
-                            pager,
+                            pager.into_arc(),
                             maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                             table_rc.as_ref(),
                             num_columns,
@@ -14785,7 +14836,7 @@ pub fn op_open_write(
                 }
                 _ => btree_cursor_with_yield_context(
                     Box::new(BTreeCursor::new_table(
-                        pager,
+                        pager.into_arc(),
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                         num_columns,
                     )),
@@ -19728,7 +19779,7 @@ fn advance_unmatched_scan(
     payload_dest_reg: Option<usize>,
     num_payload: usize,
     metrics: &mut HashJoinMetrics,
-    io_slot: &mut Option<IOCompletions>,
+    io_slot: &mut Option<super::PendingIO>,
 ) -> InsnResult {
     if hash_table.has_spilled() {
         if let Some(partition_idx) = hash_table.unmatched_scan_current_partition() {
@@ -19736,7 +19787,7 @@ fn advance_unmatched_scan(
                 match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                     crate::types::IOResult::Done(()) => {}
                     crate::types::IOResult::IO(io) => {
-                        *io_slot = Some(io);
+                        *io_slot = Some(super::PendingIO::new(io));
                         return Ok(InsnFunctionStepResult::IO);
                     }
                 }
@@ -19759,7 +19810,7 @@ fn advance_unmatched_scan(
                             match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                                 crate::types::IOResult::Done(()) => continue,
                                 crate::types::IOResult::IO(io) => {
-                                    *io_slot = Some(io);
+                                    *io_slot = Some(super::PendingIO::new(io));
                                     return Ok(InsnFunctionStepResult::IO);
                                 }
                             }
@@ -21223,6 +21274,136 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     }
 }
 
+/// FkGuard (R10): the foreign-key guard of an Atoll cursor's tree after its statement's write.
+/// Only a statement on an Atoll database emits it.
+pub fn op_fk_guard(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        FkGuard {
+            cursor_id,
+            start_reg,
+            num_regs,
+            guarded,
+        },
+        insn
+    );
+    let key = AtollKey::read(program, state, *cursor_id, *start_reg, *num_regs)?;
+    return_if_io!(
+        state,
+        atoll_cursor(state, *cursor_id)?.guard(key.as_key(), *guarded)
+    );
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// KeyProbe (A4.9): an Atoll write path's probe of a key by its newest version, before the
+/// read that answers it. Only a statement on an Atoll database emits it.
+pub fn op_key_probe(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        KeyProbe {
+            cursor_id,
+            start_reg,
+            num_regs,
+        },
+        insn
+    );
+    let key = AtollKey::read(program, state, *cursor_id, *start_reg, *num_regs)?;
+    return_if_io!(state, atoll_cursor(state, *cursor_id)?.probe(key.as_key()));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// The key an Atoll guard or probe names, read from its registers: every key for none, a table's
+/// rowid, or an index's first columns.
+enum AtollKey {
+    All,
+    Rowid(i64),
+    Columns(ImmutableRecord),
+}
+
+impl AtollKey {
+    fn read(
+        program: &Program,
+        state: &ProgramState,
+        cursor_id: usize,
+        start_reg: usize,
+        num_regs: usize,
+    ) -> Result<Self> {
+        if num_regs == 0 {
+            return Ok(Self::All);
+        }
+        if matches!(program.cursor_ref[cursor_id].1, CursorType::BTreeTable(_)) {
+            return match state.registers[start_reg].get_value() {
+                Value::Numeric(Numeric::Integer(rowid)) => Ok(Self::Rowid(*rowid)),
+                other => Err(LimboError::InternalError(format!(
+                    "an Atoll key whose rowid is no integer: {other:?}"
+                ))),
+            };
+        }
+        Ok(Self::Columns(ImmutableRecord::from_registers(
+            &state.registers[start_reg..start_reg + num_regs],
+            num_regs,
+        )?))
+    }
+
+    fn as_key(&self) -> crate::storage::atoll::sql::mode::GuardKey<'_> {
+        use crate::storage::atoll::sql::mode::GuardKey;
+        match self {
+            Self::All => GuardKey::All,
+            Self::Rowid(rowid) => GuardKey::Rowid(*rowid),
+            Self::Columns(record) => GuardKey::Columns(record),
+        }
+    }
+}
+
+/// The Atoll cursor `cursor_id` names.
+fn atoll_cursor(
+    state: &mut ProgramState,
+    cursor_id: usize,
+) -> Result<&mut crate::storage::atoll::sql::mode::SqlCursor> {
+    let c = state.get_cursor(cursor_id);
+    (c.as_btree_mut() as &mut dyn Any)
+        .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
+        .ok_or_else(|| {
+            LimboError::InternalError("an Atoll opcode on a cursor that is not Atoll's".into())
+        })
+}
+
+/// FkUnseen (R10): the Atoll cursor walks the versions its statement does not see.
+pub fn op_fk_unseen(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(FkUnseen { cursor_id }, insn);
+    atoll_cursor(state, *cursor_id)?.walk_unseen();
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// FkGuardRow (R10): the guard of the unseen version the Atoll cursor rests on.
+pub fn op_fk_guard_row(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(FkGuardRow { cursor_id }, insn);
+    return_if_io!(state, atoll_cursor(state, *cursor_id)?.unseen_hit());
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -22246,134 +22427,4 @@ mod tests {
             "Negating a blob subscript with invalid UTF-8 text should not panic"
         );
     }
-}
-
-/// FkGuard (R10): the foreign-key guard of an Atoll cursor's tree after its statement's write.
-/// Only a statement on an Atoll database emits it.
-pub fn op_fk_guard(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        FkGuard {
-            cursor_id,
-            start_reg,
-            num_regs,
-            guarded,
-        },
-        insn
-    );
-    let key = AtollKey::read(program, state, *cursor_id, *start_reg, *num_regs)?;
-    return_if_io!(
-        state,
-        atoll_cursor(state, *cursor_id)?.guard(key.as_key(), *guarded)
-    );
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// KeyProbe (A4.9): an Atoll write path's probe of a key by its newest version, before the
-/// read that answers it. Only a statement on an Atoll database emits it.
-pub fn op_key_probe(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        KeyProbe {
-            cursor_id,
-            start_reg,
-            num_regs,
-        },
-        insn
-    );
-    let key = AtollKey::read(program, state, *cursor_id, *start_reg, *num_regs)?;
-    return_if_io!(state, atoll_cursor(state, *cursor_id)?.probe(key.as_key()));
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// The key an Atoll guard or probe names, read from its registers: every key for none, a table's
-/// rowid, or an index's first columns.
-enum AtollKey {
-    All,
-    Rowid(i64),
-    Columns(ImmutableRecord),
-}
-
-impl AtollKey {
-    fn read(
-        program: &Program,
-        state: &ProgramState,
-        cursor_id: usize,
-        start_reg: usize,
-        num_regs: usize,
-    ) -> Result<Self> {
-        if num_regs == 0 {
-            return Ok(Self::All);
-        }
-        if matches!(program.cursor_ref[cursor_id].1, CursorType::BTreeTable(_)) {
-            return match state.registers[start_reg].get_value() {
-                Value::Numeric(Numeric::Integer(rowid)) => Ok(Self::Rowid(*rowid)),
-                other => Err(LimboError::InternalError(format!(
-                    "an Atoll key whose rowid is no integer: {other:?}"
-                ))),
-            };
-        }
-        Ok(Self::Columns(ImmutableRecord::from_registers(
-            &state.registers[start_reg..start_reg + num_regs],
-            num_regs,
-        )?))
-    }
-
-    fn as_key(&self) -> crate::storage::atoll::sql::mode::GuardKey<'_> {
-        use crate::storage::atoll::sql::mode::GuardKey;
-        match self {
-            Self::All => GuardKey::All,
-            Self::Rowid(rowid) => GuardKey::Rowid(*rowid),
-            Self::Columns(record) => GuardKey::Columns(record),
-        }
-    }
-}
-
-/// The Atoll cursor `cursor_id` names.
-fn atoll_cursor(
-    state: &mut ProgramState,
-    cursor_id: usize,
-) -> Result<&mut crate::storage::atoll::sql::mode::SqlCursor> {
-    let c = state.get_cursor(cursor_id);
-    (c.as_btree_mut() as &mut dyn Any)
-        .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
-        .ok_or_else(|| {
-            LimboError::InternalError("an Atoll opcode on a cursor that is not Atoll's".into())
-        })
-}
-
-/// FkUnseen (R10): the Atoll cursor walks the versions its statement does not see.
-pub fn op_fk_unseen(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(FkUnseen { cursor_id }, insn);
-    atoll_cursor(state, *cursor_id)?.walk_unseen();
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// FkGuardRow (R10): the guard of the unseen version the Atoll cursor rests on.
-pub fn op_fk_guard_row(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(FkGuardRow { cursor_id }, insn);
-    return_if_io!(state, atoll_cursor(state, *cursor_id)?.unseen_hit());
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }

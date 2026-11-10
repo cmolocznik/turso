@@ -38,7 +38,9 @@ macro_rules! done {
     };
 }
 
-/// Where putting back the entry being worked on stands.
+/// Where putting back the entry being worked on stands. One per rollback, held in place while it
+/// steps: boxing a put or a removal would allocate on every key put back.
+#[allow(clippy::large_enum_variant)]
 enum Step {
     /// Reading the key's entry, to check it is still the statement's.
     Look,

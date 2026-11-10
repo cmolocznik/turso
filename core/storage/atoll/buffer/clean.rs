@@ -81,7 +81,7 @@ impl Writeback {
         evict_after: bool,
         temporary: bool,
     ) -> Self {
-        let finished = Completion::new_wait();
+        let finished = crate::storage::atoll::notify::wait();
         if frames.is_empty() {
             finished.complete(0);
         }
@@ -248,17 +248,18 @@ impl Writeback {
                 // A block for the copy, within the bytes the copies in flight may take: each gives
                 // its share back as it lands, and wakes the pool. Until then the rest wait
                 // unsubmitted.
-                let Some(mut copy) = pool.staging.lease(self.class) else {
-                    return None;
-                };
+                let mut copy = pool.staging.lease(self.class)?;
+                crate::race::point("buffer.copy_for_write");
                 let Some(version) = h.latch.optimistic() else {
-                    // A writer holds the page for a moment: come back.
-                    return Some(Completion::new_yield());
+                    // A writer holds the page: its release, or a yield if it changed since.
+                    return Some(pool.wait_for_resident_latch(frame));
                 };
                 pool.bytes(frame, self.class).copy_to(0, copy.bytes());
                 let count = h.changes.load(Ordering::Acquire);
                 if !h.latch.validate(version) {
-                    return Some(Completion::new_yield());
+                    // Written under the copy: the writer's release if it still holds the page,
+                    // else a yield on the change.
+                    return Some(pool.wait_for_resident_latch(frame));
                 }
                 if sealed {
                     page::seal(copy.bytes(), self.pids[i]);
@@ -269,25 +270,49 @@ impl Writeback {
             };
             self.next += 1;
             self.unsettled += 1;
-            pool.writes_in_flight.fetch_add(1, Ordering::AcqRel);
             // The pool weakly: the write waits in the pool's own IO, so a strong hold would keep a
             // pool dropped with it in flight alive, and for good once nothing steps that IO.
             let (landed, woken) = (self.landed.clone(), Arc::downgrade(pool));
+            let write_out = self.outgoing[i].as_ref().map(Outgoing::version);
+            crate::race::point("buffer.write_submit");
             let ended = move |res: std::result::Result<(), CompletionError>| {
                 // Before the wake, so a waiter woken for room finds it.
                 drop(held);
                 landed.push((i, res));
                 if let Some(pool) = woken.upgrade() {
-                    pool.write_landed(frame, outgoing);
+                    pool.write_landed(frame, write_out);
                 }
             };
-            let written = match self.slots[i] {
-                Some(slot) => pool
-                    .store
-                    .write_slot(self.class, slot, buffer, ended)
-                    .map(drop),
-                None => pool.temp.write(self.pids[i], buffer, ended),
-            };
+            let slot = self.slots[i];
+            // The write entering flight changes the wait its waiters need, to the pool's own IO,
+            // stepped (DESIGN.md 9.1.3, wait kinds): an event opened before the count goes up and
+            // the write is submitted, and armed in this call, after a write-out's submission is
+            // marked, so every ticket taken before is finished.
+            let written = pool.frames.supply.change(|event| {
+                pool.writes_in_flight.fetch_add(1, Ordering::AcqRel);
+                // A request at the backend from here, so before it can land; one that never
+                // started leaves the count at once.
+                pool.requests.fetch_add(1, Ordering::AcqRel);
+                let written = match slot {
+                    Some(slot) => pool
+                        .store
+                        .write_slot(self.class, slot, buffer, ended)
+                        .map(drop),
+                    None => pool.temp.write(self.pids[i], buffer, ended),
+                };
+                match (&written, write_out) {
+                    (Ok(()), Some(version)) => pool.header(frame).submitted_at(version),
+                    (Ok(()), None) => {}
+                    // Counted and never at the backend: a stepped waiter that read the count in
+                    // between is sent back to look.
+                    (Err(_), _) => {
+                        pool.requests.fetch_sub(1, Ordering::AcqRel);
+                        event.land();
+                    }
+                }
+                event.arm();
+                written
+            });
             if let Err(e) = written {
                 // It never started: settled as failed, which fails the pool.
                 self.landed.push((i, Err(super::io_failure(&e))));

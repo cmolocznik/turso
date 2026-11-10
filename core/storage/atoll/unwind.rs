@@ -10,11 +10,13 @@
 //! guard sees began inside the frame that took the guard.
 
 /// Ends the process if this thread is unwinding: the panic, its message already printed, passes
-/// through a guard of shared state, which no other thread may then see let go.
+/// through a guard of shared state, which no other thread may then see let go. It says where (the
+/// caller, a guard's drop) and on which thread first.
 #[inline]
+#[track_caller]
 pub(crate) fn abort_if_unwinding() {
     if crate::thread::panicking() {
-        abort();
+        abort(std::panic::Location::caller());
     }
 }
 
@@ -26,6 +28,9 @@ impl Frame {
     #[inline]
     pub(crate) fn enter() -> Self {
         abort_if_unwinding();
+        crate::storage::atoll::notify::refuse_while_delivering(
+            "an Atoll entry from a waker Atoll delivers, which schedules and returns",
+        );
         Self(())
     }
 }
@@ -49,10 +54,45 @@ impl Drop for FrameEnd {
 }
 
 /// Ends the process at once, writing nothing first: a write takes stderr's lock, which another
-/// thread may hold while it waits for this one, and the process would then never end.
+/// thread may hold while it waits for this one, and even a raw `write(2)` blocks on a full pipe, so
+/// the process might never end. In tests alone, whose harness captures the panic's message and
+/// loses it to the abort, one `write(2)` of where and on which thread, from a buffer on the stack,
+/// goes first (no lock, no allocation; a line too long is cut short).
 #[cold]
 #[inline(never)]
-fn abort() -> ! {
+fn abort(at: &std::panic::Location<'_>) -> ! {
+    #[cfg(not(all(test, unix)))]
+    let _ = at;
+    #[cfg(all(test, unix))]
+    {
+        use std::fmt::Write;
+        struct Line {
+            buf: [u8; 512],
+            len: usize,
+        }
+        impl Write for Line {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                let n = s.len().min(self.buf.len() - self.len);
+                self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.len += n;
+                Ok(())
+            }
+        }
+        let mut line = Line {
+            buf: [0; 512],
+            len: 0,
+        };
+        let thread = std::thread::current();
+        let _ = writeln!(
+            line,
+            "atoll: a panic unwound through {}:{} on thread {}; the process ends",
+            at.file(),
+            at.line(),
+            thread.name().unwrap_or("<unnamed>")
+        );
+        // SAFETY: a write of `len` initialized bytes from a live buffer to the standard error.
+        let _ = unsafe { libc::write(2, line.buf.as_ptr().cast(), line.len) };
+    }
     std::process::abort()
 }
 
@@ -70,11 +110,36 @@ mod tests {
             "frees its own block, or lends it back unread",
         ),
         ("arc_cell.rs", "ArcCell", "drops its last reference"),
+        (
+            "buffer/shortage.rs",
+            "Installed",
+            "restores the thread's owner pointer, guarding no shared state",
+        ),
+        (
+            "buffer/upkeep.rs",
+            "Installed",
+            "restores the checkpoint's demand installed before; it lets no shared state go",
+        ),
+        (
+            "buffer/shortage.rs",
+            "Restore",
+            "restores a test's scarce-memory switch, guarding no shared state",
+        ),
         ("arc_cell.rs", "Counted", "a test's count of live values"),
         (
             "buffer/cell.rs",
             "CompletionCell",
             "drops its last reference",
+        ),
+        (
+            "buffer/cell/transfer_tests.rs",
+            "DropCount",
+            "a test's count of live completions",
+        ),
+        (
+            "buffer/cell/transfer_tests.rs",
+            "OnDrop",
+            "a test's owned destructor callback, which changes no database state",
         ),
         ("buffer/memory.rs", "Mapping", "unmaps its own memory"),
         ("epoch.rs", "Registry", "frees its own chunks"),
@@ -86,14 +151,34 @@ mod tests {
         ("epoch.rs", "Epochs", "frees its own waits"),
         (
             "epoch.rs",
+            "WaitList",
+            "frees the waits a wake took out of the lists",
+        ),
+        (
+            "epoch.rs",
             "Step",
             "leaves an epoch: memory kept alive, no change guarded",
+        ),
+        (
+            "epoch.rs",
+            "CompletionSlot",
+            "keeps a completion alive, guards no change, clears before dropping its reference",
         ),
         ("epoch.rs", "Retired", "frees what it retired"),
         (
             "latch.rs",
             "HandsBack",
             "a test's holder: hands its hold back through the release, which checks",
+        ),
+        (
+            "buffer/shortage.rs",
+            "ChecksDrop",
+            "a test's waker recording whether its drop ran under the queue's mutex",
+        ),
+        (
+            "buffer/shortage.rs",
+            "Looks",
+            "a test's waker recording its wakes and whether its drop ran under the queue's mutex",
         ),
         ("once.rs", "Baton", "drops the value it holds"),
         ("once.rs", "SetOnce", "drops the value it holds"),
@@ -292,12 +377,54 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-        assert!(sites.len() >= 3, "the census found {sites:?}");
+        // The latch's releases and the locks' guard drop, at the least.
+        assert!(
+            ["latch.rs: ", "locks.rs: "]
+                .iter()
+                .all(|file| sites.iter().any(|s| s.starts_with(file))),
+            "the census found {sites:?}"
+        );
     }
 
     /// Tests in Atoll that panic, and how each runs: in a child process when the panic passes a
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
+        (
+            "buffer/supply.rs",
+            "a_ticket_is_refused_while_a_scope_of_its_pool_is_open_on_the_thread",
+            "ordinary",
+        ),
+        (
+            "buffer/supply.rs",
+            "a_deferred_finish_of_a_request_is_refused",
+            "ordinary",
+        ),
+        (
+            "buffer/supply.rs",
+            "a_deferred_finish_of_a_plain_wait_is_refused",
+            "ordinary",
+        ),
+        (
+            "buffer/supply.rs",
+            "an_engines_wait_is_refused_by_a_group",
+            "ordinary",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_read_returned_neither_handed_over_nor_done_ends_the_process",
+            "child",
+        ),
+        (
+            "notify.rs",
+            "a_waker_that_enters_atoll_ends_the_process",
+            "child",
+        ),
+        ("notify.rs", "a_waker_that_parks_ends_the_process", "child"),
+        (
+            "notify.rs",
+            "a_park_inside_an_open_change_scope_ends_the_process",
+            "child",
+        ),
         (
             "requests/tests.rs",
             "a_step_that_fails_while_close_waits_ends_the_process",
@@ -377,6 +504,26 @@ mod tests {
             "sql/trees/tests.rs",
             "a_write_without_the_gate_fails_at_the_write",
             "child",
+        ),
+        (
+            "txn/tests.rs",
+            "a_reservation_position_cannot_use_a_flag_bit",
+            "ordinary",
+        ),
+        (
+            "txn/tests.rs",
+            "an_overflowing_reservation_position_is_refused_before_addition",
+            "ordinary",
+        ),
+        (
+            "txn/tests.rs",
+            "a_waited_bit_without_a_reservation_is_refused",
+            "ordinary",
+        ),
+        (
+            "txn/tests.rs",
+            "a_reservation_cannot_also_have_position_bits",
+            "ordinary",
         ),
         (
             "txn/gate/tests.rs",
@@ -899,6 +1046,7 @@ mod tests {
         #[turso_macros::atoll_entry]
         fn refers(&self, _: &PanicsOnDrop) {}
 
+        #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
         #[turso_macros::atoll_entry]
         fn records(&self) {
             crate::storage::atoll::testing::record("seen", "entered");
@@ -924,8 +1072,10 @@ mod tests {
 
     /// Code outside Atoll entering it from a destructor, as an application's unwind dropping a
     /// connection with a transaction open does.
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
     struct EntersOnDrop;
 
+    #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
     impl Drop for EntersOnDrop {
         fn drop(&mut self) {
             Probe.records();

@@ -87,7 +87,7 @@ mod loom_tests {
                     ends.wake();
                 })
             };
-            let c = Completion::new_wait();
+            let c = crate::storage::atoll::notify::wait();
             ends.register(&c);
             let parks = running.load(Ordering::Acquire) == 5;
             writer.join().unwrap();
@@ -111,7 +111,7 @@ mod loom_tests {
                     ends.wake();
                 })
             };
-            let c = Completion::new_wait();
+            let c = crate::storage::atoll::notify::wait();
             ends.register(&c);
             let parks = key.load(Ordering::Acquire) == 1;
             undo.join().unwrap();

@@ -45,6 +45,7 @@ fn config() -> AtollConfig {
             budget: MIN_DB_BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,
@@ -53,8 +54,8 @@ fn config() -> AtollConfig {
     }
 }
 
-fn run<T>(io: &Arc<dyn IO>, mut op: impl FnMut() -> Result<IOResult<T>>) -> T {
-    drive(io, || op()).unwrap()
+fn run<T>(io: &Arc<dyn IO>, op: impl FnMut() -> Result<IOResult<T>>) -> T {
+    drive(io, op).unwrap()
 }
 
 fn value(tag: &str, i: usize) -> String {

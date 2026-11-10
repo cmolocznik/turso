@@ -25,6 +25,45 @@ impl StepCounting {
     }
 }
 
+/// Counts what an ownership watch is told: the finish elsewhere left alone with the request, its
+/// retirement, and the retirements told after the first.
+pub(crate) struct Told {
+    pub(crate) left: AtomicUsize,
+    pub(crate) retired: AtomicUsize,
+    pub(crate) retired_told: AtomicUsize,
+}
+
+impl Told {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            left: AtomicUsize::new(0),
+            retired: AtomicUsize::new(0),
+            retired_told: AtomicUsize::new(0),
+        })
+    }
+
+    /// (finishers left, retirements, retirements told after the first).
+    pub(crate) fn seen(&self) -> (usize, usize, usize) {
+        (
+            self.left.load(Ordering::Acquire),
+            self.retired.load(Ordering::Acquire),
+            self.retired_told.load(Ordering::Acquire),
+        )
+    }
+}
+
+impl OwnershipWatch for Told {
+    fn finisher_left(&self) {
+        self.left.fetch_add(1, Ordering::AcqRel);
+    }
+    fn retired(&self, told: bool) {
+        self.retired.fetch_add(1, Ordering::AcqRel);
+        if told {
+            self.retired_told.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
 impl Clock for StepCounting {
     fn current_time_monotonic(&self) -> clock::MonotonicInstant {
         self.io.current_time_monotonic()
@@ -114,6 +153,59 @@ fn a_pumped_wait_steps_past_a_request_queued_ahead_until_its_own_is_delivered() 
     assert_eq!(io.in_flight(), 0);
 }
 
+#[test]
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn a_pumped_async_wait_requests_another_poll_until_its_request_finishes() {
+    use crate::types::IOCompletions;
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let backend = Arc::new(CrashIO::new(1));
+    let io = StepCounting::new(backend.clone());
+    let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+    let mine = read(512);
+    let ahead = {
+        let (file, mine) = (file.clone(), mine.clone());
+        Completion::new_read(Arc::new(Buffer::new_temporary(512)), move |_| {
+            drop(file.pread(0, mine.clone()).unwrap());
+            None
+        })
+    };
+    let ahead = file.pread(0, ahead).unwrap();
+    let wakes = std::sync::Arc::new(Wakes(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(IOCompletions(mine.clone()).wait_async(&*io));
+    for poll in 1..=4 {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => {
+                result.unwrap();
+                assert!(ahead.finished() && mine.finished());
+                assert_eq!(backend.in_flight(), 0);
+                assert_eq!(io.steps(), 2);
+                return;
+            }
+            Poll::Pending => assert!(
+                wakes.0.swap(0, Ordering::SeqCst) > 0,
+                "poll {poll} left a request queued with nobody to poll its waiter again"
+            ),
+        }
+    }
+    panic!("the async wait did not finish within four polls");
+}
+
 /// On a backend that delivers inline, what a caller still waits for another thread finishes:
 /// the waiter parks until it does and never steps (mutant: the backend taken for pumped, which
 /// steps a backend with nothing to deliver for as long as the other thread takes).
@@ -176,4 +268,373 @@ fn a_backend_that_says_it_delivers_inline_does() {
             );
         }
     }
+}
+
+#[test]
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn an_async_remote_wait_does_not_pump_or_wake_itself() {
+    use crate::types::IOCompletions;
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Wakes(AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let backend = Arc::new(CrashIO::new(1));
+    let io = StepCounting::new(backend.clone());
+    let completion = Completion::new_remote_wait();
+    assert!(completion.is_remote_wait());
+    assert_eq!(backend.in_flight(), 0);
+    let wakes = std::sync::Arc::new(Wakes(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let (polls, idle_wakes, idle_steps, finish_wakes, ready) = {
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(IOCompletions(completion.clone()).wait_async(&*io));
+        let (mut polls, mut idle_wakes) = (0, 0);
+        for _ in 0..64 {
+            assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+            polls += 1;
+            let got = wakes.0.swap(0, Ordering::SeqCst);
+            idle_wakes += got;
+            if got == 0 {
+                break;
+            }
+        }
+        let idle_steps = io.steps();
+        let finisher = {
+            let completion = completion.clone();
+            std::thread::spawn(move || completion.complete(0))
+        };
+        finisher.join().unwrap();
+        let finish_wakes = wakes.0.swap(0, Ordering::SeqCst);
+        let ready = matches!(future.as_mut().poll(&mut context), Poll::Ready(Ok(())));
+        (polls, idle_wakes, idle_steps, finish_wakes, ready)
+    };
+    let outstanding = backend.in_flight();
+    drop(completion);
+    drop(io);
+    drop(backend);
+    drop(waker);
+    println!("REMOTE_ASYNC_WAIT polls={polls} idle_wakes={idle_wakes} steps={idle_steps} outstanding={outstanding} finish_wakes={finish_wakes} ready={ready}");
+    assert_eq!(outstanding, 0);
+    assert!(
+        ready && finish_wakes > 0,
+        "the real finisher wakes and finishes its waiter"
+    );
+    assert_eq!(
+        (polls, idle_wakes, idle_steps),
+        (1, 0, 0),
+        "a remote wait has no IO to pump and waits for its finisher"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+mod cancelled_wait_audit {
+    use super::*;
+    use crate::types::IOCompletions;
+    use std::future::{Future, IntoFuture};
+    use std::task::{Context, Wake, Waker};
+
+    struct Calls(AtomicUsize);
+    impl Wake for Calls {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn task() -> std::sync::Arc<Calls> {
+        std::sync::Arc::new(Calls(AtomicUsize::new(0)))
+    }
+
+    #[test]
+    fn cancelled_async_waits_do_not_remain_registered() {
+        let io = MemoryIO::new();
+        let completion = Completion::new_remote_wait();
+        let tasks: Vec<_> = (0..32).map(|_| task()).collect();
+        let mut pending = 0;
+        for task in &tasks {
+            let waker = Waker::from(task.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut future = std::pin::pin!(IOCompletions(completion.clone()).wait_async(&io));
+            pending += usize::from(future.as_mut().poll(&mut cx).is_pending());
+        }
+        let registered_after_drop = completion.wakers();
+        let refs_after_drop: Vec<_> = tasks.iter().map(std::sync::Arc::strong_count).collect();
+        completion.complete(0);
+        let stale_wakes = tasks
+            .iter()
+            .map(|t| t.0.load(Ordering::SeqCst))
+            .sum::<usize>();
+        drop(completion);
+        drop(io);
+        eprintln!("AUDIT cancelled32 pending={pending} live_futures=0 registered_after_drop={registered_after_drop} refs={refs_after_drop:?} stale_wakes={stale_wakes}");
+        assert_eq!(
+            registered_after_drop, 0,
+            "cancelled async wait registrations retained by a held-state completion"
+        );
+        assert_eq!(stale_wakes, 0, "cancelled async tasks were woken");
+    }
+
+    #[test]
+    fn one_async_wait_replaces_changed_context_waker() {
+        let io = MemoryIO::new();
+        let completion = Completion::new_remote_wait();
+        let tasks: Vec<_> = (0..32).map(|_| task()).collect();
+        let (registered, pending) = {
+            let mut future = std::pin::pin!(IOCompletions(completion.clone()).wait_async(&io));
+            let mut pending = 0;
+            for task in &tasks {
+                let waker = Waker::from(task.clone());
+                let mut cx = Context::from_waker(&waker);
+                pending += usize::from(future.as_mut().poll(&mut cx).is_pending());
+            }
+            (completion.wakers(), pending)
+        };
+        completion.complete(0);
+        let wakes: Vec<_> = tasks.iter().map(|t| t.0.load(Ordering::SeqCst)).collect();
+        drop(completion);
+        drop(io);
+        eprintln!("AUDIT changed32 pending={pending} live_futures_at_measure=1 registered={registered} wakes_after_drop={wakes:?}");
+        assert_eq!(
+            registered, 1,
+            "one async wait retained old context wakers rather than replacing its registration"
+        );
+    }
+
+    #[test]
+    fn an_async_wait_wakes_only_its_latest_context() {
+        let io = MemoryIO::new();
+        let completion = Completion::new_remote_wait();
+        let tasks: Vec<_> = (0..32).map(|_| task()).collect();
+        let (registered, ready, wakes) = {
+            let mut future = std::pin::pin!(IOCompletions(completion.clone()).wait_async(&io));
+            for task in &tasks {
+                let waker = Waker::from(task.clone());
+                let mut cx = Context::from_waker(&waker);
+                let _ = future.as_mut().poll(&mut cx);
+            }
+            let registered = completion.wakers();
+            completion.complete(0);
+            let waker = Waker::from(tasks.last().unwrap().clone());
+            let ready = future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready();
+            (
+                registered,
+                ready,
+                tasks
+                    .iter()
+                    .map(|t| t.0.load(Ordering::SeqCst))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        drop(completion);
+        drop(io);
+        eprintln!("AUDIT latest registered={registered} ready={ready} wakes={wakes:?}");
+        assert_eq!(registered, 1);
+        assert!(
+            ready && wakes[..31].iter().all(|n| *n == 0) && wakes[31] == 1,
+            "the last Context must receive the completion's wake"
+        );
+    }
+
+    #[test]
+    fn cancelling_one_async_wait_keeps_the_other_wait_registered() {
+        let io = MemoryIO::new();
+        let completion = Completion::new_remote_wait();
+        let (a, b) = (task(), task());
+        let (wa, wb) = (Waker::from(a.clone()), Waker::from(b.clone()));
+        let mut future_b = std::pin::pin!(IOCompletions(completion.clone()).wait_async(&io));
+        let (both, one) = {
+            let mut future_a = std::pin::pin!(IOCompletions(completion.clone()).wait_async(&io));
+            let _ = future_a.as_mut().poll(&mut Context::from_waker(&wa));
+            let _ = future_b.as_mut().poll(&mut Context::from_waker(&wb));
+            (completion.wakers(), completion.finished())
+        };
+        let after_drop = completion.wakers();
+        completion.complete(0);
+        let ready = future_b
+            .as_mut()
+            .poll(&mut Context::from_waker(&wb))
+            .is_ready();
+        let (aw, bw) = (a.0.load(Ordering::SeqCst), b.0.load(Ordering::SeqCst));
+        eprintln!("AUDIT distinct both={both} finished_before={one} after_cancel={after_drop} ready={ready} wakes=({aw},{bw})");
+        assert_eq!((both, after_drop), (2, 1));
+        assert!(!one && ready && aw == 0 && bw == 1);
+    }
+
+    #[test]
+    fn a_progress_wake_allows_the_same_async_wait_to_register_again() {
+        let io = MemoryIO::new();
+        let completion = Completion::new_remote_wait();
+        let a = task();
+        let waker = Waker::from(a.clone());
+        let (after_progress, registered, ready) = {
+            let mut future = std::pin::pin!(IOCompletions(completion.clone()).wait_async(&io));
+            let _ = future.as_mut().poll(&mut Context::from_waker(&waker));
+            completion.wake();
+            let after_progress = a.0.load(Ordering::SeqCst);
+            let _ = future.as_mut().poll(&mut Context::from_waker(&waker));
+            let registered = completion.wakers();
+            completion.complete(0);
+            let ready = future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready();
+            (after_progress, registered, ready)
+        };
+        let final_wakes = a.0.load(Ordering::SeqCst);
+        eprintln!("AUDIT progress first_wakes={after_progress} registered_again={registered} ready={ready} final_wakes={final_wakes}");
+        assert_eq!((after_progress, registered, final_wakes), (1, 1, 2));
+        assert!(ready);
+    }
+
+    #[test]
+    fn direct_completion_future_replaces_changed_context_waker() {
+        let completion = Completion::new_remote_wait();
+        let tasks: Vec<_> = (0..32).map(|_| task()).collect();
+        let (registered, pending, ready) = {
+            let mut future = std::pin::pin!(completion.clone().into_future());
+            let mut pending = 0;
+            for task in &tasks {
+                let waker = Waker::from(task.clone());
+                pending += usize::from(
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending(),
+                );
+            }
+            let registered = completion.wakers();
+            completion.complete(0);
+            let waker = Waker::from(tasks.last().unwrap().clone());
+            let ready = future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready();
+            (registered, pending, ready)
+        };
+        let wakes: Vec<_> = tasks.iter().map(|t| t.0.load(Ordering::SeqCst)).collect();
+        drop(completion);
+        eprintln!("AUDIT direct_changed32 pending={pending} registered={registered} ready={ready} wakes={wakes:?}");
+        assert_eq!(
+            registered, 1,
+            "one Completion future retained every old context waker"
+        );
+        assert!(pending == 32 && ready && wakes[..31].iter().all(|n| *n == 0) && wakes[31] == 1);
+    }
+
+    #[test]
+    fn cancelled_direct_completion_futures_unregister() {
+        let completion = Completion::new_remote_wait();
+        let tasks: Vec<_> = (0..32).map(|_| task()).collect();
+        let mut pending = 0;
+        for task in &tasks {
+            let waker = Waker::from(task.clone());
+            let mut future = std::pin::pin!(completion.clone().into_future());
+            pending += usize::from(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending(),
+            );
+        }
+        let registered = completion.wakers();
+        completion.complete(0);
+        let wakes = tasks
+            .iter()
+            .map(|t| t.0.load(Ordering::SeqCst))
+            .sum::<usize>();
+        drop(completion);
+        eprintln!("AUDIT direct_cancel32 pending={pending} live_futures=0 registered={registered} stale_wakes={wakes}");
+        assert_eq!((pending, registered, wakes), (32, 0, 0));
+    }
+
+    #[test]
+    fn completion_await_uses_the_keyed_future_and_keeps_completion_small() {
+        let completion = Completion::new_remote_wait();
+        let a = task();
+        let waker = Waker::from(a.clone());
+        let (pending, registered, ready) = {
+            let awaited = completion.clone();
+            let mut future = std::pin::pin!(async move { awaited.await });
+            let pending = future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending();
+            let registered = completion.wakers();
+            completion.complete(0);
+            let ready = future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready();
+            (pending, registered, ready)
+        };
+        let size = std::mem::size_of::<Completion>();
+        eprintln!("AUDIT await pending={pending} registered={registered} ready={ready} completion_bytes={size}");
+        assert!(pending && registered == 1 && ready && size == std::mem::size_of::<usize>());
+    }
+}
+
+#[cfg(shuttle)]
+#[test]
+fn shuttle_async_wait_latest_context_is_woken_if_its_poll_is_pending() {
+    use std::future::Future;
+    use std::task::{Context, Wake, Waker};
+    struct Calls(AtomicUsize);
+    impl Wake for Calls {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    shuttle::check_random_with_seed(
+        || {
+            let io = MemoryIO::new();
+            let completion = Completion::new_remote_wait();
+            let a = std::sync::Arc::new(Calls(AtomicUsize::new(0)));
+            let b = std::sync::Arc::new(Calls(AtomicUsize::new(0)));
+            let wa = Waker::from(a.clone());
+            let wb = Waker::from(b.clone());
+            let mut future =
+                std::pin::pin!(crate::types::IOCompletions(completion.clone()).wait_async(&io));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(&wa))
+                .is_pending());
+            let producer = {
+                let c = completion.clone();
+                crate::thread::spawn(move || c.complete(0))
+            };
+            let pending = future
+                .as_mut()
+                .poll(&mut Context::from_waker(&wb))
+                .is_pending();
+            producer.join().unwrap();
+            if pending {
+                assert!(
+                    b.0.load(Ordering::SeqCst) > 0,
+                    "the latest pending Context was not woken"
+                );
+                assert!(future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&wb))
+                    .is_ready());
+            }
+        },
+        0x6f11_2026,
+        1000,
+    );
 }

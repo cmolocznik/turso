@@ -32,6 +32,7 @@ fn config(chunk_bytes: u64) -> AtollConfig {
             budget: MIN_DB_BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,

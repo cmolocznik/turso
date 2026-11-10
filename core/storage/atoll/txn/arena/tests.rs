@@ -25,6 +25,7 @@ fn open(budget: usize) -> (Arc<dyn IO>, Atoll) {
             budget,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,

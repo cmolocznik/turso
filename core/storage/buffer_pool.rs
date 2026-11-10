@@ -59,6 +59,10 @@ impl ArenaBuffer {
     pub const fn logical_len(&self) -> usize {
         self.len
     }
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.logical_len()) }
     }

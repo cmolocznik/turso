@@ -672,16 +672,33 @@ mod tests {
         common::tests::test_multiple_processes_cannot_open_file(UnixIO::new);
     }
 
+    /// A Unix file finds no holes: `has_hole` is the trait's refusal. It punches them only on
+    /// Linux, where Atoll erases a freed slot's blocks: the range reads back as zeros, the bytes
+    /// past it are kept and so is the file's size. Elsewhere punching is the trait's refusal.
     #[test]
-    fn hole_operations_return_an_error_on_a_file_without_hole_support() {
+    fn a_unix_file_punches_holes_on_linux_only_and_finds_none() {
         let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), vec![0xAB_u8; 8192]).unwrap();
         let io = UnixIO::new().unwrap();
         let file = io
             .open_file(temp.path().to_str().unwrap(), OpenFlags::None, false)
             .unwrap();
 
         assert!(file.has_hole(0, 4096).is_err());
-        assert!(file.punch_hole(0, 4096).is_err());
+        let punched = file.punch_hole(0, 4096);
+        let bytes = std::fs::read(temp.path()).unwrap();
+        if cfg!(target_os = "linux") {
+            punched.unwrap();
+            assert_eq!(bytes.len(), 8192, "the size kept");
+            assert!(
+                bytes[..4096].iter().all(|&b| b == 0),
+                "the hole reads zeros"
+            );
+            assert!(bytes[4096..].iter().all(|&b| b == 0xAB), "the rest kept");
+        } else {
+            assert!(punched.is_err());
+            assert!(bytes.iter().all(|&b| b == 0xAB), "nothing punched");
+        }
     }
 
     #[test]

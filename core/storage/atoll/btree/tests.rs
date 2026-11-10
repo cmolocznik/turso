@@ -8,6 +8,8 @@ use crate::storage::atoll::page::CLASS_COUNT;
 use crate::storage::atoll::radix::FREE;
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
+#[cfg(not(shuttle))]
+use crate::storage::atoll::testing::{step_past, HoldAt};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::cell::{Cell, RefCell};
@@ -36,6 +38,7 @@ fn config(budget: usize) -> AtollConfig {
             budget,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,
@@ -1147,5 +1150,187 @@ fn concurrent_writers_and_scans_keep_every_key_whole_and_in_order_in_shuttle_sch
 fn concurrent_writers_and_scans_through_splits_and_merges() {
     for seed in 0..20 {
         concurrent_tree(seed, 40);
+    }
+}
+
+/// A node's children, in order.
+#[cfg(not(shuttle))]
+fn children(io: &Arc<dyn IO>, pool: &Arc<BufferPool>, pid: PageId) -> Vec<PageId> {
+    let node = drive(io, || pool.fix_optimistic(pid, None)).unwrap();
+    node.read(|p| {
+        let v = View::new(p);
+        let mut out = (0..v.count()?)
+            .map(|i| v.child(i).map(|c| c.0))
+            .collect::<Option<Vec<_>>>()?;
+        out.push(v.next().0);
+        Some(out)
+    })
+    .flatten()
+    .expect("the node read whole")
+}
+
+/// The level of `pid`'s node, 0 for a leaf.
+#[cfg(not(shuttle))]
+fn level_of(io: &Arc<dyn IO>, pool: &Arc<BufferPool>, pid: PageId) -> u8 {
+    let node = drive(io, || pool.fix_optimistic(pid, None)).unwrap();
+    node.read(|p| View::new(p).level())
+        .expect("the node read whole")
+}
+
+/// Each step that finds a page held as it upgrades it, or as it reads a leaf, comes back on the
+/// wait the holder's release finishes, never on a yield it would come back from to find the page
+/// still held; a page it upgraded before the held one goes back unchanged. Each operation then
+/// ends as it would have, and the tree checks whole.
+#[cfg(not(shuttle))]
+#[test]
+fn a_page_found_held_at_its_upgrade_or_read_waits_for_its_release() {
+    const VALUE: usize = 400;
+    let key = |i: usize| format!("k{i:05}").into_bytes();
+    let mut outcomes = Vec::new();
+    for case in [
+        "put's leaf",
+        "remove's leaf",
+        "scan's leaf",
+        "grow's root",
+        "split's node",
+        "merge's left",
+        "merge's right",
+        "shrink's child",
+    ] {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open(&io, MIN_DB_BUDGET, 1);
+        let run = drive_runner(&io);
+        let tree = create(&io, &db, &run, false);
+        let pool = db.pool().clone();
+        let root = tree.root;
+        let put = |i: usize| {
+            let (tree, mut op) = (&tree, Put::new(&key(i), vec![i as u8; VALUE], Mode::Upsert));
+            move || tree.put(&mut op).map(|r| r.map(drop))
+        };
+        // Two keys in one leaf, or keys until the root first has two children.
+        let two_levels = !matches!(
+            case,
+            "put's leaf" | "remove's leaf" | "scan's leaf" | "grow's root"
+        );
+        let mut n = 0;
+        if two_levels {
+            while level_of(&io, &pool, root) == 0 {
+                run(&mut put(n));
+                n += 1;
+            }
+        } else {
+            for i in [0, 2] {
+                run(&mut put(i));
+            }
+        }
+        let point = match case {
+            "put's leaf" | "remove's leaf" => "btree.leaf_upgrade",
+            "scan's leaf" => "btree.leaf_read",
+            "grow's root" => "btree.grow_upgrade",
+            "split's node" => "btree.split_upgrade",
+            "merge's left" | "merge's right" => "btree.merge_upgrade",
+            _ => "btree.shrink_upgrade",
+        };
+        let pick = move |io: &Arc<dyn IO>, pool: &Arc<BufferPool>| match case {
+            "put's leaf" | "remove's leaf" | "scan's leaf" | "grow's root" => (vec![], vec![root]),
+            // The parent upgraded first; every leaf held, so the one split is.
+            "split's node" => (vec![root], children(io, pool, root)),
+            "merge's left" => (vec![root], vec![children(io, pool, root)[0]]),
+            "merge's right" => {
+                let c = children(io, pool, root);
+                (vec![root, c[0]], vec![c[1]])
+            }
+            _ => (vec![root], children(io, pool, root)),
+        };
+        let hold = HoldAt::set(point, &io, &pool, pick);
+        let mut cursor = Cursor::new();
+        let mut removed = n;
+        let mut passed = None;
+        // Each case's operations until one passes the point.
+        while passed.is_none() {
+            passed = match case {
+                "put's leaf" => step_past(&io, point, put(1)),
+                "remove's leaf" => {
+                    let mut op = Remove::new(&key(0));
+                    step_past(&io, point, || tree.remove(&mut op).map(|r| r.map(drop)))
+                }
+                "scan's leaf" => step_past(&io, point, || {
+                    tree.seek(&mut cursor, b"", Seek::Ge).map(|r| r.map(drop))
+                }),
+                "grow's root" | "split's node" => {
+                    n += 1;
+                    step_past(&io, point, put(n))
+                }
+                _ => {
+                    assert!(
+                        removed > 0,
+                        "{case}: every key removed, the point never passed"
+                    );
+                    removed -= 1;
+                    let mut op = Remove::new(&key(removed));
+                    step_past(&io, point, || tree.remove(&mut op).map(|r| r.map(drop)))
+                }
+            };
+        }
+        let wait = match passed.unwrap() {
+            IOResult::IO(IOCompletions(c)) => Some(c),
+            IOResult::Done(()) => None,
+        };
+        // An unrelated wake: room given back finishes the global supply, never this wait.
+        pool.wake_room();
+        let pending = wait.as_ref().is_some_and(|c| !c.finished());
+        let before = hold.versions().expect("the point passed");
+        let watched = match case {
+            "split's node" | "merge's left" | "shrink's child" => vec![root],
+            "merge's right" => vec![root, children(&io, &pool, root)[0]],
+            _ => vec![],
+        };
+        let after: Vec<u64> = watched
+            .iter()
+            .map(|&pid| {
+                drive(&io, || pool.fix_optimistic(pid, None))
+                    .unwrap()
+                    .version()
+            })
+            .collect();
+        hold.let_go();
+        let woken = wait.as_ref().is_some_and(|c| c.finished());
+        // The operation that passed the point, again, to its end; then the tree whole.
+        match case {
+            "put's leaf" => run(&mut put(1)),
+            "remove's leaf" => {
+                let mut op = Remove::new(&key(0));
+                run(&mut || tree.remove(&mut op).map(|r| r.map(drop)));
+            }
+            "scan's leaf" => {
+                run(&mut || tree.seek(&mut cursor, b"", Seek::Ge).map(|r| r.map(drop)));
+                assert_eq!(
+                    cursor.key(),
+                    Some(&key(0)[..]),
+                    "{case}: the scan's first key"
+                );
+            }
+            "grow's root" | "split's node" => run(&mut put(n)),
+            _ => {
+                let mut op = Remove::new(&key(removed));
+                run(&mut || tree.remove(&mut op).map(|r| r.map(drop)));
+            }
+        }
+        check_whole(&tree, &db, &run, case);
+        outcomes.push((case, pending, before == after, woken));
+    }
+    for (case, pending, unchanged, woken) in outcomes {
+        assert!(
+            pending,
+            "{case}: the step came back ready, not on one pending wait"
+        );
+        assert!(
+            unchanged,
+            "{case}: a page upgraded before the held one went back changed"
+        );
+        assert!(
+            woken,
+            "{case}: the holder's release left the wait unfinished"
+        );
     }
 }

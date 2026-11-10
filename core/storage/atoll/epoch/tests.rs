@@ -117,7 +117,7 @@ fn a_wait_ends_with_the_step_that_holds_it_back() {
         });
         entered_rx.recv().unwrap();
         let stamp = epochs.stamp();
-        let waited = Completion::new_wait();
+        let waited = crate::storage::atoll::notify::wait();
         assert!(
             epochs.wait_for(stamp, waited.clone()),
             "a step under way holds the horizon below the stamp"
@@ -137,19 +137,20 @@ fn a_wait_ends_with_the_step_that_holds_it_back() {
         );
         holder.join().unwrap();
         assert!(
-            !epochs.wait_for(stamp, Completion::new_wait()),
+            !epochs.wait_for(stamp, crate::storage::atoll::notify::wait()),
             "a wait already reached"
         );
     });
 }
 
-/// A grace period ends once every step under way at its start has ended, whatever began after.
+/// A wait for a new stamp ends once every step under way at the stamp has ended, whatever began
+/// after.
 #[cfg(not(shuttle))]
 #[test]
-fn a_grace_period_waits_for_the_steps_under_way_and_no_later_one() {
+fn a_wait_for_a_new_stamp_waits_for_the_steps_under_way_and_no_later_one() {
     let epochs = Epochs::new();
     assert!(
-        !epochs.grace_period(Completion::new_wait()),
+        !epochs.wait_for(epochs.stamp(), crate::storage::atoll::notify::wait()),
         "no step is under way"
     );
     std::thread::scope(|s| {
@@ -169,8 +170,11 @@ fn a_grace_period_waits_for_the_steps_under_way_and_no_later_one() {
             leaves.push(leave);
         };
         step();
-        let ended = Completion::new_wait();
-        assert!(epochs.grace_period(ended.clone()), "a step is under way");
+        let ended = crate::storage::atoll::notify::wait();
+        assert!(
+            epochs.wait_for(epochs.stamp(), ended.clone()),
+            "a step is under way"
+        );
         step();
         assert!(!ended.finished());
         leaves[0].send(()).unwrap();
@@ -259,7 +263,7 @@ fn waits_end_with_the_steps_holding_them_back(rounds: usize) {
                 let next = 1 + waiter + 2 * round;
                 alive[next].store(true, Ordering::SeqCst);
                 let old = current.swap(next as u64, Ordering::SeqCst) as usize;
-                let waited = Completion::new_wait();
+                let waited = crate::storage::atoll::notify::wait();
                 let waits = if round % 2 == 0 {
                     let _step = epochs.enter();
                     epochs.wait_for(epochs.stamp(), waited.clone())
@@ -524,4 +528,203 @@ fn a_scan_reading_a_later_step_finds_the_earlier_ones_done() {
             h.join().unwrap();
         }
     }
+}
+
+/// Two retires each paused between the swap that publishes the node and the store of its link
+/// (DESIGN.md 9.1.2): a reclaim that reaches the first carries it, a second reclaim walks from it
+/// alone and takes no new head, and once both links are stored every object comes back once, none
+/// before its link is read.
+#[test]
+fn a_retire_paused_before_its_link_is_carried_and_nothing_is_lost_or_freed_early() {
+    use crate::race;
+    let epochs = Arc::new(Epochs::new());
+    let retired: Arc<Retired<u32>> = Arc::new(Retired::default());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (epochs, retired, seen) = (epochs.clone(), retired.clone(), seen.clone());
+        race::at("epoch.retire", move || {
+            // The first retire's node is published and not linked: the reclaim carries it.
+            seen.lock().extend(retired.reclaim(&epochs));
+            {
+                let (epochs, retired, seen) = (epochs.clone(), retired.clone(), seen.clone());
+                race::at("epoch.retire", move || {
+                    // The second's is behind the head while the first is still carried.
+                    seen.lock().extend(retired.reclaim(&epochs));
+                });
+            }
+            retired.retire(&epochs, 2);
+            assert!(!race::pending("epoch.retire"));
+        });
+    }
+    retired.retire(&epochs, 1);
+    assert!(!race::pending("epoch.retire"));
+    assert!(
+        seen.lock().is_empty(),
+        "nothing came back before its link was read"
+    );
+    let mut all = retired.reclaim(&epochs);
+    all.extend(retired.reclaim(&epochs));
+    all.sort_unstable();
+    assert_eq!(all, vec![1, 2], "each object came back once");
+    assert!(retired.reclaim(&epochs).is_empty());
+}
+
+/// A wait's flag on a step that ends between the scan's read of its slot and the flag: the scan
+/// judges by the word the flag returns, the slot gone idle, and holds nothing back for it
+/// (DESIGN.md 9.1.2).
+#[test]
+fn a_flag_on_a_step_that_ended_meanwhile_holds_nothing_back() {
+    use crate::race;
+    use std::sync::mpsc::channel;
+    let epochs = Arc::new(Epochs::new());
+    let (entered_tx, entered) = channel();
+    let (leave_tx, leave) = channel::<()>();
+    let (left_tx, left) = channel();
+    let holder = {
+        let epochs = epochs.clone();
+        crate::thread::spawn(move || {
+            let step = epochs.enter();
+            entered_tx.send(()).unwrap();
+            leave.recv().unwrap();
+            drop(step);
+            left_tx.send(()).unwrap();
+        })
+    };
+    entered.recv().unwrap();
+    race::at("epoch.flag", move || {
+        leave_tx.send(()).unwrap();
+        left.recv().unwrap();
+    });
+    let wait = crate::storage::atoll::notify::wait();
+    let pending = epochs.wait_for(epochs.stamp(), wait.clone());
+    assert!(
+        !race::pending("epoch.flag"),
+        "the step ended between the read and the flag"
+    );
+    assert!(
+        !pending && wait.finished(),
+        "no step under way holds the wait back, so it is finished now"
+    );
+    holder.join().unwrap();
+}
+
+/// The waits a list holds, in its order.
+fn drained(mut list: WaitList) -> Vec<Wait> {
+    std::iter::from_fn(|| list.pop().map(|wait| *wait)).collect()
+}
+
+/// A push lost to a wake that took the slot's whole list: the push then swaps its wait in, and the
+/// wait stays registered (DESIGN.md 9.1.2).
+#[test]
+fn a_push_lost_to_a_take_of_its_list_keeps_its_wait() {
+    use crate::race;
+    let epochs = Arc::new(Epochs::new());
+    let earlier = crate::storage::atoll::notify::wait();
+    epochs.push(Box::new(Wait {
+        epoch: Plain::new(u64::MAX - 1),
+        notify: Box::new(earlier.clone()),
+        next: ptr::null_mut(),
+        fresh: false,
+    }));
+    {
+        let epochs = epochs.clone();
+        race::at("epoch.push", move || {
+            assert_eq!(
+                drained(epochs.take_waits()).len(),
+                1,
+                "the take emptied the list"
+            );
+        });
+    }
+    let later = crate::storage::atoll::notify::wait();
+    epochs.push(Box::new(Wait {
+        epoch: Plain::new(u64::MAX - 1),
+        notify: Box::new(later.clone()),
+        next: ptr::null_mut(),
+        fresh: false,
+    }));
+    assert!(!race::pending("epoch.push"));
+    let left = drained(epochs.take_waits());
+    assert_eq!(left.len(), 1, "the later wait is on the list");
+    assert!(!left[0].notify.notified());
+    left[0].notify.notify();
+    assert!(later.finished(), "and it is the later one");
+}
+
+/// Behind one paused old step, a thread registering one pending completion again after each event
+/// (as a claim does, its ticket replaced at every event) leaves its slot one node, not one per
+/// registration; finished completions registered between leave none (the auditor's 1/256/1024
+/// probe, DESIGN.md 9.1.3, other waits). The old step's end finishes what stands.
+#[test]
+fn registrations_behind_an_old_step_leave_a_slot_one_node_per_unfinished_completion() {
+    use std::sync::mpsc::channel;
+    let epochs = Arc::new(Epochs::new());
+    let (entered_tx, entered) = channel();
+    let (leave_tx, leave) = channel::<()>();
+    let holder = {
+        let epochs = epochs.clone();
+        crate::thread::spawn(move || {
+            let step = epochs.enter();
+            entered_tx.send(()).unwrap();
+            leave.recv().unwrap();
+            drop(step);
+        })
+    };
+    entered.recv().unwrap();
+    let pending = crate::storage::atoll::notify::wait();
+    for i in 0..256 {
+        // A finished completion registered and dropped: no node stays for it.
+        let gone = crate::storage::atoll::notify::wait();
+        assert!(epochs.wait_for(epochs.stamp(), gone.clone()));
+        crate::storage::atoll::notify::finish(&gone, Ok(0));
+        assert!(epochs.wait_for(epochs.stamp(), pending.clone()), "round {i}");
+        assert_eq!(epochs.own_waits(), 1, "round {i}: the slot's list grew");
+    }
+    leave_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(pending.finished(), "the old step's end finished the wait");
+    assert_eq!(epochs.own_waits(), 0);
+}
+
+/// Instance ids taken to the end of their count: each taken once and never 0, the id of the
+/// per-thread table's empty cache, and the count stays at its end with every take after it
+/// refused, from one thread and from several at once (audit epoch-entry-v1, P2-E1; mutant: a
+/// wrapping increment, which hands out the end, then 0, then ids already taken).
+#[cfg(not(shuttle))]
+#[test]
+fn instance_ids_taken_to_their_end_are_never_0_or_taken_twice() {
+    use std::sync::atomic::AtomicU64;
+    let next = AtomicU64::new(u64::MAX - 2);
+    assert_eq!(take_id(&next), Some(u64::MAX - 2));
+    assert_eq!(take_id(&next), Some(u64::MAX - 1));
+    for _ in 0..3 {
+        assert_eq!(take_id(&next), None, "a take past the end");
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            u64::MAX,
+            "the count left its end"
+        );
+    }
+    let start = u64::MAX - 64;
+    let next = AtomicU64::new(start);
+    let taken: Vec<u64> = std::thread::scope(|s| {
+        let takers: Vec<_> = (0..8)
+            .map(|_| s.spawn(|| (0..16).filter_map(|_| take_id(&next)).collect::<Vec<u64>>()))
+            .collect();
+        takers.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    let mut ids = taken.clone();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), taken.len(), "an id taken twice");
+    assert_eq!(
+        ids,
+        (start..u64::MAX).collect::<Vec<u64>>(),
+        "the ids taken from several threads"
+    );
+    assert_eq!(
+        next.load(Ordering::Relaxed),
+        u64::MAX,
+        "the count left its end"
+    );
 }

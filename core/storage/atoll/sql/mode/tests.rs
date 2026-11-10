@@ -53,6 +53,84 @@ fn within_a_minute(test: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// Runs `test` on a thread of its own, which reports each step of its work that moved
+/// (`progress`): `Err` once `quiet` passes with none, so a step that never ends, or one retried
+/// without end, fails the test rather than hanging the run, however long its whole work takes on a
+/// loaded host. Progress is one counter, so reports never queue.
+fn watch_progress(
+    quiet: std::time::Duration,
+    test: impl FnOnce(&dyn Fn()) + Send + 'static,
+) -> std::result::Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let progress = std::sync::Arc::new(AtomicU64::new(0));
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let runner = {
+        let progress = progress.clone();
+        std::thread::spawn(move || {
+            test(&|| {
+                progress.fetch_add(1, Ordering::Relaxed);
+            });
+            let _ = done.send(());
+        })
+    };
+    let mut seen = progress.load(Ordering::Relaxed);
+    loop {
+        match finished.recv_timeout(quiet) {
+            // Done, or the test panicked: its own message is the failure.
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                runner.join().unwrap();
+                return Ok(());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let now = progress.load(Ordering::Relaxed);
+                if now == seen {
+                    return Err(format!("{quiet:?} passed with no step of the test moving"));
+                }
+                seen = now;
+            }
+        }
+    }
+}
+
+/// [`watch_progress`] with a minute of quiet allowed, failing the test past it.
+fn beating_within_a_minute(test: impl FnOnce(&dyn Fn()) + Send + 'static) {
+    if let Err(e) = watch_progress(std::time::Duration::from_secs(60), test) {
+        panic!("{e}");
+    }
+}
+
+/// The watchdog fails a test whose steps never move however often they are retried, and keeps
+/// alive one that moves, past its quiet bound, for as long as it does (audit chain-fixes-v1,
+/// P2-CF2).
+#[test]
+fn the_progress_watchdog_fails_retries_that_never_move_and_keeps_a_moving_test() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let quiet = std::time::Duration::from_millis(100);
+    // Retried, never moving, until refused: the watchdog answers at its first quiet bound. The
+    // retries end by themselves only far past that, so a watchdog that never refuses lets them
+    // finish and is caught as a failure, not a hang.
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let retries = {
+        let stop = stop.clone();
+        let unrefused = std::time::Instant::now() + quiet * 300;
+        watch_progress(quiet, move |_progress| {
+            while !stop.load(Ordering::Acquire) && std::time::Instant::now() < unrefused {
+                std::thread::yield_now();
+            }
+        })
+    };
+    stop.store(true, Ordering::Release);
+    assert!(retries.is_err(), "retries that never moved were let run");
+    // Moving every 10 ms for five quiet bounds: kept alive to its end.
+    let moving = watch_progress(quiet, |progress| {
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            progress();
+        }
+    });
+    assert_eq!(moving, Ok(()), "a test that kept moving was refused");
+}
+
 fn rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
     conn.prepare(sql).unwrap().run_collect_rows().unwrap()
 }
@@ -174,8 +252,7 @@ fn an_atoll_database_is_detected_and_a_sqlite_one_refused() {
         sqlite,
         OpenOptions::new(Arc::new(SqliteDialect)).atoll(config()),
     )
-    .err()
-    .expect("a SQLite file opened in Atoll mode");
+    .expect_err("a SQLite file opened in Atoll mode");
     assert!(err.to_string().contains("not an Atoll database"), "{err}");
     let db = Database::open(io, sqlite, OpenOptions::new(Arc::new(SqliteDialect))).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -204,8 +281,7 @@ fn an_empty_file_beside_a_wal_that_holds_anything_is_refused() {
         path,
         OpenOptions::new(Arc::new(SqliteDialect)).atoll(config()),
     )
-    .err()
-    .expect("a WAL's rows opened in Atoll mode");
+    .expect_err("a WAL's rows opened in Atoll mode");
     assert!(err.to_string().contains("not an Atoll database"), "{err}");
     let main = io.open_file(path, OpenFlags::ReadOnly, false).unwrap();
     assert_eq!(main.size().unwrap(), 0, "the main file was written");
@@ -324,8 +400,7 @@ fn indexes_updates_deletes_clears_and_drops_reach_atoll() {
     );
     let err = conn
         .prepare("SELECT a FROM gone")
-        .err()
-        .expect("a dropped table");
+        .expect_err("a dropped table");
     assert!(err.to_string().contains("no such table"), "{err}");
 }
 
@@ -2747,28 +2822,51 @@ fn twelve_writers_racing_parents_and_children_leave_no_orphan() {
             .unwrap();
     }
     let start = Arc::new(std::sync::Barrier::new(THREADS + 1));
+    // Halfway, every writer pauses between transactions and waits on `release`; the checker reads
+    // one snapshot after the last has paused and before it releases them, so a read provably falls
+    // inside the run whatever the scheduler does (no count of reads is timed against the writers).
+    let paused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new(std::sync::Barrier::new(THREADS + 1));
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let checker = {
-        let (db, start, running) = (db.clone(), start.clone(), running.clone());
+        let (db, start, paused, release, running) = (
+            db.clone(),
+            start.clone(),
+            paused.clone(),
+            release.clone(),
+            running.clone(),
+        );
         std::thread::spawn(move || {
             let conn = db.connect(ConnectOpts::new()).unwrap();
             // Its begins wait for a slot behind the writers' (R13).
             conn.set_busy_timeout(std::time::Duration::from_secs(30));
             start.wait();
             let (mut checks, mut seen) = (0usize, Vec::new());
-            while running.load(std::sync::atomic::Ordering::Acquire) {
+            let mut check = |checks: &mut usize| {
                 let found = orphans(&conn);
-                checks += 1;
+                *checks += 1;
                 if !found.is_empty() && seen.is_empty() {
                     seen = found;
                 }
+            };
+            // Snapshots while the first half runs, each a real read.
+            while paused.load(std::sync::atomic::Ordering::Acquire) < THREADS {
+                check(&mut checks);
             }
-            (checks, seen)
+            // Every writer paused: the read inside the run, then the rest of the run.
+            check(&mut checks);
+            let at_pause = checks;
+            release.wait();
+            while running.load(std::sync::atomic::Ordering::Acquire) {
+                check(&mut checks);
+            }
+            (checks, at_pause, seen)
         })
     };
     let threads: Vec<_> = (0..THREADS)
         .map(|who| {
-            let (db, start) = (db.clone(), start.clone());
+            let (db, start, paused, release) =
+                (db.clone(), start.clone(), paused.clone(), release.clone());
             std::thread::spawn(move || {
                 let conn = db.connect(ConnectOpts::new()).unwrap();
                 conn.execute("PRAGMA foreign_keys = ON").unwrap();
@@ -2821,6 +2919,10 @@ fn twelve_writers_racing_parents_and_children_leave_no_orphan() {
                     if !conn.get_auto_commit() {
                         conn.execute("ROLLBACK").unwrap();
                     }
+                    if round == ROUNDS as i64 / 2 {
+                        paused.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        release.wait();
+                    }
                 }
                 ended
             })
@@ -2833,10 +2935,12 @@ fn twelve_writers_racing_parents_and_children_leave_no_orphan() {
         }
     }
     running.store(false, std::sync::atomic::Ordering::Release);
-    let (checks, seen) = checker.join().unwrap();
+    let (checks, at_pause, seen) = checker.join().unwrap();
+    // The races met depend on the schedule, so they are reported, not asserted; the tests of
+    // conflicts and deadlocks force their own.
     eprintln!(
         "fk stress: {} committed, {} conflicts, {} deadlocks, {} constraint failures; {checks} \
-         checks",
+         checks, {at_pause} by the writers' pause",
         ended[0], ended[1], ended[2], ended[3]
     );
     assert_eq!(
@@ -2844,13 +2948,8 @@ fn twelve_writers_racing_parents_and_children_leave_no_orphan() {
         Vec::<Vec<Value>>::new(),
         "a snapshot showed an orphan"
     );
-    assert!(
-        checks > 1,
-        "the checker read no snapshot while the writers ran"
-    );
     assert_eq!(orphans(&setup), Vec::<Vec<Value>>::new());
     assert!(ended[0] > 0, "nothing committed");
-    assert!(ended[1] + ended[2] > 0, "no race was met");
 }
 
 /// The orphan check the foreign-key tests read sees an orphan: one written with foreign keys off,
@@ -3207,5 +3306,625 @@ fn a_prepared_insert_looks_its_rowid_counter_up_once() {
     assert_eq!(
         rows(&conn, "SELECT count(*), max(a) FROM t"),
         vec![vec![Value::from_i64(21), Value::from_i64(21)]]
+    );
+}
+
+#[test]
+fn a_repolled_wait_owns_one_timer_and_ending_it_releases_the_completion() {
+    use super::{Waiting, Waits};
+    use crate::sync::atomic::Ordering;
+    use crate::IOResult;
+    let waits = Waits::new();
+    waits.bound.store(60_000_000_000, Ordering::Release);
+    let c = crate::storage::atoll::notify::remote_wait();
+    let mut waiting = Waiting::default();
+    let mut keys = Vec::new();
+    let mut refs = Vec::new();
+    let mut all_parked = true;
+    for _ in 0..32 {
+        all_parked &= matches!(
+            waiting.wait::<()>(&waits, c.clone()).unwrap(),
+            IOResult::IO(_)
+        );
+        keys.push(waiting.timed.as_ref().unwrap().registration());
+        refs.push(c.handles());
+    }
+    waiting.over().unwrap();
+    let after_end = c.handles();
+    drop(waiting);
+    drop(waits);
+    assert!(all_parked);
+    assert!(
+        keys.iter().all(|key| key == &keys[0]),
+        "a re-poll re-armed its timer: {keys:?}"
+    );
+    assert!(
+        refs.iter().all(|&refs| refs == 2),
+        "each poll must retain only the timer's one handle: {refs:?}"
+    );
+    assert_eq!(
+        after_end, 1,
+        "ending the wait releases its distant timer immediately"
+    );
+}
+
+#[test]
+fn a_changed_completion_replaces_its_timer_at_the_first_waits_deadline() {
+    use super::{Waiting, Waits, UNBOUNDED};
+    use crate::sync::atomic::Ordering;
+    use std::time::Duration;
+    let waits = Waits::new();
+    waits.bound.store(60_000_000_000, Ordering::Release);
+    let old = crate::storage::atoll::notify::remote_wait();
+    let new = crate::storage::atoll::notify::remote_wait();
+    let mut waiting = Waiting::default();
+    drop(waiting.wait::<()>(&waits, old.clone()).unwrap());
+    let start = waiting.since.unwrap();
+    drop(waiting.wait::<()>(&waits, new.clone()).unwrap());
+    let same_start = waiting.since == Some(start);
+    let new_target = waiting
+        .timed
+        .as_ref()
+        .unwrap()
+        .is_for(start + Duration::from_secs(60), &new);
+    let refs = (old.handles(), new.handles());
+    waits.bound.store(UNBOUNDED, Ordering::Release);
+    drop(waiting.wait::<()>(&waits, new.clone()).unwrap());
+    let unbounded_cancelled = waiting.timed.is_none() && new.handles() == 1;
+    let first_park_kept = waiting.since == Some(start);
+    drop(waiting);
+    drop(waits);
+    assert!(
+        same_start && new_target,
+        "a replacement completion changed its original deadline"
+    );
+    assert_eq!(
+        refs,
+        (1, 2),
+        "only the current completion is held by the timer"
+    );
+    assert!(
+        unbounded_cancelled,
+        "an unbounded wait must discard an old timeout"
+    );
+    assert!(
+        first_park_kept,
+        "changing the bound must preserve the first park, as before"
+    );
+}
+
+#[test]
+fn dropping_a_wait_cancels_its_timer_without_waiting_for_the_deadline() {
+    use super::{Waiting, Waits};
+    use crate::sync::atomic::Ordering;
+    let waits = Waits::new();
+    waits.bound.store(60_000_000_000, Ordering::Release);
+    let c = crate::storage::atoll::notify::remote_wait();
+    let mut waiting = Waiting::default();
+    drop(waiting.wait::<()>(&waits, c.clone()).unwrap());
+    drop(waiting);
+    drop(waits);
+    assert_eq!(
+        c.handles(),
+        1,
+        "an abandoned wait left its timer registered"
+    );
+    assert!(!c.finished());
+}
+
+/// A transaction's ending is its own top (DESIGN.md 9.1.3, *The top and the owner*): a rollback
+/// whose undo comes short of memory reserves its frame at the ending, holding nothing, and ends
+/// its tenure once done.
+#[test]
+fn an_endings_rollback_that_comes_short_reserves_at_the_ending_and_ends_there() {
+    // Checked with every Atoll value let go: a failed check unwinding through one ends the
+    // process rather than failing the test.
+    if let Err(e) = ending_comes_short() {
+        panic!("{e}");
+    }
+}
+
+fn ending_comes_short() -> std::result::Result<(), String> {
+    use crate::storage::atoll::btree::Mode;
+    use crate::storage::atoll::buffer::scarce;
+    use crate::storage::atoll::page::SizeClass;
+    use crate::storage::atoll::sql::AtollDb;
+    use crate::storage::atoll::testing::drive;
+    use crate::storage::atoll::txn::versioned::{VersionedTree, Write, WriteOp};
+    use crate::storage::atoll::txn::{Commit, Isolation};
+    use crate::types::{IOCompletions, IOResult, ImmutableRecord};
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Arc::new(AtollDb::open(io.clone(), "/db/ending-short", config()).unwrap());
+    let txns = db.atoll().transactions();
+    let begin = || {
+        let mut t = drive(&io, || txns.begin(Isolation::Snapshot)).unwrap();
+        crate::storage::atoll::testing::share(txns, &mut t);
+        txns.statement(&mut t).unwrap();
+        t
+    };
+    let a = db.atoll();
+    let record = ImmutableRecord::from_values(&[Value::build_text("v".repeat(100))], 1).unwrap();
+    let write = |tree: &VersionedTree, txn: &mut crate::storage::atoll::txn::Txn, rowid: i64| {
+        let key = crate::storage::atoll::sql::key::rowid(rowid);
+        let mut w = WriteOp::put(&key, record.get_payload().to_vec(), Mode::Upsert);
+        match drive(&io, || tree.write(txns, db.versions(), txn, &mut w)) {
+            Ok(Write::Done(_)) => Ok(()),
+            out => Err(format!("{out:?}")),
+        }
+    };
+    // A tree of more than one level, committed: its root a node no open transaction wrote.
+    let mut txn = begin();
+    let root = drive(&io, || db.create_tree(&mut txn, SizeClass::new(0).unwrap())).unwrap();
+    let tree = VersionedTree::open(io.clone(), a.pool().clone(), a.store().clone(), root);
+    for rowid in 0..300 {
+        write(&tree, &mut txn, rowid)?;
+    }
+    let mut op = Commit::new(txn);
+    drive(&io, || txns.commit(&mut op)).unwrap();
+    // A row written, then the tree written back and its root evicted: the undo reaches the
+    // row's leaf through the root, read in again.
+    let mut txn = begin();
+    write(&tree, &mut txn, 150)?;
+    super::full_checkpoint(&db).unwrap();
+    let pool = a.pool();
+    let mut sweep = pool.sweep();
+    drive(&io, || sweep.step(pool)).unwrap();
+    if !pool.evict_clean(root) {
+        return Err("the tree's root was not evicted".into());
+    }
+    let mut ending =
+        super::Ending::rollback(db.clone(), crate::storage::atoll::buffer::Conn::new(), txn);
+    let mut short = 0;
+    loop {
+        match scarce(|| ending.step()).map_err(|e| e.to_string())? {
+            IOResult::Done(()) => break,
+            IOResult::IO(IOCompletions(w)) => {
+                if ending.shortage_queued() {
+                    short += 1;
+                }
+                if !w.finished() {
+                    crate::storage::atoll::park::wait(io.as_ref(), &w);
+                }
+            }
+        }
+    }
+    if short == 0 {
+        return Err("the undo never came short: the test reached no shortage".into());
+    }
+    if ending.shortage_queued() || pool.shortage_len() != 0 {
+        return Err("the ending done kept its tenure".into());
+    }
+    Ok(())
+}
+
+/// A statement's reset ends the memory-shortage tenure of the cursors it keeps for its next
+/// execution (DESIGN.md 9.1.3, *The top and the owner*): a write that came short and was reset
+/// leaves no place in the queue, nor the gate, behind it.
+#[test]
+fn a_statements_reset_ends_its_cursors_shortage_tenure() {
+    // Checked with every Atoll value let go: a failed check unwinding through one ends the
+    // process rather than failing the test.
+    if let Err(e) = reset_ends_tenure() {
+        panic!("{e}");
+    }
+}
+
+fn reset_ends_tenure() -> std::result::Result<(), String> {
+    use crate::storage::atoll::buffer::scarce;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/reset-short");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    let pool = db
+        .atoll
+        .as_ref()
+        .expect("Atoll mode")
+        .atoll()
+        .pool()
+        .clone();
+    let mut insert = conn.prepare("INSERT INTO t (b) VALUES (?1)").unwrap();
+    for i in 0..1024 {
+        insert
+            .bind_at(
+                std::num::NonZero::<usize>::MIN,
+                Value::build_text(format!("{i:0600}")),
+            )
+            .unwrap();
+        let mut came_short = false;
+        loop {
+            match scarce(|| insert.step()).map_err(|e| e.to_string())? {
+                crate::StepResult::Done => break,
+                crate::StepResult::IO | crate::StepResult::Yield => {
+                    if pool.shortage_len() > 0 {
+                        came_short = true;
+                        break;
+                    }
+                    insert._io().step().unwrap();
+                }
+                other => return Err(format!("{other:?}")),
+            }
+        }
+        insert.reset().unwrap();
+        if came_short {
+            return match pool.shortage_len() {
+                0 => Ok(()),
+                n => Err(format!("the reset left {n} tenures behind")),
+            };
+        }
+    }
+    Err("no insert came short: the test reached no shortage".into())
+}
+
+/// Steps `stmt` under scarce memory until it is done, or until it comes short with its place in
+/// the queue (`stop_short`): whether it stopped short. A wait no event of the test finishes is a
+/// statement waiting behind its own connection: refused.
+fn step_scarce(
+    stmt: &mut crate::Statement,
+    pool: &Arc<crate::storage::atoll::buffer::BufferPool>,
+    stop_short: bool,
+) -> std::result::Result<bool, String> {
+    use crate::storage::atoll::buffer::scarce;
+    loop {
+        match scarce(|| stmt.step()).map_err(|e| e.to_string())? {
+            crate::StepResult::Done => return Ok(false),
+            crate::StepResult::Row => {}
+            crate::StepResult::IO | crate::StepResult::Yield => {
+                if stop_short && pool.shortage_len() > 0 {
+                    return Ok(true);
+                }
+                stmt._io().step().map_err(|e| e.to_string())?;
+            }
+            other => return Err(format!("{other:?}")),
+        }
+    }
+}
+
+/// A connection's statement that comes short while another of its statements is suspended in the
+/// shortage queue takes that one's place rather than waiting behind it, and completes; the
+/// suspended one, stepped again, finds its place gone and completes afresh (DESIGN.md 9.1.3,
+/// *Revoking an inactive tenure*; Clay's ruling 2026-11-09: no new error). Two scans of a table
+/// larger than the pool, whose early pages each reads in again.
+#[test]
+fn a_connections_statement_takes_the_place_of_its_suspended_sibling_and_both_complete() {
+    // No checkpointing thread: a change the gate a cut closed refuses is the one to step the cut
+    // (DESIGN.md 9.1.3), or the bulk write spins; each row written or read and each stage reports
+    // progress, a retry none, so a regression fails, not hangs.
+    beating_within_a_minute(|beat| {
+        if let Err(e) = sibling_place_taken(beat) {
+            panic!("{e}");
+        }
+    });
+}
+
+fn sibling_place_taken(beat: &dyn Fn()) -> std::result::Result<(), String> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/sibling-revoked");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    let pool = db
+        .atoll
+        .as_ref()
+        .expect("Atoll mode")
+        .atoll()
+        .pool()
+        .clone();
+    // Rows twice the pool's budget: the table's first pages are written back and evicted.
+    const ROW: usize = 3000;
+    let rows = 2 * crate::storage::atoll::buffer::MIN_DB_BUDGET / ROW;
+    let began = std::time::Instant::now();
+    conn.execute("BEGIN").unwrap();
+    let mut insert = conn.prepare("INSERT INTO t (b) VALUES (?1)").unwrap();
+    for i in 0..rows {
+        insert
+            .bind_at(
+                std::num::NonZero::<usize>::MIN,
+                Value::build_text(format!("{i:0ROW$}")),
+            )
+            .unwrap();
+        insert.run_ignore_rows().map_err(|e| e.to_string())?;
+        insert.reset().unwrap();
+        beat();
+    }
+    drop(insert);
+    conn.execute("COMMIT").unwrap();
+    beat();
+    eprintln!("SIBLING {rows} rows written in {:?}", began.elapsed());
+    // The first scan, suspended with its place in the queue.
+    let mut first = conn.prepare("SELECT b FROM t").unwrap();
+    if !step_scarce(&mut first, &pool, true)? {
+        return Err("the first scan never came short".into());
+    }
+    beat();
+    eprintln!("SIBLING first suspended at {:?}", began.elapsed());
+    if pool.shortage_len() != 1 {
+        return Err(format!("{} places queued", pool.shortage_len()));
+    }
+    // A second scan of the connection comes short in turn: it takes the first's place.
+    let mut second = conn.prepare("SELECT count(*) FROM t").unwrap();
+    let mut came_short = false;
+    let mut counted = None;
+    loop {
+        match crate::storage::atoll::buffer::scarce(|| second.step()).map_err(|e| e.to_string())? {
+            crate::StepResult::Done => break,
+            crate::StepResult::Row => {
+                counted = second.row().and_then(|r| r.get_values().next().cloned());
+                beat();
+            }
+            crate::StepResult::IO | crate::StepResult::Yield => {
+                came_short |= pool.shortage_len() > 0;
+                // Taken to read: the statement steps on without it, a wait being only a retry's
+                // cue.
+                let pending = second
+                    .take_io_completions()
+                    .is_some_and(|crate::types::IOCompletions(c)| !c.finished());
+                if pending {
+                    return Err("the second scan waits behind its own first".into());
+                }
+                second._io().step().map_err(|e| e.to_string())?;
+            }
+            other => return Err(format!("{other:?}")),
+        }
+    }
+    drop(second);
+    beat();
+    eprintln!("SIBLING second done at {:?}", began.elapsed());
+    if !came_short {
+        return Err("the second scan never came short".into());
+    }
+    // The first, stepped again, completes afresh.
+    if step_scarce(&mut first, &pool, false)? {
+        return Err("the first stopped short".into());
+    }
+    drop(first);
+    if pool.shortage_len() != 0 {
+        return Err(format!("{} places left queued", pool.shortage_len()));
+    }
+    match counted {
+        Some(Value::Numeric(crate::numeric::Numeric::Integer(k))) if k as usize == rows => Ok(()),
+        other => Err(format!("{other:?} rows counted, {rows} written")),
+    }
+}
+
+/// A transaction's end cancels its connection's suspended tenures (DESIGN.md 9.1.3): no sibling
+/// statement keeps the gate past the transaction it served.
+#[test]
+fn a_transactions_end_cancels_its_connections_suspended_tenures() {
+    if let Err(e) = end_cancels() {
+        panic!("{e}");
+    }
+}
+
+fn end_cancels() -> std::result::Result<(), String> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, "/db/end-cancels");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")
+        .unwrap();
+    let pool = db
+        .atoll
+        .as_ref()
+        .expect("Atoll mode")
+        .atoll()
+        .pool()
+        .clone();
+    let mut insert = conn.prepare("INSERT INTO t (b) VALUES (?1)").unwrap();
+    let mut n = 0;
+    loop {
+        if n == 1024 {
+            return Err("the statement never came short".into());
+        }
+        insert
+            .bind_at(
+                std::num::NonZero::<usize>::MIN,
+                Value::build_text(format!("{n:0600}")),
+            )
+            .unwrap();
+        n += 1;
+        if step_scarce(&mut insert, &pool, true)? {
+            break;
+        }
+        insert.reset().unwrap();
+    }
+    if pool.shortage_len() != 1 {
+        return Err(format!("{} places queued", pool.shortage_len()));
+    }
+    // The transaction ends under the suspended statement.
+    let ct = conn.atoll().expect("Atoll mode");
+    let ending = ct.end(false);
+    let queued = pool.shortage_len();
+    if let Some(mut ending) = ending {
+        ending.finish().map_err(|e| e.to_string())?;
+    }
+    drop(insert);
+    match queued {
+        0 => Ok(()),
+        n => Err(format!("the end left {n} places of its connection queued")),
+    }
+}
+
+/// Every `drive` a connection's facade method runs carries the connection's identity
+/// (`drive_for`), so a shortage it meets takes the place of the connection's own suspended
+/// operation rather than waiting behind it (DESIGN.md 9.1.3, *Revoking an inactive tenure*). The
+/// census reads `sql/mode.rs` and lists the bare `drive`s left, each with why it has no
+/// connection's statement to be suspended behind.
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn every_drive_of_the_connections_facade_carries_its_identity() {
+    use crate::storage::atoll::testing::{atoll_dir, code_of};
+    const BARE: &[(&str, &str)] = &[
+        (
+            "full_checkpoint",
+            "a full checkpoint, maintenance: no tenure, no connection",
+        ),
+        (
+            "finish",
+            "an ending's own owner carries the connection; the outer drive only parks",
+        ),
+        (
+            "drop",
+            "an ending's own owner carries the connection; the outer drive only parks",
+        ),
+    ];
+    let code = code_of(&std::fs::read_to_string(atoll_dir().join("sql/mode.rs")).unwrap());
+    let code = code.split("mod tests {").next().unwrap();
+    let mut found = Vec::new();
+    for (at, _) in code.match_indices("drive(") {
+        let before = &code[..at];
+        // `drive_for(` and `drive_as(` are other names; `drive(` is the bare call alone.
+        if before.ends_with('_') || before.ends_with("fn ") || before.ends_with("::") {
+            continue;
+        }
+        let caller: String = before
+            .rfind("fn ")
+            .map(|i| {
+                before[i + 3..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.push(caller);
+    }
+    found.sort();
+    let mut listed: Vec<String> = BARE.iter().map(|(f, _)| f.to_string()).collect();
+    listed.sort();
+    assert!(!found.is_empty(), "the census found no drive at all");
+    assert_eq!(
+        found, listed,
+        "a bare drive in the connection's facade not listed with why it carries no connection, \
+         or one listed that is gone"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+#[test]
+fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
+    use std::sync::mpsc;
+    use std::task::{Wake, Waker};
+    struct Calls(std::sync::atomic::AtomicUsize);
+    impl Wake for Calls {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_with(
+        &io,
+        "/db/raw-waker-bounds",
+        crate::storage::atoll::db::AtollConfig {
+            log_budget: Some(1),
+            ..config()
+        },
+    );
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY)")
+        .unwrap();
+    let mut statement = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+    let tasks: Vec<_> = (0..32)
+        .map(|_| std::sync::Arc::new(Calls(std::sync::atomic::AtomicUsize::new(0))))
+        .collect();
+    let wakers: Vec<_> = tasks.iter().map(|t| Waker::from(t.clone())).collect();
+    let atoll = db.atoll.as_ref().unwrap().atoll();
+    let (
+        pending,
+        registered,
+        idle_wakes,
+        steady_allocations,
+        steady_pending,
+        finished_wakes,
+        cut_wait_pending,
+        checkpoint_done,
+        statement_done,
+    ) = std::thread::scope(|scope| {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let store = atoll.store().clone();
+        let holder = scope.spawn(move || {
+            let change = store.change().expect("gate initially open");
+            held_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            drop(change);
+        });
+        held_rx.recv().unwrap();
+        let cp = atoll.checkpointer();
+        let ticket = cp.request_full();
+        let cut_wait_pending = matches!(cp.step_full(ticket,atoll.transactions()).unwrap(),crate::types::IOResult::IO(ref io) if !io.finished());
+        let mut pending = 0;
+        let mut wait = None;
+        for waker in &wakers {
+            let out = statement.step_with_waker(waker).unwrap();
+            if pending == 0 {
+                eprintln!("STATEMENT_FIRST_STEP {out:?}");
+            }
+            if matches!(out, crate::StepResult::IO) {
+                wait = statement.pending_io_for_test();
+                pending += usize::from(wait.as_ref().is_some_and(|c| !c.finished()));
+            } else {
+                break;
+            }
+        }
+        let registered = wait.as_ref().map_or(0, crate::Completion::wakers);
+        let idle_wakes = tasks
+            .iter()
+            .map(|t| t.0.load(std::sync::atomic::Ordering::Relaxed))
+            .sum::<usize>();
+        let before = crate::storage::atoll::testing::allocations();
+        let mut steady_pending = 0;
+        for _ in 0..32 {
+            steady_pending += usize::from(matches!(
+                statement.step_with_waker(&wakers[31]).unwrap(),
+                crate::StepResult::IO
+            ));
+        }
+        let steady_allocations = crate::storage::atoll::testing::allocations() - before;
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let checkpoint_done = crate::storage::atoll::testing::drive(&io, || {
+            cp.step_full(ticket, atoll.transactions())
+        })
+        .is_ok();
+        let statement_done = statement.run_ignore_rows().is_ok();
+        let finished_wakes = tasks
+            .iter()
+            .map(|t| t.0.load(std::sync::atomic::Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        (
+            pending,
+            registered,
+            idle_wakes,
+            steady_allocations,
+            steady_pending,
+            finished_wakes,
+            cut_wait_pending,
+            checkpoint_done,
+            statement_done,
+        )
+    });
+    drop(statement);
+    drop(conn);
+    drop(db);
+    drop(io);
+    drop(wakers);
+    drop(tasks);
+    eprintln!("STATEMENT_WAKERS pending={pending} registered={registered} idle_wakes={idle_wakes} steady_allocations={steady_allocations} steady_pending={steady_pending} finish_wakes={finished_wakes:?} cut_wait_pending={cut_wait_pending} checkpoint_done={checkpoint_done} statement_done={statement_done}");
+    assert!(cut_wait_pending && pending == 32 && checkpoint_done && statement_done);
+    assert_eq!(
+        registered, 1,
+        "one live SQL statement retained obsolete Context wakers"
+    );
+    assert_eq!(idle_wakes, 0);
+    assert_eq!(
+        (steady_pending, steady_allocations),
+        (32, 0),
+        "stable pending statement polls must not allocate"
+    );
+    assert!(
+        finished_wakes[..31].iter().all(|n| *n == 0) && finished_wakes[31] == 1,
+        "only the latest statement waker must be notified"
     );
 }

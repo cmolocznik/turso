@@ -35,7 +35,7 @@ use super::arc_cell::{ArcCell, Releasing};
 use super::blob;
 use super::btree::node::{self, View};
 use super::btree::value::{self, ValueRef};
-use super::buffer::{BufferPool, CutScan, LentUse, Relief, Source};
+use super::buffer::{BufferPool, CutScan, Relief, Relieved, Retry, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::guarded::{Guarded, Hold};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
@@ -70,6 +70,9 @@ pub const META_INTENT: Kind = Kind::new(31).unwrap();
 /// (the buffer pool's writeback sizing), at the low end, so a checkpoint never crowds the pool's
 /// own writes out.
 const WRITES: usize = 32;
+
+/// [`WRITES`], for the image bank's size (DESIGN.md 9.1.1).
+pub(crate) const IMAGE_WRITES: usize = WRITES;
 
 /// The default bytes of image writes in flight: one page of the largest class, the least that
 /// lets every page be written. [`WRITES`] small writes keep a device busy up to pages of 256 KiB,
@@ -140,6 +143,10 @@ pub struct Checkpointer {
     /// The ends of transactions waiting on the thread for a full checkpoint, woken as each
     /// checkpoint ends, fails, or the thread does.
     waiters: Mutex<Vec<Completion>>,
+    /// What a caller that found the state held waits on (`step_full`): finished as the state is
+    /// let go (DESIGN.md 9.1.3, the checkpointer's state held by another stepper). Any number
+    /// share it, which the state's two parked contenders (`Guarded`) cannot.
+    released: crate::storage::atoll::notify::LetGo,
 }
 
 /// Who steps the checkpoints (Clay's ruling of 2026-11-05: off the commit path).
@@ -167,13 +174,21 @@ impl Checkpointing {
 }
 
 /// How far a step goes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Until {
+#[derive(Clone, Copy)]
+enum Until<'a> {
     /// Whatever is due, to the end.
     Done,
-    /// Until the room for kept copies takes the request it refused: for the writer refused, who
-    /// does only the work that lets it in, its stall that work's and no more.
-    Room,
+    /// Until the writer refused may start again ([`BufferPool::may_retry`]): the room takes the
+    /// request it refused, or a frame of a class it wants came. It does only the work that lets
+    /// it in, its stall that work's and no more.
+    Room(Retry<'a>),
+}
+
+impl Until<'_> {
+    /// Whether a refused writer's relief stops here.
+    fn met(self, pool: &BufferPool) -> bool {
+        matches!(self, Until::Room(retry) if pool.may_retry(retry))
+    }
 }
 
 /// The pool's relief for a writer refused room: steps the checkpoint until the room takes it.
@@ -192,9 +207,12 @@ impl CheckpointRelief {
 }
 
 impl Relief for CheckpointRelief {
-    fn relieve(&self) -> Option<Result<IOResult<()>>> {
-        let (cp, txns) = (self.checkpointer.upgrade()?, self.txns.upgrade()?);
-        cp.relieve(&txns)
+    fn relieve(&self, retry: Retry<'_>) -> Relieved {
+        match (self.checkpointer.upgrade(), self.txns.upgrade()) {
+            (Some(cp), Some(txns)) => cp.relieve(&txns, retry),
+            // The database is closing: no checkpoint to step.
+            _ => Relieved::Elsewhere,
+        }
     }
 }
 
@@ -234,6 +252,12 @@ impl Drop for StateHold<'_> {
             self.checkpointer.wake_waiters();
         }
         self.checkpointer.pool.wake_room();
+        // A cut left under way: a writer the gate refused, its relief having found the state
+        // held, steps it now.
+        if self.checkpointer.store.gate_closed() {
+            self.checkpointer.store.wake_gate_waiters();
+        }
+        self.checkpointer.released.let_go();
     }
 }
 
@@ -245,6 +269,9 @@ struct State {
     full_done: u64,
     /// Why a checkpoint failed, if one did.
     failed: Option<String>,
+    /// The checkpoint's memory demand, kept across its steps whichever thread takes them
+    /// (DESIGN.md 9.1.3, *Maintenance keeps what it owns*).
+    upkeep: crate::storage::atoll::buffer::Upkeep,
 }
 
 /// A checkpoint under way.
@@ -361,6 +388,7 @@ impl Checkpointer {
                 run: None,
                 full_done: 0,
                 failed: None,
+                upkeep: Default::default(),
             }),
             write_bytes: write_bytes.max(page::MAX_PAGE_SIZE),
             counters: Counters::default(),
@@ -370,6 +398,7 @@ impl Checkpointer {
             full_done: AtomicU64::new(0),
             failure: Mutex::new(None),
             waiters: Mutex::new(Vec::new()),
+            released: Default::default(),
         }
     }
 
@@ -392,7 +421,7 @@ impl Checkpointer {
         &self,
         state: &mut StateHold<'_>,
         txns: &Transactions,
-        until: Until,
+        until: Until<'_>,
     ) -> Result<IOResult<()>> {
         let clock = self.store.io();
         let began = clock.current_time_monotonic();
@@ -441,6 +470,22 @@ impl Checkpointer {
             checkpointer: self,
             waiters_owed: false,
         })
+    }
+
+    /// The state, if no one holds it; else the wait its let-go finishes. Registered first and then
+    /// tried again, so a let-go in between either finds the registration or is seen let go.
+    fn hold_or_wait(&self) -> std::result::Result<StateHold<'_>, Completion> {
+        if let Some(held) = self.try_hold() {
+            return Ok(held);
+        }
+        let released = self.released.wait();
+        self.try_hold().ok_or(released)
+    }
+
+    /// Let-goes of the state that found a caller waiting, for a test.
+    #[cfg(test)]
+    pub(crate) fn released_wakes(&self) -> u64 {
+        self.released.woke()
     }
 
     /// The state, if no one holds it; else this thread is its contender, unparked once it is let
@@ -503,7 +548,6 @@ impl Checkpointer {
     /// runs, so no writer steps a checkpoint once the database is open.
     pub(crate) fn attach_driver(&self, thread: crate::thread::Thread) {
         *self.driver.lock() = Some(thread);
-        self.pool.room_freed_elsewhere(true);
         self.driven.store(true, Ordering::Release);
     }
 
@@ -518,7 +562,6 @@ impl Checkpointer {
                 crate::storage::atoll::unwind::abort_if_unwinding();
                 self.0.driven.store(false, Ordering::Release);
                 *self.0.driver.lock() = None;
-                self.0.pool.room_freed_elsewhere(false);
                 self.0.wake_waiters();
                 self.0.pool.wake_room();
             }
@@ -530,14 +573,17 @@ impl Checkpointer {
                 .map(|mut state| self.stepping(&mut state, txns, Until::Done));
             match stepped {
                 Some(Ok(IOResult::IO(IOCompletions(c)))) => {
-                    if let Err(e) = io.wait_for_completion(c) {
+                    if let Err(e) = crate::storage::atoll::park::wait_for_completion(io.as_ref(), c)
+                    {
                         tracing::warn!("the checkpoint's wait failed: {e}");
                     }
                 }
                 // Nothing due, a failure that stops every checkpoint until the database is opened
                 // again (told to whoever waits), or the state taken by another: the thread is its
                 // contender, woken once it is let go.
-                Some(Ok(IOResult::Done(()))) | Some(Err(_)) | None => crate::thread::park(),
+                Some(Ok(IOResult::Done(()))) | Some(Err(_)) | None => {
+                    crate::storage::atoll::park::thread()
+                }
             }
         }
     }
@@ -560,7 +606,7 @@ impl Checkpointer {
         if self.full_done.load(Ordering::Acquire) >= ticket {
             return Ok(IOResult::Done(()));
         }
-        let c = Completion::new_remote_wait();
+        let c = crate::storage::atoll::notify::remote_wait();
         waiters.push(c.clone());
         drop(waiters);
         self.wake_driver();
@@ -569,20 +615,23 @@ impl Checkpointer {
 
     /// For a writer refused room for kept copies, holding nothing: steps the checkpoint under way
     /// until the room takes the request it refused, its images giving copies back, kept copies
-    /// first. `None` while someone else steps it. A
-    /// checkpoint that fails meanwhile is abandoned, its cut ended and its copies dropped, and
-    /// tells its failure to whoever steps checkpoints next: the writer goes on, as commits do.
-    pub fn relieve(&self, txns: &Transactions) -> Option<Result<IOResult<()>>> {
+    /// first. [`Relieved::Elsewhere`] while the checkpointing thread steps it, and
+    /// [`Relieved::Held`] while another caller holds its state. A checkpoint that fails meanwhile
+    /// is abandoned, its cut ended and its copies dropped, and tells its failure to whoever steps
+    /// checkpoints next: the writer goes on, as commits do.
+    pub fn relieve(&self, txns: &Transactions, retry: Retry<'_>) -> Relieved {
         // The thread's to step, kept copies first while a writer waits: the writer waits for the
         // room it frees.
         if self.driven() && !self.on_driver() {
             self.wake_driver();
-            return None;
+            return Relieved::Elsewhere;
         }
-        let mut state = self.try_hold()?;
-        let out = self.stepping(&mut state, txns, Until::Room);
+        let Some(mut state) = self.try_hold() else {
+            return Relieved::Held;
+        };
+        let out = self.stepping(&mut state, txns, Until::Room(retry));
         drop(state);
-        Some(match out {
+        Relieved::Stepped(match out {
             Err(e) => {
                 tracing::warn!("a checkpoint a writer stepped for room failed: {e}");
                 Ok(IOResult::Done(()))
@@ -658,7 +707,7 @@ impl Checkpointer {
             if let Some(held) = self.hold_or_contend() {
                 return held;
             }
-            crate::thread::park();
+            crate::storage::atoll::park::thread();
         }
     }
 
@@ -689,8 +738,9 @@ impl Checkpointer {
         if self.driven() && !self.on_driver() {
             return self.wait_full(ticket);
         }
-        let Some(mut state) = self.try_hold() else {
-            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+        let mut state = match self.hold_or_wait() {
+            Ok(state) => state,
+            Err(released) => return Ok(IOResult::IO(IOCompletions(released))),
         };
         let stepped =
             (state.full_done < ticket).then(|| self.stepping(&mut state, txns, Until::Done));
@@ -712,14 +762,14 @@ impl State {
         &mut self,
         cp: &Checkpointer,
         txns: &Transactions,
-        until: Until,
+        until: Until<'_>,
     ) -> Result<IOResult<()>> {
         if let Some(failed) = &self.failed {
             return Err(LimboError::InternalError(format!(
                 "a checkpoint failed ({failed}): none runs until the database is opened again"
             )));
         }
-        if until == Until::Room && self.run.is_none() {
+        if matches!(until, Until::Room(_)) && self.run.is_none() {
             return Ok(IOResult::Done(()));
         }
         if self.run.is_none() {
@@ -739,7 +789,10 @@ impl State {
             )));
         }
         let run = self.run.as_mut().expect("a checkpoint under way");
-        let out = run.step(cp, txns, &self.superblock, until);
+        let superblock = &self.superblock;
+        let out = crate::storage::atoll::buffer::upkeep_scope(&mut self.upkeep, || {
+            run.step(cp, txns, superblock, until)
+        });
         match out {
             Ok(IOResult::Done(())) if run.superblock.is_none() => Ok(IOResult::Done(())),
             Ok(IOResult::Done(())) => {
@@ -759,6 +812,7 @@ impl State {
                 if let Some(run) = self.run.take() {
                     run.abandon(cp, txns);
                 }
+                self.upkeep.abandon();
                 self.failed = Some(e.to_string());
                 Err(e)
             }
@@ -831,10 +885,10 @@ impl Run {
         cp: &Checkpointer,
         txns: &Transactions,
         in_charge: &Superblock,
-        until: Until,
+        until: Until<'_>,
     ) -> Result<IOResult<()>> {
         loop {
-            if until == Until::Room && cp.pool.room_takes_refused() {
+            if until.met(&cp.pool) {
                 return Ok(IOResult::Done(()));
             }
             match self.phase {
@@ -924,13 +978,23 @@ impl Run {
                     if self.frames.is_empty() && !self.meta.is_empty() {
                         let ids: Vec<MetaId> = self.meta.iter().copied().collect();
                         self.frames = done!(cp.store.meta().get_all(&ids));
-                        for frame in &self.frames {
-                            if let Some(c) = cp.store.meta().write_for(frame, self.n)? {
-                                self.waits.push(c);
-                            }
-                        }
                     }
                     done!(wait_all(&mut self.waits));
+                    // Every page asked until it is written for `n`: a wait other than its write's
+                    // (a hold to end, a change settling under the look) writes nothing, and a page
+                    // left unwritten stays dirty with no later checkpoint naming it.
+                    for frame in &self.frames {
+                        if let Some(c) = cp.store.meta().write_for(frame, self.n)? {
+                            self.waits.push(c);
+                        }
+                    }
+                    if let Some(c) = self.waits.iter().find(|c| !c.finished()) {
+                        return Ok(IOResult::IO(IOCompletions(c.clone())));
+                    }
+                    if let Some(c) = self.waits.first() {
+                        // Only yields: the page's holder or changer runs before the next ask.
+                        return Ok(IOResult::IO(IOCompletions(c.clone())));
+                    }
                     cp.store.meta().end_cut(self.n, &self.frames);
                     self.waits = cp.store.sync_data_files()?;
                     self.phase = Phase::Durable;
@@ -997,11 +1061,11 @@ impl Run {
         cp: &Checkpointer,
         txns: &Transactions,
         values: bool,
-        until: Until,
+        until: Until<'_>,
     ) -> Result<IOResult<bool>> {
         loop {
             done!(self.land(cp));
-            if until == Until::Room && self.imaging.is_none() && cp.pool.room_takes_refused() {
+            if self.imaging.is_none() && until.met(&cp.pool) {
                 return Ok(IOResult::Done(false));
             }
             if self.imaging.is_none() {
@@ -1178,7 +1242,7 @@ impl Run {
             let lent = pid.class().index() <= node::MAX_CLASS;
             let block = match lent {
                 false => IOResult::Done(AlignedBlock::zeroed(pid.class().size())),
-                true => cp.pool.lend(pid.class(), LentUse::Image)?,
+                true => cp.pool.lease_image(pid.class())?,
             };
             let block = match block {
                 IOResult::Done(b) => b,
@@ -1221,7 +1285,7 @@ impl Run {
             counters
                 .bytes
                 .fetch_add(image.len() as u64, Ordering::Relaxed);
-            let landed = Completion::new_wait();
+            let landed = crate::storage::atoll::notify::wait();
             let failed = Arc::new(Mutex::new(None));
             let (ends, fails) = (landed.clone(), failed.clone());
             // Its end is told through `landed`: the write's own completion stays the IO's.

@@ -31,22 +31,22 @@ use crate::storage::atoll::btree::{Mode, Near, Outcome};
 use crate::storage::atoll::buffer::MIN_DB_BUDGET;
 use crate::storage::atoll::control::{self, Found};
 use crate::storage::atoll::db::AtollConfig;
-use crate::storage::atoll::drive;
+use crate::storage::atoll::{drive, drive_for};
 // Plain data the facade passes in or out, defined where Atoll uses it and named through here.
 pub(crate) use super::catalog::SCHEMA_ID;
 pub(crate) use super::cursor::GuardKey;
-pub(crate) use crate::storage::atoll::txn::versioned::Guarded;
-pub(crate) use crate::storage::atoll::txn::Statement;
 use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::page::PageId;
+pub(crate) use crate::storage::atoll::txn::versioned::Guarded;
 use crate::storage::atoll::txn::versioned::{Get, Guard, Write, WriteOp};
+pub(crate) use crate::storage::atoll::txn::Statement;
 use crate::storage::atoll::txn::{Abort, Blocker, Commit, Hold, Isolation, Taken, Txn};
 use crate::storage::btree::{BTreeKey, CursorTrait};
 use crate::storage::database::DatabaseStorage;
 use crate::storage::database::IOContext;
 use crate::storage::pager::{Pager, SavepointResult};
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::types::{
     IOCompletions, IOResult, IOResultOr, ImmutableRecord, IndexInfo, SeekKey, SeekOp, SeekResult,
@@ -318,6 +318,7 @@ struct Waiting {
     on: Option<(Blocker, Completion)>,
     record: Option<(On, Arc<WaitRecord>)>,
     since: Option<Instant>,
+    timed: Option<crate::timer::Timed>,
 }
 
 fn deadlock(_: super::wait::Deadlock) -> LimboError {
@@ -351,7 +352,7 @@ impl Waiting {
                 }
                 let c = match self.on.take() {
                     Some((_, c)) if !c.finished() => c,
-                    _ => Completion::new_remote_wait(),
+                    _ => crate::storage::atoll::notify::remote_wait(),
                 };
                 db.atoll().transactions().wait_end(blocker, &c);
                 self.on = Some((blocker, c));
@@ -374,6 +375,7 @@ impl Waiting {
 
     /// Ends the wait, its edge withdrawn: `Deadlock` if it was chosen as a victim first.
     fn over(&mut self) -> Result<()> {
+        self.timed = None;
         self.since = None;
         match self.record.take() {
             Some((_, record)) => graph().withdraw(&record).map_err(deadlock),
@@ -392,14 +394,26 @@ impl Waiting {
         }
         let bound = waits.bound.load(Ordering::Acquire);
         if bound == UNBOUNDED {
+            self.timed = None;
             return Ok(IOResult::IO(IOCompletions(c)));
         }
         let now = Instant::now();
         let deadline = *self.since.get_or_insert(now) + Duration::from_nanos(bound);
         // The timer wakes it at the bound, unless the blocker's end does first.
-        if now < deadline && crate::timer::complete_at(deadline, c.clone()) {
-            return Ok(IOResult::IO(IOCompletions(c)));
+        if now < deadline {
+            if !self
+                .timed
+                .as_ref()
+                .is_some_and(|timed| timed.is_for(deadline, &c))
+            {
+                self.timed = None;
+                self.timed = crate::timer::complete_at(deadline, c.clone());
+            }
+            if self.timed.is_some() {
+                return Ok(IOResult::IO(IOCompletions(c)));
+            }
         }
+        self.timed = None;
         self.since = None;
         waits.spent.store(bound != 0, Ordering::Release);
         Err(LimboError::Busy)
@@ -428,6 +442,10 @@ pub enum Begin {
         schema: bool,
     },
 }
+
+/// A header field as a transaction read it: the word, the transaction's slot and start, and the
+/// header's changes when it read it.
+type FieldRead = (u32, (u16, u64), u64);
 
 /// A connection's Atoll transaction: the `Txn` its cursors read and write in, and the header
 /// fields it wrote, by statement.
@@ -460,7 +478,7 @@ pub struct ConnTxn {
     /// Each header field as a transaction read it: the word, the transaction's slot and start,
     /// and the header's changes when it read it. Its own while the header counts no change, as a
     /// catalog row is ([`Known`]).
-    fields: Mutex<[Option<(u32, (u16, u64), u64)>; 7]>,
+    fields: Mutex<[Option<FieldRead>; 7]>,
     /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
     _frame: crate::storage::atoll::unwind::FrameEnd,
 }
@@ -506,6 +524,7 @@ impl KnownRow {
 /// connection read while it holds, and the leaf the last cursor over the tree stood at.
 fn row_in(
     db: &Arc<AtollDb>,
+    conn: &Arc<crate::storage::atoll::buffer::Conn>,
     known: &Mutex<HashMap<u64, Known>>,
     id: u64,
     txn: &mut Txn,
@@ -521,7 +540,7 @@ fn row_in(
     #[cfg(test)]
     CATALOG_READS.with(|r| r.borrow_mut().push(id));
     let mut get = Get::new(&catalog::key(id));
-    let entry = drive(db.io(), || {
+    let entry = drive_for(conn, db.io(), || {
         db.catalog()
             .get(db.atoll().transactions(), db.versions(), txn, &mut get)
     })?
@@ -560,7 +579,11 @@ pub(in crate::storage::atoll) struct TreeChanges {
     slots: Box<[[AtomicU64; 2]]>,
     /// The trees a Destroy took in the open transaction, with the statement that ran it: a cursor
     /// that statement opens on one after it reads it as empty, as SQLite's does a freed root.
-    destroyed: Mutex<Vec<(u64, Statement)>>,
+    /// Changed only through [`Self::destroyed`], which keeps `destroying`, its length, beside it.
+    destroyed_list: Mutex<Vec<(u64, Statement)>>,
+    /// The length of `destroyed_list`, written under its lock: a cursor's open reads none listed
+    /// with one load, as nearly every statement destroys nothing.
+    destroying: AtomicUsize,
 }
 
 /// What a cursor positioned at an epoch has to catch up with.
@@ -579,13 +602,22 @@ impl TreeChanges {
             slots: (0..CHANGE_SLOTS)
                 .map(|_| [AtomicU64::new(0), AtomicU64::new(0)])
                 .collect(),
-            destroyed: Mutex::new(Vec::new()),
+            destroyed_list: Mutex::new(Vec::new()),
+            destroying: AtomicUsize::new(0),
         }
     }
 
     /// Whether statement `statement` destroyed tree `id`.
     fn destroyed_in(&self, id: u64, statement: Statement) -> bool {
-        self.destroyed.lock().contains(&(id, statement))
+        self.destroying.load(Ordering::Acquire) != 0
+            && self.destroyed_list.lock().contains(&(id, statement))
+    }
+
+    /// Changes the trees destroyed with `f`, their count kept with them.
+    fn destroyed(&self, f: impl FnOnce(&mut Vec<(u64, Statement)>)) {
+        let mut list = self.destroyed_list.lock();
+        f(&mut list);
+        self.destroying.store(list.len(), Ordering::Release);
     }
 
     fn next(&self) -> u64 {
@@ -667,7 +699,7 @@ impl ConnTxn {
     pub fn new(db: Arc<AtollDb>) -> Self {
         Self {
             db,
-            cell: Arc::new(Mutex::new(None)),
+            cell: super::cursor::TxnSlot::new(None),
             written: Mutex::new(Vec::new()),
             setting: Mutex::new(None),
             taking: Mutex::new(None),
@@ -697,7 +729,7 @@ impl ConnTxn {
         }
         self.pin_began.store(!self.is_open(), Ordering::Release);
         let io = self.db.io().clone();
-        drive(&io, || self.begin(Begin::Read)).inspect_err(|_| {
+        drive_for(self.cell.conn(), &io, || self.begin(Begin::Read)).inspect_err(|_| {
             self.pinned.store(false, Ordering::Release);
         })
     }
@@ -786,7 +818,8 @@ impl ConnTxn {
     /// does not wait again. Taken: a second call reads false.
     #[turso_macros::atoll_entry]
     pub fn take_wait_spent(&self) -> bool {
-        self.waits.spent.swap(false, Ordering::AcqRel)
+        // Nearly every statement's wait was not spent: one load, and the swap only when it was.
+        self.waits.spent.load(Ordering::Acquire) && self.waits.spent.swap(false, Ordering::AcqRel)
     }
 
     #[turso_macros::atoll_entry]
@@ -849,16 +882,18 @@ impl ConnTxn {
     /// goes on. A take the gate lost to a victim's clearing is `Busy`.
     #[turso_macros::atoll_entry]
     pub fn begin(&self, wants: Begin) -> Result<IOResult<()>> {
-        self.begin_reading(wants, &[])
+        Ok(self.begin_reading(wants, &[])?.map(|_| ()))
     }
 
     /// [`begin`](Self::begin) for a schema writer that reads rows of the trees `reads` names: in a
     /// transaction that already has a snapshot, a commit that raised one's stamp past it fails the
     /// take with `BusySnapshot`, checked before it marks itself pending and again once it holds
     /// the gate (DESIGN.md §17, §3, defect 4). Its build or rewrite would read the tree at that
-    /// snapshot and miss the rows committed since, as no write conflict tells.
+    /// snapshot and miss the rows committed since, as no write conflict tells. Done, it says
+    /// whether this call found no transaction open, so began it: the Transaction opcode's one
+    /// look at the connection's transaction.
     #[turso_macros::atoll_entry]
-    pub fn begin_reading(&self, wants: Begin, reads: &[u64]) -> Result<IOResult<()>> {
+    pub fn begin_reading(&self, wants: Begin, reads: &[u64]) -> Result<IOResult<bool>> {
         let txns = self.db.atoll().transactions();
         if let Begin::Write { .. } = wants {
             // A writing statement steps the checkpointer first, holding no latch, while a
@@ -868,7 +903,8 @@ impl ConnTxn {
             self.db.atoll().checkpointer().step_due(txns).map(|_| ())?;
         }
         let mut guard = self.cell.lock();
-        if guard.is_none() {
+        let began = guard.is_none();
+        if began {
             let begun = match wants {
                 Begin::Read => txns.begin(Isolation::Snapshot)?,
                 // Its snapshot once it holds the gate: an exclusive taker's after the drain.
@@ -907,7 +943,7 @@ impl ConnTxn {
             let mut taking = self.taking.lock();
             let c = match taking.take() {
                 Some(c) if !c.finished() => c,
-                _ => Completion::new_remote_wait(),
+                _ => crate::storage::atoll::notify::remote_wait(),
             };
             let taken = match if schema {
                 txns.take_exclusive(txn, &c)
@@ -975,7 +1011,7 @@ impl ConnTxn {
         if !txn.snapped() {
             txns.take_snapshot(txn);
         }
-        Ok(IOResult::Done(()))
+        Ok(IOResult::Done(began))
     }
 
     /// Whether a commit raised the stamp of a tree `reads` names past `txn`'s snapshot: the tree
@@ -984,7 +1020,7 @@ impl ConnTxn {
         let db = &self.db;
         for id in reads {
             let mut get = Get::new(&catalog::key(*id));
-            let entry = drive(db.io(), || {
+            let entry = drive_for(self.cell.conn(), db.io(), || {
                 db.catalog()
                     .get(db.atoll().transactions(), db.versions(), txn, &mut get)
             })?;
@@ -1040,14 +1076,14 @@ impl ConnTxn {
         };
         let mut op = crate::storage::atoll::txn::rollback::Rollback::after(n);
         let (db, io) = (&self.db, self.db.io());
-        drive(io, || {
+        drive_for(self.cell.conn(), io, || {
             db.atoll()
                 .transactions()
                 .rollback_to(db.versions(), txn, &mut op)
         })?;
         self.written.lock().retain(|(s, _, _)| *s <= n);
         *self.setting.lock() = None;
-        self.changes.destroyed.lock().retain(|(_, s)| *s <= n);
+        self.changes.destroyed(|list| list.retain(|(_, s)| *s <= n));
         self.changes.rolled_back();
         // It may have undone a catalog or header write the transaction read.
         self.db.catalog().note_change();
@@ -1064,7 +1100,7 @@ impl ConnTxn {
         }
         self.savepoints.lock().clear();
         let txn = self.cell.lock().take()?;
-        self.changes.destroyed.lock().clear();
+        self.changes.destroyed(Vec::clear);
         let written = std::mem::take(&mut *self.written.lock());
         let stamped: Vec<_> = std::mem::take(&mut *self.stamped.lock())
             .into_values()
@@ -1073,11 +1109,15 @@ impl ConnTxn {
         *self.taking.lock() = None;
         let _ = self.begin_wait.lock().over();
         self.waits.end_group();
+        // No sibling cursor keeps the gate, `R` or a protected set past the transaction it served
+        // (DESIGN.md 9.1.3, *Revoking an inactive tenure*).
+        let conn = self.cell.conn().clone();
+        crate::storage::atoll::buffer::cancel_shortage(self.db.atoll().pool(), &conn);
         Some(if commit {
-            Ending::commit(self.db.clone(), txn, written, stamped)
+            Ending::commit(self.db.clone(), conn, txn, written, stamped)
         } else {
             self.changes.rolled_back();
-            Ending::rollback(self.db.clone(), txn)
+            Ending::rollback(self.db.clone(), conn, txn)
         })
     }
 
@@ -1102,7 +1142,7 @@ impl ConnTxn {
         #[cfg(test)]
         HEADER_READS.with(|r| r.set(r.get() + 1));
         let mut get = Header::get_op(field);
-        let word = drive(io, || {
+        let word = drive_for(self.cell.conn(), io, || {
             db.header().get(
                 db.atoll().transactions(),
                 db.versions(),
@@ -1138,7 +1178,7 @@ impl ConnTxn {
         let mut bytes: u64 = 0;
         for class in 0..crate::storage::atoll::page::CLASS_COUNT {
             let class = crate::storage::atoll::page::SizeClass::new(class).expect("a class");
-            let n = drive(self.db.io(), || store.pages_in_use(class))?;
+            let n = drive_for(self.cell.conn(), self.db.io(), || store.pages_in_use(class))?;
             bytes = bytes.saturating_add(n.saturating_mul(class.size() as u64));
         }
         Ok(u32::try_from(bytes.div_ceil(PAGE as u64)).unwrap_or(u32::MAX))
@@ -1232,7 +1272,8 @@ impl ConnTxn {
                     if clear {
                         self.changes.cleared(id);
                     } else {
-                        self.changes.destroyed.lock().push((id, txn.command()));
+                        self.changes
+                            .destroyed(|list| list.push((id, txn.command())));
                     }
                     return Ok(IOResult::Done(op.counted.unwrap_or(0)));
                 }
@@ -1249,7 +1290,7 @@ impl ConnTxn {
             let txn = guard.as_mut().ok_or_else(outside)?;
             let mut get = Get::new(&catalog::key(id));
             let db = &self.db;
-            drive(db.io(), || {
+            drive_for(self.cell.conn(), db.io(), || {
                 db.catalog()
                     .get(db.atoll().transactions(), db.versions(), txn, &mut get)
             })?
@@ -1264,11 +1305,11 @@ impl ConnTxn {
             key::ENCODING,
         );
         let io = self.db.io().clone();
-        drive(&io, || cursor.rewind())?;
+        drive_for(self.cell.conn(), &io, || cursor.rewind())?;
         let mut n = 0;
         while !cursor.is_empty() {
             n += 1;
-            drive(&io, || cursor.next())?;
+            drive_for(self.cell.conn(), &io, || cursor.next())?;
         }
         Ok(n)
     }
@@ -1388,10 +1429,16 @@ fn outside() -> LimboError {
 pub struct Ending {
     db: Arc<AtollDb>,
     step: Step,
+    /// The top of the ending, which keeps its memory-shortage tenure across IO (DESIGN.md 9.1.3,
+    /// *The top and the owner*).
+    owner: crate::storage::atoll::buffer::Owner,
     /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
     _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
+// One per transaction's ending, held in place while it steps: boxing the commit would allocate on
+// every commit.
+#[allow(clippy::large_enum_variant)]
 enum Step {
     Commit(Commit),
     Rollback(Abort),
@@ -1406,6 +1453,7 @@ impl Ending {
     /// trees it wrote are raised to its commit timestamp, before it releases the write gate.
     fn commit(
         db: Arc<AtollDb>,
+        conn: Arc<crate::storage::atoll::buffer::Conn>,
         txn: Txn,
         written: Vec<(Statement, Field, u32)>,
         stamped: Vec<super::trees::Stamp>,
@@ -1420,28 +1468,46 @@ impl Ending {
         Self {
             db,
             step: Step::Commit(commit),
+            owner: crate::storage::atoll::buffer::Owner::of(conn),
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
 
-    fn rollback(db: Arc<AtollDb>, txn: Txn) -> Self {
+    fn rollback(
+        db: Arc<AtollDb>,
+        conn: Arc<crate::storage::atoll::buffer::Conn>,
+        txn: Txn,
+    ) -> Self {
         if !txn.wrote() {
             db.atoll().transactions().abort(txn);
             return Self {
                 db,
                 step: Step::Drain,
+                owner: crate::storage::atoll::buffer::Owner::of(conn),
                 _frame: crate::storage::atoll::unwind::FrameEnd::default(),
             };
         }
         Self {
             db,
             step: Step::Rollback(Abort::new(txn)),
+            owner: crate::storage::atoll::buffer::Owner::of(conn),
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
 
     #[turso_macros::atoll_entry]
     pub fn step(&mut self) -> Result<IOResult<()>> {
+        crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::step_owned)
+    }
+
+    /// Whether the ending holds a memory-shortage tenure, for a test.
+    #[cfg(test)]
+    #[turso_macros::atoll_entry]
+    pub(crate) fn shortage_queued(&self) -> bool {
+        self.owner.queued()
+    }
+
+    fn step_owned(&mut self) -> Result<IOResult<()>> {
         let txns = self.db.atoll().transactions();
         loop {
             match &mut self.step {
@@ -1766,13 +1832,16 @@ impl SqlCursor {
     pub fn reopened(
         &mut self,
         ct: &ConnTxn,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
         index: Option<Arc<IndexInfo>>,
     ) -> Result<bool> {
         if !Arc::ptr_eq(&self.cell, &ct.cell) || !Arc::ptr_eq(&self.db, &ct.db) {
             return Ok(false);
         }
-        self.pager = pager;
+        // The connection's pager, nearly always the one it kept: no count taken then.
+        if !Arc::ptr_eq(&self.pager, pager) {
+            self.pager = pager.clone();
+        }
         self.index = index;
         self.null_row = false;
         self.has_record = false;
@@ -1787,7 +1856,7 @@ impl SqlCursor {
                 let changes = self.db.catalog().changes();
                 let row = match self.row.filter(|r| r.holds(txn, changes)) {
                     Some(row) => row,
-                    None => row_in(&self.db, &self.known, self.id, txn)?.0,
+                    None => row_in(&self.db, self.cell.conn(), &self.known, self.id, txn)?.0,
                 };
                 Some((row, created_now(txn, row.entry)))
             }
@@ -1844,7 +1913,7 @@ impl SqlCursor {
     fn entry_now(&self) -> Result<(Entry, bool, Near)> {
         let mut guard = self.cell.lock();
         let txn = guard.as_mut().ok_or_else(outside)?;
-        let (row, near) = row_in(&self.db, &self.known, self.id, txn)?;
+        let (row, near) = row_in(&self.db, self.cell.conn(), &self.known, self.id, txn)?;
         Ok((row.entry, created_now(txn, row.entry), near))
     }
 
@@ -1978,6 +2047,10 @@ impl CursorTrait for SqlCursor {
         self.seeding = None;
         self.counting = None;
         self.rebinding = None;
+        if let Some(cursor) = self.open.as_mut() {
+            // Its operation ends with the statement: its memory-shortage tenure is let go.
+            cursor.end_operation();
+        }
         if self.unseen {
             // A walk over unseen versions is its statement's alone: the next opens afresh.
             return false;

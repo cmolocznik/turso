@@ -41,6 +41,7 @@ fn config() -> AtollConfig {
             budget: MIN_DB_BUDGET,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget: Some(96 << 10),
         checkpoint_write_bytes: None,
@@ -400,9 +401,7 @@ fn a_checkpoint_that_fails_leaves_the_one_in_charge_and_none_runs_until_the_data
         }
     };
     let ticket = checkpointer.request_full();
-    let failed = step(ticket)
-        .err()
-        .expect("a checkpoint went on past a failed write");
+    let failed = step(ticket).expect_err("a checkpoint went on past a failed write");
     crash_io.set_faults(Faults::default());
     crash_io.set_faults_on(None);
     assert!(
@@ -418,9 +417,7 @@ fn a_checkpoint_that_fails_leaves_the_one_in_charge_and_none_runs_until_the_data
     assert_eq!(db.db.pool().cutting(), 0, "the pool's cut");
     assert_eq!(db.db.store().meta().cutting(), 0, "the metadata cut");
     assert!(db.db.store().change().is_some(), "the change gate");
-    let refused = step(checkpointer.request_full())
-        .err()
-        .expect("a checkpoint after one failed");
+    let refused = step(checkpointer.request_full()).expect_err("a checkpoint after one failed");
     assert!(refused.to_string().contains("opened again"), "{refused}");
     db.put("after", b"the failure");
     let expected = db.state(&keys);
@@ -581,3 +578,509 @@ fn a_database_dropped_with_io_in_flight_leaves_nothing_holding_its_io() {
         );
     }
 }
+
+/// With no checkpointing thread, a change the gate refused steps the cut that closed it (DESIGN.md
+/// 9.1.3, the change gate closed by a cut): the cut's own stepper left it waiting on a change since
+/// gone, and no one else would step it. Each try the gate refuses returns a wait that the IO it
+/// stepped finishes, until the change goes in; a wait on the reopening alone would never end, and
+/// a retry at once with the gate still closed would go round for good.
+#[test]
+fn a_change_the_gate_refused_steps_the_cut_left_waiting() {
+    use super::buffer::{gate_closed, Owner};
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let db = try_open(io.clone(), 1).unwrap();
+    let store = db.store().clone();
+    let change = store.change().expect("the gate open");
+    let ticket = db.checkpointer().request_full();
+    let left_waiting = matches!(
+        db.checkpointer().step_full(ticket, db.transactions()),
+        Ok(IOResult::IO(_))
+    ) && store.gate_closed();
+    drop(change);
+    let mut owner = Owner::new();
+    let mut refusals = 0;
+    let outcome = loop {
+        let tried = owner.call(|| {
+            Ok::<_, crate::LimboError>(match store.change() {
+                Some(_) => IOResult::Done(()),
+                None => gate_closed::<()>(db.pool()),
+            })
+        });
+        match tried {
+            Ok(IOResult::Done(())) => break Ok(()),
+            Ok(IOResult::IO(IOCompletions(wait))) => {
+                refusals += 1;
+                // Called again at once, with the gate still closed: refused again, a retry that
+                // moved nothing.
+                if wait.finished() && store.gate_closed() {
+                    break Err(format!(
+                        "refusal {refusals} came back at once with the gate still closed"
+                    ));
+                }
+                if let Err(e) = io.step() {
+                    break Err(format!("stepping IO failed: {e}"));
+                }
+                if !wait.finished() {
+                    break Err(format!(
+                        "refusal {refusals} waits on what nothing steps: the gate stays closed"
+                    ));
+                }
+            }
+            Err(e) => break Err(format!("the change failed: {e}")),
+        }
+    };
+    drop(owner);
+    let finished = drive(&io, || {
+        db.checkpointer().step_full(ticket, db.transactions())
+    })
+    .is_ok();
+    drop(store);
+    // Checked once the database is gone: a panic unwinding through it ends the process.
+    drop(db);
+    assert!(left_waiting, "the cut did not wait on the change under way");
+    assert!(
+        refusals > 0,
+        "the gate refused nothing: the test reached no refusal"
+    );
+    if let Err(e) = outcome {
+        panic!("{e}");
+    }
+    assert!(finished, "the full checkpoint did not finish");
+}
+
+/// A cut closing the gate while changes are inside waits for the last to leave, not a retry at
+/// once: the same pending wait at every look while a change stays in (its holder paused), finished
+/// by the last change out; a change leaving an open gate, or not the last out, takes no slow path
+/// (DESIGN.md 9.1.3, the gate's close waiting for the changes under way).
+#[test]
+fn a_cut_closing_the_gate_waits_for_the_last_change_out() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let db = try_open(io.clone(), 1).unwrap();
+    let store = db.store().clone();
+    let quiet = store.change().expect("the gate open");
+    drop(quiet);
+    let uncontended = store.drain_wakes();
+    let (first, second) = (
+        store.change().expect("the gate open"),
+        store.change().expect("the gate open"),
+    );
+    let mut waits = Vec::new();
+    for _ in 0..32 {
+        match store.close_gate() {
+            IOResult::IO(IOCompletions(c)) => waits.push(c),
+            IOResult::Done(()) => break,
+        }
+    }
+    let pending = waits.len() == 32 && waits.iter().all(|c| !c.finished());
+    drop(first);
+    let after_first = waits.iter().any(|c| c.finished());
+    drop(second);
+    let after_last = waits.iter().all(|c| c.finished());
+    let closed = matches!(store.close_gate(), IOResult::Done(()));
+    let slow = store.drain_wakes();
+    store.open_gate();
+    drop(waits);
+    drop(store);
+    // Checked once the database is gone: a panic unwinding through it ends the process.
+    drop(db);
+    assert_eq!(
+        uncontended, 0,
+        "a change leaving an open gate took the slow path"
+    );
+    assert!(
+        pending,
+        "a look with changes inside came back ready, not on one pending wait"
+    );
+    assert!(
+        !after_first,
+        "a change out before the last finished the cut's wait"
+    );
+    assert!(
+        after_last,
+        "the last change out left the cut's wait unfinished"
+    );
+    assert!(closed, "the gate did not close once the changes were out");
+    assert_eq!(slow, 1, "only the last change out takes the slow path");
+}
+
+/// A full checkpoint's step that finds the checkpointer's state held waits for its let-go, not a
+/// retry at once: the same pending wait at every look while the holder is paused, finished by the
+/// let-go; a let-go no caller waits on takes no slow path (DESIGN.md 9.1.3, the checkpointer's
+/// state held by another stepper).
+#[test]
+fn a_full_checkpoint_step_finding_the_state_held_waits_for_its_let_go() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let db = try_open(io.clone(), 1).unwrap();
+    let cp = db.checkpointer();
+    drop(cp.hold().expect("the state free"));
+    let uncontended = cp.released_wakes();
+    let ticket = cp.request_full();
+    let held = cp.hold().expect("the state free");
+    let mut waits = Vec::new();
+    for _ in 0..32 {
+        match cp.step_full(ticket, db.transactions()) {
+            Ok(IOResult::IO(IOCompletions(c))) => waits.push(c),
+            _ => break,
+        }
+    }
+    let pending = waits.len() == 32 && waits.iter().all(|c| !c.finished());
+    drop(held);
+    let woken = waits.iter().all(|c| c.finished());
+    let slow = cp.released_wakes();
+    let finished = drive(&io, || cp.step_full(ticket, db.transactions())).is_ok();
+    drop(waits);
+    // Checked once the database is gone: a panic unwinding through it ends the process.
+    drop(db);
+    assert_eq!(
+        uncontended, 0,
+        "a let-go with no one waiting took the slow path"
+    );
+    assert!(
+        pending,
+        "a look with the state held came back ready, not on one pending wait"
+    );
+    assert!(woken, "the let-go left the waiting step's wait unfinished");
+    assert_eq!(slow, 1, "one let-go found the waiter");
+    assert!(finished, "the full checkpoint did not finish");
+}
+
+/// How a checkpoint's look at a held metadata page meets the hold's end.
+#[derive(Clone, Copy, Debug)]
+enum HoldEnds {
+    /// After the look marked the hold: the let-go finishes the look's wait.
+    AfterTheMark,
+    /// Between the look and its mark: the mark finds the hold changed, and the look yields.
+    BeforeTheMark,
+}
+
+/// A checkpoint whose metadata phase finds a page dirty at its cut held by a change that has taken
+/// the page's latch and not yet kept the page as the cut found it waits for the hold, or yields,
+/// and asks the page again: the page is written for that checkpoint. Left unwritten, it would stay
+/// dirty, and only a landed write puts a dirty page back on the stack a cut takes, so no later
+/// checkpoint would name it (mutant: the phase asks each page once).
+fn a_checkpoint_writes_a_metadata_page_it_found_held(ends: HoldEnds) {
+    use super::meta::{MetaId, Tree as MetaTree};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::mpsc;
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let db = Db::create(io.clone());
+    for i in 0..20 {
+        db.put(&format!("k{i:02}"), &value(i));
+    }
+    let meta = db.db.store().meta().clone();
+    // A page of the size class no page of the database is in: the checkpoint's own edits, which
+    // would keep it as the cut found it, never touch it.
+    let id = MetaId {
+        tree: MetaTree::Map,
+        class: class(11),
+        level: 0,
+        index: 0,
+    };
+    let frame = drive(&io, || meta.get(id)).unwrap();
+    frame.try_lock().expect("the page free").commit(&meta);
+    let n = meta.in_charge() + 1;
+    let (ran, met, written) = std::thread::scope(|s| {
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (released_tx, released_rx) = mpsc::channel::<()>();
+        let holder = &frame;
+        // A change paused between taking the latch and keeping the page as the cut found it.
+        s.spawn(move || {
+            crate::race::at("meta.lock_before_keep", move || {
+                held_tx.send(()).unwrap();
+                let _ = go_rx.recv();
+            });
+            let hold = holder.try_lock().expect("the page free");
+            hold.release_unchanged();
+            released_tx.send(()).unwrap();
+        });
+        held_rx.recv().unwrap();
+        // Ends the hold, once, and returns after it ended.
+        let release = Rc::new(RefCell::new(Some((go_tx, released_rx))));
+        let end_hold = {
+            let release = release.clone();
+            move || {
+                if let Some((go, released)) = release.borrow_mut().take() {
+                    go.send(()).unwrap();
+                    released.recv().unwrap();
+                }
+            }
+        };
+        let met = Rc::new(Cell::new(false));
+        {
+            let (met, end_hold) = (met.clone(), end_hold.clone());
+            crate::race::at("meta.write_found_held", move || {
+                met.set(true);
+                if matches!(ends, HoldEnds::BeforeTheMark) {
+                    crate::race::at("meta.wait_before_mark", end_hold);
+                }
+            });
+        }
+        let cp = db.db.checkpointer();
+        let ticket = cp.request_full();
+        // What went wrong comes back as a value, so the hold ends before anything is checked and
+        // the holder's join returns.
+        let ran = (|| loop {
+            match cp.step_full(ticket, db.db.transactions()) {
+                Err(e) => return Err(format!("the checkpoint failed: {e}")),
+                Ok(IOResult::Done(())) => return Ok(()),
+                Ok(IOResult::IO(IOCompletions(c))) => {
+                    if met.get() {
+                        end_hold();
+                    }
+                    let mut steps = 0;
+                    while !c.finished() {
+                        io.step().map_err(|e| format!("a step failed: {e}"))?;
+                        steps += 1;
+                        if steps > 64 {
+                            return Err(
+                                "the checkpoint waits on something no IO and no let-go ends".into(),
+                            );
+                        }
+                    }
+                }
+            }
+        })();
+        end_hold();
+        (ran, met.get(), frame.last_written_for())
+    });
+    // Checked once the database is gone: a panic unwinding through it ends the process.
+    drop(frame);
+    drop(meta);
+    drop(db);
+    ran.unwrap_or_else(|e| panic!("{ends:?}: {e}"));
+    assert!(
+        met,
+        "{ends:?}: the checkpoint's metadata phase never found the page held"
+    );
+    assert_eq!(
+        written, n,
+        "{ends:?}: a metadata page found held was left unwritten by checkpoint {n}"
+    );
+}
+
+#[test]
+fn a_checkpoint_writes_a_metadata_page_found_held_once_its_marked_hold_ends() {
+    a_checkpoint_writes_a_metadata_page_it_found_held(HoldEnds::AfterTheMark);
+}
+
+#[test]
+fn a_checkpoint_writes_a_metadata_page_found_held_whose_hold_ended_before_the_mark() {
+    a_checkpoint_writes_a_metadata_page_it_found_held(HoldEnds::BeforeTheMark);
+}
+
+/// Every yield in Atoll's code, by file, enclosing function and kind, with each one's class: the
+/// change it follows, or the signal a held state's wait finishes, or the slice that still owes it
+/// one (DESIGN.md 9.1.3, *No retry without a change*). Test modules and test files are left out:
+/// a test's own retries are its own. A new site fails until classified; a site gone fails until
+/// its row goes.
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn every_yield_names_the_change_it_follows_or_the_wait_it_owes() {
+    use super::testing::{atoll_dir, atoll_sources, code_of};
+    use std::collections::BTreeMap;
+    let mut found: BTreeMap<(String, String, &str), usize> = BTreeMap::new();
+    for path in atoll_sources() {
+        let rel = path
+            .strip_prefix(atoll_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if name == "tests.rs"
+            || name.ends_with("_tests.rs")
+            || rel.split('/').any(|part| part == "tests")
+            || name == "testing.rs"
+            || name == "bench.rs"
+        {
+            continue;
+        }
+        let code = without_test_modules(&code_of(&std::fs::read_to_string(&path).unwrap()));
+        for kind in ["Completion::new_yield", "busy", "look_again", "yield_now"] {
+            let mut at = 0;
+            while let Some(i) = code[at..].find(kind) {
+                let start = at + i;
+                at = start + kind.len();
+                let before = code[..start].chars().next_back().unwrap_or(' ');
+                let after = code[at..].trim_start();
+                let bare = kind.contains("::")
+                    || code[..start].ends_with("Self::")
+                    || !(before.is_alphanumeric()
+                        || before == '_'
+                        || before == ':'
+                        || before == '.');
+                let word_end = !code[at..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
+                if !bare || !word_end || !after.starts_with('(') {
+                    continue;
+                }
+                let line_start = code[..start].rfind('\n').map_or(0, |n| n + 1);
+                if code[line_start..start].contains("fn ") {
+                    continue;
+                }
+                let enclosing = code[..start]
+                    .rmatch_indices("fn ")
+                    .find_map(|(i, _)| {
+                        let prev = code[..i].chars().next_back().unwrap_or(' ');
+                        (!(prev.is_alphanumeric() || prev == '_')).then(|| {
+                            code[i + 3..]
+                                .chars()
+                                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                .collect::<String>()
+                        })
+                    })
+                    .unwrap_or_default();
+                *found.entry((rel.clone(), enclosing, kind)).or_default() += 1;
+            }
+        }
+    }
+    let listed: BTreeMap<(String, String, &str), usize> = YIELDS
+        .iter()
+        .map(|(file, f, kind, n, _)| ((file.to_string(), f.to_string(), *kind), *n))
+        .collect();
+    for (key, n) in &found {
+        if listed.get(key) != Some(n) {
+            eprintln!("unlisted or miscounted: {key:?} x{n}");
+        }
+    }
+    assert_eq!(
+        found, listed,
+        "a yield site unclassified, or a row whose site is gone"
+    );
+}
+
+/// Blanks every `#[cfg(...test...)]` module block, keeping line breaks.
+#[cfg(not(any(shuttle, atoll_loom)))]
+fn without_test_modules(code: &str) -> String {
+    let mut out = code.to_string();
+    let mut from = 0;
+    while let Some(i) = out[from..].find("#[cfg(") {
+        let attr = from + i;
+        let close = attr + out[attr..].find(")]").unwrap() + 2;
+        from = close;
+        if !out[attr..close].contains("test") {
+            continue;
+        }
+        let rest = out[close..].trim_start();
+        let rest = rest.strip_prefix("pub(crate) ").unwrap_or(rest);
+        let rest = rest.strip_prefix("pub(super) ").unwrap_or(rest);
+        let rest = rest.strip_prefix("pub ").unwrap_or(rest);
+        let Some(after_mod) = rest.strip_prefix("mod ") else {
+            continue;
+        };
+        let header = after_mod.find(['{', ';']).unwrap();
+        if after_mod.as_bytes()[header] == b';' {
+            continue;
+        }
+        let open = out.len() - after_mod.len() + header;
+        let mut depth = 0;
+        let mut end = open;
+        for (j, c) in out[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + j + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let blank: String = out[attr..end]
+            .chars()
+            .map(|c| if c == '\n' { '\n' } else { ' ' })
+            .collect();
+        out.replace_range(attr..end, &blank);
+        from = attr + blank.len();
+    }
+    out
+}
+
+/// The collector's step after a begin runs as no owner's operation (the census's K1, DESIGN.md
+/// 9.1.3, *Maintenance keeps what it owns*): the begin discards what the collection comes to, so a
+/// claim of it that comes short must never be the begin's demand, and must never take the begin's
+/// reserved frame.
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn the_collector_after_a_begin_runs_as_no_owners_operation() {
+    use super::testing::{atoll_dir, code_of};
+    let code = code_of(&std::fs::read_to_string(atoll_dir().join("sql/mod.rs")).unwrap());
+    let start = code
+        .find("fn collect_after_begin")
+        .expect("the begin's collection");
+    let body = &code[start..];
+    let body = &body[..body.find("\n    }\n").expect("its body's end")];
+    assert_eq!(
+        body.matches("versions.collect(").count(),
+        1,
+        "the begin's collection is one call"
+    );
+    let collect = body.find("versions.collect(").unwrap();
+    let scope = body[..collect]
+        .rfind("unowned(")
+        .expect("the begin's collection runs outside a scope that masks its owner");
+    assert!(
+        !body[scope..collect].contains(';'),
+        "the scope does not enclose the collection"
+    );
+}
+
+/// The checkpoint's step runs in its demand's scope (DESIGN.md 9.1.3, *Maintenance keeps what it
+/// owns*): its claims name the checkpoint's demand, whoever steps it, never an operation's.
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn the_checkpoint_steps_in_its_demands_scope() {
+    use super::testing::{atoll_dir, code_of};
+    let code = code_of(&std::fs::read_to_string(atoll_dir().join("checkpoint.rs")).unwrap());
+    let state = code.find("impl State {").expect("the checkpointer's state");
+    let body = &code[state..];
+    let body = &body[..body.find("\n}\n").expect("its impl's end")];
+    assert_eq!(
+        body.matches("run.step(").count(),
+        1,
+        "the state steps its run once"
+    );
+    let step = body.find("run.step(").unwrap();
+    let scope = body[..step]
+        .rfind("upkeep_scope(")
+        .expect("the run steps outside its demand's scope");
+    assert!(
+        !body[scope..step].contains(';'),
+        "the scope does not enclose the run's step"
+    );
+}
+
+/// The yield sites ([`every_yield_names_the_change_it_follows_or_the_wait_it_owes`]): file,
+/// enclosing function, kind, count, class.
+#[cfg(not(any(shuttle, atoll_loom)))]
+const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
+    ("btree/mod.rs", "merge", "yield_now", 3, "change: a descent's Restart; the pairs read failed validation; the test's shrink hold"),
+    ("btree/mod.rs", "merge_pair", "yield_now", 2, "change: a corrupt read under an invalid parent, a pair no longer related"),
+    ("btree/mod.rs", "run", "yield_now", 1, "change: a descent's Restart or Shorter"),
+    ("btree/mod.rs", "shrink", "yield_now", 1, "change: the root no longer over the child alone"),
+    ("btree/mod.rs", "split", "yield_now", 1, "change: a descent's Restart"),
+    ("btree/mod.rs", "yield_now", "Completion::new_yield", 1, "the helper itself"),
+    ("btree/mod.rs", "yield_now", "yield_now", 1, "change: the found! macro's Restart or Shorter"),
+    ("btree/value.rs", "copy", "Completion::new_yield", 1, "change: a value page moved or evicted while copied"),
+    ("btree/value.rs", "directory", "Completion::new_yield", 1, "change: a chunk page moved or evicted while read"),
+    ("buffer/cell.rs", "current_with", "Completion::new_yield", 1, "change: the cell changed during its read"),
+    ("buffer/lend.rs", "provide", "Completion::new_yield", 1, "change: a batch changed hands, or drains for another"),
+    ("buffer/mod.rs", "begin_cut", "Completion::new_yield", 1, "change: an outgoing frame freed or reused while read"),
+    ("buffer/mod.rs", "claim", "look_again", 3, "change: work of the claim's own started, a latch it found changed, a horizon reached"),
+    ("buffer/mod.rs", "free_page", "Completion::new_yield", 1, "change: its own write landed (settle_writes)"),
+    ("buffer/mod.rs", "look_again", "Completion::new_yield", 1, "the helper itself"),
+    ("buffer/mod.rs", "wait_for_resident_latch", "Completion::new_yield", 3, "change: the latch free at the look, the frame no longer resident, the hold changed before the mark"),
+    ("buffer/shortage.rs", "gate_closed", "Completion::new_yield", 1, "held: the gate's reopening, waited at the operation's top (wait_for_gate)"),
+    ("buffer/shortage.rs", "run", "Completion::new_yield", 1, "change: the gate found open after the wait or the cut stepped"),
+    ("buffer/shortage.rs", "short", "Completion::new_yield", 1, "held: memory, reserved at the operation's top (the shortage queue)"),
+    ("checkpoint.rs", "step_full", "Completion::new_yield", 1, "change: a step of its own done and more of the full checkpoint to do"),
+    ("meta.rs", "get", "Completion::new_yield", 1, "change: a load's phase moved before the wait was registered"),
+    ("meta.rs", "wait_while_held", "Completion::new_yield", 2, "change: the hold let go or changed before the mark"),
+    ("meta.rs", "write_for", "Completion::new_yield", 3, "change: the writing cell changed, a validation failed, a write put first by another"),
+    ("store.rs", "busy", "Completion::new_yield", 1, "the helper itself"),
+    ("store.rs", "edit_cut", "busy", 1, "change: a tree's height changed after the latches"),
+    ("store.rs", "free_slot", "busy", 1, "change: a tree's height changed after the latches"),
+    ("txn/mod.rs", "wait_for_reservation", "Completion::new_yield", 1, "change: the reservation changed after the look"),
+];

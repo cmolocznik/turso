@@ -14,53 +14,75 @@ use crate::io::{
     Buffer, Completion, Delivery, File, FileId, FileSyncType, MemoryIO, OpenFlags,
     SharedWalLockKind, SharedWalMappedRegion, IO,
 };
-use crate::storage::atoll::locks::Mutex;
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::Result;
 use std::ptr::NonNull;
 
-/// The requests on a database's files submitted and not retired.
+/// The requests on a database's files submitted and not retired, in one word with close's mark:
+/// bit 0 says close waits on the word ([`CLOSING`]); then the requests submitted and not retired
+/// ([`ONE`] each); above them, those of them whose backend let them go while a finish elsewhere
+/// still runs their callback ([`LEFT`] each), which only that finish can retire. Every change is
+/// one atomic step on the word, so close reads the three together, and a change made while close
+/// waits wakes it.
 pub(super) struct Requests {
-    count: AtomicUsize,
-    /// The thread close parks while it waits for the count on a backend that needs no step, woken
-    /// by the retirement that brings the count to zero.
-    closer: Mutex<Option<crate::thread::Thread>>,
+    word: AtomicU64,
+    /// The thread close waits on, set before it marks the word.
+    closer: crate::sync::OnceLock<crate::thread::Thread>,
+}
+
+/// Close waits on the word.
+const CLOSING: u64 = 1;
+/// One request submitted and not retired.
+const ONE: u64 = 1 << 1;
+/// One of those whose backend let it go before its callback returned.
+const LEFT: u64 = 1 << 32;
+/// The requests submitted and not retired, out of a word.
+fn outstanding_in(word: u64) -> u64 {
+    (word & (LEFT - 1)) >> 1
+}
+/// Those of them only a finish under way can retire, out of a word.
+fn left_in(word: u64) -> u64 {
+    word >> 32
 }
 
 impl Default for Requests {
     fn default() -> Self {
         Self {
-            count: AtomicUsize::new(0),
-            closer: Mutex::new(None),
+            word: AtomicU64::new(0),
+            closer: crate::sync::OnceLock::new(),
         }
     }
 }
 
 impl Requests {
     /// Counts the request `submit` submits for as long as its backend owns it.
-    fn submit(self: &Arc<Self>, submit: impl FnOnce() -> Result<Completion>) -> Result<Completion> {
-        self.count.fetch_add(1, Ordering::AcqRel);
-        match submit() {
+    fn submit(
+        self: &Arc<Self>,
+        physical: Completion,
+        submit: impl FnOnce() -> Result<Completion>,
+    ) -> Result<Completion> {
+        let was = self.word.fetch_add(ONE, Ordering::AcqRel);
+        let submitted = match submit() {
             Ok(c) => {
-                let me = self.clone();
-                c.on_retired(move || me.retired());
+                physical.watch_ownership(self.clone());
                 Ok(c)
             }
             Err(e) => {
-                self.retired();
+                self.changed(self.word.fetch_sub(ONE, Ordering::AcqRel));
                 Err(e)
             }
-        }
+        };
+        // Submitted while close waits (a callback's next request): close steps the backend for
+        // it, woken once it is queued there.
+        self.changed(was);
+        submitted
     }
 
-    fn retired(&self) {
-        let was = self.count.fetch_sub(1, Ordering::AcqRel);
-        assert!(was > 0, "a request uncounted twice");
-        if was == 1 {
-            // Close reads the count after it names itself, under this lock, so it either reads
-            // zero or is woken here.
-            if let Some(closer) = &*self.closer.lock() {
+    /// A change made to the word, which read `was`: close, if it waits, looks again.
+    fn changed(&self, was: u64) {
+        if was & CLOSING != 0 {
+            if let Some(closer) = self.closer.get() {
                 closer.unpark();
             }
         }
@@ -68,32 +90,58 @@ impl Requests {
 
     /// The requests submitted and not retired.
     pub(super) fn outstanding(&self) -> usize {
-        self.count.load(Ordering::Acquire)
+        outstanding_in(self.word.load(Ordering::Acquire)) as usize
     }
 
     /// Close's wait for its requests (DESIGN.md 22.12, step 4), until every request counted has
-    /// retired: it steps a pumped backend, and parks on any other until the retirement that brings
-    /// the count to zero wakes it (22.5). Every backend retires every request it accepted (the
-    /// kernel answers each, a pumped backend delivers each when stepped), so the wait ends. A step
-    /// that fails has lost the means to retire them, and ends the process (22.11): close can
-    /// neither wait on nor return while the backend may still own its requests' buffers.
+    /// retired. On a pumped backend it steps while the backend holds any of them, and parks while
+    /// only finishes under way elsewhere can retire the rest; on any other it parks. Every change
+    /// to the word wakes it: a retirement, a request a callback submits meanwhile, a backend
+    /// letting one go. Every backend retires every request it accepted (the kernel answers each, a
+    /// pumped backend delivers each when stepped, a finish under way returns), so the wait ends.
+    /// A step that fails has lost the means to retire them, and ends the process (22.11): close
+    /// can neither wait on nor return while the backend may still own its requests' buffers.
     pub(super) fn drain(&self, io: &dyn IO) {
         // Close waits: never on a ring's delivery thread, the one that would deliver what it waits
         // for (DESIGN.md 22.5).
         crate::io::refuse_on_delivery_thread("a database's close");
-        if io.delivery() == Delivery::Pumped {
-            while self.outstanding() > 0 {
+        let me = self.closer.get_or_init(crate::thread::current);
+        assert_eq!(
+            me.id(),
+            crate::thread::current().id(),
+            "a database closed from two threads"
+        );
+        // SeqCst: a change the read below misses reads the mark.
+        self.word.fetch_or(CLOSING, Ordering::SeqCst);
+        let pumped = io.delivery() == Delivery::Pumped;
+        loop {
+            let word = self.word.load(Ordering::SeqCst);
+            let outstanding = outstanding_in(word);
+            if outstanding == 0 {
+                break;
+            }
+            if pumped && outstanding > left_in(word) {
                 if io.step().is_err() {
                     crate::io::stepping_failed("a database's close");
                 }
+            } else {
+                crate::storage::atoll::park::thread();
             }
-            return;
         }
-        *self.closer.lock() = Some(crate::thread::current());
-        while self.outstanding() > 0 {
-            crate::thread::park();
-        }
-        *self.closer.lock() = None;
+        self.word.fetch_and(!CLOSING, Ordering::SeqCst);
+    }
+}
+
+impl crate::io::OwnershipWatch for Requests {
+    fn finisher_left(&self) {
+        self.changed(self.word.fetch_add(LEFT, Ordering::AcqRel));
+    }
+
+    fn retired(&self, told: bool) {
+        let drop = if told { ONE + LEFT } else { ONE };
+        let was = self.word.fetch_sub(drop, Ordering::AcqRel);
+        assert!(outstanding_in(was) > 0, "a request uncounted twice");
+        self.changed(was);
     }
 }
 
@@ -227,19 +275,21 @@ impl File for CountedFile {
     }
 
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
-        self.requests.submit(|| self.file.pread(pos, c))
+        self.requests.submit(c.clone(), || self.file.pread(pos, c))
     }
 
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
-        self.requests.submit(|| self.file.pwrite(pos, buffer, c))
+        self.requests
+            .submit(c.clone(), || self.file.pwrite(pos, buffer, c))
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
-        self.requests.submit(|| self.file.sync(c, sync_type))
+        self.requests
+            .submit(c.clone(), || self.file.sync(c, sync_type))
     }
 
     fn sync_data(&self, c: Completion) -> Result<Completion> {
-        self.requests.submit(|| self.file.sync_data(c))
+        self.requests.submit(c.clone(), || self.file.sync_data(c))
     }
 
     fn supports_durable_writes(&self) -> bool {
@@ -248,7 +298,7 @@ impl File for CountedFile {
 
     fn pwrite_durable(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
         self.requests
-            .submit(|| self.file.pwrite_durable(pos, buffer, c))
+            .submit(c.clone(), || self.file.pwrite_durable(pos, buffer, c))
     }
 
     fn allocate(&self, pos: u64, len: u64) -> Result<()> {
@@ -256,7 +306,8 @@ impl File for CountedFile {
     }
 
     fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
-        self.requests.submit(|| self.file.pwritev(pos, buffers, c))
+        self.requests
+            .submit(c.clone(), || self.file.pwritev(pos, buffers, c))
     }
 
     fn size(&self) -> Result<u64> {
@@ -264,7 +315,8 @@ impl File for CountedFile {
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
-        self.requests.submit(|| self.file.truncate(len, c))
+        self.requests
+            .submit(c.clone(), || self.file.truncate(len, c))
     }
 
     fn has_hole(&self, pos: usize, len: usize) -> Result<bool> {

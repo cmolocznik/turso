@@ -575,7 +575,7 @@ fn read_kept(io: &Arc<dyn IO>, file: &Arc<dyn File>) -> Result<Option<Kept>> {
     }
     let block = Arc::new(AlignedBlock::zeroed(2 * KEPT_SIZE));
     let c = Completion::new_read(block.region(0, 2 * KEPT_SIZE), |res| res.err());
-    io.wait_for_completion(file.pread(0, c)?)?;
+    crate::storage::atoll::park::wait_for_completion(io.as_ref(), file.pread(0, c)?)?;
     let bytes = block.bytes();
     let newest = (0..2)
         .filter(|i| len >= (i + 1) * KEPT_SIZE)
@@ -600,8 +600,8 @@ fn write_kept(io: &Arc<dyn IO>, file: &Arc<dyn File>, kept: &Kept) -> Result<()>
     let at = (kept.seq % 2) * KEPT_SIZE as u64;
     let (write, written) = whole_write(KEPT_SIZE);
     drop(file.pwrite(at, block.region(0, KEPT_SIZE), write)?);
-    io.wait_for_completion(written)?;
-    io.wait_for_completion(file.sync_data(Completion::new_sync(|_| {}))?)?;
+    crate::storage::atoll::park::wait_for_completion(io.as_ref(), written)?;
+    crate::storage::atoll::park::wait_for_completion(io.as_ref(), file.sync_data(Completion::new_sync(|_| {}))?)?;
     Ok(())
 }
 

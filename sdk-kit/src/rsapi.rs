@@ -1522,12 +1522,12 @@ fn step_inner(
     stmt: &mut Statement,
     async_io: bool,
     waker: Option<&Waker>,
-    asleep: &mut Option<Instant>,
+    asleep: &mut Option<BusySleep>,
 ) -> Result<TursoStatusCode, TursoError> {
     // A step before a busy wait's delay ends waits without reaching the engine, which would only
     // ask for the wait again and wake the caller at once.
-    if let Some(until) = *asleep {
-        if Instant::now() < until {
+    if let Some(sleep) = asleep.as_ref() {
+        if Instant::now() < sleep.until {
             return Ok(TursoStatusCode::Io);
         }
         *asleep = None;
@@ -1568,16 +1568,24 @@ fn step_inner(
 /// Arms the wake of an asynchronous step that must wait out a busy handler's `duration`: the
 /// engine has woken the caller to step again at once, and the steps before the delay ends wait
 /// without reaching it. A caller that passes no waker steps again when it chooses.
-fn wait_out(duration: Duration, waker: Option<&Waker>, asleep: &mut Option<Instant>) {
+fn wait_out(duration: Duration, waker: Option<&Waker>, asleep: &mut Option<BusySleep>) {
     #[cfg(not(target_family = "wasm"))]
     if let Some(waker) = waker {
         let until = Instant::now() + duration;
-        *asleep = Some(until);
-        let armed = turso_core::timer::wake_at(until, waker.clone());
-        assert!(armed, "the busy-wait timer's thread failed to start");
+        let timed = turso_core::timer::wake_at(until, waker.clone())
+            .expect("the busy-wait timer's thread failed to start");
+        *asleep = Some(BusySleep {
+            until,
+            _timed: timed,
+        });
     }
     #[cfg(target_family = "wasm")]
     let _ = (duration, waker, asleep);
+}
+
+struct BusySleep {
+    until: Instant,
+    _timed: turso_core::timer::Timed,
 }
 
 pub struct TursoStatement {
@@ -1589,11 +1597,12 @@ pub struct TursoStatement {
     stmts: StmtRegistry,
     /// The instant before which a step waits out a busy handler's delay without reaching the
     /// engine.
-    asleep: Option<Instant>,
+    asleep: Option<BusySleep>,
 }
 
 impl Drop for TursoStatement {
     fn drop(&mut self) {
+        self.asleep = None;
         self.stmts.lock().unwrap().remove(&self.stmt_id);
     }
 }
@@ -1843,13 +1852,13 @@ impl TursoStatement {
     }
     /// reset internal statement state and bindings
     pub fn reset(&mut self) -> Result<(), TursoError> {
+        self.asleep = None;
         let mut handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         stmt.reset()?;
         stmt.clear_bindings();
-        self.asleep = None;
         Ok(())
     }
 
@@ -3108,5 +3117,54 @@ mod tests {
             .unwrap()
             .execute(None)
             .unwrap();
+    }
+    #[test]
+    fn a_busy_sleep_is_kept_once_and_cancelled_on_statement_reset_or_drop() {
+        use std::task::{Wake, Waker};
+        use std::time::Duration;
+        struct Count;
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {}
+        }
+        let io = Arc::new(WaitCountingIo::default());
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: "busy-timer-owner.db".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: Some(io),
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        assert!(!db.open().unwrap().is_io());
+        let connection = db.connect().unwrap();
+        for reset in [true, false] {
+            let count = Arc::new(Count);
+            let waker = Waker::from(count.clone());
+            let mut statement = connection.prepare_single("SELECT 1").unwrap();
+            super::wait_out(Duration::from_secs(60), Some(&waker), &mut statement.asleep);
+            let mut all_pending = true;
+            for _ in 0..32 {
+                all_pending &= matches!(statement.step(Some(&waker)).unwrap(), TursoStatusCode::Io);
+            }
+            let during = Arc::strong_count(&count);
+            if reset {
+                statement.reset().unwrap();
+            }
+            let after_reset = Arc::strong_count(&count);
+            drop(statement);
+            assert!(all_pending);
+            assert_eq!(during, 3, "one sleeper owns exactly one timer waker");
+            if reset {
+                assert_eq!(after_reset, 2, "reset left the sleeper registered");
+            }
+            assert_eq!(
+                Arc::strong_count(&count),
+                2,
+                "drop left the sleeper registered"
+            );
+        }
     }
 }

@@ -9,8 +9,10 @@
 //! found, so a reader takes no latch at all. A writer latches only its leaf, and checks under the
 //! latch that the leaf still covers its key. A structure change (a split, a merge, the root growing
 //! or shrinking) is its own step: it descends again and latches exactly the nodes it changes, after
-//! which the operation that needed it starts over. A latch that cannot be taken at once is a
-//! cooperative yield, like everywhere in Turso, and no latch is held across a returned `IOResult`.
+//! which the operation that needed it starts over. A latch found held is waited for: the step
+//! returns the wait its holder's release finishes (DESIGN.md 9.1.3, *No retry without a change*).
+//! A latch whose version moved is a change, and the step yields to look again. No latch is held
+//! across a returned `IOResult`.
 //!
 //! **Hints.** A child entry keeps the frame its child was last found in; a descent that finds the
 //! hint stale refreshes it if it can latch the parent at once, writing nothing a reader trusts. A
@@ -40,7 +42,7 @@ pub use drain::{Drain, Drained};
 #[cfg(test)]
 mod tests;
 
-use super::buffer::{BufferPool, Exclusive, Optimistic};
+use super::buffer::{BufferPool, Exclusive, Optimistic, Refused};
 use super::page::{self, PageId, SizeClass};
 use super::shared::{Bytes, BytesMut};
 use super::store::PageStore;
@@ -52,6 +54,11 @@ use crate::{LimboError, Result};
 use node::{Layout, Limits, View};
 use record::{Change, Record};
 use value::{Read, ValueRead, ValueRef, ValueWrite};
+
+/// The wait a held page's release finishes, or a yield after the page changed.
+fn wait_on<T>(wait: Completion) -> Result<IOResult<T>> {
+    Ok(IOResult::IO(IOCompletions(wait)))
+}
 
 fn yield_now<T>() -> Result<IOResult<T>> {
     Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
@@ -305,9 +312,9 @@ impl Tree {
             let Some(mut ex) = leaf.upgrade() else {
                 continue;
             };
-            if !self.pool.keep(&[&ex]) {
+            if let Err(refused) = self.pool.keep(&[&ex]) {
                 ex.release_unchanged();
-                done!(self.pool.wait_for_room());
+                done!(self.pool.wait_for_room(refused));
                 continue;
             }
             let reserved = View::new(ex.page()).reserved();
@@ -335,12 +342,13 @@ impl Tree {
         self.root.is_temporary()
     }
 
-    /// A new node page, of the tree's kind.
-    fn allocate(&self) -> Result<IOResult<Exclusive<'_>>> {
+    /// A new node page, of the tree's kind, for a step that holds `held` meanwhile: a shortage
+    /// keeps those pages resident while the step waits for its frame (DESIGN.md 9.1.3).
+    fn allocate(&self, held: &[PageId]) -> Result<IOResult<Exclusive<'_>>> {
         if self.temporary() {
-            self.pool.allocate_temporary(self.class())
+            self.pool.allocate_temporary_holding(self.class(), held)
         } else {
-            self.pool.allocate(self.class())
+            self.pool.allocate_holding(self.class(), held)
         }
     }
 
@@ -754,8 +762,10 @@ impl Tree {
             .unwrap_or_default();
         // Latched at the version the look read, so the leaf is as the look found it: still
         // covering the key, which is at `pos` or goes there, with the entry `present`.
-        let Some(mut ex) = leaf.upgrade() else {
-            return yield_now().map(Some);
+        crate::race::point("btree.leaf_upgrade");
+        let mut ex = match leaf.upgrade_or_wait() {
+            Ok(ex) => ex,
+            Err(wait) => return wait_on(wait).map(Some),
         };
         let v = View::new(ex.page());
         if v.reserving() != self.reserving {
@@ -795,9 +805,9 @@ impl Tree {
             drop(ex);
             return Ok(Some(IOResult::Done(Outcome::Changed)));
         }
-        if !self.pool.keep(&[&ex]) {
+        if let Err(refused) = self.pool.keep(&[&ex]) {
             ex.release_unchanged();
-            step!(self.pool.wait_for_room());
+            step!(self.pool.wait_for_room(refused));
             return Ok(None);
         }
         let change = match now {
@@ -862,8 +872,10 @@ impl Tree {
             if !done!(op.old_pages(&self.pool, self.head, &present, &|| leaf.validate())) {
                 continue;
             }
-            let Some(mut ex) = leaf.upgrade() else {
-                return yield_now();
+            crate::race::point("btree.leaf_upgrade");
+            let mut ex = match leaf.upgrade_or_wait() {
+                Ok(ex) => ex,
+                Err(wait) => return wait_on(wait),
             };
             let v = View::new(ex.page());
             let (pos, exact) = v.search(&op.key).ok_or_else(|| corrupt_node(ex.pid()))?;
@@ -872,9 +884,9 @@ impl Tree {
                 drop(ex);
                 continue;
             }
-            if !self.pool.keep(&[&ex]) {
+            if let Err(refused) = self.pool.keep(&[&ex]) {
                 ex.release_unchanged();
-                done!(self.pool.wait_for_room());
+                done!(self.pool.wait_for_room(refused));
                 continue;
             }
             Record {
@@ -925,10 +937,10 @@ impl Tree {
                 Split::Again => {}
                 Split::ParentFull(need) => done!(self.make_room(key, level + 1, need)),
                 // Its latches and the change gate let go: room for its copies, then again.
-                Split::Refused => {
+                Split::Refused(refused) => {
                     #[cfg(test)]
                     SPLITS_REFUSED.with(|n| n.set(n.get() + 1));
-                    done!(self.pool.wait_for_room())
+                    done!(self.pool.wait_for_room(refused))
                 }
             }
         }
@@ -940,7 +952,7 @@ impl Tree {
         SPLITS.with(|n| n.set(n.get() + 1));
         // The split lies wholly before a checkpoint's cut or wholly after it.
         let Some(_change) = self.store.change() else {
-            return yield_now();
+            return Ok(super::buffer::gate_closed(&self.pool));
         };
         let (node, parent) = match self.descend(key, level, Route::At)? {
             Found::Node { node, parent } => (node, parent),
@@ -952,11 +964,17 @@ impl Tree {
         let Some((parent, pos)) = parent else {
             return self.grow(node, need);
         };
-        let Some(mut p) = parent.upgrade() else {
-            return yield_now();
+        crate::race::point("btree.split_upgrade");
+        let mut p = match parent.upgrade_or_wait() {
+            Ok(p) => p,
+            Err(wait) => return wait_on(wait),
         };
-        let Some(mut n) = node.upgrade() else {
-            return yield_now();
+        let mut n = match node.upgrade_or_wait() {
+            Ok(n) => n,
+            Err(wait) => {
+                p.release_unchanged();
+                return wait_on(wait);
+            }
         };
         let pv = View::new(p.page());
         let nv = View::new(n.page());
@@ -1014,10 +1032,10 @@ impl Tree {
         if pv.free().ok_or_else(|| corrupt_node(p.pid()))? < sep_need {
             return untouched(p, n, Split::ParentFull(sep_need));
         }
-        if !self.pool.keep(&[&p, &n]) {
-            return untouched(p, n, Split::Refused);
+        if let Err(refused) = self.pool.keep(&[&p, &n]) {
+            return untouched(p, n, Split::Refused(refused));
         }
-        let mut r = done!(self.allocate());
+        let mut r = done!(self.allocate(&[p.pid(), n.pid()]));
         // The right half's entries copied straight from the node, their keys cut again.
         let mut page = r.page_mut();
         node::build(
@@ -1069,8 +1087,10 @@ impl Tree {
     /// Makes room in the root, which cannot move: its contents go to a new child, and it becomes
     /// an inner node over that child alone, which the next split splits like any other.
     fn grow(&self, root: Optimistic<'_>, need: usize) -> Result<IOResult<Split>> {
-        let Some(mut root) = root.upgrade() else {
-            return yield_now();
+        crate::race::point("btree.grow_upgrade");
+        let mut root = match root.upgrade_or_wait() {
+            Ok(root) => root,
+            Err(wait) => return wait_on(wait),
         };
         let v = View::new(root.page());
         if v.free().ok_or_else(|| corrupt_node(root.pid()))? >= need {
@@ -1078,11 +1098,11 @@ impl Tree {
             return Ok(IOResult::Done(Split::Done));
         }
         let level = v.level();
-        if !self.pool.keep(&[&root]) {
+        if let Err(refused) = self.pool.keep(&[&root]) {
             root.release_unchanged();
-            return Ok(IOResult::Done(Split::Refused));
+            return Ok(IOResult::Done(Split::Refused(refused)));
         }
-        let mut child = done!(self.allocate());
+        let mut child = done!(self.allocate(&[root.pid()]));
         let image = node::image(root.page());
         node::apply_image(&mut child.page_mut(), &image).ok_or_else(|| corrupt_node(root.pid()))?;
         node::build(
@@ -1108,7 +1128,7 @@ impl Tree {
     fn merge(&self, key: &[u8], level: u8, merging: &mut Option<u8>) -> Result<IOResult<()>> {
         // The merge lies wholly before a checkpoint's cut or wholly after it.
         let Some(_change) = self.store.change() else {
-            return yield_now();
+            return Ok(super::buffer::gate_closed(&self.pool));
         };
         let (node, parent) = match self.descend(key, level, Route::At)? {
             Found::Node {
@@ -1148,12 +1168,12 @@ impl Tree {
                     SHRINKS_HELD.with(|n| n.set(n.get() + 1));
                     return yield_now();
                 }
-                if !done!(self.shrink(parent, node, merging)) {
+                if let Some(refused) = done!(self.shrink(parent, node, merging)) {
                     #[cfg(test)]
                     SHRINKS_REFUSED.with(|n| n.set(n.get() + 1));
                     // Its latches let go: the change gate too, then room for the copies.
                     drop(_change);
-                    done!(self.pool.wait_for_room());
+                    done!(self.pool.wait_for_room(refused));
                 }
                 return Ok(IOResult::Done(()));
             }
@@ -1173,13 +1193,13 @@ impl Tree {
                     return Ok(IOResult::Done(()));
                 }
                 Paired::Unfit => continue,
-                Paired::Refused => {
+                Paired::Refused(refused) => {
                     #[cfg(test)]
                     MERGES_REFUSED.with(|n| n.set(n.get() + 1));
                     // Its latches let go: the change gate too, then room for the copies, and
                     // the merge again.
                     drop((parent, node, _change));
-                    done!(self.pool.wait_for_room());
+                    done!(self.pool.wait_for_room(refused));
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -1211,10 +1231,26 @@ impl Tree {
         };
         let l = done!(fix(left, left_hint));
         let r = done!(fix(right, right_hint));
-        let (Some(mut p), Some(l), Some(mut r)) =
-            (parent.clone().upgrade(), l.upgrade(), r.upgrade())
-        else {
-            return yield_now();
+        // Each in turn; a later one held lets the earlier go unchanged and waits for it.
+        crate::race::point("btree.merge_upgrade");
+        let mut p = match parent.clone().upgrade_or_wait() {
+            Ok(p) => p,
+            Err(wait) => return wait_on(wait),
+        };
+        let l = match l.upgrade_or_wait() {
+            Ok(l) => l,
+            Err(wait) => {
+                p.release_unchanged();
+                return wait_on(wait);
+            }
+        };
+        let mut r = match r.upgrade_or_wait() {
+            Ok(r) => r,
+            Err(wait) => {
+                p.release_unchanged();
+                l.release_unchanged();
+                return wait_on(wait);
+            }
         };
         let (pv, lv, rv) = (
             View::new(p.page()),
@@ -1297,9 +1333,9 @@ impl Tree {
             return Err(corrupt_node(r.pid()));
         }
         // The left one is freed once merged: its copy too, as a cut may still write it.
-        if !self.pool.keep(&[&p, &l, &r]) {
+        if let Err(refused) = self.pool.keep(&[&p, &l, &r]) {
             untouched(p, l, r);
-            return Ok(IOResult::Done(Paired::Refused));
+            return Ok(IOResult::Done(Paired::Refused(refused)));
         }
         SCRATCH.with(|scratch| {
             let merged = scratch.borrow();
@@ -1335,30 +1371,39 @@ impl Tree {
         Ok(IOResult::Done(Paired::Merged(next)))
     }
 
-    /// The root has one child left: the child's contents move up into it. Whether there was
-    /// room for the copies a checkpoint's cut needs of the two; if not, nothing changed.
+    /// The root has one child left: the child's contents move up into it. The refusal if there
+    /// was no room for the copies a checkpoint's cut needs of the two; then nothing changed.
     fn shrink(
         &self,
         parent: Optimistic<'_>,
         child: Optimistic<'_>,
         merging: &mut Option<u8>,
-    ) -> Result<IOResult<bool>> {
+    ) -> Result<IOResult<Option<Refused>>> {
         if parent.pid() != self.root {
             *merging = None;
-            return Ok(IOResult::Done(true));
+            return Ok(IOResult::Done(None));
         }
-        let (Some(mut root), Some(child)) = (parent.upgrade(), child.upgrade()) else {
-            return yield_now();
+        crate::race::point("btree.shrink_upgrade");
+        let mut root = match parent.upgrade_or_wait() {
+            Ok(root) => root,
+            Err(wait) => return wait_on(wait),
+        };
+        let child = match child.upgrade_or_wait() {
+            Ok(child) => child,
+            Err(wait) => {
+                root.release_unchanged();
+                return wait_on(wait);
+            }
         };
         let rv = View::new(root.page());
         if rv.count() != Some(0) || rv.next().0 != child.pid() {
             return yield_now();
         }
         // The child is freed once moved up: its copy too, as a cut may still write it.
-        if !self.pool.keep(&[&root, &child]) {
+        if let Err(refused) = self.pool.keep(&[&root, &child]) {
             root.release_unchanged();
             child.release_unchanged();
-            return Ok(IOResult::Done(false));
+            return Ok(IOResult::Done(Some(refused)));
         }
         let image = node::image(child.page());
         node::apply_image(&mut root.page_mut(), &image).ok_or_else(|| corrupt_node(child.pid()))?;
@@ -1370,7 +1415,7 @@ impl Tree {
             self.store.orphaned(freed);
         }
         *merging = None;
-        Ok(IOResult::Done(true))
+        Ok(IOResult::Done(None))
     }
 
     // ---------------------------------------------------------------- scanning
@@ -1393,7 +1438,7 @@ impl Tree {
     /// The entry after the cursor's. Step it until done.
     pub fn next(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
         if cursor.pending.is_none() {
-            if cursor.from_batch(true) {
+            if cursor.take_batched(true) {
                 return Ok(IOResult::Done(true));
             }
             if !cursor.step(Seek::Gt) {
@@ -1407,7 +1452,7 @@ impl Tree {
     /// The entry before the cursor's. Step it until done.
     pub fn prev(&self, cursor: &mut Cursor) -> Result<IOResult<bool>> {
         if cursor.pending.is_none() {
-            if cursor.from_batch(false) {
+            if cursor.take_batched(false) {
                 return Ok(IOResult::Done(true));
             }
             if !cursor.step(Seek::Lt) {
@@ -1492,6 +1537,7 @@ impl Tree {
             cursor.unread = false;
             let (mut key, mut value) = cursor.buffers();
             let batch = (cursor.lazy && cursor.stepping).then_some(&mut cursor.batch);
+            crate::race::point("btree.leaf_read");
             let read = leaf.read(|p| {
                 scan_leaf(
                     View::new(p),
@@ -1506,7 +1552,9 @@ impl Tree {
                 )
             });
             let Some(step) = read else {
-                // Changed while read: a writer holds it for a moment.
+                // Changed while read: the writer's release if it still holds it, else a yield
+                // on the change.
+                let wait = leaf.wait_if_held();
                 cursor.batch.drop_entries();
                 cursor.near = Near::NONE;
                 cursor.spare.0 = key;
@@ -1514,7 +1562,7 @@ impl Tree {
                 cursor.leaf = None;
                 cursor.at = None;
                 pending(cursor, target);
-                return yield_now();
+                return wait_on(wait);
             };
             let step = match step {
                 Some(step) => step,
@@ -1845,7 +1893,7 @@ enum Split {
     /// The parent has no room for the separator, which takes this many bytes.
     ParentFull(usize),
     /// No room for the copies a checkpoint's cut needs of its pages: wait for it, then again.
-    Refused,
+    Refused(Refused),
 }
 
 /// What merging a pair came to.
@@ -1855,7 +1903,7 @@ enum Paired {
     /// They do not fit together.
     Unfit,
     /// No room for the copies a checkpoint's cut needs of their pages: nothing changed.
-    Refused,
+    Refused(Refused),
 }
 
 /// A point lookup.
@@ -2357,7 +2405,7 @@ impl Cursor {
 
     /// Takes the next batched entry in the direction `forward` as the entry: whether there was one.
     #[inline]
-    fn from_batch(&mut self, forward: bool) -> bool {
+    fn take_batched(&mut self, forward: bool) -> bool {
         let b = &mut self.batch;
         if b.left == 0 || b.forward != forward {
             return false;
@@ -2428,7 +2476,7 @@ impl Cursor {
     /// Takes the next entry of a forward step's batch, with no move pending: whether there was one.
     #[inline]
     pub fn next_batched(&mut self) -> bool {
-        self.pending.is_none() && self.from_batch(true)
+        self.pending.is_none() && self.take_batched(true)
     }
 
     /// Stands at `key`, with no leaf to step from and its value unread: the next move seeks from

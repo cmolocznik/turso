@@ -42,7 +42,7 @@ impl Db {
         let mut t = run(&self.io, || txns.begin(Isolation::Snapshot));
         crate::storage::atoll::testing::share(txns, &mut t);
         txns.statement(&mut t).unwrap();
-        Arc::new(Mutex::new(Some(t)))
+        TxnSlot::new(Some(t))
     }
 
     fn commit(&self, cell: &TxnCell) {
@@ -401,8 +401,7 @@ fn a_tree_of_another_encoding_is_scanned_and_never_sought() {
     let err = drive(&db.io, || {
         c.seek(SeekKey::IndexKey(record.as_record_ref()), SeekOp::GT)
     })
-    .err()
-    .expect("a seek refused");
+    .expect_err("a seek refused");
     assert!(err.to_string().contains("REINDEX"), "{err}");
 }
 
@@ -460,7 +459,7 @@ impl Db {
         let mut t = run(&self.io, || txns.begin(Isolation::ReadCommitted));
         crate::storage::atoll::testing::share(txns, &mut t);
         txns.statement(&mut t).unwrap();
-        Arc::new(Mutex::new(Some(t)))
+        TxnSlot::new(Some(t))
     }
 
     fn empty(&self, layout: Layout) -> Entry {
@@ -553,9 +552,7 @@ fn a_unique_index_refuses_a_second_row_of_a_key_but_not_of_a_null() {
         drive(&db.io, || c.insert(&key))
     };
     assert!(put(&mut c, Value::from_i64(1), 10).is_ok());
-    let err = put(&mut c, Value::from_i64(1), 11)
-        .err()
-        .expect("a second row of key 1");
+    let err = put(&mut c, Value::from_i64(1), 11).expect_err("a second row of key 1");
     assert!(err.to_string().contains("UNIQUE"), "{err}");
     assert!(put(&mut c, Value::Null, 12).is_ok());
     assert!(
@@ -580,9 +577,7 @@ fn a_key_past_the_tree_is_refused() {
     let mut c = db.on(&cell, entry, Some(info(&key_info, false)));
     let record = record_of(&[Value::build_text("k".repeat(2000))]);
     let key = BTreeKey::IndexKey(record.as_record_ref());
-    let err = drive(&db.io, || c.insert(&key))
-        .err()
-        .expect("a key too long");
+    let err = drive(&db.io, || c.insert(&key)).expect_err("a key too long");
     assert!(err.to_string().contains("holds keys of at most"), "{err}");
     db.commit(&cell);
 }
@@ -817,6 +812,7 @@ fn a_probes_tombstone_answers_absent_only_where_the_statement_sees_it() {
 /// the row it shows and back: past its first rows, an insert that splits no node allocates only
 /// when its transaction's own log takes a chunk or spills one, its write's submission allocating
 /// once a chunk (DESIGN.md §11.4.1).
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
 #[test]
 fn an_insert_that_splits_nothing_allocates_nothing() {
     use crate::storage::atoll::btree::SPLITS;
@@ -861,4 +857,80 @@ fn an_insert_that_splits_nothing_allocates_nothing() {
         allocating.is_empty(),
         "inserts that split nothing and allocated: {allocating:?}"
     );
+}
+
+/// A cursor is its operation's top (DESIGN.md 9.1.3, *The top and the owner*): a write that comes
+/// short of memory reserves its frame at the cursor, holding nothing, keeps its tenure there
+/// across the calls it takes, and ends it once done; its statement's reset ends one unfinished.
+#[test]
+fn a_cursors_write_that_comes_short_reserves_at_the_cursor_and_ends_there() {
+    // Checked with every Atoll value let go: a failed check unwinding through one ends the
+    // process rather than failing the test.
+    if let Err(e) = cursor_write_comes_short() {
+        panic!("{e}");
+    }
+}
+
+fn cursor_write_comes_short() -> std::result::Result<(), String> {
+    use crate::io::Completion;
+    use crate::storage::atoll::buffer::scarce;
+    use crate::types::IOCompletions;
+    let db = Db::open();
+    let entry = db.empty(Layout::Table);
+    let cell = db.begin();
+    let mut c = db.on(&cell, entry, None);
+    let pool = db.db.atoll().pool().clone();
+    let record = record_of(&[Value::build_text("v".repeat(600))]);
+    let step =
+        |c: &mut AtollCursor, rowid: i64| -> std::result::Result<Option<Completion>, String> {
+            match scarce(|| c.insert(&table_key(rowid, &record))).map_err(|e| e.to_string())? {
+                IOResult::Done(Write::Done(_)) => Ok(None),
+                IOResult::Done(w) => Err(format!("{w:?}")),
+                IOResult::IO(IOCompletions(w)) => Ok(Some(w)),
+            }
+        };
+    let wait = |w: &Completion| {
+        if !w.finished() {
+            crate::storage::atoll::park::wait(db.io.as_ref(), w);
+        }
+    };
+    let mut short = 0;
+    for rowid in 0..64 {
+        while let Some(w) = step(&mut c, rowid)? {
+            if c.shortage_queued() {
+                short += 1;
+            }
+            wait(&w);
+        }
+        if c.shortage_queued() || pool.shortage_len() != 0 {
+            return Err(format!("write {rowid} done kept its tenure"));
+        }
+    }
+    if short == 0 {
+        return Err("no write came short: the test reached no shortage".into());
+    }
+    // A write that came short, then its statement's reset.
+    let mut rowid = 64;
+    loop {
+        if rowid == 1024 {
+            return Err("no write came short again".into());
+        }
+        match step(&mut c, rowid)? {
+            None => rowid += 1,
+            Some(_) if c.shortage_queued() => break,
+            Some(w) => wait(&w),
+        }
+    }
+    if pool.shortage_len() != 1 {
+        return Err(format!("{} places queued", pool.shortage_len()));
+    }
+    c.end_operation();
+    if c.shortage_queued() || pool.shortage_len() != 0 {
+        return Err("the reset left the write's tenure behind".into());
+    }
+    // The write goes on with memory to spare.
+    match run(&db.io, || c.insert(&table_key(rowid, &record))) {
+        Write::Done(_) => Ok(()),
+        w => Err(format!("{w:?}")),
+    }
 }

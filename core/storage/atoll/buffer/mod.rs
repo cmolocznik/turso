@@ -34,14 +34,19 @@ pub(super) mod cell;
 mod clean;
 mod frame;
 mod kept;
+mod lend;
 mod lent;
 mod memory;
+mod shortage;
 mod source;
 mod staging;
+mod supply;
+use supply::Ticket;
 #[cfg(test)]
 mod sweep;
 mod table;
 mod temp;
+mod upkeep;
 mod watt;
 
 #[cfg(test)]
@@ -50,39 +55,56 @@ mod tests;
 pub use kept::KeptCopy;
 #[cfg(test)]
 pub use kept::KeptStats;
+pub use lend::{bank_frames, Refused, Retry};
 #[cfg(test)]
 pub use lent::LentStats;
 pub use lent::Use as LentUse;
 pub use memory::MIN_BUDGET;
+#[cfg(test)]
+pub(crate) use shortage::scarce;
+pub(crate) use shortage::unowned;
+pub(crate) use shortage::{cancel as cancel_shortage, gate_closed, Conn, Owner};
+pub(crate) use upkeep::{scope as upkeep_scope, Upkeep};
+
+/// Batches the copies' worst layout takes (DESIGN.md 9.1.1, Minimum budget): one for each of the
+/// three classes a change can need copies of.
+pub const COPY_BATCHES: usize = lend::MOST_PAGES;
+
+/// The smallest budget a pool that keeps copies takes, lending nothing else: the core and the
+/// copies' worst layout.
+pub const MIN_KEEPING_BUDGET: usize = MIN_BUDGET + COPY_BATCHES * memory::BATCH;
 
 /// The smallest budget a database takes whose log's ring fits one batch, as every ring of
-/// chunks up to 256 KiB with the default writes in flight does: [`MIN_BUDGET`] and that batch.
-pub const MIN_DB_BUDGET: usize = MIN_BUDGET + memory::BATCH;
+/// chunks up to 256 KiB with the default writes in flight does, with the default image bank:
+/// [`min_budget_beside`] of that ring and bank, 22 MiB.
+pub const MIN_DB_BUDGET: usize = MIN_KEEPING_BUDGET + memory::BATCH + 2 * memory::BATCH;
 
-/// The smallest budget a pool takes when `lent` bytes of it are lent for as long as it is open
-/// (the log's ring): [`MIN_BUDGET`] beside them, in whole batches, since a batch lent to a class
-/// for them holds no other class's pages.
-pub fn min_budget_beside(lent: usize) -> usize {
-    MIN_BUDGET + lent.next_multiple_of(memory::BATCH)
+/// The smallest budget a database takes (DESIGN.md 9.1.1, Minimum budget): the core, the log's
+/// ring of `ring` bytes and the image bank of `bank` frames, each in whole batches, since a lend
+/// batch holds no other class, and one batch for each of the three classes a change can need
+/// copies of.
+pub fn min_budget_beside(ring: usize, bank: u32) -> usize {
+    MIN_KEEPING_BUDGET
+        + ring.next_multiple_of(memory::BATCH)
+        + (bank as usize).div_ceil(memory::frames_per_batch(lend::bank_class()) as usize)
+            * memory::BATCH
 }
 pub use source::{LocalSource, Located, PageSource, ReadDone};
 
 use super::aligned::AlignedBlock;
 use super::blob;
 use super::epoch::Step;
-use super::latch::{Held, VersionedLatch};
+use super::latch::{Held, HeldWord, LatchRef, Look, Marked, VersionedLatch};
 use super::once::SetOnce;
-#[cfg(test)]
-use super::page::CLASS_COUNT;
-use super::page::{self, PageId, SizeClass};
+use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::Stack;
 use super::store::PageStore;
-use cell::{CompletionCell, Retiring};
+use crate::storage::atoll::notify;
+use cell::{CompletionCell, CompletionDomain};
 use clean::{Progress, Writeback};
 use frame::{
-    FrameHeader, ABANDONED, EVICT_AFTER, FOR_GOOD, FREE, LENT, LOADING, NO_PAGE, OUTGOING,
-    RESIDENT, WRITING,
+    FrameHeader, ABANDONED, EVICT_AFTER, FREE, LENT, LOADING, NO_PAGE, OUTGOING, RESIDENT, WRITING,
 };
 use kept::KeptRoom;
 use lent::Lends;
@@ -99,7 +121,30 @@ use crate::{CompletionError, LimboError, Result};
 use std::ops::Deref;
 
 /// An exclusive hold on a frame's latch, borrowed from the pool.
-type Hold<'a> = Held<&'a VersionedLatch>;
+type Hold<'a> = Held<FrameRef<'a>>;
+
+/// A frame's latch reached by a borrow of the frames. Every hold on a frame's latch is taken
+/// through this or [`FrameLatch`], so a release a waiter marked is a change of the pool's supply,
+/// its event opened before the unlock (DESIGN.md 9.1.3).
+#[derive(Clone, Copy)]
+struct FrameRef<'a> {
+    frames: &'a Frames,
+    frame: u32,
+}
+
+impl Deref for FrameRef<'_> {
+    type Target = VersionedLatch;
+
+    fn deref(&self) -> &VersionedLatch {
+        &self.frames.headers[self.frame as usize].latch
+    }
+}
+
+impl LatchRef for FrameRef<'_> {
+    fn release_marked<F: FnOnce()>(&self, unlock: F) {
+        self.frames.release_marked(self.frame, unlock);
+    }
+}
 
 /// The frame headers and the IO in flight for frames: what a hold on a frame reaches. Apart from
 /// the pool, so a hold the pool itself keeps (a write-out queued) does not keep the pool alive.
@@ -112,14 +157,20 @@ struct Frames {
     /// Per 4 KiB grain: the IO in flight for a loading or outgoing frame that begins there. Put
     /// and taken by whoever holds the frame, read by anyone in a step.
     transits: Zeroed<CompletionCell>,
-    /// Completions taken out of the transits, and out of the pool's released cell.
-    retiring: Retiring,
+    /// Waiters for a resident frame's held latch. Only that frame's release or a queued write-out
+    /// finishes its cell, so another frame or the checkpoint's state cannot finish the wait.
+    released: Zeroed<CompletionCell>,
+    /// Completions taken out of the transits.
+    completions: CompletionDomain,
+    /// The pool's one supply (DESIGN.md 9.1.3): every change that can end a wait for frames, room
+    /// or a lend is made in its scope, and every such wait is a ticket on it.
+    supply: Arc<supply::Supply>,
 }
 
 impl Frames {
     /// Takes the IO in flight for `frame` out of its cell: for the frame's holder.
     fn end_transit(&self, frame: u32) -> Option<Completion> {
-        self.transits[frame as usize].take(&self.retiring)
+        self.transits[frame as usize].take(&self.completions)
     }
 
     /// Leaves the page whose write-out did not happen in the frame `hold` holds, and sends
@@ -130,10 +181,19 @@ impl Frames {
         self.headers[frame as usize]
             .status
             .store(RESIDENT, Ordering::Release);
+        crate::race::point("buffer.kept_published");
         drop(hold);
         if let Some(c) = waiting {
-            c.complete(0);
+            notify::finish(&c, Ok(0));
         }
+        // Resident again with its latch let go and no step held: evictable, which a claim waiting
+        // for room is told (DESIGN.md 9.1.2).
+        self.signal_released();
+    }
+
+    /// A change made: every waiter on the supply looks again (DESIGN.md 9.1.3).
+    fn signal_released(&self) {
+        self.supply.change(|event| event.arm());
     }
 }
 
@@ -152,6 +212,29 @@ impl Deref for FrameLatch {
     }
 }
 
+impl LatchRef for FrameLatch {
+    fn release_marked<F: FnOnce()>(&self, unlock: F) {
+        self.frames.release_marked(self.frame, unlock);
+    }
+}
+
+impl Frames {
+    fn release_marked<F: FnOnce()>(&self, frame: u32, unlock: F) {
+        self.supply.change(|event| {
+            crate::race::point("buffer.frame_will_unlock");
+            unlock();
+            self.finish_frame_wait(frame);
+            event.arm();
+        });
+    }
+
+    fn finish_frame_wait(&self, frame: u32) {
+        if let Some(c) = self.released[frame as usize].take(&self.completions) {
+            notify::finish(&c, Ok(0));
+        }
+    }
+}
+
 /// A page being read into a frame, which it holds exclusively until the read ends. Dropped
 /// before then, when the read was never started or a panic unwinds, it takes the frame out of
 /// the table and frees it, and whoever waits on the read looks again. The read's completion keeps
@@ -162,13 +245,26 @@ struct Loading {
     pool: Weak<BufferPool>,
     pid: PageId,
     hold: Option<Held<FrameLatch>>,
+    /// The read's own wait, which its landing finishes with its result before it marks the read
+    /// landed, so whoever sees the read off the backend reads that result here.
+    loaded: Completion,
 }
 
 impl Loading {
     fn end(mut self, res: std::result::Result<(), CompletionError>) {
         let hold = self.hold.take().expect("a read ends once");
         if let Some(pool) = self.pool.upgrade() {
-            pool.loaded(self.pid, hold, res);
+            // Its event opened before the request leaves the count (DESIGN.md 9.1.3).
+            pool.frames.supply.change(|event| {
+                // Published first and woken at the scope's close: the fix that started the read
+                // and sees it landed, so takes a wait other than this one, has its result
+                // (DESIGN.md 9.1.3, wait kinds; the auditor's #3858).
+                notify::finish(&self.loaded, res.map(|()| 0));
+                crate::race::point("buffer.read_result");
+                pool.out_of_flight(&hold, event);
+                pool.loaded(self.pid, hold, res);
+                event.arm();
+            });
         }
     }
 }
@@ -177,7 +273,11 @@ impl Drop for Loading {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
         if let (Some(hold), Some(pool)) = (self.hold.take(), self.pool.upgrade()) {
-            pool.unload(self.pid, hold, None);
+            pool.frames.supply.change(|event| {
+                pool.out_of_flight(&hold, event);
+                pool.unload(self.pid, hold, None);
+                event.arm();
+            });
         }
     }
 }
@@ -204,6 +304,11 @@ impl Outgoing {
             .frame
     }
 
+    /// The version of the write-out's hold: what its frame's submission is marked at.
+    pub(super) fn version(&self) -> u64 {
+        self.hold.as_ref().expect("held until it ends").version()
+    }
+
     /// Ends the write-out with the write of a copy holding change count `count`.
     pub(super) fn end(
         mut self,
@@ -227,6 +332,52 @@ impl Drop for Outgoing {
 }
 use std::collections::{HashMap, HashSet};
 
+/// What a round of making room did: started work that makes room (a drain of a batch no drain had,
+/// an eviction, a write-out), and what it did about the resident pages it found latched (DESIGN.md
+/// 9.1.2).
+#[derive(Default, Debug)]
+struct Room {
+    started: bool,
+    /// A latch it found held marked waited: its release finishes the claim's registration.
+    marked: bool,
+    /// A latch it found held changed before it could mark it: another party's act.
+    changed: bool,
+    /// The rare path's gate, lost by a run's drain: its wait, all the claim then waits on
+    /// (DESIGN.md 9.1.3, rule 4).
+    gate: Option<Completion>,
+    /// The lowest stamp holding a batch it passed over, being held for the class it was handed to,
+    /// with nothing else to drain: the epoch the claim waits on (DESIGN.md 9.1.3).
+    held: Option<u64>,
+}
+
+impl std::ops::BitOrAssign for Room {
+    fn bitor_assign(&mut self, other: Self) {
+        self.started |= other.started;
+        self.marked |= other.marked;
+        self.changed |= other.changed;
+        if self.gate.is_none() {
+            self.gate = other.gate;
+        }
+        self.held = match (self.held, other.held) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+}
+
+/// What a run's drain came to: run (and whether a drain started), or the gate lost, with the
+/// gate's wait.
+enum Drained {
+    Ran(bool),
+    GateLost(Completion),
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// A threshold a test sets for this thread's eviction rounds, in place of the sampled one.
+    pub(super) static THRESHOLD: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Debug, Clone)]
 pub struct BufferConfig {
     /// Bytes of the engine's memory, at least [`MIN_BUDGET`]: the frames that cache pages and
@@ -242,6 +393,18 @@ pub struct BufferConfig {
     /// ([`kept`]), each in a lent frame: `None` for [`kept::default_limit`] of the budget. At least
     /// the largest page.
     pub kept_bytes: Option<usize>,
+    /// What the pool lends for as long as it is open, taken as it opens from the highest free
+    /// batches, before anything is cached (DESIGN.md 9.1.1): the log's ring and the image bank.
+    pub lent_at_open: LentAtOpen,
+}
+
+/// The lend batches a pool takes as it opens (DESIGN.md 9.1.1).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LentAtOpen {
+    /// The class of the log's ring chunks, and how many.
+    pub ring: Option<(SizeClass, u32)>,
+    /// Frames of the image bank: `S`, of the largest node class.
+    pub bank: u32,
 }
 
 /// The default bytes of a sweep's copies in flight: two of the largest page, so a write of one
@@ -256,6 +419,7 @@ impl BufferConfig {
             budget,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: LentAtOpen::default(),
         }
     }
 }
@@ -275,17 +439,31 @@ struct Fixed<'a> {
     hold: Option<Hold<'a>>,
 }
 
+/// What following a frame came to: the frame fixed, or not holding the page, or a wait.
+enum Followed<'a> {
+    Fixed(Option<(u64, Option<Hold<'a>>)>),
+    Wait(Completion),
+}
+
 enum Probe<'a> {
     /// The frame holds the page; the version an optimistic fix saw.
     Hit(u64),
     /// The frame holds the page, latched exclusively.
     Held(Hold<'a>),
-    /// The frame holds the page, but its latch is held.
-    Busy,
-    /// The page is being read into the frame.
-    Loading(Completion),
-    /// The page is being written out of the frame.
-    Outgoing(Completion),
+    /// A resident page another caller holds: its frame's release finishes the wait.
+    ResidentBusy,
+    /// A loading or outgoing frame between its phases, its transit not yet put or already
+    /// taken. Waited on once the word the look read is marked (DESIGN.md 9.1.3).
+    Busy(HeldWord),
+    /// The page is being read into the frame: the read's completion, and whether its IO was
+    /// submitted.
+    Loading(Completion, bool),
+    /// The page is being written out of the frame: the write's completion, and whether its IO
+    /// was submitted.
+    Outgoing(Completion, bool),
+    /// The frame changed while it was looked at, by another party's act: a validation failed, a
+    /// take lost, a transit's cell moved. Looked at again.
+    Changed,
     /// The frame does not hold the page.
     Miss,
 }
@@ -300,9 +478,10 @@ pub struct BufferPool {
     epoch: AtomicU32,
     /// Bytes evicted since the pool opened; each quarter of the pool is an epoch. Relaxed: a count.
     evicted: AtomicU64,
+    /// Per class, the frame an eviction round's walk starts from next: where the last walk took a
+    /// page. Relaxed: a place to start, any value of which is correct.
+    walk: [AtomicU32; CLASS_COUNT],
     epoch_bytes: u64,
-    /// Done when a frame is next freed, if anyone waits for that.
-    released: CompletionCell,
     /// Writebacks queued and not stepped to their end: a stepping thread takes them all and puts
     /// back each one not done.
     writebacks: Stack<Writeback>,
@@ -311,16 +490,22 @@ pub struct BufferPool {
     /// Where copies of pages written back while they stay in their frames are made.
     staging: Arc<staging::Staging>,
     writes_in_flight: AtomicUsize,
+    /// The pool's own IO requests, reads and writes, handed to its backend and not yet landed:
+    /// what decides a wait's kind (DESIGN.md 9.1.3, wait kinds). Never a writeback queued or held
+    /// before its submission, nor a write landed and not yet settled: those are CPU work a thread
+    /// does, whose end is an event. Up inside the submission's event, before the request, so
+    /// before it can land; down inside the landing's event.
+    requests: AtomicUsize,
     /// Bytes of swap copies written since the pool opened. Relaxed: a count.
     swap_written: AtomicU64,
     failure: SetOnce<CompletionError>,
-    /// The checkpoint whose cut is in effect, 0 for none.
-    cutting: AtomicU64,
     /// Pages that checkpoint found owed, kept as they stood by their first change or free since
     /// (the copy hook, audit 18).
     kept: Mutex<HashMap<PageId, KeptCopy>>,
     /// The frames lent beside the page table, and what for.
     lends: Arc<Lends>,
+    /// The lend road's state for kept copies (DESIGN.md 9.1.1).
+    lend: lend::LendRoad,
     /// The room the copies are charged to ([`kept`]).
     room: Arc<KeptRoom>,
     /// What a writer refused room drives: the checkpoint, once the database is open.
@@ -329,29 +514,17 @@ pub struct BufferPool {
     /// pending.
     cut_owed: Mutex<HashSet<PageId>>,
     temp: Arc<TempPages>,
+    /// The operations waiting for memory (DESIGN.md 9.1.3, *A shortage never waits under a
+    /// hold*).
+    shortage: shortage::Queue,
+    /// The pages the shortage gate's holder keeps resident, published while it holds the gate;
+    /// `protecting` says whether any are, one load on eviction's path otherwise.
+    protected: Mutex<Vec<u64>>,
+    protecting: std::sync::atomic::AtomicBool,
     /// Each queued writeback's state after its last step, by its number, for a test that stalled
     /// to show while another thread steps it.
     #[cfg(test)]
     stepped: Mutex<HashMap<u64, String>>,
-}
-
-/// Why a request for kept copies was turned down.
-enum Turned {
-    /// The room is full.
-    Room,
-    /// No frame of the class is free without an eviction.
-    Frame(SizeClass),
-}
-
-crate::thread::thread_local! {
-    /// Frames lent to this thread for kept copies while it held no latch, after a request found
-    /// none free: its next request takes them first.
-    static SPARES: std::cell::RefCell<Vec<AlignedBlock>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// The class this thread's last request found no free frame of, if that turned it down.
-    static SHORT: std::cell::Cell<Option<SizeClass>> = const { std::cell::Cell::new(None) };
-    /// Requests turned down for a frame on this thread, for tests to see one reach a wait.
-    #[cfg(test)]
-    pub(crate) static FRAME_SHORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// What a claimed frame is for.
@@ -378,10 +551,6 @@ fn grains(frame: u32, class: SizeClass) -> std::ops::Range<usize> {
     start..start + class.size() / page::MIN_PAGE_SIZE
 }
 
-fn yield_now<T>() -> Result<IOResult<T>> {
-    Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
-}
-
 fn io_failure(e: &LimboError) -> CompletionError {
     match e {
         LimboError::CompletionError(e) => *e,
@@ -406,6 +575,9 @@ impl BufferPool {
             )));
         }
         let memory = Memory::new(config.budget)?;
+        let supply = Arc::new(supply::Supply::new(store.epochs().clone()));
+        memory.join_pool(&supply, store.epochs());
+        let batches = memory.batches;
         if config.writeback_bytes < page::MAX_PAGE_SIZE
             || !config.writeback_bytes.is_multiple_of(page::MIN_PAGE_SIZE)
         {
@@ -425,25 +597,28 @@ impl BufferPool {
                 headers: Zeroed::new(grains as usize)?,
                 given_up: Zeroed::new(grains as usize)?,
                 transits: Zeroed::new(grains as usize)?,
-                retiring: Retiring::new(store.epochs().clone()),
+                released: Zeroed::new(grains as usize)?,
+                completions: CompletionDomain::new(store.epochs().clone()),
+                supply: supply.clone(),
             }),
             table: Table::new(grains)?,
             memory,
             source,
             epoch: AtomicU32::new(watt::FIRST_EPOCH),
             evicted: AtomicU64::new(0),
+            walk: std::array::from_fn(|_| AtomicU32::new(0)),
             epoch_bytes,
-            released: CompletionCell::default(),
             writebacks: Stack::default(),
             queued: AtomicUsize::new(0),
             staging: Arc::new(staging::Staging::new(config.writeback_bytes)),
             writes_in_flight: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
             swap_written: AtomicU64::new(0),
             failure: SetOnce::default(),
-            cutting: AtomicU64::new(0),
             kept: Mutex::new(HashMap::new()),
             lends,
-            room: KeptRoom::new(kept_bytes, store.epochs().clone(), store.io().clone()),
+            lend: lend::LendRoad::new(batches),
+            room: KeptRoom::new(kept_bytes, supply.clone(), store.io().clone()),
             relief: SetOnce::default(),
             cut_owed: Mutex::new(HashSet::new()),
             temp: Arc::new(TempPages::new(
@@ -452,10 +627,14 @@ impl BufferPool {
                 store.epochs().clone(),
             )?),
             store,
+            shortage: shortage::Queue::new(supply.clone()),
+            protected: Mutex::new(Vec::new()),
+            protecting: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             stepped: Mutex::new(HashMap::new()),
         });
         pool.lends.set_pool(&pool);
+        pool.lend_at_open(config.lent_at_open)?;
         Ok(pool)
     }
 
@@ -570,35 +749,11 @@ impl BufferPool {
                 .take(1),
             );
             for (frame, from_hint) in found {
-                let (version, hold) = match self.probe(frame, pid, mode) {
-                    Probe::Hit(version) => (version, None),
-                    Probe::Held(hold) => (hold.version(), Some(hold)),
-                    Probe::Busy => return yield_now(),
-                    Probe::Loading(c) => return Ok(IOResult::IO(IOCompletions(c))),
-                    Probe::Outgoing(c) => {
-                        // Only stepping its writeback submits its write, and settles it once it
-                        // landed. The write landing completes `c` and wakes the pool's waiters;
-                        // a thread holding the writeback wakes them too if it leaves the write
-                        // unsubmitted, waiting on its plan, and `c` then waits on nothing anyone
-                        // does; and a write-out whose writeback is not queued yet has none to
-                        // step, its queueing waking them. So the wait is the pool's, started
-                        // before the look.
-                        let woken = self.released_wait();
-                        if let Some(w) = self.drive_writebacks()? {
-                            return Ok(IOResult::IO(IOCompletions(w)));
-                        }
-                        if !c.finished() {
-                            return Ok(IOResult::IO(IOCompletions(woken)));
-                        }
-                        let h = self.header(frame);
-                        if h.status() == OUTGOING && h.pid() == pid.raw() {
-                            // Landed, and its settle met a latched page or is someone else's.
-                            return yield_now();
-                        }
-                        // Settled: the page left, so look for it anew.
-                        continue;
-                    }
-                    Probe::Miss => continue,
+                let Some((version, hold)) = (match self.follow(frame, pid, mode)? {
+                    Followed::Fixed(fixed) => fixed,
+                    Followed::Wait(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
+                }) else {
+                    continue;
                 };
                 if !from_hint {
                     if let Some(h) = hint {
@@ -621,7 +776,7 @@ impl BufferPool {
                 IOResult::Done(l) => l,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            let frame = match self.claim(pid.class(), Purpose::Read)? {
+            let frame = match self.claim(pid.class(), Purpose::Read, &[])? {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -634,8 +789,19 @@ impl BufferPool {
                     h.store(frame + 1, Ordering::Relaxed);
                 }
                 if !loaded.finished() {
-                    return Ok(IOResult::IO(IOCompletions(loaded)));
+                    // The read's own wait only while its request is at the backend: the loader
+                    // decides as any fix of the page does, by looking again (DESIGN.md 9.1.3, wait
+                    // kinds; the auditor's P2-1 on v24). A read the source fills elsewhere is
+                    // waited on remote, which its landing finishes. A read whose landing has begun
+                    // has published its result before it was seen landed, so the loader keeps it.
+                    crate::race::point("buffer.loader_follows");
+                    if let Followed::Wait(wait) = self.wait_or_fix(frame, pid, mode)? {
+                        if !loaded.finished() {
+                            return Ok(IOResult::IO(IOCompletions(wait)));
+                        }
+                    }
                 }
+                // Landed meanwhile: its error is the loader's, kept on its own wait.
                 if let Some(e) = loaded.get_error() {
                     return Err(LimboError::CompletionError(e));
                 }
@@ -644,28 +810,115 @@ impl BufferPool {
         }
     }
 
+    /// [`wait_or_fix`](Self::wait_or_fix) with its first look inline: a frame free or latched as
+    /// asked, or not holding `pid`, decided without the call.
+    #[inline(always)]
+    fn follow(self: &Arc<Self>, frame: u32, pid: PageId, mode: Mode) -> Result<Followed<'_>> {
+        match self.probe(frame, pid, mode) {
+            Probe::Hit(version) => Ok(Followed::Fixed(Some((version, None)))),
+            Probe::Held(hold) => Ok(Followed::Fixed(Some((hold.version(), Some(hold))))),
+            Probe::Miss => Ok(Followed::Fixed(None)),
+            _ => self.wait_or_fix(frame, pid, mode),
+        }
+    }
+
+    /// Follows `frame` for `pid`: the version an optimistic fix saw and an exclusive fix's hold,
+    /// `None` if the frame does not hold the page, or what to wait on while another holds it
+    /// (DESIGN.md 9.1.3). A resident frame waits on its own latch release. A loading or outgoing
+    /// frame is looked at again after a ticket on the pool's supply is taken, so the second look
+    /// decides the wait's kind and the ticket covers every change after it: a latch let go after
+    /// it was marked, a read or a write submitted. A frame
+    /// that changed while it was looked at is looked at again at once: that was another party's
+    /// act, so the loop is lock-free, never a wait on anyone paused.
+    #[cold]
+    #[inline(never)]
+    fn wait_or_fix(self: &Arc<Self>, frame: u32, pid: PageId, mode: Mode) -> Result<Followed<'_>> {
+        let mut ticket = None;
+        loop {
+            match self.probe(frame, pid, mode) {
+                Probe::Hit(version) => return Ok(Followed::Fixed(Some((version, None)))),
+                Probe::Held(hold) => {
+                    return Ok(Followed::Fixed(Some((hold.version(), Some(hold)))))
+                }
+                Probe::Miss => return Ok(Followed::Fixed(None)),
+                Probe::Changed => ticket = None,
+                Probe::ResidentBusy => {
+                    return Ok(Followed::Wait(self.wait_for_resident_latch(frame)))
+                }
+                // Its IO submitted, the read lands and finishes it: stepped, its own producer. Once
+                // it holds its result its landing is under way, and its event finishes a ticket.
+                Probe::Loading(read, true) if !read.finished() => return Ok(Followed::Wait(read)),
+                Probe::Outgoing(written, true) if !written.finished() => {
+                    return Ok(Followed::Wait(written))
+                }
+                probe => {
+                    let Some(taken) = ticket.take() else {
+                        crate::race::point("buffer.fix_ticket");
+                        ticket = Some(self.frames.supply.ticket());
+                        continue;
+                    };
+                    match probe {
+                        // Only the holder's release ends this hold: its marked release is an
+                        // event, which finishes the ticket taken before the mark.
+                        Probe::Busy(word) => match self.header(frame).latch.mark_held(word) {
+                            Marked::Waits => return Ok(Followed::Wait(taken.remote())),
+                            Marked::Changed => {}
+                        },
+                        // Only stepping its writeback submits its write, and settles it once it
+                        // landed: stepped here, after the ticket, so a step of this call that
+                        // submits or settles finishes it and the caller looks again; a writeback
+                        // waiting on IO before its writes are submitted is waited on, stepped.
+                        // What is left is another thread's: a writeback it holds, whose putting
+                        // back or end is an event.
+                        Probe::Outgoing(..) => {
+                            if let Some(wait) = self.drive_writebacks()? {
+                                return Ok(Followed::Wait(wait));
+                            }
+                            return Ok(Followed::Wait(taken.remote()));
+                        }
+                        // A read not yet submitted, whose submission is an event.
+                        _ => return Ok(Followed::Wait(taken.remote())),
+                    }
+                }
+            }
+        }
+    }
+
     /// Latches `frame` in `mode` if it holds `pid`.
     fn probe(&self, frame: u32, pid: PageId, mode: Mode) -> Probe<'_> {
         let h = self.header(frame);
-        let Some(version) = h.latch.optimistic() else {
+        let version = match h.latch.look() {
+            Look::Free(version) => version,
             // Held: being read in, written out, changed, evicted or freed.
-            if h.pid() != pid.raw() {
-                return Probe::Miss;
-            }
-            let status = h.status();
-            if status == LOADING || status == OUTGOING {
-                if let Some(c) = self.transit(frame).get(&self.store.epochs().enter()) {
-                    return match status {
-                        LOADING => Probe::Loading(c),
-                        _ => Probe::Outgoing(c),
-                    };
+            Look::Held(word) => {
+                if h.pid() != pid.raw() {
+                    return Probe::Miss;
                 }
+                let status = h.status();
+                if status == LOADING || status == OUTGOING {
+                    let c = match self.transit(frame).get(&self.frames.completions) {
+                        Ok(c) => c,
+                        Err(cell::Changed) => return Probe::Changed,
+                    };
+                    if let Some(c) = c {
+                        // Read after the transit: a submission marked after its transit was put.
+                        let submitted = h.at_backend(word.version());
+                        return match status {
+                            LOADING => Probe::Loading(c, submitted),
+                            _ => Probe::Outgoing(c, submitted),
+                        };
+                    }
+                }
+                return if status == RESIDENT {
+                    Probe::ResidentBusy
+                } else {
+                    Probe::Busy(word)
+                };
             }
-            return Probe::Busy;
         };
         let holds = h.status() == RESIDENT && h.pid() == pid.raw();
         if !h.latch.validate(version) {
-            return Probe::Busy;
+            return Probe::Changed;
         }
         if !holds {
             return Probe::Miss;
@@ -674,9 +927,9 @@ impl BufferPool {
             Mode::Optimistic => Probe::Hit(version),
             // Only at the version it was seen to hold the page at: a frame that changed hands
             // meanwhile is never held, so no one ever holds a free frame.
-            Mode::Exclusive => match Held::try_take_at(&h.latch, version) {
+            Mode::Exclusive => match Held::try_take_at(self.frame_ref(frame), version) {
                 Some(hold) => Probe::Held(hold),
-                None => Probe::Busy,
+                None => Probe::Changed,
             },
         }
     }
@@ -713,7 +966,7 @@ impl BufferPool {
         h.tracker.read(self.now());
         self.mark_held(frame);
         h.status.store(LOADING, Ordering::Release);
-        let loaded = Completion::new_wait();
+        let loaded = crate::storage::atoll::notify::wait();
         self.transit(frame).put(loaded.clone());
         if self
             .table
@@ -723,24 +976,49 @@ impl BufferPool {
             self.frames.end_transit(frame);
             self.free_frame(pid.class(), frame, hold);
             // A reader may have followed a hint here meanwhile: send it to the other frame.
-            loaded.complete(0);
+            notify::finish(&loaded, Ok(0));
             return Ok(IOResult::Done(None));
         }
         // The frame is quiet (claimed for a read) and held: nothing else reaches its memory while
         // the IO writes it.
         let into = self.memory.region.buffer(frame, pid.class().size());
+        let version = hold.version();
         let reading = Loading {
             pool: Arc::downgrade(self),
             pid,
             hold: Some(hold),
+            loaded: loaded.clone(),
         };
-        // On an error or a yield the read never starts, and dropping it frees the frame.
-        Ok(
-            match located.read(into, Box::new(move |res| reading.end(res)))? {
-                IOResult::Done(()) => IOResult::Done(Some(loaded)),
-                IOResult::IO(io) => IOResult::IO(io),
-            },
-        )
+        // The read entering flight changes the wait a fix of the page needs, from the pool's to
+        // the read's own, stepped (DESIGN.md 9.1.3, wait kinds): an event opened before the
+        // submission and armed in this call, after the submission is marked, so every ticket
+        // taken before the mark is finished. On an error or a yield the read never starts, and
+        // dropping it frees the frame, which is a change too.
+        crate::race::point("buffer.read_submit");
+        let read = self.frames.supply.change(|event| {
+            // Counted in flight and marked submitted by the source right before its request, so
+            // before the read can land; the read ends, landed or given up, exactly once, through
+            // `reading`, which counts it out if it was counted in, under the same hold.
+            let submitting = || {
+                self.requests.fetch_add(1, Ordering::AcqRel);
+                h.submitted_at(version);
+            };
+            let read = located.read(into, Box::new(move |res| reading.end(res)), &submitting);
+            event.arm();
+            read
+        });
+        Ok(match read? {
+            IOResult::Done(()) => {
+                // A read returned done handed its request over or filled the page, so the fix that
+                // started it waits on its request or has its result (source.rs, `Located::read`).
+                crate::turso_assert!(
+                    h.handed_over(version) || loaded.finished(),
+                    "a page source's read returned neither handing its request over nor done"
+                );
+                IOResult::Done(Some(loaded))
+            }
+            IOResult::IO(io) => IOResult::IO(io),
+        })
     }
 
     /// Ends the read of `pid` into the frame `hold` holds.
@@ -763,15 +1041,19 @@ impl BufferPool {
                 h.imaged
                     .store(if owed { 0 } else { count }, Ordering::Release);
                 // Evicted owed at a cut and not yet imaged: still the page as the cut found it.
-                let n = self.cutting.load(Ordering::Acquire);
+                let n = self.memory.cutting.load(Ordering::Acquire);
                 let pending = n != 0 && owed && self.cut_owed.lock().contains(&pid);
                 h.pending
                     .store(if pending { n } else { 0 }, Ordering::Release);
                 h.status.store(RESIDENT, Ordering::Release);
+                crate::race::point("buffer.loaded_published");
                 drop(hold);
                 if let Some(c) = waiting {
-                    c.complete(0);
+                    notify::finish(&c, Ok(0));
                 }
+                // The page is resident and its latch let go: evictable, so a claim waiting for
+                // room has something to take now (DESIGN.md 9.1.2).
+                self.signal_released();
             }
             Err(e) => self.unload(pid, hold, Some(e)),
         }
@@ -785,26 +1067,64 @@ impl BufferPool {
         self.table.remove(&self.frames.headers, pid.raw(), frame);
         self.free_frame(pid.class(), frame, hold);
         match (waiting, error) {
-            (Some(c), Some(e)) => c.error(e),
-            (Some(c), None) => c.complete(0),
+            (Some(c), Some(e)) => notify::finish(&c, Err(e)),
+            (Some(c), None) => notify::finish(&c, Ok(0)),
             (None, _) => {}
         }
     }
 
     /// Latches a free frame exclusively. No one else ever holds a free frame: every other hold
     /// is taken at a version seen with the frame holding a page.
+    /// Marks the latch of `frame`, held by the caller, which is about to publish a new page in it,
+    /// so the hold's first release tells the released frames (DESIGN.md 9.1.2): a claim that
+    /// looked at the frame while it was free and found nothing to take is woken by the page
+    /// becoming evictable, which no other event announces. Only a new page pays it.
+    fn arm_first_release(&self, frame: u32) {
+        let marked = self.header(frame).latch.mark_waited();
+        debug_assert_eq!(
+            marked,
+            Marked::Waits,
+            "frame {frame} is not held by its installer"
+        );
+    }
+
+    /// `frame`'s latch, through a borrow of the frames.
+    fn frame_ref(&self, frame: u32) -> FrameRef<'_> {
+        FrameRef {
+            frames: &self.frames,
+            frame,
+        }
+    }
+
     fn take_free_latch(&self, frame: u32) -> Hold<'_> {
-        Held::try_take(&self.header(frame).latch)
+        Held::try_take(self.frame_ref(frame))
             .unwrap_or_else(|| panic!("free frame {frame} is held"))
     }
 
     /// Returns `frame`, unlinked, to the free frames, releasing `hold` on it.
-    fn free_frame<L: Deref<Target = VersionedLatch>>(
-        &self,
-        class: SizeClass,
-        frame: u32,
-        hold: Held<L>,
-    ) {
+    /// Publishes `pids` as the pages the gate's holder keeps resident (DESIGN.md 9.1.3, phase B).
+    fn protect(&self, pids: &[u64]) {
+        let mut set = self.protected.lock();
+        set.clear();
+        set.extend_from_slice(pids);
+        self.protecting.store(!set.is_empty(), Ordering::Release);
+    }
+
+    /// Whether `frame` holds a page the gate's holder keeps resident.
+    fn protected(&self, frame: u32) -> bool {
+        if !self.protecting.load(Ordering::Acquire) {
+            return false;
+        }
+        let pid = self.header(frame).pid();
+        self.protected.lock().contains(&pid)
+    }
+
+    /// Gives back a frame a shortage reserved and its claim never took (DESIGN.md 9.1.3).
+    fn give_back_reserved(&self, class: SizeClass, frame: u32) {
+        self.free_frame(class, frame, self.take_free_latch(frame));
+    }
+
+    fn free_frame<L: LatchRef>(&self, class: SizeClass, frame: u32, hold: Held<L>) {
         let h = self.header(frame);
         h.status.store(FREE, Ordering::Release);
         h.pid.store(NO_PAGE, Ordering::Release);
@@ -816,7 +1136,15 @@ impl BufferPool {
         for grain in &self.frames.given_up[grains(frame, class)] {
             grain.store(stamp, Ordering::Release);
         }
-        self.memory.put(class, frame);
+        // The shortage gate's holder waiting for a frame of this class takes it, its batch not
+        // draining, rather than the free lists, where a fast claim would take it first
+        // (DESIGN.md 9.1.3, phase A).
+        let handed =
+            !self.memory.draining_at(class, frame) && self.frames.supply.offer(class, frame);
+        if !handed {
+            // A batch this releases tells the pool itself (`batch_released`).
+            self.memory.put(class, frame);
+        }
         self.signal_released();
     }
 
@@ -872,8 +1200,18 @@ impl BufferPool {
 
     /// A new page of `class`, all zeros, fixed exclusively.
     pub fn allocate(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<Exclusive<'_>>> {
+        self.allocate_holding(class, &[])
+    }
+
+    /// [`allocate`](Self::allocate) for a step that holds the pages `held` meanwhile, which a
+    /// shortage keeps resident while it waits for the frame (DESIGN.md 9.1.3, phase B).
+    pub fn allocate_holding(
+        self: &Arc<Self>,
+        class: SizeClass,
+        held: &[PageId],
+    ) -> Result<IOResult<Exclusive<'_>>> {
         let step = self.store.epochs().enter();
-        let frame = match self.claim(class, Purpose::New)? {
+        let frame = match self.claim(class, Purpose::New, held)? {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -895,7 +1233,7 @@ impl BufferPool {
     /// ([`PageStore::allocate_at`]).
     pub fn allocate_at(self: &Arc<Self>, pid: PageId) -> Result<IOResult<Exclusive<'_>>> {
         let step = self.store.epochs().enter();
-        let frame = match self.claim(pid.class(), Purpose::New)? {
+        let frame = match self.claim(pid.class(), Purpose::New, &[])? {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -919,8 +1257,17 @@ impl BufferPool {
         self: &Arc<Self>,
         class: SizeClass,
     ) -> Result<IOResult<Exclusive<'_>>> {
+        self.allocate_temporary_holding(class, &[])
+    }
+
+    /// [`allocate_temporary`](Self::allocate_temporary) for a step that holds `held` meanwhile.
+    pub fn allocate_temporary_holding(
+        self: &Arc<Self>,
+        class: SizeClass,
+        held: &[PageId],
+    ) -> Result<IOResult<Exclusive<'_>>> {
         let step = self.store.epochs().enter();
-        let frame = match self.claim(class, Purpose::New)? {
+        let frame = match self.claim(class, Purpose::New, held)? {
             IOResult::Done(f) => f,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -953,6 +1300,8 @@ impl BufferPool {
         h.tracker.clear();
         h.tracker.read(self.now());
         self.mark_held(frame);
+        self.arm_first_release(frame);
+        crate::race::point("buffer.install_publish");
         h.status.store(RESIDENT, Ordering::Release);
         // A number is handed out again only once every step that could hold its last page is
         // gone (`epoch`), and the page left the table within its freer's step.
@@ -986,7 +1335,7 @@ impl BufferPool {
         let (frame, pid) = (page.frame, page.pid);
         if wait_out_a_cut
             && !pid.is_temporary()
-            && self.cutting.load(Ordering::Acquire) != 0
+            && self.memory.cutting.load(Ordering::Acquire) != 0
             && page::kind(page.page()) == blob::KIND
         {
             page.release_unchanged();
@@ -1052,7 +1401,7 @@ impl BufferPool {
         loop {
             // During a cut the page is read in: a checkpoint may owe its image, which its free
             // keeps.
-            let cut = self.cutting.load(Ordering::Acquire) != 0 && !pid.is_temporary();
+            let cut = self.memory.cutting.load(Ordering::Acquire) != 0 && !pid.is_temporary();
             if cut || self.table.find(&self.frames.headers, pid.raw()).is_some() {
                 return match self.fix_exclusive(pid, None)? {
                     IOResult::Done(page) => self.free_page(page, wait_out_a_cut),
@@ -1065,7 +1414,7 @@ impl BufferPool {
                 return Ok(IOResult::Done(()));
             }
             let class = pid.class();
-            let frame = match self.claim(class, Purpose::New)? {
+            let frame = match self.claim(class, Purpose::New, &[])? {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -1081,6 +1430,8 @@ impl BufferPool {
             h.imaged.store(0, Ordering::Release);
             h.pending.store(0, Ordering::Release);
             h.tracker.clear();
+            self.arm_first_release(frame);
+            crate::race::point("buffer.unreferenced_publish");
             h.status.store(RESIDENT, Ordering::Release);
             if self
                 .table
@@ -1142,7 +1493,9 @@ impl BufferPool {
     fn take_or_grow_by(&self, class: SizeClass, horizon: Option<u64>) -> Got {
         // Of the frames not quiet, the epoch the earliest is quiet at.
         let soonest = std::cell::Cell::new(u64::MAX);
-        loop {
+        // One take; on none, one grow and one take more (DESIGN.md 9.1.2): every look past those
+        // is the caller's.
+        for grown in [false, true] {
             let usable = |f| match horizon {
                 None => true,
                 Some(h) => {
@@ -1156,56 +1509,173 @@ impl BufferPool {
                 // Growing would take memory a later step does not need: once the steps under
                 // way end, these frames are quiet.
                 Take::Unusable => return Got::Quieting(soonest.get()),
-                Take::None => {
-                    if !self.memory.grow(class) {
-                        return Got::None;
-                    }
-                }
+                Take::None if grown || !self.memory.grow(class) => return Got::None,
+                Take::None => {}
             }
         }
+        Got::None
     }
 
     /// A free frame of `class` for `purpose`, making room if there is none.
-    fn claim(self: &Arc<Self>, class: SizeClass, purpose: Purpose) -> Result<IOResult<u32>> {
+    fn claim(
+        self: &Arc<Self>,
+        class: SizeClass,
+        purpose: Purpose,
+        held: &[PageId],
+    ) -> Result<IOResult<u32>> {
         self.failed()?;
+        // The checkpoint's claims are its demand's, never an operation's (DESIGN.md 9.1.3,
+        // *Maintenance keeps what it owns*).
+        if let Some(out) = upkeep::claim(self, class, purpose) {
+            return out;
+        }
+        if let Some(f) = shortage::take_reserved(class, purpose) {
+            return Ok(IOResult::Done(f));
+        }
+        #[cfg(test)]
+        if shortage::scarce_now() {
+            return Ok(shortage::short(self, class, purpose, held));
+        }
         let first = self.take_or_grow(class, purpose);
         if let Got::Frame(f) = first {
             return Ok(IOResult::Done(f));
         }
-        // Waiting starts before the next look, so a frame freed in between is not missed. Every
-        // wait below is this one: a frame freed finishes it, whatever else it waits for too.
-        let wait = self.released_wait();
-        let next = match first {
-            Got::Quieting(_) => self.take_or_grow(class, purpose),
+        // Inside an owner's operation, under its latches and Steps: no wait on memory here (W1,
+        // DESIGN.md 9.1.3). Work it can start, a write in flight and the rare path's gate stay
+        // as they are; what would be a wait on memory comes short, and the owner reserves the
+        // frame holding nothing.
+        let owned = shortage::owned();
+        if owned && matches!(first, Got::Quieting(_)) {
+            return Ok(shortage::short(self, class, purpose, held));
+        }
+        // Waiting starts before the next look, so a frame freed in between is not missed; and
+        // before making room, whose marks on latches it finds held come after it (DESIGN.md 9.1.2).
+        let mut wait = Some(self.frames.supply.ticket());
+        let (room, next) = match first {
+            Got::Quieting(_) => (Room::default(), self.take_or_grow(class, purpose)),
             _ => {
-                self.make_room(class)?;
-                self.take_or_grow(class, purpose)
+                let room = self.make_room(class)?;
+                (room, self.take_or_grow(class, purpose))
             }
         };
-        match next {
-            Got::Frame(f) => return Ok(IOResult::Done(f)),
-            // Until the steps that may still read the earliest free frame's memory have ended.
-            Got::Quieting(at) if self.store.epochs().wait_for(at, wait.clone()) => {
-                return Ok(IOResult::IO(IOCompletions(wait)));
+        if owned {
+            match next {
+                Got::Frame(f) => return Ok(IOResult::Done(f)),
+                Got::Quieting(_) => return Ok(shortage::short(self, class, purpose, held)),
+                Got::None => {}
             }
-            // Quiet since the look: look again.
-            Got::Quieting(_) => return yield_now(),
-            Got::None => {}
+        } else if let Some(done) = self.settle(next, &mut wait) {
+            return done;
         }
         if let Some(c) = self.drive_writebacks()? {
             return Ok(IOResult::IO(IOCompletions(c)));
         }
         if self.writes_in_flight.load(Ordering::Acquire) > 0 {
+            let wait = self.supply_wait(wait.expect("settle took no ticket"));
             return Ok(IOResult::IO(IOCompletions(wait)));
         }
-        // Every candidate is latched, or held by a writeback being stepped, by a step under way,
-        // and nothing in flight will free a frame: until those steps have ended, or a frame is
-        // freed first. A step held open while its thread waits for this claim, as a test holding
-        // pages does, ends only after it: the freed frame is what ends the wait then.
-        if self.store.epochs().grace_period(wait.clone()) {
-            return Ok(IOResult::IO(IOCompletions(wait)));
+        // Work of its own started, or a latch it found held changed under it: the caller looks
+        // again on that, each look following something new.
+        if room.started || room.changed {
+            return Ok(Self::look_again());
         }
-        yield_now()
+        // A run's drain lost the rare path's gate: its holder lets go within its own call, and that
+        // let-go is all this waits on (DESIGN.md 9.1.3, rule 4).
+        if let Some(gate) = room.gate {
+            return Ok(IOResult::IO(IOCompletions(gate)));
+        }
+        if owned {
+            return Ok(shortage::short(self, class, purpose, held));
+        }
+        // A fresh registration (the one before may be finished), one more look and one more round
+        // of making room, so a frame freed or a page made evictable before it is not missed; every
+        // outcome of that look handled as the second look's. Then the registration is returned: a
+        // frame given back, a load landing, a write-out that did not happen and the release of
+        // every latch the rounds marked waited after it finish it, whoever holds the latch, the
+        // caller included, which then waits on itself and does not go round.
+        crate::race::point("buffer.claim_fresh");
+        let mut fresh = Some(self.frames.supply.ticket());
+        if let Some(done) = self.settle(self.take_or_grow(class, purpose), &mut fresh) {
+            return done;
+        }
+        let room = self.make_room(class)?;
+        crate::race::point("buffer.claim_last_round");
+        if room.started || room.changed {
+            return Ok(Self::look_again());
+        }
+        if let Some(gate) = room.gate {
+            return Ok(IOResult::IO(IOCompletions(gate)));
+        }
+        // A batch held for the class it was handed to, and nothing else to drain: the registration
+        // goes on the stamp's epoch too, so the end of the last step under way at that hand-over
+        // finishes it. Reached since the scan, the horizon moved: the caller looks again on that
+        // rather than deciding again on the horizon it read (DESIGN.md 9.1.3).
+        let fresh = self.supply_wait(fresh.expect("settle took no ticket"));
+        if let Some(at) = room.held {
+            if !self.store.epochs().wait_for(at, fresh.clone()) {
+                return Ok(Self::look_again());
+            }
+        }
+        Ok(IOResult::IO(IOCompletions(fresh)))
+    }
+
+    /// What a look that found a frame, or free frames not yet quiet, comes to: the frame, or `wait`
+    /// put on the epoch the earliest is quiet at too (counting the caller's own step, as a frame's
+    /// reuse must; its next step announces at or above the frame's stamp). None for no frame.
+    fn settle(&self, got: Got, ticket: &mut Option<Ticket>) -> Option<Result<IOResult<u32>>> {
+        match got {
+            Got::Frame(f) => Some(Ok(IOResult::Done(f))),
+            Got::Quieting(at) => {
+                let wait = self.supply_wait(ticket.take().expect("a ticket taken before the look"));
+                // Finished already if the epoch was reached: the caller looks again on that.
+                self.store.epochs().wait_for(at, wait.clone());
+                Some(Ok(IOResult::IO(IOCompletions(wait))))
+            }
+            Got::None => None,
+        }
+    }
+
+    /// The wait a ticket gives a caller whose producers are other callers' acts and, maybe, the
+    /// pool's own IO (DESIGN.md 9.1.3, wait kinds): stepped while any of its requests is at the
+    /// backend, since stepping may be what lands it; remote otherwise, so a pumped backend with
+    /// nothing of the pool's in flight is not stepped in a loop for it, whatever writeback another
+    /// thread holds or write it has yet to settle. Decided after the look the ticket was taken
+    /// before: a request submitted afterwards is an event, which finishes the remote kind, and the
+    /// caller looks again and decides anew. The stepped kind is finished by the next landing
+    /// alone: a request at the backend lands with steps, so its waiter steps until one does, and
+    /// no other change, its own caller letting a page go on the way out included, sends it back
+    /// to look with nothing stepped (the auditor's root-growth pressure, #3850).
+    fn supply_wait(&self, ticket: Ticket) -> Completion {
+        if self.io_in_flight() {
+            ticket.stepped()
+        } else {
+            ticket.remote()
+        }
+    }
+
+    /// Counts the read of the frame `hold` holds out of the requests and marks it landed, if its
+    /// source handed it over, inside the landing's event and before anything else of it: a fix
+    /// that looks from here waits on the pool, not on a read no request is left of; and the event
+    /// is a landing, which finishes the stepped waits. The hold is the read's until here, so the
+    /// frame's mark is this read's.
+    fn out_of_flight(&self, hold: &Held<FrameLatch>, event: &supply::Event<'_>) {
+        let (h, version) = (self.header(hold.latch().frame), hold.version());
+        if h.at_backend(version) {
+            h.landed_at(version);
+            self.requests.fetch_sub(1, Ordering::AcqRel);
+            event.land();
+        }
+        crate::race::point("buffer.read_landed");
+    }
+
+    /// Whether any of the pool's own IO requests is at its backend.
+    fn io_in_flight(&self) -> bool {
+        self.requests.load(Ordering::Acquire) > 0
+    }
+
+    /// A yield: its caller looks again at once, on the event the claim names. Allocates nothing.
+    fn look_again<T>() -> IOResult<T> {
+        IOResult::IO(IOCompletions(Completion::new_yield()))
     }
 
     /// The pool's memory and writes, for a test that stalled to show.
@@ -1285,33 +1755,45 @@ impl BufferPool {
         )
     }
 
-    /// The completion a frame freed finishes. One finished otherwise, by an epoch's wait it was
-    /// also registered for, is replaced: handed out finished, it would send every claim round
-    /// again at once.
+    /// A ticket on the pool's supply, for a test that waits as `wait_for_room` does.
+    #[cfg(test)]
+    pub fn supply_ticket(&self) -> supply::Ticket {
+        self.frames.supply.ticket()
+    }
+
+    /// A remote wait on the supply, finished by the next change, for a test.
+    #[cfg(test)]
     fn released_wait(&self) -> Completion {
-        self.released
-            .current(&self.store.epochs().enter(), &self.frames.retiring)
+        self.frames.supply.ticket().remote()
+    }
+
+    /// A ticket on the pool's supply, the wait's kind decided after the look by
+    /// [`supply_wait`](Self::supply_wait).
+    fn ticket(&self) -> Ticket {
+        self.frames.supply.ticket()
     }
 
     fn signal_released(&self) {
-        if let Some(c) = self.released.take(&self.frames.retiring) {
-            c.complete(0);
-        }
+        self.frames.signal_released();
     }
 
     /// Frees frames for `class`: by moving memory from a class whose pages are worth less per
     /// byte, or else by evicting within the class.
-    fn make_room(self: &Arc<Self>, class: SizeClass) -> Result<()> {
+    ///
+    /// Whether it started something new that makes room: a drain of a batch no drain had, or an
+    /// eviction or a write-out of a page of `class`.
+    fn make_room(self: &Arc<Self>, class: SizeClass) -> Result<Room> {
         let draining = self.memory.draining();
+        let mut room = Room::default();
         for &(holder, batch) in &draining {
-            self.drain(holder, batch)?;
+            room |= self.drain(holder, batch)?;
         }
         if !draining.is_empty() {
             // Memory is on its way; meanwhile the class keeps evicting its own if it can.
             if self.memory.holds(class) {
-                self.evict_round(class)?;
+                room |= self.evict_round(class)?;
             }
-            return Ok(());
+            return Ok(room);
         }
         // What evicting the class's own least valuable page gives up per byte, against what
         // draining memory from another class gives up: the value of the pages that drain evicts,
@@ -1331,13 +1813,25 @@ impl BufferPool {
             .map_or(f32::INFINITY, |t| t / class.size() as f32);
         // Among the classes with a batch that can go to `class`: one whose only batches lie where
         // no run of `class`'s order fits has nothing to give it, and choosing it would leave
-        // `class` waiting on a drain that never starts.
+        // `class` waiting on a drain that never starts. A batch held for the class it was handed
+        // to is passed over, its stamp kept: with nothing else to drain, the claim waits on the
+        // lowest (DESIGN.md 9.1.3).
+        let passed = std::cell::Cell::new(None::<u64>);
         let colder = SizeClass::all()
             .filter(|&c| c != class)
             .filter_map(|c| {
-                let batch = self
-                    .memory
-                    .emptiest(c, class, |b| self.drainable(class, b))?;
+                let batch = self.memory.emptiest(c, class, |b| {
+                    if !self.drainable(class, b) {
+                        return false;
+                    }
+                    match self.memory.held_until(class, b, horizon) {
+                        Some(at) => {
+                            passed.set(Some(passed.get().map_or(at, |p| p.min(at))));
+                            false
+                        }
+                        None => true,
+                    }
+                })?;
                 let (held, in_use, per_byte) = self.drain_cost(class, batch, horizon);
                 Some((c, batch, held, in_use, per_byte))
             })
@@ -1346,33 +1840,87 @@ impl BufferPool {
             Some((holder, batch, _, in_use, per_byte))
                 if own == f32::INFINITY || (in_use == 0 && per_byte < own) =>
             {
-                let started = if class.size() <= memory::BATCH {
-                    self.memory.drain_for(holder, batch, class)
+                crate::race::point("buffer.chosen");
+                let (started, gate) = if class.size() <= memory::BATCH {
+                    let started = self.memory.drain_chosen_for(holder, batch, class, horizon);
+                    (started, None)
                 } else {
-                    self.memory.drain_run(class, batch)
+                    match self.drain_run(class, batch, Some(horizon)) {
+                        Drained::Ran(started) => (started, None),
+                        Drained::GateLost(gate) => (false, Some(gate)),
+                    }
+                };
+                // Not started, the batch may have been handed over since it was chosen: held,
+                // its stamp is what the claim waits on.
+                let held = (!started && gate.is_none())
+                    .then(|| self.memory.held_until(class, batch, horizon))
+                    .flatten();
+                let mut room = Room {
+                    started,
+                    gate,
+                    held,
+                    ..Room::default()
+                };
+                room |= Room {
+                    held: passed.get(),
+                    ..Room::default()
                 };
                 if started {
                     for (holder, batch) in self.memory.draining() {
-                        self.drain(holder, batch)?;
+                        room |= self.drain(holder, batch)?;
                     }
                 }
-                Ok(())
+                Ok(room)
             }
-            _ => self.evict_round(class),
+            // Evicting its own: a batch passed over as held may, once let go, cost less than the
+            // eviction did, so its stamp goes with the room whichever way the choice went.
+            _ => {
+                let mut room = self.evict_round(class)?;
+                room |= Room {
+                    held: passed.get(),
+                    ..Room::default()
+                };
+                Ok(room)
+            }
         }
     }
 
-    /// Whether the memory around `batch` for `class` can be drained: no frame of it is lent for
-    /// good ([`FOR_GOOD`]), which would never come back to free it. Measured: the log's ring, 19
-    /// frames lent at open, made the batch holding it the emptiest of its class, and a claim of
-    /// another class drained it and waited for good.
-    fn drainable(&self, class: SizeClass, batch: u32) -> bool {
-        let count = 1u32 << memory::order(class);
-        let start = batch & !(count - 1);
-        self.memory.taken_in(start, count).into_iter().all(|frame| {
-            let h = self.header(frame);
-            !(h.status() == LENT && h.flags.load(Ordering::Acquire) & FOR_GOOD != 0)
+    /// Reserves and drains the run of `class` around `batch` holding the rare path's gate
+    /// (DESIGN.md 9.1.1): no lend batch is published meanwhile, so a run holding a `LENT` batch is
+    /// refused before it is reserved, and the pass gives a `LENDING` batch to the run by the one
+    /// compare-and-swap that claims it. The gate is taken and let go inside one supply scope, so a
+    /// batch the drain releases wakes its waiters once the scope closes, the gate already free
+    /// (DESIGN.md 9.1.3). The gate lost, the gate's wait, taken before the try, is all the claim
+    /// waits on: its holder lets go within its own call (rule 4).
+    ///
+    /// As a claim's choice made at `horizon` (`chosen`), nothing is reserved while a batch of the
+    /// run is held for the class it was handed to (DESIGN.md 9.1.3).
+    fn drain_run(&self, class: SizeClass, batch: u32, chosen: Option<u64>) -> Drained {
+        let gate = self.frames.supply.gate_wait();
+        self.frames.supply.change(|_| {
+            if !self.memory.take_token(memory::RUN_TOKEN) {
+                crate::race::point("buffer.run_token_lost");
+                return Drained::GateLost(gate);
+            }
+            let started = !self.memory.run_holds_lent(class, batch)
+                && self.memory.drain_run_chosen(class, batch, chosen);
+            self.let_token_go(memory::RUN_TOKEN);
+            Drained::Ran(started)
         })
+    }
+
+    /// Lets the rare path's gate go: freed, then every caller that lost it woken (DESIGN.md 9.1.3,
+    /// rule 4). Nobody else: a gate let go is no supply.
+    pub(super) fn let_token_go(&self, holder: u64) {
+        self.memory.let_token_go(holder);
+        self.frames.supply.gate_let_go();
+    }
+
+    /// Whether the memory around `batch` for `class` can be drained: no batch of its run is a
+    /// lend batch, which no drain frees (DESIGN.md 9.1.1). A hint: `drain_run` checks it again
+    /// holding the rare path's token.
+    fn drainable(&self, class: SizeClass, batch: u32) -> bool {
+        !self.memory.run_holds_lent(class, batch)
     }
 
     /// What draining the memory around `batch` for `class` gives up: how many of its pages a step
@@ -1411,10 +1959,14 @@ impl BufferPool {
     /// The least value among a sample of `class`'s frames: free frames are worth nothing.
     /// `None` if the class holds no memory.
     fn threshold(&self, class: SizeClass) -> Option<f32> {
+        #[cfg(test)]
+        if let Some(t) = THRESHOLD.with(|t| t.get()) {
+            return Some(t);
+        }
         let now = self.now();
         let sample = self
             .memory
-            .sample(class, watt::THRESHOLD_SAMPLE, &mut rand::rng());
+            .sample(class, watt::THRESHOLD_SAMPLE, &mut sample_rng());
         sample
             .into_iter()
             .map(|f| {
@@ -1432,48 +1984,119 @@ impl BufferPool {
 
     /// One WATT round: evicts the clean pages among a sample whose value is at most the
     /// threshold, and starts writing the dirty ones out of their frames.
-    fn evict_round(self: &Arc<Self>, class: SizeClass) -> Result<()> {
+    /// Whether it evicted a page or started a write-out.
+    fn evict_round(self: &Arc<Self>, class: SizeClass) -> Result<Room> {
         let Some(threshold) = self.threshold(class) else {
-            return Ok(());
+            return Ok(Room::default());
         };
         let now = self.now();
         let mut candidates = self
             .memory
-            .sample(class, watt::CANDIDATES, &mut rand::rng());
+            .sample(class, watt::CANDIDATES, &mut sample_rng());
         candidates.sort_unstable();
         candidates.dedup();
         let mut outgoing = Vec::new();
+        let mut evicted = false;
+        let mut room = Room::default();
+        // Over the threshold: the candidates a cold value in the threshold's sample left.
+        let mut over = Vec::new();
         for frame in candidates {
             let h = self.header(frame);
-            if h.tracker.value(now) > threshold {
+            let value = h.tracker.value(now);
+            if value > threshold {
+                over.push((value, frame));
                 continue;
             }
-            let latch = || FrameLatch {
-                frames: self.frames.clone(),
-                frame,
-            };
-            let Some(hold) = self.latch_to_evict(class, frame, latch) else {
-                continue;
-            };
-            if h.dirty() {
-                // Written out of its frame, then gone: a copy to write from would take a frame of
-                // its own, which a full pool has none of to spare (one memory).
-                outgoing.push(self.start_write_out(hold));
-            } else {
-                self.evict(class, frame, hold);
+            evicted |= self.evict_or_write(class, frame, &mut outgoing, &mut room);
+        }
+        // A round that evicted nothing and started no write-out takes, from the candidates it
+        // read, the one of least value it can latch; and if none, walks the class's frames from
+        // where its last walk stopped, at most once round, for the first page it can latch
+        // (DESIGN.md 9.1.2). A sample can hold no page at all while pages are there to take, as
+        // when nearly every frame is lent. So a round frees a frame, starts a write, or found every
+        // page of the class latched, held or outgoing.
+        if !evicted && outgoing.is_empty() {
+            over.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            let taken = over
+                .into_iter()
+                .any(|(_, frame)| self.evict_or_write(class, frame, &mut outgoing, &mut room));
+            evicted = taken || self.walk_to_evict(class, &mut outgoing, &mut room);
+        }
+        let wrote = !outgoing.is_empty();
+        self.write_out(class, outgoing);
+        room.started = evicted || wrote;
+        Ok(room)
+    }
+
+    /// Walks `class`'s frames from where the last walk stopped, at most once round, and evicts or
+    /// starts writing out the first resident page it can latch: whether it did.
+    fn walk_to_evict(
+        self: &Arc<Self>,
+        class: SizeClass,
+        outgoing: &mut Vec<Outgoing>,
+        room: &mut Room,
+    ) -> bool {
+        let start = self.walk[class.index()].load(Ordering::Relaxed);
+        let after = self.memory.live_frames(class).filter(|&f| f >= start);
+        let before = self.memory.live_frames(class).take_while(|&f| f < start);
+        for frame in after.chain(before) {
+            if self.header(frame).status() == RESIDENT
+                && self.evict_or_write(class, frame, outgoing, room)
+            {
+                self.walk[class.index()].store(frame + 1, Ordering::Relaxed);
+                return true;
             }
         }
-        self.write_out(class, outgoing);
-        Ok(())
+        false
+    }
+
+    /// Evicts the page in `frame` if it is clean, or starts writing it out, if its latch can be
+    /// taken: whether it did either. A resident page of the class whose latch is held, not for a
+    /// write, is marked waited, after the claim's registration (DESIGN.md 9.1.2).
+    fn evict_or_write(
+        self: &Arc<Self>,
+        class: SizeClass,
+        frame: u32,
+        outgoing: &mut Vec<Outgoing>,
+        room: &mut Room,
+    ) -> bool {
+        let latch = || FrameLatch {
+            frames: self.frames.clone(),
+            frame,
+        };
+        if self.protected(frame) {
+            return false;
+        }
+        let Some(hold) = self.latch_to_evict(class, frame, latch) else {
+            crate::race::point("buffer.evict_lost");
+            // The take was lost: the latch was held, or let go or taken again since it was read.
+            // Marked whatever it reads now (a free latch's mark reports it changed), so a release
+            // between the lost take and the mark is the change it is, never nothing (DESIGN.md
+            // 9.1.2).
+            let h = self.header(frame);
+            let theirs = h.status() == RESIDENT
+                && PageId::from_raw(h.pid()).class() == class
+                && !h.has(WRITING);
+            if theirs {
+                match h.latch.mark_waited() {
+                    Marked::Waits => room.marked = true,
+                    Marked::Changed => room.changed = true,
+                }
+            }
+            return false;
+        };
+        if self.header(frame).dirty() {
+            // Written out of its frame, then gone: a copy to write from would take a frame of its
+            // own, which a full pool has none of to spare (one memory).
+            outgoing.push(self.start_write_out(hold));
+        } else {
+            self.evict(class, frame, hold);
+        }
+        true
     }
 
     /// Evicts the clean page in `frame`, which `hold` latches.
-    fn evict<L: Deref<Target = VersionedLatch>>(
-        &self,
-        class: SizeClass,
-        frame: u32,
-        hold: Held<L>,
-    ) {
+    fn evict<L: LatchRef>(&self, class: SizeClass, frame: u32, hold: Held<L>) {
         let h = self.header(frame);
         debug_assert!(!h.dirty() && !h.has(WRITING));
         self.table.remove(&self.frames.headers, h.pid(), frame);
@@ -1493,35 +2116,31 @@ impl BufferPool {
     /// Empties what it can of `batch`, draining out of `class`: clean pages are evicted, dirty
     /// ones written out. A page latched or being written back is looked at again on the next
     /// drain.
-    fn drain(self: &Arc<Self>, class: SizeClass, batch: u32) -> Result<()> {
+    ///
+    /// What it did, as a round of making room says it: a page evicted or a write-out started, and
+    /// every latch it found held marked waited or found changed, as eviction marks them (DESIGN.md
+    /// 9.1.2): a claim parked on the drain is woken by those releases too.
+    fn drain(self: &Arc<Self>, class: SizeClass, batch: u32) -> Result<Room> {
         let mut outgoing = Vec::new();
+        let mut room = Room::default();
         for i in 0..memory::frames_per_batch(class) {
             let frame = memory::frame_at(class, batch, i);
             if self.memory.is_free(class, frame) {
                 continue;
             }
-            let latch = || FrameLatch {
-                frames: self.frames.clone(),
-                frame,
-            };
-            let Some(hold) = self.latch_to_evict(class, frame, latch) else {
-                continue;
-            };
-            if self.header(frame).dirty() {
-                outgoing.push(self.start_write_out(hold));
-            } else {
-                self.evict(class, frame, hold);
-            }
+            let took = self.evict_or_write(class, frame, &mut outgoing, &mut room);
+            room.started |= took;
         }
+        room.started |= !outgoing.is_empty();
         self.write_out(class, outgoing);
-        Ok(())
+        Ok(room)
     }
 
     /// Latches `frame` exclusively, through `latch`, to evict its page, if it holds a page of
     /// `class` not being written. A frame chosen while its batch was `class`'s may by now be part
     /// of another class's frame, holding a page of that class or none: evicting that page as
     /// `class`'s would give its memory to two pages.
-    fn latch_to_evict<L: Deref<Target = VersionedLatch>>(
+    fn latch_to_evict<L: LatchRef>(
         &self,
         class: SizeClass,
         frame: u32,
@@ -1533,6 +2152,7 @@ impl BufferPool {
         if !holds || !h.latch.validate(version) {
             return None;
         }
+        crate::race::point("buffer.evict_take");
         let hold = Held::try_take_at(latch(), version)?;
         // WRITING is set under the latch by a pass claiming a dirty page, and cleared without it
         // when a write ends: look again later.
@@ -1549,7 +2169,8 @@ impl BufferPool {
         let frame = hold.latch().frame;
         let h = self.header(frame);
         let pid = PageId::from_raw(h.pid());
-        self.transit(frame).put(Completion::new_wait());
+        self.transit(frame)
+            .put(crate::storage::atoll::notify::wait());
         h.status.store(OUTGOING, Ordering::Release);
         Outgoing {
             pid,
@@ -1566,14 +2187,23 @@ impl BufferPool {
         if outgoing.is_empty() {
             return;
         }
-        let (temporary, logged): (Vec<Outgoing>, Vec<Outgoing>) =
-            outgoing.into_iter().partition(|o| o.pid.is_temporary());
-        for (outgoing, temporary) in [(logged, false), (temporary, true)] {
-            if !outgoing.is_empty() {
-                self.queue(Writeback::out(class, outgoing, temporary));
+        self.frames.supply.change(|event| {
+            // The frames are OUTGOING before this take. A late registration acquires its empty
+            // swap and sees that status; earlier waiters look again once the writes are queued.
+            // Wakers stay deferred until every writeback below has been published.
+            for out in &outgoing {
+                self.frames.finish_frame_wait(out.frame());
             }
-        }
-        self.signal_released();
+            crate::race::point("buffer.outgoing_waits_finished");
+            let (temporary, logged): (Vec<Outgoing>, Vec<Outgoing>) =
+                outgoing.into_iter().partition(|o| o.pid.is_temporary());
+            for (outgoing, temporary) in [(logged, false), (temporary, true)] {
+                if !outgoing.is_empty() {
+                    self.queue(Writeback::out(class, outgoing, temporary));
+                }
+            }
+            event.arm();
+        });
     }
 
     /// Ends the write-out of `pid` from the frame `hold` holds, with the write of a copy holding
@@ -1597,7 +2227,7 @@ impl BufferPool {
                 self.free_frame(pid.class(), frame, hold);
                 self.evicted(pid.class());
                 if let Some(c) = waiting {
-                    c.complete(0);
+                    notify::finish(&c, Ok(0));
                 }
             }
             Err(e) => {
@@ -1721,21 +2351,31 @@ impl BufferPool {
 
     /// Notes that a write of `frame` landed, from its completion: whoever waits on the pool, or on
     /// the frame's write-out, wakes and steps the writeback that settles it.
-    fn write_landed(&self, frame: u32, outgoing: bool) {
-        if outgoing {
-            let c = self.transit(frame).get(&self.store.epochs().enter());
-            if let Some(c) = c {
-                c.complete(0);
+    fn write_landed(&self, frame: u32, write_out: Option<u64>) {
+        // Its event opened before the request leaves the count, and a write-out's mark says it
+        // landed before anything else of it (DESIGN.md 9.1.3).
+        self.frames.supply.change(|event| {
+            if let Some(version) = write_out {
+                self.header(frame).landed_at(version);
             }
-        }
-        self.signal_released();
+            self.requests.fetch_sub(1, Ordering::AcqRel);
+            crate::race::point("buffer.write_landed");
+            if write_out.is_some() {
+                if let Ok(Some(c)) = self.transit(frame).get(&self.frames.completions) {
+                    notify::finish(&c, Ok(0));
+                }
+                // A changed cell belongs to a concurrent take or another transit. Its owner
+                // finishes the removed wait; the event still wakes the writeback drivers.
+            }
+            event.land();
+        });
     }
 
     /// Done once no writeback is queued or in flight; meanwhile, drives the queued ones.
     pub fn settle_writes(self: &Arc<Self>) -> Result<IOResult<()>> {
         let _step = self.store.epochs().enter();
         // Waiting starts before the look, so a write ending in between is not missed.
-        let wait = self.released_wait();
+        let wait = self.ticket();
         if let Some(c) = self.drive_writebacks()? {
             return Ok(IOResult::IO(IOCompletions(c)));
         }
@@ -1743,7 +2383,7 @@ impl BufferPool {
         if self.writes_in_flight.load(Ordering::Acquire) > 0
             || self.queued.load(Ordering::Acquire) > 0
         {
-            return Ok(IOResult::IO(IOCompletions(wait)));
+            return Ok(IOResult::IO(IOCompletions(self.supply_wait(wait))));
         }
         Ok(IOResult::Done(()))
     }
@@ -1761,7 +2401,7 @@ impl BufferPool {
         // Taken while WRITING keeps the page in the frame (nothing evicts or frees a page being
         // written), so the hold is on this page; once the flag is clear another may be in.
         let hold = (res.is_ok() && evict_after)
-            .then(|| Held::try_take(&h.latch))
+            .then(|| Held::try_take(self.frame_ref(frame)))
             .flatten();
         match res {
             Ok(()) => {
@@ -1794,61 +2434,15 @@ impl BufferPool {
 
     // ---------------------------------------------------------------- lending
 
-    /// A quiet free frame of `class`, lent for `what`, if one is free or the region has memory
-    /// for the class: never an eviction or a wait, so it may be taken under latches.
-    pub(crate) fn try_lend(
-        self: &Arc<Self>,
-        class: SizeClass,
-        what: LentUse,
-    ) -> Option<AlignedBlock> {
-        match self.take_or_grow(class, Purpose::Read) {
-            Got::Frame(frame) => Some(self.lend_frame(frame, class, what)),
-            Got::Quieting(_) | Got::None => None,
-        }
-    }
-
-    /// A quiet frame of `class`, lent for `what`, making room for it if need be. Step it until
-    /// done, holding no latch.
-    pub(crate) fn lend(
-        self: &Arc<Self>,
-        class: SizeClass,
-        what: LentUse,
-    ) -> Result<IOResult<AlignedBlock>> {
-        let frame = match self.claim(class, Purpose::Read)? {
-            IOResult::Done(frame) => frame,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-        };
-        Ok(IOResult::Done(self.lend_frame(frame, class, what)))
-    }
-
-    /// `frame`, free and quiet, lent for `what`: a hint to the page it last held fails, as its
-    /// latch's version rises.
-    fn lend_frame(self: &Arc<Self>, frame: u32, class: SizeClass, what: LentUse) -> AlignedBlock {
-        let h = self.header(frame);
-        let hold = self.take_free_latch(frame);
-        h.pid.store(NO_PAGE, Ordering::Release);
-        let flags = if what == LentUse::Log { FOR_GOOD } else { 0 };
-        h.flags.store(flags, Ordering::Release);
-        h.status.store(LENT, Ordering::Release);
-        drop(hold);
-        let token = self.lends.lent(frame, class, what);
-        let ptr =
-            std::ptr::NonNull::new(self.memory.region.ptr(frame)).expect("the region's memory");
-        // SAFETY: a frame of the region, which the lender keeps mapped; frames are aligned to
-        // 4 KiB; and a LENT frame is no one else's until its block gives it back.
-        unsafe { AlignedBlock::lent(ptr, class.size(), self.lends.clone(), token) }
-    }
-
-    /// A lent frame given back: free again.
+    /// A lent frame given back to its lend batch (DESIGN.md 9.1.1).
     fn take_back(&self, class: SizeClass, frame: u32) {
         debug_assert_eq!(
             self.header(frame).status(),
             LENT,
             "frame {frame} given back twice"
         );
-        // A lent frame's latch is no one's.
-        let hold = self.take_free_latch(frame);
-        self.free_frame(class, frame, hold);
+        debug_assert!(self.memory.is_lend_batch(frame / memory::GRAINS));
+        self.give_back_lent(class, frame);
     }
 
     /// The bytes lent beside the page table, by use, now and at most.
@@ -1880,7 +2474,7 @@ impl BufferPool {
     /// one that reaches here owing a copy asked for none, and a copy made now would pass the
     /// room's limit, so it is a fault.
     fn assert_kept(&self, frame: u32, pid: PageId) {
-        let n = self.cutting.load(Ordering::Acquire);
+        let n = self.memory.cutting.load(Ordering::Acquire);
         assert!(
             n == 0 || !self.owes_copy(frame, pid, n),
             "{pid:?} changed past checkpoint {n}'s cut with no room asked for its copy"
@@ -1890,7 +2484,7 @@ impl BufferPool {
     /// `pid`, in `frame` latched exclusively, is a page the cut in effect left out: owed no
     /// image, it needs no copy.
     fn left_out_of_cut(&self, frame: u32, pid: PageId) {
-        let n = self.cutting.load(Ordering::Acquire);
+        let n = self.memory.cutting.load(Ordering::Acquire);
         let h = self.header(frame);
         // Relaxed: under the frame's exclusive latch.
         if n != 0 && h.pending.load(Ordering::Relaxed) == n {
@@ -1909,44 +2503,54 @@ impl BufferPool {
             && page::kind(self.bytes(frame, pid.class())) != blob::KIND
     }
 
-    /// Copies `pid`, in `frame` latched exclusively, into `block` for the cut in effect, its room
-    /// charged.
-    fn copy_for_cut(&self, frame: u32, pid: PageId, mut block: AlignedBlock) {
+    /// Copies `pid`, in `frame` latched exclusively, into `block` for cut `n`, its room charged.
+    ///
+    /// Kept only under its own cut (DESIGN.md 9.1.1): a failed checkpoint's abandon may end cut `n`
+    /// between the change's reading of it and this insertion. `end_cut` stores `cutting` before it
+    /// takes the map's mutex and empties the map, so under that mutex either the map is emptied
+    /// after this insertion or `cutting` no longer reads `n`; then the copy is dropped, after the
+    /// guard is let go, since its block gives its frame and the room's bytes back and wakes their
+    /// waiters, and no wake runs under the map's mutex.
+    fn copy_for_cut(&self, frame: u32, pid: PageId, mut block: AlignedBlock, n: u64) {
         self.bytes(frame, pid.class()).copy_to(0, block.bytes_mut());
-        self.kept
-            .lock()
-            .insert(pid, KeptCopy::charged(block, &self.room));
+        let copy = KeptCopy::charged(block, &self.room);
+        crate::race::point("buffer.copy_for_cut");
+        let mut kept = self.kept.lock();
+        let late = if self.memory.cutting.load(Ordering::SeqCst) == n {
+            kept.insert(pid, copy);
+            None
+        } else {
+            Some(copy)
+        };
+        drop(kept);
+        drop(late);
         self.cut_owed.lock().remove(&pid);
         self.header(frame).pending.store(0, Ordering::Release);
     }
 
     /// Room for the copies the cut in effect needs of `pages`, each latched exclusively, before
     /// any of them changes: every one still owed a copy is copied as it stands, all within the
-    /// room or none. Refused, the change lets go of every latch it holds and of the change gate,
-    /// then waits ([`wait_for_room`](Self::wait_for_room)) and starts again: nothing yields once
-    /// a change has begun.
-    pub fn keep(self: &Arc<Self>, pages: &[&Exclusive<'_>]) -> bool {
-        match self.try_keep(pages) {
-            Ok(()) => {
-                self.room.admitted();
-                true
-            }
-            Err(Turned::Room) => {
-                let n = self.cutting.load(Ordering::Acquire);
+    /// room and the lend road's frames or none (DESIGN.md 9.1.1). Refused, the change lets go of
+    /// every latch it holds and of the change gate, then hands the refusal to
+    /// [`wait_for_room`](Self::wait_for_room) and starts again: nothing yields once a change has
+    /// begun.
+    pub fn keep(self: &Arc<Self>, pages: &[&Exclusive<'_>]) -> std::result::Result<(), Refused> {
+        let kept = self.try_keep(pages);
+        match &kept {
+            Ok(()) => self.room.admitted(),
+            Err(Refused {
+                why: lend::Why::Room,
+            }) => {
+                let n = self.memory.cutting.load(Ordering::Acquire);
                 self.room.refused(self.owed_bytes(pages, n));
-                false
             }
-            Err(Turned::Frame(class)) => {
-                #[cfg(test)]
-                FRAME_SHORTS.with(|n| n.set(n.get() + 1));
-                SHORT.with(|short| short.set(Some(class)));
-                false
-            }
+            Err(_) => {}
         }
+        kept
     }
 
-    fn try_keep(self: &Arc<Self>, pages: &[&Exclusive<'_>]) -> std::result::Result<(), Turned> {
-        let n = self.cutting.load(Ordering::Acquire);
+    fn try_keep(self: &Arc<Self>, pages: &[&Exclusive<'_>]) -> std::result::Result<(), Refused> {
+        let n = self.memory.cutting.load(Ordering::Acquire);
         if n == 0 {
             return Ok(());
         }
@@ -1955,40 +2559,36 @@ impl BufferPool {
             return Ok(());
         }
         if !self.room.charge(bytes) {
-            return Err(Turned::Room);
+            return Err(Refused {
+                why: lend::Why::Room,
+            });
         }
-        // A frame for each copy, every one or none, before any is made: a frame that would take
-        // an eviction is not waited for under the latches.
-        let mut owed = Vec::with_capacity(pages.len());
+        // A frame for each copy, every one or none, before any is made, from the lend road, which
+        // never waits under the latches.
+        let mut want = lend::Want::default();
         for (i, p) in pages.iter().enumerate() {
             if pages[..i].iter().any(|q| q.frame == p.frame) || !self.owes_copy(p.frame, p.pid, n) {
                 continue;
             }
-            match self.spare_or_lend(p.pid.class()) {
-                Some(block) => owed.push((p.frame, p.pid, block)),
-                None => {
-                    drop(owed);
-                    self.room.uncharge(bytes);
-                    return Err(Turned::Frame(p.pid.class()));
-                }
+            want.add(p.pid.class());
+        }
+        let mut lent = match self.lend_copies(&want) {
+            Ok(lent) => lent,
+            Err(refused) => {
+                self.room.uncharge(bytes);
+                return Err(refused);
             }
+        };
+        for (i, p) in pages.iter().enumerate() {
+            if pages[..i].iter().any(|q| q.frame == p.frame) || !self.owes_copy(p.frame, p.pid, n) {
+                continue;
+            }
+            let class = p.pid.class();
+            let frame = lent.take(class).expect("a frame lent for each copy");
+            let block = self.lent_block(class, frame);
+            self.copy_for_cut(p.frame, p.pid, block, n);
         }
-        for (frame, pid, block) in owed {
-            self.copy_for_cut(frame, pid, block);
-        }
-        // A frame lent ahead and not taken goes back.
-        SPARES.with(|spares| spares.borrow_mut().clear());
         Ok(())
-    }
-
-    /// A frame of `class` for a kept copy: one this thread was lent while it waited, or a free one.
-    fn spare_or_lend(self: &Arc<Self>, class: SizeClass) -> Option<AlignedBlock> {
-        let spare = SPARES.with(|spares| {
-            let mut spares = spares.borrow_mut();
-            let at = spares.iter().position(|b| b.len() == class.size())?;
-            Some(spares.swap_remove(at))
-        });
-        spare.or_else(|| self.try_lend(class, LentUse::Kept))
     }
 
     /// Bytes the copies of `pages` for checkpoint `n` take, each page counted once.
@@ -2006,32 +2606,89 @@ impl BufferPool {
             .sum()
     }
 
-    /// For a change refused room, which has let go of every latch and the change gate: drives
-    /// the checkpoint whose cut is in effect until its images give room back, or waits for
-    /// whoever is stepping it. An embedded database may have one connection and no other thread,
-    /// so the writer waiting is the one to step it. Done to start the change again at once.
-    pub fn wait_for_room(self: &Arc<Self>) -> Result<IOResult<()>> {
-        if let Some(class) = SHORT.with(|short| short.take()) {
-            // Turned down for a free frame, not for room: one lent now, holding nothing, which the
-            // change takes when it starts again. While it is being made, the change starting
-            // again finds the room as it did.
-            return Ok(match self.lend(class, LentUse::Kept)? {
-                IOResult::Done(block) => {
-                    SPARES.with(|spares| spares.borrow_mut().push(block));
-                    IOResult::Done(())
+    /// For a change refused (`refused`), which has let go of every latch and the change gate and
+    /// made every undo of its attempt (DESIGN.md 9.1.1, Turned down; 9.1.3, rule 5): it takes its
+    /// ticket on the supply here, then reads, taking nothing, whether what it lacks is there, and
+    /// starts again at once on a yes. Else, refused frames, it provides; else relief runs units of
+    /// the checkpoint, the only producer of returned frames and room, or the writer waits on its
+    /// ticket, of the remote kind. An embedded database may have one connection and no other
+    /// thread, so the writer waiting is the one to step it. Done to start the change again at
+    /// once.
+    pub fn wait_for_room(self: &Arc<Self>, refused: Refused) -> Result<IOResult<()>> {
+        let lend::Why::Frames {
+            want,
+            gate,
+            quiet_at,
+        } = refused.why
+        else {
+            // The room's bytes. The ticket first, here, after every undo the refusal made and with
+            // the writer's latches and change gate let go (DESIGN.md 9.1.3, rule 5); then the read:
+            // no cut, or the bytes the change was refused now there.
+            let ticket = self.frames.supply.ticket();
+            if self.memory.cutting.load(Ordering::Acquire) == 0 || self.room.takes_refused() {
+                return Ok(IOResult::Done(()));
+            }
+            return match self.relieve(Retry::Room(&ticket)) {
+                Relieved::Stepped(stepped) => stepped,
+                Relieved::Held | Relieved::Elsewhere => {
+                    Ok(IOResult::IO(IOCompletions(self.room.waiting(ticket))))
                 }
-                IOResult::IO(io) => IOResult::IO(io),
-            });
+            };
+        };
+        // The rare path's gate lost: its holder lets go within its own call, and that is all the
+        // request waits on (rule 4).
+        if let Some(gate) = gate {
+            return Ok(IOResult::IO(IOCompletions(gate)));
         }
-        // Taken first, so a release or a stepper leaving after the look below finishes it.
-        let wait = self.room.wait();
-        if self.cutting.load(Ordering::Acquire) == 0 {
+        // The ticket after every undo, then the read without taking anything: no cut, or what
+        // the change lacks reads as there now (rule 5).
+        let ticket = self.frames.supply.ticket();
+        if self.memory.cutting.load(Ordering::Acquire) == 0 || self.lend_hint(&want) {
             return Ok(IOResult::Done(()));
         }
-        match self.relief.get_ref().and_then(|relief| relief.relieve()) {
-            Some(stepped) => stepped,
-            None => Ok(IOResult::IO(IOCompletions(wait))),
+        // A cache batch outside the core: drained for the lend road, a real wait on its writes
+        // and loads, then the change again.
+        if let Some(provided) = self.provide()? {
+            return Ok(provided);
         }
+        let retry = Retry::Frames {
+            want: &want,
+            ticket: &ticket,
+        };
+        match self.relieve(retry) {
+            Relieved::Stepped(stepped) => return stepped,
+            // Another caller steps the checkpoint, or the checkpointing thread does: a state let
+            // go and every frame the checkpoint returns are changes of the supply the ticket is on.
+            Relieved::Held | Relieved::Elsewhere => {}
+        }
+        let wait = self.room.waiting(ticket);
+        if let Some(at) = quiet_at {
+            // Short only of a free batch not yet quiet: that epoch is a producer too.
+            self.store.epochs().wait_for(at, wait.clone());
+        }
+        Ok(IOResult::IO(IOCompletions(wait)))
+    }
+
+    /// For a change the change gate refused, its operation unwound to its top holding nothing
+    /// (DESIGN.md 9.1.3, the change gate closed by a cut): its wait on the gate's reopening,
+    /// registered first; then relief steps the cut, as a writer refused room does, since an
+    /// embedded database may have one connection and no other thread; else, another caller or the
+    /// checkpointing thread stepping it, the wait. Done to start the change again at once.
+    pub fn wait_for_gate(self: &Arc<Self>) -> Result<IOResult<()>> {
+        let Some(reopened) = self.store.gate_wait() else {
+            return Ok(IOResult::Done(()));
+        };
+        match self.relieve(Retry::Gate) {
+            Relieved::Stepped(stepped) => stepped,
+            Relieved::Held | Relieved::Elsewhere => Ok(IOResult::IO(IOCompletions(reopened))),
+        }
+    }
+
+    /// The relief a refused writer runs: [`Relieved::Elsewhere`] with none set.
+    fn relieve(&self, retry: Retry<'_>) -> Relieved {
+        self.relief
+            .get_ref()
+            .map_or(Relieved::Elsewhere, |relief| relief.relieve(retry))
     }
 
     /// Sets what a writer refused room drives: once, when the database opens.
@@ -2044,22 +2701,25 @@ impl BufferPool {
         self.room.wake();
     }
 
-    /// Whether room for kept copies is given back by another thread: the database's
-    /// checkpointing thread, while it runs.
-    pub fn room_freed_elsewhere(&self, elsewhere: bool) {
-        self.room.freed_elsewhere(elsewhere);
-    }
-
     /// Waits for room handed out that block until another thread gives it back.
     #[cfg(test)]
     pub fn blocking_room_waits(&self) -> u64 {
         self.room.blocking_waits()
     }
 
-    /// Whether the room takes the largest request it refused since it last admitted one: a
-    /// refused writer stepping the checkpoint stops then.
-    pub fn room_takes_refused(&self) -> bool {
-        self.cutting.load(Ordering::Acquire) == 0 || self.room.takes_refused()
+    /// Whether a refused writer may start its change again (DESIGN.md 9.1.1, Turned down): no cut
+    /// is in effect, or what it waits for came, the room taking the largest request it refused
+    /// since it last admitted one, or a frame of a class it wants. A refused writer stepping the
+    /// checkpoint stops then, at either exit of a unit.
+    pub fn may_retry(&self, retry: Retry<'_>) -> bool {
+        let uncut = self.memory.cutting.load(Ordering::Acquire) == 0;
+        match retry {
+            // The gate closes before the cut takes effect and opens after: no cut in effect says
+            // nothing of it.
+            Retry::Gate => !self.store.gate_closed(),
+            Retry::Room(_) => uncut || retry.moved() && self.room.takes_refused(),
+            Retry::Frames { want, .. } => uncut || retry.moved() && self.lend_hint(want),
+        }
     }
 
     /// Whether a change was refused room since one was last admitted: the checkpoint then images
@@ -2122,16 +2782,19 @@ impl BufferPool {
     /// on meanwhile, so the swap copies are listed after the frames, and every page owed stays
     /// listed until it is imaged or kept: one read in again comes in pending. Step it until done.
     pub fn begin_cut(&self, n: u64, scan: &mut CutScan) -> IOResult<()> {
-        self.cutting.store(n, Ordering::SeqCst);
+        self.memory.cutting.store(n, Ordering::SeqCst);
         while scan.next < self.memory.grains() {
             let h = self.header(scan.next);
             if h.status() == RESIDENT {
                 // A change holds it for a moment: come back.
-                let Some(hold) = Held::try_take(&h.latch) else {
-                    return IOResult::IO(IOCompletions(Completion::new_yield()));
+                let Some(hold) = Held::try_take(self.frame_ref(scan.next)) else {
+                    return IOResult::IO(IOCompletions(self.wait_for_resident_latch(scan.next)));
                 };
                 self.mark_owed(scan.next, n, &mut scan.owed);
                 hold.release_unchanged();
+            } else if h.status() == OUTGOING && !self.record_outgoing(scan.next, &mut scan.owed) {
+                // The write-out finished or the frame changed hands while its header was read.
+                return IOResult::IO(IOCompletions(Completion::new_yield()));
             }
             scan.next += 1;
         }
@@ -2145,20 +2808,79 @@ impl BufferPool {
         }
         // A page with a swap copy read in after the walk passed its frame, before the list was
         // set: unchanged since, the gate being closed.
+        // Only a resident page is marked here: one loading marks itself pending as it lands, the
+        // list being set, and one leaving leaves its frame, read back in pending. Their latches
+        // are held until IO no one here steps ends.
         while let Some(&pid) = scan.swapped.last() {
             if let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) {
                 let h = self.header(frame);
-                let Some(hold) = Held::try_take(&h.latch) else {
-                    return IOResult::IO(IOCompletions(Completion::new_yield()));
-                };
-                if h.status() == RESIDENT && h.pid() == pid.raw() {
-                    h.pending.store(n, Ordering::Release);
+                if h.status() == RESIDENT {
+                    let Some(hold) = Held::try_take(self.frame_ref(frame)) else {
+                        return IOResult::IO(IOCompletions(self.wait_for_resident_latch(frame)));
+                    };
+                    if h.status() == RESIDENT && h.pid() == pid.raw() {
+                        h.pending.store(n, Ordering::Release);
+                    }
+                    hold.release_unchanged();
                 }
-                hold.release_unchanged();
             }
             scan.swapped.pop();
         }
         IOResult::Done(())
+    }
+
+    /// Waits for a resident frame's held latch. A frame no longer resident, a free latch, or a
+    /// changed hold returns a yield so the caller fixes the page again under its current status.
+    /// A free latch constructs no signal. A held word's signal is registered before its status
+    /// is rechecked and that word is marked; its release finishes it after unlocking. A queued
+    /// OUTGOING transition finishes it before its deferred wake.
+    pub(super) fn wait_for_resident_latch(&self, frame: u32) -> Completion {
+        let h = self.header(frame);
+        crate::race::point("buffer.frame_before_look");
+        let seen = match h.latch.look() {
+            Look::Free(_) => return Completion::new_yield(),
+            Look::Held(seen) => seen,
+        };
+        let wait = self.frames.released[frame as usize].current_with(
+            &self.frames.completions,
+            crate::storage::atoll::notify::remote_wait,
+        );
+        crate::race::point("buffer.frame_wait_registered");
+        // The status belongs to the hold just observed. A clean eviction and a new load can
+        // change both since the caller first found a resident frame.
+        if h.status() != RESIDENT {
+            return Completion::new_yield();
+        }
+        crate::race::point("buffer.frame_before_mark");
+        match h.latch.mark_held(seen) {
+            Marked::Waits => wait,
+            Marked::Changed => Completion::new_yield(),
+        }
+    }
+
+    /// Records an owed page frozen by its write-out, even before its first swap copy exists.
+    /// The frame's hold stays at one version until the write frees it. The version check rejects
+    /// a header read across that free and a reuse of the frame.
+    fn record_outgoing(&self, frame: u32, owed: &mut Vec<PageId>) -> bool {
+        let h = self.header(frame);
+        let seen = match h.latch.look() {
+            Look::Held(seen) => seen,
+            Look::Free(_) => return false,
+        };
+        crate::race::point("buffer.cut_outgoing_seen");
+        let pid = PageId::from_raw(h.pid());
+        let needed = !pid.is_temporary() && h.owed();
+        let outgoing = h.status() == OUTGOING;
+        crate::sync::atomic::fence(Ordering::Acquire);
+        let same_hold =
+            matches!(h.latch.look(), Look::Held(now) if now.version() == seen.version());
+        if !outgoing || !same_hold {
+            return false;
+        }
+        if needed {
+            owed.push(pid);
+        }
+        true
     }
 
     fn mark_owed(&self, frame: u32, n: u64, owed: &mut Vec<PageId>) {
@@ -2208,7 +2930,7 @@ impl BufferPool {
             return;
         };
         let h = self.header(frame);
-        let Some(hold) = Held::try_take(&h.latch) else {
+        let Some(hold) = Held::try_take(self.frame_ref(frame)) else {
             // Changing: it differs from the copy, and stays owed.
             return;
         };
@@ -2231,6 +2953,12 @@ impl BufferPool {
         sweep::Sweep::new()
     }
 
+    /// The operations waiting in the shortage queue or holding its gate, for a test.
+    #[cfg(test)]
+    pub(crate) fn shortage_len(&self) -> usize {
+        self.shortage.len()
+    }
+
     /// Evicts `pid`, resident, clean and unheld, for a test: the page is then in its copies alone.
     /// Whether it was.
     #[cfg(test)]
@@ -2239,7 +2967,7 @@ impl BufferPool {
             return false;
         };
         let h = self.header(frame);
-        let Some(hold) = self.latch_to_evict(pid.class(), frame, || &h.latch) else {
+        let Some(hold) = self.latch_to_evict(pid.class(), frame, || self.frame_ref(frame)) else {
             return false;
         };
         if h.dirty() {
@@ -2252,18 +2980,41 @@ impl BufferPool {
 
     /// The checkpoint whose cut is in effect, 0 for none.
     pub fn cutting(&self) -> u64 {
-        self.cutting.load(Ordering::Acquire)
+        self.memory.cutting.load(Ordering::Acquire)
     }
 
     /// Checkpoint `n` has imaged every page its cut found owed: changes no longer keep pages.
     pub fn end_cut(&self, n: u64) {
-        debug_assert_eq!(self.cutting.load(Ordering::Acquire), n);
-        self.cutting.store(0, Ordering::SeqCst);
+        debug_assert_eq!(self.memory.cutting.load(Ordering::Acquire), n);
+        self.memory.cutting.store(0, Ordering::SeqCst);
         // Each copy's room is given back as it drops.
         let kept = std::mem::take(&mut *self.kept.lock());
         drop(kept);
         self.cut_owed.lock().clear();
-        self.room.cut_ended();
+        // Every empty copy batch and every batch a provide left lending goes back free: with the
+        // cut cleared first, a last return, a provide's release and this sweep cannot all miss
+        // one another (DESIGN.md 9.1.1). One change of the supply, whatever the sweep gave back: a
+        // writer refused frames or room needs no copy once the cut has ended, and starts again.
+        self.frames.supply.change(|event| {
+            self.sweep_lend_batches();
+            self.room.cut_ended();
+            event.arm();
+        });
+    }
+}
+
+/// What eviction samples frames with: the thread's generator, and under shuttle one seeded from
+/// shuttle's own, so a failing schedule replays the same samples and so the same latches and frames.
+fn sample_rng() -> impl rand::Rng {
+    #[cfg(shuttle)]
+    {
+        use rand::SeedableRng;
+        use shuttle::rand::RngCore;
+        rand::rngs::StdRng::seed_from_u64(shuttle::rand::thread_rng().next_u64())
+    }
+    #[cfg(not(shuttle))]
+    {
+        rand::rng()
     }
 }
 
@@ -2279,9 +3030,21 @@ pub struct CutScan {
 
 /// What a writer refused room for kept copies drives ([`BufferPool::wait_for_room`]).
 pub trait Relief: Send + Sync {
-    /// Steps the checkpoint whose cut is in effect while it is: `None` while someone else steps
-    /// it, who wakes the waiters as it leaves.
-    fn relieve(&self) -> Option<Result<IOResult<()>>>;
+    /// Steps the checkpoint whose cut is in effect until the writer may start again (`retry`,
+    /// [`BufferPool::may_retry`]), or says who steps it instead.
+    fn relieve(&self, retry: Retry<'_>) -> Relieved;
+}
+
+/// What a refused writer's relief did.
+pub enum Relieved {
+    /// Stepped the checkpoint: done, or waiting on its IO.
+    Stepped(Result<IOResult<()>>),
+    /// Another caller holds the checkpoint's state; letting it go wakes the room's waiters, and the
+    /// writer steps it then.
+    Held,
+    /// The checkpointing thread steps it, or there is no checkpoint to step: nothing for the
+    /// writer to do but wait for what it registered on.
+    Elsewhere,
 }
 
 /// What a checkpoint images of a page.
@@ -2300,8 +3063,13 @@ struct TempLocated {
 }
 
 impl Located for TempLocated {
-    fn read(self: Box<Self>, into: Arc<Buffer>, done: ReadDone) -> Result<IOResult<()>> {
-        self.temp.read(self.pid, into, done)?;
+    fn read(
+        self: Box<Self>,
+        into: Arc<Buffer>,
+        done: ReadDone,
+        submitting: source::Submitting<'_>,
+    ) -> Result<IOResult<()>> {
+        self.temp.read(self.pid, into, done, submitting)?;
         Ok(IOResult::Done(()))
     }
 }
@@ -2351,10 +3119,23 @@ impl<'a> Optimistic<'a> {
         self.pool.header(self.frame).latch.validate(self.version)
     }
 
+    /// Upgrades an unchanged page, or returns the wait for the hold that prevented the upgrade.
+    /// A moved version yields so the caller fixes the page again.
+    pub fn upgrade_or_wait(self) -> std::result::Result<Exclusive<'a>, Completion> {
+        let (pool, frame) = (self.pool, self.frame);
+        self.upgrade()
+            .ok_or_else(|| pool.wait_for_resident_latch(frame))
+    }
+
+    /// The hold preventing an optimistic read from validating, or a yield after a change.
+    pub fn wait_if_held(&self) -> Completion {
+        self.pool.wait_for_resident_latch(self.frame)
+    }
+
     /// Latches the page exclusively if it is unchanged since it was fixed.
     pub fn upgrade(self) -> Option<Exclusive<'a>> {
         let (pool, frame, pid) = (self.pool, self.frame, self.pid);
-        Held::try_take_at(&pool.header(frame).latch, self.version).map(|hold| Exclusive {
+        Held::try_take_at(pool.frame_ref(frame), self.version).map(|hold| Exclusive {
             pool,
             frame,
             pid,

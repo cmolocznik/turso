@@ -258,6 +258,35 @@ impl<K: Ord + Clone, V: Clone> MergableMap<K, V> {
     }
 }
 
+/// Opens the simulator's database: in Atoll mode through [`Database::open`], with Atoll's small
+/// configuration (Atoll's DESIGN.md §17); else as a file, as SQLite lays it out.
+fn open_database(
+    io: Arc<dyn IO>,
+    path: &str,
+    db_opts: DatabaseOpts,
+    encryption_opts: Option<EncryptionOpts>,
+    atoll: bool,
+) -> turso_core::Result<Arc<Database>> {
+    if atoll {
+        return Database::open(
+            io,
+            path,
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::default())
+                .db_opts(db_opts)
+                .atoll(turso_core::storage::atoll::db::AtollConfig::small()),
+        );
+    }
+    Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        db_opts,
+        encryption_opts,
+        Arc::new(SqliteDialect),
+    )
+}
+
 /// Configuration options for the Whopper simulator.
 pub struct WhopperOpts {
     /// Random seed for deterministic simulation. If None, a random seed is generated.
@@ -284,6 +313,8 @@ pub struct WhopperOpts {
     pub experimental_mvcc_passive_checkpoint: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
+    /// Open the database in Atoll mode (Atoll's DESIGN.md §17), with Atoll's small configuration.
+    pub atoll: bool,
     /// Elle tables to create: vec of (table_name, create_sql).
     pub elle_tables: Vec<(String, String)>,
     /// Workloads with weights: (weight, workload). Higher weight = more likely.
@@ -356,6 +387,7 @@ impl Default for WhopperOpts {
             enable_mvcc: false,
             experimental_mvcc_passive_checkpoint: false,
             enable_encryption: false,
+            atoll: false,
             elle_tables: vec![],
             workloads: vec![],
             properties: vec![],
@@ -490,6 +522,11 @@ impl WhopperOpts {
 
     pub fn with_enable_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
+        self
+    }
+
+    pub fn with_atoll(mut self, atoll: bool) -> Self {
+        self.atoll = atoll;
         self
     }
 
@@ -672,6 +709,8 @@ pub struct Whopper {
     db_path: String,
     wal_path: String,
     encryption_opts: Option<EncryptionOpts>,
+    /// Whether the database opens in Atoll mode.
+    atoll: bool,
     max_connections: usize,
     workloads: Vec<(u32, Box<dyn Workload>)>,
     properties: Vec<std::sync::Mutex<Box<dyn Property>>>,
@@ -763,13 +802,12 @@ impl Whopper {
                     opts.experimental_mvcc_passive_checkpoint,
                 );
 
-            match Database::open_file_with_flags(
+            match open_database(
                 io.clone(),
                 &db_path,
-                OpenFlags::default(),
                 db_opts,
                 encryption_opts.clone(),
-                Arc::new(SqliteDialect),
+                opts.atoll,
             ) {
                 Ok(db) => db,
                 Err(e) => {
@@ -850,6 +888,7 @@ impl Whopper {
             db_path,
             wal_path,
             encryption_opts,
+            atoll: opts.atoll,
             max_connections: opts.max_connections,
             workloads: opts.workloads,
             properties: opts
@@ -1146,6 +1185,31 @@ impl Whopper {
                         &op_result,
                     )
                     .inspect_err(|e| error!("property failed: {e}"))?;
+            }
+
+            // An error that ended the fiber's transaction, which the engine rolled back: its
+            // properties see the ROLLBACK it came to, so an Elle history fails its pending
+            // operations rather than leaving them open while the fiber goes on.
+            if txn_id.is_some()
+                && op_result.is_err()
+                && ctx.fiber.connection.get_auto_commit()
+                && !matches!(completed_op, Operation::Commit | Operation::Rollback)
+            {
+                for property in &self.properties {
+                    property
+                        .lock()
+                        .unwrap()
+                        .finish_op(
+                            self.current_step,
+                            fiber_idx,
+                            txn_id,
+                            exec_id.unwrap(),
+                            current_exec_id,
+                            &Operation::Rollback,
+                            &Ok(vec![]),
+                        )
+                        .inspect_err(|e| error!("property failed: {e}"))?;
+                }
             }
 
             // Save result for chaotic workload.
@@ -1703,13 +1767,12 @@ impl Whopper {
             .with_encryption(self.encryption_opts.is_some())
             .with_index_method(true)
             .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
-        let db = Database::open_file_with_flags(
+        let db = open_database(
             self.io.clone(),
             &self.db_path,
-            OpenFlags::default(),
             db_opts,
             self.encryption_opts.clone(),
-            Arc::new(SqliteDialect),
+            self.atoll,
         )
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
 

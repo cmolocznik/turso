@@ -1103,6 +1103,13 @@ pub(crate) type ParkedCheckpoint =
         crate::alloc::DynAllocator,
     >;
 
+/// A completion parked by one program state. Its registration ends before the state moves on.
+struct PendingIO {
+    completions: IOCompletions,
+    // One is outside any aligned Register box. Nonzero also gives Option<PendingIO> its empty value.
+    key: crate::io::WakerKey,
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -1110,7 +1117,7 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
-    pub io_completions: Option<IOCompletions>,
+    io_completions: Option<PendingIO>,
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -1168,6 +1175,7 @@ pub struct ProgramState {
     /// When the explicit checkpoint this statement parks in gives up: its busy timeout after it
     /// first parked.
     pub(crate) checkpoint_park_deadline: Option<std::time::Instant>,
+    pub(crate) checkpoint_park_timer: Option<crate::timer::Timed>,
     /// The parked checkpoint reached its busy timeout: the statement reports Busy and its busy
     /// handler does not retry, as the wait it would have slept through is spent.
     pub(crate) checkpoint_wait_spent: bool,
@@ -1386,6 +1394,7 @@ impl ProgramState {
             parked_checkpoint: None,
             steps_with_waker: false,
             checkpoint_park_deadline: None,
+            checkpoint_park_timer: None,
             checkpoint_wait_spent: false,
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
@@ -1572,6 +1581,7 @@ impl ProgramState {
         self.query_deadline = None;
         self.release_parked_checkpoint();
         self.checkpoint_park_deadline = None;
+        self.checkpoint_park_timer = None;
         self.checkpoint_wait_spent = false;
         if self.explicit_checkpoint_guard.is_some() {
             self.explicit_checkpoint_guard = None;
@@ -1832,8 +1842,19 @@ impl ProgramState {
     }
 
     /// Lets a parked checkpoint go: its locks, the database's checkpoint and the WAL's are
-    /// released, as after a failed checkpoint.
+    /// released, as after a failed checkpoint. Inline for the statement's reset, which nearly
+    /// always finds none.
+    #[inline]
     pub(crate) fn release_parked_checkpoint(&mut self) {
+        if self.checkpoint_park_timer.is_some() || self.parked_checkpoint.is_some() {
+            self.release_parked_checkpoint_now();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn release_parked_checkpoint_now(&mut self) {
+        self.checkpoint_park_timer = None;
         if let Some(mut checkpoint) = self.parked_checkpoint.take() {
             if let Err(err) = checkpoint.cleanup_after_external_io_error(LimboError::Busy) {
                 tracing::debug!("releasing a parked checkpoint: {err}");
@@ -1851,7 +1872,7 @@ impl ProgramState {
             self.io_completions.is_none(),
             "an instruction reported IO while a completion was already parked"
         );
-        self.io_completions = Some(io);
+        self.io_completions = Some(PendingIO::new(io));
         InsnFunctionStepResult::IO
     }
 
@@ -1867,9 +1888,46 @@ impl ProgramState {
 
     /// The completion the instruction that just returned `IO` parked.
     pub(crate) fn take_suspended_io(&mut self) -> IOCompletions {
-        self.io_completions
-            .take()
+        self.take_io_completions()
             .expect("an instruction that reports IO leaves its completion in the state")
+    }
+
+    /// Takes the completion and ends this state's registration on it.
+    pub(crate) fn take_io_completions(&mut self) -> Option<IOCompletions> {
+        self.io_completions.take().map(PendingIO::into_completions)
+    }
+
+    pub(crate) fn pending_io(&self) -> Option<&IOCompletions> {
+        self.io_completions
+            .as_ref()
+            .map(|pending| &pending.completions)
+    }
+
+    pub(crate) fn set_pending_io(&mut self, io: IOCompletions, waker: Option<&Waker>) {
+        // Withdraw before registering the replacement: it may be the very same completion.
+        self.io_completions = None;
+        let mut pending = PendingIO::new(io);
+        let key = waker.map(|_| self.io_waker_key());
+        pending.set_waker(key, waker);
+        self.io_completions = Some(pending);
+    }
+
+    fn set_pending_io_waker(&mut self, waker: Option<&Waker>) {
+        let key = waker.map(|_| self.io_waker_key());
+        self.io_completions
+            .as_mut()
+            .expect("a waker for a pending completion")
+            .set_waker(key, waker);
+    }
+
+    fn io_waker_key(&mut self) -> crate::io::WakerKey {
+        // SQL programs already include register zero. A zero-register helper state needs it
+        // only when it registers a waiter. The box stays at its address when the state moves;
+        // reset ends the registration before it can resize the box, and IO drops before the box.
+        if self.registers.is_empty() {
+            self.registers = vec![Register::Value(Value::Null)].into_boxed_slice();
+        }
+        crate::io::WakerKey::new(self.registers.as_ptr() as usize).expect("a nonempty register box")
     }
 
     /// Runs `f` on the metrics of this statement including its active and
@@ -2979,11 +3037,10 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Option<ProgramStep> {
         let io = state
-            .io_completions
-            .as_ref()
+            .pending_io()
             .expect("the caller checked the completion slot");
         if !io.finished() {
-            io.set_waker(waker);
+            state.set_pending_io_waker(waker);
             return Some(ProgramStep::IO);
         }
         if let Some(err) = io.get_error() {
@@ -3045,13 +3102,12 @@ impl Program {
             }
             Ok(IOResult::IO(io)) => {
                 state.pending_fail_prepare_error = Some(fail_error);
-                io.set_waker(waker);
                 if io.is_explicit_yield() {
+                    io.set_waker(waker);
                     return Some(ProgramStep::Yield);
                 }
-                let finished = io.finished();
-                state.io_completions = Some(io);
-                if !finished {
+                state.set_pending_io(io, waker);
+                if !state.pending_io().expect("just parked").finished() {
                     return Some(ProgramStep::IO);
                 }
                 None
@@ -3165,8 +3221,8 @@ impl Program {
         io: IOCompletions,
         waker: Option<&Waker>,
     ) -> Option<ProgramStep> {
-        io.set_waker(waker);
         if io.is_explicit_yield() {
+            io.set_waker(waker);
             // Yield: return control to the cooperative scheduler so
             // other connections can make progress (e.g. release a
             // contended lock). Don't store in io_completions —
@@ -3177,9 +3233,8 @@ impl Program {
             }
             return Some(ProgramStep::Yield);
         }
-        let finished = io.finished();
-        state.io_completions = Some(io);
-        if !finished {
+        state.set_pending_io(io, waker);
+        if !state.pending_io().expect("just parked").finished() {
             return Some(ProgramStep::IO);
         }
         None
@@ -3947,6 +4002,7 @@ impl Program {
         crate::native_ext::abort_aggregates(&mut state.registers);
         state.release_parked_checkpoint();
         state.checkpoint_park_deadline = None;
+        state.checkpoint_park_timer = None;
         state.checkpoint_wait_spent = false;
         state.explicit_checkpoint_guard = None;
         state.explicit_checkpoint_goal = None;
@@ -4905,6 +4961,273 @@ pub(crate) fn decode_serial_type_into_register(
         }
     }
     Ok(())
+}
+
+impl PendingIO {
+    const UNREGISTERED: crate::io::WakerKey = crate::io::WakerKey::MIN;
+
+    fn new(completions: IOCompletions) -> Self {
+        Self {
+            completions,
+            key: Self::UNREGISTERED,
+        }
+    }
+
+    fn set_waker(&mut self, key: Option<crate::io::WakerKey>, waker: Option<&Waker>) {
+        if let Some(waker) = waker {
+            let key = key.expect("a key for the program's waker");
+            turso_assert!(
+                key != Self::UNREGISTERED,
+                "a register address cannot be the unregistered value"
+            );
+            if self.key != Self::UNREGISTERED {
+                turso_assert!(
+                    self.key == key,
+                    "a pending IO registration changed its owner"
+                );
+            }
+            self.key = key;
+            self.completions.0.set_keyed_waker(key, waker);
+        } else {
+            self.clear_waker();
+        }
+    }
+
+    fn clear_waker(&mut self) {
+        let key = std::mem::replace(&mut self.key, Self::UNREGISTERED);
+        if key != Self::UNREGISTERED {
+            self.completions.0.withdraw_key(key);
+        }
+    }
+
+    fn into_completions(mut self) -> IOCompletions {
+        self.clear_waker();
+        std::mem::replace(
+            &mut self.completions,
+            IOCompletions(crate::Completion::new_yield()),
+        )
+    }
+}
+
+impl Drop for PendingIO {
+    fn drop(&mut self) {
+        self.clear_waker();
+    }
+}
+
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod pending_io_waiter_tests {
+    use super::{ProgramState, Register};
+    use crate::{types::IOCompletions, Completion};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::task::{Wake, Waker};
+
+    #[test]
+    fn changing_context_keeps_only_the_latest_statement_waker() {
+        let source = Completion::new_remote_wait();
+        let tasks: Vec<_> = (0..32).map(|_| task()).collect();
+        let wakers: Vec<_> = tasks.iter().map(|t| Waker::from(t.clone())).collect();
+        let mut state = ProgramState::new(1, 0);
+        state.set_pending_io(IOCompletions(source.clone()), Some(&wakers[0]));
+        for waker in &wakers[1..] {
+            state.set_pending_io_waker(Some(waker));
+        }
+        let registered = source.wakers();
+        source.complete(0);
+        let wakes: Vec<_> = tasks.iter().map(|t| t.calls()).collect();
+        drop(state);
+        assert_eq!(registered, 1, "one pending statement retained old Contexts");
+        assert!(wakes[..31].iter().all(|n| *n == 0));
+        assert_eq!(wakes[31], 1);
+    }
+
+    #[test]
+    fn a_statement_reregisters_after_a_progress_wake() {
+        let source = Completion::new_remote_wait();
+        let (old, latest) = (task(), task());
+        let (wo, wl) = (Waker::from(old.clone()), Waker::from(latest.clone()));
+        let mut state = ProgramState::new(1, 0);
+        state.set_pending_io(IOCompletions(source.clone()), Some(&wo));
+        source.wake();
+        let after_progress = (source.wakers(), old.calls(), source.finished());
+        state.set_pending_io_waker(Some(&wl));
+        let registered_again = source.wakers();
+        source.complete(0);
+        drop(state);
+        assert_eq!(after_progress, (0, 1, false));
+        assert_eq!(
+            registered_again, 1,
+            "a progress wake consumed the statement registration forever"
+        );
+        assert_eq!((old.calls(), latest.calls()), (1, 1));
+    }
+
+    #[test]
+    fn moving_states_preserves_two_independent_waiters_on_one_source() {
+        let source = Completion::new_remote_wait();
+        let (a, b, latest) = (task(), task(), task());
+        let (wa, wb, wl) = (
+            Waker::from(a.clone()),
+            Waker::from(b.clone()),
+            Waker::from(latest.clone()),
+        );
+        let mut states = vec![ProgramState::new(1, 0), ProgramState::new(1, 0)];
+        states[0].set_pending_io(IOCompletions(source.clone()), Some(&wa));
+        states[1].set_pending_io(IOCompletions(source.clone()), Some(&wb));
+        let before_move = source.wakers();
+        states.swap(0, 1);
+        states[1].set_pending_io_waker(Some(&wl));
+        let after_move = source.wakers();
+        drop(states.remove(0));
+        let after_drop_one = source.wakers();
+        source.complete(0);
+        drop(states);
+        assert_eq!((before_move, after_move, after_drop_one), (2, 2, 1));
+        assert_eq!((a.calls(), b.calls(), latest.calls()), (0, 0, 1));
+    }
+
+    #[test]
+    fn taking_pending_io_removes_the_statement_waker_without_cloning_the_source() {
+        let source = Completion::new_remote_wait();
+        let t = task();
+        let w = Waker::from(t.clone());
+        let mut state = ProgramState::new(1, 0);
+        state.set_pending_io(IOCompletions(source.clone()), Some(&w));
+        let before = source.handles();
+        let taken = state.take_io_completions().expect("pending IO");
+        let after = (
+            source.handles(),
+            source.wakers(),
+            state.pending_io().is_none(),
+        );
+        drop(state);
+        source.complete(0);
+        drop(taken);
+        assert_eq!(before, 2);
+        assert_eq!(after, (2, 0, true));
+        assert_eq!((source.handles(), t.calls()), (1, 0));
+    }
+
+    #[test]
+    fn reset_with_a_different_register_count_cancels_the_old_waiter() {
+        let (source, next) = (Completion::new_remote_wait(), Completion::new_remote_wait());
+        let (old, latest) = (task(), task());
+        let (wo, wl) = (Waker::from(old.clone()), Waker::from(latest.clone()));
+        let mut state = ProgramState::new(1, 0);
+        state.set_pending_io(IOCompletions(source.clone()), Some(&wo));
+        state.reset(Some(0), None);
+        let after_reset = (source.wakers(), state.pending_io().is_none());
+        state.reset(Some(4), None);
+        state.set_pending_io(IOCompletions(next.clone()), Some(&wl));
+        source.complete(0);
+        next.complete(0);
+        drop(state);
+        assert_eq!(after_reset, (0, true));
+        assert_eq!((old.calls(), latest.calls()), (0, 1));
+    }
+
+    #[test]
+    fn dropping_statement_states_leaves_no_cancelled_contexts() {
+        let source = Completion::new_remote_wait();
+        let tasks: Vec<_> = (0..32).map(|_| task()).collect();
+        let mut retained = 0;
+        for t in &tasks {
+            let w = Waker::from(t.clone());
+            let mut state = ProgramState::new(1, 0);
+            state.set_pending_io(IOCompletions(source.clone()), Some(&w));
+            drop(state);
+            retained += source.wakers();
+        }
+        source.complete(0);
+        let wakes: usize = tasks.iter().map(|t| t.calls()).sum();
+        assert_eq!((retained, wakes, source.handles()), (0, 0, 1));
+    }
+
+    #[test]
+    fn replacing_pending_io_on_the_same_source_keeps_the_new_registration() {
+        let source = Completion::new_remote_wait();
+        let (old, latest) = (task(), task());
+        let (wo, wl) = (Waker::from(old.clone()), Waker::from(latest.clone()));
+        let mut state = ProgramState::new(1, 0);
+        state.set_pending_io(IOCompletions(source.clone()), Some(&wo));
+        state.set_pending_io(IOCompletions(source.clone()), Some(&wl));
+        let registered = source.wakers();
+        source.complete(0);
+        drop(state);
+        assert_eq!(
+            registered, 1,
+            "dropping the old owner removed the new registration"
+        );
+        assert_eq!((old.calls(), latest.calls()), (0, 1));
+    }
+
+    #[test]
+    fn a_poll_without_a_waker_withdraws_the_async_registration() {
+        let source = Completion::new_remote_wait();
+        let t = task();
+        let w = Waker::from(t.clone());
+        let mut state = ProgramState::new(1, 0);
+        state.set_pending_io(IOCompletions(source.clone()), Some(&w));
+        state.set_pending_io_waker(None);
+        let registered = source.wakers();
+        source.complete(0);
+        drop(state);
+        assert_eq!((registered, t.calls()), (0, 0));
+    }
+
+    #[test]
+    fn a_zero_register_helper_can_wait_and_move_without_a_global_id() {
+        let source = Completion::new_remote_wait();
+        let t = task();
+        let w = Waker::from(t.clone());
+        let mut state = ProgramState::new(0, 0);
+        let before = state.registers.len();
+        state.set_pending_io(IOCompletions(source.clone()), Some(&w));
+        let mut moved = Box::new(state);
+        moved.set_pending_io_waker(Some(&w));
+        let after = (moved.registers.len(), source.wakers());
+        source.complete(0);
+        drop(moved);
+        assert_eq!((before, after), (0, (1, 1)));
+        assert_eq!(t.calls(), 1);
+    }
+
+    #[test]
+    fn pending_wait_storage_does_not_widen_io_completions() {
+        let word = std::mem::size_of::<usize>();
+        let completion_bytes = std::mem::size_of::<Completion>();
+        let io_bytes = std::mem::size_of::<IOCompletions>();
+        let pending_bytes = std::mem::size_of::<super::PendingIO>();
+        let slot_bytes = std::mem::size_of::<Option<super::PendingIO>>();
+        let state_bytes = std::mem::size_of::<ProgramState>();
+        let register_bytes = std::mem::size_of::<Register>();
+        eprintln!("STATEMENT_WAIT_LAYOUT completion={completion_bytes} IOCompletions={io_bytes} PendingIO={pending_bytes} Slot={slot_bytes} ProgramState={state_bytes} Register={register_bytes}");
+        assert_eq!(
+            (completion_bytes, io_bytes, pending_bytes, slot_bytes),
+            (word, word, 2 * word, 2 * word)
+        );
+    }
+
+    struct Calls(AtomicUsize);
+    impl Calls {
+        fn calls(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+    impl Wake for Calls {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn task() -> Arc<Calls> {
+        Arc::new(Calls(AtomicUsize::new(0)))
+    }
 }
 
 #[cfg(test)]

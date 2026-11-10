@@ -402,7 +402,7 @@ impl Statement {
     /// Returns None if no IO is pending.
     /// This is used by async state machines that need to yield the completions.
     pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
-        self.state.io_completions.take()
+        self.state.take_io_completions()
     }
 
     fn arm_query_timeout_if_needed(&mut self) {
@@ -516,13 +516,14 @@ impl Statement {
         match refresh_analyze_stats_nonblock(&self.program.connection, refresh) {
             Ok(crate::IOResult::IO(io)) => {
                 self.busy = true;
-                io.set_waker(waker);
                 if io.is_explicit_yield() {
+                    drop(self.state.take_io_completions());
+                    io.set_waker(waker);
                     return Ok(StepResult::Yield);
                 }
                 // Park the completion where `take_io_completions` finds it,
                 // like an instruction waiting on I/O would.
-                self.state.io_completions = Some(io);
+                self.state.set_pending_io(io, waker);
                 return Ok(StepResult::IO);
             }
             Ok(crate::IOResult::Done(())) => {}
@@ -531,6 +532,7 @@ impl Statement {
             }
         }
         self.analyze_refresh = None;
+        drop(self.state.take_io_completions());
         self.busy = false;
         Ok(StepResult::Done)
     }
@@ -809,6 +811,12 @@ impl Statement {
         self._step(None).map_err(|error| self.format_error(error))
     }
 
+    /// The pending completion, for tests that count this statement's waiter registrations.
+    #[cfg(test)]
+    pub(crate) fn pending_io_for_test(&self) -> Option<crate::Completion> {
+        self.state.pending_io().map(|io| io.0.clone())
+    }
+
     /// Whether the statement is parked in an explicit checkpoint, waiting for a release.
     #[cfg(test)]
     pub(crate) fn parked_checkpoint(&self) -> bool {
@@ -853,12 +861,15 @@ impl Statement {
     /// does. Its result is the statement's to read at its next step. A step that left no
     /// completion (a yield) gets one step of the IO, as a pump.
     pub fn wait_io(&self) -> Result<()> {
-        match &self.state.io_completions {
+        match self.state.pending_io() {
             Some(io) => {
                 self.pager.io.wait(&io.0);
                 Ok(())
             }
-            None => self.pager.io.step(),
+            None => match self.pager.io.step() {
+                Ok(()) => Ok(()),
+                Err(_error) => crate::io::stepping_failed("a statement's yield pump"),
+            },
         }
     }
 
@@ -1588,8 +1599,7 @@ impl Statement {
 
         let in_flight = self
             .state
-            .io_completions
-            .take()
+            .take_io_completions()
             .filter(|io| !io.0.is_wait());
         if let Some(io) = in_flight {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {

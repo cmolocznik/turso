@@ -26,6 +26,7 @@ use super::AtollDb;
 use crate::error::{ConstraintKind, ConstraintViolation};
 use crate::numeric::Numeric;
 use crate::storage::atoll::btree::{Cursor, Kept, Mode, Near, Outcome, Put, Remove, Seek};
+use crate::storage::atoll::buffer::Owner;
 use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::txn::versioned::{
     Guard, GuardOp, Guarded, VersionedCursor, VersionedTree, Write, WriteOp, HEADER,
@@ -75,8 +76,39 @@ macro_rules! done {
     };
 }
 
-/// The transaction a connection's cursors read in: none between transactions.
-pub type TxnCell = Arc<Mutex<Option<Txn>>>;
+/// The transaction a connection's cursors read in, none between transactions, and the
+/// connection's identity, which the memory-shortage tenures of its operations carry (DESIGN.md
+/// 9.1.3, *Revoking an inactive tenure*).
+pub struct TxnSlot {
+    txn: Mutex<Option<Txn>>,
+    conn: Arc<crate::storage::atoll::buffer::Conn>,
+}
+
+impl TxnSlot {
+    /// A connection's slot, holding `txn`.
+    pub fn new(txn: Option<Txn>) -> TxnCell {
+        Arc::new(Self {
+            txn: Mutex::new(txn),
+            conn: crate::storage::atoll::buffer::Conn::new(),
+        })
+    }
+
+    /// The connection's identity.
+    pub(in crate::storage::atoll) fn conn(&self) -> &Arc<crate::storage::atoll::buffer::Conn> {
+        &self.conn
+    }
+}
+
+impl std::ops::Deref for TxnSlot {
+    type Target = Mutex<Option<Txn>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.txn
+    }
+}
+
+/// A connection's [`TxnSlot`], shared with its cursors.
+pub type TxnCell = Arc<TxnSlot>;
 
 /// A key above every encoded key: no column's encoding begins with 0xff, its first byte being a
 /// NULL's (0x01 or 0xfe) or a tag between them, inverted or not.
@@ -132,6 +164,9 @@ pub struct AtollCursor {
     /// Whether rewinds and moves on walk the versions the statement does not see, each holding
     /// its key, as rows (R10, [`VersionedTree::unseen_first`]).
     unseen: bool,
+    /// The top of the operation under way, which keeps its memory-shortage tenure across IO
+    /// (DESIGN.md 9.1.3, *The top and the owner*): a cursor runs one operation at a time.
+    owner: Owner,
 }
 
 /// The record of the row a cursor rests on, once read, and the allocation the next is built in.
@@ -252,6 +287,8 @@ impl AtollCursor {
     ) -> Self {
         #[cfg(test)]
         CURSORS_BUILT.with(|n| n.set(n.get() + 1));
+        // The cursor's operations carry its connection's identity (DESIGN.md 9.1.3).
+        let txn_conn = txn.conn().clone();
         let a = db.atoll();
         let tree = VersionedTree::open(
             db.io().clone(),
@@ -283,6 +320,7 @@ impl AtollCursor {
             refreshing: None,
             guarding: None,
             unseen: false,
+            owner: Owner::of(txn_conn),
         }
     }
 
@@ -375,6 +413,28 @@ impl AtollCursor {
         self.cursor.rest_nowhere(near);
     }
 
+    /// Whether the operation under way holds a memory-shortage tenure, for a test.
+    #[cfg(test)]
+    pub(crate) fn shortage_queued(&self) -> bool {
+        self.owner.queued()
+    }
+
+    /// Ends the operation under way, as its statement's reset does to a cursor it keeps: the
+    /// memory-shortage tenure it held let go, its place and the gate passed on.
+    pub fn end_operation(&mut self) {
+        self.owner.end();
+    }
+
+    /// One call of the cursor's operation `op` as its owner's: a shortage `op` comes to is
+    /// reserved here, holding nothing, and its tenure kept with the cursor until `op` is done.
+    #[inline]
+    fn owned<T>(
+        &mut self,
+        op: impl FnOnce(&mut Self) -> Result<IOResult<T>>,
+    ) -> Result<IOResult<T>> {
+        Owner::call_in(self, |c| &mut c.owner, op)
+    }
+
     /// Starts from `near`, the leaf a cursor over the tree last stood at.
     pub fn start_near(&mut self, near: Near) {
         self.cursor.set_near(near);
@@ -424,9 +484,9 @@ impl AtollCursor {
     /// Moves to the first row.
     pub fn rewind(&mut self) -> Result<IOResult<()>> {
         if self.unseen {
-            return self.step_unseen(true);
+            return self.owned(|c| c.step_unseen(true));
         }
-        done!(self.step(Move::Seek(&[], Seek::Ge)));
+        done!(self.owned(|c| c.step(Move::Seek(&[], Seek::Ge))));
         Ok(IOResult::Done(()))
     }
 
@@ -436,14 +496,14 @@ impl AtollCursor {
             Layout::Table => key::rowid(i64::MAX).to_vec(),
             _ => ABOVE_ENCODED.to_vec(),
         };
-        done!(self.step(Move::Seek(&above, Seek::Le)));
+        done!(self.owned(|c| c.step(Move::Seek(&above, Seek::Le))));
         Ok(IOResult::Done(()))
     }
 
     /// Moves to the next row: from an entry found gone, the one after it, where it already stands.
     pub fn next(&mut self) -> Result<IOResult<()>> {
         if self.unseen {
-            return self.step_unseen(false);
+            return self.owned(|c| c.step_unseen(false));
         }
         if self.left.take().is_some() {
             self.record.forget(&mut self.cursor);
@@ -469,20 +529,20 @@ impl AtollCursor {
             Some(Err(e)) => return Err(e),
             None => {}
         }
-        done!(self.step(Move::Next));
+        done!(self.owned(|c| c.step(Move::Next)));
         Ok(IOResult::Done(()))
     }
 
     /// Moves to the previous row: from an entry found gone, the last one before its key.
     pub fn prev(&mut self) -> Result<IOResult<()>> {
         if let Some(key) = self.left.take() {
-            if let IOResult::IO(io) = self.step(Move::Seek(&key, Seek::Lt))? {
+            if let IOResult::IO(io) = self.owned(|c| c.step(Move::Seek(&key, Seek::Lt)))? {
                 self.left = Some(key);
                 return Ok(IOResult::IO(io));
             }
             return Ok(IOResult::Done(()));
         }
-        done!(self.step(Move::Prev));
+        done!(self.owned(|c| c.step(Move::Prev)));
         Ok(IOResult::Done(()))
     }
 
@@ -510,7 +570,7 @@ impl AtollCursor {
         let Some(key) = self.refreshing.take().or(key).or_else(|| self.position()) else {
             return Ok(IOResult::Done(()));
         };
-        if let IOResult::IO(io) = self.step(Move::Seek(&key, Seek::Ge))? {
+        if let IOResult::IO(io) = self.owned(|c| c.step(Move::Seek(&key, Seek::Ge)))? {
             self.refreshing = Some(key);
             return Ok(IOResult::IO(io));
         }
@@ -544,7 +604,7 @@ impl AtollCursor {
         if !self.index.as_ref().is_some_and(|i| i.has_rowid) {
             return Ok(IOResult::Done(None));
         }
-        done!(self.tree.load(&mut self.cursor));
+        done!(self.load());
         let record = self.record_now()?.expect("a row");
         Ok(IOResult::Done(Some(last_rowid(record)?)))
     }
@@ -569,9 +629,19 @@ impl AtollCursor {
     /// The row's record. Step it until done.
     pub fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>> {
         if !self.is_empty() {
-            done!(self.tree.load(&mut self.cursor));
+            done!(self.load());
         }
         Ok(IOResult::Done(self.record_now()?))
+    }
+
+    /// Reads the row's value where it is out of line and not read yet, as its owner's operation;
+    /// one in the entry or read already is there.
+    #[inline]
+    fn load(&mut self) -> Result<IOResult<()>> {
+        if !self.cursor.unread() {
+            return self.tree.load(&mut self.cursor);
+        }
+        self.owned(|c| c.tree.load(&mut c.cursor))
     }
 
     /// The row's record, its value read.
@@ -596,7 +666,7 @@ impl AtollCursor {
         }
         // Held apart while it runs, so its key is read where it lies.
         let mut s = self.seeking.take().expect("a seek");
-        let out = self.seek_planned(&mut s);
+        let out = self.owned(|c| c.seek_planned(&mut s));
         match out {
             Ok(IOResult::IO(_)) => self.seeking = Some(s),
             _ => self.seek_key = s.prefix,
@@ -898,12 +968,19 @@ impl AtollCursor {
                 )
             });
         }
-        self.write()
+        self.owned(Self::write)
     }
 
     /// A write path's probe of `key`, judged by its newest version as a write would judge it
     /// (A3.12, A4.9; [`VersionedTree::probe`]). Step it until done.
     pub fn probe(
+        &mut self,
+        key: &[u8],
+    ) -> Result<IOResult<crate::storage::atoll::txn::versioned::Probe>> {
+        self.owned(|c| c.probe_step(key))
+    }
+
+    fn probe_step(
         &mut self,
         key: &[u8],
     ) -> Result<IOResult<crate::storage::atoll::txn::versioned::Probe>> {
@@ -975,6 +1052,10 @@ impl AtollCursor {
     /// judged comes to, or [`Guard::Clear`] once none is. A wait keeps the guard at its key, which
     /// stepping it again judges afresh. Step it until done.
     pub fn guard(&mut self, prefix: &[u8], guarded: Guarded) -> Result<IOResult<Guard>> {
+        self.owned(|c| c.guard_step(prefix, guarded))
+    }
+
+    fn guard_step(&mut self, prefix: &[u8], guarded: Guarded) -> Result<IOResult<Guard>> {
         let mut lock = self.txn.lock();
         let txn = lock.as_mut().ok_or_else(outside)?;
         let (txns, versions) = (self.db.atoll().transactions(), self.db.versions());
@@ -1053,7 +1134,7 @@ impl AtollCursor {
                 )
             });
         }
-        self.write()
+        self.owned(Self::write)
     }
 
     fn write(&mut self) -> Result<IOResult<Write>> {

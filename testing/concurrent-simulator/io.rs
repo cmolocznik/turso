@@ -147,13 +147,20 @@ impl IO for SimulatorIO {
         self.time
             .fetch_add(duration.as_micros() as u64, Ordering::SeqCst);
     }
-    fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
+    fn open_file(&self, path: &str, flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
         let lookup_key = canonical_key(path);
         {
             let files = self.files.lock().unwrap();
             if let Some((_, file)) = files.iter().find(|f| f.0 == lookup_key) {
                 return Ok(file.clone());
             }
+        }
+        // As the real IOs do: a file that does not exist is created only when asked, so an open
+        // that probes for one, as Atoll's log does for its segments, finds it absent.
+        if !flags.contains(OpenFlags::Create) {
+            return Err(turso_core::LimboError::CompletionError(
+                turso_core::CompletionError::IOError(std::io::ErrorKind::NotFound, "open"),
+            ));
         }
 
         let file = Arc::new(SimulatorFile::new(

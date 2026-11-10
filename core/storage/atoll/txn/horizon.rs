@@ -97,7 +97,7 @@ impl Horizon {
         if self.raise(clock) >= ts {
             return None;
         }
-        let c = Completion::new_wait();
+        let c = crate::storage::atoll::notify::wait();
         self.waits.push(c.clone());
         fence(Ordering::SeqCst);
         (self.raise(clock) < ts).then_some(c)

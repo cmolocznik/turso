@@ -186,7 +186,7 @@ pub fn judge(io: &Arc<dyn IO>, file: &Arc<dyn File>) -> Result<Found> {
         }
         Err(e) => Some(e),
     });
-    io.wait_for_completion(file.pread(0, c)?)?;
+    crate::storage::atoll::park::wait_for_completion(io.as_ref(), file.pread(0, c)?)?;
     let read = got.load(Ordering::Acquire).min(len as usize);
     // SAFETY: the read filled the block, which nothing else uses.
     let bytes = unsafe { std::slice::from_raw_parts(block.as_ptr(), 2 * SIZE) };
@@ -252,7 +252,7 @@ impl Control {
         // SAFETY: a fresh block of the superblock's size.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), block.as_ptr(), SIZE) };
         let at = (seq % 2) * SIZE as u64;
-        let durable = Completion::new_wait();
+        let durable = crate::storage::atoll::notify::wait();
         let done = durable.clone();
         if self.file.supports_durable_writes() {
             let c = Completion::new_write(move |res| finish(&done, whole(SIZE, res)));
@@ -281,7 +281,7 @@ impl Control {
     /// Writes `sb` and waits until it is durable, as opening a database does.
     pub fn write_and_wait(&self, sb: &Superblock) -> Result<()> {
         let c = self.write(sb)?;
-        self.io.wait_for_completion(c)
+        crate::storage::atoll::park::wait_for_completion(self.io.as_ref(), c)
     }
 
     /// Done once `sb` is durable.
@@ -339,7 +339,7 @@ pub(crate) fn rewrite_in_charge(
     let (control, sb) = Control::open(io.clone(), base).unwrap();
     let mut sb = sb.expect("a superblock in charge");
     change(&mut sb);
-    io.wait_for_completion(control.write_encoded(sb.seq, &sb.encode()).unwrap())
+    crate::storage::atoll::park::wait_for_completion(io.as_ref(), control.write_encoded(sb.seq, &sb.encode()).unwrap())
         .unwrap();
     sb
 }

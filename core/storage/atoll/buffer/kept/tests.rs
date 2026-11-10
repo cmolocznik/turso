@@ -13,7 +13,8 @@ use crate::storage::atoll::btree::{
     SHRINKS_HELD, SHRINKS_REFUSED, SPLITS_REFUSED,
 };
 use crate::storage::atoll::buffer::{
-    BufferConfig, BufferPool, LentUse, FRAME_SHORTS, MIN_BUDGET, MIN_DB_BUDGET, WRITEBACK_BYTES,
+    lend::Want, BufferConfig, BufferPool, Relieved, Retry, MIN_BUDGET, MIN_DB_BUDGET,
+    WRITEBACK_BYTES,
 };
 use crate::storage::atoll::checkpoint::{Checkpointing, WRITER_STEPS, WRITE_BYTES};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
@@ -58,6 +59,7 @@ fn config() -> AtollConfig {
             budget: BUDGET,
             writeback_bytes: WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget: Some(512 << 10),
         checkpoint_write_bytes: None,
@@ -374,14 +376,18 @@ fn splits_past_the_room_step_the_checkpoint_themselves_and_finish_within_it() {
     for i in 0..KEYS {
         let k = 2 * i + 1;
         let mut put = Put::new(&key(k), value(k, 2), Mode::Insert);
-        within(&db.io, || {
-            if db.pool().kept_stats().refusals > 0 {
-                if let Some(h) = hold.take() {
-                    h.release_unchanged();
+        within_waiting(
+            &db.io,
+            1 << 20,
+            || {
+                if db.pool().kept_stats().refusals > 0 {
+                    if let Some(h) = hold.take() {
+                        h.release_unchanged();
+                    }
                 }
-            }
-            tree.put(&mut put)
-        });
+            },
+            || tree.put(&mut put),
+        );
         // With every kept page of one size and no other writer, the first writer refused did
         // only the work that let it in: the images of as many kept copies as its request, three
         // pages at most.
@@ -439,14 +445,18 @@ fn merges_past_the_room_step_the_checkpoint_themselves_and_finish_within_it() {
     let refused = MERGES_REFUSED.with(|n| n.get());
     for i in (0..KEYS).rev().filter(|i| i % 3 == 0) {
         let mut remove = Remove::new(&key(2 * i));
-        let removed = within(&db.io, || {
-            if db.pool().kept_stats().refusals > 0 {
-                if let Some(h) = hold.take() {
-                    h.release_unchanged();
+        let removed = within_waiting(
+            &db.io,
+            1 << 20,
+            || {
+                if db.pool().kept_stats().refusals > 0 {
+                    if let Some(h) = hold.take() {
+                        h.release_unchanged();
+                    }
                 }
-            }
-            tree.remove(&mut remove)
-        });
+            },
+            || tree.remove(&mut remove),
+        );
         assert!(removed, "key {} was there", 2 * i);
     }
     assert!(hold.is_none(), "no remove was refused room");
@@ -525,14 +535,18 @@ fn a_roots_shrink_past_the_room_steps_the_checkpoint_itself_and_finishes_within_
     db.fill_room(&filler);
     HOLD_SHRINK.with(|h| h.set(false));
     let refused = SHRINKS_REFUSED.with(|c| c.get());
-    let removed = within(&db.io, || {
-        if db.pool().kept_stats().refusals > 0 {
-            if let Some(h) = hold.take() {
-                h.release_unchanged();
+    let removed = within_waiting(
+        &db.io,
+        1 << 20,
+        || {
+            if db.pool().kept_stats().refusals > 0 {
+                if let Some(h) = hold.take() {
+                    h.release_unchanged();
+                }
             }
-        }
-        tree.remove(&mut remove)
-    });
+        },
+        || tree.remove(&mut remove),
+    );
     assert!(removed, "the held remove's key was there");
     assert!(hold.is_none(), "no change was refused room");
     assert!(
@@ -640,11 +654,12 @@ fn kept_copies_and_images_live_in_frames_the_pool_lends_and_go_back_once_written
     );
 }
 
-/// A change whose copy finds no frame free without an eviction is turned down as one past the
-/// room is: it lets go of its latches, takes a frame holding nothing, which may evict a page, and
-/// goes on with it.
+/// A change whose copy finds no lend batch with a frame and no free batch outside the core, every
+/// one held by the cache, is turned down: it lets go of its latches, provides (a cache batch
+/// outside the core drained for the lend road, `LENDING` once empty), and goes on with a frame of
+/// it (DESIGN.md 9.1.1).
 #[test]
-fn a_copy_that_finds_no_free_frame_takes_one_holding_nothing_and_goes_on() {
+fn a_copy_that_finds_no_lend_frame_provides_a_batch_and_goes_on() {
     within_a_minute(|| {
         let db = Db::memory();
         let orphan = drive(&db.io, || {
@@ -655,29 +670,186 @@ fn a_copy_that_finds_no_free_frame_takes_one_holding_nothing_and_goes_on() {
         let frame = db.orphan_leaf(orphan);
         let hold = frame.try_lock().expect("the leaf is free");
         let ticket = db.take_cut();
-        // Every free frame of the class lent, and the rest of the region with them.
-        let mut taken = Vec::new();
-        while let Some(block) = db.pool().try_lend(node_class(), LentUse::Image) {
-            taken.push(block);
-        }
-        assert!(!taken.is_empty(), "no frame free to take");
-        let shorts = FRAME_SHORTS.with(|n| n.get());
+        // Every free batch outside the core held by the cache, none lent.
+        let held = db.pool().hold_free_batches(node_class());
+        assert!(held > 0, "no free batch to hold");
+        let shorts = db.pool().lend_counts().turned_down;
         // Done within a few returns: the change turned down, the frame it takes (an eviction's write
         // at most), and the change again. A thousand is far past that.
         let mut put = Put::new(&key(0), value(0, 3), Mode::Upsert);
         within_returns(&db.io, 1 << 10, || tree.put(&mut put));
         assert!(
-            FRAME_SHORTS.with(|n| n.get()) > shorts,
+            db.pool().lend_counts().turned_down > shorts,
             "the copy found a frame free"
         );
         assert_eq!(db.get(&tree, 0), Some(value(0, 3)), "the change went in");
         let kept = db.pool().kept_stats();
         assert!(kept.used > 0 && kept.peak <= kept.limit, "{kept:?}");
-        drop(taken);
+        assert!(db.pool().lend_counts().provided > 0, "no batch provided");
         hold.release_unchanged();
         db.finish(ticket);
         drop(frame);
     });
+}
+
+/// A writer turned down for frames, the room's bytes free: its relief runs units of the
+/// checkpoint, the only producer of returned frames, and does not stop because the bytes are free
+/// or because its own units moved the supply; both exits of a unit read the frames it wants
+/// (DESIGN.md 9.1.1, Turned down; 9.1.3, rule 5).
+#[test]
+fn a_writer_turned_down_for_frames_with_the_rooms_bytes_free_runs_units_as_relief() {
+    within_a_minute(|| {
+        let db = Db::memory();
+        let orphan = drive(&db.io, || {
+            Tree::create(db.pool(), SizeClass::new(0).unwrap())
+        })
+        .unwrap();
+        let (tree, model) = db.owed_tree();
+        let frame = db.orphan_leaf(orphan);
+        let hold = frame.try_lock().expect("the leaf is free");
+        let ticket = db.take_cut();
+        hold.release_unchanged();
+        let kept = db.pool().kept_stats();
+        assert!(
+            kept.used + node_class().size() <= kept.limit,
+            "the room's bytes are free: {kept:?}"
+        );
+        // A real shortage: the lend road lends until it turns the request down, so the writer
+        // lacks a frame and its read says so; the frames lent here are no kept copies, so nothing
+        // the checkpoint does returns them before its end.
+        let mut want = Want::default();
+        want.add(node_class());
+        let mut lent = Vec::new();
+        while let Ok(mut frames) = db.pool().lend_copies(&want) {
+            lent.push(frames.take(node_class()).expect("one frame lent"));
+        }
+        assert!(!db.pool().lend_hint(&want), "the writer lacks a frame");
+        let ticket_on_supply = db.pool().supply_ticket();
+        let retry = Retry::Frames {
+            want: &want,
+            ticket: &ticket_on_supply,
+        };
+        assert!(!db.pool().may_retry(retry), "nothing came yet");
+        let cp = db.db.checkpointer();
+        let imaged = cp.stats().pages;
+        within(&db.io, || match cp.relieve(db.db.transactions(), retry) {
+            Relieved::Stepped(stepped) => stepped,
+            Relieved::Held | Relieved::Elsewhere => panic!("someone else steps it"),
+        });
+        assert!(
+            cp.stats().pages > imaged,
+            "the relief stopped with no unit run"
+        );
+        for frame in lent {
+            db.pool().give_back_lent(node_class(), frame);
+        }
+        db.finish(ticket);
+        db.assert_holds(&tree, &model, "after the relief");
+        drop(frame);
+    });
+}
+
+/// A writer refused frames while another caller holds the checkpoint's state, on the real
+/// checkpointer (the auditor's `state-wake-probe` of 2026-11-08): a real cut and a real kept
+/// copy, the root's cache batch provided, the lend road exhausted by real requests until one is
+/// turned down. Its relief finds the state held and the writer parks; the holder lets the state
+/// go having produced no frame, and that release wakes the writer, which steps the checkpoint
+/// next (DESIGN.md 9.1.1, Turned down).
+#[test]
+fn a_writer_refused_frames_wakes_when_another_caller_lets_the_checkpoints_state_go() {
+    use crate::storage::atoll::buffer::memory;
+    use std::sync::mpsc;
+    let db = Db::memory();
+    let c = SizeClass::new(0).unwrap();
+    let orphan = drive(&db.io, || Tree::create(db.pool(), c)).unwrap();
+    let metadata = db.orphan_leaf(orphan);
+    let meta_hold = metadata.try_lock().expect("the metadata page is free");
+    let ticket = db.take_cut();
+    meta_hold.release_unchanged();
+    // A real copy owed to this cut: finishing the checkpoint returns its frame.
+    let root = drive(&db.io, || db.pool().fix_exclusive(orphan, None)).unwrap();
+    db.pool()
+        .keep(&[&root])
+        .expect("room and a frame for the first copy");
+    root.release_unchanged();
+    let kept = db.pool().kept_stats();
+    assert!(
+        kept.used > 0 && kept.used + c.size() <= kept.limit,
+        "a kept copy and the room's bytes free: {kept:?}"
+    );
+    let pool = db.pool();
+    let fits = memory::frames_per_batch(c);
+    // Each cache batch outside the core provided, so nothing else can be: bounded by the batches,
+    // a provide's write settling on the next step of the IO.
+    for _ in 0..2 * pool.memory.batches {
+        if pool.memory.highest_cache_batch_outside_core().is_none()
+            && pool.memory.draining_for_lend().is_none()
+        {
+            break;
+        }
+        if let Some(IOResult::IO(wait)) = pool.provide().unwrap() {
+            if !wait.finished() {
+                db.io.step().unwrap();
+            }
+        }
+    }
+    assert!(
+        pool.memory.highest_cache_batch_outside_core().is_none()
+            && pool.memory.draining_for_lend().is_none(),
+        "nothing else can be provided"
+    );
+    let mut want = Want::default();
+    want.add(c);
+    let mut lent = Vec::new();
+    let refused = loop {
+        match pool.lend_copies(&want) {
+            Ok(mut frames) => {
+                lent.push(frames.take(c).expect("one frame lent"));
+                assert!(lent.len() <= pool.memory.batches as usize * fits as usize);
+            }
+            Err(refused) => break refused,
+        }
+    };
+    let cp = db.db.checkpointer();
+    let (outcome, pending_while_held, woken_by_the_release) = std::thread::scope(|scope| {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = scope.spawn(move || {
+            let held = cp
+                .hold()
+                .expect("another caller takes the checkpoint's state");
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(held);
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let outcome = pool.wait_for_room(refused);
+        let pending = matches!(&outcome, Ok(IOResult::IO(w)) if !w.finished());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let woken = matches!(&outcome, Ok(IOResult::IO(w)) if w.finished());
+        (outcome, pending, woken)
+    });
+    // Everything let go before the assertions: the checkpoint finished returns the kept frame.
+    db.finish(ticket);
+    let woken_by_the_checkpoint = matches!(&outcome, Ok(IOResult::IO(w)) if w.finished());
+    for frame in lent {
+        pool.give_back_lent(c, frame);
+    }
+    drop(outcome);
+    drop(metadata);
+    drop(db);
+    assert!(
+        pending_while_held,
+        "the writer parked while the state was held"
+    );
+    assert!(woken_by_the_checkpoint, "the kept copy's frame came back");
+    assert!(
+        woken_by_the_release,
+        "the state let go left the writer refused frames parked with no one to step the checkpoint"
+    );
 }
 
 /// The room of the smallest database is an eighth of its budget: the copies take its frames, so
@@ -949,14 +1121,18 @@ fn pages_evicted_after_the_cut_are_kept_within_the_room_when_read_back_and_chang
     );
     for i in 0..KEYS {
         let mut put = Put::new(&key(2 * i), value(2 * i, 2), Mode::Upsert);
-        within(&db.io, || {
-            if db.pool().kept_stats().refusals > 0 {
-                if let Some(h) = hold.take() {
-                    h.release_unchanged();
+        within_waiting(
+            &db.io,
+            1 << 20,
+            || {
+                if db.pool().kept_stats().refusals > 0 {
+                    if let Some(h) = hold.take() {
+                        h.release_unchanged();
+                    }
                 }
-            }
-            tree.put(&mut put)
-        });
+            },
+            || tree.put(&mut put),
+        );
     }
     assert!(hold.is_none(), "no change was refused room");
     assert_within_room(db.pool(), node_class().size());
@@ -1051,14 +1227,18 @@ fn a_checkpoint_failing_under_a_refused_writer_gives_the_room_back_and_the_write
         let k = 2 * i + 1;
         model.insert(k, value(k, 2));
         let mut put = Put::new(&key(k), value(k, 2), Mode::Insert);
-        within(&db.io, || {
-            if db.pool().kept_stats().refusals > 0 {
-                if let Some(h) = hold.take() {
-                    h.release_unchanged();
+        within_waiting(
+            &db.io,
+            1 << 20,
+            || {
+                if db.pool().kept_stats().refusals > 0 {
+                    if let Some(h) = hold.take() {
+                        h.release_unchanged();
+                    }
                 }
-            }
-            tree.put(&mut put)
-        });
+            },
+            || tree.put(&mut put),
+        );
     }
     assert!(hold.is_none(), "no insert was refused room");
     let cp = db.db.checkpointer();
@@ -1228,14 +1408,18 @@ fn a_waiting_writer_is_let_in_once_the_checkpoint_images_kept_copies_first() {
         let k = 2 * i + 1;
         let first = db.pool().kept_stats().refusals == 0;
         let mut put = Put::new(&key(k), value(k, 2), Mode::Insert);
-        within(&db.io, || {
-            if db.pool().kept_stats().refusals > 0 {
-                if let Some(h) = hold.take() {
-                    h.release_unchanged();
+        within_waiting(
+            &db.io,
+            1 << 20,
+            || {
+                if db.pool().kept_stats().refusals > 0 {
+                    if let Some(h) = hold.take() {
+                        h.release_unchanged();
+                    }
                 }
-            }
-            tree.put(&mut put)
-        });
+            },
+            || tree.put(&mut put),
+        );
         if first && db.pool().kept_stats().refusals > 0 {
             admitted = Some(cp.stats().pages - imaged);
             break;
@@ -1314,4 +1498,465 @@ fn a_short_image_write_fails_the_checkpoint() {
         ),
         "{failed}"
     );
+}
+
+/// A charge whose compare-and-swap is lost to another charge is turned down, once, and not tried
+/// again (DESIGN.md 9.1.2): the change waits on the room, whose look after its registration starts
+/// it again if room is free.
+#[test]
+fn a_charge_lost_to_another_is_turned_down_once() {
+    use crate::race;
+    let room = super::KeptRoom::new(
+        4 * super::LARGEST_REQUEST,
+        Arc::new(super::super::supply::Supply::new(Arc::new(
+            crate::storage::atoll::epoch::Epochs::new(),
+        ))),
+        Arc::new(MemoryIO::new()),
+    );
+    {
+        let room = room.clone();
+        race::at("kept.charge", move || assert!(room.charge(1)));
+    }
+    assert!(
+        !room.charge(super::LARGEST_REQUEST),
+        "lost to the other charge: turned down, not retried"
+    );
+    assert!(!race::pending("kept.charge"));
+    assert!(
+        room.charge(super::LARGEST_REQUEST),
+        "the next look finds the room"
+    );
+}
+
+#[test]
+fn audit_gate_wait_wakes_when_the_checkpoint_state_becomes_available() {
+    let db = Db::memory();
+    let tree = db.create(SizeClass::new(0).unwrap());
+    let root = tree.root();
+    let page = drive(&db.io, || db.pool().fix_exclusive(root, None)).unwrap();
+    let cp = db.db.checkpointer();
+    let ticket = cp.request_full();
+    let first = cp.step_full(ticket, db.db.transactions()).unwrap();
+    let closed = db.store().gate_closed();
+    page.release_unchanged();
+    let held = cp
+        .hold()
+        .expect("the state is free between checkpoint steps");
+    let wait = db.pool().wait_for_gate().unwrap();
+    let pending_before = matches!(&wait,IOResult::IO(IOCompletions(c)) if !c.finished());
+    drop(held);
+    let woke_after_release = matches!(&wait,IOResult::IO(IOCompletions(c)) if c.finished());
+    drop(wait);
+    drop(first);
+    db.finish(ticket);
+    drop(tree);
+    drop(db);
+    println!("real_cut_gate_closed={closed} pending_with_state_held={pending_before} notified_on_state_release={woke_after_release}");
+    assert!(
+        closed && pending_before,
+        "the real cut must refuse a writer while another caller holds its state"
+    );
+    assert!(
+        woke_after_release,
+        "a gate waiter must be told to take over when the other stepper releases the state"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn audit_a_cut_recovers_a_tree_leaving_before_its_first_swap_copy() {
+    let db = Db::memory();
+    let tree = db.create(SizeClass::new(0).unwrap());
+    let root = tree.root();
+    let wanted = b"kept across a first queued writeout".to_vec();
+    db.put(&tree, 42, wanted.clone());
+    let page = drive(&db.io, || db.pool().fix_optimistic(root, None)).unwrap();
+    let frame = page.hint() - 1;
+    drop(page);
+    let initially_unmapped = db.store().swap_slot(root).is_none();
+    let latch = || crate::storage::atoll::buffer::FrameLatch {
+        frames: db.pool().frames.clone(),
+        frame,
+    };
+    let outgoing = db.pool().start_write_out(
+        db.pool()
+            .latch_to_evict(root.class(), frame, latch)
+            .unwrap(),
+    );
+    db.pool().write_out(root.class(), vec![outgoing]);
+    let ticket = db.db.checkpointer().request_full();
+    db.finish(ticket);
+    // Make the first swap write finish only after the full cut, and verify its in-memory read.
+    let mut lookup = Lookup::new(&key(42));
+    let warm = drive(&db.io, || tree.lookup(&mut lookup));
+    let warm_ok = matches!(&warm, Ok(Some(value)) if value == &wanted);
+    drop(tree);
+    let db = db.reopen();
+    let tree = db.tree(root);
+    let mut lookup = Lookup::new(&key(42));
+    let recovered = drive(&db.io, || tree.lookup(&mut lookup));
+    let recovered_ok = matches!(&recovered, Ok(Some(value)) if value == &wanted);
+    let details = format!("{recovered:?}");
+    drop(tree);
+    drop(db);
+    println!("FIRST_SWAP_RECOVERY initially_unmapped={initially_unmapped} warm_ok={warm_ok} recovered_ok={recovered_ok} recovered={details}");
+    assert!(
+        initially_unmapped && warm_ok,
+        "the tree and first queued writeout must be real"
+    );
+    assert!(
+        recovered_ok,
+        "the full checkpoint omitted the tree before its first swap copy: {details}"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn audit_a_cut_recovers_a_tree_leaving_before_its_first_swap_copy_on_pumped_io() {
+    let db = Db::crash();
+    let tree = db.create(SizeClass::new(0).unwrap());
+    let root = tree.root();
+    let wanted = b"kept across a first queued writeout".to_vec();
+    db.put(&tree, 42, wanted.clone());
+    let page = drive(&db.io, || db.pool().fix_optimistic(root, None)).unwrap();
+    let frame = page.hint() - 1;
+    drop(page);
+    let initially_unmapped = db.store().swap_slot(root).is_none();
+    let latch = || crate::storage::atoll::buffer::FrameLatch {
+        frames: db.pool().frames.clone(),
+        frame,
+    };
+    let outgoing = db.pool().start_write_out(
+        db.pool()
+            .latch_to_evict(root.class(), frame, latch)
+            .unwrap(),
+    );
+    db.pool().write_out(root.class(), vec![outgoing]);
+    let ticket = db.db.checkpointer().request_full();
+    db.finish(ticket);
+    // Make the first swap write finish only after the full cut, and verify its in-memory read.
+    let mut lookup = Lookup::new(&key(42));
+    let warm = drive(&db.io, || tree.lookup(&mut lookup));
+    let warm_ok = matches!(&warm, Ok(Some(value)) if value == &wanted);
+    drop(tree);
+    let db = db.reopen();
+    let tree = db.tree(root);
+    let mut lookup = Lookup::new(&key(42));
+    let recovered = drive(&db.io, || tree.lookup(&mut lookup));
+    let recovered_ok = matches!(&recovered, Ok(Some(value)) if value == &wanted);
+    let details = format!("{recovered:?}");
+    drop(tree);
+    drop(db);
+    println!("FIRST_SWAP_RECOVERY initially_unmapped={initially_unmapped} warm_ok={warm_ok} recovered_ok={recovered_ok} recovered={details}");
+    assert!(
+        initially_unmapped && warm_ok,
+        "the tree and first queued writeout must be real"
+    );
+    assert!(
+        recovered_ok,
+        "the full checkpoint omitted the tree before its first swap copy: {details}"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn audit_a_full_checkpoint_keeps_its_frame_wait_pending_after_its_state_is_released() {
+    use std::sync::mpsc;
+    use std::task::{Wake, Waker};
+    struct Wakes(std::sync::atomic::AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let db = Db::memory();
+    let tree = db.create(SizeClass::new(0).unwrap());
+    let root = tree.root();
+    let wake = std::sync::Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = Waker::from(wake.clone());
+    let (pending, ready, before, after, finished) = std::thread::scope(|scope| {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let pool = db.pool().clone();
+        let io = db.io.clone();
+        let holder = scope.spawn(move || {
+            let page = drive(&io, || pool.fix_exclusive(root, None)).unwrap();
+            held_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            page.release_unchanged();
+        });
+        held_rx.recv().unwrap();
+        let cp = db.db.checkpointer();
+        let ticket = cp.request_full();
+        let (mut pending, mut ready) = (0, 0);
+        let mut waited = None;
+        for _ in 0..32 {
+            match cp.step_full(ticket, db.db.transactions()).unwrap() {
+                IOResult::Done(()) => break,
+                IOResult::IO(IOCompletions(c)) => {
+                    // This observation is after StateHold::drop, not inside pool.begin_cut.
+                    if c.finished() {
+                        ready += 1;
+                    } else {
+                        pending += 1;
+                    }
+                    c.set_waker(&waker);
+                    waited = Some(c);
+                }
+            }
+        }
+        let before = wake.0.load(std::sync::atomic::Ordering::Relaxed);
+        resume_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let after = wake.0.load(std::sync::atomic::Ordering::Relaxed);
+        let finished = waited.is_some_and(|c| c.finished());
+        db.finish(ticket);
+        (pending, ready, before, after, finished)
+    });
+    drop(tree);
+    drop(db);
+    drop(waker);
+    drop(wake);
+    println!("CUT_CHECKPOINT pending={pending} ready={ready} wakes_before={before} wakes_after={after} finished={finished}");
+    assert_eq!(
+        (pending, ready, before),
+        (32, 0, 0),
+        "checkpoint state release must not finish its own unchanged frame wait"
+    );
+    assert!(
+        after == 1 && finished,
+        "the actual frame release must finish the wait and notify it once"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn audit_an_image_wait_does_not_wake_itself_on_the_checkpoint_state_release() {
+    use std::sync::mpsc;
+    use std::task::{Wake, Waker};
+    struct Wakes(std::sync::atomic::AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let db = Db::memory();
+    let tree = db.create(SizeClass::new(0).unwrap());
+    let root = tree.root();
+    let orphan = drive(&db.io, || {
+        Tree::create(db.pool(), SizeClass::new(0).unwrap())
+    })
+    .unwrap();
+    let metadata = db.orphan_leaf(orphan);
+    let held_metadata = metadata.try_lock().expect("metadata initially free");
+    let ticket = db.take_cut();
+    let cut = db.db.checkpointer().cut_taken();
+    let wake = std::sync::Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = Waker::from(wake.clone());
+    let (pending, ready, before, after, finished, complete_while_held) =
+        std::thread::scope(|scope| {
+            let (held_tx, held_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let pool = db.pool().clone();
+            let io = db.io.clone();
+            let holder = scope.spawn(move || {
+                let page = drive(&io, || pool.fix_exclusive(root, None)).unwrap();
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                page.release_unchanged();
+            });
+            held_rx.recv().unwrap();
+            held_metadata.release_unchanged();
+            let cp = db.db.checkpointer();
+            let (mut pending, mut ready) = (0, 0);
+            let mut waited = None;
+            let mut complete = false;
+            for _ in 0..32 {
+                match cp.step_full(ticket, db.db.transactions()).unwrap() {
+                    IOResult::Done(()) => {
+                        complete = true;
+                        break;
+                    }
+                    IOResult::IO(IOCompletions(c)) => {
+                        if c.finished() {
+                            ready += 1;
+                        } else {
+                            pending += 1;
+                        }
+                        c.set_waker(&waker);
+                        waited = Some(c);
+                    }
+                }
+            }
+            let before = wake.0.load(std::sync::atomic::Ordering::Relaxed);
+            resume_tx.send(()).unwrap();
+            holder.join().unwrap();
+            let after = wake.0.load(std::sync::atomic::Ordering::Relaxed);
+            let finished = waited.is_some_and(|c| c.finished());
+            db.finish(ticket);
+            (pending, ready, before, after, finished, complete)
+        });
+    drop(metadata);
+    drop(tree);
+    drop(db);
+    drop(waker);
+    drop(wake);
+    eprintln!("IMAGE_CHECKPOINT cut={cut:?} pending={pending} ready={ready} idle_wakes={before} release_wakes={after} finished={finished} complete_while_held={complete_while_held}");
+    assert_eq!(
+        (pending, ready, before),
+        (32, 0, 0),
+        "the image's held frame must not retry on its own checkpoint state release"
+    );
+    assert!(
+        !complete_while_held && finished && after == 1,
+        "the actual image frame release must finish and notify once"
+    );
+}
+
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+#[test]
+fn audit_resident_fixes_and_settle_ignore_room_wakes_and_other_frame_releases() {
+    use std::sync::mpsc;
+    use std::task::{Wake, Waker};
+    struct Wakes(std::sync::atomic::AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let mut results = Vec::new();
+    for mode in ["optimistic", "exclusive", "settle"] {
+        let db = Db::memory();
+        let tree = db.create(SizeClass::new(0).unwrap());
+        let root = tree.root();
+        let prefix = db.create(SizeClass::new(0).unwrap());
+        let wake = std::sync::Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let stats = std::thread::scope(|scope| {
+            let (held_tx, held_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let pool = db.pool().clone();
+            let io = db.io.clone();
+            let holder = scope.spawn(move || {
+                let page = drive(&io, || pool.fix_exclusive(root, None)).unwrap();
+                held_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                page.release_unchanged();
+            });
+            held_rx.recv().unwrap();
+            let wait = || -> Result<IOResult<()>> {
+                match mode {
+                    "optimistic" => db.pool().fix_optimistic(root, None).map(|r| r.map(drop)),
+                    "exclusive" => db
+                        .pool()
+                        .fix_exclusive(root, None)
+                        .map(|r| r.map(|p| drop(p.release_unchanged()))),
+                    _ => tree
+                        .settle(b"", crate::storage::atoll::btree::Near::NONE, &|_| true)
+                        .map(|r| r.map(drop)),
+                }
+            };
+            let warm = match wait().unwrap() {
+                IOResult::IO(IOCompletions(c)) => c,
+                IOResult::Done(()) => Completion::new_yield(),
+            };
+            warm.set_waker(&waker);
+            db.pool().wake_room();
+            let prefix_page =
+                drive(&db.io, || db.pool().fix_exclusive(prefix.root(), None)).unwrap();
+            let prefix_wait = db.pool().wait_for_resident_latch(prefix_page.frame);
+            prefix_page.release_unchanged();
+            let prefix_finished = prefix_wait.finished();
+            let target_after_prefix = !warm.finished();
+            let (mut pending, mut ready) = (0, 0);
+            let mut waited = Some(warm);
+            let before_alloc = crate::storage::atoll::testing::allocations();
+            for _ in 0..32 {
+                match wait().unwrap() {
+                    IOResult::Done(()) => {
+                        ready += 1;
+                        break;
+                    }
+                    IOResult::IO(IOCompletions(c)) => {
+                        db.pool().wake_room();
+                        if c.finished() {
+                            ready += 1;
+                        } else {
+                            pending += 1;
+                        }
+                        c.set_waker(&waker);
+                        waited = Some(c);
+                    }
+                }
+            }
+            let allocations = crate::storage::atoll::testing::allocations() - before_alloc;
+            let before = wake.0.load(std::sync::atomic::Ordering::Relaxed);
+            resume_tx.send(()).unwrap();
+            holder.join().unwrap();
+            let after = wake.0.load(std::sync::atomic::Ordering::Relaxed);
+            let finished = waited.is_some_and(|c| c.finished());
+            // The settled empty tree returns Done(0); all three roads can finish once released.
+            let completes = matches!(wait().unwrap(), IOResult::Done(()));
+            (
+                prefix_finished,
+                target_after_prefix,
+                pending,
+                ready,
+                allocations,
+                before,
+                after,
+                finished,
+                completes,
+            )
+        });
+        drop(prefix);
+        drop(tree);
+        drop(db);
+        drop(waker);
+        drop(wake);
+        results.push((mode, stats));
+    }
+    for (
+        mode,
+        (
+            prefix_finished,
+            target_after_prefix,
+            pending,
+            ready,
+            allocations,
+            before,
+            after,
+            finished,
+            completes,
+        ),
+    ) in results
+    {
+        eprintln!("RESIDENT_FIX mode={mode} prefix_finished={prefix_finished} target_after_prefix={target_after_prefix} pending={pending} ready={ready} allocations={allocations} idle_wakes={before} release_wakes={after} finished={finished} completes={completes}");
+        assert!(
+            prefix_finished && target_after_prefix,
+            "another frame's release finished a resident fix wait"
+        );
+        assert_eq!(
+            (pending, ready, before),
+            (32, 0, 0),
+            "room wakes must not finish the held page's wait"
+        );
+        assert_eq!(
+            allocations, 0,
+            "a stable held resident fix allocates per retry"
+        );
+        assert!(
+            after == 1 && finished && completes,
+            "the held page release did not finish and notify once"
+        );
+    }
 }

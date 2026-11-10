@@ -69,7 +69,7 @@ impl Tree {
             return Ok(IOResult::Done(Drained::Gone));
         }
         let Some(change) = self.store.change() else {
-            return yield_now();
+            return Ok(crate::storage::atoll::buffer::gate_closed(&self.pool));
         };
         let (pid, parent, seen) = done!(self.walk());
         let entries = match seen {
@@ -100,12 +100,12 @@ impl Tree {
         }
         match parent {
             Some(parent) => match done!(self.unbranch(parent, pid, values)) {
-                Some(drained) => Ok(IOResult::Done(drained)),
-                None => {
+                Ok(drained) => Ok(IOResult::Done(drained)),
+                Err(refused) => {
                     // Its latches let go: the change gate too, then room for the copies, and the
                     // step again.
                     drop(change);
-                    done!(self.pool.wait_for_room());
+                    done!(self.pool.wait_for_room(refused));
                     Ok(IOResult::Done(Drained::More))
                 }
             },
@@ -163,7 +163,7 @@ impl Tree {
         parent: PageId,
         node: PageId,
         values: Vec<PageId>,
-    ) -> Result<IOResult<Option<Drained>>> {
+    ) -> Result<IOResult<std::result::Result<Drained, Refused>>> {
         let mut p = done!(self.pool.fix_exclusive(parent, None));
         let n = done!(self.pool.fix_exclusive(node, None));
         let w = View::new(n.page());
@@ -183,10 +183,10 @@ impl Tree {
             return Err(corrupt_node(parent));
         }
         // The node is freed once unlinked: its copy too, as a cut may still write it.
-        if !self.pool.keep(&[&p, &n]) {
+        if let Err(refused) = self.pool.keep(&[&p, &n]) {
             p.release_unchanged();
             n.release_unchanged();
-            return Ok(IOResult::Done(None));
+            return Ok(IOResult::Done(Err(refused)));
         }
         Record {
             pid: parent,
@@ -200,7 +200,7 @@ impl Tree {
             self.store.orphaned(node);
         }
         self.free_abandoned(values)?;
-        Ok(IOResult::Done(Some(Drained::More)))
+        Ok(IOResult::Done(Ok(Drained::More)))
     }
 }
 

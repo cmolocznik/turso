@@ -58,6 +58,7 @@ fn open_sized(slots: usize, budget: usize, class: SizeClass, log_budget: Option<
             budget,
             writeback_bytes: crate::storage::atoll::buffer::WRITEBACK_BYTES,
             kept_bytes: None,
+            lent_at_open: Default::default(),
         },
         log_budget,
         checkpoint_write_bytes: None,
@@ -326,11 +327,6 @@ fn an_older_snapshot_reads_its_versions_while_a_writer_refused_room_steps_the_ch
         // return images a page, lands a write or ends the cut.
         let mut out = None;
         for _ in 0..1 << 20 {
-            if pool.kept_stats().refusals > 0 {
-                if let Some(h) = hold.take() {
-                    h.release_unchanged();
-                }
-            }
             match db
                 .tree
                 .write(db.txns(), &db.versions, &mut w, &mut op)
@@ -341,6 +337,13 @@ fn an_older_snapshot_reads_its_versions_while_a_writer_refused_room_steps_the_ch
                     break;
                 }
                 IOResult::IO(crate::types::IOCompletions(c)) => {
+                    // The refused write can now wait for this test's held metadata. Release it
+                    // before waiting, rather than depending on another operation invocation.
+                    if pool.kept_stats().refusals > 0 {
+                        if let Some(h) = hold.take() {
+                            h.release_unchanged();
+                        }
+                    }
                     let mut steps = 0;
                     while !c.finished() {
                         db.io.step().unwrap();

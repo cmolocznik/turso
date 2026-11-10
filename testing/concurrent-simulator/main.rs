@@ -73,6 +73,10 @@ struct Args {
     /// Enable database encryption
     #[arg(long)]
     enable_encryption: bool,
+    /// Open the database in Atoll mode (Atoll's DESIGN.md §17), one process, without MVCC,
+    /// encryption or the FTS profiles, which Atoll mode refuses or does not run
+    #[arg(long)]
+    atoll: bool,
     /// Enable Elle consistency checking with specified model (uses only Elle workloads)
     #[arg(long, value_enum)]
     elle: Option<ElleModel>,
@@ -167,6 +171,18 @@ fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!(
             "--mvcc-checkpoint-threshold requires --enable-mvcc"
         ));
+    }
+
+    if args.atoll {
+        anyhow::ensure!(
+            !args.enable_mvcc && !args.enable_encryption && !args.multiprocess,
+            "--atoll runs in one process, without --enable-mvcc or --enable-encryption"
+        );
+        anyhow::ensure!(
+            FtsProfile::from_mode(&args.mode).is_none() && !is_schema_clone_fault_mode(&args.mode),
+            "--atoll does not run the FTS profiles, whose index methods Atoll mode refuses, or \
+             schema-clone-faults, which runs MVCC"
+        );
     }
 
     println!("mode = {}", args.mode);
@@ -478,6 +494,9 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
     } else {
         let allow_passive_checkpoint =
             !args.enable_mvcc || args.enable_experimental_mvcc_passive_checkpoint;
+        // Atoll mode refuses index methods (Atoll's DESIGN.md §17): no FTS table, workload or
+        // check, the other workloads drawn as they are without it.
+        let fts = |weight: u32| if args.atoll { 0 } else { weight };
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
             (
                 5,
@@ -504,28 +523,30 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (5, Box::new(AutoincUpdateRowidWorkload)),
             (3, Box::new(AutoincDeleteWorkload)),
             (8, Box::new(UpsertRowidWorkload)),
-            (12, Box::new(FtsInsertWorkload)),
-            (8, Box::new(FtsUpdateWorkload)),
-            (6, Box::new(FtsDeleteWorkload)),
-            (10, Box::new(FtsMatchWorkload)),
-            (2, Box::new(FtsOptimizeWorkload)),
+            (fts(12), Box::new(FtsInsertWorkload)),
+            (fts(8), Box::new(FtsUpdateWorkload)),
+            (fts(6), Box::new(FtsDeleteWorkload)),
+            (fts(10), Box::new(FtsMatchWorkload)),
+            (fts(2), Box::new(FtsOptimizeWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
             (10, Box::new(IntegrityCheckWorkload)),
         ];
 
-        let p: Vec<Box<dyn Property>> = vec![
+        let mut p: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
             Box::new(SimpleKeysDoNotDisappear::new()),
             Box::new(SequenceCorrectnessProperty::new()),
             Box::new(AutoincWatermarkMonotonicity::new()),
-            Box::new(FtsResultComparisonProperty),
             Box::new(SnapshotStabilityProperty::new()),
             Box::new(RolledBackInsertsNotVisible::new()),
         ];
-
-        let mut extra_schema = fts_sim_schema();
+        let mut extra_schema = Vec::new();
+        if !args.atoll {
+            p.insert(4, Box::new(FtsResultComparisonProperty));
+            extra_schema.extend(fts_sim_schema());
+        }
         extra_schema.extend(upsert_sim_schema());
         (w, p, extra_schema, vec![])
     }
@@ -596,11 +617,21 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
         .with_mvcc_checkpoint_threshold(args.mvcc_checkpoint_threshold)
         .with_enable_encryption(args.enable_encryption)
+        .with_atoll(args.atoll)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties)
         .with_chaotic_profiles(chaotic_profiles)
         .with_allocation_fault_probability(args.allocation_fault_probability);
+    // The probe checks the pager's contract, that a checkpoint is refused while a statement of its
+    // connection is suspended, whose cursors and page cache it would invalidate. Atoll's checkpoint
+    // writes pages out of place and leaves every cursor where it was, so it runs (Atoll's
+    // DESIGN.md §17, §11), and the probe is off.
+    let opts = if args.atoll {
+        opts.with_checkpoint_probe_probability(0.0)
+    } else {
+        opts
+    };
     let opts = match args.checkpoint_probe_probability {
         Some(probability) => opts.with_checkpoint_probe_probability(probability),
         None => opts,

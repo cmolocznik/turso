@@ -65,7 +65,10 @@ impl AtollConfig {
             writes_in_flight: 3,
             ..LogConfig::default()
         };
-        let budget = super::buffer::min_budget_beside(super::log::ring_bytes(&log));
+        let budget = super::buffer::min_budget_beside(
+            super::log::ring_bytes(&log),
+            super::buffer::bank_frames(WRITE_BYTES),
+        );
         Self {
             log,
             store: StoreConfig {
@@ -195,17 +198,24 @@ impl Opening {
     pub fn new(io: Arc<dyn IO>, base: &str, mut config: AtollConfig) -> Result<Self> {
         let requests = Arc::new(Requests::default());
         let io: Arc<dyn IO> = Arc::new(Counted::new(io, requests.clone()));
-        // The log's ring is lent from the pool for as long as it is open: the smallest pool is
-        // the budget beside it.
+        // The log's ring and the image bank are lent from the pool for as long as it is open,
+        // taken as it opens; the smallest pool is the budget beside them and the copies' worst
+        // layout (DESIGN.md 9.1.1).
         let ring = super::log::ring_bytes(&config.log);
-        let need = super::buffer::min_budget_beside(ring);
+        let bank = super::buffer::bank_frames(config.checkpoint_write_bytes());
+        let need = super::buffer::min_budget_beside(ring, bank);
         if config.buffer.budget < need {
             return Err(LimboError::InternalError(format!(
-                "a budget of {} bytes holds the log's ring of {ring} bytes and not the smallest \
-                 pool beside it: {need} bytes at least",
+                "a budget of {} bytes holds the log's ring of {ring} bytes, the image bank of \
+                 {bank} frames and copies of three pages, and not the smallest pool beside them: \
+                 {need} bytes at least",
                 config.buffer.budget
             )));
         }
+        config.buffer.lent_at_open = super::buffer::LentAtOpen {
+            ring: super::log::ring_chunks(&config.log),
+            bank,
+        };
         let (control, superblock) = Control::open(io.clone(), base)?;
         let Some(superblock) = superblock else {
             return Self::create(io, requests, base, config, control);

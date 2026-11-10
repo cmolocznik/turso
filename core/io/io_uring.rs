@@ -1903,6 +1903,88 @@ mod tests {
         io.drain_completions(std::slice::from_ref(&c)).unwrap();
     }
 
+    /// How a callback cancels on the delivery thread in [`a_cancel_from_inside_a_finish_returns`].
+    enum Cancels {
+        /// A sync's callback cancels the sync itself.
+        Itself,
+        /// A group's callback, run as its only request is delivered, cancels the group.
+        ItsGroup,
+    }
+
+    /// A callback on the delivery thread cancels the completion it is finishing, which IO::cancel
+    /// allows there (DESIGN.md 22.5): the cancel returns at once, the completion finishes with the
+    /// delivered result, and the ring delivers the next request (the auditor's P1-CANCEL-1;
+    /// mutant: the callback run inside the result's initialization, where the cancel's abort
+    /// waits for ever on the initialization its own thread is running). A ring left stuck is
+    /// leaked before the test fails, so the failure does not wait on its delivery thread.
+    fn a_cancel_from_inside_a_finish_returns(how: Cancels) {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(UringIO::new().unwrap());
+        let file = file_of(&dir, &io, 512);
+        let (entered, at_entry) = mpsc::channel();
+        let (returned, at_return) = mpsc::channel();
+        let own: Arc<std::sync::OnceLock<std::sync::Weak<Completion>>> = Default::default();
+        let callback = {
+            let (own, io) = (own.clone(), Arc::downgrade(&io));
+            move |_: std::result::Result<i32, crate::CompletionError>| {
+                let (c, io) = (own.get().unwrap().upgrade().unwrap(), io.upgrade().unwrap());
+                entered.send(()).unwrap();
+                io.cancel(std::slice::from_ref(c.as_ref())).unwrap();
+                returned.send(()).unwrap();
+            }
+        };
+        // What finishes, and the request the ring delivers to finish it: submitted only once the
+        // callback can find what it cancels.
+        let (finishing, request) = match how {
+            Cancels::Itself => {
+                let sync = Completion::new_sync(callback);
+                (Arc::new(sync.clone()), sync)
+            }
+            Cancels::ItsGroup => {
+                let mut group = crate::io::CompletionGroup::new(callback);
+                let request = Completion::new_sync(|_| {});
+                group.add(&request);
+                (Arc::new(group.build()), request)
+            }
+        };
+        own.set(Arc::downgrade(&finishing)).unwrap();
+        drop(file.sync(request, crate::io::FileSyncType::Fsync).unwrap());
+        let entered = at_entry.recv_timeout(BOUND).is_ok();
+        let (tx, rx) = mpsc::channel();
+        let next = file
+            .sync(
+                Completion::new_sync(move |_| tx.send(()).unwrap()),
+                crate::io::FileSyncType::Fsync,
+            )
+            .unwrap();
+        let returned = at_return.recv_timeout(BOUND).is_ok();
+        let delivered = rx.recv_timeout(BOUND).is_ok();
+        let finished = finishing.finished();
+        if !(entered && returned && delivered && finished) {
+            // The delivery thread is stuck in the callback: dropping the ring would join it.
+            std::mem::forget((io, file, next, finishing));
+            panic!(
+                "entered={entered} cancel_returned={returned} next_delivered={delivered} \
+                 own_finished={finished}"
+            );
+        }
+        assert_eq!(
+            finishing.get_error(),
+            None,
+            "the delivered result was replaced"
+        );
+    }
+
+    #[test]
+    fn a_callback_cancelling_its_own_completion_returns_and_the_ring_goes_on() {
+        a_cancel_from_inside_a_finish_returns(Cancels::Itself);
+    }
+
+    #[test]
+    fn a_groups_callback_cancelling_the_group_as_its_request_is_delivered_returns() {
+        a_cancel_from_inside_a_finish_returns(Cancels::ItsGroup);
+    }
+
     /// A partial write's progress wake runs with the ring's mutex let go: a waker that submits a
     /// request, as an executor's may, gets the mutex (DESIGN.md 22.5; mutant: the wake made under
     /// the mutex, where that submission waits for ever on the mutex the delivery thread holds).

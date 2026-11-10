@@ -1,5 +1,5 @@
 use crate::SqliteDialect;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::io::{MemoryIO, PlatformIO, IO};
 use crate::mvcc::cursor::CursorYieldPoint;
@@ -3319,4 +3319,31 @@ fn external_aggregate_context_lives_while_a_prepared_statement_uses_it() {
         1,
         "dropping the last statement releases the replaced registration"
     );
+}
+
+#[test]
+fn resetting_or_dropping_statement_state_cancels_its_checkpoint_timer() {
+    use super::ProgramState;
+    use std::time::{Duration, Instant};
+    for reset in [true, false] {
+        let c = crate::Completion::new_remote_wait();
+        let mut state = ProgramState::new(0, 0);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        state.checkpoint_park_deadline = Some(deadline);
+        state.checkpoint_park_timer = crate::timer::complete_at(deadline, c.clone());
+        if reset {
+            state.reset(None, None);
+        }
+        let after_reset = c.handles();
+        drop(state);
+        assert_eq!(
+            c.handles(),
+            1,
+            "statement state retained an abandoned deadline"
+        );
+        if reset {
+            assert_eq!(after_reset, 1, "reset retained its checkpoint timeout");
+        }
+        assert!(!c.finished());
+    }
 }

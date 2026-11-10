@@ -199,6 +199,309 @@ fn what_waits_for_a_retirement_runs_once_nobody_owns_the_request() {
     assert_eq!(ran.load(Ordering::SeqCst), 4, "not run at its retirement");
 }
 
+/// Which of a cancellation's callback and the backend's delivery of the request ends first.
+#[derive(Clone, Copy, Debug)]
+enum FirstToEnd {
+    /// The delivery, while the cancellation still runs the callback it claimed.
+    Delivery,
+    /// The cancellation's callback, before the backend delivers.
+    Callback,
+}
+
+/// A cancellation claims a request's finish and runs its callback while the pumped backend
+/// delivers the request: the delivery returns at once whichever ends first, the request stays
+/// owned until both have, and it retires once, its callback run once and its result the
+/// cancellation's (audit cancel-claim-v1, P1-CC1; mutant: a delivery that lost the callback
+/// retires at once, before that callback returned).
+fn a_cancellation_and_a_delivery_meet_once(first: FirstToEnd) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const BOUND: Duration = Duration::from_secs(20);
+    let io = Arc::new(CrashIO::new(1));
+    let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = std::sync::Mutex::new(go_rx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = {
+        let calls = calls.clone();
+        Completion::new_sync(move |res| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if res.is_err() {
+                entered_tx.send(()).unwrap();
+                go_rx.lock().unwrap().recv().unwrap();
+            }
+        })
+    };
+    let c = file.sync(c, FileSyncType::Fsync).unwrap();
+    assert!(
+        c.is_owned() && !c.finished(),
+        "the pumped backend holds the sync"
+    );
+    let retired = Arc::new(AtomicUsize::new(0));
+    {
+        let retired = retired.clone();
+        c.on_retired(move || {
+            retired.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    let cancel = {
+        let c = c.clone();
+        std::thread::spawn(move || c.abort())
+    };
+    entered_rx
+        .recv_timeout(BOUND)
+        .expect("the cancellation entered the callback");
+    let deliver = {
+        let io = io.clone();
+        move || io.step().unwrap()
+    };
+    let (delivered, mid) = match first {
+        FirstToEnd::Delivery => {
+            // On another thread, so a delivery that waited for the callback is seen.
+            let delivered = returns_within(BOUND, deliver);
+            let mid = (c.is_owned(), retired.load(Ordering::SeqCst));
+            assert!(
+                !c.finished(),
+                "{first:?}: published before its callback returned"
+            );
+            go_tx.send(()).unwrap();
+            cancel.join().unwrap();
+            (delivered, mid)
+        }
+        FirstToEnd::Callback => {
+            go_tx.send(()).unwrap();
+            cancel.join().unwrap();
+            let mid = (c.is_owned(), retired.load(Ordering::SeqCst));
+            (returns_within(BOUND, deliver), mid)
+        }
+    };
+    assert!(delivered, "{first:?}: the delivery did not return");
+    assert_eq!(
+        mid,
+        (true, 0),
+        "{first:?}: (owned, retirements) before the second end"
+    );
+    assert_eq!(
+        retired.load(Ordering::SeqCst),
+        1,
+        "{first:?}: retirements once both ended"
+    );
+    assert!(!c.is_owned(), "{first:?}: owned once both ended");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{first:?}: callbacks run");
+    assert!(
+        matches!(c.get_error(), Some(crate::CompletionError::Aborted)),
+        "{first:?}: the result kept: {:?}",
+        c.get_error()
+    );
+    assert_eq!(io.in_flight(), 0, "{first:?}: operations in flight");
+}
+
+#[test]
+fn a_delivery_meeting_a_cancellation_still_in_its_callback_leaves_it_the_retirement() {
+    a_cancellation_and_a_delivery_meet_once(FirstToEnd::Delivery);
+}
+
+#[test]
+fn a_delivery_after_a_cancellations_callback_returned_retires_the_request() {
+    a_cancellation_and_a_delivery_meet_once(FirstToEnd::Callback);
+}
+
+/// What a waiter waits for on a pumped backend.
+#[derive(Clone, Copy, Debug)]
+enum Waits {
+    /// The request's result ([`IO::wait`]).
+    Result,
+    /// Its retirement ([`IO::wait_retired`]).
+    Retirement,
+}
+
+/// What a waiter waits on.
+#[derive(Clone, Copy, Debug)]
+enum Through {
+    /// The request itself.
+    Request,
+    /// A group holding it, whose own finish is not yet claimed.
+    Group,
+    /// A request carried through it ([`Completion::carry`]), which its callback finishes and its
+    /// retirement retires.
+    Carried,
+}
+
+/// A pumped backend has delivered a request whose callback a cancellation runs, paused, on
+/// another thread: only that finish can publish its result and retire it. A waiter for either,
+/// on the request, on a group holding it or on a request carried through it, parks rather than
+/// stepping a backend that holds nothing for it, and the finish wakes it; a watch on the carried
+/// request hears its carrier leave the backend once, though it later ends itself (audit
+/// chain-fixes-v1, P2-CF1, and the auditor's group and carry controls; mutants: the waiter steps
+/// until the finish lands, a core spent on empty steps; a group judged by its own finish alone; a
+/// carried request blind to its carrier; a watch told twice).
+fn a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
+    waits: Waits,
+    through: Through,
+) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const BOUND: Duration = Duration::from_secs(20);
+    let crash = Arc::new(CrashIO::new(1));
+    let io = super::wait_tests::StepCounting::new(crash.clone());
+    let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = std::sync::Mutex::new(go_rx);
+    let carried = Completion::new_sync(|_| {});
+    let c = {
+        let carried = carried.clone();
+        Completion::new_sync(move |res| {
+            if res.is_err() {
+                entered_tx.send(()).unwrap();
+                go_rx.lock().unwrap().recv().unwrap();
+            }
+            if let Through::Carried = through {
+                match res {
+                    Ok(n) => carried.complete(n),
+                    Err(e) => carried.error(e),
+                }
+            }
+        })
+    };
+    let mut group = CompletionGroup::new(|_| {});
+    group.add(&c);
+    let group = group.build();
+    let c = match through {
+        Through::Carried => carried.carry(|| file.sync(c, FileSyncType::Fsync)),
+        Through::Request | Through::Group => file.sync(c, FileSyncType::Fsync),
+    }
+    .unwrap();
+    let watch = super::wait_tests::Told::new();
+    if let Through::Carried = through {
+        carried.watch_ownership(watch.clone());
+    }
+    let cancel = {
+        let c = c.clone();
+        std::thread::spawn(move || c.abort())
+    };
+    entered_rx
+        .recv_timeout(BOUND)
+        .expect("the cancellation entered the callback");
+    crash.step().unwrap();
+    assert!(
+        c.left_its_backend() && c.is_owned() && !c.finished(),
+        "the backend let the request go, its callback still running"
+    );
+    assert!(!group.finished(), "the group's own finish is not claimed");
+    if let Through::Carried = through {
+        assert!(
+            carried.left_its_backend() && carried.is_owned() && !carried.finished(),
+            "the carrier left its backend, the carried request unfinished"
+        );
+    }
+    let target = match through {
+        Through::Request => c.clone(),
+        Through::Group => group.clone(),
+        Through::Carried => carried.clone(),
+    };
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = {
+        let io = io.clone();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            match waits {
+                Waits::Result => io.wait(&target),
+                Waits::Retirement => io.wait_retired(&target).unwrap(),
+            }
+            done_tx.send(()).unwrap();
+        })
+    };
+    started_rx.recv().unwrap();
+    // Long enough for the waiter to reach its wait, which takes microseconds, and for a waiter
+    // that steps to step many times.
+    std::thread::sleep(Duration::from_millis(100));
+    let mid = (io.steps(), done_rx.try_recv().is_ok());
+    go_tx.send(()).unwrap();
+    cancel.join().unwrap();
+    let ended = done_rx.recv_timeout(BOUND).is_ok();
+    waiter.join().unwrap();
+    assert_eq!(
+        mid,
+        (0, false),
+        "{waits:?} through {through:?}: (steps, returned) while the finish was paused"
+    );
+    assert!(
+        ended,
+        "{waits:?} through {through:?}: the finish did not wake the waiter"
+    );
+    assert!(
+        c.finished() && !c.is_owned() && group.finished(),
+        "{waits:?} through {through:?}: the request and its group ended"
+    );
+    if let Through::Carried = through {
+        assert!(
+            carried.finished() && !carried.is_owned(),
+            "{waits:?}: the carried request ended"
+        );
+        assert_eq!(
+            watch.seen(),
+            (1, 1, 1),
+            "{waits:?}: (finishers left, retirements, told) heard by the carried request's watch"
+        );
+    }
+    assert_eq!(
+        io.steps(),
+        0,
+        "{waits:?} through {through:?}: steps taken in all"
+    );
+}
+
+#[test]
+fn a_pumped_wait_for_a_result_only_a_finish_elsewhere_can_publish_parks() {
+    a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
+        Waits::Result,
+        Through::Request,
+    );
+}
+
+#[test]
+fn a_pumped_wait_for_a_retirement_only_a_finish_elsewhere_can_make_parks() {
+    a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
+        Waits::Retirement,
+        Through::Request,
+    );
+}
+
+#[test]
+fn a_pumped_wait_on_a_group_for_its_result_only_a_finish_elsewhere_can_publish_parks() {
+    a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
+        Waits::Result,
+        Through::Group,
+    );
+}
+
+#[test]
+fn a_pumped_wait_on_a_group_for_its_retirement_only_a_finish_elsewhere_can_make_parks() {
+    a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
+        Waits::Retirement,
+        Through::Group,
+    );
+}
+
+#[test]
+fn a_pumped_wait_on_a_carried_request_for_its_result_only_its_carriers_finish_can_publish_parks() {
+    a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
+        Waits::Result,
+        Through::Carried,
+    );
+}
+
+#[test]
+fn a_pumped_wait_on_a_carried_request_for_its_retirement_only_its_carriers_finish_can_make_parks() {
+    a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
+        Waits::Retirement,
+        Through::Carried,
+    );
+}
+
 /// A file whose `pwrite` refuses its `refuse_at`th call and passes the rest to a file of a
 /// backend, so that `pwritev` takes the trait's default.
 struct RefusingAt {
@@ -393,9 +696,10 @@ fn failing_steps(io: &CrashIO) {
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     io.on_step(Some(Arc::new(move || {
         if failed.swap(true, Ordering::SeqCst) {
-            eprintln!("stepped again after a failed step");
+            crate::child_test::record("backend-step", "retried");
             std::process::exit(0);
         }
+        crate::child_test::record("backend-step", "failed");
         Err(crate::LimboError::InternalError(
             "the backend's stepping failed".into(),
         ))
@@ -556,5 +860,90 @@ fn a_step_that_fails_under_a_wait_for_retirement_ends_the_process() {
         ),
         "a wait for retirement",
         |io, c| io.drain_completions(std::slice::from_ref(c)),
+    );
+}
+
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_backend_step_failure_ends_an_async_wait() {
+    let Some(ended) = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_backend_step_failure_ends_an_async_wait"
+        ),
+        || {
+            use std::future::Future;
+            let io = CrashIO::new(9);
+            let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+            let request = file.pread(0, read(512)).unwrap();
+            assert!(request.is_owned() && !request.finished());
+            failing_steps(&io);
+            let mut future = std::pin::pin!(crate::types::IOCompletions(request).wait_async(&io));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            crate::child_test::record("target", "ready");
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            stderr_a_full_pipe();
+            let _ = future.as_mut().poll(&mut context);
+            crate::child_test::record("target", "returned");
+            std::process::exit(0);
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(
+        crate::child_test::recorded(&ended, "backend-step"),
+        "failed\n"
+    );
+    assert_eq!(crate::child_test::recorded(&ended, "target"), "ready\n");
+    assert!(
+        ended.aborted && !ended.hung,
+        "the async wait did not abort: hung {}, code {:?}",
+        ended.hung,
+        ended.code
+    );
+}
+
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_backend_step_failure_ends_a_statements_yield_pump() {
+    let Some(ended) = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_backend_step_failure_ends_a_statements_yield_pump"
+        ),
+        || {
+            let io = Arc::new(CrashIO::new(10));
+            let db = crate::Database::open(
+                io.clone(),
+                "/db/main",
+                crate::OpenOptions::new(Arc::new(crate::SqliteDialect)),
+            )
+            .unwrap();
+            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+            let statement = conn.prepare("SELECT 1").unwrap();
+            let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+            let request = file.pread(0, read(512)).unwrap();
+            assert!(request.is_owned() && !request.finished());
+            failing_steps(&io);
+            crate::child_test::record("target", "ready");
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            stderr_a_full_pipe();
+            let _ = statement.wait_io();
+            crate::child_test::record("target", "returned");
+            std::process::exit(0);
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(
+        crate::child_test::recorded(&ended, "backend-step"),
+        "failed\n"
+    );
+    assert_eq!(crate::child_test::recorded(&ended, "target"), "ready\n");
+    assert!(
+        ended.aborted && !ended.hung,
+        "the statement's pump did not abort: hung {}, code {:?}",
+        ended.hung,
+        ended.code
     );
 }

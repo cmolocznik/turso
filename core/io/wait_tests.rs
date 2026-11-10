@@ -228,6 +228,11 @@ fn every_live_place_is_a_key_of_its_own() {
     assert_eq!(steps, [Stepped::Empty; 3]);
     assert_ne!(one.key(), two.key());
     assert_eq!(
+        one.key(),
+        ReadyKey(std::num::NonZeroUsize::new(std::ptr::from_ref(&one) as usize).unwrap()),
+        "a key is its place's address, no count that could wrap"
+    );
+    assert_eq!(
         both, 2,
         "one registration per place, however often it looks"
     );

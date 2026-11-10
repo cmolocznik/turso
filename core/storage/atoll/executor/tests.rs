@@ -1530,6 +1530,301 @@ mod native {
         ));
     }
 
+    /// Asks again `steps` times, then finishes `c` and is done, recording the thread of each
+    /// step.
+    struct FinishesAfter {
+        steps: usize,
+        c: Completion,
+        ran_on: Arc<Lock<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl Task for FinishesAfter {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            self.ran_on.lock().push(std::thread::current().id());
+            if self.steps == 0 {
+                self.c.complete(0);
+                return Ok(Step::Done);
+            }
+            self.steps -= 1;
+            Ok(Step::Again)
+        }
+    }
+
+    fn finishes_after(
+        steps: usize,
+        c: &Completion,
+    ) -> (Box<dyn Task>, Arc<Lock<Vec<std::thread::ThreadId>>>) {
+        let ran_on = Arc::new(Lock::new(Vec::new()));
+        let task = Box::new(FinishesAfter {
+            steps,
+            c: c.clone(),
+            ran_on: ran_on.clone(),
+        });
+        (task, ran_on)
+    }
+
+    /// A blocking wait on executor work runs the executor itself when it has no workers, until
+    /// what it waits for finishes (22.7; mutant: a waiter that only parks, which nothing wakes).
+    #[test]
+    fn a_blocking_wait_without_workers_runs_the_executor_until_its_completion_finishes() {
+        let ex = Arc::new(executor(0));
+        let c = Completion::new_wait();
+        let (task, ran_on) = finishes_after(3, &c);
+        ex.spawn(Class::Due, task);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let (ex, c) = (ex.clone(), c.clone());
+            std::thread::spawn(move || {
+                ex.wait(&c);
+                let _ = done_tx.send(std::thread::current().id());
+            })
+        };
+        let waited = done_rx.recv_timeout(BOUND).ok();
+        if waited.is_none() {
+            // A waiter nothing woke: finish what it waits for so the thread ends.
+            c.complete(0);
+        }
+        waiter.join().unwrap();
+        let steps = ran_on.lock().clone();
+        Arc::try_unwrap(ex).ok().unwrap().close();
+        let waiter = waited.expect("the wait returned");
+        assert_eq!(steps.len(), 4, "every step of the task");
+        assert!(
+            steps.iter().all(|&id| id == waiter),
+            "a step on another thread"
+        );
+    }
+
+    /// A blocking wait with nothing to claim and an empty pumped backend parks: one look, no
+    /// steps meanwhile; a link wakes it to run what was linked (22.5, 22.7; mutant: a waiter that
+    /// keeps stepping instead of parking).
+    #[test]
+    fn a_blocking_wait_parks_with_nothing_to_do_and_a_link_wakes_it() {
+        let crash = Arc::new(CrashIO::new(1));
+        let io = crate::io::wait_tests::StepCounting::new(crash.clone());
+        let ex = Arc::new(Executor::new(io.clone(), 0).unwrap());
+        let c = Completion::new_wait();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let (ex, c) = (ex.clone(), c.clone());
+            std::thread::spawn(move || {
+                ex.wait(&c);
+                let _ = done_tx.send(());
+            })
+        };
+        // Long enough for the waiter to look and park, which takes microseconds.
+        std::thread::sleep(Duration::from_millis(100));
+        let parked = (io.steps(), done_rx.try_recv().is_ok());
+        let (task, ran_on) = finishes_after(0, &c);
+        ex.spawn(Class::Due, task);
+        let woken = done_rx.recv_timeout(BOUND).is_ok();
+        if !woken {
+            c.complete(0);
+        }
+        waiter.join().unwrap();
+        let steps = ran_on.lock().len();
+        Arc::try_unwrap(ex).ok().unwrap().close();
+        assert_eq!(
+            parked,
+            (1, false),
+            "(backend steps, returned) while nothing was queued"
+        );
+        assert!(woken, "the link woke the parked waiter");
+        assert_eq!(steps, 1);
+    }
+
+    /// With workers, a blocking wait only waits: the workers run what it waits for (22.7; mutant:
+    /// a waiter that runs the executor beside its workers).
+    #[test]
+    fn a_blocking_wait_with_workers_only_waits() {
+        let ex = executor(2);
+        let c = Completion::new_wait();
+        let (task, ran_on) = finishes_after(64, &c);
+        ex.spawn(Class::Due, task);
+        ex.wait(&c);
+        let finished = c.finished();
+        ex.close();
+        let me = std::thread::current().id();
+        let steps = ran_on.lock().clone();
+        assert!(finished);
+        assert_eq!(steps.len(), 65);
+        assert!(
+            steps.iter().all(|&id| id != me),
+            "the waiter stepped a task"
+        );
+    }
+
+    /// Counts its wakes.
+    struct Counts(Arc<AtomicUsize>);
+
+    impl std::task::Wake for Counts {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, O::AcqRel);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, O::AcqRel);
+        }
+    }
+
+    /// A cooperative wait runs one task step per poll and, while work is queued, asks its host to
+    /// poll again at once; ready once what it waits for finishes (22.7; mutant: a poll that asks
+    /// for no other while work is queued).
+    #[test]
+    fn a_cooperative_wait_runs_one_step_per_poll_and_polls_again_while_work_is_queued() {
+        use std::future::Future;
+        let ex = executor(0);
+        let c = Completion::new_wait();
+        let (task, ran_on) = finishes_after(2, &c);
+        ex.spawn(Class::Due, task);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = std::task::Waker::from(Arc::new(Counts(wakes.clone())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut polls = Vec::new();
+        {
+            let mut wait = std::pin::pin!(ex.wait_async(c.clone()));
+            for _ in 0..4 {
+                let ready = wait.as_mut().poll(&mut cx).is_ready();
+                polls.push((ready, ran_on.lock().len(), wakes.swap(0, O::AcqRel) > 0));
+                if ready {
+                    break;
+                }
+            }
+        }
+        ex.close();
+        assert_eq!(
+            polls,
+            [
+                (false, 1, true),
+                (false, 2, true),
+                (false, 3, true),
+                (true, 3, false)
+            ],
+            "(ready, steps so far, woken) per poll"
+        );
+    }
+
+    /// A cooperative wait with nothing to claim rests its node among the idle runners and asks
+    /// for no poll; a link wakes its host, whose next poll runs the task (22.3, 22.7; mutant: a
+    /// poll that leaves no node).
+    #[test]
+    fn a_cooperative_wait_with_nothing_queued_rests_and_a_link_wakes_its_host() {
+        use std::future::Future;
+        let ex = executor(0);
+        let c = Completion::new_wait();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = std::task::Waker::from(Arc::new(Counts(wakes.clone())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let (first, linked, second, third) = {
+            let mut wait = std::pin::pin!(ex.wait_async(c.clone()));
+            let first = (
+                wait.as_mut().poll(&mut cx).is_pending(),
+                wakes.swap(0, O::AcqRel),
+            );
+            let (task, ran_on) = finishes_after(0, &c);
+            ex.spawn(Class::Due, task);
+            let linked = wakes.swap(0, O::AcqRel);
+            let second = (
+                wait.as_mut().poll(&mut cx).is_pending(),
+                ran_on.lock().len(),
+            );
+            let third = wait.as_mut().poll(&mut cx).is_ready();
+            (first, linked, second, third)
+        };
+        ex.close();
+        assert_eq!(
+            first,
+            (true, 0),
+            "(pending, wakes asked) with nothing queued"
+        );
+        assert_eq!(linked, 1, "the link woke the host");
+        assert_eq!(second, (true, 1), "the next poll stepped the task");
+        assert!(third, "ready once it finished");
+    }
+
+    /// Steps by its signal: clears its own level against the count it read, then rests on it.
+    struct Sleeps {
+        signal: Arc<Signal>,
+        units: Arc<AtomicUsize>,
+    }
+
+    impl Task for Sleeps {
+        fn step(&mut self, cx: &Cx) -> Result<Step> {
+            let read = self.signal.read();
+            cx.clear_due(&self.signal, read);
+            self.units.fetch_add(1, O::Relaxed);
+            Ok(Step::Idle(Watched::of(&[(&self.signal, read)])))
+        }
+    }
+
+    /// One round of every way a task is woken and claimed: a ticket of `class`, a trigger, a
+    /// plain wake, a named claim; whether each did what it should.
+    fn cycle(
+        ex: &Executor,
+        runner: &Runner,
+        task: &TaskRef,
+        signal: &Signal,
+        waker: &std::task::Waker,
+        class: Class,
+    ) -> bool {
+        let ticket = task.ticket(class);
+        let a = runner.run_one(waker);
+        drop(ticket);
+        let b = !runner.run_one(waker);
+        task.trigger(signal);
+        let c = runner.run_one(waker);
+        let d = !runner.run_one(waker);
+        task.wake();
+        let e = runner.run_one(waker);
+        let f = !runner.run_one(waker);
+        let g = ex.run_named(task);
+        let h = !runner.run_one(waker);
+        a && b && c && d && e && f && g && h
+    }
+
+    /// Wakes, claims, class changes and external runners allocate nothing once provisioned: a
+    /// task stepped 3,072 times by tickets, triggers, plain wakes and named claims, its runner
+    /// woken 2,304 times (22.13; the auditor's probe; mutant: the task boxed again at each step).
+    #[test]
+    fn repeated_wakes_claims_and_class_changes_allocate_nothing_once_provisioned() {
+        let ex = Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap();
+        let signal = Arc::new(Signal::default());
+        let units = Arc::new(AtomicUsize::new(0));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = std::task::Waker::from(Arc::new(Counts(wakes.clone())));
+        let task = ex.spawn_watching(
+            Class::Maintenance,
+            Box::new(Sleeps {
+                signal: signal.clone(),
+                units: units.clone(),
+            }),
+            &[&signal],
+        );
+        let runner = ex.runner();
+        let mut valid = runner.run_one(&waker) && !runner.run_one(&waker);
+        // Every path once before counting, the race points' thread locals included.
+        for class in [Class::Relief, Class::Due, Class::Maintenance] {
+            valid &= cycle(&ex, &runner, &task, &signal, &waker, class);
+        }
+        let before = crate::storage::atoll::testing::allocations();
+        let (old_units, old_wakes) = (units.load(O::Relaxed), wakes.load(O::Acquire));
+        for _ in 0..256 {
+            for class in [Class::Relief, Class::Due, Class::Maintenance] {
+                valid &= cycle(&ex, &runner, &task, &signal, &waker, class);
+            }
+        }
+        let allocations = crate::storage::atoll::testing::allocations() - before;
+        let measured = (
+            units.load(O::Relaxed) - old_units,
+            wakes.load(O::Acquire) - old_wakes,
+        );
+        drop(runner);
+        ex.close();
+        assert!(valid, "a round did not wake or claim as it should");
+        assert_eq!(measured, (3072, 2304), "(steps, external wakes) counted");
+        assert_eq!(allocations, 0);
+    }
+
     /// Steps once: enters the executor through `runner`.
     struct EntersAgain {
         runner: Arc<Lock<Option<Runner>>>,

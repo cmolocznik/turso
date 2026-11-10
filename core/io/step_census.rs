@@ -30,6 +30,17 @@ const STEPS: &[(&str, &str, &str)] = &[
     ),
     (
         "core/storage/atoll/executor/mod.rs",
+        "poll",
+        "a cooperative wait on executor work: one IO step per poll, beside its one task step",
+    ),
+    (
+        "core/storage/atoll/executor/mod.rs",
+        "run_until",
+        "a blocking wait on executor work running the executor: a worker's pump, parking once \
+         nothing is claimed and the backend is empty",
+    ),
+    (
+        "core/storage/atoll/executor/mod.rs",
         "work",
         "a worker's pump: one step per task step, and with nothing to claim, steps while the \
          backend delivers and parks once it is empty",

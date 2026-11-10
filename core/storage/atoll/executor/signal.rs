@@ -38,16 +38,24 @@ pub(crate) const WATCHED: usize = 3;
 
 pub(crate) struct Signal {
     count: AtomicU64,
-    /// The tasks registered, each at most once, with room for every task declared to watch it,
-    /// so registering and notifying allocate nothing.
-    listed: Mutex<Vec<Arc<Header>>>,
+    listed: Mutex<Listed>,
+}
+
+/// The tasks registered, each at most once, and how many tasks are declared to watch the signal:
+/// the list keeps room for every one of them, so registering and notifying allocate nothing.
+struct Listed {
+    tasks: Vec<Arc<Header>>,
+    declared: usize,
 }
 
 impl Default for Signal {
     fn default() -> Self {
         Self {
             count: AtomicU64::new(0),
-            listed: Mutex::new(Vec::new()),
+            listed: Mutex::new(Listed {
+                tasks: Vec::new(),
+                declared: 0,
+            }),
         }
     }
 }
@@ -62,39 +70,66 @@ impl Signal {
     /// and the list emptied, under the mutex. Its work is at most the list, however often
     /// notifies come.
     pub(crate) fn notify(&self) {
+        self.bump();
+        self.wake_listed();
+    }
+
+    /// The count moves: a change is published, and a look that read the count before sees it.
+    pub(super) fn bump(&self) {
         self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Wakes every task listed and empties the list, under the mutex.
+    pub(super) fn wake_listed(&self) {
         let mut listed = lock(&self.listed);
-        for header in listed.drain(..) {
+        for header in listed.tasks.drain(..) {
             wake(&header);
         }
     }
 
-    /// Makes room for one more task that may watch the signal.
+    /// One more task may watch the signal: the list makes room for every task declared.
     pub(super) fn declare(&self) {
-        lock(&self.listed).reserve(1);
+        let mut listed = lock(&self.listed);
+        listed.declared += 1;
+        let room = listed.declared - listed.tasks.len();
+        listed.tasks.reserve(room);
     }
 
-    /// Registers `header` unless it is listed already; whether the count still reads `read`.
+    /// Registers `header`, a task declared to watch the signal, unless it is listed already;
+    /// whether the count still reads `read`.
     pub(super) fn register(&self, header: &Arc<Header>, read: u64) -> bool {
         crate::race::point("executor.registering");
         {
             let mut listed = lock(&self.listed);
-            if !listed.iter().any(|h| Arc::ptr_eq(h, header)) {
-                listed.push(header.clone());
+            if !listed.tasks.iter().any(|h| Arc::ptr_eq(h, header)) {
+                listed.tasks.push(header.clone());
             }
         }
         crate::race::point("executor.registered");
         self.read() == read
     }
 
-    /// Takes `header` off the list: a task removed, or closed.
-    pub(super) fn unlist(&self, header: &Arc<Header>) {
-        lock(&self.listed).retain(|h| !Arc::ptr_eq(h, header));
+    /// A task declared to watch the signal watches it no more (done, or closed): off the list,
+    /// and no longer counted in the room the list keeps.
+    pub(super) fn leave(&self, header: &Arc<Header>) {
+        let mut listed = lock(&self.listed);
+        let Some(declared) = listed.declared.checked_sub(1) else {
+            drop(listed);
+            unreachable!("a task left a signal it was not declared to watch");
+        };
+        listed.declared = declared;
+        listed.tasks.retain(|h| !Arc::ptr_eq(h, header));
     }
 
     #[cfg(test)]
     pub(super) fn listed(&self) -> usize {
-        lock(&self.listed).len()
+        lock(&self.listed).tasks.len()
+    }
+
+    /// How many tasks the list has room for.
+    #[cfg(test)]
+    pub(super) fn room(&self) -> usize {
+        lock(&self.listed).tasks.capacity()
     }
 }
 

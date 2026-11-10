@@ -266,6 +266,16 @@ impl IO for SimulatorIO {
         true
     }
 
+    /// Takes `ready`'s registration out under the queue's lock and drops it after.
+    fn withdraw(&self, ready: &std::task::Waker) {
+        let gone = {
+            let mut pending = self.pending.lock().unwrap();
+            let at = pending.ready.iter().position(|w| w.will_wake(ready));
+            at.map(|at| pending.ready.swap_remove(at))
+        };
+        drop(gone);
+    }
+
     fn generate_random_number(&self) -> i64 {
         let mut rng = self.rng.lock().unwrap();
         rng.next_u64() as i64

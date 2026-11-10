@@ -260,6 +260,11 @@ impl CrashIO {
         self.state.lock().in_flight.len()
     }
 
+    /// How many waiters' registrations the IO holds.
+    pub fn registered(&self) -> usize {
+        self.state.lock().ready.len()
+    }
+
     /// Handles on this IO's state besides this one: its files still open, and every other
     /// handle. Whoever drops all it built on the IO finds none left unless something holds one.
     pub fn other_handles(&self) -> usize {
@@ -796,6 +801,16 @@ impl IO for CrashIO {
         }
         self.complete_one();
         Ok(super::Stepped::Delivered)
+    }
+
+    /// Takes `ready`'s registration out under the lock and drops it after.
+    fn withdraw(&self, ready: &std::task::Waker) {
+        let gone = {
+            let mut state = self.state.lock();
+            let at = state.ready.iter().position(|w| w.will_wake(ready));
+            at.map(|at| state.ready.swap_remove(at))
+        };
+        drop(gone);
     }
 
     fn file_id(&self, path: &str) -> Result<FileId> {

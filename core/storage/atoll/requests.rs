@@ -115,6 +115,7 @@ impl Requests {
         self.word.fetch_or(CLOSING, Ordering::SeqCst);
         let pumped = io.delivery() == Delivery::Pumped;
         let ready = crate::io::unparking(me.clone());
+        let mut registered = false;
         while outstanding_in(self.word.load(Ordering::SeqCst)) > 0 {
             if !pumped {
                 crate::storage::atoll::park::thread();
@@ -127,8 +128,14 @@ impl Requests {
                 Ok(Stepped::Unsaid) => {
                     unreachable!("a backend that says what its steps find answered Unsaid")
                 }
-                Ok(Stepped::Empty) => crate::storage::atoll::park::thread(),
+                Ok(Stepped::Empty) => {
+                    registered = true;
+                    crate::storage::atoll::park::thread();
+                }
             }
+        }
+        if registered {
+            io.withdraw(&ready);
         }
         self.word.fetch_and(!CLOSING, Ordering::SeqCst);
     }
@@ -200,6 +207,10 @@ impl IO for Counted {
 
     fn says_what_a_step_found(&self) -> bool {
         self.io.says_what_a_step_found()
+    }
+
+    fn withdraw(&self, ready: &std::task::Waker) {
+        self.io.withdraw(ready)
     }
 
     fn delivery(&self) -> crate::io::Delivery {

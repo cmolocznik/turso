@@ -151,6 +151,16 @@ impl IO for MemoryYieldIO {
     fn says_what_a_step_found(&self) -> bool {
         true
     }
+
+    /// Takes `ready`'s registration out under the queue's lock and drops it after.
+    fn withdraw(&self, ready: &std::task::Waker) {
+        let gone = {
+            let mut pending = self.pending.lock();
+            let at = pending.ready.iter().position(|w| w.will_wake(ready));
+            at.map(|at| pending.ready.swap_remove(at))
+        };
+        drop(gone);
+    }
 }
 
 pub struct MemoryYieldFile {

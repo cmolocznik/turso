@@ -331,6 +331,10 @@ impl IO for PausingOpen {
     fn says_what_a_step_found(&self) -> bool {
         self.inner.says_what_a_step_found()
     }
+
+    fn withdraw(&self, ready: &std::task::Waker) {
+        self.inner.withdraw(ready)
+    }
 }
 
 /// A read that read the partition's state before history was let go reads every batch it found

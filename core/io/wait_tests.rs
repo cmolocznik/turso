@@ -94,6 +94,10 @@ impl IO for StepCounting {
         self.io.says_what_a_step_found()
     }
 
+    fn withdraw(&self, ready: &std::task::Waker) {
+        self.io.withdraw(ready)
+    }
+
     fn delivery(&self) -> Delivery {
         self.io.delivery()
     }

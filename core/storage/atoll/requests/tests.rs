@@ -463,6 +463,65 @@ fn close_parks_while_a_counted_request_is_not_yet_submitted_and_steps_it_once_it
     close_parks_on_an_empty_backend_and_steps_what_is_submitted(Paused::CountedNotQueued);
 }
 
+/// Close takes back the registration its look left with the backend, however its wait ends: here
+/// its last request retires by a finish elsewhere that submits nothing, so no submission takes the
+/// registration (the auditor's P2-X69-2; mutant: close leaving it behind).
+#[test]
+fn close_takes_back_its_registration_when_a_finish_elsewhere_ends_its_wait() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const BOUND: Duration = Duration::from_secs(20);
+    let crash = Arc::new(CrashIO::new(1));
+    let (io, requests) = counted(crash.clone());
+    let file = io.open_file("/db/close", OpenFlags::Create, false).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let c = Completion::new_sync(move |res| {
+        if res.is_err() {
+            entered_tx.send(()).unwrap();
+            go_rx.lock().recv().unwrap();
+        }
+    });
+    let c = file.sync(c, crate::io::FileSyncType::Fsync).unwrap();
+    let cancel = {
+        let c = c.clone();
+        std::thread::spawn(move || c.abort())
+    };
+    entered_rx
+        .recv_timeout(BOUND)
+        .expect("the cancellation reached its callback");
+    crash.step().unwrap();
+    let let_go = crash.in_flight() == 0 && c.is_owned();
+    let (done_tx, done_rx) = mpsc::channel();
+    let closer = {
+        let (requests, io) = (requests.clone(), io.clone());
+        std::thread::spawn(move || {
+            requests.drain(&*io);
+            done_tx.send(()).unwrap();
+        })
+    };
+    // Long enough for close to look and park, which takes microseconds.
+    std::thread::sleep(Duration::from_millis(100));
+    let parked = (crash.registered(), done_rx.try_recv().is_ok());
+    go_tx.send(()).unwrap();
+    cancel.join().unwrap();
+    let ended = done_rx.recv_timeout(BOUND).is_ok();
+    closer.join().unwrap();
+    let left = crash.registered();
+    assert!(
+        let_go,
+        "the backend let the request go, its callback still running"
+    );
+    assert_eq!(
+        parked,
+        (1, false),
+        "(registrations, returned) while close waited"
+    );
+    assert!(ended, "close returned once its last request retired");
+    assert_eq!(left, 0, "a registration left behind by close");
+}
+
 struct AuditGroupFile(Arc<dyn File>);
 impl File for AuditGroupFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {

@@ -52,12 +52,42 @@ pub(crate) enum Step {
     Wait(Completion),
     /// Nothing to do until one of these signals moves from the count read before the look (22.2).
     Idle(Watched),
+    /// Nothing to do until `c` finishes, which another job's work brings: the task holds a ticket
+    /// of its own class on that job while it waits (22.4), and that job ranks after it.
+    WaitOn(TaskRef, Completion),
 }
 
 /// A job the executor steps (22.1): one unit of its work per step, never waiting inside one; its
 /// progress lives in its own state, which only the step touches.
 pub(crate) trait Task: Send {
-    fn step(&mut self) -> Result<Step>;
+    fn step(&mut self, cx: &Cx) -> Result<Step>;
+}
+
+/// What a step may ask of the executor about its own task.
+pub(crate) struct Cx<'a> {
+    header: &'a Arc<Header>,
+    shared: &'a Arc<Shared>,
+}
+
+impl Cx<'_> {
+    /// The task's own trigger is gone, as the step found after reading `due` at `read`: its own
+    /// level drops to maintenance, unless a trigger came since, which moved the count and keeps
+    /// it (22.4); whether it dropped.
+    pub(crate) fn clear_due(&self, due: &Signal, read: u64) -> bool {
+        crate::race::point("executor.clearing");
+        let mut queue = lock(&self.shared.queue);
+        if due.read() != read {
+            return false;
+        }
+        {
+            let mut demand = lock(&self.header.demand);
+            if demand.own == Class::Due {
+                demand.own = Class::Maintenance;
+            }
+        }
+        queue.reclass(self.header);
+        true
+    }
 }
 
 /// A task's class, in the order runners take them (22.4): strictly by class, first in first out
@@ -74,6 +104,51 @@ pub(crate) enum Class {
 }
 
 const CLASSES: usize = 3;
+
+impl Class {
+    fn of(n: u8) -> Self {
+        match n {
+            0 => Class::Relief,
+            1 => Class::Due,
+            _ => Class::Maintenance,
+        }
+    }
+}
+
+/// A task's demand (22.4), under the queue's mutex: its own level, the live tickets on it of each
+/// class above maintenance, and the ticket it holds on another job while a logical wait stands.
+struct Demand {
+    own: Class,
+    tickets: [u32; 2],
+    waiting_on: Option<(Arc<Header>, Class)>,
+}
+
+impl Demand {
+    /// The highest of its demands.
+    fn class(&self) -> Class {
+        if self.tickets[Class::Relief as usize] > 0 {
+            Class::Relief
+        } else if self.tickets[Class::Due as usize] > 0 && self.own != Class::Relief {
+            Class::Due
+        } else {
+            self.own
+        }
+    }
+
+    fn add(&mut self, class: Class) {
+        if class != Class::Maintenance {
+            self.tickets[class as usize] += 1;
+        }
+    }
+
+    fn remove(&mut self, class: Class) {
+        if class != Class::Maintenance {
+            let n = &mut self.tickets[class as usize];
+            assert!(*n > 0, "a ticket dropped that was never taken");
+            *n -= 1;
+        }
+    }
+}
 
 /// Not queued, not running: a wake queues it.
 const IDLE: u8 = 0;
@@ -92,8 +167,13 @@ const CLOSED: u8 = 16;
 /// none to the executor but a weak one.
 struct Header {
     state: AtomicU8,
-    /// Its class, read and written under the queue's mutex only.
+    /// Its class, the highest of its demands, read and written under the queue's mutex only.
     class: AtomicU8,
+    /// Its demand, under the queue's mutex.
+    demand: Mutex<Demand>,
+    /// Its job's place in the order jobs wait on each other (22.4): a wait names only a job
+    /// ranked after it, so no cycle of waits forms and a move of tickets ends.
+    rank: u8,
     shared: Weak<Shared>,
     job: Weak<Job>,
 }
@@ -172,7 +252,8 @@ impl Queue {
         }
     }
 
-    /// The head of the highest non-empty class, moved to `RUNNING`.
+    /// The head of the highest non-empty class, moved to `RUNNING`; a logical wait it stood in
+    /// is over, and the ticket it held goes.
     fn claim(&mut self) -> Option<Arc<Header>> {
         if self.closing {
             return None;
@@ -180,7 +261,48 @@ impl Queue {
         let header = self.lists.iter_mut().find_map(VecDeque::pop_front)?;
         let was = header.state.swap(RUNNING, Ordering::AcqRel);
         assert_eq!(was, QUEUED, "a task claimed that was not queued");
+        self.end_wait(&header);
         Some(header)
+    }
+
+    /// Gives back the ticket `header` holds on another job, if a logical wait of its stood.
+    fn end_wait(&mut self, header: &Arc<Header>) {
+        let waited = lock(&header.demand).waiting_on.take();
+        if let Some((target, class)) = waited {
+            lock(&target.demand).remove(class);
+            self.reclass(&target);
+        }
+    }
+
+    /// Sets `header`'s class to the highest of its demands: a queued task moves to the back of
+    /// its new class's list, and the ticket its logical wait holds moves with it, so the job it
+    /// waits on carries its class too (22.4).
+    fn reclass(&mut self, header: &Arc<Header>) {
+        let (new, waiting) = {
+            let demand = lock(&header.demand);
+            (demand.class(), demand.waiting_on.clone())
+        };
+        let old = Class::of(header.class.load(Ordering::Relaxed));
+        if new == old {
+            return;
+        }
+        header.class.store(new as u8, Ordering::Relaxed);
+        if header.state.load(Ordering::Acquire) == QUEUED {
+            let list = &mut self.lists[old as usize];
+            if let Some(at) = list.iter().position(|h| Arc::ptr_eq(h, header)) {
+                list.remove(at);
+            }
+            self.lists[new as usize].push_back(header.clone());
+        }
+        if let Some((target, _)) = waiting {
+            lock(&header.demand).waiting_on = Some((target.clone(), new));
+            {
+                let mut demand = lock(&target.demand);
+                demand.remove(old);
+                demand.add(new);
+            }
+            self.reclass(&target);
+        }
     }
 }
 
@@ -204,19 +326,55 @@ impl Shared {
             // Removed with its subject while queued: nothing to step.
             return true;
         };
-        let step = lock(&job.task).step();
-        self.end(&header, step);
+        let cx = Cx {
+            header: &header,
+            shared: self,
+        };
+        let step = lock(&job.task).step(&cx);
+        self.end(&header, &job, step);
         true
     }
 
-    /// The end of a step (22.3), from `RUNNING` or `RUNNING|NOTIFIED`.
-    fn end(self: &Arc<Self>, header: &Arc<Header>, step: Result<Step>) {
+    /// The end of a step (22.3), from `RUNNING` or `RUNNING|NOTIFIED`; a task the executor closed
+    /// meanwhile ends no other way.
+    fn end(self: &Arc<Self>, header: &Arc<Header>, job: &Job, step: Result<Step>) {
+        if let Ok(Step::Idle(Watched(watched))) = &step {
+            // Its job declared each, so the lists have room for it: registering allocates nothing.
+            for (signal, _) in watched.iter().flatten() {
+                assert!(
+                    job.watches.iter().any(|w| Arc::ptr_eq(w, signal)),
+                    "a step watching a signal its job did not declare"
+                );
+            }
+        }
+        if header.state.load(Ordering::Acquire) == CLOSED {
+            // Close takes it off every list and drops its job, on this thread too when the step
+            // dropped the executor; it is registered on none and finished by none.
+            return;
+        }
         match step {
             // An error ends the task as its job's end does: nothing restarts it.
             Ok(Step::Done) | Err(_) => self.finish(header),
             Ok(Step::Again) => self.requeue(header),
             Ok(Step::Wait(c)) => {
                 // Registered while running: a finish from now on marks the task notified.
+                c.set_waker(&std::task::Waker::from(header.clone()));
+                self.rest(header);
+            }
+            Ok(Step::WaitOn(target, c)) => {
+                {
+                    let mut queue = lock(&self.queue);
+                    assert!(
+                        header.rank < target.0.rank,
+                        "a wait naming a job not after its own (22.4)"
+                    );
+                    let class = Class::of(header.class.load(Ordering::Relaxed));
+                    lock(&header.demand).waiting_on = Some((target.0.clone(), class));
+                    lock(&target.0.demand).add(class);
+                    queue.reclass(&target.0);
+                }
+                // Taking the ticket wakes the job it names.
+                wake(&target.0);
                 c.set_waker(&std::task::Waker::from(header.clone()));
                 self.rest(header);
             }
@@ -278,25 +436,35 @@ impl Shared {
         }
         if let Some(job) = header.job.upgrade() {
             for signal in &job.watches {
-                signal.unlist(header);
+                signal.leave(header);
             }
         }
-        lock(&self.jobs).retain(|job| !Arc::ptr_eq(&job.header, header));
-        lock(&self.queue).tasks -= 1;
+        let gone = {
+            let mut jobs = lock(&self.jobs);
+            let at = jobs.iter().position(|job| Arc::ptr_eq(&job.header, header));
+            at.map(|at| jobs.swap_remove(at))
+        };
+        // After the table's mutex: a job's drop may run anything its task holds (22.2).
+        drop(gone);
+        let mut queue = lock(&self.queue);
+        queue.end_wait(header);
+        queue.tasks -= 1;
     }
 }
 
 /// A worker's loop (22.7): claims and steps tasks by class, and on a pumped backend steps it once
 /// after each task step and, with nothing to claim, while it delivers; once it holds nothing and
-/// nothing is queued, parks until a link or the backend's next request wakes it.
+/// nothing is queued, parks until a link or the backend's next request wakes it. Closed, it takes
+/// back from the backend the registration its steps left.
 #[turso_macros::atoll_entry]
 fn work(shared: &Arc<Shared>) {
     let pumped = shared.io.delivery() == Delivery::Pumped;
     let me = crate::thread::current();
     let ready = crate::io::unparking(me.clone());
+    let mut registered = false;
     loop {
         if shared.closed.load(Ordering::Acquire) {
-            return;
+            break;
         }
         let stepped = shared.run_one();
         if pumped {
@@ -307,8 +475,12 @@ fn work(shared: &Arc<Shared>) {
                 Ok(Stepped::Unsaid) => {
                     unreachable!("a backend that says what its steps find answered Unsaid")
                 }
-                Ok(Stepped::Empty) if stepped => continue,
-                Ok(Stepped::Empty) => {}
+                Ok(Stepped::Empty) => {
+                    registered = true;
+                    if stepped {
+                        continue;
+                    }
+                }
             }
         } else if stepped {
             continue;
@@ -316,7 +488,7 @@ fn work(shared: &Arc<Shared>) {
         {
             let mut queue = lock(&shared.queue);
             if queue.closing {
-                return;
+                break;
             }
             if queue.lists.iter().any(|list| !list.is_empty()) {
                 continue;
@@ -326,6 +498,9 @@ fn work(shared: &Arc<Shared>) {
         crate::storage::atoll::park::thread();
         // Woken by the backend, or spuriously: its node goes, so a link wakes another worker.
         lock(&shared.queue).idle.retain(|t| t.id() != me.id());
+    }
+    if registered {
+        shared.io.withdraw(&ready);
     }
 }
 
@@ -349,6 +524,64 @@ impl TaskRef {
     pub(crate) fn is_done(&self) -> bool {
         self.0.state.load(Ordering::Acquire) == DONE
     }
+
+    /// A writer's ticket on this task (22.4): its demand rises to `class` while the ticket lives,
+    /// and taking it wakes the task.
+    pub(crate) fn ticket(&self, class: Class) -> Ticket {
+        if let Some(shared) = self.0.shared.upgrade() {
+            let mut queue = lock(&shared.queue);
+            lock(&self.0.demand).add(class);
+            queue.reclass(&self.0);
+        }
+        wake(&self.0);
+        Ticket {
+            header: self.0.clone(),
+            class,
+        }
+    }
+
+    /// The task's own trigger fired (22.4): `due` moves first, then its own level becomes due,
+    /// then it and every task listed on `due` is woken; a clear that read `due` before this sees
+    /// it moved and keeps the level.
+    pub(crate) fn trigger(&self, due: &Signal) {
+        due.bump();
+        if let Some(shared) = self.0.shared.upgrade() {
+            let mut queue = lock(&shared.queue);
+            {
+                let mut demand = lock(&self.0.demand);
+                if demand.own == Class::Maintenance {
+                    demand.own = Class::Due;
+                }
+            }
+            queue.reclass(&self.0);
+        }
+        due.wake_listed();
+        wake(&self.0);
+    }
+
+    /// Its class now.
+    #[cfg(test)]
+    pub(crate) fn class(&self) -> Class {
+        Class::of(self.0.class.load(Ordering::Relaxed))
+    }
+}
+
+/// A writer's demand on a task (22.4), owned by the writer: dropped (admitted, cancelled, or the
+/// connection gone), it lowers that demand, and one ticket dropped never clears another's.
+pub(crate) struct Ticket {
+    header: Arc<Header>,
+    class: Class,
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        if let Some(shared) = self.header.shared.upgrade() {
+            let mut queue = lock(&shared.queue);
+            lock(&self.header.demand).remove(self.class);
+            queue.reclass(&self.header);
+        }
+    }
 }
 
 impl Executor {
@@ -371,6 +604,7 @@ impl Executor {
             shared,
             workers: Vec::with_capacity(workers),
         };
+        // A start that fails drops the executor, which closes and joins the workers begun.
         for n in 0..workers {
             let shared = executor.shared.clone();
             let handle = crate::thread::Builder::new()
@@ -399,6 +633,18 @@ impl Executor {
         task: Box<dyn Task>,
         watches: &[&Arc<Signal>],
     ) -> TaskRef {
+        self.spawn_ranked(class, 0, task, watches)
+    }
+
+    /// [`spawn_watching`](Self::spawn_watching) for a job ranked `rank` in the order jobs wait
+    /// on each other (22.4): its logical waits name only jobs ranked after it.
+    pub(crate) fn spawn_ranked(
+        &self,
+        class: Class,
+        rank: u8,
+        task: Box<dyn Task>,
+        watches: &[&Arc<Signal>],
+    ) -> TaskRef {
         for signal in watches {
             signal.declare();
         }
@@ -406,6 +652,12 @@ impl Executor {
             header: Arc::new(Header {
                 state: AtomicU8::new(QUEUED),
                 class: AtomicU8::new(class as u8),
+                demand: Mutex::new(Demand {
+                    own: class,
+                    tickets: [0; 2],
+                    waiting_on: None,
+                }),
+                rank,
                 shared: Arc::downgrade(&self.shared),
                 job: job.clone(),
             }),
@@ -434,9 +686,16 @@ impl Executor {
         self.shared.run_one()
     }
 
+    /// Closes the executor, as dropping it does.
+    pub(crate) fn close(self) {
+        drop(self);
+    }
+
     /// Closes every task, so none is claimed or linked again, wakes the idle workers and joins
-    /// them once their steps in progress end; then drops every job.
-    pub(crate) fn close(mut self) {
+    /// them once their steps in progress end, all but the calling thread when a step of its own
+    /// dropped the executor (it leaves once that step ends); then drops every job, after the
+    /// table's mutex.
+    fn shut(&mut self) {
         {
             let mut queue = lock(&self.shared.queue);
             queue.closing = true;
@@ -453,15 +712,30 @@ impl Executor {
                 worker.unpark();
             }
         }
+        let me = crate::thread::current().id();
         for worker in self.workers.drain(..) {
+            if worker.thread().id() == me {
+                continue;
+            }
             // A worker that panicked ended the process (22.11): a join returns its loop's end.
             let _ = worker.join();
         }
+        let jobs = std::mem::take(&mut *lock(&self.shared.jobs));
         // Each task off every list it declared, outside the queue's mutex (22.3's lock order).
-        for job in lock(&self.shared.jobs).drain(..) {
+        for job in &jobs {
             for signal in &job.watches {
-                signal.unlist(&job.header);
+                signal.leave(&job.header);
             }
         }
+        drop(jobs);
+    }
+}
+
+impl Drop for Executor {
+    /// Closes the executor: a started one, or one whose start failed after some of its workers
+    /// began, leaves no worker running.
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        self.shut();
     }
 }

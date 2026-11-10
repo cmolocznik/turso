@@ -764,6 +764,14 @@ pub trait IO: Clock + Send + Sync {
         false
     }
 
+    /// Takes back the registration a step that answered `Empty` left for `ready`, if the backend
+    /// still holds it: every waiter that registered withdraws as its wait ends, so a backend holds
+    /// registrations only for waits under way, never one per wait it ever had. A backend that
+    /// registers nothing has nothing to take back.
+    fn withdraw(&self, ready: &std::task::Waker) {
+        let _ = ready;
+    }
+
     /// Blocks the calling thread until `c` finishes (DESIGN.md 22.5): a wait another thread
     /// completes, or a request of a backend that delivers inline or on a thread of its own, parks
     /// until it is finished; a pumped backend is stepped while it delivers, and once it holds
@@ -781,6 +789,7 @@ pub trait IO: Clock + Send + Sync {
             return;
         }
         let ready = unparking(crate::thread::current());
+        let mut registered = false;
         while !c.finished() {
             match self.try_step(&ready) {
                 Err(_) => stepping_failed("a wait for a completion"),
@@ -788,6 +797,7 @@ pub trait IO: Clock + Send + Sync {
                 // What `c` waits on may be another thread's to submit or finish.
                 Ok(Stepped::Unsaid) => crate::thread::yield_now(),
                 Ok(Stepped::Empty) => {
+                    registered = true;
                     // Registered before the test: a finish after it unparks this thread.
                     c.set_waker(&ready);
                     if !c.finished() {
@@ -795,6 +805,9 @@ pub trait IO: Clock + Send + Sync {
                     }
                 }
             }
+        }
+        if registered {
+            self.withdraw(&ready);
         }
     }
 
@@ -821,24 +834,27 @@ pub trait IO: Clock + Send + Sync {
     fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
         refuse_on_delivery_thread("a wait for retirement");
         let pumped = self.delivery() == Delivery::Pumped;
+        // One waker for the whole drain, taken back from the backend when the drain ends.
+        let ready = pumped.then(|| unparking(crate::thread::current()));
+        let mut registered = false;
         let mut seen = std::collections::HashSet::new();
         for c in completions {
             for request in c.requests(&mut seen) {
-                if pumped {
-                    let ready = unparking(crate::thread::current());
-                    let mut registered = false;
+                if let Some(ready) = &ready {
+                    let mut observed = false;
                     while request.is_owned() {
-                        match self.try_step(&ready) {
+                        match self.try_step(ready) {
                             Err(_) => stepping_failed("a wait for retirement"),
                             Ok(Stepped::Delivered) => {}
                             Ok(Stepped::Unsaid) => crate::thread::yield_now(),
                             Ok(Stepped::Empty) => {
-                                // Registered before the test: a retirement after it unparks this
-                                // thread, and stays registered until it comes.
-                                if !registered {
+                                registered = true;
+                                // Observed before the test: a retirement after it unparks this
+                                // thread, and stays observed until it comes.
+                                if !observed {
                                     let thread = crate::thread::current();
                                     request.on_retired(move || thread.unpark());
-                                    registered = true;
+                                    observed = true;
                                 }
                                 if request.is_owned() {
                                     crate::thread::park();
@@ -855,6 +871,9 @@ pub trait IO: Clock + Send + Sync {
                     }
                 }
             }
+        }
+        if let (true, Some(ready)) = (registered, &ready) {
+            self.withdraw(ready);
         }
         Ok(())
     }

@@ -78,6 +78,10 @@ pub(crate) const IO: &[(&str, Rule)] = &[
     ),
     ("says_what_a_step_found", Allowed(NO_CALL)),
     (
+        "withdraw",
+        Allowed("the trait's default: the ring registers no waiter, so takes none back"),
+    ),
+    (
         "cancel",
         Allowed(
             "aborts, running the callbacks with the ring's mutex let go, then queues the \

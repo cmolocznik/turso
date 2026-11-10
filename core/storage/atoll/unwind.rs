@@ -421,6 +421,11 @@ mod tests {
         ),
         ("notify.rs", "a_waker_that_parks_ends_the_process", "child"),
         (
+            "executor/tests.rs",
+            "a_step_watching_a_signal_its_job_did_not_declare_ends_the_process",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",

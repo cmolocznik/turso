@@ -22,7 +22,7 @@ mod native {
     }
 
     impl Task for Recorded {
-        fn step(&mut self) -> Result<Step> {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
             self.log.lock().push(self.name);
             if self.again == 0 {
                 return Ok(Step::Done);
@@ -83,7 +83,7 @@ mod native {
     }
 
     impl Task for WakesItself {
-        fn step(&mut self) -> Result<Step> {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
             self.steps += 1;
             if self.steps > 1 {
                 return Ok(Step::Done);
@@ -107,11 +107,19 @@ mod native {
             }),
         );
         *me.lock() = Some(task.clone());
-        assert!(ex.run_one(), "the first step");
-        assert!(ex.run_one(), "queued again by the wake during its step");
-        assert!(task.is_done());
-        assert!(!ex.run_one(), "queued once, not twice");
+        // Read out before asserting: an executor dropped while a panic unwinds ends the process
+        // (22.11), so every assertion comes after close.
+        let claims = [ex.run_one(), ex.run_one()];
+        let done = task.is_done();
+        let again = ex.run_one();
         ex.close();
+        assert_eq!(
+            claims,
+            [true, true],
+            "the first step, then the one its wake queued"
+        );
+        assert!(done);
+        assert!(!again, "queued once, not twice");
     }
 
     /// A done task stays done: a late wake, as a waker left on a completion gives, queues
@@ -138,7 +146,7 @@ mod native {
     }
 
     impl Task for WaitsOn {
-        fn step(&mut self) -> Result<Step> {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
             match self.c.take() {
                 Some(c) => Ok(Step::Wait(c)),
                 None => {
@@ -165,10 +173,12 @@ mod native {
         );
         // Long enough for a worker to step it and rest it.
         std::thread::sleep(Duration::from_millis(50));
-        assert!(!task.is_done());
+        let rested = !task.is_done();
         c.complete(0);
-        assert!(done_rx.recv_timeout(BOUND).is_ok(), "the task ran again");
+        let ran = done_rx.recv_timeout(BOUND).is_ok();
         ex.close();
+        assert!(rested);
+        assert!(ran, "the task ran again");
     }
 
     /// Syncs a file of a pumped backend and waits on it, then is done.
@@ -179,7 +189,7 @@ mod native {
     }
 
     impl Task for Syncs {
-        fn step(&mut self) -> Result<Step> {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
             if self.sync.is_none() {
                 let c = self
                     .file
@@ -193,9 +203,10 @@ mod native {
     }
 
     /// On a pumped backend the workers deliver what tasks submit, with nothing else stepping it,
-    /// and once it holds nothing they park: no step taken over a quiet window (22.5, 22.7;
-    /// mutants: a worker that never steps the backend, so the task never ends; one that steps an
-    /// empty backend without parking).
+    /// and once it holds nothing they park: no step taken over a quiet window. Closed, a worker
+    /// takes back the registration its last look left (22.5, 22.7; mutants: a worker that never
+    /// steps the backend, so the task never ends; one that steps an empty backend without parking;
+    /// one that leaves its registration behind, the auditor's P2-X69-2).
     #[test]
     fn workers_deliver_a_pumped_backends_requests_and_park_once_it_is_empty() {
         let crash = Arc::new(CrashIO::new(3));
@@ -211,21 +222,22 @@ mod native {
                 done: done_tx,
             }),
         );
-        assert!(
-            done_rx.recv_timeout(BOUND).is_ok(),
-            "the worker delivered the task's sync"
-        );
+        let delivered = done_rx.recv_timeout(BOUND).is_ok();
         // Long enough for the worker to find nothing and park.
         std::thread::sleep(Duration::from_millis(50));
         let before = io.steps();
         std::thread::sleep(Duration::from_millis(100));
+        let quiet = (before, io.steps());
+        let parked = (crash.in_flight(), crash.registered());
+        ex.close();
+        let left = crash.registered();
+        assert!(delivered, "the worker delivered the task's sync");
         assert_eq!(
-            io.steps(),
-            before,
+            quiet.1, quiet.0,
             "steps taken by a worker with nothing to do"
         );
-        assert_eq!(crash.in_flight(), 0);
-        ex.close();
+        assert_eq!(parked, (0, 1), "(in flight, registrations) while parked");
+        assert_eq!(left, 0, "a registration left behind by a closed worker");
     }
 
     /// A task that asks again until its count of steps reaches `until`, and flags a step that
@@ -238,7 +250,7 @@ mod native {
     }
 
     impl Task for Forever {
-        fn step(&mut self) -> Result<Step> {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
             if self.stepping.swap(true, O::AcqRel) {
                 self.overlapped.store(true, O::Release);
             }
@@ -425,7 +437,7 @@ mod native {
     }
 
     impl Task for Watches {
-        fn step(&mut self) -> Result<Step> {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
             let read: Vec<u64> = self.signals.iter().map(|s| s.read()).collect();
             if self.ready.load(O::Acquire) {
                 return Ok(Step::Done);
@@ -465,10 +477,15 @@ mod native {
             r.store(true, O::Release);
             s.notify();
         });
-        assert!(ex.run_one(), "the first look");
-        assert!(ex.run_one(), "queued again by the notify it missed");
-        assert!(task.is_done());
+        let claims = [ex.run_one(), ex.run_one()];
+        let done = task.is_done();
         ex.close();
+        assert_eq!(
+            claims,
+            [true, true],
+            "the first look, then queued again by the notify it missed"
+        );
+        assert!(done);
     }
 
     /// A notify after a task's registration finds it listed and wakes it (22.2; proof 1; mutant:
@@ -482,10 +499,15 @@ mod native {
             r.store(true, O::Release);
             s.notify();
         });
-        assert!(ex.run_one(), "the first look");
-        assert!(ex.run_one(), "woken from the list");
-        assert!(task.is_done());
+        let claims = [ex.run_one(), ex.run_one()];
+        let done = task.is_done();
         ex.close();
+        assert_eq!(
+            claims,
+            [true, true],
+            "the first look, then woken from the list"
+        );
+        assert!(done);
     }
 
     /// A task waits on any of its signals: each, notified alone after the task rested, wakes it;
@@ -496,27 +518,360 @@ mod native {
         for which in 0..3 {
             let ex = executor(0);
             let (task, signals, ready) = watching(&ex);
-            assert!(ex.run_one());
-            assert!(!ex.run_one(), "{which}: resting");
-            assert!(signals.iter().all(|s| s.listed() == 1));
+            let listed = |signals: &[Arc<Signal>; 3]| signals.each_ref().map(|s| s.listed());
+            let first = [ex.run_one(), ex.run_one()];
+            let resting = listed(&signals);
             // Notified with its condition still unmet: it looks, rests, and is listed once.
             signals[(which + 1) % 3].notify();
-            assert!(ex.run_one());
-            assert!(!ex.run_one());
-            assert!(
-                signals.iter().all(|s| s.listed() == 1),
-                "{which}: listed once"
-            );
+            let looked = [ex.run_one(), ex.run_one()];
+            let again = listed(&signals);
             ready.store(true, O::Release);
             signals[which].notify();
-            assert!(ex.run_one(), "{which}: woken by its signal alone");
-            assert!(task.is_done());
-            assert!(
-                signals.iter().all(|s| s.listed() == 0),
-                "{which}: a done task left listed"
-            );
+            let woken = ex.run_one();
+            let done = task.is_done();
+            let after = listed(&signals);
             ex.close();
+            assert_eq!(first, [true, false], "{which}: stepped, then resting");
+            assert_eq!(resting, [1, 1, 1], "{which}: listed on each");
+            assert_eq!(looked, [true, false], "{which}: looked again, then resting");
+            assert_eq!(again, [1, 1, 1], "{which}: listed once");
+            assert!(woken && done, "{which}: woken by its signal alone");
+            assert_eq!(after, [0, 0, 0], "{which}: a done task left listed");
         }
+    }
+
+    /// First waits on `on`'s work with a completion nothing finishes here, then is done.
+    struct WaitsOnJob {
+        on: Option<TaskRef>,
+        log: Arc<Lock<Vec<&'static str>>>,
+    }
+
+    impl Task for WaitsOnJob {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            self.log.lock().push("a");
+            match self.on.take() {
+                Some(on) => Ok(Step::WaitOn(on, Completion::new_sync(|_| {}))),
+                None => Ok(Step::Done),
+            }
+        }
+    }
+
+    /// A writer's relief reaches the job a waiting task waits on: the task's logical wait holds a
+    /// ticket of its own class on that job, moved whenever its class changes, so the job is
+    /// claimed before an unrelated task queued earlier; dropped, the writer's ticket lowers both
+    /// again (22.4; proof 4; mutants: no ticket for the dependency; the waiting ticket left at the
+    /// class it was taken with).
+    #[test]
+    fn relief_reaches_the_job_a_waiting_task_waits_on_and_goes_with_its_ticket() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let job = ex.spawn_ranked(Class::Maintenance, 4, recorded("job", 0, &log), &[]);
+        let waiting = ex.spawn_ranked(
+            Class::Due,
+            2,
+            Box::new(WaitsOnJob {
+                on: Some(job.clone()),
+                log: log.clone(),
+            }),
+            &[],
+        );
+        ex.spawn(Class::Due, recorded("other", 0, &log));
+        let stepped = ex.run_one();
+        let carried = job.class();
+        let writer = waiting.ticket(Class::Relief);
+        let relieved = (waiting.class(), job.class());
+        let stepped_again = ex.run_one();
+        let first = log.lock().clone();
+        drop(writer);
+        // The writer's ticket gone: the waiting task's own class, which its wait still carries.
+        let lowered = (waiting.class(), job.class());
+        while ex.run_one() {}
+        // The wait over once the waiting task runs again: its ticket goes too.
+        let after = job.class();
+        ex.close();
+        assert!(stepped && stepped_again, "the first two claims");
+        assert_eq!(
+            carried,
+            Class::Due,
+            "the job carries the waiting task's class"
+        );
+        assert_eq!(relieved, (Class::Relief, Class::Relief));
+        assert_eq!(
+            first,
+            ["a", "job"],
+            "the job claimed before the task queued earlier"
+        );
+        assert_eq!(
+            lowered,
+            (Class::Due, Class::Due),
+            "the writer's ticket gone"
+        );
+        assert_eq!(after, Class::Maintenance, "the wait's ticket gone");
+    }
+
+    /// One ticket dropped never clears another's: two writers' tickets, the first dropped, leave
+    /// the task at the second's class (22.4; proof 4; mutant: a drop that clears the class's
+    /// count).
+    #[test]
+    fn a_ticket_dropped_leaves_anothers_demand_standing() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let task = ex.spawn(Class::Maintenance, recorded("t", 0, &log));
+        let first = task.ticket(Class::Relief);
+        let second = task.ticket(Class::Relief);
+        drop(first);
+        let standing = task.class();
+        drop(second);
+        let gone = task.class();
+        ex.close();
+        assert_eq!(standing, Class::Relief, "the second writer's demand");
+        assert_eq!(gone, Class::Maintenance);
+    }
+
+    /// A trigger places its task in the due list as it wakes it: a due task spawned after the
+    /// trigger is claimed after it, and a maintenance task queued before it after both (22.4;
+    /// proof 4; mutant: the trigger wakes without setting the task's level).
+    #[test]
+    fn a_trigger_places_its_task_in_the_due_list() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let due = Signal::default();
+        ex.spawn(Class::Maintenance, recorded("m", 0, &log));
+        let triggered = ex.spawn(Class::Maintenance, recorded("t", 0, &log));
+        triggered.trigger(&due);
+        ex.spawn(Class::Due, recorded("d", 0, &log));
+        while ex.run_one() {}
+        ex.close();
+        let claimed = log.lock().clone();
+        assert_eq!(claimed, ["t", "d", "m"]);
+    }
+
+    /// Reads `due`, finds its trigger gone, and clears its own level.
+    struct Clears {
+        due: Arc<Signal>,
+        cleared: Arc<AtomicBool>,
+    }
+
+    impl Task for Clears {
+        fn step(&mut self, cx: &Cx) -> Result<Step> {
+            let read = self.due.read();
+            self.cleared
+                .store(cx.clear_due(&self.due, read), O::Release);
+            Ok(Step::Done)
+        }
+    }
+
+    /// A trigger arriving between a step's look and its clear keeps the task's level: the clear
+    /// checks the count it read under the queue's mutex (22.4; proof 4; mutant: the clear not
+    /// checked against the count, losing the newer level).
+    #[test]
+    fn a_trigger_between_a_look_and_its_clear_keeps_the_level() {
+        let ex = executor(0);
+        let due = Arc::new(Signal::default());
+        let cleared = Arc::new(AtomicBool::new(true));
+        let task = ex.spawn(
+            Class::Due,
+            Box::new(Clears {
+                due: due.clone(),
+                cleared: cleared.clone(),
+            }),
+        );
+        let (t, d) = (task.clone(), due.clone());
+        crate::race::at("executor.clearing", move || t.trigger(&d));
+        let stepped = ex.run_one();
+        let class = task.class();
+        let refused = !cleared.load(O::Acquire);
+        ex.close();
+        assert!(stepped);
+        assert!(refused, "a clear over a trigger that came after its look");
+        assert_eq!(class, Class::Due);
+    }
+
+    /// A queued task whose demand rises moves to the back of its new class's list (22.4; mutant:
+    /// the class stored and the task left in its old list).
+    #[test]
+    fn a_queued_task_whose_demand_rises_moves_to_its_new_class() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        ex.spawn(Class::Due, recorded("d", 0, &log));
+        let task = ex.spawn(Class::Maintenance, recorded("m", 0, &log));
+        let writer = task.ticket(Class::Relief);
+        while ex.run_one() {}
+        drop(writer);
+        ex.close();
+        let claimed = log.lock().clone();
+        assert_eq!(claimed, ["m", "d"]);
+    }
+
+    /// Reads `signal` and rests on it, every step.
+    struct WatchesOne(Arc<Signal>);
+
+    impl Task for WatchesOne {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let read = self.0.read();
+            Ok(Step::Idle(Watched::of(&[(&self.0, read)])))
+        }
+    }
+
+    /// A signal's list keeps room for every task declared to watch it, however many are declared
+    /// before any registers: the room is there before the first registration and unchanged by the
+    /// last (22.2; the auditor's P2-X69-3; mutant: each declaration making room for one more than
+    /// the list holds now).
+    #[test]
+    fn a_signals_list_keeps_room_for_every_task_declared_to_watch_it() {
+        const TASKS: usize = 32;
+        let ex = executor(0);
+        let signal = Arc::new(Signal::default());
+        for _ in 0..TASKS {
+            ex.spawn_watching(Class::Due, Box::new(WatchesOne(signal.clone())), &[&signal]);
+        }
+        let room = signal.room();
+        let mut stepped = 0;
+        while ex.run_one() {
+            stepped += 1;
+        }
+        let registered = (signal.listed(), signal.room());
+        ex.close();
+        let closed = signal.listed();
+        assert_eq!(stepped, TASKS);
+        assert!(room >= TASKS, "room for {room} of {TASKS} declared");
+        assert_eq!(
+            registered,
+            (TASKS, room),
+            "(listed, room) once every task registered"
+        );
+        assert_eq!(closed, 0, "close takes every task off");
+    }
+
+    /// A step may watch only the signals its job declared, whose lists keep room for it: one
+    /// naming another is refused, and the refusal, passing the executor, ends the process (22.2,
+    /// 22.11; mutant: the check gone, so a registration grows a list).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_step_watching_a_signal_its_job_did_not_declare_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_step_watching_a_signal_its_job_did_not_declare_ends_the_process"
+            ),
+            || {
+                let ex = executor(0);
+                ex.spawn(
+                    Class::Due,
+                    Box::new(WatchesOne(Arc::new(Signal::default()))),
+                );
+                ex.run_one();
+                ex.close();
+            },
+        );
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(
+            ended
+                .stderr
+                .contains("a step watching a signal its job did not declare"),
+            "{}",
+            ended.stderr
+        );
+    }
+
+    /// Dropping an executor closes it: its workers are joined, and nothing keeps it alive (22.7;
+    /// the auditor's P2-X69-4; mutant: a drop that closes nothing, so its parked workers keep it
+    /// for ever).
+    #[test]
+    fn dropping_an_executor_closes_it_and_joins_its_workers() {
+        let ex = executor(2);
+        let shared = Arc::downgrade(&ex.shared);
+        drop(ex);
+        assert!(
+            shared.upgrade().is_none(),
+            "an executor dropped and still alive"
+        );
+    }
+
+    /// Holds the executor that runs it, and drops it during its step.
+    struct DropsItsExecutor {
+        executor: Arc<Lock<Option<Executor>>>,
+        dropped: mpsc::Sender<()>,
+    }
+
+    impl Task for DropsItsExecutor {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let ex = self.executor.lock().take();
+            drop(ex);
+            let _ = self.dropped.send(());
+            Ok(Step::Done)
+        }
+    }
+
+    /// An executor dropped by a step on one of its own workers closes, joins its other workers
+    /// and leaves that one to end once the step returns, never joining it from itself; the end of
+    /// that step, its task closed, does nothing more (22.7; the auditor's P2-X69-4).
+    #[test]
+    fn an_executor_dropped_by_its_own_workers_step_closes_without_joining_that_worker() {
+        let slot = Arc::new(Lock::new(None));
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        *slot.lock() = Some(executor(2));
+        let task = slot.lock().as_ref().unwrap().spawn(
+            Class::Due,
+            Box::new(DropsItsExecutor {
+                executor: slot.clone(),
+                dropped: dropped_tx,
+            }),
+        );
+        let dropped = dropped_rx.recv_timeout(BOUND).is_ok();
+        let taken = slot.lock().is_none();
+        assert!(dropped && taken, "the step dropped its executor");
+        assert!(!task.is_done(), "closed, not done");
+    }
+
+    /// Records, when it is dropped, whether the executor's table of jobs was free to take: 1 when
+    /// it was held, 2 when it was free.
+    struct ProbesTheTable {
+        shared: Weak<Shared>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Task for ProbesTheTable {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            Ok(Step::Done)
+        }
+    }
+
+    impl Drop for ProbesTheTable {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            if let Some(shared) = self.shared.upgrade() {
+                let free = shared.jobs.try_lock().is_some();
+                self.dropped.store(if free { 2 } else { 1 }, O::Release);
+            }
+        }
+    }
+
+    /// Close drops every job after the table's mutex: a job's drop may run anything its task
+    /// holds, a waker's or a callback's code among it (22.2; the auditor's P2-X69-5; mutant: the
+    /// jobs dropped as the table is drained under its mutex).
+    #[test]
+    fn close_drops_every_job_after_the_tables_mutex() {
+        let ex = executor(0);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        ex.spawn(
+            Class::Due,
+            Box::new(ProbesTheTable {
+                shared: Arc::downgrade(&ex.shared),
+                dropped: dropped.clone(),
+            }),
+        );
+        ex.close();
+        assert_eq!(
+            dropped.load(O::Acquire),
+            2,
+            "a job dropped under the table's mutex (1), or never (0)"
+        );
     }
 }
 
@@ -543,6 +898,12 @@ mod loom_tests {
         Arc::new(Header {
             state: AtomicU8::new(state),
             class: AtomicU8::new(Class::Due as u8),
+            demand: Mutex::new(Demand {
+                own: Class::Due,
+                tickets: [0; 2],
+                waiting_on: None,
+            }),
+            rank: 0,
             shared: Arc::downgrade(shared),
             job: Weak::new(),
         })
@@ -576,8 +937,7 @@ mod loom_tests {
         });
     }
 
-    /// Two wakes of an idle task link it once (22.3; proof 2; mutant: the move to queued made
-    /// before the queue's mutex is taken).
+    /// Two wakes of an idle task link it once (22.3; proof 2).
     #[test]
     fn two_wakes_of_an_idle_task_link_it_once() {
         loom::model(|| {
@@ -634,6 +994,60 @@ mod loom_tests {
             notifier.join().unwrap();
             assert_eq!(h.state.load(Ordering::Acquire), QUEUED);
             assert_eq!(links(&shared, &h), 1);
+        });
+    }
+
+    /// Waits on a completion nothing finishes.
+    struct Idle;
+
+    impl Task for Idle {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            Ok(Step::Wait(Completion::new_wait()))
+        }
+    }
+
+    /// A count read as moved shows the change its notifier published before it (22.2; the
+    /// auditor's model; mutant: the count moved with no release).
+    #[test]
+    fn a_moved_count_shows_the_change_published_before_it() {
+        use loom::sync::atomic::AtomicUsize;
+        loom::model(|| {
+            let signal = Arc::new(Signal::default());
+            let value = Arc::new(AtomicUsize::new(0));
+            let publisher = {
+                let (signal, value) = (signal.clone(), value.clone());
+                thread::spawn(move || {
+                    value.store(1, Ordering::Relaxed);
+                    signal.notify();
+                })
+            };
+            let moved = signal.read() != 0;
+            let seen = value.load(Ordering::Relaxed);
+            publisher.join().unwrap();
+            assert!(
+                !moved || seen == 1,
+                "a moved count over the change before it"
+            );
+        });
+    }
+
+    /// Close racing a wake of an idle task: whichever comes first, the task ends closed and
+    /// linked nowhere (22.3; the auditor's model; mutant: the move to queued made before the
+    /// queue's mutex is taken, which close then misses).
+    #[test]
+    fn close_racing_a_wake_leaves_the_task_closed_and_unlinked() {
+        loom::model(|| {
+            let ex = Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap();
+            let task = ex.spawn(Class::Due, Box::new(Idle));
+            let stepped = ex.run_one();
+            let shared = ex.shared.clone();
+            let h = task.0.clone();
+            let waker = thread::spawn(move || task.wake());
+            ex.close();
+            waker.join().unwrap();
+            assert!(stepped);
+            assert_eq!(h.state.load(Ordering::Acquire), CLOSED);
+            assert_eq!(links(&shared, &h), 0, "close left a closed task linked");
         });
     }
 }

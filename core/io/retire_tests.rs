@@ -331,9 +331,10 @@ enum Through {
 /// A pumped backend has delivered a request whose callback a cancellation runs, paused, on
 /// another thread: only that finish can publish its result and retire it. A waiter for either,
 /// on the request, on a group holding it or on a request carried through it, looks once, finds
-/// the backend empty and parks, and the finish wakes it (audit chain-fixes-v1, P2-CF1, and the
-/// auditor's group and carry controls; mutant: the waiter steps on an empty backend until the
-/// finish lands, a core spent on empty steps).
+/// the backend empty and parks, and the finish wakes it; ended, it has taken back the
+/// registration its look left (audit chain-fixes-v1, P2-CF1, the auditor's group and carry
+/// controls, and P2-X69-2; mutants: the waiter steps on an empty backend until the finish lands, a
+/// core spent on empty steps; a wait that leaves its registration with the backend).
 fn a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
     waits: Waits,
     through: Through,
@@ -411,10 +412,16 @@ fn a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
     cancel.join().unwrap();
     let ended = done_rx.recv_timeout(BOUND).is_ok();
     waiter.join().unwrap();
+    // Nothing was submitted after its look: only the waiter itself takes its registration back.
+    let left = crash.registered();
     assert_eq!(
         mid,
         (1, false),
         "{waits:?} through {through:?}: (looks, returned) while the finish was paused"
+    );
+    assert_eq!(
+        left, 0,
+        "{waits:?} through {through:?}: a registration left behind by the wait"
     );
     assert!(
         ended,

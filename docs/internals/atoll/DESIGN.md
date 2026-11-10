@@ -4056,12 +4056,14 @@ registers a waker on a completion while it holds an executor mutex.
      cost (one fence per publication; a fence and a scan when a task waits) measured with the
      statement cost (22.16 step 10).
    - **Wait-any and storage.** A step names at most the signals its job declares (the checkpoint:
-     due, full requested, room wanted; 22.9). Registrations are not removed when the task runs
-     again: a stale one costs at most one spurious wake, after which the task checks and registers
-     again. A list is a fixed array of one entry per task that can watch the signal, sized when
-     such a task is created, so registering and notifying allocate nothing. A signal lives no
-     longer than the subject whose change it announces, and a task removed with its subject is
-     taken off every list it declared (22.3).
+     due, full requested, room wanted; 22.9), and a step naming another is refused before any
+     registration. Registrations are not removed when the task runs again: a stale one costs at
+     most one spurious wake, after which the task checks and registers again. A list keeps room for
+     every task declared to watch the signal: it counts the declarations, each made when such a
+     task is created and given back when the task ends or closes, and keeps its room at that count,
+     however many are declared before any registers (the auditor's P2-X69-3), so registering and
+     notifying allocate nothing. A signal lives no longer than the subject whose change it
+     announces, and a task removed with its subject is taken off every list it declared (22.3).
 3. **A guarded state**: state another holder may hold. `Guarded<T>` owns the lock and its
    contenders; `Hold` is its guard. (Atoll's page latches have a `Held` of their own; these are
    different types.)
@@ -4564,11 +4566,14 @@ that is CPU polling, and the exceptions are named: the C extension's VFS bridge 
 `run_once` says nothing), the other simulators' and tests' IOs that do not forward, and any
 embedder's IO that keeps the default. A waiter registers each time it finds nothing, at most once
 per waker (`will_wake`), and the next submission takes every registration and wakes it; a waiter
-that has gone costs at most one spurious unpark of its thread. A group's members are published once, as it is built
-and before its builder's token goes (that release may finish the group, and what its end runs may
-walk it), and every walk reads them with no lock: a request a walk upgrades may be the last handle
-to it, and its drop may run a callback's captures that walk the group again (the auditor's
-P1-GW1). A pumped wait steps while the backend delivers and parks on
+whose wait ends otherwise takes its own back (`IO::withdraw`): a wait for a result or for a
+retirement, close's drain and a worker leaving each withdraw as they end, so a backend holds
+registrations only for waits under way, never one for every wait it ever had (the auditor's
+P2-X69-2). A group's members are published once, as it is built and before its builder's token
+goes (that release may finish the group, and what its end runs may walk it), and every walk reads
+them with no lock: a request a walk upgrades may be the last handle to it, and its drop may run a
+callback's captures that walk the group again (the auditor's P1-GW1). A pumped wait steps while
+the backend delivers and parks on
 `Empty` until what it waits on moves (the finish's result for a wait for the result, the
 retirement for a wait for the retirement, a group's own finish) or the backend holds something,
 whoever submits it: a cancellation's callback still running elsewhere, a request carried through
@@ -5008,7 +5013,11 @@ ran while the executor still ran. Nothing the executor or a waker holds keeps th
    a backend's own work on a request (the rest of a partial write, a cancel) goes on until the
    request retires.
 5. **State dropped, runners joined**: every job's state is dropped, every worker joined, and every
-   embedder call in progress has returned.
+   embedder call in progress has returned. Jobs are dropped after the table's mutex is let go,
+   since a job's drop may run anything its task holds (the auditor's P2-X69-5). Dropping the
+   executor closes it, a start that failed after some workers began included; a worker whose own
+   step dropped it is not joined from itself, and leaves once that step ends, which on a closed
+   task does nothing more (the auditor's P2-X69-4).
 
 Close at a step boundary leaves the files in a state the crash tests cover, and the next open
 recovers from the superblock in charge. An IO error while draining is logged and the drain goes on.
@@ -5295,14 +5304,17 @@ compose, the real `Completion`, latch and backends included where named.
    running task; the run queue by class, strict by class and first in first out within one; the
    workers, which step a pumped backend once after each task step and, with nothing to claim,
    while it delivers, park once it says `Empty`, and read close at every pass so a backend that
-   cannot say still lets them go; `run_one`, the plain claim a caller makes; signals with the
-   counter, the list under its own mutex, registration and the second read, a task's declared
-   signals made room for at its creation and left at its end. The lists are deques given room for
-   every task when it is created, so no link allocates; intrusive links wait for a measured need.
-   Not built yet: threshold signals, tickets and levels with the counter-checked clear, named
-   claims of idle tasks, external runners and the to-wake list, executor completions with the
-   callers' blocking and cooperative rules, close's five phases, removal with a subject beyond a
-   task's own end.)
+   cannot say still lets them go, and withdraw their registration as they leave; `run_one`, the
+   plain claim a caller makes; signals with the counter, the list under its own mutex, registration
+   and the second read, each list keeping room for its declared tasks and a step naming an
+   undeclared signal refused; demand by class, a writer's ticket and a logical wait's ticket on the
+   job it waits on, moved with the waiter's class and given back when its wait ends, jobs ranked so
+   a wait names only a later one, a trigger's level with the counter-checked clear; dropping the
+   executor closes it, and jobs are dropped after the table's mutex. The lists are deques given
+   room for every task when it is created, so no link allocates; intrusive links wait for a
+   measured need. Not built yet: threshold signals, named claims of idle tasks, external runners
+   and the to-wake list, executor completions with the callers' blocking and cooperative rules,
+   close's five phases, removal with a subject beyond a task's own end.)
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run
    against step 4's, and the profile again.

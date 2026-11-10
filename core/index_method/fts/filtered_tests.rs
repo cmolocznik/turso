@@ -39,6 +39,7 @@ struct Doc {
     closed: i64,
     observed: Option<i64>,
     intervals: Vec<(i64, i64)>,
+    digest: [u8; 32],
 }
 
 fn packed(intervals: &[(i64, i64)]) -> String {
@@ -54,7 +55,13 @@ fn packed(intervals: &[(i64, i64)]) -> String {
 }
 
 fn random_doc(rng: &mut Rng) -> Doc {
-    let len = 1 + rng.below(25) as usize;
+    // Most documents are short; one in four is long enough that its field
+    // norm is quantized.
+    let len = if rng.below(4) == 0 {
+        30 + rng.below(250) as usize
+    } else {
+        1 + rng.below(25) as usize
+    };
     let mut intervals = Vec::new();
     for _ in 0..rng.below(3) {
         let from = if rng.below(6) == 0 {
@@ -75,6 +82,7 @@ fn random_doc(rng: &mut Rng) -> Doc {
         closed: (rng.below(3) == 0) as i64,
         observed: (rng.below(5) != 0).then(|| rng.below(100) as i64),
         intervals,
+        digest: std::array::from_fn(|_| rng.next() as u8),
     }
 }
 
@@ -88,7 +96,7 @@ fn insert_sql(rows: &[(i64, Doc)]) -> String {
         .map(|(id, doc)| {
             let body: Vec<String> = doc.words.iter().map(|&w| word(w)).collect();
             format!(
-                "({id}, '{}', {}, {}, {}, {})",
+                "({id}, '{}', {}, {}, {}, {}, X'{}')",
                 body.join(" "),
                 sql_value(doc.shape),
                 doc.closed,
@@ -97,7 +105,11 @@ fn insert_sql(rows: &[(i64, Doc)]) -> String {
                     "NULL".to_string()
                 } else {
                     packed(&doc.intervals)
-                }
+                },
+                doc.digest
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<String>()
             )
         })
         .collect();
@@ -109,7 +121,9 @@ fn insert_sql(rows: &[(i64, Doc)]) -> String {
 enum F {
     All(Vec<F>),
     Any(Vec<F>),
+    Not(Box<F>),
     In(&'static str, Vec<i64>),
+    NotIn(&'static str, Vec<i64>),
     Range(&'static str, Option<i64>, Option<i64>),
     Null(&'static str),
     Within(Option<i64>, Option<i64>),
@@ -129,6 +143,15 @@ impl F {
             F::Any(items) => format!(
                 "{{\"any\":[{}]}}",
                 items.iter().map(F::json).collect::<Vec<_>>().join(",")
+            ),
+            F::Not(inner) => format!("{{\"not\":{}}}", inner.json()),
+            F::NotIn(col, values) => format!(
+                "{{\"not_in\":[\"{col}\",[{}]]}}",
+                values
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
             F::In(col, values) => format!(
                 "{{\"in\":[\"{col}\",[{}]]}}",
@@ -150,17 +173,20 @@ impl F {
         }
     }
 
-    fn admits(&self, doc: &Doc) -> bool {
+    fn admits(&self, id: i64, doc: &Doc) -> bool {
         let column = |col: &str| match col {
+            "rowid" => Some(id),
             "shape" => doc.shape,
             "closed" => Some(doc.closed),
             "observed" => doc.observed,
             other => panic!("no column {other}"),
         };
         match self {
-            F::All(items) => items.iter().all(|f| f.admits(doc)),
-            F::Any(items) => items.iter().any(|f| f.admits(doc)),
+            F::All(items) => items.iter().all(|f| f.admits(id, doc)),
+            F::Any(items) => items.iter().any(|f| f.admits(id, doc)),
+            F::Not(inner) => !inner.admits(id, doc),
             F::In(col, values) => column(col).is_some_and(|v| values.contains(&v)),
+            F::NotIn(col, values) => column(col).is_none_or(|v| !values.contains(&v)),
             F::Range(col, lo, hi) => column(col)
                 .is_some_and(|v| lo.is_none_or(|lo| v >= lo) && hi.is_none_or(|hi| v < hi)),
             F::Null(col) => column(col).is_none(),
@@ -184,7 +210,20 @@ fn random_bound(rng: &mut Rng) -> Option<i64> {
 }
 
 fn random_filter(rng: &mut Rng, depth: u32) -> F {
-    match rng.below(if depth >= 2 { 5 } else { 7 }) {
+    match rng.below(if depth >= 2 { 7 } else { 10 }) {
+        5 => F::NotIn(
+            if rng.below(2) == 0 { "rowid" } else { "shape" },
+            (0..1 + rng.below(40))
+                .map(|_| 1 + rng.below(400) as i64)
+                .collect(),
+        ),
+        6 => F::In(
+            "rowid",
+            (0..1 + rng.below(200))
+                .map(|_| 1 + rng.below(400) as i64)
+                .collect(),
+        ),
+        7 => F::Not(Box::new(random_filter(rng, depth + 1))),
         0 => F::In(
             "shape",
             (0..1 + rng.below(3))
@@ -207,7 +246,7 @@ fn random_filter(rng: &mut Rng, depth: u32) -> F {
             let hi = random_bound(rng);
             F::Within(lo, hi)
         }
-        5 => F::All(
+        8 => F::All(
             (0..1 + rng.below(3))
                 .map(|_| random_filter(rng, depth + 1))
                 .collect(),
@@ -220,23 +259,44 @@ fn random_filter(rng: &mut Rng, depth: u32) -> F {
     }
 }
 
-/// BM25 as Tantivy scores it (k1 1.2, b 0.75; every document here is shorter
-/// than the length past which field norms are quantized), with the document
-/// count, the average length and each term's document frequency counted over
-/// the admitted documents.
-fn oracle(docs: &StdHashMap<i64, Doc>, filter: &F, terms: &[usize]) -> Vec<(f64, i64)> {
-    let admitted: Vec<(&i64, &Doc)> = docs.iter().filter(|(_, d)| filter.admits(d)).collect();
+/// A document's length as its field norm keeps it: exact up to 40 tokens,
+/// then rounded down to the nearest of Tantivy's 256 field norm values.
+fn quantized(len: usize) -> f64 {
+    use tantivy::fieldnorm::FieldNormReader;
+    f64::from(FieldNormReader::id_to_fieldnorm(
+        FieldNormReader::fieldnorm_to_id(len as u32),
+    ))
+}
+
+/// BM25 as Tantivy scores it (k1 1.2, b 0.75, lengths as their field norms
+/// keep them), with the document count, the average length and each term's
+/// document frequency counted over the admitted documents. A document must
+/// hold every `must` term and at least one term, and every distinct term it
+/// holds scores.
+fn oracle_terms(
+    docs: &StdHashMap<i64, Doc>,
+    filter: &F,
+    should: &[usize],
+    must: &[usize],
+) -> Vec<(f64, i64)> {
+    let admitted: Vec<(&i64, &Doc)> = docs
+        .iter()
+        .filter(|(id, d)| filter.admits(**id, d))
+        .collect();
     let n = admitted.len() as f64;
     if n == 0.0 {
         return Vec::new();
     }
-    let total: f64 = admitted.iter().map(|(_, d)| d.words.len() as f64).sum();
+    let total: f64 = admitted.iter().map(|(_, d)| quantized(d.words.len())).sum();
     let avg = total / n;
-    let mut terms = terms.to_vec();
+    let mut terms: Vec<usize> = should.iter().chain(must).copied().collect();
     terms.sort_unstable();
     terms.dedup();
     let mut scored = Vec::new();
     for (id, doc) in &admitted {
+        if must.iter().any(|t| !doc.words.contains(t)) {
+            continue;
+        }
         let mut score = 0.0;
         let mut matched = false;
         for &term in &terms {
@@ -250,7 +310,7 @@ fn oracle(docs: &StdHashMap<i64, Doc>, filter: &F, terms: &[usize]) -> Vec<(f64,
                 .filter(|(_, d)| d.words.contains(&term))
                 .count() as f64;
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-            let len = doc.words.len() as f64;
+            let len = quantized(doc.words.len());
             score += idf * (1.2 + 1.0) * tf / (tf + 1.2 * (1.0 - 0.75 + 0.75 * len / avg));
         }
         if matched {
@@ -259,6 +319,32 @@ fn oracle(docs: &StdHashMap<i64, Doc>, filter: &F, terms: &[usize]) -> Vec<(f64,
     }
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     scored
+}
+
+fn oracle(docs: &StdHashMap<i64, Doc>, filter: &F, terms: &[usize]) -> Vec<(f64, i64)> {
+    oracle_terms(docs, filter, terms, &[])
+}
+
+/// The oracle's population: the admitted count and the little-endian 256-bit
+/// wrapping sum of the admitted documents' digests.
+fn oracle_population(docs: &StdHashMap<i64, Doc>, filter: &F) -> Vec<u8> {
+    let mut sum = [0u8; 32];
+    let mut count = 0u64;
+    for (id, doc) in docs {
+        if !filter.admits(*id, doc) {
+            continue;
+        }
+        count += 1;
+        let mut carry = 0u16;
+        for (a, b) in sum.iter_mut().zip(&doc.digest) {
+            let total = u16::from(*a) + u16::from(*b) + carry;
+            *a = total as u8;
+            carry = total >> 8;
+        }
+    }
+    let mut blob = count.to_be_bytes().to_vec();
+    blob.extend_from_slice(&sum);
+    blob
 }
 
 fn open(mvcc: bool) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
@@ -279,12 +365,12 @@ fn open(mvcc: bool) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     }
     conn.execute(
-        "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, shape INTEGER, closed INTEGER, observed INTEGER, ivs BLOB)",
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, shape INTEGER, closed INTEGER, observed INTEGER, ivs BLOB, dig BLOB)",
     )
     .unwrap();
     conn.execute(
-        "CREATE INDEX docs_fts ON docs USING fts(body, shape, closed, observed, ivs) \
-         WITH (filter_fields = 'shape,closed,observed', interval_field = 'ivs')",
+        "CREATE INDEX docs_fts ON docs USING fts(body, shape, closed, observed, ivs, dig) \
+         WITH (filter_fields = 'shape,closed,observed', interval_field = 'ivs', sum_field = 'dig')",
     )
     .unwrap();
     (dir, db, conn)
@@ -314,35 +400,110 @@ fn filtered(conn: &Arc<Connection>, terms: &[usize], filter: &str, limit: i64) -
         .collect()
 }
 
-/// The index's answer equals the oracle's: the same scores in order, and the
-/// same documents wherever a score is not tied with the last one kept.
+/// A filtered query by pre-analyzed terms.
+fn filtered_terms(
+    conn: &Arc<Connection>,
+    should: &[usize],
+    must: &[usize],
+    filter: &str,
+    limit: i64,
+) -> Vec<(f64, i64)> {
+    let list = |terms: &[usize]| {
+        terms
+            .iter()
+            .map(|&t| format!("\"{}\"", word(t)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let query = format!(
+        "{{\"should\":[{}],\"must\":[{}]}}",
+        list(should),
+        list(must)
+    );
+    run_filtered(conn, &query, filter, limit)
+}
+
+fn run_filtered(conn: &Arc<Connection>, query: &str, filter: &str, limit: i64) -> Vec<(f64, i64)> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, fts_filtered_score(body, ?1, ?2) AS score FROM docs ORDER BY score DESC LIMIT ?3",
+        )
+        .unwrap();
+    statement
+        .bind_at(1.try_into().unwrap(), Value::build_text(query.to_string()))
+        .unwrap();
+    statement
+        .bind_at(2.try_into().unwrap(), Value::build_text(filter.to_string()))
+        .unwrap();
+    statement
+        .bind_at(3.try_into().unwrap(), Value::from_i64(limit))
+        .unwrap();
+    statement
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row[1].as_float(), row[0].as_int().unwrap()))
+        .collect()
+}
+
+/// The population row of a filter.
+fn population(conn: &Arc<Connection>, filter: &str) -> Vec<u8> {
+    let mut statement = conn
+        .prepare(
+            "SELECT fts_filtered_population(body, ?1) AS population FROM docs \
+             ORDER BY population DESC LIMIT 1",
+        )
+        .unwrap();
+    statement
+        .bind_at(1.try_into().unwrap(), Value::build_text(filter.to_string()))
+        .unwrap();
+    let rows = statement.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1, "one population row");
+    match &rows[0][0] {
+        Value::Blob(blob) => blob.to_vec(),
+        other => panic!("population is {other:?}"),
+    }
+}
+
+/// The index's answer equals the oracle's, cut tie-complete: the oracle's
+/// first `limit` hits and every further hit tied with the last of them, the
+/// scores equal, and the documents equal (ties in any order).
 fn assert_agrees(got: &[(f64, i64)], want: &[(f64, i64)], limit: usize, context: &str) {
-    let want = &want[..want.len().min(limit)];
-    assert_eq!(got.len(), want.len(), "{context}: hit count");
-    for (g, w) in got.iter().zip(want) {
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-4 * b.abs().max(1.0);
+    let want: Vec<(f64, i64)> = match want.get(limit.saturating_sub(1)) {
+        Some(last) if limit > 0 => want
+            .iter()
+            .copied()
+            // A tie is a score Tantivy's f32 cannot tell apart from the
+            // last one kept.
+            .take_while(|h| h.0 >= last.0 || (h.0 - last.0).abs() <= 1e-6 * last.0.abs().max(1.0))
+            .collect(),
+        _ => want.to_vec(),
+    };
+    let mut got_sorted = got.to_vec();
+    got_sorted.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    assert_eq!(
+        got_sorted.len(),
+        want.len(),
+        "{context}: hit count (got {got_sorted:?}, want {want:?})"
+    );
+    for (g, w) in got_sorted.iter().zip(&want) {
         assert!(
-            (g.0 - w.0).abs() <= 1e-3 * w.0.abs().max(1.0),
-            "{context}: score {} where the oracle has {} (got {got:?}, want {want:?})",
+            close(g.0, w.0),
+            "{context}: score {} where the oracle has {} (got {got_sorted:?}, want {want:?})",
             g.0,
             w.0
         );
     }
-    if let Some(last) = want.last() {
-        let strict = |hits: &[(f64, i64)]| -> Vec<i64> {
-            let mut ids: Vec<i64> = hits
-                .iter()
-                .filter(|h| h.0 > last.0 + 1e-3 * last.0.abs().max(1.0))
-                .map(|h| h.1)
-                .collect();
-            ids.sort_unstable();
-            ids
-        };
-        assert_eq!(
-            strict(got),
-            strict(want),
-            "{context}: documents above the last score"
-        );
-    }
+    let mut got_ids: Vec<i64> = got_sorted.iter().map(|h| h.1).collect();
+    let mut want_ids: Vec<i64> = want.iter().map(|h| h.1).collect();
+    got_ids.sort_unstable();
+    want_ids.sort_unstable();
+    assert_eq!(got_ids, want_ids, "{context}: documents");
+    assert!(
+        got.windows(2).all(|w| w[0].0 >= w[1].0),
+        "{context}: rows not in score order"
+    );
 }
 
 /// Random corpora written over several statements (so several segments),
@@ -399,8 +560,40 @@ fn filtered_top_k_equals_the_exact_oracle_over_the_admitted_set() {
                     let terms: Vec<usize> =
                         (0..1 + rng.below(3)).map(|_| rng.word(VOCAB)).collect();
                     let limit = [1i64, 5, 10, 50][rng.below(4) as usize];
-                    let got = filtered(&conn, &terms, &filter.json(), limit);
-                    let want = oracle(&docs, &filter, &terms);
+                    // Half the queries are pre-analyzed terms, some with a
+                    // required term; the other half go through the parser.
+                    let (got, want) = if rng.below(2) == 0 {
+                        let must: Vec<usize> = if rng.below(2) == 0 {
+                            vec![terms[0]]
+                        } else {
+                            Vec::new()
+                        };
+                        (
+                            filtered_terms(&conn, &terms, &must, &filter.json(), limit),
+                            oracle_terms(&docs, &filter, &terms, &must),
+                        )
+                    } else {
+                        (
+                            filtered(&conn, &terms, &filter.json(), limit),
+                            oracle(&docs, &filter, &terms),
+                        )
+                    };
+                    // The population row of the same filter, read right after
+                    // the query (the counted population kept for it) and of a
+                    // filter no query counted.
+                    assert_eq!(
+                        population(&conn, &filter.json()),
+                        oracle_population(&docs, &filter),
+                        "mvcc={mvcc} seed={seed} population of {}",
+                        filter.json()
+                    );
+                    let other = random_filter(&mut rng, 0);
+                    assert_eq!(
+                        population(&conn, &other.json()),
+                        oracle_population(&docs, &other),
+                        "mvcc={mvcc} seed={seed} population of {}",
+                        other.json()
+                    );
                     answered += usize::from(!want.is_empty());
                     assert_agrees(
                         &got,
@@ -445,6 +638,7 @@ fn a_filter_that_changes_the_admitted_set_changes_the_weights() {
             closed: 0,
             observed: None,
             intervals: Vec::new(),
+            digest: [id as u8; 32],
         };
         rows.push((id, doc.clone()));
         docs.insert(id, doc);
@@ -516,12 +710,112 @@ fn concurrent_writers_a_rollback_and_a_merge_keep_the_filtered_answer_exact() {
     }
 }
 
+/// The cut at the LIMIT is tie-complete: every document scoring exactly the
+/// last kept score comes back, so the embedder orders ties by its own key,
+/// and the rows can outnumber the LIMIT.
+#[test]
+fn the_cut_returns_every_document_tied_with_the_last_kept() {
+    let (_dir, _db, conn) = open(false);
+    let doc = |words: Vec<usize>| Doc {
+        words,
+        shape: Some(1),
+        closed: 0,
+        observed: None,
+        intervals: Vec::new(),
+        digest: [0; 32],
+    };
+    // One better document, then twelve identical ones in two segments.
+    let mut rows = vec![(1, doc(vec![1, 1]))];
+    rows.extend((2..=7).map(|id| (id, doc(vec![1, 2]))));
+    conn.execute(insert_sql(&rows)).unwrap();
+    let more: Vec<(i64, Doc)> = (8..=13).map(|id| (id, doc(vec![1, 2]))).collect();
+    conn.execute(insert_sql(&more)).unwrap();
+    let all = F::In("shape", vec![1]);
+    for limit in [1i64, 2, 3, 13, 20] {
+        let got = filtered(&conn, &[1], &all.json(), limit);
+        let expected = if limit == 1 { 1 } else { 13 };
+        assert_eq!(got.len(), expected, "LIMIT {limit}: {got:?}");
+        assert_eq!(got[0].1, 1);
+        let terms = filtered_terms(&conn, &[1], &[], &all.json(), limit);
+        assert_eq!(terms.len(), expected, "terms, LIMIT {limit}: {terms:?}");
+    }
+}
+
+/// Pre-analyzed terms are used verbatim: an upper-case term the default
+/// tokenizer never indexes matches nothing (the parser would lower-case it
+/// and match); a `must` term is required while every term still scores; and
+/// `not_in` on `rowid` removes exactly the excluded documents from both the
+/// hits and the statistics.
+#[test]
+fn terms_are_verbatim_must_requires_and_not_in_excludes() {
+    let (_dir, _db, conn) = open(false);
+    let mut docs = StdHashMap::new();
+    let mut rows = Vec::new();
+    for id in 1..=30i64 {
+        let words = match id % 3 {
+            0 => vec![1, 2, 2],
+            1 => vec![1, 3],
+            _ => vec![2, 3, 4],
+        };
+        let doc = Doc {
+            words,
+            shape: Some(1 + id % 2),
+            closed: 0,
+            observed: None,
+            intervals: Vec::new(),
+            digest: [id as u8; 32],
+        };
+        rows.push((id, doc.clone()));
+        docs.insert(id, doc);
+    }
+    conn.execute(insert_sql(&rows)).unwrap();
+    let all = F::In("shape", vec![1, 2]);
+    assert_eq!(
+        run_filtered(&conn, "{\"should\":[\"W1X\"]}", &all.json(), 50),
+        Vec::new(),
+        "an upper-case term is not lower-cased"
+    );
+    assert_eq!(
+        filtered(&conn, &[1], &all.json(), 50).len(),
+        20,
+        "the parser lower-cases"
+    );
+    let got = filtered_terms(&conn, &[1, 3], &[2], &all.json(), 50);
+    let want = oracle_terms(&docs, &all, &[1, 3], &[2]);
+    assert_agrees(&got, &want, 50, "must w2x");
+    assert!(got.iter().all(|h| docs[&h.1].words.contains(&2)));
+    assert!(
+        got.iter().any(|h| docs[&h.1].words.contains(&1)),
+        "w1x still scores beside w2x"
+    );
+    let excluded = F::All(vec![all, F::NotIn("rowid", vec![3, 6, 9, 10])]);
+    let got = filtered_terms(&conn, &[1, 2], &[], &excluded.json(), 50);
+    assert_agrees(
+        &got,
+        &oracle_terms(&docs, &excluded, &[1, 2], &[]),
+        50,
+        "not_in rowid",
+    );
+    assert!(got.iter().all(|h| ![3, 6, 9, 10].contains(&h.1)));
+    assert_eq!(
+        population(&conn, &excluded.json()),
+        oracle_population(&docs, &excluded)
+    );
+    let negated = F::Not(Box::new(F::In("rowid", vec![1, 2, 3])));
+    assert_agrees(
+        &filtered(&conn, &[3], &negated.json(), 50),
+        &oracle(&docs, &negated, &[3]),
+        50,
+        "not",
+    );
+}
+
 /// A filter naming a column that is not a filter column, malformed JSON, and
 /// `within` on an index with no interval field are refused, not ignored.
 #[test]
 fn a_filter_the_index_cannot_apply_is_refused() {
     let (_dir, _db, conn) = open(false);
-    conn.execute("INSERT INTO docs VALUES (1, 'w1x', 1, 0, 5, NULL)")
+    conn.execute("INSERT INTO docs VALUES (1, 'w1x', 1, 0, 5, NULL, NULL)")
         .unwrap();
     for bad in [
         "{\"in\":[\"body\",[1]]}",
@@ -563,10 +857,10 @@ fn a_filter_the_index_cannot_apply_is_refused() {
     assert!(statement.run_collect_rows().is_err());
     // A filter column must hold an integer, and the intervals a valid packing.
     assert!(conn
-        .execute("INSERT INTO docs VALUES (2, 'w1x', 'one', 0, 5, NULL)")
+        .execute("INSERT INTO docs VALUES (2, 'w1x', 'one', 0, 5, NULL, NULL)")
         .is_err());
     assert!(conn
-        .execute("INSERT INTO docs VALUES (3, 'w1x', 1, 0, 5, X'0102')")
+        .execute("INSERT INTO docs VALUES (3, 'w1x', 1, 0, 5, X'0102', NULL)")
         .is_err());
     // Searched columns come first.
     assert!(conn

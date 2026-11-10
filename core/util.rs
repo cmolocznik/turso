@@ -706,7 +706,9 @@ pub fn count_fts_column_args(expr: &Expr) -> usize {
         Expr::FunctionCall { name, args, .. } => {
             let name_lower = name.as_str().to_lowercase();
             match name_lower.as_str() {
-                "fts_match" | "fts_score" => args.len().saturating_sub(1),
+                "fts_match" | "fts_score" | "fts_filtered_population" => {
+                    args.len().saturating_sub(1)
+                }
                 "fts_filtered_score" => args.len().saturating_sub(2),
                 "fts_highlight" => args.len().saturating_sub(3),
                 _ => 0,

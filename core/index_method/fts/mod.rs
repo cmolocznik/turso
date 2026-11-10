@@ -255,6 +255,10 @@ enum ColumnRole {
     /// The event intervals column (`interval_field`): a BLOB of packed
     /// little-endian `(from, to)` i64 pairs, stored as a bytes fast field.
     Intervals(Field),
+    /// The sum column (`sum_field`): a 32-byte BLOB, a little-endian 256-bit
+    /// value, stored as four u64 fast fields so a query sums it over the
+    /// documents its filter admits.
+    Sum([Field; 4]),
 }
 
 /// Most event intervals one document may carry.
@@ -688,6 +692,17 @@ struct FtsShared {
     /// processes; the next scan or merge corrects it.
     visible_segment_estimate: AtomicUsize,
     stats: FtsRuntimeStats,
+    /// The admitted population a filtered query last counted, by segment set
+    /// and filter, for the population query that follows it.
+    population: Mutex<Option<((SearcherKey, String), FilteredPopulation)>>,
+}
+
+/// A filtered query's admitted population: its document count and, where the
+/// index has a `sum_field`, the sum of its values.
+#[derive(Debug, Clone, Copy)]
+struct FilteredPopulation {
+    documents: u64,
+    sum: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for FtsShared {
@@ -740,6 +755,8 @@ pub struct FtsIndexAttachment {
     filter_fields: Vec<(String, Field)>,
     /// The event intervals column's fast field
     interval_field: Option<Field>,
+    /// The sum column's four little-endian u64 limbs
+    sum_field: Option<[Field; 4]>,
     /// Every tokenizer name this index uses
     tokenizer_names: Vec<String>,
     /// Parsed query patterns for FTS queries
@@ -773,6 +790,7 @@ pub const SUPPORTED_WITH_KEYS: &[&str] = &[
     "tokenizers",
     "filter_fields",
     "interval_field",
+    "sum_field",
 ];
 
 /// Ngram window used when `min_gram`/`max_gram` are not given.
@@ -878,13 +896,37 @@ impl FtsIndexAttachment {
             ));
         }
         let interval_column = interval_columns.into_iter().next();
+        let sum_columns = parse_column_list(
+            parameters.get(UncasedStr::new("sum_field")).copied(),
+            &cfg.columns,
+            "sum_field",
+        )?;
+        if sum_columns.len() > 1 {
+            return Err(LimboError::ParseError(
+                "FTS sum_field names one column".into(),
+            ));
+        }
+        let sum_column = sum_columns.into_iter().next();
         let column_tokenizers = parse_column_tokenizers(
             parameters.get(UncasedStr::new("tokenizers")).copied(),
             &cfg.columns,
         )?;
         let is_value_column = |name: &str| {
-            filter_columns.iter().any(|c| c == name) || interval_column.as_deref() == Some(name)
+            filter_columns.iter().any(|c| c == name)
+                || interval_column.as_deref() == Some(name)
+                || sum_column.as_deref() == Some(name)
         };
+        if let Some(name) = &sum_column {
+            if filter_columns.contains(name)
+                || interval_column.as_deref() == Some(name.as_str())
+                || json_columns.contains(name)
+                || column_tokenizers.contains_key(name)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "FTS column '{name}' cannot be both the sum field and another kind of column"
+                )));
+            }
+        }
         for name in &filter_columns {
             if interval_column.as_deref() == Some(name.as_str())
                 || json_columns.contains(name)
@@ -1007,6 +1049,7 @@ impl FtsIndexAttachment {
         let mut roles = Vec::with_capacity(cfg.columns.len());
         let mut filter_fields = Vec::new();
         let mut interval_field = None;
+        let mut sum_field: Option<[Field; 4]> = None;
         let mut tokenizer_names: Vec<String> = vec![tokenizer_name.clone()];
         if !json_columns.is_empty() {
             tokenizer_names.push(json_tokenizer.to_string());
@@ -1016,6 +1059,15 @@ impl FtsIndexAttachment {
                 let field = schema_builder.add_i64_field(&col.name, tantivy::schema::FAST);
                 filter_fields.push((col.name.clone(), field));
                 roles.push(ColumnRole::Filter(field));
+                continue;
+            }
+            if sum_column.as_deref() == Some(col.name.as_str()) {
+                let limbs = [0, 1, 2, 3].map(|limb| {
+                    schema_builder
+                        .add_u64_field(&format!("{}__sum{limb}", col.name), tantivy::schema::FAST)
+                });
+                sum_field = Some(limbs);
+                roles.push(ColumnRole::Sum(limbs));
                 continue;
             }
             if interval_column.as_deref() == Some(col.name.as_str()) {
@@ -1093,6 +1145,9 @@ impl FtsIndexAttachment {
         let filtered_score = format!(
             "SELECT fts_filtered_score({cols}, ?1, ?2) as score FROM {table} ORDER BY score DESC LIMIT ?"
         );
+        // Pattern 8: the population a filter admits, one row.
+        let filtered_population =
+            format!("SELECT fts_filtered_population({cols}, ?1) as population FROM {table} ORDER BY population DESC LIMIT ?");
         let patterns = parse_patterns(&[
             &score_pattern,          // 0
             &combined_ordered_limit, // 1
@@ -1102,6 +1157,7 @@ impl FtsIndexAttachment {
             &match_limit,            // 5
             &match_pattern,          // 6
             &filtered_score,         // 7
+            &filtered_population,    // 8
         ])?;
         tokenizer_names.sort();
         tokenizer_names.dedup();
@@ -1115,6 +1171,7 @@ impl FtsIndexAttachment {
             roles,
             filter_fields,
             interval_field,
+            sum_field,
             tokenizer_names,
             patterns,
             field_weights,
@@ -1261,7 +1318,11 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         let ast::Expr::FunctionCall { name, args, .. } = result.as_mut() else {
             return Some(result);
         };
-        let trailing = if name.as_str().eq_ignore_ascii_case("fts_score") {
+        let trailing = if name.as_str().eq_ignore_ascii_case("fts_score")
+            || name
+                .as_str()
+                .eq_ignore_ascii_case("fts_filtered_population")
+        {
             1
         } else if name.as_str().eq_ignore_ascii_case("fts_filtered_score") {
             2
@@ -1323,6 +1384,7 @@ const FTS_PATTERN_COMBINED: i64 = 4;
 pub(crate) const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
 pub(crate) const FTS_PATTERN_MATCH: i64 = 6;
 pub(crate) const FTS_PATTERN_FILTERED_SCORE: i64 = 7;
+pub(crate) const FTS_PATTERN_FILTERED_POPULATION: i64 = 8;
 
 /// One hit of a filtered query; ordered by score, then by the earlier
 /// document, so the heap's minimum is the hit a better one displaces.
@@ -1565,6 +1627,8 @@ pub struct FtsCursor {
     filter_fields: Vec<(String, Field)>,
     /// The event intervals column's fast field
     interval_field: Option<Field>,
+    /// The sum column's four little-endian u64 limbs
+    sum_field: Option<[Field; 4]>,
     /// Every tokenizer name this index uses
     tokenizer_names: Vec<String>,
     /// The user-visible index name, for error messages.
@@ -1637,6 +1701,8 @@ pub struct FtsCursor {
     streaming_hits: Option<FtsHitStream>,
     hit_pos: usize,
     current_pattern: i64,
+    /// The row of a population query.
+    population_row: Option<Vec<u8>>,
 }
 
 impl FtsCursor {
@@ -1665,6 +1731,7 @@ impl FtsCursor {
             roles: attachment.roles.clone(),
             filter_fields: attachment.filter_fields.clone(),
             interval_field: attachment.interval_field,
+            sum_field: attachment.sum_field,
             tokenizer_names: attachment.tokenizer_names.clone(),
             index_name: attachment.cfg.index_name.clone(),
             store,
@@ -1703,6 +1770,7 @@ impl FtsCursor {
             streaming_hits: None,
             hit_pos: 0,
             current_pattern: FTS_PATTERN_SCORE,
+            population_row: None,
         }
     }
 
@@ -1884,25 +1952,19 @@ impl FtsCursor {
                 ))
             }
         };
-        let filter = filter::Filter::parse(
-            &filter_text,
-            &self.filter_fields,
-            self.interval_field.is_some(),
-        )?;
-        let parser = self.selected_parser(&fields)?;
-        let query = parse_bounded_query(&parser, &query_str)?;
+        let filter = self.parse_filter(&filter_text)?;
+        let query: Box<dyn Query> = if query_str.trim_start().starts_with('{') {
+            self.term_query(&query_str, &fields)?
+        } else {
+            let parser = self.selected_parser(&fields)?;
+            parse_bounded_query(&parser, &query_str)?
+        };
+        let admitted = self.admitted_sets(&filter)?;
         let searcher = self
             .searcher
             .as_ref()
             .expect("FTS searcher initialized by query_start");
-        let interval_column = self
-            .interval_field
-            .map(|field| self.schema.get_field_name(field).to_string());
         let readers = searcher.segment_readers();
-        let admitted = readers
-            .iter()
-            .map(|reader| filter::admitted(&filter, reader, interval_column.as_deref()))
-            .collect::<Result<Vec<_>>>()?;
         let mut terms = Vec::new();
         query.query_terms(&mut |term, _| {
             if !terms.contains(term) {
@@ -1912,6 +1974,8 @@ impl FtsCursor {
         let statistics =
             filter::FilteredStatistics::count(readers, &admitted, &self.default_fields, &terms)?;
         let limit = bounded_query_limit(Some(limit), statistics.documents);
+        let population = self.population_of(readers, &admitted)?;
+        self.remember_population(&filter_text, population);
         if limit == 0 {
             return Ok(false);
         }
@@ -1921,41 +1985,54 @@ impl FtsCursor {
                 searcher,
             ))
             .map_err(|e| LimboError::InternalError(format!("FTS query weight error: {e}")))?;
-        // A min-heap of the best `limit` (score, segment, doc), with the
-        // lowest kept score as the threshold the scorers prune by.
+        // The best `limit` hits in a min-heap, and beside it every hit scoring
+        // exactly the heap's lowest score that did not fit: the cut is
+        // tie-complete, so the embedder orders equal scores by its own key.
+        // The scorers prune below the lowest kept score, never at it.
         let mut best: std::collections::BinaryHeap<std::cmp::Reverse<FilteredHit>> =
             std::collections::BinaryHeap::with_capacity(limit + 1);
+        let mut tied: Vec<FilteredHit> = Vec::new();
         for (segment_ord, (reader, bits)) in readers.iter().zip(&admitted).enumerate() {
             if bits.count() == 0 {
                 continue;
             }
-            let threshold = if best.len() == limit {
-                best.peek().map_or(f32::MIN, |hit| hit.0.score)
-            } else {
-                f32::MIN
+            let floor = |best: &std::collections::BinaryHeap<std::cmp::Reverse<FilteredHit>>| {
+                if best.len() == limit {
+                    best.peek().map_or(f32::MIN, |hit| hit.0.score.next_down())
+                } else {
+                    f32::MIN
+                }
             };
+            let threshold = floor(&best);
             weight
                 .for_each_pruning(threshold, reader, &mut |doc, score| {
                     if bits.contains(doc) {
-                        best.push(std::cmp::Reverse(FilteredHit {
+                        let hit = FilteredHit {
                             score,
                             segment_ord: segment_ord as u32,
                             doc,
-                        }));
-                        if best.len() > limit {
-                            best.pop();
+                        };
+                        let lowest = best.peek().map(|kept| kept.0.score);
+                        if best.len() < limit {
+                            best.push(std::cmp::Reverse(hit));
+                        } else if lowest == Some(score) {
+                            tied.push(hit);
+                        } else if lowest.is_some_and(|lowest| score > lowest) {
+                            best.push(std::cmp::Reverse(hit));
+                            let out = best.pop().expect("over the limit").0;
+                            let new_lowest = best.peek().map(|kept| kept.0.score);
+                            tied.retain(|t| Some(t.score) == new_lowest);
+                            if Some(out.score) == new_lowest {
+                                tied.push(out);
+                            }
                         }
                     }
-                    if best.len() == limit {
-                        best.peek().map_or(f32::MIN, |hit| hit.0.score)
-                    } else {
-                        f32::MIN
-                    }
+                    floor(&best)
                 })
                 .map_err(|e| LimboError::InternalError(format!("FTS search error: {e}")))?;
         }
         self.current_hits.clear();
-        for std::cmp::Reverse(hit) in best {
+        for hit in best.into_iter().map(|hit| hit.0).chain(tied) {
             let rowid = self.rowid_readers[hit.segment_ord as usize]
                 .first(hit.doc)
                 .ok_or_else(|| {
@@ -1970,6 +2047,225 @@ impl FtsCursor {
                 .then(a.2.cmp(&b.2))
         });
         Ok(!self.current_hits.is_empty())
+    }
+
+    /// The JSON filter over this index's filter columns and `rowid`.
+    fn parse_filter(&self, text: &str) -> Result<filter::Filter> {
+        let mut columns = self.filter_fields.clone();
+        columns.push((ROWID_FIELD.to_string(), self.rowid_field));
+        filter::Filter::parse(text, &columns, self.interval_field.is_some())
+    }
+
+    /// The documents of each visible segment the filter admits.
+    fn admitted_sets(&self, filter: &filter::Filter) -> Result<Vec<filter::DocBits>> {
+        let searcher = self
+            .searcher
+            .as_ref()
+            .expect("FTS searcher initialized by query_start");
+        let interval_column = self
+            .interval_field
+            .map(|field| self.schema.get_field_name(field).to_string());
+        searcher
+            .segment_readers()
+            .iter()
+            .map(|reader| filter::admitted(filter, reader, interval_column.as_deref()))
+            .collect()
+    }
+
+    /// Pre-analyzed terms, used verbatim (never re-tokenized):
+    /// `{"field": "col", "should": [..], "must": [..]}`. Every term scores by
+    /// BM25 with its frequency; a `must` term is also required. A repeated
+    /// term counts once. `field` may be left out when the query selects one
+    /// column.
+    fn term_query(&self, text: &str, fields: &str) -> Result<Box<dyn Query>> {
+        let invalid = |what: &str| LimboError::InvalidArgument(format!("FTS term query: {what}"));
+        if text.len() > FTS_MAX_QUERY_BYTES {
+            return Err(invalid("too long"));
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| invalid(&format!("not JSON: {e}")))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid("an object with field, should and must"))?;
+        if let Some(key) = object
+            .keys()
+            .find(|key| !matches!(key.as_str(), "field" | "should" | "must"))
+        {
+            return Err(invalid(&format!("unknown key '{key}'")));
+        }
+        let selected: Vec<usize> = fields
+            .split(',')
+            .map(|f| f.parse::<usize>().map_err(|_| invalid("bad field list")))
+            .collect::<Result<_>>()?;
+        let field = match object.get("field") {
+            None if selected.len() == 1 => self.default_fields[selected[0]],
+            None => {
+                return Err(invalid(
+                    "name the field when the query selects several columns",
+                ))
+            }
+            Some(name) => {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| invalid("field is a column name"))?;
+                let position = self
+                    .indexed_fields
+                    .iter()
+                    .position(|(col, _)| col.name.eq_ignore_ascii_case(name))
+                    .filter(|i| selected.contains(i))
+                    .ok_or_else(|| {
+                        invalid(&format!("'{name}' is not a column the query selected"))
+                    })?;
+                self.default_fields[position]
+            }
+        };
+        let list = |key: &str| -> Result<Vec<String>> {
+            match object.get(key) {
+                None => Ok(Vec::new()),
+                Some(value) => value
+                    .as_array()
+                    .ok_or_else(|| invalid(&format!("{key} is an array of terms")))?
+                    .iter()
+                    .map(|term| {
+                        term.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| invalid(&format!("{key} holds strings")))
+                    })
+                    .collect(),
+            }
+        };
+        let mut must = list("must")?;
+        must.sort();
+        must.dedup();
+        let mut should = list("should")?;
+        should.sort();
+        should.dedup();
+        should.retain(|term| must.binary_search(term).is_err());
+        let clause = |occur, term: &String| -> (tantivy::query::Occur, Box<dyn Query>) {
+            (
+                occur,
+                Box::new(tantivy::query::TermQuery::new(
+                    Term::from_field_text(field, term),
+                    IndexRecordOption::WithFreqs,
+                )),
+            )
+        };
+        let clauses: Vec<_> = must
+            .iter()
+            .map(|t| clause(tantivy::query::Occur::Must, t))
+            .chain(
+                should
+                    .iter()
+                    .map(|t| clause(tantivy::query::Occur::Should, t)),
+            )
+            .collect();
+        Ok(Box::new(tantivy::query::BooleanQuery::new(clauses)))
+    }
+
+    /// The admitted population: its document count and, where the index has
+    /// a `sum_field`, the little-endian 256-bit wrapping sum of the admitted
+    /// documents' values.
+    fn population_of(
+        &self,
+        readers: &[SegmentReader],
+        admitted: &[filter::DocBits],
+    ) -> Result<FilteredPopulation> {
+        let mut documents = 0u64;
+        let mut sum = [0u64; 4];
+        let mut has_sum = false;
+        for (reader, bits) in readers.iter().zip(admitted) {
+            documents += bits.count();
+            let Some(limbs) = self.sum_field else {
+                continue;
+            };
+            has_sum = true;
+            let columns = limbs
+                .iter()
+                .map(|field| {
+                    reader
+                        .fast_fields()
+                        .u64(self.schema.get_field_name(*field))
+                        .map_err(|e| LimboError::InternalError(format!("FTS sum column: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for doc in bits.docs() {
+                let mut carry = 0u128;
+                for (limb, column) in sum.iter_mut().zip(&columns) {
+                    let total =
+                        u128::from(*limb) + u128::from(column.first(doc).unwrap_or(0)) + carry;
+                    *limb = total as u64;
+                    carry = total >> 64;
+                }
+            }
+        }
+        Ok(FilteredPopulation {
+            documents,
+            sum: has_sum.then(|| {
+                let mut bytes = [0u8; 32];
+                for (chunk, limb) in bytes.chunks_exact_mut(8).zip(sum) {
+                    chunk.copy_from_slice(&limb.to_le_bytes());
+                }
+                bytes
+            }),
+        })
+    }
+
+    /// Keep a filter's population for a population query that follows on the
+    /// same snapshot, when the view is one every snapshot of this segment set
+    /// shares.
+    fn remember_population(&self, filter_text: &str, population: FilteredPopulation) {
+        if !self.view_is_cacheable() {
+            return;
+        }
+        let key = (searcher_key(&self.segments), filter_text.to_string());
+        *self.shared.population.lock() = Some((key, population));
+    }
+
+    /// `fts_filtered_population(cols, ?1 filter)`: one row, a BLOB of the
+    /// admitted document count (u64, big-endian) followed, where the index has
+    /// a `sum_field`, by the 32-byte sum.
+    fn query_population(&mut self, values: &[Register]) -> Result<bool> {
+        // values: [pattern, filter, limit, fields]
+        let filter_text = match values.get(1).map(Register::get_value) {
+            Some(Value::Text(text)) => text.as_str().to_string(),
+            _ => {
+                return Err(LimboError::InvalidArgument(
+                    "FTS filter must be JSON text".into(),
+                ))
+            }
+        };
+        let cached = self.view_is_cacheable().then(|| {
+            let key = (searcher_key(&self.segments), filter_text.clone());
+            self.shared
+                .population
+                .lock()
+                .as_ref()
+                .filter(|(cached, _)| *cached == key)
+                .map(|(_, population)| *population)
+        });
+        let population = match cached.flatten() {
+            Some(population) => population,
+            None => {
+                let filter = self.parse_filter(&filter_text)?;
+                let admitted = self.admitted_sets(&filter)?;
+                let searcher = self
+                    .searcher
+                    .as_ref()
+                    .expect("FTS searcher initialized by query_start");
+                let population = self.population_of(searcher.segment_readers(), &admitted)?;
+                self.remember_population(&filter_text, population);
+                population
+            }
+        };
+        let mut blob = population.documents.to_be_bytes().to_vec();
+        if let Some(sum) = population.sum {
+            blob.extend_from_slice(&sum);
+        }
+        self.population_row = Some(blob);
+        self.current_hits.clear();
+        self.current_hits.push((0.0, DocAddress::new(0, 0), 0));
+        self.hit_pos = 0;
+        Ok(true)
     }
 
     fn build_query_parser(&self, index: &Index) -> Arc<tantivy::query::QueryParser> {
@@ -3674,6 +3970,34 @@ impl IndexMethodCursor for FtsCursor {
                     }
                     continue;
                 }
+                ColumnRole::Sum(limbs) => {
+                    match reg.get_value() {
+                        Value::Blob(bytes) => {
+                            let bytes: &[u8] = bytes.as_ref();
+                            if bytes.len() != 32 {
+                                return Err(LimboError::Constraint(format!(
+                                    "FTS sum column must hold 32 bytes, got {}",
+                                    bytes.len()
+                                ))
+                                .into());
+                            }
+                            for (field, limb) in limbs.iter().zip(bytes.chunks_exact(8)) {
+                                doc.add_u64(
+                                    *field,
+                                    u64::from_le_bytes(limb.try_into().expect("8 bytes")),
+                                );
+                            }
+                        }
+                        Value::Null => {}
+                        _ => {
+                            return Err(LimboError::Constraint(
+                                "FTS sum column must hold a 32-byte BLOB or NULL".into(),
+                            )
+                            .into())
+                        }
+                    }
+                    continue;
+                }
                 ColumnRole::Intervals(field) => {
                     match reg.get_value() {
                         Value::Blob(bytes) => {
@@ -3793,8 +4117,12 @@ impl IndexMethodCursor for FtsCursor {
             _ => FTS_PATTERN_SCORE,
         };
         self.current_pattern = pattern_idx;
+        self.population_row = None;
         if pattern_idx == FTS_PATTERN_FILTERED_SCORE {
             return Ok(IOResult::Done(self.query_filtered(values)?));
+        }
+        if pattern_idx == FTS_PATTERN_FILTERED_POPULATION {
+            return Ok(IOResult::Done(self.query_population(values)?));
         }
 
         // Determine the optional SQL LIMIT captured by the selected pattern.
@@ -4062,6 +4390,16 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Returns the column value for the current result (score or match indicator).
     fn query_column(&mut self, idx: usize) -> IOResultOr<Value> {
+        if self.current_pattern == FTS_PATTERN_FILTERED_POPULATION {
+            return match (&self.population_row, idx) {
+                (Some(row), 0) if self.hit_pos == 0 => {
+                    Ok(IOResult::Done(Value::from_blob(row.clone())))
+                }
+                _ => Err(
+                    LimboError::InternalError("FTS: population column out of bounds".into()).into(),
+                ),
+            };
+        }
         // Column 0 is the score for score queries, or 1 (true) for match queries.
         // Column 1 is the score for match queries.
         if idx != 0

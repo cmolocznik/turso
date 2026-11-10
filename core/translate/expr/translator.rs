@@ -2179,6 +2179,15 @@ fn translate_function_call_expr(
             2,
         ),
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        Func::Fts(FtsFunc::FilteredPopulation) => translate_fts_score(
+            program,
+            referenced_tables,
+            args,
+            target_register,
+            name.as_str(),
+            1,
+        ),
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         Func::Fts(FtsFunc::Match) => {
             crate::bail_parse_error!("{} requires an FTS index query", name.as_str())
         }

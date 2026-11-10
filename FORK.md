@@ -1505,6 +1505,20 @@ concurrent writers, a rollback and a merge, refused filters and columns, a regis
 and OPTIMIZE INDEX after a DELETE leaving none of the erased document's segment rows in the store
 or the file under `secure_delete`.
 
+2026-11-11 later, same branch: the store's BM25 exactly. A query string that is a JSON object
+(`{"field": col, "should": [..], "must": [..]}`) is pre-analyzed terms taken verbatim, a
+BooleanQuery of term queries with frequencies (never re-tokenized; a repeated term counts once;
+`must` terms are required and score). The filter gains `not` and `not_in` (a missing value is
+not in any set) and `rowid` as a column. The cut at the LIMIT is tie-complete: every document
+scoring exactly the last kept one is returned, so rows may outnumber the LIMIT and the embedder
+orders ties by its own key. A `sum_field` column (a 32-byte BLOB, stored as four u64 fast fields)
+and `SELECT fts_filtered_population(cols, ?1) AS population FROM t ORDER BY population DESC
+LIMIT 1` give the admitted population: a BLOB of the document count (u64 big-endian) and the
+little-endian 256-bit wrapping sum of the admitted documents' sum values; a filtered query keeps
+the population it counted for a population query of the same filter on the same segment set.
+Field norms are Tantivy's (exact to 40 tokens, then quantized): the oracle quantizes with
+`FieldNormReader::{fieldnorm_to_id, id_to_fieldnorm}`, reachable through the re-exported `tantivy`.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

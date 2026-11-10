@@ -20,8 +20,12 @@ const MAX_FILTER_DEPTH: usize = 32;
 pub(crate) enum Filter {
     All(Vec<Filter>),
     Any(Vec<Filter>),
-    /// The column's value is one of these.
+    /// The documents the inner filter does not admit.
+    Not(Box<Filter>),
+    /// The column's value is one of these (sorted).
     In(String, Vec<i64>),
+    /// The column has no value, or one that is none of these (sorted).
+    NotIn(String, Vec<i64>),
     /// `lo <= value < hi`; an absent bound is open, a missing value never matches.
     Range(String, Option<i64>, Option<i64>),
     /// The column has no value.
@@ -98,19 +102,33 @@ impl Filter {
                     Self::Any(items)
                 })
             }
-            "in" => {
+            "in" | "not_in" => {
                 let items = pair(arg, 2)?;
-                let values = items[1]
+                let mut values = items[1]
                     .as_array()
-                    .ok_or_else(|| invalid("'in' takes a column and an array of integers"))?
+                    .ok_or_else(|| {
+                        invalid(format!("'{key}' takes a column and an array of integers"))
+                    })?
                     .iter()
                     .map(|v| {
                         v.as_i64()
-                            .ok_or_else(|| invalid("'in' values are integers"))
+                            .ok_or_else(|| invalid(format!("'{key}' values are integers")))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Ok(Self::In(column(&items[0])?, values))
+                values.sort_unstable();
+                values.dedup();
+                Ok(if key == "in" {
+                    Self::In(column(&items[0])?, values)
+                } else {
+                    Self::NotIn(column(&items[0])?, values)
+                })
             }
+            "not" => Ok(Self::Not(Box::new(Self::from_value(
+                arg,
+                columns,
+                intervals,
+                depth + 1,
+            )?))),
             "range" => {
                 let items = pair(arg, 3)?;
                 Ok(Self::Range(
@@ -177,6 +195,13 @@ impl DocBits {
         for (word, other) in self.words.iter_mut().zip(&other.words) {
             *word &= other;
         }
+    }
+
+    fn not(&mut self) {
+        for word in &mut self.words {
+            *word = !*word;
+        }
+        self.trim();
     }
 
     fn or(&mut self, other: &Self) {
@@ -288,13 +313,31 @@ fn evaluate(filter: &Filter, columns: &mut SegmentColumns<'_>, max_doc: u32) -> 
             }
             bits
         }
+        Filter::Not(inner) => {
+            let mut bits = evaluate(inner, columns, max_doc)?;
+            bits.not();
+            bits
+        }
         Filter::In(name, values) => {
             let column = columns.column(name)?;
             let mut bits = DocBits::empty(max_doc);
             for doc in 0..max_doc {
                 if column
                     .first(doc)
-                    .is_some_and(|value| values.contains(&value))
+                    .is_some_and(|value| values.binary_search(&value).is_ok())
+                {
+                    bits.insert(doc);
+                }
+            }
+            bits
+        }
+        Filter::NotIn(name, values) => {
+            let column = columns.column(name)?;
+            let mut bits = DocBits::empty(max_doc);
+            for doc in 0..max_doc {
+                if column
+                    .first(doc)
+                    .is_none_or(|value| values.binary_search(&value).is_err())
                 {
                     bits.insert(doc);
                 }

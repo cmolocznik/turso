@@ -703,6 +703,84 @@ mod native {
         assert_eq!(claimed, ["m", "d"]);
     }
 
+    /// A named claim takes a queued task out of its list and steps it at once, ahead of a task
+    /// queued before it, and it is stepped once; a done one it leaves (22.7; mutant: a queued task
+    /// left to the queue's order).
+    #[test]
+    fn a_named_claim_takes_a_queued_task_out_of_its_list() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        ex.spawn(Class::Due, recorded("a", 0, &log));
+        let b = ex.spawn(Class::Due, recorded("b", 0, &log));
+        let named = ex.run_named(&b);
+        while ex.run_one() {}
+        let again = ex.run_named(&b);
+        ex.close();
+        let claimed = log.lock().clone();
+        assert!(named, "the queued task claimed by name");
+        assert_eq!(claimed, ["b", "a"]);
+        assert!(!again, "a done task claimed by name");
+    }
+
+    /// A named claim runs an idle task, which nothing else woke, for its claimer's own reason
+    /// (22.7; mutant: an idle task left idle).
+    #[test]
+    fn a_named_claim_runs_an_idle_task() {
+        let ex = executor(0);
+        let c = Completion::new_sync(|_| {});
+        let (done_tx, done_rx) = mpsc::channel();
+        let task = ex.spawn(
+            Class::Maintenance,
+            Box::new(WaitsOn {
+                c: Some(c.clone()),
+                done: done_tx,
+            }),
+        );
+        let first = ex.run_one();
+        let idle = !ex.run_one();
+        let named = ex.run_named(&task);
+        let done = (done_rx.try_recv().is_ok(), task.is_done());
+        ex.close();
+        assert!(first && idle, "stepped, then waiting");
+        assert!(named, "the idle task claimed by name");
+        assert_eq!(done, (true, true), "its step ran");
+    }
+
+    /// Steps once: says it entered, then waits for `go`.
+    struct Blocks {
+        entered: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+    }
+
+    impl Task for Blocks {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let _ = self.entered.send(());
+            let _ = self.go.recv();
+            Ok(Step::Done)
+        }
+    }
+
+    /// A named claim leaves a running task to its runner, returning at once (22.7).
+    #[test]
+    fn a_named_claim_leaves_a_running_task_to_its_runner() {
+        let ex = executor(1);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let task = ex.spawn(
+            Class::Due,
+            Box::new(Blocks {
+                entered: entered_tx,
+                go: go_rx,
+            }),
+        );
+        let running = entered_rx.recv_timeout(BOUND).is_ok();
+        let named = ex.run_named(&task);
+        go_tx.send(()).unwrap();
+        ex.close();
+        assert!(running, "a worker stepped it");
+        assert!(!named, "a running task claimed by name");
+    }
+
     /// Reads `signal` and rests on it, every step.
     struct WatchesOne(Arc<Signal>);
 
@@ -873,6 +951,311 @@ mod native {
             "a job dropped under the table's mutex (1), or never (0)"
         );
     }
+
+    /// An external runner's waker: counts its wakes, and records whether the queue's mutex and,
+    /// when it watches one, a signal's list were free to take at each, and at its drop.
+    struct Probe {
+        shared: Weak<Shared>,
+        signal: Option<Arc<Signal>>,
+        /// A flag the test sets, read at each wake.
+        flag: Arc<AtomicBool>,
+        woken: AtomicUsize,
+        /// Wakes with every watched mutex free; wakes with the flag set.
+        free: AtomicUsize,
+        flagged: AtomicUsize,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Probe {
+        fn new(ex: &Executor, signal: Option<Arc<Signal>>) -> Arc<Self> {
+            Self::reading(ex, signal, Arc::new(AtomicBool::new(false)))
+        }
+
+        fn reading(ex: &Executor, signal: Option<Arc<Signal>>, flag: Arc<AtomicBool>) -> Arc<Self> {
+            Arc::new(Self {
+                shared: Arc::downgrade(&ex.shared),
+                signal,
+                flag,
+                woken: AtomicUsize::new(0),
+                free: AtomicUsize::new(0),
+                flagged: AtomicUsize::new(0),
+                dropped: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+
+        /// Whether every mutex it watches is free now.
+        fn all_free(&self) -> bool {
+            let queue = self
+                .shared
+                .upgrade()
+                .is_none_or(|shared| shared.queue.try_lock().is_some());
+            let listed = self.signal.as_ref().is_none_or(|s| s.listed_free());
+            queue && listed
+        }
+
+        fn counts(&self) -> (usize, usize, usize) {
+            (
+                self.woken.load(O::Acquire),
+                self.free.load(O::Acquire),
+                self.flagged.load(O::Acquire),
+            )
+        }
+    }
+
+    impl std::task::Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            if self.all_free() {
+                self.free.fetch_add(1, O::AcqRel);
+            }
+            if self.flag.load(O::Acquire) {
+                self.flagged.fetch_add(1, O::AcqRel);
+            }
+            self.woken.fetch_add(1, O::AcqRel);
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            // 2 with the queue's mutex free, 1 under it.
+            self.dropped
+                .store(if self.all_free() { 2 } else { 1 }, O::Release);
+        }
+    }
+
+    /// An external runner with nothing to claim leaves its waker on its node; a link moves the
+    /// node and the linking operation invokes the waker once, after the queue's mutex is let go,
+    /// and the runner then steps the task (22.3, 22.7; mutant: the waker invoked by the link,
+    /// under the mutex).
+    #[test]
+    fn an_external_runner_is_woken_by_a_link_after_the_queues_mutex() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let runner = ex.runner();
+        let probe = Probe::new(&ex, None);
+        let waker = std::task::Waker::from(probe.clone());
+        let first = runner.run_one(&waker);
+        ex.spawn(Class::Due, recorded("t", 0, &log));
+        let woken = probe.counts();
+        let stepped = runner.run_one(&waker);
+        drop(runner);
+        ex.close();
+        let claimed = log.lock().clone();
+        // Every probe gone before asserting: one dropped while a panic unwinds ends the process.
+        drop((waker, probe));
+        assert!(!first, "nothing to claim");
+        assert_eq!(woken.0, 1, "woken once by the link");
+        assert_eq!(woken.1, 1, "woken after the queue's mutex");
+        assert!(stepped);
+        assert_eq!(claimed, ["t"]);
+    }
+
+    /// A runner registering again swaps its new waker into its node: the link wakes that one, and
+    /// the one it replaced is dropped after the queue's mutex (22.3; mutant: the first waker kept).
+    #[test]
+    fn a_runner_registering_again_is_woken_through_its_new_waker() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let runner = ex.runner();
+        let (old, new) = (Probe::new(&ex, None), Probe::new(&ex, None));
+        let dropped = old.dropped.clone();
+        let registered = runner.run_one(&std::task::Waker::from(old.clone()));
+        // The node's clone is now the old waker's last handle.
+        drop(old);
+        let again = runner.run_one(&std::task::Waker::from(new.clone()));
+        ex.spawn(Class::Due, recorded("t", 0, &log));
+        let woken = new.counts();
+        drop(runner);
+        ex.close();
+        drop(new);
+        assert!(!registered && !again, "nothing to claim, twice");
+        assert_eq!(
+            dropped.load(O::Acquire),
+            2,
+            "replaced, and dropped after the mutex"
+        );
+        assert_eq!(
+            (woken.0, woken.1),
+            (1, 1),
+            "the new waker woken, after the mutex"
+        );
+    }
+
+    /// Each operation's drain invokes no more nodes than its own links moved, from the head of
+    /// the to-wake list: an operation coming between another's link and its drain wakes the first
+    /// node moved, and the first operation then the second (22.3; mutant: a drain that empties
+    /// the list).
+    #[test]
+    fn each_drain_invokes_no_more_than_its_own_operation_moved() {
+        let ex = Arc::new(executor(0));
+        let log = Arc::new(Lock::new(Vec::new()));
+        let (one, two) = (ex.runner(), ex.runner());
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = Probe::reading(&ex, None, flag.clone());
+        let second = Probe::reading(&ex, None, flag.clone());
+        let registered = [
+            one.run_one(&std::task::Waker::from(first.clone())),
+            two.run_one(&std::task::Waker::from(second.clone())),
+        ];
+        {
+            let (ex, log, flag) = (ex.clone(), log.clone(), flag.clone());
+            crate::race::at("executor.draining", move || {
+                ex.spawn(Class::Due, recorded("b", 0, &log));
+                flag.store(true, O::Release);
+            });
+        }
+        ex.spawn(Class::Due, recorded("a", 0, &log));
+        let woken = (first.counts(), second.counts());
+        drop((one, two));
+        let ex = Arc::into_inner(ex);
+        let alone = ex.is_some();
+        if let Some(ex) = ex {
+            ex.close();
+        }
+        drop((first, second));
+        assert!(alone, "the executor held by the race action");
+        assert_eq!(registered, [false, false]);
+        assert_eq!(woken.0 .0, 1, "the first node moved woken once");
+        assert_eq!(
+            woken.0 .2, 0,
+            "by the operation that came between, before it returned"
+        );
+        assert_eq!(
+            (woken.1 .0, woken.1 .2),
+            (1, 1),
+            "the second by the first operation, after"
+        );
+    }
+
+    /// A runner dropped after a link moved its node, before the drain: its node goes off the
+    /// to-wake list, and nothing invokes its waker (22.3; mutant: a drop that leaves the node).
+    #[test]
+    fn a_runner_dropped_after_its_node_moved_is_never_woken() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let runner = Arc::new(Lock::new(Some(ex.runner())));
+        let probe = Probe::new(&ex, None);
+        let registered = runner
+            .lock()
+            .as_ref()
+            .unwrap()
+            .run_one(&std::task::Waker::from(probe.clone()));
+        {
+            let runner = runner.clone();
+            crate::race::at("executor.draining", move || {
+                let gone = runner.lock().take();
+                drop(gone);
+            });
+        }
+        ex.spawn(Class::Due, recorded("t", 0, &log));
+        let woken = probe.counts().0;
+        ex.close();
+        drop((runner, probe));
+        assert!(!registered);
+        assert_eq!(woken, 0, "a dropped runner's waker invoked");
+    }
+
+    /// Close wakes the external runners idle among the runners, after its mutexes, so each sees
+    /// it closed (22.12; mutant: close moving them and invoking none).
+    #[test]
+    fn close_wakes_the_idle_external_runners() {
+        let ex = executor(0);
+        let runner = ex.runner();
+        let probe = Probe::new(&ex, None);
+        let registered = runner.run_one(&std::task::Waker::from(probe.clone()));
+        ex.close();
+        let woken = probe.counts();
+        let after = runner.run_one(&std::task::Waker::from(probe.clone()));
+        drop((runner, probe));
+        assert!(!registered && !after, "nothing to claim, open or closed");
+        assert_eq!(
+            (woken.0, woken.1),
+            (1, 1),
+            "woken by close, after its mutex"
+        );
+    }
+
+    /// A notify's wakes move external runners while the signal's mutex is held, and the notify
+    /// invokes them once it lets that mutex and the queue's go (22.2, 22.3; mutant: each listed
+    /// task woken as an operation of its own, under the signal's mutex).
+    #[test]
+    fn a_notify_wakes_the_runners_it_moved_after_the_signals_mutex() {
+        let ex = executor(0);
+        let (task, signals, ready) = watching(&ex);
+        let stepped = ex.run_one();
+        let runner = ex.runner();
+        let probe = Probe::new(&ex, Some(signals[0].clone()));
+        let registered = runner.run_one(&std::task::Waker::from(probe.clone()));
+        ready.store(true, O::Release);
+        signals[0].notify();
+        let woken = probe.counts();
+        let ran = runner.run_one(&std::task::Waker::from(probe.clone()));
+        let done = task.is_done();
+        drop(runner);
+        ex.close();
+        drop(probe);
+        assert!(stepped && !registered);
+        assert_eq!((woken.0, woken.1), (1, 1), "woken once, after both mutexes");
+        assert!(ran && done, "the runner stepped the task the notify queued");
+    }
+
+    /// Steps once: enters the executor through `runner`.
+    struct EntersAgain {
+        runner: Arc<Lock<Option<Runner>>>,
+    }
+
+    impl Task for EntersAgain {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let waker = std::task::Waker::noop().clone();
+            if let Some(runner) = self.runner.lock().as_ref() {
+                runner.run_one(&waker);
+            }
+            Ok(Step::Done)
+        }
+    }
+
+    /// A runner never enters the executor from inside a step: one that does ends the process
+    /// (22.7, 22.11; mutant: the check gone).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_runner_entering_from_inside_a_step_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_runner_entering_from_inside_a_step_ends_the_process"
+            ),
+            || {
+                let ex = executor(0);
+                let runner = Arc::new(Lock::new(Some(ex.runner())));
+                ex.spawn(
+                    Class::Due,
+                    Box::new(EntersAgain {
+                        runner: runner.clone(),
+                    }),
+                );
+                ex.run_one();
+                drop(runner.lock().take());
+                ex.close();
+            },
+        );
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(
+            ended
+                .stderr
+                .contains("a runner entered the executor from inside a step or a waker"),
+            "{}",
+            ended.stderr
+        );
+    }
 }
 
 #[cfg(atoll_loom)]
@@ -881,13 +1264,10 @@ mod loom_tests {
     use loom::thread;
 
     fn shared() -> Arc<Shared> {
+        let mut queue = Queue::new(0);
+        queue.tasks = 1;
         Arc::new(Shared {
-            queue: Mutex::new(Queue {
-                lists: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
-                idle: VecDeque::new(),
-                tasks: 1,
-                closing: false,
-            }),
+            queue: Mutex::new(queue),
             closed: AtomicBool::new(false),
             jobs: Mutex::new(Vec::new()),
             io: Arc::new(crate::io::MemoryIO::new()),
@@ -986,7 +1366,7 @@ mod loom_tests {
                 let signal = signal.clone();
                 thread::spawn(move || signal.notify())
             };
-            if signal.register(&h, read) {
+            if signal.register(&h, read, &shared) {
                 shared.rest(&h);
             } else {
                 shared.requeue(&h);

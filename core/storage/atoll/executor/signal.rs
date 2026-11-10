@@ -11,8 +11,8 @@
 //! the counter would have to come all the way round between the two reads to hide a notify.
 
 use self::sync::{lock, AtomicU64, Mutex, Ordering};
-use super::{wake, Header};
-use std::sync::Arc;
+use super::{wake_nested, Header, Shared};
+use std::sync::{Arc, OnceLock, Weak};
 
 #[cfg(not(atoll_loom))]
 mod sync {
@@ -39,6 +39,9 @@ pub(crate) const WATCHED: usize = 3;
 pub(crate) struct Signal {
     count: AtomicU64,
     listed: Mutex<Listed>,
+    /// The executor whose tasks register here, set by the first: a signal serves one, whose
+    /// drain invokes the external runners a notify's wakes moved.
+    owner: OnceLock<Weak<Shared>>,
 }
 
 /// The tasks registered, each at most once, and how many tasks are declared to watch the signal:
@@ -56,6 +59,7 @@ impl Default for Signal {
                 tasks: Vec::new(),
                 declared: 0,
             }),
+            owner: OnceLock::new(),
         }
     }
 }
@@ -79,11 +83,21 @@ impl Signal {
         self.count.fetch_add(1, Ordering::Release);
     }
 
-    /// Wakes every task listed and empties the list, under the mutex.
+    /// Wakes every task listed and empties the list, under the mutex; then, the mutex let go,
+    /// invokes the external runners those wakes moved (22.3).
     pub(super) fn wake_listed(&self) {
-        let mut listed = lock(&self.listed);
-        for header in listed.tasks.drain(..) {
-            wake(&header);
+        let moved: usize = {
+            let mut listed = lock(&self.listed);
+            listed
+                .tasks
+                .drain(..)
+                .map(|header| wake_nested(&header))
+                .sum()
+        };
+        if moved > 0 {
+            if let Some(shared) = self.owner.get().and_then(Weak::upgrade) {
+                shared.drain(moved);
+            }
         }
     }
 
@@ -95,9 +109,14 @@ impl Signal {
         listed.tasks.reserve(room);
     }
 
-    /// Registers `header`, a task declared to watch the signal, unless it is listed already;
-    /// whether the count still reads `read`.
-    pub(super) fn register(&self, header: &Arc<Header>, read: u64) -> bool {
+    /// Registers `header`, a task of `shared` declared to watch the signal, unless it is listed
+    /// already; whether the count still reads `read`.
+    pub(super) fn register(&self, header: &Arc<Header>, read: u64, shared: &Arc<Shared>) -> bool {
+        let owner = self.owner.get_or_init(|| Arc::downgrade(shared));
+        assert!(
+            std::ptr::eq(owner.as_ptr(), Arc::as_ptr(shared)),
+            "a signal watched by the tasks of two executors"
+        );
         crate::race::point("executor.registering");
         {
             let mut listed = lock(&self.listed);
@@ -130,6 +149,12 @@ impl Signal {
     #[cfg(test)]
     pub(super) fn room(&self) -> usize {
         lock(&self.listed).tasks.capacity()
+    }
+
+    /// Whether the list's mutex is free to take now.
+    #[cfg(all(test, not(atoll_loom)))]
+    pub(super) fn listed_free(&self) -> bool {
+        self.listed.try_lock().is_some()
     }
 }
 

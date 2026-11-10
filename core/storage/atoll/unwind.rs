@@ -426,6 +426,11 @@ mod tests {
             "child",
         ),
         (
+            "executor/tests.rs",
+            "a_runner_entering_from_inside_a_step_ends_the_process",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",

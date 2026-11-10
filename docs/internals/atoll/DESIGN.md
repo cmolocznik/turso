@@ -5310,11 +5310,16 @@ compose, the real `Completion`, latch and backends included where named.
    undeclared signal refused; demand by class, a writer's ticket and a logical wait's ticket on the
    job it waits on, moved with the waiter's class and given back when its wait ends, jobs ranked so
    a wait names only a later one, a trigger's level with the counter-checked clear; dropping the
-   executor closes it, and jobs are dropped after the table's mutex. The lists are deques given
-   room for every task when it is created, so no link allocates; intrusive links wait for a
-   measured need. Not built yet: threshold signals, named claims of idle tasks, external runners
-   and the to-wake list, executor completions with the callers' blocking and cooperative rules,
-   close's five phases, removal with a subject beyond a task's own end.)
+   executor closes it, and jobs are dropped after the table's mutex; named claims (22.7), a queued
+   task unlinked, an idle one claimed straight to running, a running one left; runner nodes, a
+   worker's thread or an embedder runner's waker, the to-wake list, and each operation's drain
+   bounded by the nodes its own links moved, so no external runner's waker is invoked under an
+   executor mutex (a signal serves the tasks of one executor, whose drain a notify runs after its
+   mutex), and a runner entering from inside a step or an invoked waker refused. The lists are
+   deques given room for every task and every node when each is created, so no link or move
+   allocates; intrusive links wait for a measured need. Not built yet: threshold signals,
+   executor completions with the callers' blocking and cooperative rules, close's five phases and
+   its wait for embedder calls in progress, removal with a subject beyond a task's own end.)
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run
    against step 4's, and the profile again.

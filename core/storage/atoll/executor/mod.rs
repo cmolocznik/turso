@@ -195,9 +195,21 @@ impl std::task::Wake for Header {
     }
 }
 
-/// Wakes `header`'s task (22.3): a running one is marked to run again, an idle one is queued under
-/// the mutex with its link, any other is left as it is.
+/// Wakes `header`'s task, an operation of its own: then invokes the external runners its link
+/// moved, once every executor mutex is let go (22.3).
 fn wake(header: &Arc<Header>) {
+    let moved = wake_nested(header);
+    if moved > 0 {
+        if let Some(shared) = header.shared.upgrade() {
+            shared.drain(moved);
+        }
+    }
+}
+
+/// Wakes `header`'s task inside another operation (22.3): a running one is marked to run again,
+/// an idle one is queued under the mutex with its link, any other is left as it is. How many
+/// external runners its link moved, for the operation to invoke once it lets every mutex go.
+fn wake_nested(header: &Arc<Header>) -> usize {
     let mut state = header.state.load(Ordering::Acquire);
     loop {
         match state {
@@ -207,12 +219,12 @@ fn wake(header: &Arc<Header>) {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => return 0,
                 Err(now) => state = now,
             },
             IDLE => {
                 let Some(shared) = header.shared.upgrade() else {
-                    return;
+                    return 0;
                 };
                 let mut queue = lock(&shared.queue);
                 match header.state.compare_exchange(
@@ -221,35 +233,187 @@ fn wake(header: &Arc<Header>) {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => {
-                        queue.link(header);
-                        return;
-                    }
+                    Ok(_) => return queue.link(header),
                     Err(now) => state = now,
                 }
             }
-            _ => return,
+            _ => return 0,
         }
     }
 }
 
-/// The run queue (22.3): one list per class, and the workers parked with nothing to claim.
+#[cfg(not(atoll_loom))]
+crate::thread::thread_local! {
+    /// Whether this thread is inside a task's step or a waker a drain invokes, where no runner
+    /// may enter the executor (22.7).
+    static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(atoll_loom)]
+loom::thread_local! {
+    static INSIDE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// This thread inside a step or an invoked waker, until dropped.
+struct Inside(bool);
+
+impl Inside {
+    fn enter() -> Self {
+        Self(INSIDE.with(|inside| inside.replace(true)))
+    }
+
+    /// Whether this thread is inside a step or an invoked waker.
+    fn here() -> bool {
+        INSIDE.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        INSIDE.with(|inside| inside.set(self.0));
+    }
+}
+
+/// A runner's node among the idle runners (22.3): a worker's thread, parked, or an external
+/// runner's last waker, which only a drain invokes, after every executor mutex is let go.
+enum Node {
+    Thread(crate::thread::Thread),
+    External(Option<std::task::Waker>),
+}
+
+/// Which list a node is on: a node is on at most one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum On {
+    Nowhere,
+    Idle,
+    ToWake,
+}
+
+/// A node and where it is; a node given back leaves its slot for the next.
+struct Slot {
+    node: Option<Node>,
+    on: On,
+}
+
+/// The run queue (22.3): one list per class, and the runners with nothing to claim.
 struct Queue {
     lists: [VecDeque<Arc<Header>>; CLASSES],
-    idle: VecDeque<crate::thread::Thread>,
     /// The tasks the executor holds, which every list has room for, so a link never allocates.
     tasks: usize,
+    /// Every runner's node by its number, each runner bringing its own; a slot given back is
+    /// reused.
+    nodes: Vec<Slot>,
+    free: Vec<usize>,
+    /// The idle runners' nodes, first in first out, with room for every node.
+    idle: VecDeque<usize>,
+    /// External nodes a link took off the idle runners, first in first out, each waiting for a
+    /// drain to invoke its waker, with room for every node.
+    to_wake: VecDeque<usize>,
     closing: bool,
 }
 
 impl Queue {
-    /// Links a task just moved to `QUEUED` at the back of its class, and unparks one idle worker.
-    fn link(&mut self, header: &Arc<Header>) {
+    fn new(workers: usize) -> Self {
+        Self {
+            lists: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
+            tasks: 0,
+            nodes: Vec::with_capacity(workers),
+            free: Vec::new(),
+            idle: VecDeque::with_capacity(workers),
+            to_wake: VecDeque::new(),
+            closing: false,
+        }
+    }
+
+    /// Links a task just moved to `QUEUED` at the back of its class, and takes one idle runner's
+    /// node off the list; how many external nodes it moved.
+    fn link(&mut self, header: &Arc<Header>) -> usize {
         let class = header.class.load(Ordering::Relaxed) as usize;
         self.lists[class].push_back(header.clone());
-        if let Some(worker) = self.idle.pop_front() {
-            worker.unpark();
+        self.wake_one_idle()
+    }
+
+    /// Takes the first idle runner's node off the list: a thread is unparked, an external node
+    /// moved to the tail of the to-wake list; how many external nodes it moved.
+    fn wake_one_idle(&mut self) -> usize {
+        let Some(n) = self.idle.pop_front() else {
+            return 0;
+        };
+        let slot = &mut self.nodes[n];
+        match &slot.node {
+            Some(Node::Thread(thread)) => {
+                slot.on = On::Nowhere;
+                thread.unpark();
+                0
+            }
+            Some(Node::External(_)) => {
+                slot.on = On::ToWake;
+                self.to_wake.push_back(n);
+                1
+            }
+            None => unreachable!("an idle runner's node given back"),
         }
+    }
+
+    /// A runner's node, provisioned with it: both lists keep room for every node.
+    fn add_node(&mut self, node: Node) -> usize {
+        let n = match self.free.pop() {
+            Some(n) => n,
+            None => {
+                self.nodes.push(Slot {
+                    node: None,
+                    on: On::Nowhere,
+                });
+                self.nodes.len() - 1
+            }
+        };
+        self.nodes[n].node = Some(node);
+        let live = self.nodes.len() - self.free.len();
+        self.idle.reserve(live.saturating_sub(self.idle.len()));
+        self.to_wake
+            .reserve(live.saturating_sub(self.to_wake.len()));
+        n
+    }
+
+    /// Takes node `n` off whichever list holds it.
+    fn unlist(&mut self, n: usize) {
+        let list = match self.nodes[n].on {
+            On::Nowhere => return,
+            On::Idle => &mut self.idle,
+            On::ToWake => &mut self.to_wake,
+        };
+        if let Some(at) = list.iter().position(|&m| m == n) {
+            list.remove(at);
+        }
+        self.nodes[n].on = On::Nowhere;
+    }
+
+    /// Gives node `n` back: off its list, its slot free; what it held, to drop after the mutex.
+    fn remove_node(&mut self, n: usize) -> Option<Node> {
+        self.unlist(n);
+        self.free.push(n);
+        self.nodes[n].node.take()
+    }
+
+    /// Node `n` among the idle runners, at the tail, unless it is on a list already.
+    fn idle_node(&mut self, n: usize) {
+        if self.nodes[n].on == On::Nowhere {
+            self.nodes[n].on = On::Idle;
+            self.idle.push_back(n);
+        }
+    }
+
+    /// Swaps `waker` into external node `n` and places it among the idle runners, unless a link
+    /// already moved it, whose drain then invokes this waker; the waker it replaces, to drop after
+    /// the mutex.
+    fn register_external(&mut self, n: usize, waker: std::task::Waker) -> Option<std::task::Waker> {
+        let Some(Node::External(slot)) = &mut self.nodes[n].node else {
+            unreachable!("a waker registered on a node that is not external");
+        };
+        let replaced = slot.replace(waker);
+        self.idle_node(n);
+        replaced
     }
 
     /// The head of the highest non-empty class, moved to `RUNNING`; a logical wait it stood in
@@ -263,6 +427,32 @@ impl Queue {
         assert_eq!(was, QUEUED, "a task claimed that was not queued");
         self.end_wait(&header);
         Some(header)
+    }
+
+    /// Claims `header` by name (22.7): a queued task is unlinked and claimed, an idle one is moved
+    /// straight to `RUNNING` (its claimer has its own reason to run it), and one running, done or
+    /// closed is left as it is; whether it was claimed. A logical wait it stood in is over.
+    fn claim_named(&mut self, header: &Arc<Header>) -> bool {
+        if self.closing {
+            return false;
+        }
+        // Under the mutex no other move leaves `QUEUED` or `IDLE`: each takes it (22.3).
+        match header.state.load(Ordering::Acquire) {
+            QUEUED => {
+                let class = header.class.load(Ordering::Relaxed) as usize;
+                let list = &mut self.lists[class];
+                let at = list.iter().position(|h| Arc::ptr_eq(h, header));
+                let Some(at) = at else {
+                    return false;
+                };
+                list.remove(at);
+                header.state.store(RUNNING, Ordering::Release);
+            }
+            IDLE => header.state.store(RUNNING, Ordering::Release),
+            _ => return false,
+        }
+        self.end_wait(header);
+        true
     }
 
     /// Gives back the ticket `header` holds on another job, if a logical wait of its stood.
@@ -322,22 +512,40 @@ impl Shared {
         let Some(header) = lock(&self.queue).claim() else {
             return false;
         };
+        self.step(header);
+        true
+    }
+
+    /// Claims `header` by name and steps it once; whether it was claimed.
+    fn run_named(self: &Arc<Self>, header: &Arc<Header>) -> bool {
+        if !lock(&self.queue).claim_named(header) {
+            return false;
+        }
+        self.step(header.clone());
+        true
+    }
+
+    /// Steps a task its runner claimed, once.
+    fn step(self: &Arc<Self>, header: Arc<Header>) {
         let Some(job) = header.job.upgrade() else {
             // Removed with its subject while queued: nothing to step.
-            return true;
+            return;
         };
         let cx = Cx {
             header: &header,
             shared: self,
         };
-        let step = lock(&job.task).step(&cx);
-        self.end(&header, &job, step);
-        true
+        let step = {
+            let _inside = Inside::enter();
+            lock(&job.task).step(&cx)
+        };
+        let moved = self.end(&header, &job, step);
+        self.drain(moved);
     }
 
     /// The end of a step (22.3), from `RUNNING` or `RUNNING|NOTIFIED`; a task the executor closed
-    /// meanwhile ends no other way.
-    fn end(self: &Arc<Self>, header: &Arc<Header>, job: &Job, step: Result<Step>) {
+    /// meanwhile ends no other way. How many external runners its links moved.
+    fn end(self: &Arc<Self>, header: &Arc<Header>, job: &Job, step: Result<Step>) -> usize {
         if let Ok(Step::Idle(Watched(watched))) = &step {
             // Its job declared each, so the lists have room for it: registering allocates nothing.
             for (signal, _) in watched.iter().flatten() {
@@ -350,24 +558,28 @@ impl Shared {
         if header.state.load(Ordering::Acquire) == CLOSED {
             // Close takes it off every list and drops its job, on this thread too when the step
             // dropped the executor; it is registered on none and finished by none.
-            return;
+            return 0;
         }
         match step {
             // An error ends the task as its job's end does: nothing restarts it.
-            Ok(Step::Done) | Err(_) => self.finish(header),
+            Ok(Step::Done) | Err(_) => {
+                self.finish(header);
+                0
+            }
             Ok(Step::Again) => self.requeue(header),
             Ok(Step::Wait(c)) => {
                 // Registered while running: a finish from now on marks the task notified.
                 c.set_waker(&std::task::Waker::from(header.clone()));
-                self.rest(header);
+                self.rest(header)
             }
             Ok(Step::WaitOn(target, c)) => {
+                // Before any mutex: a refusal passing one ends the process (22.11).
+                assert!(
+                    header.rank < target.0.rank,
+                    "a wait naming a job not after its own (22.4)"
+                );
                 {
                     let mut queue = lock(&self.queue);
-                    assert!(
-                        header.rank < target.0.rank,
-                        "a wait naming a job not after its own (22.4)"
-                    );
                     let class = Class::of(header.class.load(Ordering::Relaxed));
                     lock(&header.demand).waiting_on = Some((target.0.clone(), class));
                     lock(&target.0.demand).add(class);
@@ -376,41 +588,42 @@ impl Shared {
                 // Taking the ticket wakes the job it names.
                 wake(&target.0);
                 c.set_waker(&std::task::Waker::from(header.clone()));
-                self.rest(header);
+                self.rest(header)
             }
             Ok(Step::Idle(Watched(watched))) => {
                 // Registered while running: a notify from now on marks the task notified, and
                 // one between its look and its registration has moved a count.
                 let mut moved = false;
                 for (signal, read) in watched.iter().flatten() {
-                    moved |= !signal.register(header, *read);
+                    moved |= !signal.register(header, *read, self);
                 }
                 if moved {
-                    self.requeue(header);
+                    self.requeue(header)
                 } else {
-                    self.rest(header);
+                    self.rest(header)
                 }
             }
         }
     }
 
     /// A task that waits: from `RUNNING` to `IDLE` by one compare-exchange, or, woken while it
-    /// ran, queued again.
-    fn rest(&self, header: &Arc<Header>) {
+    /// ran, queued again; how many external runners its link moved.
+    fn rest(&self, header: &Arc<Header>) -> usize {
         match header
             .state
             .compare_exchange(RUNNING, IDLE, Ordering::AcqRel, Ordering::Acquire)
         {
-            Ok(_) | Err(CLOSED) => {}
+            Ok(_) | Err(CLOSED) => 0,
             Err(_) => self.requeue(header),
         }
     }
 
-    /// Queues a task again at the back of its class, unless the executor closed it.
-    fn requeue(&self, header: &Arc<Header>) {
+    /// Queues a task again at the back of its class, unless the executor closed it; how many
+    /// external runners its link moved.
+    fn requeue(&self, header: &Arc<Header>) -> usize {
         let mut queue = lock(&self.queue);
         if header.state.load(Ordering::Acquire) == CLOSED {
-            return;
+            return 0;
         }
         // Only this runner moves the task out of running, and close moves it under this mutex;
         // a wake meanwhile either marked it first, which the swap replaces, or finds it queued.
@@ -419,7 +632,38 @@ impl Shared {
             was & RUNNING != 0,
             "a task queued again that was not running: {was}"
         );
-        queue.link(header);
+        queue.link(header)
+    }
+
+    /// Invokes up to `moved` external runners' wakers, the count an operation's links moved, once
+    /// that operation has let every executor mutex go: each is popped from the head of the
+    /// to-wake list under the queue's mutex and woken after it (22.3). A drain stops at its count
+    /// or at an empty list, so every node moved is invoked by some drain and no drain does more
+    /// than its own moves.
+    fn drain(&self, mut moved: usize) {
+        if moved == 0 {
+            return;
+        }
+        crate::race::point("executor.draining");
+        while moved > 0 {
+            let waker = {
+                let mut queue = lock(&self.queue);
+                let Some(n) = queue.to_wake.pop_front() else {
+                    return;
+                };
+                let slot = &mut queue.nodes[n];
+                slot.on = On::Nowhere;
+                match &mut slot.node {
+                    Some(Node::External(waker)) => waker.take(),
+                    _ => unreachable!("a node on the to-wake list that is not external"),
+                }
+            };
+            moved -= 1;
+            if let Some(waker) = waker {
+                let _inside = Inside::enter();
+                waker.wake();
+            }
+        }
     }
 
     /// Ends a task: its word says done whether or not it was notified, and its job goes.
@@ -462,6 +706,7 @@ fn work(shared: &Arc<Shared>) {
     let me = crate::thread::current();
     let ready = crate::io::unparking(me.clone());
     let mut registered = false;
+    let node = lock(&shared.queue).add_node(Node::Thread(me.clone()));
     loop {
         if shared.closed.load(Ordering::Acquire) {
             break;
@@ -493,12 +738,14 @@ fn work(shared: &Arc<Shared>) {
             if queue.lists.iter().any(|list| !list.is_empty()) {
                 continue;
             }
-            queue.idle.push_back(me.clone());
+            queue.idle_node(node);
         }
         crate::storage::atoll::park::thread();
-        // Woken by the backend, or spuriously: its node goes, so a link wakes another worker.
-        lock(&shared.queue).idle.retain(|t| t.id() != me.id());
+        // Woken by the backend, or spuriously: its node goes, so a link wakes another runner.
+        lock(&shared.queue).unlist(node);
     }
+    let gone = lock(&shared.queue).remove_node(node);
+    drop(gone);
     if registered {
         shared.io.withdraw(&ready);
     }
@@ -508,6 +755,53 @@ fn work(shared: &Arc<Shared>) {
 pub(crate) struct Executor {
     shared: Arc<Shared>,
     workers: Vec<crate::thread::JoinHandle<()>>,
+}
+
+/// An embedder thread's runner (22.7): it steps one task at a time, and with none to claim leaves
+/// its waker on its node among the idle runners, which a link moves to the to-wake list and an
+/// operation's drain invokes once every executor mutex is let go. Dropped, its node goes, off
+/// whichever list holds it.
+pub(crate) struct Runner {
+    shared: Arc<Shared>,
+    node: usize,
+}
+
+impl Runner {
+    /// Claims the next task by class and steps it once; with none to claim, registers `waker` on
+    /// this runner's node among the idle runners, so the next link wakes it. Whether it stepped
+    /// one. Never from inside a step or a waker the executor invoked.
+    pub(crate) fn run_one(&self, waker: &std::task::Waker) -> bool {
+        assert!(
+            !Inside::here(),
+            "a runner entered the executor from inside a step or a waker"
+        );
+        // Cloned before any executor mutex is taken, and what it replaces dropped after.
+        let waker = waker.clone();
+        let (claimed, replaced) = {
+            let mut queue = lock(&self.shared.queue);
+            match queue.claim() {
+                Some(header) => (Some(header), None),
+                None if queue.closing => (None, None),
+                None => (None, queue.register_external(self.node, waker)),
+            }
+        };
+        drop(replaced);
+        match claimed {
+            Some(header) => {
+                self.shared.step(header);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        let gone = lock(&self.shared.queue).remove_node(self.node);
+        drop(gone);
+    }
 }
 
 /// A task as its creator names it.
@@ -590,12 +884,7 @@ impl Executor {
     pub(crate) fn new(io: Arc<dyn IO>, workers: usize) -> Result<Self> {
         crate::storage::atoll::db::refuse_a_backend_that_would_poll(&*io)?;
         let shared = Arc::new(Shared {
-            queue: Mutex::new(Queue {
-                lists: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
-                idle: VecDeque::with_capacity(workers),
-                tasks: 0,
-                closing: false,
-            }),
+            queue: Mutex::new(Queue::new(workers)),
             closed: AtomicBool::new(false),
             jobs: Mutex::new(Vec::new()),
             io,
@@ -672,18 +961,37 @@ impl Executor {
         for list in &mut queue.lists {
             list.reserve(tasks.saturating_sub(list.len()));
         }
-        if queue.closing {
+        let moved = if queue.closing {
             header.state.store(CLOSED, Ordering::Release);
+            0
         } else {
-            queue.link(&header);
-        }
+            queue.link(&header)
+        };
+        drop(queue);
+        self.shared.drain(moved);
         TaskRef(header)
+    }
+
+    /// A runner of an embedder's thread (22.7), with its node among the idle runners.
+    pub(crate) fn runner(&self) -> Runner {
+        let node = lock(&self.shared.queue).add_node(Node::External(None));
+        Runner {
+            shared: self.shared.clone(),
+            node,
+        }
     }
 
     /// Claims the next task by class and steps it once, on the calling thread; whether there was
     /// one. A caller's runner (22.7), and the deterministic one.
     pub(crate) fn run_one(&self) -> bool {
         self.shared.run_one()
+    }
+
+    /// Claims `task` by name and steps it once, on the calling thread (22.7): queued, it is taken
+    /// out of its list; idle, it runs for its claimer's own reason; running, done or closed, it is
+    /// left. Whether it was stepped.
+    pub(crate) fn run_named(&self, task: &TaskRef) -> bool {
+        self.shared.run_named(&task.0)
     }
 
     /// Closes the executor, as dropping it does.
@@ -696,7 +1004,7 @@ impl Executor {
     /// dropped the executor (it leaves once that step ends); then drops every job, after the
     /// table's mutex.
     fn shut(&mut self) {
-        {
+        let moved = {
             let mut queue = lock(&self.shared.queue);
             queue.closing = true;
             self.shared.closed.store(true, Ordering::Release);
@@ -708,10 +1016,13 @@ impl Executor {
             for job in lock(&self.shared.jobs).iter() {
                 job.header.state.store(CLOSED, Ordering::Release);
             }
-            for worker in queue.idle.drain(..) {
-                worker.unpark();
+            let mut moved = 0;
+            while !queue.idle.is_empty() {
+                moved += queue.wake_one_idle();
             }
-        }
+            moved
+        };
+        self.shared.drain(moved);
         let me = crate::thread::current().id();
         for worker in self.workers.drain(..) {
             if worker.thread().id() == me {

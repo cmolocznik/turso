@@ -5336,7 +5336,10 @@ compose, the real `Completion`, latch and backends included where named.
    workers, and otherwise runs it, claiming by class, stepping a pumped backend between task
    steps and parking among the idle runners with nothing to claim; a cooperative wait
    (`Executor::wait_async`) runs one task step and one IO step per poll, rests its node or asks to
-   be polled again while work is queued. The lists are deques given room for every task and every
+   be polled again while work is queued, and gives its node and its backend registration back the
+   moment it is ready, however long its owner keeps it, so no later link wakes it in place of a
+   live waiter (the auditor's P1-E9-R1); its poll is an entry, a panic of its host's waker ending
+   the process (P2-E9-F1), and the ring's delivery thread is refused a blocking one (P2-E9-D1). The lists are deques given room for every task and every
    node when each is created, so no link or move allocates (counted: 3,072 steps and 2,304
    external wakes, none allocating); intrusive links wait for a measured need. Threshold signals: a signal's
    least threshold wanted, lowered under its mutex and fenced by the task before it computes the

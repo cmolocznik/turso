@@ -456,6 +456,16 @@ mod tests {
             "child",
         ),
         (
+            "executor/tests.rs",
+            "a_wait_on_executor_work_from_the_delivery_thread_ends_the_process",
+            "child",
+        ),
+        (
+            "executor/tests.rs",
+            "a_host_waker_panicking_in_a_poll_ends_the_process",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",

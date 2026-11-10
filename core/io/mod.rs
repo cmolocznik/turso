@@ -57,6 +57,13 @@ crate::thread::thread_local! {
     static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Marks this thread as a ring's delivery thread for the rest of its life, as the ring marks its
+/// own: for a test of what such a thread refuses.
+#[cfg(test)]
+pub(crate) fn deliver_on_this_thread() {
+    DELIVERING.with(|d| d.set(true));
+}
+
 /// Ends the thread with a panic if it is a ring's delivery thread, which never makes a call that can
 /// wait: nothing else would deliver what it waits for, and every delivery behind it would wait on
 /// the file system, on another holder of a lock, or on time (DESIGN.md 22.5; the calls ruled are

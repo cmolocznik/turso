@@ -1948,6 +1948,134 @@ mod native {
         assert_eq!(done, [true, true]);
     }
 
+    /// A cooperative wait gives its runner's node back once ready, though its owner keeps it:
+    /// a link after that wakes a live waiter, never the finished one (22.3, 22.7; the auditor's
+    /// P1-E9-R1; mutant: the node kept until the wait is dropped).
+    #[test]
+    fn a_ready_wait_kept_alive_takes_no_wake_owed_to_another_waiter() {
+        use std::future::Future;
+        let ex = executor(0);
+        let (first, second) = (Completion::new_wait(), Completion::new_wait());
+        let (first_wakes, second_wakes) =
+            (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let first_waker = std::task::Waker::from(Arc::new(Counts(first_wakes.clone())));
+        let second_waker = std::task::Waker::from(Arc::new(Counts(second_wakes.clone())));
+        let mut first_cx = std::task::Context::from_waker(&first_waker);
+        let mut second_cx = std::task::Context::from_waker(&second_waker);
+        let mut kept = Box::pin(ex.wait_async(first.clone()));
+        let rested = kept.as_mut().poll(&mut first_cx).is_pending();
+        // Finished by another caller while it rests.
+        first.complete(0);
+        let ready = kept.as_mut().poll(&mut first_cx).is_ready();
+        let mut live = Box::pin(ex.wait_async(second.clone()));
+        let pending = live.as_mut().poll(&mut second_cx).is_pending();
+        let before = (
+            first_wakes.load(O::Acquire),
+            second_wakes.swap(0, O::AcqRel),
+        );
+        let (task, _) = finishes_after(0, &second);
+        ex.spawn(Class::Due, task);
+        let woken = second_wakes.load(O::Acquire);
+        // Ready either way, so every handle goes before close.
+        let mut polls = 0;
+        while live.as_mut().poll(&mut second_cx).is_pending() && polls < 4 {
+            polls += 1;
+        }
+        let finished = second.finished();
+        drop((kept, live));
+        ex.close();
+        assert!(rested && ready && pending);
+        assert_eq!(before.1, 0, "the live waiter woken before any link");
+        assert_eq!(
+            woken, 1,
+            "the link woke the finished waiter, not the live one"
+        );
+        assert!(finished);
+    }
+
+    /// The ring's delivery thread never waits: a blocking wait on executor work made there ends
+    /// the process before it runs anything (22.5; the auditor's P2-E9-D1; mutant: the refusal
+    /// gone, so the wait runs the executor on the delivery thread).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_wait_on_executor_work_from_the_delivery_thread_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_wait_on_executor_work_from_the_delivery_thread_ends_the_process"
+            ),
+            || {
+                let ex = executor(0);
+                let c = Completion::new_wait();
+                let (task, _) = finishes_after(0, &c);
+                ex.spawn(Class::Due, task);
+                crate::io::deliver_on_this_thread();
+                ex.wait(&c);
+                ex.close();
+            },
+        );
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(
+            ended.stderr.contains("on the ring's delivery thread"),
+            "{}",
+            ended.stderr
+        );
+    }
+
+    /// Panics when woken.
+    struct PanicsOnWake;
+
+    impl std::task::Wake for PanicsOnWake {
+        fn wake(self: Arc<Self>) {
+            panic!("a host's waker panicked");
+        }
+    }
+
+    /// A cooperative wait's poll is an entry: a host waker panicking when the poll asks it for
+    /// another poll ends the process, though nothing of Atoll's would drop while it unwinds
+    /// (22.11; the auditor's P2-E9-F1; mutant: the poll without its frame).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_host_waker_panicking_in_a_poll_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_host_waker_panicking_in_a_poll_ends_the_process"
+            ),
+            || {
+                use std::future::Future;
+                // Never dropped: a panic out of the poll unwinds through nothing of Atoll's.
+                let ex: &'static Executor = Box::leak(Box::new(executor(0)));
+                let c = Completion::new_wait();
+                let (task, _) = finishes_after(1, &c);
+                ex.spawn(Class::Due, task);
+                let wait = Box::leak(Box::new(ex.wait_async(c)));
+                // SAFETY: leaked, the wait never moves again.
+                let wait = unsafe { std::pin::Pin::new_unchecked(wait) };
+                let waker = std::task::Waker::from(Arc::new(PanicsOnWake));
+                let mut cx = std::task::Context::from_waker(&waker);
+                // A step leaves the task queued: the poll asks its host for another.
+                let _ = wait.poll(&mut cx);
+            },
+        );
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(
+            ended.stderr.contains("a host's waker panicked"),
+            "{}",
+            ended.stderr
+        );
+    }
+
     /// Steps once: enters the executor through `runner`.
     struct EntersAgain {
         runner: Arc<Lock<Option<Runner>>>,

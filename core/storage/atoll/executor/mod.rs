@@ -911,6 +911,7 @@ impl Runner {
     /// Claims the next task by class and steps it once; with none to claim, registers `waker` on
     /// this runner's node among the idle runners, so the next link wakes it. Whether it stepped
     /// one. Never from inside a step or a waker the executor invoked.
+    #[turso_macros::atoll_entry]
     pub(crate) fn run_one(&self, waker: &std::task::Waker) -> bool {
         refuse_entry_from_inside();
         // Cloned before any executor mutex is taken, and what it replaces dropped after.
@@ -966,7 +967,23 @@ impl Runner {
 pub(crate) struct Wait<'a> {
     executor: &'a Executor,
     completion: crate::io::CompletionFuture,
-    runner: Runner,
+    /// The wait's runner, with its node among the idle runners, while it may still run the
+    /// executor: none with workers, and none once the wait is ready, so a link after that wakes
+    /// a live runner rather than this finished one.
+    runner: Option<Runner>,
+}
+
+impl Wait<'_> {
+    /// Gives the runner's node and the backend registration back, the wait's own and no longer
+    /// needed: at its ready, and at its drop if it never was.
+    fn release(&mut self) {
+        drop(self.runner.take());
+        if let Some(key) = self.completion.ready_key() {
+            if self.executor.shared.io.delivery() == Delivery::Pumped {
+                self.executor.shared.io.withdraw(key);
+            }
+        }
+    }
 }
 
 impl std::future::Future for Wait<'_> {
@@ -976,19 +993,24 @@ impl std::future::Future for Wait<'_> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<()>> {
+        // An entry (22.11): the host's waker, cloned, invoked or dropped here, panics into a
+        // frame that ends the process, as every waker Atoll runs does.
+        let _frame = crate::storage::atoll::unwind::Frame::enter();
         refuse_entry_from_inside();
         // SAFETY: `completion` is never moved while pinned, here or by the drop, and no other
         // field is pinned. There is no Unpin implementation for the enclosing future.
         let this = unsafe { self.get_unchecked_mut() };
         let completion = unsafe { std::pin::Pin::new_unchecked(&mut this.completion) };
         if let std::task::Poll::Ready(ended) = completion.poll(cx) {
+            this.release();
             return std::task::Poll::Ready(ended);
         }
-        if !this.executor.workers.is_empty() {
+        let Some(runner) = &this.runner else {
+            // Workers run the executor: the wait only waits.
             return std::task::Poll::Pending;
-        }
+        };
         let shared = &this.executor.shared;
-        let stepped = this.runner.run_one(cx.waker());
+        let stepped = runner.run_one(cx.waker());
         let delivered = shared.io.delivery() == Delivery::Pumped && {
             // Polled pending, the completion's future has its key: the backend's too.
             let key = this
@@ -1008,7 +1030,7 @@ impl std::future::Future for Wait<'_> {
         // A runner that stepped rests its node or polls again; one that did not has its node.
         let again = this.completion.completion().finished()
             || delivered
-            || (stepped && this.runner.rest_or_queued(cx.waker()));
+            || (stepped && runner.rest_or_queued(cx.waker()));
         if again {
             cx.waker().wake_by_ref();
         }
@@ -1017,14 +1039,10 @@ impl std::future::Future for Wait<'_> {
 }
 
 impl Drop for Wait<'_> {
-    /// Takes the wait's registration back from a pumped backend; its node goes with its runner.
+    /// Gives the runner's node and the backend registration back, if the wait never was ready.
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        if let Some(key) = self.completion.ready_key() {
-            if self.executor.shared.io.delivery() == Delivery::Pumped {
-                self.executor.shared.io.withdraw(key);
-            }
-        }
+        self.release();
     }
 }
 
@@ -1235,7 +1253,10 @@ impl Executor {
     /// Waits for `c`, which this executor's work finishes, holding the calling thread (22.7): with
     /// workers it only waits; without, it runs the executor until `c` finishes. Never from inside
     /// a step or a waker the executor invoked.
+    #[turso_macros::atoll_entry]
     pub(crate) fn wait(&self, c: &Completion) {
+        // A wait, which the ring's delivery thread never makes (22.5).
+        crate::io::refuse_on_delivery_thread("a wait on executor work");
         refuse_entry_from_inside();
         if c.finished() {
             return;
@@ -1257,7 +1278,7 @@ impl Executor {
         Wait {
             executor: self,
             completion: std::future::IntoFuture::into_future(c),
-            runner: self.runner(),
+            runner: self.workers.is_empty().then(|| self.runner()),
         }
     }
 

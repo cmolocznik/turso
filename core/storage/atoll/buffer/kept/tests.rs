@@ -928,26 +928,27 @@ fn with_a_checkpointing_thread_a_writer_refused_room_waits_for_the_room_it_frees
 /// checkpointing thread took no cut").
 #[test]
 fn a_hold_let_go_wakes_the_checkpointing_thread_that_found_the_state_held() {
+    let within_a_minute = |done: &dyn Fn() -> bool| {
+        let began = std::time::Instant::now();
+        while !done() {
+            if began.elapsed() > std::time::Duration::from_secs(60) {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    };
     let db = Db::threaded();
     let cp = db.db.checkpointer();
     let held = cp.hold().expect("the state free");
     let ticket = cp.request_full();
-    let began = std::time::Instant::now();
-    while !cp.driver_contends() {
-        assert!(
-            began.elapsed() < std::time::Duration::from_secs(60),
-            "the checkpointing thread never waited for the state"
-        );
-        std::thread::yield_now();
-    }
+    let contended = within_a_minute(&|| cp.driver_contends());
     drop(held);
-    let began = std::time::Instant::now();
-    while cp.fulls_done() < ticket {
-        assert!(
-            began.elapsed() < std::time::Duration::from_secs(60),
-            "the checkpointing thread was left parked after the state was let go"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
+    let done = contended && within_a_minute(&|| cp.fulls_done() >= ticket);
+    if !done {
+        // The checkpoint's task is left asleep: closing would wait for it for good.
+        std::mem::forget(db);
+        panic!("the task contended {contended}, then was left asleep after the state was let go");
     }
 }
 
@@ -1044,7 +1045,7 @@ fn a_waiter_woken_for_a_full_checkpoint_may_take_the_checkpoint_state_from_its_w
 fn a_checkpoint_failing_on_the_thread_is_told_to_whoever_waits_for_it() {
     let db = Db::threaded();
     let crash = db.crash.clone().unwrap();
-    let (_tree, _) = db.owed_tree();
+    let (tree, _) = db.owed_tree();
     // The writes of the tree's pages fail; the log's never do.
     crash.set_faults_on(Some(&format!("{BASE}.c{}.0", node_class().index())));
     crash.set_faults(Faults {
@@ -1073,6 +1074,17 @@ fn a_checkpoint_failing_on_the_thread_is_told_to_whoever_waits_for_it() {
             "no failure told"
         );
     };
+    // Told the failure, the task is over, with nothing to restart it.
+    let began = std::time::Instant::now();
+    while !cp.task_done() && began.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::yield_now();
+    }
+    let over = cp.task_done();
+    if !over {
+        // The task goes on stepping a failed state: closing would wait on its loop.
+        std::mem::forget((tree, db));
+    }
+    assert!(over, "the checkpoint's task went on after its failure");
     assert!(failed.to_string().contains("failed"), "{failed}");
 }
 
@@ -1085,6 +1097,44 @@ fn a_closed_database_ends_and_joins_its_checkpointing_thread() {
     assert!(
         held.upgrade().is_none(),
         "the checkpointing thread holds the checkpointer"
+    );
+}
+
+/// The checkpoint's task, closed with its executor while a checkpoint it stepped is under way,
+/// abandons that checkpoint as a failed one is: its cut ends, and the state holds no run
+/// (DESIGN.md 22.12 step 3; mutant: an abandonment that leaves the run).
+#[test]
+fn closing_the_checkpoints_task_abandons_the_checkpoint_under_way() {
+    use crate::storage::atoll::checkpoint::CheckpointTask;
+    use crate::storage::atoll::executor::{Class, Executor};
+    // No thread steps it: the test runs the task, one step at a time.
+    let db = Db::crash();
+    let (tree, _) = db.owed_tree();
+    let cp = db.db.checkpointer_arc().clone();
+    let ex = Executor::new(db.io.clone(), 0).unwrap();
+    ex.spawn(
+        Class::Due,
+        Box::new(CheckpointTask::new(
+            cp.clone(),
+            db.db.transactions_arc().clone(),
+        )),
+    );
+    cp.request_full();
+    let mut steps = 0;
+    while cp.cut_taken().is_none() && steps < 1_000 && ex.run_one() {
+        steps += 1;
+    }
+    let (cut, cutting) = (cp.cut_taken(), db.pool().cutting());
+    ex.close();
+    let after = (db.pool().cutting(), cp.cut_taken());
+    // Every assertion with the database closed, so a failing one drops nothing of it unwinding.
+    drop((tree, cp, db));
+    assert!(cut.is_some(), "no cut taken in {steps} steps");
+    assert_ne!(cutting, 0, "no cut in effect");
+    assert_eq!(
+        after,
+        (0, None),
+        "(cut in effect, run under way) after close"
     );
 }
 

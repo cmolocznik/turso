@@ -2280,6 +2280,18 @@ mod tests {
             "file_id" => {
                 let _ = io.file_id(&path("absent"));
             }
+            "try_step" => {
+                let place = crate::io::ReadyPlace::default();
+                let _ = io.try_step(place.key(), std::task::Waker::noop());
+                io.withdraw(place.key());
+            }
+            "says_what_a_step_found" => {
+                let _ = io.says_what_a_step_found();
+            }
+            "withdraw" => {
+                let place = crate::io::ReadyPlace::default();
+                io.withdraw(place.key());
+            }
             _ => panic!("no call for {method}"),
         }
     }

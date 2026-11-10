@@ -76,6 +76,12 @@ pub(crate) struct Cx<'a> {
 }
 
 impl Cx<'_> {
+    /// The task this step is a step of, as its creator names it: for a step that registers it to
+    /// be woken, as a guarded state's contender.
+    pub(crate) fn task(&self) -> TaskRef {
+        TaskRef(self.header.clone())
+    }
+
     /// The task's own trigger is gone, as the step found after reading `due` at `read`: its own
     /// level drops to maintenance, unless a trigger came since, which moved the count and keeps
     /// it (22.4); whether it dropped.
@@ -1180,6 +1186,11 @@ impl TaskRef {
         }
     }
 
+    /// Whether `other` names this task.
+    pub(crate) fn same(&self, other: &TaskRef) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Wakes the task, as a completion it waits on would.
     pub(crate) fn wake(&self) {
         wake(&self.0);
@@ -1355,7 +1366,9 @@ impl Executor {
     }
 
     /// Claims the next task by class and steps it once, on the calling thread; whether there was
-    /// one. A caller's runner (22.7), and the deterministic one.
+    /// one. A caller's runner (22.7), and the deterministic one; an entry, so a refusal in it ends
+    /// the process at its own frame (22.11).
+    #[turso_macros::atoll_entry]
     pub(crate) fn run_one(&self) -> bool {
         refuse_entry_from_inside();
         self.shared.run_one()
@@ -1363,7 +1376,8 @@ impl Executor {
 
     /// Claims `task` by name and steps it once, on the calling thread (22.7): queued, it is taken
     /// out of its list; idle, it runs for its claimer's own reason; running, done or closed, it is
-    /// left. Whether it was stepped.
+    /// left. Whether it was stepped. An entry, as [`run_one`](Self::run_one) is.
+    #[turso_macros::atoll_entry]
     pub(crate) fn run_named(&self, task: &TaskRef) -> bool {
         refuse_entry_from_inside();
         assert!(
@@ -1444,6 +1458,9 @@ impl Executor {
     /// counts to retire, and drops every job, after the table's mutex. A second close finds
     /// nothing left to do.
     fn shut(&mut self, requests: Option<&Requests>) {
+        // A close joins workers and waits for calls, which the ring's delivery thread never does:
+        // what they wait for may be its own next delivery (22.5).
+        crate::io::refuse_on_delivery_thread("an executor's close");
         let moved = {
             let mut queue = lock(&self.shared.queue);
             queue.closing = true;

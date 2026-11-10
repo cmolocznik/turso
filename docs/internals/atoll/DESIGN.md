@@ -4076,15 +4076,18 @@ registers a waker on a completion while it holds an executor mutex.
      who wanted it: a task that finds nothing to do cannot wake itself and requeue forever.
      Contenders are executor targets (the checkpoint's task, and an integrity check's parked
      thread), kept in a fixed array sized by the takers that may contend: two, the checkpoint and
-     one integrity check, which holds the write gate exclusive, so no second runs beside it. Until
-     the checkpoint becomes a task (22.16 step 7) its contender is the checkpointing thread, parked,
-     and the checkpointer's hold, let go, also wakes the writers waiting for room, under
+     one integrity check, which holds the write gate exclusive, so no second runs beside it. The
+     checkpoint's task (22.16 step 7) contends as a task, which a release queues; the contenders
+     are taken off the list under its mutex and woken after it, since a task's wake takes the
+     queue's mutex and invokes the external runners it moves. The checkpointer's hold, let go,
+     also wakes the writers waiting for room, under
      `Checkpointing::Writers` only: a writer refused room whose relief found the state held steps
-     the checkpoint itself once it is let go. With the checkpointing thread no writer steps it,
-     and the room's releases alone wake those waiting: the thread lets the state go after every
-     unit (step 4), and a wake at each woke a refused writer only to be refused again.
-   - **A release** lets the state go, then takes the contenders' mutex, wakes each contender and
-     empties the list. The lock order is the state, then its contenders' mutex, then the queue's.
+     the checkpoint itself once it is let go. With the checkpoint's task no writer steps it, and
+     the room's releases alone wake those waiting: the task lets the state go after every unit
+     (step 4), and a wake at each woke a refused writer only to be refused again.
+   - **A release** lets the state go, then takes the contenders off the list under its mutex and
+     wakes each after it. The lock order is the state, then its contenders' mutex; no other
+     executor mutex is taken under it.
    - The checkpoint's state, an integrity check's hold of it, and the maintenance gate (22.9 item 3)
      are guarded states. The checkpoint's `wake_waiters`, whose waiters are completions with
      arbitrary wakers, takes the list into a local and completes it with no lock held (the guard
@@ -5368,6 +5371,18 @@ compose, the real `Completion`, latch and backends included where named.
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run
    against step 4's, and the profile again.
+   (Built, first part: `Checkpointing::Thread` is the database's executor with one worker and the
+   checkpoint's task, `CheckpointTask`. A step holds the state, or contends for it as a task while
+   an integrity check holds it, and steps it until it waits on writes (`Wait` on them) or finds
+   nothing due (`Idle`). A writing statement that finds a checkpoint due, a transaction's end, a
+   full checkpoint asked for and a writer wanting room wake it, as each woke the thread, and a
+   wake while it steps queues it again. A failure, told to every waiter by the
+   state, ends the task; no checkpoint runs until the database is opened again, and writers go
+   on, as with the thread. Closing the database closes the executor, which abandons a checkpoint
+   under way as a failed one is. Not built yet: the due trigger and its level (a transaction's end
+   wakes the task whether or not one is due, as it woke the thread, and erasure rides those
+   wakes), the room tickets, the callers replacing `Checkpointing::Writers`, close's durable end
+   and the request count through `close_after`, the sustained run and the profile.)
 8. **The segment preparers**, every open log, replacing the interim adapter and the callback chain
    in the same change; the callers' fresh-segment cases of proof 12 first. Step 4's exception, a
    unit's budget of one start and one finish, goes with the adapter.

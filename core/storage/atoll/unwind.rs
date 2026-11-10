@@ -496,6 +496,11 @@ mod tests {
             "child",
         ),
         (
+            "executor/tests.rs",
+            "closing_an_executor_on_the_rings_delivery_thread_ends_the_process",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",

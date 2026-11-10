@@ -1006,8 +1006,8 @@ mod native {
     }
 
     /// A task is claimed by name only on its own executor: a claim on another ends the process
-    /// before any mutex (22.7, 22.11; mutant: the check gone, which claims it out of a queue it
-    /// is not in).
+    /// before any mutex, at the claim's own frame (22.7, 22.11; mutants: the check gone, which
+    /// claims it out of a queue it is not in; the claim no entry).
     #[test]
     #[cfg(all(unix, not(any(shuttle, miri))))]
     fn a_named_claim_on_another_executor_ends_the_process() {
@@ -1017,12 +1017,13 @@ mod native {
                 "::a_named_claim_on_another_executor_ends_the_process"
             ),
             || {
-                let (a, b) = (executor(0), executor(0));
+                // Never dropped: the claim's own frame, not an executor dropped while a panic
+                // unwinds, must end the process (the auditor's P2-EX-F3).
+                let a: &'static Executor = Box::leak(Box::new(executor(0)));
+                let b: &'static Executor = Box::leak(Box::new(executor(0)));
                 let log = Arc::new(Lock::new(Vec::new()));
                 let task = b.spawn(Class::Due, recorded("t", 0, &log));
                 a.run_named(&task);
-                a.close();
-                b.close();
             },
         );
         let Some(ended) = ended else { return };
@@ -2023,6 +2024,38 @@ mod native {
         );
         assert!(
             ended.stderr.contains("on the ring's delivery thread"),
+            "{}",
+            ended.stderr
+        );
+    }
+
+    /// Closing an executor joins its workers and waits for its calls, which the ring's delivery
+    /// thread never does: a close there ends the process before it waits for anything (22.5; the
+    /// auditor's P2-EX-D2; mutant: the refusal gone).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn closing_an_executor_on_the_rings_delivery_thread_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::closing_an_executor_on_the_rings_delivery_thread_ends_the_process"
+            ),
+            || {
+                let ex = executor(1);
+                crate::io::deliver_on_this_thread();
+                ex.close();
+            },
+        );
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(
+            ended
+                .stderr
+                .contains("an executor's close on the ring's delivery thread"),
             "{}",
             ended.stderr
         );

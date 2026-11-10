@@ -7,8 +7,10 @@
 //! and try again; whenever a contending taker holds the state, at its first try or its second, it
 //! takes back any registration of its own, so a holder is never a contender of its own hold. Letting a hold go lets the state go first, then wakes every
 //! contender and empties the list: a contender woken while the state was still held would find it
-//! held, wait again, and nothing would wake it. Nobody but a contender is woken.
+//! held, wait again, and nothing would wake it. Nobody but a contender is woken. A contender is an
+//! executor target (DESIGN.md 22.2): a parked thread, or a task, which a wake queues.
 
+use super::executor::TaskRef;
 use super::locks::{Mutex, MutexGuard};
 use crate::thread::Thread;
 use std::ops::{Deref, DerefMut};
@@ -26,14 +28,39 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// The takers that may wait for one state at once: the database's checkpointing thread, and an
-/// integrity check, which holds the write gate exclusive, so at most one runs at a time.
+/// The takers that may wait for one state at once: the database's checkpoint, and an integrity
+/// check, which holds the write gate exclusive, so at most one runs at a time.
 const CONTENDERS: usize = 2;
+
+/// A taker waiting for a state (DESIGN.md 22.2 item 3): a parked thread, unparked, or an
+/// executor's task, woken as a completion it waits on would wake it.
+#[derive(Clone)]
+pub enum Contender {
+    Thread(Thread),
+    Task(TaskRef),
+}
+
+impl Contender {
+    fn is(&self, other: &Contender) -> bool {
+        match (self, other) {
+            (Self::Thread(a), Self::Thread(b)) => a.id() == b.id(),
+            (Self::Task(a), Self::Task(b)) => a.same(b),
+            _ => false,
+        }
+    }
+
+    fn wake(self) {
+        match self {
+            Self::Thread(t) => t.unpark(),
+            Self::Task(t) => t.wake(),
+        }
+    }
+}
 
 pub struct Guarded<T> {
     state: Mutex<T>,
-    /// Threads parked until the state is let go, at most [`CONTENDERS`], each once.
-    contenders: Mutex<[Option<Thread>; CONTENDERS]>,
+    /// Takers waiting until the state is let go, at most [`CONTENDERS`], each once.
+    contenders: Mutex<[Option<Contender>; CONTENDERS]>,
 }
 
 /// The state, held: letting it go wakes whoever waits for it.
@@ -61,7 +88,7 @@ impl<T> Guarded<T> {
     /// The state, if no one holds it; else `me` is a contender, unparked once the state is let
     /// go, which parks and tries again. Registered first and then tried again, so a hold let go
     /// in between either finds `me` listed or is seen let go.
-    pub fn hold_or_contend(&self, me: &Thread) -> Option<Hold<'_, T>> {
+    pub fn hold_or_contend(&self, me: &Contender) -> Option<Hold<'_, T>> {
         if let Some(held) = self.try_hold() {
             return Some(self.withdrawn(held, me));
         }
@@ -71,7 +98,7 @@ impl<T> Guarded<T> {
         }
         {
             let mut listed = self.contenders.lock();
-            if !listed.iter().flatten().any(|t| t.id() == me.id()) {
+            if !listed.iter().flatten().any(|t| t.is(me)) {
                 let free = listed
                     .iter_mut()
                     .find(|t| t.is_none())
@@ -86,9 +113,9 @@ impl<T> Guarded<T> {
     /// `held`, with any registration of `me`'s taken back: its own letting go must not wake it.
     /// A contender may hold at its first try while still listed from an earlier call: woken by
     /// another's letting go, or for no reason, before the holder it waited for woke anyone.
-    fn withdrawn<'a>(&'a self, held: Hold<'a, T>, me: &Thread) -> Hold<'a, T> {
+    fn withdrawn<'a>(&'a self, held: Hold<'a, T>, me: &Contender) -> Hold<'a, T> {
         for t in self.contenders.lock().iter_mut() {
-            if t.as_ref().is_some_and(|t| t.id() == me.id()) {
+            if t.as_ref().is_some_and(|t| t.is(me)) {
                 *t = None;
             }
         }
@@ -97,12 +124,8 @@ impl<T> Guarded<T> {
 
     /// Whether `who` waits for the state.
     #[cfg(test)]
-    pub(crate) fn contends(&self, who: &Thread) -> bool {
-        self.contenders
-            .lock()
-            .iter()
-            .flatten()
-            .any(|t| t.id() == who.id())
+    pub(crate) fn contends(&self, who: &Contender) -> bool {
+        self.contenders.lock().iter().flatten().any(|t| t.is(who))
     }
 }
 
@@ -128,11 +151,14 @@ impl<T> Drop for Hold<'_, T> {
         if let Some(between) = BEFORE_WAKING.with(|b| b.borrow_mut().take()) {
             between();
         }
-        // Unparking runs no code of anyone's and takes no lock, so it is done under the mutex.
-        for t in self.guarded.contenders.lock().iter_mut() {
-            if let Some(t) = t.take() {
-                t.unpark();
-            }
+        // Taken off the list under its mutex and woken after it: a task's wake takes the queue's
+        // mutex and invokes the external runners its link moves, code of anyone's.
+        let woken = std::mem::replace(
+            &mut *self.guarded.contenders.lock(),
+            [const { None }; CONTENDERS],
+        );
+        for t in woken.into_iter().flatten() {
+            t.wake();
         }
     }
 }
@@ -163,6 +189,10 @@ mod tests {
                      }}\n\
                  }}\n\
                  mod thread {{ pub use std::thread::*; }}\n\
+                 mod executor {{\n\
+                     #[derive(Clone)] pub struct TaskRef;\n\
+                     impl TaskRef {{ pub fn same(&self, _: &Self) -> bool {{ true }} pub fn wake(&self) {{}} }}\n\
+                 }}\n\
                  mod unwind {{ pub fn abort_if_unwinding() {{}} }}\n\
                  #[path = {module:?}]\n\
                  mod guarded;\n\
@@ -217,7 +247,7 @@ mod tests {
             let (done, finished) = mpsc::channel();
             let g = guarded.clone();
             let contender = std::thread::spawn(move || {
-                let me = std::thread::current();
+                let me = Contender::Thread(std::thread::current());
                 let mut hold = loop {
                     if let Some(hold) = g.hold_or_contend(&me) {
                         break hold;
@@ -230,7 +260,7 @@ mod tests {
                 done.send(()).unwrap();
             });
             parked.recv().unwrap();
-            let thread = contender.thread().clone();
+            let thread = Contender::Thread(contender.thread().clone());
             assert!(guarded.contends(&thread));
             drop(held);
             finished
@@ -265,7 +295,7 @@ mod tests {
                 let_go.recv().unwrap();
             }))
         });
-        let me = std::thread::current();
+        let me = Contender::Thread(std::thread::current());
         let hold = guarded
             .hold_or_contend(&me)
             .expect("let go before the registration, so taken on the retry");
@@ -283,7 +313,7 @@ mod tests {
     #[test]
     fn a_contender_that_holds_at_its_first_try_is_listed_no_more() {
         let guarded = Arc::new(Guarded::new(0u32));
-        let me = std::thread::current();
+        let me = Contender::Thread(std::thread::current());
         let first = guarded.try_hold().expect("free");
         assert!(guarded.hold_or_contend(&me).is_none(), "held, so listed");
         assert!(guarded.contends(&me));
@@ -340,7 +370,7 @@ mod child_tests {
                 };
                 held.1.recv().unwrap();
                 let contender = std::thread::spawn(move || {
-                    let me = std::thread::current();
+                    let me = Contender::Thread(std::thread::current());
                     record("seen", "contending");
                     let state = loop {
                         if let Some(state) = guarded.hold_or_contend(&me) {
@@ -388,7 +418,7 @@ mod shuttle_tests {
                     .map(|_| {
                         let g = guarded.clone();
                         crate::thread::spawn(move || {
-                            let me = crate::thread::current();
+                            let me = Contender::Thread(crate::thread::current());
                             let mut hold = loop {
                                 if let Some(hold) = g.hold_or_contend(&me) {
                                     break hold;

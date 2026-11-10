@@ -2,8 +2,11 @@
 //! recovered from what a crash left.
 
 use super::buffer::{BufferConfig, BufferPool, LocalSource};
-use super::checkpoint::{CheckpointRelief, Checkpointer, Checkpointing, WRITE_BYTES};
+use super::checkpoint::{
+    CheckpointRelief, CheckpointTask, Checkpointer, Checkpointing, WRITE_BYTES,
+};
 use super::control::{Control, Superblock};
+use super::executor::{Class, Executor};
 use super::log::{Log, LogConfig};
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
@@ -102,9 +105,9 @@ pub(in crate::storage::atoll) struct Atoll {
     pool: Arc<BufferPool>,
     checkpointer: Arc<Checkpointer>,
     txns: Arc<Transactions>,
-    /// The checkpointing thread ([`Checkpointing::Thread`]), ended and joined when the database
-    /// closes.
-    driver: Option<crate::thread::JoinHandle<()>>,
+    /// The executor whose one worker steps the checkpoint's task ([`Checkpointing::Thread`]),
+    /// closed with the database.
+    executor: Option<Executor>,
     /// The IO every file of the database was opened through, counting its requests.
     io: Arc<dyn IO>,
     requests: Arc<Requests>,
@@ -113,12 +116,9 @@ pub(in crate::storage::atoll) struct Atoll {
 impl Drop for Atoll {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        if let Some(driver) = self.driver.take() {
-            self.checkpointer.stop_driver();
-            if driver.join().is_err() {
-                tracing::error!("the checkpointing thread panicked");
-            }
-        }
+        // The checkpoint's task closed, a checkpoint under way abandoned, and its worker joined
+        // (DESIGN.md 22.12, steps 2, 3 and 5).
+        drop(self.executor.take());
         // No request on the database's files outlives it (DESIGN.md 22.12, step 4).
         self.requests.drain(&*self.io);
     }
@@ -159,10 +159,16 @@ impl Atoll {
         &self.checkpointer
     }
 
-    /// The checkpointer as the checkpointing thread holds it, for a test to tell it let go.
+    /// The checkpointer as the checkpoint's task holds it, for a test to tell it let go.
     #[cfg(test)]
     pub(crate) fn checkpointer_arc(&self) -> &Arc<Checkpointer> {
         &self.checkpointer
+    }
+
+    /// The transactions as the checkpoint's task holds them, for a test that makes one.
+    #[cfg(test)]
+    pub(crate) fn transactions_arc(&self) -> &Arc<Transactions> {
+        &self.txns
     }
 }
 
@@ -376,22 +382,18 @@ impl Opening {
         // A writer refused room for kept copies steps the checkpoint itself, or with a thread
         // stepping checkpoints waits for the room it frees.
         pool.set_relief(Arc::new(CheckpointRelief::new(&checkpointer, &txns)));
-        let driver = match self.checkpointing {
+        let executor = match self.checkpointing {
             Checkpointing::Writers => None,
             Checkpointing::Thread => {
-                let (cp, txns, io) = (checkpointer.clone(), txns.clone(), self.io.clone());
-                let handle = crate::thread::Builder::new()
-                    .name("atoll-checkpoint".into())
-                    .spawn(move || cp.drive(&io, &txns))
-                    .map_err(|e| {
-                        LimboError::InternalError(format!(
-                            "the checkpointing thread did not start: {e}"
-                        ))
-                    })?;
+                let executor = Executor::new(self.io.clone(), 1)?;
+                let task = executor.spawn(
+                    Class::Maintenance,
+                    Box::new(CheckpointTask::new(checkpointer.clone(), txns.clone())),
+                );
                 // Named before the database is handed out: from then on no writer steps a
                 // checkpoint.
-                checkpointer.attach_driver(handle.thread().clone());
-                Some(handle)
+                checkpointer.attach(task);
+                Some(executor)
             }
         };
         Ok(Atoll {
@@ -402,7 +404,7 @@ impl Opening {
             store: self.store,
             pool,
             checkpointer,
-            driver,
+            executor,
             io: self.io,
             requests: self.requests,
         })

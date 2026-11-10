@@ -674,7 +674,8 @@ impl Shared {
 
     /// Steps a task its runner claimed, once. The whole unit is inside (22.7): the step, its end,
     /// the drain and the job's last drop with its task's destructor, the guard declared before the
-    /// job so it outlives it, so no runner enters the executor from any of them.
+    /// job so it outlives it, so no runner enters the executor from any of them, and a panic in
+    /// any of them ends the process as the guard drops, on every road that steps a task (22.11).
     fn step(self: &Arc<Self>, header: Arc<Header>) {
         let _inside = Inside::enter();
         let Some(job) = header.job.upgrade() else {
@@ -910,6 +911,9 @@ fn work(shared: &Arc<Shared>) {
 pub(crate) struct Executor {
     shared: Arc<Shared>,
     workers: Vec<crate::thread::JoinHandle<()>>,
+    /// Dropped last: the end of the frame its `Drop` opens, so the jobs close drops, with their
+    /// tasks' destructors, and every field after them drop inside it (22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 /// An embedder thread's runner (22.7): it steps one task at a time, and with none to claim leaves
@@ -919,6 +923,9 @@ pub(crate) struct Executor {
 pub(crate) struct Runner {
     shared: Arc<Shared>,
     node: usize,
+    /// Dropped last: the end of the frame its `Drop` opens, so the host's waker its node held
+    /// drops inside it (22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 impl Runner {
@@ -985,6 +992,9 @@ pub(crate) struct Wait<'a> {
     /// executor: none with workers, and none once the wait is ready, so a link after that wakes
     /// a live runner rather than this finished one.
     runner: Option<Runner>,
+    /// Dropped last: the end of the frame its `Drop` opens, so the host's wakers the completion
+    /// and the runner held drop inside it, the completion's after the body (22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 impl Wait<'_> {
@@ -1057,15 +1067,15 @@ impl std::future::Future for Wait<'_> {
 
 impl Drop for Wait<'_> {
     /// Gives the runner's node and the backend registration back, if the wait never was ready.
+    #[turso_macros::atoll_entry]
     fn drop(&mut self) {
-        crate::storage::atoll::unwind::abort_if_unwinding();
         self.release();
     }
 }
 
 impl Drop for Runner {
+    #[turso_macros::atoll_entry]
     fn drop(&mut self) {
-        crate::storage::atoll::unwind::abort_if_unwinding();
         let (gone, moved) = lock(&self.shared.queue).remove_node(self.node);
         drop(gone);
         self.shared.drain(moved);
@@ -1160,6 +1170,7 @@ impl Executor {
         let mut executor = Self {
             shared,
             workers: Vec::with_capacity(workers),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         };
         // A start that fails drops the executor, which closes and joins the workers begun.
         for n in 0..workers {
@@ -1246,6 +1257,7 @@ impl Executor {
         Runner {
             shared: self.shared.clone(),
             node,
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
 
@@ -1297,6 +1309,7 @@ impl Executor {
             executor: self,
             completion: std::future::IntoFuture::into_future(c),
             runner: self.workers.is_empty().then(|| self.runner()),
+            _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
 
@@ -1366,8 +1379,8 @@ impl Executor {
 impl Drop for Executor {
     /// Closes the executor: a started one, or one whose start failed after some of its workers
     /// began, leaves no worker running.
+    #[turso_macros::atoll_entry]
     fn drop(&mut self) {
-        crate::storage::atoll::unwind::abort_if_unwinding();
         self.shut();
     }
 }

@@ -5343,11 +5343,17 @@ compose, the real `Completion`, latch and backends included where named.
    refused (P2-E9-F1); the ring's delivery thread is refused a blocking one (P2-E9-D1). A runner
    leaving after a link chose or woke it, work still queued (a cancel, a wait's let-go, a
    waiter's or a worker's end), hands that wake to another idle runner, one and only with work
-   queued, so no runner sleeps with work its leaving predecessor was woken for (P1-EX-H1). The lists are deques given room for every task and every
+   queued, so no runner sleeps with work its leaving predecessor was woken for (P1-EX-H1). A
+   cancelled wait, a dropped runner and the executor's drop are entries whose type's last field
+   ends the frame, so a host's waker or a task's destructor panicking in their bodies or their
+   fields' drops ends the process (P2-EX-F2); a census pairs every framed destructor with that
+   field. The lists are deques given room for every task and every
    node when each is created, so no link or move allocates (counted: 3,072 steps and 2,304
    external wakes, none allocating); intrusive links wait for a measured need. Threshold signals: a signal's
    least threshold wanted, lowered under its mutex and fenced by the task before it computes the
-   value, fenced and loaded by a producer after its publication, reset by a notify. Not built yet:
+   value, fenced and loaded by a producer after its publication, reset by a notify in the same
+   hold of the mutex as the count's move, so a task whose look read the moved count wants after
+   the reset and no notify erases its want (P1-E11-T1). Not built yet:
    the jobs' logical waits made executor completions (with the jobs, 22.16
    steps 7 to 10), close's five phases, removal with a subject beyond a task's own end.)
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace

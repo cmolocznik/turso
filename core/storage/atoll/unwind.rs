@@ -471,6 +471,26 @@ mod tests {
             "child",
         ),
         (
+            "executor/tests.rs",
+            "a_host_waker_panicking_as_a_cancelled_wait_drops_it_ends_the_process",
+            "child",
+        ),
+        (
+            "executor/tests.rs",
+            "a_host_waker_panicking_as_its_runner_drops_it_ends_the_process",
+            "child",
+        ),
+        (
+            "executor/tests.rs",
+            "a_tasks_destructor_panicking_as_close_drops_its_job_ends_the_process",
+            "child",
+        ),
+        (
+            "executor/tests.rs",
+            "a_tasks_destructor_panicking_as_its_last_step_ends_ends_the_process",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",
@@ -1060,6 +1080,73 @@ mod tests {
             visible >= 20,
             "{visible} items open to code outside Atoll found"
         );
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Every framed destructor in Atoll is its type's, whose last field ends the frame, and every
+    /// type whose last field ends a frame has a framed destructor: its body and every field it
+    /// drops after the body drop inside the frame, so a panic in any of them ends the process
+    /// (22.11). A type and its destructor are read at one level of one file.
+    #[test]
+    fn every_framed_destructor_ends_its_frame_with_its_types_last_field() {
+        let dir = atoll_dir();
+        let (mut framed, mut wrong) = (Vec::new(), Vec::new());
+        for path in atoll_sources() {
+            let file = path.strip_prefix(&dir).unwrap().display().to_string();
+            let code = code_of(&std::fs::read_to_string(&path).unwrap());
+            let mut levels = vec![items(&code)];
+            while let Some(level) = levels.pop() {
+                let drops: Vec<&str> = level
+                    .iter()
+                    .filter(|i| {
+                        i.kind == "impl"
+                            && i.head.contains("Drop for")
+                            && i.body
+                                .is_some_and(|b| b.contains("#[turso_macros::atoll_entry]"))
+                    })
+                    .map(|i| i.name.as_str())
+                    .collect();
+                let ending: Vec<&str> = level
+                    .iter()
+                    .filter(|i| {
+                        i.kind == "struct"
+                            && i.body.is_some_and(|fields| {
+                                fields
+                                    .split(',')
+                                    .map(str::trim)
+                                    .rfind(|f| !f.is_empty())
+                                    .is_some_and(|l| {
+                                        l.contains("_frame:") && l.contains("FrameEnd")
+                                    })
+                            })
+                    })
+                    .map(|i| i.name.as_str())
+                    .collect();
+                for ty in &drops {
+                    framed.push(format!("{file}: {ty}"));
+                    if !ending.contains(ty) {
+                        wrong.push(format!(
+                            "{file}: {ty} has a framed destructor, its last field no frame's end"
+                        ));
+                    }
+                }
+                for ty in &ending {
+                    if !drops.contains(ty) {
+                        wrong.push(format!(
+                            "{file}: {ty}'s last field ends a frame its destructor never opens"
+                        ));
+                    }
+                }
+                for i in &level {
+                    if let (true, Some(body)) = (i.kind == "mod", i.body) {
+                        levels.push(items(body));
+                    }
+                }
+            }
+        }
+        // The facade's six owning types, the executor's teardown entries, and this file's test
+        // value, at the least.
+        assert!(framed.len() >= 10, "the census found {framed:?}");
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 

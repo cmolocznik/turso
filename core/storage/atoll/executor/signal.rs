@@ -1,8 +1,8 @@
 //! Signals (DESIGN.md 22.2 item 2): "something a task watches changed". A signal is a counter and
 //! the list of tasks registered on it, under the signal's own mutex.
 //!
-//! A notifier publishes its change first, by its own release store or under its own lock, then
-//! moves the counter (release) and, under the mutex, wakes every listed task and empties the list.
+//! A notifier publishes its change first, by its own release store or under its own lock, then,
+//! under the mutex, moves the counter (release), wakes every listed task and empties the list.
 //! A task reads each counter it watches (acquire) before it looks at its condition; finding it
 //! unmet, its step says `Idle` with the counts it read, and the executor registers it on each
 //! signal under the mutex, then reads the counter again: one moved means a notify came between the
@@ -14,8 +14,11 @@
 //! (22.2): a task stores its threshold under the mutex ([`Signal::want`]), fences, then computes
 //! the value whole and runs again if it already reached it; a producer publishes its change,
 //! fences ([`Signal::wanted`]), loads the threshold, and notifies once its value reached it.
-//! Between the two fences one side always sees the other. A notify empties the list and resets the
-//! word to none.
+//! Between the two fences one side always sees the other. A notify resets the word to none and
+//! moves the count in one hold of the mutex, the reset first: a task whose look read the moved
+//! count wants only once the notify let the mutex go, so no reset erases its want, and a want a
+//! reset erased was made by a task whose look read the count before, which the notify wakes from
+//! the list or whose registration finds the count moved.
 
 use self::sync::{fence, lock, AtomicU64, Mutex, Ordering};
 use super::{wake_nested, Header, Shared};
@@ -84,32 +87,43 @@ impl Signal {
         self.count.load(Ordering::Acquire)
     }
 
-    /// Announces a change already published: the count moves, then every task listed is woken
-    /// and the list emptied, under the mutex. Its work is at most the list, however often
+    /// Announces a change already published: under the mutex, the threshold goes back to none,
+    /// the count moves, and every task listed is woken and the list emptied; then the external
+    /// runners those wakes moved are invoked. Its work is at most the list, however often
     /// notifies come.
     pub(crate) fn notify(&self) {
-        self.bump();
-        self.wake_listed();
+        let moved = {
+            let mut listed = lock(&self.listed);
+            self.reset_and_move(&mut listed);
+            wake_all(&mut listed)
+        };
+        self.drain(moved);
     }
 
-    /// The count moves: a change is published, and a look that read the count before sees it.
+    /// The count moves, the threshold back to none first, under the mutex: a change is
+    /// published, a look that read the count before sees it, and a task whose look read the
+    /// moved count wants after the reset.
     pub(super) fn bump(&self) {
-        self.count.fetch_add(1, Ordering::Release);
+        self.reset_and_move(&mut lock(&self.listed));
     }
 
     /// Wakes every task listed and empties the list, under the mutex; then, the mutex let go,
     /// invokes the external runners those wakes moved (22.3).
     pub(super) fn wake_listed(&self) {
-        let moved: usize = {
-            let mut listed = lock(&self.listed);
-            // Every task waiting goes, and with it every threshold it wanted.
-            self.threshold.store(NONE, Ordering::Relaxed);
-            listed
-                .tasks
-                .drain(..)
-                .map(|header| wake_nested(&header))
-                .sum()
-        };
+        let moved = wake_all(&mut lock(&self.listed));
+        self.drain(moved);
+    }
+
+    /// The threshold back to none, then the count moved, `listed` the mutex held over both: every
+    /// task that wanted a threshold before is woken from the list or finds the count moved when
+    /// it registers, and wants again when it looks again.
+    fn reset_and_move(&self, _listed: &mut Listed) {
+        self.threshold.store(NONE, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Invokes the external runners `moved` wakes moved, every mutex let go (22.3).
+    fn drain(&self, moved: usize) {
         if moved > 0 {
             if let Some(shared) = self.owner.get().and_then(Weak::upgrade) {
                 shared.drain(moved);
@@ -203,6 +217,16 @@ impl Signal {
     pub(super) fn listed_free(&self) -> bool {
         self.listed.try_lock().is_some()
     }
+}
+
+/// Wakes every task in `listed`, under its signal's mutex, and empties it: how many external
+/// runners the wakes moved.
+fn wake_all(listed: &mut Listed) -> usize {
+    listed
+        .tasks
+        .drain(..)
+        .map(|header| wake_nested(&header))
+        .sum()
 }
 
 /// The signals one step waits on, each with the count it read before looking: at most

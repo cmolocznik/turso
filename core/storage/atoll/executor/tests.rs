@@ -2191,6 +2191,163 @@ mod native {
         ended_refused(ended);
     }
 
+    /// A host's waker whose destructor panics once armed.
+    struct PanicsWhenDropped(Arc<AtomicBool>);
+
+    impl std::task::Wake for PanicsWhenDropped {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for PanicsWhenDropped {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            if self.0.load(O::Acquire) {
+                panic!("a host's waker panicked in its destructor");
+            }
+        }
+    }
+
+    /// A host's waker, armed by the flag returned, and a weak handle that counts its clones.
+    fn panics_when_dropped() -> (
+        std::task::Waker,
+        Arc<AtomicBool>,
+        std::sync::Weak<PanicsWhenDropped>,
+    ) {
+        let armed = Arc::new(AtomicBool::new(false));
+        let host = Arc::new(PanicsWhenDropped(armed.clone()));
+        let clones = Arc::downgrade(&host);
+        (std::task::Waker::from(host), armed, clones)
+    }
+
+    /// The child aborted on `panicked`, passed up from inside a frame.
+    fn ended_in_a_frame(ended: Option<crate::storage::atoll::testing::Ended>, panicked: &str) {
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(ended.stderr.contains(panicked), "{}", ended.stderr);
+    }
+
+    /// A cancelled wait drops its host's wakers inside a frame, the last of them in its
+    /// completion's own drop after the body: one panicking ends the process (22.11; the
+    /// auditor's P2-EX-F2; mutant: the frame's end not the wait's last field).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_host_waker_panicking_as_a_cancelled_wait_drops_it_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_host_waker_panicking_as_a_cancelled_wait_drops_it_ends_the_process"
+            ),
+            || {
+                use std::future::Future;
+                // Never dropped: nothing of Atoll's but the wait drops while a panic unwinds.
+                let ex: &'static Executor = Box::leak(Box::new(executor(0)));
+                let (waker, armed, clones) = panics_when_dropped();
+                let mut wait = Box::pin(ex.wait_async(Completion::new_wait()));
+                let pending = wait
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker))
+                    .is_pending();
+                drop(waker);
+                // The completion's clone and the runner node's, at the least.
+                let held = clones.strong_count();
+                assert!(
+                    pending && held >= 2,
+                    "pending {pending}, {held} clones held"
+                );
+                armed.store(true, O::Release);
+                drop(wait);
+            },
+        );
+        ended_in_a_frame(ended, "a host's waker panicked in its destructor");
+    }
+
+    /// A runner dropped drops the host's waker its node held inside a frame: one panicking ends
+    /// the process (22.11; the auditor's P2-EX-F2; mutant: the runner's drop unframed).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_host_waker_panicking_as_its_runner_drops_it_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_host_waker_panicking_as_its_runner_drops_it_ends_the_process"
+            ),
+            || {
+                let ex: &'static Executor = Box::leak(Box::new(executor(0)));
+                let runner = ex.runner();
+                let (waker, armed, clones) = panics_when_dropped();
+                let rested = !runner.run_one(&waker);
+                drop(waker);
+                let held = clones.strong_count();
+                assert!(rested && held == 1, "rested {rested}, {held} clones held");
+                armed.store(true, O::Release);
+                drop(runner);
+            },
+        );
+        ended_in_a_frame(ended, "a host's waker panicked in its destructor");
+    }
+
+    /// A task whose destructor panics: queued and never stepped, or done after one step.
+    struct PanicsAtItsEnd;
+
+    impl Task for PanicsAtItsEnd {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            Ok(Step::Done)
+        }
+    }
+
+    impl Drop for PanicsAtItsEnd {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            panic!("a task's destructor panicked");
+        }
+    }
+
+    /// Close drops the jobs of tasks never stepped, with their tasks, inside a frame: a task's
+    /// destructor panicking ends the process (22.11; the auditor's P2-EX-F2; mutant: the
+    /// executor's drop unframed).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_tasks_destructor_panicking_as_close_drops_its_job_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_tasks_destructor_panicking_as_close_drops_its_job_ends_the_process"
+            ),
+            || {
+                let ex = executor(0);
+                let task = ex.spawn(Class::Due, Box::new(PanicsAtItsEnd));
+                ex.close();
+                drop(task);
+            },
+        );
+        ended_in_a_frame(ended, "a task's destructor panicked");
+    }
+
+    /// The step that ends a task drops its job, with the task, inside the step's unit, on every
+    /// road that steps it, a caller's claim among them: the task's destructor panicking ends the
+    /// process as the unit's guard drops (22.11; the auditor's P2-EX-F2; mutant: the guard's
+    /// check gone).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_tasks_destructor_panicking_as_its_last_step_ends_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_tasks_destructor_panicking_as_its_last_step_ends_ends_the_process"
+            ),
+            || {
+                let ex: &'static Executor = Box::leak(Box::new(executor(0)));
+                ex.spawn(Class::Due, Box::new(PanicsAtItsEnd));
+                ex.run_one();
+            },
+        );
+        ended_in_a_frame(ended, "a task's destructor panicked");
+    }
+
     /// Steps once: enters the executor through `runner`.
     struct EntersAgain {
         runner: Arc<Lock<Option<Runner>>>,
@@ -2397,20 +2554,30 @@ mod loom_tests {
         });
     }
 
-    /// Waits on `signal` until `value` reaches one.
-    struct AwaitsOne {
+    /// Waits on `signal` until `value` reaches `threshold`.
+    struct AwaitsThreshold {
         signal: Arc<Signal>,
         value: Arc<loom::sync::atomic::AtomicU64>,
+        threshold: u64,
     }
 
-    impl Task for AwaitsOne {
+    impl Task for AwaitsThreshold {
         fn step(&mut self, _cx: &Cx) -> Result<Step> {
             let read = self.signal.read();
-            self.signal.want(1);
-            if self.value.load(Ordering::Relaxed) >= 1 {
+            self.signal.want(self.threshold);
+            if self.value.load(Ordering::Relaxed) >= self.threshold {
                 return Ok(Step::Done);
             }
             Ok(Step::Idle(Watched::of(&[(&self.signal, read)])))
+        }
+    }
+
+    /// A producer's change: the value published, then a notify once it reached the least
+    /// threshold wanted.
+    fn publish(value: &loom::sync::atomic::AtomicU64, signal: &Signal, to: u64) {
+        value.store(to, Ordering::Relaxed);
+        if signal.wanted().is_some_and(|least| to >= least) {
+            signal.notify();
         }
     }
 
@@ -2426,20 +2593,16 @@ mod loom_tests {
             let value = Arc::new(AtomicU64::new(0));
             let task = ex.spawn_watching(
                 Class::Due,
-                Box::new(AwaitsOne {
+                Box::new(AwaitsThreshold {
                     signal: signal.clone(),
                     value: value.clone(),
+                    threshold: 1,
                 }),
                 &[&signal],
             );
             let producer = {
                 let (signal, value) = (signal.clone(), value.clone());
-                thread::spawn(move || {
-                    value.store(1, Ordering::Relaxed);
-                    if signal.wanted().is_some_and(|least| least <= 1) {
-                        signal.notify();
-                    }
-                })
+                thread::spawn(move || publish(&value, &signal, 1))
             };
             let looked = ex.run_one();
             producer.join().unwrap();
@@ -2448,6 +2611,55 @@ mod loom_tests {
             ex.close();
             assert!(looked);
             assert!(done, "a task left waiting on a value already reached");
+        });
+    }
+
+    /// A notify racing a task's look: a task whose look read the count the notify moved wants
+    /// after the notify's reset, so the notify cannot erase its want, and a later value that
+    /// reaches it wakes it. The notify is a producer's at a value below the task's threshold,
+    /// made for a want a task already done left standing (22.2; the auditor's P1-E11-T1 model;
+    /// mutant: the count moved outside the mutex, before the reset).
+    #[test]
+    fn a_notify_cannot_erase_the_want_of_a_task_that_read_its_moved_count() {
+        use loom::sync::atomic::AtomicU64;
+        loom::model(|| {
+            let ex = Arc::new(Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap());
+            let signal = Arc::new(Signal::default());
+            let value = Arc::new(AtomicU64::new(3));
+            let awaits = |threshold| {
+                ex.spawn_watching(
+                    Class::Due,
+                    Box::new(AwaitsThreshold {
+                        signal: signal.clone(),
+                        value: value.clone(),
+                        threshold,
+                    }),
+                    &[&signal],
+                )
+            };
+            // Done at once, its want of 3 left standing until the next notify.
+            let done = awaits(3);
+            let first = ex.run_one();
+            let standing = signal.wanted();
+            let live = awaits(5);
+            let producer = {
+                let (signal, value) = (signal.clone(), value.clone());
+                thread::spawn(move || publish(&value, &signal, 4))
+            };
+            let looked = ex.run_one();
+            producer.join().unwrap();
+            publish(&value, &signal, 5);
+            while ex.run_one() {}
+            let finished = (done.is_done(), live.is_done());
+            let (wanted, listed) = (signal.wanted(), signal.listed());
+            Arc::try_unwrap(ex).ok().unwrap().close();
+            assert!(first && looked);
+            assert_eq!(standing, Some(3));
+            assert_eq!(
+                finished,
+                (true, true),
+                "the task wanting 5 left waiting: wanted {wanted:?}, {listed} listed"
+            );
         });
     }
 

@@ -5328,8 +5328,9 @@ compose, the real `Completion`, latch and backends included where named.
    worker's thread or an embedder runner's waker, the to-wake list, and each operation's drain
    bounded by the nodes its own links moved, so no external runner's waker is invoked under an
    executor mutex (a signal serves the tasks of one executor, whose drain a notify runs after its
-   mutex), and every caller entering from inside a step or an invoked waker refused (the
-   auditor's P2-E5-R1); close waits, parked, for every external call stepping a task, but a call
+   mutex), and every caller entering from inside a unit (its step, its end, its drain and its
+   job's last drop with the task's destructor) or an invoked waker refused (the auditor's
+   P2-E5-R1, P2-E8-C2); close waits, parked, for every external call stepping a task, but a call
    of its own thread whose step dropped the executor (the auditor's P2-E5-C1). Executor
    completions' waits (22.7): a blocking wait (`Executor::wait`) only waits when the executor has
    workers, and otherwise runs it, claiming by class, stepping a pumped backend between task

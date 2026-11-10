@@ -293,21 +293,23 @@ loom::thread_local! {
 /// one but the calling thread's own (22.7).
 struct Calling<'a> {
     shared: &'a Shared,
+    /// The thread's marker before this call, given back at its end.
+    previous: usize,
 }
 
 impl<'a> Calling<'a> {
     /// Counts a call whose claim the caller made under the queue's mutex, `queue` that guard.
     fn enter(shared: &'a Shared, queue: &mut Queue) -> Self {
         queue.calls += 1;
-        CALLING.with(|calling| calling.set(std::ptr::from_ref(shared) as usize));
-        Self { shared }
+        let previous = CALLING.with(|calling| calling.replace(std::ptr::from_ref(shared) as usize));
+        Self { shared, previous }
     }
 }
 
 impl Drop for Calling<'_> {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        CALLING.with(|calling| calling.set(0));
+        CALLING.with(|calling| calling.set(self.previous));
         let closer = {
             let mut queue = lock(&self.shared.queue);
             queue.calls -= 1;
@@ -657,8 +659,11 @@ impl Shared {
         }
     }
 
-    /// Steps a task its runner claimed, once.
+    /// Steps a task its runner claimed, once. The whole unit is inside (22.7): the step, its end,
+    /// the drain and the job's last drop with its task's destructor, the guard declared before the
+    /// job so it outlives it, so no runner enters the executor from any of them.
     fn step(self: &Arc<Self>, header: Arc<Header>) {
+        let _inside = Inside::enter();
         let Some(job) = header.job.upgrade() else {
             // Removed with its subject while queued: nothing to step.
             return;
@@ -668,10 +673,7 @@ impl Shared {
             shared: self,
         };
         let mut task = job.take_task();
-        let step = {
-            let _inside = Inside::enter();
-            task.step(&cx)
-        };
+        let step = task.step(&cx);
         job.put_task(task);
         let moved = self.end(&header, &job, step);
         self.drain(moved);

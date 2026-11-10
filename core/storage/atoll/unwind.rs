@@ -451,6 +451,11 @@ mod tests {
             "child",
         ),
         (
+            "executor/tests.rs",
+            "a_tasks_destructor_entering_an_executor_ends_the_process",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",

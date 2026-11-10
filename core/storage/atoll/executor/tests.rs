@@ -1825,6 +1825,53 @@ mod native {
         assert_eq!(allocations, 0);
     }
 
+    /// Done at its first step; its destructor enters another executor through `runner`.
+    struct EntersFromItsDrop {
+        runner: Option<Runner>,
+    }
+
+    impl Task for EntersFromItsDrop {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            Ok(Step::Done)
+        }
+    }
+
+    impl Drop for EntersFromItsDrop {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            if let Some(runner) = self.runner.take() {
+                runner.run_one(std::task::Waker::noop());
+            }
+        }
+    }
+
+    /// A unit's cleanup is inside it: a task's destructor, run as its job's last handle goes at
+    /// the end of its step, entering any executor ends the process (22.7, 22.11; the auditor's
+    /// P2-E8-C2; mutant: the guard scoped to the step alone).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_tasks_destructor_entering_an_executor_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_tasks_destructor_entering_an_executor_ends_the_process"
+            ),
+            || {
+                let (a, b) = (executor(0), executor(0));
+                a.spawn(
+                    Class::Due,
+                    Box::new(EntersFromItsDrop {
+                        runner: Some(b.runner()),
+                    }),
+                );
+                a.run_one();
+                a.close();
+                b.close();
+            },
+        );
+        ended_refused(ended);
+    }
+
     /// Steps once: enters the executor through `runner`.
     struct EntersAgain {
         runner: Arc<Lock<Option<Runner>>>,

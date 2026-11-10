@@ -1382,6 +1382,154 @@ mod native {
         );
     }
 
+    /// Close waits for every external call stepping a task: an embedder's call in a step when
+    /// close begins ends that step before close returns (22.7; the auditor's P2-E5-C1; mutant:
+    /// close joining its workers alone).
+    #[test]
+    fn close_waits_for_an_external_call_in_progress() {
+        let ex = executor(0);
+        let runner = ex.runner();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        ex.spawn(
+            Class::Due,
+            Box::new(Blocks {
+                entered: entered_tx,
+                go: go_rx,
+            }),
+        );
+        let call = std::thread::spawn(move || runner.run_one(std::task::Waker::noop()));
+        let entered = entered_rx.recv_timeout(BOUND).is_ok();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            ex.close();
+            let _ = closed_tx.send(());
+        });
+        // Long enough for a close that does not wait to return, which takes microseconds.
+        let early = closed_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        go_tx.send(()).unwrap();
+        let closed = early || closed_rx.recv_timeout(BOUND).is_ok();
+        let stepped = call.join().unwrap();
+        closer.join().unwrap();
+        assert!(entered, "the external call stepped the task");
+        assert!(!early, "close returned while an external call was stepping");
+        assert!(closed && stepped);
+    }
+
+    /// An executor dropped by a step of an external call closes without waiting for that call,
+    /// its own (22.7).
+    #[test]
+    fn an_executor_dropped_by_an_external_calls_own_step_closes() {
+        let slot = Arc::new(Lock::new(None));
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let ex = executor(0);
+        let runner = ex.runner();
+        ex.spawn(
+            Class::Due,
+            Box::new(DropsItsExecutor {
+                executor: slot.clone(),
+                dropped: dropped_tx,
+            }),
+        );
+        *slot.lock() = Some(ex);
+        let call = std::thread::spawn(move || runner.run_one(std::task::Waker::noop()));
+        let dropped = dropped_rx.recv_timeout(BOUND).is_ok();
+        let stepped = dropped && call.join().unwrap();
+        let taken = slot.lock().is_none();
+        assert!(
+            dropped && taken,
+            "the call's step dropped its executor and closed it"
+        );
+        assert!(stepped);
+    }
+
+    /// Calls back into its executor from its step: by name when it names a task, else for the
+    /// next.
+    struct CallsBack {
+        executor: Arc<Lock<Option<Arc<Executor>>>>,
+        named: Option<TaskRef>,
+    }
+
+    impl Task for CallsBack {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let ex = self.executor.lock().clone();
+            if let Some(ex) = ex {
+                match &self.named {
+                    Some(task) => ex.run_named(task),
+                    None => ex.run_one(),
+                };
+            }
+            Ok(Step::Done)
+        }
+    }
+
+    /// Runs, in a child, a task whose step calls back into its own executor.
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn calls_back_from_a_step(named: bool) {
+        let ex = Arc::new(executor(0));
+        let slot = Arc::new(Lock::new(Some(ex.clone())));
+        let log = Arc::new(Lock::new(Vec::new()));
+        let other = ex.spawn(Class::Maintenance, recorded("other", 0, &log));
+        ex.spawn(
+            Class::Due,
+            Box::new(CallsBack {
+                executor: slot.clone(),
+                named: named.then_some(other),
+            }),
+        );
+        ex.run_one();
+        drop(slot.lock().take());
+        if let Ok(ex) = Arc::try_unwrap(ex) {
+            ex.close();
+        }
+    }
+
+    /// The parent's half: the child ended by abort, saying why.
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn ended_refused(ended: Option<crate::storage::atoll::testing::Ended>) {
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted,
+            "the child did not abort: {:?}\n{}",
+            ended.code, ended.stderr
+        );
+        assert!(
+            ended
+                .stderr
+                .contains("a runner entered the executor from inside a step or a waker"),
+            "{}",
+            ended.stderr
+        );
+    }
+
+    /// A caller's claim never enters from inside a step: one that does ends the process (22.7,
+    /// 22.11; the auditor's P2-E5-R1; mutant: the plain caller's entry unchecked).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_caller_entering_from_inside_a_step_ends_the_process() {
+        ended_refused(crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_caller_entering_from_inside_a_step_ends_the_process"
+            ),
+            || calls_back_from_a_step(false),
+        ));
+    }
+
+    /// A named claim never enters from inside a step either (22.7, 22.11; the auditor's
+    /// P2-E5-R1; mutant: the named claim's entry unchecked).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_named_claim_from_inside_a_step_ends_the_process() {
+        ended_refused(crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_named_claim_from_inside_a_step_ends_the_process"
+            ),
+            || calls_back_from_a_step(true),
+        ));
+    }
+
     /// Steps once: enters the executor through `runner`.
     struct EntersAgain {
         runner: Arc<Lock<Option<Runner>>>,
@@ -1553,6 +1701,106 @@ mod loom_tests {
             notifier.join().unwrap();
             assert_eq!(h.state.load(Ordering::Acquire), QUEUED);
             assert_eq!(links(&shared, &h), 1);
+        });
+    }
+
+    /// Counts its steps, and is done.
+    struct Count(Arc<loom::sync::atomic::AtomicUsize>);
+
+    impl Task for Count {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Step::Done)
+        }
+    }
+
+    /// Counts the wakes of an external runner's host.
+    struct Wakes(Arc<loom::sync::atomic::AtomicUsize>);
+
+    impl std::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A link racing an external runner's registration: the work is either claimed by the
+    /// runner or its host is woken (22.3; the auditor's model; mutant: a link that takes no idle
+    /// runner's node).
+    #[test]
+    fn a_link_racing_an_external_registration_leaves_work_claimed_or_host_woken() {
+        use loom::sync::atomic::AtomicUsize;
+        loom::model(|| {
+            let ex = Arc::new(Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap());
+            let runner = Arc::new(ex.runner());
+            let units = Arc::new(AtomicUsize::new(0));
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let producer = {
+                let (ex, units) = (ex.clone(), units.clone());
+                thread::spawn(move || {
+                    ex.spawn(Class::Due, Box::new(Count(units)));
+                })
+            };
+            let host = {
+                let (wakes, runner) = (wakes.clone(), runner.clone());
+                thread::spawn(move || {
+                    let waker = std::task::Waker::from(Arc::new(Wakes(wakes)));
+                    runner.run_one(&waker)
+                })
+            };
+            producer.join().unwrap();
+            let ran = host.join().unwrap();
+            let observed = (units.load(Ordering::Relaxed), wakes.load(Ordering::Relaxed));
+            drop(runner);
+            Arc::try_unwrap(ex).ok().unwrap().close();
+            assert_eq!(observed.0, usize::from(ran));
+            assert!(
+                ran || observed.1 > 0,
+                "a registered host was not woken for queued work"
+            );
+        });
+    }
+
+    /// An external runner dropped while a link races to move its node: the node goes off both
+    /// lists and its slot is freed exactly once, its host woken at most once (22.3; the auditor's
+    /// model).
+    #[test]
+    fn an_external_cancel_racing_a_link_frees_its_node_exactly_once() {
+        use loom::sync::atomic::AtomicUsize;
+        loom::model(|| {
+            let ex = Arc::new(Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap());
+            let runner = ex.runner();
+            let n = runner.node;
+            let units = Arc::new(AtomicUsize::new(0));
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let waker = std::task::Waker::from(Arc::new(Wakes(wakes.clone())));
+            let empty = !runner.run_one(&waker);
+            let producer = {
+                let (ex, units) = (ex.clone(), units.clone());
+                thread::spawn(move || {
+                    ex.spawn(Class::Due, Box::new(Count(units)));
+                })
+            };
+            let cancel = thread::spawn(move || drop(runner));
+            producer.join().unwrap();
+            cancel.join().unwrap();
+            let observed = {
+                let queue = lock(&ex.shared.queue);
+                (
+                    queue.nodes[n].node.is_none(),
+                    queue.nodes[n].on,
+                    queue.free.iter().filter(|&&m| m == n).count(),
+                    queue.idle.len(),
+                    queue.to_wake.len(),
+                    wakes.load(Ordering::Relaxed),
+                )
+            };
+            Arc::try_unwrap(ex).ok().unwrap().close();
+            drop(waker);
+            assert!(empty && observed.0);
+            assert_eq!(observed.1, On::Nowhere);
+            assert_eq!(observed.2, 1);
+            assert_eq!((observed.3, observed.4), (0, 0));
+            assert!(observed.5 <= 1);
         });
     }
 

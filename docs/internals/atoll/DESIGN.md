@@ -5328,11 +5328,12 @@ compose, the real `Completion`, latch and backends included where named.
    worker's thread or an embedder runner's waker, the to-wake list, and each operation's drain
    bounded by the nodes its own links moved, so no external runner's waker is invoked under an
    executor mutex (a signal serves the tasks of one executor, whose drain a notify runs after its
-   mutex), and a runner entering from inside a step or an invoked waker refused. The lists are
+   mutex), and every caller entering from inside a step or an invoked waker refused (the
+   auditor's P2-E5-R1); close waits, parked, for every external call stepping a task, but a call
+   of its own thread whose step dropped the executor (the auditor's P2-E5-C1). The lists are
    deques given room for every task and every node when each is created, so no link or move
    allocates; intrusive links wait for a measured need. Not built yet: threshold signals,
-   executor completions with the callers' blocking and cooperative rules, close's five phases and
-   its wait for embedder calls in progress, removal with a subject beyond a task's own end.)
+   executor completions with the callers' blocking and cooperative rules, close's five phases, removal with a subject beyond a task's own end.)
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run
    against step 4's, and the profile again.

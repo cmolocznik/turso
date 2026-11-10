@@ -277,11 +277,47 @@ crate::thread::thread_local! {
     /// Whether this thread is inside a task's step or a waker a drain invokes, where no runner
     /// may enter the executor (22.7).
     static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The executor this thread is stepping a task of for an external call ([`Runner::run_one`]),
+    /// by the address of its shared part, or zero: a close of that executor made from inside that
+    /// step does not wait for it.
+    static CALLING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(atoll_loom)]
 loom::thread_local! {
     static INSIDE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static CALLING: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+/// An external call stepping a task, counted in the queue until it ends: close waits for every
+/// one but the calling thread's own (22.7).
+struct Calling<'a> {
+    shared: &'a Shared,
+}
+
+impl<'a> Calling<'a> {
+    /// Counts a call whose claim the caller made under the queue's mutex, `queue` that guard.
+    fn enter(shared: &'a Shared, queue: &mut Queue) -> Self {
+        queue.calls += 1;
+        CALLING.with(|calling| calling.set(std::ptr::from_ref(shared) as usize));
+        Self { shared }
+    }
+}
+
+impl Drop for Calling<'_> {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        CALLING.with(|calling| calling.set(0));
+        let closer = {
+            let mut queue = lock(&self.shared.queue);
+            queue.calls -= 1;
+            queue.closer.take()
+        };
+        // The closer looks again, under the mutex, at the calls left.
+        if let Some(closer) = closer {
+            closer.unpark();
+        }
+    }
 }
 
 /// This thread inside a step or an invoked waker, until dropped.
@@ -303,6 +339,16 @@ impl Drop for Inside {
         crate::storage::atoll::unwind::abort_if_unwinding();
         INSIDE.with(|inside| inside.set(self.0));
     }
+}
+
+/// A caller enters the executor only from outside every step and every waker the executor
+/// invokes (22.7): a runner entered from one would run a step inside another. Workers enter
+/// through their own loop, never through here.
+fn refuse_entry_from_inside() {
+    assert!(
+        !Inside::here(),
+        "a runner entered the executor from inside a step or a waker"
+    );
 }
 
 /// A runner's node among the idle runners (22.3): a worker's thread, parked, or an external
@@ -341,6 +387,10 @@ struct Queue {
     /// drain to invoke its waker, with room for every node.
     to_wake: VecDeque<usize>,
     closing: bool,
+    /// External calls stepping a task now, which close waits for, and the closer parked while
+    /// any is.
+    calls: usize,
+    closer: Option<crate::thread::Thread>,
 }
 
 impl Queue {
@@ -353,6 +403,8 @@ impl Queue {
             idle: VecDeque::with_capacity(workers),
             to_wake: VecDeque::new(),
             closing: false,
+            calls: 0,
+            closer: None,
         }
     }
 
@@ -808,24 +860,25 @@ impl Runner {
     /// this runner's node among the idle runners, so the next link wakes it. Whether it stepped
     /// one. Never from inside a step or a waker the executor invoked.
     pub(crate) fn run_one(&self, waker: &std::task::Waker) -> bool {
-        assert!(
-            !Inside::here(),
-            "a runner entered the executor from inside a step or a waker"
-        );
+        refuse_entry_from_inside();
         // Cloned before any executor mutex is taken, and what it replaces dropped after.
         let waker = waker.clone();
         let (claimed, replaced) = {
             let mut queue = lock(&self.shared.queue);
             match queue.claim() {
-                Some(header) => (Some(header), None),
+                Some(header) => (
+                    Some((header, Calling::enter(&self.shared, &mut queue))),
+                    None,
+                ),
                 None if queue.closing => (None, None),
                 None => (None, queue.register_external(self.node, waker)),
             }
         };
         drop(replaced);
         match claimed {
-            Some(header) => {
+            Some((header, call)) => {
                 self.shared.step(header);
+                drop(call);
                 true
             }
             None => false,
@@ -1021,6 +1074,7 @@ impl Executor {
     /// Claims the next task by class and steps it once, on the calling thread; whether there was
     /// one. A caller's runner (22.7), and the deterministic one.
     pub(crate) fn run_one(&self) -> bool {
+        refuse_entry_from_inside();
         self.shared.run_one()
     }
 
@@ -1028,6 +1082,7 @@ impl Executor {
     /// out of its list; idle, it runs for its claimer's own reason; running, done or closed, it is
     /// left. Whether it was stepped.
     pub(crate) fn run_named(&self, task: &TaskRef) -> bool {
+        refuse_entry_from_inside();
         assert!(
             std::ptr::eq(task.0.shared.as_ptr(), Arc::as_ptr(&self.shared)),
             "a task claimed by name on another executor"
@@ -1071,6 +1126,21 @@ impl Executor {
             }
             // A worker that panicked ended the process (22.11): a join returns its loop's end.
             let _ = worker.join();
+        }
+        // Every external call's step ends before the jobs go, but this thread's own, when its
+        // step dropped the executor: no call starts once closing is published.
+        let mine = Arc::as_ptr(&self.shared) as usize;
+        let own = usize::from(CALLING.with(std::cell::Cell::get) == mine);
+        loop {
+            {
+                let mut queue = lock(&self.shared.queue);
+                if queue.calls <= own {
+                    break;
+                }
+                queue.closer = Some(crate::thread::current());
+            }
+            // Unparked by a call's end, or spuriously: either way it looks again.
+            crate::storage::atoll::park::thread();
         }
         let jobs = std::mem::take(&mut *lock(&self.shared.jobs));
         // Each task off every list it declared, outside the queue's mutex (22.3's lock order).

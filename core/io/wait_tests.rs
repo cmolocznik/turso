@@ -25,45 +25,6 @@ impl StepCounting {
     }
 }
 
-/// Counts what an ownership watch is told: the finish elsewhere left alone with the request, its
-/// retirement, and the retirements told after the first.
-pub(crate) struct Told {
-    pub(crate) left: AtomicUsize,
-    pub(crate) retired: AtomicUsize,
-    pub(crate) retired_told: AtomicUsize,
-}
-
-impl Told {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            left: AtomicUsize::new(0),
-            retired: AtomicUsize::new(0),
-            retired_told: AtomicUsize::new(0),
-        })
-    }
-
-    /// (finishers left, retirements, retirements told after the first).
-    pub(crate) fn seen(&self) -> (usize, usize, usize) {
-        (
-            self.left.load(Ordering::Acquire),
-            self.retired.load(Ordering::Acquire),
-            self.retired_told.load(Ordering::Acquire),
-        )
-    }
-}
-
-impl OwnershipWatch for Told {
-    fn finisher_left(&self) {
-        self.left.fetch_add(1, Ordering::AcqRel);
-    }
-    fn retired(&self, told: bool) {
-        self.retired.fetch_add(1, Ordering::AcqRel);
-        if told {
-            self.retired_told.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-}
-
 impl Clock for StepCounting {
     fn current_time_monotonic(&self) -> clock::MonotonicInstant {
         self.io.current_time_monotonic()
@@ -94,6 +55,11 @@ impl IO for StepCounting {
     fn step(&self) -> Result<()> {
         self.steps.fetch_add(1, Ordering::SeqCst);
         self.io.step()
+    }
+
+    fn try_step(&self, ready: &std::task::Waker) -> Result<Stepped> {
+        self.steps.fetch_add(1, Ordering::SeqCst);
+        self.io.try_step(ready)
     }
 
     fn delivery(&self) -> Delivery {

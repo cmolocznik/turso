@@ -4,7 +4,8 @@
 //! for a pumped backend. A step anywhere else is a blocking caller stepping in a loop of its own,
 //! which spins on a backend whose step does nothing.
 //!
-//! The scan finds a step by its receiver's name: `io`, `.io`, `io()` or `_io()`, which is how
+//! A step is `step` or `try_step` (which also says what it found). The scan finds a step by its
+//! receiver's name: `io`, `.io`, `io()` or `_io()`, which is how
 //! every IO is reached in the workspace's production code. The trait's own waits step `self` and
 //! are the implementation, not callers.
 
@@ -28,6 +29,12 @@ const STEPS: &[(&str, &str, &str)] = &[
         "a yield, which leaves nothing to wait for: one turn of the IO",
     ),
     (
+        "core/storage/atoll/executor/mod.rs",
+        "work",
+        "a worker's pump: one step per task step, and with nothing to claim, steps while the \
+         backend delivers and parks once it is empty",
+    ),
+    (
         "core/storage/atoll/requests.rs",
         "drain",
         "close's wait for its count on a pumped backend; it parks on the others",
@@ -36,6 +43,11 @@ const STEPS: &[(&str, &str, &str)] = &[
         "core/storage/atoll/requests.rs",
         "step",
         "the counting IO forwards its embedder's step",
+    ),
+    (
+        "core/storage/atoll/requests.rs",
+        "try_step",
+        "the counting IO forwards its embedder's step that says what it found",
     ),
     (
         "sdk-kit/src/rsapi.rs",
@@ -88,8 +100,8 @@ fn production_sources(root: &std::path::Path) -> Vec<(String, std::path::PathBuf
     out
 }
 
-/// Whether the code ending just before a `.step()` names an IO: a name `io`, or one ending in
-/// `_io`, read or called.
+/// Whether the code ending just before a `.step()` or `.try_step(` names an IO: a name `io`, or
+/// one ending in `_io`, read or called.
 fn names_an_io(before: &str) -> bool {
     let name = before.strip_suffix("()").unwrap_or(before);
     let start = name
@@ -112,7 +124,10 @@ fn every_io_step_outside_tests_is_a_pump_a_forward_or_a_pumped_wait() {
         };
         scanned += 1;
         let code = without_test_modules(&code_of(&text));
-        for (at, _) in code.match_indices(".step()") {
+        let steps = code
+            .match_indices(".step()")
+            .chain(code.match_indices(".try_step("));
+        for (at, _) in steps {
             let before = code[..at].trim_end();
             if !names_an_io(before) {
                 continue;

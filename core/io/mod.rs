@@ -680,6 +680,33 @@ pub enum Delivery {
     Pumped,
 }
 
+/// What one step of a pumped backend found ([`IO::try_step`], DESIGN.md 22.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stepped {
+    /// It delivered a request: whatever waits may have moved, and another step may deliver more.
+    Delivered,
+    /// It held nothing to deliver, and registered the waker it was handed, which it wakes as soon
+    /// as it holds something.
+    Empty,
+    /// It stepped and cannot say what it found: a backend that does not tell.
+    Unsaid,
+}
+
+/// A waker that unparks `thread`: a blocking waiter's, for what it waits on and for the backend's
+/// next work.
+pub(crate) fn unparking(thread: crate::thread::Thread) -> std::task::Waker {
+    struct Unpark(crate::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    std::task::Waker::from(std::sync::Arc::new(Unpark(thread)))
+}
+
 pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
@@ -718,13 +745,24 @@ pub trait IO: Clock + Send + Sync {
         Delivery::Pumped
     }
 
+    /// One step of a pumped backend that says what it found. `Empty` only after registering
+    /// `ready` under the exclusion its submissions take, so a request submitted after the look
+    /// wakes it: a waiter then parks until the backend holds something or what it waits on moves,
+    /// and spends nothing on a backend that holds nothing for it. A backend that cannot say steps
+    /// and answers `Unsaid`, and its waiters yield between steps.
+    fn try_step(&self, ready: &std::task::Waker) -> Result<Stepped> {
+        let _ = ready;
+        self.step()?;
+        Ok(Stepped::Unsaid)
+    }
+
     /// Blocks the calling thread until `c` finishes (DESIGN.md 22.5): a wait another thread
     /// completes, or a request of a backend that delivers inline or on a thread of its own, parks
-    /// until it is finished; a pumped backend is stepped until it is, the processor yielded between
-    /// steps that leave it unfinished, since what it waits on may be another thread's to submit,
-    /// and the waiter parks on `c` once only finishes under way elsewhere can finish it, its
-    /// requests having left the backend. Its result is its owner's to read. A step that fails ends
-    /// the process, the backend having lost what it accepted.
+    /// until it is finished; a pumped backend is stepped while it delivers, and once it holds
+    /// nothing the waiter parks until `c` finishes or the backend holds something, whoever submits
+    /// it (a backend that cannot say is stepped with the processor yielded between steps). Its
+    /// result is its owner's to read. A step that fails ends the process, the backend having lost
+    /// what it accepted.
     fn wait(&self, c: &Completion) {
         refuse_on_delivery_thread("a wait for a completion");
         if c.finished() {
@@ -734,19 +772,20 @@ pub trait IO: Clock + Send + Sync {
             c.block_on();
             return;
         }
+        let ready = unparking(crate::thread::current());
         while !c.finished() {
-            if c.only_finishers_left() {
-                // A step does nothing for it: the finish publishes its result and wakes this one.
-                c.block_on();
-                return;
-            }
-            if self.step().is_err() {
-                stepping_failed("a wait for a completion");
-            }
-            if !c.finished() {
-                // A step delivers only what was submitted, and what `c` waits on may be another
-                // thread's to submit or finish: give it the processor rather than spin.
-                crate::thread::yield_now();
+            match self.try_step(&ready) {
+                Err(_) => stepping_failed("a wait for a completion"),
+                Ok(Stepped::Delivered) => {}
+                // What `c` waits on may be another thread's to submit or finish.
+                Ok(Stepped::Unsaid) => crate::thread::yield_now(),
+                Ok(Stepped::Empty) => {
+                    // Registered before the test: a finish after it unparks this thread.
+                    c.set_waker(&ready);
+                    if !c.finished() {
+                        crate::thread::park();
+                    }
+                }
             }
         }
     }
@@ -759,9 +798,9 @@ pub trait IO: Clock + Send + Sync {
     /// Waits until no backend owns `c`: for a request, until it is retired, or at once if it was
     /// never accepted; for a group, until every request beneath it is (DESIGN.md 22.5). A
     /// cancelled request is finished at once and still owned until its backend lets it go, with
-    /// the buffers it reads into or writes from: retirement, not finishing, says they are free. A
-    /// request the backend let go while a finish elsewhere still runs its callback retires when
-    /// that callback returns: the waiter parks for it rather than stepping.
+    /// the buffers it reads into or writes from: retirement, not finishing, says they are free. On
+    /// a pumped backend that holds nothing, the waiter parks until the request retires (a finish
+    /// elsewhere still running its callback, a carrier retiring) or the backend holds something.
     /// The caller is the owner of what it waits for, and has stopped submitting to it.
     fn wait_retired(&self, c: &Completion) -> Result<()> {
         self.drain_completions(std::slice::from_ref(c))
@@ -778,18 +817,25 @@ pub trait IO: Clock + Send + Sync {
         for c in completions {
             for request in c.requests(&mut seen) {
                 if pumped {
+                    let ready = unparking(crate::thread::current());
                     let mut registered = false;
                     while request.is_owned() {
-                        if request.left_its_backend() {
-                            // Only the finish under way retires it now, and wakes this one.
-                            if !registered {
-                                let thread = crate::thread::current();
-                                request.on_retired(move || thread.unpark());
-                                registered = true;
+                        match self.try_step(&ready) {
+                            Err(_) => stepping_failed("a wait for retirement"),
+                            Ok(Stepped::Delivered) => {}
+                            Ok(Stepped::Unsaid) => crate::thread::yield_now(),
+                            Ok(Stepped::Empty) => {
+                                // Registered before the test: a retirement after it unparks this
+                                // thread, and stays registered until it comes.
+                                if !registered {
+                                    let thread = crate::thread::current();
+                                    request.on_retired(move || thread.unpark());
+                                    registered = true;
+                                }
+                                if request.is_owned() {
+                                    crate::thread::park();
+                                }
                             }
-                            crate::thread::park();
-                        } else if self.step().is_err() {
-                            stepping_failed("a wait for retirement");
                         }
                     }
                 } else if request.is_owned() {

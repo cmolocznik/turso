@@ -34,6 +34,10 @@ mod control;
 mod crc;
 pub mod db;
 mod epoch;
+// The executor's core is built on test jobs before any job of the database moves onto it (DESIGN.md
+// 22.16 step 6).
+#[cfg_attr(not(test), expect(dead_code))]
+mod executor;
 // A production build carries only what production calls: an item whose only callers are tests
 // is compiled for tests alone, and so are `floors` and `stream`, whose consumers (the collector,
 // the stream catalog) are not built.

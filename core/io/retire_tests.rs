@@ -330,12 +330,10 @@ enum Through {
 
 /// A pumped backend has delivered a request whose callback a cancellation runs, paused, on
 /// another thread: only that finish can publish its result and retire it. A waiter for either,
-/// on the request, on a group holding it or on a request carried through it, parks rather than
-/// stepping a backend that holds nothing for it, and the finish wakes it; a watch on the carried
-/// request hears its carrier leave the backend once, though it later ends itself (audit
-/// chain-fixes-v1, P2-CF1, and the auditor's group and carry controls; mutants: the waiter steps
-/// until the finish lands, a core spent on empty steps; a group judged by its own finish alone; a
-/// carried request blind to its carrier; a watch told twice).
+/// on the request, on a group holding it or on a request carried through it, looks once, finds
+/// the backend empty and parks, and the finish wakes it (audit chain-fixes-v1, P2-CF1, and the
+/// auditor's group and carry controls; mutant: the waiter steps on an empty backend until the
+/// finish lands, a core spent on empty steps).
 fn a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
     waits: Waits,
     through: Through,
@@ -373,10 +371,6 @@ fn a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
         Through::Request | Through::Group => file.sync(c, FileSyncType::Fsync),
     }
     .unwrap();
-    let watch = super::wait_tests::Told::new();
-    if let Through::Carried = through {
-        carried.watch_ownership(watch.clone());
-    }
     let cancel = {
         let c = c.clone();
         std::thread::spawn(move || c.abort())
@@ -386,16 +380,10 @@ fn a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
         .expect("the cancellation entered the callback");
     crash.step().unwrap();
     assert!(
-        c.left_its_backend() && c.is_owned() && !c.finished(),
+        crash.in_flight() == 0 && c.is_owned() && !c.finished(),
         "the backend let the request go, its callback still running"
     );
     assert!(!group.finished(), "the group's own finish is not claimed");
-    if let Through::Carried = through {
-        assert!(
-            carried.left_its_backend() && carried.is_owned() && !carried.finished(),
-            "the carrier left its backend, the carried request unfinished"
-        );
-    }
     let target = match through {
         Through::Request => c.clone(),
         Through::Group => group.clone(),
@@ -425,8 +413,8 @@ fn a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
     waiter.join().unwrap();
     assert_eq!(
         mid,
-        (0, false),
-        "{waits:?} through {through:?}: (steps, returned) while the finish was paused"
+        (1, false),
+        "{waits:?} through {through:?}: (looks, returned) while the finish was paused"
     );
     assert!(
         ended,
@@ -441,16 +429,11 @@ fn a_pumped_waiter_parks_while_only_a_finish_elsewhere_can_end_its_wait(
             carried.finished() && !carried.is_owned(),
             "{waits:?}: the carried request ended"
         );
-        assert_eq!(
-            watch.seen(),
-            (1, 1, 1),
-            "{waits:?}: (finishers left, retirements, told) heard by the carried request's watch"
-        );
     }
     assert_eq!(
         io.steps(),
-        0,
-        "{waits:?} through {through:?}: steps taken in all"
+        1,
+        "{waits:?} through {through:?}: looks taken in all"
     );
 }
 
@@ -500,6 +483,58 @@ fn a_pumped_wait_on_a_carried_request_for_its_retirement_only_its_carriers_finis
         Waits::Retirement,
         Through::Carried,
     );
+}
+
+/// A waiter parked on an empty pumped backend steps the request another thread submits next,
+/// whose callback finishes what it waits for: the submission wakes it (DESIGN.md 22.5; mutant:
+/// a backend that registers no waiter, or a submission that wakes none, leaves it parked).
+#[test]
+fn a_pumped_wait_on_an_empty_backend_steps_the_request_submitted_next() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const BOUND: Duration = Duration::from_secs(20);
+    let crash = Arc::new(CrashIO::new(2));
+    let io = super::wait_tests::StepCounting::new(crash.clone());
+    let file = io.open_file("/db/f", OpenFlags::Create, false).unwrap();
+    let waited = Completion::new_sync(|_| {});
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = {
+        let (io, waited) = (io.clone(), waited.clone());
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            io.wait(&waited);
+            done_tx.send(()).unwrap();
+        })
+    };
+    started_rx.recv().unwrap();
+    // Long enough for the waiter to look and park.
+    std::thread::sleep(Duration::from_millis(100));
+    let parked = (io.steps(), done_rx.try_recv().is_ok());
+    let next = {
+        let waited = waited.clone();
+        Completion::new_sync(move |res| match res {
+            Ok(n) => waited.complete(n),
+            Err(e) => waited.error(e),
+        })
+    };
+    let next = file.sync(next, FileSyncType::Fsync).unwrap();
+    let woke = done_rx.recv_timeout(BOUND).is_ok();
+    if !woke {
+        // A waiter nothing woke: step it out here so the thread ends.
+        while crash.in_flight() > 0 {
+            crash.step().unwrap();
+        }
+        waiter.thread().unpark();
+    }
+    waiter.join().unwrap();
+    assert_eq!(
+        parked,
+        (1, false),
+        "(looks, returned) before the submission"
+    );
+    assert!(woke, "the submission did not wake the parked waiter");
+    assert!(next.finished() && !next.is_owned() && waited.finished());
 }
 
 /// A file whose `pwrite` refuses its `refuse_at`th call and passes the rest to a file of a

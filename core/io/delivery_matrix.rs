@@ -73,6 +73,10 @@ pub(crate) const IO: &[(&str, Rule)] = &[
         Allowed("nothing to do on the ring: its delivery thread delivers"),
     ),
     (
+        "try_step",
+        Allowed("the trait's default: a step, which does nothing on the ring, answering Unsaid"),
+    ),
+    (
         "cancel",
         Allowed(
             "aborts, running the callbacks with the ring's mutex let go, then queues the \

@@ -126,9 +126,6 @@ struct ContextInner {
     /// What runs once the request is retired, registered while a backend owns it
     /// ([`Completion::on_retired`]).
     on_retired: Vec<Box<dyn FnOnce() + Send>>,
-    /// What watches the request's ownership ([`Completion::watch_ownership`]), each with whether
-    /// it was told that only a finish under way can retire the request now.
-    watches: Vec<(Arc<dyn OwnershipWatch>, bool)>,
     // TODO: add abort signal
 }
 
@@ -137,7 +134,6 @@ impl Debug for ContextInner {
         f.debug_struct("ContextInner")
             .field("wakers", &self.wakers.len())
             .field("on_retired", &self.on_retired.len())
-            .field("watches", &self.watches.len())
             .finish()
     }
 }
@@ -157,16 +153,6 @@ impl ContextInner {
         Self {
             wakers: SmallVec::new(),
             on_retired: Vec::new(),
-            watches: Vec::new(),
-        }
-    }
-
-    /// Tells each watch not yet told that only finishes elsewhere move the request now: once
-    /// each, whichever let it go first, its own backend or its carrier's.
-    fn tell_finisher_left(&mut self) {
-        for (watch, told) in self.watches.iter_mut().filter(|(_, told)| !*told) {
-            watch.finisher_left();
-            *told = true;
         }
     }
 
@@ -295,41 +281,10 @@ const OBSERVED: u8 = 4;
 /// The request's callback, run by a finish other than its delivery (a cancellation, a carrying
 /// layer's finish), has returned.
 const CALLED: u8 = 8;
-/// What watches a request's ownership (DESIGN.md 22.5): told once if its backend, or the backend
-/// of the request carrying it ([`Completion::carry`]), lets it go while another finish still runs
-/// a callback, so that only finishes elsewhere can move it, and told when it retires. The first is told under the completion's lock, as is the taking of the watches at
-/// retirement, so a watch hears the two in that order: a count kept from them never goes below
-/// what it counted.
-pub trait OwnershipWatch: Send + Sync {
-    /// The backend let the request, or the one carrying it, go while another finish runs a
-    /// callback.
-    fn finisher_left(&self);
-    /// The request retired; `told` if [`finisher_left`](Self::finisher_left) was told first.
-    fn retired(&self, told: bool);
-}
-
 /// The backend let the request go while another finish was still running its callback. The
 /// retirement waits for both [`CALLED`] and this: whichever is set second, by the one atomic step
 /// that sets it, sees the other and retires the request, so each happens once and neither waits.
 const ENDED: u8 = 16;
-/// The request carrying this one ([`Completion::carry`]) left its backend while a finish elsewhere
-/// still runs its callback, so that only finishes elsewhere move this one now. It says who can
-/// make progress, never who holds the buffers: the retirement waits for the carrier's, as before,
-/// and this bit takes no part in it.
-const CARRIER_ENDED: u8 = 32;
-
-/// What a request carried through another ([`Completion::carry`]) learns from its carrier: that it
-/// left its backend, and its retirement, which retires the carried request in turn.
-struct Carried(Completion);
-
-impl OwnershipWatch for Carried {
-    fn finisher_left(&self) {
-        self.0.carrier_left();
-    }
-    fn retired(&self, _told: bool) {
-        self.0.retire();
-    }
-}
 
 pub(super) struct CompletionInner {
     completion_type: CompletionType,
@@ -494,23 +449,6 @@ struct GroupCompletionInner {
     complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
     /// Cached result after all completions finish
     result: OnceLock<Option<CompletionError>>,
-}
-
-/// Whether `holds` holds for every request beneath `list`, walked newest first and stopped at the
-/// first it fails for, with no allocation: a pumped wait asks it before each step, and the newest
-/// request is the likeliest one a backend still holds. A request gone is owned by no one and a
-/// wait another thread finishes is no backend's: neither is asked. Lists point only down, so the
-/// walk ends; a list reached twice is walked twice, which changes no answer.
-fn every_request(list: &Members, holds: &impl Fn(&Completion) -> bool) -> bool {
-    list.0.lock().iter().rev().all(|member| match member {
-        Member::Group(list) => every_request(list, holds),
-        Member::Request(weak) => weak.upgrade().is_none_or(|inner| {
-            matches!(
-                inner.completion_type,
-                CompletionType::Yield | CompletionType::Remote
-            ) || holds(&Completion { inner: Some(inner) })
-        }),
-    })
 }
 
 /// What a group lists, walked down to the requests beneath it (DESIGN.md 22.5). A request is held
@@ -1035,37 +973,16 @@ impl Completion {
     /// The backend's end of a request whose callback a finish has claimed: retires it if that
     /// callback returned, or marks the end for its finish to retire it as it returns.
     fn ended(&self) {
-        let inner = self.get_inner();
+        let ownership = &self.get_inner().ownership;
         // Already returned: its finish saw no end and will not retire, so this one does.
-        if inner.ownership.load(Ordering::Acquire) & CALLED != 0 {
+        if ownership.load(Ordering::Acquire) & CALLED != 0 {
             return self.retire_now();
         }
-        let was = {
-            // Under the lock the watches register and are taken at retirement under: each hears
-            // the end before the retirement, and one registering now reads the end itself.
-            let mut context = inner.context.inner.lock();
-            let was = inner.ownership.fetch_or(ENDED, Ordering::AcqRel);
-            turso_assert!(was & (RETIRED | ENDED) == 0, "a request retired twice");
-            context.tell_finisher_left();
-            was
-        };
+        let was = ownership.fetch_or(ENDED, Ordering::AcqRel);
+        turso_assert!(was & (RETIRED | ENDED) == 0, "a request retired twice");
         if was & CALLED != 0 {
             self.retire_now();
         }
-    }
-
-    /// The request carrying this one left its backend while a finish elsewhere runs its callback
-    /// ([`CARRIER_ENDED`]): its watches hear it as they hear the request's own end, once each. A
-    /// carried request's lock is taken under its carrier's, never the reverse.
-    fn carrier_left(&self) {
-        let inner = self.get_inner();
-        let mut context = inner.context.inner.lock();
-        let was = inner.ownership.fetch_or(CARRIER_ENDED, Ordering::AcqRel);
-        turso_assert!(
-            was & ACCEPTED != 0,
-            "a carried request was let go before its carrier retired"
-        );
-        context.tell_finisher_left();
     }
 
     /// A finish other than the delivery ran the request's callback, which returned: retires the
@@ -1094,9 +1011,7 @@ impl Completion {
     /// finishes this one: a layer between a caller and a backend that reads into a buffer of its
     /// own, or checks what it read, before it finishes the caller's request. This request is
     /// accepted before the submission, given back with it if it is refused, and retired once the
-    /// other retires, so a wait for its retirement waits for the backend's. It watches the other's
-    /// ownership: once that one's backend lets it go while a finish elsewhere runs its callback,
-    /// only finishes elsewhere move this one, and a wait for it parks rather than steps.
+    /// other retires, so a wait for its retirement waits for the backend's.
     pub fn carry(
         &self,
         submit: impl FnOnce() -> crate::Result<Completion>,
@@ -1104,7 +1019,8 @@ impl Completion {
         self.accept();
         match submit() {
             Ok(inner) => {
-                inner.watch_ownership(Arc::new(Carried(self.clone())));
+                let me = self.clone();
+                inner.on_retired(move || me.retire());
                 Ok(inner)
             }
             Err(e) => {
@@ -1124,7 +1040,7 @@ impl Completion {
     /// Runs `f` once no backend owns the request: now, if none does (never submitted, given back,
     /// or retired), or as the backend that owns it lets it go. An unowned request is read on the
     /// ownership word alone, without its context's lock: Acquire, so `f` sees what the retirement
-    /// released.
+    /// released, and a request its backend delivered inline costs its observer no lock.
     pub fn on_retired(&self, f: impl FnOnce() + Send + 'static) {
         let inner = self.get_inner();
         if inner.ownership.load(Ordering::Acquire) & ACCEPTED == 0 {
@@ -1151,80 +1067,10 @@ impl Completion {
         f();
     }
 
-    /// Watches the request's ownership with `watch` ([`OwnershipWatch`]): told now if its backend
-    /// already let it go while its callback runs elsewhere, and at its retirement; told only of
-    /// the retirement, at once, if no backend owns it: read on the ownership word alone, as
-    /// [`on_retired`](Self::on_retired) reads it, so a request its backend delivered inline is
-    /// counted out without its context's lock.
-    pub fn watch_ownership(&self, watch: Arc<dyn OwnershipWatch>) {
-        let inner = self.get_inner();
-        if inner.ownership.load(Ordering::Acquire) & ACCEPTED == 0 {
-            watch.retired(false);
-            return;
-        }
-        let mut context = inner.context.inner.lock();
-        let mut state = inner.ownership.load(Ordering::Acquire);
-        while state & ACCEPTED != 0 {
-            match inner.ownership.compare_exchange(
-                state,
-                state | OBSERVED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // The end is set under this lock: read here, it is read whole.
-                    let told = state & (ENDED | CARRIER_ENDED) != 0;
-                    if told {
-                        watch.finisher_left();
-                    }
-                    context.watches.push((watch, told));
-                    return;
-                }
-                Err(now) => state = now,
-            }
-        }
-        drop(context);
-        watch.retired(false);
-    }
-
-    /// Whether the request's backend, or the backend of the request carrying it, has let it go
-    /// while it is still owned: only finishes elsewhere move it now, and stepping the backend does
-    /// nothing for it.
-    pub fn left_its_backend(&self) -> bool {
-        self.inner.as_ref().is_some_and(|inner| {
-            inner.ownership.load(Ordering::Acquire) & (ENDED | CARRIER_ENDED) != 0
-        })
-    }
-
-    /// Whether only finishes under way elsewhere can finish this completion, its requests having
-    /// left their backends: a request its backend let go while another finish runs its callback,
-    /// or a group whose every request is finished or so let go. A waiter then parks on the
-    /// completion rather than stepping a backend that holds nothing for it (DESIGN.md 22.5).
-    pub fn only_finishers_left(&self) -> bool {
-        match self.inner.as_ref().map(|inner| &inner.completion_type) {
-            Some(CompletionType::Group(group)) => every_request(&group.inner.members, &|r| {
-                r.finished() || r.left_its_backend()
-            }),
-            Some(_) if self.is_request() => self.left_its_backend(),
-            _ => false,
-        }
-    }
-
     /// Takes what waited for the retirement, under the lock its registrations hold, and runs it
     /// once the lock is free.
     fn let_go_observers(&self) {
-        let (observers, watches) = {
-            let mut context = self.get_inner().context.inner.lock();
-            (
-                std::mem::take(&mut context.on_retired),
-                std::mem::take(&mut context.watches),
-            )
-        };
-        // The watches first: what counts the request has let it go before anything that waited
-        // for the retirement runs and reads it.
-        for (watch, told) in watches {
-            watch.retired(told);
-        }
+        let observers = std::mem::take(&mut self.get_inner().context.inner.lock().on_retired);
         for f in observers {
             f();
         }
@@ -1432,21 +1278,11 @@ mod tests {
 
     use super::*;
 
-    /// What waits for a request's retirement.
-    #[derive(Clone, Copy, Debug)]
-    enum Observes {
-        /// A callback ([`Completion::on_retired`]).
-        Callback,
-        /// An ownership watch ([`Completion::watch_ownership`]).
-        Watch,
-    }
-
-    /// A request no backend owns, never submitted or already retired, tells what waits for its
+    /// A request no backend owns, never submitted or already retired, runs what waits for its
     /// retirement at once, on its ownership word alone: its context's lock is held by the test
-    /// throughout (the auditor's retired-observer-fast-v1, extended to the watch; mutant: the lock
-    /// taken first, and the observer waits for it).
-    fn an_unowned_request_is_observed_without_its_context(retired: bool, observes: Observes) {
-        use crate::io::wait_tests::Told;
+    /// throughout (the auditor's retired-observer-fast-v1; mutant: the lock taken first, and the
+    /// observer waits for it).
+    fn an_unowned_requests_observer_does_not_wait_for_its_context(retired: bool) {
         use std::sync::{atomic::AtomicUsize, atomic::Ordering, mpsc};
         use std::time::Duration;
         // Long past the few instructions the observer takes, Miri's included.
@@ -1459,19 +1295,15 @@ mod tests {
         let inner = completion.get_inner().clone();
         let held = inner.context.inner.lock();
         let calls = Arc::new(AtomicUsize::new(0));
-        let told = Told::new();
         let (entered, entry) = mpsc::channel();
         let (done, finished) = mpsc::channel();
         let thread = {
-            let (calls, told) = (calls.clone(), told.clone());
+            let calls = calls.clone();
             std::thread::spawn(move || {
                 entered.send(()).unwrap();
-                match observes {
-                    Observes::Callback => completion.on_retired(move || {
-                        calls.fetch_add(1, Ordering::AcqRel);
-                    }),
-                    Observes::Watch => completion.watch_ownership(told),
-                }
+                completion.on_retired(move || {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                });
                 let _ = done.send(());
             })
         };
@@ -1480,73 +1312,22 @@ mod tests {
         drop(held);
         let joined = thread.join().is_ok();
         drop(inner);
-        assert!(
-            began && joined,
-            "{observes:?}: the observing thread did not complete"
-        );
+        assert!(began && joined, "the observing thread did not complete");
         assert!(
             returned_while_held,
-            "{observes:?}: an unowned request waited for its context"
+            "an unowned request waited for its context"
         );
-        let seen = match observes {
-            Observes::Callback => (calls.load(Ordering::Acquire), 0, 0),
-            Observes::Watch => {
-                let (left, retired, retired_told) = told.seen();
-                (retired, left, retired_told)
-            }
-        };
-        assert_eq!(
-            seen,
-            (1, 0, 0),
-            "{observes:?}: (retirements, finishers left, retirements told) seen"
-        );
+        assert_eq!(calls.load(Ordering::Acquire), 1, "observers run");
     }
 
     #[test]
     fn an_observer_of_a_retired_request_does_not_wait_for_its_context() {
-        an_unowned_request_is_observed_without_its_context(true, Observes::Callback);
+        an_unowned_requests_observer_does_not_wait_for_its_context(true);
     }
 
     #[test]
     fn an_observer_of_an_unsubmitted_request_does_not_wait_for_its_context() {
-        an_unowned_request_is_observed_without_its_context(false, Observes::Callback);
-    }
-
-    #[test]
-    fn a_watch_of_a_retired_request_does_not_wait_for_its_context() {
-        an_unowned_request_is_observed_without_its_context(true, Observes::Watch);
-    }
-
-    #[test]
-    fn a_watch_of_an_unsubmitted_request_does_not_wait_for_its_context() {
-        an_unowned_request_is_observed_without_its_context(false, Observes::Watch);
-    }
-
-    /// A carried request's watch hears that only finishes elsewhere move it once, from its
-    /// carrier, though the request later ends itself while a finish elsewhere still runs its
-    /// callback, and its retirement is told as following that (mutant: every end tells every
-    /// watch, and a count kept from them counts the request twice).
-    #[test]
-    fn a_carried_requests_watch_is_told_once_though_it_ends_after_its_carrier() {
-        let told = crate::io::wait_tests::Told::new();
-        let carried = Completion::new_sync(|_| {});
-        carried.accept();
-        carried.watch_ownership(told.clone());
-        carried.carrier_left();
-        // A finish elsewhere claims the callback and runs it; its return comes after the end.
-        assert!(
-            carried.run_callback(Ok(0)),
-            "the finish claimed the callback"
-        );
-        carried.retire();
-        assert!(carried.is_owned(), "retired before the callback returned");
-        carried.called();
-        assert!(!carried.is_owned(), "the callback's return retires it");
-        assert_eq!(
-            told.seen(),
-            (1, 1, 1),
-            "(finishers left, retirements, told) heard by the watch"
-        );
+        an_unowned_requests_observer_does_not_wait_for_its_context(false);
     }
 
     #[test]

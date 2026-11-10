@@ -1918,13 +1918,13 @@ non-blocking wake that enters no Atoll code, and a `RawWaker`'s clone and drop a
 reference counting only. Atoll's own wakers (the facade's unpark, `block_on`'s unpark) keep it.
 Registration clones the waker before taking the completion's lock and drops
 an unused clone after letting it go, so even a waker breaking that contract never runs code under
-the completion's lock. A request's retirement observers (`on_retired`) and ownership watches are taken under that lock
-and run after it is let go, after the backend let the request's buffers go, the watches first; a
-request no backend owns (never submitted, or retired) is told at once on its ownership word alone,
-read Acquire, without the lock, so a request a backend delivered inline costs its submitter no
-lock. Atoll registers a watch (`Requests::submit`: the close word lowered and, while close waits,
-the closer unparked), which does not block and holds no pool hold; retirement is physical and
-does not go through the held queue. Fixtures: a waker that opens an Atoll entry ends the process in its own child, and
+the completion's lock. A request's retirement observers (`on_retired`) are taken under that lock
+and run after it is let go, after the backend let the request's buffers go; a request no backend
+owns (never submitted, or retired) runs its observer at once, read on its ownership word alone
+(Acquire), without the lock, so a request a backend delivered inline costs its submitter no lock.
+Atoll registers one (`Requests::submit`: the count lowered and, while close waits, the closer
+unparked), which does not block and holds no pool hold; retirement is physical and does not go
+through the held queue. Fixtures: a waker that opens an Atoll entry ends the process in its own child, and
 one that parks the same (the delivery refusals); the integrity check's page arm under
 `StateHold`, a waker delivered at a change scope's close inside one of its drives, which unparks
 its own thread and returns, the check finishing; a facade helper's drive under `cell` the same;
@@ -3789,7 +3789,8 @@ work says which parts are done.
     retention (built: `stream.rs`); then segment index files, the stream's memory budget, the
     catalog in trees, transactions with streams, and consumer and producer state.
 13. **The executor** (section 22): designed on 2026-11-06 and revised after seven audits; built
-    through step 2 of its own order of work, 22.16.
+    through step 3 of its own order of work, 22.16, step 4's units (its sustained run not yet
+    made), and the first part of step 6.
 
 ## 21. Streams (Clay's spec of 2026-11-06)
 
@@ -3914,7 +3915,7 @@ of every segment retained); the stream's own memory budget (chunks come from a f
 the log's buffer, and a read copies each batch into a heap buffer of its own); the catalog in trees,
 and streams of several partitions; leases that read with no copy; and section 21.6.
 
-## 22. The executor (designed 2026-11-06, revised after seven audits; not built)
+## 22. The executor (designed 2026-11-06, revised after seven audits; built in part, 22.16)
 
 Every background job of a database runs as a task on one executor of the database's own, which
 owns their scheduling and every wake. A job says what it waits on and whose work that wait needs;
@@ -4551,28 +4552,26 @@ gone, and the delivery thread's rulings hold `IO::wait` refused there and `IO::d
 blocking callers wait through it: `Statement::wait_io` under the `run_*` helpers, the
 reset's halt loop, the incremental blob's steps, Atoll's `drive` and its checkpointing thread, the
 SDK kit's synchronous step, the PostgreSQL frontend's two blocking loops and `tools/dbhash`; a busy
-wait in those loops sleeps rather than steps. A pumped wait parks, rather than steps, once only a
-finish under way elsewhere can end it: a request the backend let go while a cancellation still runs
-its callback (`Completion::left_its_backend`), a request carried through one so let go
-(`Completion::carry` watches its carrier, whose end marks the carried request: a mark of who can
-move it, never of who holds the buffers, whose retirement still follows the carrier's), or a group
-whose every request is finished or so let go, its lists walked newest first with no allocation and
-stopped at the first request a backend still holds; the finish's result wakes a wait for the result,
-its retirement a wait for the retirement. A watch hears that only finishes elsewhere move its
-request once, whichever end comes first, the request's own or its carrier's.
-Atoll's close keeps its count in one word with its mark and the count of requests so let go: on a
-pumped backend it steps while the backend holds any of its requests and parks while only finishes
-elsewhere can retire the rest, and on any other it parks; every change to the word while it waits
-wakes it, a request a callback submits meanwhile among them, which it then steps. A retirement
-with no close waiting takes no lock. The word learns of a request let go before its callback
-returned through the request's ownership watch (`OwnershipWatch`), told of it under the
-completion's lock, before its retirement. A cooperative
-poll steps a pumped backend alone. A census lists every IO step outside tests by the function that
-takes it: the hosts' pumps, a yield's one turn, a cooperative poll's, the counting IO's forward and
-close's wait on a pumped backend. A pumped backend's ownership is 3b's: accepted at its queue,
+wait in those loops sleeps rather than steps. A pumped backend says what a step found
+(`IO::try_step`, the auditor's #4179): `Delivered`, a request delivered; `Empty`, nothing to
+deliver, after registering the waker it was handed under the exclusion its submissions take, so a
+request submitted after the look wakes it; or `Unsaid`, a backend that cannot tell, whose waiters
+yield between steps as before. A pumped wait steps while the backend delivers and parks on
+`Empty` until what it waits on moves (the finish's result for a wait for the result, the
+retirement for a wait for the retirement, a group's own finish) or the backend holds something,
+whoever submits it: a cancellation's callback still running elsewhere, a request carried through
+one, a group's members, a request counted and not yet submitted all end in one of those two
+wakes, so no dependency is inferred and none can be missed. Atoll's close keeps its count in one
+word with its mark: on a pumped backend it steps while the backend delivers and parks on `Empty`,
+and on any other it parks; a retirement lowering the count while close waits wakes it, and the
+backend's own wake brings it to a request submitted meanwhile. A retirement with no close waiting
+takes no lock. A cooperative poll steps a pumped backend alone. A census lists every IO step outside tests by the function that
+takes it: the hosts' pumps, a yield's one turn, a cooperative poll's, the counting IO's forwards (a step
+and a step that says what it found) and close's wait on a pumped backend. A pumped backend's ownership is 3b's: accepted at its queue,
 retired at the step that delivers it, or, where a cancellation still runs its callback then, when
-that callback returns. How many requests a pumped backend holds is read only by the
-runners' rule of one step per task step, so it is built with them, in step 6.)
+that callback returns. `CrashIO` says what each step found; the other pumped backends of tests and
+simulators answer `Unsaid` until they do. How many requests a pumped backend holds is read only by
+the runners' rule of one step per task step, so it is built with them, in step 6.)
 
 (Built, step 4: the checkpoint is stepped a unit at a time on today's drivers. `Run::step` does
 one unit and says `Again`, `Wait(c)` or `Done`. The checkpointing thread runs units back to back,
@@ -4987,7 +4986,8 @@ ran while the executor still ran. Nothing the executor or a waker holds keeps th
    step, so nothing waits for a producer that close stopped. Registrations are removed with the
    tasks (22.3).
 4. **Physical requests retired**: the closing thread waits until Atoll's count of its files'
-   requests submitted and not retired reaches zero (22.5), stepping a pumped backend meanwhile.
+   requests submitted and not retired reaches zero (22.5), stepping a pumped backend meanwhile
+   while it delivers and parking while it holds nothing.
    Every backend retires every request it accepted (the kernel answers every request it was given,
    with a result or an error; a pumped backend delivers each when stepped), so the wait ends; a
    device that never answers holds close as it holds any write. A request cancelled or abandoned by
@@ -5278,6 +5278,20 @@ compose, the real `Completion`, latch and backends included where named.
    completions with the callers' blocking and bounded cooperative rules, close with its final flush,
    logical abandonment and physical drain, the four runners; proofs 1, 2, 4, 5, 7 and 12's callers
    and external-host cases on test jobs, no real job moved.
+   (Built, first part, `storage/atoll/executor`: the header and its state word with every move
+   of 22.3, a wake marking a running task and queuing an idle one under the queue's mutex, the end
+   of a step resting by one compare-exchange or queuing again by a swap that asserts it moves a
+   running task; the run queue by class, strict by class and first in first out within one; the
+   workers, which step a pumped backend once after each task step and, with nothing to claim,
+   while it delivers, park once it says `Empty`, and read close at every pass so a backend that
+   cannot say still lets them go; `run_one`, the plain claim a caller makes; signals with the
+   counter, the list under its own mutex, registration and the second read, a task's declared
+   signals made room for at its creation and left at its end. The lists are deques given room for
+   every task when it is created, so no link allocates; intrusive links wait for a measured need.
+   Not built yet: threshold signals, tickets and levels with the counter-checked clear, named
+   claims of idle tasks, external runners and the to-wake list, executor completions with the
+   callers' blocking and cooperative rules, close's five phases, removal with a subject beyond a
+   task's own end.)
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run
    against step 4's, and the profile again.

@@ -12,7 +12,7 @@
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{
     Buffer, Completion, Delivery, File, FileId, FileSyncType, MemoryIO, OpenFlags,
-    SharedWalLockKind, SharedWalMappedRegion, IO,
+    SharedWalLockKind, SharedWalMappedRegion, Stepped, IO,
 };
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
@@ -20,11 +20,9 @@ use crate::Result;
 use std::ptr::NonNull;
 
 /// The requests on a database's files submitted and not retired, in one word with close's mark:
-/// bit 0 says close waits on the word ([`CLOSING`]); then the requests submitted and not retired
-/// ([`ONE`] each); above them, those of them whose backend let them go while a finish elsewhere
-/// still runs their callback ([`LEFT`] each), which only that finish can retire. Every change is
-/// one atomic step on the word, so close reads the three together, and a change made while close
-/// waits wakes it.
+/// bit 0 says close waits on the word ([`CLOSING`]), and the rest count the requests ([`ONE`]
+/// each). Every change is one atomic step on the word, so a change made while close waits wakes
+/// it.
 pub(super) struct Requests {
     word: AtomicU64,
     /// The thread close waits on, set before it marks the word.
@@ -35,15 +33,9 @@ pub(super) struct Requests {
 const CLOSING: u64 = 1;
 /// One request submitted and not retired.
 const ONE: u64 = 1 << 1;
-/// One of those whose backend let it go before its callback returned.
-const LEFT: u64 = 1 << 32;
 /// The requests submitted and not retired, out of a word.
 fn outstanding_in(word: u64) -> u64 {
-    (word & (LEFT - 1)) >> 1
-}
-/// Those of them only a finish under way can retire, out of a word.
-fn left_in(word: u64) -> u64 {
-    word >> 32
+    word >> 1
 }
 
 impl Default for Requests {
@@ -62,10 +54,14 @@ impl Requests {
         physical: Completion,
         submit: impl FnOnce() -> Result<Completion>,
     ) -> Result<Completion> {
-        let was = self.word.fetch_add(ONE, Ordering::AcqRel);
+        self.word.fetch_add(ONE, Ordering::AcqRel);
+        // Counted and not yet the backend's: a close that looks now finds the backend empty and
+        // parks, and the submission wakes it (`IO::try_step`).
+        crate::race::point("requests.counted");
         let submitted = match submit() {
             Ok(c) => {
-                physical.watch_ownership(self.clone());
+                let requests = self.clone();
+                physical.on_retired(move || requests.retired());
                 Ok(c)
             }
             Err(e) => {
@@ -73,10 +69,14 @@ impl Requests {
                 Err(e)
             }
         };
-        // Submitted while close waits (a callback's next request): close steps the backend for
-        // it, woken once it is queued there.
-        self.changed(was);
         submitted
+    }
+
+    /// A request counted has retired.
+    fn retired(&self) {
+        let was = self.word.fetch_sub(ONE, Ordering::AcqRel);
+        assert!(outstanding_in(was) > 0, "a request uncounted twice");
+        self.changed(was);
     }
 
     /// A change made to the word, which read `was`: close, if it waits, looks again.
@@ -94,13 +94,13 @@ impl Requests {
     }
 
     /// Close's wait for its requests (DESIGN.md 22.12, step 4), until every request counted has
-    /// retired. On a pumped backend it steps while the backend holds any of them, and parks while
-    /// only finishes under way elsewhere can retire the rest; on any other it parks. Every change
-    /// to the word wakes it: a retirement, a request a callback submits meanwhile, a backend
-    /// letting one go. Every backend retires every request it accepted (the kernel answers each, a
-    /// pumped backend delivers each when stepped, a finish under way returns), so the wait ends.
-    /// A step that fails has lost the means to retire them, and ends the process (22.11): close
-    /// can neither wait on nor return while the backend may still own its requests' buffers.
+    /// retired. On a pumped backend it steps while the backend delivers, and once the backend
+    /// holds nothing it parks until a change to the word (a retirement, a request a callback
+    /// counts meanwhile) or the backend's next request wakes it (`IO::try_step`); on any other it
+    /// parks. Every backend retires every request it accepted (the kernel answers each, a pumped
+    /// backend delivers each when stepped, a finish under way returns), so the wait ends. A step
+    /// that fails has lost the means to retire them, and ends the process (22.11): close can
+    /// neither wait on nor return while the backend may still own its requests' buffers.
     pub(super) fn drain(&self, io: &dyn IO) {
         // Close waits: never on a ring's delivery thread, the one that would deliver what it waits
         // for (DESIGN.md 22.5).
@@ -114,34 +114,20 @@ impl Requests {
         // SeqCst: a change the read below misses reads the mark.
         self.word.fetch_or(CLOSING, Ordering::SeqCst);
         let pumped = io.delivery() == Delivery::Pumped;
-        loop {
-            let word = self.word.load(Ordering::SeqCst);
-            let outstanding = outstanding_in(word);
-            if outstanding == 0 {
-                break;
-            }
-            if pumped && outstanding > left_in(word) {
-                if io.step().is_err() {
-                    crate::io::stepping_failed("a database's close");
-                }
-            } else {
+        let ready = crate::io::unparking(me.clone());
+        while outstanding_in(self.word.load(Ordering::SeqCst)) > 0 {
+            if !pumped {
                 crate::storage::atoll::park::thread();
+                continue;
+            }
+            match io.try_step(&ready) {
+                Err(_) => crate::io::stepping_failed("a database's close"),
+                Ok(Stepped::Delivered) => {}
+                Ok(Stepped::Unsaid) => crate::thread::yield_now(),
+                Ok(Stepped::Empty) => crate::storage::atoll::park::thread(),
             }
         }
         self.word.fetch_and(!CLOSING, Ordering::SeqCst);
-    }
-}
-
-impl crate::io::OwnershipWatch for Requests {
-    fn finisher_left(&self) {
-        self.changed(self.word.fetch_add(LEFT, Ordering::AcqRel));
-    }
-
-    fn retired(&self, told: bool) {
-        let drop = if told { ONE + LEFT } else { ONE };
-        let was = self.word.fetch_sub(drop, Ordering::AcqRel);
-        assert!(outstanding_in(was) > 0, "a request uncounted twice");
-        self.changed(was);
     }
 }
 
@@ -203,6 +189,10 @@ impl IO for Counted {
 
     fn step(&self) -> Result<()> {
         self.io.step()
+    }
+
+    fn try_step(&self, ready: &std::task::Waker) -> Result<Stepped> {
+        self.io.try_step(ready)
     }
 
     fn delivery(&self) -> crate::io::Delivery {

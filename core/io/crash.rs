@@ -76,6 +76,9 @@ struct State {
     file_work_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     /// Run as each step begins: an error it returns is the step's, which then delivers nothing.
     step_hook: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    /// The waiters that found nothing to deliver ([`IO::try_step`]), each once, woken by the next
+    /// submission.
+    ready: Vec<std::task::Waker>,
 }
 
 crate::thread::thread_local! {
@@ -192,6 +195,7 @@ impl CrashIO {
                 file_work_in_callbacks: Vec::new(),
                 file_work_hook: None,
                 step_hook: None,
+                ready: Vec::new(),
             })),
         }
     }
@@ -341,11 +345,12 @@ fn image(state: &State, seed: u64) -> CrashIO {
 
 impl CrashIO {
     /// Completes one operation in flight, chosen at random. Callbacks run with no lock held.
-    fn complete_one(&self) {
+    /// Delivers one operation in flight, chosen at random; whether there was one.
+    fn complete_one(&self) -> bool {
         let (op, outcome) = {
             let mut state = self.state.lock();
             if state.in_flight.is_empty() {
-                return;
+                return false;
             }
             let count = state.in_flight.len();
             let at = state.rng.below(count);
@@ -372,6 +377,7 @@ impl CrashIO {
         let outer = DELIVERING.with(|d| d.replace(true));
         op.completion.deliver(outcome);
         DELIVERING.with(|d| d.set(outer));
+        true
     }
 
     fn submit(
@@ -395,6 +401,11 @@ impl CrashIO {
             kind,
             completion: completion.clone(),
         });
+        let ready = std::mem::take(&mut state.ready);
+        drop(state);
+        for waiter in ready {
+            waiter.wake();
+        }
         completion
     }
 }
@@ -755,6 +766,32 @@ impl IO for CrashIO {
         }
         self.complete_one();
         Ok(())
+    }
+
+    /// Looks for an operation in flight under the lock a submission takes, and registers `ready`
+    /// there if there is none, so a submission after the look wakes it. One found, it is
+    /// delivered as `step` delivers; one another stepper took first is progress all the same.
+    fn try_step(&self, ready: &std::task::Waker) -> Result<super::Stepped> {
+        let hook = self.state.lock().step_hook.clone();
+        if let Some(hook) = hook {
+            hook()?;
+        }
+        // Cloned before the lock is taken and dropped after it is let go, if it was not kept.
+        let mut waiter = Some(ready.clone());
+        let empty = {
+            let mut state = self.state.lock();
+            let empty = state.in_flight.is_empty();
+            if empty && !state.ready.iter().any(|w| w.will_wake(ready)) {
+                state.ready.extend(waiter.take());
+            }
+            empty
+        };
+        drop(waiter);
+        if empty {
+            return Ok(super::Stepped::Empty);
+        }
+        self.complete_one();
+        Ok(super::Stepped::Delivered)
     }
 
     fn file_id(&self, path: &str) -> Result<FileId> {

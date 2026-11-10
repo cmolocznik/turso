@@ -317,15 +317,25 @@ fn close_parks_on_the_ring_until_its_last_request_retires() {
     assert_eq!(ring.steps(), 0, "close stepped the ring");
 }
 
+/// Where the cancellation of close's request is paused.
+#[derive(Clone, Copy, Debug)]
+enum Paused {
+    /// In its callback, before the callback submits a request of its own.
+    InCallback,
+    /// Inside that submission, the request counted and not yet the backend's (the auditor's
+    /// #4177).
+    CountedNotQueued,
+}
+
 /// Close on a pumped backend that has let a request go while a cancellation, paused on another
-/// thread, still runs its callback: close parks, stepping nothing, as only that finish can retire
-/// it; a request submitted meanwhile wakes it and it steps that one; the callback, resumed,
-/// submits a request of its own, which close steps too; close returns once all retired (audit
-/// chain-fixes-v1, P2-CF1; mutants: close stepping until the finish lands spends the pause on
-/// empty steps; close parking whatever the backend holds, or not woken by a submission, never
-/// steps the new requests).
-#[test]
-fn close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submits() {
+/// thread, still runs its callback: close looks once, finds the backend empty and parks, however
+/// many requests are counted; a request submitted meanwhile wakes it and it steps that one; the
+/// callback, resumed, submits a request of its own (or finishes submitting the one it counted),
+/// which close steps too; close returns once all retired (audit chain-fixes-v1, P2-CF1, and the
+/// auditor's #4177; mutants: close stepping an empty backend spends the pause on empty steps;
+/// close parking whatever the backend holds, or not woken by a submission, never steps the new
+/// requests).
+fn close_parks_on_an_empty_backend_and_steps_what_is_submitted(paused: Paused) {
     use std::sync::mpsc;
     use std::time::Duration;
     const BOUND: Duration = Duration::from_secs(20);
@@ -336,13 +346,18 @@ fn close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submit
     let (entered_tx, entered_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let go_rx = Mutex::new(go_rx);
+    let pause: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        go_rx.lock().recv().unwrap();
+    });
     let child = Arc::new(Mutex::new(None::<Completion>));
     let c = {
-        let (file, child) = (file.clone(), child.clone());
+        let (file, child, pause) = (file.clone(), child.clone(), pause.clone());
         Completion::new_sync(move |res| {
             if res.is_err() {
-                entered_tx.send(()).unwrap();
-                go_rx.lock().recv().unwrap();
+                if let Paused::InCallback = paused {
+                    pause();
+                }
                 let next = file
                     .pwrite(
                         0,
@@ -357,14 +372,23 @@ fn close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submit
     let c = file.sync(c, crate::io::FileSyncType::Fsync).unwrap();
     let cancel = {
         let c = c.clone();
-        std::thread::spawn(move || c.abort())
+        std::thread::spawn(move || {
+            if let Paused::CountedNotQueued = paused {
+                crate::race::at("requests.counted", move || pause());
+            }
+            c.abort()
+        })
     };
     entered_rx
         .recv_timeout(BOUND)
-        .expect("the cancellation entered the callback");
+        .expect("the cancellation reached its pause");
     crash.step().unwrap();
-    assert!(c.left_its_backend() && c.is_owned());
-    assert_eq!(requests.outstanding(), 1);
+    assert!(crash.in_flight() == 0 && c.is_owned());
+    let counted = match paused {
+        Paused::InCallback => 1,
+        Paused::CountedNotQueued => 2,
+    };
+    assert_eq!(requests.outstanding(), counted, "{paused:?}: counted");
     let (started_tx, started_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let closer = {
@@ -405,32 +429,38 @@ fn close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submit
     let child = child.lock().take();
     assert_eq!(
         mid,
-        (0, false),
-        "(steps, returned) while the finish was paused"
+        (1, false),
+        "{paused:?}: (looks, returned) while the finish was paused"
     );
     assert!(
         stepped_for_it,
-        "close did not step a request submitted while it waited"
+        "{paused:?}: close did not step a request submitted while it waited"
     );
     assert!(
         !other.is_owned(),
-        "the request submitted while close waited"
+        "{paused:?}: the request submitted while close waited"
     );
     assert!(
         ended,
-        "close did not return once every request could retire"
+        "{paused:?}: close did not return once every request could retire"
     );
     let child = child.expect("the callback submitted its request");
     assert!(
         child.finished() && !child.is_owned(),
-        "the callback's request"
+        "{paused:?}: the callback's request"
     );
-    assert!(!c.is_owned(), "the cancelled request");
+    assert!(!c.is_owned(), "{paused:?}: the cancelled request");
     assert_eq!(requests.outstanding(), 0);
-    assert!(
-        stepping.steps() > 0,
-        "close never stepped the callback's request"
-    );
+}
+
+#[test]
+fn close_parks_while_only_a_finish_elsewhere_can_retire_and_steps_what_it_submits() {
+    close_parks_on_an_empty_backend_and_steps_what_is_submitted(Paused::InCallback);
+}
+
+#[test]
+fn close_parks_while_a_counted_request_is_not_yet_submitted_and_steps_it_once_it_is() {
+    close_parks_on_an_empty_backend_and_steps_what_is_submitted(Paused::CountedNotQueued);
 }
 
 struct AuditGroupFile(Arc<dyn File>);

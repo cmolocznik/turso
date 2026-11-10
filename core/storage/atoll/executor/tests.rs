@@ -2076,6 +2076,121 @@ mod native {
         );
     }
 
+    /// A runner cancelled after a link chose it, before the link's drain woke it, hands the wake
+    /// to another idle runner while the work is queued (22.3; the auditor's P1-EX-H1; mutant: a
+    /// cancel that frees the node and hands nothing on).
+    #[test]
+    fn a_runner_cancelled_after_a_link_chose_it_hands_its_wake_to_another() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let chosen = Arc::new(Lock::new(Some(ex.runner())));
+        let other = ex.runner();
+        let (chosen_wakes, other_wakes) =
+            (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let rested = [
+            chosen
+                .lock()
+                .as_ref()
+                .unwrap()
+                .run_one(&std::task::Waker::from(Arc::new(Counts(
+                    chosen_wakes.clone(),
+                )))),
+            other.run_one(&std::task::Waker::from(Arc::new(Counts(
+                other_wakes.clone(),
+            )))),
+        ];
+        {
+            let chosen = chosen.clone();
+            crate::race::at("executor.draining", move || {
+                let gone = chosen.lock().take();
+                drop(gone);
+            });
+        }
+        ex.spawn(Class::Due, recorded("t", 0, &log));
+        let woken = (chosen_wakes.load(O::Acquire), other_wakes.load(O::Acquire));
+        let ran = other.run_one(std::task::Waker::noop());
+        drop(other);
+        ex.close();
+        assert_eq!(rested, [false, false]);
+        assert_eq!(
+            woken,
+            (0, 1),
+            "(cancelled, live) wakes once the cancel let go of its own"
+        );
+        assert!(ran);
+    }
+
+    /// A runner woken by a link and dropped before it acted, the work still queued, hands its
+    /// wake to another idle runner (22.3; the auditor's P1-EX-H1, the drop after the wake;
+    /// mutant: the handoff gone).
+    #[test]
+    fn a_runner_woken_and_dropped_before_it_acted_hands_its_wake_on() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let woken_one = ex.runner();
+        let other = ex.runner();
+        let (first_wakes, other_wakes) =
+            (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let rested = [
+            woken_one.run_one(&std::task::Waker::from(Arc::new(Counts(
+                first_wakes.clone(),
+            )))),
+            other.run_one(&std::task::Waker::from(Arc::new(Counts(
+                other_wakes.clone(),
+            )))),
+        ];
+        ex.spawn(Class::Due, recorded("t", 0, &log));
+        let first = (first_wakes.load(O::Acquire), other_wakes.load(O::Acquire));
+        drop(woken_one);
+        let handed = other_wakes.load(O::Acquire);
+        let ran = other.run_one(std::task::Waker::noop());
+        drop(other);
+        ex.close();
+        assert_eq!(rested, [false, false]);
+        assert_eq!(first, (1, 0), "the link woke the first idle runner");
+        assert_eq!(handed, 1, "the wake left with the dropped runner");
+        assert!(ran);
+    }
+
+    /// Enters the executor when woken.
+    struct EntersWhenWoken(&'static Executor);
+
+    impl std::task::Wake for EntersWhenWoken {
+        fn wake(self: Arc<Self>) {
+            self.0.run_one();
+        }
+    }
+
+    /// A cooperative wait invokes its host's waker as a drain does, inside: a host entering the
+    /// executor from that wake ends the process rather than running a second unit in the poll
+    /// (22.7; the auditor's P2-E9-F1, the self-wake's re-entry; mutant: the wake invoked outside).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_host_entering_from_the_polls_own_wake_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_host_entering_from_the_polls_own_wake_ends_the_process"
+            ),
+            || {
+                use std::future::Future;
+                // Never dropped: nothing of Atoll's drops while a panic unwinds.
+                let ex: &'static Executor = Box::leak(Box::new(executor(0)));
+                let c = Completion::new_wait();
+                let (task, _) = finishes_after(2, &c);
+                ex.spawn(Class::Due, task);
+                let wait = Box::leak(Box::new(ex.wait_async(c)));
+                // SAFETY: leaked, the wait never moves again.
+                let wait = unsafe { std::pin::Pin::new_unchecked(wait) };
+                let waker = std::task::Waker::from(Arc::new(EntersWhenWoken(ex)));
+                let mut cx = std::task::Context::from_waker(&waker);
+                // A step leaves the task queued: the poll asks its host for another.
+                let _ = wait.poll(&mut cx);
+            },
+        );
+        ended_refused(ended);
+    }
+
     /// Steps once: enters the executor through `runner`.
     struct EntersAgain {
         runner: Arc<Lock<Option<Runner>>>,
@@ -2247,6 +2362,38 @@ mod loom_tests {
             notifier.join().unwrap();
             assert_eq!(h.state.load(Ordering::Acquire), QUEUED);
             assert_eq!(links(&shared, &h), 1);
+        });
+    }
+
+    /// Two idle external runners, one cancelled racing a link: whichever comes first, the live
+    /// runner's host is woken for the queued work (22.3; the auditor's P1-EX-H1; mutant: a cancel
+    /// that hands nothing on).
+    #[test]
+    fn a_cancel_racing_a_link_leaves_the_live_runner_woken() {
+        use loom::sync::atomic::AtomicUsize;
+        loom::model(|| {
+            let ex = Arc::new(Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap());
+            let (cancelled, live) = (ex.runner(), ex.runner());
+            let units = Arc::new(AtomicUsize::new(0));
+            let (cancelled_wakes, live_wakes) =
+                (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let rested = !cancelled
+                .run_one(&std::task::Waker::from(Arc::new(Wakes(cancelled_wakes))))
+                && !live.run_one(&std::task::Waker::from(Arc::new(Wakes(live_wakes.clone()))));
+            let producer = {
+                let (ex, units) = (ex.clone(), units.clone());
+                thread::spawn(move || {
+                    ex.spawn(Class::Due, Box::new(Count(units)));
+                })
+            };
+            let cancel = thread::spawn(move || drop(cancelled));
+            producer.join().unwrap();
+            cancel.join().unwrap();
+            let woken = live_wakes.load(Ordering::Relaxed);
+            drop(live);
+            Arc::try_unwrap(ex).ok().unwrap().close();
+            assert!(rested);
+            assert!(woken > 0, "the live runner left asleep with work queued");
         });
     }
 

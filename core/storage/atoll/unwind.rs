@@ -466,6 +466,11 @@ mod tests {
             "child",
         ),
         (
+            "executor/tests.rs",
+            "a_host_entering_from_the_polls_own_wake_ends_the_process",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",

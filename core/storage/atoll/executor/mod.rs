@@ -473,11 +473,23 @@ impl Queue {
         self.nodes[n].on = On::Nowhere;
     }
 
-    /// Gives node `n` back: off its list, its slot free; what it held, to drop after the mutex.
-    fn remove_node(&mut self, n: usize) -> Option<Node> {
+    /// Gives node `n` back: off its list, its slot free. A node that was not idle may carry a
+    /// wake a link gave it (chosen for the to-wake list, or woken and not yet acted on): with work
+    /// still queued, that wake goes on to another idle runner, so a runner leaving never strands
+    /// the work it was woken for (the auditor's P1-EX-H1). What the node held, to drop after the
+    /// mutex, and how many external nodes the handoff moved, for the caller to drain after it.
+    fn remove_node(&mut self, n: usize) -> (Option<Node>, usize) {
+        let woken = self.nodes[n].on != On::Idle;
         self.unlist(n);
         self.free.push(n);
-        self.nodes[n].node.take()
+        let node = self.nodes[n].node.take();
+        let queued = self.lists.iter().any(|list| !list.is_empty());
+        let moved = if woken && queued && !self.closing {
+            self.wake_one_idle()
+        } else {
+            0
+        };
+        (node, moved)
     }
 
     /// Node `n` among the idle runners, at the tail, unless it is on a list already.
@@ -652,8 +664,9 @@ impl Shared {
             // Woken, or spuriously: its node goes, so a link wakes another runner.
             lock(&self.queue).unlist(node);
         }
-        let gone = lock(&self.queue).remove_node(node);
+        let (gone, moved) = lock(&self.queue).remove_node(node);
         drop(gone);
+        self.drain(moved);
         if registered {
             self.io.withdraw(place.key());
         }
@@ -885,8 +898,9 @@ fn work(shared: &Arc<Shared>) {
         // Woken by the backend, or spuriously: its node goes, so a link wakes another runner.
         lock(&shared.queue).unlist(node);
     }
-    let gone = lock(&shared.queue).remove_node(node);
+    let (gone, moved) = lock(&shared.queue).remove_node(node);
     drop(gone);
+    shared.drain(moved);
     if registered {
         shared.io.withdraw(place.key());
     }
@@ -1032,6 +1046,9 @@ impl std::future::Future for Wait<'_> {
             || delivered
             || (stepped && runner.rest_or_queued(cx.waker()));
         if again {
+            // Invoked as a drain invokes a waker: a host entering the executor from it is
+            // refused (22.7).
+            let _inside = Inside::enter();
             cx.waker().wake_by_ref();
         }
         std::task::Poll::Pending
@@ -1049,8 +1066,9 @@ impl Drop for Wait<'_> {
 impl Drop for Runner {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        let gone = lock(&self.shared.queue).remove_node(self.node);
+        let (gone, moved) = lock(&self.shared.queue).remove_node(self.node);
         drop(gone);
+        self.shared.drain(moved);
     }
 }
 

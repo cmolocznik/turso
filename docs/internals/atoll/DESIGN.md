@@ -5339,7 +5339,11 @@ compose, the real `Completion`, latch and backends included where named.
    be polled again while work is queued, and gives its node and its backend registration back the
    moment it is ready, however long its owner keeps it, so no later link wakes it in place of a
    live waiter (the auditor's P1-E9-R1); its poll is an entry, a panic of its host's waker ending
-   the process (P2-E9-F1), and the ring's delivery thread is refused a blocking one (P2-E9-D1). The lists are deques given room for every task and every
+   the process, and it invokes that waker inside, as a drain does, so a host entering from it is
+   refused (P2-E9-F1); the ring's delivery thread is refused a blocking one (P2-E9-D1). A runner
+   leaving after a link chose or woke it, work still queued (a cancel, a wait's let-go, a
+   waiter's or a worker's end), hands that wake to another idle runner, one and only with work
+   queued, so no runner sleeps with work its leaving predecessor was woken for (P1-EX-H1). The lists are deques given room for every task and every
    node when each is created, so no link or move allocates (counted: 3,072 steps and 2,304
    external wakes, none allocating); intrusive links wait for a measured need. Threshold signals: a signal's
    least threshold wanted, lowered under its mutex and fenced by the task before it computes the

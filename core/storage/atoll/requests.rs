@@ -114,14 +114,15 @@ impl Requests {
         // SeqCst: a change the read below misses reads the mark.
         self.word.fetch_or(CLOSING, Ordering::SeqCst);
         let pumped = io.delivery() == Delivery::Pumped;
-        let (key, ready) = (crate::io::ReadyKey::new(), crate::io::unparking(me.clone()));
+        let place = crate::io::ReadyPlace::default();
+        let ready = crate::io::unparking(me.clone());
         let mut registered = false;
         while outstanding_in(self.word.load(Ordering::SeqCst)) > 0 {
             if !pumped {
                 crate::storage::atoll::park::thread();
                 continue;
             }
-            match io.try_step(key, &ready) {
+            match io.try_step(place.key(), &ready) {
                 Err(_) => crate::io::stepping_failed("a database's close"),
                 Ok(Stepped::Delivered) => {}
                 // Refused at open (`refuse_a_backend_that_would_poll`).
@@ -135,7 +136,7 @@ impl Requests {
             }
         }
         if registered {
-            io.withdraw(key);
+            io.withdraw(place.key());
         }
         self.word.fetch_and(!CLOSING, Ordering::SeqCst);
     }

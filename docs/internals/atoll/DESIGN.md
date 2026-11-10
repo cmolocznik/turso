@@ -4570,12 +4570,16 @@ submission takes every registration and wakes it; a waiter whose wait ends other
 own back by its key (`IO::withdraw`): a wait for a result or for a retirement, an async wait
 ready or dropped, close's drain and a worker leaving each withdraw as they end, so a backend
 holds registrations only for waits under way (the auditor's P2-X69-2), and two waits sharing one
-waker, two futures of one task, each take back only theirs (#4204). An async wait takes one step
-per poll: after a delivery it asks for another poll while unfinished, and on `Empty`, registered
-with the backend as with what it waits on, it returns and is polled again when either wakes it
-(the auditor's P2-E1b-A1); its key is its completion future's own, the address of that
-future's pinned key, so the wait adds no word (a minted key is odd, an address even). A group's members are published once, as it is built and before its builder's token
-goes (that release may finish the group, and what its end runs may walk it), and every walk reads
+waker, two futures of one task, each take back only theirs (#4204). A key is the address of
+something its waiter owns and keeps in place while its registration may stand, and withdraws
+before it goes: a blocking wait's, a drain's, close's or a worker's place (`ReadyPlace`), or an
+async wait's completion future's pinned key. Two live waiters never share an address, an address
+used again belongs to a waiter whose predecessor withdrew, and no key is minted, so none runs out
+(the auditor's P2-E1c-K1). An async wait takes one step per poll: after a delivery it asks for
+another poll while unfinished, and on `Empty`, registered with the backend as with what it waits
+on, it returns and is polled again when either wakes it (the auditor's P2-E1b-A1); its key being
+its future's own, the wait adds no word. A group's members are published once, as it is built
+and before its builder's token goes (that release may finish the group, and what its end runs may walk it), and every walk reads
 them with no lock: a request a walk upgrades may be the last handle to it, and its drop may run a
 callback's captures that walk the group again (the auditor's P1-GW1). A pumped wait steps while
 the backend delivers and parks on
@@ -5317,7 +5321,9 @@ compose, the real `Completion`, latch and backends included where named.
    a wait names only a later one of its own executor (a wait or a named claim naming another
    executor's task is refused before any mutex, the auditor's P2-E4-O1), a trigger's level with
    the counter-checked clear; dropping the
-   executor closes it, and jobs are dropped after the table's mutex; named claims (22.7), a queued
+   executor closes it, and jobs are dropped after the table's mutex; a task owned by its job
+   between steps and moved out by its runner for one, stepped holding no executor mutex (the
+   auditor's P2-E4-W1); named claims (22.7), a queued
    task unlinked, an idle one claimed straight to running, a running one left; runner nodes, a
    worker's thread or an embedder runner's waker, the to-wake list, and each operation's drain
    bounded by the nodes its own links moved, so no external runner's waker is invoked under an

@@ -12,7 +12,7 @@
 //! and `DONE` are compare-exchanges. A wake while a step runs sets `NOTIFIED`, and the step's end
 //! then requeues the task instead of resting it, so no wake is lost and none doubles the task.
 
-use self::sync::{lock, AtomicBool, AtomicU8, Mutex, Ordering};
+use self::sync::{lock, AtomicBool, AtomicPtr, AtomicU8, Mutex, Ordering};
 use crate::io::{Completion, Delivery, Stepped, IO};
 use crate::Result;
 use std::collections::VecDeque;
@@ -21,7 +21,7 @@ use std::sync::{Arc, Weak};
 #[cfg(not(atoll_loom))]
 mod sync {
     pub(super) use crate::storage::atoll::locks::{Mutex, MutexGuard};
-    pub(super) use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    pub(super) use crate::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
     pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         m.lock()
     }
@@ -29,7 +29,7 @@ mod sync {
 
 #[cfg(atoll_loom)]
 mod sync {
-    pub(super) use loom::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    pub(super) use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
     pub(super) use loom::sync::{Mutex, MutexGuard};
     pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         m.lock().unwrap()
@@ -181,9 +181,39 @@ struct Header {
 /// A task's job, held by the executor's table while the task lives.
 struct Job {
     header: Arc<Header>,
-    task: Mutex<Box<dyn Task>>,
+    /// The task, owned here between steps and by its runner during one: the runner that moved
+    /// the task to `RUNNING` takes it out and puts it back before the step's end publishes the
+    /// next state, so it steps it holding no executor mutex (22.2) and no lock guards the task.
+    task: AtomicPtr<Box<dyn Task>>,
     /// The signals it may watch, which take it off their lists when it goes.
     watches: Vec<Arc<Signal>>,
+}
+
+impl Job {
+    /// The task, out of the job for its runner's step.
+    fn take_task(&self) -> Box<Box<dyn Task>> {
+        let held = self.task.swap(std::ptr::null_mut(), Ordering::Acquire);
+        assert!(!held.is_null(), "a task taken by two runners");
+        // SAFETY: a non-null pointer here came from `Box::into_raw` at the spawn or at a step's
+        // put-back, and the swap made this runner its only holder.
+        unsafe { Box::from_raw(held) }
+    }
+
+    /// The task back in the job, before the step's end publishes the next state.
+    fn put_task(&self, task: Box<Box<dyn Task>>) {
+        self.task.store(Box::into_raw(task), Ordering::Release);
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        let held = self.task.swap(std::ptr::null_mut(), Ordering::Acquire);
+        if !held.is_null() {
+            // SAFETY: as in `take_task`; the job's last handle is gone, so no runner holds it.
+            drop(unsafe { Box::from_raw(held) });
+        }
+    }
 }
 
 impl std::task::Wake for Header {
@@ -535,10 +565,12 @@ impl Shared {
             header: &header,
             shared: self,
         };
+        let mut task = job.take_task();
         let step = {
             let _inside = Inside::enter();
-            lock(&job.task).step(&cx)
+            task.step(&cx)
         };
+        job.put_task(task);
         let moved = self.end(&header, &job, step);
         self.drain(moved);
     }
@@ -708,7 +740,8 @@ impl Shared {
 fn work(shared: &Arc<Shared>) {
     let pumped = shared.io.delivery() == Delivery::Pumped;
     let me = crate::thread::current();
-    let (key, ready) = (crate::io::ReadyKey::new(), crate::io::unparking(me.clone()));
+    let place = crate::io::ReadyPlace::default();
+    let ready = crate::io::unparking(me.clone());
     let mut registered = false;
     let node = lock(&shared.queue).add_node(Node::Thread(me.clone()));
     loop {
@@ -717,7 +750,7 @@ fn work(shared: &Arc<Shared>) {
         }
         let stepped = shared.run_one();
         if pumped {
-            match shared.io.try_step(key, &ready) {
+            match shared.io.try_step(place.key(), &ready) {
                 Err(_) => crate::io::stepping_failed("an executor's worker"),
                 Ok(Stepped::Delivered) => continue,
                 // Refused at creation, as Atoll refuses it at open.
@@ -751,7 +784,7 @@ fn work(shared: &Arc<Shared>) {
     let gone = lock(&shared.queue).remove_node(node);
     drop(gone);
     if registered {
-        shared.io.withdraw(key);
+        shared.io.withdraw(place.key());
     }
 }
 
@@ -954,7 +987,7 @@ impl Executor {
                 shared: Arc::downgrade(&self.shared),
                 job: job.clone(),
             }),
-            task: Mutex::new(task),
+            task: AtomicPtr::new(Box::into_raw(Box::new(task))),
             watches: watches.iter().map(|s| (*s).clone()).collect(),
         });
         let header = job.header.clone();

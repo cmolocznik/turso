@@ -208,6 +208,33 @@ fn a_pumped_async_wait_requests_another_poll_until_its_request_finishes() {
     panic!("the async wait did not finish within four polls");
 }
 
+/// A blocking waiter's key is the address of the place it keeps: two places live at once are two
+/// keys, so each registers and withdraws its own (DESIGN.md 22.5; the auditor's P2-E1c-K1;
+/// mutant: every place under one key).
+#[test]
+fn every_live_place_is_a_key_of_its_own() {
+    let backend = CrashIO::new(1);
+    let (one, two) = (ReadyPlace::default(), ReadyPlace::default());
+    let waker = unparking(crate::thread::current());
+    let steps = [
+        backend.try_step(one.key(), &waker).unwrap(),
+        backend.try_step(two.key(), &waker).unwrap(),
+        backend.try_step(one.key(), &waker).unwrap(),
+    ];
+    let both = backend.registered();
+    backend.withdraw(one.key());
+    let left = backend.registered();
+    backend.withdraw(two.key());
+    assert_eq!(steps, [Stepped::Empty; 3]);
+    assert_ne!(one.key(), two.key());
+    assert_eq!(
+        both, 2,
+        "one registration per place, however often it looks"
+    );
+    assert_eq!(left, 1, "the other place's registration kept");
+    assert_eq!(backend.registered(), 0);
+}
+
 /// Counts the wakes of an async wait's host.
 struct HostWakes(AtomicUsize);
 

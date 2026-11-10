@@ -1117,10 +1117,9 @@ mod native {
 
         /// Whether every mutex it watches is free now.
         fn all_free(&self) -> bool {
-            let queue = self
-                .shared
-                .upgrade()
-                .is_none_or(|shared| shared.queue.try_lock().is_some());
+            let queue = self.shared.upgrade().is_none_or(|shared| {
+                shared.queue.try_lock().is_some() && shared.jobs.try_lock().is_some()
+            });
             let listed = self.signal.as_ref().is_none_or(|s| s.listed_free());
             queue && listed
         }
@@ -1333,6 +1332,54 @@ mod native {
         assert!(stepped && !registered);
         assert_eq!((woken.0, woken.1), (1, 1), "woken once, after both mutexes");
         assert!(ran && done, "the runner stepped the task the notify queued");
+    }
+
+    /// Steps once: syncs a file of a backend that delivers inline, whose completion carries the
+    /// probe's waker, registered before the submission, so the sync's finish wakes it inside the
+    /// step.
+    struct SyncsInline {
+        file: Arc<dyn crate::io::File>,
+        probe: Option<Arc<Probe>>,
+    }
+
+    impl Task for SyncsInline {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let c = Completion::new_sync(|_| {});
+            if let Some(probe) = self.probe.take() {
+                c.set_waker(&std::task::Waker::from(probe));
+            }
+            // Finished at its submission: the probe counts the wake its finish made.
+            drop(self.file.sync(c, FileSyncType::Fsync)?);
+            Ok(Step::Done)
+        }
+    }
+
+    /// A step holds no executor mutex: a request's waker its unit's inline submission invokes
+    /// runs with the queue's and the table's mutexes free, and the task is held by no lock (22.2;
+    /// the auditor's P2-E4-W1; mutant: the step taken under the table's mutex).
+    #[test]
+    fn a_waker_a_step_invokes_runs_with_every_executor_mutex_free() {
+        let memory = Arc::new(crate::io::MemoryIO::new());
+        let file = memory.open_file("/db/f", OpenFlags::Create, false).unwrap();
+        let ex = Executor::new(memory, 0).unwrap();
+        let probe = Probe::new(&ex, None);
+        ex.spawn(
+            Class::Due,
+            Box::new(SyncsInline {
+                file,
+                probe: Some(probe.clone()),
+            }),
+        );
+        let stepped = ex.run_one();
+        let woken = probe.counts();
+        ex.close();
+        drop(probe);
+        assert!(stepped);
+        assert_eq!(
+            (woken.0, woken.1),
+            (1, 1),
+            "woken once, with every executor mutex free"
+        );
     }
 
     /// Steps once: enters the executor through `runner`.

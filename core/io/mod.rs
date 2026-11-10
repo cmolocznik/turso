@@ -692,34 +692,35 @@ pub enum Stepped {
     Unsaid,
 }
 
-/// A waiter's key for its registration with a pumped backend (DESIGN.md 22.5), held by no other
-/// waiter while its registration may stand. A backend keeps one registration per key, with the
-/// last waker given, and a waiter takes back exactly its own by its key: two futures of one task
-/// share the task's waker, and each withdraws only what it registered. A key is either minted,
-/// odd and never given twice in a process, or the even address of a pinned future's own key,
-/// which that future withdraws before its place is reused, so the two never meet.
+/// A waiter's key for its registration with a pumped backend (DESIGN.md 22.5): the address of
+/// something the waiter owns and keeps in place while its registration may stand, a blocking
+/// wait's [`ReadyPlace`] or a pinned future's own completion key. A backend keeps one
+/// registration per key, with the last waker given, and a waiter takes back exactly its own by its
+/// key before that place goes: two live waiters never share an address, and an address used again
+/// belongs to a waiter whose predecessor has withdrawn. Two futures of one task share the task's
+/// waker, and each withdraws only what it registered. No key is minted, so none runs out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ReadyKey(std::num::NonZeroUsize);
 
 impl ReadyKey {
-    pub fn new() -> Self {
-        // A count, not a synchronization: only its uniqueness is read.
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-        let key = NEXT.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        Self(std::num::NonZeroUsize::new(key).expect("registration keys exhausted"))
-    }
-
-    /// The key of a pinned future, from the address of its own completion key: even, as an
-    /// aligned address is.
+    /// The key of a pinned future, the address of its own completion key.
     pub(crate) fn of_place(key: crate::io::WakerKey) -> Self {
-        assert!(key.get() % 2 == 0, "a future's key at an odd address");
         Self(key)
     }
 }
 
-impl Default for ReadyKey {
-    fn default() -> Self {
-        Self::new()
+/// What a blocking waiter keeps in place, unmoved, for as long as its registration with a pumped
+/// backend may stand, withdrawing it before the place goes: its address is the waiter's key.
+#[derive(Default)]
+pub struct ReadyPlace {
+    /// A byte, so that two places alive at once never share an address.
+    _byte: u8,
+}
+
+impl ReadyPlace {
+    pub fn key(&self) -> ReadyKey {
+        let at = std::ptr::from_ref(self) as usize;
+        ReadyKey(std::num::NonZeroUsize::new(at).expect("a place at address zero"))
     }
 }
 
@@ -860,10 +861,10 @@ pub trait IO: Clock + Send + Sync {
             c.block_on();
             return;
         }
-        let (key, ready) = (ReadyKey::new(), unparking(crate::thread::current()));
+        let (place, ready) = (ReadyPlace::default(), unparking(crate::thread::current()));
         let mut registered = false;
         while !c.finished() {
-            match self.try_step(key, &ready) {
+            match self.try_step(place.key(), &ready) {
                 Err(_) => stepping_failed("a wait for a completion"),
                 Ok(Stepped::Delivered) => {}
                 // What `c` waits on may be another thread's to submit or finish.
@@ -879,7 +880,7 @@ pub trait IO: Clock + Send + Sync {
             }
         }
         if registered {
-            self.withdraw(key);
+            self.withdraw(place.key());
         }
     }
 
@@ -907,15 +908,16 @@ pub trait IO: Clock + Send + Sync {
         refuse_on_delivery_thread("a wait for retirement");
         let pumped = self.delivery() == Delivery::Pumped;
         // One waker for the whole drain, taken back from the backend when the drain ends.
-        let ready = pumped.then(|| (ReadyKey::new(), unparking(crate::thread::current())));
+        let place = ReadyPlace::default();
+        let ready = pumped.then(|| unparking(crate::thread::current()));
         let mut registered = false;
         let mut seen = std::collections::HashSet::new();
         for c in completions {
             for request in c.requests(&mut seen) {
-                if let Some((key, ready)) = &ready {
+                if let Some(ready) = &ready {
                     let mut observed = false;
                     while request.is_owned() {
-                        match self.try_step(*key, ready) {
+                        match self.try_step(place.key(), ready) {
                             Err(_) => stepping_failed("a wait for retirement"),
                             Ok(Stepped::Delivered) => {}
                             Ok(Stepped::Unsaid) => crate::thread::yield_now(),
@@ -944,8 +946,8 @@ pub trait IO: Clock + Send + Sync {
                 }
             }
         }
-        if let (true, Some((key, _))) = (registered, &ready) {
-            self.withdraw(*key);
+        if registered {
+            self.withdraw(place.key());
         }
         Ok(())
     }

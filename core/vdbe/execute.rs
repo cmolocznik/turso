@@ -12405,7 +12405,8 @@ pub fn op_function(
                 FtsFunc::Score
                 | FtsFunc::Match
                 | FtsFunc::FilteredScore
-                | FtsFunc::FilteredPopulation => {
+                | FtsFunc::FilteredPopulation
+                | FtsFunc::Segments => {
                     return Err(LimboError::InternalError(
                         "unplanned FTS function reached execution".to_string(),
                     )

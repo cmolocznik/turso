@@ -1519,6 +1519,17 @@ the population it counted for a population query of the same filter on the same 
 Field norms are Tantivy's (exact to 40 tokens, then quantized): the oracle quantizes with
 `FieldNormReader::{fieldnorm_to_id, id_to_fieldnorm}`, reachable through the re-exported `tantivy`.
 
+2026-11-11, later still: the cut is exactly the LIMIT, with equal scores ordered by an embedder tie
+key (`tie_field`, a 16-byte BLOB read as a big-endian u128, stored as two u64 fast fields; a
+missing value orders last), or by the rowid where the index has none. A document tied with the
+lowest kept score still reaches the heap (the scorers' threshold sits one f32 step below it) and
+enters only when its key orders before the last kept one. The tie-complete cut is gone: on real
+memories with identical text its rows grew with the population. An inspection report,
+`SELECT fts_segments(cols, ?1) AS report FROM t ORDER BY report DESC LIMIT 1` (tests and the
+`fts_inspect` feature only), lists the visible segments with their document, live and tombstone
+counts and whether a probed term is in each term dictionary, so a test can show an erased
+document's term gone after OPTIMIZE INDEX.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

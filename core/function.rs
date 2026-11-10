@@ -463,6 +463,9 @@ pub enum FtsFunc {
     /// fts_filtered_population(col1, ..., filter): the count (and the sum
     /// column's sum) of the documents a JSON filter admits
     FilteredPopulation,
+    /// fts_segments(col1, ..., probe): an inspection report of the index's
+    /// visible segments (inspection builds only)
+    Segments,
     /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
     /// Wraps matching query terms in the text with before_tag and after_tag markers
     Highlight,
@@ -478,7 +481,11 @@ impl FtsFunc {
         match self {
             Self::Highlight => &[4],
             // Score and Match take variable columns + query
-            Self::Score | Self::Match | Self::FilteredScore | Self::FilteredPopulation => &[-1],
+            Self::Score
+            | Self::Match
+            | Self::FilteredScore
+            | Self::FilteredPopulation
+            | Self::Segments => &[-1],
         }
     }
 }
@@ -491,6 +498,7 @@ impl Display for FtsFunc {
             Self::Match => "fts_match",
             Self::FilteredScore => "fts_filtered_score",
             Self::FilteredPopulation => "fts_filtered_population",
+            Self::Segments => "fts_segments",
             Self::Highlight => "fts_highlight",
         };
         write!(f, "{str}")

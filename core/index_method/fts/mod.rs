@@ -259,6 +259,10 @@ enum ColumnRole {
     /// value, stored as four u64 fast fields so a query sums it over the
     /// documents its filter admits.
     Sum([Field; 4]),
+    /// The tie column (`tie_field`): a 16-byte BLOB read as a big-endian
+    /// u128, stored as two u64 fast fields (high, low). Equal scores are cut
+    /// in its ascending order.
+    Tie([Field; 2]),
 }
 
 /// Most event intervals one document may carry.
@@ -757,6 +761,8 @@ pub struct FtsIndexAttachment {
     interval_field: Option<Field>,
     /// The sum column's four little-endian u64 limbs
     sum_field: Option<[Field; 4]>,
+    /// The tie column's two halves, high then low
+    tie_field: Option<[Field; 2]>,
     /// Every tokenizer name this index uses
     tokenizer_names: Vec<String>,
     /// Parsed query patterns for FTS queries
@@ -791,6 +797,7 @@ pub const SUPPORTED_WITH_KEYS: &[&str] = &[
     "filter_fields",
     "interval_field",
     "sum_field",
+    "tie_field",
 ];
 
 /// Ngram window used when `min_gram`/`max_gram` are not given.
@@ -907,6 +914,17 @@ impl FtsIndexAttachment {
             ));
         }
         let sum_column = sum_columns.into_iter().next();
+        let tie_columns = parse_column_list(
+            parameters.get(UncasedStr::new("tie_field")).copied(),
+            &cfg.columns,
+            "tie_field",
+        )?;
+        if tie_columns.len() > 1 {
+            return Err(LimboError::ParseError(
+                "FTS tie_field names one column".into(),
+            ));
+        }
+        let tie_column = tie_columns.into_iter().next();
         let column_tokenizers = parse_column_tokenizers(
             parameters.get(UncasedStr::new("tokenizers")).copied(),
             &cfg.columns,
@@ -915,7 +933,20 @@ impl FtsIndexAttachment {
             filter_columns.iter().any(|c| c == name)
                 || interval_column.as_deref() == Some(name)
                 || sum_column.as_deref() == Some(name)
+                || tie_column.as_deref() == Some(name)
         };
+        if let Some(name) = &tie_column {
+            if filter_columns.contains(name)
+                || interval_column.as_deref() == Some(name.as_str())
+                || sum_column.as_deref() == Some(name.as_str())
+                || json_columns.contains(name)
+                || column_tokenizers.contains_key(name)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "FTS column '{name}' cannot be both the tie field and another kind of column"
+                )));
+            }
+        }
         if let Some(name) = &sum_column {
             if filter_columns.contains(name)
                 || interval_column.as_deref() == Some(name.as_str())
@@ -1050,6 +1081,7 @@ impl FtsIndexAttachment {
         let mut filter_fields = Vec::new();
         let mut interval_field = None;
         let mut sum_field: Option<[Field; 4]> = None;
+        let mut tie_field: Option<[Field; 2]> = None;
         let mut tokenizer_names: Vec<String> = vec![tokenizer_name.clone()];
         if !json_columns.is_empty() {
             tokenizer_names.push(json_tokenizer.to_string());
@@ -1059,6 +1091,15 @@ impl FtsIndexAttachment {
                 let field = schema_builder.add_i64_field(&col.name, tantivy::schema::FAST);
                 filter_fields.push((col.name.clone(), field));
                 roles.push(ColumnRole::Filter(field));
+                continue;
+            }
+            if tie_column.as_deref() == Some(col.name.as_str()) {
+                let halves = [0, 1].map(|half| {
+                    schema_builder
+                        .add_u64_field(&format!("{}__tie{half}", col.name), tantivy::schema::FAST)
+                });
+                tie_field = Some(halves);
+                roles.push(ColumnRole::Tie(halves));
                 continue;
             }
             if sum_column.as_deref() == Some(col.name.as_str()) {
@@ -1148,6 +1189,12 @@ impl FtsIndexAttachment {
         // Pattern 8: the population a filter admits, one row.
         let filtered_population =
             format!("SELECT fts_filtered_population({cols}, ?1) as population FROM {table} ORDER BY population DESC LIMIT ?");
+        // Pattern 9 (inspection builds only): the visible segments, their
+        // tombstones, and whether a term is in any term dictionary.
+        #[cfg(any(test, feature = "fts_inspect"))]
+        let segments_report = format!(
+            "SELECT fts_segments({cols}, ?1) as report FROM {table} ORDER BY report DESC LIMIT ?"
+        );
         let patterns = parse_patterns(&[
             &score_pattern,          // 0
             &combined_ordered_limit, // 1
@@ -1158,6 +1205,8 @@ impl FtsIndexAttachment {
             &match_pattern,          // 6
             &filtered_score,         // 7
             &filtered_population,    // 8
+            #[cfg(any(test, feature = "fts_inspect"))]
+            &segments_report, // 9
         ])?;
         tokenizer_names.sort();
         tokenizer_names.dedup();
@@ -1172,6 +1221,7 @@ impl FtsIndexAttachment {
             filter_fields,
             interval_field,
             sum_field,
+            tie_field,
             tokenizer_names,
             patterns,
             field_weights,
@@ -1322,6 +1372,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
             || name
                 .as_str()
                 .eq_ignore_ascii_case("fts_filtered_population")
+            || name.as_str().eq_ignore_ascii_case("fts_segments")
         {
             1
         } else if name.as_str().eq_ignore_ascii_case("fts_filtered_score") {
@@ -1385,12 +1436,15 @@ pub(crate) const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
 pub(crate) const FTS_PATTERN_MATCH: i64 = 6;
 pub(crate) const FTS_PATTERN_FILTERED_SCORE: i64 = 7;
 pub(crate) const FTS_PATTERN_FILTERED_POPULATION: i64 = 8;
+pub(crate) const FTS_PATTERN_SEGMENTS: i64 = 9;
 
-/// One hit of a filtered query; ordered by score, then by the earlier
-/// document, so the heap's minimum is the hit a better one displaces.
+/// One hit of a filtered query. A better hit has the higher score, then the
+/// lower tie key, then the earlier document, so the heap's minimum is the
+/// hit a better one displaces.
 #[derive(Debug, Clone, Copy)]
 struct FilteredHit {
     score: f32,
+    key: (u64, u64),
     segment_ord: u32,
     doc: tantivy::DocId,
 }
@@ -1413,7 +1467,35 @@ impl Ord for FilteredHit {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score
             .total_cmp(&other.score)
-            .then((other.segment_ord, other.doc).cmp(&(self.segment_ord, self.doc)))
+            .then((other.key, other.segment_ord, other.doc).cmp(&(
+                self.key,
+                self.segment_ord,
+                self.doc,
+            )))
+    }
+}
+
+/// A segment's tie keys.
+enum TieKeys {
+    Field(Column<u64>, Column<u64>),
+    Rowid(Column<i64>),
+}
+
+impl TieKeys {
+    fn key(&self, doc: tantivy::DocId) -> (u64, u64) {
+        match self {
+            Self::Field(high, low) => match (high.first(doc), low.first(doc)) {
+                (Some(high), Some(low)) => (high, low),
+                _ => (u64::MAX, u64::MAX),
+            },
+            // Ascending i64 order as unsigned: flip the sign bit.
+            Self::Rowid(rowid) => (
+                rowid
+                    .first(doc)
+                    .map_or(u64::MAX, |r| (r as u64) ^ (1 << 63)),
+                0,
+            ),
+        }
     }
 }
 
@@ -1629,6 +1711,8 @@ pub struct FtsCursor {
     interval_field: Option<Field>,
     /// The sum column's four little-endian u64 limbs
     sum_field: Option<[Field; 4]>,
+    /// The tie column's two halves, high then low
+    tie_field: Option<[Field; 2]>,
     /// Every tokenizer name this index uses
     tokenizer_names: Vec<String>,
     /// The user-visible index name, for error messages.
@@ -1732,6 +1816,7 @@ impl FtsCursor {
             filter_fields: attachment.filter_fields.clone(),
             interval_field: attachment.interval_field,
             sum_field: attachment.sum_field,
+            tie_field: attachment.tie_field,
             tokenizer_names: attachment.tokenizer_names.clone(),
             index_name: attachment.cfg.index_name.clone(),
             store,
@@ -1985,17 +2070,18 @@ impl FtsCursor {
                 searcher,
             ))
             .map_err(|e| LimboError::InternalError(format!("FTS query weight error: {e}")))?;
-        // The best `limit` hits in a min-heap, and beside it every hit scoring
-        // exactly the heap's lowest score that did not fit: the cut is
-        // tie-complete, so the embedder orders equal scores by its own key.
-        // The scorers prune below the lowest kept score, never at it.
+        // The best `limit` hits in a min-heap: by score, then the tie key
+        // ascending, so the cut is exactly `limit` rows. The scorers report a
+        // document only above their threshold, so the threshold sits just
+        // below the lowest kept score: a document tied with it still enters
+        // when its key orders before the last kept one.
         let mut best: std::collections::BinaryHeap<std::cmp::Reverse<FilteredHit>> =
             std::collections::BinaryHeap::with_capacity(limit + 1);
-        let mut tied: Vec<FilteredHit> = Vec::new();
         for (segment_ord, (reader, bits)) in readers.iter().zip(&admitted).enumerate() {
             if bits.count() == 0 {
                 continue;
             }
+            let keys = self.tie_keys(reader)?;
             let floor = |best: &std::collections::BinaryHeap<std::cmp::Reverse<FilteredHit>>| {
                 if best.len() == limit {
                     best.peek().map_or(f32::MIN, |hit| hit.0.score.next_down())
@@ -2009,30 +2095,25 @@ impl FtsCursor {
                     if bits.contains(doc) {
                         let hit = FilteredHit {
                             score,
+                            key: keys.key(doc),
                             segment_ord: segment_ord as u32,
                             doc,
                         };
-                        let lowest = best.peek().map(|kept| kept.0.score);
                         if best.len() < limit {
                             best.push(std::cmp::Reverse(hit));
-                        } else if lowest == Some(score) {
-                            tied.push(hit);
-                        } else if lowest.is_some_and(|lowest| score > lowest) {
+                        } else if best.peek().is_some_and(|lowest| hit > lowest.0) {
                             best.push(std::cmp::Reverse(hit));
-                            let out = best.pop().expect("over the limit").0;
-                            let new_lowest = best.peek().map(|kept| kept.0.score);
-                            tied.retain(|t| Some(t.score) == new_lowest);
-                            if Some(out.score) == new_lowest {
-                                tied.push(out);
-                            }
+                            best.pop();
                         }
                     }
                     floor(&best)
                 })
                 .map_err(|e| LimboError::InternalError(format!("FTS search error: {e}")))?;
         }
+        let mut kept: Vec<FilteredHit> = best.into_iter().map(|hit| hit.0).collect();
+        kept.sort_by(|a, b| b.cmp(a));
         self.current_hits.clear();
-        for hit in best.into_iter().map(|hit| hit.0).chain(tied) {
+        for hit in kept {
             let rowid = self.rowid_readers[hit.segment_ord as usize]
                 .first(hit.doc)
                 .ok_or_else(|| {
@@ -2041,12 +2122,27 @@ impl FtsCursor {
             self.current_hits
                 .push((hit.score, DocAddress::new(hit.segment_ord, hit.doc), rowid));
         }
-        self.current_hits.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.2.cmp(&b.2))
-        });
         Ok(!self.current_hits.is_empty())
+    }
+
+    /// The tie key a segment's documents are cut by: the `tie_field` (a
+    /// missing value orders last), else the rowid.
+    fn tie_keys(&self, reader: &SegmentReader) -> Result<TieKeys> {
+        let map =
+            |e: tantivy::TantivyError| LimboError::InternalError(format!("FTS tie column: {e}"));
+        Ok(match self.tie_field {
+            Some([high, low]) => TieKeys::Field(
+                reader
+                    .fast_fields()
+                    .u64(self.schema.get_field_name(high))
+                    .map_err(map)?,
+                reader
+                    .fast_fields()
+                    .u64(self.schema.get_field_name(low))
+                    .map_err(map)?,
+            ),
+            None => TieKeys::Rowid(reader.fast_fields().i64(ROWID_FIELD).map_err(map)?),
+        })
     }
 
     /// The JSON filter over this index's filter columns and `rowid`.
@@ -2219,6 +2315,76 @@ impl FtsCursor {
         }
         let key = (searcher_key(&self.segments), filter_text.to_string());
         *self.shared.population.lock() = Some((key, population));
+    }
+
+    /// `fts_segments(cols, ?1 probe)` (inspection builds only): one row, a
+    /// JSON report of the visible segments with their document, live and
+    /// tombstone counts and, when the probe names `{"field", "term"}`,
+    /// whether the term is in the segment's term dictionary.
+    fn query_segments(&mut self, values: &[Register]) -> Result<bool> {
+        let probe = match values.get(1).map(Register::get_value) {
+            Some(Value::Text(text)) => text.as_str().to_string(),
+            _ => {
+                return Err(LimboError::InvalidArgument(
+                    "FTS probe must be JSON text".into(),
+                ))
+            }
+        };
+        let probe: serde_json::Value = serde_json::from_str(&probe)
+            .map_err(|e| LimboError::InvalidArgument(format!("FTS probe: {e}")))?;
+        let term = match (probe.get("field"), probe.get("term")) {
+            (Some(field), Some(term)) => {
+                let (field, term) = (
+                    field.as_str().unwrap_or_default(),
+                    term.as_str().unwrap_or_default(),
+                );
+                let field = self
+                    .indexed_fields
+                    .iter()
+                    .find(|(col, _)| col.name.eq_ignore_ascii_case(field))
+                    .map(|(_, field)| *field)
+                    .ok_or_else(|| {
+                        LimboError::InvalidArgument(format!(
+                            "FTS probe: no searched column {field}"
+                        ))
+                    })?;
+                Some(Term::from_field_text(field, term))
+            }
+            _ => None,
+        };
+        let searcher = self
+            .searcher
+            .as_ref()
+            .expect("FTS searcher initialized by query_start");
+        let mut segments = Vec::new();
+        for reader in searcher.segment_readers() {
+            let mut entry = serde_json::json!({
+                "id": reader.segment_id().uuid_string(),
+                "max_doc": reader.max_doc(),
+                "live": reader.num_docs(),
+                "tombstones": reader.max_doc() - reader.num_docs(),
+            });
+            if let Some(term) = &term {
+                let present = reader
+                    .inverted_index(term.field())
+                    .map_err(|e| LimboError::InternalError(format!("FTS probe: {e}")))?
+                    .terms()
+                    .term_ord(term.serialized_value_bytes())
+                    .map_err(|e| LimboError::InternalError(format!("FTS probe: {e}")))?
+                    .is_some();
+                entry["term"] = serde_json::Value::Bool(present);
+            }
+            segments.push(entry);
+        }
+        self.population_row = Some(
+            serde_json::json!({ "segments": segments })
+                .to_string()
+                .into_bytes(),
+        );
+        self.current_hits.clear();
+        self.current_hits.push((0.0, DocAddress::new(0, 0), 0));
+        self.hit_pos = 0;
+        Ok(true)
     }
 
     /// `fts_filtered_population(cols, ?1 filter)`: one row, a BLOB of the
@@ -3970,6 +4136,34 @@ impl IndexMethodCursor for FtsCursor {
                     }
                     continue;
                 }
+                ColumnRole::Tie(halves) => {
+                    match reg.get_value() {
+                        Value::Blob(bytes) => {
+                            let bytes: &[u8] = bytes.as_ref();
+                            if bytes.len() != 16 {
+                                return Err(LimboError::Constraint(format!(
+                                    "FTS tie column must hold 16 bytes, got {}",
+                                    bytes.len()
+                                ))
+                                .into());
+                            }
+                            for (field, half) in halves.iter().zip(bytes.chunks_exact(8)) {
+                                doc.add_u64(
+                                    *field,
+                                    u64::from_be_bytes(half.try_into().expect("8 bytes")),
+                                );
+                            }
+                        }
+                        Value::Null => {}
+                        _ => {
+                            return Err(LimboError::Constraint(
+                                "FTS tie column must hold a 16-byte BLOB or NULL".into(),
+                            )
+                            .into())
+                        }
+                    }
+                    continue;
+                }
                 ColumnRole::Sum(limbs) => {
                     match reg.get_value() {
                         Value::Blob(bytes) => {
@@ -4123,6 +4317,9 @@ impl IndexMethodCursor for FtsCursor {
         }
         if pattern_idx == FTS_PATTERN_FILTERED_POPULATION {
             return Ok(IOResult::Done(self.query_population(values)?));
+        }
+        if pattern_idx == FTS_PATTERN_SEGMENTS {
+            return Ok(IOResult::Done(self.query_segments(values)?));
         }
 
         // Determine the optional SQL LIMIT captured by the selected pattern.
@@ -4390,6 +4587,16 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Returns the column value for the current result (score or match indicator).
     fn query_column(&mut self, idx: usize) -> IOResultOr<Value> {
+        if self.current_pattern == FTS_PATTERN_SEGMENTS {
+            return match (&self.population_row, idx) {
+                (Some(row), 0) if self.hit_pos == 0 => Ok(IOResult::Done(Value::build_text(
+                    String::from_utf8(row.clone()).expect("the report is JSON text"),
+                ))),
+                _ => {
+                    Err(LimboError::InternalError("FTS: report column out of bounds".into()).into())
+                }
+            };
+        }
         if self.current_pattern == FTS_PATTERN_FILTERED_POPULATION {
             return match (&self.population_row, idx) {
                 (Some(row), 0) if self.hit_pos == 0 => {

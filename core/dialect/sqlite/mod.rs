@@ -534,6 +534,8 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         "fts_filtered_population" => Ok(Some(Func::Fts(FtsFunc::FilteredPopulation))),
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        "fts_segments" => Ok(Some(Func::Fts(FtsFunc::Segments))),
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         "fts_highlight" => Ok(Some(Func::Fts(FtsFunc::Highlight))),
         // Test type functions (for custom type system testing)
         "test_uint_encode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEncode))),

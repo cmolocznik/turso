@@ -2179,7 +2179,7 @@ fn translate_function_call_expr(
             2,
         ),
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-        Func::Fts(FtsFunc::FilteredPopulation) => translate_fts_score(
+        Func::Fts(FtsFunc::FilteredPopulation | FtsFunc::Segments) => translate_fts_score(
             program,
             referenced_tables,
             args,

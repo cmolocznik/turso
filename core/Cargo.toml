@@ -57,6 +57,8 @@ test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
 fts = ["dep:tantivy", "dep:tantivy-common", "dep:serde", "dep:serde_json", "dep:crc32fast"]
+# The FTS inspection report (`fts_segments`), for tests and evaluation builds.
+fts_inspect = ["fts"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]

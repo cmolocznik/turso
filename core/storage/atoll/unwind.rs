@@ -491,6 +491,11 @@ mod tests {
             "child",
         ),
         (
+            "executor/tests.rs",
+            "a_task_entering_the_executor_from_its_abandonment_ends_the_process",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",

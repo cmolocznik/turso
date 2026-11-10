@@ -8,6 +8,7 @@ mod native {
     use crate::io::crash::CrashIO;
     use crate::io::{FileSyncType, OpenFlags};
     use crate::storage::atoll::locks::Mutex as Lock;
+    use crate::storage::atoll::requests::{Counted, Requests};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as O};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -2348,6 +2349,446 @@ mod native {
         ended_in_a_frame(ended, "a task's destructor panicked");
     }
 
+    /// What happened to whom, in order.
+    type Events = Arc<Lock<Vec<(&'static str, &'static str)>>>;
+
+    /// Waits on `waits` if it has one, else is done; records its step, its abandonment (with the
+    /// thread and whether inside) and its drop.
+    struct Abandons {
+        name: &'static str,
+        waits: Option<Completion>,
+        events: Events,
+        abandoned_on: Arc<Lock<Vec<(std::thread::ThreadId, bool)>>>,
+    }
+
+    impl Task for Abandons {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            self.events.lock().push((self.name, "stepped"));
+            Ok(match &self.waits {
+                Some(c) => Step::Wait(c.clone()),
+                None => Step::Done,
+            })
+        }
+
+        fn abandon(&mut self) {
+            self.events.lock().push((self.name, "abandoned"));
+            self.abandoned_on
+                .lock()
+                .push((std::thread::current().id(), Inside::here()));
+        }
+    }
+
+    impl Drop for Abandons {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            self.events.lock().push((self.name, "dropped"));
+        }
+    }
+
+    fn abandons(
+        name: &'static str,
+        waits: Option<&Completion>,
+        events: &Events,
+        abandoned_on: &Arc<Lock<Vec<(std::thread::ThreadId, bool)>>>,
+    ) -> Box<dyn Task> {
+        Box::new(Abandons {
+            name,
+            waits: waits.cloned(),
+            events: events.clone(),
+            abandoned_on: abandoned_on.clone(),
+        })
+    }
+
+    /// The events of `name`, in order.
+    fn of(events: &Events, name: &str) -> Vec<&'static str> {
+        events
+            .lock()
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|(_, e)| *e)
+            .collect()
+    }
+
+    /// Close gives up the logical waits of every task it closes, once each, on the closing
+    /// thread, after every step and inside, before it drops the task: a queued task and an idle
+    /// one alike, and none for a task already done, whose job is gone (22.12 step 3; mutants: no
+    /// abandonment; the abandonment outside).
+    #[test]
+    fn close_gives_up_each_closed_tasks_waits_once_on_the_closing_thread() {
+        let ex = executor(0);
+        let (events, on) = (Events::default(), Arc::new(Lock::new(Vec::new())));
+        let never = Completion::new_wait();
+        ex.spawn(Class::Due, abandons("idle", Some(&never), &events, &on));
+        ex.spawn(Class::Due, abandons("done", None, &events, &on));
+        assert!(ex.run_one() && ex.run_one());
+        ex.spawn(Class::Due, abandons("queued", None, &events, &on));
+        let closer = std::thread::spawn(move || {
+            ex.close();
+            std::thread::current().id()
+        });
+        let closer = closer.join().unwrap();
+        // Read out before any assertion: none panics holding a lock of Atoll's (22.11).
+        let on = on.lock().clone();
+        assert_eq!(of(&events, "idle"), ["stepped", "abandoned", "dropped"]);
+        assert_eq!(of(&events, "done"), ["stepped", "dropped"]);
+        assert_eq!(of(&events, "queued"), ["abandoned", "dropped"]);
+        assert_eq!(on, [(closer, true), (closer, true)]);
+    }
+
+    /// Close waits for the logs' durable end while every job still runs: without workers it runs
+    /// them itself until the end is durable, and only then closes them (22.12 step 1; mutant:
+    /// closing published before the wait).
+    #[test]
+    fn close_waits_for_the_durable_end_while_every_job_still_runs() {
+        let ex = executor(0);
+        let durable = Completion::new_wait();
+        let (task, ran_on) = finishes_after(3, &durable);
+        ex.spawn(Class::Due, task);
+        let closed = ex.close_after(&durable, &Requests::default());
+        assert!(closed.is_ok(), "{closed:?}");
+        let steps = ran_on.lock().len();
+        assert!(durable.succeeded(), "closed before the end was durable");
+        assert_eq!(steps, 4);
+    }
+
+    /// A durable end that failed is returned, after close gave up every task's waits, waited for
+    /// every counted request to retire and dropped every job, in that order (22.12; mutants: a
+    /// failure returned at once; no wait for the requests; the requests waited for after the
+    /// jobs are dropped).
+    #[test]
+    fn a_failed_durable_end_is_returned_after_every_later_step_of_close() {
+        let requests = Arc::new(Requests::default());
+        let crash = Arc::new(CrashIO::new(1));
+        let io: Arc<dyn IO> = Arc::new(Counted::new(crash.clone(), requests.clone()));
+        let ex = Executor::new(io.clone(), 0).unwrap();
+        let (events, on) = (Events::default(), Arc::new(Lock::new(Vec::new())));
+        let never = Completion::new_wait();
+        ex.spawn(Class::Due, abandons("idle", Some(&never), &events, &on));
+        assert!(ex.run_one());
+        let file = io.open_file("/close/r", OpenFlags::Create, false).unwrap();
+        let read = {
+            let events = events.clone();
+            Completion::new_read(Arc::new(crate::io::Buffer::new_temporary(512)), move |_| {
+                events.lock().push(("request", "finished"));
+                None
+            })
+        };
+        let read = file.pread(0, read).unwrap();
+        assert_eq!((requests.outstanding(), crash.in_flight()), (1, 1));
+        let durable = Completion::new_wait();
+        durable.error(crate::CompletionError::Aborted);
+        let closed = ex.close_after(&durable, &requests);
+        events.lock().push(("close", "returned"));
+        let events = events.lock().clone();
+        assert!(
+            matches!(
+                closed,
+                Err(crate::LimboError::CompletionError(
+                    crate::CompletionError::Aborted
+                ))
+            ),
+            "{closed:?}"
+        );
+        assert_eq!(
+            events,
+            [
+                ("idle", "stepped"),
+                ("idle", "abandoned"),
+                ("request", "finished"),
+                ("idle", "dropped"),
+                ("close", "returned"),
+            ]
+        );
+        assert!(read.finished());
+        assert_eq!((requests.outstanding(), crash.in_flight()), (0, 0));
+    }
+
+    /// Waits on a completion nothing finishes; at close, enters the executor through `runner`.
+    struct EntersOnAbandon {
+        runner: Option<Runner>,
+        never: Completion,
+    }
+
+    impl Task for EntersOnAbandon {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            Ok(Step::Wait(self.never.clone()))
+        }
+
+        fn abandon(&mut self) {
+            if let Some(runner) = &self.runner {
+                runner.run_one(std::task::Waker::noop());
+            }
+        }
+    }
+
+    /// A task's abandonment runs inside: one entering the executor from it ends the process
+    /// (22.7, 22.12 step 3; mutant: the abandonment outside).
+    #[test]
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn a_task_entering_the_executor_from_its_abandonment_ends_the_process() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_task_entering_the_executor_from_its_abandonment_ends_the_process"
+            ),
+            || {
+                let ex = executor(0);
+                ex.spawn(
+                    Class::Due,
+                    Box::new(EntersOnAbandon {
+                        runner: Some(ex.runner()),
+                        never: Completion::new_wait(),
+                    }),
+                );
+                ex.run_one();
+                ex.close();
+            },
+        );
+        ended_refused(ended);
+    }
+
+    /// Rests watching `signal`, its condition never met; records its steps, an abandonment and
+    /// its drop.
+    struct WatchesUntilRemoved {
+        name: &'static str,
+        signal: Arc<Signal>,
+        events: Events,
+    }
+
+    impl Task for WatchesUntilRemoved {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            self.events.lock().push((self.name, "stepped"));
+            let read = self.signal.read();
+            Ok(Step::Idle(Watched::of(&[(&self.signal, read)])))
+        }
+
+        fn abandon(&mut self) {
+            self.events.lock().push((self.name, "abandoned"));
+        }
+    }
+
+    impl Drop for WatchesUntilRemoved {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            self.events.lock().push((self.name, "dropped"));
+        }
+    }
+
+    fn watches_until_removed(
+        ex: &Executor,
+        name: &'static str,
+        signal: &Arc<Signal>,
+        events: &Events,
+    ) -> TaskRef {
+        ex.spawn_watching(
+            Class::Due,
+            Box::new(WatchesUntilRemoved {
+                name,
+                signal: signal.clone(),
+                events: events.clone(),
+            }),
+            &[signal],
+        )
+    }
+
+    /// A task removed while queued or idle is closed, unlinked, off its signal and out of the
+    /// table, its job dropped by the remover at once: no runner claims it, a notify wakes nothing,
+    /// a second removal does nothing, and close gives up nothing of it (22.3; mutant: a queued
+    /// task left linked).
+    #[test]
+    fn a_task_removed_queued_or_idle_lets_its_job_go_at_once() {
+        let ex = executor(0);
+        let events = Events::default();
+        let signal = Arc::new(Signal::default());
+        let idle = watches_until_removed(&ex, "idle", &signal, &events);
+        assert!(ex.run_one());
+        let queued = watches_until_removed(&ex, "queued", &signal, &events);
+        let before = (signal.listed(), signal.declared());
+        idle.remove();
+        queued.remove();
+        let after = (signal.listed(), signal.declared());
+        let (tasks, linked) = {
+            let queue = lock(&ex.shared.queue);
+            (
+                queue.tasks,
+                queue
+                    .lists
+                    .iter()
+                    .map(std::collections::VecDeque::len)
+                    .sum::<usize>(),
+            )
+        };
+        let jobs = lock(&ex.shared.jobs).len();
+        // No claim of a removed task left linked, which would fail the claim's own check; every
+        // assertion after close, so a failing one drops no executor while it unwinds.
+        let claimed = linked == 0 && {
+            signal.notify();
+            ex.run_one()
+        };
+        idle.remove();
+        ex.close();
+        assert_eq!(linked, 0, "a removed task left linked");
+        assert_eq!(before, (1, 2));
+        assert_eq!(after, (0, 0), "(listed, declared) once both are removed");
+        assert_eq!((tasks, jobs), (0, 0));
+        assert!(!claimed, "a removed task claimed");
+        assert_eq!(of(&events, "idle"), ["stepped", "dropped"]);
+        assert_eq!(of(&events, "queued"), ["dropped"]);
+    }
+
+    /// A task removed while its runner steps it, after its step registered it on a signal and
+    /// before the end's rest: the end finds it closed and lets its job go, off the signal it had
+    /// just been listed on (22.3; mutant: an end that finds it closed and leaves the job).
+    #[test]
+    fn a_task_removed_while_its_step_ends_lets_its_job_go_from_that_end() {
+        let ex = executor(0);
+        let events = Events::default();
+        let signal = Arc::new(Signal::default());
+        let task = watches_until_removed(&ex, "running", &signal, &events);
+        {
+            let task = task.clone();
+            crate::race::at("executor.registered", move || task.remove());
+        }
+        let claimed = ex.run_one();
+        let after = (signal.listed(), signal.declared());
+        let tasks = lock(&ex.shared.queue).tasks;
+        let jobs = lock(&ex.shared.jobs).len();
+        let claimed_again = ex.run_one();
+        ex.close();
+        assert!(claimed && !claimed_again);
+        assert_eq!(after, (0, 0), "(listed, declared) after the end");
+        assert_eq!((tasks, jobs), (0, 0));
+        assert_eq!(of(&events, "running"), ["stepped", "dropped"]);
+    }
+
+    /// A task removed from inside its own step lets its job go as that step ends (22.3).
+    #[test]
+    fn a_task_removing_itself_in_its_step_goes_as_the_step_ends() {
+        struct RemovesItself {
+            me: Arc<Lock<Option<TaskRef>>>,
+            events: Events,
+        }
+        impl Task for RemovesItself {
+            fn step(&mut self, _cx: &Cx) -> Result<Step> {
+                if let Some(me) = self.me.lock().take() {
+                    me.remove();
+                }
+                self.events.lock().push(("self", "stepped"));
+                Ok(Step::Again)
+            }
+        }
+        impl Drop for RemovesItself {
+            fn drop(&mut self) {
+                crate::storage::atoll::unwind::abort_if_unwinding();
+                self.events.lock().push(("self", "dropped"));
+            }
+        }
+        let ex = executor(0);
+        let events = Events::default();
+        let me = Arc::new(Lock::new(None));
+        let task = ex.spawn(
+            Class::Due,
+            Box::new(RemovesItself {
+                me: me.clone(),
+                events: events.clone(),
+            }),
+        );
+        *me.lock() = Some(task);
+        let claims = [ex.run_one(), ex.run_one()];
+        let left = (lock(&ex.shared.queue).tasks, lock(&ex.shared.jobs).len());
+        ex.close();
+        assert_eq!(claims, [true, false], "a removed task queued again");
+        assert_eq!(left, (0, 0));
+        assert_eq!(of(&events, "self"), ["stepped", "dropped"]);
+    }
+
+    /// Steps once, held mid-step until `go`; then waits on a completion nothing finishes.
+    struct HeldMidStep {
+        go: Option<mpsc::Receiver<()>>,
+        started: mpsc::Sender<()>,
+        events: Events,
+    }
+
+    impl Task for HeldMidStep {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            if let Some(go) = self.go.take() {
+                self.started.send(()).unwrap();
+                go.recv().unwrap();
+            }
+            self.events.lock().push(("held", "stepped"));
+            Ok(Step::Wait(Completion::new_wait()))
+        }
+
+        fn abandon(&mut self) {
+            self.events.lock().push(("held", "abandoned"));
+        }
+    }
+
+    impl Drop for HeldMidStep {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            self.events.lock().push(("held", "dropped"));
+        }
+    }
+
+    /// A task an external runner is stepping when close begins: its step's end finds it closed
+    /// and leaves it to close, which gives up its waits after the step and drops it (22.12 step 3;
+    /// mutant: the end letting the job go itself, as for a removal).
+    #[test]
+    fn a_task_running_when_close_begins_is_given_up_by_close() {
+        const BOUND: Duration = Duration::from_secs(20);
+        let ex = executor(0);
+        let events = Events::default();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        ex.spawn(
+            Class::Due,
+            Box::new(HeldMidStep {
+                go: Some(go_rx),
+                started: started_tx,
+                events: events.clone(),
+            }),
+        );
+        let runner = ex.runner();
+        let stepper = std::thread::spawn(move || runner.run_one(std::task::Waker::noop()));
+        started_rx.recv_timeout(BOUND).expect("the step began");
+        let shared = ex.shared.clone();
+        let closer = std::thread::spawn(move || ex.close());
+        let start = std::time::Instant::now();
+        while !shared.closed.load(O::Acquire) {
+            assert!(start.elapsed() < BOUND, "close never published closing");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        go_tx.send(()).unwrap();
+        assert!(stepper.join().unwrap());
+        closer.join().unwrap();
+        assert_eq!(of(&events, "held"), ["stepped", "abandoned", "dropped"]);
+    }
+
+    /// A waiting task removed gives back the ticket its logical wait held on the job it waited
+    /// on, which falls back to its own class (22.3, 22.4; mutant: the wait not ended).
+    #[test]
+    fn a_waiting_task_removed_gives_back_its_ticket_on_the_job_it_waited_on() {
+        let ex = executor(0);
+        let log = Arc::new(Lock::new(Vec::new()));
+        let job = ex.spawn_ranked(Class::Maintenance, 4, recorded("job", 0, &log), &[]);
+        let waiting = ex.spawn_ranked(
+            Class::Due,
+            2,
+            Box::new(WaitsOnJob {
+                on: Some(job.clone()),
+                log: log.clone(),
+            }),
+            &[],
+        );
+        assert!(ex.run_one());
+        let carried = job.class();
+        waiting.remove();
+        let after = job.class();
+        ex.close();
+        assert_eq!((carried, after), (Class::Due, Class::Maintenance));
+    }
+
     /// Steps once: enters the executor through `runner`.
     struct EntersAgain {
         runner: Arc<Lock<Option<Runner>>>,
@@ -2660,6 +3101,63 @@ mod loom_tests {
                 (true, true),
                 "the task wanting 5 left waiting: wanted {wanted:?}, {listed} listed"
             );
+        });
+    }
+
+    /// Rests watching `signal`; counts its drops.
+    struct RestsWatching {
+        signal: Arc<Signal>,
+        drops: Arc<loom::sync::atomic::AtomicUsize>,
+    }
+
+    impl Task for RestsWatching {
+        fn step(&mut self, _cx: &Cx) -> Result<Step> {
+            let read = self.signal.read();
+            Ok(Step::Idle(Watched::of(&[(&self.signal, read)])))
+        }
+    }
+
+    impl Drop for RestsWatching {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A removal racing a step's end: whichever sees the other, the job goes once, off the
+    /// signal, out of the table, and nothing is left listed (22.3; mutant: the remover letting
+    /// the job go while a runner steps it, so the end lists it after it left).
+    #[test]
+    fn a_removal_racing_a_steps_end_lets_the_job_go_once() {
+        use loom::sync::atomic::AtomicUsize;
+        loom::model(|| {
+            let ex = Arc::new(Executor::new(Arc::new(crate::io::MemoryIO::new()), 0).unwrap());
+            let signal = Arc::new(Signal::default());
+            let drops = Arc::new(AtomicUsize::new(0));
+            let task = ex.spawn_watching(
+                Class::Due,
+                Box::new(RestsWatching {
+                    signal: signal.clone(),
+                    drops: drops.clone(),
+                }),
+                &[&signal],
+            );
+            let remover = {
+                let task = task.clone();
+                thread::spawn(move || task.remove())
+            };
+            let claimed = ex.run_one();
+            remover.join().unwrap();
+            let left = (
+                signal.listed(),
+                signal.declared(),
+                lock(&ex.shared.queue).tasks,
+                lock(&ex.shared.jobs).len(),
+                drops.load(Ordering::Relaxed),
+            );
+            Arc::try_unwrap(ex).ok().unwrap().close();
+            drop(task);
+            assert_eq!(left, (0, 0, 0, 0, 1), "claimed {claimed}");
         });
     }
 

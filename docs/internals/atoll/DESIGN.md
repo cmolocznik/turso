@@ -5353,9 +5353,18 @@ compose, the real `Completion`, latch and backends included where named.
    least threshold wanted, lowered under its mutex and fenced by the task before it computes the
    value, fenced and loaded by a producer after its publication, reset by a notify in the same
    hold of the mutex as the count's move, so a task whose look read the moved count wants after
-   the reset and no notify erases its want (P1-E11-T1). Not built yet:
-   the jobs' logical waits made executor completions (with the jobs, 22.16
-   steps 7 to 10), close's five phases, removal with a subject beyond a task's own end.)
+   the reset and no notify erases its want (P1-E11-T1). Close in 22.12's order
+   (`Executor::close_after`): the logs' durable end waited for while every job still runs,
+   closing published and every step ended, each closed task's logical waits given up once on
+   the closing thread, after every step and inside (`Task::abandon`), every request Atoll counts
+   retired, every job dropped, and a failed durable end returned after the last; a plain drop
+   gives the waits up as well. Removal with a subject (`TaskRef::remove`): the task closed under
+   the queue's mutex and unlinked if queued, then off its signals, its logical wait given back
+   and out of the table, by the remover, or, when a runner was stepping it, by that step's end,
+   whichever exchange of the state word comes second; whoever takes the table's entry lets the
+   job go, once, and a task close closed is left to close, which gives up its waits. Not built
+   yet: the jobs' logical waits made executor completions (with the jobs, 22.16 steps 7 to 10),
+   the database's close on `close_after` (with them).)
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run
    against step 4's, and the profile again.

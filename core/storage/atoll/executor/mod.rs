@@ -13,6 +13,7 @@
 //! then requeues the task instead of resting it, so no wake is lost and none doubles the task.
 
 use self::sync::{lock, AtomicBool, AtomicPtr, AtomicU8, Mutex, Ordering};
+use super::requests::Requests;
 use crate::io::{Completion, Delivery, Stepped, IO};
 use crate::Result;
 use std::collections::VecDeque;
@@ -61,6 +62,11 @@ pub(crate) enum Step {
 /// progress lives in its own state, which only the step touches.
 pub(crate) trait Task: Send {
     fn step(&mut self, cx: &Cx) -> Result<Step>;
+
+    /// Gives up what the task waits for of other jobs' work, the executor closing (22.12 step
+    /// 3): once, on the closing thread, every step ended and outside any, before close waits for
+    /// any request. A task waiting on no other job's work has nothing to give up.
+    fn abandon(&mut self) {}
 }
 
 /// What a step may ask of the executor about its own task.
@@ -202,6 +208,20 @@ impl Job {
     /// The task back in the job, before the step's end publishes the next state.
     fn put_task(&self, task: Box<Box<dyn Task>>) {
         self.task.store(Box::into_raw(task), Ordering::Release);
+    }
+
+    /// Its task's logical waits given up at close (22.12 step 3). A task out of its job is the
+    /// one whose own step is closing the executor: that step ends it, and nothing more is done
+    /// for it (22.12 step 5).
+    fn abandon(&self) {
+        let held = self.task.swap(std::ptr::null_mut(), Ordering::Acquire);
+        if held.is_null() {
+            return;
+        }
+        // SAFETY: as in `take_task`; the swap made this thread its only holder.
+        let mut task = unsafe { Box::from_raw(held) };
+        task.abandon();
+        self.put_task(task);
     }
 }
 
@@ -706,8 +726,8 @@ impl Shared {
             }
         }
         if header.state.load(Ordering::Acquire) == CLOSED {
-            // Close takes it off every list and drops its job, on this thread too when the step
-            // dropped the executor; it is registered on none and finished by none.
+            // Closed or removed while it ran: registered on none and finished by none.
+            self.release_removed(header);
             return 0;
         }
         match step {
@@ -767,16 +787,22 @@ impl Shared {
             .state
             .compare_exchange(RUNNING, IDLE, Ordering::AcqRel, Ordering::Acquire)
         {
-            Ok(_) | Err(CLOSED) => 0,
+            Ok(_) => 0,
+            Err(CLOSED) => {
+                self.release_removed(header);
+                0
+            }
             Err(_) => self.requeue(header),
         }
     }
 
-    /// Queues a task again at the back of its class, unless the executor closed it; how many
+    /// Queues a task again at the back of its class, unless it was closed or removed; how many
     /// external runners its link moved.
     fn requeue(&self, header: &Arc<Header>) -> usize {
         let mut queue = lock(&self.queue);
         if header.state.load(Ordering::Acquire) == CLOSED {
+            drop(queue);
+            self.release_removed(header);
             return 0;
         }
         // Only this runner moves the task out of running, and close moves it under this mutex;
@@ -832,21 +858,42 @@ impl Shared {
                 Err(now) => state = now,
             }
         }
-        if let Some(job) = header.job.upgrade() {
-            for signal in &job.watches {
-                signal.leave(header);
-            }
+        self.release_closed(header);
+    }
+
+    /// A task its step's end found closed: one removed lets its job go here; one close closed is
+    /// left to close, which gives up its waits before it drops the job (22.12 step 3). A task
+    /// removed before close began and read closed only once it had is left to close too.
+    fn release_removed(&self, header: &Arc<Header>) {
+        if !self.closed.load(Ordering::Acquire) {
+            self.release_closed(header);
         }
+    }
+
+    /// A task done, closed or removed lets its job go: out of the table, off every signal it
+    /// declared, the logical wait it stood in given back and its count gone, then the job
+    /// dropped inside, after every mutex, since its drop may run anything its task holds (22.2,
+    /// 22.3). Whoever takes the table's entry does it, once: a step's end, a removal or close;
+    /// the job's last drop is a step's when one still holds it.
+    fn release_closed(&self, header: &Arc<Header>) {
         let gone = {
             let mut jobs = lock(&self.jobs);
             let at = jobs.iter().position(|job| Arc::ptr_eq(&job.header, header));
             at.map(|at| jobs.swap_remove(at))
         };
-        // After the table's mutex: a job's drop may run anything its task holds (22.2).
-        drop(gone);
-        let mut queue = lock(&self.queue);
-        queue.end_wait(header);
-        queue.tasks -= 1;
+        let Some(job) = gone else {
+            return;
+        };
+        for signal in &job.watches {
+            signal.leave(header);
+        }
+        {
+            let mut queue = lock(&self.queue);
+            queue.end_wait(header);
+            queue.tasks -= 1;
+        }
+        let _inside = Inside::enter();
+        drop(job);
     }
 }
 
@@ -1087,6 +1134,52 @@ impl Drop for Runner {
 pub(crate) struct TaskRef(Arc<Header>);
 
 impl TaskRef {
+    /// Removes the task with its subject (22.3: a log closed, a rollback finished): closed under
+    /// the queue's mutex and unlinked if queued, so no runner claims or links it again, then off
+    /// every signal it declared and out of the table, its job dropped, by this caller, or by the
+    /// runner stepping it as that step ends. Its header goes with the last completion holding its
+    /// waker, and a wake of it does nothing. A task done, closed or removed already, or one whose
+    /// executor is closing, is left to its end or to close.
+    pub(crate) fn remove(&self) {
+        let Some(shared) = self.0.shared.upgrade() else {
+            return;
+        };
+        let ours = {
+            let mut queue = lock(&shared.queue);
+            if queue.closing {
+                return;
+            }
+            // Under the mutex only a step's end moves the task out of running, and only by
+            // compare-exchange: whichever exchange comes second sees the other.
+            let mut state = self.0.state.load(Ordering::Acquire);
+            loop {
+                if state == DONE || state == CLOSED {
+                    return;
+                }
+                match self.0.state.compare_exchange(
+                    state,
+                    CLOSED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(now) => state = now,
+                }
+            }
+            if state == QUEUED {
+                let class = self.0.class.load(Ordering::Relaxed) as usize;
+                let list = &mut queue.lists[class];
+                let at = list.iter().position(|h| Arc::ptr_eq(h, &self.0));
+                list.remove(at.expect("a queued task linked in no list"));
+            }
+            state & RUNNING == 0
+        };
+        // A running task's end lets its job go when it finds the task closed.
+        if ours {
+            shared.release_closed(&self.0);
+        }
+    }
+
     /// Wakes the task, as a completion it waits on would.
     pub(crate) fn wake(&self) {
         wake(&self.0);
@@ -1318,11 +1411,39 @@ impl Executor {
         drop(self);
     }
 
+    /// Closes the executor in 22.12's order: `durable`, the end each open log had when close
+    /// began made durable, waited for while every job still runs (step 1); closing published,
+    /// every step in progress ended and every worker joined (2); each task's logical waits given
+    /// up (3); every request `requests` counts retired (4); every job dropped (5). A `durable`
+    /// that failed ends its wait at once, close goes on through every later step, and the failure
+    /// is logged and returned after the last. Never from inside a step or a waker the executor
+    /// invoked.
+    pub(crate) fn close_after(mut self, durable: &Completion, requests: &Requests) -> Result<()> {
+        self.close_in_order(durable, requests);
+        drop(self);
+        match durable.get_error() {
+            None => Ok(()),
+            Some(e) => {
+                tracing::error!("the logs were not made durable before close: {e}");
+                Err(crate::LimboError::CompletionError(e))
+            }
+        }
+    }
+
+    /// Steps 1 to 5 of close (22.12); dropping the executor afterwards finds nothing left.
+    #[turso_macros::atoll_entry]
+    fn close_in_order(&mut self, durable: &Completion, requests: &Requests) {
+        self.wait(durable);
+        self.shut(Some(requests));
+    }
+
     /// Closes every task, so none is claimed or linked again, wakes the idle workers and joins
     /// them once their steps in progress end, all but the calling thread when a step of its own
-    /// dropped the executor (it leaves once that step ends); then drops every job, after the
-    /// table's mutex.
-    fn shut(&mut self) {
+    /// dropped the executor (it leaves once that step ends); takes every job out of the table,
+    /// gives up each task's logical waits on this thread, waits for every request `requests`
+    /// counts to retire, and drops every job, after the table's mutex. A second close finds
+    /// nothing left to do.
+    fn shut(&mut self, requests: Option<&Requests>) {
         let moved = {
             let mut queue = lock(&self.shared.queue);
             queue.closing = true;
@@ -1372,6 +1493,19 @@ impl Executor {
                 signal.leave(&job.header);
             }
         }
+        // Each task's logical waits given up, every step ended and outside any, so no task waits
+        // for a producer close stopped; inside, so one entering the executor from its
+        // abandonment is refused (22.12 step 3).
+        {
+            let _inside = Inside::enter();
+            for job in &jobs {
+                job.abandon();
+            }
+        }
+        // No request lands on a file once close returns (22.12 step 4).
+        if let Some(requests) = requests {
+            requests.drain(&*self.shared.io);
+        }
         drop(jobs);
     }
 }
@@ -1381,6 +1515,6 @@ impl Drop for Executor {
     /// began, leaves no worker running.
     #[turso_macros::atoll_entry]
     fn drop(&mut self) {
-        self.shut();
+        self.shut(None);
     }
 }

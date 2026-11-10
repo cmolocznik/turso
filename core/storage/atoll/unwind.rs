@@ -106,8 +106,14 @@ mod tests {
         ("pins.rs", "Counted", "a test's count of live values"),
         ("segmented.rs", "Segmented", "frees its own segments"),
         ("stack.rs", "Stack", "frees its own nodes"),
+        ("stack.rs", "Chain", "frees its own nodes"),
         ("stack.rs", "Popped", "frees its own node"),
         ("stack.rs", "FreeList", "frees its own nodes"),
+        (
+            "visits.rs",
+            "Counted",
+            "ends a unit's count of page visits, which guards no state",
+        ),
         (
             "unwind.rs",
             "PanicsOnDrop",
@@ -298,6 +304,11 @@ mod tests {
     /// Tests in Atoll that panic, and how each runs: in a child process when the panic passes a
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
+        (
+            "tests.rs",
+            "a_checkpoint_unit_that_waits_ends_the_process",
+            "child",
+        ),
         (
             "requests/tests.rs",
             "a_step_that_fails_while_close_waits_ends_the_process",

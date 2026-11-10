@@ -139,6 +139,8 @@ pub struct GeneratorConfig {
     pub no_rowid_alias: bool,
     /// Enable MVCC mode (experimental journal mode)
     pub mvcc: bool,
+    /// Create the database in Atoll mode (Atoll's DESIGN.md §17)
+    pub atoll: bool,
 }
 
 impl Default for GeneratorConfig {
@@ -149,6 +151,7 @@ impl Default for GeneratorConfig {
             seed: 42,
             no_rowid_alias: false,
             mvcc: false,
+            atoll: false,
         }
     }
 }
@@ -156,6 +159,7 @@ impl Default for GeneratorConfig {
 /// Generate a database with fake user and product data
 pub async fn generate_database(config: &GeneratorConfig) -> Result<()> {
     let db = Builder::new_local(&config.db_path)
+        .experimental_atoll(config.atoll)
         .build()
         .await
         .with_context(|| format!("failed to create database at '{}'", config.db_path))?;
@@ -1645,6 +1649,7 @@ impl DefaultDatabases {
         seed: u64,
         user_count: usize,
         mvcc: bool,
+        atoll: bool,
     ) -> Result<Option<Self>> {
         if !needs.any() {
             return Ok(None);
@@ -1663,6 +1668,7 @@ impl DefaultDatabases {
                 seed,
                 no_rowid_alias: false,
                 mvcc,
+                atoll,
             };
             generate_database(&config)
                 .await
@@ -1678,6 +1684,7 @@ impl DefaultDatabases {
                 seed,
                 no_rowid_alias: true,
                 mvcc,
+                atoll,
             };
             generate_database(&config)
                 .await
@@ -1715,6 +1722,7 @@ mod tests {
             seed: 42,
             no_rowid_alias: false,
             mvcc: false,
+            atoll: false,
         }
     }
 

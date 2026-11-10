@@ -33,6 +33,8 @@ pub enum TxnMode {
     Immediate,
     /// MVCC journal with `BEGIN CONCURRENT` and passive checkpointing.
     Concurrent,
+    /// Atoll storage, every transaction running beside the others, started with `BEGIN`.
+    Atoll,
 }
 
 impl TxnMode {
@@ -40,6 +42,7 @@ impl TxnMode {
         match self {
             TxnMode::Immediate => "immediate",
             TxnMode::Concurrent => "concurrent",
+            TxnMode::Atoll => "atoll",
         }
     }
 }

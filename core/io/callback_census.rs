@@ -153,6 +153,7 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "new_write",
         "records a temporary page written and hands the result on",
     ),
+    ("storage/atoll/checkpoint.rs", "step", "new_sync", "nothing"),
     (
         "storage/atoll/control.rs",
         "judge",
@@ -249,23 +250,12 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "new_write",
         "finishes the caller's completion with a whole write's result",
     ),
-    (
-        "storage/atoll/store.rs",
-        "erase_freed",
-        "new_sync",
-        "nothing",
-    ),
+    ("storage/atoll/store.rs", "erase_one", "new_sync", "nothing"),
     (
         "storage/atoll/store.rs",
         "read_slot_into",
         "new_read",
         "verifies a page read and hands it to its waiter",
-    ),
-    (
-        "storage/atoll/store.rs",
-        "sync_data_files",
-        "new_sync",
-        "nothing",
     ),
     (
         "storage/atoll/store.rs",

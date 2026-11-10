@@ -62,6 +62,7 @@ mod store;
 mod stream;
 mod txn;
 mod unwind;
+mod visits;
 
 #[cfg(all(test, not(atoll_loom), not(shuttle), not(miri)))]
 mod bench;

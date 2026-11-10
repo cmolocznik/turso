@@ -579,6 +579,52 @@ fn a_batch_holding_a_frame_lent_for_good_is_never_drained() {
     }
 }
 
+/// A cut's walk over the pool goes a run at a time: at most the frame headers one page of the
+/// header table holds per call, then a shard of the swap table, then the swapped pages looked at
+/// again a run at a time, until it says it is done (DESIGN.md 22.9; mutant: the walk over every
+/// frame in one call). Every page owed is found all the same.
+#[test]
+fn a_cuts_walk_over_the_pool_goes_a_run_at_a_time() {
+    let b = &backends()[0];
+    let pool = open(b, MIN_BUDGET);
+    let mut owed = Vec::new();
+    for v in 1..=40u64 {
+        let mut g = drive(&b.io, || pool.allocate(class(0))).unwrap();
+        let pid = g.pid();
+        stamp(&mut g.page_mut(), pid, v);
+        g.changed();
+        owed.push(pid);
+    }
+    let mut scan = CutScan::default();
+    let mut calls = 0;
+    loop {
+        let before = scan.next;
+        let done = match pool.begin_cut(1, &mut scan) {
+            IOResult::Done(done) => done,
+            IOResult::IO(_) => continue,
+        };
+        calls += 1;
+        assert!(
+            (scan.next - before) as usize <= CUT_RUN,
+            "a call walked {} frames",
+            scan.next - before
+        );
+        if done {
+            break;
+        }
+    }
+    pool.end_cut(1);
+    let frames = pool.memory.grains() as usize;
+    assert!(
+        calls > frames.div_ceil(CUT_RUN),
+        "{calls} calls for {frames} frames: the walk was not a run at a time"
+    );
+    let mut found = scan.owed.clone();
+    found.sort();
+    owed.sort();
+    assert_eq!(found, owed, "the pages owed the walk found");
+}
+
 #[test]
 fn temporary_pages_go_to_their_files_and_never_to_a_checkpoint() {
     for b in backends() {
@@ -620,7 +666,7 @@ fn temporary_pages_go_to_their_files_and_never_to_a_checkpoint() {
         g.changed();
         drop(g);
         let mut scan = CutScan::default();
-        assert!(matches!(pool.begin_cut(1, &mut scan), IOResult::Done(())));
+        while !matches!(pool.begin_cut(1, &mut scan), IOResult::Done(true)) {}
         pool.end_cut(1);
         assert_eq!(
             scan.owed,
@@ -1600,6 +1646,10 @@ fn children_read_through_their_directory_are_whole_and_in_the_life_it_names_in_s
 fn checkpoint_meta(io: &Arc<dyn IO>, store: &Arc<PageStore>) {
     let n = store.meta().in_charge() + 1;
     let (dirty, _) = store.begin_cut(n);
+    let dirty: Vec<_> = dirty
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let frames = drive(io, || store.meta().get_all(&dirty)).unwrap();
     for frame in &frames {
         if let Some(c) = store.meta().write_for(frame, n).unwrap() {

@@ -1194,6 +1194,66 @@ fn a_writer_waiting_for_room_behind_a_held_checkpointer_is_woken_when_it_is_let_
     drop(frame);
 }
 
+/// With a thread driving the checkpoints, a writer refused room waits for room given back and for
+/// nothing else: the thread lets the state go after every unit, and a wake at each let-go would
+/// wake the writer only to be refused again (mutant: every let-go wakes the room's waiters). A
+/// writer coming to wait once room has been given back for what was refused starts again at once,
+/// never waiting for a release that has happened (mutant: the room not looked at again once the
+/// wait is taken). A thread attached that never steps stands for the driver, and the test steps
+/// the checkpoint as it would, so nothing steps it behind the test's back.
+#[test]
+fn with_a_thread_driving_a_writer_waiting_for_room_is_woken_by_room_given_back_alone() {
+    let db = Db::memory();
+    let orphan = drive(&db.io, || {
+        Tree::create(db.pool(), SizeClass::new(0).unwrap())
+    })
+    .unwrap();
+    let (tree, _) = db.owed_tree();
+    let frame = db.orphan_leaf(orphan);
+    let hold = frame.try_lock().expect("the leaf is free");
+    let ticket = db.take_cut();
+    db.fill_room(&tree);
+    hold.release_unchanged();
+    let cp = db.db.checkpointer();
+    let parked = std::thread::spawn(std::thread::park);
+    cp.attach_driver(parked.thread().clone());
+    // The highest key's leaf, past every leaf the room filled with.
+    let last = 2 * (KEYS - 1);
+    let mut put = Put::new(&key(last), value(last, 3), Mode::Upsert);
+    let wait = match tree.put(&mut put).unwrap() {
+        IOResult::IO(IOCompletions(c)) => c,
+        IOResult::Done(_) => panic!("a change went in past a full room"),
+    };
+    drop(cp.hold().expect("no one steps the checkpointer"));
+    assert!(
+        !wait.finished(),
+        "the state let go, no room given back, woke the writer"
+    );
+    let txns = db.db.transactions();
+    while !db.pool().room_takes_refused() {
+        if let Some(c) = cp.one_unit(txns).unwrap() {
+            db.io.wait(&c);
+        }
+    }
+    assert_ne!(
+        db.pool().cutting(),
+        0,
+        "the cut ended before the room took the request"
+    );
+    assert!(wait.finished(), "room given back woke no waiter");
+    assert!(
+        matches!(db.pool().wait_for_room().unwrap(), IOResult::Done(())),
+        "a writer came to wait for room given back already"
+    );
+    cp.detach_driver();
+    parked.thread().unpark();
+    parked.join().unwrap();
+    within(&db.io, || tree.put(&mut put));
+    assert_within_room(db.pool(), node_class().size());
+    db.finish(ticket);
+    drop(frame);
+}
+
 /// While a writer waits for room, the checkpoint images the kept copies first: with another
 /// tree's owed pages ahead of them in its queue, the refused writer is let in after no more images
 /// than one round of writes in flight, all of them copies.

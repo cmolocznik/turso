@@ -138,6 +138,7 @@ async fn connection(
     let begin_sql = match mode {
         TxnMode::Immediate => "BEGIN IMMEDIATE",
         TxnMode::Concurrent => "BEGIN CONCURRENT",
+        TxnMode::Atoll => "BEGIN",
     };
     let mut begin_stmt = conn.prepare(begin_sql).await.unwrap();
     let mut commit_stmt = conn.prepare("COMMIT").await.unwrap();
@@ -219,6 +220,7 @@ async fn setup(config: &Config) -> Database {
             builder.experimental_mvcc_passive_checkpoint(true)
         }
         (TxnMode::Concurrent, CheckpointMode::Truncate) | (TxnMode::Immediate, _) => builder,
+        (TxnMode::Atoll, _) => builder.experimental_atoll(true),
     };
     let db = builder.build().await.unwrap();
 

@@ -270,6 +270,20 @@ expect {
     4096
 }
 
+# The temp database's page size is temp's own: setting it before temp exists takes, whether or
+# not main has been written already.
+test pragma-temp-page-size-set-after-main-is-written {
+    CREATE TABLE pagesize_main_t(a);
+    PRAGMA temp.page_size=1024;
+    CREATE TEMP TABLE pagesize_temp_t(a);
+    PRAGMA temp.page_size;
+    PRAGMA main.page_size;
+}
+expect {
+    1024
+    4096
+}
+
 test pragma-temp-freelist-count-matches-sqlite {
     CREATE TEMP TABLE t(a);
     INSERT INTO t SELECT zeroblob(5000) FROM generate_series(1, 10);

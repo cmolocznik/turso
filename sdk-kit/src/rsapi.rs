@@ -407,6 +407,14 @@ impl TursoDatabaseConfig {
         }
         opts
     }
+
+    /// Whether the `"atoll"` experimental feature asks for the database in Atoll mode (Atoll's
+    /// DESIGN.md §17): a new database is created as Atoll's, and one already Atoll's opens so.
+    pub fn atoll(&self) -> bool {
+        self.experimental_features
+            .as_deref()
+            .is_some_and(|f| f.split(',').any(|s| s.trim() == "atoll"))
+    }
 }
 
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
@@ -746,6 +754,8 @@ impl From<LimboError> for TursoError {
             }
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            // A deadlock's victim was rolled back: the caller retries its transaction.
+            err @ LimboError::Deadlock => TursoError::Busy(err.to_string()),
             // Same-connection rejections carry SQLITE_BUSY semantics, but the
             // caller must finish/reset its own statement rather than wait.
             err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),
@@ -1003,6 +1013,30 @@ impl TursoDatabase {
                     let mut open_flags = self.config.open_flags;
                     if opts.enable_multiprocess_wal {
                         open_flags |= OpenFlags::NoLock;
+                    }
+                    if self.config.atoll() {
+                        // Atoll mode keeps its own storage and opens its files itself: no SQLite
+                        // descriptor is opened on the path, whose close would drop the process's
+                        // locks on it. Its open steps its own IO to the end.
+                        if self.config.db_file.is_some() {
+                            return Err(TursoError::Misuse(
+                                "an Atoll database keeps its own storage: db_file cannot be set"
+                                    .to_string(),
+                            ));
+                        }
+                        let options = OpenOptions::new(Arc::new(SqliteDialect))
+                            .flags(open_flags)
+                            .db_opts(opts)
+                            .encryption(self.config.encryption.clone())
+                            .page_codec(self.config.page_codec.clone())
+                            .atoll(turso_core::storage::atoll::sql::mode::config_for(None));
+                        let db = Database::open(io.clone(), &self.config.path, options)?;
+                        // The guard taken at the top of this phase, held while it opened.
+                        drop(inner_db);
+                        *self.db.lock().unwrap() = Some(db);
+                        state.io = Some(io);
+                        state.phase = TursoDatabaseOpenPhase::Done;
+                        return Ok(IOResult::Done(()));
                     }
                     let db_file = if let Some(db_file) = &self.config.db_file {
                         db_file.clone()

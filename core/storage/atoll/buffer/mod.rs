@@ -2023,9 +2023,10 @@ impl BufferPool {
                 IOResult::IO(io) => IOResult::IO(io),
             });
         }
-        // Taken first, so a release or a stepper leaving after the look below finishes it.
+        // Taken first, so a release or a stepper leaving after the look below finishes it; room
+        // given back before then, once it takes what was refused, starts the change again now.
         let wait = self.room.wait();
-        if self.cutting.load(Ordering::Acquire) == 0 {
+        if self.room_takes_refused() {
             return Ok(IOResult::Done(()));
         }
         match self.relief.get_ref().and_then(|relief| relief.relieve()) {
@@ -2120,32 +2121,53 @@ impl BufferPool {
     /// is marked pending, under its latch, so its first change from then on keeps it as it
     /// stands. `scan` collects them, those with a swap copy and no frame included. Eviction goes
     /// on meanwhile, so the swap copies are listed after the frames, and every page owed stays
-    /// listed until it is imaged or kept: one read in again comes in pending. Step it until done.
-    pub fn begin_cut(&self, n: u64, scan: &mut CutScan) -> IOResult<()> {
+    /// listed until it is imaged or kept: one read in again comes in pending. Each call does one
+    /// run of the walk (DESIGN.md 22.1, 22.9): the frame headers one page of the header table
+    /// holds ([`CUT_RUN`]), or one shard of the swap table, or [`CUT_RUN`] of the swapped pages
+    /// looked at again. Done(true) once the cut has found every page owed.
+    pub fn begin_cut(&self, n: u64, scan: &mut CutScan) -> IOResult<bool> {
         self.cutting.store(n, Ordering::SeqCst);
-        while scan.next < self.memory.grains() {
-            let h = self.header(scan.next);
-            if h.status() == RESIDENT {
-                // A change holds it for a moment: come back.
-                let Some(hold) = Held::try_take(&h.latch) else {
-                    return IOResult::IO(IOCompletions(Completion::new_yield()));
-                };
-                self.mark_owed(scan.next, n, &mut scan.owed);
-                hold.release_unchanged();
+        let grains = self.memory.grains();
+        if scan.next < grains {
+            let end = grains.min(scan.next + CUT_RUN as u32);
+            while scan.next < end {
+                let h = self.header(scan.next);
+                if h.status() == RESIDENT {
+                    // A change holds it for a moment: come back.
+                    let Some(hold) = Held::try_take(&h.latch) else {
+                        return IOResult::IO(IOCompletions(Completion::new_yield()));
+                    };
+                    self.mark_owed(scan.next, n, &mut scan.owed);
+                    hold.release_unchanged();
+                }
+                scan.next += 1;
             }
-            scan.next += 1;
+            return IOResult::Done(false);
         }
-        if !scan.listed {
-            let mut seen: HashSet<PageId> = scan.owed.iter().copied().collect();
-            scan.swapped = self.store.swap_pages();
-            scan.owed
-                .extend(scan.swapped.iter().copied().filter(|pid| seen.insert(*pid)));
-            *self.cut_owed.lock() = seen;
-            scan.listed = true;
+        if scan.shard < self.store.swap_shards() {
+            if scan.shard == 0 {
+                scan.seen = scan.owed.iter().copied().collect();
+            }
+            let listed = self.store.swap_shard_pages(scan.shard);
+            for pid in listed {
+                if scan.seen.insert(pid) {
+                    scan.owed.push(pid);
+                }
+                scan.swapped.push(pid);
+            }
+            scan.shard += 1;
+            if scan.shard == self.store.swap_shards() {
+                *self.cut_owed.lock() = std::mem::take(&mut scan.seen);
+            }
+            return IOResult::Done(false);
         }
         // A page with a swap copy read in after the walk passed its frame, before the list was
         // set: unchanged since, the gate being closed.
+        let mut looked = 0;
         while let Some(&pid) = scan.swapped.last() {
+            if looked == CUT_RUN {
+                return IOResult::Done(false);
+            }
             if let Some(frame) = self.table.find(&self.frames.headers, pid.raw()) {
                 let h = self.header(frame);
                 let Some(hold) = Held::try_take(&h.latch) else {
@@ -2157,8 +2179,9 @@ impl BufferPool {
                 hold.release_unchanged();
             }
             scan.swapped.pop();
+            looked += 1;
         }
-        IOResult::Done(())
+        IOResult::Done(true)
     }
 
     fn mark_owed(&self, frame: u32, n: u64, owed: &mut Vec<PageId>) {
@@ -2267,13 +2290,19 @@ impl BufferPool {
     }
 }
 
+/// The frames a cut's walk looks at in one run: the frame headers one page of the header table
+/// holds (DESIGN.md 22.1), and as many of the swapped pages looked at again.
+pub const CUT_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<frame::FrameHeader>();
+
 /// A cut's walk over the frames for the pages owed an image ([`BufferPool::begin_cut`]).
 #[derive(Default)]
 pub struct CutScan {
     next: u32,
     pub owed: Vec<PageId>,
-    /// Whether the swap copies are listed, and those still to look at.
-    listed: bool,
+    /// The next shard of the swap table to list, the pages listed so far, and the swapped pages
+    /// still to look at again.
+    shard: usize,
+    seen: HashSet<PageId>,
     swapped: Vec<PageId>,
 }
 

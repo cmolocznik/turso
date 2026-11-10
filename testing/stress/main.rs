@@ -675,6 +675,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         sql_logger.clone(),
         vfs_option.clone(),
         opts.fts,
+        opts.tx_mode == TxMode::Atoll,
     )));
 
     let mut stress_counter = StressCounter::new(opts.nr_threads, opts.nr_iterations);
@@ -733,6 +734,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         TxMode::Concurrent => {
             conn.pragma_update("journal_mode", "mvcc").await?;
         }
+        TxMode::Atoll => {
+            conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+        }
     };
 
     let mut batch_idx: u64 = 0;
@@ -781,6 +785,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         TxMode::Concurrent => {
                             rng.random_ratio(9, 10).then_some("BEGIN CONCURRENT;")
                         }
+                        TxMode::Atoll => rng.random_ratio(1, 2).then_some("BEGIN;"),
                     };
 
                     if let Some(tx_stmt) = tx {
@@ -974,8 +979,26 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             conn.pragma_update("journal_mode", "WAL").await?;
             println!("Switched journal mode back to WAL for SQLite integrity check");
         }
-        println!("Running SQLite Integrity check");
-        sqlite_integrity_check(std::path::Path::new(&db_file))?;
+        if opts.tx_mode == TxMode::Atoll {
+            // SQLite cannot read an Atoll file: its own check, page arm and all, reads it.
+            println!("Running Atoll integrity check");
+            let db = Builder::new_local(&db_file)
+                .experimental_atoll(true)
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().await? {
+                found.push(format!("{:?}", row.get_value(0)?));
+            }
+            if found != ["Text(\"ok\")"] {
+                return Err(format!("Atoll integrity check: {found:?}").into());
+            }
+        } else {
+            println!("Running SQLite Integrity check");
+            sqlite_integrity_check(std::path::Path::new(&db_file))?;
+        }
     }
 
     Ok(())
@@ -999,6 +1022,7 @@ mod rollback_tests {
             db_file.to_str().unwrap().to_owned(),
             logger,
             None,
+            false,
             false,
         )));
         let conn = StressDb::connect(&db, ThreadId::new(0), 1000)

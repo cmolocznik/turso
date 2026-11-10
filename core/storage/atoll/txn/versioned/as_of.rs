@@ -99,9 +99,17 @@ impl AsOf {
         Ok(v.ts <= last)
     }
 
-    /// Judges every entry, following the arenas where the snapshot does not see the leaf's.
-    pub fn step(&mut self, txns: &Transactions, pool: &Arc<BufferPool>) -> Result<IOResult<()>> {
+    /// Judges the entries, following the arenas where the snapshot does not see the leaf's: each
+    /// call reads at most one arena page and returns after it (DESIGN.md 22.1), judging the
+    /// entries the leaf answers on its own before it. Done(true) once every entry is judged, from
+    /// a call that read none.
+    pub fn step(&mut self, txns: &Transactions, pool: &Arc<BufferPool>) -> Result<IOResult<bool>> {
+        let mut read = false;
         while self.next < self.copied.len() {
+            if read {
+                // What follows a read is the next call's.
+                return Ok(IOResult::Done(false));
+            }
             let v = match self.chain {
                 Some(v) => v,
                 None => {
@@ -128,6 +136,7 @@ impl AsOf {
                     v
                 }
             };
+            read = true;
             let Some(Stored { head, value }) = done!(below(pool, &v)) else {
                 self.chain = None;
                 self.next += 1;
@@ -145,7 +154,7 @@ impl AsOf {
                 StoredValue::OutOfLine(r) => self.keep(&below, key, &r.encode(), true),
             }
         }
-        Ok(IOResult::Done(()))
+        Ok(IOResult::Done(!read))
     }
 
     /// Keeps `key` at version `v`, its value or reference `rest`, unless `v` deletes it.

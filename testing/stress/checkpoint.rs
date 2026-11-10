@@ -33,6 +33,8 @@ pub fn pick_mode(rng: &mut ThreadRng, tx_mode: TxMode) -> &'static str {
             1 => "RESTART",
             _ => "TRUNCATE",
         },
+        // Atoll checkpoints its log whole whatever the mode names.
+        TxMode::Atoll => "PASSIVE",
     }
 }
 

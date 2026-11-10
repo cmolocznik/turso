@@ -5,6 +5,7 @@ pub mod matrix_oracle;
 pub mod output;
 pub mod parser;
 pub mod runner;
+pub mod skip_list;
 pub mod snapshot;
 pub mod tcl_converter;
 
@@ -26,6 +27,7 @@ pub use runner::{
     FileResult, LoadedTests, RunSummary, RunnerConfig, TestOutcome, TestResult, TestRunner,
     load_test_files, summarize,
 };
+pub use skip_list::SkipList;
 pub use snapshot::{
     SnapshotManager, SnapshotResult, SnapshotUpdateMode, find_all_pending_snapshots,
     find_pending_snapshots, is_ci,

@@ -44,6 +44,8 @@ pub struct RustBackend {
     default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
     /// Enable MVCC mode
     mvcc: bool,
+    /// Open every database in Atoll mode (Atoll's DESIGN.md §17)
+    atoll: bool,
 }
 
 impl RustBackend {
@@ -51,6 +53,7 @@ impl RustBackend {
         Self {
             default_db_resolver: None,
             mvcc: false,
+            atoll: false,
         }
     }
 
@@ -63,6 +66,11 @@ impl RustBackend {
     /// Enable MVCC mode (experimental journal mode)
     pub fn with_mvcc(mut self, mvcc: bool) -> Self {
         self.mvcc = mvcc;
+        self
+    }
+
+    pub fn with_atoll(mut self, atoll: bool) -> Self {
+        self.atoll = atoll;
         self
     }
 }
@@ -130,6 +138,7 @@ impl SqlBackend for RustBackend {
 
         // Create the database using the Turso builder
         let db = apply_turso_experimental_features(Builder::new_local(&db_path))
+            .experimental_atoll(self.atoll)
             .build()
             .await
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;

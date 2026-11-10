@@ -22,6 +22,11 @@ fn delete_at_process_exit(dir: TempDir) {
     TEMP_DIRS.lock().unwrap().push(dir);
 }
 
+/// Whether the suite runs in Atoll mode: `TURSO_TEST_ATOLL=1`.
+pub fn atoll_mode() -> bool {
+    std::env::var("TURSO_TEST_ATOLL").is_ok_and(|v| v == "1")
+}
+
 #[ctor::dtor]
 fn delete_temp_dirs() {
     TEMP_DIRS.lock().unwrap().clear();
@@ -224,7 +229,12 @@ impl TempDatabaseBuilder {
             }
         };
 
-        if let Some(init_sql) = &self.init_sql {
+        // `TURSO_TEST_ATOLL=1` opens every new database of the suite in Atoll mode (Atoll's
+        // DESIGN.md §17, §15): its rows are Atoll's, so a test's init SQL runs through Turso, not
+        // rusqlite, which cannot read the file. A database built for MVCC opens as upstream does:
+        // MVCC is a storage engine of its own.
+        let atoll = atoll_mode() && !self.enable_mvcc;
+        if let Some(init_sql) = self.init_sql.as_ref().filter(|_| !atoll) {
             let connection = rusqlite::Connection::open(&db_path).unwrap();
             connection
                 .pragma_update(None, "journal_mode", "wal")
@@ -249,15 +259,33 @@ impl TempDatabaseBuilder {
             }
         };
         let dialect = self.dialect.unwrap_or_else(|| Arc::new(SqliteDialect));
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            db_path.to_str().unwrap(),
-            flags,
-            opts,
-            None,
-            dialect,
-        )
-        .unwrap();
+        let db = if atoll {
+            let db = Database::open(
+                io.clone(),
+                db_path.to_str().unwrap(),
+                turso_core::OpenOptions::new(dialect)
+                    .flags(flags)
+                    .db_opts(opts)
+                    .atoll(turso_core::storage::atoll::db::AtollConfig::small()),
+            )
+            .unwrap();
+            if let Some(init_sql) = &self.init_sql {
+                let conn = db.connect(ConnectOpts::new()).unwrap();
+                conn.prepare_execute_batch(init_sql).unwrap();
+                conn.close().unwrap();
+            }
+            db
+        } else {
+            Database::open_file_with_flags(
+                io.clone(),
+                db_path.to_str().unwrap(),
+                flags,
+                opts,
+                None,
+                dialect,
+            )
+            .unwrap()
+        };
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
@@ -294,11 +322,10 @@ impl TempDatabase {
 
     /// Creates a new database with MVCC mode enabled.
     pub fn new_with_mvcc(db_name: &str) -> Self {
-        let db = Self::new(db_name);
-        let conn = db.connect_limbo();
-        conn.pragma_update("journal_mode", "'mvcc'")
-            .expect("enable mvcc");
-        db
+        Self::builder()
+            .with_db_name(db_name)
+            .with_mvcc(true)
+            .build()
     }
 
     pub fn new_with_existent(db_path: &Path) -> Self {

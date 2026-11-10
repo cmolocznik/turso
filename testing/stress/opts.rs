@@ -11,6 +11,9 @@ pub enum TxMode {
     SQLite,
     /// Concurrent transaction mode with multiple-writer, multiple-reader semantics.
     Concurrent,
+    /// Atoll storage, opened so: every transaction runs beside the others, started with BEGIN,
+    /// waiting on the writers in its way up to the busy timeout.
+    Atoll,
 }
 
 impl fmt::Display for TxMode {
@@ -18,6 +21,7 @@ impl fmt::Display for TxMode {
         match self {
             TxMode::SQLite => write!(f, "sqlite"),
             TxMode::Concurrent => write!(f, "concurrent"),
+            TxMode::Atoll => write!(f, "atoll"),
         }
     }
 }

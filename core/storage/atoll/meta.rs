@@ -38,7 +38,7 @@ use super::page::{self, PageId, SizeClass, CLASS_COUNT, MIN_PAGE_SIZE};
 use super::pins::{Cells, PinCell, Pinnable, Pinned, Pins};
 use super::segmented::Segmented;
 use super::shared::{Bytes, BytesMut, Shared, Writer};
-use super::stack::Stack;
+use super::stack::{Chain, Stack};
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::storage::atoll::locks::Mutex;
@@ -682,18 +682,17 @@ impl MetaCache {
     // ---------------------------------------------------------------- checkpoints
 
     /// The cut of checkpoint `n`: from now until [`end_cut`](Self::end_cut), a page's first
-    /// change keeps the page as it stood, for `n` to write. Returns the pages dirty at the cut.
-    pub fn begin_cut(&self, n: u64) -> Vec<MetaId> {
+    /// change keeps the page as it stood, for `n` to write. Returns the pages dirty at the cut,
+    /// handed over unread for the checkpoint to read a run at a time (DESIGN.md 22.9), a page
+    /// listed once each time it turned dirty.
+    pub fn begin_cut(&self, n: u64) -> Chain<MetaId> {
         assert!(
             n > self.in_charge(),
             "checkpoint {n} cut after {}",
             self.in_charge()
         );
         self.cutting.store(n, Ordering::SeqCst);
-        let mut ids = self.dirty.take_all();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+        self.dirty.take_chain()
     }
 
     /// Marks `frame` owed a write: a checkpoint cut short may have written its other place, which
@@ -768,19 +767,45 @@ impl MetaCache {
         // The file weakly too: it holds the IO the write waits in. A file closed before its sync
         // leaves the copy not durable.
         let sync_file = Arc::downgrade(&file);
-        let done = move |res: std::result::Result<(), CompletionError>| {
-            // Gone, the cache has no one left to wait on the write.
-            let Some(me) = me.upgrade() else { return };
-            if res.is_ok() {
-                target.written_side.store(side + 1, Ordering::Release);
-                target.written_for.store(n, Ordering::Release);
-                target.written(&me, count);
-            }
-            if let Some(c) = target.writing.take(&me.retiring) {
-                match res {
-                    Ok(()) => c.complete(0),
-                    Err(e) => c.error(e),
+        // How the write ended, as its callbacks found it; `writing` is told once the last request
+        // retires, so a checkpoint counts the write in its flight set until no backend owns its
+        // buffer (DESIGN.md 22.13).
+        let outcome: Arc<Mutex<Option<std::result::Result<(), CompletionError>>>> =
+            Arc::new(Mutex::new(None));
+        type Tell = Arc<TakeOnce<Box<dyn FnOnce() + Send>>>;
+        let told: Tell = {
+            let (target, me, outcome) = (target.clone(), me.clone(), outcome.clone());
+            Arc::new(TakeOnce::new(Box::new(move || {
+                // Gone, the cache has no one left to wait on the write.
+                let Some(me) = me.upgrade() else { return };
+                if let Some(c) = target.writing.take(&me.retiring) {
+                    match outcome
+                        .lock()
+                        .take()
+                        .unwrap_or(Err(CompletionError::Aborted))
+                    {
+                        Ok(()) => c.complete(0),
+                        Err(e) => c.error(e),
+                    }
                 }
+            })))
+        };
+        let tell = |told: &Tell| {
+            if let Some(told) = told.take() {
+                told();
+            }
+        };
+        let done = {
+            let outcome = outcome.clone();
+            move |res: std::result::Result<(), CompletionError>| {
+                if let Some(me) = me.upgrade() {
+                    if res.is_ok() {
+                        target.written_side.store(side + 1, Ordering::Release);
+                        target.written_for.store(n, Ordering::Release);
+                        target.written(&me, count);
+                    }
+                }
+                *outcome.lock() = Some(res);
             }
         };
         let done = Arc::new(TakeOnce::new(done));
@@ -789,35 +814,56 @@ impl MetaCache {
                 done(res);
             }
         };
-        let c = Completion::new_write(move |res| {
-            let res = whole(META_PAGE, res);
-            match res {
-                Ok(()) if !durable => {
-                    // Durable only once synced: until then the copy in charge is the one that
-                    // counts.
-                    let Some(sync_file) = sync_file.upgrade() else {
-                        return finish(Err(CompletionError::Aborted));
-                    };
-                    let after = finish.clone();
-                    let synced = Completion::new_sync(move |r| after(r.map(|_| ())));
-                    if let Err(e) = sync_file.sync_data(synced) {
-                        finish(Err(io_failure(&e)));
+        // Whether the write's callback handed the outcome on to a sync, whose retirement, not the
+        // write's, then tells `writing`.
+        let synced_after = Arc::new(AtomicBool::new(false));
+        let c = {
+            let (told, synced_after) = (told.clone(), synced_after.clone());
+            Completion::new_write(move |res| {
+                let res = whole(META_PAGE, res);
+                match res {
+                    Ok(()) if !durable => {
+                        // Durable only once synced: until then the copy in charge is the one
+                        // that counts.
+                        let Some(sync_file) = sync_file.upgrade() else {
+                            return finish(Err(CompletionError::Aborted));
+                        };
+                        let after = finish.clone();
+                        let synced = Completion::new_sync(move |r| after(r.map(|_| ())));
+                        synced_after.store(true, Ordering::Release);
+                        match sync_file.sync_data(synced) {
+                            Ok(synced) => {
+                                let told = told.clone();
+                                synced.on_retired(move || tell(&told));
+                            }
+                            Err(e) => {
+                                finish(Err(io_failure(&e)));
+                                tell(&told);
+                            }
+                        }
                     }
+                    res => finish(res),
                 }
-                res => finish(res),
-            }
-        });
+            })
+        };
         let buffer = copy.region(0, META_PAGE);
         let submitted = if durable {
             file.pwrite_durable(at, buffer, c)
         } else {
             file.pwrite(at, buffer, c)
         };
-        if let Err(e) = submitted {
-            if let Some(c) = frame.writing.take(&self.retiring) {
-                c.error(io_failure(&e));
+        match submitted {
+            Ok(c) => c.on_retired(move || {
+                if !synced_after.load(Ordering::Acquire) {
+                    tell(&told);
+                }
+            }),
+            Err(e) => {
+                if let Some(c) = frame.writing.take(&self.retiring) {
+                    c.error(io_failure(&e));
+                }
+                return Err(e);
             }
-            return Err(e);
         }
         Ok(Some(writing))
     }

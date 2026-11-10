@@ -172,8 +172,8 @@ impl KeptRoom {
         self.wake();
     }
 
-    /// Done when room is next given back or the checkpoint's stepper leaves: what a refused
-    /// writer that could not step the checkpoint waits on.
+    /// Done when room is next given back or, while writers step the checkpoint, its stepper
+    /// leaves: what a refused writer that could not step the checkpoint waits on.
     pub fn wait(&self) -> Completion {
         let fresh = if self.freed_elsewhere.load(Ordering::Acquire) {
             #[cfg(test)]

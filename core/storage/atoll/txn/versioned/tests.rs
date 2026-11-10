@@ -1569,7 +1569,7 @@ impl Db {
     /// The leaf `page` as of the snapshot taken at `at`.
     fn as_of(&self, page: &[u8], at: Ts) -> Vec<u8> {
         let mut as_of = AsOf::new(page, at).unwrap();
-        run(&self.io, || as_of.step(self.txns(), self.db.pool()));
+        while !run(&self.io, || as_of.step(self.txns(), self.db.pool())) {}
         as_of.image().unwrap()
     }
 

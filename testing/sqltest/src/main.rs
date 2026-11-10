@@ -3,7 +3,7 @@ use miette::{NamedSource, Report};
 use owo_colors::OwoColorize;
 use sqltest::{
     DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
-    OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
+    OutputFormat, ParseError, RunnerConfig, SkipList, SnapshotUpdateMode, TestRunner,
     backends::cli::CliBackend, backends::js::JsBackend, backends::postgres::PostgresBackend,
     backends::rust::RustBackend, backends::tursopg::TursopgBackend, create_output,
     find_all_pending_snapshots, generate_database, generate_integrity_fixture, load_test_files,
@@ -72,6 +72,15 @@ enum Commands {
         /// Enable MVCC mode (experimental journal mode)
         #[arg(long)]
         mvcc: bool,
+
+        /// Open every database in Atoll mode (Atoll's DESIGN.md §17); the rust backend only
+        #[arg(long)]
+        atoll: bool,
+
+        /// Tests to skip, each with its reason: a file of `file<TAB>test<TAB>reason` rows. A row
+        /// whose file is loaded without its test fails the run
+        #[arg(long)]
+        skip_list: Option<PathBuf>,
 
         /// Snapshot update mode:
         /// - auto: 'no' in CI, 'new' otherwise (default)
@@ -167,6 +176,8 @@ async fn main() -> ExitCode {
             output,
             timeout,
             mvcc,
+            atoll,
+            skip_list,
             snapshot_mode,
             snapshot_filter,
             cross_check_binary,
@@ -184,6 +195,8 @@ async fn main() -> ExitCode {
                 output,
                 timeout,
                 mvcc,
+                atoll,
+                skip_list,
                 snapshot_mode,
                 snapshot_filter,
                 cross_check_binary,
@@ -242,12 +255,18 @@ async fn run_tests(
     output_format: String,
     timeout: u64,
     mvcc: bool,
+    atoll: bool,
+    skip_list: Option<PathBuf>,
     snapshot_mode: SnapshotUpdateMode,
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
     postgres_dsn: Option<String>,
     fail_fast: bool,
 ) -> ExitCode {
+    if atoll && (backend_type != "rust" || mvcc) {
+        eprintln!("Error: --atoll runs with --backend rust, without --mvcc");
+        return ExitCode::from(2);
+    }
     match (&postgres_dsn, backend_type.as_str()) {
         (None, "postgres") => {
             eprintln!("Error: --backend postgres needs --postgres-dsn");
@@ -299,13 +318,36 @@ async fn run_tests(
     };
 
     // Load and parse test files
-    let loaded = match load_test_files(&paths).await {
+    let mut loaded = match load_test_files(&paths).await {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("Error loading test files: {e}");
             return ExitCode::from(1);
         }
     };
+
+    if let Some(path) = skip_list {
+        let list = match std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| SkipList::parse(&text))
+        {
+            Ok(list) => list,
+            Err(e) => {
+                eprintln!("Error: skip list {}: {e}", path.display());
+                return ExitCode::from(2);
+            }
+        };
+        match list.apply(&mut loaded) {
+            Ok(marked) => eprintln!("skipping {marked} tests that {} lists", path.display()),
+            Err(stale) => {
+                eprintln!("Error: skip list {} has stale rows:", path.display());
+                for row in stale {
+                    eprintln!("  {row}");
+                }
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     let integrity_fixtures = collect_integrity_fixtures(loaded.test_files());
     if !integrity_fixtures.is_empty() {
@@ -330,7 +372,8 @@ async fn run_tests(
     // Generate default databases if needed
     let default_dbs = if needs.any() {
         eprintln!("Generating default databases...");
-        match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT, mvcc).await {
+        match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT, mvcc, atoll).await
+        {
             Ok(dbs) => dbs,
             Err(e) => {
                 eprintln!("Error generating default databases: {e}");
@@ -387,7 +430,7 @@ async fn run_tests(
                 .await
         }
         "rust" => {
-            let mut backend = RustBackend::new().with_mvcc(mvcc);
+            let mut backend = RustBackend::new().with_mvcc(mvcc).with_atoll(atoll);
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }
@@ -908,6 +951,7 @@ async fn generate_debug_databases(
         seed,
         no_rowid_alias: false,
         mvcc,
+        atoll: false,
     };
 
     if let Err(e) = generate_database(&config).await {
@@ -934,6 +978,7 @@ async fn generate_debug_databases(
         seed,
         no_rowid_alias: true,
         mvcc,
+        atoll: false,
     };
 
     if let Err(e) = generate_database(&config).await {

@@ -77,7 +77,8 @@ impl ValueRef {
         })
     }
 
-    fn chunks(&self) -> Option<usize> {
+    /// How many chunks a directory page lists, for a value large enough to have one.
+    pub fn chunks(&self) -> Option<usize> {
         (self.len as usize > chunk()).then(|| (self.len as usize).div_ceil(chunk()))
     }
 }
@@ -381,6 +382,7 @@ fn directory(
     count: usize,
     holder: &dyn Fn() -> bool,
 ) -> Result<IOResult<std::result::Result<Vec<PageId>, Read>>> {
+    crate::storage::atoll::visits::visit();
     let page = match fix(pool, reference.pid, holder)? {
         IOResult::Done(Fixed::Page(p)) => p,
         IOResult::Done(Fixed::Freed) => return Ok(IOResult::Done(Err(Read::Changed))),

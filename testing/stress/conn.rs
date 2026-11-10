@@ -13,6 +13,7 @@ pub struct StressDb {
     vfs: Option<String>,
     sql_logger: Arc<SqlLogger>,
     fts: bool,
+    atoll: bool,
 }
 
 impl StressDb {
@@ -21,6 +22,7 @@ impl StressDb {
         sql_logger: Arc<SqlLogger>,
         vfs: Option<String>,
         fts: bool,
+        atoll: bool,
     ) -> Self {
         Self {
             db: None,
@@ -28,12 +30,15 @@ impl StressDb {
             sql_logger,
             vfs,
             fts,
+            atoll,
         }
     }
 
     async fn get_or_init(&mut self) -> turso::Result<&turso::Database> {
         if self.db.is_none() {
-            let mut builder = Builder::new_local(&self.db_file).experimental_index_method(self.fts);
+            let mut builder = Builder::new_local(&self.db_file)
+                .experimental_index_method(self.fts)
+                .experimental_atoll(self.atoll);
             if let Some(ref vfs) = self.vfs {
                 builder = builder.with_io(vfs.clone());
             }
@@ -130,6 +135,8 @@ impl StressConn {
                 self.pragma_update("mvcc_checkpoint_threshold", bytes)
                     .await?;
             }
+            // Atoll's checkpoints follow its log's budget, set at open.
+            TxMode::Atoll => {}
         }
         Ok(())
     }

@@ -521,6 +521,7 @@ impl Completion {
             }
         }
         super::refuse_on_delivery_thread("a blocking wait");
+        super::refuse_in_unit("a blocking wait");
         if self.finished() {
             return;
         }

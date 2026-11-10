@@ -169,6 +169,7 @@ pub struct Builder {
     read_only: bool,
     enable_encryption: bool,
     enable_attach: bool,
+    enable_atoll: bool,
     enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
@@ -189,6 +190,7 @@ impl Builder {
             read_only: false,
             enable_encryption: false,
             enable_attach: false,
+            enable_atoll: false,
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
@@ -214,6 +216,13 @@ impl Builder {
 
     /// Kept for backwards compatibility. Triggers are now always enabled.
     pub fn experimental_triggers(self, _triggers_enabled: bool) -> Self {
+        self
+    }
+
+    /// Opens the database in Atoll mode (Atoll's DESIGN.md §17): a new database is created as
+    /// Atoll's, and one already Atoll's opens so. Experimental.
+    pub fn experimental_atoll(mut self, atoll_enabled: bool) -> Self {
+        self.enable_atoll = atoll_enabled;
         self
     }
 
@@ -288,6 +297,9 @@ impl Builder {
         let mut features = Vec::new();
         if self.enable_encryption {
             features.push("encryption");
+        }
+        if self.enable_atoll {
+            features.push("atoll");
         }
         if self.enable_attach {
             features.push("attach");

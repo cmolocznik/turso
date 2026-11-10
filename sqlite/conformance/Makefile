@@ -79,6 +79,11 @@ run-rust: build-runner
 	$(TEST_RUNNER) run $(SQLITE_TESTS) --backend rust $(MVCC_FLAG) $(ARGS)
 	$(TEST_RUNNER) run $(TURSO_TESTS) --backend rust $(MVCC_FLAG) $(ARGS)
 
+# Run tests in Atoll mode (Rust backend), skipping the cases atoll-skips.tsv lists
+run-atoll: build-runner
+	$(TEST_RUNNER) run $(SQLITE_TESTS) --backend rust --atoll --skip-list atoll-skips.tsv $(ARGS)
+	$(TEST_RUNNER) run $(TURSO_TESTS) --backend rust --atoll --skip-list atoll-skips.tsv $(ARGS)
+
 # Build JavaScript bindings (requires Node.js and yarn)
 JS_DIR := $(ROOT_DIR)/bindings/javascript
 build-js-bindings:

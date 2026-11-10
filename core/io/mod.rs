@@ -55,6 +55,38 @@ cfg_block! {
 crate::thread::thread_local! {
     /// Set on a ring's delivery thread for its whole life (DESIGN.md 22.5).
     static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set on a thread for the length of a unit of a job's work (DESIGN.md 22.1).
+    static IN_UNIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A unit of a job's work under way on this thread, until it drops, an unwind's drop included
+/// (DESIGN.md 22.1): a unit never waits, blocks or parks, and none runs inside another.
+pub(crate) struct UnitFrame(());
+
+impl UnitFrame {
+    pub(crate) fn enter() -> Self {
+        assert!(
+            !IN_UNIT.with(|u| u.replace(true)),
+            "a unit of a job's work entered inside another"
+        );
+        Self(())
+    }
+}
+
+impl Drop for UnitFrame {
+    fn drop(&mut self) {
+        IN_UNIT.with(|u| u.set(false));
+    }
+}
+
+/// Ends the thread with a panic if it is running a unit of a job's work, which never waits,
+/// blocks or parks: what it would wait for is another unit's, or a request in flight the job's
+/// driver waits on between units (DESIGN.md 22.1, 22.15 proof 3).
+pub(crate) fn refuse_in_unit(what: &str) {
+    assert!(
+        !IN_UNIT.with(|u| u.get()),
+        "{what} inside a unit of a job's work, which never waits"
+    );
 }
 
 /// Ends the thread with a panic if it is a ring's delivery thread, which never makes a call that can
@@ -726,6 +758,7 @@ pub trait IO: Clock + Send + Sync {
     /// lost what it accepted.
     fn wait(&self, c: &Completion) {
         refuse_on_delivery_thread("a wait for a completion");
+        refuse_in_unit("a wait for a completion");
         if c.finished() {
             return;
         }

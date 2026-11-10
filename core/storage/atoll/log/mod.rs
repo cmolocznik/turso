@@ -61,6 +61,9 @@ mod segment;
 mod waits;
 
 pub use reader::{LogReader, OwnedRecord, Rereader};
+/// A record's alignment, for a test to size records to a place.
+#[cfg(test)]
+pub(crate) use record::ALIGN;
 pub use record::{framed_len, GroupStart, Header, Kind, Lsn, Place, BLOCK, MAX_PAYLOAD};
 
 use super::aligned::AlignedBlock;
@@ -87,6 +90,19 @@ use waits::{Look, Waits};
 crate::thread::thread_local! {
     /// Bytes copied into the ring on this thread: what a measurement counts per operation.
     pub(crate) static COPIED_IN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Turns of the flush taken on this thread.
+    pub(crate) static TURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Set by a test: the next turn taken on this thread asks for another while it runs, as
+    /// another thread's flush would.
+    pub(crate) static ASK_DURING_TURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by a test: run once by the next segment start on this thread, before its file is made,
+    /// as another thread's admission would run meanwhile.
+    pub(crate) static DURING_START: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by a test: run once after the next segment finish a caller takes on this thread, as
+    /// another thread's preparation step would run meanwhile.
+    pub(crate) static AFTER_FINISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The chunks of the ring of `config`: room for the admitted bytes, a padded block per write in
@@ -658,25 +674,46 @@ impl Log {
     /// a completion that means only: call again. A call registers its wait, flushes, runs a step
     /// it finds runnable, then reads the position again.
     pub fn wait_durable(self: &Arc<Self>, lsn: Lsn) -> Result<IOResult<()>> {
+        Ok(self.wait_durable_turns(lsn, false)?.0)
+    }
+
+    /// [`wait_durable`](Self::wait_durable) for a unit of a job's work (DESIGN.md 22.1), which
+    /// takes at most one turn of the flush where `wait_durable` takes turns until none is asked
+    /// for. Also says whether a turn is owed: one was asked for during this call's turn, which
+    /// the turn's holder answers ([`Solo`]); the caller answers it with
+    /// [`flush_one_turn`](Self::flush_one_turn) in its next unit.
+    pub fn wait_durable_turn(self: &Arc<Self>, lsn: Lsn) -> Result<(IOResult<()>, bool)> {
+        self.wait_durable_turns(lsn, true)
+    }
+
+    fn wait_durable_turns(self: &Arc<Self>, lsn: Lsn, one: bool) -> Result<(IOResult<()>, bool)> {
         if self.durable() >= lsn {
-            return Ok(IOResult::Done(()));
+            return Ok((IOResult::Done(()), false));
         }
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
         self.wanted.fetch_max(lsn, Ordering::SeqCst);
         let Some(c) = self.durable_waits.wait(lsn, || self.durable()) else {
-            return Ok(IOResult::Done(()));
+            return Ok((IOResult::Done(()), false));
         };
-        self.flush();
-        self.steps();
+        let owed = if one {
+            // Preparation first, the interim adapter's step any waiter runs (section 7.4), then
+            // the one turn.
+            self.prepare();
+            self.flush_one_turn()
+        } else {
+            self.flush();
+            self.steps();
+            false
+        };
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
         if self.durable() >= lsn {
-            return Ok(IOResult::Done(()));
+            return Ok((IOResult::Done(()), owed));
         }
-        Ok(IOResult::IO(IOCompletions(c)))
+        Ok((IOResult::IO(IOCompletions(c)), owed))
     }
 
     /// Deletes the segments wholly before `lsn`, which nothing needs any more.
@@ -802,18 +839,57 @@ impl Log {
     /// time ([`Solo`]).
     fn flush(self: &Arc<Self>) {
         self.flushes.ask();
-        while let Some(turn) = self.flushes.turn() {
-            let (writes, unprepared) = self.plan_writes();
-            drop(turn);
-            for (start, end, block) in writes {
-                self.submit_write(start, end, block);
-            }
-            // Padding waits for a segment nobody prepares: the step is a caller's, and every
-            // waiter comes back to run it.
-            if unprepared && self.preparation.need() {
-                self.wake_all();
+        while self.flush_turn() {}
+    }
+
+    /// Asks for a flush and takes at most one turn of it, for a unit of a job's work (DESIGN.md
+    /// 22.1). Whether a turn is owed: this call took a turn and a request came during it. The
+    /// holder of a turn answers the requests made during it ([`Solo`]), so a caller that stops
+    /// after one turn takes the owed one in its next unit, never leaving it unanswered.
+    pub fn flush_one_turn(self: &Arc<Self>) -> bool {
+        self.flushes.ask();
+        self.flush_turn() && self.flushes.asked()
+    }
+
+    /// How far the prepared segments reach past what is admitted, and a segment's size, for a test
+    /// to bring an admission within a segment of the prepared end.
+    #[cfg(test)]
+    pub(crate) fn prepared_ahead(&self) -> (u64, u64) {
+        (
+            self.room.prepared_end().saturating_sub(self.room.reach()),
+            self.segments.size,
+        )
+    }
+
+    /// Whether a turn of the flush is asked for and not taken, for a test.
+    #[cfg(test)]
+    pub(crate) fn flush_asked(&self) -> bool {
+        self.flushes.asked()
+    }
+
+    /// One turn of the flush, if one is asked for and none is under way: whether it took one.
+    fn flush_turn(self: &Arc<Self>) -> bool {
+        let Some(turn) = self.flushes.turn() else {
+            return false;
+        };
+        #[cfg(test)]
+        {
+            TURNS.with(|n| n.set(n.get() + 1));
+            if ASK_DURING_TURN.with(|a| a.replace(false)) {
+                self.flushes.ask();
             }
         }
+        let (writes, unprepared) = self.plan_writes();
+        drop(turn);
+        for (start, end, block) in writes {
+            self.submit_write(start, end, block);
+        }
+        // Padding waits for a segment nobody prepares: the step is a caller's, and every waiter
+        // comes back to run it.
+        if unprepared && self.preparation.need() {
+            self.wake_all();
+        }
+        true
     }
 
     /// The writes to start, from where the last ended, and whether padding waits for a segment:
@@ -1048,8 +1124,25 @@ impl Log {
     /// never a callback: each is a synchronous file call. A finished step looks for the next, then
     /// flushes, since padding may have waited for the segment.
     fn steps(self: &Arc<Self>) {
+        if self.prepare() {
+            self.flush();
+        }
+    }
+
+    /// Runs the preparation steps it finds runnable: whether it ran any. A unit of a job's work
+    /// starts at most one segment and finishes at most one (DESIGN.md 22.16 step 4), whoever's
+    /// they are. A step needed and refused it for that is left to whoever calls next, and every
+    /// waiter comes back to run it, the unit's own included, since the mover of the word to needed
+    /// or owed may have woken them before they waited.
+    fn prepare(self: &Arc<Self>) -> bool {
+        use crate::storage::atoll::visits::{may_finish_segment, may_start_segment};
         let mut stepped = false;
-        while let Some(step) = self.preparation.take(|| self.short_of_segments()) {
+        while let Some(step) = self
+            .preparation
+            .take(may_start_segment, may_finish_segment, || {
+                self.short_of_segments()
+            })
+        {
             // A failed log begins no preparation work.
             if self.failure().is_some() {
                 self.preparation.let_go(step);
@@ -1057,16 +1150,27 @@ impl Log {
             }
             let went_on = match step {
                 Step::Start => self.start_preparing(),
-                Step::Finish => self.finish_preparing(),
+                Step::Finish => {
+                    crate::storage::atoll::visits::finish();
+                    let went_on = self.finish_preparing();
+                    #[cfg(test)]
+                    if let Some(meanwhile) = AFTER_FINISH.with(|d| d.borrow_mut().take()) {
+                        meanwhile();
+                    }
+                    went_on
+                }
             };
             if !went_on {
                 break;
             }
             stepped = true;
         }
-        if stepped {
-            self.flush();
+        if (self.preparation.needed() && !may_start_segment())
+            || (self.preparation.owed() && !may_finish_segment())
+        {
+            self.wake_all();
         }
+        stepped
     }
 
     /// Starts preparing the segment past the prepared end, the step this caller took: a spare
@@ -1074,6 +1178,11 @@ impl Log {
     /// allocated and handed to its zero-fill writes. Whether the preparation went on: a failure,
     /// its own or one read after its synchronous calls, lets the word go where it stands.
     fn start_preparing(self: &Arc<Self>) -> bool {
+        crate::storage::atoll::visits::segment();
+        #[cfg(test)]
+        if let Some(meanwhile) = DURING_START.with(|d| d.borrow_mut().take()) {
+            meanwhile();
+        }
         let number = self.segments.number(self.room.prepared_end());
         // A spare is whole already: renamed, it is ready once its directory is synced.
         match self.segments.reuse(number) {

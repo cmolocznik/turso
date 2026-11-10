@@ -45,6 +45,25 @@ fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> turso_core::types::IOResultO
     }
 }
 
+/// Runs `f`, which opens an index method's cursor by hand, inside a transaction in Atoll mode, as
+/// a statement's cursor always is: an Atoll read takes one, and a raw cursor begins none (Atoll's
+/// DESIGN.md §17). Under WAL, or inside the caller's own transaction, `f` runs as it is.
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+fn in_atoll_read<T>(
+    conn: &Arc<turso_core::Connection>,
+    table_name: &str,
+    f: impl FnOnce() -> T,
+) -> T {
+    if !crate::common::atoll_mode() || !conn.get_auto_commit() {
+        return f();
+    }
+    conn.execute("BEGIN").unwrap();
+    limbo_exec_rows(conn, &format!("SELECT count(*) FROM {table_name}"));
+    let out = f();
+    conn.execute("COMMIT").unwrap();
+    out
+}
+
 fn index_method_context(
     connection: &Arc<turso_core::Connection>,
     attachment: &dyn IndexMethodAttachment,
@@ -72,11 +91,13 @@ fn fts_test_stats(
         })
         .unwrap();
     let mut cursor = attachment.init().unwrap();
-    run(db, || {
-        cursor.open_read(&index_method_context(conn, attachment.as_ref()))
+    in_atoll_read(conn, table_name, || {
+        run(db, || {
+            cursor.open_read(&index_method_context(conn, attachment.as_ref()))
+        })
+        .unwrap();
+        cursor.test_stats().unwrap().unwrap()
     })
-    .unwrap();
-    cursor.test_stats().unwrap().unwrap()
 }
 
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
@@ -95,11 +116,13 @@ fn fts_attachment_test_stats(
         .unwrap()
         .expect("FTS attachment must exist in the connection schema");
     let mut cursor = attachment.init().unwrap();
-    run(db, || {
-        cursor.open_read(&index_method_context(conn, attachment.as_ref()))
+    in_atoll_read(conn, table_name, || {
+        run(db, || {
+            cursor.open_read(&index_method_context(conn, attachment.as_ref()))
+        })
+        .unwrap();
+        cursor.test_stats().unwrap().unwrap()
     })
-    .unwrap();
-    cursor.test_stats().unwrap().unwrap()
 }
 
 /// Under MVCC the stats probe needs a live transaction; the touching SELECT
@@ -5126,11 +5149,13 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
     let mut hits_before = 0;
     for (round, reader) in readers.iter().enumerate() {
         let mut cursor = attachment.init().unwrap();
-        run(&tmp_db, || {
-            cursor.open_read(&index_method_context(reader, attachment.as_ref()))
-        })
-        .unwrap();
-        let stats = cursor.test_stats().unwrap().unwrap();
+        let stats = in_atoll_read(reader, "docs", || {
+            run(&tmp_db, || {
+                cursor.open_read(&index_method_context(reader, attachment.as_ref()))
+            })
+            .unwrap();
+            cursor.test_stats().unwrap().unwrap()
+        });
         assert_eq!(
             stats.cached_connection_count,
             Some(1),

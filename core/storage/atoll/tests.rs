@@ -444,6 +444,7 @@ crate::thread::thread_local! {
 /// they run out, with what the operation submitted still in flight. A yield spends one too, so
 /// they always run out.
 fn drive_for<T>(
+    crash: &CrashIO,
     io: &Arc<dyn IO>,
     left: &Cell<u64>,
     mut op: impl FnMut() -> Result<IOResult<T>>,
@@ -453,11 +454,10 @@ fn drive_for<T>(
             IOResult::Done(v) => return Some(v),
             IOResult::IO(IOCompletions(c)) => loop {
                 if left.get() == 0 {
-                    let owned = c
-                        .requests(&mut std::collections::HashSet::new())
-                        .iter()
-                        .any(|r| r.is_owned());
-                    OWNED_AT_RUN_OUT.with(|o| o.set(owned));
+                    // What the operation waits on may be no request itself (a checkpoint waits
+                    // for its writes' retirement): the backend's own count says what is in
+                    // flight.
+                    OWNED_AT_RUN_OUT.with(|o| o.set(crash.in_flight() > 0));
                     return None;
                 }
                 left.set(left.get() - 1);
@@ -490,36 +490,40 @@ fn settle(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Option<()> {
 fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Option<()> {
     let root = {
         let db = try_open(io.clone(), 1).unwrap();
-        let root = drive_for(io, left, || Tree::create_versioned(db.pool(), class(0)))?;
+        let root = drive_for(crash, io, left, || {
+            Tree::create_versioned(db.pool(), class(0))
+        })?;
         let db = Db::with(io.clone(), db, root);
         let txns = db.db.transactions();
         for v in 1..=8 {
-            let mut txn = drive_for(io, left, || txns.begin(Isolation::Snapshot))?;
+            let mut txn = drive_for(crash, io, left, || txns.begin(Isolation::Snapshot))?;
             txns.statement(&mut txn).unwrap();
             let mut op = WriteOp::put(&[v as u8], vec![v as u8; 3000], Mode::Upsert);
-            drive_for(io, left, || {
+            drive_for(crash, io, left, || {
                 db.tree.write(txns, &db.versions, &mut txn, &mut op)
             })?;
             let mut commit = Commit::new(txn);
-            drive_for(io, left, || txns.commit(&mut commit))?;
+            drive_for(crash, io, left, || txns.commit(&mut commit))?;
         }
         let ticket = db.db.checkpointer().request_full();
-        drive_for(io, left, || db.db.checkpointer().step_full(ticket, txns))?;
+        drive_for(crash, io, left, || {
+            db.db.checkpointer().step_full(ticket, txns)
+        })?;
         // The next segment's zeros go one write at a time, then its sync: all of it lands.
         settle(crash, io, left)?;
         // Twice the pool of them: a pool's worth at least is written out, and the tree's pages
         // leave memory.
         let temp = class(5);
         for v in 0..2 * MIN_DB_BUDGET / temp.size() {
-            let mut page = drive_for(io, left, || db.db.pool().allocate_temporary(temp))?;
+            let mut page = drive_for(crash, io, left, || db.db.pool().allocate_temporary(temp))?;
             page.page_mut().put_u64(HEADER_SIZE, v as u64);
             page.changed();
         }
-        let mut txn = drive_for(io, left, || txns.begin(Isolation::Snapshot))?;
+        let mut txn = drive_for(crash, io, left, || txns.begin(Isolation::Snapshot))?;
         txns.statement(&mut txn).unwrap();
         for v in 1..=8u8 {
             let mut op = Get::new(&[v]);
-            drive_for(io, left, || {
+            drive_for(crash, io, left, || {
                 db.tree.get(txns, &db.versions, &mut txn, &mut op)
             })?;
         }
@@ -530,11 +534,11 @@ fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Opti
     settle(crash, io, left)?;
     let db = Db::recover(io.clone(), root, 1).unwrap();
     let txns = db.db.transactions();
-    let mut txn = drive_for(io, left, || txns.begin(Isolation::Snapshot))?;
+    let mut txn = drive_for(crash, io, left, || txns.begin(Isolation::Snapshot))?;
     txns.statement(&mut txn).unwrap();
     for v in 1..=8u8 {
         let mut op = Get::new(&[v]);
-        drive_for(io, left, || {
+        drive_for(crash, io, left, || {
             db.tree.get(txns, &db.versions, &mut txn, &mut op)
         })?;
     }
@@ -579,5 +583,348 @@ fn a_database_dropped_with_io_in_flight_leaves_nothing_holding_its_io() {
             dropped_in_flight > 0,
             "no drop with IO in flight (durable writes: {durable_writes})"
         );
+    }
+}
+
+/// A full checkpoint of the database, its units counted from here: what each visited at most, and
+/// how many ran, with the pages it imaged.
+fn checkpoint_counted(db: &Db) -> (u32, u64, u64) {
+    let pages = db.db.checkpointer().stats().pages;
+    let _ = super::visits::most_and_units();
+    db.checkpoint();
+    let (most, units) = super::visits::most_and_units();
+    (most, units, db.db.checkpointer().stats().pages - pages)
+}
+
+/// Proof 3 (DESIGN.md 22.15): a checkpoint's units each visit at most one page, however much it
+/// images: 4,000 rows, values with a directory page each, and every row rewritten by a
+/// transaction still open at the cut, so each leaf's image as of the cut follows its versions
+/// into the arenas. Debug builds assert the bound in each unit; the units' count is weighed
+/// against the pages imaged (mutants: the phase loop that images every page in one call; an
+/// image built whole, every arena page in one call).
+#[test]
+fn a_checkpoints_units_each_visit_at_most_one_page() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let db = Db::create(io.clone());
+    for i in 0..4_000 {
+        db.put(&format!("k{i:05}"), &value(i));
+    }
+    // Larger than a page of the largest class: each needs a directory page.
+    for i in 0..4 {
+        db.put(
+            &format!("big{i}"),
+            &vec![i as u8; 2 * crate::storage::atoll::page::MAX_PAGE_SIZE],
+        );
+    }
+    let txns = db.db.transactions();
+    let mut open = db.begin();
+    for i in 0..4_000 {
+        let mut op = WriteOp::put(format!("k{i:05}").as_bytes(), value(i + 1), Mode::Upsert);
+        let write = drive(&io, || {
+            db.tree.write(txns, &db.versions, &mut open, &mut op)
+        })
+        .unwrap();
+        assert!(matches!(write, Write::Done(_)), "{write:?}");
+    }
+    let (most, units, pages) = checkpoint_counted(&db);
+    assert_eq!(most, 1, "the units visited {most} pages at most");
+    // More pages than a flight set holds, so the phase's units interleave writes and landings.
+    assert!(
+        pages > super::checkpoint::WRITES as u64 && units >= 2 * pages,
+        "{units} units imaged {pages} pages: a page's source and its write are a unit each"
+    );
+    let mut commit = Commit::new(open);
+    drive(&io, || txns.commit(&mut commit)).unwrap();
+}
+
+/// The checkpoint keeps its flight set full: each unit starts one write, and it waits only once
+/// [`super::checkpoint::WRITES`] are in flight (DESIGN.md 22.1; mutant: a wait after every
+/// submission, one write in flight). The writes stay in flight until the IO is stepped.
+#[test]
+fn a_checkpoint_keeps_its_flight_set_full() {
+    let crash = Arc::new(CrashIO::new(3));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = Db::create(io.clone());
+    for i in 0..2_000 {
+        db.put(&format!("k{i:05}"), &value(i * 5 + 1));
+    }
+    db.checkpoint();
+    let peak = db.db.checkpointer().stats().flying_writes_peak;
+    assert_eq!(peak, flight_set(), "image writes in flight at most");
+}
+
+/// The image writes of the tree's pages a checkpoint keeps in flight: [`super::checkpoint::WRITES`]
+/// of them, within its write bytes.
+fn flight_set() -> usize {
+    super::checkpoint::WRITES.min(super::checkpoint::WRITE_BYTES / class(0).size())
+}
+
+/// A cancelled image write keeps its place in the flight set until its request retires, and the
+/// unit waiting for a place waits on that retirement (DESIGN.md 22.13; mutants: the place freed
+/// when the write finishes, letting twice the limit be owned; the wait on the write's own
+/// completion, finished already, which a waiter would spin on).
+#[test]
+fn a_cancelled_image_write_holds_its_place_until_it_retires() {
+    let crash = Arc::new(CrashIO::new(5));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = Db::create(io.clone());
+    for i in 0..2_000 {
+        db.put(&format!("k{i:05}"), &value(i * 5 + 1));
+    }
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    cp.request_full();
+    let full = flight_set();
+    // Units until the flight set is full, the IO stepped only for what is no image write.
+    loop {
+        match cp.one_unit(txns).unwrap() {
+            Some(_) if cp.image_writes_in_flight() == full => break,
+            Some(c) => io.wait(&c),
+            None => {}
+        }
+    }
+    assert_eq!(cp.cancel_image_writes(), full);
+    let waited = cp.one_unit(txns).unwrap();
+    assert_eq!(
+        cp.image_writes_in_flight(),
+        full,
+        "a cancelled write let its place go before it retired"
+    );
+    let waited = waited.expect("the unit waits for a place");
+    assert!(
+        !waited.finished(),
+        "the unit waits on a completion finished already"
+    );
+    while crash.in_flight() > 0 {
+        io.step().unwrap();
+    }
+    assert!(waited.finished(), "the retirement did not end the wait");
+}
+
+/// A unit of the checkpoint never waits: one that would ends the process, its wait refused
+/// inside the unit (DESIGN.md 22.1, 22.15 proof 3; mutant: no unit frame, so the wait goes on and
+/// the child ends normally).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_checkpoint_unit_that_waits_ends_the_process() {
+    let Some(ended) = crate::child_test::in_child(
+        concat!(
+            module_path!(),
+            "::a_checkpoint_unit_that_waits_ends_the_process"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+            let db = Db::create(io.clone());
+            db.put("k", b"v");
+            let finished = Completion::new_yield();
+            let waiter = io.clone();
+            super::checkpoint::IN_UNIT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || waiter.wait(&finished)));
+            });
+            db.checkpoint();
+            eprintln!("the unit's wait went on");
+        },
+    ) else {
+        return;
+    };
+    assert!(
+        ended.aborted,
+        "the unit's wait did not end the process: {:?} {}",
+        ended.code, ended.stderr
+    );
+    assert!(
+        ended
+            .stderr
+            .contains("a wait for a completion inside a unit of a job's work"),
+        "{}",
+        ended.stderr
+    );
+}
+
+/// A flush asked for during the checkpoint's own turn of it, as another thread's commit would, is
+/// answered by the checkpoint's next unit: no request made during a turn is left for nobody
+/// (DESIGN.md 22.1, `Solo`). Asked during each turn toward the intent record's durability, so
+/// during the last, after which the checkpoint takes no turn of its own: the log's end is durable
+/// by then (mutant: the owed turn dropped, the request still asked for once the checkpoint is done).
+#[test]
+fn a_flush_asked_during_the_checkpoints_turn_is_answered() {
+    use super::log::{ASK_DURING_TURN, TURNS};
+    let crash = Arc::new(CrashIO::new(7));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = Db::create(io.clone());
+    for i in 0..50 {
+        db.put(&format!("k{i:05}"), &value(i * 5 + 1));
+    }
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    let ticket = cp.request_full();
+    let (mut asked, mut turns_after) = (0, 0);
+    while cp.fulls_done() < ticket {
+        // The next turn the checkpoint takes toward its intent's durability is asked for again
+        // while it runs.
+        let armed = cp.next_turn_for_intent();
+        if armed {
+            ASK_DURING_TURN.with(|a| a.set(true));
+        }
+        let turns = TURNS.with(|n| n.get());
+        match cp.one_unit(txns).unwrap() {
+            Some(c) => io.wait(&c),
+            // The commit that asked waits for its own record, stepping this backend as it does.
+            None if armed => io.step().unwrap(),
+            None => {}
+        }
+        if armed && !ASK_DURING_TURN.with(|a| a.replace(false)) {
+            asked += 1;
+            turns_after = 0;
+        } else {
+            turns_after += TURNS.with(|n| n.get()) - turns;
+        }
+    }
+    assert!(
+        asked > 0,
+        "no turn toward the intent's durability was asked for again"
+    );
+    assert!(
+        turns_after > 0,
+        "the checkpoint took no turn after the request made during its last"
+    );
+    assert!(
+        !db.db.log().flush_asked(),
+        "a flush asked for during the checkpoint's turn was left unanswered"
+    );
+}
+
+/// A checkpoint unit whose intent record's admission must start the log's next segment runs that
+/// preparation inside the unit: the interim adapter's one step any caller runs, the stated
+/// exception to a unit's one page until the segment preparer is a task (DESIGN.md 22.16 steps 4
+/// and 8), its budget one segment, on this inline backend its whole zero-fill. Debug builds assert
+/// the budget in each unit (mutant: preparation that goes on past one segment in one call).
+#[test]
+fn a_checkpoint_unit_whose_admission_needs_a_segment_prepares_one() {
+    use super::log::{framed_len, Header, Kind, ALIGN};
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let db = Db::create(io.clone());
+    for i in 0..200 {
+        db.put(&format!("k{i:05}"), &value(i * 5 + 1));
+    }
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    let log = db.db.log();
+    // Admitted to a record's alignment short of being within a segment of the prepared end, in
+    // records no larger than half the log's buffer: the checkpoint's one admission, its intent
+    // record's, larger than that alignment, comes within a segment, and prepares.
+    let header = Header {
+        kind: Kind::new(1).unwrap(),
+        flags: 0,
+        txn: 0,
+        prev: None,
+    };
+    let largest = framed_len(config().log.buffer_bytes as usize / 2);
+    let overhead = framed_len(0) as usize;
+    loop {
+        let (ahead, segment) = log.prepared_ahead();
+        let room = ahead.saturating_sub(segment);
+        if room < framed_len(0) + ALIGN {
+            break;
+        }
+        // A record of exactly this framed length: room aligned, the payload filling the frame.
+        let framed = (room - ALIGN).min(largest);
+        let filler = vec![0u8; framed as usize - overhead];
+        assert_eq!(framed_len(filler.len()), framed);
+        let mut admitted = drive(&io, || log.admit(framed)).unwrap();
+        log.append(&mut admitted, &header, &[&filler]);
+        assert!(
+            log.prepared_ahead().0 < ahead,
+            "the filler's admission started preparing a segment"
+        );
+    }
+    let (ahead, segment) = log.prepared_ahead();
+    assert!(ahead > segment, "the filler itself came within a segment");
+    let _ = super::visits::most_segments();
+    let ticket = cp.request_full();
+    while cp.fulls_done() < ticket {
+        if let Some(c) = cp.one_unit(txns).unwrap() {
+            io.wait(&c);
+        }
+    }
+    assert_eq!(
+        super::visits::most_segments(),
+        1,
+        "the segment the intent record's admission needed, started inside its unit"
+    );
+}
+
+/// A checkpoint whose metadata writes fail ends failed at the first failed one it finds, and never
+/// waits on a write that has ended: with more dirty metadata pages than its flight set holds, the
+/// write it waits on for a place is one that failed (DESIGN.md 22.9; mutant: a failed write kept in
+/// the flight set, its unit waiting on it, ended already, for ever). Bounded by the units the same
+/// checkpoint took when its writes landed: a failure only ends it sooner.
+#[test]
+fn a_checkpoint_whose_metadata_writes_fail_ends_failed() {
+    use super::checkpoint::WRITES;
+    use super::meta::{MetaId, Tree as MetaTree};
+    let crash = Arc::new(CrashIO::new(11));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = Db::create(io.clone());
+    for i in 0..50 {
+        db.put(&format!("k{i:05}"), &value(i * 5 + 1));
+    }
+    db.checkpoint();
+    // Twice the pages the flight set holds, in the map tree's first file, each made dirty by a
+    // change that leaves its bytes as they are: the next checkpoint writes every one.
+    let meta = db.db.store().meta().clone();
+    let dirty_pages = || {
+        for index in 0..2 * WRITES as u64 {
+            let id = MetaId {
+                tree: MetaTree::Map,
+                class: SizeClass::new(0).unwrap(),
+                level: 0,
+                index,
+            };
+            let frame = drive(&io, || meta.get(id)).unwrap();
+            frame.try_lock().expect("no change under way").commit(&meta);
+        }
+    };
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    let run = |most: Option<u64>| {
+        dirty_pages();
+        let ticket = cp.request_full();
+        let mut units = 0u64;
+        let ended = loop {
+            if cp.fulls_done() >= ticket {
+                break Some(Ok(()));
+            }
+            if most.is_some_and(|most| units >= most) {
+                break None;
+            }
+            units += 1;
+            match cp.one_unit(txns) {
+                Err(e) => break Some(Err(e)),
+                Ok(Some(c)) => io.wait(&c),
+                Ok(None) => {}
+            }
+        };
+        (units, ended)
+    };
+    let (landed, ended) = run(None);
+    assert!(
+        matches!(ended, Some(Ok(()))),
+        "the checkpoint failed with its writes landing"
+    );
+    crash.set_faults_on(Some(&format!("{BASE}.map0.0")));
+    crash.set_faults(Faults {
+        write: 1.0,
+        ..Faults::default()
+    });
+    let (units, ended) = run(Some(landed));
+    crash.set_faults(Faults::default());
+    crash.set_faults_on(None);
+    match ended {
+        Some(Err(crate::LimboError::CompletionError(_))) => {}
+        Some(other) => panic!("the checkpoint ended {other:?}"),
+        None => panic!(
+            "the checkpoint still ran after {units} units, {landed} for one whose writes landed"
+        ),
     }
 }

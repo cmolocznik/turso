@@ -4610,21 +4610,26 @@ taken again between units, so a contender or a writer's relief gets in between t
 statement's step, a transaction's end, a wait for a full checkpoint and a refused writer's relief
 run units until one waits or nothing more is due (relief until the room takes its request),
 claiming the task for each where the writers step checkpoints: today's semantics, in bounded
-units. The units built: the gate tried; the cut's `L` and `C`; each orphan's edit, then its free;
-each image's source taken, its image built, each directory page of a value it names read, its
-write started, and each landing; the intent record's size checked against the log's buffer before
-it is built, then admitted and appended; its durability; each metadata page fetched in order and
-its write started, at most `WRITES` waiting at once, each asked again until it is written for the
-checkpoint (a wait on a hold or a change settling under the look writes nothing); the superblock.
-Not built yet: the pool's walk a run of frames at a time (`CUT_RUN`) and the swap table a shard at
-a time, which one unit does whole; the dirty set handed over as a chain and moved a run at a time
-(`DIRTY_RUN`); a versioned leaf's image an arena page a unit, where one unit walks every arena page
-its versions reach; each data file's sync started a unit; each deferred free and each slot erased
-a unit, then each file synced; a flush turn per unit for the intent's durability and the log's
-end (`Log::wait_durable_turn`), with the turn owed; the frame refusing `IO::wait`, a blocking wait
-and a park inside a unit; debug builds counting a unit's page visits and asserting at most one;
-the segment preparation's budget of one start and one finish per unit; an image write's place
-freed at its request's retirement; proof 3; the sustained run against before.)
+units, a checkpoint's last unit saying `Done` so one due again at once is the next step's. The
+units built: the gate tried; the cut's `L` and `C`; the pool's walk a run of frames at a time
+(`CUT_RUN`, the headers one page of the header table holds), then the swap table a shard at a
+time, then the swapped pages looked at again a run at a time (`BufferPool::cut_run`); the metadata
+cut, the gate opened; the metadata pages dirty at the cut, handed over unread as the dirty stack's
+chain (`Stack::take_chain`) and moved a run at a time (`DIRTY_RUN`, one page of ids) into the
+ordered set the run walks; each orphan's edit, then its free; each image's source taken, each
+arena page its versions reach (`AsOf::step` returns after the one page a call reads), its image
+built, each directory page of a value it names read, its write started, and each landing; the
+intent record's size checked against the log's buffer before it is built, then admitted and
+appended; its durability; each metadata page fetched in order and its write started, at most
+`WRITES` waiting at once, each asked again until it is written for the checkpoint (a wait on a
+hold or a change settling under the look writes nothing); each data file's sync started; the log's
+end; the superblock; each deferred free (`PageStore::after_one`); each slot erased, then each file
+it was in synced (`PageStore::erase_one`). Not built yet: a flush turn per unit for the intent's
+durability and the log's end (`Log::wait_durable_turn`), with the turn owed; the frame refusing
+`IO::wait`, a blocking wait and a park inside a unit; debug builds counting a unit's page visits
+and asserting at most one; the segment preparation's budget of one start and one finish per unit;
+an image write's place freed at its request's retirement; proof 3; the sustained run against
+before.)
 
 **Who waits how.** Every caller that waits for IO is one of three kinds:
 
@@ -4746,7 +4751,7 @@ cores the database is given. The embedder can always set it.
      one image written; the intent record, its size checked against the log buffer before it is
      built, then built, admitted and appended as one record, then its durability; one metadata page
      written, the dirty set walked in order through the ordered set the run keeps (today
-     `MetaCache::begin_cut` takes, sorts and dedups the whole dirty list: it becomes a walk); one
+     `MetaCache::begin_cut` took, sorted and deduped the whole dirty list: it is a walk now); one
      data file synced; the superblock written; one deferred free (`PageStore::after`); one slot
      erased. Before step 4 `Run::step` ran phase after phase in one call, and `image_pages` went
      on while writes completed inline: on `MemoryIO` one call imaged 4,044 pages of a 4,000-row

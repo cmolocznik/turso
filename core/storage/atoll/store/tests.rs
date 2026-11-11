@@ -276,14 +276,13 @@ fn a_value_removed_while_a_checkpoint_yields_after_its_cut_is_written_as_the_cut
     let cp = db.db.checkpointer();
     let ticket = cp.request_full();
     let hold = frame.try_lock().expect("the leaf is free");
-    assert!(
-        matches!(
-            cp.step_full(ticket, db.db.transactions()).unwrap(),
-            IOResult::IO(_)
-        ),
-        "the checkpoint went on under a held latch"
+    // Read with the latch held, asserted once the database is closed: a panic through it ends
+    // the process.
+    let yielded = matches!(
+        cp.step_full(ticket, db.db.transactions()).unwrap(),
+        IOResult::IO(_)
     );
-    assert!(cp.cut_taken().is_some(), "the yield came before the cut");
+    let cut_first = cp.cut_taken().is_some();
     let mut remove = crate::storage::atoll::btree::Remove::new(b"k");
     drive(&db.io, || db.tree(root).remove(&mut remove)).unwrap();
     hold.release_unchanged();
@@ -304,8 +303,13 @@ fn a_value_removed_while_a_checkpoint_yields_after_its_cut_is_written_as_the_cut
         root,
     );
     let mut lookup = crate::storage::atoll::btree::Lookup::new(b"k");
+    let found = drive(&io, || tree.lookup(&mut lookup)).unwrap();
+    drop(tree);
+    drop(reopened);
+    assert!(yielded, "the checkpoint went on under a held latch");
+    assert!(cut_first, "the yield came before the cut");
     assert_eq!(
-        drive(&io, || tree.lookup(&mut lookup)).unwrap(),
+        found,
         Some(value),
         "the value as the checkpoint in charge cut it"
     );
@@ -724,15 +728,22 @@ fn a_step_of_the_checkpoints_task_images_at_most_one_page() {
     let in_charge = cp.superblock().checkpoint;
     cp.request_full();
     let imaged = cp.stats().pages;
-    let (mut steps, mut most) = (0u64, 0u64);
-    while cp.superblock().checkpoint == in_charge {
+    let (mut steps, mut most, mut refused) = (0u64, 0u64, false);
+    while cp.superblock().checkpoint == in_charge && steps < 1 << 20 {
         let before = cp.stats().pages;
-        assert!(cp.claim_one(), "a claim refused with no other stepper");
+        if !cp.claim_one() {
+            refused = true;
+            break;
+        }
         most = most.max(cp.stats().pages - before);
         steps += 1;
-        assert!(steps < 1 << 20, "the checkpoint did not end");
     }
+    let ended = cp.superblock().checkpoint != in_charge;
     let pages = cp.stats().pages - imaged;
+    // Asserted once the database is closed: a panic through it ends the process.
+    drop(db);
+    assert!(!refused, "a claim refused with no other stepper");
+    assert!(ended, "the checkpoint did not end in {steps} steps");
     assert!(
         pages >= PAGES,
         "{pages} pages imaged of the {PAGES} changed"

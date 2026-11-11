@@ -38,7 +38,7 @@ use super::page::{self, PageId, SizeClass, CLASS_COUNT, MIN_PAGE_SIZE};
 use super::pins::{Cells, PinCell, Pinnable, Pinned, Pins};
 use super::segmented::Segmented;
 use super::shared::{Bytes, BytesMut, Shared, Writer};
-use super::stack::Stack;
+use super::stack::{Chain, Stack};
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::storage::atoll::locks::Mutex;
@@ -802,18 +802,17 @@ impl MetaCache {
     // ---------------------------------------------------------------- checkpoints
 
     /// The cut of checkpoint `n`: from now until [`end_cut`](Self::end_cut), a page's first
-    /// change keeps the page as it stood, for `n` to write. Returns the pages dirty at the cut.
-    pub fn begin_cut(&self, n: u64) -> Vec<MetaId> {
+    /// change keeps the page as it stood, for `n` to write. Returns the pages dirty at the cut,
+    /// handed over unread for the checkpoint to read a run at a time (DESIGN.md 22.9 item 1), a
+    /// page listed once each time it turned dirty.
+    pub fn begin_cut(&self, n: u64) -> Chain<MetaId> {
         assert!(
             n > self.in_charge(),
             "checkpoint {n} cut after {}",
             self.in_charge()
         );
         self.cutting.store(n, Ordering::SeqCst);
-        let mut ids = self.dirty.take_all();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+        self.dirty.take_chain()
     }
 
     /// Marks `frame` owed a write: a checkpoint cut short may have written its other place, which

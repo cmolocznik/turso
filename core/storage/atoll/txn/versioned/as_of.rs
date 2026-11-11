@@ -99,8 +99,10 @@ impl AsOf {
         Ok(v.ts <= last)
     }
 
-    /// Judges every entry, following the arenas where the snapshot does not see the leaf's.
-    pub fn step(&mut self, txns: &Transactions, pool: &Arc<BufferPool>) -> Result<IOResult<()>> {
+    /// Judges the entries in order, following the arenas where the snapshot does not see the
+    /// leaf's, and returns after each arena page it reads (DESIGN.md 22.1, 22.9 item 1): Done(true)
+    /// once every entry is judged.
+    pub fn step(&mut self, txns: &Transactions, pool: &Arc<BufferPool>) -> Result<IOResult<bool>> {
         while self.next < self.copied.len() {
             let v = match self.chain {
                 Some(v) => v,
@@ -128,15 +130,16 @@ impl AsOf {
                     v
                 }
             };
+            // The arena page read is this call's.
             let Some(Stored { head, value }) = done!(below(pool, &v)) else {
                 self.chain = None;
                 self.next += 1;
-                continue;
+                return Ok(IOResult::Done(self.next == self.copied.len()));
             };
             let below = Version::decode(&head).ok_or_else(corrupt_header)?;
             if !self.sees(txns, &below)? {
                 self.chain = Some(below);
-                continue;
+                return Ok(IOResult::Done(false));
             }
             self.chain = None;
             let key = std::mem::take(&mut self.copied[self.next].key);
@@ -144,8 +147,9 @@ impl AsOf {
                 StoredValue::Inline(value) => self.keep(&below, key, &value, false),
                 StoredValue::OutOfLine(r) => self.keep(&below, key, &r.encode(), true),
             }
+            return Ok(IOResult::Done(self.next == self.copied.len()));
         }
-        Ok(IOResult::Done(()))
+        Ok(IOResult::Done(true))
     }
 
     /// Keeps `key` at version `v`, its value or reference `rest`, unless `v` deletes it.

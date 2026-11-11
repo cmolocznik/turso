@@ -1670,7 +1670,12 @@ fn children_read_through_their_directory_are_whole_and_in_the_life_it_names_in_s
 /// stood then, the cut ended and the checkpoint put in charge, its waiting frees done.
 fn checkpoint_meta(io: &Arc<dyn IO>, store: &Arc<PageStore>) {
     let n = store.meta().in_charge() + 1;
-    let (dirty, _) = store.begin_cut(n);
+    let dirty: Vec<_> = store
+        .begin_cut(n)
+        .0
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let frames = drive(io, || store.meta().get_all(&dirty)).unwrap();
     for frame in &frames {
         // Asked until written: a wait for a hold or a settling change writes nothing.
@@ -6965,4 +6970,52 @@ fn a_checkpoint_step_inside_an_operations_call_leaves_the_operations_owner_alone
         "the operation's owner took the checkpoint's demand"
     );
     assert!(named, "the checkpoint's claim named no demand of its own");
+}
+
+/// A cut walks the frames a run at a time (DESIGN.md 22.1, 22.9 item 1): the frame headers one
+/// page of the header table holds, then a shard of the swap table, then a run of the swapped
+/// pages, and finds owed what one walk finds (mutant: the frames walked whole in one run).
+#[test]
+fn a_cut_walks_the_frames_a_run_at_a_time() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-runs", MIN_BUDGET);
+    let grains = pool.memory.grains();
+    let mut stored = Vec::new();
+    for v in 0..8 {
+        let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+        let pid = g.pid();
+        stamp(&mut g.page_mut(), pid, v);
+        g.changed();
+        drop(g);
+        stored.push(pid);
+    }
+    let mut scan = CutScan::default();
+    let (mut runs, mut most) = (0usize, 0u32);
+    loop {
+        let before = scan.next;
+        let done = match pool.cut_run(1, &mut scan) {
+            IOResult::Done(done) => done,
+            IOResult::IO(_) => panic!("a cut with no holder waited"),
+        };
+        most = most.max(scan.next - before);
+        runs += 1;
+        if done {
+            break;
+        }
+    }
+    pool.end_cut(1);
+    let mut owed = std::mem::take(&mut scan.owed);
+    owed.sort();
+    stored.sort();
+    drop(pool);
+    assert!(
+        grains as usize > 2 * CUT_RUN,
+        "{grains} frames: a walk of one run"
+    );
+    assert_eq!(most as usize, CUT_RUN, "a run looked at {most} frames");
+    assert!(
+        runs > (grains as usize).div_ceil(CUT_RUN),
+        "{runs} runs over {grains} frames"
+    );
+    assert_eq!(owed, stored, "what the cut found owed");
 }

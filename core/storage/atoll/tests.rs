@@ -1067,7 +1067,7 @@ const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
     ("btree/value.rs", "directory", "Completion::new_yield", 1, "change: a chunk page moved or evicted while read"),
     ("buffer/cell.rs", "current_with", "Completion::new_yield", 1, "change: the cell changed during its read"),
     ("buffer/lend.rs", "provide", "Completion::new_yield", 1, "change: a batch changed hands, or drains for another"),
-    ("buffer/mod.rs", "begin_cut", "Completion::new_yield", 1, "change: an outgoing frame freed or reused while read"),
+    ("buffer/mod.rs", "cut_run", "Completion::new_yield", 1, "change: an outgoing frame freed or reused while read"),
     ("buffer/mod.rs", "claim", "look_again", 3, "change: work of the claim's own started, a latch it found changed, a horizon reached"),
     ("buffer/mod.rs", "free_page", "Completion::new_yield", 1, "change: its own write landed (settle_writes)"),
     ("buffer/mod.rs", "look_again", "Completion::new_yield", 1, "the helper itself"),

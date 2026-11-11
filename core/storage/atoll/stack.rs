@@ -92,22 +92,17 @@ impl<T> Stack<T> {
 
     /// Every item pushed and not taken, the oldest first: the caller's from now on.
     pub fn take_all(&self) -> Vec<T> {
-        let mut raw = self.head.swap(ptr::null_mut(), Ordering::Acquire);
-        let mut out = Vec::new();
-        while !raw.is_null() {
-            // SAFETY: published by `push` with a release exchange, and the swap above made this
-            // thread its only holder.
-            let node = unsafe { Box::from_raw(raw) };
-            // SAFETY: written before the push that published the node.
-            assert!(
-                node.pushed.with(|p| unsafe { *p }),
-                "a node taken unwritten"
-            );
-            raw = linked(node.next);
-            out.push(node.item);
-        }
+        let mut out: Vec<T> = self.take_chain().collect();
         out.reverse();
         out
+    }
+
+    /// Every item pushed and not taken, handed over unread with one swap of the head: the
+    /// caller's from now on, to read as it goes, the newest first ([`Chain`]).
+    pub fn take_chain(&self) -> Chain<T> {
+        Chain {
+            head: self.head.swap(ptr::null_mut(), Ordering::Acquire),
+        }
     }
 
     /// Whether no item is pushed and not taken; one a taker holds does not count.
@@ -122,7 +117,56 @@ impl<T> Drop for Stack<T> {
         if cfg!(atoll_loom) && std::thread::panicking() {
             return;
         }
-        drop(self.take_all());
+        drop(self.take_chain());
+    }
+}
+
+/// The items a [`Stack::take_chain`] handed over, read one at a time, the newest first: what a
+/// caller reads in runs rather than collects whole.
+pub struct Chain<T> {
+    head: *mut Node<T>,
+}
+
+// SAFETY: the chain's nodes are its holder's alone since the swap that took them.
+unsafe impl<T: Send> Send for Chain<T> {}
+
+impl<T> Default for Chain<T> {
+    fn default() -> Self {
+        Self {
+            head: ptr::null_mut(),
+        }
+    }
+}
+
+impl<T> Iterator for Chain<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.head.is_null() {
+            return None;
+        }
+        // SAFETY: published by `push` with a release exchange, and the swap that made this chain
+        // made its holder the node's only holder.
+        let node = unsafe { Box::from_raw(self.head) };
+        // SAFETY: written before the push that published the node.
+        assert!(
+            node.pushed.with(|p| unsafe { *p }),
+            "a node taken unwritten"
+        );
+        self.head = linked(node.next);
+        Some(node.item)
+    }
+}
+
+impl<T> Drop for Chain<T> {
+    fn drop(&mut self) {
+        // A failed loom model is torn down while its threads unwind; its atomics then panic again.
+        if cfg!(atoll_loom) && std::thread::panicking() {
+            return;
+        }
+        for item in self.by_ref() {
+            drop(item);
+        }
     }
 }
 

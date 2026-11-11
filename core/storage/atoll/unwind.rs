@@ -191,6 +191,7 @@ mod tests {
         ("pins.rs", "Counted", "a test's count of live values"),
         ("segmented.rs", "Segmented", "frees its own segments"),
         ("stack.rs", "Stack", "frees its own nodes"),
+        ("stack.rs", "Chain", "frees its own nodes"),
         ("stack.rs", "Popped", "frees its own node"),
         ("stack.rs", "FreeList", "frees its own nodes"),
         (

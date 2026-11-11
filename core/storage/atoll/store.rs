@@ -44,6 +44,7 @@ use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
 use super::segmented::Segmented;
 use super::shared::Writer;
+use super::stack::Chain;
 use super::whole_write;
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::storage::atoll::locks::Mutex;
@@ -177,13 +178,18 @@ struct Eraser {
     current: Option<Erasure>,
 }
 
-/// Freed slots being erased: holes punched or zeros written, then their files synced.
+/// Freed slots being erased: holes punched or zeros written, a slot a unit, then their files
+/// synced, a file a unit.
 struct Erasure {
     slots: Vec<(SizeClass, u64)>,
-    files: Vec<Arc<dyn File>>,
+    /// How many of `slots` are punched out, or have their zeros' write started.
+    punched: usize,
+    /// The files the slots are in, each synced once every slot is punched; then those whose sync is
+    /// still to start.
+    files: BTreeMap<(SizeClass, u64), Arc<dyn File>>,
+    unsynced: Option<Vec<Arc<dyn File>>>,
     /// The zero writes, then the syncs.
     pending: Vec<Completion>,
-    synced: bool,
 }
 
 /// A change of several pages inside the change gate ([`PageStore::change`]): it leaves the gate
@@ -546,11 +552,21 @@ impl PageStore {
     }
 
     /// Every page with a swap copy: each differs from its checkpoint copy.
+    #[cfg(test)]
     pub fn swap_pages(&self) -> Vec<PageId> {
-        self.swap
-            .iter()
-            .flat_map(|shard| shard.lock().keys().copied().collect::<Vec<_>>())
+        (0..SWAP_SHARDS)
+            .flat_map(|i| self.swap_shard_pages(i))
             .collect()
+    }
+
+    /// The shards of the swap table, which a cut lists one at a time.
+    pub fn swap_shards(&self) -> usize {
+        SWAP_SHARDS
+    }
+
+    /// The pages with a swap copy in shard `i` of the swap table.
+    pub fn swap_shard_pages(&self, i: usize) -> Vec<PageId> {
+        self.swap[i].lock().keys().copied().collect()
     }
 
     /// `pid` has no swap copy any more: its page is settled at a checkpoint, freed, or changed and
@@ -864,8 +880,9 @@ impl PageStore {
 
     /// The cut of checkpoint `n`, under a closed gate: the changes made from now on are checkpoint
     /// `n + 1`'s, and every metadata page keeps its state as of now for `n` to write. Returns the
-    /// metadata pages dirty at the cut and every tree's height then.
-    pub fn begin_cut(&self, n: u64) -> (Vec<MetaId>, [[u8; CLASS_COUNT]; TREES]) {
+    /// metadata pages dirty at the cut, unread ([`MetaCache::begin_cut`]), and every tree's height
+    /// then.
+    pub fn begin_cut(&self, n: u64) -> (Chain<MetaId>, [[u8; CLASS_COUNT]; TREES]) {
         let heights = self.heights();
         let dirty = self.meta.begin_cut(n);
         self.epoch.store(n + 1, Ordering::SeqCst);
@@ -1010,39 +1027,50 @@ impl PageStore {
             .collect()
     }
 
-    /// Checkpoint `n` is durable: every free that waited for it is done, its numbers reusable once
-    /// no step holds them, its slots erased before they are taken again. Each free leaves the list
-    /// only once it is done, so a yield leaves every one not yet done listed, to be taken up on
-    /// the next call. Step it until done.
-    pub fn after(self: &Arc<Self>, n: u64) -> Result<IOResult<()>> {
-        loop {
-            let next = {
-                let deferred = self.deferred.lock();
-                deferred
-                    .iter()
-                    .next()
-                    .filter(|&(&e, _)| e <= n)
-                    .map(|(&e, frees)| (e, *frees.front().expect("an empty list removed")))
-            };
-            let Some((e, d)) = next else {
-                return Ok(IOResult::Done(()));
-            };
-            match d {
-                Deferred::Number(pid) => self.freed_numbers.retire(&self.epochs, pid),
-                Deferred::Slot(class, slot) => {
-                    if let IOResult::IO(io) = self.free_slot(class, slot)? {
-                        return Ok(IOResult::IO(io));
-                    }
+    /// Checkpoint `n` is durable: one free that waited for it is done, its number reusable once no
+    /// step holds it, its slot erased before it is taken again: a unit (DESIGN.md 22.9 item 1). A
+    /// free leaves the list only once it is done, so a wait leaves it listed, to be taken up on the
+    /// next call. Done(true) once none is left.
+    pub fn after_one(self: &Arc<Self>, n: u64) -> Result<IOResult<bool>> {
+        let next = {
+            let deferred = self.deferred.lock();
+            deferred
+                .iter()
+                .next()
+                .filter(|&(&e, _)| e <= n)
+                .map(|(&e, frees)| (e, *frees.front().expect("an empty list removed")))
+        };
+        let Some((e, d)) = next else {
+            return Ok(IOResult::Done(true));
+        };
+        match d {
+            Deferred::Number(pid) => self.freed_numbers.retire(&self.epochs, pid),
+            Deferred::Slot(class, slot) => {
+                if let IOResult::IO(io) = self.free_slot(class, slot)? {
+                    return Ok(IOResult::IO(io));
                 }
             }
-            // Only this call takes frees off the list; frees are added at the back.
-            let mut deferred = self.deferred.lock();
-            let frees = deferred
-                .get_mut(&e)
-                .expect("the list the free was read from");
-            assert_eq!(frees.pop_front(), Some(d), "a free taken off by another");
-            if frees.is_empty() {
-                deferred.remove(&e);
+        }
+        // Only this call takes frees off the list; frees are added at the back.
+        let mut deferred = self.deferred.lock();
+        let frees = deferred
+            .get_mut(&e)
+            .expect("the list the free was read from");
+        assert_eq!(frees.pop_front(), Some(d), "a free taken off by another");
+        if frees.is_empty() {
+            deferred.remove(&e);
+        }
+        Ok(IOResult::Done(false))
+    }
+
+    /// Every free that waited for durable checkpoint `n`, for a test. Step it until done.
+    #[cfg(test)]
+    pub fn after(self: &Arc<Self>, n: u64) -> Result<IOResult<()>> {
+        loop {
+            match self.after_one(n)? {
+                IOResult::Done(true) => return Ok(IOResult::Done(())),
+                IOResult::Done(false) => {}
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
     }
@@ -1072,29 +1100,27 @@ impl PageStore {
         Ok(IOResult::Done(()))
     }
 
-    /// Syncs every data file opened: what a checkpoint wrote to them is durable once each is done.
-    pub fn sync_data_files(&self) -> Result<Vec<Completion>> {
-        let mut out = Vec::new();
+    /// Every data file opened: what a checkpoint wrote to them is durable once each is synced.
+    pub fn data_files(&self) -> Vec<Arc<dyn File>> {
+        let mut files = Vec::new();
         for class in &self.files {
-            let mut files = Vec::new();
             class.each(|_, cell| {
                 if let Some(f) = cell.get() {
                     files.push(f);
                 }
             });
-            for f in files {
-                out.push(f.sync_data(Completion::new_sync(|_| {}))?);
-            }
         }
-        Ok(out)
+        files
     }
 
     // ---------------------------------------------------------------- erasing
 
-    /// Erases every slot freed since a durable checkpoint stopped naming it and every step that
-    /// may have looked it up has ended: holes punched, or zeros written where the file cannot
-    /// punch them, then each file synced once; then the slots may be taken. Step it until done.
-    pub fn erase_freed(&self) -> Result<IOResult<()>> {
+    /// One unit of erasure (DESIGN.md 22.9 item 1) of the slots freed since a durable checkpoint
+    /// stopped naming them, once every step that may have looked one up has ended: a slot punched
+    /// out, or its zeros' write started where its file cannot punch holes; once every slot of the
+    /// batch is, one of their files' syncs started; then the batch's end, after which its slots
+    /// may be taken. Done(true) once nothing is left to erase.
+    pub fn erase_one(&self) -> Result<IOResult<bool>> {
         // A caller that finds another erasing waits for its let-go (DESIGN.md 9.1.3, *No retry
         // without a change*).
         let mut eraser = match own(&self.erasure, &self.erased) {
@@ -1102,62 +1128,66 @@ impl PageStore {
             Err(erased) => return Ok(IOResult::IO(IOCompletions(erased))),
         };
         let eraser = &mut *eraser;
-        loop {
-            let Some(e) = eraser.current.as_mut() else {
-                eraser.ready.extend(self.to_erase.reclaim(&self.epochs));
-                if eraser.ready.is_empty() {
-                    return Ok(IOResult::Done(()));
-                }
-                let slots = std::mem::take(&mut eraser.ready);
-                eraser.current = Some(self.start_erasure(slots)?);
-                continue;
-            };
-            if let Some(c) = e.pending.iter().find(|c| !c.finished()) {
-                return Ok(IOResult::IO(IOCompletions(c.clone())));
+        let Some(e) = eraser.current.as_mut() else {
+            eraser.ready.extend(self.to_erase.reclaim(&self.epochs));
+            if eraser.ready.is_empty() {
+                return Ok(IOResult::Done(true));
             }
-            if let Some(err) = e.pending.iter().find_map(|c| c.get_error()) {
-                // Kept for the next try: a slot not erased is never taken.
-                let failed = eraser.current.take().expect("an erasure");
-                eraser.ready.extend(failed.slots);
-                return Err(LimboError::CompletionError(err));
-            }
-            if !e.synced {
-                e.synced = true;
-                e.pending = e
-                    .files
-                    .iter()
-                    .map(|f| f.sync_data(Completion::new_sync(|_| {})))
-                    .collect::<Result<_>>()?;
-                continue;
-            }
-            let done = eraser.current.take().expect("an erasure");
-            for (class, slot) in done.slots {
-                self.unerased[class.index()].clear(slot);
-            }
-            return Ok(IOResult::Done(()));
-        }
-    }
-
-    /// Punches out `slots`, or starts writing zeros over each where its file cannot punch holes.
-    fn start_erasure(&self, slots: Vec<(SizeClass, u64)>) -> Result<Erasure> {
-        let mut files: BTreeMap<(SizeClass, u64), Arc<dyn File>> = BTreeMap::new();
-        let mut pending = Vec::new();
-        for &(class, slot) in &slots {
+            eraser.current = Some(Erasure {
+                slots: std::mem::take(&mut eraser.ready),
+                punched: 0,
+                files: BTreeMap::new(),
+                unsynced: None,
+                pending: Vec::new(),
+            });
+            return Ok(IOResult::Done(false));
+        };
+        if let Some(&(class, slot)) = e.slots.get(e.punched) {
             let (file, at) = self.data_file(class, slot)?;
             if file.punch_hole(at as usize, class.size()).is_err() {
                 let zeros = Arc::new(AlignedBlock::zeroed(class.size()));
                 let (write, zeroed) = whole_write(class.size());
                 drop(file.pwrite(at, zeros.region(0, class.size()), write)?);
-                pending.push(zeroed);
+                e.pending.push(zeroed);
             }
-            files.insert((class, slot / self.slots_per_file(class)), file);
+            e.files
+                .insert((class, slot / self.slots_per_file(class)), file);
+            e.punched += 1;
+            return Ok(IOResult::Done(false));
         }
-        Ok(Erasure {
-            slots,
-            files: files.into_values().collect(),
-            pending,
-            synced: false,
-        })
+        if let Some(c) = e.pending.iter().find(|c| !c.finished()) {
+            return Ok(IOResult::IO(IOCompletions(c.clone())));
+        }
+        if let Some(err) = e.pending.iter().find_map(|c| c.get_error()) {
+            // Kept for the next try: a slot not erased is never taken.
+            let failed = eraser.current.take().expect("an erasure");
+            eraser.ready.extend(failed.slots);
+            return Err(LimboError::CompletionError(err));
+        }
+        let unsynced = e
+            .unsynced
+            .get_or_insert_with(|| std::mem::take(&mut e.files).into_values().collect());
+        if let Some(f) = unsynced.pop() {
+            e.pending.push(f.sync_data(Completion::new_sync(|_| {}))?);
+            return Ok(IOResult::Done(false));
+        }
+        let done = eraser.current.take().expect("an erasure");
+        for (class, slot) in done.slots {
+            self.unerased[class.index()].clear(slot);
+        }
+        Ok(IOResult::Done(false))
+    }
+
+    /// Erases every slot freed and ready, for a test. Step it until done.
+    #[cfg(test)]
+    pub fn erase_freed(&self) -> Result<IOResult<()>> {
+        loop {
+            match self.erase_one()? {
+                IOResult::Done(true) => return Ok(IOResult::Done(())),
+                IOResult::Done(false) => {}
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
     }
 
     // ---------------------------------------------------------------- growth and search

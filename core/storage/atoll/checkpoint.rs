@@ -42,10 +42,11 @@ use super::guarded::{Contender, Guarded, Hold};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
+use super::stack::Chain;
 use super::store::PageStore;
 use super::txn::versioned::AsOf;
 use super::txn::{Cut, Transactions, Ts};
-use crate::io::Completion;
+use crate::io::{Completion, File};
 use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
@@ -422,6 +423,8 @@ struct Run {
     clock: u64,
     heights: [[u8; CLASS_COUNT]; TREES],
     scan: CutScan,
+    /// The metadata pages dirty at the cut, as the cut handed them over, still to move into `meta`.
+    dirty: Chain<MetaId>,
     /// The metadata pages it writes: those dirty at the cut, then every one it edits.
     meta: BTreeSet<MetaId>,
     /// The last metadata page whose write it started: the next is the one after it.
@@ -452,7 +455,9 @@ struct Run {
     /// What each metadata page asked to be written waits on, by its place in `frames`: its write,
     /// or a hold or a change to end before its write starts.
     writing: Vec<(usize, Completion)>,
-    /// The data files' syncs.
+    /// The data files whose syncs are still to start, once the metadata is written, and their
+    /// syncs.
+    unsynced: Option<Vec<Arc<dyn File>>>,
     waits: Vec<Completion>,
     written: Option<Completion>,
     superblock: Option<Superblock>,
@@ -463,12 +468,14 @@ enum Phase {
     Gate,
     Cut,
     Scan,
+    Dirty,
     Orphans,
     Images,
     Values,
     Intent,
     IntentDurable,
     Meta,
+    Files,
     Durable,
     Superblock,
     After,
@@ -1006,6 +1013,10 @@ impl Checkpointer {
     }
 }
 
+/// The metadata ids a run of the dirty set moves: as many as one page of ids holds (DESIGN.md
+/// 22.1).
+const DIRTY_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<MetaId>();
+
 /// What a unit of a checkpoint's work leaves (DESIGN.md 22.1).
 enum Unit {
     /// Nothing more to do now: no checkpoint is due and nothing is left to erase.
@@ -1049,9 +1060,9 @@ impl State {
                 .saturating_sub(cp.began_at.load(Ordering::Acquire))
                 >= cp.budget / SHARES;
             if wanted <= self.full_done && !due {
-                return Ok(match cp.store.erase_freed()? {
-                    IOResult::Done(()) => Unit::Done,
-                    IOResult::IO(IOCompletions(c)) => Unit::Wait(c),
+                return Ok(match unit!(cp.store.erase_one()) {
+                    true => Unit::Done,
+                    false => Unit::Again,
                 });
             }
             cp.began_at.store(cp.log.end(), Ordering::Release);
@@ -1105,6 +1116,7 @@ impl Run {
             clock: 0,
             heights: [[0; CLASS_COUNT]; TREES],
             scan: CutScan::default(),
+            dirty: Chain::default(),
             meta: BTreeSet::new(),
             meta_at: None,
             set_aside: HashSet::new(),
@@ -1122,6 +1134,7 @@ impl Run {
             intent_end: None,
             frames: Vec::new(),
             writing: Vec::new(),
+            unsynced: None,
             waits: Vec::new(),
             written: None,
             superblock: None,
@@ -1177,15 +1190,16 @@ impl Run {
                     return Ok(Unit::Again);
                 }
                 Phase::Scan => {
-                    if let IOResult::IO(IOCompletions(c)) =
-                        cp.pool.begin_cut(self.n, &mut self.scan)
-                    {
-                        return Ok(Unit::Wait(c));
+                    // The pool's walk a run at a time, then the metadata cut.
+                    match cp.pool.cut_run(self.n, &mut self.scan) {
+                        IOResult::IO(IOCompletions(c)) => return Ok(Unit::Wait(c)),
+                        IOResult::Done(false) => return Ok(Unit::Again),
+                        IOResult::Done(true) => {}
                     }
                     let (dirty, heights) = cp.store.begin_cut(self.n);
                     cp.store.open_gate();
                     self.heights = heights;
-                    self.meta.extend(dirty);
+                    self.dirty = dirty;
                     for (root, slot, start) in cp.store.creations() {
                         if txns.committed_by(slot, start, self.c) {
                             self.mapped_roots.push(root);
@@ -1194,7 +1208,13 @@ impl Run {
                         }
                     }
                     self.queue = std::mem::take(&mut self.scan.owed).into_iter().collect();
-                    self.phase = Phase::Orphans;
+                    self.phase = Phase::Dirty;
+                    return Ok(Unit::Again);
+                }
+                Phase::Dirty => {
+                    if self.dirty_run() {
+                        self.phase = Phase::Orphans;
+                    }
                     return Ok(Unit::Again);
                 }
                 Phase::Orphans => {
@@ -1266,8 +1286,19 @@ impl Run {
                     return Ok(Unit::Again);
                 }
                 Phase::Meta => return self.meta_unit(cp),
-                Phase::Durable => {
+                Phase::Files => {
+                    // A data file's sync started a unit; then every one waited for.
+                    let unsynced = self.unsynced.get_or_insert_with(|| cp.store.data_files());
+                    if let Some(file) = unsynced.pop() {
+                        self.waits
+                            .push(file.sync_data(Completion::new_sync(|_| {}))?);
+                        return Ok(Unit::Again);
+                    }
                     unit!(wait_all(&mut self.waits));
+                    self.phase = Phase::Durable;
+                    return Ok(Unit::Again);
+                }
+                Phase::Durable => {
                     unit!(cp.log.wait_durable(cp.log.end()));
                     self.phase = Phase::Superblock;
                     return Ok(Unit::Again);
@@ -1300,7 +1331,10 @@ impl Run {
                     return Ok(Unit::Again);
                 }
                 Phase::After => {
-                    unit!(cp.store.after(self.n));
+                    // A deferred free a unit.
+                    if !unit!(cp.store.after_one(self.n)) {
+                        return Ok(Unit::Again);
+                    }
                     for root in self.mapped_roots.drain(..) {
                         cp.store.forget_creation(root);
                     }
@@ -1310,11 +1344,28 @@ impl Run {
                     return Ok(Unit::Again);
                 }
                 Phase::Erase => {
-                    unit!(cp.store.erase_freed());
-                    return Ok(Unit::Done);
+                    return Ok(match unit!(cp.store.erase_one()) {
+                        true => Unit::Done,
+                        false => Unit::Again,
+                    });
                 }
             }
         }
+    }
+
+    /// One run of the metadata pages dirty at the cut, [`DIRTY_RUN`] of them at most, into the
+    /// ordered set the run walks, a page listed once for each time it turned dirty: whether none
+    /// is left.
+    fn dirty_run(&mut self) -> bool {
+        for _ in 0..DIRTY_RUN {
+            match self.dirty.next() {
+                Some(id) => {
+                    self.meta.insert(id);
+                }
+                None => return true,
+            }
+        }
+        false
     }
 
     /// One unit of the metadata's writes, the pages taken in their order: a write that ended
@@ -1347,8 +1398,7 @@ impl Run {
                 return Ok(Unit::Wait(c.clone()));
             }
             cp.store.meta().end_cut(self.n, &self.frames);
-            self.waits = cp.store.sync_data_files()?;
-            self.phase = Phase::Durable;
+            self.phase = Phase::Files;
             return Ok(Unit::Again);
         };
         let frame = unit!(cp.store.meta().get(id));
@@ -1475,13 +1525,16 @@ impl Run {
                             Some(a) => a,
                             None => imaging.as_of.insert(AsOf::new(bytes, self.c)?),
                         };
-                        unit!(as_of.step(txns, &cp.pool));
+                        // An arena page a unit, until every entry is judged.
+                        if !unit!(as_of.step(txns, &cp.pool)) {
+                            return Ok(Unit::Again);
+                        }
                         let as_of = imaging.as_of.take().expect("judged");
                         let adoptable = as_of.adoptable();
                         let image = as_of.image()?;
                         let settles = live.filter(|_| adoptable || image.as_slice() == bytes);
                         imaging.image = Some((image, settles));
-                        // The arena pages its versions reach were this unit's.
+                        // The last arena page its versions reach was this unit's.
                         return Ok(Unit::Again);
                     }
                     imaging.image = Some((bytes.to_vec(), live));
@@ -1680,4 +1733,49 @@ fn wait_all(waits: &mut Vec<Completion>) -> Result<IOResult<()>> {
     }
     waits.clear();
     Ok(IOResult::Done(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The metadata pages dirty at a cut move into the ordered set a run of [`DIRTY_RUN`] at a
+    /// time (DESIGN.md 22.9 item 1; mutant: the chain read whole in one unit).
+    #[test]
+    fn the_dirty_set_is_walked_a_run_at_a_time_into_order() {
+        let stack = super::super::stack::Stack::default();
+        let count = 2 * DIRTY_RUN + 1;
+        // Pushed out of order, three of them twice.
+        for i in (0..count as u64).rev().chain(0..3) {
+            stack.push(MetaId {
+                tree: super::super::meta::Tree::Map,
+                class: page::SizeClass::new(0).unwrap(),
+                level: 0,
+                index: (i * 7919) % count as u64,
+            });
+        }
+        let mut run = Run::new(1, None);
+        run.dirty = stack.take_chain();
+        let mut runs = 0;
+        loop {
+            let before = run.meta.len();
+            let done = run.dirty_run();
+            runs += 1;
+            let moved = run.meta.len() - before;
+            assert!(moved <= DIRTY_RUN, "a run moved {moved}");
+            if done {
+                break;
+            }
+        }
+        assert_eq!(run.meta.len(), count, "every page once");
+        // The chain holds three pages twice; the run that finds it empty says so.
+        assert_eq!(
+            runs,
+            (count + 3) / DIRTY_RUN + 1,
+            "runs for {} entries",
+            count + 3
+        );
+        let ids: Vec<_> = run.meta.iter().collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "in order");
+    }
 }

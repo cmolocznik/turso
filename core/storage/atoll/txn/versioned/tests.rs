@@ -1564,16 +1564,20 @@ fn an_insert_appends_nothing_to_the_arena_and_its_rollback_removes_it() {
 }
 
 impl Db {
-    /// The tree's root, a leaf, as of the snapshot taken at `at`.
-    fn root_as_of(&self, at: Ts) -> Vec<u8> {
-        self.as_of(&self.page(self.tree.root()), at)
-    }
-
     /// The leaf `page` as of the snapshot taken at `at`.
     fn as_of(&self, page: &[u8], at: Ts) -> Vec<u8> {
+        self.as_of_stepped(page, at).0
+    }
+
+    /// The leaf `page` as of the snapshot taken at `at`, and the calls it took: an arena page a
+    /// call, until every entry is judged.
+    fn as_of_stepped(&self, page: &[u8], at: Ts) -> (Vec<u8>, usize) {
         let mut as_of = AsOf::new(page, at).unwrap();
-        run(&self.io, || as_of.step(self.txns(), self.db.pool()));
-        as_of.image().unwrap()
+        let mut calls = 1;
+        while !run(&self.io, || as_of.step(self.txns(), self.db.pool())) {
+            calls += 1;
+        }
+        (as_of.image().unwrap(), calls)
     }
 
     /// A copy of page `pid`.
@@ -1635,7 +1639,9 @@ fn a_leaf_as_of_a_snapshot_holds_each_key_as_the_snapshot_reads_it_settled() {
     db.put(&mut t3, "d", "44", Mode::Update);
     db.put(&mut t3, "h", "8", Mode::Insert);
 
-    let image = db.root_as_of(at);
+    // A call reads one arena page (DESIGN.md 22.9 item 1): a, b, big, c, d and e each read below
+    // the leaf's version, a and c twice. Asserted once the database is closed.
+    let (image, calls) = db.as_of_stepped(&db.page(db.tree.root()), at);
     let entries = View::new(&image[..]).entries().unwrap();
     let keys: Vec<&[u8]> = entries.iter().map(|e| &e.key[..]).collect();
     assert_eq!(
@@ -1677,6 +1683,9 @@ fn a_leaf_as_of_a_snapshot_holds_each_key_as_the_snapshot_reads_it_settled() {
     assert_eq!(layout(&image), layout(&live), "the leaf's layout");
     assert_eq!(image[..page::HEADER_SIZE], live[..page::HEADER_SIZE]);
     db.rollback(t3);
+    drop(reader);
+    drop(db);
+    assert!(calls >= 8, "{calls} calls judged the leaf");
 }
 
 #[test]

@@ -507,10 +507,13 @@ pub struct Connection {
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// The main database's Atoll transaction, in Atoll mode (DESIGN.md §17).
     pub(crate) atoll: Option<crate::storage::atoll::sql::mode::ConnTxn>,
-    /// Whether a statement of the connection has begun to end its transaction in Atoll mode: the
-    /// commit or rollback is decided and that statement's to finish, whole, as it steps, is reset
-    /// or drops (`vdbe::EndingBegun`); a close meanwhile is refused.
-    pub(crate) atoll_ending_begun: AtomicBool,
+    /// Who holds the end of the connection's transaction: nobody ([`Self::END_FREE`]), a statement
+    /// that has begun to end it in Atoll mode ([`Self::END_ENDING`], `vdbe::EndingBegun`), whose
+    /// commit or rollback is decided and is that statement's to finish whole as it steps, is reset
+    /// or drops, or a close ([`Self::END_CLOSING`]), for good. One word taken by compare-and-swap,
+    /// so a close and an ending's start exclude each other on any threads: a close meeting an
+    /// ending is refused, an ending meeting a close does not begin.
+    pub(crate) atoll_end: AtomicU8,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
@@ -2538,6 +2541,13 @@ impl Connection {
         }
     }
 
+    /// [`Self::atoll_end`]: nobody holds the end of the connection's transaction.
+    pub(crate) const END_FREE: u8 = 0;
+    /// [`Self::atoll_end`]: a statement ending the connection's Atoll transaction holds it.
+    pub(crate) const END_ENDING: u8 = 1;
+    /// [`Self::atoll_end`]: a close holds it.
+    pub(crate) const END_CLOSING: u8 = 2;
+
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
         if self.is_closed() {
@@ -2547,12 +2557,22 @@ impl Connection {
         // publishes the schema it changed and ends the attached databases' transactions once its
         // ending has ended, which a rollback here would undo under it. The close is refused, the
         // connection left as it was, until the statement has finished or been reset or dropped (the
-        // auditor's P1-DDL-END1, #4417).
-        if self.atoll_ending_begun.load(Ordering::Acquire) {
-            return Err(LimboError::StatementsInProgress(
-                "a statement is ending the connection's transaction: step it to its end, reset it \
-                 or drop it before closing",
-            ));
+        // auditor's P1-DDL-END1, #4417). Taken, the end is the close's for good.
+        match self.atoll_end.compare_exchange(
+            Self::END_FREE,
+            Self::END_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(Self::END_ENDING) => {
+                return Err(LimboError::StatementsInProgress(
+                    "a statement is ending the connection's transaction: step it to its end, \
+                     reset it or drop it before closing",
+                ))
+            }
+            // Another close holds it.
+            Err(_) => return Ok(()),
         }
         self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();
@@ -4753,6 +4773,15 @@ impl Connection {
         if activity.explicit_checkpoint_active {
             return Err(LimboError::StatementsInProgress(
                 "cannot start a statement while a checkpoint is active",
+            ));
+        }
+        // A statement ending the connection's transaction finishes it before another begins: one
+        // starting meanwhile would begin a transaction, or end or roll back one, under it (the
+        // auditor's #4423, #4425). It is refused, changing nothing.
+        if self.atoll_end.load(Ordering::Acquire) == Self::END_ENDING {
+            return Err(LimboError::StatementsInProgress(
+                "a statement is ending the connection's transaction: step it to its end, reset it \
+                 or drop it before starting another",
             ));
         }
         self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);

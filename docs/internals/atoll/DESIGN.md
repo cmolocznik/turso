@@ -3633,6 +3633,26 @@ MVCC plugs into the same places with 38 explicit branches in `core/vdbe/execute.
   through cursors, so they run unchanged. They get the snapshot timestamp as their snapshot identity.
 - **PostgreSQL frontend.** It opens MVCC today and turns BEGIN into BEGIN CONCURRENT. It gains a
   switch to open Atoll databases.
+- **A transaction's end.** A statement that begins to end its connection's transaction (a halt in
+  autocommit, `COMMIT`) takes the connection's end word (`Connection::atoll_end`), which a close
+  takes too, each by compare-and-swap, so a close and an ending's start exclude each other on any
+  threads: a close meeting an ending is refused (`StatementsInProgress`), changing nothing, and an
+  ending meeting a close does not begin. While the word is held no root statement of the
+  connection starts (refused the same way at its start), so no second transaction begins, ends or
+  rolls back under the first's ending; a statement already running goes on. The ending is decided
+  and finished whole by its statement, stepped on, reset or dropped: the storage's ending, then a
+  rollback's schema put back, then temp's and the attached databases' transactions ended, the
+  connection's state last. No interrupt, deadline or progress handler stops it. A commit's schema
+  is published with the commit, in the hook that publishes its header fields and its trees' stamps
+  before the write gate is let go, so whoever takes the gate next prepares against it, and nothing
+  the ending meets after can leave it unpublished. A commit is decided at its publication: a failure
+  its ending meets after (its wait for durability, its drain, a full checkpoint's wait) ends the
+  ending, whose rest is never stepped again, the commit is finished whole, the attached databases'
+  transactions committed, and the statement returns the failure in place of `Done`; one met before
+  rolls every part back. Across databases a commit is atomic per database, as SQLite's is in WAL
+  mode: the attached databases commit after the main database's commit is published, not after it is
+  durable. `ROLLBACK` drives its ending to its end inside its own step, so no statement is ever left
+  holding a rollback's ending.
 
 ## 18. Concurrency inside the engine
 

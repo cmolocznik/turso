@@ -676,6 +676,13 @@ impl Statement {
                 .step(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
+        // A commit in Atoll mode that met a failure once published has finished whole: the
+        // statement is done, and the failure is what it returns (DESIGN.md §17).
+        let commit_failure = match &res {
+            Ok(StepResult::Done) => self.state.take_atoll_commit_failure(),
+            _ => None,
+        };
+
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
             let connection = &self.program.connection;
@@ -687,7 +694,7 @@ impl Statement {
             self.state.query_deadline = None;
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
-            if self.program.refreshes_analyze_stats {
+            if self.program.refreshes_analyze_stats && commit_failure.is_none() {
                 // The stats refresh runs a SELECT on this same connection. At
                 // this point ANALYZE is already Done, so it must not count as a
                 // sibling root statement for that internal SELECT.
@@ -799,6 +806,9 @@ impl Statement {
 
         if matches!(res, Ok(StepResult::Done)) {
             self.state.pending_fresh_tx = None;
+        }
+        if let Some(failure) = commit_failure {
+            return Err(failure);
         }
 
         // The interpreter chain carries a boxed error to keep per-row returns
@@ -1636,19 +1646,18 @@ impl Statement {
             loop {
                 match self._step(None) {
                     Ok(StepResult::Done) => break,
-                    Ok(StepResult::IO) => {
-                        if let Some(io) = self.state.take_io_completions() {
-                            if let Err(err) = io.wait(self.pager.io.as_ref()) {
-                                capture_reset_error(
-                                    &mut reset_error,
-                                    err,
-                                    "Error while finishing a decided commit during statement reset",
-                                );
-                                break;
-                            }
+                    // The completion stays the statement's: its next step reads what it came to,
+                    // so a failure meets the commit's own handling (`Program::finish_pending_io`).
+                    Ok(StepResult::IO | StepResult::Yield) => {
+                        if let Err(err) = self.wait_io() {
+                            capture_reset_error(
+                                &mut reset_error,
+                                err,
+                                "Error while finishing a decided commit during statement reset",
+                            );
+                            break;
                         }
                     }
-                    Ok(StepResult::Yield) => {}
                     Ok(other) => {
                         capture_reset_error(
                             &mut reset_error,
@@ -1725,6 +1734,13 @@ impl Statement {
                 }
 
                 statement_failed = !halt_completed;
+                if let Some(failure) = self.state.take_atoll_commit_failure() {
+                    capture_reset_error(
+                        &mut reset_error,
+                        failure,
+                        "A commit finished during statement reset failed once published",
+                    );
+                }
                 if !halt_completed {
                     if let Err(abort_err) = self.program.abort(
                         &self.pager,

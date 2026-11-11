@@ -1095,6 +1095,19 @@ impl ConnTxn {
     /// while a schema reparse holds it.
     #[turso_macros::atoll_entry]
     pub fn end(&self, commit: bool) -> Option<Ending> {
+        self.end_publishing(commit, None)
+    }
+
+    /// [`end`](Self::end), with `publish` run as the commit is published, after its header fields
+    /// and its trees' stamps and before the write gate is let go, so whoever takes the gate next
+    /// sees what it publishes: the SQL schema a commit changed (DESIGN.md §17). Dropped unrun by a
+    /// rollback, or by a commit that fails before it is published.
+    #[turso_macros::atoll_entry]
+    pub fn end_publishing(
+        &self,
+        commit: bool,
+        publish: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<Ending> {
         if self.pinned.load(Ordering::Acquire) {
             return None;
         }
@@ -1114,7 +1127,7 @@ impl ConnTxn {
         let conn = self.cell.conn().clone();
         crate::storage::atoll::buffer::cancel_shortage(self.db.atoll().pool(), &conn);
         Some(if commit {
-            Ending::commit(self.db.clone(), conn, txn, written, stamped)
+            Ending::commit(self.db.clone(), conn, txn, written, stamped, publish)
         } else {
             self.changes.rolled_back();
             Ending::rollback(self.db.clone(), conn, txn)
@@ -1447,18 +1460,22 @@ enum Step {
     Drain,
     /// A full checkpoint, by the wait for it, which holds the end's demand on the checkpoint.
     Checkpoint(crate::storage::atoll::checkpoint::FullWait),
+    /// A published commit's ending whose IO failed: its next step returns the failure.
+    Failed(LimboError),
     Done,
 }
 
 impl Ending {
     /// Commits `txn`: once it is published, its header fields `written` and the stamps of the
-    /// trees it wrote are raised to its commit timestamp, before it releases the write gate.
+    /// trees it wrote are raised to its commit timestamp, and `publish` runs, before it releases
+    /// the write gate.
     fn commit(
         db: Arc<AtollDb>,
         conn: Arc<crate::storage::atoll::buffer::Conn>,
         txn: Txn,
         written: Vec<(Statement, Field, u32)>,
         stamped: Vec<super::trees::Stamp>,
+        publish: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
         let published = db.clone();
         let commit = Commit::new(txn).on_published(move |ts| {
@@ -1466,6 +1483,9 @@ impl Ending {
                 published.header().publish(field, ts, value);
             }
             super::trees::TreeStamps::raise(&stamped, ts);
+            if let Some(publish) = publish {
+                publish();
+            }
         });
         Self {
             db,
@@ -1503,6 +1523,20 @@ impl Ending {
     #[turso_macros::atoll_entry]
     pub fn step(&mut self) -> Result<IOResult<()>> {
         crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::step_owned)
+    }
+
+    /// An IO the ending waited on failed, its commit published (DESIGN.md §17): the commit stands,
+    /// the next step returns the failure, and the ending is over. What was left of it, the wait for
+    /// durability, the drain (which the next ending's goes on with) or a full checkpoint's wait, is
+    /// not stepped again: stepped again, a fix whose read failed would issue the read anew.
+    #[turso_macros::atoll_entry]
+    pub fn failed(&mut self, failure: LimboError) {
+        crate::turso_assert!(
+            self.published(),
+            "only a published commit's ending takes its IO's failure"
+        );
+        self.published = true;
+        self.step = Step::Failed(failure);
     }
 
     /// Whether the ending holds a memory-shortage tenure, for a test.
@@ -1553,6 +1587,13 @@ impl Ending {
                     done!(self.db.atoll().checkpointer().step_full(wait, txns));
                     self.step = Step::Done;
                 }
+                Step::Failed(_) => {
+                    let Step::Failed(failure) = std::mem::replace(&mut self.step, Step::Done)
+                    else {
+                        unreachable!("the step just matched")
+                    };
+                    return Err(failure);
+                }
                 Step::Done => return Ok(IOResult::Done(())),
             }
         }
@@ -1585,6 +1626,7 @@ impl std::fmt::Debug for Ending {
             Step::Rollback(_) => "rolling back",
             Step::Drain => "draining",
             Step::Checkpoint(_) => "checkpointing",
+            Step::Failed(_) => "failed",
             Step::Done => "done",
         };
         f.debug_tuple("Ending").field(&step).finish()

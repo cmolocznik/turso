@@ -4808,3 +4808,513 @@ fn a_create_table_whose_published_commit_then_fails_publishes_its_table() {
         "a published commit that then failed left its table unpublished: {ended:?}"
     );
 }
+
+/// Runs `sql` on `conn` to its end on `crash`, stepping the IO it waits on, and says how it ended.
+fn ran_on(
+    conn: &Arc<Connection>,
+    crash: &crate::io::crash::CrashIO,
+    sql: &str,
+) -> std::result::Result<(), String> {
+    let mut statement = conn.prepare(sql).map_err(|e| e.to_string())?;
+    loop {
+        match statement.step() {
+            Ok(crate::StepResult::IO) => crash.step().map_err(|e| e.to_string())?,
+            Ok(crate::StepResult::Done) => return Ok(()),
+            Ok(crate::StepResult::Row) => {}
+            Ok(other) => return Err(format!("{other:?}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// An Atoll database at `/db/{name}` whose connections may attach database files.
+fn open_attaching(io: &Arc<dyn IO>, name: &str) -> Arc<Database> {
+    Database::open(
+        io.clone(),
+        &format!("/db/{name}"),
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .atoll(config())
+            .db_opts(DatabaseOpts::default().with_attach(true)),
+    )
+    .unwrap()
+}
+
+/// The rows of `side` in the database file `/db/{name}-aux`, read through a database of its own.
+fn side_rows(io: &Arc<dyn IO>, name: &str) -> std::result::Result<Vec<Vec<Value>>, String> {
+    let aux = Database::open(
+        io.clone(),
+        &format!("/db/{name}-aux"),
+        OpenOptions::new(Arc::new(SqliteDialect)),
+    )
+    .map_err(|e| e.to_string())?;
+    let conn = aux.connect(ConnectOpts::new()).map_err(|e| e.to_string())?;
+    conn.prepare("SELECT b FROM side")
+        .and_then(|mut statement| statement.run_collect_rows())
+        .map_err(|e| e.to_string())
+}
+
+/// A `COMMIT` of a table made in the main database and a row written to a table of an attached
+/// database file, its commit published, then its log failing (faults on the log's file alone): the
+/// commit stands, so the statement finishes it whole, the attached database's part committed, and
+/// returns the failure once done. Stepped to its end, or, if `dropped`, dropped with its wait on
+/// the failing log in flight, the reset finishing it (before, the failure aborted the statement,
+/// rolling the attached database's part back under the main database's published commit).
+fn a_published_commit_whose_log_fails(seed: u64, dropped: bool) {
+    let name = format!(
+        "published-then-failed-attached{}",
+        if dropped { "-dropped" } else { "" }
+    );
+    let crash = Arc::new(crate::io::crash::CrashIO::new(seed));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open_attaching(&io, &name);
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let setup = [
+        format!("ATTACH '/db/{name}-aux' AS aux"),
+        "BEGIN".to_string(),
+        "CREATE TABLE kept(a INTEGER)".to_string(),
+        "CREATE TABLE aux.side(b INTEGER)".to_string(),
+        "INSERT INTO aux.side VALUES (1)".to_string(),
+    ]
+    .iter()
+    .map(|sql| ran_on(&writer, &crash, sql))
+    .collect::<std::result::Result<Vec<_>, _>>();
+    let mut statement = writer.prepare("COMMIT").unwrap();
+    let published = loop {
+        match statement.step() {
+            Ok(crate::StepResult::IO) => {
+                if statement.atoll_ending_published() {
+                    break Ok(());
+                }
+                crash.step().unwrap();
+            }
+            Ok(other) => break Err(format!("{other:?}")),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    crash.set_faults_on(Some(&format!("/db/{name}.log.{:016x}", 0)));
+    crash.set_faults(crate::io::crash::Faults {
+        read: 0.0,
+        write: 1.0,
+        sync: 1.0,
+        short_write: 0.0,
+    });
+    let ended = match dropped {
+        true => None,
+        false => Some(loop {
+            match statement.step() {
+                Ok(crate::StepResult::IO) => crash.step().unwrap(),
+                Ok(crate::StepResult::Done) => break Ok(()),
+                Ok(other) => break Err(format!("{other:?}")),
+                Err(e) => break Err(e.to_string()),
+            }
+        }),
+    };
+    drop(statement);
+    crash.set_faults(crate::io::crash::Faults::default());
+    crash.set_faults_on(None);
+    // The log failed for good: a later commit to the main database fails.
+    let later = ran_on(&reader, &crash, "CREATE TABLE later(a INTEGER)");
+    let seen = sees(&reader, "kept");
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((writer, reader, db));
+    let beside = side_rows(&io, &name);
+    assert_eq!(setup.map(drop), Ok(()));
+    assert_eq!(
+        published,
+        Ok(()),
+        "the COMMIT was never published with its ending waiting"
+    );
+    if let Some(ended) = ended {
+        assert!(
+            ended.is_err(),
+            "the COMMIT did not return its log's failure: {ended:?}"
+        );
+    }
+    assert!(
+        later.is_err(),
+        "the log did not fail: a later commit went through"
+    );
+    assert_eq!(
+        seen,
+        Ok(()),
+        "a published commit whose log failed left its main table unpublished"
+    );
+    assert_eq!(
+        beside,
+        Ok(vec![vec![Value::from_i64(1)]]),
+        "a published commit whose log failed rolled back its attached database's part"
+    );
+    assert_eq!(
+        state,
+        (true, crate::connection::TransactionState::None),
+        "a published commit whose log failed left its connection in a transaction"
+    );
+}
+
+#[test]
+fn a_published_commit_whose_log_fails_commits_its_attached_part_and_returns_the_failure() {
+    a_published_commit_whose_log_fails(659, false);
+}
+
+#[test]
+fn a_published_commit_dropped_as_its_log_fails_commits_its_attached_part() {
+    a_published_commit_whose_log_fails(660, true);
+}
+
+/// An Atoll ending told that an IO it waited on failed, its commit published, returns that failure
+/// at its next step and is over: stepped again, it is done, nothing of it run again.
+#[test]
+fn a_published_endings_failure_is_what_its_next_step_returns() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(661));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, "/db/ending-told-it-failed");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let setup = ["BEGIN", "CREATE TABLE t(a INTEGER)"]
+        .iter()
+        .map(|sql| ran_on(&conn, &crash, sql))
+        .collect::<std::result::Result<Vec<_>, _>>();
+    let mut ending = conn.atoll().unwrap().end(true).unwrap();
+    let published = loop {
+        match ending.step() {
+            Ok(crate::IOResult::IO(_)) if ending.published() => break Ok(()),
+            Ok(crate::IOResult::IO(_)) => crash.step().unwrap(),
+            Ok(crate::IOResult::Done(())) => break Err("done before it waited".to_string()),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    ending.failed(crate::LimboError::InternalError(
+        "the test's failure".to_string(),
+    ));
+    let first = ending.step().map(|_| ()).map_err(|e| e.to_string());
+    let second = ending
+        .step()
+        .map(|stepped| !stepped.is_io())
+        .map_err(|e| e.to_string());
+    drop(ending);
+    drop((conn, db));
+    assert_eq!(setup.map(drop), Ok(()));
+    assert_eq!(published, Ok(()), "the commit never waited once published");
+    assert_eq!(first, Err("Internal error: the test's failure".to_string()));
+    assert_eq!(
+        second,
+        Ok(true),
+        "an ending over after its failure stepped on"
+    );
+}
+
+/// A progress handler asking to stop once a `COMMIT`'s ending has begun does not stop it: the
+/// outcome is decided, so the commit finishes whole, the attached database's part committed, and
+/// the statement is done (before, its interrupt aborted the `COMMIT` mid-ending, rolling the
+/// attached database's part back under the main database's commit).
+#[test]
+fn a_progress_handler_at_a_commits_ending_does_not_stop_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let name = "progress-at-ending";
+    let crash = Arc::new(crate::io::crash::CrashIO::new(662));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open_attaching(&io, name);
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let setup = [
+        format!("ATTACH '/db/{name}-aux' AS aux"),
+        "BEGIN".to_string(),
+        "CREATE TABLE kept(a INTEGER)".to_string(),
+        "CREATE TABLE aux.side(b INTEGER)".to_string(),
+        "INSERT INTO aux.side VALUES (1)".to_string(),
+    ]
+    .iter()
+    .map(|sql| ran_on(&writer, &crash, sql))
+    .collect::<std::result::Result<Vec<_>, _>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    writer.set_progress_handler(
+        1,
+        Some(Box::new({
+            let stop = stop.clone();
+            move || stop.load(Ordering::SeqCst)
+        })),
+    );
+    let mut statement = writer.prepare("COMMIT").unwrap();
+    let outcome = loop {
+        match statement.step() {
+            Ok(crate::StepResult::IO) => {
+                if statement.atoll_ending_phase() == Some("ending") {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                crash.step().unwrap();
+            }
+            Ok(crate::StepResult::Done) => break Ok(()),
+            Ok(other) => break Err(format!("{other:?}")),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    drop(statement);
+    writer.set_progress_handler(0, None);
+    let seen = sees(&reader, "kept");
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((writer, reader, db));
+    let beside = side_rows(&io, name);
+    assert_eq!(setup.map(drop), Ok(()));
+    assert!(
+        stop.load(Ordering::SeqCst),
+        "the COMMIT never waited in its ending"
+    );
+    assert_eq!(
+        outcome,
+        Ok(()),
+        "a progress handler stopped a COMMIT whose ending had begun"
+    );
+    assert_eq!(seen, Ok(()));
+    assert_eq!(
+        beside,
+        Ok(vec![vec![Value::from_i64(1)]]),
+        "a COMMIT stopped mid-ending rolled back its attached database's part"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+}
+
+/// A `ROLLBACK` ends its transaction within its first step, its ending driven to its end in place
+/// (`Connection::rollback_atoll`, a synchronous site, R19), so no statement is ever left holding a
+/// rollback's ending to be reset or dropped: the transaction made a table in the main database and
+/// one in an attached database file, both gone from every schema once that step returns, the
+/// connection back in autocommit, and the main table's name free for its next statement.
+#[test]
+fn a_rollback_ends_its_transaction_within_its_first_step() {
+    let name = "rollback-in-one-step";
+    let crash = Arc::new(crate::io::crash::CrashIO::new(663));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open_attaching(&io, name);
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let setup = [
+        format!("ATTACH '/db/{name}-aux' AS aux"),
+        "BEGIN".to_string(),
+        "CREATE TABLE gone(a INTEGER)".to_string(),
+        "INSERT INTO gone VALUES (1)".to_string(),
+        "CREATE TABLE aux.side(b INTEGER)".to_string(),
+        "INSERT INTO aux.side VALUES (1)".to_string(),
+    ]
+    .iter()
+    .map(|sql| ran_on(&writer, &crash, sql))
+    .collect::<std::result::Result<Vec<_>, _>>();
+    let first = writer
+        .prepare("ROLLBACK")
+        .and_then(|mut statement| statement.step())
+        .map(|stepped| format!("{stepped:?}"))
+        .map_err(|e| e.to_string());
+    let gone = (
+        sees(&reader, "gone").is_err(),
+        sees(&writer, "gone").is_err(),
+        sees(&writer, "aux.side").is_err(),
+    );
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    let remade = ran_on(&writer, &crash, "CREATE TABLE gone(a INTEGER)");
+    let seen_remade = sees(&reader, "gone");
+    drop((writer, reader, db));
+    assert_eq!(setup.map(drop), Ok(()));
+    assert_eq!(
+        first,
+        Ok("Done".to_string()),
+        "a ROLLBACK left its first step with its ending unfinished"
+    );
+    assert_eq!(
+        gone,
+        (true, true, true),
+        "a ROLLBACK left a table it rolled back"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+    assert_eq!(remade, Ok(()));
+    assert_eq!(seen_remade, Ok(()));
+}
+
+/// Steps `statement` until it returns `IO` with its Atoll commit published, stepping the IO it
+/// waits on before that, and says how far it got.
+fn step_until_published(
+    statement: &mut crate::Statement,
+    crash: &crate::io::crash::CrashIO,
+) -> std::result::Result<(), String> {
+    loop {
+        match statement.step() {
+            Ok(crate::StepResult::IO) => {
+                if statement.atoll_ending_published() {
+                    return Ok(());
+                }
+                crash.step().map_err(|e| e.to_string())?;
+            }
+            Ok(other) => return Err(format!("{other:?}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Steps `statement` to its end, stepping the IO it waits on, and says how it ended.
+fn step_to_end(
+    statement: &mut crate::Statement,
+    crash: &crate::io::crash::CrashIO,
+) -> std::result::Result<(), String> {
+    loop {
+        match statement.step() {
+            Ok(crate::StepResult::IO) => crash.step().map_err(|e| e.to_string())?,
+            Ok(crate::StepResult::Done) => return Ok(()),
+            Ok(crate::StepResult::Row) => {}
+            Ok(other) => return Err(format!("{other:?}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// A statement of a connection started while another of its statements holds the connection's
+/// end, a `CREATE TABLE` waiting in its commit's ending, is refused and changes nothing, and a close
+/// then is too; once the first has finished, as it drops, the refused statement runs and the
+/// connection closes (the auditor's #4423: before, the second ran its own ending to its end, letting
+/// the first's protection go, and a close then went ahead under the first).
+#[test]
+fn a_statement_started_while_another_ends_the_transaction_is_refused() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(665));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, "/db/ending-overlap");
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let setup = ran_on(&writer, &crash, "CREATE TABLE t(a INTEGER)");
+    let mut first = writer.prepare("CREATE TABLE made(a INTEGER)").unwrap();
+    let met = loop {
+        match first.step() {
+            Ok(crate::StepResult::IO) => {
+                if first.atoll_ending_phase() == Some("ending") {
+                    break Ok(());
+                }
+                crash.step().unwrap();
+            }
+            Ok(other) => break Err(format!("{other:?}")),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    let mut second = writer.prepare("INSERT INTO t VALUES (2)").unwrap();
+    let refused = match second.step() {
+        Err(crate::LimboError::StatementsInProgress(_)) => Ok(()),
+        other => Err(format!("{other:?}")),
+    };
+    let close_refused = match writer.close() {
+        Err(crate::LimboError::StatementsInProgress(_)) => Ok(()),
+        other => Err(format!("{other:?}")),
+    };
+    drop(first);
+    let ran = second
+        .reset()
+        .map_err(|e| e.to_string())
+        .and_then(|()| step_to_end(&mut second, &crash));
+    drop(second);
+    let rows = reader
+        .prepare("SELECT a FROM t")
+        .and_then(|mut statement| statement.run_collect_rows())
+        .map_err(|e| e.to_string());
+    let seen = sees(&reader, "made");
+    let closed = writer.close().map_err(|e| e.to_string());
+    drop((writer, reader, db));
+    assert_eq!(setup, Ok(()));
+    assert_eq!(met, Ok(()), "the CREATE TABLE never waited in its ending");
+    assert_eq!(
+        refused,
+        Ok(()),
+        "a statement started while another ended the transaction"
+    );
+    assert_eq!(
+        close_refused,
+        Ok(()),
+        "a close went ahead while a statement ended the transaction"
+    );
+    assert_eq!(
+        ran,
+        Ok(()),
+        "the refused statement did not run once the ending had finished"
+    );
+    assert_eq!(rows, Ok(vec![vec![Value::from_i64(2)]]));
+    assert_eq!(seen, Ok(()));
+    assert_eq!(closed, Ok(()));
+}
+
+/// A `CREATE TABLE` whose commit is published and still waits for its durability: its table is in
+/// the shared schema already, so another connection prepares a statement on it and commits a
+/// `CREATE TABLE` of its own meanwhile, and both tables are there once both have finished and after a
+/// reopen (before, the schema was published only once the whole ending had ended, so for as long as
+/// it waited, on durability, its drain or a full checkpoint, the committed table was missing from the
+/// schema every other connection prepared against).
+#[test]
+fn a_commits_schema_is_published_with_its_commit() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(666));
+    let io: Arc<dyn IO> = crash.clone();
+    let path = "/db/ddl-published-with-its-commit";
+    let db = open(&io, path);
+    let first_conn = db.connect(ConnectOpts::new()).unwrap();
+    let second_conn = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let mut first = first_conn.prepare("CREATE TABLE first(a INTEGER)").unwrap();
+    let published = step_until_published(&mut first, &crash);
+    let while_waiting = sees(&reader, "first");
+    let second = ran_on(&second_conn, &crash, "CREATE TABLE second(a INTEGER)");
+    let first_ended = step_to_end(&mut first, &crash);
+    drop(first);
+    let seen = (sees(&reader, "first"), sees(&reader, "second"));
+    drop((first_conn, second_conn, reader, db));
+    let reopened = open(&io, path);
+    let fresh = reopened.connect(ConnectOpts::new()).unwrap();
+    let after_reopen = (sees(&fresh, "first"), sees(&fresh, "second"));
+    drop((fresh, reopened));
+    assert_eq!(
+        published,
+        Ok(()),
+        "the CREATE TABLE's commit was never published with its ending waiting"
+    );
+    assert_eq!(
+        while_waiting,
+        Ok(()),
+        "a published commit's table was missing from the shared schema while its ending waited"
+    );
+    assert_eq!(second, Ok(()));
+    assert_eq!(first_ended, Ok(()));
+    assert_eq!(seen, (Ok(()), Ok(())));
+    assert_eq!(after_reopen, (Ok(()), Ok(())));
+}
+
+/// The end of a connection's transaction is one word that a close and an ending's start take by
+/// compare-and-swap, so they exclude each other on any threads: an ending holding it refuses a
+/// close, which goes ahead once the ending lets go, and a second ending; a close holding it keeps an
+/// ending from beginning.
+#[test]
+fn a_close_and_an_endings_start_exclude_each_other() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(664));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, "/db/end-word");
+    let ending_first = db.connect(ConnectOpts::new()).unwrap();
+    let closed_first = db.connect(ConnectOpts::new()).unwrap();
+    let ending = crate::vdbe::EndingBegun::new(&ending_first).map_err(|e| e.to_string());
+    let second_refused = matches!(
+        crate::vdbe::EndingBegun::new(&ending_first),
+        Err(crate::LimboError::StatementsInProgress(_))
+    );
+    let refused = matches!(
+        ending_first.close(),
+        Err(crate::LimboError::StatementsInProgress(_))
+    );
+    let open_after_refusal = !ending_first.is_closed();
+    drop(ending);
+    let closed = ending_first.close().map_err(|e| e.to_string());
+    let closing = closed_first.close().map_err(|e| e.to_string());
+    let begun = crate::vdbe::EndingBegun::new(&closed_first)
+        .map(drop)
+        .map_err(|e| e.to_string());
+    drop((ending_first, closed_first, db));
+    assert!(
+        second_refused,
+        "a second ending began while another held the end"
+    );
+    assert!(refused, "a close went ahead while an ending held the end");
+    assert!(open_after_refusal, "a refused close closed its connection");
+    assert_eq!(closed, Ok(()));
+    assert_eq!(closing, Ok(()));
+    assert_eq!(
+        begun,
+        Err("Internal error: Connection closed".to_string()),
+        "an ending began on a connection a close held"
+    );
+}

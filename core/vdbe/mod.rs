@@ -420,21 +420,40 @@ enum CommitState {
     },
 }
 
-/// A statement's mark on its connection while it ends the connection's transaction in Atoll mode
-/// (`Connection::atoll_ending_begun`): set as the ending begins, let go as it is dropped, with the
+/// A statement's hold on the end of its connection's transaction in Atoll mode
+/// (`Connection::atoll_end`): taken as the ending begins, let go as it is dropped, with the
 /// statement's commit state or once the commit has been finished whole.
 pub(crate) struct EndingBegun(Arc<Connection>);
 
 impl EndingBegun {
-    fn new(connection: &Arc<Connection>) -> Self {
-        connection.atoll_ending_begun.store(true, Ordering::Release);
-        Self(connection.clone())
+    /// Takes the end of `connection`'s transaction for the statement about to end it. A close that
+    /// holds it has the transaction: the statement's ending does not begin.
+    pub(crate) fn new(connection: &Arc<Connection>) -> Result<Self> {
+        match connection.atoll_end.compare_exchange(
+            Connection::END_FREE,
+            Connection::END_ENDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(Self(connection.clone())),
+            Err(Connection::END_CLOSING) => {
+                Err(LimboError::InternalError("Connection closed".to_string()))
+            }
+            // Another statement's ending: no root statement starts while it stands
+            // (`Connection::start_root_statement`), so only one already running could meet it.
+            Err(_) => Err(LimboError::StatementsInProgress(
+                "a statement is ending the connection's transaction: step it to its end, reset it \
+                 or drop it before ending another",
+            )),
+        }
     }
 }
 
 impl Drop for EndingBegun {
     fn drop(&mut self) {
-        self.0.atoll_ending_begun.store(false, Ordering::Release);
+        self.0
+            .atoll_end
+            .store(Connection::END_FREE, Ordering::Release);
     }
 }
 
@@ -1316,9 +1335,12 @@ pub struct ProgramState {
     /// Whether this statement's Transaction opcode left a take of Atoll's write gate waiting,
     /// which it gives up if it stops waiting (R15).
     pub(crate) atoll_taking: bool,
-    /// In Atoll mode, this statement's mark on its connection while it ends the transaction, from
-    /// the ending's start to the end of the commit's finishing (`Connection::atoll_ending_begun`).
+    /// In Atoll mode, this statement's hold on the end of its connection's transaction, from the
+    /// ending's start to the end of the commit's finishing (`Connection::atoll_end`).
     pub(crate) atoll_ending_begun: Option<EndingBegun>,
+    /// In Atoll mode, the failure the statement's commit met once published (DESIGN.md §17): the
+    /// commit stands, so it is finished whole, and then the failure is the statement's outcome.
+    pub(crate) atoll_commit_failure: Option<LimboError>,
     /// In Atoll mode, a CreateBtree under way (DESIGN.md §17).
     pub(crate) atoll_create: Option<crate::storage::atoll::sql::mode::CreateOp>,
     /// In Atoll mode, a Destroy or ClearBtree under way (DESIGN.md §17).
@@ -1450,6 +1472,7 @@ impl ProgramState {
             atoll_statement: None,
             atoll_taking: false,
             atoll_ending_begun: None,
+            atoll_commit_failure: None,
             atoll_create: None,
             atoll_retire: None,
             is_active_write: false,
@@ -1623,6 +1646,7 @@ impl ProgramState {
         }
         // After the ending it marked, which has driven itself to its end as it dropped.
         self.atoll_ending_begun = None;
+        self.atoll_commit_failure = None;
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
@@ -1932,6 +1956,12 @@ impl ProgramState {
     #[cfg(test)]
     pub(crate) fn atoll_ending_published(&self) -> bool {
         matches!(&self.commit_state, CommitState::Atoll { ending, .. } if ending.published())
+    }
+
+    /// The failure the statement's published Atoll commit met, once the commit has finished
+    /// whole: the statement's outcome in place of its `Done` (DESIGN.md §17).
+    pub(crate) fn take_atoll_commit_failure(&mut self) -> Option<LimboError> {
+        self.atoll_commit_failure.take()
     }
 
     /// The completion the instruction that just returned `IO` parked.
@@ -3108,6 +3138,15 @@ impl Program {
                 pager.cleanup_after_checkpoint_failure();
                 return Some(ProgramStep::Error(checkpoint_err.into()));
             }
+            // The ending of a published Atoll commit takes the failure as its own: the instruction
+            // that waited steps it on to finish the commit whole (DESIGN.md §17).
+            if let CommitState::Atoll { ending, .. } = &mut state.commit_state {
+                if ending.published() {
+                    ending.failed(err.into());
+                    state.io_completions = None;
+                    return None;
+                }
+            }
             let err = err.into();
             if let Err(abort_err) = self.abort(pager, Some(&err), state, true) {
                 tracing::error!("Abort failed during error handling: {abort_err}");
@@ -3479,8 +3518,18 @@ impl Program {
                 }
             );
             let atoll = connection.atoll().expect("Atoll mode");
-            program_state.atoll_ending_begun = Some(EndingBegun::new(connection));
-            program_state.commit_state = match atoll.end(!rollback) {
+            program_state.atoll_ending_begun = Some(EndingBegun::new(connection)?);
+            // The statement's outcome is decided: no interrupt, deadline or progress handler stops
+            // what is left of it (`Program::maybe_request_interrupt`).
+            program_state.halt_in_progress = true;
+            // A commit that changed the schema publishes it as it publishes its writes, before the
+            // write gate is let go, so whoever takes the gate next reads it, and nothing the ending
+            // meets after, a failure, a reset or a drop, can leave it unpublished (DESIGN.md §17).
+            let publish = (schema_did_change && !rollback).then(|| {
+                let (db, schema) = (connection.db.clone(), connection.schema.read().clone());
+                Box::new(move || db.update_schema_if_newer(schema)) as Box<dyn FnOnce() + Send>
+            });
+            program_state.commit_state = match atoll.end_publishing(!rollback, publish) {
                 Some(ending) => CommitState::Atoll {
                     ending: Box::new(ending),
                     schema_did_change,
@@ -3495,16 +3544,21 @@ impl Program {
             rollback,
         } = &mut program_state.commit_state
         {
-            return_if_io!(ending.step());
-            let (schema_did_change, rollback) = (*schema_did_change, *rollback);
-            if schema_did_change {
-                if rollback {
-                    *connection.schema.write() = connection.db.clone_schema();
-                    connection.bump_prepare_context_generation();
-                } else {
-                    let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema);
+            match ending.step() {
+                Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                Ok(IOResult::Done(())) => {}
+                // A commit published before its ending failed is decided: it is finished whole, the
+                // attached databases' transactions committed, and the failure is then the
+                // statement's outcome (DESIGN.md §17).
+                Err(failure) if ending.published() => {
+                    program_state.atoll_commit_failure = Some(failure)
                 }
+                Err(e) => return Err(e.into()),
+            }
+            // A commit's schema was published with it; a rollback's is put back.
+            if *schema_did_change && *rollback {
+                *connection.schema.write() = connection.db.clone_schema();
+                connection.bump_prepare_context_generation();
             }
             program_state.commit_state = CommitState::CommittingAttached;
         }
@@ -4045,20 +4099,6 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
-        // An Atoll commit published before its ending failed stays, whatever ends the statement:
-        // the schema it changed is published before the rollback below puts the connection's
-        // back from the shared one (the auditor's #4412).
-        if let CommitState::Atoll {
-            ending,
-            schema_did_change: true,
-            rollback: false,
-        } = &state.commit_state
-        {
-            if ending.published() {
-                let schema = self.connection.schema.read().clone();
-                self.connection.db.update_schema_if_newer(schema);
-            }
-        }
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
         }

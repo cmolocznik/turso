@@ -1479,3 +1479,49 @@ fn registration_after_a_load_changes_phase_rechecks_its_new_producer() {
         "the next registration waits on the publishing actor and is completed there"
     );
 }
+
+/// A metadata write's end is told at its request's retirement, not at its callback: a write
+/// cancelled, its callback run aborted while its backend still owns it, leaves the write's wait
+/// unfinished until the backend delivers it, then fails it (DESIGN.md 22.1, 22.13; mutant: the
+/// wait told in the callback).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_metadata_writes_wait_ends_when_its_request_retires() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let cache = Arc::new(MetaCache::new(
+        io.clone(),
+        "meta-retire-test",
+        16,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    let frame = crate::storage::atoll::testing::drive(&io, || cache.get(id(0))).unwrap();
+    frame
+        .try_lock()
+        .expect("the loaded page is free")
+        .commit(&cache);
+    cache.begin_cut(1);
+    let wait = cache
+        .write_for(&frame, 1)
+        .unwrap()
+        .expect("a write started");
+    let write = LAST_WRITE
+        .with(|w| w.borrow_mut().take())
+        .expect("the write's request");
+    write.abort();
+    let told_at_abort = wait.finished();
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let told_at_retirement = wait.finished();
+    let failed = wait.get_error().is_some();
+    drop(frame);
+    drop(cache);
+    assert!(
+        !told_at_abort,
+        "the write's wait ended while its backend still owned it"
+    );
+    assert!(told_at_retirement, "the retirement told the wait nothing");
+    assert!(failed, "a cancelled write's wait ended without its failure");
+}

@@ -1099,6 +1099,8 @@ fn a_checkpoint_keeps_its_flight_set_full() {
     }
     db.checkpoint();
     let peak = db.db.checkpointer().stats().flying_writes_peak;
+    // Asserted once the database is closed: a panic through it ends the process.
+    drop(db);
     assert_eq!(peak, flight_set(), "image writes in flight at most");
 }
 
@@ -1132,22 +1134,27 @@ fn a_cancelled_image_write_holds_its_place_until_it_retires() {
             None => {}
         }
     }
-    assert_eq!(cp.cancel_image_writes(), full);
+    let cancelled = cp.cancel_image_writes();
     let waited = cp.one_unit(txns).unwrap();
-    assert_eq!(
-        cp.image_writes_in_flight(),
-        full,
-        "a cancelled write let its place go before it retired"
-    );
-    let waited = waited.expect("the unit waits for a place");
-    assert!(
-        !waited.finished(),
-        "the unit waits on a completion finished already"
-    );
+    let held = cp.image_writes_in_flight();
+    let pending = waited.as_ref().map(|c| !c.finished());
     while crash.in_flight() > 0 {
         io.step().unwrap();
     }
-    assert!(waited.finished(), "the retirement did not end the wait");
+    let ended = waited.as_ref().map(Completion::finished);
+    // Asserted once the database is closed: a panic through it ends the process.
+    drop(db);
+    assert_eq!(cancelled, full);
+    assert_eq!(
+        held, full,
+        "a cancelled write let its place go before it retired"
+    );
+    assert_eq!(
+        pending,
+        Some(true),
+        "the unit waits for a place, on a completion not finished yet"
+    );
+    assert_eq!(ended, Some(true), "the retirement did not end the wait");
 }
 
 /// A flush asked for during the checkpoint's own turn of it, as another thread's commit would, is
@@ -1189,6 +1196,9 @@ fn a_flush_asked_during_the_checkpoints_turn_is_answered() {
             turns_after += TURNS.with(|n| n.get()) - turns;
         }
     }
+    let left = db.db.log().flush_asked();
+    // Asserted once the database is closed: a panic through it ends the process.
+    drop(db);
     assert!(
         asked > 0,
         "no turn toward the intent's durability was asked for again"
@@ -1198,7 +1208,7 @@ fn a_flush_asked_during_the_checkpoints_turn_is_answered() {
         "the checkpoint took no turn after the request made during its last"
     );
     assert!(
-        !db.db.log().flush_asked(),
+        !left,
         "a flush asked for during the checkpoint's turn was left unanswered"
     );
 }

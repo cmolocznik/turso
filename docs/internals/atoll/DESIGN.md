@@ -4643,9 +4643,10 @@ needed or owed for the budget wakes every waiter, the unit's own included, so th
 it (`Log::prepare`). An image write's place in the flight set is freed when its request retires,
 no backend owning its buffer any more, its outcome recorded by its callback (a request retired
 with none told fails the checkpoint), and a unit waiting for a place waits on that retirement.
-Not built yet: a metadata write's end told at its last request's retirement (its sync's, where
-the file is not written durably), which today is told at its write's completion; the sustained
-run against before.)
+A metadata write's end is told at its last request's retirement (its sync's, where the file is
+not written durably), its outcome recorded by its callbacks, so the checkpoint's metadata writes,
+held to `WRITES` waiting, keep their places until no backend owns their buffers. Not built yet:
+the sustained run against before.)
 
 **Who waits how.** Every caller that waits for IO is one of three kinds:
 

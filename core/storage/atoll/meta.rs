@@ -507,6 +507,24 @@ impl<'a> MetaHold<'a> {
     }
 }
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The request of the last metadata write submitted on this thread, for a test to cancel as a
+    /// backend's cancel would.
+    pub(crate) static LAST_WRITE: std::cell::RefCell<Option<Completion>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tells a metadata write's waiter how it ended, once ([`MetaCache::write_for`]).
+type Tell = TakeOnce<Box<dyn FnOnce() + Send>>;
+
+/// Runs a [`Tell`] if no one has yet.
+fn tell_once(tell: &Tell) {
+    if let Some(tell) = tell.take() {
+        tell();
+    }
+}
+
 /// One tree's file for a size class and level, and the cells of its pages.
 #[derive(Default)]
 struct FileSlot {
@@ -895,19 +913,40 @@ impl MetaCache {
         // The file weakly too: it holds the IO the write waits in. A file closed before its sync
         // leaves the copy not durable.
         let sync_file = Arc::downgrade(&file);
-        let done = move |res: std::result::Result<(), CompletionError>| {
-            // Gone, the cache has no one left to wait on the write.
-            let Some(me) = me.upgrade() else { return };
-            if res.is_ok() {
-                target.written_side.store(side + 1, Ordering::Release);
-                target.written_for.store(n, Ordering::Release);
-                target.written(&me, count);
-            }
-            if let Some(c) = target.writing.take(&me.completions) {
-                match res {
-                    Ok(()) => c.complete(0),
-                    Err(e) => c.error(e),
+        // How the write ended, as its callbacks found it. `writing` is told once its last request
+        // retires, no backend owning its buffer any more: the write's own, or, where the file is
+        // not written durably, its sync's. A checkpoint counts the write in its flight set until
+        // then (DESIGN.md 22.1, 22.13).
+        let outcome = Arc::new(Mutex::new(None));
+        let tell: Arc<Tell> = {
+            let (target, me, outcome) = (target.clone(), me.clone(), outcome.clone());
+            Arc::new(TakeOnce::new(Box::new(move || {
+                // Gone, the cache has no one left to wait on the write.
+                let Some(me) = me.upgrade() else { return };
+                if let Some(c) = target.writing.take(&me.completions) {
+                    // A request let go with no outcome told never ran.
+                    match outcome
+                        .lock()
+                        .take()
+                        .unwrap_or(Err(CompletionError::Aborted))
+                    {
+                        Ok(()) => c.complete(0),
+                        Err(e) => c.error(e),
+                    }
                 }
+            })))
+        };
+        let done = {
+            let outcome = outcome.clone();
+            move |res: std::result::Result<(), CompletionError>| {
+                if let Some(me) = me.upgrade() {
+                    if res.is_ok() {
+                        target.written_side.store(side + 1, Ordering::Release);
+                        target.written_for.store(n, Ordering::Release);
+                        target.written(&me, count);
+                    }
+                }
+                *outcome.lock() = Some(res);
             }
         };
         let done = Arc::new(TakeOnce::new(done));
@@ -916,35 +955,60 @@ impl MetaCache {
                 done(res);
             }
         };
-        let c = Completion::new_write(move |res| {
-            let res = whole(META_PAGE, res);
-            match res {
-                Ok(()) if !durable => {
-                    // Durable only once synced: until then the copy in charge is the one that
-                    // counts.
-                    let Some(sync_file) = sync_file.upgrade() else {
-                        return finish(Err(CompletionError::Aborted));
-                    };
-                    let after = finish.clone();
-                    let synced = Completion::new_sync(move |r| after(r.map(|_| ())));
-                    if let Err(e) = sync_file.sync_data(synced) {
-                        finish(Err(io_failure(&e)));
+        // Whether the write's callback handed the outcome on to a sync, whose retirement then
+        // tells: set before the write's own retirement, which comes after its callback.
+        let synced_after = Arc::new(AtomicBool::new(false));
+        let c = {
+            let (tell, synced_after) = (tell.clone(), synced_after.clone());
+            Completion::new_write(move |res| {
+                let res = whole(META_PAGE, res);
+                match res {
+                    Ok(()) if !durable => {
+                        // Durable only once synced: until then the copy in charge is the one
+                        // that counts.
+                        let Some(sync_file) = sync_file.upgrade() else {
+                            return finish(Err(CompletionError::Aborted));
+                        };
+                        let after = finish.clone();
+                        let synced = Completion::new_sync(move |r| after(r.map(|_| ())));
+                        synced_after.store(true, Ordering::Release);
+                        match sync_file.sync_data(synced) {
+                            Ok(synced) => {
+                                let tell = tell.clone();
+                                synced.on_retired(move || tell_once(&tell));
+                            }
+                            Err(e) => {
+                                finish(Err(io_failure(&e)));
+                                tell_once(&tell);
+                            }
+                        }
                     }
+                    res => finish(res),
                 }
-                res => finish(res),
-            }
-        });
+            })
+        };
         let buffer = copy.region(0, META_PAGE);
         let submitted = if durable {
             file.pwrite_durable(at, buffer, c)
         } else {
             file.pwrite(at, buffer, c)
         };
-        if let Err(e) = submitted {
-            if let Some(c) = frame.writing.take(&self.completions) {
-                c.error(io_failure(&e));
+        match submitted {
+            Ok(c) => {
+                #[cfg(test)]
+                LAST_WRITE.with(|w| *w.borrow_mut() = Some(c.clone()));
+                c.on_retired(move || {
+                    if !synced_after.load(Ordering::Acquire) {
+                        tell_once(&tell);
+                    }
+                })
             }
-            return Err(e);
+            Err(e) => {
+                if let Some(c) = frame.writing.take(&self.completions) {
+                    c.error(io_failure(&e));
+                }
+                return Err(e);
+            }
         }
         Ok(Some(writing))
     }

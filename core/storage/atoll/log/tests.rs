@@ -1285,19 +1285,19 @@ fn a_units_durable_wait_takes_one_flush_turn_and_owes_one_asked_during_it() {
     TURNS.with(|n| n.set(0));
     ASK_DURING_TURN.with(|a| a.set(true));
     let (waited, owed) = log.wait_durable_turn(lsn).unwrap();
-    assert_eq!(TURNS.with(|n| n.get()), 1, "turns the unit took");
-    assert!(owed, "the request made during the turn was not owed");
-    assert!(
-        matches!(waited, IOResult::IO(_)),
-        "durable with its write unstepped"
-    );
+    let turns = TURNS.with(|n| n.get());
+    let waits = matches!(waited, IOResult::IO(_));
     // The next unit answers it, with one turn of its own, and owes nothing more.
-    assert!(
-        !log.flush_one_turn(),
-        "a turn owed with no request during it"
-    );
-    assert_eq!(TURNS.with(|n| n.get()), 2);
+    let owed_again = log.flush_one_turn();
+    let turns_after = TURNS.with(|n| n.get());
     drive(&io, || log.wait_durable(lsn)).unwrap();
+    // Asserted once the log is closed: a panic through it ends the process.
+    drop(log);
+    assert_eq!(turns, 1, "turns the unit took");
+    assert!(owed, "the request made during the turn was not owed");
+    assert!(waits, "durable with its write unstepped");
+    assert!(!owed_again, "a turn owed with no request during it");
+    assert_eq!(turns_after, 2);
 }
 
 /// A log whose buffer is four segments, so one admission takes all the room prepared ahead, with
@@ -1342,59 +1342,76 @@ fn a_little_more_than_a_segment_ahead(io: &Arc<dyn IO>) -> Arc<Log> {
 /// segment is ready it is all that is prepared ahead, short again. The unit starts no second;
 /// the next caller does, a writer's admission after it (mutant: no budget, the unit starts a
 /// second segment in the same call, which debug builds refuse as the unit ends).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn a_unit_starts_one_segment_however_far_another_admission_takes_the_reach() {
-    use crate::storage::atoll::unit;
-    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let log = a_little_more_than_a_segment_ahead(&io);
-    let segment = small().segment_bytes;
-    let (ahead, _) = log.prepared_ahead();
-    // The unit's admission, a little past what is a segment ahead: it comes within a segment.
-    let framed = ahead - segment + ALIGN;
-    let record = vec![2u8; (framed - framed_len(0)) as usize];
-    assert_eq!(framed_len(record.len()), framed);
-    let taken: Arc<crate::storage::atoll::locks::Mutex<Option<Admitted>>> = Arc::default();
-    DURING_START.with(|d| {
-        let (log, io, taken) = (log.clone(), io.clone(), taken.clone());
-        *d.borrow_mut() = Some(Box::new(move || {
-            let (left, _) = log.prepared_ahead();
-            let admitted = std::thread::scope(|s| {
-                s.spawn(|| drive(&io, || log.admit(left)).unwrap())
-                    .join()
-                    .unwrap()
+    // In a child: past its budget a unit ends the process, which the parent reads.
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_unit_starts_one_segment_however_far_another_admission_takes_the_reach"
+        ),
+        || {
+            use crate::storage::atoll::unit;
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let log = a_little_more_than_a_segment_ahead(&io);
+            let segment = small().segment_bytes;
+            let (ahead, _) = log.prepared_ahead();
+            // The unit's admission, a little past what is a segment ahead: it comes within a segment.
+            let framed = ahead - segment + ALIGN;
+            let record = vec![2u8; (framed - framed_len(0)) as usize];
+            assert_eq!(framed_len(record.len()), framed);
+            let taken: Arc<crate::storage::atoll::locks::Mutex<Option<Admitted>>> = Arc::default();
+            DURING_START.with(|d| {
+                let (log, io, taken) = (log.clone(), io.clone(), taken.clone());
+                *d.borrow_mut() = Some(Box::new(move || {
+                    let (left, _) = log.prepared_ahead();
+                    let admitted = std::thread::scope(|s| {
+                        s.spawn(|| drive(&io, || log.admit(left)).unwrap())
+                            .join()
+                            .unwrap()
+                    });
+                    assert_eq!(log.prepared_ahead().0, 0, "the room left not all taken");
+                    *taken.lock() = Some(admitted);
+                }));
             });
-            assert_eq!(log.prepared_ahead().0, 0, "the room left not all taken");
-            *taken.lock() = Some(admitted);
-        }));
-    });
-    let _ = unit::segments();
-    {
-        let _unit = unit::Unit::enter();
-        let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
-            panic!("the unit's admission waited");
-        };
-        log.append(&mut admitted, &header(1), &[&record]);
-    }
+            let _ = unit::segments();
+            {
+                let _unit = unit::Unit::enter();
+                let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
+                    panic!("the unit's admission waited");
+                };
+                log.append(&mut admitted, &header(1), &[&record]);
+            }
+            assert!(
+                DURING_START.with(|d| d.borrow().is_none()),
+                "the unit started no segment"
+            );
+            assert!(taken.lock().is_some(), "the other admission ran");
+            assert_eq!(unit::segments().0, 1, "the segments the unit started");
+            assert_eq!(
+                log.prepared_ahead().0,
+                segment,
+                "the unit's segment is not all that is prepared ahead"
+            );
+            // The start the unit left: the next caller's.
+            let mut next = drive(&io, || log.admit(framed_len(0))).unwrap();
+            let nothing: &[&[u8]] = &[];
+            log.append(&mut next, &header(2), nothing);
+            assert!(
+                log.prepared_ahead().0 > segment,
+                "the next caller started no segment"
+            );
+            drop(taken.lock().take());
+        },
+    );
+    let Some(ended) = ended else { return };
     assert!(
-        DURING_START.with(|d| d.borrow().is_none()),
-        "the unit started no segment"
+        !ended.aborted && !ended.hung && ended.code == Some(0),
+        "{:?}\n{}",
+        ended.code,
+        ended.stderr
     );
-    assert!(taken.lock().is_some(), "the other admission ran");
-    assert_eq!(unit::segments().0, 1, "the segments the unit started");
-    assert_eq!(
-        log.prepared_ahead().0,
-        segment,
-        "the unit's segment is not all that is prepared ahead"
-    );
-    // The start the unit left: the next caller's.
-    let mut next = drive(&io, || log.admit(framed_len(0))).unwrap();
-    let nothing: &[&[u8]] = &[];
-    log.append(&mut next, &header(2), nothing);
-    assert!(
-        log.prepared_ahead().0 > segment,
-        "the next caller started no segment"
-    );
-    drop(taken.lock().take());
 }
 
 /// A start needed while the unit asking has its one segment started (DESIGN.md 22.16 step 4) is
@@ -1405,54 +1422,71 @@ fn a_unit_starts_one_segment_however_far_another_admission_takes_the_reach() {
 /// turn waits afresh: the start it may not run must wake it, else nothing runs the start and the
 /// wait stands for ever (mutant: the start left with no wake). Once out of the unit, a caller runs
 /// it and the record is durable.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn a_start_a_unit_may_not_run_wakes_its_waiters() {
-    use crate::storage::atoll::unit;
-    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let log = a_little_more_than_a_segment_ahead(&io);
-    let segment = small().segment_bytes;
-    let (ahead, _) = log.prepared_ahead();
-    // A little past what is a segment ahead, ending inside a block: its flush pads.
-    let framed = ahead - segment + ALIGN;
-    let record = vec![3u8; (framed - framed_len(0)) as usize];
-    assert_eq!(framed_len(record.len()), framed);
-    let _ = unit::segments();
-    let (lsn, held, second) = {
-        let _unit = unit::Unit::enter();
-        let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
-            panic!("the unit's admission waited");
-        };
-        let lsn = log.append(&mut admitted, &header(1), &[&record]);
-        assert!(!lsn.is_multiple_of(BLOCK), "the record ends on a block");
-        assert!(
-            !unit::may_start_segment(),
-            "the admission started no segment"
-        );
-        let (left, _) = log.prepared_ahead();
-        let IOResult::Done(held) = log.admit(left).unwrap() else {
-            panic!("the hold waited");
-        };
-        let (first, _) = log.wait_durable_turn(lsn).unwrap();
-        let IOResult::IO(IOCompletions(first)) = first else {
-            panic!("durable with no room to pad");
-        };
-        assert!(log.preparation.needed(), "the padding needed no start");
-        assert!(first.finished(), "the move to needed woke nobody");
-        let (second, _) = log.wait_durable_turn(lsn).unwrap();
-        let IOResult::IO(IOCompletions(second)) = second else {
-            panic!("durable with no room to pad");
-        };
-        assert!(log.preparation.needed(), "the unit ran the start");
-        (lsn, held, second)
-    };
-    assert_eq!(unit::segments().0, 1, "the segments the unit started");
-    assert!(
-        second.finished(),
-        "a wait made after the move to needed, the start left by the unit: never woken"
+    // In a child: past its budget a unit ends the process, which the parent reads.
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_start_a_unit_may_not_run_wakes_its_waiters"
+        ),
+        || {
+            use crate::storage::atoll::unit;
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let log = a_little_more_than_a_segment_ahead(&io);
+            let segment = small().segment_bytes;
+            let (ahead, _) = log.prepared_ahead();
+            // A little past what is a segment ahead, ending inside a block: its flush pads.
+            let framed = ahead - segment + ALIGN;
+            let record = vec![3u8; (framed - framed_len(0)) as usize];
+            assert_eq!(framed_len(record.len()), framed);
+            let _ = unit::segments();
+            let (lsn, held, second) = {
+                let _unit = unit::Unit::enter();
+                let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
+                    panic!("the unit's admission waited");
+                };
+                let lsn = log.append(&mut admitted, &header(1), &[&record]);
+                assert!(!lsn.is_multiple_of(BLOCK), "the record ends on a block");
+                assert!(
+                    !unit::may_start_segment(),
+                    "the admission started no segment"
+                );
+                let (left, _) = log.prepared_ahead();
+                let IOResult::Done(held) = log.admit(left).unwrap() else {
+                    panic!("the hold waited");
+                };
+                let (first, _) = log.wait_durable_turn(lsn).unwrap();
+                let IOResult::IO(IOCompletions(first)) = first else {
+                    panic!("durable with no room to pad");
+                };
+                assert!(log.preparation.needed(), "the padding needed no start");
+                assert!(first.finished(), "the move to needed woke nobody");
+                let (second, _) = log.wait_durable_turn(lsn).unwrap();
+                let IOResult::IO(IOCompletions(second)) = second else {
+                    panic!("durable with no room to pad");
+                };
+                assert!(log.preparation.needed(), "the unit ran the start");
+                (lsn, held, second)
+            };
+            assert_eq!(unit::segments().0, 1, "the segments the unit started");
+            assert!(
+                second.finished(),
+                "a wait made after the move to needed, the start left by the unit: never woken"
+            );
+            drive(&io, || log.wait_durable(lsn)).unwrap();
+            assert!(log.durable() >= lsn);
+            drop(held);
+        },
     );
-    drive(&io, || log.wait_durable(lsn)).unwrap();
-    assert!(log.durable() >= lsn);
-    drop(held);
+    let Some(ended) = ended else { return };
+    assert!(
+        !ended.aborted && !ended.hung && ended.code == Some(0),
+        "{:?}\n{}",
+        ended.code,
+        ended.stderr
+    );
 }
 
 /// A unit of a job's work finishes at most one segment (DESIGN.md 22.16 step 4), whoever's it is:
@@ -1460,54 +1494,72 @@ fn a_start_a_unit_may_not_run_wakes_its_waiters() {
 /// sync lands, leaving a finish owed. The unit takes no second finish, and a wait registered
 /// before it gives the finish up is woken to run it (mutants: no finish budget, the unit finishes
 /// the other's segment, which debug builds refuse as the unit ends; the finish left with no wake).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 #[test]
 fn a_unit_finishes_one_segment_however_many_others_start_meanwhile() {
-    use crate::storage::atoll::unit;
-    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let log = a_little_more_than_a_segment_ahead(&io);
-    let segment = small().segment_bytes;
-    let (ahead, _) = log.prepared_ahead();
-    let framed = ahead - segment + ALIGN;
-    let record = vec![4u8; (framed - framed_len(0)) as usize];
-    assert_eq!(framed_len(record.len()), framed);
-    let waiting: Arc<crate::storage::atoll::locks::Mutex<Option<Completion>>> = Arc::default();
-    AFTER_FINISH.with(|d| {
-        let (log, waiting) = (log.clone(), waiting.clone());
-        *d.borrow_mut() = Some(Box::new(move || {
-            // Another caller's start, its data sync landed: the word is owed again.
+    // In a child: past its budget a unit ends the process, which the parent reads.
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_unit_finishes_one_segment_however_many_others_start_meanwhile"
+        ),
+        || {
+            use crate::storage::atoll::unit;
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let log = a_little_more_than_a_segment_ahead(&io);
+            let segment = small().segment_bytes;
+            let (ahead, _) = log.prepared_ahead();
+            let framed = ahead - segment + ALIGN;
+            let record = vec![4u8; (framed - framed_len(0)) as usize];
+            assert_eq!(framed_len(record.len()), framed);
+            let waiting: Arc<crate::storage::atoll::locks::Mutex<Option<Completion>>> =
+                Arc::default();
+            AFTER_FINISH.with(|d| {
+                let (log, waiting) = (log.clone(), waiting.clone());
+                *d.borrow_mut() = Some(Box::new(move || {
+                    // Another caller's start, its data sync landed: the word is owed again.
+                    assert!(
+                        log.preparation.need(),
+                        "the unit's finish left no done word"
+                    );
+                    let started = log.preparation.take(|| true, || true, || false);
+                    assert_eq!(started, Some(Step::Start));
+                    log.preparation.hand_to_requests();
+                    log.preparation.owe();
+                    // A wait made as the finish became owed, before the unit gives it up.
+                    let wait = Completion::new_wait();
+                    room::wait_on(&log.admitters, wait.clone());
+                    *waiting.lock() = Some(wait);
+                }));
+            });
+            let _ = unit::segments();
+            let woken;
+            {
+                let _unit = unit::Unit::enter();
+                let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
+                    panic!("the unit's admission waited");
+                };
+                // Before the append: its flush finishes waits of its own.
+                woken = waiting.lock().as_ref().unwrap().finished();
+                log.append(&mut admitted, &header(1), &[&record]);
+            }
             assert!(
-                log.preparation.need(),
-                "the unit's finish left no done word"
+                AFTER_FINISH.with(|d| d.borrow().is_none()),
+                "the unit finished no segment"
             );
-            let started = log.preparation.take(|| true, || true, || false);
-            assert_eq!(started, Some(Step::Start));
-            log.preparation.hand_to_requests();
-            log.preparation.owe();
-            // A wait made as the finish became owed, before the unit gives it up.
-            let wait = Completion::new_wait();
-            room::wait_on(&log.admitters, wait.clone());
-            *waiting.lock() = Some(wait);
-        }));
-    });
-    let _ = unit::segments();
-    let woken;
-    {
-        let _unit = unit::Unit::enter();
-        let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
-            panic!("the unit's admission waited");
-        };
-        // Before the append: its flush finishes waits of its own.
-        woken = waiting.lock().as_ref().unwrap().finished();
-        log.append(&mut admitted, &header(1), &[&record]);
-    }
-    assert!(
-        AFTER_FINISH.with(|d| d.borrow().is_none()),
-        "the unit finished no segment"
+            assert_eq!(unit::segments().1, 1, "the segments the unit finished");
+            assert!(log.preparation.owed(), "the other's finish was taken");
+            assert!(
+                woken,
+                "a wait made as the finish became owed, the finish left by the unit: never woken"
+            );
+        },
     );
-    assert_eq!(unit::segments().1, 1, "the segments the unit finished");
-    assert!(log.preparation.owed(), "the other's finish was taken");
+    let Some(ended) = ended else { return };
     assert!(
-        woken,
-        "a wait made as the finish became owed, the finish left by the unit: never woken"
+        !ended.aborted && !ended.hung && ended.code == Some(0),
+        "{:?}\n{}",
+        ended.code,
+        ended.stderr
     );
 }

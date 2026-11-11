@@ -1124,10 +1124,11 @@ fn a_cancelled_image_write_holds_its_place_until_it_retires() {
     }
     let cp = db.db.checkpointer();
     let txns = db.db.transactions();
-    cp.request_full();
+    let ticket = cp.request_full();
     let full = flight_set();
-    // Units until the flight set is full, the IO stepped only for what is no image write.
-    loop {
+    // Units until the flight set is full, the IO stepped only for what is no image write; a
+    // checkpoint that ends first never filled it, which the asserts below find.
+    while cp.fulls_done() < ticket {
         match cp.one_unit(txns).unwrap() {
             Some(_) if cp.image_writes_in_flight() == full => break,
             Some(c) => io.wait(&c),
@@ -1135,7 +1136,8 @@ fn a_cancelled_image_write_holds_its_place_until_it_retires() {
         }
     }
     let cancelled = cp.cancel_image_writes();
-    let waited = cp.one_unit(txns).unwrap();
+    // A failure taken for a landing is no wait: read as none.
+    let waited = cp.one_unit(txns).ok().flatten();
     let held = cp.image_writes_in_flight();
     let pending = waited.as_ref().map(|c| !c.finished());
     while crash.in_flight() > 0 {

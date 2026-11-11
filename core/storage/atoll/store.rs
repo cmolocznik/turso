@@ -39,7 +39,7 @@ use super::aligned::AlignedBlock;
 use super::bits::GrowBits;
 use super::buffer::Exclusive;
 use super::checkpoint::WRITES;
-use super::epoch::{Epochs, Retired};
+use super::epoch::{Epochs, HeldBack, Retired};
 use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, Tree, TREES};
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
@@ -232,6 +232,17 @@ impl Erasure {
         request.on_retired(move || place.complete(0));
         self.pending.push((outcome, retired));
     }
+}
+
+/// What a unit of erasure came to ([`PageStore::erase_one`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Erasing {
+    /// A unit done, or slots still to take: more is owed.
+    More,
+    /// Nothing owed.
+    Done,
+    /// Slots owed, none erasable until every step under way has announced this epoch or ended.
+    HeldBack(u64),
 }
 
 /// A change of several pages inside the change gate ([`PageStore::change`]): it leaves the gate
@@ -1237,8 +1248,9 @@ impl PageStore {
     /// stopped naming them, once every step that may have looked one up has ended: a slot punched
     /// out, or its zeros' write started where its file cannot punch holes; once every slot of the
     /// batch is, one of their files' syncs started; then the batch's end, after which its slots
-    /// may be taken. Done(true) once nothing is left to erase.
-    pub fn erase_one(&self) -> Result<IOResult<bool>> {
+    /// may be taken. What the unit came to: more owed, none, or slots owed none of which is
+    /// erasable until every step under way has announced an epoch (the auditor's P2-CP-E1).
+    pub fn erase_one(&self) -> Result<IOResult<Erasing>> {
         // A caller that finds another erasing waits for its let-go (DESIGN.md 9.1.3, *No retry
         // without a change*).
         let mut eraser = match own(&self.erasure, &self.erased) {
@@ -1256,7 +1268,7 @@ impl PageStore {
                     .extend(self.to_erase.reclaim_up_to(&self.epochs, room));
             }
             if eraser.ready.is_empty() {
-                return Ok(IOResult::Done(true));
+                return Ok(IOResult::Done(self.unready()));
             }
             let take = eraser.ready.len().min(ERASE_RUN);
             eraser.current = Some(Erasure {
@@ -1267,7 +1279,7 @@ impl PageStore {
                 pending: Vec::new(),
                 failed: None,
             });
-            return Ok(IOResult::Done(false));
+            return Ok(IOResult::Done(Erasing::More));
         };
         e.settle();
         if e.pending.len() >= WRITES {
@@ -1284,7 +1296,7 @@ impl PageStore {
             e.files
                 .insert((class, slot / self.slots_per_file(class)), file);
             e.punched += 1;
-            return Ok(IOResult::Done(false));
+            return Ok(IOResult::Done(Erasing::More));
         }
         // Every zero write retired before the syncs start, and every sync before the batch ends.
         if let Some((_, retired)) = e.pending.first() {
@@ -1302,7 +1314,7 @@ impl PageStore {
         if let Some(f) = unsynced.pop() {
             let sync = f.sync_data(Completion::new_sync(|_| {}))?;
             e.hold(sync.clone(), &sync);
-            return Ok(IOResult::Done(false));
+            return Ok(IOResult::Done(Erasing::More));
         }
         let done = eraser.current.take().expect("an erasure");
         let erased = done.slots.len();
@@ -1311,7 +1323,25 @@ impl PageStore {
         }
         let owed = self.erase_owed.fetch_sub(erased, Ordering::AcqRel);
         debug_assert!(owed >= erased, "slots erased that none owed");
-        Ok(IOResult::Done(false))
+        Ok(IOResult::Done(Erasing::More))
+    }
+
+    /// Where erasure stands with no batch under way and none ready: nothing owed, slots still to
+    /// take from the retired, or every slot owed held back until every step under way has
+    /// announced the lowest stamp among them, the horizon read now so the verdict is not one a
+    /// horizon known before a step ended gives.
+    fn unready(&self) -> Erasing {
+        if self.erase_owed.load(Ordering::Acquire) == 0 {
+            return Erasing::Done;
+        }
+        match self.to_erase.held_back() {
+            HeldBack::ToTake => Erasing::More,
+            HeldBack::Since(stamp) if self.epochs.horizon() >= stamp => Erasing::More,
+            HeldBack::Since(stamp) => Erasing::HeldBack(stamp),
+            // Owed with none retired: owed by a batch that failed, its slots ready again, or by
+            // a free not yet retired, which the freeing unit's erasure takes.
+            HeldBack::Nothing => Erasing::Done,
+        }
     }
 
     /// Whether slots freed are not yet erased (DESIGN.md 22.9): a step's end may let them be.
@@ -1339,8 +1369,10 @@ impl PageStore {
     pub fn erase_freed(&self) -> Result<IOResult<()>> {
         loop {
             match self.erase_one()? {
-                IOResult::Done(true) => return Ok(IOResult::Done(())),
-                IOResult::Done(false) => {}
+                IOResult::Done(Erasing::Done | Erasing::HeldBack(_)) => {
+                    return Ok(IOResult::Done(()))
+                }
+                IOResult::Done(Erasing::More) => {}
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }

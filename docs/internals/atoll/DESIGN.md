@@ -5452,8 +5452,15 @@ compose, the real `Completion`, latch and backends included where named.
    unless a trigger came since its read (`Cx::clear_due`). A full checkpoint asked for and a
    writer wanting room wake it, and a wake while it steps queues it again. Slots a checkpoint
    freed that its erasure could not take yet, waiting for a step that may have looked them up, are
-   counted (`PageStore::erasure_owed`): while any are owed, a statement's step or a transaction's
-   end, the end of such a step, wakes the task at its own level to erase them. A failure, told to
+   counted (`PageStore::erasure_owed`), and the erasure that finds every one held back says the
+   lowest stamp among them (`Erasing::HeldBack`, the horizon read then, not one known before a
+   step ended): it lowers the erasure's level, then registers a wait for every step under way to
+   announce that stamp (`Epochs::wait_for`), whose registration is its last look, the level raised
+   again and the erasure going on where the epoch was reached already. The step whose end gets
+   there raises the level and notifies the erasure's signal, which the task watches as it rests,
+   so the erasure runs with no statement after that end. A statement wakes no one for it: with a
+   worker it does nothing for erasure, and among writers it steps the erasure only while the
+   level stands raised (the auditor's P2-CP-E1). A failure, told to
    every waiter by the
    state, ends the task; no checkpoint runs until the database is opened again, and writers go
    on, as with the thread. Closing the database closes the executor, which abandons a checkpoint

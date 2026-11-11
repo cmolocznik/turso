@@ -37,13 +37,14 @@ use super::btree::node::{self, View};
 use super::btree::value::{self, ValueRef};
 use super::buffer::{BufferPool, CutScan, EndCut, Relief, Relieved, Retry, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
+use super::epoch::Notify;
 use super::executor::{self, Class, Cx, Signal, Step, Task, TaskRef, Watched};
 use super::guarded::{Contender, Guarded, Hold};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
 use super::stack::Chain;
-use super::store::PageStore;
+use super::store::{Erasing, PageStore};
 use super::txn::versioned::AsOf;
 use super::txn::{Cut, Transactions, Ts};
 use super::unit;
@@ -70,11 +71,43 @@ crate::thread::thread_local! {
     /// Triggers of a checkpoint's task notified on this thread.
     #[cfg(test)]
     pub(crate) static TRIGGERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Wakes of a checkpoint's task made on this thread ([`Checkpointer::wake_driver`]).
+    #[cfg(test)]
+    pub(crate) static DRIVER_WAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The record naming the metadata pages a checkpoint is about to write: its number, then each
 /// page's id (audit 18, review 2).
 pub const META_INTENT: Kind = Kind::new(31).unwrap();
+
+/// Whether erasure may go on (DESIGN.md 22.9, the auditor's P2-CP-E1): lowered by an erasure that
+/// finds every slot owed held back by a step under way, before it registers its wait for that
+/// step's end, and raised by the wait's notify, which also notifies `signal`, the task's watch.
+/// A statement steps erasure only while it is raised; the task, idle, wakes on the signal.
+struct Erasable {
+    level: AtomicBool,
+    signal: Arc<Signal>,
+}
+
+/// The wait an erasure held back registers ([`Epochs::wait_for`]): the step whose end lets the
+/// slots be erased raises the level, then notifies the signal. Finished once the level stands
+/// raised, and one per erasure in a slot's list, the lowest epoch kept.
+struct EraseWake(Arc<Erasable>);
+
+impl Notify for EraseWake {
+    fn notify(&self) {
+        self.0.level.store(true, Ordering::SeqCst);
+        self.0.signal.notify();
+    }
+
+    fn notified(&self) -> bool {
+        self.0.level.load(Ordering::SeqCst)
+    }
+
+    fn identity(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.0) as usize)
+    }
+}
 
 /// One past the start of the latest checkpoint a trigger was notified for (`began_at` as the
 /// notifying statement read it, plus one), raised and never lowered: one trigger a crossing of the
@@ -152,6 +185,9 @@ pub struct Checkpointer {
     /// Notified by a writing statement that finds a checkpoint due (DESIGN.md 22.9, Due): it
     /// sets the task's own level to due as it wakes it, and the task reads it before it looks.
     due: Arc<Signal>,
+    /// Whether erasure may go on, and the signal the task watches for it (the auditor's
+    /// P2-CP-E1).
+    erasable: Arc<Erasable>,
     /// Whether a checkpoint is under way, set and cleared under the state: the writers stepping
     /// checkpoints step one under way whether or not another is due.
     under_way: AtomicBool,
@@ -271,8 +307,10 @@ impl CheckpointTask {
 impl Task for CheckpointTask {
     fn step(&mut self, cx: &Cx) -> Result<Step> {
         let cp = &*self.cp;
-        // Read before the look: a trigger after it moves the count, keeping the task's level.
+        // Read before the look: a trigger after it moves the count, keeping the task's level; an
+        // erasure's wait notified after it moves its own.
         let read = cp.due.read();
+        let erase_read = cp.erasable.signal.read();
         let held = cp
             .state
             .hold_or_contend(&Contender::Task(cx.task()))
@@ -305,7 +343,10 @@ impl Task for CheckpointTask {
             // keeps it and, the count moved, wakes it again.
             Ok(Unit::Done) => {
                 cx.clear_due(&cp.due, read);
-                Step::Idle(Watched::of(&[(&cp.due, read)]))
+                Step::Idle(Watched::of(&[
+                    (&cp.due, read),
+                    (&cp.erasable.signal, erase_read),
+                ]))
             }
             Err(_) => Step::Done,
         };
@@ -620,6 +661,10 @@ impl Checkpointer {
             full_wanted: AtomicU64::new(0),
             began_at,
             due: Arc::default(),
+            erasable: Arc::new(Erasable {
+                level: AtomicBool::new(true),
+                signal: Arc::default(),
+            }),
             under_way: AtomicBool::new(false),
             triggered_for: TriggerWord::default(),
             published: ArcCell::new(Arc::new(superblock.clone())),
@@ -808,8 +853,16 @@ impl Checkpointer {
             return;
         }
         if let Some(task) = self.task.get() {
+            #[cfg(test)]
+            DRIVER_WAKES.with(|n| n.set(n.get() + 1));
             task.wake();
         }
+    }
+
+    /// Whether an erasure held back by a step has lowered the level and waits for its end.
+    #[cfg(test)]
+    pub(crate) fn erasure_held(&self) -> bool {
+        !self.erasable.level.load(Ordering::SeqCst)
     }
 
     /// The checkpoint's task, named before the database is handed out: from then on only the
@@ -1037,9 +1090,13 @@ impl Checkpointer {
         let began = self.began_at.load(Ordering::SeqCst);
         let due = self.due_since(began);
         let under_way = self.under_way.load(Ordering::Acquire);
-        // Slots freed and not yet erased: the end of the step that may have held one, a
-        // statement's or a transaction's, may let them be erased now.
-        let erasing = !due && !under_way && self.store.erasure_owed();
+        // Slots freed and not yet erased, and erasable as far as any erasure knows: one held back
+        // by a step has lowered the level, which the end of the steps holding it raises, so
+        // statements meanwhile pass over it (the auditor's P2-CP-E1).
+        let erasing = !due
+            && !under_way
+            && self.erasable.level.load(Ordering::SeqCst)
+            && self.store.erasure_owed();
         if !due && !under_way && !erasing {
             #[cfg(test)]
             STEPS_PASSED_OVER.with(|n| n.set(n.get() + 1));
@@ -1053,14 +1110,10 @@ impl Checkpointer {
             }
         }
         match self.stepper() {
-            // Its own IO steps a checkpoint under way, and the trigger woke it for one due; the
-            // erasure owed is maintenance, woken at the task's own level.
-            Stepper::Worker => {
-                if erasing {
-                    self.wake_driver();
-                }
-                Ok(IOResult::Done(()))
-            }
+            // Its own IO steps a checkpoint under way, the trigger woke it for one due, and the
+            // erasure's own wait wakes it once what held the erasure back has ended: a statement
+            // has nothing to do here.
+            Stepper::Worker => Ok(IOResult::Done(())),
             Stepper::Caller(_) | Stepper::Writer => self.step(txns),
         }
     }
@@ -1095,6 +1148,41 @@ impl Checkpointer {
     /// The signal a checkpoint due is notified on, which its task watches (DESIGN.md 22.9).
     pub(crate) fn due_signal(&self) -> &Arc<Signal> {
         &self.due
+    }
+
+    /// The signal an erasure held back is notified on once what held it has ended, which the task
+    /// watches as it rests (the auditor's P2-CP-E1).
+    pub(crate) fn erasure_signal(&self) -> &Arc<Signal> {
+        &self.erasable.signal
+    }
+
+    /// Erasure held back until every step under way has announced `stamp`: its level lowered, a
+    /// wait for that epoch registered, whose notify raises the level and the signal, and then the
+    /// one look the wait's registration makes. Whether it is held; if the epoch was reached, the
+    /// level is raised again and the erasure goes on (the auditor's P2-CP-E1).
+    fn hold_erasure(&self, stamp: u64) -> bool {
+        self.erasable.level.store(false, Ordering::SeqCst);
+        if self
+            .store
+            .epochs()
+            .wait_for(stamp, EraseWake(self.erasable.clone()))
+        {
+            return true;
+        }
+        self.erasable.level.store(true, Ordering::SeqCst);
+        false
+    }
+
+    /// The unit an erasure's outcome comes to.
+    fn erasure_unit(&self, erasing: Erasing) -> Unit {
+        match erasing {
+            Erasing::More => Unit::Again,
+            Erasing::Done => Unit::Done,
+            Erasing::HeldBack(stamp) => match self.hold_erasure(stamp) {
+                true => Unit::Done,
+                false => Unit::Again,
+            },
+        }
     }
 
     /// Holds the checkpointer idle, if no one is stepping it: no checkpoint runs until the hold is
@@ -1332,10 +1420,7 @@ impl State {
             let wanted = cp.full_wanted.load(Ordering::Acquire);
             if wanted <= self.full_done && !cp.due_now() {
                 unit::visit();
-                return Ok(match unit!(cp.store.erase_one()) {
-                    true => Unit::Done,
-                    false => Unit::Again,
-                });
+                return Ok(cp.erasure_unit(unit!(cp.store.erase_one())));
             }
             cp.began_at.store(cp.log.begin_input(), Ordering::SeqCst);
             cp.under_way.store(true, Ordering::Release);
@@ -1761,10 +1846,7 @@ impl Run {
                 }
                 Phase::Erase => {
                     unit::visit();
-                    return Ok(match unit!(cp.store.erase_one()) {
-                        true => Unit::Done,
-                        false => Unit::Again,
-                    });
+                    return Ok(cp.erasure_unit(unit!(cp.store.erase_one())));
                 }
             }
         }

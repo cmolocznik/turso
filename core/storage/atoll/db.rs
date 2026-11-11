@@ -388,7 +388,7 @@ impl Opening {
         let task = executor.spawn_watching(
             Class::Maintenance,
             Box::new(CheckpointTask::new(checkpointer.clone(), txns.clone())),
-            &[checkpointer.due_signal()],
+            &[checkpointer.due_signal(), checkpointer.erasure_signal()],
         );
         // Named before the database is handed out: from then on only the task steps checkpoints.
         checkpointer.attach(task, worker);

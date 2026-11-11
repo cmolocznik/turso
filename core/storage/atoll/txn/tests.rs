@@ -32,6 +32,21 @@ fn open(io: &Arc<dyn IO>, slots: usize) -> Atoll {
 
 /// [`open`], recovery kept to replaying `log_budget` bytes of log.
 fn open_with_budget(io: &Arc<dyn IO>, slots: usize, log_budget: u64) -> Atoll {
+    open_in(
+        io,
+        slots,
+        log_budget,
+        crate::storage::atoll::checkpoint::Checkpointing::Writers,
+    )
+}
+
+/// [`open`], its checkpoints stepped as `checkpointing` says.
+fn open_in(
+    io: &Arc<dyn IO>,
+    slots: usize,
+    log_budget: u64,
+    checkpointing: crate::storage::atoll::checkpoint::Checkpointing,
+) -> Atoll {
     let config = AtollConfig {
         log: log_config(),
         store: StoreConfig {
@@ -46,7 +61,7 @@ fn open_with_budget(io: &Arc<dyn IO>, slots: usize, log_budget: u64) -> Atoll {
         },
         log_budget: Some(log_budget),
         checkpoint_write_bytes: None,
-        checkpointing: crate::storage::atoll::checkpoint::Checkpointing::Writers,
+        checkpointing,
         txn: TxnConfig { slots },
     };
     let db = Atoll::open(io.clone(), BASE, config).unwrap();
@@ -871,9 +886,10 @@ fn a_checkpoint_ending_due_again_keeps_its_tasks_level() {
 }
 
 /// Slots a checkpoint freed that its own erasure could not take yet, still waiting for a step
-/// that may have looked them up, are erased by the writers' steps that follow while nothing is due:
-/// a statement's step or a transaction's end steps the erasure while any slot is owed it, the end
-/// of a step being what lets them be erased (DESIGN.md 22.9; mutant: owed erasure passed over).
+/// that may have looked them up, are erased by the writers' steps that follow that step's end
+/// while nothing is due, and passed over before it: the erasure held back lowered its level and
+/// waits for the step's end, which raises it (DESIGN.md 22.9, the auditor's P2-CP-E1; mutants:
+/// owed erasure passed over, the level not kept, the wait's notify leaving the level down).
 #[test]
 fn slots_owed_erasure_are_erased_by_the_steps_that_follow_with_nothing_due() {
     use crate::storage::atoll::checkpoint::STEPS_PASSED_OVER;
@@ -904,6 +920,22 @@ fn slots_owed_erasure_are_erased_by_the_steps_that_follow_with_nothing_due() {
         }
         checkpoint(&io, &db);
     }
+    // While the reader's step stands, statements pass over the erasure it holds back.
+    let held = db.checkpointer().erasure_held();
+    let (passed_held, stepped_held) = {
+        use crate::storage::atoll::checkpoint::WRITER_STEPS;
+        let (passed, stepped) = (
+            STEPS_PASSED_OVER.with(|n| n.get()),
+            WRITER_STEPS.with(|n| n.get()),
+        );
+        for _ in 0..16 {
+            drive(&io, || db.checkpointer().step_due(db.transactions())).unwrap();
+        }
+        (
+            STEPS_PASSED_OVER.with(|n| n.get()) - passed,
+            WRITER_STEPS.with(|n| n.get()) - stepped,
+        )
+    };
     // The reader's step ends: the slots may be erased now.
     let _ = leave_tx.send(());
     let joined = reader.join().is_ok();
@@ -925,11 +957,89 @@ fn slots_owed_erasure_are_erased_by_the_steps_that_follow_with_nothing_due() {
         owed > 0 && !due,
         "slots owed erasure, nothing due: {owed} owed"
     );
+    assert!(
+        held,
+        "the erasure the reader held back did not lower its level"
+    );
+    assert_eq!(
+        (passed_held, stepped_held),
+        (16, 0),
+        "statements while the reader stood: passed over, and checkpoint steps taken"
+    );
     assert_eq!(
         (left, passed),
         (0, 0),
         "{owed} slots owed, after {steps} statements' steps"
     );
+}
+
+/// On a checkpoint's own thread, slots a checkpoint freed while a step held them back are erased
+/// once that step ends, with no statement after it, and statements meanwhile wake no one for them:
+/// the erasure, held, lowered its level and waits for the step's end, whose notify wakes the task
+/// (the auditor's P2-CP-E1; mutants: a held erasure registering no wait, a statement waking the
+/// task for owed erasure).
+#[test]
+fn erasure_a_step_holds_back_runs_at_its_end_and_statements_meanwhile_wake_no_one() {
+    use crate::storage::atoll::checkpoint::{Checkpointing, DRIVER_WAKES};
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_in(&io, 4, 512 << 10, Checkpointing::Thread);
+    let tree = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), root());
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (leave_tx, leave_rx) = std::sync::mpsc::channel::<()>();
+    let reader = {
+        let epochs = db.store().epochs().clone();
+        std::thread::spawn(move || {
+            let step = epochs.enter();
+            entered_tx.send(()).unwrap();
+            let _ = leave_rx.recv();
+            drop(step);
+        })
+    };
+    for round in 0..3u8 {
+        for k in 0..64u64 {
+            let mut put = Put::new(&k.to_be_bytes(), vec![round; 512], Mode::Upsert);
+            drive(&io, || tree.put(&mut put)).unwrap();
+        }
+        if round == 2 {
+            entered_rx.recv().unwrap();
+        }
+        checkpoint(&io, &db);
+    }
+    let cp = db.checkpointer();
+    // The task's erasure finds the slots held back and lowers the level.
+    let mut held = false;
+    for _ in 0..10_000 {
+        held = cp.erasure_held() && !cp.is_under_way();
+        if held {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let owed = db.store().erase_owed();
+    let wakes = DRIVER_WAKES.with(|n| n.get());
+    for _ in 0..16 {
+        drive(&io, || cp.step_due(db.transactions())).unwrap();
+    }
+    let woken = DRIVER_WAKES.with(|n| n.get()) - wakes;
+    let still_owed = db.store().erase_owed();
+    // The reader's step ends, and no statement follows.
+    let _ = leave_tx.send(());
+    let joined = reader.join().is_ok();
+    let mut left = db.store().erase_owed();
+    for _ in 0..10_000 {
+        if left == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        left = db.store().erase_owed();
+    }
+    drop((tree, db));
+    assert!(joined, "the reader panicked");
+    assert!(held, "the task's erasure held back did not lower its level");
+    assert!(owed > 0, "no slot owed erasure while the reader stood");
+    assert_eq!(woken, 0, "wakes of the task from statements meanwhile");
+    assert_eq!(still_owed, owed, "slots erased while the reader stood");
+    assert_eq!(left, 0, "slots left unerased once the reader's step ended");
 }
 
 /// A checkpoint releases the log's segments before its redo point one a unit, then syncs their

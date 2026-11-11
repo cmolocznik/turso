@@ -1038,6 +1038,17 @@ impl<T> Ord for Stamped<T> {
     }
 }
 
+/// Where a list's objects not handed back stand ([`Retired::held_back`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldBack {
+    /// Some are still to take into the reclaim's heap.
+    ToTake,
+    /// Every one is taken; none is reusable before every step under way announces this epoch.
+    Since(u64),
+    /// None is held.
+    Nothing,
+}
+
 /// What the reclaim under way owns.
 struct Taken<T> {
     heap: BinaryHeap<Stamped<T>>,
@@ -1118,6 +1129,26 @@ impl<T> Retired<T> {
             out.push(taken.heap.pop().expect("an object").1);
         }
         out
+    }
+
+    /// Where the objects retired and not handed back stand, for a caller that found none
+    /// reusable: some still to take, or every one taken, the lowest stamp among them what each
+    /// step under way must announce before any is reusable, or none at all.
+    pub fn held_back(&self) -> HeldBack {
+        // Only tried, as a reclaim: one under way is taking them.
+        let Some(taken) = self.taken.try_lock() else {
+            return HeldBack::ToTake;
+        };
+        // Relaxed: `carry` is read and written only under the reclaim's lock.
+        if !taken.carry.load(Ordering::Relaxed).is_null()
+            || !self.pushed.load(Ordering::Acquire).is_null()
+        {
+            return HeldBack::ToTake;
+        }
+        taken
+            .heap
+            .peek()
+            .map_or(HeldBack::Nothing, |s| HeldBack::Since(s.0))
     }
 
     /// Moves the objects pushed since into the heap, `max` at most: those after the node the last

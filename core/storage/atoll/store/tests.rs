@@ -948,11 +948,11 @@ fn an_erasure_batch_is_a_run_of_slots_its_requests_held_to_the_flight_limit_unti
     let (mut finished, mut stuck, mut error) = (false, false, None);
     for _ in 0..1 << 20 {
         match store.erase_one() {
-            Ok(IOResult::Done(true)) => {
+            Ok(IOResult::Done(Erasing::Done | Erasing::HeldBack(_))) => {
                 finished = true;
                 break;
             }
-            Ok(IOResult::Done(false)) => {}
+            Ok(IOResult::Done(Erasing::More)) => {}
             Ok(IOResult::IO(IOCompletions(wait))) => {
                 if !wait.finished() && !answers.answer_oldest(&held, &wait) {
                     stuck = true;

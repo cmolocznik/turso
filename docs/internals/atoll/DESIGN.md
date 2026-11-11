@@ -4624,12 +4624,28 @@ appended; its durability; each metadata page fetched in order and its write star
 `WRITES` waiting at once, each asked again until it is written for the checkpoint (a wait on a
 hold or a change settling under the look writes nothing); each data file's sync started; the log's
 end; the superblock; each deferred free (`PageStore::after_one`); each slot erased, then each file
-it was in synced (`PageStore::erase_one`). Not built yet: a flush turn per unit for the intent's
-durability and the log's end (`Log::wait_durable_turn`), with the turn owed; the frame refusing
-`IO::wait`, a blocking wait and a park inside a unit; debug builds counting a unit's page visits
-and asserting at most one; the segment preparation's budget of one start and one finish per unit;
-an image write's place freed at its request's retirement; proof 3; the sustained run against
-before.)
+it was in synced (`PageStore::erase_one`). A unit under way is marked on its thread
+(`unit::Unit`, entered for each unit the checkpoint's state steps): every park, IO wait and
+blocking wait refuses it (`park.rs`, Atoll's one place a thread blocks), and debug builds count
+the pages it visits, where the checkpoint touches one and inside the reads it makes through other
+modules (an arena page below a version, a value's directory page), and assert at most one as it
+ends. The intent's durability and the log's end take a flush turn per unit
+(`Log::wait_durable_turn`): a request made during the checkpoint's turn is owed, and its next unit
+takes the owed turn before anything else (`Solo::asked`), so no request goes unanswered; an
+abandoned checkpoint takes the turns it owes. One exception is stated until the segment preparer
+is a task (step 8): a log call a unit makes, an admission or a wait for durability, may run the
+log's segment preparation, the interim adapter any caller runs, within the unit's budget of one
+start and one finish, whoever's segments they are: a start is a file created and allocated, on an
+inline backend its whole zero-fill and data sync, or a spare renamed and its directory synced; a
+finish is the directory sync that publishes the segment. The budget is kept in every build: past
+it the preparation's word offers the unit no start and no finish (`Word::take`), and a step left
+needed or owed for the budget wakes every waiter, the unit's own included, so the next caller runs
+it (`Log::prepare`). An image write's place in the flight set is freed when its request retires,
+no backend owning its buffer any more, its outcome recorded by its callback (a request retired
+with none told fails the checkpoint), and a unit waiting for a place waits on that retirement.
+Not built yet: a metadata write's end told at its last request's retirement (its sync's, where
+the file is not written durably), which today is told at its write's completion; the sustained
+run against before.)
 
 **Who waits how.** Every caller that waits for IO is one of three kinds:
 

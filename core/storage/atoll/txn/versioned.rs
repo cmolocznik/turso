@@ -246,6 +246,7 @@ pub(super) fn below(pool: &Arc<BufferPool>, v: &Version) -> Result<IOResult<Opti
     let Some(ptr) = v.prev else {
         return Ok(IOResult::Done(None));
     };
+    crate::storage::atoll::unit::visit();
     let entry = done!(super::arena::read(pool, ptr));
     let earlier = decode_entry(&entry.replaced)?;
     if let Some(e) = &earlier {

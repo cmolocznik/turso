@@ -386,6 +386,7 @@ fn directory(
     count: usize,
     holder: &dyn Fn() -> bool,
 ) -> Result<IOResult<std::result::Result<Vec<PageId>, Read>>> {
+    crate::storage::atoll::unit::visit();
     let page = match fix(pool, reference.pid, holder)? {
         IOResult::Done(Fixed::Page(p)) => p,
         IOResult::Done(Fixed::Freed) => return Ok(IOResult::Done(Err(Read::Changed))),

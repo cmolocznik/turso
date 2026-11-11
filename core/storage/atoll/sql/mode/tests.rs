@@ -3943,3 +3943,86 @@ fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
         "only the latest statement waker must be notified"
     );
 }
+
+/// Proof 3 (DESIGN.md 22.15): a step of the checkpoint's task is one unit, and a unit visits at
+/// most one page, over a checkpoint that reads values out of line through their directories,
+/// follows a running transaction's versions into the arenas, writes the metadata it edits and
+/// does the frees the last checkpoint deferred. Run in a child: a unit visiting two pages ends the
+/// process in a debug build (mutant: an image unit going on to the next page).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_checkpoint_unit_visits_at_most_one_page() {
+    use crate::storage::atoll::testing::{drive, in_child};
+    use crate::storage::atoll::unit;
+    let ended = in_child(
+        concat!(
+            module_path!(),
+            "::a_checkpoint_unit_visits_at_most_one_page"
+        ),
+        || {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = open_with(
+                &io,
+                "/db/proof-3",
+                crate::storage::atoll::db::AtollConfig {
+                    log_budget: Some(64 << 20),
+                    ..config()
+                },
+            );
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+                .unwrap();
+            // Many leaves, a value out of line through its directory on every tenth row.
+            for i in 0..2_000 {
+                let len = if i % 10 == 0 { 40_000 } else { 100 };
+                conn.execute(format!("INSERT INTO t VALUES ({i}, zeroblob({len}))"))
+                    .unwrap();
+            }
+            let atoll = db.atoll.as_ref().unwrap().atoll();
+            let cp = atoll.checkpointer();
+            let ticket = cp.request_full();
+            drive(&io, || cp.step_full(ticket, atoll.transactions())).unwrap();
+            // Frees the next checkpoint does, and a running transaction's versions, which the cut
+            // reads below the leaves' in the arenas.
+            conn.execute("DELETE FROM t WHERE a % 2 = 1 AND a % 7 = 0")
+                .unwrap();
+            let writer = db.connect(ConnectOpts::new()).unwrap();
+            writer.execute("BEGIN").unwrap();
+            writer
+                .execute("UPDATE t SET b = zeroblob(10) WHERE a % 2 = 0")
+                .unwrap();
+            let in_charge = cp.superblock().checkpoint;
+            cp.request_full();
+            unit::most_and_units();
+            let imaged = cp.stats().pages;
+            let mut steps = 0u64;
+            while cp.superblock().checkpoint == in_charge && steps < 1 << 20 {
+                if !cp.claim_one() {
+                    break;
+                }
+                steps += 1;
+            }
+            let (most, units) = unit::most_and_units();
+            let pages = cp.stats().pages - imaged;
+            let ended = cp.superblock().checkpoint != in_charge;
+            writer.execute("ROLLBACK").unwrap();
+            drop(writer);
+            drop(conn);
+            drop(db);
+            eprintln!("PROOF3 most={most} units={units} steps={steps} pages={pages}");
+            assert!(ended, "the checkpoint did not end in {steps} steps");
+            assert_eq!(most, 1, "a unit visited {most} pages");
+            assert_eq!(units, steps, "{units} units in {steps} steps");
+            assert!(pages >= 20, "{pages} pages imaged");
+            assert!(units > 2 * pages, "{units} units imaged {pages} pages");
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert!(
+        !ended.aborted && !ended.hung && ended.code == Some(0),
+        "{:?}\n{}",
+        ended.code,
+        ended.stderr
+    );
+    assert!(ended.stderr.contains("PROOF3 most=1 "), "{}", ended.stderr);
+}

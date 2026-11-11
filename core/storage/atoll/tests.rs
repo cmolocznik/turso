@@ -1085,3 +1085,120 @@ const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
     ("store.rs", "free_slot", "busy", 1, "change: a tree's height changed after the latches"),
     ("txn/mod.rs", "wait_for_reservation", "Completion::new_yield", 1, "change: the reservation changed after the look"),
 ];
+
+/// The checkpoint keeps its flight set full: each unit starts one write, and it waits only once
+/// [`super::checkpoint::IMAGE_WRITES`] are in flight (DESIGN.md 22.1; mutant: a wait after every
+/// submission, one write in flight). The writes stay in flight until the IO is stepped.
+#[test]
+fn a_checkpoint_keeps_its_flight_set_full() {
+    let crash = Arc::new(CrashIO::new(3));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = Db::create(io.clone());
+    for i in 0..2_000 {
+        db.put(&format!("k{i:05}"), &value(i * 5 + 1));
+    }
+    db.checkpoint();
+    let peak = db.db.checkpointer().stats().flying_writes_peak;
+    assert_eq!(peak, flight_set(), "image writes in flight at most");
+}
+
+/// The image writes of the tree's pages a checkpoint keeps in flight: [`super::checkpoint::IMAGE_WRITES`]
+/// of them, within its write bytes.
+fn flight_set() -> usize {
+    super::checkpoint::IMAGE_WRITES.min(super::checkpoint::WRITE_BYTES / class(0).size())
+}
+
+/// A cancelled image write keeps its place in the flight set until its request retires, and the
+/// unit waiting for a place waits on that retirement (DESIGN.md 22.13; mutants: the place freed
+/// when the write finishes, letting twice the limit be owned; the wait on the write's own
+/// completion, finished already, which a waiter would spin on).
+#[test]
+fn a_cancelled_image_write_holds_its_place_until_it_retires() {
+    let crash = Arc::new(CrashIO::new(5));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = Db::create(io.clone());
+    for i in 0..2_000 {
+        db.put(&format!("k{i:05}"), &value(i * 5 + 1));
+    }
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    cp.request_full();
+    let full = flight_set();
+    // Units until the flight set is full, the IO stepped only for what is no image write.
+    loop {
+        match cp.one_unit(txns).unwrap() {
+            Some(_) if cp.image_writes_in_flight() == full => break,
+            Some(c) => io.wait(&c),
+            None => {}
+        }
+    }
+    assert_eq!(cp.cancel_image_writes(), full);
+    let waited = cp.one_unit(txns).unwrap();
+    assert_eq!(
+        cp.image_writes_in_flight(),
+        full,
+        "a cancelled write let its place go before it retired"
+    );
+    let waited = waited.expect("the unit waits for a place");
+    assert!(
+        !waited.finished(),
+        "the unit waits on a completion finished already"
+    );
+    while crash.in_flight() > 0 {
+        io.step().unwrap();
+    }
+    assert!(waited.finished(), "the retirement did not end the wait");
+}
+
+/// A flush asked for during the checkpoint's own turn of it, as another thread's commit would, is
+/// answered by the checkpoint's next unit: no request made during a turn is left for nobody
+/// (DESIGN.md 22.1, `Solo`). Asked during each turn toward the intent record's durability, so
+/// during the last, after which the checkpoint takes no turn of its own: the log's end is durable
+/// by then (mutant: the owed turn dropped, the request still asked for once the checkpoint is done).
+#[test]
+fn a_flush_asked_during_the_checkpoints_turn_is_answered() {
+    use super::log::{ASK_DURING_TURN, TURNS};
+    let crash = Arc::new(CrashIO::new(7));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = Db::create(io.clone());
+    for i in 0..50 {
+        db.put(&format!("k{i:05}"), &value(i * 5 + 1));
+    }
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    let ticket = cp.request_full();
+    let (mut asked, mut turns_after) = (0, 0);
+    while cp.fulls_done() < ticket {
+        // The next turn the checkpoint takes toward its intent's durability is asked for again
+        // while it runs.
+        let armed = cp.next_turn_for_intent();
+        if armed {
+            ASK_DURING_TURN.with(|a| a.set(true));
+        }
+        let turns = TURNS.with(|n| n.get());
+        match cp.one_unit(txns).unwrap() {
+            Some(c) => io.wait(&c),
+            // The commit that asked waits for its own record, stepping this backend as it does.
+            None if armed => io.step().unwrap(),
+            None => {}
+        }
+        if armed && !ASK_DURING_TURN.with(|a| a.replace(false)) {
+            asked += 1;
+            turns_after = 0;
+        } else {
+            turns_after += TURNS.with(|n| n.get()) - turns;
+        }
+    }
+    assert!(
+        asked > 0,
+        "no turn toward the intent's durability was asked for again"
+    );
+    assert!(
+        turns_after > 0,
+        "the checkpoint took no turn after the request made during its last"
+    );
+    assert!(
+        !db.db.log().flush_asked(),
+        "a flush asked for during the checkpoint's turn was left unanswered"
+    );
+}

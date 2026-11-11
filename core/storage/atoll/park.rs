@@ -12,6 +12,12 @@ use crate::Result;
 #[inline]
 fn before(what: &'static str) {
     notify::refuse_while_delivering(what);
+    // A unit of a job's work never waits: what it would wait for is its next unit's, or its
+    // driver's between units (DESIGN.md 22.1).
+    assert!(
+        !crate::storage::atoll::unit::inside(),
+        "{what}: a park inside a unit of a job's work"
+    );
     debug_assert!(
         !notify::scope_open(),
         "a thread parked with a change scope open, its wakers held across the park"

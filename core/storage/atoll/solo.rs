@@ -51,6 +51,14 @@ impl Solo {
         fence(Ordering::SeqCst);
     }
 
+    /// Whether a turn's work is asked for and not yet taken: read after this thread's turn ended,
+    /// a request made during it.
+    pub fn asked(&self) -> bool {
+        // Pairs with the fence of a request, as the end of a turn does.
+        fence(Ordering::SeqCst);
+        self.asked.load(Ordering::Relaxed)
+    }
+
     /// A turn, if one was asked for and none is under way.
     pub fn turn(&self) -> Option<Turn<'_>> {
         // Relaxed: read after the fence of a request or of the last turn's end, which orders it.

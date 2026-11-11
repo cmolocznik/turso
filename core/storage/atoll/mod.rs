@@ -67,6 +67,7 @@ mod store;
 #[cfg(test)]
 mod stream;
 mod txn;
+mod unit;
 mod unwind;
 
 #[cfg(all(test, not(atoll_loom), not(shuttle), not(miri)))]

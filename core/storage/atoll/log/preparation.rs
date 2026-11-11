@@ -80,14 +80,31 @@ impl Word {
         matches!(self.0.load(Ordering::SeqCst), NEEDED | OWED)
     }
 
+    /// Whether a start is needed: a flush's padding waits for the segment.
+    pub(super) fn needed(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == NEEDED
+    }
+
+    /// Whether a finish is owed: the segment's directory sync and the publishing of its end.
+    pub(super) fn owed(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == OWED
+    }
+
     /// Takes the step a caller may run: finishing from owed, starting from needed, or from done
-    /// when `short` says less than a segment is prepared ahead of what is admitted.
-    pub(super) fn take(&self, short: impl Fn() -> bool) -> Option<Step> {
+    /// when `short` says less than a segment is prepared ahead of what is admitted; a start only
+    /// where `may_start` says the caller may start one, a finish only where `may_finish` says it
+    /// may finish one.
+    pub(super) fn take(
+        &self,
+        may_start: impl Fn() -> bool,
+        may_finish: impl Fn() -> bool,
+        short: impl Fn() -> bool,
+    ) -> Option<Step> {
         loop {
             let (from, to, step) = match self.0.load(Ordering::SeqCst) {
-                OWED => (OWED, FINISHING, Step::Finish),
-                NEEDED => (NEEDED, STARTING, Step::Start),
-                DONE if short() => (DONE, STARTING, Step::Start),
+                OWED if may_finish() => (OWED, FINISHING, Step::Finish),
+                NEEDED if may_start() => (NEEDED, STARTING, Step::Start),
+                DONE if short() && may_start() => (DONE, STARTING, Step::Start),
                 _ => return None,
             };
             if self
@@ -159,7 +176,7 @@ mod loom_tests {
                 .map(|_| {
                     let (word, taken) = (word.clone(), taken.clone());
                     thread::spawn(move || {
-                        if let Some(step) = word.take(|| false) {
+                        if let Some(step) = word.take(|| true, || true, || false) {
                             assert_eq!(step, Step::Start);
                             taken.fetch_add(1, Ordering::SeqCst);
                         }
@@ -186,7 +203,7 @@ mod loom_tests {
         use loom::sync::atomic::{fence, AtomicBool};
         check(|| {
             let word = Arc::new(Word::default());
-            assert_eq!(word.take(|| true), Some(Step::Start));
+            assert_eq!(word.take(|| true, || true, || true), Some(Step::Start));
             word.hand_to_requests();
             let waiting = Arc::new(Stack::<Arc<AtomicBool>>::default());
             let mover = {
@@ -202,7 +219,7 @@ mod loom_tests {
             let woken = Arc::new(AtomicBool::new(false));
             waiting.push(woken.clone());
             fence(Ordering::SeqCst);
-            let took = word.take(|| false);
+            let took = word.take(|| true, || true, || false);
             mover.join().unwrap();
             assert!(
                 took == Some(Step::Finish) || woken.load(Ordering::Acquire),

@@ -5538,6 +5538,351 @@ fn a_scan_dropped_while_its_connection_commits_its_attached_part_leaves_it_whole
     assert_eq!(state, (true, crate::connection::TransactionState::None));
 }
 
+/// A scan begun inside an explicit transaction, part way through when its `COMMIT` ends, reads on
+/// in the read the `COMMIT`'s end begins for it, and once the scan has finished and dropped that
+/// read is gone: the connection's next statement sees a row another connection committed after (the
+/// auditor's #4446: the read stayed open with no statement left, and the next statement read its
+/// old snapshot, missing the row).
+#[test]
+fn a_scan_begun_in_a_transaction_and_finished_after_its_commit_leaves_no_read_behind() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(670));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, "/db/scan-spanning-a-commit");
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    let setup = [
+        "CREATE TABLE scanned(a INTEGER)",
+        "INSERT INTO scanned VALUES (10), (20), (30)",
+        "CREATE TABLE kept(a INTEGER)",
+        "BEGIN",
+        "INSERT INTO kept VALUES (1)",
+    ]
+    .iter()
+    .map(|sql| ran_on(&writer, &crash, sql))
+    .collect::<std::result::Result<Vec<_>, _>>();
+    let mut scan = writer.prepare("SELECT a FROM scanned").unwrap();
+    let mut read = Vec::new();
+    let first = scan_first(&mut scan, &crash).map(|row| read.push(row));
+    let committed = ran_on(&writer, &crash, "COMMIT");
+    let rest = scan_rest(&mut scan, &crash, &mut read);
+    drop(scan);
+    let left_open = writer.atoll().unwrap().is_open();
+    let later = ran_on(&other, &crash, "INSERT INTO kept VALUES (2)");
+    let seen = writer
+        .prepare("SELECT a FROM kept")
+        .and_then(|mut statement| statement.run_collect_rows())
+        .map_err(|e| e.to_string());
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((writer, other, db));
+    assert_eq!(setup.map(drop), Ok(()));
+    assert_eq!(first, Ok(()));
+    assert_eq!(committed, Ok(()));
+    assert_eq!(rest, Ok(()));
+    assert_eq!(
+        read,
+        [10, 20, 30].map(|a| vec![Value::from_i64(a)]).to_vec()
+    );
+    assert!(
+        !left_open,
+        "a read begun for a scan outlived it with no statement left"
+    );
+    assert_eq!(later, Ok(()));
+    assert_eq!(
+        seen,
+        Ok(vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]),
+        "the connection's next statement read an old snapshot"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+}
+
+/// A scan that read on beside a `CREATE TABLE` whose commit, published, still waits, then dropped
+/// before that ending is done: the read begun for it is ended as it goes, while the ending still
+/// waits, since only the statement ending the transaction is left and it reads in no read of its
+/// own (the auditor's #4443 item 4), and with no ending of its own made beside the one waiting (the
+/// auditor's #4459); the ending then finishes, its table published.
+#[test]
+fn a_sibling_gone_while_its_connections_commit_waits_releases_its_read_at_once() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(671));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, "/db/sibling-gone-beside-an-ending");
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let setup = [
+        "CREATE TABLE t(a INTEGER)",
+        "INSERT INTO t VALUES (1), (2), (3)",
+    ]
+    .iter()
+    .map(|sql| ran_on(&writer, &crash, sql))
+    .collect::<std::result::Result<Vec<_>, _>>();
+    let mut scan = writer.prepare("SELECT a FROM t").unwrap();
+    let first = scan_first(&mut scan, &crash);
+    let mut ender = writer.prepare("CREATE TABLE made(a INTEGER)").unwrap();
+    let waited = step_to_ending(&mut ender, &crash, true);
+    let second = scan_first(&mut scan, &crash);
+    let served = writer.atoll().unwrap().is_open();
+    let made = crate::storage::atoll::testing::endings_made();
+    drop(scan);
+    let after_the_sibling = (
+        writer.atoll().unwrap().is_open(),
+        ender.atoll_ending_phase(),
+        crate::storage::atoll::testing::endings_made() - made,
+    );
+    let ended = step_to_end(&mut ender, &crash);
+    drop(ender);
+    let seen = sees(&reader, "made");
+    let state = (
+        writer.get_auto_commit(),
+        writer.get_tx_state(),
+        writer.atoll().unwrap().is_open(),
+    );
+    drop((writer, reader, db));
+    assert_eq!(setup.map(drop), Ok(()));
+    assert_eq!(first, Ok(vec![Value::from_i64(1)]));
+    assert_eq!(waited, Ok(()));
+    assert_eq!(second, Ok(vec![Value::from_i64(2)]));
+    assert!(served, "no read was begun for the scan");
+    assert_eq!(
+        after_the_sibling,
+        (false, Some("ending"), 0),
+        "the read begun for a scan outlived it while the ending waited, or its end made a second \
+         ending of the connection"
+    );
+    assert_eq!(ended, Ok(()));
+    assert_eq!(seen, Ok(()));
+    assert_eq!(
+        state,
+        (true, crate::connection::TransactionState::None, false)
+    );
+}
+
+/// The setup of a `COMMIT` of a table made in the main database and a row written to a table of
+/// an attached database file, with a scan of the connection at its first row beside it.
+fn commit_beside_a_scan(
+    name: &str,
+    crash: &Arc<crate::io::crash::CrashIO>,
+) -> (
+    Arc<Database>,
+    Arc<Connection>,
+    Arc<Connection>,
+    std::result::Result<(), String>,
+) {
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open_attaching(&io, name);
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let setup = [
+        format!("ATTACH '/db/{name}-aux' AS aux"),
+        "CREATE TABLE scanned(a INTEGER)".to_string(),
+        "INSERT INTO scanned VALUES (10), (20), (30)".to_string(),
+        "CREATE TABLE aux.side(b INTEGER)".to_string(),
+        "BEGIN".to_string(),
+        "CREATE TABLE kept(a INTEGER)".to_string(),
+        "INSERT INTO aux.side VALUES (1)".to_string(),
+    ]
+    .iter()
+    .try_for_each(|sql| ran_on(&writer, crash, sql));
+    (db, writer, reader, setup)
+}
+
+/// A scan reading on beside its connection's `COMMIT`, paused before it publishes, is the one to
+/// step it to its publication: the scan reads on at once, never handed the commit's wait for
+/// durability, and when the main log then fails, the failure is the `COMMIT`'s, which returns it
+/// and finishes the commit whole, the attached row committed and the table published (the
+/// auditor's #4454: the scan was handed that wait, met its failure, and its abort rolled the
+/// attached part back under the published main commit).
+#[test]
+fn a_sibling_that_publishes_its_connections_commit_reads_on_and_leaves_the_failure_to_it() {
+    let name = "sibling-publishes-then-the-log-fails";
+    let crash = Arc::new(crate::io::crash::CrashIO::new(672));
+    let (db, writer, reader, setup) = commit_beside_a_scan(name, &crash);
+    let mut scan = writer.prepare("SELECT a FROM scanned").unwrap();
+    let mut read = Vec::new();
+    let first = scan_first(&mut scan, &crash).map(|row| read.push(row));
+    let pause = crate::io::Completion::new_wait();
+    crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = Some(pause.clone()));
+    let mut ender = writer.prepare("COMMIT").unwrap();
+    let waited = step_to_ending(&mut ender, &crash, false);
+    pause.complete(0);
+    crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
+    let helped = match scan.step() {
+        Ok(crate::StepResult::Row) => {
+            read.push(scan.row().unwrap().get_values().cloned().collect());
+            Ok(())
+        }
+        other => Err(format!("{other:?}")),
+    };
+    let published = ender.atoll_ending_published();
+    crash.set_faults_on(Some(&format!("/db/{name}.log.{:016x}", 0)));
+    crash.set_faults(crate::io::crash::Faults {
+        read: 0.0,
+        write: 1.0,
+        sync: 1.0,
+        short_write: 0.0,
+    });
+    let rest = scan_rest(&mut scan, &crash, &mut read);
+    drop(scan);
+    let ended = step_to_end(&mut ender, &crash);
+    drop(ender);
+    crash.set_faults(crate::io::crash::Faults::default());
+    crash.set_faults_on(None);
+    let table = sees(&reader, "kept");
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((writer, reader, db));
+    let io: Arc<dyn IO> = crash.clone();
+    let side = side_rows(&io, name);
+    drop(io);
+    let in_flight = crash.in_flight();
+    assert_eq!(setup, Ok(()));
+    assert_eq!(first, Ok(()));
+    assert_eq!(waited, Ok(()), "the COMMIT never waited before publishing");
+    assert_eq!(
+        helped,
+        Ok(()),
+        "the scan that published the commit did not read on at once"
+    );
+    assert!(published, "the scan's step did not publish the commit");
+    assert_eq!(rest, Ok(()), "the scan met the commit's failure");
+    assert_eq!(
+        read,
+        [10, 20, 30].map(|a| vec![Value::from_i64(a)]).to_vec()
+    );
+    assert!(ended.is_err(), "the COMMIT lost the log's failure");
+    assert_eq!(table, Ok(()));
+    assert_eq!(
+        side,
+        Ok(vec![vec![Value::from_i64(1)]]),
+        "the attached part of the published commit was rolled back"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+    assert_eq!(in_flight, 0);
+}
+
+/// A scan that fails while another statement of its connection ends the transaction rolls
+/// nothing back: here its step of the `COMMIT`'s ending, paused before publishing, fails (the
+/// test's pause failed, standing for any failure a statement reading on meets), the scan returns
+/// the failure, and the `COMMIT` goes on to commit whole, the attached row and the table committed
+/// (the auditor's #4454: the failing statement's abort rolled the connection's transaction back,
+/// the attached part with it, under the ending).
+#[test]
+fn a_sibling_that_fails_beside_its_connections_ending_rolls_nothing_back() {
+    let name = "sibling-fails-beside-an-ending";
+    let crash = Arc::new(crate::io::crash::CrashIO::new(673));
+    let (db, writer, reader, setup) = commit_beside_a_scan(name, &crash);
+    let mut scan = writer.prepare("SELECT a FROM scanned").unwrap();
+    let first = scan_first(&mut scan, &crash);
+    let held = crate::io::Completion::new_wait();
+    crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = Some(held.clone()));
+    let mut ender = writer.prepare("COMMIT").unwrap();
+    let waited = step_to_ending(&mut ender, &crash, false);
+    // The ending's next stepper, the scan, waits on a pause of its own, which fails.
+    let failing = crate::io::Completion::new_wait();
+    crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = Some(failing.clone()));
+    held.complete(0);
+    let scan_waited = match scan.step() {
+        Ok(crate::StepResult::IO) => Ok(()),
+        other => Err(format!("{other:?}")),
+    };
+    failing.error(crate::error::CompletionError::IOError(
+        std::io::ErrorKind::Other,
+        "a sibling's pause",
+    ));
+    crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
+    let failed = match scan.step() {
+        Err(e) => Ok(e.to_string()),
+        other => Err(format!("{other:?}")),
+    };
+    drop(scan);
+    let ended = step_to_end(&mut ender, &crash);
+    drop(ender);
+    let table = sees(&reader, "kept");
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((writer, reader, db));
+    let io: Arc<dyn IO> = crash.clone();
+    let side = side_rows(&io, name);
+    drop(io);
+    let in_flight = crash.in_flight();
+    assert_eq!(setup, Ok(()));
+    assert_eq!(first, Ok(vec![Value::from_i64(10)]));
+    assert_eq!(waited, Ok(()), "the COMMIT never waited before publishing");
+    assert_eq!(scan_waited, Ok(()), "the scan did not step the ending");
+    assert!(
+        failed.is_ok(),
+        "the scan's failure was not returned: {failed:?}"
+    );
+    assert_eq!(ended, Ok(()), "the COMMIT did not finish");
+    assert_eq!(table, Ok(()));
+    assert_eq!(
+        side,
+        Ok(vec![vec![Value::from_i64(1)]]),
+        "a failing scan rolled the attached part back under its connection's ending"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+    assert_eq!(in_flight, 0);
+}
+
+/// A scan reading on beside its connection's `COMMIT` begins its read only once the horizon covers
+/// the commit, so that the read sees it: while the horizon lags the published commit (held here by
+/// the test, as a commit below it still drawing on another slot holds it: row writers hold the
+/// write gate shared, so several connections' commits draw at once), the scan waits, and once it
+/// rises the scan reads every row its transaction wrote (begun at the publication, the read would
+/// be below the commit and miss them).
+#[test]
+fn a_sibling_reads_on_only_once_the_horizon_covers_its_connections_commit() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(674));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, "/db/sibling-under-a-held-horizon");
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let setup = [
+        "CREATE TABLE t(a INTEGER)",
+        "INSERT INTO t VALUES (1), (2), (3)",
+        "BEGIN",
+        "INSERT INTO t VALUES (4), (5)",
+    ]
+    .iter()
+    .try_for_each(|sql| ran_on(&writer, &crash, sql));
+    let mut scan = writer.prepare("SELECT a FROM t").unwrap();
+    let mut read = Vec::new();
+    let first = scan_first(&mut scan, &crash).map(|row| read.push(row));
+    writer.atoll().unwrap().hold_horizon(true);
+    let mut ender = writer.prepare("COMMIT").unwrap();
+    let published = step_until_published(&mut ender, &crash);
+    let scan_waited = match scan.step() {
+        Ok(crate::StepResult::IO) => Ok(()),
+        other => Err(format!("{other:?}")),
+    };
+    writer.atoll().unwrap().hold_horizon(false);
+    let rest = scan_rest(&mut scan, &crash, &mut read);
+    drop(scan);
+    let ended = step_to_end(&mut ender, &crash);
+    drop(ender);
+    let committed = reader
+        .prepare("SELECT count(*) FROM t")
+        .and_then(|mut statement| statement.run_collect_rows())
+        .map_err(|e| e.to_string());
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((writer, reader, db));
+    assert_eq!(setup, Ok(()));
+    assert_eq!(first, Ok(()));
+    assert_eq!(published, Ok(()));
+    assert_eq!(
+        scan_waited,
+        Ok(()),
+        "the scan began its read while the horizon lagged the commit"
+    );
+    assert_eq!(rest, Ok(()));
+    assert_eq!(
+        read,
+        (1..=5)
+            .map(|a| vec![Value::from_i64(a)])
+            .collect::<Vec<_>>(),
+        "the scan read below its connection's commit"
+    );
+    assert_eq!(ended, Ok(()));
+    assert_eq!(committed, Ok(vec![vec![Value::from_i64(5)]]));
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+}
+
 /// The end of a connection's transaction is one word that a close and an ending's start take by
 /// compare-and-swap, so they exclude each other on any threads: an ending holding it refuses a
 /// close, which goes ahead once the ending lets go, and a second ending; a close holding it keeps an

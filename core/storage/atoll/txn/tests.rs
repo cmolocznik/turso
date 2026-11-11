@@ -122,19 +122,27 @@ type Seen = (Ts, (u16, Ts), bool);
 /// Writers commit transactions, and abort some that wrote nothing, while readers look at whether
 /// the transactions begun so far are visible to their snapshots, under both isolations: each is
 /// visible exactly when it committed at or below the snapshot, and a commit once acknowledged is
-/// visible to the next snapshot taken.
+/// visible to the next snapshot taken. Both answers come up on every schedule: a transaction begun
+/// before the threads and committed only after them is invisible to every reader's statement, and
+/// a snapshot taken last sees every commit. Nothing is asserted while the database is open: a
+/// thread's failure is raised once it is closed (DESIGN.md 22.11).
 fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it(
     writers: u64,
     readers: u64,
     rounds: usize,
 ) {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Arc::new(open(&io, (writers + readers) as usize));
+    let db = Arc::new(open(&io, (writers + readers + 1) as usize));
     // Every writing transaction begun, and the commit timestamp of each that committed.
     let begun: Arc<Mutex<Vec<(u16, Ts)>>> = Arc::new(Mutex::new(Vec::new()));
     let committed: Arc<Mutex<HashMap<(u16, Ts), Ts>>> = Arc::new(Mutex::new(HashMap::new()));
     // What readers saw: their snapshot, the transaction, and whether it was visible.
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
+    // Committed once every thread is done: after every reader's snapshot.
+    let mut held = begin(&io, &db, Isolation::Snapshot);
+    write(&io, &db, &mut held);
+    let held_key = (held.slot(), held.start());
+    begun.lock().push(held_key);
     let mut threads = Vec::new();
     for w in 0..writers {
         let (io, db, begun, committed) = (io.clone(), db.clone(), begun.clone(), committed.clone());
@@ -154,11 +162,12 @@ fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it(
                 committed.lock().insert(key, ts);
                 let mut after = begin(&io, &db, Isolation::Snapshot);
                 db.transactions().statement(&mut after).unwrap();
+                let visible = db.transactions().visible(&mut after, key.0, key.1);
+                db.transactions().abort(after);
                 assert!(
-                    db.transactions().visible(&mut after, key.0, key.1),
+                    visible,
                     "{key:?}, committed at {ts}, unseen by a snapshot taken after"
                 );
-                db.transactions().abort(after);
             }
         }));
     }
@@ -172,39 +181,50 @@ fn a_snapshot_sees_exactly_the_transactions_committed_at_or_before_it(
                 for _ in 0..3 {
                     db.transactions().statement(&mut txn).unwrap();
                     let known = begun.lock().clone();
-                    for _ in 0..20 {
-                        let Some(&(slot, start)) =
-                            known.get(rng.random_range(0..known.len().max(1)))
-                        else {
-                            continue;
-                        };
+                    let sampled = (0..20).map(|_| known[rng.random_range(0..known.len())]);
+                    for (slot, start) in std::iter::once(held_key).chain(sampled) {
                         let v = db.transactions().visible(&mut txn, slot, start);
                         // Asked again in the same statement, the answer holds.
-                        assert_eq!(v, db.transactions().visible(&mut txn, slot, start));
+                        let again = db.transactions().visible(&mut txn, slot, start);
                         seen.lock().push((txn.snapshot, (slot, start), v));
+                        if v != again {
+                            db.transactions().abort(txn);
+                            panic!("{slot}/{start}: {v}, then {again} in one statement");
+                        }
                     }
                 }
                 db.transactions().abort(txn);
             }
         }));
     }
-    for t in threads {
-        t.join().unwrap();
-    }
+    let joined: Vec<_> = threads.into_iter().map(|t| t.join()).collect();
+    let ts = commit(&io, &db, held).expect("a commit timestamp");
+    committed.lock().insert(held_key, ts);
     let committed = std::mem::take(&mut *committed.lock());
-    let seen = std::mem::take(&mut *seen.lock());
-    if rounds >= 100 {
-        // Both answers come up: visible, and committed only after the snapshot.
-        let after = seen
-            .iter()
-            .filter(|&&(at, key, v)| !v && committed.get(&key).is_some_and(|&ts| ts > at))
-            .count();
-        assert!(
-            after > 0 && seen.iter().any(|s| s.2),
-            "{after} of {}",
-            seen.len()
-        );
+    let mut last = begin(&io, &db, Isolation::Snapshot);
+    db.transactions().statement(&mut last).unwrap();
+    let mut seen = std::mem::take(&mut *seen.lock());
+    for &key in committed.keys() {
+        let v = db.transactions().visible(&mut last, key.0, key.1);
+        seen.push((last.snapshot, key, v));
     }
+    db.transactions().abort(last);
+    drop(db);
+    for result in joined {
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+    // Both answers come up: visible, and committed only after the snapshot.
+    let after = seen
+        .iter()
+        .filter(|&&(at, key, v)| !v && committed.get(&key).is_some_and(|&ts| ts > at))
+        .count();
+    assert!(
+        after > 0 && seen.iter().any(|s| s.2),
+        "{after} of {}",
+        seen.len()
+    );
     for (snapshot, key, visible) in seen {
         let before = committed.get(&key).is_some_and(|&ts| ts <= snapshot);
         assert_eq!(

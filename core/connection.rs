@@ -2548,6 +2548,14 @@ impl Connection {
     /// [`Self::atoll_end`]: a close holds it.
     pub(crate) const END_CLOSING: u8 = 2;
 
+    /// Whether another statement of the connection is ending its Atoll transaction, `ender` saying
+    /// whether the asker began that ending: the transaction is that statement's, and the asker,
+    /// reading on beside it, holds no part of it to end or roll back (DESIGN.md §17).
+    #[inline]
+    pub(crate) fn atoll_ending_elsewhere(&self, ender: bool) -> bool {
+        !ender && self.atoll_end.load(Ordering::Acquire) == Self::END_ENDING
+    }
+
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
         if self.is_closed() {
@@ -4751,6 +4759,26 @@ impl Connection {
     /// Returns true if an interrupt is currently pending for this connection.
     pub fn is_interrupted(&self) -> bool {
         self.interrupt_requested.load(Ordering::SeqCst)
+    }
+
+    /// Ends a read transaction begun for statements reading on beside an ending (`ConnTxn::
+    /// serve_sibling`, and the one an ending's end begins for its siblings) once none can read in
+    /// it: no root statement is left, or only the one ending the transaction, which reads in no
+    /// read of its own (the auditor's #4443, #4446: left open, it held its snapshot for the
+    /// connection's next statements). Its slot and snapshot are let go, no ending of its own made
+    /// beside the one the ending statement holds (`ConnTxn::end_served`, the auditor's #4459).
+    pub(crate) fn end_served_atoll_read(&self, remaining: i32) {
+        let Some(atoll) = self.atoll.as_ref() else {
+            return;
+        };
+        let ender_only =
+            remaining == 1 && self.atoll_end.load(Ordering::Acquire) == Self::END_ENDING;
+        if !(remaining == 0 || ender_only) || !atoll.end_served() {
+            return;
+        }
+        if remaining == 0 {
+            self.set_tx_state(TransactionState::None);
+        }
     }
 
     /// Clear the connection interrupt once no root statements remain active.

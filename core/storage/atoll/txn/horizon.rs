@@ -37,6 +37,9 @@ pub(super) struct Horizon {
     marks: Box<[CachePadded<AtomicU64>]>,
     /// Commits waiting for the horizon to reach them.
     waits: Stack<Completion>,
+    /// A test's hold: the horizon rises no further than this ([`hold`](Self::hold)).
+    #[cfg(all(test, not(atoll_loom)))]
+    held: AtomicU64,
 }
 
 impl Horizon {
@@ -48,6 +51,8 @@ impl Horizon {
                 .map(|_| CachePadded::new(AtomicU64::new(0)))
                 .collect(),
             waits: Stack::default(),
+            #[cfg(all(test, not(atoll_loom)))]
+            held: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -79,6 +84,10 @@ impl Horizon {
     /// Raises the horizon as far as every commit at or below it is published; returns it.
     fn raise(&self, clock: &Clock) -> Ts {
         let mut to = clock.now();
+        #[cfg(all(test, not(atoll_loom)))]
+        {
+            to = to.min(self.held.load(Ordering::SeqCst));
+        }
         for mark in self.marks.iter() {
             let m = mark.load(Ordering::SeqCst);
             if m & DRAWING != 0 {
@@ -88,6 +97,24 @@ impl Horizon {
             }
         }
         self.at.fetch_max(to, Ordering::SeqCst).max(to)
+    }
+
+    /// Holds the horizon where it stands, for a test: a commit published meanwhile is not covered
+    /// until the hold is let go, as one is not while a commit below it on another slot draws.
+    #[cfg(all(test, not(atoll_loom)))]
+    pub(super) fn hold(&self) {
+        self.held.store(self.at(), Ordering::SeqCst);
+    }
+
+    /// Lets a test's hold go: the horizon rises, and the commits waiting look again.
+    #[cfg(all(test, not(atoll_loom)))]
+    pub(super) fn let_go(&self, clock: &Clock) {
+        self.held.store(u64::MAX, Ordering::SeqCst);
+        self.raise(clock);
+        fence(Ordering::SeqCst);
+        for c in self.waits.take_all() {
+            c.complete(0);
+        }
     }
 
     /// `None` once the horizon covers `ts`; until then, the completion to wait on, to look again

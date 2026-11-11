@@ -3008,8 +3008,9 @@ impl Program {
                 // Another statement of the connection is ending its transaction, which this one
                 // was reading (no root statement starts meanwhile): it reads on in a view of its
                 // own (DESIGN.md §17).
-                if program.connection.atoll_end.load(Ordering::Acquire) == Connection::END_ENDING
-                    && !state.ending_begun()
+                if program
+                    .connection
+                    .atoll_ending_elsewhere(state.ending_begun())
                 {
                     if let Some(result) = program.serve_atoll_sibling(state, pager, waker) {
                         return result;
@@ -3555,7 +3556,7 @@ impl Program {
             // Another statement of the connection is ending its transaction: this one, a sibling
             // reading on in a read of its own (`ConnTxn::serve_sibling`), ends nothing; that
             // statement ends the read at its own end once no sibling reads in it.
-            if connection.atoll_end.load(Ordering::Acquire) == Connection::END_ENDING {
+            if connection.atoll_ending_elsewhere(program_state.ending_begun()) {
                 return Ok(IOResult::Done(()));
             }
             let schema_did_change = matches!(
@@ -3645,6 +3646,7 @@ impl Program {
             crate::storage::atoll::drive(&io, || {
                 atoll.begin(crate::storage::atoll::sql::mode::Begin::Read)
             })?;
+            atoll.mark_served();
             connection.set_tx_state(TransactionState::Read);
         }
         Ok(IOResult::Done(()))
@@ -4309,8 +4311,15 @@ impl Program {
                 atoll.give_up();
             }
         }
-        // Errors from nested statements are handled by the parent statement.
-        if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+        // Errors from nested statements are handled by the parent statement. A statement reading
+        // on while another of the connection ends its Atoll transaction holds no part of that
+        // transaction: whatever it meets, an error, a reset or a drop, ends and rolls back nothing,
+        // so neither the main commit nor the attached part the ending finishes is undone under it
+        // (the auditor's #4454). What it read in is ended once none can read in it.
+        if !self.connection.is_nested_stmt()
+            && !self.is_trigger_subprogram()
+            && !self.connection.atoll_ending_elsewhere(state.ending_begun())
+        {
             state.pending_fresh_tx = None;
             let unfinished_statement_reset_or_drop =
                 err.is_none() && state.execution_state.is_running();

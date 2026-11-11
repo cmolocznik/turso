@@ -309,6 +309,21 @@ crate::thread::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// How many transaction endings were made on this thread.
+    static ENDINGS_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts an ending made on this thread.
+pub(crate) fn ending_made() {
+    ENDINGS_MADE.with(|n| n.set(n.get() + 1));
+}
+
+/// How many transaction endings were made on this thread so far.
+pub(crate) fn endings_made() -> usize {
+    ENDINGS_MADE.with(|n| n.get())
+}
+
 /// The pause a test set on this thread before a commit's publication, while it is unfinished.
 pub(crate) fn pause_ending() -> Option<crate::io::Completion> {
     ENDING_PAUSE.with(|p| p.borrow().clone().filter(|c| !c.finished()))

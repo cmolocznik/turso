@@ -483,6 +483,10 @@ pub struct ConnTxn {
     /// (DESIGN.md §17): whichever statement of the connection meets it steps it, the one that
     /// began it to its end, a sibling still reading until its commit is published.
     ending: Mutex<Option<Ending>>,
+    /// Whether the open transaction is a read begun for statements reading on beside an ending
+    /// (`serve_sibling`, and the one an ending's end begins for its siblings), which no statement
+    /// began for itself: the connection ends it once none can read in it.
+    served: AtomicBool,
     /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
     _frame: crate::storage::atoll::unwind::FrameEnd,
 }
@@ -717,6 +721,7 @@ impl ConnTxn {
             known: Arc::new(Mutex::new(HashMap::default())),
             fields: Mutex::new([None; 7]),
             ending: Mutex::new(None),
+            served: AtomicBool::new(false),
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
@@ -1122,6 +1127,20 @@ impl ConnTxn {
         if self.pinned.load(Ordering::Acquire) {
             return None;
         }
+        self.served.store(false, Ordering::Release);
+        let (txn, written, stamped) = self.take_to_end()?;
+        let conn = self.cell.conn().clone();
+        Some(if commit {
+            Ending::commit(self.db.clone(), conn, txn, written, stamped, publish)
+        } else {
+            self.changes.rolled_back();
+            Ending::rollback(self.db.clone(), conn, txn)
+        })
+    }
+
+    /// The open transaction, taken out of the connection to be ended, with what it wrote to the
+    /// header and the trees it stamped; the connection's part of it let go.
+    fn take_to_end(&self) -> Option<EndedTxn> {
         self.savepoints.lock().clear();
         let txn = self.cell.lock().take()?;
         self.changes.destroyed(Vec::clear);
@@ -1135,14 +1154,31 @@ impl ConnTxn {
         self.waits.end_group();
         // No sibling cursor keeps the gate, `R` or a protected set past the transaction it served
         // (DESIGN.md 9.1.3, *Revoking an inactive tenure*).
-        let conn = self.cell.conn().clone();
-        crate::storage::atoll::buffer::cancel_shortage(self.db.atoll().pool(), &conn);
-        Some(if commit {
-            Ending::commit(self.db.clone(), conn, txn, written, stamped, publish)
-        } else {
-            self.changes.rolled_back();
-            Ending::rollback(self.db.clone(), conn, txn)
-        })
+        crate::storage::atoll::buffer::cancel_shortage(self.db.atoll().pool(), self.cell.conn());
+        Some((txn, written, stamped))
+    }
+
+    /// Ends the open read begun for siblings (`served`) by letting its slot and snapshot go: it
+    /// wrote and abandoned nothing, so it owes no rollback and has no ending of its own, the drain
+    /// and the checkpoint's pacing a transaction's end does left to the endings that write, the one
+    /// in the connection's place among them (the auditor's #4459: an ending of its own beside that
+    /// one would be a second ending of the connection, with a drain and a full checkpoint's wait to
+    /// owe). Whether it ended one: not while a schema reparse holds the transaction, nor one a
+    /// later statement wrote in, which that statement ends.
+    #[turso_macros::atoll_entry]
+    pub fn end_served(&self) -> bool {
+        if self.pinned.load(Ordering::Acquire) || !self.served.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        if !self.cell.lock().as_ref().is_some_and(|txn| !txn.wrote()) {
+            return false;
+        }
+        let Some((txn, _, _)) = self.take_to_end() else {
+            return false;
+        };
+        self.changes.rolled_back();
+        self.db.atoll().transactions().abort(txn);
+        true
     }
 
     /// Puts `ending` in the connection's place, where whichever statement of the connection meets
@@ -1186,23 +1222,38 @@ impl ConnTxn {
 
     /// A view for a statement that was reading the connection's transaction when another statement
     /// of the connection began to end it, and steps again before that ending is done (the auditor's
-    /// #4435): the ending in the place is stepped until its commit is published, its own waits the
-    /// statement's to wait on, and then a read transaction is begun, which sees what the commit left,
-    /// as the one the ending begins for its siblings at its end does (DESIGN.md §17). Done at once
-    /// with a transaction open.
+    /// #4435): the ending in the place is served ([`Ending::serve`]) until its transaction is over
+    /// and the horizon covers its commit, its waits until then the statement's to wait on, and then
+    /// a read transaction is begun, which sees what the commit left, as the one the ending begins
+    /// for its siblings at its end does (DESIGN.md §17). Done at once with a transaction open.
     #[turso_macros::atoll_entry]
     pub fn serve_sibling(&self) -> Result<IOResult<()>> {
         if self.cell.lock().is_some() {
             return Ok(IOResult::Done(()));
         }
         if let Some(ending) = self.ending.lock().as_mut() {
-            if !ending.published() {
-                if let IOResult::IO(io) = ending.step()? {
-                    return Ok(IOResult::IO(io));
-                }
+            if let IOResult::IO(io) = ending.serve()? {
+                return Ok(IOResult::IO(io));
             }
         }
-        self.begin(Begin::Read)
+        let begun = self.begin(Begin::Read)?;
+        if !begun.is_io() {
+            self.mark_served();
+        }
+        Ok(begun)
+    }
+
+    /// Holds the database's horizon where it stands, or lets it go, for a test.
+    #[cfg(all(test, not(atoll_loom)))]
+    #[turso_macros::atoll_entry]
+    pub(crate) fn hold_horizon(&self, hold: bool) {
+        self.db.atoll().transactions().hold_horizon(hold);
+    }
+
+    /// Marks the open transaction a read begun for siblings (`served`).
+    #[turso_macros::atoll_entry]
+    pub fn mark_served(&self) {
+        self.served.store(true, Ordering::Release);
     }
 
     /// The schema cookie: at the transaction's view, or committed outside one.
@@ -1508,6 +1559,10 @@ fn outside() -> LimboError {
     LimboError::InternalError("an Atoll read or write outside any transaction".to_string())
 }
 
+/// An open transaction taken out of its connection to be ended ([`ConnTxn::take_to_end`]), with the
+/// header fields it wrote and the stamps of the trees it wrote.
+type EndedTxn = (Txn, Vec<(Statement, Field, u32)>, Vec<super::trees::Stamp>);
+
 /// A transaction's commit or rollback, then the drain of the trees it abandoned. Step it until
 /// done. Never abandoned: dropped unfinished, it is driven to its end where it drops (R19).
 pub struct Ending {
@@ -1548,6 +1603,8 @@ impl Ending {
         stamped: Vec<super::trees::Stamp>,
         publish: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
+        #[cfg(test)]
+        crate::storage::atoll::testing::ending_made();
         let published = db.clone();
         let commit = Commit::new(txn).on_published(move |ts| {
             for (_, field, value) in written {
@@ -1572,6 +1629,8 @@ impl Ending {
         conn: Arc<crate::storage::atoll::buffer::Conn>,
         txn: Txn,
     ) -> Self {
+        #[cfg(test)]
+        crate::storage::atoll::testing::ending_made();
         if !txn.wrote() {
             db.atoll().transactions().abort(txn);
             return Self {
@@ -1617,27 +1676,88 @@ impl Ending {
         self.owner.queued()
     }
 
+    /// A sibling's step of the ending (DESIGN.md §17): the transaction's own step, until the
+    /// transaction is over (its commit published, or ended having written nothing; its rollback's
+    /// changes put back), its waits the sibling's, then the wait for the horizon to cover a
+    /// commit, once a snapshot taken sees it. Never past: the wait for durability, the drain and a
+    /// full checkpoint's wait are the ending's own, and their IO and its failure are for the
+    /// statement that began it (the auditor's #4454).
+    #[turso_macros::atoll_entry]
+    pub fn serve(&mut self) -> Result<IOResult<()>> {
+        crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::serve_owned)
+    }
+
+    fn serve_owned(&mut self) -> Result<IOResult<()>> {
+        let ended = match &self.step {
+            Step::Commit(op) => op.ended(),
+            Step::Rollback(op) => op.ended(),
+            _ => return Ok(IOResult::Done(())),
+        };
+        if !ended {
+            let io = match self.step {
+                Step::Commit(_) => self.step_commit()?,
+                _ => self.step_rollback()?,
+            };
+            match &self.step {
+                Step::Commit(op) if !op.ended() => return Ok(io),
+                Step::Rollback(_) => return Ok(io),
+                // The step that ended the transaction went on to a commit's waits: they are the
+                // ending's, its IO dropped here and waited on as the ending is stepped again.
+                _ => {}
+            }
+        }
+        let Step::Commit(op) = &self.step else {
+            return Ok(IOResult::Done(()));
+        };
+        Ok(
+            match op
+                .ts()
+                .and_then(|ts| self.db.atoll().transactions().wait_covered(ts))
+            {
+                Some(wait) => IOResult::IO(IOCompletions(wait)),
+                None => IOResult::Done(()),
+            },
+        )
+    }
+
+    /// The commit's step, then the drain once it is done.
+    fn step_commit(&mut self) -> Result<IOResult<()>> {
+        let Step::Commit(op) = &mut self.step else {
+            unreachable!("a commit's step of an ending that commits")
+        };
+        #[cfg(test)]
+        if !op.published() {
+            if let Some(pause) = crate::storage::atoll::testing::pause_ending() {
+                return Ok(IOResult::IO(IOCompletions(pause)));
+            }
+        }
+        done!(self.db.atoll().transactions().commit(op));
+        self.db.abandoned(op.abandoned());
+        self.published = op.published();
+        self.step = Step::Drain;
+        Ok(IOResult::Done(()))
+    }
+
+    /// The rollback's step, then the drain once it is done.
+    fn step_rollback(&mut self) -> Result<IOResult<()>> {
+        let Step::Rollback(op) = &mut self.step else {
+            unreachable!("a rollback's step of an ending that rolls back")
+        };
+        done!(self
+            .db
+            .atoll()
+            .transactions()
+            .rollback(self.db.versions(), op));
+        self.db.abandoned(op.abandoned());
+        self.step = Step::Drain;
+        Ok(IOResult::Done(()))
+    }
+
     fn step_owned(&mut self) -> Result<IOResult<()>> {
-        let txns = self.db.atoll().transactions();
         loop {
             match &mut self.step {
-                Step::Commit(op) => {
-                    #[cfg(test)]
-                    if !op.published() {
-                        if let Some(pause) = crate::storage::atoll::testing::pause_ending() {
-                            return Ok(IOResult::IO(IOCompletions(pause)));
-                        }
-                    }
-                    done!(txns.commit(op));
-                    self.db.abandoned(op.abandoned());
-                    self.published = op.published();
-                    self.step = Step::Drain;
-                }
-                Step::Rollback(op) => {
-                    done!(txns.rollback(self.db.versions(), op));
-                    self.db.abandoned(op.abandoned());
-                    self.step = Step::Drain;
-                }
+                Step::Commit(_) => done!(self.step_commit()),
+                Step::Rollback(_) => done!(self.step_rollback()),
                 Step::Drain => {
                     done!(self.db.drain());
                     // A transaction's end steps the checkpointer, holding no latch. Past twice its
@@ -1651,7 +1771,7 @@ impl Ending {
                     let checkpointer = self.db.atoll().checkpointer();
                     let over = 2 * checkpointer.budget();
                     self.step = if checkpointer.lag() > over
-                        && checkpointer.lag_to(txns.held_from()) > over
+                        && checkpointer.lag_to(self.db.atoll().transactions().held_from()) > over
                     {
                         Step::Checkpoint(checkpointer.request_full())
                     } else {

@@ -450,6 +450,7 @@ impl Statement {
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
             }
+            self.program.connection.end_served_atoll_read(previous - 1);
             self.counted_as_active_root = false;
         }
     }

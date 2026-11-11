@@ -493,6 +493,11 @@ impl Abort {
     pub fn abandoned(&self) -> &[PageId] {
         &self.abandoned
     }
+
+    /// Whether every change of the transaction is put back and its slot freed.
+    pub fn ended(&self) -> bool {
+        self.txn.is_none()
+    }
 }
 
 /// A commit in progress: step it with [`Transactions::commit`].
@@ -532,6 +537,18 @@ impl Commit {
     /// since and stays so, whatever its wait for durability then meets.
     pub fn published(&self) -> bool {
         self.ts.is_some()
+    }
+
+    /// The commit timestamp, once the commit is published; `None` before, and for a transaction
+    /// that wrote nothing.
+    pub fn ts(&self) -> Option<Ts> {
+        self.ts
+    }
+
+    /// Whether the transaction is over and its slot freed: its commit published, or, having
+    /// written nothing, ended without one. What is left is the commit's waits.
+    pub fn ended(&self) -> bool {
+        self.txn.is_none()
     }
 
     /// Once the commit is done, the trees whose creation a statement rollback undid: each on its
@@ -1192,6 +1209,23 @@ impl Transactions {
             IOResult::Done(()) => IOResult::Done(op.ts),
             IOResult::IO(io) => IOResult::IO(io),
         })
+    }
+
+    /// `None` once every snapshot taken from now on sees the commit at `ts`, the horizon covering
+    /// it; until then, the completion to wait on, to look again once it is done. A published
+    /// commit's horizon may lag it while a commit below it on another slot is still drawing.
+    pub fn wait_covered(&self, ts: Ts) -> Option<Completion> {
+        self.horizon.wait(ts, &self.clock)
+    }
+
+    /// Holds the horizon where it stands, or lets it go, for a test ([`Horizon::hold`]).
+    #[cfg(all(test, not(atoll_loom)))]
+    pub(crate) fn hold_horizon(&self, hold: bool) {
+        if hold {
+            self.horizon.hold();
+        } else {
+            self.horizon.let_go(&self.clock);
+        }
     }
 
     /// Ends `txn`, which wrote nothing, without committing it. One that wrote is rolled back

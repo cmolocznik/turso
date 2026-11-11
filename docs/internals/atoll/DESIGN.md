@@ -3640,23 +3640,36 @@ MVCC plugs into the same places with 38 explicit branches in `core/vdbe/execute.
   ending meeting a close does not begin. While the word is held no root statement of the connection
   starts (refused the same way at its start), so no second transaction begins, ends or rolls back
   under the first's ending. A statement already running goes on: the storage ending waits in the
-  connection's place (`ConnTxn::place`), and a sibling that steps while it is there steps it itself
-  until its commit is published, waiting on what it waits on, then reads on in a read transaction
-  begun for it, which sees what the commit left (`ConnTxn::serve_sibling`); the sibling's own end
-  ends nothing, and that read is ended at the ending's end once no sibling reads in it. The ending
-  is decided and finished whole by its statement, stepped on, reset or dropped: the storage's
-  ending, then a rollback's schema put back, then temp's and the attached databases' transactions
-  ended, the connection's state last. No interrupt, deadline or progress handler stops it. A
-  commit's schema is published with the commit, in the hook that publishes its header fields and its
-  trees' stamps before the write gate is let go, so whoever takes the gate next prepares against it,
-  and nothing the ending meets after can leave it unpublished. A commit is decided at its
-  publication: a failure its ending meets after (its wait for durability, its drain, a full
-  checkpoint's wait) ends the ending, whose rest is never stepped again, the commit is finished
-  whole, the attached databases' transactions committed, and the statement returns the failure in
-  place of `Done`; one met before rolls every part back. Across databases a commit is atomic per
-  database, as SQLite's is in WAL mode: the attached databases commit after the main database's
-  commit is published, not after it is durable. `ROLLBACK` drives its ending to its end inside its
-  own step, so no statement is ever left holding a rollback's ending.
+  connection's place (`ConnTxn::place`), and a sibling that steps while it is there steps the
+  transaction's own step itself until the transaction is over (a commit published, a rollback's
+  changes put back), waiting on what that step waits on, then waits for the horizon to cover a
+  commit, and reads on in a read transaction begun for it, which sees what the commit left
+  (`ConnTxn::serve_sibling`, `Ending::serve`): a snapshot taken at the publication is below the
+  commit while a commit under it on another slot is still drawing, as several connections' commits
+  do at once, row writers holding the write gate shared. Never past: the wait for durability, the
+  drain and a full checkpoint's wait, their IO and its failure, are the ending's statement's. A
+  sibling holds no part of the transaction: its own end ends nothing, and whatever it meets, an
+  error, a reset or a drop, ends and rolls back nothing (`Program::abort`). The read begun for
+  siblings, marked so (`ConnTxn::served`), is ended as the last statement that can read in it lets
+  go: at the one count of root statements every step, reset and drop goes through, once none is
+  left, or only the statement ending the transaction, which reads in no read of its own
+  (`Connection::end_served_atoll_read`); left open, it held its snapshot for the connection's next
+  statements. It ends by letting its slot and snapshot go (`ConnTxn::end_served`): having written
+  and abandoned nothing, it has no ending of its own, which beside the one in the place would be a
+  second ending of the connection, with a drain and a full checkpoint's wait to owe. The ending is
+  decided and finished whole by its statement, stepped on, reset or dropped: the storage's ending,
+  then a rollback's schema put back, then temp's and the attached databases' transactions ended, the
+  connection's state last. No interrupt, deadline or progress handler stops it. A commit's schema is
+  published with the commit, in the hook that publishes its header fields and its trees' stamps
+  before the write gate is let go, so whoever takes the gate next prepares against it, and nothing
+  the ending meets after can leave it unpublished. A commit is decided at its publication: a failure
+  its ending meets after (its wait for durability, its drain, a full checkpoint's wait) ends the
+  ending, whose rest is never stepped again, the commit is finished whole, the attached databases'
+  transactions committed, and the statement returns the failure in place of `Done`; one met before
+  rolls every part back. Across databases a commit is atomic per database, as SQLite's is in WAL
+  mode: the attached databases commit after the main database's commit is published, not after it is
+  durable. `ROLLBACK` drives its ending to its end inside its own step, so no statement is ever left
+  holding a rollback's ending.
 ## 18. Concurrency inside the engine
 
 Turso runs a connection's statements on whatever thread steps them. IO completes either inside the

@@ -5398,20 +5398,28 @@ compose, the real `Completion`, latch and backends included where named.
    worker: a writing statement, a transaction's end and a wait for a full checkpoint each claim it
    by name (`TaskRef::run_once`), one step a call, and the step tells the writer that claimed it,
    on its own thread, what it came to: its wait, done, or the failure it met, so the writer meets
-   that failure as a writer stepping the state did. A writer refused room or the gate steps the
-   state itself only as far as its room needs, as writers always have: a claim would step the task
-   as far as it goes, more than a caller may run (22.7), until the task's steps are units and the
-   room tickets carry the demand (22.4). With no task yet (recovery), or a task that failed or
-   closed, a writer steps the state itself. A claim that finds the task stepped by another writer
-   waits on the state's let-go, registered before it claimed, and a claim whose step held the state
+   that failure as a writer stepping the state did. A writer refused room or the gate claims the
+   task for its relief, a unit a claim, only as far as its room or the gate needs. A change refused
+   room holds a room ticket (`RoomWait`, its operation's across its retries: a put, a removal, a
+   drain, a versioned write and its giving back) with the bytes it last asked for, counted by size
+   so that the room presses for the largest alive, and with a relief-class ticket on the
+   checkpoint's task, which taking wakes; its change admitted, or its operation gone, lets it go,
+   and every such drop is a change of the supply, since a smaller largest request may let another
+   waiter in. With no task yet (recovery), or a task that failed or
+   closed, a writer steps the state itself. A claim for a full checkpoint that finds the task
+   stepped by another writer, or the state held, registers on the state's let-go and claims once
+   more, and waits only if that claim is refused too, so a claim that steps registers nothing (the
+   auditor's P2-CP-W1: a registration a unit cost a wait's allocation and two visits of its mutex);
+   a claim whose step held the state
    wakes the writers waiting on the room, the gate and the let-go once that step has ended, since
    the step's own let-go may come before another writer looks; one whose step only contended for a
    state another holds wakes no one, and that holder's let-go does. Another holder's let-go (an
    integrity check, a writer's relief) wakes those writers only where the writers step checkpoints:
    with a worker, they wait on the room the worker frees and the gate it opens. Not built yet: the
    due trigger and its level (a transaction's end wakes the task whether or not one is due, as it
-   woke the thread, and erasure rides those wakes), the room tickets, close's durable end and the
-   request count through `close_after`, the sustained run and the profile.)
+   woke the thread, and erasure rides those wakes), the ticket a transaction's end waiting for a
+   full checkpoint holds on it (22.4), close's durable end and the request count through
+   `close_after`, the sustained run and the profile.)
 8. **The segment preparers**, every open log, replacing the interim adapter and the callback chain
    in the same change; the callers' fresh-segment cases of proof 12 first. Step 4's exception, a
    unit's budget of one start and one finish, goes with the adapter.

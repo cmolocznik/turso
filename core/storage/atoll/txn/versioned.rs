@@ -36,7 +36,7 @@ use crate::storage::atoll::btree::value::{Read, ValueRead, ValueRef};
 use crate::storage::atoll::btree::{
     node, Kept, Lookup, Mode, Near, Outcome, Put, Stored, StoredValue, Tree,
 };
-use crate::storage::atoll::buffer::BufferPool;
+use crate::storage::atoll::buffer::{BufferPool, RoomWait};
 use crate::storage::atoll::page::PageId;
 use crate::storage::atoll::store::PageStore;
 use crate::sync::Arc;
@@ -412,6 +412,9 @@ pub struct WriteOp {
     kept: Option<Kept>,
     /// What the write has done about a full leaf keeping reserves.
     reserves: Reserves,
+    /// Its wait for room for the copies a checkpoint's cut keeps, while no put holds it: the
+    /// write's across its puts and its giving back (DESIGN.md 22.4).
+    room: RoomWait,
 }
 
 /// A write's dealings with the reserves of a leaf too full for it ([`Tree::settle`]).
@@ -448,6 +451,7 @@ impl WriteOp {
             near: Near::NONE,
             kept: None,
             reserves: Reserves::Untouched,
+            room: RoomWait::default(),
         }
     }
 
@@ -468,6 +472,7 @@ impl WriteOp {
             near: Near::NONE,
             kept: None,
             reserves: Reserves::Untouched,
+            room: RoomWait::default(),
         }
     }
 
@@ -484,7 +489,8 @@ impl WriteOp {
 
     /// The put's buffers back from `put`, once it is done or must be built again: the entry, whole
     /// unless its value went out of line, when the copy kept for that is the entry.
-    fn take_back(&mut self, put: Put) {
+    fn take_back(&mut self, mut put: Put) {
+        self.room = put.take_room();
         let (key, entry) = put.into_buffers();
         self.key = key;
         if let Some(entry) = entry {
@@ -842,7 +848,7 @@ impl VersionedTree {
                 let settled = |head: &[u8]| {
                     Version::decode(head).is_some_and(|v| txns.seen_from_now(v.slot, v.ts))
                 };
-                done!(self.tree.settle(&op.key, op.near, &settled));
+                done!(self.tree.settle(&op.key, op.near, &settled, &mut op.room));
                 op.reserves = Reserves::GivenBack;
             }
             // One look serves the judgment and the write: the put goes in at its leaf if the leaf
@@ -954,7 +960,8 @@ impl VersionedTree {
             let keep = newest.is_some_and(|v| own || !txns.visible(txn, v.slot, v.ts));
             let put = Put::with_owned(std::mem::take(&mut op.key), entry, HEADER, Mode::Upsert)
                 .expecting_entry(leaf_entry)
-                .reserving(keep);
+                .reserving(keep)
+                .with_room(std::mem::take(&mut op.room));
             let put = match op.reserves {
                 Reserves::Untouched => put.settling(),
                 _ => put,

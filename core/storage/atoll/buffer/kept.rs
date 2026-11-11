@@ -8,8 +8,14 @@
 //! it holds and waits, driving the checkpoint itself. Only node pages are kept, at most 64 KiB
 //! each ([`MAX_CLASS`](super::super::btree::node::MAX_CLASS)), and a change asks for three at
 //! most, so every request fits the smallest limit, one page of the largest class.
+//!
+//! A refused change's wait is a ticket its operation owns across its retries ([`RoomWait`],
+//! DESIGN.md 22.4), with the bytes it last asked for and a demand on the checkpoint that frees
+//! room; the room presses for the largest request among the tickets alive.
 
 use super::super::aligned::AlignedBlock;
+use super::super::executor;
+use super::super::page::MIN_PAGE_SIZE;
 use crate::io::{Completion, IO};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
@@ -38,6 +44,10 @@ const _: () = assert!(
     "a change's request fits under the cap"
 );
 
+/// The sizes a room ticket can name, in pages of the smallest size: a request is a sum of node
+/// pages, each a whole number of the smallest, and at most [`LARGEST_REQUEST`].
+const SIZES: usize = LARGEST_REQUEST / MIN_PAGE_SIZE + 1;
+
 /// What the room has held and how often it refused, since the pool opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeptStats {
@@ -45,7 +55,7 @@ pub struct KeptStats {
     pub used: usize,
     pub peak: usize,
     pub refusals: u64,
-    /// Nanoseconds from each refusal to the refused thread's next admitted request.
+    /// Nanoseconds from each operation's first refusal to its change admitted.
     pub waited_ns: u64,
     /// The longest of those waits since the peaks were last reset.
     pub longest_wait_ns: u64,
@@ -58,10 +68,13 @@ pub struct KeptRoom {
     refusals: AtomicU64,
     waited_ns: AtomicU64,
     longest_wait_ns: AtomicU64,
-    /// Bytes of a request refused since one was last admitted: the checkpoint images kept
-    /// copies first while it is not 0.
-    pressing: AtomicUsize,
-    /// The pool's supply: room given back and a cut ended are changes of it (DESIGN.md 9.1.3).
+    /// The room tickets alive, counted by the bytes each last asked for, in pages of the
+    /// smallest size: the largest is the request the room presses for.
+    tickets: [AtomicUsize; SIZES],
+    /// How many room tickets are alive: the checkpoint images kept copies first while any is.
+    waiting: AtomicUsize,
+    /// The pool's supply: room given back, a cut ended and a ticket dropped are changes of it
+    /// (DESIGN.md 9.1.3).
     supply: Arc<super::supply::Supply>,
     /// Waits for room handed out, each of the remote kind, for tests.
     #[cfg(test)]
@@ -69,9 +82,42 @@ pub struct KeptRoom {
     io: Arc<dyn IO>,
 }
 
-crate::thread::thread_local! {
-    /// When this thread's last request was refused, if none has been admitted since.
-    static REFUSED_AT: std::cell::Cell<Option<MonotonicInstant>> = const { std::cell::Cell::new(None) };
+/// A refused change's wait for room (DESIGN.md 22.4), owned by its operation across its retries:
+/// empty until the room refuses it, then the ticket of its refusals until its change is
+/// admitted. Dropped with the operation (cancelled, the connection gone), it lets the ticket go.
+#[derive(Default)]
+pub struct RoomWait(Option<RoomTicket>);
+
+impl RoomWait {
+    /// Whether the room refused the operation and has not admitted its change since.
+    #[cfg(test)]
+    pub fn waiting(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+/// A live room ticket: the bytes its operation last asked for, counted among the room's tickets,
+/// when its first refusal was, and its demand on the checkpoint, of the relief class, while the
+/// checkpoint is a task.
+struct RoomTicket {
+    room: Arc<KeptRoom>,
+    bytes: usize,
+    since: MonotonicInstant,
+    _demand: Option<executor::Ticket>,
+}
+
+impl Drop for RoomTicket {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        // A smaller largest request may let another waiter in, so the drop is a change of the
+        // supply (DESIGN.md 9.1.3, rule 5), the count lowered inside it.
+        let room = &self.room;
+        room.supply.change(|event| {
+            room.tickets[KeptRoom::size(self.bytes)].fetch_sub(1, Ordering::AcqRel);
+            room.waiting.fetch_sub(1, Ordering::AcqRel);
+            event.arm();
+        });
+    }
 }
 
 impl KeptRoom {
@@ -83,7 +129,8 @@ impl KeptRoom {
             refusals: AtomicU64::new(0),
             waited_ns: AtomicU64::new(0),
             longest_wait_ns: AtomicU64::new(0),
-            pressing: AtomicUsize::new(0),
+            tickets: std::array::from_fn(|_| AtomicUsize::new(0)),
+            waiting: AtomicUsize::new(0),
             supply,
             #[cfg(test)]
             blocking_waits: AtomicU64::new(0),
@@ -115,46 +162,92 @@ impl KeptRoom {
         true
     }
 
-    /// A request of `bytes` refused: the thread waits from now.
-    pub fn refused(&self, bytes: usize) {
-        self.refusals.fetch_add(1, Ordering::Relaxed);
-        self.pressing.fetch_max(bytes, Ordering::AcqRel);
-        let now = self.io.current_time_monotonic();
-        REFUSED_AT.with(|at| {
-            if at.get().is_none() {
-                at.set(Some(now));
-            }
-        });
+    /// A ticket's size: its bytes in pages of the smallest size.
+    fn size(bytes: usize) -> usize {
+        debug_assert!(
+            bytes > 0 && bytes <= LARGEST_REQUEST && bytes % MIN_PAGE_SIZE == 0,
+            "a request of {bytes} bytes no ticket names"
+        );
+        bytes / MIN_PAGE_SIZE
     }
 
-    /// A request of this thread's admitted: its wait, if it waited, ends.
-    pub fn admitted(&self) {
-        let Some(at) = REFUSED_AT.with(|at| at.take()) else {
+    /// A request of `bytes` refused, its operation's wait `wait`: a ticket from a refusal before
+    /// names these bytes now, counted under them before it leaves its old ones, so the largest
+    /// request read meanwhile is never below either; else a ticket is taken, its wait timed from
+    /// now and its demand on the checkpoint made (`demand`). A request of no bytes, its cut ended
+    /// since the charge, waits for nothing.
+    pub fn refused(
+        self: &Arc<Self>,
+        bytes: usize,
+        wait: &mut RoomWait,
+        demand: impl FnOnce() -> Option<executor::Ticket>,
+    ) {
+        self.refusals.fetch_add(1, Ordering::Relaxed);
+        if bytes == 0 {
+            return;
+        }
+        let size = Self::size(bytes);
+        match &mut wait.0 {
+            Some(ticket) if ticket.bytes == bytes => {}
+            Some(ticket) => {
+                self.tickets[size].fetch_add(1, Ordering::AcqRel);
+                let was = Self::size(ticket.bytes);
+                self.supply.change(|event| {
+                    self.tickets[was].fetch_sub(1, Ordering::AcqRel);
+                    event.arm();
+                });
+                ticket.bytes = bytes;
+            }
+            None => {
+                self.tickets[size].fetch_add(1, Ordering::AcqRel);
+                self.waiting.fetch_add(1, Ordering::AcqRel);
+                wait.0 = Some(RoomTicket {
+                    room: self.clone(),
+                    bytes,
+                    since: self.io.current_time_monotonic(),
+                    _demand: demand(),
+                });
+            }
+        }
+    }
+
+    /// The change of the operation waiting on `wait` admitted: its wait, if it waited, ends, and
+    /// its ticket goes.
+    pub fn admitted(&self, wait: &mut RoomWait) {
+        let Some(ticket) = wait.0.take() else {
             return;
         };
-        self.pressing.store(0, Ordering::Release);
-        let waited = self.io.current_time_monotonic().duration_since(at);
+        let waited = self
+            .io
+            .current_time_monotonic()
+            .duration_since(ticket.since);
         let waited = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
         self.waited_ns.fetch_add(waited, Ordering::Relaxed);
         self.longest_wait_ns.fetch_max(waited, Ordering::Relaxed);
     }
 
-    /// Whether the largest request refused since one was last admitted fits now.
+    /// The largest request among the room tickets alive, 0 with none.
+    pub fn pressing(&self) -> usize {
+        (1..SIZES)
+            .rev()
+            .find(|&size| self.tickets[size].load(Ordering::Acquire) != 0)
+            .map_or(0, |size| size * MIN_PAGE_SIZE)
+    }
+
+    /// Whether the largest request among the room tickets alive fits now.
     pub fn takes_refused(&self) -> bool {
-        self.used.load(Ordering::Acquire) + self.pressing.load(Ordering::Acquire) <= self.limit
+        self.used.load(Ordering::Acquire) + self.pressing() <= self.limit
     }
 
-    /// Whether a request was refused since one was last admitted.
+    /// Whether a room ticket is alive.
     pub fn pressed(&self) -> bool {
-        self.pressing.load(Ordering::Acquire) != 0
+        self.waiting.load(Ordering::Acquire) != 0
     }
 
-    /// The cut ended: no copy is kept, and none is wanted.
+    /// The cut ended: no copy is kept, and every waiter looks again. Its tickets live until their
+    /// operations' changes are admitted or the operations go.
     pub fn cut_ended(&self) {
-        self.supply.change(|event| {
-            self.pressing.store(0, Ordering::Release);
-            event.arm();
-        });
+        self.supply.change(|event| event.arm());
     }
 
     /// Gives back `bytes` charged for copies that were not made after all.

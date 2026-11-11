@@ -198,8 +198,8 @@ pub struct Refused {
 }
 
 pub(super) enum Why {
-    /// The room's bytes.
-    Room,
+    /// The room's bytes: as many as the change asked for.
+    Room { bytes: usize },
     /// Frames.
     Frames {
         want: Want,
@@ -242,7 +242,7 @@ impl Retry<'_> {
 impl std::fmt::Debug for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.why {
-            Why::Room => f.write_str("Refused(room)"),
+            Why::Room { bytes } => write!(f, "Refused(room {bytes})"),
             Why::Frames { want, .. } => write!(f, "Refused(frames {want:?})"),
         }
     }

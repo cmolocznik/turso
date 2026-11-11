@@ -13,11 +13,12 @@ use crate::storage::atoll::btree::{
     SHRINKS_HELD, SHRINKS_REFUSED, SPLITS_REFUSED,
 };
 use crate::storage::atoll::buffer::{
-    lend::Want, BufferConfig, BufferPool, Relieved, Retry, MIN_BUDGET, MIN_DB_BUDGET,
+    lend::Want, BufferConfig, BufferPool, Relieved, Retry, RoomWait, MIN_BUDGET, MIN_DB_BUDGET,
     WRITEBACK_BYTES,
 };
-use crate::storage::atoll::checkpoint::{Checkpointing, WRITER_STEPS, WRITE_BYTES};
+use crate::storage::atoll::checkpoint::{Checkpointing, CLAIMS, WRITER_STEPS, WRITE_BYTES};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
+use crate::storage::atoll::executor::Class;
 use crate::storage::atoll::log::{ring_bytes, LogConfig};
 use crate::storage::atoll::meta::MetaRef;
 use crate::storage::atoll::page::{PageId, SizeClass, MAX_PAGE_SIZE};
@@ -769,7 +770,7 @@ fn a_writer_refused_frames_wakes_when_another_caller_lets_the_checkpoints_state_
     // A real copy owed to this cut: finishing the checkpoint returns its frame.
     let root = drive(&db.io, || db.pool().fix_exclusive(orphan, None)).unwrap();
     db.pool()
-        .keep(&[&root])
+        .keep(&[&root], &mut RoomWait::default())
         .expect("room and a frame for the first copy");
     root.release_unchanged();
     let kept = db.pool().kept_stats();
@@ -2142,7 +2143,12 @@ fn audit_resident_fixes_and_settle_ignore_room_wakes_and_other_frame_releases() 
                         .fix_exclusive(root, None)
                         .map(|r| r.map(|p| drop(p.release_unchanged()))),
                     _ => tree
-                        .settle(b"", crate::storage::atoll::btree::Near::NONE, &|_| true)
+                        .settle(
+                            b"",
+                            crate::storage::atoll::btree::Near::NONE,
+                            &|_| true,
+                            &mut RoomWait::default(),
+                        )
                         .map(|r| r.map(drop)),
                 }
             };
@@ -2240,4 +2246,182 @@ fn audit_resident_fixes_and_settle_ignore_room_wakes_and_other_frame_releases() 
             "the held page release did not finish and notify once"
         );
     }
+}
+
+/// A room of `limit` bytes on a supply of its own, as a pool makes it.
+fn room_of(limit: usize) -> (Arc<super::KeptRoom>, Arc<super::super::supply::Supply>) {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let epochs = Arc::new(crate::storage::atoll::epoch::Epochs::new());
+    let supply = Arc::new(super::super::supply::Supply::new(epochs));
+    (super::KeptRoom::new(limit, supply.clone(), io), supply)
+}
+
+/// Two refusals of different sizes, the smaller admitted first: the room still presses for the
+/// larger, which still waits, and the checkpoint still images kept copies first; once the larger
+/// is admitted nothing presses (DESIGN.md 22.4; proof 4; mutant: one shared "pressing" cleared by
+/// any admission).
+#[test]
+fn two_refusals_of_different_sizes_the_smaller_admitted_first_press_for_the_larger() {
+    let page = node_class().size();
+    let (room, _supply) = room_of(super::LARGEST_REQUEST);
+    assert!(room.charge(super::LARGEST_REQUEST - 2 * page));
+    let (mut large, mut small) = (RoomWait::default(), RoomWait::default());
+    room.refused(3 * page, &mut large, || None);
+    room.refused(page, &mut small, || None);
+    let both = (room.pressing(), room.pressed(), room.takes_refused());
+    room.admitted(&mut small);
+    let after_small = (
+        room.pressing(),
+        room.pressed(),
+        room.takes_refused(),
+        large.waiting(),
+        small.waiting(),
+    );
+    room.admitted(&mut large);
+    let after_large = (room.pressing(), room.pressed(), large.waiting());
+    // Every ticket gone before the asserts: a drop while one unwinds ends the process.
+    drop((large, small));
+    assert_eq!(both, (3 * page, true, false), "both waiting");
+    assert_eq!(
+        after_small,
+        (3 * page, true, false, true, false),
+        "the smaller admitted, the larger still presses"
+    );
+    assert_eq!(after_large, (0, false, false), "both admitted");
+}
+
+/// A refused operation that goes without its change admitted (cancelled, its connection gone) lets
+/// its ticket go as a change of the supply: a smaller waiter that only the larger's bytes held
+/// back wakes, and the room takes it now. A refusal again with fewer bytes presses for those
+/// (DESIGN.md 22.4, 9.1.3 rule 5; mutant: a ticket's drop lowering the count outside a change).
+#[test]
+fn a_room_wait_dropped_unadmitted_wakes_the_waiters_it_held_back() {
+    let page = node_class().size();
+    let (room, supply) = room_of(super::LARGEST_REQUEST);
+    assert!(room.charge(super::LARGEST_REQUEST - 2 * page));
+    let (mut large, mut small) = (RoomWait::default(), RoomWait::default());
+    room.refused(3 * page, &mut large, || None);
+    room.refused(page, &mut small, || None);
+    // The smaller waiter's look: its ticket first, then the read.
+    let look = supply.ticket();
+    let held_back = room.takes_refused();
+    let unmoved = look.moved();
+    drop(large);
+    let woken = (look.moved(), room.takes_refused(), room.pressing());
+    let mut again = RoomWait::default();
+    room.refused(3 * page, &mut again, || None);
+    room.refused(2 * page, &mut again, || None);
+    let resized = (room.pressing(), room.takes_refused());
+    drop((small, again));
+    let gone = (room.pressing(), room.pressed());
+    assert!(
+        !held_back && !unmoved,
+        "the larger's bytes hold the smaller back"
+    );
+    assert_eq!(
+        woken,
+        (true, true, page),
+        "the larger gone, the smaller wakes and fits"
+    );
+    assert_eq!(
+        resized,
+        (2 * page, true),
+        "a refusal again names its new bytes"
+    );
+    assert_eq!(gone, (0, false));
+}
+
+/// A change refused room holds its ticket's demand on the checkpoint's task while its operation
+/// waits: the task is of the relief class until the operation goes (DESIGN.md 22.4; mutant: no
+/// demand taken).
+#[test]
+fn a_change_refused_room_makes_the_checkpoints_task_relief_while_it_waits() {
+    within_a_minute(|| {
+        let db = Db::memory();
+        let orphan = drive(&db.io, || {
+            Tree::create(db.pool(), SizeClass::new(0).unwrap())
+        })
+        .unwrap();
+        let (tree, _model) = db.owed_tree();
+        let frame = db.orphan_leaf(orphan);
+        let hold = frame.try_lock().expect("the leaf is free");
+        let ticket = db.take_cut();
+        hold.release_unchanged();
+        db.fill_room(&tree);
+        let cp = db.db.checkpointer();
+        let own = cp.task_class();
+        // A leaf past those changed, owed a copy the room has no bytes for; its relief finds the
+        // state held, so the put waits with its ticket alive.
+        let k = 2 * (KEYS - 1);
+        let mut put = Put::new(&key(k), value(k, 4), Mode::Upsert);
+        let held = cp.hold().expect("the state free");
+        // No panic while the state is held: the asserts come once it is let go.
+        let waited = matches!(tree.put(&mut put), Ok(IOResult::IO(_)));
+        let demanded = cp.task_class();
+        drop(put);
+        let after = cp.task_class();
+        drop(held);
+        db.finish(ticket);
+        drop((frame, tree, db));
+        assert!(waited, "the put was refused room and waits");
+        assert_eq!(demanded, Some(Class::Relief), "its ticket's demand");
+        assert_eq!(after, own, "the put gone, its demand with it");
+    });
+}
+
+/// A writer refused room with the writers stepping checkpoints claims the checkpoint's task for
+/// its relief, a unit a claim, until the room takes it (DESIGN.md 22.4, 22.7; mutant: the relief
+/// stepping the state itself).
+#[test]
+fn a_writer_refused_room_claims_the_checkpoints_task_for_its_relief() {
+    within_a_minute(|| {
+        let db = Db::memory();
+        let orphan = drive(&db.io, || {
+            Tree::create(db.pool(), SizeClass::new(0).unwrap())
+        })
+        .unwrap();
+        let (tree, _model) = db.owed_tree();
+        let frame = db.orphan_leaf(orphan);
+        let hold = frame.try_lock().expect("the leaf is free");
+        let ticket = db.take_cut();
+        hold.release_unchanged();
+        db.fill_room(&tree);
+        let cp = db.db.checkpointer();
+        let (claims, imaged) = (CLAIMS.with(|n| n.get()), cp.stats().pages);
+        let k = 2 * (KEYS - 1);
+        db.put(&tree, k, value(k, 4));
+        let (claimed, after) = (CLAIMS.with(|n| n.get()) - claims, cp.stats().pages - imaged);
+        db.finish(ticket);
+        let got = db.get(&tree, k);
+        drop((frame, tree, db));
+        assert_eq!(got, Some(value(k, 4)), "the change went on");
+        assert!(
+            claimed > 0 && after > 0,
+            "the relief claimed the task {claimed} times and imaged {after} pages"
+        );
+    });
+}
+
+/// A writer claiming the checkpoint's task for a full checkpoint with no one in the way registers
+/// no wait on the state's let-go: a unit costs no wait (the auditor's P2-CP-W1; mutant: a wait
+/// registered before every claim).
+#[test]
+fn a_full_checkpoint_claimed_alone_registers_no_wait_on_the_states_let_go() {
+    within_a_minute(|| {
+        let db = Db::memory();
+        let (tree, _model) = db.owed_tree();
+        let cp = db.db.checkpointer();
+        let (woke, claims) = (cp.released_wakes(), CLAIMS.with(|n| n.get()));
+        db.checkpoint();
+        let (woken, claimed) = (
+            cp.released_wakes() - woke,
+            CLAIMS.with(|n| n.get()) - claims,
+        );
+        drop((tree, db));
+        assert!(claimed > 1, "the checkpoint took {claimed} claims");
+        assert_eq!(
+            woken, 0,
+            "let-goes that found a wait, over {claimed} claims"
+        );
+    });
 }

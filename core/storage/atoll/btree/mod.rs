@@ -42,7 +42,7 @@ pub use drain::{Drain, Drained};
 #[cfg(test)]
 mod tests;
 
-use super::buffer::{BufferPool, Exclusive, Optimistic, Refused};
+use super::buffer::{BufferPool, Exclusive, Optimistic, Refused, RoomWait};
 use super::page::{self, PageId, SizeClass};
 use super::shared::{Bytes, BytesMut};
 use super::store::PageStore;
@@ -281,6 +281,7 @@ impl Tree {
         key: &[u8],
         near: Near,
         settled: &dyn Fn(&[u8]) -> bool,
+        room: &mut RoomWait,
     ) -> Result<IOResult<usize>> {
         loop {
             let looked = done!(self.look(key, near));
@@ -312,7 +313,7 @@ impl Tree {
             let Some(mut ex) = leaf.upgrade() else {
                 continue;
             };
-            if let Err(refused) = self.pool.keep(&[&ex]) {
+            if let Err(refused) = self.pool.keep(&[&ex], room) {
                 ex.release_unchanged();
                 done!(self.pool.wait_for_room(refused));
                 continue;
@@ -797,7 +798,7 @@ impl Tree {
         }
         if free < need {
             drop(ex);
-            step!(self.make_room(&op.key, 0, need));
+            step!(self.make_room(&op.key, 0, need, &mut op.room));
             return Ok(None);
         }
         let pid = ex.pid();
@@ -805,7 +806,7 @@ impl Tree {
             drop(ex);
             return Ok(Some(IOResult::Done(Outcome::Changed)));
         }
-        if let Err(refused) = self.pool.keep(&[&ex]) {
+        if let Err(refused) = self.pool.keep(&[&ex], &mut op.room) {
             ex.release_unchanged();
             step!(self.pool.wait_for_room(refused));
             return Ok(None);
@@ -850,7 +851,7 @@ impl Tree {
     pub fn remove(&self, op: &mut Remove) -> Result<IOResult<bool>> {
         loop {
             if let Some(level) = op.merging {
-                done!(self.merge(&op.key, level, &mut op.merging));
+                done!(self.merge(&op.key, level, &mut op.merging, &mut op.room));
                 if op.merging.is_none() {
                     return Ok(IOResult::Done(true));
                 }
@@ -884,7 +885,7 @@ impl Tree {
                 drop(ex);
                 continue;
             }
-            if let Err(refused) = self.pool.keep(&[&ex]) {
+            if let Err(refused) = self.pool.keep(&[&ex], &mut op.room) {
                 ex.release_unchanged();
                 done!(self.pool.wait_for_room(refused));
                 continue;
@@ -930,12 +931,18 @@ impl Tree {
 
     /// Splits the node at `level` covering `key` until it has `need` bytes free, splitting its
     /// ancestors first where they lack room for the separator.
-    fn make_room(&self, key: &[u8], level: u8, need: usize) -> Result<IOResult<()>> {
+    fn make_room(
+        &self,
+        key: &[u8],
+        level: u8,
+        need: usize,
+        room: &mut RoomWait,
+    ) -> Result<IOResult<()>> {
         loop {
-            match done!(self.split(key, level, need)) {
+            match done!(self.split(key, level, need, room)) {
                 Split::Done => return Ok(IOResult::Done(())),
                 Split::Again => {}
-                Split::ParentFull(need) => done!(self.make_room(key, level + 1, need)),
+                Split::ParentFull(need) => done!(self.make_room(key, level + 1, need, room)),
                 // Its latches and the change gate let go: room for its copies, then again.
                 Split::Refused(refused) => {
                     #[cfg(test)]
@@ -947,7 +954,13 @@ impl Tree {
     }
 
     /// One split of the node at `level` covering `key`, if it lacks `need` bytes.
-    fn split(&self, key: &[u8], level: u8, need: usize) -> Result<IOResult<Split>> {
+    fn split(
+        &self,
+        key: &[u8],
+        level: u8,
+        need: usize,
+        room: &mut RoomWait,
+    ) -> Result<IOResult<Split>> {
         #[cfg(test)]
         SPLITS.with(|n| n.set(n.get() + 1));
         // The split lies wholly before a checkpoint's cut or wholly after it.
@@ -962,7 +975,7 @@ impl Tree {
             Found::Io(io) => return Ok(IOResult::IO(io)),
         };
         let Some((parent, pos)) = parent else {
-            return self.grow(node, need);
+            return self.grow(node, need, room);
         };
         crate::race::point("btree.split_upgrade");
         let mut p = match parent.upgrade_or_wait() {
@@ -1032,7 +1045,7 @@ impl Tree {
         if pv.free().ok_or_else(|| corrupt_node(p.pid()))? < sep_need {
             return untouched(p, n, Split::ParentFull(sep_need));
         }
-        if let Err(refused) = self.pool.keep(&[&p, &n]) {
+        if let Err(refused) = self.pool.keep(&[&p, &n], room) {
             return untouched(p, n, Split::Refused(refused));
         }
         let mut r = done!(self.allocate(&[p.pid(), n.pid()]));
@@ -1086,7 +1099,12 @@ impl Tree {
 
     /// Makes room in the root, which cannot move: its contents go to a new child, and it becomes
     /// an inner node over that child alone, which the next split splits like any other.
-    fn grow(&self, root: Optimistic<'_>, need: usize) -> Result<IOResult<Split>> {
+    fn grow(
+        &self,
+        root: Optimistic<'_>,
+        need: usize,
+        room: &mut RoomWait,
+    ) -> Result<IOResult<Split>> {
         crate::race::point("btree.grow_upgrade");
         let mut root = match root.upgrade_or_wait() {
             Ok(root) => root,
@@ -1098,7 +1116,7 @@ impl Tree {
             return Ok(IOResult::Done(Split::Done));
         }
         let level = v.level();
-        if let Err(refused) = self.pool.keep(&[&root]) {
+        if let Err(refused) = self.pool.keep(&[&root], room) {
             root.release_unchanged();
             return Ok(IOResult::Done(Split::Refused(refused)));
         }
@@ -1125,7 +1143,13 @@ impl Tree {
     /// Merges the node at `level` covering `key` with a neighbour if it is underfull and the two
     /// fit; then its parent, if that is left underfull, and the root, if left with one child.
     /// `merging` holds the level still to look at, `None` once done.
-    fn merge(&self, key: &[u8], level: u8, merging: &mut Option<u8>) -> Result<IOResult<()>> {
+    fn merge(
+        &self,
+        key: &[u8],
+        level: u8,
+        merging: &mut Option<u8>,
+        room: &mut RoomWait,
+    ) -> Result<IOResult<()>> {
         // The merge lies wholly before a checkpoint's cut or wholly after it.
         let Some(_change) = self.store.change() else {
             return Ok(super::buffer::gate_closed(&self.pool));
@@ -1168,7 +1192,7 @@ impl Tree {
                     SHRINKS_HELD.with(|n| n.set(n.get() + 1));
                     return yield_now();
                 }
-                if let Some(refused) = done!(self.shrink(parent, node, merging)) {
+                if let Some(refused) = done!(self.shrink(parent, node, merging, room)) {
                     #[cfg(test)]
                     SHRINKS_REFUSED.with(|n| n.set(n.get() + 1));
                     // Its latches let go: the change gate too, then room for the copies.
@@ -1187,6 +1211,7 @@ impl Tree {
                 pos,
                 level,
                 (left_pos, left, left_hint, right, right_hint),
+                room,
             )) {
                 Paired::Merged(next) => {
                     *merging = next;
@@ -1218,6 +1243,7 @@ impl Tree {
         pos: usize,
         level: u8,
         (left_pos, left, left_hint, right, right_hint): (usize, PageId, u32, PageId, u32),
+        room: &mut RoomWait,
     ) -> Result<IOResult<Paired>> {
         let fix = |pid: PageId, hint: u32| -> Result<IOResult<Optimistic<'_>>> {
             if pid == node.pid() {
@@ -1333,7 +1359,7 @@ impl Tree {
             return Err(corrupt_node(r.pid()));
         }
         // The left one is freed once merged: its copy too, as a cut may still write it.
-        if let Err(refused) = self.pool.keep(&[&p, &l, &r]) {
+        if let Err(refused) = self.pool.keep(&[&p, &l, &r], room) {
             untouched(p, l, r);
             return Ok(IOResult::Done(Paired::Refused(refused)));
         }
@@ -1378,6 +1404,7 @@ impl Tree {
         parent: Optimistic<'_>,
         child: Optimistic<'_>,
         merging: &mut Option<u8>,
+        room: &mut RoomWait,
     ) -> Result<IOResult<Option<Refused>>> {
         if parent.pid() != self.root {
             *merging = None;
@@ -1400,7 +1427,7 @@ impl Tree {
             return yield_now();
         }
         // The child is freed once moved up: its copy too, as a cut may still write it.
-        if let Err(refused) = self.pool.keep(&[&root, &child]) {
+        if let Err(refused) = self.pool.keep(&[&root, &child], room) {
             root.release_unchanged();
             child.release_unchanged();
             return Ok(IOResult::Done(Some(refused)));
@@ -2033,6 +2060,8 @@ pub struct Put {
     reserve_over: Option<bool>,
     /// A full leaf keeping reserves answers [`Outcome::Full`] instead of splitting.
     settle: bool,
+    /// Its wait for room for the copies a checkpoint's cut keeps, across its steps.
+    room: RoomWait,
 }
 
 /// `stored` as the leaf keeps it: its bytes, and whether its value is out of line.
@@ -2081,6 +2110,7 @@ impl Put {
             near: Near::NONE,
             reserve_over: None,
             settle: false,
+            room: RoomWait::default(),
         }
     }
 
@@ -2097,6 +2127,18 @@ impl Put {
     pub fn settling(mut self) -> Self {
         self.settle = true;
         self
+    }
+
+    /// Its wait for room carried over from the put of the same write it is built again for
+    /// (DESIGN.md 22.4): a refusal's ticket stays the write's until its change is admitted.
+    pub fn with_room(mut self, room: RoomWait) -> Self {
+        self.room = room;
+        self
+    }
+
+    /// Its wait for room, for the put of the same write built next.
+    pub fn take_room(&mut self) -> RoomWait {
+        std::mem::take(&mut self.room)
     }
 
     /// Tries `near` before a descent.
@@ -2215,6 +2257,8 @@ pub struct Remove {
     expected: Option<(Vec<u8>, bool)>,
     /// Pages abandoned with the entry, and freed after it.
     also: Vec<PageId>,
+    /// Its wait for room for the copies a checkpoint's cut keeps, across its steps.
+    room: RoomWait,
 }
 
 impl Remove {
@@ -2230,6 +2274,7 @@ impl Remove {
             merging: None,
             expected: None,
             also: Vec::new(),
+            room: RoomWait::default(),
         }
     }
 

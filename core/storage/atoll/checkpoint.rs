@@ -37,7 +37,7 @@ use super::btree::node::{self, View};
 use super::btree::value::{self, ValueRef};
 use super::buffer::{BufferPool, CutScan, Relief, Relieved, Retry, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
-use super::executor::{Cx, Step, Task, TaskRef, Watched};
+use super::executor::{self, Class, Cx, Step, Task, TaskRef, Watched};
 use super::guarded::{Contender, Guarded, Hold};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
@@ -64,6 +64,9 @@ crate::thread::thread_local! {
     /// Steps of the checkpoint state taken on this thread, for tests to tell a thread that did
     /// checkpoint work: a writer's, or the worker stepping the checkpoint's task.
     pub(crate) static WRITER_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Claims of a checkpoint's task that stepped it, made on this thread.
+    #[cfg(test)]
+    pub(crate) static CLAIMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The record naming the metadata pages a checkpoint is about to write: its number, then each
@@ -353,6 +356,10 @@ impl Relief for CheckpointRelief {
             // The database is closing: no checkpoint to step.
             _ => Relieved::Elsewhere,
         }
+    }
+
+    fn demand(&self) -> Option<executor::Ticket> {
+        self.checkpointer.upgrade()?.demand()
     }
 }
 
@@ -770,6 +777,8 @@ impl Checkpointer {
         if !ran {
             return Claimed::Refused;
         }
+        #[cfg(test)]
+        CLAIMS.with(|n| n.set(n.get() + 1));
         let Claiming::Told(claimed) = claiming else {
             unreachable!("a claimed step did not tell its claimant what it came to")
         };
@@ -817,6 +826,17 @@ impl Checkpointer {
         Ok(IOResult::IO(IOCompletions(c)))
     }
 
+    /// A refused writer's demand on the checkpoint's task, of the relief class (DESIGN.md 22.4),
+    /// which its room ticket holds: taken, it raises the task's class and wakes it. None with no
+    /// task, a task over, or for the task's own step, whose writer is the task.
+    fn demand(&self) -> Option<executor::Ticket> {
+        if self.on_driver() {
+            return None;
+        }
+        let task = self.task.get()?;
+        (!task.is_over()).then(|| task.ticket(Class::Relief))
+    }
+
     /// For a writer refused room for kept copies, holding nothing: steps the checkpoint under way
     /// until the room takes the request it refused, its images giving copies back, kept copies
     /// first. [`Relieved::Elsewhere`] while the checkpointing thread steps it, and
@@ -828,12 +848,21 @@ impl Checkpointer {
         if self.on_driver() {
             return Relieved::Held;
         }
-        // The worker's to step: the writer waits for the room it frees. Otherwise the writer steps
-        // the state itself only as far as its room needs, as writers always have: a claim of the
-        // task would step it as far as it goes (DESIGN.md 22.7).
-        if let Stepper::Worker = self.stepper() {
-            self.wake_driver();
-            return Relieved::Elsewhere;
+        match self.stepper() {
+            // The worker's to step: the writer waits for the room it frees, its ticket's demand
+            // having woken it.
+            Stepper::Worker => {
+                self.wake_driver();
+                return Relieved::Elsewhere;
+            }
+            // The task's units claimed one at a time, only as far as the writer's room needs.
+            Stepper::Caller(task) => {
+                if let Some(relieved) = self.claim_relief(task, retry) {
+                    return relieved;
+                }
+                // The task over since the writer looked: it steps the state itself.
+            }
+            Stepper::Writer => {}
         }
         let Some(mut state) = self.try_hold() else {
             return Relieved::Held;
@@ -847,6 +876,31 @@ impl Checkpointer {
             }
             stepped => stepped,
         })
+    }
+
+    /// [`relieve`](Self::relieve) for a writer that claims the checkpoint's task (DESIGN.md 22.4,
+    /// 22.7): a unit a claim, until the writer may start again or a unit waits. [`Relieved::Held`]
+    /// while another writer's claim or a holder of the state steps it, whose end wakes the room's
+    /// waiters; `None` once the task is over, the writer then stepping the state.
+    fn claim_relief(&self, task: &TaskRef, retry: Retry<'_>) -> Option<Relieved> {
+        loop {
+            if self.pool.may_retry(retry) {
+                return Some(Relieved::Stepped(Ok(IOResult::Done(()))));
+            }
+            return Some(match self.claim(task) {
+                Claimed::Stepped(Ok(Unit::Again)) => continue,
+                Claimed::Stepped(Ok(Unit::Wait(c))) => {
+                    Relieved::Stepped(Ok(IOResult::IO(IOCompletions(c))))
+                }
+                Claimed::Stepped(Ok(Unit::Done)) => Relieved::Stepped(Ok(IOResult::Done(()))),
+                Claimed::Stepped(Err(e)) => {
+                    tracing::warn!("a checkpoint a writer stepped for room failed: {e}");
+                    Relieved::Stepped(Ok(IOResult::Done(())))
+                }
+                Claimed::Refused if task.is_over() => return None,
+                Claimed::Refused | Claimed::Held => Relieved::Held,
+            });
+        }
     }
 
     /// The log, in bytes, the checkpointer keeps a recovery to replaying.
@@ -985,37 +1039,50 @@ impl Checkpointer {
 
     /// [`step_full`](Self::step_full) for a writer that claims the checkpoint's task: its units
     /// claimed one at a time, as far as they go now, done once the full checkpoint `ticket` names
-    /// is. A claim another writer's step holds waits on the state's let-go, registered before the
-    /// claim, which that writer's claim finishes once its step has ended; so does a step that found
-    /// the state held by another. Registered again before each claim, since the writer's own
-    /// claims finish what it registered before.
+    /// is. A claim another writer's step holds, or whose step found the state held by another,
+    /// registers on the state's let-go and claims once more, waiting only if that claim is refused
+    /// too: a let-go before the registration is seen by the claim after it, and one after it
+    /// finishes the wait. A claim that steps registers nothing, so a unit costs no wait (the
+    /// auditor's P2-CP-W1).
     fn claim_full(&self, task: &TaskRef, ticket: u64) -> Result<IOResult<()>> {
         let done = |cp: &Self| cp.full_done.load(Ordering::Acquire) >= ticket;
         if done(self) {
             return Ok(IOResult::Done(()));
         }
+        let mut released: Option<Completion> = None;
         loop {
             crate::race::point("checkpoint.claiming");
-            let released = self.released.wait();
             return match self.claim(task) {
                 Claimed::Stepped(Err(e)) => Err(e),
                 Claimed::Stepped(Ok(Unit::Wait(c))) => Ok(IOResult::IO(IOCompletions(c))),
                 Claimed::Stepped(Ok(Unit::Again | Unit::Done)) if done(self) => {
                     Ok(IOResult::Done(()))
                 }
-                Claimed::Stepped(Ok(Unit::Again)) => continue,
-                Claimed::Refused if !task.is_over() => {
-                    crate::race::point("checkpoint.claim_refused");
-                    Ok(IOResult::IO(IOCompletions(released)))
+                Claimed::Stepped(Ok(Unit::Again)) => {
+                    // The claim's own let-go finished any wait registered before it.
+                    released = None;
+                    continue;
                 }
-                Claimed::Held => Ok(IOResult::IO(IOCompletions(released))),
                 // Nothing more due short of the full checkpoint, whose next call claims the next
                 // unit; or the task over (failed or closed) since the writer looked, its last
-                // claim's wakes perhaps before this wait was registered, whose next call steps
+                // claim's wakes perhaps before any wait was registered, whose next call steps
                 // the state.
-                Claimed::Stepped(Ok(Unit::Done)) | Claimed::Refused => {
+                Claimed::Stepped(Ok(Unit::Done)) => {
                     Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
                 }
+                Claimed::Refused if task.is_over() => {
+                    Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
+                }
+                Claimed::Refused | Claimed::Held => match released.take() {
+                    Some(released) => {
+                        crate::race::point("checkpoint.claim_refused");
+                        Ok(IOResult::IO(IOCompletions(released)))
+                    }
+                    None => {
+                        released = Some(self.released.wait());
+                        continue;
+                    }
+                },
             };
         }
     }
@@ -1061,6 +1128,12 @@ impl Checkpointer {
             Unit::Wait(c) => Some(c),
             Unit::Again | Unit::Done => None,
         })
+    }
+
+    /// The class of the checkpoint's task now, if it has one (DESIGN.md 22.4).
+    #[cfg(test)]
+    pub(crate) fn task_class(&self) -> Option<Class> {
+        self.task.get().map(TaskRef::class)
     }
 
     /// One claim of the checkpoint's task, for a test: whether it stepped.

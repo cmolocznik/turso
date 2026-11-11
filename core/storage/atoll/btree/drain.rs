@@ -34,6 +34,8 @@ pub struct Drain {
     key: Vec<u8>,
     /// The last group's removal of that key, once begun.
     last: Option<Remove>,
+    /// Its wait for room for the copies a checkpoint's cut keeps, across its steps.
+    room: RoomWait,
 }
 
 impl Drain {
@@ -42,6 +44,7 @@ impl Drain {
         Self {
             key: key.to_vec(),
             last: None,
+            room: RoomWait::default(),
         }
     }
 }
@@ -99,7 +102,7 @@ impl Tree {
             }
         }
         match parent {
-            Some(parent) => match done!(self.unbranch(parent, pid, values)) {
+            Some(parent) => match done!(self.unbranch(parent, pid, values, &mut op.room)) {
                 Ok(drained) => Ok(IOResult::Done(drained)),
                 Err(refused) => {
                     // Its latches let go: the change gate too, then room for the copies, and the
@@ -163,6 +166,7 @@ impl Tree {
         parent: PageId,
         node: PageId,
         values: Vec<PageId>,
+        room: &mut RoomWait,
     ) -> Result<IOResult<std::result::Result<Drained, Refused>>> {
         let mut p = done!(self.pool.fix_exclusive(parent, None));
         let n = done!(self.pool.fix_exclusive(node, None));
@@ -183,7 +187,7 @@ impl Tree {
             return Err(corrupt_node(parent));
         }
         // The node is freed once unlinked: its copy too, as a cut may still write it.
-        if let Err(refused) = self.pool.keep(&[&p, &n]) {
+        if let Err(refused) = self.pool.keep(&[&p, &n], room) {
             p.release_unchanged();
             n.release_unchanged();
             return Ok(IOResult::Done(Err(refused)));

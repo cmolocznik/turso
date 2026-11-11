@@ -55,6 +55,7 @@ mod tests;
 pub use kept::KeptCopy;
 #[cfg(test)]
 pub use kept::KeptStats;
+pub use kept::RoomWait;
 pub use lend::{bank_frames, Refused, Retry};
 #[cfg(test)]
 pub use lent::LentStats;
@@ -2533,17 +2534,22 @@ impl BufferPool {
     /// room and the lend road's frames or none (DESIGN.md 9.1.1). Refused, the change lets go of
     /// every latch it holds and of the change gate, then hands the refusal to
     /// [`wait_for_room`](Self::wait_for_room) and starts again: nothing yields once a change has
-    /// begun.
-    pub fn keep(self: &Arc<Self>, pages: &[&Exclusive<'_>]) -> std::result::Result<(), Refused> {
+    /// begun. `wait` is the operation's wait for room, held across its retries (DESIGN.md 22.4):
+    /// refused room, it holds a ticket for the bytes asked for, and the change admitted lets it go.
+    /// A change refused frames keeps it: it is not admitted yet.
+    pub fn keep(
+        self: &Arc<Self>,
+        pages: &[&Exclusive<'_>],
+        wait: &mut RoomWait,
+    ) -> std::result::Result<(), Refused> {
         let kept = self.try_keep(pages);
         match &kept {
-            Ok(()) => self.room.admitted(),
+            Ok(()) => self.room.admitted(wait),
             Err(Refused {
-                why: lend::Why::Room,
-            }) => {
-                let n = self.memory.cutting.load(Ordering::Acquire);
-                self.room.refused(self.owed_bytes(pages, n));
-            }
+                why: lend::Why::Room { bytes },
+            }) => self.room.refused(*bytes, wait, || {
+                self.relief.get_ref().and_then(|relief| relief.demand())
+            }),
             Err(_) => {}
         }
         kept
@@ -2560,7 +2566,7 @@ impl BufferPool {
         }
         if !self.room.charge(bytes) {
             return Err(Refused {
-                why: lend::Why::Room,
+                why: lend::Why::Room { bytes },
             });
         }
         // A frame for each copy, every one or none, before any is made, from the lend road, which
@@ -3075,6 +3081,10 @@ pub trait Relief: Send + Sync {
     /// Steps the checkpoint whose cut is in effect until the writer may start again (`retry`,
     /// [`BufferPool::may_retry`]), or says who steps it instead.
     fn relieve(&self, retry: Retry<'_>) -> Relieved;
+
+    /// A refused writer's demand on the checkpoint, of the relief class (DESIGN.md 22.4), held by
+    /// its room ticket: none while the checkpoint is no task, or for the task's own step.
+    fn demand(&self) -> Option<crate::storage::atoll::executor::Ticket>;
 }
 
 /// What a refused writer's relief did.

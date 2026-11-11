@@ -1745,7 +1745,11 @@ fn a_copy_made_after_its_cut_ended_is_not_kept() {
             let pool = pool.clone();
             race::at("buffer.copy_for_cut", move || pool.end_cut(1));
         }
-        assert!(pool.keep(&[&g]).is_ok(), "{}: the change went on", b.name);
+        assert!(
+            pool.keep(&[&g], &mut RoomWait::default()).is_ok(),
+            "{}: the change went on",
+            b.name
+        );
         assert!(!race::pending("buffer.copy_for_cut"));
         drop(g);
         assert!(
@@ -2386,7 +2390,10 @@ fn a_kept_copy_never_holds_up_a_claim_of_another_class() {
     assert!(matches!(pool.begin_cut(1, &mut scan), IOResult::Done(())));
     assert_eq!(scan.owed, vec![pid]);
     let g = drive(&io, || pool.fix_exclusive(pid, None)).unwrap();
-    assert!(pool.keep(&[&g]).is_ok(), "the copy kept");
+    assert!(
+        pool.keep(&[&g], &mut RoomWait::default()).is_ok(),
+        "the copy kept"
+    );
     drop(g);
     let copy_frame = (0..pool.memory.grains())
         .find(|&f| pool.header(f).status() == LENT)
@@ -2523,7 +2530,7 @@ fn want_of(classes: &[SizeClass]) -> lend::Want {
 fn frames_refusal(refused: Refused) -> (Option<Completion>, Option<u64>) {
     match refused.why {
         lend::Why::Frames { gate, quiet_at, .. } => (gate, quiet_at),
-        lend::Why::Room => panic!("refused for room, not frames"),
+        lend::Why::Room { .. } => panic!("refused for room, not frames"),
     }
 }
 
@@ -3007,6 +3014,10 @@ fn a_writer_turned_down_for_frames_wakes_when_a_held_checkpoint_is_let_go() {
     impl Relief for Says {
         fn relieve(&self, _: Retry<'_>) -> Relieved {
             (self.0)()
+        }
+
+        fn demand(&self) -> Option<crate::storage::atoll::executor::Ticket> {
+            None
         }
     }
     for (says, base, woken) in [

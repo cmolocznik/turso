@@ -5562,9 +5562,14 @@ compose, the real `Completion`, latch and backends included where named.
    dropped while the log stands still; those given up after it, the last waiter's included, stay
    until the next take, by a raise or a registration, so the entries never number more than one
    more than twice the most waits that stood at once (the auditor's #4356 and #4360). A wake takes
-   the stack once: across a fence, a raiser that put waits back looks at the failure and at the
-   position again, finishing in place each one a raise during its hold reached, as its waiter
-   would, so neither a raise nor a registration's take chases a position that keeps rising. Made
+   the stack twice at most and, unless a raise during its hold reached a wait it put back,
+   allocates nothing: it pushes the waits it keeps back in the nodes they came in, with one
+   exchange of the head (`Stack::push_gathered`), and across a fence looks at the failure and at
+   the position; every raise past the least mark it kept comes after that look, and its take
+   finds them. If one came before, a second pass takes the stack, finishing what it reaches, and
+   looks again, finishing in place each wait a raise during its own hold reached, standing or
+   given up, as its waiter would (the auditor's #4366 and #4373). So neither a raise nor a
+   registration's take chases a position that keeps rising. Made
    inside a step or a unit (the checkpoint's intent and its durability turns,
    stepped by its task or by a writer during recovery) a wait names the preparer instead, and the
    step waits on it with `Step::WaitOn`, its class riding there, or the writer runs it once its

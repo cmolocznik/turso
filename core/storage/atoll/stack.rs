@@ -67,8 +67,16 @@ impl<T> Default for Stack<T> {
     }
 }
 
+#[cfg(all(test, not(atoll_loom)))]
+crate::thread::thread_local! {
+    /// Nodes made by pushes on this thread, for a test of what a caller allocates.
+    pub static NODES_MADE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl<T> Stack<T> {
     pub fn push(&self, item: T) {
+        #[cfg(all(test, not(atoll_loom)))]
+        NODES_MADE.with(|n| n.set(n.get() + 1));
         let node = Box::into_raw(Box::new(Node {
             item,
             pushed: Plain::new(true),
@@ -109,6 +117,29 @@ impl<T> Stack<T> {
     pub fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire).is_null()
     }
+
+    /// Pushes back every node `gathered` holds with one exchange of the head, allocating nothing:
+    /// a later take finds them as it finds items pushed.
+    pub fn push_gathered(&self, mut gathered: Gathered<T>) {
+        let first = std::mem::replace(&mut gathered.head, ptr::null_mut());
+        let last = gathered.tail;
+        if first.is_null() {
+            return;
+        }
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: the nodes are this holder's until the exchange below publishes them.
+            unsafe { (*last).next = head };
+            // Release: whoever takes them sees them whole.
+            match self
+                .head
+                .compare_exchange_weak(head, first, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(now) => head = now,
+            }
+        }
+    }
 }
 
 impl<T> Drop for Stack<T> {
@@ -143,25 +174,87 @@ impl<T> Chain<T> {
     pub fn is_empty(&self) -> bool {
         self.head.is_null()
     }
+
+    /// The next node whole, its item read in place ([`Held`]).
+    pub fn next_held(&mut self) -> Option<Held<T>> {
+        if self.head.is_null() {
+            return None;
+        }
+        // SAFETY: published by a push with a release exchange, and the swap that made this chain
+        // made its holder the node's only holder.
+        let node = unsafe { Box::from_raw(self.head) };
+        // SAFETY: written before the push that first published the node.
+        assert!(
+            node.pushed.with(|p| unsafe { *p }),
+            "a node taken unwritten"
+        );
+        self.head = linked(node.next);
+        Some(Held(node))
+    }
 }
 
 impl<T> Iterator for Chain<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
-        if self.head.is_null() {
-            return None;
+        self.next_held().map(Held::into_item)
+    }
+}
+
+/// A node a [`Chain`] handed over whole: its item read in place, and the node then either gathered
+/// to be pushed back as it is ([`Gathered`]) or dropped with its item.
+pub struct Held<T>(Box<Node<T>>);
+
+impl<T> Held<T> {
+    pub fn item(&self) -> &T {
+        &self.0.item
+    }
+
+    pub fn into_item(self) -> T {
+        self.0.item
+    }
+}
+
+/// Nodes held, linked to one another to be pushed back with one exchange of the head
+/// ([`Stack::push_gathered`]), allocating nothing; dropped, they drop their items.
+pub struct Gathered<T> {
+    head: *mut Node<T>,
+    tail: *mut Node<T>,
+}
+
+// SAFETY: the nodes are their gatherer's alone until it pushes them back.
+unsafe impl<T: Send> Send for Gathered<T> {}
+
+impl<T> Default for Gathered<T> {
+    fn default() -> Self {
+        Self {
+            head: ptr::null_mut(),
+            tail: ptr::null_mut(),
         }
-        // SAFETY: published by `push` with a release exchange, and the swap that made this chain
-        // made its holder the node's only holder.
-        let node = unsafe { Box::from_raw(self.head) };
-        // SAFETY: written before the push that published the node.
-        assert!(
-            node.pushed.with(|p| unsafe { *p }),
-            "a node taken unwritten"
-        );
-        self.head = linked(node.next);
-        Some(node.item)
+    }
+}
+
+impl<T> Gathered<T> {
+    pub fn is_empty(&self) -> bool {
+        self.head.is_null()
+    }
+
+    pub fn add(&mut self, held: Held<T>) {
+        let node = Box::into_raw(held.0);
+        // SAFETY: the node is this gatherer's alone.
+        unsafe { (*node).next = self.head };
+        if self.tail.is_null() {
+            self.tail = node;
+        }
+        self.head = node;
+    }
+}
+
+impl<T> Drop for Gathered<T> {
+    fn drop(&mut self) {
+        drop(Chain {
+            head: std::mem::replace(&mut self.head, ptr::null_mut()),
+        });
     }
 }
 
@@ -454,6 +547,33 @@ mod loom_tests {
             out.extend(stack.take_all());
             out.sort_unstable();
             assert_eq!(out, vec![0, 1]);
+        });
+    }
+
+    /// A taker gathers what it took and pushes it back while a push races it: each item comes out
+    /// once, whole, from the nodes it was first pushed in.
+    #[test]
+    fn gathered_items_pushed_back_come_out_once_and_whole() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(|| {
+            let stack = Arc::new(Stack::default());
+            stack.push(0);
+            stack.push(1);
+            let pusher = {
+                let stack = stack.clone();
+                thread::spawn(move || stack.push(2))
+            };
+            let mut gathered = Gathered::default();
+            let mut chain = stack.take_chain();
+            while let Some(held) = chain.next_held() {
+                gathered.add(held);
+            }
+            stack.push_gathered(gathered);
+            pusher.join().unwrap();
+            let mut out = stack.take_all();
+            out.sort_unstable();
+            assert_eq!(out, vec![0, 1, 2]);
         });
     }
 }

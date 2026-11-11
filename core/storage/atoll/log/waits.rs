@@ -8,10 +8,12 @@
 //!
 //! Putting a wait back is a registration, and it ends as one does: across a fence, the raiser then
 //! looks at what else finishes every wait (the log's failure), since a failure whose take ran
-//! while it held the waits found none of them, and at the position again, finishing in place each
-//! wait it put back that a raise while it held them reached, as that wait's waiter would. So a
-//! wake takes the stack once, however the position moves meanwhile, never chasing it (the
-//! auditor's #4360).
+//! while it held the waits found none of them, and at the position again. It puts them back in
+//! the nodes they came in, allocating nothing; only if a raise while it held them reached one does
+//! it take the stack a second time, finishing what that reaches and, looking once more, finishing
+//! in place each wait a raise during that hold reached, as that wait's waiter would. So a wake
+//! takes the stack twice at most, however the position moves meanwhile, never chasing it (the
+//! auditor's #4360, #4366 and #4373).
 //!
 //! A registration is its waiter's ([`Registration`]): given up (its wait ended or dropped) while
 //! still on the stack, it is counted, and a take drops it rather than putting it back, finishing
@@ -28,7 +30,7 @@
 //! auditor's #4356 and #4360).
 
 use self::sync::{fence, AtomicU64, AtomicU8, Ordering};
-use super::super::stack::Stack;
+use super::super::stack::{Gathered, Stack};
 use crate::io::Completion;
 use crate::sync::Arc;
 use crate::CompletionError;
@@ -96,6 +98,12 @@ fn end_standing(counts: &AtomicU64, end: &AtomicU8, to: u8) -> bool {
     moved
 }
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The passes of `wake_again` on this thread that put waits back.
+    static WAKES_AGAIN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// What a raiser that put waits back finds when it looks again.
 pub(super) enum Look {
     /// Nothing that finishes every wait.
@@ -156,28 +164,74 @@ impl Waits {
         }
     }
 
-    /// Finishes every wait `position()` reaches, once it is raised: takes the stack once, finishing
-    /// the waits reached, dropping those given up and putting the rest back. Across a fence, those
-    /// put back are looked at again: with `look`, which a failure stores before its take, and at
-    /// the position, each one a raise reached while they were held finished in place.
+    /// Finishes every wait `position()` reaches, once it is raised, allocating nothing as it does:
+    /// takes the stack, finishing the waits reached and dropping those given up, and pushes the
+    /// rest back in the nodes they came in. Across a fence, those put back are looked at again:
+    /// with `look`, which a failure stores before its take, and at the position. Unless a raise
+    /// while they were held reached one of them, which that raise's take may have missed, nothing
+    /// more is owed: every raise past the least of their marks comes after the look, and its take
+    /// finds them. Otherwise one more pass ([`wake_again`](Self::wake_again)) finishes them, so a
+    /// wake takes the stack twice at most, however the position moves meanwhile (the auditor's
+    /// #4360 and #4373).
     pub(super) fn wake(&self, position: impl Fn() -> u64, look: impl Fn() -> Look) {
         fence(Ordering::SeqCst);
         let reached = position();
-        let mut kept = Vec::new();
-        for (mark, c, end) in self.stack.take_all() {
-            if mark > reached && end.load(Ordering::Acquire) == STANDING {
+        let mut kept = Gathered::default();
+        let mut least = u64::MAX;
+        let mut taken = self.stack.take_chain();
+        while let Some(held) = taken.next_held() {
+            let (mark, _, end) = held.item();
+            if *mark > reached && end.load(Ordering::Acquire) == STANDING {
                 // Its waiter may give it up from here on: counted, and a later take drops it.
-                self.stack.push((mark, c.clone(), end.clone()));
-                kept.push((mark, c, end));
+                least = least.min(*mark);
+                kept.add(held);
             } else {
+                let (_, c, end) = held.into_item();
                 self.drop_taken(&c, &end, |c| c.complete(0));
             }
         }
         if kept.is_empty() {
             return;
         }
+        self.stack.push_gathered(kept);
         // Those kept were on no stack for a moment: a failure's take then missed them, and a
         // position raised then woke none of them.
+        fence(Ordering::SeqCst);
+        if let Look::Fail(e) = look() {
+            return self.fail(e);
+        }
+        if position() >= least {
+            self.wake_again(position, look);
+        }
+    }
+
+    /// A wake's pass after a raise during its hold reached a wait it put back: takes the stack
+    /// once, finishing the waits reached and dropping those given up, puts the rest back, and
+    /// across a fence looks at the failure and at the position again, finishing in place each one
+    /// a raise during this hold reached. It keeps what that look needs of each, which allocates,
+    /// in a pass made only when a wait is to be finished.
+    fn wake_again(&self, position: impl Fn() -> u64, look: impl Fn() -> Look) {
+        fence(Ordering::SeqCst);
+        let reached = position();
+        let mut kept = Gathered::default();
+        let mut looked = Vec::new();
+        let mut taken = self.stack.take_chain();
+        while let Some(held) = taken.next_held() {
+            let (mark, c, end) = held.item();
+            if *mark > reached && end.load(Ordering::Acquire) == STANDING {
+                looked.push((*mark, c.clone(), end.clone()));
+                kept.add(held);
+            } else {
+                let (_, c, end) = held.into_item();
+                self.drop_taken(&c, &end, |c| c.complete(0));
+            }
+        }
+        if kept.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        WAKES_AGAIN.with(|n| n.set(n.get() + 1));
+        self.stack.push_gathered(kept);
         fence(Ordering::SeqCst);
         if let Look::Fail(e) = look() {
             return self.fail(e);
@@ -190,7 +244,7 @@ impl Waits {
         // standing one counted with those given up; one given up while held, counted already, for
         // a waiter that still looks at it, the take that would have finished it having found the
         // stack without it (the auditor's #4366).
-        for (mark, c, end) in kept {
+        for (mark, c, end) in looked {
             if mark <= now
                 && (end_standing(&self.counts, &end, FINISHED)
                     || end
@@ -228,43 +282,127 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    /// A wake takes the stack once however the position moves meanwhile (the auditor's #4360): a
-    /// wait it put back that a raise during its hold reached is finished in place, and counted
-    /// given up for the next take to drop (mutant: the wake taking the stack again while the
-    /// position moves, which chases a position raised at every look).
+    /// A wake takes the stack twice at most however the position moves meanwhile (the auditor's
+    /// #4360): a raise during its first hold that reaches a wait put back costs one more pass,
+    /// whose take finishes it, and a wait that pass put back that a raise during its own hold
+    /// reached is finished in place, counted given up for the next take to drop (mutant: the
+    /// first pass taking the stack again while the position moves, which chases a position
+    /// raised at every look).
     #[test]
-    fn a_wake_takes_the_stack_once_however_the_position_moves_meanwhile() {
+    fn a_wake_takes_the_stack_twice_at_most_however_the_position_moves_meanwhile() {
         let waits = Waits::default();
-        let position = Cell::new(0u64);
-        let near = waits.wait(10, || position.get(), || Look::Stay).unwrap();
-        let far = waits
-            .wait(1_000_000, || position.get(), || Look::Stay)
-            .unwrap();
-        position.set(5);
-        // Each look raises the position, as raises landing during every hold do.
+        let position = Cell::new(5u64);
+        let registrations: Vec<_> = [10, 100, 1000]
+            .into_iter()
+            .map(|m| waits.wait(m, || position.get(), || Look::Stay).unwrap())
+            .collect();
+        WAKES_AGAIN.with(|n| n.set(0));
+        // Each look raises the position past the next mark, as raises landing during each hold do.
         let looks = Cell::new(0u32);
         waits.wake(
             || position.get(),
             || {
                 looks.set(looks.get() + 1);
-                position.set(position.get() + 10);
-                // A wake that looks again and again is cut off here.
                 match looks.get() {
-                    1..=3 => Look::Stay,
-                    _ => Look::Fail(CompletionError::Aborted),
+                    1 => position.set(15),
+                    2 => position.set(150),
+                    3 => position.set(1500),
+                    // A wake that looks again and again is cut off here.
+                    _ => return Look::Fail(CompletionError::Aborted),
                 }
+                Look::Stay
             },
         );
-        let (looked, near_done, far_done) = (looks.get(), near.wait.finished(), far.wait.failed());
+        let looked = looks.get();
+        let again = WAKES_AGAIN.with(|n| n.get());
+        let finished: Vec<bool> = registrations.iter().map(|r| r.wait.finished()).collect();
+        let failed = registrations.iter().any(|r| r.wait.failed());
         let after = waits.counts();
-        drop((near, far));
-        assert_eq!(looked, 1, "looks one wake took");
-        assert!(
-            near_done,
-            "a wait the position reached during the hold was left"
-        );
-        assert!(!far_done, "a wait the position never reached was failed");
+        drop(registrations);
+        assert_eq!(looked, 2, "looks the wake took");
+        assert_eq!(again, 1, "passes after the first");
+        assert_eq!(finished, [true, true, false], "waits finished, by mark");
+        assert!(!failed, "a wait failed");
         assert_eq!(after, (2, 1), "entries and those given up after the wake");
+    }
+
+    /// A wait given up that a raise during a pass's hold reached is finished by that pass's look
+    /// at the position, counted given up already, for a waiter that dropped its registration and
+    /// still waits on its wait: the raise's take found the stack without it (the auditor's #4366;
+    /// mutant: the look finishing only waits still standing).
+    #[test]
+    fn a_wait_given_up_and_reached_during_a_hold_is_finished_by_the_look() {
+        let waits = Waits::default();
+        let position = Cell::new(5u64);
+        let near = waits.wait(10, || position.get(), || Look::Stay).unwrap();
+        let far = waits.wait(20, || position.get(), || Look::Stay).unwrap();
+        let far_wait = far.wait.clone();
+        let far = std::cell::RefCell::new(Some(far));
+        let looks = Cell::new(0u32);
+        waits.wake(
+            || position.get(),
+            || {
+                looks.set(looks.get() + 1);
+                match looks.get() {
+                    // The first pass's hold: a raise reaches the near wait, so a second pass runs.
+                    1 => position.set(10),
+                    // The second pass's hold: the far wait's waiter gives it up and a raise
+                    // reaches it, the raise's take having found the stack without it.
+                    2 => {
+                        far.borrow_mut().take().unwrap().give_up();
+                        position.set(20);
+                    }
+                    _ => {}
+                }
+                Look::Stay
+            },
+        );
+        let finished = (near.wait.finished(), far_wait.finished());
+        let after = waits.counts();
+        drop(near);
+        assert_eq!(finished, (true, true), "(near, far given up) finished");
+        assert_eq!(after, (1, 1), "entries and those given up after the wake");
+    }
+
+    /// A wake whose waits all stand puts them back in the nodes they came in and makes no second
+    /// pass, so it allocates nothing; one that finishes some drops their nodes and makes none
+    /// (the auditor's #4373; mutant: the waits put back as items pushed anew, each in a node made
+    /// for it).
+    #[test]
+    fn a_wake_puts_waits_back_in_their_own_nodes() {
+        use super::super::super::stack::NODES_MADE;
+        let waits = Waits::default();
+        let position = Cell::new(0u64);
+        let registrations: Vec<_> = (1..=64)
+            .map(|m| {
+                waits
+                    .wait(m * 10, || position.get(), || Look::Stay)
+                    .unwrap()
+            })
+            .collect();
+        WAKES_AGAIN.with(|n| n.set(0));
+        NODES_MADE.with(|n| n.set(0));
+        position.set(5);
+        waits.wake(|| position.get(), || Look::Stay);
+        let standing = (NODES_MADE.with(|n| n.get()), waits.counts());
+        position.set(320);
+        waits.wake(|| position.get(), || Look::Stay);
+        let half = (NODES_MADE.with(|n| n.get()), waits.counts());
+        let again = WAKES_AGAIN.with(|n| n.get());
+        let finished = registrations.iter().filter(|r| r.wait.finished()).count();
+        drop(registrations);
+        assert_eq!(
+            standing,
+            (0, (64, 0)),
+            "(nodes made, counts) after a wake finishing none"
+        );
+        assert_eq!(
+            half,
+            (0, (32, 0)),
+            "(nodes made, counts) once half were reached"
+        );
+        assert_eq!(finished, 32, "waits finished");
+        assert_eq!(again, 0, "second passes");
     }
 
     /// A raise's take drops every wait given up and counts them gone, and the count of those given

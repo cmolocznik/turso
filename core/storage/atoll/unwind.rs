@@ -192,6 +192,7 @@ mod tests {
         ("segmented.rs", "Segmented", "frees its own segments"),
         ("stack.rs", "Stack", "frees its own nodes"),
         ("stack.rs", "Chain", "frees its own nodes"),
+        ("stack.rs", "Gathered", "frees its own nodes"),
         (
             "unit.rs",
             "Unit",

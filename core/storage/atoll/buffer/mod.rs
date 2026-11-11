@@ -331,7 +331,7 @@ impl Drop for Outgoing {
         }
     }
 }
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// What a round of making room did: started work that makes room (a drain of a batch no drain had,
 /// an eviction, a write-out), and what it did about the resident pages it found latched (DESIGN.md
@@ -502,7 +502,7 @@ pub struct BufferPool {
     failure: SetOnce<CompletionError>,
     /// Pages that checkpoint found owed, kept as they stood by their first change or free since
     /// (the copy hook, audit 18).
-    kept: Mutex<HashMap<PageId, KeptCopy>>,
+    kept: Mutex<BTreeMap<PageId, KeptCopy>>,
     /// The frames lent beside the page table, and what for.
     lends: Arc<Lends>,
     /// The lend road's state for kept copies (DESIGN.md 9.1.1).
@@ -616,7 +616,7 @@ impl BufferPool {
             requests: AtomicUsize::new(0),
             swap_written: AtomicU64::new(0),
             failure: SetOnce::default(),
-            kept: Mutex::new(HashMap::new()),
+            kept: Mutex::new(BTreeMap::new()),
             lends,
             lend: lend::LendRoad::new(batches),
             room: KeptRoom::new(kept_bytes, supply.clone(), store.io().clone()),
@@ -2736,9 +2736,7 @@ impl BufferPool {
 
     /// A page the cut in effect kept, its copy taken out, if any.
     pub fn take_kept(&self) -> Option<(PageId, KeptCopy)> {
-        let mut kept = self.kept.lock();
-        let pid = *kept.keys().next()?;
-        kept.remove_entry(&pid)
+        self.kept.lock().pop_first()
     }
 
     /// What the room for kept copies has held, and refused.
@@ -2824,14 +2822,23 @@ impl BufferPool {
         let shards = self.store.swap_shards();
         if scan.shard < shards {
             // The pages owed so far are in `seen` already, each run of the frames having put its
-            // own there, so a swapped page among them is listed once.
-            for pid in self.store.swap_shard_pages(scan.shard) {
+            // own there, so a swapped page among them is listed once. A shard a run at a time,
+            // from where the shard's last run ended.
+            let pages = self
+                .store
+                .swap_shard_pages(scan.shard, scan.shard_after, CUT_RUN);
+            for &pid in &pages {
                 if scan.seen.insert(pid) {
                     scan.owed.push(pid);
                 }
                 scan.swapped.push(pid);
             }
-            scan.shard += 1;
+            if pages.len() < CUT_RUN {
+                scan.shard += 1;
+                scan.shard_after = None;
+            } else {
+                scan.shard_after = pages.last().copied();
+            }
             if scan.shard == shards {
                 *self.cut_owed.lock() = std::mem::take(&mut scan.seen);
             }
@@ -3031,22 +3038,56 @@ impl BufferPool {
     }
 
     /// Checkpoint `n` has imaged every page its cut found owed: changes no longer keep pages.
+    /// Whole, for a checkpoint abandoned and for tests; a checkpoint ends its cut a run a unit
+    /// ([`end_cut_run`](Self::end_cut_run)).
     pub fn end_cut(&self, n: u64) {
-        debug_assert_eq!(self.memory.cutting.load(Ordering::Acquire), n);
-        self.memory.cutting.store(0, Ordering::SeqCst);
-        // Each copy's room is given back as it drops.
-        let kept = std::mem::take(&mut *self.kept.lock());
-        drop(kept);
-        self.cut_owed.lock().clear();
+        let mut at = EndCut::default();
+        while !self.end_cut_run(n, &mut at) {}
+    }
+
+    /// One run of the end of checkpoint `n`'s cut, `at` where it stands (DESIGN.md 22.1): the cut
+    /// stopped first, changes no longer keeping pages; then the copies it kept dropped, [`CUT_RUN`]
+    /// a call, each given back as it drops, outside the map's lock; the set of the pages it found
+    /// owed let go whole, which drops no element; then the lend batches swept, [`CUT_RUN`] a call;
+    /// the room told last. Whether the cut has ended.
+    pub fn end_cut_run(&self, n: u64, at: &mut EndCut) -> bool {
+        if !at.stopped {
+            debug_assert_eq!(self.memory.cutting.load(Ordering::Acquire), n);
+            self.memory.cutting.store(0, Ordering::SeqCst);
+            at.stopped = true;
+        }
+        let Some(from) = at.swept else {
+            let mut dropped = 0;
+            while dropped < CUT_RUN {
+                let Some((_, copy)) = self.kept.lock().pop_first() else {
+                    break;
+                };
+                drop(copy);
+                dropped += 1;
+            }
+            if dropped == CUT_RUN {
+                return false;
+            }
+            drop(std::mem::take(&mut *self.cut_owed.lock()));
+            at.swept = Some(memory::CORE);
+            return false;
+        };
         // Every empty copy batch and every batch a provide left lending goes back free: with the
         // cut cleared first, a last return, a provide's release and this sweep cannot all miss
-        // one another (DESIGN.md 9.1.1). One change of the supply, whatever the sweep gave back: a
-        // writer refused frames or room needs no copy once the cut has ended, and starts again.
+        // one another (DESIGN.md 9.1.1). A change of the supply a run, whatever it gave back, and
+        // the last tells the room: a writer refused frames or room needs no copy once the cut has
+        // ended, and starts again.
+        let to = (from + CUT_RUN as u32).min(self.memory.batches);
+        let ended = to == self.memory.batches;
         self.frames.supply.change(|event| {
-            self.sweep_lend_batches();
-            self.room.cut_ended();
+            self.sweep_lend_batches(from..to);
+            if ended {
+                self.room.cut_ended();
+            }
             event.arm();
         });
+        at.swept = Some(to);
+        ended
     }
 }
 
@@ -3069,6 +3110,21 @@ fn sample_rng() -> impl rand::Rng {
 /// holds (DESIGN.md 22.1), and as many of the swapped pages looked at again.
 pub const CUT_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<FrameHeader>();
 
+/// Where the end of a cut stands ([`BufferPool::end_cut_run`]): whether the cut is stopped, and
+/// once the copies it kept are dropped, the next lend batch to sweep.
+#[derive(Default)]
+pub struct EndCut {
+    stopped: bool,
+    swept: Option<u32>,
+}
+
+impl EndCut {
+    /// Whether the cut was stopped, its end under way.
+    pub fn begun(&self) -> bool {
+        self.stopped
+    }
+}
+
 /// A cut's walk over the frames for the pages owed an image ([`BufferPool::cut_run`]).
 #[derive(Default)]
 pub struct CutScan {
@@ -3077,6 +3133,8 @@ pub struct CutScan {
     /// The next shard of the swap table to list, the pages owed listed so far, and the swapped
     /// pages still to look at again.
     shard: usize,
+    /// Where the shard being listed was listed to, by its pages' order.
+    shard_after: Option<PageId>,
     seen: HashSet<PageId>,
     swapped: Vec<PageId>,
 }

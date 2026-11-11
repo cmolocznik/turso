@@ -8,6 +8,7 @@ use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{ring_bytes, LogConfig};
 use crate::storage::atoll::testing::drive;
 use crate::storage::atoll::txn::versioned::Versions;
+use std::collections::BTreeSet;
 
 const BASE: &str = "/db/store";
 
@@ -750,4 +751,417 @@ fn a_step_of_the_checkpoints_task_images_at_most_one_page() {
     );
     assert_eq!(most, 1, "a step imaged {most} pages");
     assert!(steps > pages, "{steps} steps imaged {pages} pages");
+}
+
+// ---------------------------------------------------------------- held requests
+
+/// The data files from this one on are held: files no database here opens of itself.
+const HELD_FROM: u64 = 1000;
+
+/// What [`HeldIO`] holds: once armed, every sync to a held data file (and every write too, with
+/// `writes`) is accepted and kept, its callback not run, until the test answers it and then lets
+/// it go, so a place in flight is seen held past its answer, until its request retires.
+#[derive(Default)]
+struct Held {
+    armed: crate::sync::atomic::AtomicBool,
+    writes: crate::sync::atomic::AtomicBool,
+    queue: Mutex<VecDeque<(Completion, i32)>>,
+    most: crate::sync::atomic::AtomicUsize,
+}
+
+impl Held {
+    fn hold(&self, c: Completion, result: i32) -> Result<Completion> {
+        c.accept();
+        let mut queue = self.queue.lock();
+        queue.push_back((c.clone(), result));
+        self.most.fetch_max(queue.len(), Ordering::Relaxed);
+        Ok(c)
+    }
+
+    fn most(&self) -> usize {
+        self.most.load(Ordering::Relaxed)
+    }
+
+    /// The oldest request held, taken out: the test answers it, then lets it go.
+    fn oldest(&self) -> Option<(Completion, i32)> {
+        self.queue.lock().pop_front()
+    }
+}
+
+/// A [`MemoryIO`] whose held data files ([`HELD_FROM`] on, class 0) hold their requests while
+/// [`Held`] is armed. No file here punches holes, so an erasure writes zeros.
+struct HeldIO {
+    inner: Arc<MemoryIO>,
+    held: Arc<Held>,
+}
+
+impl crate::io::Clock for HeldIO {
+    fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for HeldIO {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        let held = path
+            .strip_prefix(&format!("{BASE}.c0."))
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| n >= HELD_FROM);
+        Ok(Arc::new(HeldFile {
+            file: self.inner.open_file(path, flags, direct)?,
+            held: held.then(|| self.held.clone()),
+        }))
+    }
+    fn sync_directory(&self, path: &str) -> Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn delivery(&self) -> crate::io::Delivery {
+        self.inner.delivery()
+    }
+    fn step(&self) -> Result<()> {
+        self.inner.step()
+    }
+    fn try_step(
+        &self,
+        key: crate::io::ReadyKey,
+        ready: &std::task::Waker,
+    ) -> Result<crate::io::Stepped> {
+        self.inner.try_step(key, ready)
+    }
+    fn says_what_a_step_found(&self) -> bool {
+        self.inner.says_what_a_step_found()
+    }
+    fn withdraw(&self, key: crate::io::ReadyKey) {
+        self.inner.withdraw(key)
+    }
+}
+
+struct HeldFile {
+    file: Arc<dyn File>,
+    held: Option<Arc<Held>>,
+}
+
+impl HeldFile {
+    fn holding(&self, write: bool) -> Option<&Held> {
+        self.held.as_deref().filter(|h| {
+            h.armed.load(Ordering::Relaxed) && (!write || h.writes.load(Ordering::Relaxed))
+        })
+    }
+}
+
+impl File for HeldFile {
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
+        self.file.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> Result<()> {
+        self.file.unlock_file()
+    }
+    fn pread(&self, at: u64, c: Completion) -> Result<Completion> {
+        self.file.pread(at, c)
+    }
+    fn pwrite(&self, at: u64, bytes: Arc<crate::io::Buffer>, c: Completion) -> Result<Completion> {
+        match self.holding(true) {
+            Some(held) => held.hold(c, bytes.len() as i32),
+            None => self.file.pwrite(at, bytes, c),
+        }
+    }
+    fn sync(&self, c: Completion, how: crate::io::FileSyncType) -> Result<Completion> {
+        match self.holding(false) {
+            Some(held) => held.hold(c, 0),
+            None => self.file.sync(c, how),
+        }
+    }
+    fn size(&self) -> Result<u64> {
+        self.file.size()
+    }
+    fn truncate(&self, n: u64, c: Completion) -> Result<Completion> {
+        self.file.truncate(n, c)
+    }
+}
+
+/// What answering and letting go of held requests one at a time showed, for the wait each answer
+/// was for.
+#[derive(Default)]
+struct Answers {
+    /// Waits still pending once the oldest request was answered, finished once it was let go: a
+    /// place held past the answer, until the retirement.
+    held_to_retirement: usize,
+    /// Waits still pending once the oldest request was let go too.
+    left_pending: usize,
+}
+
+impl Answers {
+    /// Answers the oldest request `held` holds and lets it go, reading `wait` between.
+    fn answer_oldest(&mut self, held: &Held, wait: &Completion) -> bool {
+        let Some((request, result)) = held.oldest() else {
+            return false;
+        };
+        request.complete(result);
+        let pending = !wait.finished();
+        request.retire();
+        match wait.finished() {
+            true if pending => self.held_to_retirement += 1,
+            true => {}
+            false => self.left_pending += 1,
+        }
+        true
+    }
+}
+
+/// An erasure batch takes a run of slots at most, and its zero writes and syncs hold their places
+/// in flight to `WRITES`, each until its request retires, not until it is answered (the auditor's
+/// P2-CP-U1 and P2-CP-F1; mutants: a batch of every slot ready, the flight unbounded, a place let
+/// go at the answer).
+#[test]
+fn an_erasure_batch_is_a_run_of_slots_its_requests_held_to_the_flight_limit_until_retired() {
+    let held = Arc::new(Held::default());
+    let db = Db::open_on(Arc::new(HeldIO {
+        inner: Arc::new(MemoryIO::new()),
+        held: held.clone(),
+    }));
+    let store = db.store().clone();
+    let class = class(0);
+    // Slots in the held files, freed as a checkpoint's frees free them: more than two batches'.
+    let slots = 2 * ERASE_RUN as u64 + 40;
+    let first = HELD_FROM * store.slots_per_file(class);
+    for slot in first..first + slots {
+        store.unerased[class.index()].set(slot);
+        store.erase_owed.fetch_add(1, Ordering::AcqRel);
+        store.to_erase.retire(&store.epochs, (class, slot));
+    }
+    held.writes.store(true, Ordering::Relaxed);
+    held.armed.store(true, Ordering::Relaxed);
+    let mut answers = Answers::default();
+    let (mut owed, mut batches, mut largest) = (store.erase_owed(), Vec::new(), 0);
+    let (mut finished, mut stuck, mut error) = (false, false, None);
+    for _ in 0..1 << 20 {
+        match store.erase_one() {
+            Ok(IOResult::Done(true)) => {
+                finished = true;
+                break;
+            }
+            Ok(IOResult::Done(false)) => {}
+            Ok(IOResult::IO(IOCompletions(wait))) => {
+                if !wait.finished() && !answers.answer_oldest(&held, &wait) {
+                    stuck = true;
+                    break;
+                }
+            }
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+        let now = store.erase_owed();
+        if now < owed {
+            batches.push(owed - now);
+            largest = largest.max(owed - now);
+            owed = now;
+        }
+    }
+    held.armed.store(false, Ordering::Relaxed);
+    while let Some((request, result)) = held.oldest() {
+        request.complete(result);
+        request.retire();
+    }
+    let most = held.most();
+    drop(store);
+    // Checked once the database is gone: a panic unwinding through it ends the process.
+    drop(db);
+    assert_eq!(error, None);
+    assert!(!stuck, "an erasure waited with nothing held");
+    assert!(finished, "the erasure did not end");
+    assert_eq!(owed, 0, "slots left unerased");
+    assert!(
+        largest <= ERASE_RUN,
+        "a batch of {largest} slots: {batches:?}"
+    );
+    assert!(batches.len() >= 3, "batches {batches:?}");
+    assert_eq!(most, WRITES, "requests in flight at most");
+    assert!(
+        answers.held_to_retirement > 0,
+        "no place was held past its answer"
+    );
+    assert_eq!(
+        answers.left_pending, 0,
+        "a wait outlived the oldest request"
+    );
+}
+
+/// A checkpoint syncs the data files a file a unit, walking them by a cursor, and their syncs hold
+/// their places in flight to `WRITES`, each until its request retires (the auditor's P2-CP-F1 and
+/// P2-CP-U1; mutants: the flight unbounded, a place let go at the answer).
+#[test]
+fn a_checkpoints_file_syncs_hold_their_places_to_the_flight_limit_until_retired() {
+    let held = Arc::new(Held::default());
+    let db = Db::open_on(Arc::new(HeldIO {
+        inner: Arc::new(MemoryIO::new()),
+        held: held.clone(),
+    }));
+    let store = db.store().clone();
+    let files = WRITES as u64 + 9;
+    let per_file = store.slots_per_file(class(0));
+    for n in HELD_FROM..HELD_FROM + files {
+        store.data_file(class(0), n * per_file).unwrap();
+    }
+    let root = db.node();
+    db.checkpoint();
+    db.change(root, b"k");
+    held.armed.store(true, Ordering::Relaxed);
+    let cp = db.db.checkpointer();
+    let in_charge = cp.superblock().checkpoint;
+    let ticket = cp.request_full();
+    let mut answers = Answers::default();
+    let (mut finished, mut stuck, mut error) = (false, false, None);
+    for _ in 0..1 << 20 {
+        match cp.step_full(ticket, db.db.transactions()) {
+            Ok(IOResult::Done(())) => {
+                finished = true;
+                break;
+            }
+            Ok(IOResult::IO(IOCompletions(wait))) => {
+                if wait.finished() || answers.answer_oldest(&held, &wait) {
+                    continue;
+                }
+                for _ in 0..1 << 16 {
+                    if wait.finished() {
+                        break;
+                    }
+                    db.io.step().unwrap();
+                }
+                if !wait.finished() {
+                    stuck = true;
+                    break;
+                }
+            }
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    held.armed.store(false, Ordering::Relaxed);
+    while let Some((request, result)) = held.oldest() {
+        request.complete(result);
+        request.retire();
+    }
+    let ended = cp.superblock().checkpoint != in_charge;
+    let most = held.most();
+    drop(store);
+    drop(db);
+    assert_eq!(error, None);
+    assert!(!stuck, "the checkpoint waited on what nothing advances");
+    assert!(finished && ended, "the checkpoint did not end");
+    assert_eq!(
+        most, WRITES,
+        "syncs in flight at most, of {files} held files"
+    );
+    assert!(
+        answers.held_to_retirement > 0,
+        "no place was held past its answer"
+    );
+}
+
+/// The data files are walked by a cursor: each file once, in order, a run of their places looked
+/// at a call, and a segment of places never made passed whole (the auditor's P2-CP-U1; mutants:
+/// a run unbounded, a run's end not kept).
+#[test]
+fn the_data_files_are_walked_a_run_of_places_a_call() {
+    let db = Db::open();
+    let store = db.store().clone();
+    // Files far apart in one segment of places, and one in a later segment.
+    let per_file = store.slots_per_file(class(0));
+    let wanted: Vec<u64> = vec![2000, 2001, 2000 + 3 * FILE_RUN + 5, 9000];
+    for &n in &wanted {
+        store.data_file(class(0), n * per_file).unwrap();
+    }
+    let mut opened = BTreeSet::new();
+    for class in 0..CLASS_COUNT {
+        store.files[class].each(|i, cell| {
+            if cell.get().is_some() {
+                opened.insert((class, i));
+            }
+        });
+    }
+    let mut at = (0, 0);
+    let (mut found, mut runs, mut calls) = (Vec::new(), 0, 0);
+    while calls < 1 << 16 {
+        calls += 1;
+        match store.data_file_from(&mut at) {
+            // The cursor stands just past the file found.
+            Some(Some(_)) => found.push((at.0, at.1 - 1)),
+            Some(None) => runs += 1,
+            None => break,
+        }
+    }
+    let last = store.data_file_from(&mut at).is_none();
+    drop(store);
+    drop(db);
+    let found_set: BTreeSet<_> = found.iter().copied().collect();
+    assert_eq!(
+        found.len(),
+        found_set.len(),
+        "a file found twice: {found:?}"
+    );
+    assert_eq!(found_set, opened, "the files found against those opened");
+    assert!(
+        found.windows(2).all(|w| w[0] < w[1]),
+        "out of order: {found:?}"
+    );
+    assert!(
+        runs >= 3,
+        "{runs} runs found no file: a gap of {} places",
+        3 * FILE_RUN + 3
+    );
+    assert!(last, "a walk passed its end began again");
+}
+
+/// A shard of the swap table is listed a run at a time, in page order, from where the last run
+/// ended: every page once and none past the run (the auditor's P2-CP-U1; mutants: a run
+/// unbounded, a run listed from the shard's start again).
+#[test]
+fn a_swap_shard_is_listed_a_run_at_a_time_from_where_the_last_ended() {
+    const RUN: usize = 7;
+    let db = Db::open();
+    let store = db.store().clone();
+    // Pages of one shard, chosen by the shard the table puts them in.
+    let target: *const _ = store.swap_shard(PageId::new(class(0), 1 << 20));
+    let pages: Vec<PageId> = ((1 << 20)..)
+        .map(|n| PageId::new(class(0), n))
+        .filter(|&pid| std::ptr::eq(store.swap_shard(pid), target))
+        .take(3 * RUN + 2)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for (i, &pid) in pages.iter().enumerate() {
+        store.set_swap(pid, i as u64 + 1);
+    }
+    let shard = (0..store.swap_shards())
+        .find(|&i| std::ptr::eq(&store.swap[i], target))
+        .expect("the shard");
+    let (mut listed, mut runs, mut after) = (Vec::new(), Vec::new(), None);
+    for _ in 0..pages.len() + 2 {
+        let run = store.swap_shard_pages(shard, after, RUN);
+        runs.push(run.len());
+        listed.extend(run.iter().copied());
+        if run.len() < RUN {
+            break;
+        }
+        after = run.last().copied();
+    }
+    // Taken out of the table alone: the slots named were never taken, so none is given up.
+    for &pid in &pages {
+        store.swap[shard].lock().remove(&pid);
+    }
+    drop(store);
+    drop(db);
+    assert!(runs.iter().all(|&n| n <= RUN), "runs {runs:?}");
+    assert_eq!(listed, pages, "the pages listed against those swapped");
+    assert_eq!(runs, [RUN, RUN, RUN, 2]);
 }

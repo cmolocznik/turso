@@ -19,6 +19,17 @@ mod sync {
 const FIRST_SHIFT: u32 = 6;
 const SEGMENTS: usize = (64 - FIRST_SHIFT + 1) as usize;
 
+/// What [`Segmented::next_from`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Next {
+    /// The item at this index is wanted.
+    At(u64),
+    /// None wanted among the items looked at: look again from this index.
+    Passed(u64),
+    /// No item at or after the index is wanted: every segment after it passed.
+    End,
+}
+
 pub struct Segmented<T> {
     segments: [AtomicPtr<T>; SEGMENTS],
 }
@@ -69,6 +80,31 @@ impl<T: Default> Segmented<T> {
                 f(first + at as u64, unsafe { &*p.add(at) });
             }
         }
+    }
+
+    /// The first item at or after `i` that `wanted` takes, looking at `max` items at most and
+    /// passing a segment never made at once (DESIGN.md 22.1).
+    pub fn next_from(&self, i: u64, max: u64, wanted: impl Fn(&T) -> bool) -> Next {
+        let mut i = i;
+        let mut looked = 0;
+        while looked < max {
+            let (k, _) = locate(i);
+            if self.segments[k].load(Ordering::Acquire).is_null() {
+                if k + 1 >= SEGMENTS {
+                    return Next::End;
+                }
+                // The next segment's first item: a segment never made is passed whole.
+                i = ((1u64 << (k + 1)) - 1) << FIRST_SHIFT;
+                continue;
+            }
+            let item = self.get(i).expect("an item of a segment made");
+            looked += 1;
+            if wanted(item) {
+                return Next::At(i);
+            }
+            i += 1;
+        }
+        Next::Passed(i)
     }
 
     /// Item `i`, its segment made if it was not.

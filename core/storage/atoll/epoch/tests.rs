@@ -728,3 +728,59 @@ fn instance_ids_taken_to_their_end_are_never_0_or_taken_twice() {
         "the count left its end"
     );
 }
+
+/// A bounded reclaim takes `max` objects retired since at most and hands back `max` at most,
+/// leaving the rest for the next, every object handed back once (DESIGN.md 22.1; mutants: the
+/// take unbounded, the hand-back unbounded).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+#[test]
+fn a_bounded_reclaim_takes_and_hands_back_a_run_and_leaves_the_rest() {
+    // In a child: a take past its bound breaks the take's own count under the reclaim's lock,
+    // which ends the process, and the parent reads that.
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_bounded_reclaim_takes_and_hands_back_a_run_and_leaves_the_rest"
+        ),
+        || {
+            let epochs = Epochs::new();
+            let retired: Retired<u32> = Retired::default();
+            // Retired under a step, so the takes below find none reusable and the heap fills.
+            let step = epochs.enter();
+            for i in 0..10 {
+                retired.retire(&epochs, i);
+            }
+            let mut takes = Vec::new();
+            for _ in 0..5 {
+                let mut taken = retired.taken.lock();
+                takes.push(retired.take_pushed(&mut taken, 3));
+            }
+            let held_back = retired.reclaim_up_to(&epochs, 3).len();
+            drop(step);
+            let (mut runs, mut back) = (Vec::new(), Vec::new());
+            for _ in 0..epochs.participants().max(1) + 8 {
+                let got = retired.reclaim_up_to(&epochs, 3);
+                if !got.is_empty() {
+                    runs.push(got.len());
+                }
+                back.extend(got);
+            }
+            // Checked once the list is gone: its drop takes its lock, which a panic unwinding
+            // through it refuses by ending the process.
+            drop(retired);
+            drop(epochs);
+            back.sort_unstable();
+            assert_eq!(takes, [3, 3, 3, 1, 0], "objects taken a call");
+            assert_eq!(held_back, 0, "handed back under the step that holds them");
+            assert_eq!(runs, [3, 3, 3, 1], "objects handed back a call");
+            assert_eq!(back, (0..10).collect::<Vec<_>>());
+        },
+    );
+    let Some(ended) = ended else { return };
+    assert!(
+        !ended.aborted && !ended.hung && ended.code == Some(0),
+        "{:?}\n{}",
+        ended.code,
+        ended.stderr
+    );
+}

@@ -37,12 +37,13 @@
 
 use super::aligned::AlignedBlock;
 use super::bits::GrowBits;
+use super::checkpoint::WRITES;
 use super::epoch::{Epochs, Retired};
 use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, Tree, TREES};
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
-use super::segmented::Segmented;
+use super::segmented::{Next, Segmented};
 use super::shared::Writer;
 use super::stack::Chain;
 use super::whole_write;
@@ -98,6 +99,14 @@ pub enum Deferred {
 /// Swap copies, sharded by page id: per page, its slot.
 const SWAP_SHARDS: usize = 64;
 
+/// The places of a class's data files a walk of them looks at a call, at most: as many as one page
+/// of their cells holds (DESIGN.md 22.1).
+const FILE_RUN: u64 = (page::MIN_PAGE_SIZE / std::mem::size_of::<SetOnce<Arc<dyn File>>>()) as u64;
+
+/// The slots an erasure batch takes, at most: as many as one page of them holds (DESIGN.md 22.1,
+/// the auditor's P2-CP-U1).
+const ERASE_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<(SizeClass, u64)>();
+
 /// In the change gate's word: a cut holds the gate, or waits for it.
 const CUT: u64 = 1 << 63;
 
@@ -125,7 +134,7 @@ pub struct PageStore {
     /// after the one cut and not yet in charge.
     epoch: AtomicU64,
     /// Swap copies.
-    swap: Box<[Mutex<HashMap<PageId, u64>>]>,
+    swap: Box<[Mutex<BTreeMap<PageId, u64>>]>,
     /// Frees waiting for a checkpoint, by the checkpoint each waits for: each stays listed until
     /// it is done, so a free a yield interrupts is taken up where it was.
     deferred: Mutex<BTreeMap<u64, VecDeque<Deferred>>>,
@@ -181,8 +190,8 @@ struct Eraser {
     current: Option<Erasure>,
 }
 
-/// Freed slots being erased: holes punched or zeros written, a slot a unit, then their files
-/// synced, a file a unit.
+/// Freed slots being erased, [`ERASE_RUN`] at most: holes punched or zeros written, a slot a unit,
+/// then their files synced, a file a unit.
 struct Erasure {
     slots: Vec<(SizeClass, u64)>,
     /// How many of `slots` are punched out, or have their zeros' write started.
@@ -191,8 +200,32 @@ struct Erasure {
     /// still to start.
     files: BTreeMap<(SizeClass, u64), Arc<dyn File>>,
     unsynced: Option<Vec<Arc<dyn File>>>,
-    /// The zero writes, then the syncs.
-    pending: Vec<Completion>,
+    /// The zero writes, then the syncs, in flight: each its outcome and what its request's
+    /// retirement completes, its place held until then, [`WRITES`] of them at most (the
+    /// auditor's P2-CP-F1).
+    pending: Vec<(Completion, Completion)>,
+    /// The first failure a retired request told.
+    failed: Option<CompletionError>,
+}
+
+impl Erasure {
+    /// Lets go of the places of the requests retired, keeping the first failure they told.
+    fn settle(&mut self) {
+        for (outcome, retired) in &self.pending {
+            if retired.finished() && self.failed.is_none() {
+                self.failed = outcome.get_error();
+            }
+        }
+        self.pending.retain(|(_, retired)| !retired.finished());
+    }
+
+    /// Holds `request`'s place, with `outcome`, until it retires.
+    fn hold(&mut self, outcome: Completion, request: &Completion) {
+        let retired = crate::storage::atoll::notify::wait();
+        let place = retired.clone();
+        request.on_retired(move || place.complete(0));
+        self.pending.push((outcome, retired));
+    }
 }
 
 /// A change of several pages inside the change gate ([`PageStore::change`]): it leaves the gate
@@ -247,7 +280,7 @@ impl PageStore {
             epochs,
             epoch: AtomicU64::new(in_charge + 1),
             swap: (0..SWAP_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| Mutex::new(BTreeMap::new()))
                 .collect(),
             deferred: Mutex::new(BTreeMap::new()),
             unreusable: Default::default(),
@@ -537,7 +570,7 @@ impl PageStore {
 
     // ---------------------------------------------------------------- swap copies
 
-    fn swap_shard(&self, pid: PageId) -> &Mutex<HashMap<PageId, u64>> {
+    fn swap_shard(&self, pid: PageId) -> &Mutex<BTreeMap<PageId, u64>> {
         let h = pid.raw().wrapping_mul(0x9e37_79b9_7f4a_7c15);
         &self.swap[(h >> 58) as usize % SWAP_SHARDS]
     }
@@ -559,7 +592,7 @@ impl PageStore {
     #[cfg(test)]
     pub fn swap_pages(&self) -> Vec<PageId> {
         (0..SWAP_SHARDS)
-            .flat_map(|i| self.swap_shard_pages(i))
+            .flat_map(|i| self.swap[i].lock().keys().copied().collect::<Vec<_>>())
             .collect()
     }
 
@@ -568,9 +601,15 @@ impl PageStore {
         SWAP_SHARDS
     }
 
-    /// The pages with a swap copy in shard `i` of the swap table.
-    pub fn swap_shard_pages(&self, i: usize) -> Vec<PageId> {
-        self.swap[i].lock().keys().copied().collect()
+    /// The pages with a swap copy in shard `i` of the swap table after `after`, in order, `max` at
+    /// most: a cut lists a shard a run at a time, from where its last run ended.
+    pub fn swap_shard_pages(&self, i: usize, after: Option<PageId>, max: usize) -> Vec<PageId> {
+        let shard = self.swap[i].lock();
+        let from = match after {
+            Some(pid) => (std::ops::Bound::Excluded(pid), std::ops::Bound::Unbounded),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        };
+        shard.range(from).map(|(&pid, _)| pid).take(max).collect()
     }
 
     /// `pid` has no swap copy any more: its page is settled at a checkpoint, freed, or changed and
@@ -1105,17 +1144,28 @@ impl PageStore {
         Ok(IOResult::Done(()))
     }
 
-    /// Every data file opened: what a checkpoint wrote to them is durable once each is synced.
-    pub fn data_files(&self) -> Vec<Arc<dyn File>> {
-        let mut files = Vec::new();
-        for class in &self.files {
-            class.each(|_, cell| {
-                if let Some(f) = cell.get() {
-                    files.push(f);
+    /// The next data file from `at` on, `at` moved past it, a run of [`FILE_RUN`] places looked
+    /// at a call at most (DESIGN.md 22.1): `Some(None)` where a run found none, `None` once every
+    /// class's files are passed.
+    pub fn data_file_from(&self, at: &mut (usize, u64)) -> Option<Option<Arc<dyn File>>> {
+        loop {
+            let (class, index) = *at;
+            if class >= CLASS_COUNT {
+                return None;
+            }
+            let files = &self.files[class];
+            match files.next_from(index, FILE_RUN, |cell| cell.get().is_some()) {
+                Next::At(i) => {
+                    *at = (class, i + 1);
+                    return Some(files.get(i).and_then(|cell| cell.get()));
                 }
-            });
+                Next::Passed(i) => {
+                    *at = (class, i);
+                    return Some(None);
+                }
+                Next::End => *at = (class + 1, 0),
+            }
         }
-        files
     }
 
     // ---------------------------------------------------------------- erasing
@@ -1134,36 +1184,50 @@ impl PageStore {
         };
         let eraser = &mut *eraser;
         let Some(e) = eraser.current.as_mut() else {
-            eraser.ready.extend(self.to_erase.reclaim(&self.epochs));
+            // A batch of a run of slots at most, and no more taken from the retired than it
+            // needs.
+            let room = ERASE_RUN.saturating_sub(eraser.ready.len());
+            if room > 0 {
+                eraser
+                    .ready
+                    .extend(self.to_erase.reclaim_up_to(&self.epochs, room));
+            }
             if eraser.ready.is_empty() {
                 return Ok(IOResult::Done(true));
             }
+            let take = eraser.ready.len().min(ERASE_RUN);
             eraser.current = Some(Erasure {
-                slots: std::mem::take(&mut eraser.ready),
+                slots: eraser.ready.drain(..take).collect(),
                 punched: 0,
                 files: BTreeMap::new(),
                 unsynced: None,
                 pending: Vec::new(),
+                failed: None,
             });
             return Ok(IOResult::Done(false));
         };
+        e.settle();
+        if e.pending.len() >= WRITES {
+            return Ok(IOResult::IO(IOCompletions(e.pending[0].1.clone())));
+        }
         if let Some(&(class, slot)) = e.slots.get(e.punched) {
             let (file, at) = self.data_file(class, slot)?;
             if file.punch_hole(at as usize, class.size()).is_err() {
                 let zeros = Arc::new(AlignedBlock::zeroed(class.size()));
                 let (write, zeroed) = whole_write(class.size());
-                drop(file.pwrite(at, zeros.region(0, class.size()), write)?);
-                e.pending.push(zeroed);
+                let request = file.pwrite(at, zeros.region(0, class.size()), write)?;
+                e.hold(zeroed, &request);
             }
             e.files
                 .insert((class, slot / self.slots_per_file(class)), file);
             e.punched += 1;
             return Ok(IOResult::Done(false));
         }
-        if let Some(c) = e.pending.iter().find(|c| !c.finished()) {
-            return Ok(IOResult::IO(IOCompletions(c.clone())));
+        // Every zero write retired before the syncs start, and every sync before the batch ends.
+        if let Some((_, retired)) = e.pending.first() {
+            return Ok(IOResult::IO(IOCompletions(retired.clone())));
         }
-        if let Some(err) = e.pending.iter().find_map(|c| c.get_error()) {
+        if let Some(err) = e.failed.take() {
             // Kept for the next try: a slot not erased is never taken.
             let failed = eraser.current.take().expect("an erasure");
             eraser.ready.extend(failed.slots);
@@ -1173,7 +1237,8 @@ impl PageStore {
             .unsynced
             .get_or_insert_with(|| std::mem::take(&mut e.files).into_values().collect());
         if let Some(f) = unsynced.pop() {
-            e.pending.push(f.sync_data(Completion::new_sync(|_| {}))?);
+            let sync = f.sync_data(Completion::new_sync(|_| {}))?;
+            e.hold(sync.clone(), &sync);
             return Ok(IOResult::Done(false));
         }
         let done = eraser.current.take().expect("an erasure");

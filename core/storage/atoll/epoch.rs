@@ -1093,11 +1093,17 @@ impl<T> Retired<T> {
     /// since the last as a scan reads slots: a scan's cost is spread over that many, and a
     /// caller that reclaims again and again for want of objects gets its scan.
     pub fn reclaim(&self, epochs: &Epochs) -> Vec<T> {
+        self.reclaim_up_to(epochs, usize::MAX)
+    }
+
+    /// [`reclaim`](Self::reclaim), taking `max` objects retired since at most and handing back
+    /// `max` at most, the rest left for the next call (DESIGN.md 22.1: a unit's work bounded).
+    pub fn reclaim_up_to(&self, epochs: &Epochs, max: usize) -> Vec<T> {
         let Some(mut taken) = self.taken.try_lock() else {
             return Vec::new();
         };
         let taken = &mut *taken;
-        taken.since_scan += 1 + self.take_pushed(taken);
+        taken.since_scan += 1 + self.take_pushed(taken, max);
         // Every object stamped at or below a horizon was unlinked before the scan that found
         // it, whenever it was retired.
         let mut horizon = epochs.known_horizon();
@@ -1108,21 +1114,21 @@ impl<T> Retired<T> {
             horizon = epochs.horizon();
         }
         let mut out = Vec::new();
-        while taken.heap.peek().is_some_and(|s| s.0 <= horizon) {
+        while out.len() < max && taken.heap.peek().is_some_and(|s| s.0 <= horizon) {
             out.push(taken.heap.pop().expect("an object").1);
         }
         out
     }
 
-    /// Moves every object pushed since into the heap: those after the node the last take carried,
-    /// then those pushed since; returns how many.
-    fn take_pushed(&self, taken: &mut Taken<T>) -> usize {
+    /// Moves the objects pushed since into the heap, `max` at most: those after the node the last
+    /// take carried, then those pushed since; returns how many.
+    fn take_pushed(&self, taken: &mut Taken<T>, max: usize) -> usize {
         // Relaxed: `carry` is read and written only under the reclaim's lock.
         let carried = taken.carry.swap(ptr::null_mut(), Ordering::Relaxed);
-        let mut count = Self::take_chain(taken, carried);
+        let mut count = Self::take_chain(taken, carried, max);
         if taken.carry.load(Ordering::Relaxed).is_null() {
             let head = self.pushed.swap(ptr::null_mut(), Ordering::Acquire);
-            count += Self::take_chain(taken, head);
+            count += Self::take_chain(taken, head, max - count);
         } else {
             // The carried chain's end is still being linked; what was pushed since waits behind
             // it for the next take, which then reaches it through the head.
@@ -1130,11 +1136,15 @@ impl<T> Retired<T> {
         count
     }
 
-    /// Takes the chain from `raw` into the heap, stopping at a node whose push has not linked what
-    /// follows it yet, which is carried to the next take.
-    fn take_chain(taken: &mut Taken<T>, mut raw: *mut Node<T>) -> usize {
+    /// Takes the chain from `raw` into the heap, `max` nodes at most, stopping at a node whose push
+    /// has not linked what follows it yet or past the most: that node is carried to the next take.
+    fn take_chain(taken: &mut Taken<T>, mut raw: *mut Node<T>, max: usize) -> usize {
         let mut count = 0;
         while !raw.is_null() {
+            if count == max {
+                taken.carry.store(raw, Ordering::Relaxed);
+                break;
+            }
             // SAFETY: published by `retire`, and taken by the swap of the head or carried here,
             // so this thread its only holder.
             let next = unsafe { (*raw).next.load(Ordering::Acquire) };
@@ -1160,7 +1170,7 @@ impl<T> Retired<T> {
         T: Clone,
     {
         let mut taken = self.taken.lock();
-        self.take_pushed(&mut taken);
+        self.take_pushed(&mut taken, usize::MAX);
         taken.heap.iter().map(|s| s.1.clone()).collect()
     }
 }

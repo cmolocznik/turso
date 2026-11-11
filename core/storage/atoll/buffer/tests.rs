@@ -7070,3 +7070,137 @@ fn a_cut_lists_the_pages_owed_a_run_at_a_time() {
         "a call put {most} pages in the set, of {owed} owed"
     );
 }
+
+/// A cut lists the swap table a run of pages a call, a shard's run from where its last ended:
+/// every swapped page owed once and no call listing more than a run (the auditor's P2-CP-U1;
+/// mutants: a shard listed whole, a shard left after its first run).
+#[cfg(not(shuttle))]
+#[test]
+fn a_cut_lists_the_swap_table_a_run_a_call_and_every_swapped_page_once() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-swap", MIN_BUDGET);
+    // Enough swapped pages that shards hold more than a run: none of them resident, the slots
+    // named never taken.
+    let count = (pool.store.swap_shards() * (2 * CUT_RUN + 8)) as u64;
+    let pages: Vec<PageId> = (0..count)
+        .map(|i| PageId::new(class(0), (1 << 20) + i))
+        .collect();
+    for (i, &pid) in pages.iter().enumerate() {
+        pool.store.set_swap(pid, (1 << 30) + i as u64);
+    }
+    let fullest = (0..pool.store.swap_shards())
+        .map(|i| pool.store.swap_shard_pages(i, None, usize::MAX).len())
+        .max()
+        .unwrap_or(0);
+    const N: u64 = 3;
+    let mut scan = CutScan::default();
+    let (mut most, mut calls, mut done) = (0, 0, false);
+    while calls < 1 << 20 {
+        calls += 1;
+        let listed = scan.swapped.len();
+        match pool.cut_run(N, &mut scan) {
+            IOResult::Done(true) => {
+                done = true;
+                break;
+            }
+            IOResult::Done(false) => {}
+            IOResult::IO(IOCompletions(c)) => {
+                while !c.finished() {
+                    io.step().unwrap();
+                }
+            }
+        }
+        most = most.max(scan.swapped.len().saturating_sub(listed));
+    }
+    let owed = pool.cut_owed.lock().clone();
+    let listed_twice = scan.owed.len() - scan.owed.iter().collect::<HashSet<_>>().len();
+    pool.end_cut(N);
+    for &pid in &pages {
+        pool.store.drop_swap(pid);
+    }
+    drop(pool);
+    assert!(
+        fullest > CUT_RUN,
+        "no shard holds more than a run: {fullest}"
+    );
+    assert!(done, "the cut did not end in {calls} calls");
+    assert!(most <= CUT_RUN, "a call listed {most} swapped pages");
+    assert_eq!(listed_twice, 0, "pages owed twice");
+    let missed: Vec<_> = pages.iter().filter(|pid| !owed.contains(pid)).collect();
+    assert!(missed.is_empty(), "{} swapped pages not owed", missed.len());
+}
+
+/// The end of a cut runs in steps: the cut stopped first, then the copies it kept dropped a run a
+/// call, each giving its room back, then the lend batches swept a run a call, the room told on the
+/// last (the auditor's P2-CP-U1; mutants: every copy dropped in one call, every batch swept in one
+/// call).
+#[cfg(not(shuttle))]
+#[test]
+fn a_cuts_end_drops_its_copies_and_sweeps_its_batches_a_run_a_call() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    // More lend batches past the core than a run sweeps.
+    let budget = MIN_BUDGET + (CUT_RUN + 2) * memory::BATCH;
+    let pool = open_on(&io, "/db/cut-end", budget);
+    const N: u64 = 7;
+    let copies = 2 * CUT_RUN + 3;
+    let size = class(0).size();
+    pool.memory.cutting.store(N, Ordering::SeqCst);
+    let mut charged = 0;
+    for i in 0..copies {
+        if !pool.room.charge(size) {
+            break;
+        }
+        charged += 1;
+        let block = crate::storage::atoll::aligned::AlignedBlock::zeroed(size);
+        let pid = PageId::new(class(0), (1 << 20) + i as u64);
+        pool.kept
+            .lock()
+            .insert(pid, KeptCopy::charged(block, &pool.room));
+    }
+    let used = pool.room.stats().used;
+    let swept = pool.memory.batches - memory::CORE;
+    let mut at = EndCut::default();
+    let (mut calls, mut ended, mut stopped_first) = (Vec::new(), false, None);
+    while calls.len() < 1 << 16 {
+        ended = pool.end_cut_run(N, &mut at);
+        stopped_first.get_or_insert(pool.memory.cutting.load(Ordering::SeqCst) == 0);
+        calls.push((pool.kept.lock().len(), at.swept));
+        if ended {
+            break;
+        }
+    }
+    let used_after = pool.room.stats().used;
+    drop(pool);
+    assert_eq!(charged, copies, "the room refused a copy");
+    assert!(swept as usize > CUT_RUN, "{swept} batches swept");
+    assert!(ended, "the cut did not end in {} calls", calls.len());
+    assert_eq!(
+        stopped_first,
+        Some(true),
+        "the first call left the cut running"
+    );
+    let mut left = copies;
+    let mut from = memory::CORE;
+    for &(kept, at) in &calls {
+        assert!(
+            left - kept <= CUT_RUN,
+            "a call dropped {} copies",
+            left - kept
+        );
+        left = kept;
+        if let Some(to) = at {
+            assert!(
+                to - from <= CUT_RUN as u32,
+                "a call swept {} batches",
+                to - from
+            );
+            from = to;
+        }
+    }
+    assert_eq!((left, from), (0, memory::CORE + swept));
+    assert_eq!(
+        used - used_after,
+        copies * size,
+        "the room the copies gave back"
+    );
+}

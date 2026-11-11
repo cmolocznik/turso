@@ -396,6 +396,11 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "epoch/tests.rs",
+            "a_bounded_reclaim_takes_and_hands_back_a_run_and_leaves_the_rest",
+            "child",
+        ),
+        (
             "log/tests.rs",
             "a_unit_starts_one_segment_however_far_another_admission_takes_the_reach",
             "child",

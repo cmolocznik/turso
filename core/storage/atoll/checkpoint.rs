@@ -35,7 +35,7 @@ use super::arc_cell::{ArcCell, Releasing};
 use super::blob;
 use super::btree::node::{self, View};
 use super::btree::value::{self, ValueRef};
-use super::buffer::{BufferPool, CutScan, Relief, Relieved, Retry, Source};
+use super::buffer::{BufferPool, CutScan, EndCut, Relief, Relieved, Retry, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::executor::{self, Class, Cx, Signal, Step, Task, TaskRef, Watched};
 use super::guarded::{Contender, Guarded, Hold};
@@ -47,7 +47,7 @@ use super::store::PageStore;
 use super::txn::versioned::AsOf;
 use super::txn::{Cut, Transactions, Ts};
 use super::unit;
-use crate::io::{Completion, File};
+use crate::io::Completion;
 use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
@@ -76,10 +76,26 @@ crate::thread::thread_local! {
 /// page's id (audit 18, review 2).
 pub const META_INTENT: Kind = Kind::new(31).unwrap();
 
+/// One past the start of the latest checkpoint a trigger was notified for (`began_at` as the
+/// notifying statement read it, plus one), raised and never lowered: one trigger a crossing of the
+/// threshold, the statements after it reading this word alone.
+#[derive(Default)]
+struct TriggerWord(AtomicU64);
+
+impl TriggerWord {
+    /// Whether this claim, for the crossing since `began`, is the first to raise the word past
+    /// `began`. A claim after it reads the word alone, and one that read an earlier start never
+    /// lowers it, whatever claims run beside it: the raise is a maximum, never a store.
+    fn claim(&self, began: Lsn) -> bool {
+        self.0.load(Ordering::Acquire) <= began
+            && self.0.fetch_max(began + 1, Ordering::AcqRel) <= began
+    }
+}
+
 /// Image writes a checkpoint keeps in flight: the 32 to 128 small writes that keep a device busy
 /// (the buffer pool's writeback sizing), at the low end, so a checkpoint never crowds the pool's
 /// own writes out.
-const WRITES: usize = 32;
+pub(crate) const WRITES: usize = 32;
 
 /// [`WRITES`], for the image bank's size (DESIGN.md 9.1.1).
 pub(crate) const IMAGE_WRITES: usize = WRITES;
@@ -139,10 +155,8 @@ pub struct Checkpointer {
     /// Whether a checkpoint is under way, set and cleared under the state: the writers stepping
     /// checkpoints step one under way whether or not another is due.
     under_way: AtomicBool,
-    /// One past the start of the latest checkpoint a trigger was notified for (`began_at` as the
-    /// notifying statement read it, plus one), raised and never lowered: one trigger a crossing of
-    /// the threshold, the statements after it reading this word alone (the auditor's P2-EX-H1).
-    triggered_for: AtomicU64,
+    /// Which crossing of the threshold a trigger was last notified for (the auditor's P2-EX-H1).
+    triggered_for: TriggerWord,
     /// The superblock in charge, as the checkpoint stepping it last wrote it, for anyone to read.
     published: ArcCell<Superblock>,
     releasing: Releasing<Superblock>,
@@ -493,14 +507,17 @@ struct Run {
     /// What each metadata page asked to be written waits on, by its place in `frames`: its write,
     /// or a hold or a change to end before its write starts.
     writing: Vec<(usize, Completion)>,
-    /// The data files whose syncs are still to start, once the metadata is written, and their
-    /// syncs.
-    unsynced: Option<Vec<Arc<dyn File>>>,
-    waits: Vec<Completion>,
+    /// Where the walk of the data files for their syncs stands.
+    files_at: (usize, u64),
+    /// The data files' syncs in flight, each with what its retirement completes: held to
+    /// [`WRITES`] until they retire (the auditor's P2-CP-F1).
+    syncing: Vec<(Completion, Completion)>,
     written: Option<Completion>,
     superblock: Option<Superblock>,
     /// Where the walk of `frames` a run at a time is, in the phases that take one.
     frames_at: usize,
+    /// Where the end of the pool's cut stands.
+    end_cut: EndCut,
     /// The next segment to release, counting down from the first kept, once the release has
     /// begun; and whether one was released, which owes the directory its sync.
     release: Option<u64>,
@@ -516,6 +533,8 @@ enum Phase {
     Orphans,
     Images,
     Values,
+    /// The pool's cut ended, a run of its copies or lend batches a unit.
+    EndCut,
     Intent,
     IntentDurable,
     Meta,
@@ -594,7 +613,7 @@ impl Checkpointer {
             began_at,
             due: Arc::default(),
             under_way: AtomicBool::new(false),
-            triggered_for: AtomicU64::new(0),
+            triggered_for: TriggerWord::default(),
             published: ArcCell::new(Arc::new(superblock.clone())),
             releasing,
             state: Guarded::new(State {
@@ -1042,8 +1061,7 @@ impl Checkpointer {
     /// trigger for that crossing: the first to raise the word past `began`. A statement after it
     /// reads the word alone, and one that read an earlier start never lowers it.
     fn claim_trigger(&self, began: Lsn) -> bool {
-        self.triggered_for.load(Ordering::Acquire) <= began
-            && self.triggered_for.fetch_max(began + 1, Ordering::AcqRel) <= began
+        self.triggered_for.claim(began)
     }
 
     /// Whether a checkpoint is due by the log appended since the last began (DESIGN.md §17).
@@ -1380,11 +1398,12 @@ impl Run {
             turn_owed: false,
             frames: Vec::new(),
             writing: Vec::new(),
-            unsynced: None,
-            waits: Vec::new(),
+            files_at: (0, 0),
+            syncing: Vec::new(),
             written: None,
             superblock: None,
             frames_at: 0,
+            end_cut: EndCut::default(),
             release: None,
             released: false,
         }
@@ -1393,7 +1412,7 @@ impl Run {
     /// Lets go of what a checkpoint that cannot finish holds: the gate, the cuts, the snapshot,
     /// and the pages handed over to it. A turn of the log's flush it owes is taken, so no request
     /// made during its last turn goes unanswered.
-    fn abandon(self, cp: &Checkpointer, txns: &Transactions) {
+    fn abandon(mut self, cp: &Checkpointer, txns: &Transactions) {
         let mut owed = self.turn_owed;
         while owed {
             owed = cp.log.flush_one_turn();
@@ -1401,8 +1420,9 @@ impl Run {
         if matches!(self.phase, Phase::Gate | Phase::Cut | Phase::Scan) {
             cp.store.open_gate();
         }
-        if cp.pool.cutting() == self.n {
-            cp.pool.end_cut(self.n);
+        // A cut stopped, its end under way, is ended too.
+        if cp.pool.cutting() == self.n || self.end_cut.begun() {
+            while !cp.pool.end_cut_run(self.n, &mut self.end_cut) {}
         }
         // The cut copies its frames kept go even where the cut ended before (`Uncut`).
         if cp.store.meta().cutting() == self.n {
@@ -1509,12 +1529,18 @@ impl Run {
                 },
                 Phase::Values => match self.image_unit(cp, txns, true)? {
                     Unit::Done => {
-                        cp.pool.end_cut(self.n);
-                        self.phase = Phase::Intent;
+                        self.phase = Phase::EndCut;
                         return Ok(Unit::Again);
                     }
                     unit => return Ok(unit),
                 },
+                Phase::EndCut => {
+                    unit::visit();
+                    if cp.pool.end_cut_run(self.n, &mut self.end_cut) {
+                        self.phase = Phase::Intent;
+                    }
+                    return Ok(Unit::Again);
+                }
                 Phase::Intent => {
                     // Its size checked before anything is built: a record past the log's buffer
                     // is never admitted.
@@ -1565,16 +1591,39 @@ impl Run {
                     return Ok(Unit::Again);
                 }
                 Phase::Files => {
-                    // A data file's sync started a unit; then every one waited for.
-                    let unsynced = self.unsynced.get_or_insert_with(|| cp.store.data_files());
-                    if let Some(file) = unsynced.pop() {
-                        unit::visit();
-                        self.waits
-                            .push(file.sync_data(Completion::new_sync(|_| {}))?);
-                        return Ok(Unit::Again);
+                    // A data file's sync started a unit, the files walked by a cursor; each holds
+                    // its place in flight until its request retires, `WRITES` of them at most, a
+                    // failure failing the checkpoint; then every one waited for.
+                    if let Some(e) = self
+                        .syncing
+                        .iter()
+                        .filter(|(_, retired)| retired.finished())
+                        .find_map(|(sync, _)| sync.get_error())
+                    {
+                        return Err(LimboError::CompletionError(e));
                     }
-                    unit!(wait_all(&mut self.waits));
-                    self.phase = Phase::Durable;
+                    self.syncing.retain(|(_, retired)| !retired.finished());
+                    if self.syncing.len() >= WRITES {
+                        return Ok(Unit::Wait(self.syncing[0].1.clone()));
+                    }
+                    match cp.store.data_file_from(&mut self.files_at) {
+                        Some(Some(file)) => {
+                            unit::visit();
+                            let sync = file.sync_data(Completion::new_sync(|_| {}))?;
+                            let retired = crate::storage::atoll::notify::wait();
+                            let place = retired.clone();
+                            sync.on_retired(move || place.complete(0));
+                            self.syncing.push((sync, retired));
+                        }
+                        // A run of places with no file in it.
+                        Some(None) => unit::visit(),
+                        None => {
+                            if let Some((_, retired)) = self.syncing.first() {
+                                return Ok(Unit::Wait(retired.clone()));
+                            }
+                            self.phase = Phase::Durable;
+                        }
+                    }
                     return Ok(Unit::Again);
                 }
                 Phase::Durable => {
@@ -2092,19 +2141,6 @@ fn corrupt_image(pid: PageId) -> LimboError {
     LimboError::Corrupt(format!("the image of {pid:?} does not decode"))
 }
 
-/// Done once every one of `waits` has finished; the first error any ended with.
-fn wait_all(waits: &mut Vec<Completion>) -> Result<IOResult<()>> {
-    if let Some(c) = waits.iter().find(|c| !c.finished()) {
-        return Ok(IOResult::IO(IOCompletions(c.clone())));
-    }
-    if let Some(e) = waits.iter().find_map(|c| c.get_error()) {
-        waits.clear();
-        return Err(LimboError::CompletionError(e));
-    }
-    waits.clear();
-    Ok(IOResult::Done(()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2217,6 +2253,45 @@ mod tests {
         ];
         drop(db);
         assert_eq!(claims, [true, false, false, false, true, false]);
+    }
+
+    /// Claims running beside one another: one for an earlier start, read stale, and two for the
+    /// newer. One of the newer claims, and the word ends one past the newer start, whatever the
+    /// interleaving: the stale claim never lowers it (the auditor's model of #4315; mutant: the
+    /// word swapped in, which the stale claim lowers between the newer two, so both claim).
+    fn a_stale_claim_never_lowers_the_trigger_word(rounds: usize) {
+        for _ in 0..rounds {
+            let word = Arc::new(TriggerWord::default());
+            let claim = |began: Lsn| {
+                let word = word.clone();
+                crate::thread::spawn(move || word.claim(began))
+            };
+            let stale = claim(4096);
+            let newer = [claim(8192), claim(8192)];
+            let newer = newer
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|&claimed| claimed)
+                .count();
+            stale.join().unwrap();
+            assert_eq!(newer, 1, "claims for the newer start");
+            assert_eq!(word.0.load(Ordering::SeqCst), 8193, "the word at the end");
+        }
+    }
+
+    #[cfg(not(shuttle))]
+    #[test]
+    fn a_stale_claim_never_lowers_the_trigger_word_on_threads() {
+        a_stale_claim_never_lowers_the_trigger_word(if cfg!(miri) { 20 } else { 5_000 });
+    }
+
+    #[cfg(shuttle)]
+    #[test]
+    fn a_stale_claim_never_lowers_the_trigger_word_in_shuttle_schedules() {
+        crate::storage::atoll::testing::schedules(
+            || a_stale_claim_never_lowers_the_trigger_word(1),
+            2_000,
+        );
     }
 
     /// The bookkeeping over the frames a checkpoint wrote is a run of them a unit: giving each page

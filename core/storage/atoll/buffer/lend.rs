@@ -888,8 +888,8 @@ impl BufferPool {
     /// batch a provide left `LENDING` given back free, and every empty copy batch retired and
     /// given back free, each by the one compare-and-swap its other roads take it by. `end_cut`
     /// signals every class after it.
-    pub(super) fn sweep_lend_batches(&self) {
-        for batch in CORE..self.memory.batches {
+    pub(super) fn sweep_lend_batches(&self, batches: std::ops::Range<u32>) {
+        for batch in batches {
             let word = self.memory.lend_word(batch);
             match word.kind() {
                 LendKind::Lending => {

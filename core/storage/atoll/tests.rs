@@ -439,9 +439,11 @@ crate::thread::thread_local! {
 
 /// [`drive`] while `left` holds IO steps, each step spending one, shared across calls: `None` once
 /// they run out, with what the operation submitted still in flight. A yield spends one too, so
-/// they always run out.
+/// they always run out. Whether a request is in flight at the run-out is the backend's own count:
+/// the operation may be waiting for a place in a flight set, which a request's retirement gives
+/// back, and no request lies beneath that wait.
 fn drive_for<T>(
-    io: &Arc<dyn IO>,
+    crash: &CrashIO,
     left: &Cell<u64>,
     mut op: impl FnMut() -> Result<IOResult<T>>,
 ) -> Option<T> {
@@ -450,15 +452,11 @@ fn drive_for<T>(
             IOResult::Done(v) => return Some(v),
             IOResult::IO(IOCompletions(c)) => loop {
                 if left.get() == 0 {
-                    let owned = c
-                        .requests(&mut std::collections::HashSet::new())
-                        .iter()
-                        .any(|r| r.is_owned());
-                    OWNED_AT_RUN_OUT.with(|o| o.set(owned));
+                    OWNED_AT_RUN_OUT.with(|o| o.set(crash.in_flight() > 0));
                     return None;
                 }
                 left.set(left.get() - 1);
-                io.step().unwrap();
+                crash.step().unwrap();
                 if c.finished() {
                     break;
                 }
@@ -487,36 +485,36 @@ fn settle(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Option<()> {
 fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Option<()> {
     let root = {
         let db = try_open(io.clone(), 1).unwrap();
-        let root = drive_for(io, left, || Tree::create_versioned(db.pool(), class(0)))?;
+        let root = drive_for(crash, left, || Tree::create_versioned(db.pool(), class(0)))?;
         let db = Db::with(io.clone(), db, root);
         let txns = db.db.transactions();
         for v in 1..=8 {
-            let mut txn = drive_for(io, left, || txns.begin(Isolation::Snapshot))?;
+            let mut txn = drive_for(crash, left, || txns.begin(Isolation::Snapshot))?;
             txns.statement(&mut txn).unwrap();
             let mut op = WriteOp::put(&[v as u8], vec![v as u8; 3000], Mode::Upsert);
-            drive_for(io, left, || {
+            drive_for(crash, left, || {
                 db.tree.write(txns, &db.versions, &mut txn, &mut op)
             })?;
             let mut commit = Commit::new(txn);
-            drive_for(io, left, || txns.commit(&mut commit))?;
+            drive_for(crash, left, || txns.commit(&mut commit))?;
         }
         let ticket = db.db.checkpointer().request_full();
-        drive_for(io, left, || db.db.checkpointer().step_full(ticket, txns))?;
+        drive_for(crash, left, || db.db.checkpointer().step_full(ticket, txns))?;
         // The next segment's zeros go one write at a time, then its sync: all of it lands.
         settle(crash, io, left)?;
         // Twice the pool of them: a pool's worth at least is written out, and the tree's pages
         // leave memory.
         let temp = class(5);
         for v in 0..2 * MIN_DB_BUDGET / temp.size() {
-            let mut page = drive_for(io, left, || db.db.pool().allocate_temporary(temp))?;
+            let mut page = drive_for(crash, left, || db.db.pool().allocate_temporary(temp))?;
             page.page_mut().put_u64(HEADER_SIZE, v as u64);
             page.changed();
         }
-        let mut txn = drive_for(io, left, || txns.begin(Isolation::Snapshot))?;
+        let mut txn = drive_for(crash, left, || txns.begin(Isolation::Snapshot))?;
         txns.statement(&mut txn).unwrap();
         for v in 1..=8u8 {
             let mut op = Get::new(&[v]);
-            drive_for(io, left, || {
+            drive_for(crash, left, || {
                 db.tree.get(txns, &db.versions, &mut txn, &mut op)
             })?;
         }
@@ -527,11 +525,11 @@ fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Opti
     settle(crash, io, left)?;
     let db = Db::recover(io.clone(), root, 1).unwrap();
     let txns = db.db.transactions();
-    let mut txn = drive_for(io, left, || txns.begin(Isolation::Snapshot))?;
+    let mut txn = drive_for(crash, left, || txns.begin(Isolation::Snapshot))?;
     txns.statement(&mut txn).unwrap();
     for v in 1..=8u8 {
         let mut op = Get::new(&[v]);
-        drive_for(io, left, || {
+        drive_for(crash, left, || {
             db.tree.get(txns, &db.versions, &mut txn, &mut op)
         })?;
     }

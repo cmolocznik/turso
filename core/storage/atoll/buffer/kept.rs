@@ -172,10 +172,9 @@ impl KeptRoom {
     }
 
     /// A request of `bytes` refused, its operation's wait `wait`: a ticket from a refusal before
-    /// names these bytes now, counted under them before it leaves its old ones, so the largest
-    /// request read meanwhile is never below either; else a ticket is taken, its wait timed from
-    /// now and its demand on the checkpoint made (`demand`). A request of no bytes, its cut ended
-    /// since the charge, waits for nothing.
+    /// names these bytes now, counted under them before it leaves its old ones; else a ticket is
+    /// taken, its wait timed from now and its demand on the checkpoint made (`demand`). A request
+    /// of no bytes, its cut ended since the charge, waits for nothing.
     pub fn refused(
         self: &Arc<Self>,
         bytes: usize,
@@ -226,7 +225,11 @@ impl KeptRoom {
         self.longest_wait_ns.fetch_max(waited, Ordering::Relaxed);
     }
 
-    /// The largest request among the room tickets alive, 0 with none.
+    /// The largest request among the room tickets alive, 0 with none: read bucket by bucket, from
+    /// the largest, so no exact maximum while tickets move between sizes (one moving from a size
+    /// not yet read to one already read is missed). Its bound is the reader's own: a caller whose
+    /// ticket stays alive and unmoved through the read reads at least its own request, and a
+    /// charge it then makes is still checked against the room's limit.
     pub fn pressing(&self) -> usize {
         (1..SIZES)
             .rev()

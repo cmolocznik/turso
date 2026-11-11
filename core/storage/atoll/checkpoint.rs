@@ -39,7 +39,7 @@ use super::buffer::{BufferPool, CutScan, Relief, Relieved, Retry, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::executor::{self, Class, Cx, Signal, Step, Task, TaskRef, Watched};
 use super::guarded::{Contender, Guarded, Hold};
-use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
+use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, BLOCK};
 use super::meta::{MetaId, MetaRef, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
 use super::stack::Chain;
@@ -67,6 +67,9 @@ crate::thread::thread_local! {
     /// Claims of a checkpoint's task that stepped it, made on this thread.
     #[cfg(test)]
     pub(crate) static CLAIMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Triggers of a checkpoint's task notified on this thread.
+    #[cfg(test)]
+    pub(crate) static TRIGGERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The record naming the metadata pages a checkpoint is about to write: its number, then each
@@ -136,6 +139,15 @@ pub struct Checkpointer {
     /// Whether a checkpoint is under way, set and cleared under the state: the writers stepping
     /// checkpoints step one under way whether or not another is due.
     under_way: AtomicBool,
+    /// Where the intent record of the checkpoint that began last was reserved, and where it ends,
+    /// once appended (`u64::MAX` and 0 before): that record and the padding around it are no input
+    /// to the log, so they make no checkpoint due (the auditor's P1-CP-D1).
+    own_from: AtomicU64,
+    own_to: AtomicU64,
+    /// The start of the checkpoint the last trigger was notified for, `began_at` as it read: one
+    /// trigger a crossing of the threshold, the statements after it reading this word alone (the
+    /// auditor's P2-EX-H1).
+    triggered_for: AtomicU64,
     /// The superblock in charge, as the checkpoint stepping it last wrote it, for anyone to read.
     published: ArcCell<Superblock>,
     releasing: Releasing<Superblock>,
@@ -587,6 +599,9 @@ impl Checkpointer {
             began_at,
             due: Arc::default(),
             under_way: AtomicBool::new(false),
+            own_from: AtomicU64::new(u64::MAX),
+            own_to: AtomicU64::new(0),
+            triggered_for: AtomicU64::new(u64::MAX),
             published: ArcCell::new(Arc::new(superblock.clone())),
             releasing,
             state: Guarded::new(State {
@@ -1009,8 +1024,16 @@ impl Checkpointer {
             return Ok(IOResult::Done(()));
         }
         if due {
-            if let Some(task) = self.task.get().filter(|task| !task.is_over()) {
-                task.trigger(&self.due);
+            // One trigger a crossing: a statement after the first reads this word and goes on.
+            let began = self.began_at.load(Ordering::Acquire);
+            if self.triggered_for.load(Ordering::Acquire) != began
+                && self.triggered_for.swap(began, Ordering::AcqRel) != began
+            {
+                if let Some(task) = self.task.get().filter(|task| !task.is_over()) {
+                    #[cfg(test)]
+                    TRIGGERS.with(|n| n.set(n.get() + 1));
+                    task.trigger(&self.due);
+                }
             }
         }
         match self.stepper() {
@@ -1026,12 +1049,20 @@ impl Checkpointer {
         }
     }
 
-    /// Whether a checkpoint is due by the log appended since the last began (DESIGN.md §17).
+    /// Whether a checkpoint is due by the log appended since the last began (DESIGN.md §17): a
+    /// share of the budget, at least a byte, and more than the checkpoint's own intent record and
+    /// the padding of the blocks around it, which are no input (P1-CP-D1: a quiet database whose
+    /// checkpoints' own records made the next due checkpointed forever).
     fn due_now(&self) -> bool {
-        self.log
-            .end()
-            .saturating_sub(self.began_at.load(Ordering::Acquire))
-            >= self.budget / SHARES
+        let end = self.log.end();
+        let began = self.began_at.load(Ordering::Acquire);
+        if end.saturating_sub(began) < (self.budget / SHARES).max(1) {
+            return false;
+        }
+        let from = self.own_from.load(Ordering::Acquire);
+        let to = self.own_to.load(Ordering::Acquire);
+        let own_alone = from <= began.next_multiple_of(BLOCK) && end <= to.next_multiple_of(BLOCK);
+        !own_alone
     }
 
     /// Whether a full checkpoint asked for is not done yet, as the state last recorded them.
@@ -1281,6 +1312,8 @@ impl State {
                 });
             }
             cp.began_at.store(cp.log.end(), Ordering::Release);
+            cp.own_from.store(u64::MAX, Ordering::Release);
+            cp.own_to.store(0, Ordering::Release);
             cp.under_way.store(true, Ordering::Release);
             self.run = Some(Box::new(Run::new(
                 self.superblock.checkpoint + 1,
@@ -1512,7 +1545,9 @@ impl Run {
                         prev: None,
                     };
                     let payload = intent_payload(self.n, &self.meta);
-                    let end = cp.log.append(admitted, &header, &[&payload]);
+                    let (from, end) = cp.log.append_with(admitted, &header, &[&payload], |_| {});
+                    cp.own_to.store(end, Ordering::Release);
+                    cp.own_from.store(from.get(), Ordering::Release);
                     self.intent = None;
                     self.intent_end = Some(end);
                     self.phase = Phase::IntentDurable;

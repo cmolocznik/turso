@@ -5400,7 +5400,13 @@ compose, the real `Completion`, latch and backends included where named.
    checkpoint's task, `CheckpointTask`. A step holds the state, or contends for it as a task while
    an integrity check holds it, and steps it until it waits on writes (`Wait` on them) or finds
    nothing due (`Idle`). A writing statement or a transaction's end that finds a checkpoint due
-   (`step_due`) notifies *due*, which sets the task's own level as it wakes it; the task reads
+   (`step_due`) notifies *due*, which sets the task's own level as it wakes it, once a crossing of
+   the threshold (`triggered_for`, the checkpoint start it was notified for: the statements after
+   it read that word alone, the auditor's P2-EX-H1); a checkpoint is due by a share of the budget,
+   at least a byte, appended since the last began beyond that checkpoint's own intent record and
+   the padding of the blocks around it, which are no input, so a quiet database with a small budget
+   is not checkpointed forever by its checkpoints' own records (P1-CP-D1; input of less than a
+   block beside the intent waits for the next); the task reads
    *due* before its look, and a step that finds nothing due compares the log's end with the
    threshold, and a full checkpoint asked for with those done, itself before it rests, so a
    database due again as a checkpoint ends needs no further append, then drops its own level

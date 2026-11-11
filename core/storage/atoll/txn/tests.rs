@@ -27,6 +27,11 @@ fn log_config() -> LogConfig {
 }
 
 fn open(io: &Arc<dyn IO>, slots: usize) -> Atoll {
+    open_with_budget(io, slots, 512 << 10)
+}
+
+/// [`open`], recovery kept to replaying `log_budget` bytes of log.
+fn open_with_budget(io: &Arc<dyn IO>, slots: usize, log_budget: u64) -> Atoll {
     let config = AtollConfig {
         log: log_config(),
         store: StoreConfig {
@@ -39,7 +44,7 @@ fn open(io: &Arc<dyn IO>, slots: usize) -> Atoll {
             kept_bytes: None,
             lent_at_open: Default::default(),
         },
-        log_budget: Some(512 << 10),
+        log_budget: Some(log_budget),
         checkpoint_write_bytes: None,
         checkpointing: crate::storage::atoll::checkpoint::Checkpointing::Writers,
         txn: TxnConfig { slots },
@@ -961,4 +966,65 @@ fn a_checkpoint_releases_the_logs_segments_one_a_unit() {
     drop((tree, db));
     assert!(total >= 2, "{total} segments released");
     assert_eq!(most, 1, "the most segments one unit released, of {total}");
+}
+
+/// A quiet database is not due again because of its checkpoints' own records: with a log budget
+/// of a byte or of 64, its checkpoint's intent record past the threshold, a checkpoint ends and the
+/// task rests, and the statements after it pass over the checkpointer; new input makes it due
+/// (the auditor's P1-CP-D1; mutant: the checkpoint's own record counted as input).
+#[test]
+fn a_quiet_database_is_not_due_for_its_checkpoints_own_records() {
+    use crate::storage::atoll::checkpoint::STEPS_PASSED_OVER;
+    for budget in [1u64, 64] {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        // Its first full checkpoint is made at open.
+        let db = open_with_budget(&io, 4, budget);
+        let cp = db.checkpointer();
+        let rested = (cp.is_due(), cp.task_class());
+        let checkpoint = cp.superblock().checkpoint;
+        let passed = STEPS_PASSED_OVER.with(|n| n.get());
+        for _ in 0..3 {
+            drive(&io, || cp.step_due(db.transactions())).unwrap();
+        }
+        let quiet = (
+            STEPS_PASSED_OVER.with(|n| n.get()) - passed,
+            cp.superblock().checkpoint - checkpoint,
+        );
+        let mut txn = begin(&io, &db, Isolation::Snapshot);
+        write(&io, &db, &mut txn);
+        commit(&io, &db, txn);
+        let written = cp.is_due();
+        drop(db);
+        assert_eq!(
+            rested,
+            (false, Some(Class::Maintenance)),
+            "budget {budget}: due after the open's checkpoint"
+        );
+        assert_eq!(
+            quiet,
+            (3, 0),
+            "budget {budget}: passes over, checkpoints made"
+        );
+        assert!(written, "budget {budget}: a commit's record is input");
+    }
+}
+
+/// Statements that find a checkpoint due trigger its task once for the crossing, the rest reading
+/// the word that says so (the auditor's P2-EX-H1; mutant: a trigger, its four locks, a statement).
+#[test]
+fn statements_finding_a_checkpoint_due_trigger_its_task_once() {
+    use crate::storage::atoll::checkpoint::TRIGGERS;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 4);
+    let cp = db.checkpointer();
+    append_until_due(&io, &db, 32 << 10);
+    let triggers = TRIGGERS.with(|n| n.get());
+    // The state held, as an integrity check holds it: no checkpoint begins, so the crossing stands.
+    let held = cp.hold().expect("the state free");
+    let stepped = (0..5).all(|_| cp.step_due(db.transactions()).is_ok());
+    let triggered = TRIGGERS.with(|n| n.get()) - triggers;
+    drop(held);
+    drop(db);
+    assert!(stepped, "a statement's step failed");
+    assert_eq!(triggered, 1, "triggers over five statements");
 }

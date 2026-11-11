@@ -294,3 +294,16 @@ pub(super) fn step_past<T>(
     .unwrap();
     passed
 }
+
+crate::thread::thread_local! {
+    /// Run, and taken, as a database on this thread begins to close: a test's pause in the close.
+    pub(crate) static CLOSE_PAUSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs the pause a test set on this thread for a database's close, if it set one.
+pub(crate) fn pause_close() {
+    if let Some(pause) = CLOSE_PAUSE.with(|p| p.borrow_mut().take()) {
+        pause();
+    }
+}

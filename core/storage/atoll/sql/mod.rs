@@ -70,6 +70,8 @@ pub struct AtollDb {
 impl Drop for AtollDb {
     #[turso_macros::atoll_entry]
     fn drop(&mut self) {
+        #[cfg(test)]
+        crate::storage::atoll::testing::pause_close();
         let log = self.atoll.log().clone();
         let end = log.end();
         let mut wait = LogWait::default();

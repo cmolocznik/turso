@@ -4039,3 +4039,79 @@ fn a_checkpoint_unit_visits_at_most_one_page() {
     );
     assert!(ended.stderr.contains("PROOF3 most=1 "), "{}", ended.stderr);
 }
+
+/// A database whose last handle drops keeps its files, and the locks they hold, until they close,
+/// and an open of the file meanwhile waits for them: no probe and no second open closes a
+/// descriptor of the file while they are open, which would drop every lock the process holds on it
+/// (R17), the reopened database's own once the old files close (the auditor's #4385; mutant: the
+/// registry forgetting the database as its last handle drops, before its files close). The lock is
+/// looked at through one descriptor kept open to the end: an open file description's lock query
+/// meets a traditional lock even this process holds.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reopen_while_the_database_closes_waits_and_keeps_the_files_lock() {
+    use crate::database::CLOSING_WAITS;
+    use crate::storage::atoll::testing::CLOSE_PAUSE;
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db").to_str().unwrap().to_string();
+    let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let first = open(&io, &path);
+    let look = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    // Whether another holder could not take a write lock on the whole file.
+    let locked = |file: &std::fs::File| {
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as libc::c_short;
+        lock.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: a query on a descriptor this test holds open, into a struct it owns.
+        let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut lock) };
+        assert_eq!(r, 0, "the lock query failed");
+        lock.l_type != libc::F_UNLCK as libc::c_short
+    };
+    let held_at_open = locked(&look);
+    let (told, heard) = std::sync::mpsc::channel::<&'static str>();
+    let (go, wait_go) = std::sync::mpsc::channel::<()>();
+    let closer = {
+        let told = told.clone();
+        std::thread::spawn(move || {
+            CLOSE_PAUSE.with(|p| {
+                *p.borrow_mut() = Some(Box::new(move || {
+                    told.send("paused").unwrap();
+                    wait_go.recv().unwrap();
+                }))
+            });
+            drop(first);
+        })
+    };
+    let paused = heard.recv().unwrap();
+    let opener = {
+        let (io, path) = (io.clone(), path.clone());
+        std::thread::spawn(move || {
+            CLOSING_WAITS.with(|w| *w.borrow_mut() = Some(told.clone()));
+            let db = open(&io, &path);
+            told.send("opened").unwrap();
+            db
+        })
+    };
+    let met = heard.recv().unwrap();
+    go.send(()).unwrap();
+    closer.join().unwrap();
+    let second = opener.join().unwrap();
+    let held_after = locked(&look);
+    drop(second);
+    drop(look);
+    assert!(held_at_open, "an open database holds no lock on its file");
+    assert_eq!(paused, "paused", "the close did not pause");
+    assert_eq!(
+        met, "waiting",
+        "an open of the file went ahead while its database was closing"
+    );
+    assert!(
+        held_after,
+        "the reopened database's lock on its file was dropped as the old one closed"
+    );
+}

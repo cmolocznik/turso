@@ -638,6 +638,60 @@ pub(crate) enum RegistryEntry {
     Opening,
     /// The database has been opened and is (or was) live.
     Ready(Weak<Database>),
+    /// The database is closing: its last handle dropped and its files not yet closed, which this
+    /// completion says once they are. An open of the file waits for it, so no probe and no second
+    /// open of the file closes a descriptor of it meanwhile: closing one drops every lock the
+    /// process holds on the file, those its closing files still hold and, once they close, those a
+    /// second open had taken (R17).
+    Closing(Completion),
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Told when an open on this thread waits for a database of its file to close: a test's look.
+    pub(crate) static CLOSING_WAITS: std::cell::RefCell<Option<std::sync::mpsc::Sender<&'static str>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tells a test waiting on [`CLOSING_WAITS`] that an open on this thread waits for a closing.
+fn closing_wait_seen() {
+    #[cfg(test)]
+    CLOSING_WAITS.with(|w| {
+        if let Some(tell) = w.borrow().as_ref() {
+            let _ = tell.send("waiting");
+        }
+    });
+}
+
+/// The last field of a [`Database`]: once it drops, every file the database held is closed, and
+/// the registry's closing entry for it goes and its waiters are woken.
+struct Closed {
+    /// Finished by this drop, on whatever thread drops the database: a wait another thread ends.
+    done: Completion,
+    /// The registry's key for the database, once its drop has marked it closing.
+    key: OnceLock<DatabaseKey>,
+}
+
+impl Default for Closed {
+    fn default() -> Self {
+        Self {
+            done: Completion::new_remote_wait(),
+            key: OnceLock::new(),
+        }
+    }
+}
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.get() {
+            let mut registry = DATABASE_MANAGER.lock();
+            if matches!(registry.get(key), Some(RegistryEntry::Closing(c)) if c.ptr_eq(&self.done))
+            {
+                registry.remove(key);
+            }
+        }
+        self.done.complete(0);
+    }
 }
 
 /// The database manager ensures that there is a single, shared
@@ -739,6 +793,9 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+
+    /// Declared last, so it drops after every field holding a file (see [`RegistryEntry::Closing`]).
+    closed: Closed,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -804,10 +861,16 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Data
             return;
         };
         let mut registry = DATABASE_MANAGER.lock();
-        // Another open of the same file may have replaced the entry already.
+        // Another open of the same file may have replaced the entry already. Its files close as
+        // its fields drop after this, the last of them saying so: until then an open of the file
+        // waits (`RegistryEntry::Closing`).
         if matches!(registry.get(key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
         {
-            registry.remove(key);
+            let _ = self.closed.key.set(key.clone());
+            registry.insert(
+                key.clone(),
+                RegistryEntry::Closing(self.closed.done.clone()),
+            );
         }
     }
 }
@@ -905,6 +968,7 @@ impl Database {
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
             page_codec_id,
+            closed: Closed::default(),
 
             durable_storage: None,
         };
@@ -1087,6 +1151,15 @@ impl Database {
                         Some(RegistryEntry::Opening) => {
                             drop(registry);
                             crate::thread::yield_now();
+                            continue;
+                        }
+                        // A database of the file closing: probing it now could close a descriptor
+                        // of the file while its own are still open (R17).
+                        Some(RegistryEntry::Closing(closing)) => {
+                            let closing = closing.clone();
+                            drop(registry);
+                            closing_wait_seen();
+                            io.wait(&closing);
                             continue;
                         }
                         // The instance this IO keys the path to, the one entry its open would
@@ -1549,6 +1622,12 @@ impl Database {
                         return Ok(IOResult::IO(types::IOCompletions(
                             io::Completion::new_yield(),
                         )));
+                    }
+                    Some(RegistryEntry::Closing(closing)) => {
+                        // A database of this file is closing: opening it now would put a second
+                        // descriptor beside those it still holds (`RegistryEntry::Closing`).
+                        closing_wait_seen();
+                        return Ok(IOResult::IO(types::IOCompletions(closing.clone())));
                     }
                     None => {
                         // Not in registry — mark as Opening and proceed.

@@ -3191,9 +3191,7 @@ impl Program {
             progress_ops
         };
         state.check_countdown = state.check_interval;
-        // A statement that has begun to end its connection's transaction finishes it on a closed
-        // connection too: the close left it to it.
-        if self.connection.is_closed() && state.atoll_ending_begun.is_none() {
+        if self.connection.is_closed() {
             return Some(ProgramStep::Error(self.closed_during_step(pager)));
         }
         // With no interrupt requested, no deadline and no progress handler

@@ -4411,8 +4411,9 @@ fn drop_at_its_ending(
     drop_at_its_ending_closing(conn, crash, sql, phase, false)
 }
 
-/// [`drop_at_its_ending`], closing the connection first if `close`, the statement still holding
-/// its ending.
+/// [`drop_at_its_ending`], if `close` with a close of the connection tried first, the statement
+/// still holding its ending, which must be refused, and tried again once the statement has dropped,
+/// which must close it.
 fn drop_at_its_ending_closing(
     conn: &Arc<Connection>,
     crash: &crate::io::crash::CrashIO,
@@ -4434,15 +4435,25 @@ fn drop_at_its_ending_closing(
             Err(e) => break (false, Some(e.to_string())),
         }
     };
-    let met = match close && met.0 {
+    let refused = match close && met.0 {
         true => match conn.close() {
-            Ok(()) => met,
-            Err(e) => (false, Some(format!("the close failed: {e}"))),
+            Err(crate::LimboError::StatementsInProgress(_)) => None,
+            other => Some(format!("a close at the ending: {other:?}")),
         },
-        false => met,
+        false => None,
     };
     drop(statement);
-    met
+    let closed = match close && met.0 {
+        true => conn
+            .close()
+            .err()
+            .map(|e| format!("the close after the drop: {e}")),
+        false => None,
+    };
+    match (refused, closed) {
+        (None, None) => met,
+        (Some(e), _) | (None, Some(e)) => (false, Some(e)),
+    }
 }
 
 /// Whether `conn` can read the table `name`, as a prepared statement sees it.
@@ -4506,9 +4517,10 @@ fn commit_dropped_at(phase: &str, seed: u64, beside: &str) {
     commit_dropped_at_closing(phase, seed, beside, false)
 }
 
-/// [`commit_dropped_at`], the connection closed first if `close`, the `COMMIT` still holding its
-/// ending: the close leaves the commit to the statement, which finishes it whole as it drops, on
-/// the closed connection (the auditor's #4414). What it kept is read through another connection.
+/// [`commit_dropped_at`], if `close` with a close of the connection tried while the `COMMIT` holds
+/// its ending, refused with the connection left as it was, the statement then finishing the commit
+/// whole as it drops, and the connection closed after (the auditor's #4414, #4417). What it kept is
+/// read through another connection.
 fn commit_dropped_at_closing(phase: &str, seed: u64, beside: &str, close: bool) {
     let name = format!(
         "commit-ending-{phase}{}",
@@ -4526,12 +4538,6 @@ fn commit_dropped_at_closing(phase: &str, seed: u64, beside: &str, close: bool) 
     .unwrap();
     let writer = db.connect(ConnectOpts::new()).unwrap();
     let reader = db.connect(ConnectOpts::new()).unwrap();
-    // Closed, the writer's every step passes the VM's check of its connection, the one the
-    // finishing steps after the close must pass (a progress handler of one instruction that never
-    // interrupts).
-    if close {
-        writer.set_progress_handler(1, Some(Box::new(|| false)));
-    }
     let side = if beside == "TEMP" {
         "temp.side".to_string()
     } else {
@@ -4588,7 +4594,7 @@ fn a_commit_dropped_once_its_storage_ended_finishes_the_attached_databases_commi
 }
 
 #[test]
-fn a_commit_whose_connection_closes_once_its_storage_ended_finishes_the_attached_commit() {
+fn a_close_once_a_commits_storage_ended_is_refused_and_the_attached_commit_finishes() {
     commit_dropped_at_closing("attached", 658, "aux", true);
 }
 
@@ -4671,13 +4677,13 @@ fn a_create_table_dropped_at_its_ending_beside_a_scan_finishes_and_the_scan_read
     assert_eq!(state, (true, crate::connection::TransactionState::None));
 }
 
-/// A `CREATE TABLE` stepped into its commit's ending, then its connection closed before the
-/// statement drops: the close leaves the decided commit to the statement, which finishes it whole
-/// as it drops, on the closed connection; the table is in the shared schema for the connection
-/// left open and after a reopen (the auditor's #4414: before, the close rolled the connection's
-/// schema back under the ending and nothing published it).
+/// A close of a connection whose `CREATE TABLE` is at its commit's ending is refused, the connection
+/// left as it was; the statement then finishes the commit whole as it drops, the table is in the
+/// shared schema for the other connection and after a reopen, and the connection closes (the
+/// auditor's #4414, #4417: before, the close rolled the connection's schema back under the ending
+/// and returned, and nothing published the table).
 #[test]
-fn a_create_table_whose_connection_closes_at_its_ending_is_published_as_it_drops() {
+fn a_close_at_a_create_tables_ending_is_refused_and_the_commit_finishes_as_it_drops() {
     let crash = Arc::new(crate::io::crash::CrashIO::new(656));
     let io: Arc<dyn IO> = crash.clone();
     let path = "/db/ddl-ending-close";
@@ -4697,8 +4703,13 @@ fn a_create_table_whose_connection_closes_at_its_ending_is_published_as_it_drops
             Err(e) => break Err(e.to_string()),
         }
     };
-    let closed = writer.close().map_err(|e| e.to_string());
+    let refused = match writer.close() {
+        Err(crate::LimboError::StatementsInProgress(_)) => Ok(()),
+        other => Err(format!("{other:?}")),
+    };
+    let left = (writer.is_closed(), writer.get_tx_state());
     drop(statement);
+    let closed = writer.close().map_err(|e| e.to_string());
     let seen = sees(&reader, "made");
     drop((writer, reader, db));
     let reopened = open(&io, path);
@@ -4710,11 +4721,30 @@ fn a_create_table_whose_connection_closes_at_its_ending_is_published_as_it_drops
         Ok(()),
         "the statement never reached its commit's ending"
     );
-    assert_eq!(closed, Ok(()));
+    assert_eq!(
+        refused,
+        Ok(()),
+        "a close at a commit's ending was not refused"
+    );
+    assert_eq!(
+        left,
+        (
+            false,
+            crate::connection::TransactionState::Write {
+                schema_did_change: true
+            }
+        ),
+        "a refused close changed its connection"
+    );
+    assert_eq!(
+        closed,
+        Ok(()),
+        "the connection did not close once its commit had finished"
+    );
     assert_eq!(
         seen,
         Ok(()),
-        "a commit its connection's close left behind was not published"
+        "the commit a refused close left to its statement was not published"
     );
     assert_eq!(after_reopen, Ok(()));
 }

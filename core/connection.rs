@@ -509,7 +509,7 @@ pub struct Connection {
     pub(crate) atoll: Option<crate::storage::atoll::sql::mode::ConnTxn>,
     /// Whether a statement of the connection has begun to end its transaction in Atoll mode: the
     /// commit or rollback is decided and that statement's to finish, whole, as it steps, is reset
-    /// or drops (`vdbe::EndingBegun`); a close leaves it to it.
+    /// or drops (`vdbe::EndingBegun`); a close meanwhile is refused.
     pub(crate) atoll_ending_begun: AtomicBool,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -2543,19 +2543,24 @@ impl Connection {
         if self.is_closed() {
             return Ok(());
         }
-        self.closed.store(true, Ordering::SeqCst);
-        let pager = self.pager.load();
         // A transaction a statement has begun to end is that statement's to finish: its commit
         // publishes the schema it changed and ends the attached databases' transactions once its
-        // ending has ended, which a rollback here would have undone under it (the auditor's
-        // P1-DDL-END1).
-        let ending_begun = self.atoll_ending_begun.load(Ordering::Acquire);
+        // ending has ended, which a rollback here would undo under it. The close is refused, the
+        // connection left as it was, until the statement has finished or been reset or dropped (the
+        // auditor's P1-DDL-END1, #4417).
+        if self.atoll_ending_begun.load(Ordering::Acquire) {
+            return Err(LimboError::StatementsInProgress(
+                "a statement is ending the connection's transaction: step it to its end, reset it \
+                 or drop it before closing",
+            ));
+        }
+        self.closed.store(true, Ordering::SeqCst);
+        let pager = self.pager.load();
 
         match self.get_tx_state() {
             TransactionState::None => {
                 // No active transaction
             }
-            _ if ending_begun => {}
             _ => {
                 if self.mvcc_enabled() {
                     if let Some(mv_store) = self.mv_store().as_ref() {
@@ -2581,9 +2586,7 @@ impl Connection {
         if let Some(atoll) = self.atoll.as_ref() {
             drop(atoll.end(false));
         }
-        if !ending_begun {
-            self.index_methods_on_transaction_rolled_back();
-        }
+        self.index_methods_on_transaction_rolled_back();
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);

@@ -52,6 +52,7 @@ use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::ops::{Deref, DerefMut};
 
 #[cfg(test)]
@@ -172,8 +173,9 @@ enum Claimed {
     Refused,
     /// The step found the state held by another (an integrity check) and contends for it.
     Held,
-    /// What the step came to: its wait, done, or the failure it met.
-    Stepped(Result<IOResult<()>>),
+    /// What the step's unit came to: more ready, its wait, nothing more due, or the failure it
+    /// met.
+    Stepped(Result<Unit>),
 }
 
 /// Tells a writer whose claim runs the step on this thread what the step came to; a step on a
@@ -255,10 +257,11 @@ impl Task for CheckpointTask {
         drop(state);
         crate::race::point("checkpoint.let_go");
         let step = match &out {
-            Ok(IOResult::IO(IOCompletions(c))) if c.finished() => Step::Again,
-            Ok(IOResult::IO(IOCompletions(c))) => Step::Wait(c.clone()),
+            Ok(Unit::Again) => Step::Again,
+            Ok(Unit::Wait(c)) if c.finished() => Step::Again,
+            Ok(Unit::Wait(c)) => Step::Wait(c.clone()),
             // Nothing due now: a wake after the look, while this step runs, queues it again.
-            Ok(IOResult::Done(())) => Step::Idle(Watched::of(&[])),
+            Ok(Unit::Done) => Step::Idle(Watched::of(&[])),
             Err(_) => Step::Done,
         };
         tell_claimant(Claimed::Stepped(out));
@@ -421,6 +424,8 @@ struct Run {
     scan: CutScan,
     /// The metadata pages it writes: those dirty at the cut, then every one it edits.
     meta: BTreeSet<MetaId>,
+    /// The last metadata page whose write it started: the next is the one after it.
+    meta_at: Option<MetaId>,
     /// Roots of the trees whose creation the snapshot does not see: left out whole.
     set_aside: HashSet<PageId>,
     /// The pending pages still to image, and the value pages, judged once every node page is.
@@ -442,7 +447,12 @@ struct Run {
     mapped_roots: Vec<PageId>,
     intent: Option<Admitted>,
     intent_end: Option<Lsn>,
+    /// The metadata pages fetched to write, in their order.
     frames: Vec<MetaRef>,
+    /// What each metadata page asked to be written waits on, by its place in `frames`: its write,
+    /// or a hold or a change to end before its write starts.
+    writing: Vec<(usize, Completion)>,
+    /// The data files' syncs.
     waits: Vec<Completion>,
     written: Option<Completion>,
     superblock: Option<Superblock>,
@@ -452,14 +462,17 @@ struct Run {
 enum Phase {
     Gate,
     Cut,
+    Scan,
     Orphans,
     Images,
     Values,
     Intent,
+    IntentDurable,
     Meta,
     Durable,
     Superblock,
     After,
+    Erase,
 }
 
 /// The page being imaged.
@@ -546,14 +559,14 @@ impl Checkpointer {
         }
     }
 
-    /// Steps the state, timed. Whoever steps it wakes any waiter for a full checkpoint, and any
-    /// writer waiting for room, once it has let the state go ([`StateHold`]).
+    /// One unit of the state, timed. Whoever steps it wakes any waiter for a full checkpoint, and
+    /// any writer waiting for room, once it has let the state go ([`StateHold`]).
     fn stepping(
         &self,
         state: &mut StateHold<'_>,
         txns: &Transactions,
         until: Until<'_>,
-    ) -> Result<IOResult<()>> {
+    ) -> Result<Unit> {
         let clock = self.store.io();
         let began = clock.current_time_monotonic();
         #[cfg(test)]
@@ -567,6 +580,27 @@ impl Checkpointer {
         let moved = self.recorded(state);
         state.waiters_owed |= moved;
         out
+    }
+
+    /// Units of the state, held, until one waits or nothing more is due, or, for a writer refused
+    /// room, until the room takes it: a writer steps the checkpoint as far as it always has, a
+    /// unit at a time.
+    fn run_units(
+        &self,
+        state: &mut StateHold<'_>,
+        txns: &Transactions,
+        until: Until<'_>,
+    ) -> Result<IOResult<()>> {
+        loop {
+            if until.met(&self.pool) {
+                return Ok(IOResult::Done(()));
+            }
+            match self.stepping(state, txns, until)? {
+                Unit::Again => {}
+                Unit::Wait(c) => return Ok(IOResult::IO(IOCompletions(c))),
+                Unit::Done => return Ok(IOResult::Done(())),
+            }
+        }
     }
 
     /// What the state records of full checkpoints and failure, published for a transaction's end
@@ -782,7 +816,7 @@ impl Checkpointer {
         let Some(mut state) = self.try_hold() else {
             return Relieved::Held;
         };
-        let out = self.stepping(&mut state, txns, Until::Room(retry));
+        let out = self.run_units(&mut state, txns, Until::Room(retry));
         drop(state);
         Relieved::Stepped(match out {
             Err(e) => {
@@ -823,17 +857,25 @@ impl Checkpointer {
                 self.wake_driver();
                 return Ok(IOResult::Done(()));
             }
-            Stepper::Caller(task) => match self.claim(task) {
-                Claimed::Stepped(stepped) => return stepped,
-                // Another writer or holder steps it now: nothing is owed here.
-                Claimed::Refused | Claimed::Held => return Ok(IOResult::Done(())),
+            // Its units claimed one at a time, as far as they go now.
+            Stepper::Caller(task) => loop {
+                match self.claim(task) {
+                    Claimed::Stepped(Ok(Unit::Again)) => {}
+                    Claimed::Stepped(Ok(Unit::Wait(c))) => {
+                        return Ok(IOResult::IO(IOCompletions(c)))
+                    }
+                    Claimed::Stepped(Ok(Unit::Done)) => return Ok(IOResult::Done(())),
+                    Claimed::Stepped(Err(e)) => return Err(e),
+                    // Another writer or holder steps it now: nothing is owed here.
+                    Claimed::Refused | Claimed::Held => return Ok(IOResult::Done(())),
+                }
             },
             Stepper::Writer => {}
         }
         let Some(mut state) = self.try_hold() else {
             return Ok(IOResult::Done(()));
         };
-        let out = self.stepping(&mut state, txns, Until::Done);
+        let out = self.run_units(&mut state, txns, Until::Done);
         drop(state);
         out
     }
@@ -877,7 +919,7 @@ impl Checkpointer {
     pub(crate) fn cut_taken(&self) -> Option<u64> {
         let state = self.try_hold()?;
         let run = state.run.as_ref()?;
-        (!matches!(run.phase, Phase::Gate | Phase::Cut)).then_some(run.n)
+        (!matches!(run.phase, Phase::Gate | Phase::Cut | Phase::Scan)).then_some(run.n)
     }
 
     /// Asks for a full checkpoint: one begun after the ask, done. Step it with
@@ -906,7 +948,7 @@ impl Checkpointer {
             Err(released) => return Ok(IOResult::IO(IOCompletions(released))),
         };
         let stepped =
-            (state.full_done < ticket).then(|| self.stepping(&mut state, txns, Until::Done));
+            (state.full_done < ticket).then(|| self.run_units(&mut state, txns, Until::Done));
         let done = state.full_done >= ticket;
         drop(state);
         if let Some(IOResult::IO(io)) = stepped.transpose()? {
@@ -919,51 +961,85 @@ impl Checkpointer {
         })
     }
 
-    /// [`step_full`](Self::step_full) for a writer that claims the checkpoint's task: one step
-    /// a call, done once the full checkpoint `ticket` names is. A claim another writer's step
-    /// holds waits on the state's let-go, registered before the claim, which that writer's claim
-    /// finishes once its step has ended; so does a step that found the state held by another.
+    /// [`step_full`](Self::step_full) for a writer that claims the checkpoint's task: its units
+    /// claimed one at a time, as far as they go now, done once the full checkpoint `ticket` names
+    /// is. A claim another writer's step holds waits on the state's let-go, registered before the
+    /// claim, which that writer's claim finishes once its step has ended; so does a step that found
+    /// the state held by another. Registered again before each claim, since the writer's own
+    /// claims finish what it registered before.
     fn claim_full(&self, task: &TaskRef, ticket: u64) -> Result<IOResult<()>> {
         let done = |cp: &Self| cp.full_done.load(Ordering::Acquire) >= ticket;
         if done(self) {
             return Ok(IOResult::Done(()));
         }
-        crate::race::point("checkpoint.claiming");
-        let released = self.released.wait();
-        match self.claim(task) {
-            Claimed::Stepped(Err(e)) => Err(e),
-            Claimed::Stepped(Ok(IOResult::IO(io))) => Ok(IOResult::IO(io)),
-            Claimed::Stepped(Ok(IOResult::Done(()))) if done(self) => Ok(IOResult::Done(())),
-            Claimed::Refused if !task.is_over() => {
-                crate::race::point("checkpoint.claim_refused");
-                Ok(IOResult::IO(IOCompletions(released)))
-            }
-            Claimed::Held => Ok(IOResult::IO(IOCompletions(released))),
-            // A step that went as far as it could short of the full checkpoint, whose next call
-            // claims the next; or the task over (failed or closed) since the writer looked, its
-            // last claim's wakes perhaps before this wait was registered, whose next call steps
-            // the state.
-            Claimed::Stepped(Ok(IOResult::Done(()))) | Claimed::Refused => {
-                Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
-            }
+        loop {
+            crate::race::point("checkpoint.claiming");
+            let released = self.released.wait();
+            return match self.claim(task) {
+                Claimed::Stepped(Err(e)) => Err(e),
+                Claimed::Stepped(Ok(Unit::Wait(c))) => Ok(IOResult::IO(IOCompletions(c))),
+                Claimed::Stepped(Ok(Unit::Again | Unit::Done)) if done(self) => {
+                    Ok(IOResult::Done(()))
+                }
+                Claimed::Stepped(Ok(Unit::Again)) => continue,
+                Claimed::Refused if !task.is_over() => {
+                    crate::race::point("checkpoint.claim_refused");
+                    Ok(IOResult::IO(IOCompletions(released)))
+                }
+                Claimed::Held => Ok(IOResult::IO(IOCompletions(released))),
+                // Nothing more due short of the full checkpoint, whose next call claims the next
+                // unit; or the task over (failed or closed) since the writer looked, its last
+                // claim's wakes perhaps before this wait was registered, whose next call steps
+                // the state.
+                Claimed::Stepped(Ok(Unit::Done)) | Claimed::Refused => {
+                    Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
+                }
+            };
         }
+    }
+
+    /// One claim of the checkpoint's task, for a test: whether it stepped.
+    #[cfg(test)]
+    pub(crate) fn claim_one(&self) -> bool {
+        let task = self.task.get().expect("the checkpoint's task");
+        !matches!(self.claim(task), Claimed::Refused)
     }
 }
 
+/// What a unit of a checkpoint's work leaves (DESIGN.md 22.1).
+enum Unit {
+    /// Nothing more to do now: no checkpoint is due and nothing is left to erase.
+    Done,
+    /// A unit done, and the next ready now.
+    Again,
+    /// The next unit waits on this: a request in flight, a place in the flight set, or what a
+    /// step it depends on waits for.
+    Wait(Completion),
+}
+
+/// The value of a step that is done, or the unit's wait on what it handed back.
+macro_rules! unit {
+    ($e:expr) => {
+        match $e? {
+            IOResult::Done(v) => v,
+            IOResult::IO(IOCompletions(c)) => return Ok(Unit::Wait(c)),
+        }
+    };
+}
+
 impl State {
-    fn step(
-        &mut self,
-        cp: &Checkpointer,
-        txns: &Transactions,
-        until: Until<'_>,
-    ) -> Result<IOResult<()>> {
+    /// One unit of whatever is due: a checkpoint, begun once its share of the log is appended or
+    /// a full one is asked for, or, with none due, erasure. A checkpoint's last unit erases what
+    /// its frees let go, and says Done: one due again at once is begun by the next unit. A writer
+    /// refused room has nothing to do here with none under way.
+    fn step(&mut self, cp: &Checkpointer, txns: &Transactions, until: Until<'_>) -> Result<Unit> {
         if let Some(failed) = &self.failed {
             return Err(LimboError::InternalError(format!(
                 "a checkpoint failed ({failed}): none runs until the database is opened again"
             )));
         }
         if matches!(until, Until::Room(_)) && self.run.is_none() {
-            return Ok(IOResult::Done(()));
+            return Ok(Unit::Done);
         }
         if self.run.is_none() {
             let wanted = cp.full_wanted.load(Ordering::Acquire);
@@ -973,7 +1049,10 @@ impl State {
                 .saturating_sub(cp.began_at.load(Ordering::Acquire))
                 >= cp.budget / SHARES;
             if wanted <= self.full_done && !due {
-                return cp.store.erase_freed();
+                return Ok(match cp.store.erase_freed()? {
+                    IOResult::Done(()) => Unit::Done,
+                    IOResult::IO(IOCompletions(c)) => Unit::Wait(c),
+                });
             }
             cp.began_at.store(cp.log.end(), Ordering::Release);
             self.run = Some(Box::new(Run::new(
@@ -984,19 +1063,20 @@ impl State {
         let run = self.run.as_mut().expect("a checkpoint under way");
         let superblock = &self.superblock;
         let out = crate::storage::atoll::buffer::upkeep_scope(&mut self.upkeep, || {
-            run.step(cp, txns, superblock, until)
+            run.step(cp, txns, superblock)
         });
         match out {
-            Ok(IOResult::Done(())) if run.superblock.is_none() => Ok(IOResult::Done(())),
-            Ok(IOResult::Done(())) => {
+            // One checkpoint a step's run of units, as before them: one due again at once is the
+            // next step's.
+            Ok(Unit::Done) => {
                 let run = self.run.take().expect("a checkpoint under way");
                 self.superblock = run.superblock.expect("the checkpoint's superblock");
                 if let Some(full) = run.full {
                     self.full_done = self.full_done.max(full);
                 }
-                Ok(IOResult::Done(()))
+                Ok(Unit::Done)
             }
-            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Ok(unit) => Ok(unit),
             Err(e) => {
                 // A checkpoint that cannot finish leaves the one in charge in charge: the pages
                 // it wrote are named by no superblock. What it marked imaged and edited as it
@@ -1013,15 +1093,6 @@ impl State {
     }
 }
 
-macro_rules! done {
-    ($e:expr) => {
-        match $e? {
-            IOResult::Done(v) => v,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-        }
-    };
-}
-
 impl Run {
     fn new(n: u64, full: Option<u64>) -> Self {
         Self {
@@ -1035,6 +1106,7 @@ impl Run {
             heights: [[0; CLASS_COUNT]; TREES],
             scan: CutScan::default(),
             meta: BTreeSet::new(),
+            meta_at: None,
             set_aside: HashSet::new(),
             queue: VecDeque::new(),
             values: Vec::new(),
@@ -1049,6 +1121,7 @@ impl Run {
             intent: None,
             intent_end: None,
             frames: Vec::new(),
+            writing: Vec::new(),
             waits: Vec::new(),
             written: None,
             superblock: None,
@@ -1058,7 +1131,7 @@ impl Run {
     /// Lets go of what a checkpoint that cannot finish holds: the gate, the cuts, the snapshot,
     /// and the pages handed over to it.
     fn abandon(self, cp: &Checkpointer, txns: &Transactions) {
-        if self.phase == Phase::Gate || self.phase == Phase::Cut {
+        if matches!(self.phase, Phase::Gate | Phase::Cut | Phase::Scan) {
             cp.store.open_gate();
         }
         if cp.pool.cutting() == self.n {
@@ -1073,42 +1146,48 @@ impl Run {
         txns.release_checkpoint();
     }
 
+    /// One unit of the checkpoint (DESIGN.md 22.9 item 1): each phase is a cursor the next unit
+    /// goes on from. Done once its superblock is in charge, every free that waited for it is done
+    /// and the slots freed are erased.
     fn step(
         &mut self,
         cp: &Checkpointer,
         txns: &Transactions,
         in_charge: &Superblock,
-        until: Until<'_>,
-    ) -> Result<IOResult<()>> {
+    ) -> Result<Unit> {
         loop {
-            if until.met(&cp.pool) {
-                return Ok(IOResult::Done(()));
-            }
             match self.phase {
                 Phase::Gate => {
-                    if let IOResult::IO(io) = cp.store.close_gate() {
-                        return Ok(IOResult::IO(io));
+                    if let IOResult::IO(IOCompletions(c)) = cp.store.close_gate() {
+                        return Ok(Unit::Wait(c));
                     }
                     // Before the cut: a page handed over once it is in effect, a value's page an
                     // image may name, waits for the next checkpoint.
                     self.orphans = cp.store.take_orphans();
                     self.phase = Phase::Cut;
+                    return Ok(Unit::Again);
                 }
                 Phase::Cut => {
-                    let (l, c) = done!(txns.cut(&mut self.cut));
+                    let (l, c) = unit!(txns.cut(&mut self.cut));
                     self.l = l;
                     self.c = c;
                     self.clock = txns.clock_now();
                     txns.hold_checkpoint(c);
-                    if let IOResult::IO(io) = cp.pool.begin_cut(self.n, &mut self.scan) {
-                        return Ok(IOResult::IO(io));
+                    self.phase = Phase::Scan;
+                    return Ok(Unit::Again);
+                }
+                Phase::Scan => {
+                    if let IOResult::IO(IOCompletions(c)) =
+                        cp.pool.begin_cut(self.n, &mut self.scan)
+                    {
+                        return Ok(Unit::Wait(c));
                     }
                     let (dirty, heights) = cp.store.begin_cut(self.n);
                     cp.store.open_gate();
                     self.heights = heights;
                     self.meta.extend(dirty);
                     for (root, slot, start) in cp.store.creations() {
-                        if txns.committed_by(slot, start, c) {
+                        if txns.committed_by(slot, start, self.c) {
                             self.mapped_roots.push(root);
                         } else {
                             self.set_aside.insert(root);
@@ -1116,86 +1195,82 @@ impl Run {
                     }
                     self.queue = std::mem::take(&mut self.scan.owed).into_iter().collect();
                     self.phase = Phase::Orphans;
+                    return Ok(Unit::Again);
                 }
                 Phase::Orphans => {
-                    while let Some(&pid) = self.orphans.last() {
-                        // Named by nothing: free as of the cut, and freed as it stands. Marked
-                        // left out only once its edit is made, so a yield in the edit makes it
-                        // again.
-                        if !self.freed.contains(&pid) {
-                            let edited = done!(cp.store.left_out(self.n, &self.heights, pid));
-                            self.meta.extend(edited);
-                            self.freed.insert(pid);
-                        }
-                        done!(cp.pool.free_orphan(pid));
-                        self.orphans.pop();
+                    let Some(&pid) = self.orphans.last() else {
+                        self.phase = Phase::Images;
+                        continue;
+                    };
+                    // Named by nothing: free as of the cut, and freed as it stands. Marked left
+                    // out only once its edit is made, so a wait in the edit makes it again.
+                    if !self.freed.contains(&pid) {
+                        let edited = unit!(cp.store.left_out(self.n, &self.heights, pid));
+                        self.meta.extend(edited);
+                        self.freed.insert(pid);
+                        return Ok(Unit::Again);
                     }
-                    self.phase = Phase::Images;
+                    unit!(cp.pool.free_orphan(pid));
+                    self.orphans.pop();
+                    return Ok(Unit::Again);
                 }
-                Phase::Images => {
-                    if done!(self.image_pages(cp, txns, false, until)) {
+                Phase::Images => match self.image_unit(cp, txns, false)? {
+                    Unit::Done => {
                         debug_assert!(self.early.is_empty(), "a page imaged early still queued");
                         self.queue = std::mem::take(&mut self.values).into_iter().collect();
                         self.phase = Phase::Values;
                     }
-                }
-                Phase::Values => {
-                    if done!(self.image_pages(cp, txns, true, until)) {
+                    unit => return Ok(unit),
+                },
+                Phase::Values => match self.image_unit(cp, txns, true)? {
+                    Unit::Done => {
                         cp.pool.end_cut(self.n);
                         self.phase = Phase::Intent;
+                        return Ok(Unit::Again);
                     }
-                }
+                    unit => return Ok(unit),
+                },
                 Phase::Intent => {
-                    if self.intent_end.is_none() {
-                        let payload = self.intent_payload();
-                        let admitted = match &mut self.intent {
-                            Some(a) => a,
-                            None => self
-                                .intent
-                                .insert(done!(cp.log.admit(framed_len(payload.len())))),
-                        };
-                        let header = Header {
-                            kind: META_INTENT,
-                            flags: 0,
-                            txn: 0,
-                            prev: None,
-                        };
-                        let end = cp.log.append(admitted, &header, &[&payload]);
-                        self.intent = None;
-                        self.intent_end = Some(end);
+                    // Its size checked before anything is built: a record past the log's buffer
+                    // is never admitted.
+                    let len = framed_len(8 + 8 * self.meta.len());
+                    if len > cp.log.buffer_bytes() {
+                        return Err(LimboError::InternalError(format!(
+                            "checkpoint {} writes {} metadata pages: its intent record, {len} \
+                             bytes, is past the log's buffer of {} bytes",
+                            self.n,
+                            self.meta.len(),
+                            cp.log.buffer_bytes()
+                        )));
                     }
-                    done!(cp.log.wait_durable(self.intent_end.expect("appended")));
+                    let admitted = match &mut self.intent {
+                        Some(a) => a,
+                        None => self.intent.insert(unit!(cp.log.admit(len))),
+                    };
+                    let header = Header {
+                        kind: META_INTENT,
+                        flags: 0,
+                        txn: 0,
+                        prev: None,
+                    };
+                    let payload = intent_payload(self.n, &self.meta);
+                    let end = cp.log.append(admitted, &header, &[&payload]);
+                    self.intent = None;
+                    self.intent_end = Some(end);
+                    self.phase = Phase::IntentDurable;
+                    return Ok(Unit::Again);
+                }
+                Phase::IntentDurable => {
+                    unit!(cp.log.wait_durable(self.intent_end.expect("appended")));
                     self.phase = Phase::Meta;
+                    return Ok(Unit::Again);
                 }
-                Phase::Meta => {
-                    if self.frames.is_empty() && !self.meta.is_empty() {
-                        let ids: Vec<MetaId> = self.meta.iter().copied().collect();
-                        self.frames = done!(cp.store.meta().get_all(&ids));
-                    }
-                    done!(wait_all(&mut self.waits));
-                    // Every page asked until it is written for `n`: a wait other than its write's
-                    // (a hold to end, a change settling under the look) writes nothing, and a page
-                    // left unwritten stays dirty with no later checkpoint naming it.
-                    for frame in &self.frames {
-                        if let Some(c) = cp.store.meta().write_for(frame, self.n)? {
-                            self.waits.push(c);
-                        }
-                    }
-                    if let Some(c) = self.waits.iter().find(|c| !c.finished()) {
-                        return Ok(IOResult::IO(IOCompletions(c.clone())));
-                    }
-                    if let Some(c) = self.waits.first() {
-                        // Only yields: the page's holder or changer runs before the next ask.
-                        return Ok(IOResult::IO(IOCompletions(c.clone())));
-                    }
-                    cp.store.meta().end_cut(self.n, &self.frames);
-                    self.waits = cp.store.sync_data_files()?;
-                    self.phase = Phase::Durable;
-                }
+                Phase::Meta => return self.meta_unit(cp),
                 Phase::Durable => {
-                    done!(wait_all(&mut self.waits));
-                    done!(cp.log.wait_durable(cp.log.end()));
+                    unit!(wait_all(&mut self.waits));
+                    unit!(cp.log.wait_durable(cp.log.end()));
                     self.phase = Phase::Superblock;
+                    return Ok(Unit::Again);
                 }
                 Phase::Superblock => {
                     let sb = self.superblock.get_or_insert_with(|| {
@@ -1217,54 +1292,89 @@ impl Run {
                             ..in_charge.clone()
                         }
                     });
-                    done!(cp.control.step_write(sb, &mut self.written));
+                    unit!(cp.control.step_write(sb, &mut self.written));
                     cp.store.meta().checkpointed(self.n, &self.frames);
                     cp.published
                         .replace(Some(Arc::new(sb.clone())), &cp.releasing);
                     self.phase = Phase::After;
+                    return Ok(Unit::Again);
                 }
                 Phase::After => {
-                    done!(cp.store.after(self.n));
+                    unit!(cp.store.after(self.n));
                     for root in self.mapped_roots.drain(..) {
                         cp.store.forget_creation(root);
                     }
                     cp.log.release_before(self.l)?;
                     txns.release_checkpoint();
-                    return cp.store.erase_freed();
+                    self.phase = Phase::Erase;
+                    return Ok(Unit::Again);
+                }
+                Phase::Erase => {
+                    unit!(cp.store.erase_freed());
+                    return Ok(Unit::Done);
                 }
             }
         }
     }
 
-    /// The intent record's payload: the checkpoint's number, then each metadata page's id.
-    fn intent_payload(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 8 * self.meta.len());
-        out.extend_from_slice(&self.n.to_le_bytes());
-        for id in &self.meta {
-            out.extend_from_slice(&id.pid().raw().to_le_bytes());
+    /// One unit of the metadata's writes, the pages taken in their order: a write that ended
+    /// asked again, or the next page fetched and its write started, each held to [`WRITES`] in
+    /// flight. Every page is asked until it is written for this checkpoint: a wait other than its
+    /// write's (a hold to end, a change settling under the look) writes nothing, and a page left
+    /// unwritten would stay dirty with no later cut naming it. Once every page is, the data files'
+    /// syncs start.
+    fn meta_unit(&mut self, cp: &Checkpointer) -> Result<Unit> {
+        if let Some(i) = self.writing.iter().position(|(_, c)| c.finished()) {
+            let (at, c) = self.writing.swap_remove(i);
+            if let Some(e) = c.get_error() {
+                return Err(LimboError::CompletionError(e));
+            }
+            if let Some(c) = cp.store.meta().write_for(&self.frames[at], self.n)? {
+                self.writing.push((at, c));
+            }
+            return Ok(Unit::Again);
         }
-        out
+        if self.writing.len() >= WRITES {
+            return Ok(Unit::Wait(self.writing[0].1.clone()));
+        }
+        let next = match self.meta_at {
+            None => self.meta.iter().next(),
+            Some(at) => self.meta.range((Excluded(at), Unbounded)).next(),
+        }
+        .copied();
+        let Some(id) = next else {
+            if let Some((_, c)) = self.writing.first() {
+                return Ok(Unit::Wait(c.clone()));
+            }
+            cp.store.meta().end_cut(self.n, &self.frames);
+            self.waits = cp.store.sync_data_files()?;
+            self.phase = Phase::Durable;
+            return Ok(Unit::Again);
+        };
+        let frame = unit!(cp.store.meta().get(id));
+        self.meta_at = Some(id);
+        let at = self.frames.len();
+        self.frames.push(frame);
+        if let Some(c) = cp.store.meta().write_for(&self.frames[at], self.n)? {
+            self.writing.push((at, c));
+        }
+        Ok(Unit::Again)
     }
 
-    /// Images the queue's pages: node pages, the value pages put aside for later, or, with
-    /// `values`, value pages, written only where an image names them. Done once every write has
-    /// landed and been named in the page table.
-    fn image_pages(
-        &mut self,
-        cp: &Checkpointer,
-        txns: &Transactions,
-        values: bool,
-        until: Until<'_>,
-    ) -> Result<IOResult<bool>> {
+    /// One unit of imaging the queue's pages (DESIGN.md 22.9 item 1): node pages, the value pages
+    /// put aside for later, or, with `values`, value pages, written only where an image names
+    /// them. A unit lands one write that ended, or takes one page's source, or builds one image,
+    /// or reads one directory page of a value an image names, or starts one image's write: the
+    /// flight set stays as full as its limits allow, and the unit waits only for a place in it, or
+    /// for its last writes. Done once every page is imaged and every write has landed.
+    fn image_unit(&mut self, cp: &Checkpointer, txns: &Transactions, values: bool) -> Result<Unit> {
+        if unit!(self.land_one(cp)) {
+            return Ok(Unit::Again);
+        }
         loop {
-            done!(self.land(cp));
-            if self.imaging.is_none() && until.met(&cp.pool) {
-                return Ok(IOResult::Done(false));
-            }
-            if self.imaging.is_none() {
+            let Some(imaging) = self.imaging.as_mut() else {
                 if self.flying.len() >= WRITES {
-                    let c = self.flying[0].landed.clone();
-                    return Ok(IOResult::IO(IOCompletions(c)));
+                    return Ok(Unit::Wait(self.flying[0].landed.clone()));
                 }
                 // While a writer waits for room, a kept copy first: imaging it gives its room
                 // back. Only node pages are kept, so only among the node pages.
@@ -1279,11 +1389,10 @@ impl Run {
                     }
                     None => {
                         let Some(pid) = self.queue.pop_front() else {
-                            if self.flying.is_empty() {
-                                return Ok(IOResult::Done(true));
-                            }
-                            let c = self.flying[0].landed.clone();
-                            return Ok(IOResult::IO(IOCompletions(c)));
+                            return Ok(match self.flying.first() {
+                                None => Unit::Done,
+                                Some(f) => Unit::Wait(f.landed.clone()),
+                            });
                         };
                         if self.early.remove(&pid) {
                             continue;
@@ -1300,20 +1409,20 @@ impl Run {
                     // snapshot reaches.
                     match cp.store.left_out(self.n, &self.heights, pid)? {
                         IOResult::Done(edited) => self.meta.extend(edited),
-                        IOResult::IO(io) => {
+                        IOResult::IO(IOCompletions(c)) => {
                             self.queue.push_front(pid);
-                            return Ok(IOResult::IO(io));
+                            return Ok(Unit::Wait(c));
                         }
                     }
-                    continue;
+                    return Ok(Unit::Again);
                 }
                 let source = match kept {
                     Some(copy) => Source::Kept(copy),
                     None => match cp.pool.image_source(self.n, pid)? {
                         IOResult::Done(s) => s,
-                        IOResult::IO(io) => {
+                        IOResult::IO(IOCompletions(c)) => {
                             self.queue.push_front(pid);
-                            return Ok(IOResult::IO(io));
+                            return Ok(Unit::Wait(c));
                         }
                     },
                 };
@@ -1324,8 +1433,8 @@ impl Run {
                     image: None,
                     refs: None,
                 });
-            }
-            let imaging = self.imaging.as_mut().expect("a page being imaged");
+                return Ok(Unit::Again);
+            };
             let pid = imaging.pid;
             let bytes: &[u8] = match &imaging.source {
                 Source::Kept(b) => b,
@@ -1356,28 +1465,30 @@ impl Run {
                     }
                     if self.set_aside.contains(&v.root()) {
                         // A tree whose creation the snapshot does not see: left out whole.
-                        let edited = done!(cp.store.left_out(self.n, &self.heights, pid));
+                        let edited = unit!(cp.store.left_out(self.n, &self.heights, pid));
                         self.meta.extend(edited);
                         self.imaging = None;
-                        continue;
+                        return Ok(Unit::Again);
                     }
                     if v.is_leaf() && v.reserving() {
                         let as_of = match &mut imaging.as_of {
                             Some(a) => a,
                             None => imaging.as_of.insert(AsOf::new(bytes, self.c)?),
                         };
-                        done!(as_of.step(txns, &cp.pool));
+                        unit!(as_of.step(txns, &cp.pool));
                         let as_of = imaging.as_of.take().expect("judged");
                         let adoptable = as_of.adoptable();
                         let image = as_of.image()?;
                         let settles = live.filter(|_| adoptable || image.as_slice() == bytes);
                         imaging.image = Some((image, settles));
-                    } else {
-                        imaging.image = Some((bytes.to_vec(), live));
+                        // The arena pages its versions reach were this unit's.
+                        return Ok(Unit::Again);
                     }
+                    imaging.image = Some((bytes.to_vec(), live));
                 }
             }
-            // The values the image names: their pages are mapped with it.
+            // The values the image names: their pages are mapped with it, a directory page a
+            // unit.
             let (image, _) = imaging.image.as_ref().expect("built");
             let v = View::new(image.as_slice());
             if v.is_node() && v.is_leaf() {
@@ -1399,8 +1510,8 @@ impl Run {
                         imaging.refs.insert((refs, 0))
                     }
                 };
-                while refs.1 < refs.0.len() {
-                    let pages = match done!(value::pages(&cp.pool, refs.0[refs.1], &|| true)) {
+                if let Some(&reference) = refs.0.get(refs.1) {
+                    let pages = match unit!(value::pages(&cp.pool, reference, &|| true)) {
                         Ok(pages) => pages,
                         Err(_) => {
                             return Err(LimboError::Corrupt(format!(
@@ -1410,119 +1521,139 @@ impl Run {
                     };
                     self.named.extend(pages);
                     refs.1 += 1;
+                    if reference.directory() {
+                        // Its directory page was read: this unit's.
+                        return Ok(Unit::Again);
+                    }
+                    continue;
                 }
             }
-            // Its write buffer joins the writes in flight only within their bytes, one always
-            // going: a large page's writes go fewer at once.
-            let len = self
-                .imaging
-                .as_ref()
-                .and_then(|i| i.image.as_ref())
-                .map_or(0, |i| i.0.len());
-            if !self.flying.is_empty() && self.flying_bytes + len > cp.write_bytes {
-                let c = self.flying[0].landed.clone();
-                return Ok(IOResult::IO(IOCompletions(c)));
-            }
-            let imaging = self.imaging.take().expect("a page being imaged");
-            let source_bytes = match &imaging.source {
-                Source::Live { bytes, .. } => bytes.len(),
-                // Charged to the room for kept copies, not to the checkpoint.
-                Source::Kept(_) => 0,
-            };
-            let (mut image, settles) = imaging.image.expect("built");
-            // The write buffer of a node page is a frame lent from the pool, given back once the
-            // write lands. A value page's, of a class a small pool holds one frame of, is not.
-            let lent = pid.class().index() <= node::MAX_CLASS;
-            let block = match lent {
-                false => IOResult::Done(AlignedBlock::zeroed(pid.class().size())),
-                true => cp.pool.lease_image(pid.class())?,
-            };
-            let block = match block {
-                IOResult::Done(b) => b,
-                IOResult::IO(io) => {
-                    // The image stays built.
-                    self.imaging = Some(Imaging {
-                        image: Some((image, settles)),
-                        ..imaging
-                    });
-                    return Ok(IOResult::IO(io));
-                }
-            };
-            let slot = match cp.store.take_copy_slot(pid.class())? {
-                IOResult::Done(s) => s,
-                IOResult::IO(io) => {
-                    // The image stays built; its frame goes back meanwhile.
-                    drop(block);
-                    self.imaging = Some(Imaging {
-                        image: Some((image, settles)),
-                        ..imaging
-                    });
-                    return Ok(IOResult::IO(io));
-                }
-            };
-            page::seal(&mut image[..], pid);
-            let block = Arc::new(block);
-            let buffer = block.region(0, image.len());
-            buffer.as_mut_slice().copy_from_slice(&image);
-            // The most it holds: the source, the image and every write buffer, this one's too.
-            self.flying_bytes += image.len();
-            let counters = &cp.counters;
-            counters.working_peak.fetch_max(
-                source_bytes + image.len() + self.flying_bytes,
-                Ordering::AcqRel,
-            );
-            counters
-                .flying_peak
-                .fetch_max(self.flying_bytes, Ordering::AcqRel);
-            counters.pages.fetch_add(1, Ordering::Relaxed);
-            counters
-                .bytes
-                .fetch_add(image.len() as u64, Ordering::Relaxed);
-            let landed = crate::storage::atoll::notify::wait();
-            let failed = Arc::new(Mutex::new(None));
-            let (ends, fails) = (landed.clone(), failed.clone());
-            // Its end is told through `landed`: the write's own completion stays the IO's.
-            drop(cp.store.write_slot(pid.class(), slot, buffer, move |res| {
-                *fails.lock() = res.err();
-                ends.complete(0);
-            })?);
-            self.flying.push(Flying {
-                pid,
-                slot,
-                landed,
-                failed,
-                bytes: image.len(),
-                settles,
-                edited: false,
-            });
+            return self.start_write(cp);
         }
     }
 
-    /// Names in the page table every image write that has landed; fails on one that failed.
-    fn land(&mut self, cp: &Checkpointer) -> Result<IOResult<()>> {
-        let mut i = 0;
-        while i < self.flying.len() {
-            let f = &mut self.flying[i];
-            if !f.landed.finished() {
-                i += 1;
-                continue;
-            }
-            if let Some(e) = *f.failed.lock() {
-                return Err(LimboError::CompletionError(e));
-            }
-            if !f.edited {
-                let edited = done!(cp.store.copied(self.n, &self.heights, f.pid, f.slot));
-                self.meta.extend(edited);
-                f.edited = true;
-                if let Some(count) = f.settles {
-                    cp.pool.settled(f.pid, count);
-                }
-            }
-            self.flying_bytes -= f.bytes;
-            self.flying.swap_remove(i);
+    /// Starts the write of the image built, within the flight set's bytes, one always going: a
+    /// large page's writes go fewer at once.
+    fn start_write(&mut self, cp: &Checkpointer) -> Result<Unit> {
+        let len = self
+            .imaging
+            .as_ref()
+            .and_then(|i| i.image.as_ref())
+            .map_or(0, |i| i.0.len());
+        if !self.flying.is_empty() && self.flying_bytes + len > cp.write_bytes {
+            return Ok(Unit::Wait(self.flying[0].landed.clone()));
         }
-        Ok(IOResult::Done(()))
+        let imaging = self.imaging.take().expect("a page being imaged");
+        let pid = imaging.pid;
+        let source_bytes = match &imaging.source {
+            Source::Live { bytes, .. } => bytes.len(),
+            // Charged to the room for kept copies, not to the checkpoint.
+            Source::Kept(_) => 0,
+        };
+        let (mut image, settles) = imaging.image.expect("built");
+        // The write buffer of a node page is a frame lent from the pool, given back once the
+        // write lands. A value page's, of a class a small pool holds one frame of, is not.
+        let lent = pid.class().index() <= node::MAX_CLASS;
+        let block = match lent {
+            false => IOResult::Done(AlignedBlock::zeroed(pid.class().size())),
+            true => cp.pool.lease_image(pid.class())?,
+        };
+        let block = match block {
+            IOResult::Done(b) => b,
+            IOResult::IO(IOCompletions(c)) => {
+                // The image stays built.
+                self.imaging = Some(Imaging {
+                    image: Some((image, settles)),
+                    ..imaging
+                });
+                return Ok(Unit::Wait(c));
+            }
+        };
+        let slot = match cp.store.take_copy_slot(pid.class())? {
+            IOResult::Done(s) => s,
+            IOResult::IO(IOCompletions(c)) => {
+                // The image stays built; its frame goes back meanwhile.
+                drop(block);
+                self.imaging = Some(Imaging {
+                    image: Some((image, settles)),
+                    ..imaging
+                });
+                return Ok(Unit::Wait(c));
+            }
+        };
+        page::seal(&mut image[..], pid);
+        let block = Arc::new(block);
+        let buffer = block.region(0, image.len());
+        buffer.as_mut_slice().copy_from_slice(&image);
+        // The most it holds: the source, the image and every write buffer, this one's too.
+        self.flying_bytes += image.len();
+        let counters = &cp.counters;
+        counters.working_peak.fetch_max(
+            source_bytes + image.len() + self.flying_bytes,
+            Ordering::AcqRel,
+        );
+        counters
+            .flying_peak
+            .fetch_max(self.flying_bytes, Ordering::AcqRel);
+        counters.pages.fetch_add(1, Ordering::Relaxed);
+        counters
+            .bytes
+            .fetch_add(image.len() as u64, Ordering::Relaxed);
+        let landed = crate::storage::atoll::notify::wait();
+        let failed = Arc::new(Mutex::new(None));
+        let (ends, fails) = (landed.clone(), failed.clone());
+        // Its end is told through `landed`: the write's own completion stays the IO's.
+        drop(cp.store.write_slot(pid.class(), slot, buffer, move |res| {
+            *fails.lock() = res.err();
+            ends.complete(0);
+        })?);
+        self.flying.push(Flying {
+            pid,
+            slot,
+            landed,
+            failed,
+            bytes: image.len(),
+            settles,
+            edited: false,
+        });
+        Ok(Unit::Again)
     }
+
+    /// Names in the page table one image write that has landed, its place in the flight set
+    /// freed: whether there was one. Fails on one that failed.
+    fn land_one(&mut self, cp: &Checkpointer) -> Result<IOResult<bool>> {
+        let Some(i) = self.flying.iter().position(|f| f.landed.finished()) else {
+            return Ok(IOResult::Done(false));
+        };
+        let f = &mut self.flying[i];
+        if let Some(e) = *f.failed.lock() {
+            return Err(LimboError::CompletionError(e));
+        }
+        if !f.edited {
+            let edited = match cp.store.copied(self.n, &self.heights, f.pid, f.slot)? {
+                IOResult::Done(edited) => edited,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            self.meta.extend(edited);
+            f.edited = true;
+            if let Some(count) = f.settles {
+                cp.pool.settled(f.pid, count);
+            }
+        }
+        self.flying_bytes -= f.bytes;
+        self.flying.swap_remove(i);
+        Ok(IOResult::Done(true))
+    }
+}
+
+/// The intent record's payload: the checkpoint's number, then each metadata page's id.
+fn intent_payload(n: u64, meta: &BTreeSet<MetaId>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 8 * meta.len());
+    out.extend_from_slice(&n.to_le_bytes());
+    for id in meta {
+        out.extend_from_slice(&id.pid().raw().to_le_bytes());
+    }
+    out
 }
 
 /// The bytes before a value reference in an entry out of line: a versioned tree's head.

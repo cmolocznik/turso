@@ -80,6 +80,11 @@ impl ValueRef {
     fn chunks(&self) -> Option<usize> {
         (self.len as usize > chunk()).then(|| (self.len as usize).div_ceil(chunk()))
     }
+
+    /// Whether its pages are named by a directory page, which [`pages`] reads.
+    pub(crate) fn directory(&self) -> bool {
+        self.chunks().is_some()
+    }
 }
 
 /// The classes of the pages a value of `len` bytes takes: the page or directory, then the chunks.

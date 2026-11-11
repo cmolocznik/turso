@@ -707,3 +707,36 @@ fn a_growth_or_erasure_finding_another_under_way_waits_for_its_let_go() {
         );
     }
 }
+
+/// A step of the checkpoint's task is one unit of its work (DESIGN.md 22.1, 22.9 item 1): on a
+/// backend whose writes land inline, a step images at most one page, where one step once imaged
+/// every page owed, and the checkpoint still ends with every changed page imaged.
+#[test]
+fn a_step_of_the_checkpoints_task_images_at_most_one_page() {
+    const PAGES: u64 = 64;
+    let db = Db::open();
+    let roots: Vec<PageId> = (0..PAGES).map(|_| db.node()).collect();
+    db.checkpoint();
+    for (i, &root) in roots.iter().enumerate() {
+        db.change(root, &(i as u64).to_le_bytes());
+    }
+    let cp = db.db.checkpointer();
+    let in_charge = cp.superblock().checkpoint;
+    cp.request_full();
+    let imaged = cp.stats().pages;
+    let (mut steps, mut most) = (0u64, 0u64);
+    while cp.superblock().checkpoint == in_charge {
+        let before = cp.stats().pages;
+        assert!(cp.claim_one(), "a claim refused with no other stepper");
+        most = most.max(cp.stats().pages - before);
+        steps += 1;
+        assert!(steps < 1 << 20, "the checkpoint did not end");
+    }
+    let pages = cp.stats().pages - imaged;
+    assert!(
+        pages >= PAGES,
+        "{pages} pages imaged of the {PAGES} changed"
+    );
+    assert_eq!(most, 1, "a step imaged {most} pages");
+    assert!(steps > pages, "{steps} steps imaged {pages} pages");
+}

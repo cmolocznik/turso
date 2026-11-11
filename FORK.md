@@ -1530,6 +1530,15 @@ memories with identical text its rows grew with the population. An inspection re
 counts and whether a probed term is in each term dictionary, so a test can show an erased
 document's term gone after OPTIMIZE INDEX.
 
+2026-11-11, last: a term query's score is deterministic. The pruning scorers add a document's term
+scores in whatever order they meet them, and f32 addition is not associative, so three or more
+terms could differ by an ulp from a sum in any fixed order. The selection now keeps every hit within
+a slack (1e-5 relative) of the lowest kept score, scores the kept hits again as the f32 sum of each
+term's score (a term query of its own under the same statistics) in clause order (the `must` terms
+as given, then the `should` terms as given, repeats dropped), and cuts by that score, then the tie
+key. Proof: `many_term_queries_sum_in_clause_order_bit_for_bit`, 3 to 12 terms against an f32
+oracle built on Tantivy's `Bm25Weight`.
+
 ## Taken upstream
 
 ### An index method's LIMIT applied before an aggregate or DISTINCT

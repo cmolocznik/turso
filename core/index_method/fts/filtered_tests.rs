@@ -839,6 +839,136 @@ fn equal_scores_are_cut_by_the_tie_key_to_exactly_the_limit() {
     assert_eq!(ids, vec![3, 4, 5], "rowid orders ties without a tie field");
 }
 
+/// The store's oracle for a term query, in f32 exactly as Tantivy computes
+/// it: each term's BM25 score from `Bm25Weight` under the admitted set's
+/// statistics, summed in clause order (the `must` terms as given, then the
+/// `should` terms as given), equal scores cut by the tie key.
+fn oracle_clause_order(
+    docs: &StdHashMap<i64, Doc>,
+    filter: &F,
+    must: &[usize],
+    should: &[usize],
+    limit: usize,
+) -> Vec<(f32, i64)> {
+    use tantivy::fieldnorm::FieldNormReader;
+    use tantivy::query::Bm25Weight;
+    let admitted: Vec<(&i64, &Doc)> = docs
+        .iter()
+        .filter(|(id, d)| filter.admits(**id, d))
+        .collect();
+    if admitted.is_empty() {
+        return Vec::new();
+    }
+    let norm = |len: usize| FieldNormReader::fieldnorm_to_id(len as u32);
+    let total: u64 = admitted
+        .iter()
+        .map(|(_, d)| u64::from(FieldNormReader::id_to_fieldnorm(norm(d.words.len()))))
+        .sum();
+    let n = admitted.len() as u64;
+    let average = total as f32 / n as f32;
+    let mut clauses: Vec<usize> = Vec::new();
+    for &t in must.iter().chain(should) {
+        if !clauses.contains(&t) {
+            clauses.push(t);
+        }
+    }
+    let weights: Vec<Bm25Weight> = clauses
+        .iter()
+        .map(|t| {
+            let df = admitted.iter().filter(|(_, d)| d.words.contains(t)).count() as u64;
+            Bm25Weight::for_one_term(df, n, average)
+        })
+        .collect();
+    let mut scored: Vec<(f32, i64)> = Vec::new();
+    for (id, doc) in &admitted {
+        if must.iter().any(|t| !doc.words.contains(t)) {
+            continue;
+        }
+        let mut score = 0.0f32;
+        let mut matched = false;
+        for (t, weight) in clauses.iter().zip(&weights) {
+            let tf = doc.words.iter().filter(|&w| w == t).count() as u32;
+            if tf > 0 {
+                matched = true;
+                score += weight.score(norm(doc.words.len()), tf);
+            }
+        }
+        if matched {
+            scored.push((score, **id));
+        }
+    }
+    let tie = |id: &i64| u128::from_be_bytes(docs[id].tie);
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(tie(&a.1).cmp(&tie(&b.1))));
+    scored.truncate(limit);
+    scored
+}
+
+/// Term queries of 3 to 12 terms score bit for bit as the f32 sum of their
+/// terms' scores in clause order, and cut by that score then the tie key:
+/// the rows equal the oracle's exactly, in WAL and MVCC, across segments and
+/// after a merge.
+#[test]
+fn many_term_queries_sum_in_clause_order_bit_for_bit() {
+    for mvcc in [false, true] {
+        let mut rng = Rng(0xA11CE ^ u64::from(mvcc));
+        let (_dir, _db, conn) = open(mvcc);
+        let mut docs: StdHashMap<i64, Doc> = StdHashMap::new();
+        for batch in 0..5i64 {
+            let rows: Vec<(i64, Doc)> = (batch * 80 + 1..=batch * 80 + 80)
+                .map(|id| (id, random_doc(&mut rng)))
+                .collect();
+            conn.execute(insert_sql(&rows)).unwrap();
+            docs.extend(rows);
+        }
+        let mut checked = 0;
+        let mut rows_seen = 0;
+        for round in 0..2 {
+            if round == 1 {
+                conn.execute("OPTIMIZE INDEX docs_fts").unwrap();
+            }
+            for _ in 0..60 {
+                let count = 3 + rng.below(10) as usize;
+                let mut terms: Vec<usize> = Vec::new();
+                while terms.len() < count {
+                    let t = rng.below(VOCAB as u64) as usize;
+                    if !terms.contains(&t) {
+                        terms.push(t);
+                    }
+                }
+                let must: Vec<usize> = if rng.below(4) == 0 {
+                    vec![terms[0]]
+                } else {
+                    Vec::new()
+                };
+                let should: Vec<usize> = terms[must.len()..].to_vec();
+                let filter = random_filter(&mut rng, 0);
+                let limit = [1usize, 5, 10, 50][rng.below(4) as usize];
+                let got: Vec<(f32, i64)> =
+                    filtered_terms(&conn, &should, &must, &filter.json(), limit as i64)
+                        .into_iter()
+                        .map(|(score, id)| (score as f32, id))
+                        .collect();
+                let want = oracle_clause_order(&docs, &filter, &must, &should, limit);
+                assert_eq!(
+                    got.iter().map(|h| (h.0.to_bits(), h.1)).collect::<Vec<_>>(),
+                    want.iter()
+                        .map(|h| (h.0.to_bits(), h.1))
+                        .collect::<Vec<_>>(),
+                    "mvcc={mvcc} round={round} must={must:?} should={should:?} filter={}",
+                    filter.json()
+                );
+                checked += 1;
+                rows_seen += got.len();
+            }
+        }
+        assert_eq!(checked, 120);
+        assert!(
+            rows_seen > 500,
+            "mvcc={mvcc}: only {rows_seen} rows compared"
+        );
+    }
+}
+
 /// Pre-analyzed terms are used verbatim: an upper-case term the default
 /// tokenizer never indexes matches nothing (the parser would lower-case it
 /// and match); a `must` term is required while every term still scores; and

@@ -2038,12 +2038,16 @@ impl FtsCursor {
             }
         };
         let filter = self.parse_filter(&filter_text)?;
-        let query: Box<dyn Query> = if query_str.trim_start().starts_with('{') {
-            self.term_query(&query_str, &fields)?
-        } else {
-            let parser = self.selected_parser(&fields)?;
-            parse_bounded_query(&parser, &query_str)?
-        };
+        // A term query's clause order is the order its kept documents'
+        // scores are summed in.
+        let (query, clauses): (Box<dyn Query>, Option<Vec<Term>>) =
+            if query_str.trim_start().starts_with('{') {
+                let (query, clauses) = self.term_query(&query_str, &fields)?;
+                (query, Some(clauses))
+            } else {
+                let parser = self.selected_parser(&fields)?;
+                (parse_bounded_query(&parser, &query_str)?, None)
+            };
         let admitted = self.admitted_sets(&filter)?;
         let searcher = self
             .searcher
@@ -2075,8 +2079,24 @@ impl FtsCursor {
         // document only above their threshold, so the threshold sits just
         // below the lowest kept score: a document tied with it still enters
         // when its key orders before the last kept one.
+        //
+        // A term query's scores are summed afterwards in clause order: the
+        // pruning scorers add a document's term scores in whatever order they
+        // meet them, and f32 addition is not associative. The selection then
+        // keeps, beside the heap, every hit within a slack of its lowest
+        // score (far wider than any reordering moves a sum), and the kept
+        // hits are scored again in clause order before the cut.
+        let fixed = clauses.is_some();
+        let slack = |score: f32| {
+            if fixed {
+                score.abs() * 1e-5 + f32::MIN_POSITIVE
+            } else {
+                0.0
+            }
+        };
         let mut best: std::collections::BinaryHeap<std::cmp::Reverse<FilteredHit>> =
             std::collections::BinaryHeap::with_capacity(limit + 1);
+        let mut near: Vec<FilteredHit> = Vec::new();
         for (segment_ord, (reader, bits)) in readers.iter().zip(&admitted).enumerate() {
             if bits.count() == 0 {
                 continue;
@@ -2084,7 +2104,9 @@ impl FtsCursor {
             let keys = self.tie_keys(reader)?;
             let floor = |best: &std::collections::BinaryHeap<std::cmp::Reverse<FilteredHit>>| {
                 if best.len() == limit {
-                    best.peek().map_or(f32::MIN, |hit| hit.0.score.next_down())
+                    best.peek().map_or(f32::MIN, |hit| {
+                        (hit.0.score - slack(hit.0.score)).next_down()
+                    })
                 } else {
                     f32::MIN
                 }
@@ -2103,7 +2125,16 @@ impl FtsCursor {
                             best.push(std::cmp::Reverse(hit));
                         } else if best.peek().is_some_and(|lowest| hit > lowest.0) {
                             best.push(std::cmp::Reverse(hit));
-                            best.pop();
+                            let out = best.pop().expect("over the limit").0;
+                            if fixed {
+                                near.push(out);
+                            }
+                        } else if fixed
+                            && best.peek().is_some_and(|lowest| {
+                                score >= lowest.0.score - slack(lowest.0.score)
+                            })
+                        {
+                            near.push(hit);
                         }
                     }
                     floor(&best)
@@ -2111,7 +2142,16 @@ impl FtsCursor {
                 .map_err(|e| LimboError::InternalError(format!("FTS search error: {e}")))?;
         }
         let mut kept: Vec<FilteredHit> = best.into_iter().map(|hit| hit.0).collect();
+        if let Some(clauses) = &clauses {
+            let lowest = kept.iter().map(|hit| hit.score).fold(f32::MAX, f32::min);
+            kept.extend(
+                near.into_iter()
+                    .filter(|hit| hit.score >= lowest - slack(lowest)),
+            );
+            self.rescore_in_clause_order(&mut kept, clauses, &statistics)?;
+        }
         kept.sort_by(|a, b| b.cmp(a));
+        kept.truncate(limit);
         self.current_hits.clear();
         for hit in kept {
             let rowid = self.rowid_readers[hit.segment_ord as usize]
@@ -2123,6 +2163,62 @@ impl FtsCursor {
                 .push((hit.score, DocAddress::new(hit.segment_ord, hit.doc), rowid));
         }
         Ok(!self.current_hits.is_empty())
+    }
+
+    /// Score each hit again as the f32 sum of its terms' BM25 scores in
+    /// clause order, every term scored as its own term query under the
+    /// filtered statistics (exactly what the pruning scorers add).
+    fn rescore_in_clause_order(
+        &self,
+        hits: &mut [FilteredHit],
+        clauses: &[Term],
+        statistics: &filter::FilteredStatistics,
+    ) -> Result<()> {
+        let searcher = self
+            .searcher
+            .as_ref()
+            .expect("FTS searcher initialized by query_start");
+        let map = |e: tantivy::TantivyError| LimboError::InternalError(format!("FTS rescore: {e}"));
+        let weights = clauses
+            .iter()
+            .map(|term| {
+                tantivy::query::TermQuery::new(term.clone(), IndexRecordOption::WithFreqs)
+                    .weight(EnableScoring::enabled_from_statistics_provider(
+                        statistics, searcher,
+                    ))
+                    .map_err(map)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        hits.sort_by_key(|hit| (hit.segment_ord, hit.doc));
+        let readers = searcher.segment_readers();
+        let mut start = 0;
+        while start < hits.len() {
+            let segment_ord = hits[start].segment_ord;
+            let end = start
+                + hits[start..]
+                    .iter()
+                    .take_while(|hit| hit.segment_ord == segment_ord)
+                    .count();
+            let reader = &readers[segment_ord as usize];
+            let mut scorers = weights
+                .iter()
+                .map(|weight| weight.scorer(reader, 1.0).map_err(map))
+                .collect::<Result<Vec<_>>>()?;
+            for hit in &mut hits[start..end] {
+                let mut score = 0.0f32;
+                for scorer in &mut scorers {
+                    if scorer.doc() < hit.doc {
+                        scorer.seek(hit.doc);
+                    }
+                    if scorer.doc() == hit.doc {
+                        score += scorer.score();
+                    }
+                }
+                hit.score = score;
+            }
+            start = end;
+        }
+        Ok(())
     }
 
     /// The tie key a segment's documents are cut by: the `tie_field` (a
@@ -2173,7 +2269,7 @@ impl FtsCursor {
     /// BM25 with its frequency; a `must` term is also required. A repeated
     /// term counts once. `field` may be left out when the query selects one
     /// column.
-    fn term_query(&self, text: &str, fields: &str) -> Result<Box<dyn Query>> {
+    fn term_query(&self, text: &str, fields: &str) -> Result<(Box<dyn Query>, Vec<Term>)> {
         let invalid = |what: &str| LimboError::InvalidArgument(format!("FTS term query: {what}"));
         if text.len() > FTS_MAX_QUERY_BYTES {
             return Err(invalid("too long"));
@@ -2230,13 +2326,20 @@ impl FtsCursor {
                     .collect(),
             }
         };
-        let mut must = list("must")?;
-        must.sort();
-        must.dedup();
-        let mut should = list("should")?;
-        should.sort();
-        should.dedup();
-        should.retain(|term| must.binary_search(term).is_err());
+        // Clause order: the `must` terms as given, then the `should` terms as
+        // given, each repeat after the first left out.
+        let mut must: Vec<String> = Vec::new();
+        for term in list("must")? {
+            if !must.contains(&term) {
+                must.push(term);
+            }
+        }
+        let mut should: Vec<String> = Vec::new();
+        for term in list("should")? {
+            if !must.contains(&term) && !should.contains(&term) {
+                should.push(term);
+            }
+        }
         let clause = |occur, term: &String| -> (tantivy::query::Occur, Box<dyn Query>) {
             (
                 occur,
@@ -2255,7 +2358,12 @@ impl FtsCursor {
                     .map(|t| clause(tantivy::query::Occur::Should, t)),
             )
             .collect();
-        Ok(Box::new(tantivy::query::BooleanQuery::new(clauses)))
+        let order = must
+            .iter()
+            .chain(&should)
+            .map(|t| Term::from_field_text(field, t))
+            .collect();
+        Ok((Box::new(tantivy::query::BooleanQuery::new(clauses)), order))
     }
 
     /// The admitted population: its document count and, where the index has

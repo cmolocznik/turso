@@ -1886,6 +1886,27 @@ impl ProgramState {
         }
     }
 
+    /// Whether the main database's Atoll transaction has begun to end, a commit or a rollback the
+    /// statement decided: its storage ending under way, or ended with the attached databases' still
+    /// to end. Read only in Atoll mode, where nothing else leaves `CommittingAttached`.
+    pub(crate) fn atoll_ending_begun(&self) -> bool {
+        matches!(
+            self.commit_state,
+            CommitState::Atoll { .. } | CommitState::CommittingAttached
+        )
+    }
+
+    /// Where an Atoll transaction's ending stands, for tests: its storage ending under way, or
+    /// ended with the attached databases' still to end.
+    #[cfg(test)]
+    pub(crate) fn atoll_ending_phase(&self) -> Option<&'static str> {
+        match self.commit_state {
+            CommitState::Atoll { .. } => Some("ending"),
+            CommitState::CommittingAttached => Some("attached"),
+            _ => None,
+        }
+    }
+
     /// The completion the instruction that just returned `IO` parked.
     pub(crate) fn take_suspended_io(&mut self) -> IOCompletions {
         self.take_io_completions()

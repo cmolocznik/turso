@@ -817,6 +817,12 @@ impl Statement {
         self.state.pending_io().map(|io| io.0.clone())
     }
 
+    /// Where the statement's Atoll transaction's ending stands, if it has begun.
+    #[cfg(test)]
+    pub(crate) fn atoll_ending_phase(&self) -> Option<&'static str> {
+        self.state.atoll_ending_phase()
+    }
+
     /// Whether the statement is parked in an explicit checkpoint, waiting for a release.
     #[cfg(test)]
     pub(crate) fn parked_checkpoint(&self) -> bool {
@@ -1608,6 +1614,54 @@ impl Statement {
                     err,
                     "Error while draining pending IO during statement reset",
                 );
+            }
+        }
+
+        // A commit or rollback whose Atoll ending has begun is decided: the statement runs on to its
+        // end, so the instruction that began it (a halt, `COMMIT` or `ROLLBACK`) finishes it whole,
+        // as its next step would have: the schema published or put back, temp's and the attached
+        // databases' transactions ended, the connection's state and the outcome delivered. Dropped
+        // with the statement, the ending would finish only the storage's part (the auditor's
+        // P1-DDL-END1). A failure on the way is the statement's, and the cleanup below handles it.
+        if self.state.execution_state.is_running()
+            && self.program.connection.atoll().is_some()
+            && self.state.atoll_ending_begun()
+        {
+            loop {
+                match self._step(None) {
+                    Ok(StepResult::Done) => break,
+                    Ok(StepResult::IO) => {
+                        if let Some(io) = self.state.take_io_completions() {
+                            if let Err(err) = io.wait(self.pager.io.as_ref()) {
+                                capture_reset_error(
+                                    &mut reset_error,
+                                    err,
+                                    "Error while finishing a decided commit during statement reset",
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Ok(StepResult::Yield) => {}
+                    Ok(other) => {
+                        capture_reset_error(
+                            &mut reset_error,
+                            LimboError::InternalError(format!(
+                                "a decided commit stepped to {other:?} during statement reset"
+                            )),
+                            "Statement reset could not finish a decided commit",
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        capture_reset_error(
+                            &mut reset_error,
+                            err,
+                            "Error while finishing a decided commit during statement reset",
+                        );
+                        break;
+                    }
+                }
             }
         }
 

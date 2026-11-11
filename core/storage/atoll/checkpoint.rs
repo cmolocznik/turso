@@ -39,7 +39,7 @@ use super::buffer::{BufferPool, CutScan, Relief, Relieved, Retry, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::executor::{self, Class, Cx, Signal, Step, Task, TaskRef, Watched};
 use super::guarded::{Contender, Guarded, Hold};
-use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn, BLOCK};
+use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
 use super::stack::Chain;
@@ -139,14 +139,9 @@ pub struct Checkpointer {
     /// Whether a checkpoint is under way, set and cleared under the state: the writers stepping
     /// checkpoints step one under way whether or not another is due.
     under_way: AtomicBool,
-    /// Where the intent record of the checkpoint that began last was reserved, and where it ends,
-    /// once appended (`u64::MAX` and 0 before): that record and the padding around it are no input
-    /// to the log, so they make no checkpoint due (the auditor's P1-CP-D1).
-    own_from: AtomicU64,
-    own_to: AtomicU64,
-    /// The start of the checkpoint the last trigger was notified for, `began_at` as it read: one
-    /// trigger a crossing of the threshold, the statements after it reading this word alone (the
-    /// auditor's P2-EX-H1).
+    /// One past the start of the latest checkpoint a trigger was notified for (`began_at` as the
+    /// notifying statement read it, plus one), raised and never lowered: one trigger a crossing of
+    /// the threshold, the statements after it reading this word alone (the auditor's P2-EX-H1).
     triggered_for: AtomicU64,
     /// The superblock in charge, as the checkpoint stepping it last wrote it, for anyone to read.
     published: ArcCell<Superblock>,
@@ -599,9 +594,7 @@ impl Checkpointer {
             began_at,
             due: Arc::default(),
             under_way: AtomicBool::new(false),
-            own_from: AtomicU64::new(u64::MAX),
-            own_to: AtomicU64::new(0),
-            triggered_for: AtomicU64::new(u64::MAX),
+            triggered_for: AtomicU64::new(0),
             published: ArcCell::new(Arc::new(superblock.clone())),
             releasing,
             state: Guarded::new(State {
@@ -1013,7 +1006,9 @@ impl Checkpointer {
     /// wakes it; a worker steps the task, and the writers stepping checkpoints claim it, as they
     /// do while one is under way or erasure is owed.
     pub fn step_due(&self, txns: &Transactions) -> Result<IOResult<()>> {
-        let due = self.due_now();
+        // One read of where the last checkpoint began, for the threshold and the trigger alike.
+        let began = self.began_at.load(Ordering::SeqCst);
+        let due = self.due_since(began);
         let under_way = self.under_way.load(Ordering::Acquire);
         // Slots freed and not yet erased: the end of the step that may have held one, a
         // statement's or a transaction's, may let them be erased now.
@@ -1023,17 +1018,11 @@ impl Checkpointer {
             STEPS_PASSED_OVER.with(|n| n.set(n.get() + 1));
             return Ok(IOResult::Done(()));
         }
-        if due {
-            // One trigger a crossing: a statement after the first reads this word and goes on.
-            let began = self.began_at.load(Ordering::Acquire);
-            if self.triggered_for.load(Ordering::Acquire) != began
-                && self.triggered_for.swap(began, Ordering::AcqRel) != began
-            {
-                if let Some(task) = self.task.get().filter(|task| !task.is_over()) {
-                    #[cfg(test)]
-                    TRIGGERS.with(|n| n.set(n.get() + 1));
-                    task.trigger(&self.due);
-                }
+        if due && self.claim_trigger(began) {
+            if let Some(task) = self.task.get().filter(|task| !task.is_over()) {
+                #[cfg(test)]
+                TRIGGERS.with(|n| n.set(n.get() + 1));
+                task.trigger(&self.due);
             }
         }
         match self.stepper() {
@@ -1049,20 +1038,27 @@ impl Checkpointer {
         }
     }
 
-    /// Whether a checkpoint is due by the log appended since the last began (DESIGN.md §17): a
-    /// share of the budget, at least a byte, and more than the checkpoint's own intent record and
-    /// the padding of the blocks around it, which are no input (P1-CP-D1: a quiet database whose
-    /// checkpoints' own records made the next due checkpointed forever).
+    /// Whether this statement, which found a checkpoint due since `began`, is the one to notify the
+    /// trigger for that crossing: the first to raise the word past `began`. A statement after it
+    /// reads the word alone, and one that read an earlier start never lowers it.
+    fn claim_trigger(&self, began: Lsn) -> bool {
+        self.triggered_for.load(Ordering::Acquire) <= began
+            && self.triggered_for.fetch_max(began + 1, Ordering::AcqRel) <= began
+    }
+
+    /// Whether a checkpoint is due by the log appended since the last began (DESIGN.md §17).
     fn due_now(&self) -> bool {
-        let end = self.log.end();
-        let began = self.began_at.load(Ordering::Acquire);
-        if end.saturating_sub(began) < (self.budget / SHARES).max(1) {
-            return false;
-        }
-        let from = self.own_from.load(Ordering::Acquire);
-        let to = self.own_to.load(Ordering::Acquire);
-        let own_alone = from <= began.next_multiple_of(BLOCK) && end <= to.next_multiple_of(BLOCK);
-        !own_alone
+        self.due_since(self.began_at.load(Ordering::SeqCst))
+    }
+
+    /// Whether a checkpoint is due by the log appended since `began`: a share of the budget, at
+    /// least a byte, with a record other than a checkpoint's own among it. A checkpoint's own
+    /// intent record and the padding around it are no input (the auditor's P1-CP-D1: a quiet
+    /// database whose checkpoints' own records made the next due checkpointed forever). Both rise
+    /// and neither falls until a checkpoint begins, so once due, due until then.
+    fn due_since(&self, began: Lsn) -> bool {
+        self.log.end().saturating_sub(began) >= (self.budget / SHARES).max(1)
+            && self.log.input_since()
     }
 
     /// Whether a full checkpoint asked for is not done yet, as the state last recorded them.
@@ -1311,9 +1307,7 @@ impl State {
                     false => Unit::Again,
                 });
             }
-            cp.began_at.store(cp.log.end(), Ordering::Release);
-            cp.own_from.store(u64::MAX, Ordering::Release);
-            cp.own_to.store(0, Ordering::Release);
+            cp.began_at.store(cp.log.begin_input(), Ordering::SeqCst);
             cp.under_way.store(true, Ordering::Release);
             self.run = Some(Box::new(Run::new(
                 self.superblock.checkpoint + 1,
@@ -1545,9 +1539,8 @@ impl Run {
                         prev: None,
                     };
                     let payload = intent_payload(self.n, &self.meta);
-                    let (from, end) = cp.log.append_with(admitted, &header, &[&payload], |_| {});
-                    cp.own_to.store(end, Ordering::Release);
-                    cp.own_from.store(from.get(), Ordering::Release);
+                    // The checkpoint's own record: no input that makes another due.
+                    let (_, end) = cp.log.append_own(admitted, &header, &[&payload]);
                     self.intent = None;
                     self.intent_end = Some(end);
                     self.phase = Phase::IntentDurable;
@@ -2203,6 +2196,27 @@ mod tests {
             units += 1;
         }
         units
+    }
+
+    /// The trigger is claimed once a crossing: the first statement past a start claims it, the next
+    /// for that start does not, one that read an earlier start neither claims it nor lowers it, and
+    /// the next start's first does (the auditor's P2-EX-H1; mutant: the word swapped in, a stale
+    /// start lowering it and the newer start claimed twice).
+    #[test]
+    fn the_trigger_is_claimed_once_a_crossing_and_never_for_an_earlier_start() {
+        let io: Arc<dyn crate::io::IO> = Arc::new(crate::io::MemoryIO::new());
+        let db = open(&io);
+        let cp = db.checkpointer();
+        let claims = [
+            cp.claim_trigger(4096),
+            cp.claim_trigger(4096),
+            cp.claim_trigger(0),
+            cp.claim_trigger(4096),
+            cp.claim_trigger(8192),
+            cp.claim_trigger(8192),
+        ];
+        drop(db);
+        assert_eq!(claims, [true, false, false, false, true, false]);
     }
 
     /// The bookkeeping over the frames a checkpoint wrote is a run of them a unit: giving each page

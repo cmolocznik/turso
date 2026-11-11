@@ -1028,3 +1028,39 @@ fn statements_finding_a_checkpoint_due_trigger_its_task_once() {
     assert!(stepped, "a statement's step failed");
     assert_eq!(triggered, 1, "triggers over five statements");
 }
+
+/// A checkpoint once due stays due until the next begins: a checkpoint's own record appended
+/// meanwhile is no input and takes nothing away, and the next checkpoint's begin, with nothing
+/// appended since but its own record, leaves none due (the auditor's P1-CP-D1 follow-up: a due
+/// that fell back within one start lost its one trigger).
+#[test]
+fn a_checkpoint_once_due_stays_due_until_the_next_begins() {
+    use crate::storage::atoll::log::{Header, Kind};
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_with_budget(&io, 4, 64);
+    let cp = db.checkpointer();
+    let rested = cp.is_due();
+    let mut txn = begin(&io, &db, Isolation::Snapshot);
+    write(&io, &db, &mut txn);
+    commit(&io, &db, txn);
+    let written = cp.is_due();
+    // A record of the checkpoint's own kind, appended as its intent is.
+    let header = Header {
+        kind: Kind::new(31).unwrap(),
+        flags: 0,
+        txn: 0,
+        prev: None,
+    };
+    let mut admitted = drive(&io, || db.log().admit(256)).unwrap();
+    db.log().append_own(&mut admitted, &header, &[&[0u8; 64]]);
+    drop(admitted);
+    let own_appended = cp.is_due();
+    checkpoint(&io, &db);
+    let after = cp.is_due();
+    drop(db);
+    assert_eq!(
+        (rested, written, own_appended, after),
+        (false, true, true, false),
+        "at rest, after a commit, after an own record, after the next checkpoint"
+    );
+}

@@ -88,6 +88,12 @@ impl Room {
         self.ends.insert.load(Ordering::Acquire)
     }
 
+    /// [`end`](Self::end), in the total order of every reservation and of the log's input mark
+    /// ([`Log::begin_input`](super::Log::begin_input)).
+    pub(super) fn end_ordered(&self) -> u64 {
+        self.ends.insert.load(Ordering::SeqCst)
+    }
+
     pub(super) fn durable(&self) -> u64 {
         self.durable.load(Ordering::Acquire)
     }

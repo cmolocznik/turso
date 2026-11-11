@@ -5401,12 +5401,15 @@ compose, the real `Completion`, latch and backends included where named.
    an integrity check holds it, and steps it until it waits on writes (`Wait` on them) or finds
    nothing due (`Idle`). A writing statement or a transaction's end that finds a checkpoint due
    (`step_due`) notifies *due*, which sets the task's own level as it wakes it, once a crossing of
-   the threshold (`triggered_for`, the checkpoint start it was notified for: the statements after
-   it read that word alone, the auditor's P2-EX-H1); a checkpoint is due by a share of the budget,
-   at least a byte, appended since the last began beyond that checkpoint's own intent record and
-   the padding of the blocks around it, which are no input, so a quiet database with a small budget
-   is not checkpointed forever by its checkpoints' own records (P1-CP-D1; input of less than a
-   block beside the intent waits for the next); the task reads
+   the threshold (`triggered_for`, one past the latest checkpoint start a trigger was notified
+   for, raised and never lowered, from the same read of the start as the threshold's: the
+   statements after it read that word alone, the auditor's P2-EX-H1); a checkpoint is due by a
+   share of the budget, at least a byte, appended since the last began with a record other than a
+   checkpoint's own among it (the log's input mark, set after each such record's reservation and
+   cleared as a checkpoint begins, before it reads the log's end: `Log::begin_input`, and a
+   checkpoint's intent appended by `Log::append_own`), so a quiet database with a small budget is
+   not checkpointed forever by its checkpoints' own records (P1-CP-D1), and once due a checkpoint
+   stays due until the next begins; the task reads
    *due* before its look, and a step that finds nothing due compares the log's end with the
    threshold, and a full checkpoint asked for with those done, itself before it rests, so a
    database due again as a checkpoint ends needs no further append, then drops its own level

@@ -183,6 +183,11 @@ pub struct Log {
     /// The furthest anyone has waited for the log to be durable to. Raised by every commit, so on
     /// a line of its own.
     wanted: CachePadded<AtomicU64>,
+    /// Whether a record other than a checkpoint's own was reserved since the last checkpoint began
+    /// ([`begin_input`](Self::begin_input)), recovery's tail counting as one: set by every such
+    /// append after its reservation, read first and written only while clear, so the appends
+    /// after the first only read it; on a line of its own (DESIGN.md 22.9, Due).
+    input: CachePadded<AtomicBool>,
     /// Where the flush taking its turn writes from next: the turn's own.
     submitted: CachePadded<AtomicU64>,
     /// Writes submitted and not landed. Moved by every write and its landing, so on a line of its
@@ -311,6 +316,7 @@ impl Log {
             // The writes in flight lie within the ring of the position, in whole blocks.
             landed: CachePadded::new(Prefix::new(start, span, BLOCK)),
             wanted: CachePadded::new(AtomicU64::new(0)),
+            input: CachePadded::new(AtomicBool::new(true)),
             submitted: CachePadded::new(AtomicU64::new(start)),
             in_flight: CachePadded::new(AtomicUsize::new(0)),
             flushes: CachePadded::default(),
@@ -391,6 +397,28 @@ impl Log {
     /// Where the next record will start.
     pub fn end(&self) -> Lsn {
         self.room.end()
+    }
+
+    /// A record other than a checkpoint's own was reserved: the input mark set, if clear. After the
+    /// reservation, both in the total order of the reservations and the mark: a checkpoint's begin
+    /// that reads the end before this reservation clears the mark before this reads it.
+    fn mark_input(&self) {
+        if !self.input.load(Ordering::SeqCst) {
+            self.input.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A checkpoint begins: the input mark cleared, then the end read, where the log ended as it
+    /// began. A record whose reservation the read missed sets the mark again.
+    pub fn begin_input(&self) -> Lsn {
+        self.input.store(false, Ordering::SeqCst);
+        self.room.end_ordered()
+    }
+
+    /// Whether a record other than a checkpoint's own was reserved since the last checkpoint
+    /// began, or, before any, since the log was opened.
+    pub fn input_since(&self) -> bool {
+        self.input.load(Ordering::SeqCst)
     }
 
     /// Everything before this is durable.
@@ -491,8 +519,33 @@ impl Log {
         payload: &[&[u8]],
         reserved: impl FnOnce(GroupStart),
     ) -> (GroupStart, Lsn) {
+        self.append_marked(admitted, header, payload, reserved, true)
+    }
+
+    /// [`append_with`](Self::append_with) for a checkpoint's own record, which is no input to the
+    /// log: it leaves the input mark as it stands.
+    pub fn append_own(
+        self: &Arc<Self>,
+        admitted: &mut Admitted,
+        header: &Header,
+        payload: &[&[u8]],
+    ) -> (GroupStart, Lsn) {
+        self.append_marked(admitted, header, payload, |_| {}, false)
+    }
+
+    fn append_marked(
+        self: &Arc<Self>,
+        admitted: &mut Admitted,
+        header: &Header,
+        payload: &[&[u8]],
+        reserved: impl FnOnce(GroupStart),
+        input: bool,
+    ) -> (GroupStart, Lsn) {
         let len = framed_len(payload_len(payload));
         let start = self.reserve(admitted, len);
+        if input {
+            self.mark_input();
+        }
         reserved(GroupStart::at(start));
         let lsn = self.write_record(start, header, Place::ALONE, payload);
         self.count_copied(start, lsn);
@@ -529,6 +582,7 @@ impl Log {
             block.len()
         );
         let (gap, start) = self.room.reserve_aligned(whole);
+        self.mark_input();
         assert!(
             start - gap + whole <= admitted.left,
             "{} bytes published with {} bytes admitted",
@@ -629,6 +683,7 @@ impl Log {
             .sum();
         // One reservation, so no other record lands inside the group.
         let start = self.reserve(admitted, total);
+        self.mark_input();
         reserved(GroupStart::at(start));
         let size = records.len() as u8;
         let mut at = start;

@@ -7030,3 +7030,43 @@ fn a_cut_walks_the_frames_a_run_at_a_time() {
     );
     assert_eq!(owed, stored, "what the cut found owed");
 }
+
+/// A cut lists the pages it finds owed in its set of pages seen as it walks the frames, a run at a
+/// time, so no call copies every page owed into the set at once (the auditor's P2-CP-U1; mutant:
+/// the owed list copied whole into the set at the swap table's first shard).
+#[test]
+fn a_cut_lists_the_pages_owed_a_run_at_a_time() {
+    let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+    let pool = open_on(&io, "/db/cut-seen", 8 * MIN_BUDGET);
+    let mut stored = Vec::new();
+    for v in 0..CUT_RUN as u64 + 2 {
+        let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+        let pid = g.pid();
+        stamp(&mut g.page_mut(), pid, v);
+        g.changed();
+        drop(g);
+        stored.push(pid);
+    }
+    let mut scan = CutScan::default();
+    let mut most = 0;
+    loop {
+        let before = scan.seen.len();
+        let done = match pool.cut_run(1, &mut scan) {
+            IOResult::Done(done) => done,
+            IOResult::IO(_) => panic!("a cut with no holder waited"),
+        };
+        // The set is handed to the pool once the swap table is listed, and reads empty then.
+        most = most.max(scan.seen.len().saturating_sub(before));
+        if done {
+            break;
+        }
+    }
+    pool.end_cut(1);
+    let owed = scan.owed.len();
+    drop(pool);
+    assert!(owed > CUT_RUN, "{owed} pages owed: a cut of one run");
+    assert!(
+        most <= CUT_RUN,
+        "a call put {most} pages in the set, of {owed} owed"
+    );
+}

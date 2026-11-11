@@ -1037,10 +1037,21 @@ impl MetaCache {
     }
 
     /// Checkpoint `n` has written every page it writes: changes no longer keep a page first, and
-    /// what was kept goes.
+    /// what was kept goes, for the frames it wrote, `frames`.
     pub fn end_cut(&self, n: u64, frames: &[MetaRef]) {
+        self.stop_keeping(n);
+        self.uncut(n, frames);
+    }
+
+    /// Checkpoint `n` has written every page it writes: changes no longer keep a page first. What
+    /// was kept goes with [`uncut`](Self::uncut), a run of the frames at a time.
+    pub fn stop_keeping(&self, n: u64) {
         debug_assert_eq!(self.cutting.load(Ordering::Acquire), n);
         self.cutting.store(0, Ordering::SeqCst);
+    }
+
+    /// What checkpoint `n`'s cut kept of `frames` goes, changes no longer keeping any.
+    pub fn uncut(&self, n: u64, frames: &[MetaRef]) {
         for f in frames {
             if f.cut_for.load(Ordering::Acquire) == n {
                 *f.cut.lock() = None;
@@ -1048,15 +1059,28 @@ impl MetaCache {
         }
     }
 
-    /// Checkpoint `n` is in charge, its superblock durable: each page it wrote has its durable
-    /// copy where it wrote it.
+    /// Checkpoint `n` is in charge, its superblock durable: each page it wrote, of `frames`, has
+    /// its durable copy where it wrote it.
+    #[cfg(test)]
     pub fn checkpointed(&self, n: u64, frames: &[MetaRef]) {
+        self.durable_sides(n, frames);
+        self.put_in_charge(n);
+    }
+
+    /// Checkpoint `n`'s superblock is durable: each page it wrote, of `frames`, has its durable
+    /// copy where it wrote it. A run of the frames at a time, then
+    /// [`put_in_charge`](Self::put_in_charge).
+    pub fn durable_sides(&self, n: u64, frames: &[MetaRef]) {
         for f in frames {
             if f.written_for.load(Ordering::Acquire) == n {
                 f.durable_side
                     .store(f.written_side.load(Ordering::Acquire), Ordering::Release);
             }
         }
+    }
+
+    /// Checkpoint `n` is in charge, every page it wrote given its durable place.
+    pub fn put_in_charge(&self, n: u64) {
         self.in_charge.store(n, Ordering::Release);
     }
 

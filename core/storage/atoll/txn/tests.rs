@@ -926,3 +926,39 @@ fn slots_owed_erasure_are_erased_by_the_steps_that_follow_with_nothing_due() {
         "{owed} slots owed, after {steps} statements' steps"
     );
 }
+
+/// A checkpoint releases the log's segments before its redo point one a unit, then syncs their
+/// directory in a unit of its own (the auditor's P2-CP-U1; mutant: the whole prefix released in
+/// one unit).
+#[test]
+fn a_checkpoint_releases_the_logs_segments_one_a_unit() {
+    use crate::storage::atoll::log::SEGMENTS_RELEASED;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 4);
+    let tree = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), root());
+    let value = vec![9u8; 32 << 10];
+    // Four segments of log and more, none of it checkpointed: the commits only append.
+    while db.log().end() < 4 * log_config().segment_bytes {
+        let mut txn = begin(&io, &db, Isolation::Snapshot);
+        let key = txn.start().to_be_bytes();
+        let mut put = Put::new(&key, value.clone(), Mode::Upsert);
+        drive(&io, || tree.put(&mut put)).unwrap();
+        txn.changed(|s, c| c.plain_put(s, root(), &key, &value));
+        commit(&io, &db, txn);
+    }
+    let cp = db.checkpointer();
+    let ticket = cp.request_full();
+    let (mut most, mut total) = (0, 0);
+    while cp.fulls_done() < ticket {
+        let before = SEGMENTS_RELEASED.with(|r| r.get());
+        if let Some(c) = cp.one_unit(db.transactions()).unwrap() {
+            io.wait(&c);
+        }
+        let released = SEGMENTS_RELEASED.with(|r| r.get()) - before;
+        most = most.max(released);
+        total += released;
+    }
+    drop((tree, db));
+    assert!(total >= 2, "{total} segments released");
+    assert_eq!(most, 1, "the most segments one unit released, of {total}");
+}

@@ -88,6 +88,8 @@ crate::thread::thread_local! {
     pub(crate) static COPIED_IN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Turns of the flush taken on this thread.
     pub(crate) static TURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Segments released on this thread.
+    pub(crate) static SEGMENTS_RELEASED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Set by a test: the next turn taken on this thread asks for another while it runs, as
     /// another thread's flush would.
     pub(crate) static ASK_DURING_TURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -726,21 +728,39 @@ impl Log {
 
     /// Deletes the segments wholly before `lsn`, which nothing needs any more.
     pub fn release_before(&self, lsn: Lsn) -> Result<()> {
-        let keep = self.segments.number(lsn.min(self.durable()));
+        let mut n = self.kept_from(lsn);
         let mut removed = false;
-        let mut n = keep;
-        while n > 0 {
+        while n > 0 && self.release_segment(n - 1)? {
             n -= 1;
-            if self.segments.open(n)?.is_none() {
-                break;
-            }
-            self.segments.release(n)?;
             removed = true;
         }
         if removed {
-            self.io.sync_directory(&self.segments.directory())?;
+            self.sync_released()?;
         }
         Ok(())
+    }
+
+    /// The first segment kept for everything from `lsn` on, as far as the log is durable: those
+    /// before it nothing needs any more, the newest of them first to go.
+    pub fn kept_from(&self, lsn: Lsn) -> u64 {
+        self.segments.number(lsn.min(self.durable()))
+    }
+
+    /// Releases segment `n`, made a spare or removed, if it is still there: whether it was. The
+    /// segments before a released one were released before it.
+    pub fn release_segment(&self, n: u64) -> Result<bool> {
+        if self.segments.open(n)?.is_none() {
+            return Ok(false);
+        }
+        self.segments.release(n)?;
+        #[cfg(test)]
+        SEGMENTS_RELEASED.with(|r| r.set(r.get() + 1));
+        Ok(true)
+    }
+
+    /// Makes the segments released so far gone for good: the directory synced.
+    pub fn sync_released(&self) -> Result<()> {
+        self.io.sync_directory(&self.segments.directory())
     }
 
     fn slot(&self, lsn: Lsn) -> (&Slot, usize) {

@@ -4612,8 +4612,10 @@ run units until one waits or nothing more is due (relief until the room takes it
 claiming the task for each where the writers step checkpoints: today's semantics, in bounded
 units, a checkpoint's last unit saying `Done` so one due again at once is the next step's. The
 units built: the gate tried; the cut's `L` and `C`; the pool's walk a run of frames at a time
-(`CUT_RUN`, the headers one page of the header table holds), then the swap table a shard at a
-time, then the swapped pages looked at again a run at a time (`BufferPool::cut_run`); the metadata
+(`CUT_RUN`, the headers one page of the header table holds), the pages it finds owed put in its
+set of pages seen as each run finds them, then the swap table a shard at a time, then the swapped
+pages looked at again a run at a time (`BufferPool::cut_run`); the pages owed handed to the image
+queue whole, a vector becoming a queue in place; the metadata
 cut, the gate opened; the metadata pages dirty at the cut, handed over unread as the dirty stack's
 chain (`Stack::take_chain`) and moved a run at a time (`DIRTY_RUN`, one page of ids) into the
 ordered set the run walks; each orphan's edit, then its free; each image's source taken, each
@@ -4622,9 +4624,15 @@ built, each directory page of a value it names read, its write started, and each
 intent record's size checked against the log's buffer before it is built, then admitted and
 appended; its durability; each metadata page fetched in order and its write started, at most
 `WRITES` waiting at once, each asked again until it is written for the checkpoint (a wait on a
-hold or a change settling under the look writes nothing); each data file's sync started; the log's
-end; the superblock; each deferred free (`PageStore::after_one`); each slot erased, then each file
-it was in synced (`PageStore::erase_one`). A unit under way is marked on its thread
+hold or a change settling under the look writes nothing); the metadata's cut copies let go, a run
+of its frames a unit (`FRAME_RUN`, one page of their references: `MetaCache::uncut`); each data
+file's sync started; the log's end; the superblock; each page the checkpoint wrote given its
+durable place, a run of its frames a unit (`MetaCache::durable_sides`), then the checkpoint put in
+charge; each deferred free (`PageStore::after_one`); each tree seen created forgotten as a
+creation; each log segment before the redo point released, the newest first
+(`Log::release_segment`), then the directory synced in a unit of its own (`Log::sync_released`);
+each slot erased, then each file it was in synced (`PageStore::erase_one`). Every such run, release
+and sync counts as the unit's visit (the auditor's P2-CP-U1). A unit under way is marked on its thread
 (`unit::Unit`, entered for each unit the checkpoint's state steps): every park, IO wait and
 blocking wait refuses it (`park.rs`, Atoll's one place a thread blocks), and debug builds count
 the pages it visits, where the checkpoint touches one and inside the reads it makes through other
@@ -4643,9 +4651,11 @@ needed or owed for the budget wakes every waiter, the unit's own included, so th
 it (`Log::prepare`). An image write's place in the flight set is freed when its request retires,
 no backend owning its buffer any more, its outcome recorded by its callback (a request retired
 with none told fails the checkpoint), and a unit waiting for a place waits on that retirement.
-A metadata write's end is told at its last request's retirement (its sync's, where the file is
-not written durably), its outcome recorded by its callbacks, so the checkpoint's metadata writes,
-held to `WRITES` waiting, keep their places until no backend owns their buffers. Not built yet:
+A metadata write's end is told once every request it made has retired, the write's own and, where
+the file is not written durably, its sync's, either of which may retire first on a backend
+several threads step (a count of the requests not yet retired, the sync's counted before it is
+submitted: the auditor's P2-META-R1), its outcome recorded by its callbacks, so the checkpoint's
+metadata writes, held to `WRITES` waiting, keep their places until no backend owns their buffers. Not built yet:
 the sustained run against before.)
 
 **Who waits how.** Every caller that waits for IO is one of three kinds:

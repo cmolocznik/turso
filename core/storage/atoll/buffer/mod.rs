@@ -2804,12 +2804,18 @@ impl BufferPool {
                             self.wait_for_resident_latch(scan.next),
                         ));
                     };
+                    let listed = scan.owed.len();
                     self.mark_owed(scan.next, n, &mut scan.owed);
                     hold.release_unchanged();
-                } else if h.status() == OUTGOING && !self.record_outgoing(scan.next, &mut scan.owed)
-                {
-                    // The write-out finished or the frame changed hands while its header was read.
-                    return IOResult::IO(IOCompletions(Completion::new_yield()));
+                    scan.seen.extend(scan.owed[listed..].iter().copied());
+                } else if h.status() == OUTGOING {
+                    let listed = scan.owed.len();
+                    if !self.record_outgoing(scan.next, &mut scan.owed) {
+                        // The write-out finished or the frame changed hands while its header was
+                        // read.
+                        return IOResult::IO(IOCompletions(Completion::new_yield()));
+                    }
+                    scan.seen.extend(scan.owed[listed..].iter().copied());
                 }
                 scan.next += 1;
             }
@@ -2817,9 +2823,8 @@ impl BufferPool {
         }
         let shards = self.store.swap_shards();
         if scan.shard < shards {
-            if scan.shard == 0 {
-                scan.seen = scan.owed.iter().copied().collect();
-            }
+            // The pages owed so far are in `seen` already, each run of the frames having put its
+            // own there, so a swapped page among them is listed once.
             for pid in self.store.swap_shard_pages(scan.shard) {
                 if scan.seen.insert(pid) {
                     scan.owed.push(pid);

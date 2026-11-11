@@ -492,6 +492,12 @@ struct Run {
     waits: Vec<Completion>,
     written: Option<Completion>,
     superblock: Option<Superblock>,
+    /// Where the walk of `frames` a run at a time is, in the phases that take one.
+    frames_at: usize,
+    /// The next segment to release, counting down from the first kept, once the release has
+    /// begun; and whether one was released, which owes the directory its sync.
+    release: Option<u64>,
+    released: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -506,10 +512,21 @@ enum Phase {
     Intent,
     IntentDurable,
     Meta,
+    /// The metadata's cut copies let go, a run of its frames a unit.
+    Uncut,
     Files,
     Durable,
     Superblock,
+    /// Each page the checkpoint wrote given its durable place, a run of its frames a unit, then
+    /// the checkpoint put in charge.
+    InCharge,
     After,
+    /// The trees created before the cut forgotten as creations, one a unit.
+    Forget,
+    /// The log's segments before the redo point released, one a unit.
+    Release,
+    /// The directory synced, if a segment was released.
+    Released,
     Erase,
 }
 
@@ -1215,6 +1232,10 @@ impl Checkpointer {
 /// 22.1).
 const DIRTY_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<MetaId>();
 
+/// The metadata frames a run of the checkpoint's bookkeeping over them walks: as many as one page
+/// of their references holds (DESIGN.md 22.1).
+const FRAME_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<MetaRef>();
+
 /// What a unit of a checkpoint's work leaves (DESIGN.md 22.1).
 enum Unit {
     /// Nothing more to do now: no checkpoint is due and nothing is left to erase.
@@ -1336,6 +1357,9 @@ impl Run {
             waits: Vec::new(),
             written: None,
             superblock: None,
+            frames_at: 0,
+            release: None,
+            released: false,
         }
     }
 
@@ -1353,9 +1377,11 @@ impl Run {
         if cp.pool.cutting() == self.n {
             cp.pool.end_cut(self.n);
         }
+        // The cut copies its frames kept go even where the cut ended before (`Uncut`).
         if cp.store.meta().cutting() == self.n {
-            cp.store.meta().end_cut(self.n, &self.frames);
+            cp.store.meta().stop_keeping(self.n);
         }
+        cp.store.meta().uncut(self.n, &self.frames);
         for pid in self.orphans {
             cp.store.orphaned(pid);
         }
@@ -1417,7 +1443,8 @@ impl Run {
                             self.set_aside.insert(root);
                         }
                     }
-                    self.queue = std::mem::take(&mut self.scan.owed).into_iter().collect();
+                    // Handed over whole, no copy made: a vector becomes a queue in place.
+                    self.queue = VecDeque::from(std::mem::take(&mut self.scan.owed));
                     self.phase = Phase::Dirty;
                     return Ok(Unit::Again);
                 }
@@ -1448,7 +1475,7 @@ impl Run {
                 Phase::Images => match self.image_unit(cp, txns, false)? {
                     Unit::Done => {
                         debug_assert!(self.early.is_empty(), "a page imaged early still queued");
-                        self.queue = std::mem::take(&mut self.values).into_iter().collect();
+                        self.queue = VecDeque::from(std::mem::take(&mut self.values));
                         self.phase = Phase::Values;
                     }
                     unit => return Ok(unit),
@@ -1500,6 +1527,15 @@ impl Run {
                     return Ok(Unit::Again);
                 }
                 Phase::Meta => return self.meta_unit(cp),
+                Phase::Uncut => {
+                    unit::visit();
+                    if let Some(run) = self.frame_run() {
+                        cp.store.meta().uncut(self.n, &self.frames[run]);
+                        return Ok(Unit::Again);
+                    }
+                    self.phase = Phase::Files;
+                    return Ok(Unit::Again);
+                }
                 Phase::Files => {
                     // A data file's sync started a unit; then every one waited for.
                     let unsynced = self.unsynced.get_or_insert_with(|| cp.store.data_files());
@@ -1542,7 +1578,18 @@ impl Run {
                     });
                     unit::visit();
                     unit!(cp.control.step_write(sb, &mut self.written));
-                    cp.store.meta().checkpointed(self.n, &self.frames);
+                    self.frames_at = 0;
+                    self.phase = Phase::InCharge;
+                    return Ok(Unit::Again);
+                }
+                Phase::InCharge => {
+                    unit::visit();
+                    if let Some(run) = self.frame_run() {
+                        cp.store.meta().durable_sides(self.n, &self.frames[run]);
+                        return Ok(Unit::Again);
+                    }
+                    cp.store.meta().put_in_charge(self.n);
+                    let sb = self.superblock.as_ref().expect("the superblock written");
                     cp.published
                         .replace(Some(Arc::new(sb.clone())), &cp.releasing);
                     self.phase = Phase::After;
@@ -1554,10 +1601,36 @@ impl Run {
                     if !unit!(cp.store.after_one(self.n)) {
                         return Ok(Unit::Again);
                     }
-                    for root in self.mapped_roots.drain(..) {
-                        cp.store.forget_creation(root);
+                    self.phase = Phase::Forget;
+                    return Ok(Unit::Again);
+                }
+                Phase::Forget => {
+                    let Some(root) = self.mapped_roots.pop() else {
+                        self.phase = Phase::Release;
+                        continue;
+                    };
+                    unit::visit();
+                    cp.store.forget_creation(root);
+                    return Ok(Unit::Again);
+                }
+                Phase::Release => {
+                    // The newest segment before the redo point first: the ones before a segment
+                    // gone went before it.
+                    let next = *self.release.get_or_insert_with(|| cp.log.kept_from(self.l));
+                    unit::visit();
+                    if next > 0 && cp.log.release_segment(next - 1)? {
+                        self.release = Some(next - 1);
+                        self.released = true;
+                        return Ok(Unit::Again);
                     }
-                    cp.log.release_before(self.l)?;
+                    self.phase = Phase::Released;
+                    return Ok(Unit::Again);
+                }
+                Phase::Released => {
+                    if std::mem::take(&mut self.released) {
+                        unit::visit();
+                        cp.log.sync_released()?;
+                    }
                     txns.release_checkpoint();
                     self.phase = Phase::Erase;
                     return Ok(Unit::Again);
@@ -1585,6 +1658,18 @@ impl Run {
             IOResult::IO(_) if owed => Some(Unit::Again),
             IOResult::IO(IOCompletions(c)) => Some(Unit::Wait(c)),
         })
+    }
+
+    /// The next run of the frames the checkpoint wrote, [`FRAME_RUN`] of them at most, its cursor
+    /// moved past it: `None` once the walk has passed them all.
+    fn frame_run(&mut self) -> Option<std::ops::Range<usize>> {
+        let at = self.frames_at;
+        if at >= self.frames.len() {
+            return None;
+        }
+        let end = self.frames.len().min(at + FRAME_RUN);
+        self.frames_at = end;
+        Some(at..end)
     }
 
     /// One run of the metadata pages dirty at the cut, [`DIRTY_RUN`] of them at most, into the
@@ -1633,8 +1718,9 @@ impl Run {
             if let Some((_, c)) = self.writing.first() {
                 return Ok(Unit::Wait(c.clone()));
             }
-            cp.store.meta().end_cut(self.n, &self.frames);
-            self.phase = Phase::Files;
+            cp.store.meta().stop_keeping(self.n);
+            self.frames_at = 0;
+            self.phase = Phase::Uncut;
             return Ok(Unit::Again);
         };
         unit::visit();
@@ -2033,5 +2119,101 @@ mod tests {
         );
         let ids: Vec<_> = run.meta.iter().collect();
         assert!(ids.windows(2).all(|w| w[0] < w[1]), "in order");
+    }
+
+    /// A database whose writers step its checkpoints, on `io`.
+    fn open(io: &Arc<dyn crate::io::IO>) -> crate::storage::atoll::db::Atoll {
+        use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET, WRITEBACK_BYTES};
+        use crate::storage::atoll::db::{Atoll, AtollConfig};
+        use crate::storage::atoll::log::LogConfig;
+        use crate::storage::atoll::store::StoreConfig;
+        let config = AtollConfig {
+            log: LogConfig {
+                segment_bytes: 1 << 20,
+                buffer_bytes: 256 << 10,
+                chunk_bytes: 16 << 10,
+                writes_in_flight: 3,
+                direct: true,
+            },
+            store: StoreConfig {
+                file_bytes: 1 << 30,
+                meta_pages: 1 << 10,
+            },
+            buffer: BufferConfig {
+                budget: MIN_DB_BUDGET,
+                writeback_bytes: WRITEBACK_BYTES,
+                kept_bytes: None,
+                lent_at_open: Default::default(),
+            },
+            log_budget: Some(512 << 10),
+            checkpoint_write_bytes: None,
+            checkpointing: Checkpointing::Writers,
+            txn: Default::default(),
+        };
+        Atoll::open(io.clone(), "/db/checkpoint-units", config).unwrap()
+    }
+
+    /// The units `run` takes in its phase from where it stands, stepped until it leaves it: a unit
+    /// that goes on into the next phase counts.
+    fn units_in(
+        run: &mut Run,
+        db: &crate::storage::atoll::db::Atoll,
+        in_charge: &Superblock,
+    ) -> usize {
+        let phase = run.phase;
+        let mut units = 0;
+        while run.phase == phase {
+            run.step(db.checkpointer(), db.transactions(), in_charge)
+                .unwrap();
+            units += 1;
+        }
+        units
+    }
+
+    /// The bookkeeping over the frames a checkpoint wrote is a run of them a unit: giving each page
+    /// its durable place, then putting the checkpoint in charge, and letting go of their cut
+    /// copies; and the trees it saw created are forgotten as creations one a unit (the auditor's
+    /// P2-CP-U1; mutants: a phase walking them whole in one unit).
+    #[test]
+    fn the_checkpoints_bookkeeping_walks_its_frames_a_run_a_unit() {
+        let io: Arc<dyn crate::io::IO> = Arc::new(crate::io::MemoryIO::new());
+        let db = open(&io);
+        let in_charge = db.checkpointer().superblock();
+        let id = MetaId {
+            tree: super::super::meta::Tree::Map,
+            class: page::SizeClass::new(0).unwrap(),
+            level: 0,
+            index: 0,
+        };
+        let frame =
+            crate::storage::atoll::testing::drive(&io, || db.store().meta().get(id)).unwrap();
+        // The checkpoint in charge again: its pages' places and its number stand as they are.
+        let mut run = Run::new(in_charge.checkpoint, None);
+        run.frames = (0..2 * FRAME_RUN + 1).map(|_| frame.clone()).collect();
+        run.superblock = Some(in_charge.clone());
+        run.phase = Phase::InCharge;
+        let in_charge_units = units_in(&mut run, &db, &in_charge);
+        let after_in_charge = run.phase;
+        run.phase = Phase::Uncut;
+        run.frames_at = 0;
+        let uncut_units = units_in(&mut run, &db, &in_charge);
+        let after_uncut = run.phase;
+        run.phase = Phase::Forget;
+        run.mapped_roots = (0..3)
+            .map(|i| PageId::new(page::SizeClass::new(0).unwrap(), 1 << 20 | i))
+            .collect();
+        let forget_units = units_in(&mut run, &db, &in_charge);
+        drop((run, frame, db));
+        assert_eq!(
+            (in_charge_units, after_in_charge),
+            (4, Phase::After),
+            "three runs, then the checkpoint put in charge"
+        );
+        assert_eq!(
+            (uncut_units, after_uncut),
+            (4, Phase::Files),
+            "three runs, then done"
+        );
+        assert_eq!(forget_units, 4, "three roots, then the next phase");
     }
 }

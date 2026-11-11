@@ -3267,7 +3267,8 @@ fn a_statement_run_again_after_a_busy_write_writes_its_own_row() {
 }
 
 /// A writing statement steps the checkpointer only while a pass is due or under way: fifty small
-/// inserts in one transaction, far short of a pass's share of the log, each pass over it.
+/// inserts in one transaction, far short of a pass's share of the log, each pass over it, and so
+/// does the transaction's end.
 #[test]
 fn a_writing_statement_passes_over_a_checkpointer_with_nothing_due() {
     use crate::storage::atoll::checkpoint::STEPS_PASSED_OVER;
@@ -3282,8 +3283,14 @@ fn a_writing_statement_passes_over_a_checkpointer_with_nothing_due() {
         conn.execute(format!("INSERT INTO t VALUES ({i}, 'r{i}')"))
             .unwrap();
     }
-    assert_eq!(STEPS_PASSED_OVER.with(|n| n.get()) - before, 50);
+    let inserted = STEPS_PASSED_OVER.with(|n| n.get()) - before;
     conn.execute("COMMIT").unwrap();
+    let ended = STEPS_PASSED_OVER.with(|n| n.get()) - before - inserted;
+    drop((conn, db));
+    assert_eq!(inserted, 50);
+    // The transaction's end passes over it too (DESIGN.md 22.9, Due; mutant: an end that wakes
+    // the checkpoint's task whatever is due).
+    assert_eq!(ended, 1, "the transaction's end");
 }
 
 /// A prepared insert looks its table's rowid counter up once: the cursor it parks keeps it, and

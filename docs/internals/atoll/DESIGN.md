@@ -5389,14 +5389,23 @@ compose, the real `Completion`, latch and backends included where named.
    (Built, first part: `Checkpointing::Thread` is the database's executor with one worker and the
    checkpoint's task, `CheckpointTask`. A step holds the state, or contends for it as a task while
    an integrity check holds it, and steps it until it waits on writes (`Wait` on them) or finds
-   nothing due (`Idle`). A writing statement that finds a checkpoint due, a transaction's end, a
-   full checkpoint asked for and a writer wanting room wake it, as each woke the thread, and a
-   wake while it steps queues it again. A failure, told to every waiter by the
+   nothing due (`Idle`). A writing statement or a transaction's end that finds a checkpoint due
+   (`step_due`) notifies *due*, which sets the task's own level as it wakes it; the task reads
+   *due* before its look, and a step that finds nothing due compares the log's end with the
+   threshold, and a full checkpoint asked for with those done, itself before it rests, so a
+   database due again as a checkpoint ends needs no further append, then drops its own level
+   unless a trigger came since its read (`Cx::clear_due`). A full checkpoint asked for and a
+   writer wanting room wake it, and a wake while it steps queues it again. Slots a checkpoint
+   freed that its erasure could not take yet, waiting for a step that may have looked them up, are
+   counted (`PageStore::erasure_owed`): while any are owed, a statement's step or a transaction's
+   end, the end of such a step, wakes the task at its own level to erase them. A failure, told to
+   every waiter by the
    state, ends the task; no checkpoint runs until the database is opened again, and writers go
    on, as with the thread. Closing the database closes the executor, which abandons a checkpoint
    under way as a failed one is. `Checkpointing::Writers` is the same task on an executor with no
-   worker: a writing statement, a transaction's end and a wait for a full checkpoint each claim it
-   by name (`TaskRef::run_once`), one step a call, and the step tells the writer that claimed it,
+   worker: a writing statement and a transaction's end while a checkpoint is due or under way or
+   erasure is owed, and a wait for a full checkpoint, each claim it by name (`TaskRef::run_once`),
+   one step a call, and the step tells the writer that claimed it,
    on its own thread, what it came to: its wait, done, or the failure it met, so the writer meets
    that failure as a writer stepping the state did. A writer refused room or the gate claims the
    task for its relief, a unit a claim, only as far as its room or the gate needs. A change refused
@@ -5416,10 +5425,8 @@ compose, the real `Completion`, latch and backends included where named.
    state another holds wakes no one, and that holder's let-go does. Another holder's let-go (an
    integrity check, a writer's relief) wakes those writers only where the writers step checkpoints:
    with a worker, they wait on the room the worker frees and the gate it opens. Not built yet: the
-   due trigger and its level (a transaction's end wakes the task whether or not one is due, as it
-   woke the thread, and erasure rides those wakes), the ticket a transaction's end waiting for a
-   full checkpoint holds on it (22.4), close's durable end and the request count through
-   `close_after`, the sustained run and the profile.)
+   ticket a transaction's end waiting for a full checkpoint holds on it (22.4), close's durable end
+   and the request count through `close_after`, the sustained run and the profile.)
 8. **The segment preparers**, every open log, replacing the interim adapter and the callback chain
    in the same change; the callers' fresh-segment cases of proof 12 first. Step 4's exception, a
    unit's budget of one start and one finish, goes with the adapter.

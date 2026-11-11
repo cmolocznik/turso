@@ -385,9 +385,10 @@ impl Opening {
         // The checkpoint's task, on one worker or on none, its writers claiming it.
         let worker = matches!(self.checkpointing, Checkpointing::Thread);
         let executor = Executor::new(self.io.clone(), usize::from(worker))?;
-        let task = executor.spawn(
+        let task = executor.spawn_watching(
             Class::Maintenance,
             Box::new(CheckpointTask::new(checkpointer.clone(), txns.clone())),
+            &[checkpointer.due_signal()],
         );
         // Named before the database is handed out: from then on only the task steps checkpoints.
         checkpointer.attach(task, worker);

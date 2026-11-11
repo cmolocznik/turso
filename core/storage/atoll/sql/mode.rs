@@ -1382,13 +1382,13 @@ pub fn full_checkpoint(db: &AtollDb) -> Result<()> {
     drive(db.io(), || checkpointer.step_full(ticket, txns))
 }
 
-/// Steps the checkpointer, which does whatever is due: a checkpoint once its share of the log
-/// budget has been appended. Its IO is not waited for: the checkpoint goes on at the next step,
-/// whoever takes it.
+/// Steps the checkpointer only while a checkpoint is due, once its share of the log budget has
+/// been appended, or one is under way (DESIGN.md 22.9, Due). Its IO is not waited for: the
+/// checkpoint goes on at the next step, whoever takes it.
 fn nudge_checkpoint(db: &AtollDb) -> Result<()> {
     db.atoll()
         .checkpointer()
-        .step(db.atoll().transactions())
+        .step_due(db.atoll().transactions())
         .map(|_| ())
 }
 

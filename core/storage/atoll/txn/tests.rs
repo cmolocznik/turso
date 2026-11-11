@@ -3,6 +3,7 @@ use crate::io::{MemoryIO, IO};
 use crate::storage::atoll::btree::{Mode, Put, Tree};
 use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
+use crate::storage::atoll::executor::Class;
 use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::log::LogConfig;
 use crate::storage::atoll::radix::FREE;
@@ -773,4 +774,155 @@ fn a_waited_bit_without_a_reservation_is_refused() {
 #[should_panic(expected = "invalid reservation word")]
 fn a_reservation_cannot_also_have_position_bits() {
     decode_reservation(RESERVING | 1);
+}
+
+/// Commits transactions of `bytes`-byte changes into the tests' plain tree until a checkpoint is
+/// due by the log appended since the last began: what a writing statement then finds.
+fn append_until_due(io: &Arc<dyn IO>, db: &Atoll, bytes: usize) {
+    let tree = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), root());
+    let value = vec![7u8; bytes];
+    while !db.checkpointer().is_due() {
+        let mut txn = begin(io, db, Isolation::Snapshot);
+        let key = txn.start().to_be_bytes();
+        let mut put = Put::new(&key, value.clone(), Mode::Upsert);
+        drive(io, || tree.put(&mut put)).unwrap();
+        txn.changed(|s, c| c.plain_put(s, root(), &key, &value));
+        commit(io, db, txn);
+    }
+}
+
+/// A writing statement that finds a checkpoint due raises the checkpoint's task to the due class
+/// as it wakes it; the task's own step that finds nothing more due drops it to maintenance again
+/// (DESIGN.md 22.9, Due; 22.4; mutants: a trigger that only wakes, a step that never clears).
+#[test]
+fn a_checkpoint_due_raises_its_tasks_level_until_its_step_finds_none_due() {
+    // IO that completes only as it is stepped: a unit's writes stay in flight, so a call
+    // returns with its checkpoint under way.
+    let io: Arc<dyn IO> = Arc::new(crate::io::crash::CrashIO::new(0));
+    let db = open(&io, 4);
+    let cp = db.checkpointer();
+    let rested = cp.task_class();
+    append_until_due(&io, &db, 32 << 10);
+    let before = cp.task_class();
+    let mut next = cp.step_due(db.transactions()).unwrap();
+    let under_way = (cp.is_under_way(), cp.task_class());
+    // The statements after it step the checkpoint under way to its end: done once it ended.
+    while let IOResult::IO(IOCompletions(c)) = next {
+        io.wait(&c);
+        next = cp.step_due(db.transactions()).unwrap();
+    }
+    let ended = (cp.is_under_way(), cp.is_due(), cp.task_class());
+    drop(db);
+    assert_eq!(rested, Some(Class::Maintenance), "nothing due at open");
+    assert_eq!(
+        before,
+        Some(Class::Maintenance),
+        "due, but no statement looked"
+    );
+    assert_eq!(
+        under_way,
+        (true, Some(Class::Due)),
+        "the statement's trigger"
+    );
+    assert_eq!(
+        ended,
+        (false, false, Some(Class::Maintenance)),
+        "nothing due once it ended"
+    );
+}
+
+/// A checkpoint ending with another share of the log appended since it began is due again: its
+/// task goes on rather than rest, keeping its level, with no statement to trigger it (DESIGN.md
+/// 22.9, Due: the task compares the two itself before it returns Idle; mutant: no compare).
+#[test]
+fn a_checkpoint_ending_due_again_keeps_its_tasks_level() {
+    // IO that completes only as it is stepped: a unit's writes stay in flight, so a call
+    // returns with its checkpoint under way.
+    let io: Arc<dyn IO> = Arc::new(crate::io::crash::CrashIO::new(0));
+    let db = open(&io, 4);
+    let cp = db.checkpointer();
+    append_until_due(&io, &db, 32 << 10);
+    if let IOResult::IO(IOCompletions(c)) = cp.step_due(db.transactions()).unwrap() {
+        io.wait(&c);
+    }
+    let began = cp.is_under_way();
+    // Another share while it runs: no statement steps the checkpoint, the commits only append.
+    append_until_due(&io, &db, 32 << 10);
+    let still = cp.is_under_way();
+    while let IOResult::IO(IOCompletions(c)) = cp.step(db.transactions()).unwrap() {
+        io.wait(&c);
+    }
+    let ended = (cp.is_under_way(), cp.is_due(), cp.task_class());
+    drop(db);
+    assert!(
+        began && still,
+        "the first checkpoint began, and ran on past the appends"
+    );
+    assert_eq!(
+        ended,
+        (false, true, Some(Class::Due)),
+        "the task, due again as its checkpoint ended"
+    );
+}
+
+/// Slots a checkpoint freed that its own erasure could not take yet, still waiting for a step
+/// that may have looked them up, are erased by the writers' steps that follow while nothing is due:
+/// a statement's step or a transaction's end steps the erasure while any slot is owed it, the end
+/// of a step being what lets them be erased (DESIGN.md 22.9; mutant: owed erasure passed over).
+#[test]
+fn slots_owed_erasure_are_erased_by_the_steps_that_follow_with_nothing_due() {
+    use crate::storage::atoll::checkpoint::STEPS_PASSED_OVER;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 4);
+    let tree = Tree::open(io.clone(), db.pool().clone(), db.store().clone(), root());
+    // The same keys rewritten between full checkpoints: each frees the slots of the images the
+    // one before wrote. Another thread's step stands through the last, as a reader's would, so
+    // the slots that checkpoint frees wait for it, and its own erasure leaves them owed.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (leave_tx, leave_rx) = std::sync::mpsc::channel::<()>();
+    let reader = {
+        let epochs = db.store().epochs().clone();
+        std::thread::spawn(move || {
+            let step = epochs.enter();
+            entered_tx.send(()).unwrap();
+            let _ = leave_rx.recv();
+            drop(step);
+        })
+    };
+    for round in 0..3u8 {
+        for k in 0..64u64 {
+            let mut put = Put::new(&k.to_be_bytes(), vec![round; 512], Mode::Upsert);
+            drive(&io, || tree.put(&mut put)).unwrap();
+        }
+        if round == 2 {
+            entered_rx.recv().unwrap();
+        }
+        checkpoint(&io, &db);
+    }
+    // The reader's step ends: the slots may be erased now.
+    let _ = leave_tx.send(());
+    let joined = reader.join().is_ok();
+    let cp = db.checkpointer();
+    let owed = db.store().erase_owed();
+    let due = cp.is_due() || cp.is_under_way();
+    let passed = STEPS_PASSED_OVER.with(|n| n.get());
+    let bound = owed + db.store().epochs().participants() + 1;
+    let mut steps = 0;
+    while db.store().erasure_owed() && steps < bound {
+        drive(&io, || cp.step_due(db.transactions())).unwrap();
+        steps += 1;
+    }
+    let passed = STEPS_PASSED_OVER.with(|n| n.get()) - passed;
+    let left = db.store().erase_owed();
+    drop((tree, db));
+    assert!(joined, "the reader panicked");
+    assert!(
+        owed > 0 && !due,
+        "slots owed erasure, nothing due: {owed} owed"
+    );
+    assert_eq!(
+        (left, passed),
+        (0, 0),
+        "{owed} slots owed, after {steps} statements' steps"
+    );
 }

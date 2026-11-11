@@ -37,7 +37,7 @@ use super::btree::node::{self, View};
 use super::btree::value::{self, ValueRef};
 use super::buffer::{BufferPool, CutScan, Relief, Relieved, Retry, Source};
 use super::control::{Control, Superblock, MAX_CONTINUATIONS};
-use super::executor::{self, Class, Cx, Step, Task, TaskRef, Watched};
+use super::executor::{self, Class, Cx, Signal, Step, Task, TaskRef, Watched};
 use super::guarded::{Contender, Guarded, Hold};
 use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
@@ -130,6 +130,12 @@ pub struct Checkpointer {
     /// Where the log ended when the last checkpoint began: what a writing statement reads before
     /// stepping ([`step_due`](Self::step_due)).
     began_at: AtomicU64,
+    /// Notified by a writing statement that finds a checkpoint due (DESIGN.md 22.9, Due): it
+    /// sets the task's own level to due as it wakes it, and the task reads it before it looks.
+    due: Arc<Signal>,
+    /// Whether a checkpoint is under way, set and cleared under the state: the writers stepping
+    /// checkpoints step one under way whether or not another is due.
+    under_way: AtomicBool,
     /// The superblock in charge, as the checkpoint stepping it last wrote it, for anyone to read.
     published: ArcCell<Superblock>,
     releasing: Releasing<Superblock>,
@@ -244,6 +250,8 @@ impl CheckpointTask {
 impl Task for CheckpointTask {
     fn step(&mut self, cx: &Cx) -> Result<Step> {
         let cp = &*self.cp;
+        // Read before the look: a trigger after it moves the count, keeping the task's level.
+        let read = cp.due.read();
         let held = cp
             .state
             .hold_or_contend(&Contender::Task(cx.task()))
@@ -268,8 +276,16 @@ impl Task for CheckpointTask {
             Ok(Unit::Again) => Step::Again,
             Ok(Unit::Wait(c)) if c.finished() => Step::Again,
             Ok(Unit::Wait(c)) => Step::Wait(c.clone()),
-            // Nothing due now: a wake after the look, while this step runs, queues it again.
-            Ok(Unit::Done) => Step::Idle(Watched::of(&[])),
+            // A checkpoint ended, or none was due: the task looks itself before it rests, so a
+            // database due when the task was made, or due again as a checkpoint ends, or a full
+            // checkpoint asked for meanwhile, needs no further wake (DESIGN.md 22.9, Due).
+            Ok(Unit::Done) if cp.due_now() || cp.full_pending() => Step::Again,
+            // Nothing due: its own level drops, unless a trigger came since the read, which
+            // keeps it and, the count moved, wakes it again.
+            Ok(Unit::Done) => {
+                cx.clear_due(&cp.due, read);
+                Step::Idle(Watched::of(&[(&cp.due, read)]))
+            }
             Err(_) => Step::Done,
         };
         tell_claimant(Claimed::Stepped(out));
@@ -285,6 +301,7 @@ impl Task for CheckpointTask {
                 run.abandon(cp, &self.txns);
                 state.upkeep.abandon();
             }
+            cp.under_way.store(false, Ordering::Release);
         }
         cp.ended();
     }
@@ -551,6 +568,8 @@ impl Checkpointer {
             budget,
             full_wanted: AtomicU64::new(0),
             began_at,
+            due: Arc::default(),
+            under_way: AtomicBool::new(false),
             published: ArcCell::new(Arc::new(superblock.clone())),
             releasing,
             state: Guarded::new(State {
@@ -956,20 +975,56 @@ impl Checkpointer {
         out
     }
 
-    /// A writing statement's step (DESIGN.md §17): only once a checkpoint is due by the log
-    /// appended since the last began, or one is under way.
+    /// A writing statement's step and a transaction's end (DESIGN.md §17, 22.9): only once a
+    /// checkpoint is due by the log appended since the last began, one is under way, or slots
+    /// freed are owed their erasure. Due, it notifies *due*, which sets the task's own level as it
+    /// wakes it; a worker steps the task, and the writers stepping checkpoints claim it, as they
+    /// do while one is under way or erasure is owed.
     pub fn step_due(&self, txns: &Transactions) -> Result<IOResult<()>> {
-        let due = self
-            .log
-            .end()
-            .saturating_sub(self.began_at.load(Ordering::Acquire))
-            >= self.budget / SHARES;
-        if !due {
+        let due = self.due_now();
+        let under_way = self.under_way.load(Ordering::Acquire);
+        // Slots freed and not yet erased: the end of the step that may have held one, a
+        // statement's or a transaction's, may let them be erased now.
+        let erasing = !due && !under_way && self.store.erasure_owed();
+        if !due && !under_way && !erasing {
             #[cfg(test)]
             STEPS_PASSED_OVER.with(|n| n.set(n.get() + 1));
             return Ok(IOResult::Done(()));
         }
-        self.step(txns)
+        if due {
+            if let Some(task) = self.task.get().filter(|task| !task.is_over()) {
+                task.trigger(&self.due);
+            }
+        }
+        match self.stepper() {
+            // Its own IO steps a checkpoint under way, and the trigger woke it for one due; the
+            // erasure owed is maintenance, woken at the task's own level.
+            Stepper::Worker => {
+                if erasing {
+                    self.wake_driver();
+                }
+                Ok(IOResult::Done(()))
+            }
+            Stepper::Caller(_) | Stepper::Writer => self.step(txns),
+        }
+    }
+
+    /// Whether a checkpoint is due by the log appended since the last began (DESIGN.md §17).
+    fn due_now(&self) -> bool {
+        self.log
+            .end()
+            .saturating_sub(self.began_at.load(Ordering::Acquire))
+            >= self.budget / SHARES
+    }
+
+    /// Whether a full checkpoint asked for is not done yet, as the state last recorded them.
+    fn full_pending(&self) -> bool {
+        self.full_wanted.load(Ordering::Acquire) > self.full_done.load(Ordering::Acquire)
+    }
+
+    /// The signal a checkpoint due is notified on, which its task watches (DESIGN.md 22.9).
+    pub(crate) fn due_signal(&self) -> &Arc<Signal> {
+        &self.due
     }
 
     /// Holds the checkpointer idle, if no one is stepping it: no checkpoint runs until the hold is
@@ -1130,6 +1185,18 @@ impl Checkpointer {
         })
     }
 
+    /// Whether a checkpoint is due by the log appended since the last began.
+    #[cfg(test)]
+    pub(crate) fn is_due(&self) -> bool {
+        self.due_now()
+    }
+
+    /// Whether a checkpoint is under way.
+    #[cfg(test)]
+    pub(crate) fn is_under_way(&self) -> bool {
+        self.under_way.load(Ordering::Acquire)
+    }
+
     /// The class of the checkpoint's task now, if it has one (DESIGN.md 22.4).
     #[cfg(test)]
     pub(crate) fn task_class(&self) -> Option<Class> {
@@ -1185,12 +1252,7 @@ impl State {
         }
         if self.run.is_none() {
             let wanted = cp.full_wanted.load(Ordering::Acquire);
-            let due = cp
-                .log
-                .end()
-                .saturating_sub(cp.began_at.load(Ordering::Acquire))
-                >= cp.budget / SHARES;
-            if wanted <= self.full_done && !due {
+            if wanted <= self.full_done && !cp.due_now() {
                 unit::visit();
                 return Ok(match unit!(cp.store.erase_one()) {
                     true => Unit::Done,
@@ -1198,6 +1260,7 @@ impl State {
                 });
             }
             cp.began_at.store(cp.log.end(), Ordering::Release);
+            cp.under_way.store(true, Ordering::Release);
             self.run = Some(Box::new(Run::new(
                 self.superblock.checkpoint + 1,
                 (wanted > self.full_done).then_some(wanted),
@@ -1213,6 +1276,7 @@ impl State {
             // next step's.
             Ok(Unit::Done) => {
                 let run = self.run.take().expect("a checkpoint under way");
+                cp.under_way.store(false, Ordering::Release);
                 self.superblock = run.superblock.expect("the checkpoint's superblock");
                 if let Some(full) = run.full {
                     self.full_done = self.full_done.max(full);
@@ -1228,6 +1292,7 @@ impl State {
                 if let Some(run) = self.run.take() {
                     run.abandon(cp, txns);
                 }
+                cp.under_way.store(false, Ordering::Release);
                 self.upkeep.abandon();
                 self.failed = Some(e.to_string());
                 Err(e)

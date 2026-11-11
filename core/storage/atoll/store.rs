@@ -49,7 +49,7 @@ use super::whole_write;
 use crate::io::{Buffer, Completion, File, OpenFlags, IO};
 use crate::storage::atoll::locks::Mutex;
 use crate::storage::atoll::notify::LetGo;
-use crate::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use crate::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
@@ -137,6 +137,9 @@ pub struct PageStore {
     unerased: [GrowBits; CLASS_COUNT],
     /// Slots no durable checkpoint names, waiting for every step that may have looked them up.
     to_erase: Retired<(SizeClass, u64)>,
+    /// Slots freed and not yet erased, whether still waiting for those steps or ready: a step
+    /// that ends may let them be erased, so writers step erasure while any are owed.
+    erase_owed: AtomicUsize,
     /// Swap slots given up, waiting for every step that may have looked them up.
     swap_freed: Retired<(SizeClass, u64)>,
     /// The erasure in progress: owned by whoever steps it, and only ever tried.
@@ -251,6 +254,7 @@ impl PageStore {
             freed_numbers: Retired::default(),
             unerased: Default::default(),
             to_erase: Retired::default(),
+            erase_owed: AtomicUsize::new(0),
             swap_freed: Retired::default(),
             erasure: Mutex::new(Eraser::default()),
             reserved: Default::default(),
@@ -1096,6 +1100,7 @@ impl PageStore {
         self.unerased[class.index()].set(slot);
         set_space(&mut locked, class, slot, false);
         locked.commit(&self.meta);
+        self.erase_owed.fetch_add(1, Ordering::AcqRel);
         self.to_erase.retire(&self.epochs, (class, slot));
         Ok(IOResult::Done(()))
     }
@@ -1172,10 +1177,24 @@ impl PageStore {
             return Ok(IOResult::Done(false));
         }
         let done = eraser.current.take().expect("an erasure");
+        let erased = done.slots.len();
         for (class, slot) in done.slots {
             self.unerased[class.index()].clear(slot);
         }
+        let owed = self.erase_owed.fetch_sub(erased, Ordering::AcqRel);
+        debug_assert!(owed >= erased, "slots erased that none owed");
         Ok(IOResult::Done(false))
+    }
+
+    /// Whether slots freed are not yet erased (DESIGN.md 22.9): a step's end may let them be.
+    pub fn erasure_owed(&self) -> bool {
+        self.erase_owed.load(Ordering::Acquire) != 0
+    }
+
+    /// Slots freed and not yet erased.
+    #[cfg(test)]
+    pub fn erase_owed(&self) -> usize {
+        self.erase_owed.load(Ordering::Acquire)
     }
 
     /// Erases every slot freed and ready, for a test. Step it until done.

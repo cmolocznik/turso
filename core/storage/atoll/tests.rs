@@ -56,7 +56,7 @@ fn class(i: usize) -> SizeClass {
 
 /// Opens the database on `threads` threads, the way an embedder lends them to recovery.
 fn try_open(io: Arc<dyn IO>, threads: usize) -> Result<Atoll> {
-    let opening = Opening::new(io, BASE, config())?;
+    let opening = Opening::new(io, BASE, config(), None)?;
     let worked: Vec<Result<()>> = std::thread::scope(|s| {
         let others: Vec<_> = (1..threads).map(|_| s.spawn(|| opening.work())).collect();
         let mut worked = vec![opening.work()];

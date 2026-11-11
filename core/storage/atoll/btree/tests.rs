@@ -49,7 +49,7 @@ fn config(budget: usize) -> AtollConfig {
 
 /// Opens the database on `threads` threads, the way an embedder lends them to recovery.
 fn open(io: &Arc<dyn IO>, budget: usize, threads: usize) -> Atoll {
-    let opening = Opening::new(io.clone(), BASE, config(budget)).unwrap();
+    let opening = Opening::new(io.clone(), BASE, config(budget), None).unwrap();
     std::thread::scope(|s| {
         for _ in 1..threads {
             s.spawn(|| opening.work().unwrap());
@@ -1093,7 +1093,7 @@ fn a_tree_recovered_on_threads_at_once_reads_back_whole(threads: usize, keys: u6
         checkpoint(&db, &run);
         tree.root()
     };
-    let opening = Arc::new(Opening::new(io.clone(), BASE, config(MIN_DB_BUDGET)).unwrap());
+    let opening = Arc::new(Opening::new(io.clone(), BASE, config(MIN_DB_BUDGET), None).unwrap());
     let others: Vec<_> = (1..threads)
         .map(|_| {
             let opening = opening.clone();

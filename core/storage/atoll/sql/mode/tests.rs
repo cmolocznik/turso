@@ -38,6 +38,11 @@ fn threaded() -> crate::storage::atoll::db::AtollConfig {
 /// on is the checkpointing thread's work on a database in memory, far shorter, and a wait nothing
 /// ends would otherwise hang the run.
 fn within_a_minute(test: impl FnOnce() + Send + 'static) {
+    within_a_minute_or("a wait on the checkpointing thread never ended", test)
+}
+
+/// [`within_a_minute`], failing with `never` if `test` is not done within it.
+fn within_a_minute_or(never: &'static str, test: impl FnOnce() + Send + 'static) {
     let (done, finished) = std::sync::mpsc::channel();
     let runner = std::thread::spawn(move || {
         test();
@@ -47,9 +52,7 @@ fn within_a_minute(test: impl FnOnce() + Send + 'static) {
         Ok(()) => runner.join().unwrap(),
         // The test panicked: its own message is the failure.
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => runner.join().unwrap(),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("a wait on the checkpointing thread never ended")
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{never}"),
     }
 }
 
@@ -4040,17 +4043,41 @@ fn a_checkpoint_unit_visits_at_most_one_page() {
     assert!(ended.stderr.contains("PROOF3 most=1 "), "{}", ended.stderr);
 }
 
-/// A database whose last handle drops keeps its files, and the locks they hold, until they close,
-/// and an open of the file meanwhile waits for them: no probe and no second open closes a
-/// descriptor of the file while they are open, which would drop every lock the process holds on it
-/// (R17), the reopened database's own once the old files close (the auditor's #4385; mutant: the
-/// registry forgetting the database as its last handle drops, before its files close). The lock is
-/// looked at through one descriptor kept open to the end: an open file description's lock query
-/// meets a traditional lock even this process holds.
+/// How a test drops a database while it reopens it, and where the close pauses.
 #[cfg(target_os = "linux")]
-#[test]
-fn a_reopen_while_the_database_closes_waits_and_keeps_the_files_lock() {
-    use crate::database::CLOSING_WAITS;
+#[derive(Clone, Copy)]
+enum Closing {
+    /// The test drops its last handle, and the drop pauses as it begins: nothing of the database
+    /// dropped yet, its handle no longer upgrading.
+    DropBegins,
+    /// The test drops its last handle, and the drop pauses as the Atoll database begins to close.
+    AtollCloses,
+    /// The test drops its handle while a connection holds the database, then the connection, and
+    /// the drop pauses as the Atoll database begins to close: the connection's transaction holds it
+    /// past the `Database`, whose fields have all dropped by then.
+    LastConnection,
+}
+
+/// How a test reopens the file.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum Reopen {
+    /// [`Database::open`], which resolves Atoll mode first.
+    Open,
+    /// [`Database::open_async`] with Atoll's options set, its first phase reading the registry.
+    OpenAsync,
+}
+
+/// A database closing keeps its files, and the locks they hold, until they close, and an open of
+/// the file meanwhile waits for them: no probe and no second open closes a descriptor of the file
+/// while they are open, which would drop every lock the process holds on it (R17), the reopened
+/// database's own once the old files close (the auditor's #4385, #4389). The lock is looked at
+/// through one descriptor kept open to the end, at the open, while the reopen waits and after both
+/// have ended: an open file description's lock query meets a traditional lock even this process
+/// holds, and it is asserted to meet the first database's.
+#[cfg(target_os = "linux")]
+fn reopen_while_closing(closing: Closing, reopen: Reopen) {
+    use crate::database::{CLOSING_WAITS, DROP_PAUSE};
     use crate::storage::atoll::testing::CLOSE_PAUSE;
     use std::os::fd::AsRawFd;
     let dir = tempfile::tempdir().unwrap();
@@ -4073,18 +4100,31 @@ fn a_reopen_while_the_database_closes_waits_and_keeps_the_files_lock() {
         lock.l_type != libc::F_UNLCK as libc::c_short
     };
     let held_at_open = locked(&look);
+    // What the closer drops: the database, or a connection holding it once the test's handle went.
+    let last: Box<dyn std::any::Any + Send> = match closing {
+        Closing::DropBegins | Closing::AtollCloses => Box::new(first),
+        Closing::LastConnection => {
+            let conn = first.connect(ConnectOpts::new()).unwrap();
+            drop(first);
+            Box::new(conn)
+        }
+    };
     let (told, heard) = std::sync::mpsc::channel::<&'static str>();
     let (go, wait_go) = std::sync::mpsc::channel::<()>();
     let closer = {
         let told = told.clone();
         std::thread::spawn(move || {
-            CLOSE_PAUSE.with(|p| {
-                *p.borrow_mut() = Some(Box::new(move || {
-                    told.send("paused").unwrap();
-                    wait_go.recv().unwrap();
-                }))
+            let pause: Box<dyn FnOnce()> = Box::new(move || {
+                told.send("paused").unwrap();
+                wait_go.recv().unwrap();
             });
-            drop(first);
+            match closing {
+                Closing::DropBegins => DROP_PAUSE.with(|p| *p.borrow_mut() = Some(pause)),
+                Closing::AtollCloses | Closing::LastConnection => {
+                    CLOSE_PAUSE.with(|p| *p.borrow_mut() = Some(pause))
+                }
+            }
+            drop(last);
         })
     };
     let paused = heard.recv().unwrap();
@@ -4092,12 +4132,29 @@ fn a_reopen_while_the_database_closes_waits_and_keeps_the_files_lock() {
         let (io, path) = (io.clone(), path.clone());
         std::thread::spawn(move || {
             CLOSING_WAITS.with(|w| *w.borrow_mut() = Some(told.clone()));
-            let db = open(&io, &path);
+            let db = match reopen {
+                Reopen::Open => open(&io, &path),
+                Reopen::OpenAsync => {
+                    let options = OpenOptions::new(Arc::new(SqliteDialect))
+                        .atoll(config())
+                        .storage(Arc::new(crate::storage::atoll::sql::mode::RefusingStorage));
+                    let mut state = crate::database::OpenDbAsyncState::new();
+                    loop {
+                        match Database::open_async(&mut state, io.clone(), &path, &options).unwrap()
+                        {
+                            crate::IOResult::Done(db) => break db,
+                            crate::IOResult::IO(c) => c.wait(&*io).unwrap(),
+                        }
+                    }
+                }
+            };
             told.send("opened").unwrap();
             db
         })
     };
     let met = heard.recv().unwrap();
+    // The close still paused: an open that probed the file first has closed a descriptor of it.
+    let held_while_closing = locked(&look);
     go.send(()).unwrap();
     closer.join().unwrap();
     let second = opener.join().unwrap();
@@ -4111,7 +4168,54 @@ fn a_reopen_while_the_database_closes_waits_and_keeps_the_files_lock() {
         "an open of the file went ahead while its database was closing"
     );
     assert!(
+        held_while_closing,
+        "the closing database's lock on its file was dropped while it closed"
+    );
+    assert!(
         held_after,
         "the reopened database's lock on its file was dropped as the old one closed"
     );
+}
+
+/// What a reopen test that does not end within a minute says: its close never reached its pause,
+/// or the close or the reopen never ended.
+#[cfg(target_os = "linux")]
+const NEVER_REOPENED: &str = "a close never paused, or a close or a reopen never ended";
+
+/// Mutant: an open's resolution taking a database whose handle no longer upgrades for none, and
+/// probing the file (its first phase then waits, but the probe has closed a descriptor).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reopen_as_the_databases_drop_begins_waits_and_keeps_the_files_lock() {
+    within_a_minute_or(NEVER_REOPENED, || {
+        reopen_while_closing(Closing::DropBegins, Reopen::Open)
+    });
+}
+
+/// Mutant: the same, or the registry forgetting the database before its files close.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reopen_while_the_database_closes_waits_and_keeps_the_files_lock() {
+    within_a_minute_or(NEVER_REOPENED, || {
+        reopen_while_closing(Closing::AtollCloses, Reopen::Open)
+    });
+}
+
+/// Mutant: the registry forgetting the database once the `Database` has dropped, its Atoll files
+/// still open in the connection's transaction (#4389).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reopen_while_the_last_connection_closes_the_database_waits_and_keeps_the_files_lock() {
+    within_a_minute_or(NEVER_REOPENED, || {
+        reopen_while_closing(Closing::LastConnection, Reopen::Open)
+    });
+}
+
+/// Mutant: the open's first phase taking a database whose handle no longer upgrades for none.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_async_reopen_while_the_database_closes_waits_and_keeps_the_files_lock() {
+    within_a_minute_or(NEVER_REOPENED, || {
+        reopen_while_closing(Closing::AtollCloses, Reopen::OpenAsync)
+    });
 }

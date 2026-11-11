@@ -87,8 +87,21 @@ impl AtollDb {
     /// dropped lists.
     #[turso_macros::atoll_entry]
     pub fn open(io: Arc<dyn IO>, path: &str, config: AtollConfig) -> Result<Self> {
+        Self::open_holding(io, path, config, None)
+    }
+
+    /// [`AtollDb::open`], the database's files holding `held` until the last of them has closed,
+    /// whatever holds the database last: the registry's sign that no descriptor of the database is
+    /// open (R17).
+    #[turso_macros::atoll_entry]
+    pub fn open_holding(
+        io: Arc<dyn IO>,
+        path: &str,
+        config: AtollConfig,
+        held: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Self> {
         let slots = config.txn.slots;
-        let atoll = Atoll::open(io.clone(), path, config)?;
+        let atoll = Atoll::open_holding(io.clone(), path, config, held)?;
         // Turso's SQL writes only under the write gate (DESIGN.md §17), its open's own included.
         atoll.transactions().require_gate();
         let mut made = false;

@@ -174,7 +174,18 @@ impl Atoll {
     /// Opens the database at `base`, creating it if it does not exist and recovering it on this
     /// thread if it does. To recover on several threads, use [`Opening`].
     pub fn open(io: Arc<dyn IO>, base: &str, config: AtollConfig) -> Result<Self> {
-        let opening = Opening::new(io, base, config)?;
+        Self::open_holding(io, base, config, None)
+    }
+
+    /// [`Atoll::open`], the database's files holding `held` until the last of them has closed
+    /// ([`Requests`]).
+    pub fn open_holding(
+        io: Arc<dyn IO>,
+        base: &str,
+        config: AtollConfig,
+        held: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Self> {
+        let opening = Opening::new(io, base, config, held)?;
         opening.work()?;
         opening.finish()
     }
@@ -265,9 +276,16 @@ pub(super) fn refuse_a_backend_that_would_poll(io: &dyn IO) -> Result<()> {
 }
 
 impl Opening {
-    pub fn new(io: Arc<dyn IO>, base: &str, mut config: AtollConfig) -> Result<Self> {
+    /// Opens the database at `base`, its files holding `held` until the last of them has closed
+    /// ([`Requests`]).
+    pub fn new(
+        io: Arc<dyn IO>,
+        base: &str,
+        mut config: AtollConfig,
+        held: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Self> {
         refuse_a_backend_that_would_poll(&*io)?;
-        let requests = Arc::new(Requests::default());
+        let requests = Arc::new(Requests::holding(held));
         let io: Arc<dyn IO> = Arc::new(Counted::new(io, requests.clone()));
         // The log's ring and the image bank are lent from the pool for as long as it is open,
         // taken as it opens; the smallest pool is the budget beside them and the copies' worst

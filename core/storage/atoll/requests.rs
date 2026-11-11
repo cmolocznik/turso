@@ -29,6 +29,12 @@ pub(super) struct Requests {
     word: AtomicU64,
     /// The thread close waits on, set before it marks the word.
     closer: crate::sync::OnceLock<crate::thread::Thread>,
+    /// What the embedder handed the database to drop once its files are closed: the IO that opens
+    /// them, every file and every request on them holds these requests, and a file drops its
+    /// descriptor before it lets them go ([`CountedFile`]), so the last of them drops this after the
+    /// last descriptor of the database has closed, and with it every lock the process held on its
+    /// files (R17), whatever held the database last.
+    _held: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Close waits on the word.
@@ -44,14 +50,20 @@ fn outstanding_in(word: u64) -> u64 {
 
 impl Default for Requests {
     fn default() -> Self {
-        Self {
-            word: AtomicU64::new(0),
-            closer: crate::sync::OnceLock::new(),
-        }
+        Self::holding(None)
     }
 }
 
 impl Requests {
+    /// No request yet, holding `held` until the last file and request of the database has gone.
+    pub(super) fn holding(held: Option<Arc<dyn std::any::Any + Send + Sync>>) -> Self {
+        Self {
+            word: AtomicU64::new(0),
+            closer: crate::sync::OnceLock::new(),
+            _held: held,
+        }
+    }
+
     /// Counts the request `submit` submits for as long as its backend owns it; refused, never
     /// submitted, once close has sealed the count.
     fn submit(
@@ -293,6 +305,8 @@ impl IO for Counted {
 /// A file whose requests count in its database's [`Requests`]. Every other call goes to the file
 /// it wraps.
 struct CountedFile {
+    /// The only holder of the file it wraps, so its drop closes the descriptor: declared before
+    /// `requests`, so the descriptor closes before the requests, and what they hold, go.
     file: Arc<dyn File>,
     requests: Arc<Requests>,
 }

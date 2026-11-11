@@ -636,14 +636,13 @@ pub(crate) enum RegistryEntry {
     /// Another caller is currently opening this database. Callers that see
     /// this should yield and retry later.
     Opening,
-    /// The database has been opened and is (or was) live.
-    Ready(Weak<Database>),
-    /// The database is closing: its last handle dropped and its files not yet closed, which this
-    /// completion says once they are. An open of the file waits for it, so no probe and no second
-    /// open of the file closes a descriptor of it meanwhile: closing one drops every lock the
-    /// process holds on the file, those its closing files still hold and, once they close, those a
-    /// second open had taken (R17).
-    Closing(Completion),
+    /// The database has been opened, and the completion its [`Closed`] finishes once every file it
+    /// opened has closed, which removes the entry. A handle that no longer upgrades is a database
+    /// closing: its last handle dropped and its files, or some of them, still open. An open of the
+    /// file waits for the completion, so no probe and no second open of the file closes a
+    /// descriptor of it meanwhile: closing one drops every lock the process holds on the file, those
+    /// the closing files still hold and, once they close, those a second open had taken (R17).
+    Ready(Weak<Database>, Completion),
 }
 
 #[cfg(test)]
@@ -651,6 +650,23 @@ crate::thread::thread_local! {
     /// Told when an open on this thread waits for a database of its file to close: a test's look.
     pub(crate) static CLOSING_WAITS: std::cell::RefCell<Option<std::sync::mpsc::Sender<&'static str>>> =
         const { std::cell::RefCell::new(None) };
+    /// Run, and taken, as a database's drop begins on this thread, its last handle gone and nothing
+    /// of it dropped yet: a test's pause there.
+    pub(crate) static DROP_PAUSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A [`Database`]'s first field, in tests: its drop runs the pause [`DROP_PAUSE`] holds, if any.
+#[cfg(test)]
+struct DropBegins;
+
+#[cfg(test)]
+impl Drop for DropBegins {
+    fn drop(&mut self) {
+        if let Some(pause) = DROP_PAUSE.with(|p| p.borrow_mut().take()) {
+            pause();
+        }
+    }
 }
 
 /// Tells a test waiting on [`CLOSING_WAITS`] that an open on this thread waits for a closing.
@@ -663,12 +679,15 @@ fn closing_wait_seen() {
     });
 }
 
-/// The last field of a [`Database`]: once it drops, every file the database held is closed, and
-/// the registry's closing entry for it goes and its waiters are woken.
+/// Held by a [`Database`], as its last field, and, in Atoll mode, by every file of the database
+/// and every request on them (`AtollDb::open_holding`), so it drops once the database has dropped
+/// and every file it opened has closed, whatever held either last: a connection's transaction, a
+/// cursor, a request a backend still owns. Its drop removes the database's registry entry and
+/// finishes the completion an open of the file waits on meanwhile ([`RegistryEntry::Ready`]).
 struct Closed {
-    /// Finished by this drop, on whatever thread drops the database: a wait another thread ends.
+    /// Finished by this drop, on whatever thread drops the last holder: a wait another thread ends.
     done: Completion,
-    /// The registry's key for the database, once its drop has marked it closing.
+    /// The registry's key for the database, once it is registered.
     key: OnceLock<DatabaseKey>,
 }
 
@@ -685,11 +704,13 @@ impl Drop for Closed {
     fn drop(&mut self) {
         if let Some(key) = self.key.get() {
             let mut registry = DATABASE_MANAGER.lock();
-            if matches!(registry.get(key), Some(RegistryEntry::Closing(c)) if c.ptr_eq(&self.done))
+            // The entry is this database's unless a test took it out of the registry.
+            if matches!(registry.get(key), Some(RegistryEntry::Ready(_, c)) if c.ptr_eq(&self.done))
             {
                 registry.remove(key);
             }
         }
+        // Waiters woken with the registry's lock let go.
         self.done.complete(0);
     }
 }
@@ -714,8 +735,9 @@ impl Drop for Closed {
 /// event loops because the blocked thread
 /// can never resume the coroutine that owns the lock.
 ///
-/// Never drop an `Arc<Database>` while holding the mutex either: dropping the
-/// last one runs `Database::drop`, which locks the mutex to remove the entry.
+/// Never drop an `Arc<Database>` while holding the mutex either, nor anything that holds
+/// a database's files: dropping the last holder drops its [`Closed`], which locks the
+/// mutex to remove the entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DatabaseKey {
     File(io::FileId),
@@ -747,6 +769,9 @@ pub struct Database<
     A: alloc::ConcurrentAllocator = alloc::DynAllocator,
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
+    /// First, so its drop is the first thing of a database's drop.
+    #[cfg(test)]
+    _drop_begins: DropBegins,
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
     /// The Atoll database in Atoll mode (DESIGN.md §17): set at open, never changed after.
     pub(crate) atoll: Option<Arc<crate::storage::atoll::sql::AtollDb>>,
@@ -786,16 +811,13 @@ pub struct Database<
     pub(crate) incarnation: u64,
 
     pager_state: Arc<SharedPagerState>,
-    /// Key of this database's entry in `DATABASE_MANAGER`, set once the
-    /// database is registered. `Drop` uses it to remove the entry.
-    registry_key: OnceLock<DatabaseKey>,
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
 
-    /// Declared last, so it drops after every field holding a file (see [`RegistryEntry::Closing`]).
-    closed: Closed,
+    /// Declared last, so the database's own share of it drops after every field holding a file.
+    closed: Arc<Closed>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -855,26 +877,6 @@ impl fmt::Debug for Database {
     }
 }
 
-impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Database<A, F> {
-    fn drop(&mut self) {
-        let Some(key) = self.registry_key.get() else {
-            return;
-        };
-        let mut registry = DATABASE_MANAGER.lock();
-        // Another open of the same file may have replaced the entry already. Its files close as
-        // its fields drop after this, the last of them saying so: until then an open of the file
-        // waits (`RegistryEntry::Closing`).
-        if matches!(registry.get(key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
-        {
-            let _ = self.closed.key.set(key.clone());
-            registry.insert(
-                key.clone(),
-                RegistryEntry::Closing(self.closed.done.clone()),
-            );
-        }
-    }
-}
-
 impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
@@ -927,6 +929,8 @@ impl Database {
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
 
         let db = Database {
+            #[cfg(test)]
+            _drop_begins: DropBegins,
             mv_store,
             atoll: None,
             allocators,
@@ -962,13 +966,12 @@ impl Database {
             },
 
             pager_state: Arc::new(SharedPagerState::new(init_page_1)),
-            registry_key: OnceLock::new(),
 
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
             page_codec_id,
-            closed: Closed::default(),
+            closed: Arc::new(Closed::default()),
 
             durable_storage: None,
         };
@@ -1001,7 +1004,7 @@ impl Database {
 
         {
             let registry = DATABASE_MANAGER.lock();
-            if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
+            if let Some(RegistryEntry::Ready(weak, _)) = registry.get(&key) {
                 if let Some(db) = weak.upgrade() {
                     drop(registry);
                     Self::check_registry_dialect(&db, dialect.as_ref())?;
@@ -1014,17 +1017,22 @@ impl Database {
         let db = Self::open_file(io, ":memory:", dialect.clone())?;
 
         let mut registry = DATABASE_MANAGER.lock();
-        if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
+        // A database of the name whose last handle dropped is replaced: it has no files.
+        if let Some(RegistryEntry::Ready(weak, _)) = registry.get(&key) {
             if let Some(existing) = weak.upgrade() {
                 drop(registry);
                 Self::check_registry_dialect(&existing, dialect.as_ref())?;
                 return Ok(existing);
             }
         }
-        db.registry_key
+        db.closed
+            .key
             .set(key.clone())
             .expect("database is registered once");
-        registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
+        registry.insert(
+            key,
+            RegistryEntry::Ready(Arc::downgrade(&db), db.closed.done.clone()),
+        );
         Ok(db)
     }
 
@@ -1153,19 +1161,10 @@ impl Database {
                             crate::thread::yield_now();
                             continue;
                         }
-                        // A database of the file closing: probing it now could close a descriptor
-                        // of the file while its own are still open (R17).
-                        Some(RegistryEntry::Closing(closing)) => {
-                            let closing = closing.clone();
-                            drop(registry);
-                            closing_wait_seen();
-                            io.wait(&closing);
-                            continue;
-                        }
                         // The instance this IO keys the path to, the one entry its open would
                         // collide with: a lookup through the file system's identity could miss
                         // it under an IO whose files are not on disk, and wait for it forever.
-                        Some(RegistryEntry::Ready(weak)) => {
+                        Some(RegistryEntry::Ready(weak, closed)) => {
                             if let Some(db) = weak.upgrade() {
                                 drop(registry);
                                 return Ok(AtollResolved::Hit(Self::registry_hit(
@@ -1175,8 +1174,15 @@ impl Database {
                                     options.page_codec.as_deref(),
                                 )?));
                             }
+                            // A database of the file closing: probing it now could close a
+                            // descriptor of the file while its own are still open (R17).
+                            let closed = closed.clone();
+                            drop(registry);
+                            closing_wait_seen();
+                            io.wait(&closed);
+                            continue;
                         }
-                        _ => {}
+                        None => {}
                     }
                 }
             }
@@ -1336,8 +1342,9 @@ impl Database {
         let key = DatabaseKey::File(file_id);
         let registry = DATABASE_MANAGER.lock();
         let db = match registry.get(&key) {
-            Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
+            Some(RegistryEntry::Ready(weak, _)) => match weak.upgrade() {
                 Some(db) => db,
+                // Closing: the open's resolution waits for it.
                 None => return Ok(None),
             },
             _ => return Ok(None),
@@ -1595,7 +1602,7 @@ impl Database {
             if let Ok(file_id) = io.file_id(path) {
                 let key = DatabaseKey::File(file_id);
                 match registry.get(&key) {
-                    Some(RegistryEntry::Ready(weak)) => {
+                    Some(RegistryEntry::Ready(weak, closed)) => {
                         if let Some(db) = weak.upgrade() {
                             drop(registry);
                             tracing::debug!("took database {path:?} from the registry");
@@ -1613,8 +1620,10 @@ impl Database {
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             return Ok(IOResult::Done(db));
                         }
-                        // Weak ref expired — treat as absent, fall through to insert Opening.
-                        registry.insert(key.clone(), RegistryEntry::Opening);
+                        // A database of this file is closing: opening it now would put a second
+                        // descriptor beside those it still holds (`RegistryEntry::Ready`).
+                        closing_wait_seen();
+                        return Ok(IOResult::IO(types::IOCompletions(closed.clone())));
                     }
                     Some(RegistryEntry::Opening) => {
                         // Another caller is already opening this path. Yield so the
@@ -1622,12 +1631,6 @@ impl Database {
                         return Ok(IOResult::IO(types::IOCompletions(
                             io::Completion::new_yield(),
                         )));
-                    }
-                    Some(RegistryEntry::Closing(closing)) => {
-                        // A database of this file is closing: opening it now would put a second
-                        // descriptor beside those it still holds (`RegistryEntry::Closing`).
-                        closing_wait_seen();
-                        return Ok(IOResult::IO(types::IOCompletions(closing.clone())));
                     }
                     None => {
                         // Not in registry — mark as Opening and proceed.
@@ -1668,11 +1671,15 @@ impl Database {
             Ok(IOResult::Done(db)) => {
                 // Register the opened database and remove the Opening sentinel.
                 if let Some(registry_key) = state.registry_key.take() {
-                    db.registry_key
+                    db.closed
+                        .key
                         .set(registry_key.clone())
                         .expect("database is registered once");
                     let mut registry = DATABASE_MANAGER.lock();
-                    registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
+                    registry.insert(
+                        registry_key,
+                        RegistryEntry::Ready(Arc::downgrade(db), db.closed.done.clone()),
+                    );
                 }
             }
             Err(_) => {
@@ -1866,11 +1873,14 @@ impl Database {
                     let pager = if let Some(config) = state.atoll.clone() {
                         // Atoll mode: the database opens here, recovering what a crash left, and
                         // the main pager reads nothing (DESIGN.md §17).
-                        db.atoll = Some(Arc::new(crate::storage::atoll::sql::AtollDb::open(
-                            io.clone(),
-                            path,
-                            config,
-                        )?));
+                        // Its files hold the database's `Closed`, so the registry waits for them.
+                        db.atoll =
+                            Some(Arc::new(crate::storage::atoll::sql::AtollDb::open_holding(
+                                io.clone(),
+                                path,
+                                config,
+                                Some(db.closed.clone() as Arc<dyn std::any::Any + Send + Sync>),
+                            )?));
                         Arc::new(db.atoll_pager()?)
                     } else {
                         let mut hv_state = std::mem::take(&mut state.header_validation_state);

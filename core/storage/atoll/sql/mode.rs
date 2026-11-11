@@ -479,6 +479,10 @@ pub struct ConnTxn {
     /// and the header's changes when it read it. Its own while the header counts no change, as a
     /// catalog row is ([`Known`]).
     fields: Mutex<[Option<FieldRead>; 7]>,
+    /// The connection's place for the ending of its transaction, once a statement has begun it
+    /// (DESIGN.md §17): whichever statement of the connection meets it steps it, the one that
+    /// began it to its end, a sibling still reading until its commit is published.
+    ending: Mutex<Option<Ending>>,
     /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
     _frame: crate::storage::atoll::unwind::FrameEnd,
 }
@@ -712,6 +716,7 @@ impl ConnTxn {
             stamped: Arc::new(Mutex::new(HashMap::default())),
             known: Arc::new(Mutex::new(HashMap::default())),
             fields: Mutex::new([None; 7]),
+            ending: Mutex::new(None),
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
@@ -831,6 +836,12 @@ impl ConnTxn {
     #[turso_macros::atoll_entry]
     pub fn is_open(&self) -> bool {
         self.cell.lock().is_some()
+    }
+
+    /// Whether a schema reparse holds the transaction ([`pin`](Self::pin)).
+    #[turso_macros::atoll_entry]
+    pub fn is_pinned(&self) -> bool {
+        self.pinned.load(Ordering::Acquire)
     }
 
     /// Whether the open transaction has written.
@@ -1132,6 +1143,66 @@ impl ConnTxn {
             self.changes.rolled_back();
             Ending::rollback(self.db.clone(), conn, txn)
         })
+    }
+
+    /// Puts `ending` in the connection's place, where whichever statement of the connection meets
+    /// it steps it (DESIGN.md §17). One at a time: the end word lets one statement end the
+    /// connection's transaction (`Connection::atoll_end`).
+    #[turso_macros::atoll_entry]
+    pub fn place(&self, ending: Ending) {
+        let mut place = self.ending.lock();
+        crate::turso_assert!(place.is_none(), "two endings in one connection's place");
+        *place = Some(ending);
+    }
+
+    /// Steps the ending in the place; done with none there.
+    #[turso_macros::atoll_entry]
+    pub fn step_placed(&self) -> Result<IOResult<()>> {
+        match self.ending.lock().as_mut() {
+            Some(ending) => ending.step(),
+            None => Ok(IOResult::Done(())),
+        }
+    }
+
+    /// Whether the ending in the place commits and has published its commit.
+    #[turso_macros::atoll_entry]
+    pub fn placed_published(&self) -> bool {
+        self.ending.lock().as_ref().is_some_and(Ending::published)
+    }
+
+    /// Hands the ending in the place the failure an IO it waited on met ([`Ending::failed`]).
+    #[turso_macros::atoll_entry]
+    pub fn fail_placed(&self, failure: LimboError) {
+        if let Some(ending) = self.ending.lock().as_mut() {
+            ending.failed(failure);
+        }
+    }
+
+    /// Takes the ending out of the place: done, or to drop, which drives it to its end.
+    #[turso_macros::atoll_entry]
+    pub fn take_placed(&self) -> Option<Ending> {
+        self.ending.lock().take()
+    }
+
+    /// A view for a statement that was reading the connection's transaction when another statement
+    /// of the connection began to end it, and steps again before that ending is done (the auditor's
+    /// #4435): the ending in the place is stepped until its commit is published, its own waits the
+    /// statement's to wait on, and then a read transaction is begun, which sees what the commit left,
+    /// as the one the ending begins for its siblings at its end does (DESIGN.md §17). Done at once
+    /// with a transaction open.
+    #[turso_macros::atoll_entry]
+    pub fn serve_sibling(&self) -> Result<IOResult<()>> {
+        if self.cell.lock().is_some() {
+            return Ok(IOResult::Done(()));
+        }
+        if let Some(ending) = self.ending.lock().as_mut() {
+            if !ending.published() {
+                if let IOResult::IO(io) = ending.step()? {
+                    return Ok(IOResult::IO(io));
+                }
+            }
+        }
+        self.begin(Begin::Read)
     }
 
     /// The schema cookie: at the transaction's view, or committed outside one.
@@ -1551,6 +1622,12 @@ impl Ending {
         loop {
             match &mut self.step {
                 Step::Commit(op) => {
+                    #[cfg(test)]
+                    if !op.published() {
+                        if let Some(pause) = crate::storage::atoll::testing::pause_ending() {
+                            return Ok(IOResult::IO(IOCompletions(pause)));
+                        }
+                    }
                     done!(txns.commit(op));
                     self.db.abandoned(op.abandoned());
                     self.published = op.published();

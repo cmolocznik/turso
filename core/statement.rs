@@ -836,7 +836,7 @@ impl Statement {
     /// Whether the statement's Atoll ending commits and has published its commit.
     #[cfg(test)]
     pub(crate) fn atoll_ending_published(&self) -> bool {
-        self.state.atoll_ending_published()
+        self.state.atoll_ending_published(&self.program.connection)
     }
 
     /// Whether the statement is parked in an explicit checkpoint, waiting for a release.

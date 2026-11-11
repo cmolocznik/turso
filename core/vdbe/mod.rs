@@ -411,10 +411,10 @@ enum CommitState {
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
-    /// Ending the main database's Atoll transaction (DESIGN.md §17): dropped unfinished, the
-    /// ending drives itself to its end.
+    /// Ending the main database's Atoll transaction (DESIGN.md §17), its storage ending in the
+    /// connection's place (`ConnTxn::place`): dropped unfinished, it drives itself to its end as
+    /// the statement's hold on the end goes ([`EndingBegun`]).
     Atoll {
-        ending: Box<crate::storage::atoll::sql::mode::Ending>,
         schema_did_change: bool,
         rollback: bool,
     },
@@ -451,6 +451,11 @@ impl EndingBegun {
 
 impl Drop for EndingBegun {
     fn drop(&mut self) {
+        // An ending still in the place drives itself to its end as it drops, before the end is
+        // let go.
+        if let Some(atoll) = self.0.atoll() {
+            drop(atoll.take_placed());
+        }
         self.0
             .atoll_end
             .store(Connection::END_FREE, Ordering::Release);
@@ -1954,8 +1959,11 @@ impl ProgramState {
 
     /// Whether the statement's Atoll ending commits and has published its commit, for tests.
     #[cfg(test)]
-    pub(crate) fn atoll_ending_published(&self) -> bool {
-        matches!(&self.commit_state, CommitState::Atoll { ending, .. } if ending.published())
+    pub(crate) fn atoll_ending_published(&self, connection: &Connection) -> bool {
+        matches!(self.commit_state, CommitState::Atoll { .. })
+            && connection
+                .atoll()
+                .is_some_and(|atoll| atoll.placed_published())
     }
 
     /// The failure the statement's published Atoll commit met, once the commit has finished
@@ -2997,6 +3005,16 @@ impl Program {
                         None => continue 'io_check,
                     }
                 }
+                // Another statement of the connection is ending its transaction, which this one
+                // was reading (no root statement starts meanwhile): it reads on in a view of its
+                // own (DESIGN.md §17).
+                if program.connection.atoll_end.load(Ordering::Acquire) == Connection::END_ENDING
+                    && !state.ending_begun()
+                {
+                    if let Some(result) = program.serve_atoll_sibling(state, pager, waker) {
+                        return result;
+                    }
+                }
                 loop {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
@@ -3140,9 +3158,11 @@ impl Program {
             }
             // The ending of a published Atoll commit takes the failure as its own: the instruction
             // that waited steps it on to finish the commit whole (DESIGN.md §17).
-            if let CommitState::Atoll { ending, .. } = &mut state.commit_state {
-                if ending.published() {
-                    ending.failed(err.into());
+            if let (CommitState::Atoll { .. }, Some(atoll)) =
+                (&state.commit_state, self.connection.atoll())
+            {
+                if atoll.placed_published() {
+                    atoll.fail_placed(err.into());
                     state.io_completions = None;
                     return None;
                 }
@@ -3155,6 +3175,27 @@ impl Program {
         }
         state.io_completions = None;
         None
+    }
+
+    /// A statement reading the connection's transaction when another statement of the connection
+    /// began to end it, stepped again before that ending is done: the ending, in the connection's
+    /// place, is stepped until its commit is published, its waits this statement's, then a read
+    /// transaction is begun for it, which sees what the commit left (`ConnTxn::serve_sibling`, the
+    /// auditor's #4435). None means it reads on.
+    #[cold]
+    #[inline(never)]
+    fn serve_atoll_sibling(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Option<ProgramStep> {
+        let atoll = self.connection.atoll()?;
+        match atoll.serve_sibling() {
+            Ok(IOResult::Done(())) => None,
+            Ok(IOResult::IO(io)) => self.park_on_io(state, io, waker),
+            Err(err) => self.fail_step(state, pager, err),
+        }
     }
 
     /// A FAIL-mode error (ON CONFLICT FAIL, or RAISE(FAIL) in a trigger)
@@ -3511,6 +3552,12 @@ impl Program {
             if !connection.auto_commit.load(Ordering::SeqCst) {
                 return Ok(IOResult::Done(()));
             }
+            // Another statement of the connection is ending its transaction: this one, a sibling
+            // reading on in a read of its own (`ConnTxn::serve_sibling`), ends nothing; that
+            // statement ends the read at its own end once no sibling reads in it.
+            if connection.atoll_end.load(Ordering::Acquire) == Connection::END_ENDING {
+                return Ok(IOResult::Done(()));
+            }
             let schema_did_change = matches!(
                 connection.get_tx_state(),
                 TransactionState::Write {
@@ -3530,33 +3577,37 @@ impl Program {
                 Box::new(move || db.update_schema_if_newer(schema)) as Box<dyn FnOnce() + Send>
             });
             program_state.commit_state = match atoll.end_publishing(!rollback, publish) {
-                Some(ending) => CommitState::Atoll {
-                    ending: Box::new(ending),
-                    schema_did_change,
-                    rollback,
-                },
+                Some(ending) => {
+                    atoll.place(ending);
+                    CommitState::Atoll {
+                        schema_did_change,
+                        rollback,
+                    }
+                }
                 None => CommitState::CommittingAttached,
             };
         }
         if let CommitState::Atoll {
-            ending,
             schema_did_change,
             rollback,
-        } = &mut program_state.commit_state
+        } = program_state.commit_state
         {
-            match ending.step() {
+            let atoll = connection.atoll().expect("Atoll mode");
+            match atoll.step_placed() {
                 Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                 Ok(IOResult::Done(())) => {}
                 // A commit published before its ending failed is decided: it is finished whole, the
                 // attached databases' transactions committed, and the failure is then the
                 // statement's outcome (DESIGN.md §17).
-                Err(failure) if ending.published() => {
+                Err(failure) if atoll.placed_published() => {
                     program_state.atoll_commit_failure = Some(failure)
                 }
                 Err(e) => return Err(e.into()),
             }
+            // Over: done, or failed once published.
+            drop(atoll.take_placed());
             // A commit's schema was published with it; a rollback's is put back.
-            if *schema_did_change && *rollback {
+            if schema_did_change && rollback {
                 *connection.schema.write() = connection.db.clone_schema();
                 connection.bump_prepare_context_generation();
             }
@@ -3572,10 +3623,18 @@ impl Program {
         program_state.atoll_ending_begun = None;
         let atoll = connection.atoll().expect("Atoll mode");
         // A halt that ended nothing, the transaction held by a schema reparse, leaves it open for
-        // the statements reading in it: the connection's state says so.
+        // the statements reading in it, and so does one whose sibling began its read meanwhile
+        // (`ConnTxn::serve_sibling`) while a sibling still reads: the connection's state says so.
         if atoll.is_open() {
-            connection.set_tx_state(TransactionState::Read);
-            return Ok(IOResult::Done(()));
+            if atoll.is_pinned() || connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+                connection.set_tx_state(TransactionState::Read);
+                return Ok(IOResult::Done(()));
+            }
+            // A read a sibling began meanwhile, which nothing reads in any more: ended here, driven
+            // to its end as the synchronous sites drive theirs (R19).
+            if let Some(mut ending) = atoll.end(false) {
+                ending.finish()?;
+            }
         }
         connection.set_tx_state(TransactionState::None);
         // A writer ends the shared autocommit transaction at its own halt, as SQLite's does,

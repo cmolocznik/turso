@@ -301,6 +301,19 @@ crate::thread::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+crate::thread::thread_local! {
+    /// Waited on by each ending on this thread whose commit is not yet published, before its
+    /// commit step, while it is unfinished: a test's pause before a commit's publication, which the
+    /// ending's stepper waits on as on the ending's own IO.
+    pub(crate) static ENDING_PAUSE: std::cell::RefCell<Option<crate::io::Completion>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The pause a test set on this thread before a commit's publication, while it is unfinished.
+pub(crate) fn pause_ending() -> Option<crate::io::Completion> {
+    ENDING_PAUSE.with(|p| p.borrow().clone().filter(|c| !c.finished()))
+}
+
 /// Runs the pause a test set on this thread for a database's close, if it set one.
 pub(crate) fn pause_close() {
     if let Some(pause) = CLOSE_PAUSE.with(|p| p.borrow_mut().take()) {

@@ -12,8 +12,9 @@
 //! the nodes they came in, allocating nothing; only if a raise while it held them reached one does
 //! it take the stack a second time, finishing what that reaches and, looking once more, finishing
 //! in place each wait a raise during that hold reached, as that wait's waiter would. So a wake
-//! takes the stack twice at most, however the position moves meanwhile, never chasing it (the
-//! auditor's #4360, #4366 and #4373).
+//! takes the stack twice at most to finish waits, however the position moves meanwhile, never
+//! chasing it, and once more, after either look, if the log has failed, to fail every wait (the
+//! auditor's #4360, #4366, #4373 and #4394).
 //!
 //! A registration is its waiter's ([`Registration`]): given up (its wait ended or dropped) while
 //! still on the stack, it is counted, and a take drops it rather than putting it back, finishing
@@ -171,8 +172,9 @@ impl Waits {
     /// while they were held reached one of them, which that raise's take may have missed, nothing
     /// more is owed: every raise past the least of their marks comes after the look, and its take
     /// finds them. Otherwise one more pass ([`wake_again`](Self::wake_again)) finishes them, so a
-    /// wake takes the stack twice at most, however the position moves meanwhile (the auditor's
-    /// #4360 and #4373).
+    /// wake takes the stack twice at most to finish waits, however the position moves meanwhile,
+    /// and once more, from either look, to fail them all if the log has failed (the auditor's
+    /// #4360, #4373 and #4394).
     pub(super) fn wake(&self, position: impl Fn() -> u64, look: impl Fn() -> Look) {
         fence(Ordering::SeqCst);
         let reached = position();
@@ -282,8 +284,8 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    /// A wake takes the stack twice at most however the position moves meanwhile (the auditor's
-    /// #4360): a raise during its first hold that reaches a wait put back costs one more pass,
+    /// A wake on a log that has not failed takes the stack twice at most however the position
+    /// moves meanwhile (the auditor's #4360): a raise during its first hold that reaches a wait put back costs one more pass,
     /// whose take finishes it, and a wait that pass put back that a raise during its own hold
     /// reached is finished in place, counted given up for the next take to drop (mutant: the
     /// first pass taking the stack again while the position moves, which chases a position

@@ -4068,6 +4068,41 @@ enum Reopen {
     OpenAsync,
 }
 
+#[cfg(target_os = "linux")]
+impl Reopen {
+    fn open(self, io: &Arc<dyn IO>, path: &str) -> Arc<Database> {
+        match self {
+            Reopen::Open => open(io, path),
+            Reopen::OpenAsync => {
+                let options = OpenOptions::new(Arc::new(SqliteDialect))
+                    .atoll(config())
+                    .storage(Arc::new(crate::storage::atoll::sql::mode::RefusingStorage));
+                let mut state = crate::database::OpenDbAsyncState::new();
+                loop {
+                    match Database::open_async(&mut state, io.clone(), path, &options).unwrap() {
+                        crate::IOResult::Done(db) => break db,
+                        crate::IOResult::IO(c) => c.wait(&**io).unwrap(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether another holder could not take a write lock on the whole of `file`: an open file
+/// description's lock query, which meets a traditional lock even this process holds.
+#[cfg(target_os = "linux")]
+fn locked(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    // SAFETY: a query on a descriptor the caller holds open, into a struct this call owns.
+    let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut lock) };
+    assert_eq!(r, 0, "the lock query failed");
+    lock.l_type != libc::F_UNLCK as libc::c_short
+}
+
 /// A database closing keeps its files, and the locks they hold, until they close, and an open of
 /// the file meanwhile waits for them: no probe and no second open closes a descriptor of the file
 /// while they are open, which would drop every lock the process holds on it (R17), the reopened
@@ -4077,9 +4112,8 @@ enum Reopen {
 /// holds, and it is asserted to meet the first database's.
 #[cfg(target_os = "linux")]
 fn reopen_while_closing(closing: Closing, reopen: Reopen) {
-    use crate::database::{CLOSING_WAITS, DROP_PAUSE};
+    use crate::database::{DROP_PAUSE, REGISTRY_WAITS};
     use crate::storage::atoll::testing::CLOSE_PAUSE;
-    use std::os::fd::AsRawFd;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db").to_str().unwrap().to_string();
     let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
@@ -4089,16 +4123,6 @@ fn reopen_while_closing(closing: Closing, reopen: Reopen) {
         .write(true)
         .open(&path)
         .unwrap();
-    // Whether another holder could not take a write lock on the whole file.
-    let locked = |file: &std::fs::File| {
-        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-        lock.l_type = libc::F_WRLCK as libc::c_short;
-        lock.l_whence = libc::SEEK_SET as libc::c_short;
-        // SAFETY: a query on a descriptor this test holds open, into a struct it owns.
-        let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, &mut lock) };
-        assert_eq!(r, 0, "the lock query failed");
-        lock.l_type != libc::F_UNLCK as libc::c_short
-    };
     let held_at_open = locked(&look);
     // What the closer drops: the database, or a connection holding it once the test's handle went.
     let last: Box<dyn std::any::Any + Send> = match closing {
@@ -4131,23 +4155,8 @@ fn reopen_while_closing(closing: Closing, reopen: Reopen) {
     let opener = {
         let (io, path) = (io.clone(), path.clone());
         std::thread::spawn(move || {
-            CLOSING_WAITS.with(|w| *w.borrow_mut() = Some(told.clone()));
-            let db = match reopen {
-                Reopen::Open => open(&io, &path),
-                Reopen::OpenAsync => {
-                    let options = OpenOptions::new(Arc::new(SqliteDialect))
-                        .atoll(config())
-                        .storage(Arc::new(crate::storage::atoll::sql::mode::RefusingStorage));
-                    let mut state = crate::database::OpenDbAsyncState::new();
-                    loop {
-                        match Database::open_async(&mut state, io.clone(), &path, &options).unwrap()
-                        {
-                            crate::IOResult::Done(db) => break db,
-                            crate::IOResult::IO(c) => c.wait(&*io).unwrap(),
-                        }
-                    }
-                }
-            };
+            REGISTRY_WAITS.with(|w| *w.borrow_mut() = Some(told.clone()));
+            let db = reopen.open(&io, &path);
             told.send("opened").unwrap();
             db
         })
@@ -4217,5 +4226,174 @@ fn a_reopen_while_the_last_connection_closes_the_database_waits_and_keeps_the_fi
 fn an_async_reopen_while_the_database_closes_waits_and_keeps_the_files_lock() {
     within_a_minute_or(NEVER_REOPENED, || {
         reopen_while_closing(Closing::AtollCloses, Reopen::OpenAsync)
+    });
+}
+
+/// How the open a test pauses ends while another open of the file waits for it.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum FirstOpen {
+    /// It registers its database.
+    Registers,
+    /// It fails once its Atoll database is open, which then closes, and the close pauses.
+    Fails,
+}
+
+/// An open of a file another open of it has under way waits for that open's end, once, and looks
+/// again: it takes the database the first registered, or, the first having failed, opens the file
+/// once everything the first opened has closed, the first's lock held until then and its own after
+/// (the auditor's #4392: a yield and a retry until the first ended, before).
+#[cfg(target_os = "linux")]
+fn open_while_another_opens(first: FirstOpen, reopen: Reopen) {
+    use crate::database::{OPEN_PAUSE, REGISTRY_WAITS};
+    use crate::storage::atoll::testing::CLOSE_PAUSE;
+    use crate::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db").to_str().unwrap().to_string();
+    let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    drop(open(&io, &path));
+    let key = DatabaseKey::File(io.file_id(&path).unwrap());
+    let look = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let (told, heard) = std::sync::mpsc::channel::<&'static str>();
+    let (go, wait_go) = std::sync::mpsc::channel::<()>();
+    let (go_close, wait_go_close) = std::sync::mpsc::channel::<()>();
+    let opener = {
+        let (io, path) = (io.clone(), path.clone());
+        std::thread::spawn(move || {
+            let paused = told.clone();
+            OPEN_PAUSE.with(|p| {
+                *p.borrow_mut() = Some(Box::new(move || {
+                    paused.send("paused").unwrap();
+                    wait_go.recv().unwrap();
+                    match first {
+                        FirstOpen::Registers => Ok(()),
+                        FirstOpen::Fails => Err(crate::LimboError::InternalError(
+                            "the test's open fails".to_string(),
+                        )),
+                    }
+                }))
+            });
+            if let FirstOpen::Fails = first {
+                CLOSE_PAUSE.with(|p| {
+                    *p.borrow_mut() = Some(Box::new(move || {
+                        told.send("closing").unwrap();
+                        wait_go_close.recv().unwrap();
+                    }))
+                });
+            }
+            Database::open(
+                io.clone(),
+                &path,
+                OpenOptions::new(Arc::new(SqliteDialect)).atoll(config()),
+            )
+        })
+    };
+    assert_eq!(
+        heard.recv().unwrap(),
+        "paused",
+        "the first open did not pause"
+    );
+    let mark = match DATABASE_MANAGER.lock().get(&key) {
+        Some(RegistryEntry::Opening(c)) => c.clone(),
+        _ => panic!("the paused open has no mark on its file's entry"),
+    };
+    let (seen, waits) = std::sync::mpsc::channel::<&'static str>();
+    let second = {
+        let (io, path) = (io.clone(), path.clone());
+        std::thread::spawn(move || {
+            REGISTRY_WAITS.with(|w| *w.borrow_mut() = Some(seen.clone()));
+            let db = reopen.open(&io, &path);
+            seen.send("opened").unwrap();
+            db
+        })
+    };
+    assert_eq!(
+        waits.recv().unwrap(),
+        "opening",
+        "the second open did not wait"
+    );
+    go.send(()).unwrap();
+    // The first failed: its database closes, paused, its mark still standing and its lock held.
+    let closing = match first {
+        FirstOpen::Registers => None,
+        FirstOpen::Fails => {
+            let closed = heard.recv().unwrap();
+            let state = (closed, !mark.finished(), locked(&look));
+            go_close.send(()).unwrap();
+            Some(state)
+        }
+    };
+    let first_opened = opener.join().unwrap();
+    let second = second.join().unwrap();
+    let held_after = locked(&look);
+    let after: Vec<&'static str> = waits.try_iter().collect();
+    drop(look);
+    // Every database dropped before any assertion, so none drops while a failed one unwinds.
+    let (first_opened, same) = match first_opened {
+        Ok(first) => (Ok(()), Some(Arc::ptr_eq(&first, &second))),
+        Err(e) => (Err(e), None),
+    };
+    drop(second);
+    assert_eq!(
+        after,
+        ["opened"],
+        "the second open looked at the registry again before the first ended"
+    );
+    match (first, first_opened, same, closing) {
+        (FirstOpen::Registers, Ok(()), Some(same), None) => assert!(
+            same,
+            "the second open did not take the database the first registered"
+        ),
+        (FirstOpen::Fails, Err(_), None, Some((closed, marked, held))) => {
+            assert_eq!(
+                closed, "closing",
+                "the failed open's database did not close"
+            );
+            assert!(
+                marked,
+                "the failed open's mark went before its database closed"
+            );
+            assert!(
+                held,
+                "the failed open's lock went before its database closed"
+            );
+            assert!(
+                held_after,
+                "the second open's lock went as the failed one closed"
+            );
+        }
+        (_, opened, _, _) => panic!("the first open ended unlike the test made it: {opened:?}"),
+    }
+}
+
+/// Mutant: an open's resolution yielding and looking again while another open is under way.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_open_while_another_opens_the_file_waits_once_and_takes_its_database() {
+    within_a_minute_or(NEVER_REOPENED, || {
+        open_while_another_opens(FirstOpen::Registers, Reopen::Open)
+    });
+}
+
+/// Mutant: the async open's first phase handing back a yield, not the first open's end.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_async_open_while_another_opens_the_file_waits_once_and_takes_its_database() {
+    within_a_minute_or(NEVER_REOPENED, || {
+        open_while_another_opens(FirstOpen::Registers, Reopen::OpenAsync)
+    });
+}
+
+/// Mutants: a failed open taking its mark out as it fails, before what it opened closes; and a
+/// mark whose drop wakes no one (the test's bound ends it).
+#[cfg(target_os = "linux")]
+#[test]
+fn an_open_while_another_fails_waits_for_what_the_failed_one_opened_to_close() {
+    within_a_minute_or(NEVER_REOPENED, || {
+        open_while_another_opens(FirstOpen::Fails, Reopen::Open)
     });
 }

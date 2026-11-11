@@ -572,8 +572,6 @@ pub struct OpenDbAsyncState {
     make_from_btree_state: schema::MakeFromBtreeState,
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
-    /// Registry key for insertion (computed once at start)
-    pub(crate) registry_key: Option<DatabaseKey>,
     /// The database being built, held across the ValidatingHeader phase yields
     /// before it is wrapped in an `Arc`.
     building_db: Option<Database>,
@@ -592,6 +590,11 @@ pub struct OpenDbAsyncState {
     atoll: Option<crate::storage::atoll::db::AtollConfig>,
     /// The schema's load through SQL in Atoll mode, held across yields.
     atoll_reparse: crate::connection::ReparseSchemaState,
+    /// The open's mark on its file's registry entry, from its first phase until it registers the
+    /// database. Last, so an open dropped unfinished, or failed, lets the other opens of the file
+    /// go only once everything above, the database it was building and its files among them, has
+    /// dropped.
+    pub(crate) opening: Option<OpeningMark>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -610,7 +613,6 @@ impl OpenDbAsyncState {
             encryption_key: None,
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
-            registry_key: None,
             building_db: None,
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
@@ -618,24 +620,52 @@ impl OpenDbAsyncState {
             mvcc_convert_stmt: None,
             atoll: None,
             atoll_reparse: crate::connection::ReparseSchemaState::Start,
+            opening: None,
         }
     }
 }
 
-impl Drop for OpenDbAsyncState {
+/// An open's mark on its file's registry entry ([`RegistryEntry::Opening`]). Its drop takes the
+/// mark out of the registry, unless the open has replaced it with its database, and finishes the
+/// completion every other open of the file waits on meanwhile: once the open has registered its
+/// database, or has ended unfinished, failed or dropped, with whatever it opened.
+pub(crate) struct OpeningMark {
+    key: DatabaseKey,
+    done: Completion,
+}
+
+impl OpeningMark {
+    /// Marks `key`'s entry, which has none, as opening.
+    pub(crate) fn mark(
+        registry: &mut HashMap<DatabaseKey, RegistryEntry>,
+        key: DatabaseKey,
+    ) -> Self {
+        let done = Completion::new_remote_wait();
+        registry.insert(key.clone(), RegistryEntry::Opening(done.clone()));
+        Self { key, done }
+    }
+}
+
+impl Drop for OpeningMark {
     fn drop(&mut self) {
-        if let Some(registry_key) = self.registry_key.take() {
+        {
             let mut registry = DATABASE_MANAGER.lock();
-            registry.remove(&registry_key);
+            if matches!(registry.get(&self.key), Some(RegistryEntry::Opening(c)) if c.ptr_eq(&self.done))
+            {
+                registry.remove(&self.key);
+            }
         }
+        // Waiters woken with the registry's lock let go.
+        self.done.complete(0);
     }
 }
 
 /// Per-path entry in the database registry.
 pub(crate) enum RegistryEntry {
-    /// Another caller is currently opening this database. Callers that see
-    /// this should yield and retry later.
-    Opening,
+    /// Another open of the file is under way, and the completion its [`OpeningMark`] finishes
+    /// once it has registered its database or ended unfinished: an open of the file waits for it
+    /// and looks again.
+    Opening(Completion),
     /// The database has been opened, and the completion its [`Closed`] finishes once every file it
     /// opened has closed, which removes the entry. A handle that no longer upgrades is a database
     /// closing: its last handle dropped and its files, or some of them, still open. An open of the
@@ -647,8 +677,13 @@ pub(crate) enum RegistryEntry {
 
 #[cfg(test)]
 crate::thread::thread_local! {
-    /// Told when an open on this thread waits for a database of its file to close: a test's look.
-    pub(crate) static CLOSING_WAITS: std::cell::RefCell<Option<std::sync::mpsc::Sender<&'static str>>> =
+    /// Told when an open on this thread waits for a database of its file, `"waiting"` for one
+    /// closing and `"opening"` for another open of it: a test's look.
+    pub(crate) static REGISTRY_WAITS: std::cell::RefCell<Option<std::sync::mpsc::Sender<&'static str>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Run, and taken, once an open on this thread has opened its Atoll database: a test's pause
+    /// there, and the open's failure if it returns one.
+    pub(crate) static OPEN_PAUSE: std::cell::RefCell<Option<Box<dyn FnOnce() -> Result<()>>>> =
         const { std::cell::RefCell::new(None) };
     /// Run, and taken, as a database's drop begins on this thread, its last handle gone and nothing
     /// of it dropped yet: a test's pause there.
@@ -669,12 +704,13 @@ impl Drop for DropBegins {
     }
 }
 
-/// Tells a test waiting on [`CLOSING_WAITS`] that an open on this thread waits for a closing.
-fn closing_wait_seen() {
+/// Tells a test waiting on [`REGISTRY_WAITS`] that an open on this thread waits, for a database
+/// of its file closing (`"waiting"`) or for another open of it (`"opening"`).
+fn registry_wait_seen(_what: &'static str) {
     #[cfg(test)]
-    CLOSING_WAITS.with(|w| {
+    REGISTRY_WAITS.with(|w| {
         if let Some(tell) = w.borrow().as_ref() {
-            let _ = tell.send("waiting");
+            let _ = tell.send(_what);
         }
     });
 }
@@ -1156,9 +1192,12 @@ impl Database {
             if !is_memory_like(path) {
                 if let Ok(file_id) = io.file_id(path) {
                     match registry.get(&DatabaseKey::File(file_id)) {
-                        Some(RegistryEntry::Opening) => {
+                        // Another open of the file under way: its end is a change to look at.
+                        Some(RegistryEntry::Opening(opening)) => {
+                            let opening = opening.clone();
                             drop(registry);
-                            crate::thread::yield_now();
+                            registry_wait_seen("opening");
+                            io.wait(&opening);
                             continue;
                         }
                         // The instance this IO keys the path to, the one entry its open would
@@ -1178,7 +1217,7 @@ impl Database {
                             // descriptor of the file while its own are still open (R17).
                             let closed = closed.clone();
                             drop(registry);
-                            closing_wait_seen();
+                            registry_wait_seen("waiting");
                             io.wait(&closed);
                             continue;
                         }
@@ -1622,24 +1661,22 @@ impl Database {
                         }
                         // A database of this file is closing: opening it now would put a second
                         // descriptor beside those it still holds (`RegistryEntry::Ready`).
-                        closing_wait_seen();
+                        registry_wait_seen("waiting");
                         return Ok(IOResult::IO(types::IOCompletions(closed.clone())));
                     }
-                    Some(RegistryEntry::Opening) => {
-                        // Another caller is already opening this path. Yield so the
-                        // event loop can make progress and we retry later.
-                        return Ok(IOResult::IO(types::IOCompletions(
-                            io::Completion::new_yield(),
-                        )));
+                    Some(RegistryEntry::Opening(opening)) => {
+                        // Another open of this path is under way: the caller waits for its end
+                        // and calls again.
+                        registry_wait_seen("opening");
+                        return Ok(IOResult::IO(types::IOCompletions(opening.clone())));
                     }
                     None => {
                         // Not in registry — mark as Opening and proceed.
-                        registry.insert(key.clone(), RegistryEntry::Opening);
+                        state.opening = Some(OpeningMark::mark(&mut registry, key));
                     }
                 }
-                state.registry_key = Some(key);
             }
-            // Lock is dropped here — the Opening sentinel prevents concurrent opens
+            // Lock is dropped here — the Opening mark prevents concurrent opens
             // of the same path without holding the mutex across yields.
         }
 
@@ -1669,27 +1706,22 @@ impl Database {
 
         match &result {
             Ok(IOResult::Done(db)) => {
-                // Register the opened database and remove the Opening sentinel.
-                if let Some(registry_key) = state.registry_key.take() {
+                // Register the opened database in place of the Opening mark, whose drop then
+                // wakes the opens waiting on it.
+                if let Some(opening) = state.opening.take() {
                     db.closed
                         .key
-                        .set(registry_key.clone())
+                        .set(opening.key.clone())
                         .expect("database is registered once");
-                    let mut registry = DATABASE_MANAGER.lock();
-                    registry.insert(
-                        registry_key,
+                    DATABASE_MANAGER.lock().insert(
+                        opening.key.clone(),
                         RegistryEntry::Ready(Arc::downgrade(db), db.closed.done.clone()),
                     );
                 }
             }
-            Err(_) => {
-                // On error, remove the Opening sentinel so other callers can proceed.
-                if let Some(registry_key) = state.registry_key.take() {
-                    let mut registry = DATABASE_MANAGER.lock();
-                    registry.remove(&registry_key);
-                }
-            }
-            Ok(IOResult::IO(_)) => {}
+            // A failed open keeps its mark until its state drops, after the database it was
+            // building: the other opens of the file wait for what it opened to close.
+            Err(_) | Ok(IOResult::IO(_)) => {}
         }
         result
     }
@@ -1881,6 +1913,10 @@ impl Database {
                                 config,
                                 Some(db.closed.clone() as Arc<dyn std::any::Any + Send + Sync>),
                             )?));
+                        #[cfg(test)]
+                        if let Some(pause) = OPEN_PAUSE.with(|p| p.borrow_mut().take()) {
+                            pause()?;
+                        }
                         Arc::new(db.atoll_pager()?)
                     } else {
                         let mut hv_state = std::mem::take(&mut state.header_validation_state);

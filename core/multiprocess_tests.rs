@@ -182,13 +182,9 @@ fn open_db_async_state_drop_clears_opening_registry_entry() {
     let key = DatabaseKey::SharedMemory(
         "open-db-async-state-drop-clears-opening-registry-entry".to_string(),
     );
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.insert(key.clone(), RegistryEntry::Opening);
-    }
-
+    let mark = OpeningMark::mark(&mut DATABASE_MANAGER.lock(), key.clone());
     let mut state = OpenDbAsyncState::new();
-    state.registry_key = Some(key.clone());
+    state.opening = Some(mark);
     drop(state);
 
     let manager = DATABASE_MANAGER.lock();

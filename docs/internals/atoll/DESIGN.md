@@ -5562,8 +5562,9 @@ compose, the real `Completion`, latch and backends included where named.
    dropped while the log stands still; those given up after it, the last waiter's included, stay
    until the next take, by a raise or a registration, so the entries never number more than one
    more than twice the most waits that stood at once (the auditor's #4356 and #4360). A wake takes
-   the stack twice at most and, unless a raise during its hold reached a wait it put back,
-   allocates nothing: it pushes the waits it keeps back in the nodes they came in, with one
+   the stack twice at most to finish waits, and once more, from either look, to fail them all if
+   the log has failed (the auditor's #4394); unless a raise during its hold reached a wait it put
+   back, it allocates nothing: it pushes the waits it keeps back in the nodes they came in, with one
    exchange of the head (`Stack::push_gathered`), and across a fence looks at the failure and at
    the position; every raise past the least mark it kept comes after that look, and its take
    finds them. If one came before, a second pass takes the stack, finishing what it reaches, and

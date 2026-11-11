@@ -81,9 +81,10 @@ crate::thread::thread_local! {
 pub const META_INTENT: Kind = Kind::new(31).unwrap();
 
 /// A wait for a full checkpoint ([`Checkpointer::request_full`]), owned by the waiter across its
-/// polls: the full checkpoints asked for when it was made, done once as many are, and while a
-/// worker steps the checkpoints and the wait stands, its demand on the checkpoint's task, of the
-/// relief class (DESIGN.md 22.4). Dropped, its demand goes.
+/// polls: the full checkpoints asked for when it was made, done once as many are, and while the
+/// checkpoint's task steps the checkpoints and the wait stands, its demand on that task, of the
+/// relief class (DESIGN.md 22.4), whether a worker steps the task or the waiter claims it.
+/// Dropped, its demand goes.
 pub struct FullWait {
     ticket: u64,
     demand: Option<executor::Ticket>,
@@ -238,9 +239,10 @@ pub struct Checkpointer {
     /// transaction's end waiting on the thread without taking the state.
     full_done: AtomicU64,
     failure: Mutex<Option<String>>,
-    /// The ends of transactions waiting on the thread for a full checkpoint, woken as each
-    /// checkpoint ends, fails, or the thread does.
-    waiters: Mutex<Vec<Completion>>,
+    /// What the ends of transactions waiting for a full checkpoint wait on, finished as each
+    /// checkpoint ends or fails, or the task does: any number share one registration, so a wait
+    /// polled again or dropped while it stands leaves nothing behind (the auditor's #4340).
+    full_ends: crate::storage::atoll::notify::LetGo,
     /// What a caller that found the state held waits on (`step_full`): finished as the state is
     /// let go (DESIGN.md 9.1.3, the checkpointer's state held by another stepper). Any number
     /// share it, which the state's two parked contenders (`Guarded`) cannot.
@@ -707,7 +709,7 @@ impl Checkpointer {
             driven: AtomicBool::new(false),
             full_done: AtomicU64::new(0),
             failure: Mutex::new(None),
-            waiters: Mutex::new(Vec::new()),
+            full_ends: Default::default(),
             released: Default::default(),
         }
     }
@@ -787,13 +789,11 @@ impl Checkpointer {
         before != state.full_done || failed
     }
 
-    /// Completes the waiters taken off the list, with no lock held: a waiter's waker may run code,
-    /// and one that waits for a full checkpoint again takes the list's lock.
+    /// Finishes the wait the full checkpoints' waiters share, after the count or the failure they
+    /// wait on was recorded, with no lock held: a waiter's waker may run code, and one that waits
+    /// for a full checkpoint again registers anew.
     fn wake_waiters(&self) {
-        let waiters = std::mem::take(&mut *self.waiters.lock());
-        for c in waiters {
-            c.complete(0);
-        }
+        self.full_ends.let_go();
     }
 
     /// The state, if no one holds it: let go, it wakes whoever waits on it.
@@ -956,33 +956,47 @@ impl Checkpointer {
         self.pool.wake_room();
     }
 
-    /// A transaction's end waiting for the full checkpoint `wait` names, which the thread does:
-    /// done once it is, a failure once one has failed, else a wait the thread finishes. While it
-    /// waits, `wait` holds a demand on the checkpoint's task, of the relief class (DESIGN.md 22.4),
-    /// taken at its first poll outside the waiters' lock and let go as it ends.
+    /// A transaction's end waiting for the full checkpoint `wait` names, which the worker does:
+    /// done once it is, a failure once one has failed, else the shared wait the next checkpoint's
+    /// end finishes, registered and then looked at again, so an end between either finds the
+    /// registration or is seen.
     fn wait_full(&self, wait: &mut FullWait) -> Result<IOResult<()>> {
+        self.hold_demand(wait);
+        let out = match self.full_outcome(wait.ticket) {
+            Some(out) => out,
+            None => {
+                let c = self.full_ends.wait();
+                match self.full_outcome(wait.ticket) {
+                    Some(out) => out,
+                    None => {
+                        self.wake_driver();
+                        return Ok(IOResult::IO(IOCompletions(c)));
+                    }
+                }
+            }
+        };
+        wait.demand = None;
+        out
+    }
+
+    /// What a wait for the full checkpoint `ticket` counts to has come to, if anything: the
+    /// failure of one, or that one is done.
+    fn full_outcome(&self, ticket: u64) -> Option<Result<IOResult<()>>> {
+        if let Some(failed) = self.failure.lock().clone() {
+            return Some(Err(LimboError::InternalError(format!(
+                "a checkpoint failed ({failed}): none runs until the database is opened again"
+            ))));
+        }
+        (self.full_done.load(Ordering::Acquire) >= ticket).then_some(Ok(IOResult::Done(())))
+    }
+
+    /// While `wait` stands, its demand on the checkpoint's task, of the relief class (DESIGN.md
+    /// 22.4), whoever steps the task: taken at its first poll and held across its polls, with no
+    /// lock of the checkpointer's held (the ticket takes the executor's queue lock).
+    fn hold_demand(&self, wait: &mut FullWait) {
         if wait.demand.is_none() && self.full_done.load(Ordering::Acquire) < wait.ticket {
             wait.demand = self.demand();
         }
-        let mut waiters = self.waiters.lock();
-        let failed = self.failure.lock().clone();
-        let out = if let Some(failed) = failed {
-            Err(LimboError::InternalError(format!(
-                "a checkpoint failed ({failed}): none runs until the database is opened again"
-            )))
-        } else if self.full_done.load(Ordering::Acquire) >= wait.ticket {
-            Ok(IOResult::Done(()))
-        } else {
-            let c = crate::storage::atoll::notify::remote_wait();
-            waiters.push(c.clone());
-            drop(waiters);
-            self.wake_driver();
-            return Ok(IOResult::IO(IOCompletions(c)));
-        };
-        drop(waiters);
-        // Its demand let go once the waiters' lock is: the ticket's drop takes the queue's.
-        wait.demand = None;
-        out
     }
 
     /// A refused writer's demand on the checkpoint's task, of the relief class (DESIGN.md 22.4),
@@ -1268,7 +1282,14 @@ impl Checkpointer {
         let ticket = wait.ticket;
         match self.stepper() {
             Stepper::Worker => return self.wait_full(wait),
-            Stepper::Caller(task) => return self.claim_full(task, ticket),
+            Stepper::Caller(task) => {
+                self.hold_demand(wait);
+                let out = self.claim_full(task, ticket);
+                if !matches!(out, Ok(IOResult::IO(_))) {
+                    wait.demand = None;
+                }
+                return out;
+            }
             Stepper::Writer => {}
         }
         let mut state = match self.hold_or_wait() {

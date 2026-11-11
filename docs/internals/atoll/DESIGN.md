@@ -5488,9 +5488,13 @@ compose, the real `Completion`, latch and backends included where named.
    integrity check, a writer's relief) wakes those writers only where the writers step checkpoints:
    with a worker, they wait on the room the worker frees and the gate it opens. A transaction's end
    waiting for a full checkpoint holds the wait as a value it owns across its polls
-   (`FullWait`, from `request_full`), which, while a worker steps the checkpoints, takes a demand
-   on the checkpoint's task of the relief class at its first poll, outside the waiters' lock, and
-   lets it go as the wait ends or is dropped (22.4). The database closes in 22.12's order, by its
+   (`FullWait`, from `request_full`), which, while the checkpoint's task steps the checkpoints,
+   takes a demand on that task of the relief class at its first poll, with no lock of the
+   checkpointer's held, whether a worker steps the task or the waiter claims it, and lets it go as
+   the wait ends or is dropped (22.4). The waits share one registration (`notify::LetGo`),
+   registered and then looked at again, finished at each checkpoint's end, failure, or the task's,
+   so a wait polled again or dropped while none can end leaves nothing behind (the auditor's
+   #4340). The database closes in 22.12's order, by its
    drop or by `Atoll::close`, which returns the log's failure: the log made durable to the end it
    had when close began, the closing thread waiting as any caller of `wait_durable` does while the
    checkpoint's task still runs, then `Executor::close_after` with that end and the database's

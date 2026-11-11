@@ -998,6 +998,91 @@ fn a_wait_for_a_full_checkpoint_makes_the_checkpoint_relief_while_it_stands() {
     assert_ne!(done, Some(Class::Relief), "a wait done kept its demand");
 }
 
+/// A wait for a full checkpoint makes the checkpoint relief while it stands where the writers
+/// claim the checkpoint's task too, not only where a worker steps it (DESIGN.md 22.4, the
+/// auditor's #4340): with the state held, a pending wait raises the task's class, and a dropped
+/// wait and a wait done let it go (mutant: the claimant taking no demand).
+#[test]
+fn a_claimants_wait_for_a_full_checkpoint_makes_the_checkpoint_relief_while_it_stands() {
+    let db = Db::memory();
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    let held = cp.hold().expect("the state free");
+    let mut wait = cp.request_full();
+    let pending = matches!(cp.step_full(&mut wait, txns).unwrap(), IOResult::IO(_));
+    let waiting = cp.task_class();
+    drop(wait);
+    let dropped = cp.task_class();
+    let mut wait = cp.request_full();
+    let again = matches!(cp.step_full(&mut wait, txns).unwrap(), IOResult::IO(_));
+    let waiting_again = cp.task_class();
+    drop(held);
+    within(&db.io, || cp.step_full(&mut wait, txns));
+    let done = cp.task_class();
+    drop(wait);
+    drop(db);
+    assert!(
+        pending && again,
+        "a full checkpoint done while its state was held"
+    );
+    assert_eq!(
+        (waiting, waiting_again),
+        (Some(Class::Relief), Some(Class::Relief)),
+        "the task's class while a claimant's wait for a full checkpoint stands"
+    );
+    assert_ne!(
+        dropped,
+        Some(Class::Relief),
+        "a dropped wait kept its demand"
+    );
+    assert_ne!(done, Some(Class::Relief), "a wait done kept its demand");
+}
+
+/// The waits for a full checkpoint share one registration, however often one is polled and
+/// however many are made and dropped while none can end (the auditor's #4340): with the state
+/// held, a hundred more polls of a pending wait and a hundred waits made, polled and dropped are
+/// all handed the same wait, which the checkpoint's end finishes (mutant: a registration per
+/// poll, which keeps one for every poll and every dropped wait until a checkpoint ends).
+#[test]
+fn waits_for_a_full_checkpoint_share_one_registration_however_often_polled_or_dropped() {
+    const POLLS: usize = 100;
+    let db = Db::threaded();
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    let held = cp.hold().expect("the state free");
+    let mut wait = cp.request_full();
+    let IOResult::IO(IOCompletions(first)) = cp.step_full(&mut wait, txns).unwrap() else {
+        panic!("a full checkpoint done while its state was held");
+    };
+    let shared =
+        |out: IOResult<()>| matches!(out, IOResult::IO(IOCompletions(c)) if c.ptr_eq(&first));
+    let polled = (0..POLLS)
+        .filter(|_| shared(cp.step_full(&mut wait, txns).unwrap()))
+        .count();
+    let made = (0..POLLS)
+        .filter(|_| {
+            let mut other = cp.request_full();
+            shared(cp.step_full(&mut other, txns).unwrap())
+        })
+        .count();
+    let pending = !first.finished();
+    drop(held);
+    within(&db.io, || cp.step_full(&mut wait, txns));
+    let finished = first.finished();
+    drop(wait);
+    drop(db);
+    assert!(pending, "the wait finished while the state was held");
+    assert_eq!(
+        (polled, made),
+        (POLLS, POLLS),
+        "polls and waits handed a registration of their own"
+    );
+    assert!(
+        finished,
+        "the shared wait not finished by the checkpoint's end"
+    );
+}
+
 /// The ends of transactions waiting for a full checkpoint are woken with no lock held: a waiter
 /// whose waker waits for the next full checkpoint again, from inside its wake on the
 /// checkpointing thread, is not blocked by the lock the wake would otherwise still hold.

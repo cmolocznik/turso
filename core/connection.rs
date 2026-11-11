@@ -507,6 +507,10 @@ pub struct Connection {
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// The main database's Atoll transaction, in Atoll mode (DESIGN.md §17).
     pub(crate) atoll: Option<crate::storage::atoll::sql::mode::ConnTxn>,
+    /// Whether a statement of the connection has begun to end its transaction in Atoll mode: the
+    /// commit or rollback is decided and that statement's to finish, whole, as it steps, is reset
+    /// or drops (`vdbe::EndingBegun`); a close leaves it to it.
+    pub(crate) atoll_ending_begun: AtomicBool,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
     pub(crate) attached_mv_txs:
@@ -2541,11 +2545,17 @@ impl Connection {
         }
         self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();
+        // A transaction a statement has begun to end is that statement's to finish: its commit
+        // publishes the schema it changed and ends the attached databases' transactions once its
+        // ending has ended, which a rollback here would have undone under it (the auditor's
+        // P1-DDL-END1).
+        let ending_begun = self.atoll_ending_begun.load(Ordering::Acquire);
 
         match self.get_tx_state() {
             TransactionState::None => {
                 // No active transaction
             }
+            _ if ending_begun => {}
             _ => {
                 if self.mvcc_enabled() {
                     if let Some(mv_store) = self.mv_store().as_ref() {
@@ -2571,7 +2581,9 @@ impl Connection {
         if let Some(atoll) = self.atoll.as_ref() {
             drop(atoll.end(false));
         }
-        self.index_methods_on_transaction_rolled_back();
+        if !ending_begun {
+            self.index_methods_on_transaction_rolled_back();
+        }
         self.clear_mvcc_log_meta();
 
         let is_memory_db = is_memory_like(&self.db.path);

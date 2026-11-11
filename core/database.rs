@@ -3083,6 +3083,7 @@ impl Database {
                 .atoll
                 .as_ref()
                 .map(|db| crate::storage::atoll::sql::mode::ConnTxn::new(db.clone())),
+            atoll_ending_begun: AtomicBool::new(false),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]
             yield_injector: RwLock::new(None),

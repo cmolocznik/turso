@@ -823,6 +823,12 @@ impl Statement {
         self.state.atoll_ending_phase()
     }
 
+    /// Whether the statement's Atoll ending commits and has published its commit.
+    #[cfg(test)]
+    pub(crate) fn atoll_ending_published(&self) -> bool {
+        self.state.atoll_ending_published()
+    }
+
     /// Whether the statement is parked in an explicit checkpoint, waiting for a release.
     #[cfg(test)]
     pub(crate) fn parked_checkpoint(&self) -> bool {
@@ -1625,7 +1631,7 @@ impl Statement {
         // P1-DDL-END1). A failure on the way is the statement's, and the cleanup below handles it.
         if self.state.execution_state.is_running()
             && self.program.connection.atoll().is_some()
-            && self.state.atoll_ending_begun()
+            && self.state.ending_begun()
         {
             loop {
                 match self._step(None) {

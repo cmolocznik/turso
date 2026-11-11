@@ -4408,6 +4408,18 @@ fn drop_at_its_ending(
     sql: &str,
     phase: &str,
 ) -> (bool, Option<String>) {
+    drop_at_its_ending_closing(conn, crash, sql, phase, false)
+}
+
+/// [`drop_at_its_ending`], closing the connection first if `close`, the statement still holding
+/// its ending.
+fn drop_at_its_ending_closing(
+    conn: &Arc<Connection>,
+    crash: &crate::io::crash::CrashIO,
+    sql: &str,
+    phase: &str,
+    close: bool,
+) -> (bool, Option<String>) {
     let mut statement = conn.prepare(sql).unwrap();
     let met = loop {
         match statement.step() {
@@ -4421,6 +4433,13 @@ fn drop_at_its_ending(
             Ok(other) => break (false, Some(format!("{other:?}"))),
             Err(e) => break (false, Some(e.to_string())),
         }
+    };
+    let met = match close && met.0 {
+        true => match conn.close() {
+            Ok(()) => met,
+            Err(e) => (false, Some(format!("the close failed: {e}"))),
+        },
+        false => met,
     };
     drop(statement);
     met
@@ -4484,11 +4503,22 @@ fn run_on(conn: &Arc<Connection>, crash: &crate::io::crash::CrashIO, sql: &str) 
 /// schemas once the dropped `COMMIT` has finished, the row written beside is there, and the
 /// connection is back in autocommit.
 fn commit_dropped_at(phase: &str, seed: u64, beside: &str) {
+    commit_dropped_at_closing(phase, seed, beside, false)
+}
+
+/// [`commit_dropped_at`], the connection closed first if `close`, the `COMMIT` still holding its
+/// ending: the close leaves the commit to the statement, which finishes it whole as it drops, on
+/// the closed connection (the auditor's #4414). What it kept is read through another connection.
+fn commit_dropped_at_closing(phase: &str, seed: u64, beside: &str, close: bool) {
+    let name = format!(
+        "commit-ending-{phase}{}",
+        if close { "-closed" } else { "" }
+    );
     let crash = Arc::new(crate::io::crash::CrashIO::new(seed));
     let io: Arc<dyn IO> = crash.clone();
     let db = Database::open(
         io.clone(),
-        &format!("/db/commit-ending-{phase}"),
+        &format!("/db/{name}"),
         OpenOptions::new(Arc::new(SqliteDialect))
             .atoll(config())
             .db_opts(DatabaseOpts::default().with_attach(true)),
@@ -4496,14 +4526,16 @@ fn commit_dropped_at(phase: &str, seed: u64, beside: &str) {
     .unwrap();
     let writer = db.connect(ConnectOpts::new()).unwrap();
     let reader = db.connect(ConnectOpts::new()).unwrap();
+    // Closed, the writer's every step passes the VM's check of its connection, the one the
+    // finishing steps after the close must pass (a progress handler of one instruction that never
+    // interrupts).
+    if close {
+        writer.set_progress_handler(1, Some(Box::new(|| false)));
+    }
     let side = if beside == "TEMP" {
         "temp.side".to_string()
     } else {
-        run_on(
-            &writer,
-            &crash,
-            &format!("ATTACH '/db/commit-ending-{phase}-aux' AS aux"),
-        );
+        run_on(&writer, &crash, &format!("ATTACH '/db/{name}-aux' AS aux"));
         "aux.side".to_string()
     };
     for sql in [
@@ -4514,13 +4546,23 @@ fn commit_dropped_at(phase: &str, seed: u64, beside: &str) {
     ] {
         run_on(&writer, &crash, &sql);
     }
-    let met = drop_at_its_ending(&writer, &crash, "COMMIT", phase);
-    let seen = (sees(&reader, "kept"), sees(&writer, "kept"));
-    let autocommit = writer.get_auto_commit();
-    let kept_beside = writer
+    let met = drop_at_its_ending_closing(&writer, &crash, "COMMIT", phase, close);
+    let looker = if close {
+        let looker = db.connect(ConnectOpts::new()).unwrap();
+        if beside != "TEMP" {
+            run_on(&looker, &crash, &format!("ATTACH '/db/{name}-aux' AS aux"));
+        }
+        looker
+    } else {
+        writer.clone()
+    };
+    let seen = (sees(&reader, "kept"), sees(&looker, "kept"));
+    let autocommit = close || writer.get_auto_commit();
+    let kept_beside = looker
         .prepare(format!("SELECT b FROM {side}"))
         .and_then(|mut statement| statement.run_collect_rows())
         .map_err(|e| e.to_string());
+    drop(looker);
     drop((writer, reader, db));
     assert_eq!(met, (true, None), "the COMMIT never reached {phase}");
     assert_eq!(
@@ -4543,4 +4585,196 @@ fn a_commit_dropped_once_its_ending_began_finishes_the_main_and_temporary_schema
 #[test]
 fn a_commit_dropped_once_its_storage_ended_finishes_the_attached_databases_commit() {
     commit_dropped_at("attached", 654, "aux");
+}
+
+#[test]
+fn a_commit_whose_connection_closes_once_its_storage_ended_finishes_the_attached_commit() {
+    commit_dropped_at_closing("attached", 658, "aux", true);
+}
+
+/// A writer's `CREATE TABLE` dropped once its commit's ending began, while a sibling statement of
+/// its connection is part way through a scan: the commit is finished whole with the sibling still
+/// counted, so the scan goes on in the read transaction the halt begins for it and reads every
+/// row, and the table is in the shared schema (the auditor's #4413).
+#[test]
+fn a_create_table_dropped_at_its_ending_beside_a_scan_finishes_and_the_scan_reads_on() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(655));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, "/db/ddl-ending-beside-a-scan");
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    run_on(&writer, &crash, "CREATE TABLE t(a INTEGER)");
+    for a in 1..=3 {
+        run_on(&writer, &crash, &format!("INSERT INTO t VALUES ({a})"));
+    }
+    let mut scan = writer.prepare("SELECT a FROM t").unwrap();
+    let mut scanned = Vec::new();
+    // The scan's first row, then the writer's statement beside it.
+    loop {
+        match scan.step().unwrap() {
+            crate::StepResult::IO => crash.step().unwrap(),
+            crate::StepResult::Row => {
+                scanned.push(
+                    scan.row()
+                        .unwrap()
+                        .get_values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                );
+                break;
+            }
+            other => panic!("the scan stepped to {other:?}"),
+        }
+    }
+    let met = drop_at_its_ending(&writer, &crash, "CREATE TABLE made(a INTEGER)", "ending");
+    let rest = loop {
+        match scan.step() {
+            Ok(crate::StepResult::IO) => crash.step().unwrap(),
+            Ok(crate::StepResult::Row) => scanned.push(
+                scan.row()
+                    .unwrap()
+                    .get_values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            Ok(crate::StepResult::Done) => break Ok(()),
+            Ok(other) => break Err(format!("{other:?}")),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    drop(scan);
+    let seen = (sees(&reader, "made"), sees(&writer, "made"));
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((writer, reader, db));
+    assert_eq!(
+        met,
+        (true, None),
+        "the statement never reached its commit's ending"
+    );
+    assert_eq!(
+        rest,
+        Ok(()),
+        "the scan beside the dropped commit did not go on"
+    );
+    assert_eq!(
+        scanned,
+        (1..=3)
+            .map(|a| vec![Value::from_i64(a)])
+            .collect::<Vec<_>>(),
+        "the scan beside the dropped commit lost rows"
+    );
+    assert_eq!(
+        seen,
+        (Ok(()), Ok(())),
+        "a commit finished by a drop left its table unpublished"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+}
+
+/// A `CREATE TABLE` stepped into its commit's ending, then its connection closed before the
+/// statement drops: the close leaves the decided commit to the statement, which finishes it whole
+/// as it drops, on the closed connection; the table is in the shared schema for the connection
+/// left open and after a reopen (the auditor's #4414: before, the close rolled the connection's
+/// schema back under the ending and nothing published it).
+#[test]
+fn a_create_table_whose_connection_closes_at_its_ending_is_published_as_it_drops() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(656));
+    let io: Arc<dyn IO> = crash.clone();
+    let path = "/db/ddl-ending-close";
+    let db = open(&io, path);
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let mut statement = writer.prepare("CREATE TABLE made(a INTEGER)").unwrap();
+    let met = loop {
+        match statement.step() {
+            Ok(crate::StepResult::IO) => {
+                if statement.atoll_ending_phase() == Some("ending") {
+                    break Ok(());
+                }
+                crash.step().unwrap();
+            }
+            Ok(other) => break Err(format!("{other:?}")),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    let closed = writer.close().map_err(|e| e.to_string());
+    drop(statement);
+    let seen = sees(&reader, "made");
+    drop((writer, reader, db));
+    let reopened = open(&io, path);
+    let fresh = reopened.connect(ConnectOpts::new()).unwrap();
+    let after_reopen = sees(&fresh, "made");
+    drop((fresh, reopened));
+    assert_eq!(
+        met,
+        Ok(()),
+        "the statement never reached its commit's ending"
+    );
+    assert_eq!(closed, Ok(()));
+    assert_eq!(
+        seen,
+        Ok(()),
+        "a commit its connection's close left behind was not published"
+    );
+    assert_eq!(after_reopen, Ok(()));
+}
+
+/// A `CREATE TABLE` whose commit has been published, whose wait for durability then fails: the
+/// commit stays, so its table is published to the shared schema all the same as the statement
+/// fails (the auditor's #4412: the schema published only once the whole ending had succeeded).
+#[test]
+fn a_create_table_whose_published_commit_then_fails_publishes_its_table() {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(657));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, "/db/ddl-published-then-failed");
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let mut statement = writer.prepare("CREATE TABLE made(a INTEGER)").unwrap();
+    let published = loop {
+        match statement.step() {
+            Ok(crate::StepResult::IO) => {
+                if statement.atoll_ending_published() {
+                    break Ok(());
+                }
+                crash.step().unwrap();
+            }
+            Ok(other) => break Err(format!("{other:?}")),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    crash.set_faults(crate::io::crash::Faults {
+        read: 0.0,
+        write: 1.0,
+        sync: 1.0,
+        short_write: 0.0,
+    });
+    let ended = loop {
+        match statement.step() {
+            Ok(crate::StepResult::IO) => {
+                if let Err(e) = crash.step() {
+                    break Err(e.to_string());
+                }
+            }
+            Ok(crate::StepResult::Done) => break Ok(()),
+            Ok(other) => break Err(format!("{other:?}")),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    drop(statement);
+    let seen = sees(&reader, "made");
+    drop((writer, reader, db));
+    assert_eq!(
+        published,
+        Ok(()),
+        "the commit was never published with its ending waiting"
+    );
+    assert!(
+        ended.is_err(),
+        "the commit's wait for durability did not fail: {ended:?}"
+    );
+    assert_eq!(
+        seen,
+        Ok(()),
+        "a published commit that then failed left its table unpublished: {ended:?}"
+    );
 }

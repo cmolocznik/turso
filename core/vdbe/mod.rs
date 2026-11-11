@@ -420,6 +420,24 @@ enum CommitState {
     },
 }
 
+/// A statement's mark on its connection while it ends the connection's transaction in Atoll mode
+/// (`Connection::atoll_ending_begun`): set as the ending begins, let go as it is dropped, with the
+/// statement's commit state or once the commit has been finished whole.
+pub(crate) struct EndingBegun(Arc<Connection>);
+
+impl EndingBegun {
+    fn new(connection: &Arc<Connection>) -> Self {
+        connection.atoll_ending_begun.store(true, Ordering::Release);
+        Self(connection.clone())
+    }
+}
+
+impl Drop for EndingBegun {
+    fn drop(&mut self) {
+        self.0.atoll_ending_begun.store(false, Ordering::Release);
+    }
+}
+
 impl CommitState {
     fn cleanup_mvcc_checkpoint_state(&mut self) {
         match self {
@@ -1298,6 +1316,9 @@ pub struct ProgramState {
     /// Whether this statement's Transaction opcode left a take of Atoll's write gate waiting,
     /// which it gives up if it stops waiting (R15).
     pub(crate) atoll_taking: bool,
+    /// In Atoll mode, this statement's mark on its connection while it ends the transaction, from
+    /// the ending's start to the end of the commit's finishing (`Connection::atoll_ending_begun`).
+    pub(crate) atoll_ending_begun: Option<EndingBegun>,
     /// In Atoll mode, a CreateBtree under way (DESIGN.md §17).
     pub(crate) atoll_create: Option<crate::storage::atoll::sql::mode::CreateOp>,
     /// In Atoll mode, a Destroy or ClearBtree under way (DESIGN.md §17).
@@ -1428,6 +1449,7 @@ impl ProgramState {
             uses_subjournal: false,
             atoll_statement: None,
             atoll_taking: false,
+            atoll_ending_begun: None,
             atoll_create: None,
             atoll_retire: None,
             is_active_write: false,
@@ -1599,6 +1621,8 @@ impl ProgramState {
             self.commit_state.cleanup_mvcc_checkpoint_state();
             self.commit_state = CommitState::Ready;
         }
+        // After the ending it marked, which has driven itself to its end as it dropped.
+        self.atoll_ending_begun = None;
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
@@ -1886,14 +1910,11 @@ impl ProgramState {
         }
     }
 
-    /// Whether the main database's Atoll transaction has begun to end, a commit or a rollback the
-    /// statement decided: its storage ending under way, or ended with the attached databases' still
-    /// to end. Read only in Atoll mode, where nothing else leaves `CommittingAttached`.
-    pub(crate) fn atoll_ending_begun(&self) -> bool {
-        matches!(
-            self.commit_state,
-            CommitState::Atoll { .. } | CommitState::CommittingAttached
-        )
+    /// Whether this statement has begun to end its connection's Atoll transaction, a commit or a
+    /// rollback it decided, and not finished it: its storage ending under way, or ended with the
+    /// attached databases' still to end (it holds its mark, [`EndingBegun`]).
+    pub(crate) fn ending_begun(&self) -> bool {
+        self.atoll_ending_begun.is_some()
     }
 
     /// Where an Atoll transaction's ending stands, for tests: its storage ending under way, or
@@ -1905,6 +1926,12 @@ impl ProgramState {
             CommitState::CommittingAttached => Some("attached"),
             _ => None,
         }
+    }
+
+    /// Whether the statement's Atoll ending commits and has published its commit, for tests.
+    #[cfg(test)]
+    pub(crate) fn atoll_ending_published(&self) -> bool {
+        matches!(&self.commit_state, CommitState::Atoll { ending, .. } if ending.published())
     }
 
     /// The completion the instruction that just returned `IO` parked.
@@ -3164,7 +3191,9 @@ impl Program {
             progress_ops
         };
         state.check_countdown = state.check_interval;
-        if self.connection.is_closed() {
+        // A statement that has begun to end its connection's transaction finishes it on a closed
+        // connection too: the close left it to it.
+        if self.connection.is_closed() && state.atoll_ending_begun.is_none() {
             return Some(ProgramStep::Error(self.closed_during_step(pager)));
         }
         // With no interrupt requested, no deadline and no progress handler
@@ -3452,6 +3481,7 @@ impl Program {
                 }
             );
             let atoll = connection.atoll().expect("Atoll mode");
+            program_state.atoll_ending_begun = Some(EndingBegun::new(connection));
             program_state.commit_state = match atoll.end(!rollback) {
                 Some(ending) => CommitState::Atoll {
                     ending: Box::new(ending),
@@ -3487,6 +3517,7 @@ impl Program {
         return_if_io!(self.end_attached_write_txns(connection, rollback, false));
         self.end_attached_read_txns(connection);
         program_state.commit_state = CommitState::Ready;
+        program_state.atoll_ending_begun = None;
         let atoll = connection.atoll().expect("Atoll mode");
         // A halt that ended nothing, the transaction held by a schema reparse, leaves it open for
         // the statements reading in it: the connection's state says so.
@@ -4016,6 +4047,20 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        // An Atoll commit published before its ending failed stays, whatever ends the statement:
+        // the schema it changed is published before the rollback below puts the connection's
+        // back from the shared one (the auditor's #4412).
+        if let CommitState::Atoll {
+            ending,
+            schema_did_change: true,
+            rollback: false,
+        } = &state.commit_state
+        {
+            if ending.published() {
+                let schema = self.connection.schema.read().clone();
+                self.connection.db.update_schema_if_newer(schema);
+            }
+        }
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
         }

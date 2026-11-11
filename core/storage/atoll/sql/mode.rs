@@ -1429,6 +1429,8 @@ fn outside() -> LimboError {
 pub struct Ending {
     db: Arc<AtollDb>,
     step: Step,
+    /// Whether its commit was published, once its commit step is behind it.
+    published: bool,
     /// The top of the ending, which keeps its memory-shortage tenure across IO (DESIGN.md 9.1.3,
     /// *The top and the owner*).
     owner: crate::storage::atoll::buffer::Owner,
@@ -1468,6 +1470,7 @@ impl Ending {
         Self {
             db,
             step: Step::Commit(commit),
+            published: false,
             owner: crate::storage::atoll::buffer::Owner::of(conn),
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
@@ -1483,6 +1486,7 @@ impl Ending {
             return Self {
                 db,
                 step: Step::Drain,
+                published: false,
                 owner: crate::storage::atoll::buffer::Owner::of(conn),
                 _frame: crate::storage::atoll::unwind::FrameEnd::default(),
             };
@@ -1490,6 +1494,7 @@ impl Ending {
         Self {
             db,
             step: Step::Rollback(Abort::new(txn)),
+            published: false,
             owner: crate::storage::atoll::buffer::Owner::of(conn),
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
@@ -1514,6 +1519,7 @@ impl Ending {
                 Step::Commit(op) => {
                     done!(txns.commit(op));
                     self.db.abandoned(op.abandoned());
+                    self.published = op.published();
                     self.step = Step::Drain;
                 }
                 Step::Rollback(op) => {
@@ -1549,6 +1555,17 @@ impl Ending {
                 }
                 Step::Done => return Ok(IOResult::Done(())),
             }
+        }
+    }
+
+    /// Whether the ending commits and its commit has been published: what the transaction wrote
+    /// is visible and stays so, whatever a later step of the ending, its wait for durability
+    /// among them, meets.
+    #[turso_macros::atoll_entry]
+    pub fn published(&self) -> bool {
+        match &self.step {
+            Step::Commit(op) => op.published(),
+            _ => self.published,
         }
     }
 

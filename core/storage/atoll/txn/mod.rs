@@ -528,6 +528,12 @@ impl Commit {
         self
     }
 
+    /// Whether the commit has been published: what it wrote is visible to every transaction begun
+    /// since and stays so, whatever its wait for durability then meets.
+    pub fn published(&self) -> bool {
+        self.ts.is_some()
+    }
+
     /// Once the commit is done, the trees whose creation a statement rollback undid: each on its
     /// list, the Commit appended before them.
     pub fn abandoned(&self) -> &[PageId] {

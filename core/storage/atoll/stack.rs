@@ -138,6 +138,13 @@ impl<T> Default for Chain<T> {
     }
 }
 
+impl<T> Chain<T> {
+    /// Whether every item has been read.
+    pub fn is_empty(&self) -> bool {
+        self.head.is_null()
+    }
+}
+
 impl<T> Iterator for Chain<T> {
     type Item = T;
 

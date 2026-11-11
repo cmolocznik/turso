@@ -2749,7 +2749,14 @@ store's in `store.rs` (the cut's metadata edits, the frees that wait for a check
     imaged, and the page table entries it named as they stand, are not undone, so none runs again
     until the database is opened again and recovers from the one in charge. Its cut ends and its
     copies are dropped; a writer that was stepping it for room goes on, as commits do, and the
-    failure is told to whoever steps checkpoints next. A write that lands short is a failure.
+    failure is told to whoever steps checkpoints next. A write that lands short is a failure. It
+    lets go of what it holds a unit at a time, as its work was, from the unit after the one that
+    failed: the gate; its cut's end, a run a unit; the cut copies of its frames, a run a unit;
+    its frames, then the metadata pages it held and those the cut handed it, a run a unit; the
+    orphans handed back, a run a unit; then its snapshot, and the failure is told by that last
+    unit. The database closing on it lets go of the same, whole, on the closing
+    thread outside any unit. (Built, step 4 residual: `Letting` and `Run::let_go_unit`, the
+    auditor's #4347.)
 11. **Memory**, in the one region (section 9.1) or beside it, each amount accounted: the kept
     copies and the images of node pages in lent frames; the image write buffers in flight within
     `checkpoint_write_bytes`, one page of the largest class by default, beside the 32 writes, so a
@@ -4665,7 +4672,14 @@ file it was in synced, a sync's place kept the same way, the first failure any o
 keeping the batch's slots for the next try (`PageStore::erase_one`, P2-CP-F1). Every such run, release
 and sync counts as the unit's visit (the auditor's P2-CP-U1), and tests count the entries a unit
 walks where the walk is done (`unit::walked`, in the metadata helpers and the registry's walk), so
-a call site handing a helper more than its run is seen. Two scans are bounded by configuration
+a call site handing a helper more than its run is seen. What a checkpoint holds element by element
+is let go of the same way, never as its run ends (the auditor's #4350): once it is in charge it
+drops its frames' references, `FRAME_RUN` a unit from the last, then the metadata pages it wrote,
+`DIRTY_RUN` a unit (`Phase::LetGo`, `Run::release_run`), and a failed one does the same as it lets
+go; every other collection it holds is a bound's worth at most (`WRITES` writes and syncs, one
+page being imaged) or holds elements that need no drop, so dropping it frees one allocation
+whatever its length. A census test reads the run's fields from the source and fails on one not
+classed so, and on a collection classed one free whose elements need a drop. Two scans are bounded by configuration
 rather than by a page, an exception stated as such: the cut (`Transactions::cut`) reads every
 reserved transaction slot, and building a reserving leaf's image reads the oldest snapshot over
 every slot (`AsOf::step` through `oldest_snapshot`), its per-leaf vector growing to the highest

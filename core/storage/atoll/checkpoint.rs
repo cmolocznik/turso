@@ -597,6 +597,10 @@ struct Run {
     creations_end: Option<PageId>,
     /// Where the end of the pool's cut stands.
     end_cut: EndCut,
+    /// What made it unable to finish, while it lets go of what it holds.
+    failure: Option<LimboError>,
+    /// Where its letting go stands, once it fails or the database closes on it.
+    letting: Letting,
     /// The next segment to release, counting down from the first kept, once the release has
     /// begun; and whether one was released, which owes the directory its sync.
     release: Option<u64>,
@@ -627,6 +631,9 @@ enum Phase {
     /// Each page the checkpoint wrote given its durable place, a run of its frames a unit, then
     /// the checkpoint put in charge.
     InCharge,
+    /// What it holds element by element and needs no more let go of, a run a unit
+    /// ([`Run::release_run`]).
+    LetGo,
     After,
     /// The trees created before the cut forgotten as creations, one a unit.
     Forget,
@@ -1469,6 +1476,33 @@ const FRAME_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<MetaRef>();
 /// (DESIGN.md 22.1).
 const CREATION_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<(PageId, u16, u64)>();
 
+/// The orphans a checkpoint that cannot finish hands back a unit: as many as one page of them
+/// holds (DESIGN.md 22.1).
+const ORPHAN_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<PageId>();
+
+/// Where a checkpoint that cannot finish stands in letting go of what it holds, a unit at a time
+/// as its work was (DESIGN.md 22.1, the auditor's #4347 and #4350): the gate, its cut's end a run a
+/// unit, its frames' cut copies a run a unit, what it holds element by element a run a unit (its
+/// frames, then the metadata pages), the orphans handed back a run a unit, then its snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Letting {
+    Gate,
+    EndCut,
+    Frames(usize),
+    Held,
+    Orphans(usize),
+    Snapshot,
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// What the last checkpoint run to end on this thread still held element by element as it
+    /// ended ([`Run::holds`]).
+    static HELD_AT_END: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The most a checkpoint in charge held element by element as it began letting go of it.
+    static HELD_AT_LET_GO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// What a unit of a checkpoint's work leaves (DESIGN.md 22.1).
 enum Unit {
     /// Nothing more to do now: no checkpoint is due and nothing is left to erase.
@@ -1504,6 +1538,21 @@ impl State {
                 "a checkpoint failed ({failed}): none runs until the database is opened again"
             )));
         }
+        // A checkpoint that cannot finish lets go of what it holds a unit at a time, then tells
+        // its failure.
+        if let Some(run) = self.run.as_mut().filter(|run| run.failure.is_some()) {
+            if !run.let_go_unit(cp, txns) {
+                return Ok(Unit::Again);
+            }
+            let run = self.run.take().expect("a checkpoint letting go");
+            #[cfg(test)]
+            HELD_AT_END.with(|h| h.set(Some(run.holds())));
+            cp.under_way.store(false, Ordering::Release);
+            self.upkeep.abandon();
+            let e = run.failure.expect("a checkpoint's failure");
+            self.failed = Some(e.to_string());
+            return Err(e);
+        }
         if matches!(until, Until::Room(_)) && self.run.is_none() {
             return Ok(Unit::Done);
         }
@@ -1530,6 +1579,8 @@ impl State {
             // next step's.
             Ok(Unit::Done) => {
                 let run = self.run.take().expect("a checkpoint under way");
+                #[cfg(test)]
+                HELD_AT_END.with(|h| h.set(Some(run.holds())));
                 cp.under_way.store(false, Ordering::Release);
                 self.superblock = run.superblock.expect("the checkpoint's superblock");
                 if let Some(full) = run.full {
@@ -1542,14 +1593,11 @@ impl State {
                 // A checkpoint that cannot finish leaves the one in charge in charge: the pages
                 // it wrote are named by no superblock. What it marked imaged and edited as it
                 // stands is not undone, so no checkpoint runs again until the database is opened
-                // again and recovers from the one in charge.
-                if let Some(run) = self.run.take() {
-                    run.abandon(cp, txns);
-                }
-                cp.under_way.store(false, Ordering::Release);
-                self.upkeep.abandon();
-                self.failed = Some(e.to_string());
-                Err(e)
+                // again and recovers from the one in charge. It lets go of what it holds from
+                // the next unit on, a unit at a time, and tells its failure once it has.
+                let run = self.run.as_mut().expect("a checkpoint under way");
+                run.failure = Some(e);
+                Ok(Unit::Again)
             }
         }
     }
@@ -1596,35 +1644,89 @@ impl Run {
             creations_at: None,
             creations_end: None,
             end_cut: EndCut::default(),
+            failure: None,
+            letting: Letting::Gate,
             release: None,
             released: false,
         }
     }
 
-    /// Lets go of what a checkpoint that cannot finish holds: the gate, the cuts, the snapshot,
-    /// and the pages handed over to it. A turn of the log's flush it owes is taken, so no request
-    /// made during its last turn goes unanswered.
+    /// Lets go of what a checkpoint the database closes on holds (DESIGN.md 22.12 step 3), on the
+    /// closing thread, outside any unit: whole, where a checkpoint that cannot finish lets go a
+    /// unit at a time ([`let_go_unit`](Self::let_go_unit)), from where that stood.
     fn abandon(mut self, cp: &Checkpointer, txns: &Transactions) {
-        let mut owed = self.turn_owed;
-        while owed {
-            owed = cp.log.flush_one_turn();
+        while !self.let_go_unit(cp, txns) {}
+    }
+
+    /// One unit of letting go of what a checkpoint that cannot finish holds: the gate, the cuts,
+    /// the snapshot, and the pages handed over to it, a run at a time where they are many. A turn
+    /// of the log's flush it owes is taken first, one a unit, so no request made during its last
+    /// turn goes unanswered. Whether it has let go of everything.
+    fn let_go_unit(&mut self, cp: &Checkpointer, txns: &Transactions) -> bool {
+        if self.turn_owed {
+            self.turn_owed = cp.log.flush_one_turn();
+            return false;
         }
-        if matches!(self.phase, Phase::Gate | Phase::Cut | Phase::Scan) {
-            cp.store.open_gate();
+        loop {
+            match self.letting {
+                Letting::Gate => {
+                    if matches!(self.phase, Phase::Gate | Phase::Cut | Phase::Scan) {
+                        cp.store.open_gate();
+                    }
+                    self.letting = Letting::EndCut;
+                }
+                // A cut stopped, its end under way, is ended too, a run a unit.
+                Letting::EndCut => {
+                    if (cp.pool.cutting() == self.n || self.end_cut.begun())
+                        && !cp.pool.end_cut_run(self.n, &mut self.end_cut)
+                    {
+                        return false;
+                    }
+                    // The cut copies its frames kept go even where the cut ended before.
+                    if cp.store.meta().cutting() == self.n {
+                        cp.store.meta().stop_keeping(self.n);
+                    }
+                    self.letting = Letting::Frames(0);
+                }
+                // The cut copies its frames kept, a run a unit, even where the cut ended before
+                // (`Uncut`).
+                Letting::Frames(at) => {
+                    if at == self.frames.len() {
+                        self.letting = Letting::Held;
+                        continue;
+                    }
+                    let end = self.frames.len().min(at + FRAME_RUN);
+                    cp.store.meta().uncut(self.n, &self.frames[at..end]);
+                    self.letting = Letting::Frames(end);
+                    return false;
+                }
+                Letting::Held => {
+                    if self.holds() == 0 {
+                        self.letting = Letting::Orphans(0);
+                        continue;
+                    }
+                    self.release_run();
+                    return false;
+                }
+                Letting::Orphans(at) => {
+                    let end = self.orphans.len().min(at + ORPHAN_RUN);
+                    for &pid in &self.orphans[at..end] {
+                        unit::walked();
+                        cp.store.orphaned(pid);
+                    }
+                    if end < self.orphans.len() {
+                        self.letting = Letting::Orphans(end);
+                        return false;
+                    }
+                    // The snapshot's release is no run: the last run of orphans takes it too.
+                    self.letting = Letting::Snapshot;
+                }
+                Letting::Snapshot => {
+                    txns.release_checkpoint();
+                    return true;
+                }
+            }
         }
-        // A cut stopped, its end under way, is ended too.
-        if cp.pool.cutting() == self.n || self.end_cut.begun() {
-            while !cp.pool.end_cut_run(self.n, &mut self.end_cut) {}
-        }
-        // The cut copies its frames kept go even where the cut ended before (`Uncut`).
-        if cp.store.meta().cutting() == self.n {
-            cp.store.meta().stop_keeping(self.n);
-        }
-        cp.store.meta().uncut(self.n, &self.frames);
-        for pid in self.orphans {
-            cp.store.orphaned(pid);
-        }
-        txns.release_checkpoint();
     }
 
     /// One unit of the checkpoint (DESIGN.md 22.9 item 1): each phase is a cursor the next unit
@@ -1901,7 +2003,15 @@ impl Run {
                     let sb = self.superblock.as_ref().expect("the superblock written");
                     cp.published
                         .replace(Some(Arc::new(sb.clone())), &cp.releasing);
-                    self.phase = Phase::After;
+                    self.phase = Phase::LetGo;
+                    return Ok(Unit::Again);
+                }
+                Phase::LetGo => {
+                    #[cfg(test)]
+                    HELD_AT_LET_GO.with(|h| h.set(h.get().max(self.holds())));
+                    if !self.release_run() {
+                        self.phase = Phase::After;
+                    }
                     return Ok(Unit::Again);
                 }
                 Phase::After => {
@@ -1968,6 +2078,40 @@ impl Run {
                 None => Unit::Wait(c),
             }),
         })
+    }
+
+    /// Lets go of a run of what the checkpoint holds element by element, once it needs it no more
+    /// (DESIGN.md 22.1, the auditor's #4350): the last [`FRAME_RUN`] of its frames' references, or,
+    /// those gone, [`DIRTY_RUN`] of the metadata pages it wrote and those the cut handed it, each
+    /// counted walked. Its other collections hold elements that need no drop, each one free
+    /// whatever its length, or a bound's worth at most (the census test). Whether any is left.
+    fn release_run(&mut self) -> bool {
+        if !self.frames.is_empty() {
+            let keep = self.frames.len().saturating_sub(FRAME_RUN);
+            for _ in keep..self.frames.len() {
+                unit::walked();
+            }
+            self.frames.truncate(keep);
+        } else {
+            for _ in 0..DIRTY_RUN {
+                if self
+                    .meta
+                    .pop_first()
+                    .or_else(|| self.dirty.next())
+                    .is_none()
+                {
+                    break;
+                }
+                unit::walked();
+            }
+        }
+        self.holds() > 0
+    }
+
+    /// What the checkpoint holds element by element: its frames' references, the metadata pages
+    /// it wrote, and whether any the cut handed it are still to be read.
+    fn holds(&self) -> usize {
+        self.frames.len() + self.meta.len() + usize::from(!self.dirty.is_empty())
     }
 
     /// The next run of the frames the checkpoint wrote, [`FRAME_RUN`] of them at most, its cursor
@@ -2585,7 +2729,7 @@ mod tests {
         drop((run, frame, db));
         assert_eq!(
             (in_charge_units, after_in_charge),
-            (4, Phase::After),
+            (4, Phase::LetGo),
             "three runs, then the checkpoint put in charge"
         );
         assert_eq!(
@@ -2599,6 +2743,89 @@ mod tests {
             (FRAME_RUN, FRAME_RUN),
             "the most frames a unit's helper walked, giving places and letting cut copies go"
         );
+    }
+
+    /// A checkpoint that cannot finish lets go of what it holds a unit at a time, as its work was
+    /// (the auditor's #4347, the residual of P2-CP-U1): here one failing at its intent record,
+    /// written for more metadata pages than the log's buffer holds, with more frames and orphans
+    /// than a run of each. The failing unit lets go of nothing, each unit after it walks a run at
+    /// most, every frame's cut copy, frame, metadata page and orphan is let go of once, the orphans
+    /// handed back, the run ends holding nothing element by element, and the failure is told by the
+    /// last unit, after which no checkpoint runs (mutant: the letting go whole in the unit that
+    /// failed).
+    #[test]
+    fn a_failed_checkpoint_lets_go_of_what_it_holds_a_run_a_unit() {
+        let io: Arc<dyn crate::io::IO> = Arc::new(crate::io::MemoryIO::new());
+        let db = open(&io);
+        let cp = db.checkpointer();
+        let txns = db.transactions();
+        let in_charge = cp.superblock();
+        let class = page::SizeClass::new(0).unwrap();
+        let id = |index| MetaId {
+            tree: super::super::meta::Tree::Map,
+            class,
+            level: 0,
+            index,
+        };
+        let frame =
+            crate::storage::atoll::testing::drive(&io, || db.store().meta().get(id(0))).unwrap();
+        let mut run = Run::new(in_charge.checkpoint + 1, None);
+        run.phase = Phase::Intent;
+        // Its intent record past the log's buffer: the unit that builds it fails.
+        let past = cp.log.buffer_bytes() / 8 + 1;
+        run.meta = (0..past).map(id).collect();
+        run.frames = (0..2 * FRAME_RUN + 1).map(|_| frame.clone()).collect();
+        let orphans: Vec<PageId> = (0..2 * ORPHAN_RUN as u64 + 1)
+            .map(|i| PageId::new(class, 1 << 20 | i))
+            .collect();
+        run.orphans = orphans.clone();
+        let mut state = cp.try_hold().expect("the state free");
+        state.run = Some(Box::new(run));
+        cp.under_way.store(true, Ordering::Release);
+        let (mut units, mut most, mut first, mut told) = (0, 0, None, None);
+        HELD_AT_END.with(|h| h.set(None));
+        unit::take_walked();
+        while units < 1 << 12 {
+            let out = cp.stepping(&mut state, txns, Until::Done);
+            units += 1;
+            let walked = unit::take_walked();
+            first.get_or_insert(walked);
+            most = most.max(walked);
+            match out {
+                Ok(Unit::Again) => {}
+                Ok(_) => break,
+                Err(e) => {
+                    told = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        let held = HELD_AT_END.with(|h| h.take());
+        let after = cp.stepping(&mut state, txns, Until::Done).map(|_| ());
+        let handed_back = db.store().take_orphans();
+        let running = cp.under_way.load(Ordering::Acquire);
+        drop(state);
+        drop((frame, db));
+        assert_eq!(first, Some(0), "the failing unit let go of something");
+        assert_eq!(
+            most,
+            FRAME_RUN.max(DIRTY_RUN).max(ORPHAN_RUN),
+            "the most a unit of letting go walked"
+        );
+        assert_eq!(
+            units,
+            1 + 3 + 3 + past.div_ceil(DIRTY_RUN as u64) as usize + 3,
+            "the failing unit, three runs of cut copies, three of frames, the runs of metadata \
+             pages, three of orphans"
+        );
+        assert_eq!(held, Some(0), "held element by element as the run ended");
+        assert!(
+            told.as_deref().is_some_and(|e| e.contains("intent record")),
+            "{told:?}"
+        );
+        assert_eq!(handed_back, orphans, "the orphans handed back");
+        assert!(!running, "a checkpoint still under way");
+        assert!(after.is_err(), "a checkpoint ran after one failed");
     }
 
     /// The registry of trees created is read a run of roots a unit, from where the last run ended,
@@ -2662,6 +2889,173 @@ mod tests {
             units,
             registered.div_ceil(CREATION_RUN),
             "units to read {registered} creations"
+        );
+    }
+
+    /// The metadata page `index` of the page table of the smallest class.
+    fn map_id(index: u64) -> MetaId {
+        MetaId {
+            tree: super::super::meta::Tree::Map,
+            class: page::SizeClass::new(0).unwrap(),
+            level: 0,
+            index,
+        }
+    }
+
+    /// Once in charge, a checkpoint lets go of its frames' references and the metadata pages it
+    /// held a run a unit (DESIGN.md 22.1, the auditor's #4350): no unit walks more than a run, and
+    /// every one goes before the next phase (mutant: all of it let go of in one unit).
+    #[test]
+    fn a_checkpoint_in_charge_lets_go_of_its_frames_and_pages_a_run_a_unit() {
+        let io: Arc<dyn crate::io::IO> = Arc::new(crate::io::MemoryIO::new());
+        let db = open(&io);
+        let in_charge = db.checkpointer().superblock();
+        let frame = crate::storage::atoll::testing::drive(&io, || db.store().meta().get(map_id(0)))
+            .unwrap();
+        let mut run = Run::new(in_charge.checkpoint + 1, None);
+        run.phase = Phase::LetGo;
+        run.frames = (0..2 * FRAME_RUN + 1).map(|_| frame.clone()).collect();
+        run.meta = (0..2 * DIRTY_RUN as u64 + 1).map(map_id).collect();
+        let (units, walk) = units_and_walk(&mut run, &db, &in_charge);
+        let (after, held) = (run.phase, run.holds());
+        drop((run, frame, db));
+        assert_eq!(
+            (units, after, held),
+            (6, Phase::After, 0),
+            "three runs of frames, three of pages, then the next phase holding none"
+        );
+        assert_eq!(
+            walk,
+            FRAME_RUN.max(DIRTY_RUN),
+            "the most a unit of letting go walked"
+        );
+    }
+
+    /// A checkpoint that finishes ends holding nothing element by element: what it held, it let
+    /// go of a run a unit once in charge, so its end drops no run of references in one unit (the
+    /// auditor's #4350; mutant: the letting go passed over, the frames and pages dropped with the
+    /// run as it ends).
+    #[test]
+    fn a_finished_checkpoint_ends_holding_nothing_element_by_element() {
+        let io: Arc<dyn crate::io::IO> = Arc::new(crate::io::MemoryIO::new());
+        let db = open(&io);
+        let class = page::SizeClass::new(0).unwrap();
+        for _ in 0..64 {
+            crate::storage::atoll::testing::drive(&io, || db.store().allocate(class)).unwrap();
+        }
+        HELD_AT_END.with(|h| h.set(None));
+        HELD_AT_LET_GO.with(|h| h.set(0));
+        let mut ticket = db.checkpointer().request_full();
+        crate::storage::atoll::testing::drive(&io, || {
+            db.checkpointer().step_full(&mut ticket, db.transactions())
+        })
+        .unwrap();
+        let (at_let_go, at_end) = (
+            HELD_AT_LET_GO.with(|h| h.take()),
+            HELD_AT_END.with(|h| h.take()),
+        );
+        drop(ticket);
+        drop(db);
+        assert!(at_let_go > 0, "the checkpoint held nothing to let go of");
+        assert_eq!(at_end, Some(0), "held element by element as it ended");
+    }
+
+    /// Every field of a checkpoint's run is let go of within a unit's budget (DESIGN.md 22.1, the
+    /// auditor's #4350): released a run a unit before the run ends, whether it finishes or fails;
+    /// a bound's worth at most; one free whatever its length, its elements needing no drop; or
+    /// held whole, nothing per element. The fields are read from this file, so one added is
+    /// classed here or the census fails.
+    #[test]
+    fn every_field_of_a_checkpoint_run_is_let_go_of_within_a_unit() {
+        use std::collections::{HashSet, VecDeque};
+        use std::mem::needs_drop;
+        const A_RUN_A_UNIT: &[&str] = &["frames", "meta", "dirty"];
+        // `writing`, `flying` and `syncing` are held to `WRITES`; `imaging` to one page.
+        const BOUNDED: &[&str] = &["writing", "flying", "syncing", "imaging"];
+        const ONE_FREE: &[&str] = &[
+            "set_aside",
+            "queue",
+            "values",
+            "named",
+            "early",
+            "orphans",
+            "freed",
+            "mapped_roots",
+            "scan",
+            "superblock",
+        ];
+        const WHOLE: &[&str] = &[
+            "n",
+            "full",
+            "phase",
+            "cut",
+            "l",
+            "c",
+            "clock",
+            "heights",
+            "meta_at",
+            "flying_bytes",
+            "intent",
+            "intent_end",
+            "log_wait",
+            "turn_owed",
+            "files_at",
+            "files_end",
+            "written",
+            "frames_at",
+            "creations_at",
+            "creations_end",
+            "end_cut",
+            "failure",
+            "letting",
+            "release",
+            "released",
+        ];
+        let source = include_str!("checkpoint.rs");
+        let at = source.find("\nstruct Run {\n").expect("the run's struct");
+        let body = &source[at..];
+        let body = &body[..body.find("\n}\n").expect("the struct's end")];
+        let fields: Vec<&str> = body
+            .lines()
+            .skip(2)
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && !l.starts_with('#') && !l.is_empty())
+            .map(|l| l.split(':').next().unwrap().trim())
+            .collect();
+        let classed: Vec<&str> = [A_RUN_A_UNIT, BOUNDED, ONE_FREE, WHOLE].concat();
+        let unclassed: Vec<_> = fields.iter().filter(|f| !classed.contains(f)).collect();
+        let stale: Vec<_> = classed.iter().filter(|f| !fields.contains(f)).collect();
+        assert!(fields.len() > 40, "fields read: {fields:?}");
+        assert!(unclassed.is_empty(), "fields not classed: {unclassed:?}");
+        assert!(stale.is_empty(), "classed fields gone: {stale:?}");
+        // One free: the elements of each need no drop, so dropping it frees one allocation.
+        fn set<T>(_: &HashSet<T>) -> bool {
+            !needs_drop::<T>()
+        }
+        fn deque<T>(_: &VecDeque<T>) -> bool {
+            !needs_drop::<T>()
+        }
+        fn vec<T>(_: &Vec<T>) -> bool {
+            !needs_drop::<T>()
+        }
+        let run = Run::new(1, None);
+        let one_free = [
+            set(&run.set_aside),
+            deque(&run.queue),
+            vec(&run.values),
+            set(&run.named),
+            set(&run.early),
+            vec(&run.orphans),
+            set(&run.freed),
+            vec(&run.mapped_roots),
+            // The cut's scan holds pages owed an image, seen and swapped, all page ids.
+            vec(&run.scan.owed) && !needs_drop::<PageId>(),
+            !needs_drop::<(Lsn, Lsn)>(),
+        ];
+        drop(run);
+        assert_eq!(
+            one_free, [true; 10],
+            "fields one free, by their place in ONE_FREE"
         );
     }
 }

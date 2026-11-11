@@ -1525,3 +1525,93 @@ fn a_metadata_writes_wait_ends_when_its_request_retires() {
     assert!(told_at_retirement, "the retirement told the wait nothing");
     assert!(failed, "a cancelled write's wait ended without its failure");
 }
+
+/// A metadata write on a file not written durably ends at the retirement of its last request,
+/// whichever of the write's and its sync's that is: on a backend two threads step, the sync can
+/// retire while the write's own request is still owned, paused after its callback submitted the
+/// sync, and the write's place stays held until the write retires too (DESIGN.md 22.1, 22.13; the
+/// auditor's P2-META-R1 probe; mutant: the sync's retirement telling alone).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_metadata_sync_cannot_end_the_write_while_the_writes_request_is_owned() {
+    use crate::storage::atoll::requests::{Counted, Requests};
+    use crate::storage::atoll::testing::drive;
+    use std::sync::mpsc;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+    let crash = Arc::new(crate::io::crash::CrashIO::new(0));
+    crash.set_durable_writes(false);
+    let requests = Arc::new(Requests::default());
+    let io: Arc<dyn IO> = Arc::new(Counted::new(crash.clone(), requests.clone()));
+    let cache = Arc::new(MetaCache::new(
+        io.clone(),
+        "meta-sync-before-write",
+        16,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    let frame = drive(&io, || cache.get(id(0))).unwrap();
+    frame
+        .try_lock()
+        .expect("the loaded page is free")
+        .commit(&cache);
+    drop(cache.begin_cut(1));
+    let wait = cache
+        .write_for(&frame, 1)
+        .unwrap()
+        .expect("a write started");
+    let write = LAST_WRITE
+        .with(|w| w.borrow_mut().take())
+        .expect("the write's request");
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let parent = {
+        let crash = crash.clone();
+        std::thread::spawn(move || {
+            // The write's callback has submitted the sync; its own request is still owned, its
+            // completion published before it retires.
+            crate::race::at("completion.published", move || {
+                let _ = paused_tx.send(());
+                let _ = resume_rx.recv_timeout(BOUND);
+            });
+            crash.step()
+        })
+    };
+    let paused = paused_rx.recv_timeout(BOUND).is_ok();
+    let before = (
+        write.finished(),
+        write.is_owned(),
+        wait.finished(),
+        requests.outstanding(),
+        crash.in_flight(),
+    );
+    let synced = paused && before.4 == 1 && crash.step().is_ok();
+    let after_sync = (
+        write.is_owned(),
+        wait.finished(),
+        requests.outstanding(),
+        crash.in_flight(),
+    );
+    let _ = resume_tx.send(());
+    let parent_ended = parent.join().is_ok_and(|r| r.is_ok());
+    requests.drain(&*io);
+    let after_both = (
+        !write.is_owned(),
+        wait.finished(),
+        wait.get_error(),
+        requests.outstanding(),
+    );
+    cache.end_cut(1, std::slice::from_ref(&frame));
+    drop((write, wait, frame, cache, io, requests, crash));
+    assert!(paused && synced && parent_ended, "the steps did not run");
+    assert_eq!(
+        before,
+        (true, true, false, 2, 1),
+        "the write's callback published with its sync submitted"
+    );
+    assert_eq!(
+        after_sync,
+        (true, false, 1, 0),
+        "the sync retired with the write's request still owned"
+    );
+    assert_eq!(after_both, (true, true, None, 0), "both retired");
+}

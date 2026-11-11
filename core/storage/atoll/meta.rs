@@ -525,6 +525,15 @@ fn tell_once(tell: &Tell) {
     }
 }
 
+/// One request of a metadata write retired (or a sync refused): the last of `unretired` tells.
+fn retired(unretired: &AtomicUsize, tell: &Tell) {
+    let before = unretired.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(before > 0, "a metadata write's request retired twice");
+    if before == 1 {
+        tell_once(tell);
+    }
+}
+
 /// One tree's file for a size class and level, and the cells of its pages.
 #[derive(Default)]
 struct FileSlot {
@@ -913,10 +922,11 @@ impl MetaCache {
         // The file weakly too: it holds the IO the write waits in. A file closed before its sync
         // leaves the copy not durable.
         let sync_file = Arc::downgrade(&file);
-        // How the write ended, as its callbacks found it. `writing` is told once its last request
-        // retires, no backend owning its buffer any more: the write's own, or, where the file is
-        // not written durably, its sync's. A checkpoint counts the write in its flight set until
-        // then (DESIGN.md 22.1, 22.13).
+        // How the write ended, as its callbacks found it. `writing` is told once every request of
+        // the write has retired, no backend owning its buffer any more: the write's own and, where
+        // the file is not written durably, its sync's, either of which may retire first on a
+        // backend stepped by several threads. A checkpoint counts the write in its flight set
+        // until then (DESIGN.md 22.1, 22.13).
         let outcome = Arc::new(Mutex::new(None));
         let tell: Arc<Tell> = {
             let (target, me, outcome) = (target.clone(), me.clone(), outcome.clone());
@@ -924,12 +934,10 @@ impl MetaCache {
                 // Gone, the cache has no one left to wait on the write.
                 let Some(me) = me.upgrade() else { return };
                 if let Some(c) = target.writing.take(&me.completions) {
-                    // A request let go with no outcome told never ran.
-                    match outcome
-                        .lock()
-                        .take()
-                        .unwrap_or(Err(CompletionError::Aborted))
-                    {
+                    // A request let go with no outcome told never ran. Taken out of its lock
+                    // before the wait is finished, whose waker may run code.
+                    let told = outcome.lock().take();
+                    match told.unwrap_or(Err(CompletionError::Aborted)) {
                         Ok(()) => c.complete(0),
                         Err(e) => c.error(e),
                     }
@@ -955,11 +963,12 @@ impl MetaCache {
                 done(res);
             }
         };
-        // Whether the write's callback handed the outcome on to a sync, whose retirement then
-        // tells: set before the write's own retirement, which comes after its callback.
-        let synced_after = Arc::new(AtomicBool::new(false));
+        // The write's requests not yet retired: its own, and its sync's, counted before the sync is
+        // submitted, which the write's own retirement, after its callback, cannot precede. The
+        // last to retire tells.
+        let unretired = Arc::new(AtomicUsize::new(1));
         let c = {
-            let (tell, synced_after) = (tell.clone(), synced_after.clone());
+            let (tell, unretired) = (tell.clone(), unretired.clone());
             Completion::new_write(move |res| {
                 let res = whole(META_PAGE, res);
                 match res {
@@ -971,15 +980,16 @@ impl MetaCache {
                         };
                         let after = finish.clone();
                         let synced = Completion::new_sync(move |r| after(r.map(|_| ())));
-                        synced_after.store(true, Ordering::Release);
+                        unretired.fetch_add(1, Ordering::AcqRel);
                         match sync_file.sync_data(synced) {
                             Ok(synced) => {
-                                let tell = tell.clone();
-                                synced.on_retired(move || tell_once(&tell));
+                                let (tell, unretired) = (tell.clone(), unretired.clone());
+                                synced.on_retired(move || retired(&unretired, &tell));
                             }
+                            // Refused, the sync never was a request.
                             Err(e) => {
                                 finish(Err(io_failure(&e)));
-                                tell_once(&tell);
+                                retired(&unretired, &tell);
                             }
                         }
                     }
@@ -997,11 +1007,7 @@ impl MetaCache {
             Ok(c) => {
                 #[cfg(test)]
                 LAST_WRITE.with(|w| *w.borrow_mut() = Some(c.clone()));
-                c.on_retired(move || {
-                    if !synced_after.load(Ordering::Acquire) {
-                        tell_once(&tell);
-                    }
-                })
+                c.on_retired(move || retired(&unretired, &tell))
             }
             Err(e) => {
                 if let Some(c) = frame.writing.take(&self.completions) {

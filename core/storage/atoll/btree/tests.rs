@@ -221,12 +221,16 @@ fn create(io: &Arc<dyn IO>, db: &Atoll, run: &Runner<'_>, temporary: bool) -> Tr
 
 /// A full checkpoint, done: every page owed an image written, and its superblock in charge.
 fn checkpoint(db: &Atoll, run: &Runner<'_>) {
-    let ticket = db.checkpointer().request_full();
-    run(&mut || db.checkpointer().step_full(ticket, db.transactions()));
+    let mut ticket = db.checkpointer().request_full();
+    run(&mut || db.checkpointer().step_full(&mut ticket, db.transactions()));
 }
 
 /// One step of the full checkpoint `ticket`, the IO it started waited out: true once it is done.
-fn step_checkpoint(io: &Arc<dyn IO>, db: &Atoll, ticket: u64) -> bool {
+fn step_checkpoint(
+    io: &Arc<dyn IO>,
+    db: &Atoll,
+    ticket: &mut crate::storage::atoll::checkpoint::FullWait,
+) -> bool {
     match db
         .checkpointer()
         .step_full(ticket, db.transactions())
@@ -331,7 +335,7 @@ fn holds_what_a_sorted_map_holds(temporary: bool) {
         if op % 1000 == 0 {
             ticket.get_or_insert_with(|| db.checkpointer().request_full());
         }
-        if let Some(t) = ticket {
+        if let Some(t) = ticket.as_mut() {
             if step_checkpoint(&io, &db, t) {
                 ticket = None;
             }
@@ -664,7 +668,7 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
         };
         // One step of the full checkpoint `ticket`: true once it is done. The tree as the step
         // found it is the tree at any cut it took.
-        let step = |ticket: u64| {
+        let step = |ticket: &mut crate::storage::atoll::checkpoint::FullWait| {
             let cp = db.checkpointer();
             let out = cp.step_full(ticket, db.transactions()).unwrap();
             let n = cp.cut_taken().unwrap_or_else(|| cp.superblock().checkpoint);
@@ -684,8 +688,8 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
             }
         };
         let created = run_to(&run, || Tree::create(db.pool(), class(0)));
-        let first = db.checkpointer().request_full();
-        while !step(first) {}
+        let mut first = db.checkpointer().request_full();
+        while !step(&mut first) {}
         root.set(Some(created));
         let tree = tree_of(&io, &db, created);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -707,7 +711,7 @@ fn crashes_recover_the_tree_the_checkpoint_in_charge_cut(durable_writes: bool) {
             if op % 50 == 0 {
                 ticket.get_or_insert_with(|| db.checkpointer().request_full());
             }
-            if let Some(t) = ticket {
+            if let Some(t) = ticket.as_mut() {
                 if step(t) {
                     ticket = None;
                 }

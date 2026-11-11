@@ -352,9 +352,9 @@ impl Db {
     }
 
     fn checkpoint(&self) -> Superblock {
-        let ticket = self.db.checkpointer().request_full();
+        let mut ticket = self.db.checkpointer().request_full();
         run(&self.io, || {
-            self.db.checkpointer().step_full(ticket, self.txns())
+            self.db.checkpointer().step_full(&mut ticket, self.txns())
         });
         self.db.checkpointer().superblock()
     }

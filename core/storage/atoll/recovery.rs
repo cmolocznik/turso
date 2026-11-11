@@ -145,8 +145,8 @@ pub fn recover(
         config.checkpoint_write_bytes(),
     );
     // What was recovered is in memory alone until a checkpoint writes it.
-    let ticket = checkpointer.request_full();
-    drive(&io, || checkpointer.step_full(ticket, &txns))?;
+    let mut ticket = checkpointer.request_full();
+    drive(&io, || checkpointer.step_full(&mut ticket, &txns))?;
     Ok(Recovered {
         log,
         pool,

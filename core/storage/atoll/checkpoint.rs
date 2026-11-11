@@ -80,6 +80,31 @@ crate::thread::thread_local! {
 /// page's id (audit 18, review 2).
 pub const META_INTENT: Kind = Kind::new(31).unwrap();
 
+/// A wait for a full checkpoint ([`Checkpointer::request_full`]), owned by the waiter across its
+/// polls: the full checkpoints asked for when it was made, done once as many are, and while a
+/// worker steps the checkpoints and the wait stands, its demand on the checkpoint's task, of the
+/// relief class (DESIGN.md 22.4). Dropped, its demand goes.
+pub struct FullWait {
+    ticket: u64,
+    demand: Option<executor::Ticket>,
+}
+
+impl FullWait {
+    /// The full checkpoints asked for when this wait was made.
+    pub fn ticket(&self) -> u64 {
+        self.ticket
+    }
+
+    /// A wait for the full checkpoint `ticket` counts to, asked for or not, for a test.
+    #[cfg(test)]
+    pub(crate) fn at(ticket: u64) -> Self {
+        Self {
+            ticket,
+            demand: None,
+        }
+    }
+}
+
 /// Whether erasure may go on (DESIGN.md 22.9, the auditor's P2-CP-E1): lowered by an erasure that
 /// finds every slot owed held back by a step under way, before it registers its wait for that
 /// step's end, and raised by the wait's notify, which also notifies `signal`, the task's watch.
@@ -843,8 +868,8 @@ impl Checkpointer {
     /// A transaction's end's wait for full checkpoint `ticket`, as the thread does it: for a
     /// test's waker to wait again from inside its wake.
     #[cfg(test)]
-    pub(crate) fn wait_full_on_the_thread(&self, ticket: u64) -> Result<IOResult<()>> {
-        self.wait_full(ticket)
+    pub(crate) fn wait_full_on_the_thread(&self, wait: &mut FullWait) -> Result<IOResult<()>> {
+        self.wait_full(wait)
     }
 
     /// Wakes the checkpoint's task, from anywhere but its own step: a checkpoint may be due.
@@ -931,23 +956,33 @@ impl Checkpointer {
         self.pool.wake_room();
     }
 
-    /// A transaction's end waiting for full checkpoint `ticket`, which the thread does: done once
-    /// it is, a failure once one has failed, else a wait the thread finishes.
-    fn wait_full(&self, ticket: u64) -> Result<IOResult<()>> {
+    /// A transaction's end waiting for the full checkpoint `wait` names, which the thread does:
+    /// done once it is, a failure once one has failed, else a wait the thread finishes. While it
+    /// waits, `wait` holds a demand on the checkpoint's task, of the relief class (DESIGN.md 22.4),
+    /// taken at its first poll outside the waiters' lock and let go as it ends.
+    fn wait_full(&self, wait: &mut FullWait) -> Result<IOResult<()>> {
+        if wait.demand.is_none() && self.full_done.load(Ordering::Acquire) < wait.ticket {
+            wait.demand = self.demand();
+        }
         let mut waiters = self.waiters.lock();
-        if let Some(failed) = self.failure.lock().as_ref() {
-            return Err(LimboError::InternalError(format!(
+        let failed = self.failure.lock().clone();
+        let out = if let Some(failed) = failed {
+            Err(LimboError::InternalError(format!(
                 "a checkpoint failed ({failed}): none runs until the database is opened again"
-            )));
-        }
-        if self.full_done.load(Ordering::Acquire) >= ticket {
-            return Ok(IOResult::Done(()));
-        }
-        let c = crate::storage::atoll::notify::remote_wait();
-        waiters.push(c.clone());
+            )))
+        } else if self.full_done.load(Ordering::Acquire) >= wait.ticket {
+            Ok(IOResult::Done(()))
+        } else {
+            let c = crate::storage::atoll::notify::remote_wait();
+            waiters.push(c.clone());
+            drop(waiters);
+            self.wake_driver();
+            return Ok(IOResult::IO(IOCompletions(c)));
+        };
         drop(waiters);
-        self.wake_driver();
-        Ok(IOResult::IO(IOCompletions(c)))
+        // Its demand let go once the waiters' lock is: the ticket's drop takes the queue's.
+        wait.demand = None;
+        out
     }
 
     /// A refused writer's demand on the checkpoint's task, of the relief class (DESIGN.md 22.4),
@@ -1219,16 +1254,20 @@ impl Checkpointer {
         self.full_wanted.load(Ordering::Acquire)
     }
 
-    pub fn request_full(&self) -> u64 {
+    pub fn request_full(&self) -> FullWait {
         let ticket = self.full_wanted.fetch_add(1, Ordering::AcqRel) + 1;
         self.wake_driver();
-        ticket
+        FullWait {
+            ticket,
+            demand: None,
+        }
     }
 
-    /// Done once the full checkpoint `ticket` names is done.
-    pub fn step_full(&self, ticket: u64, txns: &Transactions) -> Result<IOResult<()>> {
+    /// Done once the full checkpoint `wait` names is done.
+    pub fn step_full(&self, wait: &mut FullWait, txns: &Transactions) -> Result<IOResult<()>> {
+        let ticket = wait.ticket;
         match self.stepper() {
-            Stepper::Worker => return self.wait_full(ticket),
+            Stepper::Worker => return self.wait_full(wait),
             Stepper::Caller(task) => return self.claim_full(task, ticket),
             Stepper::Writer => {}
         }

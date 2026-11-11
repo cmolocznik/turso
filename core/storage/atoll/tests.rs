@@ -152,9 +152,9 @@ impl Db {
 
     fn checkpoint(&self) {
         let checkpointer = self.db.checkpointer();
-        let ticket = checkpointer.request_full();
+        let mut ticket = checkpointer.request_full();
         drive(&self.io, || {
-            checkpointer.step_full(ticket, self.db.transactions())
+            checkpointer.step_full(&mut ticket, self.db.transactions())
         })
         .unwrap();
     }
@@ -389,8 +389,8 @@ fn a_checkpoint_that_fails_leaves_the_one_in_charge_and_none_runs_until_the_data
     let checkpointer = db.db.checkpointer();
     // Stepped here, not through `drive`, which returns a failed write's error from its completion
     // before the checkpointer has seen it: the checkpointer meets the failure itself.
-    let step = |ticket: u64| loop {
-        match checkpointer.step_full(ticket, db.db.transactions()) {
+    let step = |mut ticket: crate::storage::atoll::checkpoint::FullWait| loop {
+        match checkpointer.step_full(&mut ticket, db.db.transactions()) {
             Err(e) => return Err(e),
             Ok(IOResult::Done(())) => return Ok(()),
             Ok(IOResult::IO(IOCompletions(c))) => {
@@ -498,8 +498,10 @@ fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Opti
             let mut commit = Commit::new(txn);
             drive_for(crash, left, || txns.commit(&mut commit))?;
         }
-        let ticket = db.db.checkpointer().request_full();
-        drive_for(crash, left, || db.db.checkpointer().step_full(ticket, txns))?;
+        let mut ticket = db.db.checkpointer().request_full();
+        drive_for(crash, left, || {
+            db.db.checkpointer().step_full(&mut ticket, txns)
+        })?;
         // The next segment's zeros go one write at a time, then its sync: all of it lands.
         settle(crash, io, left)?;
         // Twice the pool of them: a pool's worth at least is written out, and the tree's pages
@@ -589,9 +591,9 @@ fn a_change_the_gate_refused_steps_the_cut_left_waiting() {
     let db = try_open(io.clone(), 1).unwrap();
     let store = db.store().clone();
     let change = store.change().expect("the gate open");
-    let ticket = db.checkpointer().request_full();
+    let mut ticket = db.checkpointer().request_full();
     let left_waiting = matches!(
-        db.checkpointer().step_full(ticket, db.transactions()),
+        db.checkpointer().step_full(&mut ticket, db.transactions()),
         Ok(IOResult::IO(_))
     ) && store.gate_closed();
     drop(change);
@@ -629,7 +631,7 @@ fn a_change_the_gate_refused_steps_the_cut_left_waiting() {
     };
     drop(owner);
     let finished = drive(&io, || {
-        db.checkpointer().step_full(ticket, db.transactions())
+        db.checkpointer().step_full(&mut ticket, db.transactions())
     })
     .is_ok();
     drop(store);
@@ -712,11 +714,11 @@ fn a_full_checkpoint_step_finding_the_state_held_waits_for_its_let_go() {
     let cp = db.checkpointer();
     drop(cp.hold().expect("the state free"));
     let uncontended = cp.released_wakes();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let held = cp.hold().expect("the state free");
     let mut waits = Vec::new();
     for _ in 0..32 {
-        match cp.step_full(ticket, db.transactions()) {
+        match cp.step_full(&mut ticket, db.transactions()) {
             Ok(IOResult::IO(IOCompletions(c))) => waits.push(c),
             _ => break,
         }
@@ -725,7 +727,7 @@ fn a_full_checkpoint_step_finding_the_state_held_waits_for_its_let_go() {
     drop(held);
     let woken = waits.iter().all(|c| c.finished());
     let slow = cp.released_wakes();
-    let finished = drive(&io, || cp.step_full(ticket, db.transactions())).is_ok();
+    let finished = drive(&io, || cp.step_full(&mut ticket, db.transactions())).is_ok();
     drop(waits);
     // Checked once the database is gone: a panic unwinding through it ends the process.
     drop(db);
@@ -816,11 +818,11 @@ fn a_checkpoint_writes_a_metadata_page_it_found_held(ends: HoldEnds) {
             });
         }
         let cp = db.db.checkpointer();
-        let ticket = cp.request_full();
+        let mut ticket = cp.request_full();
         // What went wrong comes back as a value, so the hold ends before anything is checked and
         // the holder's join returns.
         let ran = (|| loop {
-            match cp.step_full(ticket, db.db.transactions()) {
+            match cp.step_full(&mut ticket, db.db.transactions()) {
                 Err(e) => return Err(format!("the checkpoint failed: {e}")),
                 Ok(IOResult::Done(())) => return Ok(()),
                 Ok(IOResult::IO(IOCompletions(c))) => {
@@ -1126,7 +1128,7 @@ fn a_cancelled_image_write_holds_its_place_until_it_retires() {
     let full = flight_set();
     // Units until the flight set is full, the IO stepped only for what is no image write; a
     // checkpoint that ends first never filled it, which the asserts below find.
-    while cp.fulls_done() < ticket {
+    while cp.fulls_done() < ticket.ticket() {
         match cp.one_unit(txns).unwrap() {
             Some(_) if cp.image_writes_in_flight() == full => break,
             Some(c) => io.wait(&c),
@@ -1175,7 +1177,7 @@ fn a_flush_asked_during_the_checkpoints_turn_is_answered() {
     let txns = db.db.transactions();
     let ticket = cp.request_full();
     let (mut asked, mut turns_after) = (0, 0);
-    while cp.fulls_done() < ticket {
+    while cp.fulls_done() < ticket.ticket() {
         // The next turn the checkpoint takes toward its intent's durability is asked for again
         // while it runs.
         let armed = cp.next_turn_for_intent();

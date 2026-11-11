@@ -16,7 +16,9 @@ use crate::storage::atoll::buffer::{
     lend::Want, BufferConfig, BufferPool, Relieved, Retry, RoomWait, MIN_BUDGET, MIN_DB_BUDGET,
     WRITEBACK_BYTES,
 };
-use crate::storage::atoll::checkpoint::{Checkpointing, CLAIMS, WRITER_STEPS, WRITE_BYTES};
+use crate::storage::atoll::checkpoint::{
+    Checkpointing, FullWait, CLAIMS, WRITER_STEPS, WRITE_BYTES,
+};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::executor::Class;
 use crate::storage::atoll::log::{ring_bytes, LogConfig};
@@ -265,9 +267,11 @@ impl Db {
         self.finish(ticket);
     }
 
-    fn finish(&self, ticket: u64) {
+    fn finish(&self, mut ticket: FullWait) {
         let cp = self.db.checkpointer();
-        within(&self.io, || cp.step_full(ticket, self.db.transactions()));
+        within(&self.io, || {
+            cp.step_full(&mut ticket, self.db.transactions())
+        });
     }
 
     /// The page-table leaf of `orphan`, a page handed to the checkpointer: latched, it holds the
@@ -280,12 +284,12 @@ impl Db {
     }
 
     /// Begins a full checkpoint and steps it to its cut, which the latch held keeps it at.
-    fn take_cut(&self) -> u64 {
+    fn take_cut(&self) -> FullWait {
         let cp = self.db.checkpointer();
-        let ticket = cp.request_full();
+        let mut ticket = cp.request_full();
         assert!(
             matches!(
-                cp.step_full(ticket, self.db.transactions()).unwrap(),
+                cp.step_full(&mut ticket, self.db.transactions()).unwrap(),
                 IOResult::IO(_)
             ),
             "the checkpoint went on under a held latch"
@@ -945,12 +949,53 @@ fn a_hold_let_go_wakes_the_checkpointing_thread_that_found_the_state_held() {
     let ticket = cp.request_full();
     let contended = within_a_minute(&|| cp.driver_contends());
     drop(held);
-    let done = contended && within_a_minute(&|| cp.fulls_done() >= ticket);
+    let done = contended && within_a_minute(&|| cp.fulls_done() >= ticket.ticket());
     if !done {
         // The checkpoint's task is left asleep: closing would wait for it for good.
         std::mem::forget(db);
         panic!("the task contended {contended}, then was left asleep after the state was let go");
     }
+}
+
+/// A transaction's end waiting for a full checkpoint the worker steps holds a demand on the
+/// checkpoint's task, of the relief class, from its first poll until its wait ends, and lets it go
+/// when the checkpoint is done or the wait is dropped (DESIGN.md 22.4, 22.16 step 7; mutants: no
+/// demand taken, the demand kept past the checkpoint's end).
+#[test]
+fn a_wait_for_a_full_checkpoint_makes_the_checkpoint_relief_while_it_stands() {
+    let db = Db::threaded();
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    // The state held: no checkpoint goes on while the waits stand.
+    let held = cp.hold().expect("the state free");
+    let mut wait = cp.request_full();
+    let pending = matches!(cp.step_full(&mut wait, txns).unwrap(), IOResult::IO(_));
+    let waiting = cp.task_class();
+    drop(wait);
+    let dropped = cp.task_class();
+    let mut wait = cp.request_full();
+    let again = matches!(cp.step_full(&mut wait, txns).unwrap(), IOResult::IO(_));
+    let waiting_again = cp.task_class();
+    drop(held);
+    within(&db.io, || cp.step_full(&mut wait, txns));
+    let done = cp.task_class();
+    drop(wait);
+    drop(db);
+    assert!(
+        pending && again,
+        "a full checkpoint done while its state was held"
+    );
+    assert_eq!(
+        (waiting, waiting_again),
+        (Some(Class::Relief), Some(Class::Relief)),
+        "the task's class while a full checkpoint's wait stands"
+    );
+    assert_ne!(
+        dropped,
+        Some(Class::Relief),
+        "a dropped wait kept its demand"
+    );
+    assert_ne!(done, Some(Class::Relief), "a wait done kept its demand");
 }
 
 /// The ends of transactions waiting for a full checkpoint are woken with no lock held: a waiter
@@ -962,26 +1007,32 @@ fn a_waiter_woken_for_a_full_checkpoint_may_wait_again_from_its_wake() {
     use std::task::{Wake, Waker};
     struct Again {
         cp: Arc<crate::storage::atoll::checkpoint::Checkpointer>,
-        ticket: u64,
+        ticket: crate::storage::atoll::locks::Mutex<crate::storage::atoll::checkpoint::FullWait>,
         told: crate::storage::atoll::locks::Mutex<mpsc::Sender<bool>>,
     }
     impl Wake for Again {
         fn wake(self: std::sync::Arc<Self>) {
-            let waited = self.cp.wait_full_on_the_thread(self.ticket).is_ok();
+            let waited = {
+                let mut ticket = self.ticket.lock();
+                self.cp.wait_full_on_the_thread(&mut ticket).is_ok()
+            };
             let _ = self.told.lock().send(waited);
         }
     }
     let db = Db::threaded();
     let cp = db.db.checkpointer_arc().clone();
     let held = cp.hold().expect("the state free");
-    let ticket = cp.request_full();
-    let IOResult::IO(IOCompletions(c)) = cp.step_full(ticket, db.db.transactions()).unwrap() else {
+    let mut ticket = cp.request_full();
+    let IOResult::IO(IOCompletions(c)) = cp.step_full(&mut ticket, db.db.transactions()).unwrap()
+    else {
         panic!("a full checkpoint done while its state was held");
     };
     let (told, woke) = mpsc::channel();
     c.set_waker(&Waker::from(std::sync::Arc::new(Again {
         cp: cp.clone(),
-        ticket: ticket + 1,
+        ticket: crate::storage::atoll::locks::Mutex::new(
+            crate::storage::atoll::checkpoint::FullWait::at(ticket.ticket() + 1),
+        ),
         told: crate::storage::atoll::locks::Mutex::new(told),
     })));
     drop(held);
@@ -1016,8 +1067,9 @@ fn a_waiter_woken_for_a_full_checkpoint_may_take_the_checkpoint_state_from_its_w
     let db = Db::threaded();
     let cp = db.db.checkpointer_arc().clone();
     let held = cp.hold().expect("the state free");
-    let ticket = cp.request_full();
-    let IOResult::IO(IOCompletions(c)) = cp.step_full(ticket, db.db.transactions()).unwrap() else {
+    let mut ticket = cp.request_full();
+    let IOResult::IO(IOCompletions(c)) = cp.step_full(&mut ticket, db.db.transactions()).unwrap()
+    else {
         panic!("a full checkpoint done while its state was held");
     };
     let (told, woke) = mpsc::channel();
@@ -1054,10 +1106,10 @@ fn a_checkpoint_failing_on_the_thread_is_told_to_whoever_waits_for_it() {
         ..Faults::default()
     });
     let cp = db.db.checkpointer();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let began = std::time::Instant::now();
     let failed = loop {
-        match cp.step_full(ticket, db.db.transactions()) {
+        match cp.step_full(&mut ticket, db.db.transactions()) {
             Err(e) => break e,
             Ok(IOResult::Done(())) => {
                 panic!("a full checkpoint done with every image write failing")
@@ -1151,7 +1203,7 @@ fn a_claim_left_to_another_writers_step_is_woken_once_that_step_ends() {
     let (tree, _) = db.owed_tree();
     let cp = db.db.checkpointer_arc().clone();
     let txns = db.db.transactions_arc().clone();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let (paused_tx, paused_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let other = {
@@ -1166,7 +1218,7 @@ fn a_claim_left_to_another_writers_step_is_woken_once_that_step_ends() {
         })
     };
     let paused = paused_rx.recv_timeout(BOUND).is_ok();
-    let wait = match cp.step_full(ticket, &txns) {
+    let wait = match cp.step_full(&mut ticket, &txns) {
         Ok(IOResult::IO(IOCompletions(c))) => Some(c),
         _ => None,
     };
@@ -1199,7 +1251,7 @@ fn a_claim_refused_is_woken_by_a_step_that_ends_before_the_claim_returns() {
     let (tree, _) = db.owed_tree();
     let cp = db.db.checkpointer_arc().clone();
     let txns = db.db.transactions_arc().clone();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let (paused_tx, paused_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let (ended_tx, ended_rx) = mpsc::channel::<()>();
@@ -1226,7 +1278,7 @@ fn a_claim_refused_is_woken_by_a_step_that_ends_before_the_claim_returns() {
             ended.store(seen, std::sync::atomic::Ordering::Release);
         });
     }
-    let wait = match cp.step_full(ticket, &txns) {
+    let wait = match cp.step_full(&mut ticket, &txns) {
         Ok(IOResult::IO(IOCompletions(c))) => Some(c),
         _ => None,
     };
@@ -1267,24 +1319,26 @@ fn a_claim_refused_by_a_task_that_failed_before_its_wait_does_not_wait() {
     }
     let cp = db.db.checkpointer_arc().clone();
     let txns = db.db.transactions_arc().clone();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let (paused_tx, paused_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let other = {
         let (cp, txns) = (cp.clone(), txns.clone());
+        // The other writer's own wait for the same full checkpoint.
+        let mut ticket = FullWait::at(ticket.ticket());
         std::thread::spawn(move || {
             crate::race::at("checkpoint.claiming", move || {
                 paused_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
             });
             // Looked, found the task not over, and pauses before registering its wait.
-            let first = cp.step_full(ticket, &txns);
+            let first = cp.step_full(&mut ticket, &txns);
             let first = match first {
                 Ok(IOResult::IO(IOCompletions(c))) => Some(c.finished()),
                 _ => None,
             };
             // Its next call steps the failed state.
-            let next = cp.step_full(ticket, &txns);
+            let next = cp.step_full(&mut ticket, &txns);
             (first, next.is_err())
         })
     };
@@ -1295,7 +1349,7 @@ fn a_claim_refused_by_a_task_that_failed_before_its_wait_does_not_wait() {
         ..Faults::default()
     });
     let failed = loop {
-        match cp.step_full(ticket, &txns) {
+        match cp.step_full(&mut ticket, &txns) {
             Err(_) => break true,
             Ok(IOResult::Done(())) => break false,
             Ok(IOResult::IO(IOCompletions(c))) => {
@@ -1488,7 +1542,7 @@ fn a_checkpoint_failing_under_a_refused_writer_gives_the_room_back_and_the_write
     let (tree, mut model) = db.owed_tree();
     let frame = db.orphan_leaf(orphan);
     let mut hold = Some(frame.try_lock().expect("the leaf is free"));
-    let ticket = db.take_cut();
+    let mut ticket = db.take_cut();
     // The writes of the tree's pages fail; the log's never do.
     crash.set_faults_on(Some(&format!("{BASE}.c{}.0", node_class().index())));
     crash.set_faults(Faults {
@@ -1515,7 +1569,7 @@ fn a_checkpoint_failing_under_a_refused_writer_gives_the_room_back_and_the_write
     assert!(hold.is_none(), "no insert was refused room");
     let cp = db.db.checkpointer();
     let failed = loop {
-        match cp.step_full(ticket, db.db.transactions()) {
+        match cp.step_full(&mut ticket, db.db.transactions()) {
             Err(e) => break Some(e),
             Ok(IOResult::Done(())) => break None,
             Ok(IOResult::IO(IOCompletions(c))) => {
@@ -1756,9 +1810,9 @@ fn a_short_image_write_fails_the_checkpoint() {
         ..Faults::default()
     });
     let cp = db.db.checkpointer();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let failed = loop {
-        match cp.step_full(ticket, db.db.transactions()) {
+        match cp.step_full(&mut ticket, db.db.transactions()) {
             Err(e) => break Some(e),
             Ok(IOResult::Done(())) => break None,
             Ok(IOResult::IO(IOCompletions(c))) => {
@@ -1817,8 +1871,8 @@ fn audit_gate_wait_wakes_when_the_checkpoint_state_becomes_available() {
     let root = tree.root();
     let page = drive(&db.io, || db.pool().fix_exclusive(root, None)).unwrap();
     let cp = db.db.checkpointer();
-    let ticket = cp.request_full();
-    let first = cp.step_full(ticket, db.db.transactions()).unwrap();
+    let mut ticket = cp.request_full();
+    let first = cp.step_full(&mut ticket, db.db.transactions()).unwrap();
     let closed = db.store().gate_closed();
     page.release_unchanged();
     let held = cp
@@ -1972,11 +2026,11 @@ fn audit_a_full_checkpoint_keeps_its_frame_wait_pending_after_its_state_is_relea
         });
         held_rx.recv().unwrap();
         let cp = db.db.checkpointer();
-        let ticket = cp.request_full();
+        let mut ticket = cp.request_full();
         let (mut pending, mut ready) = (0, 0);
         let mut waited = None;
         for _ in 0..32 {
-            match cp.step_full(ticket, db.db.transactions()).unwrap() {
+            match cp.step_full(&mut ticket, db.db.transactions()).unwrap() {
                 IOResult::Done(()) => break,
                 IOResult::IO(IOCompletions(c)) => {
                     // This observation is after StateHold::drop, not inside pool.begin_cut.
@@ -2037,7 +2091,7 @@ fn audit_an_image_wait_does_not_wake_itself_on_the_checkpoint_state_release() {
     .unwrap();
     let metadata = db.orphan_leaf(orphan);
     let held_metadata = metadata.try_lock().expect("metadata initially free");
-    let ticket = db.take_cut();
+    let mut ticket = db.take_cut();
     let cut = db.db.checkpointer().cut_taken();
     let wake = std::sync::Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
     let waker = Waker::from(wake.clone());
@@ -2060,7 +2114,7 @@ fn audit_an_image_wait_does_not_wake_itself_on_the_checkpoint_state_release() {
             let mut waited = None;
             let mut complete = false;
             for _ in 0..32 {
-                match cp.step_full(ticket, db.db.transactions()).unwrap() {
+                match cp.step_full(&mut ticket, db.db.transactions()).unwrap() {
                     IOResult::Done(()) => {
                         complete = true;
                         break;

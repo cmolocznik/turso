@@ -3860,10 +3860,10 @@ fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
         });
         held_rx.recv().unwrap();
         let cp = atoll.checkpointer();
-        let ticket = cp.request_full();
+        let mut ticket = cp.request_full();
         // The writers claim the checkpoint's task: the step this claim runs waits for the held
         // change to leave the closing gate, its own waker on that wait.
-        let cut_wait = match cp.step_full(ticket, atoll.transactions()).unwrap() {
+        let cut_wait = match cp.step_full(&mut ticket, atoll.transactions()).unwrap() {
             crate::types::IOResult::IO(crate::types::IOCompletions(c)) if !c.finished() => Some(c),
             _ => None,
         };
@@ -3901,7 +3901,7 @@ fn a_statement_with_one_pending_wait_keeps_only_its_latest_waker() {
         resume_tx.send(()).unwrap();
         holder.join().unwrap();
         let checkpoint_done = crate::storage::atoll::testing::drive(&io, || {
-            cp.step_full(ticket, atoll.transactions())
+            cp.step_full(&mut ticket, atoll.transactions())
         })
         .is_ok();
         let statement_done = statement.run_ignore_rows().is_ok();
@@ -3987,8 +3987,8 @@ fn a_checkpoint_unit_visits_at_most_one_page() {
             }
             let atoll = db.atoll.as_ref().unwrap().atoll();
             let cp = atoll.checkpointer();
-            let ticket = cp.request_full();
-            drive(&io, || cp.step_full(ticket, atoll.transactions())).unwrap();
+            let mut ticket = cp.request_full();
+            drive(&io, || cp.step_full(&mut ticket, atoll.transactions())).unwrap();
             // Frees the next checkpoint does, and a running transaction's versions, which the cut
             // reads below the leaves' in the arenas.
             conn.execute("DELETE FROM t WHERE a % 2 = 1 AND a % 7 = 0")

@@ -251,8 +251,8 @@ fn a_leaf_an_older_snapshot_reads_below_is_taken_for_an_image_only_once_it_ends(
     assert_eq!(db.put(&mut w, "k", "v2", Mode::Update), DONE_UPDATED);
     db.commit(w);
     let cp = db.db.checkpointer();
-    let ticket = cp.request_full();
-    drive(&db.io, || cp.step_full(ticket, db.txns())).unwrap();
+    let mut ticket = cp.request_full();
+    drive(&db.io, || cp.step_full(&mut ticket, db.txns())).unwrap();
     let pool = db.db.pool();
     let mut sweep = pool.sweep();
     drive(&db.io, || sweep.step(pool)).unwrap();
@@ -263,8 +263,8 @@ fn a_leaf_an_older_snapshot_reads_below_is_taken_for_an_image_only_once_it_ends(
         "the older snapshot's version"
     );
     db.commit(old);
-    let ticket = cp.request_full();
-    drive(&db.io, || cp.step_full(ticket, db.txns())).unwrap();
+    let mut ticket = cp.request_full();
+    drive(&db.io, || cp.step_full(&mut ticket, db.txns())).unwrap();
     assert!(
         db.db.store().swap_slot(db.tree.root()).is_none(),
         "the leaf kept its swap copy"
@@ -298,8 +298,8 @@ fn an_older_snapshot_reads_its_versions_while_a_writer_refused_room_steps_the_ch
     }
     db.commit(w);
     let cp = db.db.checkpointer();
-    let ticket = cp.request_full();
-    drive(&db.io, || cp.step_full(ticket, db.txns())).unwrap();
+    let mut ticket = cp.request_full();
+    drive(&db.io, || cp.step_full(&mut ticket, db.txns())).unwrap();
     let mut old = db.begin(Isolation::Snapshot);
     assert_eq!(db.get(&mut old, &keys[0]), Some(v(1, &keys[0])));
     let mut w = db.begin(Isolation::Snapshot);
@@ -313,9 +313,12 @@ fn an_older_snapshot_reads_its_versions_while_a_writer_refused_room_steps_the_ch
         .unwrap()
         .expect("the orphan's page-table leaf");
     let mut hold = Some(frame.try_lock().expect("the leaf is free"));
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     assert!(
-        matches!(cp.step_full(ticket, db.txns()).unwrap(), IOResult::IO(_)),
+        matches!(
+            cp.step_full(&mut ticket, db.txns()).unwrap(),
+            IOResult::IO(_)
+        ),
         "the checkpoint went on under a held latch"
     );
     assert!(cp.cut_taken().is_some(), "the hold came before the cut");
@@ -359,7 +362,7 @@ fn an_older_snapshot_reads_its_versions_while_a_writer_refused_room_steps_the_ch
     let stats = pool.kept_stats();
     assert!(stats.peak <= stats.limit, "the copies: {stats:?}");
     db.commit(w);
-    drive(&db.io, || cp.step_full(ticket, db.txns())).unwrap();
+    drive(&db.io, || cp.step_full(&mut ticket, db.txns())).unwrap();
     drop(hold);
     drop(frame);
     // Every page of the tree in its copies alone.

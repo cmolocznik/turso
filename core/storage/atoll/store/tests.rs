@@ -71,8 +71,11 @@ impl Db {
 
     fn checkpoint(&self) {
         let cp = self.db.checkpointer();
-        let ticket = cp.request_full();
-        drive(&self.io, || cp.step_full(ticket, self.db.transactions())).unwrap();
+        let mut ticket = cp.request_full();
+        drive(&self.io, || {
+            cp.step_full(&mut ticket, self.db.transactions())
+        })
+        .unwrap();
     }
 
     /// A new plain tree's root, a node a checkpoint images.
@@ -170,10 +173,10 @@ fn a_slot_a_checkpoint_stops_naming_is_kept_until_it_is_in_charge_then_freed_and
     db.change(pid, b"k");
     let cp = db.db.checkpointer();
     let in_charge = cp.superblock().checkpoint;
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let mut steps = 0;
     loop {
-        let out = cp.step_full(ticket, db.db.transactions()).unwrap();
+        let out = cp.step_full(&mut ticket, db.db.transactions()).unwrap();
         if cp.superblock().checkpoint == in_charge {
             // An eraser may run at any time: none erases a slot the checkpoint in charge names.
             drive(&db.io, || db.store().erase_freed()).unwrap();
@@ -232,9 +235,9 @@ fn a_page_in_its_swap_copy_alone_at_a_cut_is_imaged_as_the_cut_found_it() {
     let swap = db.store().swap_slot(pid).expect("in its swap copy alone");
     let at_cut = db.copy_in(pid, swap).expect("the swap copy");
     let cp = db.db.checkpointer();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     loop {
-        let out = cp.step_full(ticket, db.db.transactions()).unwrap();
+        let out = cp.step_full(&mut ticket, db.db.transactions()).unwrap();
         if cp.cut_taken().is_some() {
             break;
         }
@@ -248,7 +251,7 @@ fn a_page_in_its_swap_copy_alone_at_a_cut_is_imaged_as_the_cut_found_it() {
         }
     }
     db.change(pid, b"b");
-    drive(&db.io, || cp.step_full(ticket, db.db.transactions())).unwrap();
+    drive(&db.io, || cp.step_full(&mut ticket, db.db.transactions())).unwrap();
     assert_eq!(
         db.copy_in(pid, db.slot_of(pid)),
         Some(at_cut),
@@ -275,19 +278,19 @@ fn a_value_removed_while_a_checkpoint_yields_after_its_cut_is_written_as_the_cut
         .unwrap()
         .expect("the orphan's page-table leaf");
     let cp = db.db.checkpointer();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let hold = frame.try_lock().expect("the leaf is free");
     // Read with the latch held, asserted once the database is closed: a panic through it ends
     // the process.
     let yielded = matches!(
-        cp.step_full(ticket, db.db.transactions()).unwrap(),
+        cp.step_full(&mut ticket, db.db.transactions()).unwrap(),
         IOResult::IO(_)
     );
     let cut_first = cp.cut_taken().is_some();
     let mut remove = crate::storage::atoll::btree::Remove::new(b"k");
     drive(&db.io, || db.tree(root).remove(&mut remove)).unwrap();
     hold.release_unchanged();
-    drive(&db.io, || cp.step_full(ticket, db.db.transactions())).unwrap();
+    drive(&db.io, || cp.step_full(&mut ticket, db.db.transactions())).unwrap();
     drop(frame);
     let Db {
         io,
@@ -422,17 +425,17 @@ fn an_orphan_whose_free_yielded_is_free_in_the_checkpoint_and_after_a_reopen() {
         .unwrap()
         .expect("the root's page-table leaf");
     let cp = db.db.checkpointer();
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let hold = frame.try_lock().expect("the leaf is free");
     assert!(
         matches!(
-            cp.step_full(ticket, db.db.transactions()).unwrap(),
+            cp.step_full(&mut ticket, db.db.transactions()).unwrap(),
             IOResult::IO(_)
         ),
         "the checkpoint went on under a held latch"
     );
     hold.release_unchanged();
-    drive(&db.io, || cp.step_full(ticket, db.db.transactions())).unwrap();
+    drive(&db.io, || cp.step_full(&mut ticket, db.db.transactions())).unwrap();
     assert_eq!(drive(&db.io, || db.store().entry(root)).unwrap(), FREE);
     drop(frame);
     let Db {
@@ -1024,11 +1027,11 @@ fn a_checkpoints_file_syncs_hold_their_places_to_the_flight_limit_until_retired(
     held.armed.store(true, Ordering::Relaxed);
     let cp = db.db.checkpointer();
     let in_charge = cp.superblock().checkpoint;
-    let ticket = cp.request_full();
+    let mut ticket = cp.request_full();
     let mut answers = Answers::default();
     let (mut finished, mut stuck, mut error) = (false, false, None);
     for _ in 0..1 << 20 {
-        match cp.step_full(ticket, db.db.transactions()) {
+        match cp.step_full(&mut ticket, db.db.transactions()) {
             Ok(IOResult::Done(())) => {
                 finished = true;
                 break;

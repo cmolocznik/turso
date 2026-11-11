@@ -354,9 +354,9 @@ fn the_clock_restarts_above_every_timestamp_and_what_was_written_reads_committed
 
 /// A full checkpoint, done.
 fn checkpoint(io: &Arc<dyn IO>, db: &Atoll) {
-    let ticket = db.checkpointer().request_full();
+    let mut ticket = db.checkpointer().request_full();
     drive(io, || {
-        db.checkpointer().step_full(ticket, db.transactions())
+        db.checkpointer().step_full(&mut ticket, db.transactions())
     })
     .unwrap();
 }
@@ -1064,7 +1064,7 @@ fn a_checkpoint_releases_the_logs_segments_one_a_unit() {
     let cp = db.checkpointer();
     let ticket = cp.request_full();
     let (mut most, mut total) = (0, 0);
-    while cp.fulls_done() < ticket {
+    while cp.fulls_done() < ticket.ticket() {
         let before = SEGMENTS_RELEASED.with(|r| r.get());
         if let Some(c) = cp.one_unit(db.transactions()).unwrap() {
             io.wait(&c);

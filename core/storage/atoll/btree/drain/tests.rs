@@ -72,9 +72,9 @@ impl Db {
     /// A full checkpoint, done.
     fn checkpoint(&self) {
         let checkpointer = self.db.checkpointer();
-        let ticket = checkpointer.request_full();
+        let mut ticket = checkpointer.request_full();
         run(&self.io, || {
-            checkpointer.step_full(ticket, self.db.transactions())
+            checkpointer.step_full(&mut ticket, self.db.transactions())
         });
     }
 

@@ -5486,9 +5486,12 @@ compose, the real `Completion`, latch and backends included where named.
    the step's own let-go may come before another writer looks; one whose step only contended for a
    state another holds wakes no one, and that holder's let-go does. Another holder's let-go (an
    integrity check, a writer's relief) wakes those writers only where the writers step checkpoints:
-   with a worker, they wait on the room the worker frees and the gate it opens. Not built yet: the
-   ticket a transaction's end waiting for a full checkpoint holds on it (22.4), close's durable end
-   and the request count through `close_after`, the sustained run and the profile.)
+   with a worker, they wait on the room the worker frees and the gate it opens. A transaction's end
+   waiting for a full checkpoint holds the wait as a value it owns across its polls
+   (`FullWait`, from `request_full`), which, while a worker steps the checkpoints, takes a demand
+   on the checkpoint's task of the relief class at its first poll, outside the waiters' lock, and
+   lets it go as the wait ends or is dropped (22.4). Not built yet: close's durable end and the
+   request count through `close_after`, the sustained run and the profile.)
 8. **The segment preparers**, every open log, replacing the interim adapter and the callback chain
    in the same change; the callers' fresh-segment cases of proof 12 first. Step 4's exception, a
    unit's budget of one start and one finish, goes with the adapter.

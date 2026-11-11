@@ -1377,9 +1377,9 @@ pub struct RetireOp {
 #[turso_macros::atoll_entry]
 pub fn full_checkpoint(db: &AtollDb) -> Result<()> {
     let checkpointer = db.atoll().checkpointer();
-    let ticket = checkpointer.request_full();
+    let mut ticket = checkpointer.request_full();
     let txns = db.atoll().transactions();
-    drive(db.io(), || checkpointer.step_full(ticket, txns))
+    drive(db.io(), || checkpointer.step_full(&mut ticket, txns))
 }
 
 /// Steps the checkpointer only while a checkpoint is due, once its share of the log budget has
@@ -1443,8 +1443,8 @@ enum Step {
     Commit(Commit),
     Rollback(Abort),
     Drain,
-    /// A full checkpoint, by its ticket.
-    Checkpoint(u64),
+    /// A full checkpoint, by the wait for it, which holds the end's demand on the checkpoint.
+    Checkpoint(crate::storage::atoll::checkpoint::FullWait),
     Done,
 }
 
@@ -1542,9 +1542,9 @@ impl Ending {
                         Step::Done
                     };
                 }
-                Step::Checkpoint(ticket) => {
+                Step::Checkpoint(wait) => {
                     let txns = self.db.atoll().transactions();
-                    done!(self.db.atoll().checkpointer().step_full(*ticket, txns));
+                    done!(self.db.atoll().checkpointer().step_full(wait, txns));
                     self.step = Step::Done;
                 }
                 Step::Done => return Ok(IOResult::Done(())),

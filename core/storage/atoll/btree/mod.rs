@@ -196,26 +196,38 @@ pub enum Outcome {
 impl Tree {
     /// A new, empty tree whose nodes are of `class`: its root page, which names it.
     pub fn create(pool: &Arc<BufferPool>, class: SizeClass) -> Result<IOResult<PageId>> {
-        Self::create_in_at(pool, class, false, None, false)
+        Self::create_in_at(pool, class, false, None, false, |_| {})
     }
 
     /// [`create`](Self::create), a versioned tree's: its root a reserving leaf
     /// ([`node::RESERVE`]).
     pub fn create_versioned(pool: &Arc<BufferPool>, class: SizeClass) -> Result<IOResult<PageId>> {
-        Self::create_in_at(pool, class, false, None, true)
+        Self::create_in_at(pool, class, false, None, true, |_| {})
+    }
+
+    /// A new, empty versioned tree a transaction makes: `created` is handed its root page while
+    /// the page is still held, so a checkpoint's walk, which takes a page's latch to find it owed
+    /// an image, finds the tree's creation registered before it finds the root (DESIGN.md 22.1,
+    /// the auditor's #4326).
+    pub fn create_versioned_by(
+        pool: &Arc<BufferPool>,
+        class: SizeClass,
+        created: impl FnOnce(&Exclusive<'_>),
+    ) -> Result<IOResult<PageId>> {
+        Self::create_in_at(pool, class, false, None, true, created)
     }
 
     /// A new, empty temporary tree (DESIGN.md §6.4), whose nodes and values are temporary pages:
     /// no checkpoint writes it, and it does not outlive the process.
     #[cfg(test)]
     pub fn create_temporary(pool: &Arc<BufferPool>, class: SizeClass) -> Result<IOResult<PageId>> {
-        Self::create_in_at(pool, class, true, None, false)
+        Self::create_in_at(pool, class, true, None, false, |_| {})
     }
 
     /// A new, empty versioned tree at `root`, which must be free: replay's creation of a tree at
     /// the root its change names, made by a transaction (audit 17).
     pub fn create_at(pool: &Arc<BufferPool>, root: PageId) -> Result<IOResult<PageId>> {
-        Self::create_in_at(pool, root.class(), false, Some(root), true)
+        Self::create_in_at(pool, root.class(), false, Some(root), true, |_| {})
     }
 
     fn create_in_at(
@@ -224,6 +236,7 @@ impl Tree {
         temporary: bool,
         at: Option<PageId>,
         versioned: bool,
+        created: impl FnOnce(&Exclusive<'_>),
     ) -> Result<IOResult<PageId>> {
         let mut page = match (temporary, at) {
             (true, _) => done!(pool.allocate_temporary(class)),
@@ -233,6 +246,7 @@ impl Tree {
         let pid = page.pid();
         empty_root(&mut page, versioned);
         page.changed();
+        created(&page);
         Ok(IOResult::Done(pid))
     }
 

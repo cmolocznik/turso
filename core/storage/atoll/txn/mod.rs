@@ -900,11 +900,13 @@ impl Transactions {
     ) -> Result<IOResult<PageId>> {
         assert!(txn.command > 0, "a tree created before the first statement");
         let (pool, store) = versions.pool_and_store();
-        let root = match Tree::create_versioned(pool, class)? {
+        let (slot, start) = (txn.slot, txn.start);
+        let root = match Tree::create_versioned_by(pool, class, |page| {
+            store.created(page, slot, start)
+        })? {
             IOResult::Done(root) => root,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
-        store.created(root, txn.slot, txn.start);
         txn.changed(|statement, changes| changes.create(statement, root, list));
         txn.created.push(Created {
             statement: txn.command,

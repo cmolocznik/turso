@@ -107,6 +107,18 @@ impl<T: Default> Segmented<T> {
         Next::Passed(i)
     }
 
+    /// The index past the last item of the highest segment made as this reads them: an item made
+    /// later at or past it is outside what was made.
+    pub fn made_end(&self) -> u64 {
+        (0..SEGMENTS)
+            .rev()
+            .find(|&k| !self.segments[k].load(Ordering::Acquire).is_null())
+            .map_or(0, |k| {
+                let end = ((1u128 << (k + 1)) - 1) << FIRST_SHIFT;
+                u64::try_from(end).unwrap_or(u64::MAX)
+            })
+    }
+
     /// Item `i`, its segment made if it was not.
     pub fn get_or_make(&self, i: u64) -> &T {
         let (k, at) = locate(i);

@@ -37,6 +37,7 @@
 
 use super::aligned::AlignedBlock;
 use super::bits::GrowBits;
+use super::buffer::Exclusive;
 use super::checkpoint::WRITES;
 use super::epoch::{Epochs, Retired};
 use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, Tree, TREES};
@@ -54,7 +55,7 @@ use crate::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 #[cfg(all(test, not(shuttle), not(atoll_loom)))]
 mod tests;
@@ -135,6 +136,11 @@ pub struct PageStore {
     epoch: AtomicU64,
     /// Swap copies.
     swap: Box<[Mutex<BTreeMap<PageId, u64>>]>,
+    /// The zeros an erasure writes over a slot no hole can be punched in, a block per class made
+    /// at its first need and only ever read: every such write of the class shares it, holding it
+    /// until its request retires, so what they hold is a class's size at most however many are in
+    /// flight (the auditor's #4324).
+    zeros: [SetOnce<Arc<AlignedBlock>>; CLASS_COUNT],
     /// Frees waiting for a checkpoint, by the checkpoint each waits for: each stays listed until
     /// it is done, so a free a yield interrupts is taken up where it was.
     deferred: Mutex<BTreeMap<u64, VecDeque<Deferred>>>,
@@ -177,7 +183,7 @@ pub struct PageStore {
     drain_wakes: AtomicU64,
     /// Each tree a transaction created, by root, with its creator's slot and start: no
     /// checkpoint maps it before one's snapshot sees the creation (audit 18, review 8).
-    creations: Mutex<HashMap<PageId, (u16, u64)>>,
+    creations: Mutex<BTreeMap<PageId, (u16, u64)>>,
     /// Pages no tree names any more whose free met a latched page: the checkpointer frees them,
     /// and leaves them out.
     orphans: Mutex<Vec<PageId>>,
@@ -282,6 +288,7 @@ impl PageStore {
             swap: (0..SWAP_SHARDS)
                 .map(|_| Mutex::new(BTreeMap::new()))
                 .collect(),
+            zeros: std::array::from_fn(|_| SetOnce::default()),
             deferred: Mutex::new(BTreeMap::new()),
             unreusable: Default::default(),
             freed_numbers: Retired::default(),
@@ -298,7 +305,7 @@ impl PageStore {
             drained: Mutex::new(None),
             #[cfg(test)]
             drain_wakes: AtomicU64::new(0),
-            creations: Mutex::new(HashMap::new()),
+            creations: Mutex::new(BTreeMap::new()),
             orphans: Mutex::new(Vec::new()),
         })
     }
@@ -627,18 +634,53 @@ impl PageStore {
 
     // ---------------------------------------------------------------- creations
 
-    /// The tree rooted at `root` was created by the transaction of `slot` that started at
-    /// `start`.
-    pub fn created(&self, root: PageId, slot: u16, start: u64) {
+    /// The tree whose root page is `root`, still held by its maker, was created by the transaction
+    /// of `slot` that started at `start`. Registered under the root's latch: a checkpoint's walk
+    /// finds a page owed only once it has its latch, so every root a cut finds owed is registered
+    /// by then (the auditor's #4326).
+    pub fn created(&self, root: &Exclusive<'_>, slot: u16, start: u64) {
+        self.creations.lock().insert(root.pid(), (slot, start));
+    }
+
+    /// [`created`](Self::created) for a root no page holds, for a test's registry.
+    #[cfg(test)]
+    pub fn created_unheld(&self, root: PageId, slot: u16, start: u64) {
         self.creations.lock().insert(root, (slot, start));
     }
 
-    /// Every tree created and not yet seen by a durable checkpoint, with its creator.
-    pub fn creations(&self) -> Vec<(PageId, u16, u64)> {
+    /// The last root of the registry of trees created, if any: a checkpoint reads the registry up
+    /// to it, taken before its gate reopens, and no further.
+    pub fn last_creation(&self) -> Option<PageId> {
         self.creations
             .lock()
-            .iter()
-            .map(|(&root, &(slot, start))| (root, slot, start))
+            .last_key_value()
+            .map(|(&root, _)| root)
+    }
+
+    /// The trees created and not yet seen by a durable checkpoint whose roots follow `after` and
+    /// go to `end`, with their creators, in root order, `max` at most: a checkpoint reads the
+    /// registry a run a unit, from where its last run ended, to the end it took (DESIGN.md 22.1).
+    pub fn creations_after(
+        &self,
+        after: Option<PageId>,
+        end: PageId,
+        max: usize,
+    ) -> Vec<(PageId, u16, u64)> {
+        let from = match after {
+            Some(root) => (
+                std::ops::Bound::Excluded(root),
+                std::ops::Bound::Included(end),
+            ),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Included(end)),
+        };
+        self.creations
+            .lock()
+            .range(from)
+            .take(max)
+            .map(|(&root, &(slot, start))| {
+                super::unit::walked();
+                (root, slot, start)
+            })
             .collect()
     }
 
@@ -1144,26 +1186,47 @@ impl PageStore {
         Ok(IOResult::Done(()))
     }
 
-    /// The next data file from `at` on, `at` moved past it, a run of [`FILE_RUN`] places looked
-    /// at a call at most (DESIGN.md 22.1): `Some(None)` where a run found none, `None` once every
-    /// class's files are passed.
-    pub fn data_file_from(&self, at: &mut (usize, u64)) -> Option<Option<Arc<dyn File>>> {
+    /// Where each class's data files end as this reads them ([`Segmented::made_end`]): a walk to
+    /// these ends is finite, however many files are opened meanwhile, and passes every file opened
+    /// before it was read (the auditor's #4327).
+    pub fn data_files_end(&self) -> [u64; CLASS_COUNT] {
+        std::array::from_fn(|class| self.files[class].made_end())
+    }
+
+    /// The next data file from `at` on and before its class's end in `ends`, `at` moved past it, a
+    /// run of [`FILE_RUN`] places looked at a call at most (DESIGN.md 22.1): `Some(None)` where a
+    /// run found none or a class's files are passed, `None` once every class's are.
+    pub fn data_file_from(
+        &self,
+        at: &mut (usize, u64),
+        ends: &[u64; CLASS_COUNT],
+    ) -> Option<Option<Arc<dyn File>>> {
         loop {
             let (class, index) = *at;
             if class >= CLASS_COUNT {
                 return None;
             }
+            let end = ends[class];
+            if index >= end {
+                *at = (class + 1, 0);
+                continue;
+            }
             let files = &self.files[class];
-            match files.next_from(index, FILE_RUN, |cell| cell.get().is_some()) {
-                Next::At(i) => {
+            let wanted = |cell: &SetOnce<Arc<dyn File>>| cell.get_ref().is_some();
+            match files.next_from(index, FILE_RUN.min(end - index), wanted) {
+                Next::At(i) if i < end => {
                     *at = (class, i + 1);
                     return Some(files.get(i).and_then(|cell| cell.get()));
                 }
-                Next::Passed(i) => {
+                Next::Passed(i) if i < end => {
                     *at = (class, i);
                     return Some(None);
                 }
-                Next::End => *at = (class + 1, 0),
+                // Past the class's end: the run that found it is this call's.
+                _ => {
+                    *at = (class + 1, 0);
+                    return Some(None);
+                }
             }
         }
     }
@@ -1213,7 +1276,7 @@ impl PageStore {
         if let Some(&(class, slot)) = e.slots.get(e.punched) {
             let (file, at) = self.data_file(class, slot)?;
             if file.punch_hole(at as usize, class.size()).is_err() {
-                let zeros = Arc::new(AlignedBlock::zeroed(class.size()));
+                let zeros = self.zeros(class);
                 let (write, zeroed) = whole_write(class.size());
                 let request = file.pwrite(at, zeros.region(0, class.size()), write)?;
                 e.hold(zeroed, &request);
@@ -1254,6 +1317,15 @@ impl PageStore {
     /// Whether slots freed are not yet erased (DESIGN.md 22.9): a step's end may let them be.
     pub fn erasure_owed(&self) -> bool {
         self.erase_owed.load(Ordering::Acquire) != 0
+    }
+
+    /// The class's block of zeros, made at its first need: two makers racing keep the first.
+    fn zeros(&self, class: SizeClass) -> Arc<AlignedBlock> {
+        let cell = &self.zeros[class.index()];
+        match cell.get() {
+            Some(zeros) => zeros,
+            None => cell.set(Arc::new(AlignedBlock::zeroed(class.size()))),
+        }
     }
 
     /// Slots freed and not yet erased.

@@ -4618,7 +4618,15 @@ in page order from where the shard's last run ended (each shard an ordered map:
 `PageStore::swap_shard_pages`), then the swapped pages looked at again a run at a time
 (`BufferPool::cut_run`); the pages owed handed to the image
 queue whole, a vector becoming a queue in place; the metadata
-cut, the gate opened; the metadata pages dirty at the cut, handed over unread as the dirty stack's
+cut, the registry's last root taken and the gate opened; the registry of trees created read a run
+of roots a unit from where the last ended, to that root (`CREATION_RUN`, one page of its entries;
+the registry ordered by root: `PageStore::creations_after`), each creation the snapshot does not
+see set aside, a finite inventory however many trees are created meanwhile: a tree's creation is
+registered while its maker still holds the root's page (`Tree::create_versioned_by`, and
+`PageStore::created` takes the held page), and the walk finds a page owed only once it has its
+latch, so every root the walk found owed is registered before the last root is taken, and only
+the checkpoint's own forgetting takes one out;
+the metadata pages dirty at the cut, handed over unread as the dirty stack's
 chain (`Stack::take_chain`) and moved a run at a time (`DIRTY_RUN`, one page of ids) into the
 ordered set the run walks; each orphan's edit, then its free; each image's source taken, each
 arena page its versions reach (`AsOf::step` returns after the one page a call reads), its image
@@ -4632,7 +4640,9 @@ appended; its durability; each metadata page fetched in order and its write star
 hold or a change settling under the look writes nothing); the metadata's cut copies let go, a run
 of its frames a unit (`FRAME_RUN`, one page of their references: `MetaCache::uncut`); each data
 file's sync started, the files walked by a cursor a run of their places a unit (`FILE_RUN`, one
-page of their cells, a segment of places never made passed whole: `PageStore::data_file_from`),
+page of their cells, a segment of places never made passed whole: `PageStore::data_file_from`), to
+each class's end as the walk began, past the last segment of files then made (`data_files_end`):
+the files every image used, and no file opened later,
 at most `WRITES` in flight, each keeping its place until its request retires, the first failure
 failing the checkpoint (the auditor's P2-CP-F1); the log's end; the superblock; each page the checkpoint wrote given its
 durable place, a run of its frames a unit (`MetaCache::durable_sides`), then the checkpoint put in
@@ -4641,10 +4651,22 @@ creation; each log segment before the redo point released, the newest first
 (`Log::release_segment`), then the directory synced in a unit of its own (`Log::sync_released`);
 each slot erased, a batch of `ERASE_RUN` slots at most (one page of them; the slots retired since
 are taken from the epoch list no more than the batch needs, `Retired::reclaim_up_to`), its zero
-writes held to `WRITES` in flight, each keeping its place until its request retires, then each
+writes held to `WRITES` in flight, each keeping its place until its request retires, and every
+one of a class reading the class's one block of zeros, made at its first need and only read, so
+the bytes they hold are a class's size at most (no backend or wrapper in the tree writes into a
+write's bytes; a VFS extension is handed them through a mutable pointer, its contract to read), then each
 file it was in synced, a sync's place kept the same way, the first failure any of them told
 keeping the batch's slots for the next try (`PageStore::erase_one`, P2-CP-F1). Every such run, release
-and sync counts as the unit's visit (the auditor's P2-CP-U1). A unit under way is marked on its thread
+and sync counts as the unit's visit (the auditor's P2-CP-U1), and tests count the entries a unit
+walks where the walk is done (`unit::walked`, in the metadata helpers and the registry's walk), so
+a call site handing a helper more than its run is seen. Two scans are bounded by configuration
+rather than by a page, an exception stated as such: the cut (`Transactions::cut`) reads every
+reserved transaction slot, and building a reserving leaf's image reads the oldest snapshot over
+every slot (`AsOf::step` through `oldest_snapshot`), its per-leaf vector growing to the highest
+slot it meets: each is O(W), W the transaction slots configured at open (default 100), the same in
+every unit whatever the data holds. Its cure is the oldest snapshot read once per checkpoint after
+the cut's horizon, every later snapshot at or past it, which needs its own proof of publication
+order before it replaces the per-leaf read. A unit under way is marked on its thread
 (`unit::Unit`, entered for each unit the checkpoint's state steps): every park, IO wait and
 blocking wait refuses it (`park.rs`, Atoll's one place a thread blocks), and debug builds count
 the pages it visits, where the checkpoint touches one and inside the reads it makes through other
@@ -4805,8 +4827,10 @@ cores the database is given. The embedder can always set it.
      does today, and when past it notifies *due*, which sets the checkpoint's own level (22.4).
      The task compares the same two itself before it returns `Idle` and goes on if past, so a
      database already due when the task is created, or after a checkpoint ends, needs no further
-     append. Nothing arms an edge: a notify with no task waiting costs the counter's increment,
-     paid only by statements between the crossing and the checkpoint's start.
+     append. Nothing arms an edge. A crossing is promoted once per checkpoint start: the first
+     statement past it to raise the trigger word (`TriggerWord::claim`) notifies *due*, the one
+     cold notify, with the signal's, queue's and demand's own work; every statement after it until
+     the next start reads the word alone, with no queue wait and no allocation (step 7).
    - **Full requested**: `request_full` raises the count asked for, then notifies. A ticket is
      answered by a checkpoint begun after the request, as now.
    - **Room wanted**: the room tickets (22.4): kept pages' images first while any lives.

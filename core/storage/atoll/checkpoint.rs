@@ -507,8 +507,10 @@ struct Run {
     /// What each metadata page asked to be written waits on, by its place in `frames`: its write,
     /// or a hold or a change to end before its write starts.
     writing: Vec<(usize, Completion)>,
-    /// Where the walk of the data files for their syncs stands.
+    /// Where the walk of the data files for their syncs stands, and where each class's files ended
+    /// as the walk began.
     files_at: (usize, u64),
+    files_end: Option<[u64; page::CLASS_COUNT]>,
     /// The data files' syncs in flight, each with what its retirement completes: held to
     /// [`WRITES`] until they retire (the auditor's P2-CP-F1).
     syncing: Vec<(Completion, Completion)>,
@@ -516,6 +518,10 @@ struct Run {
     superblock: Option<Superblock>,
     /// Where the walk of `frames` a run at a time is, in the phases that take one.
     frames_at: usize,
+    /// The last root of the registry of trees created read, once a run of it has been, and the
+    /// registry's last root as the cut left it: the walk's end.
+    creations_at: Option<PageId>,
+    creations_end: Option<PageId>,
     /// Where the end of the pool's cut stands.
     end_cut: EndCut,
     /// The next segment to release, counting down from the first kept, once the release has
@@ -529,6 +535,8 @@ enum Phase {
     Gate,
     Cut,
     Scan,
+    /// The registry of trees created read, a run of roots a unit.
+    Creations,
     Dirty,
     Orphans,
     Images,
@@ -1281,6 +1289,10 @@ const DIRTY_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<MetaId>();
 /// of their references holds (DESIGN.md 22.1).
 const FRAME_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<MetaRef>();
 
+/// The trees created a run of the registry's walk reads: as many as one page of its entries holds
+/// (DESIGN.md 22.1).
+const CREATION_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<(PageId, u16, u64)>();
+
 /// What a unit of a checkpoint's work leaves (DESIGN.md 22.1).
 enum Unit {
     /// Nothing more to do now: no checkpoint is due and nothing is left to erase.
@@ -1399,10 +1411,13 @@ impl Run {
             frames: Vec::new(),
             writing: Vec::new(),
             files_at: (0, 0),
+            files_end: None,
             syncing: Vec::new(),
             written: None,
             superblock: None,
             frames_at: 0,
+            creations_at: None,
+            creations_end: None,
             end_cut: EndCut::default(),
             release: None,
             released: false,
@@ -1480,19 +1495,46 @@ impl Run {
                         IOResult::Done(true) => {}
                     }
                     let (dirty, heights) = cp.store.begin_cut(self.n);
+                    // The registry's end, taken once the walk has found every page owed: each of
+                    // those a tree's root was registered before the walk took its latch.
+                    self.creations_end = cp.store.last_creation();
                     cp.store.open_gate();
                     self.heights = heights;
                     self.dirty = dirty;
-                    for (root, slot, start) in cp.store.creations() {
+                    // Handed over whole, no copy made: a vector becomes a queue in place.
+                    self.queue = VecDeque::from(std::mem::take(&mut self.scan.owed));
+                    self.phase = Phase::Creations;
+                    return Ok(Unit::Again);
+                }
+                Phase::Creations => {
+                    // The registry of trees created, a run of roots a unit from where the last
+                    // ended, to the end taken before the gate reopened: a finite inventory, however
+                    // many trees are created meanwhile. Every creation registered by then is read,
+                    // only this checkpoint's `Forget` taking one out; one registered since is a
+                    // tree created after the pool's walk, no page owed an image one of its pages,
+                    // and those a run reads below the end are set aside as the snapshot does not
+                    // see them.
+                    let Some(end) = self.creations_end else {
+                        self.phase = Phase::Dirty;
+                        continue;
+                    };
+                    unit::visit();
+                    let run = cp
+                        .store
+                        .creations_after(self.creations_at, end, CREATION_RUN);
+                    for &(root, slot, start) in &run {
                         if txns.committed_by(slot, start, self.c) {
                             self.mapped_roots.push(root);
                         } else {
                             self.set_aside.insert(root);
                         }
                     }
-                    // Handed over whole, no copy made: a vector becomes a queue in place.
-                    self.queue = VecDeque::from(std::mem::take(&mut self.scan.owed));
-                    self.phase = Phase::Dirty;
+                    match run.last() {
+                        Some(&(root, ..)) if run.len() == CREATION_RUN && root != end => {
+                            self.creations_at = Some(root)
+                        }
+                        _ => self.phase = Phase::Dirty,
+                    }
                     return Ok(Unit::Again);
                 }
                 Phase::Dirty => {
@@ -1606,7 +1648,12 @@ impl Run {
                     if self.syncing.len() >= WRITES {
                         return Ok(Unit::Wait(self.syncing[0].1.clone()));
                     }
-                    match cp.store.data_file_from(&mut self.files_at) {
+                    // The files as they stand once every image is written: those opened later need
+                    // no sync of this checkpoint's.
+                    let ends = *self
+                        .files_end
+                        .get_or_insert_with(|| cp.store.data_files_end());
+                    match cp.store.data_file_from(&mut self.files_at, &ends) {
                         Some(Some(file)) => {
                             unit::visit();
                             let sync = file.sync_data(Completion::new_sync(|_| {}))?;
@@ -2234,6 +2281,26 @@ mod tests {
         units
     }
 
+    /// The units `run` takes in its phase from where it stands, stepped until it leaves it or has
+    /// taken `1 << 16`, and the most entries of bookkeeping any of them walked where the walk is
+    /// done (`unit::walked`), whatever run its call site handed the walk.
+    fn units_and_walk(
+        run: &mut Run,
+        db: &crate::storage::atoll::db::Atoll,
+        in_charge: &Superblock,
+    ) -> (usize, usize) {
+        let phase = run.phase;
+        let (mut units, mut most) = (0, 0);
+        unit::take_walked();
+        while run.phase == phase && units < 1 << 16 {
+            run.step(db.checkpointer(), db.transactions(), in_charge)
+                .unwrap();
+            units += 1;
+            most = most.max(unit::take_walked());
+        }
+        (units, most)
+    }
+
     /// The trigger is claimed once a crossing: the first statement past a start claims it, the next
     /// for that start does not, one that read an earlier start neither claims it nor lowers it, and
     /// the next start's first does (the auditor's P2-EX-H1; mutant: the word swapped in, a stale
@@ -2296,8 +2363,10 @@ mod tests {
 
     /// The bookkeeping over the frames a checkpoint wrote is a run of them a unit: giving each page
     /// its durable place, then putting the checkpoint in charge, and letting go of their cut
-    /// copies; and the trees it saw created are forgotten as creations one a unit (the auditor's
-    /// P2-CP-U1; mutants: a phase walking them whole in one unit).
+    /// copies, each run walking no more frames than it holds, whatever its call site hands the
+    /// helper; and the trees it saw created are forgotten as creations one a unit (the auditor's
+    /// P2-CP-U1 and #4319; mutants: a phase walking them whole in one unit, a call site handing a
+    /// helper the rest of the frames past its run).
     #[test]
     fn the_checkpoints_bookkeeping_walks_its_frames_a_run_a_unit() {
         let io: Arc<dyn crate::io::IO> = Arc::new(crate::io::MemoryIO::new());
@@ -2316,11 +2385,11 @@ mod tests {
         run.frames = (0..2 * FRAME_RUN + 1).map(|_| frame.clone()).collect();
         run.superblock = Some(in_charge.clone());
         run.phase = Phase::InCharge;
-        let in_charge_units = units_in(&mut run, &db, &in_charge);
+        let (in_charge_units, in_charge_walk) = units_and_walk(&mut run, &db, &in_charge);
         let after_in_charge = run.phase;
         run.phase = Phase::Uncut;
         run.frames_at = 0;
-        let uncut_units = units_in(&mut run, &db, &in_charge);
+        let (uncut_units, uncut_walk) = units_and_walk(&mut run, &db, &in_charge);
         let after_uncut = run.phase;
         run.phase = Phase::Forget;
         run.mapped_roots = (0..3)
@@ -2339,5 +2408,74 @@ mod tests {
             "three runs, then done"
         );
         assert_eq!(forget_units, 4, "three roots, then the next phase");
+        assert_eq!(
+            (in_charge_walk, uncut_walk),
+            (FRAME_RUN, FRAME_RUN),
+            "the most frames a unit's helper walked, giving places and letting cut copies go"
+        );
+    }
+
+    /// The registry of trees created is read a run of roots a unit, from where the last run ended,
+    /// to the end the cut took: every creation registered by then read once, each the snapshot
+    /// does not see set aside, and the walk ends on that inventory although a full run of trees is
+    /// created past its end after every unit (the auditor's P2-CP-U1, #4319 and #4326; mutants:
+    /// the registry read whole in a unit, a run read from the registry's start again, the walk
+    /// read past the end it took).
+    #[test]
+    fn the_registry_of_trees_created_is_read_a_run_a_unit_to_the_end_the_cut_took() {
+        let io: Arc<dyn crate::io::IO> = Arc::new(crate::io::MemoryIO::new());
+        let db = open(&io);
+        let in_charge = db.checkpointer().superblock();
+        let class = page::SizeClass::new(0).unwrap();
+        let store = db.store().clone();
+        let roots: Vec<PageId> = (0..2 * CREATION_RUN as u64 + 1)
+            .map(|i| PageId::new(class, 1 << 20 | i))
+            .collect();
+        // Created by a transaction no snapshot sees: its start past every commit.
+        for &root in &roots {
+            store.created_unheld(root, 0, u64::MAX);
+        }
+        let end = store.last_creation();
+        let registered = end.map_or(0, |end| store.creations_after(None, end, usize::MAX).len());
+        let mut run = Run::new(in_charge.checkpoint, None);
+        run.phase = Phase::Creations;
+        run.creations_end = end;
+        let mut later = Vec::new();
+        let (mut units, mut most) = (0, 0);
+        unit::take_walked();
+        while run.phase == Phase::Creations && units < 1 << 12 {
+            run.step(db.checkpointer(), db.transactions(), &in_charge)
+                .unwrap();
+            units += 1;
+            most = most.max(unit::take_walked());
+            // Trees created after the cut, past its end, a full run of them.
+            for _ in 0..CREATION_RUN {
+                let root = PageId::new(class, 1 << 21 | later.len() as u64);
+                store.created_unheld(root, 0, u64::MAX);
+                later.push(root);
+            }
+        }
+        let after = run.phase;
+        let set_aside = roots.iter().filter(|r| run.set_aside.contains(r)).count();
+        let later_read = later.iter().filter(|r| run.set_aside.contains(r)).count();
+        let read = run.set_aside.len() + run.mapped_roots.len();
+        for &root in roots.iter().chain(&later) {
+            store.forget_creation(root);
+        }
+        drop((run, store, db));
+        assert_eq!(after, Phase::Dirty, "the registry's walk did not end");
+        assert_eq!(
+            set_aside,
+            roots.len(),
+            "creations no snapshot sees set aside"
+        );
+        assert_eq!(later_read, 0, "creations past the cut's end read");
+        assert_eq!(read, registered, "creations read against those registered");
+        assert!(most <= CREATION_RUN, "a unit walked {most} creations");
+        assert_eq!(
+            units,
+            registered.div_ceil(CREATION_RUN),
+            "units to read {registered} creations"
+        );
     }
 }

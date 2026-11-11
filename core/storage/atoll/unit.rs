@@ -37,6 +37,8 @@ crate::thread::thread_local! {
     /// Log segments units on this thread started and finished preparing, since the last read.
     static STARTS: Cell<u32> = const { Cell::new(0) };
     static FINISHES: Cell<u32> = const { Cell::new(0) };
+    /// The entries of bookkeeping walked on this thread, since the last read.
+    static WALKED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A unit under way on this thread until it drops. Left on the thread that entered it.
@@ -124,6 +126,21 @@ pub(crate) fn visit() {
     if inside() {
         VISITS.with(|v| v.set(v.get() + 1));
     }
+}
+
+/// Counts an entry of bookkeeping walked on this thread, where the walk is done (a frame a
+/// checkpoint wrote, a tree's creation): a test reads how many a unit walked, whatever run its
+/// caller handed the walk (DESIGN.md 22.1).
+#[inline]
+pub(crate) fn walked() {
+    #[cfg(test)]
+    WALKED.with(|w| w.set(w.get() + 1));
+}
+
+/// The entries of bookkeeping walked on this thread, since the last call.
+#[cfg(test)]
+pub(crate) fn take_walked() -> usize {
+    WALKED.with(|w| w.replace(0))
 }
 
 /// The log segments units on this thread started and finished preparing, since the last call.

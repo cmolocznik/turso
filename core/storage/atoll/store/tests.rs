@@ -767,6 +767,8 @@ struct Held {
     writes: crate::sync::atomic::AtomicBool,
     queue: Mutex<VecDeque<(Completion, i32)>>,
     most: crate::sync::atomic::AtomicUsize,
+    /// Where each held write's bytes start: the blocks the writes read from.
+    sources: Mutex<BTreeSet<usize>>,
 }
 
 impl Held {
@@ -867,7 +869,10 @@ impl File for HeldFile {
     }
     fn pwrite(&self, at: u64, bytes: Arc<crate::io::Buffer>, c: Completion) -> Result<Completion> {
         match self.holding(true) {
-            Some(held) => held.hold(c, bytes.len() as i32),
+            Some(held) => {
+                held.sources.lock().insert(bytes.as_ptr() as usize);
+                held.hold(c, bytes.len() as i32)
+            }
             None => self.file.pwrite(at, bytes, c),
         }
     }
@@ -915,9 +920,10 @@ impl Answers {
 }
 
 /// An erasure batch takes a run of slots at most, and its zero writes and syncs hold their places
-/// in flight to `WRITES`, each until its request retires, not until it is answered (the auditor's
-/// P2-CP-U1 and P2-CP-F1; mutants: a batch of every slot ready, the flight unbounded, a place let
-/// go at the answer).
+/// in flight to `WRITES`, each until its request retires, not until it is answered; the zero
+/// writes all read from the class's one block (the auditor's P2-CP-U1, P2-CP-F1 and #4324;
+/// mutants: a batch of every slot ready, the flight unbounded, a place let go at the answer, a
+/// block of zeros made for each write).
 #[test]
 fn an_erasure_batch_is_a_run_of_slots_its_requests_held_to_the_flight_limit_until_retired() {
     let held = Arc::new(Held::default());
@@ -971,10 +977,12 @@ fn an_erasure_batch_is_a_run_of_slots_its_requests_held_to_the_flight_limit_unti
         request.retire();
     }
     let most = held.most();
+    let sources = held.sources.lock().len();
     drop(store);
     // Checked once the database is gone: a panic unwinding through it ends the process.
     drop(db);
     assert_eq!(error, None);
+    assert_eq!(sources, 1, "the blocks the zero writes read from");
     assert!(!stuck, "an erasure waited with nothing held");
     assert!(finished, "the erasure did not end");
     assert_eq!(owed, 0, "slots left unerased");
@@ -1068,9 +1076,10 @@ fn a_checkpoints_file_syncs_hold_their_places_to_the_flight_limit_until_retired(
     );
 }
 
-/// The data files are walked by a cursor: each file once, in order, a run of their places looked
-/// at a call, and a segment of places never made passed whole (the auditor's P2-CP-U1; mutants:
-/// a run unbounded, a run's end not kept).
+/// The data files are walked by a cursor: each file opened before the walk once, in order, a run
+/// of their places looked at a call, a segment of places never made passed whole, and the walk
+/// ends at the ends it took although a file is opened past them after every call (the auditor's
+/// P2-CP-U1 and #4327; mutants: a run unbounded, a run's end not kept, the ends not kept).
 #[test]
 fn the_data_files_are_walked_a_run_of_places_a_call() {
     let db = Db::open();
@@ -1089,20 +1098,32 @@ fn the_data_files_are_walked_a_run_of_places_a_call() {
             }
         });
     }
+    let ends = store.data_files_end();
     let mut at = (0, 0);
     let (mut found, mut runs, mut calls) = (Vec::new(), 0, 0);
+    // A file opened past class 0's end after every call: a later writer's, which this walk passes.
+    let mut later = Vec::new();
+    let past = ends[0].next_multiple_of(1 << 20);
     while calls < 1 << 16 {
         calls += 1;
-        match store.data_file_from(&mut at) {
+        let step = store.data_file_from(&mut at, &ends);
+        let n = past + later.len() as u64;
+        store.data_file(class(0), n * per_file).unwrap();
+        later.push((0, n));
+        match step {
             // The cursor stands just past the file found.
             Some(Some(_)) => found.push((at.0, at.1 - 1)),
             Some(None) => runs += 1,
             None => break,
         }
     }
-    let last = store.data_file_from(&mut at).is_none();
+    let last = store.data_file_from(&mut at, &ends).is_none();
     drop(store);
     drop(db);
+    assert!(
+        later.iter().all(|f| !found.contains(f)),
+        "a file opened past the end the walk took was walked"
+    );
     let found_set: BTreeSet<_> = found.iter().copied().collect();
     assert_eq!(
         found.len(),

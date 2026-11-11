@@ -1053,6 +1053,7 @@ impl MetaCache {
     /// What checkpoint `n`'s cut kept of `frames` goes, changes no longer keeping any.
     pub fn uncut(&self, n: u64, frames: &[MetaRef]) {
         for f in frames {
+            super::unit::walked();
             if f.cut_for.load(Ordering::Acquire) == n {
                 *f.cut.lock() = None;
             }
@@ -1072,6 +1073,7 @@ impl MetaCache {
     /// [`put_in_charge`](Self::put_in_charge).
     pub fn durable_sides(&self, n: u64, frames: &[MetaRef]) {
         for f in frames {
+            super::unit::walked();
             if f.written_for.load(Ordering::Acquire) == n {
                 f.durable_side
                     .store(f.written_side.load(Ordering::Acquire), Ordering::Release);

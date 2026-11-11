@@ -5426,9 +5426,9 @@ compose, the real `Completion`, latch and backends included where named.
    the queue's mutex and unlinked if queued, then off its signals, its logical wait given back
    and out of the table, by the remover, or, when a runner was stepping it, by that step's end,
    whichever exchange of the state word comes second; whoever takes the table's entry lets the
-   job go, once, and a task close closed is left to close, which gives up its waits. Not built
-   yet: the jobs' logical waits made executor completions (with the jobs, 22.16 steps 7 to 10),
-   the database's close on `close_after` (with them).)
+   job go, once, and a task close closed is left to close, which gives up its waits. The database
+   closes on `close_after` (step 7). Not built yet: the jobs' logical waits made executor
+   completions (with the jobs, 22.16 steps 7 to 10).)
 7. **The checkpoint onto it**: one worker replaces `Checkpointing::Thread`, callers replace
    `Checkpointing::Writers`; every checkpoint and kept test under each runner; the sustained run
    against step 4's, and the profile again.
@@ -5490,8 +5490,13 @@ compose, the real `Completion`, latch and backends included where named.
    waiting for a full checkpoint holds the wait as a value it owns across its polls
    (`FullWait`, from `request_full`), which, while a worker steps the checkpoints, takes a demand
    on the checkpoint's task of the relief class at its first poll, outside the waiters' lock, and
-   lets it go as the wait ends or is dropped (22.4). Not built yet: close's durable end and the
-   request count through `close_after`, the sustained run and the profile.)
+   lets it go as the wait ends or is dropped (22.4). The database closes in 22.12's order, by its
+   drop or by `Atoll::close`, which returns the log's failure: the log made durable to the end it
+   had when close began, the closing thread waiting as any caller of `wait_durable` does while the
+   checkpoint's task still runs, then `Executor::close_after` with that end and the database's
+   request count, which closes the task, gives up its waits, waits for every request on the
+   database's files to retire and drops the task; a failure is returned after the last step. Not
+   built yet: the sustained run and the profile.)
 8. **The segment preparers**, every open log, replacing the interim adapter and the callback chain
    in the same change; the callers' fresh-segment cases of proof 12 first. Step 4's exception, a
    unit's budget of one start and one finish, goes with the adapter.

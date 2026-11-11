@@ -6,6 +6,7 @@ use super::checkpoint::{
     CheckpointRelief, CheckpointTask, Checkpointer, Checkpointing, WRITE_BYTES,
 };
 use super::control::{Control, Superblock};
+use super::drive;
 use super::executor::{Class, Executor};
 use super::log::{Log, LogConfig};
 use super::meta::TREES;
@@ -116,15 +117,58 @@ pub(in crate::storage::atoll) struct Atoll {
 impl Drop for Atoll {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        // The checkpoint's task closed, a checkpoint under way abandoned, and its worker joined
-        // (DESIGN.md 22.12, steps 2, 3 and 5).
-        drop(self.executor.take());
-        // No request on the database's files outlives it (DESIGN.md 22.12, step 4).
-        self.requests.drain(&*self.io);
+        // Closed in DESIGN.md 22.12's order; a failure to make the log durable is logged there.
+        let _ = self.close_in_order();
     }
 }
 
 impl Atoll {
+    /// Closes the database in DESIGN.md 22.12's order, as dropping it does, and says whether its
+    /// log was made durable to the end it had when close began: a failure is returned after every
+    /// later step of close.
+    pub fn close(mut self) -> Result<()> {
+        self.close_in_order()
+    }
+
+    /// 22.12's order: the log made durable to the end it had when close began, while every job
+    /// still runs (step 1), the closing thread waiting as any caller of `wait_durable` does and
+    /// running an owed preparation step itself until the preparers exist (22.5); then the
+    /// executor's close (`Executor::close_after`): closing published and every step ended (2),
+    /// each task's logical waits given up (3), every request on the database's files retired (4),
+    /// every job dropped (5). The log's failure is returned after the last. A second close finds
+    /// nothing to do.
+    fn close_in_order(&mut self) -> Result<()> {
+        let Some(executor) = self.executor.take() else {
+            return Ok(());
+        };
+        let end = self.log.end();
+        let durable = crate::io::Completion::new_wait();
+        // A failure the log tells is the durable end's; any other is kept beside it and
+        // returned once the close has ended.
+        let other = match drive(&self.io, || self.log.wait_durable(end)) {
+            Ok(()) => {
+                durable.complete(0);
+                None
+            }
+            Err(LimboError::CompletionError(e)) => {
+                durable.error(e);
+                None
+            }
+            Err(e) => {
+                durable.complete(0);
+                Some(e)
+            }
+        };
+        let closed = executor.close_after(&durable, &self.requests);
+        match other {
+            Some(e) => {
+                tracing::error!("the log was not made durable before close: {e}");
+                Err(e)
+            }
+            None => closed,
+        }
+    }
+
     /// Opens the database at `base`, creating it if it does not exist and recovering it on this
     /// thread if it does. To recover on several threads, use [`Opening`].
     pub fn open(io: Arc<dyn IO>, base: &str, config: AtollConfig) -> Result<Self> {

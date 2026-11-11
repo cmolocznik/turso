@@ -1197,6 +1197,13 @@ const CALLERS: &[(&str, &str, &str, &str, &str)] = &[
         "drive: called again until done",
         "logged: the database is closing",
     ),
+    (
+        "db.rs",
+        "close_in_order",
+        "wait_durable",
+        "drive: called again until done",
+        "close goes on through its later steps and returns it after the last",
+    ),
 ];
 
 #[cfg(not(any(shuttle, atoll_loom)))]

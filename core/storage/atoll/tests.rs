@@ -539,6 +539,68 @@ fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Opti
     Some(())
 }
 
+/// A record appended and not waited for, the log's end after it.
+fn appended_undurable(io: &Arc<dyn IO>, log: &Arc<Log>) -> Lsn {
+    use super::log::{framed_len, Header, Kind};
+    let payload = [7u8; 300];
+    let mut admitted = drive(io, || log.admit(framed_len(payload.len()))).unwrap();
+    let header = Header {
+        kind: Kind::new(1).unwrap(),
+        flags: 0,
+        txn: 0,
+        prev: None,
+    };
+    log.append(&mut admitted, &header, &[&payload]);
+    log.end()
+}
+
+/// A database closed makes its log durable to the end it had when close began, then closes its
+/// jobs (DESIGN.md 22.12 step 1; mutant: no durable end waited for).
+#[test]
+fn a_database_closed_makes_its_log_durable_to_the_end_it_had() {
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = try_open(io.clone(), 1).unwrap();
+    let log = db.log().clone();
+    let end = appended_undurable(&io, &log);
+    let before = log.durable();
+    let closed = db.close();
+    let after = log.durable();
+    drop(log);
+    assert!(closed.is_ok(), "{closed:?}");
+    assert!(
+        before < end,
+        "the record was durable before close: {before} of {end}"
+    );
+    assert!(
+        after >= end,
+        "close left the log durable to {after} of {end}"
+    );
+    assert_eq!(crash.in_flight(), 0, "a request outlived the close");
+}
+
+/// A log that cannot be made durable at close is returned by an explicit close, after every
+/// later step: the checkpoint's task closed and every request retired (DESIGN.md 22.12; mutant:
+/// the failure dropped).
+#[test]
+fn a_close_whose_log_fails_returns_the_failure_after_closing() {
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = try_open(io.clone(), 1).unwrap();
+    let log = db.log().clone();
+    appended_undurable(&io, &log);
+    crash.set_faults(Faults {
+        write: 1.0,
+        ..Faults::default()
+    });
+    let closed = db.close();
+    crash.set_faults(Faults::default());
+    let in_flight = crash.in_flight();
+    drop(log);
+    assert!(closed.is_err(), "a close whose log failed reported success");
+    assert_eq!(in_flight, 0, "a request outlived the close");
+}
+
 /// A database dropped with its IO in flight retires every request on its files before the drop
 /// returns (DESIGN.md 22.12, step 4), and leaves nothing holding the IO: a completion that held
 /// its owner, or a file it syncs, strongly would keep the IO and all it holds alive for good.

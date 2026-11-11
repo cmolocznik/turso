@@ -4422,6 +4422,12 @@ does with an error. `CrashIO` records every synchronous file call made from insi
 step delivers, and none is made over eight segments, fresh and spares. Loom models the word's
 handshake with a waiter and the look after a put-back.)
 
+(Replaced, step 8: the preparer task of 22.9 item 2 runs every step of the preparation, and the
+adapter, the callers' word handshake (*owed*, *in flight*, the taken states) and the zero fill's
+callback chain are gone. The word keeps two bits, *needed* and *preparing*, read by the preparer
+and by waits on durability (`log/preparation.rs`); the wake that puts waits back looks again at
+the failure and at the position, finishing in place the waits a raise during its hold reached.)
+
 **Retirement is not finishing.** A request is retired when its backend lets go of it and of every
 buffer it reads into or writes from, after its callback has returned. A request owns those buffers
 until then, through references the backend holds; a completion finished early (a cancel aborts the
@@ -4674,15 +4680,11 @@ modules (an arena page below a version, a value's directory page), and assert at
 ends. The intent's durability and the log's end take a flush turn per unit
 (`Log::wait_durable_turn`): a request made during the checkpoint's turn is owed, and its next unit
 takes the owed turn before anything else (`Solo::asked`), so no request goes unanswered; an
-abandoned checkpoint takes the turns it owes. One exception is stated until the segment preparer
-is a task (step 8): a log call a unit makes, an admission or a wait for durability, may run the
-log's segment preparation, the interim adapter any caller runs, within the unit's budget of one
-start and one finish, whoever's segments they are: a start is a file created and allocated, on an
-inline backend its whole zero-fill and data sync, or a spare renamed and its directory synced; a
-finish is the directory sync that publishes the segment. The budget is kept in every build: past
-it the preparation's word offers the unit no start and no finish (`Word::take`), and a step left
-needed or owed for the budget wakes every waiter, the unit's own included, so the next caller runs
-it (`Log::prepare`). An image write's place in the flight set is freed when its request retires,
+abandoned checkpoint takes the turns it owes. A log call a unit makes, an admission or a wait for
+durability, runs no preparation of the log's: since step 8 that is the preparer's, a task of its
+own, which the unit's step waits on (`Step::WaitOn`), and the exception step 4 stated for the
+interim adapter, a unit's budget of one segment started and one finished, is gone with it. An
+image write's place in the flight set is freed when its request retires,
 no backend owning its buffer any more, its outcome recorded by its callback (a request retired
 with none told fails the checkpoint), and a unit waiting for a place waits on that retirement.
 A metadata write's end is told once every request it made has retired, the write's own and, where
@@ -4768,7 +4770,10 @@ One loop takes the next task by class and steps it (22.3). Four runners call it:
   the completion and on its external node in the idle runners (22.3), wakes its own waker if
   anything is still queued, and returns `Pending`, so its host has control back after each unit and
   polls again when one of those wakes it: the completion finishing, or a task linked while its node
-  is idle. Neither enters
+  is idle. A wait on a log's preparer from a host that waits on completions (a statement, a
+  writer claiming the checkpoint) is a named claim instead, one step a call: the caller steps the
+  preparer once and waits on what that step left, a yield with more to do now, its request, or
+  the let-go of another caller stepping it (built at 22.16 step 8). Neither enters
   the executor from inside a step or a waker. Either runs only as much as today's
   `Checkpointing::Writers` makes a writer run. The
   waiter's ticket (22.4) makes what it waits for, and what that waits for, the first claimed.
@@ -4849,6 +4854,29 @@ cores the database is given. The embedder can always set it.
    that padding waited on retried. It is due when admission comes within a segment of the prepared
    end, and relief through admitters' tickets. Its failure fails the log: every durable and
    admission waiter is told (section 7.5).
+   (Built, step 8: `log/preparer.rs`. One unit a step, each inside `unit::Unit` (no park, its work
+   counted): a spare's rename with its directory sync and publication; a fresh file's create and
+   allocation, the failure read again after each; one zero-fill write; the data sync; the finish,
+   which takes one turn of the flush, a turn asked for meanwhile owed to its next unit, which takes
+   it first. Each request's place is held until it retires, not
+   until its result is published (*Retirement is not finishing*): the step after a request is woken
+   by the request's retirement, and its callback only records a failure, which the next step reads
+   and ends the task on. Every log is opened on an executor: the database's is made before
+   recovery opens its log, the checkpoint's task spawned on it at the open's finish, ranked before
+   the preparer (`executor::rank`); a log opened alone, today a stream partition and the log's
+   tests, owns an executor with no worker, stepped only by callers of the log's own calls, which
+   hold the log, so the log is never dropped inside its preparer's step and its drop closes an
+   executor with no step running. The preparer holds its log weakly (22.3). Due, promoted once per
+   prepared end: the first admission that finds the reach within a segment of the end it read
+   raises a word to that end and triggers the preparer (`Log::trigger_short`), keyed on the
+   prepared end, which only rises, never on the reach, which falls as unused room is given back; a
+   flush meeting padding with no segment sets *needed* and, moving the word from nothing set,
+   triggers it. The preparer clears both bits as it publishes, then flushes, and that flush sets
+   *needed* anew if padding waits on the next segment: a need set while it prepared is never lost.
+   An admission the prepared segments refuse raises the end it needs (`wanted_end`, only rising)
+   and triggers the preparer, which prepares until the prepared end reaches it, however many
+   segments past that is: an admission up to the buffer's size is never stranded (the auditor's
+   P1-LOG-ADMIT1).)
 3. **Collection** (section 11.5): one maintenance task per slot.
    - **One collector per slot is the task itself.** A begin's inline step is a named claim of its
      slot's task and of the next slot's (22.7). Inline and background collection are one code path
@@ -5054,8 +5082,9 @@ ran while the executor still ran. Nothing the executor or a waker holds keeps th
    abandons, which recovery treats as a crash would. A failure (a failed log, section 7.5) ends the
    wait at once, since the log fails every durable waiter; it is kept, close goes on through every
    later step, and the failure is logged and returned to an explicit close only after step 5.
-   Until the preparers exist (22.16 step 8), close's wait is a `wait_durable` caller like any
-   other: it comes back and runs an owed preparation step itself (22.5).
+   Close's wait is a wait on the log like any caller's (`LogWait`, 22.7): with a worker it waits
+   while the worker runs the preparer, and with none the closing thread runs the preparer itself
+   whenever the wait stands on it.
 2. **Closing published**: no task is claimed or linked again, and every step in progress ends; its
    runner sees closing and leaves. A worker's steps end with it, joined; every other step (an
    embedder's, a caller's wait running the executor, a named claim) and every removal letting its
@@ -5503,7 +5532,42 @@ compose, the real `Completion`, latch and backends included where named.
    built yet: the sustained run and the profile.)
 8. **The segment preparers**, every open log, replacing the interim adapter and the callback chain
    in the same change; the callers' fresh-segment cases of proof 12 first. Step 4's exception, a
-   unit's budget of one start and one finish, goes with the adapter.
+   unit's budget of one start and one finish, goes with the adapter. (Built, step 8, for the
+   database's log and the test-only stream partitions: 22.9 item 2's paragraph. A wait on the log is
+   the caller's value across its calls (`LogWait`: a transaction's spills, a commit's admission and
+   durability, rollback's read of a part, a sequence's and a drain's publication, close and the
+   facade's drop), holding while it stands on the preparer a demand of the relief class on it, and
+   its registration for durability, given up as the wait ends or drops. Admitters share one
+   registration, all of them woken whenever room may have been made, so a wait called again, or
+   made and dropped, adds none; a wake with no admitter waiting is a fence and a load. A durability
+   registration given up stays counted on its stack until a take drops it; one word counts the
+   entries, on the stack or held by a take, and those of them given up, so a registration reads
+   both at one moment, and one made while those given up outnumber the rest takes the stack first,
+   as a raise does. Once no registration, give-up or wake is under way, the entries number at most
+   one more than twice the waits that stood at the newest registration, however many are made and
+   dropped while the log stands still; those given up after it, the last waiter's included, stay
+   until the next take, by a raise or a registration, so the entries never number more than one
+   more than twice the most waits that stood at once (the auditor's #4356 and #4360). A wake takes
+   the stack once: across a fence, a raiser that put waits back looks at the failure and at the
+   position again, finishing in place each one a raise during its hold reached, as its waiter
+   would, so neither a raise nor a registration's take chases a position that keeps rising. Made
+   inside a step or a unit (the checkpoint's intent and its durability turns,
+   stepped by its task or by a writer during recovery) a wait names the preparer instead, and the
+   step waits on it with `Step::WaitOn`, its class riding there, or the writer runs it once its
+   unit has ended. With no worker, whoever waits on the preparer runs it (22.7), one step a call,
+   as completion hosts do: it claims the preparer by name and steps it once on its own thread,
+   then waits on what that step left: a yield where the preparer has more to do now, so the host
+   calls again (a blocking caller's loop, a cooperative poll's next poll), the request the step
+   waits on, or, finding another caller mid-step, that caller's let-go, which comes after the
+   executor published the step's end, registered first and claimed once more. So every such wait
+   ends on a physical request, a let-go or the caller's next call, with no node of its own among
+   the idle runners. The named claim takes exactly the job its wait names, so the runner's
+   class and first-in-first-out order are not its rule, and a pumped backend is stepped by the
+   host between calls, never inside the claim. A writer whose claimed checkpoint step waits on the
+   preparer runs it the same way, outside that step. An admission granted runs one step of the
+   preparer only when it is queued, so its room is handed over with no executor mutex taken while
+   the preparer waits on its request. Not built yet: a stream partition's preparer on its
+   database's executor, with section 21's catalog.)
 9. **io_uring as the default**: the census of callbacks clean, its fallbacks, the report, explicit
    choices kept, and the validation and latency measurement of 22.6, run over Turso's own suites as
    well as Atoll's, since the default reaches every database; then the default.

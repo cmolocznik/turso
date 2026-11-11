@@ -2327,7 +2327,13 @@ fn a_crash_anywhere_in_sql_recovers_a_prefix_of_its_commits() {
             let label = format!("seed {seed}, after commit {j}");
             assert_eq!(recover(image, &label), states[j], "{label}");
         }
-        assert!(images.len() > 20, "seed {seed}: {} images", images.len());
+        // Every commit acknowledged completed at least one write of the log, and an image falls
+        // at every second operation completed.
+        assert!(
+            images.len() >= TRANSACTIONS as usize / 2,
+            "seed {seed}: {} images",
+            images.len()
+        );
         let mut reached = BTreeSet::new();
         for (i, image) in images.into_iter().enumerate() {
             let label = format!("seed {seed}, image {i}");

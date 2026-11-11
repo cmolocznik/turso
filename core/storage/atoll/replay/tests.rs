@@ -168,7 +168,13 @@ fn replaying_the_published_changes_rebuilds_every_tree() {
 
     // Changes published alone are durable with the log, not when made: wait for all of it.
     let log = source.atoll().log().clone();
-    drive(&io, || log.wait_durable(log.end())).unwrap();
+    drive(&io, || {
+        log.wait_durable(
+            &mut crate::storage::atoll::log::LogWait::default(),
+            log.end(),
+        )
+    })
+    .unwrap();
     let mut reader = Log::reader(io.clone(), path, &keeping_the_log().log, 0);
     let mut gather = Gather::new(0);
     let mut rereader = Log::rereader(io.clone(), path, &keeping_the_log().log);
@@ -565,7 +571,13 @@ fn a_commit_at_or_below_the_snapshot_whose_parts_precede_the_redo_start_is_skipp
     let redo = log.end();
     let mut op = Commit::new(t);
     let ts = drive(&io, || txns.commit(&mut op)).unwrap().unwrap();
-    drive(&io, || log.wait_durable(log.end())).unwrap();
+    drive(&io, || {
+        log.wait_durable(
+            &mut crate::storage::atoll::log::LogWait::default(),
+            log.end(),
+        )
+    })
+    .unwrap();
     assert!(redo < log.end(), "the Commit past the redo start");
     let read = |from, snapshot| -> Result<Vec<(Option<u64>, Body)>> {
         let mut g = Gather::new(snapshot);

@@ -25,6 +25,7 @@ use super::changes::{starts, Keyed, Source};
 use super::versioned::{decode_entry, restored_reserve, Version, Versions};
 use super::{Statement, Transactions, Ts, Txn};
 use crate::storage::atoll::btree::{Mode, Outcome, Put, Remove};
+use crate::storage::atoll::log::LogWait;
 use crate::storage::atoll::page::PageId;
 use crate::types::IOResult;
 use crate::{LimboError, Result};
@@ -72,6 +73,8 @@ pub struct Rollback {
     /// The part being walked, read back from the log: where it begins, and its bytes.
     read: Option<(u64, Vec<u8>)>,
     working: Option<Working>,
+    /// Its wait on the log while a part it reads back is not yet durable (DESIGN.md 22.4).
+    log_wait: LogWait,
 }
 
 impl Rollback {
@@ -84,6 +87,7 @@ impl Rollback {
             left: Vec::new(),
             read: None,
             working: None,
+            log_wait: LogWait::default(),
         }
     }
 
@@ -245,7 +249,7 @@ fn walk_on(txns: &Transactions, txn: &Txn, op: &mut Rollback) -> Result<IOResult
                 op.read = None;
             }
             Source::Spilled(part) => {
-                done!(txns.log.wait_durable(part.lsn));
+                done!(txns.log.wait_durable(&mut op.log_wait, part.lsn));
                 let record = txns.log.read_record(part.at)?;
                 let payload = &record.payload;
                 let word = |at: usize| {

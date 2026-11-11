@@ -102,6 +102,15 @@ impl Cx<'_> {
     }
 }
 
+/// Each job's place in the order jobs wait on each other (22.4): rollback, then collection, then
+/// the checkpoint, then its image slots, then the preparers. A job's logical wait names only a
+/// job after it (`Step::WaitOn`); rollback, collection and the image slots take their places when
+/// they become tasks.
+pub(crate) mod rank {
+    pub(crate) const CHECKPOINT: u8 = 2;
+    pub(crate) const PREPARER: u8 = 4;
+}
+
 /// A task's class, in the order runners take them (22.4): strictly by class, first in first out
 /// within one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,6 +382,13 @@ impl Drop for Inside {
     }
 }
 
+/// Whether this thread is inside a step or a waker an executor invoked: a wait made there is the
+/// step's own, which the step hands its executor (`Step::Wait`, `Step::WaitOn`), never a runner
+/// of its own (22.7).
+pub(crate) fn inside() -> bool {
+    Inside::here()
+}
+
 /// A caller enters the executor only from outside every step and every waker the executor
 /// invokes (22.7): a runner entered from one would run a step inside another. Workers enter
 /// through their own loop, never through here.
@@ -630,6 +646,9 @@ struct Shared {
     /// Every task's job, until the task is done or closed.
     jobs: Mutex<Vec<Arc<Job>>>,
     io: Arc<dyn IO>,
+    /// Whether workers of the executor's own run its tasks: with none, whoever waits on its work
+    /// runs it (22.7).
+    driven: bool,
 }
 
 impl Shared {
@@ -1228,6 +1247,17 @@ impl TaskRef {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// Whether it is queued: work it has to do, waiting for a runner. One load of its state.
+    pub(crate) fn queued(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) == QUEUED
+    }
+
+    /// Whether workers of its executor's own step it: with none, whoever waits on its work runs
+    /// the executor (22.7). False once the executor is gone.
+    pub(crate) fn driven(&self) -> bool {
+        self.0.shared.upgrade().is_some_and(|shared| shared.driven)
+    }
+
     /// Wakes the task, as a completion it waits on would.
     pub(crate) fn wake(&self) {
         wake(&self.0);
@@ -1312,6 +1342,7 @@ impl Executor {
             closed: AtomicBool::new(false),
             jobs: Mutex::new(Vec::new()),
             io,
+            driven: workers > 0,
         });
         let mut executor = Self {
             shared,
@@ -1513,7 +1544,7 @@ impl Executor {
                 }
             }
             for job in lock(&self.shared.jobs).iter() {
-                job.header.state.store(CLOSED, Ordering::Release);
+                close_unless_done(&job.header);
             }
             let mut moved = 0;
             while !queue.idle.is_empty() {
@@ -1568,6 +1599,22 @@ impl Executor {
             requests.drain(&*self.shared.io);
         }
         drop(jobs);
+    }
+}
+
+/// Closes a task its executor's close finds in its table, unless the task's step's end set it done
+/// first: a worker's end sets the word done and lets the job go after, so a task close meets
+/// between the two has ended, and stays done.
+fn close_unless_done(header: &Header) {
+    let mut state = header.state.load(Ordering::Acquire);
+    while state != DONE && state != CLOSED {
+        match header
+            .state
+            .compare_exchange(state, CLOSED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return,
+            Err(now) => state = now,
+        }
     }
 }
 

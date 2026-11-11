@@ -14,6 +14,7 @@
 use super::catalog::{key, Entry, Layout, System};
 use super::AtollDb;
 use crate::storage::atoll::btree::{Cursor, Mode, Outcome, Put, Remove, Seek, StoredValue, Tree};
+use crate::storage::atoll::log::LogWait;
 use crate::storage::atoll::txn::changes::Changes;
 use crate::storage::atoll::txn::versioned::{Get, Write, WriteOp};
 use crate::storage::atoll::txn::{Isolation, Ts, Txn};
@@ -75,6 +76,8 @@ pub struct Create {
     put: Option<Put>,
     /// The value row put, published as a change of its own.
     publishing: Option<Changes>,
+    /// Its wait on the log for the publication's room.
+    log_wait: LogWait,
 }
 
 impl Create {
@@ -85,6 +88,7 @@ impl Create {
             row: None,
             put: None,
             publishing: None,
+            log_wait: LogWait::default(),
         }
     }
 }
@@ -96,6 +100,8 @@ pub struct Change {
     put: Option<(Put, Value)>,
     /// The value put, and its publication as a change of its own.
     publishing: Option<(Changes, Value)>,
+    /// Its wait on the log for the publication's room.
+    log_wait: LogWait,
 }
 
 impl Change {
@@ -105,6 +111,7 @@ impl Change {
             key,
             put: None,
             publishing: None,
+            log_wait: LogWait::default(),
         }
     }
 }
@@ -160,7 +167,10 @@ impl AtollDb {
                 }
             }
         }
-        done!(txns.publish_alone(op.publishing.as_ref().expect("a value row put")));
+        done!(txns.publish_alone(
+            &mut op.log_wait,
+            op.publishing.as_ref().expect("a value row put")
+        ));
         Ok(IOResult::Done(Write::Done(Outcome::Inserted)))
     }
 
@@ -176,7 +186,10 @@ impl AtollDb {
         let tree = self.sequences();
         loop {
             if let Some((changes, new)) = &op.publishing {
-                done!(self.atoll.transactions().publish_alone(changes));
+                done!(self
+                    .atoll
+                    .transactions()
+                    .publish_alone(&mut op.log_wait, changes));
                 let new = *new;
                 op.publishing = None;
                 return Ok(IOResult::Done(new));

@@ -40,7 +40,7 @@ use super::control::{Control, Superblock, MAX_CONTINUATIONS};
 use super::epoch::Notify;
 use super::executor::{self, Class, Cx, Signal, Step, Task, TaskRef, Watched};
 use super::guarded::{Contender, Guarded, Hold};
-use super::log::{framed_len, Admitted, Header, Kind, Log, Lsn};
+use super::log::{framed_len, Admitted, Header, Kind, Log, LogWait, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
 use super::stack::Chain;
@@ -360,8 +360,10 @@ impl Task for CheckpointTask {
         crate::race::point("checkpoint.let_go");
         let step = match &out {
             Ok(Unit::Again) => Step::Again,
-            Ok(Unit::Wait(c)) if c.finished() => Step::Again,
+            Ok(Unit::Wait(c) | Unit::WaitOn(_, c)) if c.finished() => Step::Again,
             Ok(Unit::Wait(c)) => Step::Wait(c.clone()),
+            // The task's class rides on the preparer while it waits (DESIGN.md 22.4).
+            Ok(Unit::WaitOn(preparer, c)) => Step::WaitOn(preparer.clone(), c.clone()),
             // A checkpoint ended, or none was due: the task looks itself before it rests, so a
             // database due when the task was made, or due again as a checkpoint ends, or a full
             // checkpoint asked for meanwhile, needs no further wake (DESIGN.md 22.9, Due).
@@ -567,6 +569,9 @@ struct Run {
     mapped_roots: Vec<PageId>,
     intent: Option<Admitted>,
     intent_end: Option<Lsn>,
+    /// Its waits on the log, across its units: its intent record's admission, then the record's
+    /// durability.
+    log_wait: LogWait,
     /// A turn of the log's flush asked for during this checkpoint's last one, which it answers
     /// first in its next unit.
     turn_owed: bool,
@@ -770,6 +775,9 @@ impl Checkpointer {
             match self.stepping(state, txns, until)? {
                 Unit::Again => {}
                 Unit::Wait(c) => return Ok(IOResult::IO(IOCompletions(c))),
+                // A writer stepping the state is in no step, but its unit was: the unit named the
+                // preparer, which the writer runs now the unit has ended, where no worker does.
+                Unit::WaitOn(_, c) => return Ok(IOResult::IO(IOCompletions(self.run_awaited(c)))),
                 Unit::Done => return Ok(IOResult::Done(())),
             }
         }
@@ -937,6 +945,17 @@ impl Checkpointer {
         claimed
     }
 
+    /// What a writer whose claimed step waits on the log's preparer waits on: with no worker,
+    /// the writer runs the preparer itself, as whoever waits on executor work does (DESIGN.md
+    /// 22.7, 22.15 proof 12), and waits on what that run leaves it, the preparer's request or
+    /// another caller's let-go of it; or, the preparer resting, on `c`, the step's own wait.
+    fn run_awaited(&self, c: Completion) -> Completion {
+        if self.log.preparer_driven() {
+            return c;
+        }
+        self.log.run_preparer().unwrap_or(c)
+    }
+
     /// Wakes the writers waiting on the state's let-go to step the checkpoint themselves: those
     /// refused room, those the gate refused while a cut is under way, and those waiting for a
     /// full checkpoint.
@@ -1065,6 +1084,9 @@ impl Checkpointer {
                 Claimed::Stepped(Ok(Unit::Wait(c))) => {
                     Relieved::Stepped(Ok(IOResult::IO(IOCompletions(c))))
                 }
+                Claimed::Stepped(Ok(Unit::WaitOn(_, c))) => {
+                    Relieved::Stepped(Ok(IOResult::IO(IOCompletions(self.run_awaited(c)))))
+                }
                 Claimed::Stepped(Ok(Unit::Done)) => Relieved::Stepped(Ok(IOResult::Done(()))),
                 Claimed::Stepped(Err(e)) => {
                     tracing::warn!("a checkpoint a writer stepped for room failed: {e}");
@@ -1112,6 +1134,9 @@ impl Checkpointer {
                     Claimed::Stepped(Ok(Unit::Again)) => {}
                     Claimed::Stepped(Ok(Unit::Wait(c))) => {
                         return Ok(IOResult::IO(IOCompletions(c)))
+                    }
+                    Claimed::Stepped(Ok(Unit::WaitOn(_, c))) => {
+                        return Ok(IOResult::IO(IOCompletions(self.run_awaited(c))))
                     }
                     Claimed::Stepped(Ok(Unit::Done)) => return Ok(IOResult::Done(())),
                     Claimed::Stepped(Err(e)) => return Err(e),
@@ -1328,6 +1353,9 @@ impl Checkpointer {
             return match self.claim(task) {
                 Claimed::Stepped(Err(e)) => Err(e),
                 Claimed::Stepped(Ok(Unit::Wait(c))) => Ok(IOResult::IO(IOCompletions(c))),
+                Claimed::Stepped(Ok(Unit::WaitOn(_, c))) => {
+                    Ok(IOResult::IO(IOCompletions(self.run_awaited(c))))
+                }
                 Claimed::Stepped(Ok(Unit::Again | Unit::Done)) if done(self) => {
                     Ok(IOResult::Done(()))
                 }
@@ -1398,7 +1426,7 @@ impl Checkpointer {
     pub(crate) fn one_unit(&self, txns: &Transactions) -> Result<Option<Completion>> {
         let mut state = self.try_hold().expect("the state free");
         Ok(match self.stepping(&mut state, txns, Until::Done)? {
-            Unit::Wait(c) => Some(c),
+            Unit::Wait(c) | Unit::WaitOn(_, c) => Some(c),
             Unit::Again | Unit::Done => None,
         })
     }
@@ -1450,6 +1478,9 @@ enum Unit {
     /// The next unit waits on this: a request in flight, a place in the flight set, or what a
     /// step it depends on waits for.
     Wait(Completion),
+    /// The next unit waits on this, which another job's work brings: the log's preparer, whose
+    /// work its intent record's admission or durability waits on (DESIGN.md 22.4).
+    WaitOn(TaskRef, Completion),
 }
 
 /// The value of a step that is done, or the unit's wait on what it handed back.
@@ -1552,6 +1583,7 @@ impl Run {
             mapped_roots: Vec::new(),
             intent: None,
             intent_end: None,
+            log_wait: LogWait::default(),
             turn_owed: false,
             frames: Vec::new(),
             writing: Vec::new(),
@@ -1743,7 +1775,15 @@ impl Run {
                     }
                     let admitted = match &mut self.intent {
                         Some(a) => a,
-                        None => self.intent.insert(unit!(cp.log.admit(len))),
+                        None => match cp.log.admit(&mut self.log_wait, len)? {
+                            IOResult::Done(a) => self.intent.insert(a),
+                            IOResult::IO(IOCompletions(c)) => {
+                                return Ok(self
+                                    .log_wait
+                                    .on()
+                                    .map_or(Unit::Wait(c.clone()), |p| Unit::WaitOn(p, c)))
+                            }
+                        },
                     };
                     let header = Header {
                         kind: META_INTENT,
@@ -1915,14 +1955,18 @@ impl Run {
     /// One turn of the log's flush toward everything before `lsn` being durable: `None` once it
     /// is; else the unit's outcome, a turn owed answered first ([`Log::wait_durable_turn`]).
     fn durable_turn(&mut self, cp: &Checkpointer, lsn: Lsn) -> Result<Option<Unit>> {
-        let (r, owed) = cp.log.wait_durable_turn(lsn)?;
+        let (r, owed) = cp.log.wait_durable_turn(&mut self.log_wait, lsn)?;
         self.turn_owed = owed;
+        let on = self.log_wait.on();
         Ok(match r {
             IOResult::Done(()) => None,
             // The owed turn first: waiting with it unanswered would leave its request waiting on
             // this checkpoint's own write.
             IOResult::IO(_) if owed => Some(Unit::Again),
-            IOResult::IO(IOCompletions(c)) => Some(Unit::Wait(c)),
+            IOResult::IO(IOCompletions(c)) => Some(match on {
+                Some(preparer) => Unit::WaitOn(preparer, c),
+                None => Unit::Wait(c),
+            }),
         })
     }
 

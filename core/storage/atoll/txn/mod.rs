@@ -32,7 +32,7 @@ use self::sync::{fence, AtomicU64, Ordering};
 use super::btree::Tree;
 use super::buffer::cell::{CompletionCell, CompletionDomain};
 use super::epoch::Epochs;
-use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, Lsn, BLOCK};
+use super::log::{framed_len, Admitted, GroupStart, Header, Kind, Log, LogWait, Lsn, BLOCK};
 use super::page::{PageId, SizeClass};
 use super::segmented::Segmented;
 use super::stack::Stack;
@@ -367,6 +367,8 @@ pub struct Txn {
     /// Whether it has taken its snapshot: an exclusive taker begun without one takes it after the
     /// drain.
     snapped: bool,
+    /// Its waits on the log across its spills (DESIGN.md 22.4).
+    log_wait: LogWait,
     /// Whether its database requires writers to hold the write gate
     /// ([`Transactions::require_gate`]): then it changes anything only under a hold.
     gated: bool,
@@ -497,6 +499,8 @@ impl Abort {
 pub struct Commit {
     txn: Option<Txn>,
     admitted: Option<Admitted>,
+    /// Its waits on the log across its steps: the commit record's admission, then durability.
+    log_wait: LogWait,
     ts: Option<Ts>,
     durable: Lsn,
     abandoned: Vec<PageId>,
@@ -508,6 +512,7 @@ impl Commit {
         Self {
             txn: Some(txn),
             admitted: None,
+            log_wait: LogWait::default(),
             ts: None,
             durable: 0,
             abandoned: Vec::new(),
@@ -614,7 +619,7 @@ impl Transactions {
         while let Some(len) = txn.changes.sealed_len() {
             // Its record in whole blocks, and the rest of the block before it.
             let room = framed_len(16 + len).next_multiple_of(BLOCK) + BLOCK;
-            let mut admitted = match self.log.admit(room)? {
+            let mut admitted = match self.log.admit(&mut txn.log_wait, room)? {
                 IOResult::Done(a) => a,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -755,6 +760,7 @@ impl Transactions {
             hold: Hold::None,
             wrote_schema: false,
             snapped: false,
+            log_wait: LogWait::default(),
             gated: self.gated.load(std::sync::atomic::Ordering::Acquire),
             replaced: None,
             // SAFETY: the slot was just taken.
@@ -918,9 +924,13 @@ impl Transactions {
 
     /// Publishes `changes`, made outside any transaction, in one [`RUN`] record (audit 17). Done
     /// once it is appended; durable with the log. Step it until done.
-    pub fn publish_alone(&self, changes: &changes::Changes) -> Result<IOResult<()>> {
+    pub fn publish_alone(
+        &self,
+        wait: &mut LogWait,
+        changes: &changes::Changes,
+    ) -> Result<IOResult<()>> {
         let bytes = changes.bytes();
-        let mut admitted = match self.log.admit(framed_len(bytes.len()))? {
+        let mut admitted = match self.log.admit(wait, framed_len(bytes.len()))? {
             IOResult::Done(a) => a,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
@@ -1119,10 +1129,15 @@ impl Transactions {
                 }
                 if op.admitted.is_none() {
                     let (_, tail) = txn.changes.tail();
-                    op.admitted = Some(match self.log.admit(framed_len(16 + tail.len()))? {
-                        IOResult::Done(a) => a,
-                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                    });
+                    op.admitted = Some(
+                        match self
+                            .log
+                            .admit(&mut op.log_wait, framed_len(16 + tail.len()))?
+                        {
+                            IOResult::Done(a) => a,
+                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        },
+                    );
                 }
             }
             let mut txn = op.txn.take().expect("a transaction");
@@ -1167,7 +1182,7 @@ impl Transactions {
                 return Ok(IOResult::IO(IOCompletions(wait)));
             }
         }
-        Ok(match self.log.wait_durable(op.durable)? {
+        Ok(match self.log.wait_durable(&mut op.log_wait, op.durable)? {
             IOResult::Done(()) => IOResult::Done(op.ts),
             IOResult::IO(io) => IOResult::IO(io),
         })

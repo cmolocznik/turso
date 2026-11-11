@@ -8,37 +8,95 @@
 //! prepared segments, before the end moves: a grant and a padding racing are then two exchanges of
 //! the reach, and whichever comes second sees the first.
 
-use self::sync::{fence, AtomicU64, Ordering};
-use crate::storage::atoll::stack::Stack;
+use self::sync::{fence, lock, AtomicBool, AtomicU64, Mutex, Ordering};
+use crate::io::Completion;
+use crate::CompletionError;
 use crossbeam_utils::CachePadded;
 
 #[cfg(not(atoll_loom))]
 mod sync {
-    pub(super) use crate::sync::atomic::{fence, AtomicU64, Ordering};
+    pub(super) use crate::storage::atoll::locks::{Mutex, MutexGuard};
+    pub(super) use crate::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+
+    pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock()
+    }
 }
 
 #[cfg(atoll_loom)]
 mod sync {
-    pub(super) use loom::sync::atomic::{fence, AtomicU64, Ordering};
-}
+    pub(super) use loom::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+    pub(super) use loom::sync::{Mutex, MutexGuard};
 
-/// Puts `wait` on `waiting` and passes a fence, before the caller looks at the room again: paired
-/// with [`wake`]'s, either that look finds the room a waker made, or the waker finds the wait.
-pub(super) fn wait_on<T>(waiting: &Stack<T>, wait: T) {
-    waiting.push(wait);
-    fence(Ordering::SeqCst);
-}
-
-/// Wakes everyone on `waiting`, after the caller made room: a fence, paired with [`wait_on`]'s,
-/// then the stack read, and taken only if anyone is on it, since every operation's room left over
-/// comes back through here and a take from an empty stack still writes its line.
-pub(super) fn wake<T>(waiting: &Stack<T>, mut woken: impl FnMut(T)) {
-    fence(Ordering::SeqCst);
-    if waiting.is_empty() {
-        return;
+    pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap()
     }
-    for w in waiting.take_all() {
-        woken(w);
+}
+
+/// Those waiting to be admitted, sharing one registration (the auditor's #4356): every admitter is
+/// woken to try again whenever room may have been made, so they wait on one completion, and a
+/// wait called again, or made and dropped, adds nothing. An admitter registers and then, across a
+/// fence, looks at the room again; whoever makes room makes it and then, across one, reads whether
+/// anyone waits, taking the wait only if so: either the look finds the room, or the waker finds the
+/// wait. A wake no one waits for is a fence and a load.
+pub(super) struct Admitters<W = Completion> {
+    wait: Mutex<Option<W>>,
+    waited: AtomicBool,
+}
+
+impl<W> Default for Admitters<W> {
+    fn default() -> Self {
+        Self {
+            wait: Mutex::new(None),
+            waited: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<W: Clone> Admitters<W> {
+    /// The wait the next wake takes, `make`'s if none is registered, registered: look at the room
+    /// again after it.
+    fn register(&self, make: impl FnOnce() -> W) -> W {
+        let w = lock(&self.wait).get_or_insert_with(make).clone();
+        self.waited.store(true, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        w
+    }
+
+    /// Whether anyone waits to be admitted: a flush then pads what it holds for them.
+    pub(super) fn waiting(&self) -> bool {
+        self.waited.load(Ordering::SeqCst)
+    }
+
+    /// The shared wait, taken if anyone waits, after the caller made room: a fence, then the flag
+    /// read and cleared.
+    fn taken(&self) -> Option<W> {
+        fence(Ordering::SeqCst);
+        if !self.waited.load(Ordering::Relaxed) || !self.waited.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        lock(&self.wait).take()
+    }
+}
+
+impl Admitters {
+    /// The wait the next wake finishes, registered: look at the room again after it.
+    pub(super) fn wait(&self) -> Completion {
+        self.register(crate::storage::atoll::notify::wait)
+    }
+
+    /// Wakes everyone waiting, to try again, after the caller made room.
+    pub(super) fn wake(&self) {
+        if let Some(c) = self.taken() {
+            c.complete(0);
+        }
+    }
+
+    /// Fails everyone waiting with `e`, once the failure is visible to admitters looking again.
+    pub(super) fn fail(&self, e: CompletionError) {
+        if let Some(c) = self.taken() {
+            c.error(e);
+        }
     }
 }
 
@@ -140,6 +198,13 @@ impl Room {
         }
     }
 
+    /// Where the prepared segments must end for `bytes` to fit after what is granted, if they end
+    /// short of it now.
+    pub(super) fn unprepared_for(&self, bytes: u64) -> Option<u64> {
+        let wanted = self.reach() + bytes;
+        (wanted > self.prepared_end()).then_some(wanted)
+    }
+
     /// Gives back bytes granted and not appended.
     pub(super) fn give_back(&self, bytes: u64) {
         self.ends.reach.fetch_sub(bytes, Ordering::SeqCst);
@@ -235,20 +300,18 @@ mod loom_tests {
             // A buffer of 64 bytes, which the giver's admission holds whole.
             let room = Arc::new(Room::new(0, u64::MAX, 64));
             assert!(room.grant(64, true));
-            let waiting = Arc::new(Stack::<Arc<AtomicBool>>::default());
+            let waiting = Arc::new(Admitters::<Arc<AtomicBool>>::default());
             let giver = {
                 let (room, waiting) = (room.clone(), waiting.clone());
                 thread::spawn(move || {
                     room.give_back(64);
-                    wake(&waiting, |w| w.store(true, Ordering::Release));
+                    if let Some(w) = waiting.taken() {
+                        w.store(true, Ordering::Release);
+                    }
                 })
             };
             let first = room.grant(64, true);
-            let wait = (!first).then(|| {
-                let woken = Arc::new(AtomicBool::new(false));
-                wait_on(&waiting, woken.clone());
-                woken
-            });
+            let wait = (!first).then(|| waiting.register(|| Arc::new(AtomicBool::new(false))));
             let admitted = first || room.grant(64, true);
             giver.join().unwrap();
             if !admitted {

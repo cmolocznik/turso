@@ -401,21 +401,6 @@ mod tests {
             "child",
         ),
         (
-            "log/tests.rs",
-            "a_unit_starts_one_segment_however_far_another_admission_takes_the_reach",
-            "child",
-        ),
-        (
-            "log/tests.rs",
-            "a_start_a_unit_may_not_run_wakes_its_waiters",
-            "child",
-        ),
-        (
-            "log/tests.rs",
-            "a_unit_finishes_one_segment_however_many_others_start_meanwhile",
-            "child",
-        ),
-        (
             "sql/mode/tests.rs",
             "a_checkpoint_unit_visits_at_most_one_page",
             "child",

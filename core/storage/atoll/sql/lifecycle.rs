@@ -16,6 +16,7 @@
 use super::catalog::{Catalog, Entry, System};
 use super::AtollDb;
 use crate::storage::atoll::btree::{Cursor, Drain, Drained, Mode, Outcome, Seek, Tree};
+use crate::storage::atoll::log::LogWait;
 use crate::storage::atoll::page::{PageId, SizeClass};
 use crate::storage::atoll::txn::changes::Changes;
 use crate::storage::atoll::txn::versioned::{Get, Write, WriteOp};
@@ -165,9 +166,14 @@ impl AtollDb {
                 let Some(root) = self.draining.lock().pop() else {
                     return Ok(IOResult::Done(()));
                 };
-                *current = Some((root, Drain::new(&root.raw().to_be_bytes()), false));
+                *current = Some((
+                    root,
+                    Drain::new(&root.raw().to_be_bytes()),
+                    false,
+                    LogWait::default(),
+                ));
             }
-            let (root, op, gone) = current.as_mut().expect("a tree being drained");
+            let (root, op, gone, log_wait) = current.as_mut().expect("a tree being drained");
             let root = *root;
             if !*gone {
                 if done!(self.open_plain(root).drain(&list, op)) == Drained::More {
@@ -179,7 +185,7 @@ impl AtollDb {
             // (audit 17).
             let mut drained = Changes::new();
             drained.drained(root, System::Abandoned.root());
-            done!(self.atoll.transactions().publish_alone(&drained));
+            done!(self.atoll.transactions().publish_alone(log_wait, &drained));
             *current = None;
             self.rowids.forget(root);
             self.stamps.forget(root);
@@ -209,8 +215,9 @@ impl AtollDb {
                 while super::drive(&self.io, || tree.drain(&list, &mut op))? == Drained::More {}
                 let mut drained = Changes::new();
                 drained.drained(root, system.root());
+                let mut wait = LogWait::default();
                 super::drive(&self.io, || {
-                    self.atoll.transactions().publish_alone(&drained)
+                    self.atoll.transactions().publish_alone(&mut wait, &drained)
                 })?;
                 self.rowids.forget(root);
             }

@@ -1161,7 +1161,11 @@ fn a_checkpoint_once_due_stays_due_until_the_next_begins() {
         txn: 0,
         prev: None,
     };
-    let mut admitted = drive(&io, || db.log().admit(256)).unwrap();
+    let mut admitted = drive(&io, || {
+        db.log()
+            .admit(&mut crate::storage::atoll::log::LogWait::default(), 256)
+    })
+    .unwrap();
     db.log().append_own(&mut admitted, &header, &[&[0u8; 64]]);
     drop(admitted);
     let own_appended = cp.is_due();

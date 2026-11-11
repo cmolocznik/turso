@@ -36,14 +36,15 @@
 //! the log to be durable wait on take-all stacks ([`waits`]), looking again once they are on them,
 //! so a waker either finds them or they see what it did.
 //!
-//! **Preparing a segment** (DESIGN.md 22.5) is owned through a word of its own ([`preparation`]).
-//! Its synchronous steps (a create, an allocation, a rename, a directory sync) run only in a caller
-//! of [`Log::admit`] or [`Log::wait_durable`], never in a callback: a callback only submits and
-//! records, moving the word to *needed* where a flush meets padding waiting for a segment and to
-//! *owed* where the segment's data sync lands, and each such move wakes every waiter to call again.
-//! So a completion either call returns means only: call again. Room is reported only by `admit`
-//! returning it, durability only by `wait_durable` returning `Done`, and the log's failure only by
-//! either returning it.
+//! **Preparing a segment** (DESIGN.md 22.9 item 2) is the work of the log's preparer, one executor
+//! task per open log ([`preparer`]), the only producer of every step of it; a word of its own says
+//! whether a flush's padding waits for a segment ([`preparation`]). Callbacks only record: a
+//! flush meeting such padding sets the word and triggers the preparer, which is due too once
+//! admission comes within a segment of the prepared end. A wait on the preparer is the waiter's
+//! value ([`LogWait`]): a demand of the relief class on it while it stands, and, where no worker
+//! steps it, the waiter's own run of it (DESIGN.md 22.7). So a completion either call returns
+//! means only: call again. Room is reported only by `admit` returning it, durability only by
+//! `wait_durable` returning `Done`, and the log's failure only by either returning it.
 //!
 //! **Segments.** The log is cut into segment files ([`segment`]). A segment is written full of
 //! zeros and synced, with its directory, before any record goes into it, so a later write changes
@@ -54,12 +55,14 @@
 //! log refuses every append after it and fails everyone waiting.
 
 mod preparation;
+mod preparer;
 mod reader;
 mod record;
 mod room;
 mod segment;
 mod waits;
 
+pub use preparer::LogWait;
 pub use reader::{LogReader, OwnedRecord, Rereader};
 pub use record::{framed_len, GroupStart, Header, Kind, Lsn, Place, BLOCK, MAX_PAYLOAD};
 
@@ -69,15 +72,16 @@ use super::once::SetOnce;
 use super::page::SizeClass;
 use super::prefix::Prefix;
 use super::solo::{Claim, Solo};
-use super::stack::Stack;
 use super::{whole, whole_write};
 use crate::io::{Completion, CompletionGroup, IO};
-use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::storage::atoll::executor::{self, rank, Class, Executor, Signal, TaskRef};
+use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
 use crossbeam_utils::CachePadded;
-use preparation::{Step, Word};
+use preparation::Word;
+use preparer::{PreparerTask, Told};
 use room::{Pad, Room};
 use segment::Segments;
 use waits::{Look, Waits};
@@ -93,14 +97,6 @@ crate::thread::thread_local! {
     /// Set by a test: the next turn taken on this thread asks for another while it runs, as
     /// another thread's flush would.
     pub(crate) static ASK_DURING_TURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set by a test: run once by the next segment start on this thread, before its file is made,
-    /// as another thread's admission would run meanwhile.
-    pub(crate) static DURING_START: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
-    /// Set by a test: run once after the next segment finish a caller takes on this thread, as
-    /// another thread's preparation step would run meanwhile.
-    pub(crate) static AFTER_FINISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 /// The chunks of the ring of `config`: room for the admitted bytes, a padded block per write in
@@ -197,13 +193,34 @@ pub struct Log {
     flushes: CachePadded<Solo>,
     /// The sync in flight, without durable writes.
     sync: CachePadded<Claim>,
-    /// Where the preparation of the next segment stands, and who owns it.
+    /// Whether a flush's padding waits for a segment, and whether the preparer prepares one.
     preparation: CachePadded<Word>,
+    /// The log's preparer (DESIGN.md 22.9 item 2), named once the log is made, on the executor it
+    /// was opened on.
+    preparer: std::sync::OnceLock<TaskRef>,
+    /// The preparer's trigger.
+    due: Arc<Signal>,
+    /// The prepared end the preparer was last made due for by an admission coming within a
+    /// segment of it: each prepared end is promoted once, the admissions after the first reading
+    /// this word alone (DESIGN.md 22.9 item 2).
+    triggered_for: AtomicU64,
+    /// The prepared end an admission waiting on the preparer needs, raised to the furthest: the
+    /// preparer prepares until the prepared end reaches it, however far ahead of a segment that is
+    /// (the auditor's P1-LOG-ADMIT1: an admission up to the buffer's size).
+    wanted_end: AtomicU64,
+    /// Let go by a caller once its run of the preparer has stepped it, where no worker steps it: a
+    /// caller that found it stepped by another waits on this (DESIGN.md 22.7).
+    stepped: crate::storage::atoll::notify::LetGo,
+    /// The executor of a log opened alone, which steps its preparer, with no worker: dropped with
+    /// the log, so it closes as the log goes.
+    #[cfg(test)]
+    own: Option<Executor>,
     /// Waiting for the log to be durable to a mark. Pushed onto by every commit that waits, so on a
     /// line of its own.
     durable_waits: CachePadded<Waits>,
-    /// Waiting to be admitted, woken to try again whenever room may have been made.
-    admitters: CachePadded<Stack<Completion>>,
+    /// Waiting to be admitted, woken to try again whenever room may have been made: one
+    /// registration they share.
+    admitters: CachePadded<room::Admitters>,
     failed: AtomicBool,
     failure: SetOnce<CompletionError>,
     zeros: Arc<AlignedBlock>,
@@ -234,6 +251,13 @@ impl Drop for Admitted {
 /// write starts, or, for `None`, the ring.
 type WriteSource = Option<(Arc<AlignedBlock>, usize)>;
 
+/// The executor a log is opened on: its database's, or, for a log opened alone, one of its own.
+enum Owner<'a> {
+    Shared(&'a Executor),
+    #[cfg(test)]
+    Own(Executor),
+}
+
 impl Log {
     /// Where [`open`](Self::open) resumes appending to a log that ends at `end`: the next block
     /// boundary.
@@ -249,21 +273,43 @@ impl Log {
     /// the log again. The bytes between `end` and that boundary stay unreadable, so a reader
     /// starting before `end` stops there: the caller must not acknowledge anything appended until
     /// a checkpoint whose redo point is at or past [`Log::end`] is durable.
+    ///
+    /// Opened alone, the log has an executor of its own with no worker, which steps its preparer,
+    /// its callers running it (DESIGN.md 22.7).
     #[cfg(test)]
     pub fn open(io: Arc<dyn IO>, base: &str, config: LogConfig, end: Lsn) -> Result<Arc<Self>> {
-        Self::open_with(io, base, config, end, |len| Ok(AlignedBlock::zeroed(len)))
+        let own = Executor::new(io.clone(), 0)?;
+        Self::open_with(io, base, config, end, Owner::Own(own), |len| {
+            Ok(AlignedBlock::zeroed(len))
+        })
+    }
+
+    /// [`open`](Self::open), its preparer a task of `executor`, whose workers then step it.
+    #[cfg(test)]
+    pub fn open_on(
+        io: Arc<dyn IO>,
+        base: &str,
+        config: LogConfig,
+        end: Lsn,
+        executor: &Executor,
+    ) -> Result<Arc<Self>> {
+        Self::open_with(io, base, config, end, Owner::Shared(executor), |len| {
+            Ok(AlignedBlock::zeroed(len))
+        })
     }
 
     /// [`open`](Self::open), its ring's chunks in frames `pool` lends for as long as the log is
-    /// open, so the log's memory is the pool's (one memory, Clay's ruling of 2026-11-05).
+    /// open, so the log's memory is the pool's (one memory, Clay's ruling of 2026-11-05), and its
+    /// preparer a task of the database's `executor`.
     pub fn open_in(
         io: Arc<dyn IO>,
         base: &str,
         config: LogConfig,
         end: Lsn,
         pool: &Arc<BufferPool>,
+        executor: &Executor,
     ) -> Result<Arc<Self>> {
-        Self::open_with(io, base, config, end, |len| {
+        Self::open_with(io, base, config, end, Owner::Shared(executor), |len| {
             let class = SizeClass::fitting(len).ok_or_else(|| {
                 LimboError::InternalError(format!("a log chunk of {len} bytes fits no page class"))
             })?;
@@ -279,6 +325,7 @@ impl Log {
         base: &str,
         config: LogConfig,
         end: Lsn,
+        executor: Owner<'_>,
         mut chunk: impl FnMut(usize) -> Result<AlignedBlock>,
     ) -> Result<Arc<Self>> {
         assert!(
@@ -298,6 +345,13 @@ impl Log {
         let start = Self::resumes_at(end);
         let current = segments.number(start);
         let durable_writes = Self::open_segments(&io, &segments, end, start)?;
+        #[cfg(test)]
+        let (own, shared) = match executor {
+            Owner::Shared(executor) => (None, Some(executor)),
+            Owner::Own(executor) => (Some(executor), None),
+        };
+        #[cfg(not(test))]
+        let Owner::Shared(shared) = executor;
         let slots = ring_slots(&config);
         let span = slots as u64 * config.chunk_bytes;
         let ring = (0..slots)
@@ -322,6 +376,13 @@ impl Log {
             flushes: CachePadded::default(),
             sync: CachePadded::default(),
             preparation: CachePadded::default(),
+            preparer: std::sync::OnceLock::new(),
+            due: Arc::new(Signal::default()),
+            triggered_for: AtomicU64::new(0),
+            wanted_end: AtomicU64::new(0),
+            stepped: Default::default(),
+            #[cfg(test)]
+            own,
             durable_waits: CachePadded::default(),
             admitters: CachePadded::default(),
             failed: AtomicBool::new(false),
@@ -333,6 +394,24 @@ impl Log {
             config,
         });
         log.account_resumed(start);
+        // The preparer, after the checkpoint in the order jobs wait on each other (DESIGN.md 22.4),
+        // holding the log weakly: nothing the executor holds keeps the log alive.
+        #[cfg(test)]
+        let executor = shared
+            .or(log.own.as_ref())
+            .expect("a log opened on an executor or with its own");
+        #[cfg(not(test))]
+        let executor = shared;
+        let task = executor.spawn_ranked(
+            Class::Maintenance,
+            rank::PREPARER,
+            Box::new(PreparerTask::new(Arc::downgrade(&log), log.due.clone())),
+            &[&log.due],
+        );
+        assert!(
+            log.preparer.set(task).is_ok(),
+            "a log given a second preparer"
+        );
         Ok(log)
     }
 
@@ -443,8 +522,9 @@ impl Log {
 
     /// Room to append at most `bytes` (the sum of [`framed_len`] of the records), taken before an
     /// operation's first latch. Waits while the unflushed log or the prepared segments are too
-    /// short for it.
-    pub fn admit(self: &Arc<Self>, bytes: u64) -> Result<IOResult<Admitted>> {
+    /// short for it; `wait`, the caller's across its calls, stands on the preparer while the
+    /// prepared segments are.
+    pub fn admit(self: &Arc<Self>, wait: &mut LogWait, bytes: u64) -> Result<IOResult<Admitted>> {
         if bytes > self.config.buffer_bytes {
             return Err(LimboError::InternalError(format!(
                 "an operation needs {bytes} bytes of log, more than the {} byte log buffer",
@@ -459,28 +539,62 @@ impl Log {
             left: bytes,
         };
         if self.room.grant(bytes, true) {
+            wait.end();
             return self.hand_over(admitted());
         }
-        // A call: it registers, flushes, runs a step it finds runnable, then reads again. The
-        // completion it returns means only that it should be called again. One left behind is
-        // finished by the next wake, for no one.
-        let c = crate::storage::atoll::notify::wait();
-        room::wait_on(&self.admitters, c.clone());
+        // A call: it registers, flushes, waits on the preparer if the prepared segments refuse
+        // it, then reads again. The completion it returns means only that it should be called
+        // again. One left behind is finished by the next wake, for no one.
+        let c = self.admitters.wait();
         self.flush();
-        self.steps();
+        let on = match self.room.unprepared_for(bytes) {
+            Some(wanted) => {
+                // The preparer prepares to where this admission fits, raised before its trigger.
+                self.wanted_end.fetch_max(wanted, Ordering::SeqCst);
+                self.preparer().trigger(&self.due);
+                self.wait_on_preparer(wait)
+            }
+            None => None,
+        };
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
         if self.room.grant(bytes, true) {
+            wait.end();
             return self.hand_over(admitted());
         }
-        Ok(IOResult::IO(IOCompletions(c)))
+        Ok(IOResult::IO(IOCompletions(on.unwrap_or(c))))
     }
 
-    /// Runs the steps a caller may once room is granted, then reads the log's failure again, a
-    /// step's own included: a failed log hands over no room, and what was granted goes back.
+    /// Hands granted room over, the preparer made due first if the room reaches within a segment
+    /// of the prepared end, and run by this admission while it has more to do now where no worker
+    /// steps it, as admissions ran the preparation before it was a task (DESIGN.md 22.7); then
+    /// reads the log's failure again: a failed log hands over no room, and what was granted goes
+    /// back.
     fn hand_over(self: &Arc<Self>, admitted: Admitted) -> Result<IOResult<Admitted>> {
-        self.steps();
+        // One read of the prepared end for the test and the trigger: what the trigger promotes is
+        // the end the admission found itself within a segment of.
+        let end = self.room.prepared_end();
+        if end.saturating_sub(self.room.reach()) <= self.segments.size {
+            self.trigger_short(end);
+            let preparer = self.preparer();
+            // Only with work queued: an admission's room handed over takes no executor mutex
+            // while the preparer waits on its request or rests. Never inside a step or a unit of
+            // a job's work, which runs no other's step: there the next caller outside one runs it.
+            if preparer.queued()
+                && !executor::inside()
+                && !crate::storage::atoll::unit::inside()
+                && !preparer.driven()
+            {
+                // What the run would have the caller wait on is no concern of an admission
+                // granted: the next caller runs the preparer on.
+                let _more = self.run_preparer();
+                #[cfg(test)]
+                if _more.is_some() {
+                    preparer::GRANTED_MORE.with(|n| n.set(n.get() + 1));
+                }
+            }
+        }
         if let Some(e) = self.failure() {
             drop(admitted);
             return Err(LimboError::CompletionError(e));
@@ -494,7 +608,7 @@ impl Log {
     /// finds the copy. Without it each can miss the other, and nobody flushes.
     fn flush_wanted(&self) -> bool {
         fence(Ordering::SeqCst);
-        !self.durable_waits.is_empty() || !self.admitters.is_empty()
+        !self.durable_waits.is_empty() || self.admitters.waiting()
     }
 
     /// Appends one record within `admitted`'s room and returns its LSN. The caller holds the
@@ -738,8 +852,8 @@ impl Log {
     /// Done once everything before `lsn` is durable, read from the durable position; until then,
     /// a completion that means only: call again. A call registers its wait, flushes, runs a step
     /// it finds runnable, then reads the position again.
-    pub fn wait_durable(self: &Arc<Self>, lsn: Lsn) -> Result<IOResult<()>> {
-        Ok(self.wait_durable_turns(lsn, false)?.0)
+    pub fn wait_durable(self: &Arc<Self>, wait: &mut LogWait, lsn: Lsn) -> Result<IOResult<()>> {
+        Ok(self.wait_durable_turns(wait, lsn, false)?.0)
     }
 
     /// [`wait_durable`](Self::wait_durable) for a unit of a job's work (DESIGN.md 22.1), which
@@ -747,38 +861,69 @@ impl Log {
     /// for. Also says whether a turn is owed: one was asked for during this call's turn, which the
     /// turn's holder answers ([`Solo`]); the caller answers it with
     /// [`flush_one_turn`](Self::flush_one_turn) in its next unit.
-    pub fn wait_durable_turn(self: &Arc<Self>, lsn: Lsn) -> Result<(IOResult<()>, bool)> {
-        self.wait_durable_turns(lsn, true)
+    pub fn wait_durable_turn(
+        self: &Arc<Self>,
+        wait: &mut LogWait,
+        lsn: Lsn,
+    ) -> Result<(IOResult<()>, bool)> {
+        self.wait_durable_turns(wait, lsn, true)
     }
 
-    fn wait_durable_turns(self: &Arc<Self>, lsn: Lsn, one: bool) -> Result<(IOResult<()>, bool)> {
+    fn wait_durable_turns(
+        self: &Arc<Self>,
+        wait: &mut LogWait,
+        lsn: Lsn,
+        one: bool,
+    ) -> Result<(IOResult<()>, bool)> {
         if self.durable() >= lsn {
+            wait.end();
             return Ok((IOResult::Done(()), false));
         }
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
         self.wanted.fetch_max(lsn, Ordering::SeqCst);
-        let Some(c) = self.durable_waits.wait(lsn, || self.durable()) else {
-            return Ok((IOResult::Done(()), false));
+        let c = match &wait.durability {
+            // Still standing for the same mark: registered by an earlier call of this wait.
+            Some((mark, registration)) if *mark == lsn && !registration.wait.finished() => {
+                registration.wait.clone()
+            }
+            _ => {
+                if let Some((_, registration)) = wait.durability.take() {
+                    registration.give_up();
+                }
+                let Some(registration) =
+                    self.durable_waits
+                        .wait(lsn, || self.durable(), || self.look())
+                else {
+                    wait.end();
+                    return Ok((IOResult::Done(()), false));
+                };
+                let c = registration.wait.clone();
+                wait.durability = Some((lsn, registration));
+                c
+            }
         };
         let owed = if one {
-            // Preparation first, the interim adapter's step any waiter runs (section 7.4), then
-            // the one turn.
-            self.prepare();
             self.flush_one_turn()
         } else {
             self.flush();
-            self.steps();
             false
+        };
+        // Padding waiting for a segment: the wait stands on the preparer.
+        let on = if self.preparation.needed() {
+            self.wait_on_preparer(wait)
+        } else {
+            None
         };
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
         if self.durable() >= lsn {
+            wait.end();
             return Ok((IOResult::Done(()), owed));
         }
-        Ok((IOResult::IO(IOCompletions(c)), owed))
+        Ok((IOResult::IO(IOCompletions(on.unwrap_or(c))), owed))
     }
 
     /// Deletes the segments wholly before `lsn`, which nothing needs any more.
@@ -944,6 +1089,18 @@ impl Log {
         )
     }
 
+    /// All the room left before the prepared end, granted straight from the room as no admission
+    /// is, so that the next admission waits on the preparer, for a test.
+    #[cfg(test)]
+    pub(crate) fn hold_prepared_room(self: &Arc<Self>) -> Admitted {
+        let left = self.room.prepared_end() - self.room.reach();
+        assert!(self.room.grant(left, false), "the room left not granted");
+        Admitted {
+            log: self.clone(),
+            left,
+        }
+    }
+
     /// Whether a turn of the flush is asked for and not taken, for a test.
     #[cfg(test)]
     pub(crate) fn flush_asked(&self) -> bool {
@@ -967,10 +1124,9 @@ impl Log {
         for (start, end, block) in writes {
             self.submit_write(start, end, block);
         }
-        // Padding waits for a segment nobody prepares: the step is a caller's, and every waiter
-        // comes back to run it.
+        // Padding waits for a segment: the preparer's, made due by whoever sets the word first.
         if unprepared && self.preparation.need() {
-            self.wake_all();
+            self.preparer().trigger(&self.due);
         }
         true
     }
@@ -983,7 +1139,7 @@ impl Log {
             return (writes, false);
         }
         let wanted = self.wanted.load(Ordering::SeqCst);
-        let admitting = !self.admitters.is_empty();
+        let admitting = self.admitters.waiting();
         let limit = if self.durable_writes {
             self.config.writes_in_flight
         } else {
@@ -1167,240 +1323,102 @@ impl Log {
         self.wake_admitters();
     }
 
-    /// What finishes every durable wait, read by a wake that put waits back: the log's failure,
-    /// or a preparation step a caller must run.
+    /// What finishes every durable wait, read by a wake that put waits back: the log's failure.
     fn look(&self) -> Look {
-        if let Some(e) = self.failure() {
-            return Look::Fail(e);
+        match self.failure() {
+            Some(e) => Look::Fail(e),
+            None => Look::Stay,
         }
-        if self.preparation.wants_a_caller() {
-            return Look::Retry;
-        }
-        Look::Stay
-    }
-
-    /// Wakes every waiter, durable and admission alike, to call again: a preparation step became
-    /// runnable. After the move the caller stored, across the fence each take passes.
-    fn wake_all(&self) {
-        self.durable_waits.wake_all();
-        self.wake_admitters();
     }
 
     /// Wakes everyone waiting to be admitted, to try again.
     fn wake_admitters(&self) {
-        room::wake(&self.admitters, |c| c.complete(0));
+        self.admitters.wake();
     }
 
-    /// Whether less than a segment is prepared ahead of what is admitted.
+    /// Whether a segment is to be prepared: less than a segment prepared ahead of what is
+    /// admitted, or an admission waiting for a prepared end past the one published.
     fn short_of_segments(&self) -> bool {
-        self.room.prepared_end().saturating_sub(self.room.reach()) <= self.segments.size
+        let end = self.room.prepared_end();
+        end.saturating_sub(self.room.reach()) <= self.segments.size
+            || self.wanted_end.load(Ordering::SeqCst) > end
     }
 
-    /// Runs every preparation step a caller may: finishing a segment owed, starting one needed, or
-    /// one when less than a segment is prepared ahead of what is admitted. A step taken here is
-    /// this caller's alone; one under way elsewhere, or in flight, is left. Only callers run them,
-    /// never a callback: each is a synchronous file call. A finished step looks for the next, then
-    /// flushes, since padding may have waited for the segment.
-    fn steps(self: &Arc<Self>) {
-        if self.prepare() {
-            self.flush();
-        }
+    /// Whether workers step the log's preparer: with none, whoever waits on it runs it.
+    pub(crate) fn preparer_driven(&self) -> bool {
+        self.preparer().driven()
     }
 
-    /// Runs the preparation steps it finds runnable: whether it ran any. A unit of a job's work
-    /// starts at most one segment and finishes at most one (DESIGN.md 22.16 step 4), whoever's
-    /// they are ([`unit`](crate::storage::atoll::unit)). A step needed and refused for that is left
-    /// to whoever calls next, and every waiter comes back to run it, the unit's own included, since
-    /// the mover of the word to needed or owed may have woken them before they waited.
-    fn prepare(self: &Arc<Self>) -> bool {
-        use crate::storage::atoll::unit;
-        let mut stepped = false;
-        while let Some(step) =
-            self.preparation
-                .take(unit::may_start_segment, unit::may_finish_segment, || {
-                    self.short_of_segments()
-                })
+    /// The log's preparer.
+    fn preparer(&self) -> &TaskRef {
+        self.preparer
+            .get()
+            .expect("a log made without its preparer")
+    }
+
+    /// Makes the preparer due for `end`, the prepared end an admission came within a segment of,
+    /// once per prepared end (DESIGN.md 22.9 item 2): the first admission past the line raises the
+    /// word and notifies; those after it read the word alone. Keyed on the prepared end, which
+    /// only rises, never on the reach, which falls as unused room is given back. The preparer,
+    /// resting, looks itself before it rests, so an end it was not made due for is still
+    /// prepared.
+    fn trigger_short(&self, end: Lsn) {
+        if self.triggered_for.load(Ordering::Acquire) < end
+            && self.triggered_for.fetch_max(end, Ordering::AcqRel) < end
         {
-            // A failed log begins no preparation work.
-            if self.failure().is_some() {
-                self.preparation.let_go(step);
-                break;
-            }
-            let went_on = match step {
-                Step::Start => {
-                    unit::segment_started();
-                    self.start_preparing()
-                }
-                Step::Finish => {
-                    unit::segment_finished();
-                    let went_on = self.finish_preparing();
-                    #[cfg(test)]
-                    if let Some(meanwhile) = AFTER_FINISH.with(|d| d.borrow_mut().take()) {
-                        meanwhile();
-                    }
-                    went_on
-                }
-            };
-            if !went_on {
-                break;
-            }
-            stepped = true;
+            self.preparer().trigger(&self.due);
         }
-        if (self.preparation.needed() && !unit::may_start_segment())
-            || (self.preparation.owed() && !unit::may_finish_segment())
-        {
-            self.wake_all();
-        }
-        stepped
     }
 
-    /// Starts preparing the segment past the prepared end, the step this caller took: a spare
-    /// renamed into place, whose directory sync it then runs too, or a fresh file created,
-    /// allocated and handed to its zero-fill writes. Whether the preparation went on: a failure,
-    /// its own or one read after its synchronous calls, lets the word go where it stands.
-    fn start_preparing(self: &Arc<Self>) -> bool {
-        #[cfg(test)]
-        if let Some(meanwhile) = DURING_START.with(|d| d.borrow_mut().take()) {
-            meanwhile();
+    /// A wait that stands on the preparer (DESIGN.md 22.4, 22.7). Made inside a step or a unit of
+    /// a job's work, it names the preparer for whoever runs that step or unit to wait on
+    /// (`Step::WaitOn`), the step's own class riding on it, since a step runs no other job's step
+    /// and a unit holds no other. Otherwise `wait` holds a demand of the relief class on the
+    /// preparer, and where no worker steps it, the caller runs it, a step a call
+    /// ([`run_preparer`](Self::run_preparer)): what the caller then waits on, if not its own
+    /// registration.
+    fn wait_on_preparer(&self, wait: &mut LogWait) -> Option<Completion> {
+        let preparer = self.preparer();
+        if executor::inside() || crate::storage::atoll::unit::inside() {
+            wait.on = Some(preparer.clone());
+            return None;
         }
-        let number = self.segments.number(self.room.prepared_end());
-        // A spare is whole already: renamed, it is ready once its directory is synced.
-        match self.segments.reuse(number) {
-            Ok(Some(_)) => {
-                if self.failure().is_some() {
-                    self.preparation.let_go(Step::Start);
-                    return false;
-                }
-                self.preparation.start_to_finish();
-                return self.finish_preparing();
-            }
-            Ok(None) => {}
-            Err(e) => {
-                self.preparation.let_go(Step::Start);
-                self.fail(io_failure(&e));
-                return false;
-            }
+        if wait.demand.is_none() {
+            wait.demand = Some(preparer.ticket(Class::Relief));
         }
-        let file = match self.segments.create(number) {
-            Ok(file) => file,
-            Err(e) => {
-                self.preparation.let_go(Step::Start);
-                self.fail(io_failure(&e));
-                return false;
-            }
-        };
-        // Read again once each synchronous call returns: a request may have failed meanwhile.
-        if self.failure().is_some() {
-            self.preparation.let_go(Step::Start);
-            return false;
+        if preparer.driven() {
+            return None;
         }
-        let _ = file.allocate(0, self.segments.size);
-        if self.failure().is_some() {
-            self.preparation.let_go(Step::Start);
-            return false;
-        }
-        // From here the preparation is its requests': on a backend that completes inside the
-        // submission the whole fill and its sync land here, moving the word on to owed.
-        self.preparation.hand_to_requests();
-        self.zero_fill(number, 0);
-        true
+        self.run_preparer()
     }
 
-    /// Finishes the preparation owed, the step this caller took: syncs the segments' directory,
-    /// publishes the prepared end and lets the word go done, then wakes the admitters. Whether it
-    /// went on, as [`start_preparing`](Self::start_preparing) says.
-    fn finish_preparing(self: &Arc<Self>) -> bool {
-        let number = self.segments.number(self.room.prepared_end());
-        if let Err(e) = self.io.sync_directory(&self.segments.directory()) {
-            self.preparation.let_go(Step::Finish);
-            self.fail(io_failure(&e));
-            return false;
+    /// A caller's run of the preparer where no worker steps it (DESIGN.md 22.7), one step a call:
+    /// claims it by name and steps it once on this thread, then says what the caller waits on: a
+    /// yield, finished, where the preparer has more to do now, so the caller calls again (a
+    /// blocking caller's loop, a cooperative poll's next poll) and steps it once more; the request
+    /// the step waits on; or, another caller stepping it, that caller's let-go of it, registered
+    /// first and then claimed once more, so a let-go between either finds the registration or is
+    /// seen as a claim that steps. None: the preparer rests, or its task is over (the log failed,
+    /// or its executor closed), and the caller waits on its own registration, finished by the
+    /// failure or the publication it waits for. Whoever steps the preparer this way lets go after
+    /// the step's end is published, so a caller that found it stepped finds it free when woken.
+    pub(crate) fn run_preparer(&self) -> Option<Completion> {
+        let preparer = self.preparer();
+        let mut ran = preparer::claim(preparer);
+        if ran.is_none() && !preparer.is_over() {
+            let released = self.stepped.wait();
+            ran = preparer::claim(preparer);
+            if ran.is_none() {
+                return (!preparer.is_over()).then_some(released);
+            }
         }
-        // Read again once the synchronous call returns: a request may have failed meanwhile.
-        if self.failure().is_some() {
-            self.preparation.let_go(Step::Finish);
-            return false;
+        if ran.is_some() {
+            self.stepped.let_go();
         }
-        self.room.set_prepared_end(self.segments.start(number + 1));
-        self.preparation.done();
-        self.wake_admitters();
-        true
-    }
-
-    /// The data sync of the segment being prepared landed, in its callback: the directory sync and
-    /// the rest are owed to a caller, and every waiter comes back to run them.
-    fn data_synced(&self) {
-        self.preparation.owe();
-        self.wake_all();
-    }
-
-    /// Writes zeros into segment `number` from `at`, one write after another, then syncs its
-    /// data; the sync's landing leaves the directory sync owed to a caller
-    /// ([`data_synced`](Self::data_synced)). A write's callback submits the next and does nothing
-    /// synchronous. A write whose completion runs inside its own submission, as a memory IO's
-    /// does, lets this loop go on to the next; one completed later resumes the fill from its
-    /// completion. Either way no write's completion runs inside another's, so a segment of many
-    /// chunks costs no frame per chunk.
-    fn zero_fill(self: &Arc<Self>, number: u64, mut at: u64) {
-        /// The submission has not returned, nor the completion run.
-        const SUBMITTING: u8 = 0;
-        /// The completion ran inside the submission: the loop goes on.
-        const INLINE: u8 = 1;
-        /// The submission returned with the write in flight: the completion goes on.
-        const IN_FLIGHT: u8 = 2;
-        /// The write failed: nobody goes on.
-        const FAILED: u8 = 3;
-        let file = self.segments.file(number);
-        loop {
-            if at == self.segments.size {
-                let me = self.held();
-                let c = Completion::new_sync(move |res| {
-                    let Some(me) = me.upgrade() else { return };
-                    match res {
-                        Ok(_) => me.data_synced(),
-                        Err(e) => me.fail(e),
-                    }
-                });
-                if let Err(e) = file.sync_data(c) {
-                    self.fail(io_failure(&e));
-                }
-                return;
-            }
-            let len = (self.segments.size - at).min(self.zeros.len() as u64);
-            let state = Arc::new(AtomicU8::new(SUBMITTING));
-            let seen = state.clone();
-            let me = self.held();
-            let c = Completion::new_write(move |res| {
-                let Some(me) = me.upgrade() else { return };
-                match whole(len as usize, res) {
-                    Ok(()) => {
-                        if seen
-                            .compare_exchange(
-                                SUBMITTING,
-                                INLINE,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_err()
-                        {
-                            me.zero_fill(number, at + len);
-                        }
-                    }
-                    Err(e) => {
-                        seen.store(FAILED, Ordering::Release);
-                        me.fail(e);
-                    }
-                }
-            });
-            if let Err(e) = file.pwrite(at, self.zeros.region(0, len as usize), c) {
-                self.fail(io_failure(&e));
-                return;
-            }
-            match state.compare_exchange(SUBMITTING, IN_FLIGHT, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Err(INLINE) => at += len,
-                _ => return,
-            }
+        match ran? {
+            Told::Again => Some(Completion::new_yield()),
+            Told::Wait(c) => Some(c),
+            Told::Rest => None,
         }
     }
 
@@ -1413,11 +1431,8 @@ impl Log {
             tracing::error!("the log failed: {e}");
         }
         self.durable_waits.fail(e);
-        // Pairs with the fence of an admitter: either this finds it, or it sees the failure.
-        fence(Ordering::SeqCst);
-        for c in self.admitters.take_all() {
-            c.error(e);
-        }
+        // Its fence pairs with an admitter's: either this finds it, or it sees the failure.
+        self.admitters.fail(e);
     }
 
     /// The error the log failed with, if it did.

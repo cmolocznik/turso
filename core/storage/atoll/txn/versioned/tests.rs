@@ -497,7 +497,13 @@ impl Db {
 
     /// The kinds of `start`'s records, in log order.
     fn records(&self, start: Ts) -> Vec<Kind> {
-        drive(&self.io, || self.db.log().wait_durable(self.db.log().end())).unwrap();
+        drive(&self.io, || {
+            self.db.log().wait_durable(
+                &mut crate::storage::atoll::log::LogWait::default(),
+                self.db.log().end(),
+            )
+        })
+        .unwrap();
         let mut reader = crate::storage::atoll::log::Log::reader(
             self.io.clone(),
             BASE,

@@ -1,7 +1,7 @@
 use super::record::ALIGN;
 use super::*;
 use crate::io::crash::{CrashIO, Faults};
-use crate::io::{Completion, MemoryIO, OpenFlags, IO};
+use crate::io::{Completion, File, MemoryIO, OpenFlags, IO};
 use crate::storage::atoll::aligned::AlignedBlock;
 use crate::storage::atoll::testing::drive;
 use std::cell::Cell;
@@ -65,10 +65,13 @@ fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order(
             crate::thread::spawn(move || {
                 for seq in 0..each {
                     let p = payload(writer, seq);
-                    let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+                    let mut admitted = drive(&io, || {
+                        log.admit(&mut LogWait::default(), framed_len(p.len()))
+                    })
+                    .unwrap();
                     let lsn = log.append(&mut admitted, &header(writer), &[&p]);
                     if seq % 17 == 0 {
-                        drive(&io, || log.wait_durable(lsn)).unwrap();
+                        drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
                     }
                 }
             })
@@ -77,7 +80,7 @@ fn records_appended_from_many_threads_read_back_once_each_in_each_threads_order(
     for h in handles {
         h.join().unwrap();
     }
-    drive(&io, || log.wait_durable(log.end())).unwrap();
+    drive(&io, || log.wait_durable(&mut LogWait::default(), log.end())).unwrap();
     let (records, _) = read_all(io, 0);
     assert_eq!(records.len() as u64, writers * each);
     let mut next = vec![0u64; writers as usize];
@@ -149,17 +152,21 @@ fn records_published_in_place_read_back_among_the_rings(io: Arc<dyn IO>, writers
                         block.bytes_mut()[record::HEADER..record::HEADER + p.len()]
                             .copy_from_slice(&p);
                         let room = framed_len(p.len()).next_multiple_of(BLOCK) + BLOCK;
-                        let mut admitted = drive(&io, || log.admit(room)).unwrap();
+                        let mut admitted =
+                            drive(&io, || log.admit(&mut LogWait::default(), room)).unwrap();
                         let (at, lsn) =
                             log.publish(&mut admitted, &header(writer), block, p.len(), |_| {});
                         assert!(at.get().is_multiple_of(BLOCK), "in place at {}", at.get());
                         lsn
                     } else {
-                        let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+                        let mut admitted = drive(&io, || {
+                            log.admit(&mut LogWait::default(), framed_len(p.len()))
+                        })
+                        .unwrap();
                         log.append(&mut admitted, &header(writer), &[&p])
                     };
                     if seq % 7 == 0 {
-                        drive(&io, || log.wait_durable(lsn)).unwrap();
+                        drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
                     }
                 }
             })
@@ -168,7 +175,7 @@ fn records_published_in_place_read_back_among_the_rings(io: Arc<dyn IO>, writers
     for h in handles {
         h.join().unwrap();
     }
-    drive(&io, || log.wait_durable(log.end())).unwrap();
+    drive(&io, || log.wait_durable(&mut LogWait::default(), log.end())).unwrap();
     let (records, _) = read_all(io, 0);
     assert_eq!(records.len() as u64, writers * each);
     let mut next = vec![0u64; writers as usize];
@@ -208,11 +215,17 @@ fn a_log_dropped_with_writes_in_flight_is_freed() {
     let io: Arc<dyn IO> = crash.clone();
     let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
     let p = payload(0, 0);
-    let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+    let mut admitted = drive(&io, || {
+        log.admit(&mut LogWait::default(), framed_len(p.len()))
+    })
+    .unwrap();
     let lsn = log.append(&mut admitted, &header(0), &[&p]);
     drop(admitted);
     // Asks for the flush, and nothing steps the IO from here: its write stays in flight.
-    let waiting = matches!(log.wait_durable(lsn).unwrap(), IOResult::IO(_));
+    let waiting = matches!(
+        log.wait_durable(&mut LogWait::default(), lsn).unwrap(),
+        IOResult::IO(_)
+    );
     assert!(waiting && crash.in_flight() > 0, "no write left in flight");
     let held = Arc::downgrade(&log);
     drop(log);
@@ -278,17 +291,19 @@ fn a_crash_leaves_an_unbroken_prefix_holding_every_acknowledged_record(durable_w
             let p = payload(0, seq);
             let mut admitted = None;
             run(&mut || {
-                admitted = Some(match log.admit(framed_len(p.len()))? {
-                    IOResult::Done(a) => a,
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
-                });
+                admitted = Some(
+                    match log.admit(&mut LogWait::default(), framed_len(p.len()))? {
+                        IOResult::Done(a) => a,
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    },
+                );
                 Ok(IOResult::Done(()))
             });
             let lsn = log.append(admitted.as_mut().unwrap(), &header(0), &[&p]);
             appended.set(seq + 1);
             // Waits at varying distances, so flushes run from part of a block to several.
             if (seq * 7 + seed) % 23 == 0 {
-                run(&mut || log.wait_durable(lsn));
+                run(&mut || log.wait_durable(&mut LogWait::default(), lsn));
                 acknowledged.set(seq + 1);
                 // Right after the acknowledgement, with whatever writes are still in flight.
                 for c in 0..4 {
@@ -305,9 +320,15 @@ fn a_crash_leaves_an_unbroken_prefix_holding_every_acknowledged_record(durable_w
         let resumed = reopened.end();
         for seq in 0..50u64 {
             let p = payload(1, seq);
-            let mut admitted = drive(&crashed_io, || reopened.admit(framed_len(p.len()))).unwrap();
+            let mut admitted = drive(&crashed_io, || {
+                reopened.admit(&mut LogWait::default(), framed_len(p.len()))
+            })
+            .unwrap();
             let lsn = reopened.append(&mut admitted, &header(1), &[&p]);
-            drive(&crashed_io, || reopened.wait_durable(lsn)).unwrap();
+            drive(&crashed_io, || {
+                reopened.wait_durable(&mut LogWait::default(), lsn)
+            })
+            .unwrap();
         }
         // Where the crash left a partial block, a reader from the start stops there; where it
         // ended on a block boundary, the new records continue the log.
@@ -350,10 +371,13 @@ fn no_byte_of_the_log_is_written_twice() {
     let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
     for seq in 0..400u64 {
         let p = payload(0, seq);
-        let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+        let mut admitted = drive(&io, || {
+            log.admit(&mut LogWait::default(), framed_len(p.len()))
+        })
+        .unwrap();
         let lsn = log.append(&mut admitted, &header(0), &[&p]);
         // Waiting on every record pads a partial block each time.
-        drive(&io, || log.wait_durable(lsn)).unwrap();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
     }
     let segments = log.end() / config.segment_bytes + 1;
     let mut log_writes = 0;
@@ -409,11 +433,14 @@ fn released_segments_come_back_as_spares_whose_old_records_never_read() {
     let mut acknowledged = 0;
     for seq in 0..3_000u64 {
         let p = payload(0, seq);
-        let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+        let mut admitted = drive(&io, || {
+            log.admit(&mut LogWait::default(), framed_len(p.len()))
+        })
+        .unwrap();
         lsns.push(log.append(&mut admitted, &header(0), &[&p]));
         if seq % 50 == 49 {
             let lsn = *lsns.last().unwrap();
-            drive(&io, || log.wait_durable(lsn)).unwrap();
+            drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
             acknowledged = lsns.len();
             // As a checkpoint does: the log before a record two segments back is let go.
             if let Some(i) = lsns.iter().rposition(|&l| l + 2 * size <= lsn) {
@@ -464,9 +491,15 @@ fn released_segments_come_back_as_spares_whose_old_records_never_read() {
         expect(&records, &format!("crash {c}"));
         let reopened = Log::open(crashed.clone(), BASE, config.clone(), end).unwrap();
         let p = payload(1, 0);
-        let mut admitted = drive(&crashed, || reopened.admit(framed_len(p.len()))).unwrap();
+        let mut admitted = drive(&crashed, || {
+            reopened.admit(&mut LogWait::default(), framed_len(p.len()))
+        })
+        .unwrap();
         let lsn = reopened.append(&mut admitted, &header(1), &[&p]);
-        drive(&crashed, || reopened.wait_durable(lsn)).unwrap();
+        drive(&crashed, || {
+            reopened.wait_durable(&mut LogWait::default(), lsn)
+        })
+        .unwrap();
         let (again, _) = read_all(crashed, from);
         assert_eq!(again[..records.len()], records[..], "crash {c}: reopened");
     }
@@ -478,16 +511,19 @@ fn a_failed_write_fails_its_waiters_and_every_later_operation() {
     let io: Arc<dyn IO> = crash_io.clone();
     let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
     let p = payload(0, 0);
-    let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+    let mut admitted = drive(&io, || {
+        log.admit(&mut LogWait::default(), framed_len(p.len()))
+    })
+    .unwrap();
     let lsn = log.append(&mut admitted, &header(0), &[&p]);
     drop(admitted);
     crash_io.set_faults(Faults {
         write: 1.0,
         ..Faults::default()
     });
-    assert!(drive(&io, || log.wait_durable(lsn)).is_err());
+    assert!(drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).is_err());
     assert!(log.failure().is_some());
-    assert!(log.admit(64).is_err());
+    assert!(log.admit(&mut LogWait::default(), 64).is_err());
 }
 
 /// A segment is zeroed whole before the log uses it: a zero write that lands short fails the open,
@@ -519,25 +555,29 @@ fn padding_never_pushes_an_admitted_record_into_a_segment_still_being_prepared()
         let io: Arc<dyn IO> = crash.clone();
         let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
         while log.end() < resume {
-            let mut admitted = drive(&io, || log.admit(1024)).unwrap();
+            let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 1024)).unwrap();
             log.append(&mut admitted, &header(0), &[&filler]);
         }
-        drive(&io, || log.wait_durable(resume)).unwrap();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), resume)).unwrap();
         drop(log);
         // Reopened there, as after a crash: the next segment is prepared only once asked for.
         let log = Log::open(io.clone(), BASE, config.clone(), resume).unwrap();
         let first = vec![1u8; 36];
-        let mut admitted_first = drive(&io, || log.admit(framed_len(first.len()))).unwrap();
+        let mut admitted_first = drive(&io, || {
+            log.admit(&mut LogWait::default(), framed_len(first.len()))
+        })
+        .unwrap();
         // The second fits before the segment's end from where the log stands now.
         let second = vec![2u8; (segment - resume - 64 - 64) as usize - 28];
         let second_len = framed_len(second.len());
         assert!(resume + framed_len(first.len()) + second_len <= segment);
-        let mut admitted_second = drive(&io, || log.admit(second_len)).unwrap();
+        let mut admitted_second =
+            drive(&io, || log.admit(&mut LogWait::default(), second_len)).unwrap();
         let lsn = log.append(&mut admitted_first, &header(1), &[&first]);
         // Waiting on the first pads its block, moving the second past the segment's end.
-        drive(&io, || log.wait_durable(lsn)).unwrap();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
         let lsn = log.append(&mut admitted_second, &header(2), &[&second]);
-        drive(&io, || log.wait_durable(lsn)).unwrap();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
         while crash.in_flight() > 0 {
             io.step().unwrap();
         }
@@ -639,7 +679,7 @@ fn crashes_leave_whole_groups_or_none_of_them(durable_writes: bool) {
             let len = records.iter().map(|r| framed_len(r.len())).sum();
             let mut admitted = None;
             run(&mut || {
-                admitted = Some(match log.admit(len)? {
+                admitted = Some(match log.admit(&mut LogWait::default(), len)? {
                     IOResult::Done(a) => a,
                     IOResult::IO(io) => return Ok(IOResult::IO(io)),
                 });
@@ -648,7 +688,7 @@ fn crashes_leave_whole_groups_or_none_of_them(durable_writes: bool) {
             let lsn = append_unit(&log, admitted.as_mut().unwrap(), &records);
             appended.set(seq + 1);
             if (seq * 5 + seed) % 11 == 0 {
-                run(&mut || log.wait_durable(lsn));
+                run(&mut || log.wait_durable(&mut LogWait::default(), lsn));
                 acknowledged.set(seq + 1);
             }
         }
@@ -677,14 +717,14 @@ fn records_appended_after_a_partial_group_never_complete_it() {
     for later_group in [false, true] {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
-        let mut admitted = drive(&io, || log.admit(2 * BLOCK)).unwrap();
+        let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 2 * BLOCK)).unwrap();
         log.append(&mut admitted, &header(0), &[&first]);
         let (start, lsns) = log.append_group(
             &mut admitted,
             &[(header(0), &[g0.as_slice()]), (header(0), &[g1.as_slice()])],
         );
         assert_eq!((start, lsns[0]), (framed_len(first.len()), BLOCK));
-        drive(&io, || log.wait_durable(lsns[1])).unwrap();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), lsns[1])).unwrap();
         drop(log);
         // The crash loses the block holding the group's second record.
         let file = io
@@ -711,7 +751,7 @@ fn records_appended_after_a_partial_group_never_complete_it() {
             BLOCK,
             "the log restarts where the group's second record was"
         );
-        let mut admitted = drive(&io, || log.admit(BLOCK)).unwrap();
+        let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), BLOCK)).unwrap();
         let later = vec![4u8; 50];
         let lsn = if later_group {
             log.append_group(
@@ -725,7 +765,7 @@ fn records_appended_after_a_partial_group_never_complete_it() {
         } else {
             log.append(&mut admitted, &header(0), &[&later])
         };
-        drive(&io, || log.wait_durable(lsn)).unwrap();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
         let (records, end) = read_all(io.clone(), 0);
         assert_eq!(
             (records.len(), end),
@@ -748,7 +788,7 @@ fn a_group_reads_whole_from_where_it_starts_and_nowhere_else() {
     for seq in 0..200 {
         let records = unit(seq);
         let len = records.iter().map(|r| framed_len(r.len())).sum();
-        let mut admitted = drive(&io, || log.admit(len)).unwrap();
+        let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), len)).unwrap();
         let mut reserved = None;
         let start = if records.len() == 1 {
             log.append_with(&mut admitted, &header(seq), &[&records[0]], |s| {
@@ -765,7 +805,7 @@ fn a_group_reads_whole_from_where_it_starts_and_nowhere_else() {
         assert_eq!(reserved, Some(start), "the hook saw another start");
         starts.push((start, records));
     }
-    drive(&io, || log.wait_durable(log.end())).unwrap();
+    drive(&io, || log.wait_durable(&mut LogWait::default(), log.end())).unwrap();
     for (start, records) in &starts {
         let read = Log::read_group(io.clone(), BASE, &small(), *start).unwrap();
         let payloads: Vec<&[u8]> = read.iter().map(|r| r.payload.as_slice()).collect();
@@ -800,10 +840,13 @@ fn a_segment_of_many_chunks_fills_on_a_small_stack_when_writes_complete_inline()
             };
             let log = Log::open(io.clone(), BASE, config, 0).unwrap();
             let p = payload(0, 0);
-            let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+            let mut admitted = drive(&io, || {
+                log.admit(&mut LogWait::default(), framed_len(p.len()))
+            })
+            .unwrap();
             let lsn = log.append(&mut admitted, &header(0), &[&p]);
             drop(admitted);
-            drive(&io, || log.wait_durable(lsn)).unwrap();
+            drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
         })
         .unwrap()
         .join()
@@ -825,11 +868,11 @@ fn no_callback_of_the_log_does_file_work() {
         let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
         let mut released = 0;
         while log.end() < 8 * segment {
-            let mut admitted = drive(&io, || log.admit(1024)).unwrap();
+            let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 1024)).unwrap();
             let lsn = log.append(&mut admitted, &header(0), &[&filler]);
             drop(admitted);
             if lsn % (segment / 4) < 1024 {
-                drive(&io, || log.wait_durable(lsn)).unwrap();
+                drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
                 // Two segments behind: those before come back as spares for the next ones.
                 if lsn >= released + 3 * segment {
                     released = lsn - 2 * segment;
@@ -837,7 +880,7 @@ fn no_callback_of_the_log_does_file_work() {
                 }
             }
         }
-        drive(&io, || log.wait_durable(log.end())).unwrap();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), log.end())).unwrap();
         assert!(
             log.end() >= 8 * segment,
             "seed {seed}: the log prepared too little"
@@ -847,11 +890,16 @@ fn no_callback_of_the_log_does_file_work() {
     }
 }
 
-/// A caller parked while the next segment's preparation is in flight, the padding it waits on
-/// waiting for that segment, is woken by the step that lands the segment's data sync, as the
-/// directory sync becomes owed; its next call runs it, and its record becomes durable.
+/// Where no worker steps the preparer, a caller waiting on what only it brings runs it (DESIGN.md
+/// 22.7, 22.15 proof 12: a fresh segment needed at an admission with no worker and no later
+/// caller): the admission that comes within a segment of the prepared end starts the next one,
+/// and a wait for durability whose padding waits for that segment runs the preparer and waits on
+/// the preparer's own request, never on the log alone, so each landing brings it back to run the
+/// next step, until the segment is published and the record is durable. The IO is stepped one
+/// request at a time and no other caller comes (mutant: the wait returning its registration
+/// without running the preparer, which nothing then finishes).
 #[test]
-fn a_caller_parked_on_a_segment_in_flight_is_woken_when_its_step_is_owed() {
+fn a_waiter_runs_the_preparer_where_no_worker_steps_it_and_waits_on_its_requests() {
     let config = small();
     let segment = config.segment_bytes;
     let filler = vec![7u8; 996];
@@ -861,10 +909,10 @@ fn a_caller_parked_on_a_segment_in_flight_is_woken_when_its_step_is_owed() {
         let io: Arc<dyn IO> = crash.clone();
         let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
         while log.end() < resume {
-            let mut admitted = drive(&io, || log.admit(1024)).unwrap();
+            let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 1024)).unwrap();
             log.append(&mut admitted, &header(0), &[&filler]);
         }
-        drive(&io, || log.wait_durable(resume)).unwrap();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), resume)).unwrap();
         // The next segment this log prepared goes, so that the log opened next prepares a fresh
         // one rather than making a spare of it.
         let next = log.segments.path(1);
@@ -875,14 +923,14 @@ fn a_caller_parked_on_a_segment_in_flight_is_woken_when_its_step_is_owed() {
         let record = vec![1u8; 36];
         // Less than a segment is prepared ahead, so this admission starts preparing the next:
         // its zero fill is in flight until the IO is stepped.
-        let mut admitted = drive(&io, || log.admit(framed_len(record.len()))).unwrap();
+        let mut admitted = drive(&io, || {
+            log.admit(&mut LogWait::default(), framed_len(record.len()))
+        })
+        .unwrap();
         let lsn = log.append(&mut admitted, &header(1), &[&record]);
         drop(admitted);
-        assert_eq!(
-            log.room.prepared_end(),
-            segment,
-            "seed {seed}: the next segment prepared at once"
-        );
+        let started = log.preparation.preparing();
+        let prepared = log.room.prepared_end();
         // Room granted to the prepared end, as an admission may be, leaves none to pad the
         // record's block with: the padding waits for the segment in flight.
         let rest = segment - 8 - log.room.reach();
@@ -891,39 +939,48 @@ fn a_caller_parked_on_a_segment_in_flight_is_woken_when_its_step_is_owed() {
             log: log.clone(),
             left: rest,
         };
-        let IOResult::IO(IOCompletions(c)) = log.wait_durable(lsn).unwrap() else {
-            panic!("seed {seed}: durable while its padding waits for a segment in flight");
-        };
-        assert!(!c.finished(), "seed {seed}: woken before anything landed");
-        // A step delivers one request: the one that lands the segment's data sync, moving the
-        // word to owed, wakes the parked caller itself, nothing else having become durable.
-        while !log.preparation.wants_a_caller() {
-            assert!(
-                crash.in_flight() > 0,
-                "seed {seed}: nothing left in flight and no step owed"
-            );
-            assert!(!c.finished(), "seed {seed}: woken before its step was owed");
-            io.step().unwrap();
+        let mut wait = LogWait::default();
+        let mut calls = 0;
+        let mut on_requests = true;
+        loop {
+            calls += 1;
+            assert!(calls < 10_000, "seed {seed}: never durable");
+            let IOResult::IO(IOCompletions(c)) = log.wait_durable(&mut wait, lsn).unwrap() else {
+                break;
+            };
+            // Only the IO's steps finish what the caller waits on: no other caller comes.
+            while !c.finished() {
+                if crash.in_flight() == 0 {
+                    on_requests = false;
+                    break;
+                }
+                io.step().unwrap();
+            }
+            if !on_requests {
+                break;
+            }
         }
-        assert!(
-            c.finished(),
-            "seed {seed}: the parked caller was not woken when its step became owed"
-        );
-        assert!(c.get_error().is_none(), "seed {seed}: woken with an error");
-        assert!(
-            log.durable() < lsn,
-            "seed {seed}: durable before the step ran"
-        );
-        drive(&io, || log.wait_durable(lsn)).unwrap();
-        assert!(log.durable() >= lsn, "seed {seed}");
+        let durable = log.durable();
+        drop(wait);
         drop(held);
+        drop(log);
+        assert!(started, "seed {seed}: the admission started no segment");
+        assert_eq!(
+            prepared, segment,
+            "seed {seed}: the next segment prepared at once"
+        );
+        assert!(
+            on_requests,
+            "seed {seed}: a wait left with nothing in flight to finish it"
+        );
+        assert!(durable >= lsn, "seed {seed}");
         let calls = crash.file_work_in_callbacks();
         assert!(calls.is_empty(), "seed {seed}: callbacks made {calls:?}");
     }
 }
 
 /// A log opened three blocks before its first segment's end, nothing granted, less than a segment
-/// prepared ahead: the next caller to run steps prepares the next segment. With `fresh_next`, the
+/// prepared ahead: the preparer's next step prepares the next segment. With `fresh_next`, the
 /// next segment the log before it prepared is gone, so it is created fresh, not made of a spare.
 fn reopened_short(io: &Arc<dyn IO>, fresh_next: bool) -> Arc<Log> {
     let config = small();
@@ -932,10 +989,10 @@ fn reopened_short(io: &Arc<dyn IO>, fresh_next: bool) -> Arc<Log> {
     let resume = segment - 3 * BLOCK;
     let log = Log::open(io.clone(), BASE, config.clone(), 0).unwrap();
     while log.end() < resume {
-        let mut admitted = drive(io, || log.admit(1024)).unwrap();
+        let mut admitted = drive(io, || log.admit(&mut LogWait::default(), 1024)).unwrap();
         log.append(&mut admitted, &header(0), &[&filler]);
     }
-    drive(io, || log.wait_durable(resume)).unwrap();
+    drive(io, || log.wait_durable(&mut LogWait::default(), resume)).unwrap();
     let next = log.segments.path(1);
     drop(log);
     if fresh_next {
@@ -945,10 +1002,10 @@ fn reopened_short(io: &Arc<dyn IO>, fresh_next: bool) -> Arc<Log> {
 }
 
 /// A log opened three blocks before its first segment's end, with a record appended and room
-/// granted past it straight from the room, as no caller does, so that padding the record's block
-/// waits for the next segment while no step has begun preparing it: the state a flush meets only
-/// if no caller ran a step since less than a segment was prepared ahead. Returns the log, the
-/// record's LSN and the room still held.
+/// granted past it straight from the room, as no admission does, so that padding the record's
+/// block waits for the next segment while the preparer has not begun it: the state a flush meets
+/// only if the preparer has not run since less than a segment was prepared ahead. Returns the
+/// log, the record's LSN and the room still held.
 fn padding_with_no_preparation(io: &Arc<dyn IO>, fresh_next: bool) -> (Arc<Log>, Lsn, Admitted) {
     let segment = small().segment_bytes;
     let log = reopened_short(io, fresh_next);
@@ -962,7 +1019,10 @@ fn padding_with_no_preparation(io: &Arc<dyn IO>, fresh_next: bool) -> (Arc<Log>,
     let lsn = log.append(&mut admitted, &header(1), &[&record]);
     let rest = segment - 8 - log.room.reach();
     assert!(log.room.grant(rest, true));
-    assert!(!log.preparation.wants_a_caller(), "a step already runnable");
+    assert!(
+        !log.preparation.needed() && !log.preparation.preparing(),
+        "a preparation already under way"
+    );
     let held = Admitted {
         log: log.clone(),
         left: rest,
@@ -983,9 +1043,9 @@ fn failing_at(log: &Arc<Log>, at: &'static str) -> Option<Arc<dyn Fn(&'static st
     }))
 }
 
-/// Another request's failure published while a starter's create runs: the starter reads it as
-/// the create returns and lets the word go, allocating nothing and submitting nothing, and every
-/// waiter gets the error.
+/// Another request's failure published while the preparer's create runs: it reads the failure as
+/// the create returns, allocating nothing and submitting nothing, and its task ends; every waiter
+/// gets the error.
 #[test]
 fn a_failure_during_a_starters_create_stops_the_preparation() {
     let crash = Arc::new(CrashIO::new(0));
@@ -994,61 +1054,71 @@ fn a_failure_during_a_starters_create_stops_the_preparation() {
     log.wanted.fetch_max(lsn, Ordering::SeqCst);
     let durable = log
         .durable_waits
-        .wait(lsn, || log.durable())
-        .expect("not durable yet");
+        .wait(lsn, || log.durable(), || super::waits::Look::Stay)
+        .expect("not durable yet")
+        .wait
+        .clone();
     let in_flight = crash.in_flight();
     crash.on_file_work(failing_at(&log, "open"));
-    log.steps();
+    let _ = log.run_preparer();
     crash.on_file_work(None);
     let created = io
         .open_file(&log.segments.path(1), OpenFlags::None, false)
         .expect("the starter's create ran");
     assert_eq!(created.size().unwrap(), 0, "allocated after the failure");
     assert_eq!(crash.in_flight(), in_flight, "submitted after the failure");
-    assert!(log.preparation.wants_a_caller(), "the word not let go");
+    assert!(
+        log.preparer().is_over(),
+        "the preparer went on after the failure"
+    );
     assert_eq!(durable.get_error(), Some(CompletionError::Aborted));
     drop(held);
 }
 
-/// Another request's failure published while a finisher's directory sync runs: the finisher reads
-/// it as the sync returns and lets the word go, publishing no prepared end, and every waiter gets
+/// Another request's failure published while the preparer's directory sync runs: it reads the
+/// failure as the sync returns, publishing no prepared end, and its task ends; every waiter gets
 /// the error.
 #[test]
 fn a_failure_during_a_finishers_directory_sync_publishes_nothing() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
-    // The next segment from a spare: its starter goes straight on to finish it.
+    // The next segment from a spare: the preparer's start goes straight on to finish it.
     let (log, lsn, held) = padding_with_no_preparation(&io, false);
     log.wanted.fetch_max(lsn, Ordering::SeqCst);
     let durable = log
         .durable_waits
-        .wait(lsn, || log.durable())
-        .expect("not durable yet");
+        .wait(lsn, || log.durable(), || super::waits::Look::Stay)
+        .expect("not durable yet")
+        .wait
+        .clone();
     let prepared = log.room.prepared_end();
     crash.on_file_work(failing_at(&log, "directory sync"));
-    log.steps();
+    let _ = log.run_preparer();
     crash.on_file_work(None);
     assert_eq!(
         log.room.prepared_end(),
         prepared,
         "published after the failure"
     );
-    assert!(log.preparation.wants_a_caller(), "the word not let go");
+    assert!(
+        log.preparer().is_over(),
+        "the preparer went on after the failure"
+    );
     assert_eq!(durable.get_error(), Some(CompletionError::Aborted));
     drop(held);
 }
 
-/// An admission whose room is granted at once, and whose own step meets a failure, returns the
-/// failure, never the room, and gives the room back.
+/// An admission whose room is granted at once, and whose run of the preparer, no worker stepping
+/// it, meets a failure, returns the failure, never the room, and gives the room back.
 #[test]
 fn an_admission_whose_step_fails_the_log_returns_the_failure_and_gives_its_room_back() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let log = reopened_short(&io, true);
-    assert!(log.short_of_segments(), "no step would run");
+    assert!(log.short_of_segments(), "no preparation would start");
     let reach = log.room.reach();
     crash.on_file_work(failing_at(&log, "open"));
-    let admitted = log.admit(64);
+    let admitted = log.admit(&mut LogWait::default(), 64);
     crash.on_file_work(None);
     match admitted {
         Err(LimboError::CompletionError(CompletionError::Aborted)) => {}
@@ -1058,11 +1128,13 @@ fn an_admission_whose_step_fails_the_log_returns_the_failure_and_gives_its_room_
     assert_eq!(log.room.reach(), reach, "the room granted not given back");
 }
 
-/// A flush that meets padding waiting for a segment nobody prepares moves the word to needed and
-/// wakes every waiter, durable and admission alike, whatever its mark: the step is a caller's,
-/// and each comes back to call again. A caller then runs it, and the record becomes durable.
+/// A flush that meets padding waiting for a segment nobody prepares sets the word needed and makes
+/// the preparer due (DESIGN.md 22.9 item 2), finishing no waiter: waiters are woken by their marks
+/// and by room. A caller's wait then runs the preparer, and the record becomes durable (mutant:
+/// the word set and the preparer left at its own level).
 #[test]
-fn a_flush_meeting_padding_nobody_prepares_needs_a_step_and_wakes_every_waiter() {
+fn a_flush_meeting_padding_nobody_prepares_makes_the_preparer_due_and_wakes_no_waiter() {
+    use crate::storage::atoll::executor::Class;
     for seed in 0..4 {
         let crash = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash.clone();
@@ -1070,53 +1142,59 @@ fn a_flush_meeting_padding_nobody_prepares_needs_a_step_and_wakes_every_waiter()
         log.wanted.fetch_max(lsn, Ordering::SeqCst);
         let durable = log
             .durable_waits
-            .wait(lsn, || log.durable())
-            .expect("not durable yet");
-        let admission = Completion::new_wait();
-        room::wait_on(&log.admitters, admission.clone());
+            .wait(lsn, || log.durable(), || super::waits::Look::Stay)
+            .expect("not durable yet")
+            .wait
+            .clone();
+        let admission = log.admitters.wait();
+        let before = log.preparer().class();
         // What a write's callback runs once it lands.
         log.flush();
-        assert!(
-            log.preparation.wants_a_caller(),
-            "seed {seed}: no step needed"
-        );
-        assert!(
-            durable.finished() && admission.finished(),
-            "seed {seed}: a waiter not woken: durable {} admission {}",
-            durable.finished(),
-            admission.finished()
-        );
-        assert!(durable.get_error().is_none() && admission.get_error().is_none());
-        drive(&io, || log.wait_durable(lsn)).unwrap();
-        assert!(log.durable() >= lsn, "seed {seed}");
+        let needed = log.preparation.needed();
+        let after = log.preparer().class();
+        let woken = (durable.finished(), admission.finished());
+        drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
+        let reached = log.durable() >= lsn;
         drop(held);
+        drop(log);
+        assert_eq!(
+            before,
+            Class::Maintenance,
+            "seed {seed}: due before any flush"
+        );
+        assert!(needed, "seed {seed}: the padding needed no segment");
+        assert_eq!(after, Class::Due, "seed {seed}: the preparer not made due");
+        assert_eq!(
+            woken,
+            (false, false),
+            "seed {seed}: a waiter woken by the flush"
+        );
+        assert!(reached, "seed {seed}");
         let calls = crash.file_work_in_callbacks();
         assert!(calls.is_empty(), "seed {seed}: callbacks made {calls:?}");
     }
 }
 
-/// A completion from `wait_durable` means only call again: a caller whose own flush moves the
-/// word, finishing its own completion, is told to call again, never that the log is durable,
-/// while the step it then started is still in flight.
+/// A completion from `wait_durable` means only call again: a wait whose padding waits for a
+/// segment, the caller running the preparer, is told to call again on the preparer's request,
+/// never that the log is durable, while that request is still in flight.
 #[test]
 fn a_finished_completion_is_no_report_of_durability() {
     for seed in 0..4 {
         let crash = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash.clone();
         let (log, lsn, held) = padding_with_no_preparation(&io, false);
-        match log.wait_durable(lsn).unwrap() {
-            IOResult::Done(()) => panic!(
-                "seed {seed}: reported durable to {lsn} with the log durable to {}",
-                log.durable()
-            ),
-            IOResult::IO(IOCompletions(c)) => assert!(
-                c.finished(),
-                "seed {seed}: its own move should have finished its completion"
-            ),
-        }
-        drive(&io, || log.wait_durable(lsn)).unwrap();
-        assert!(log.durable() >= lsn, "seed {seed}");
+        let first = log.wait_durable(&mut LogWait::default(), lsn).unwrap();
+        let durable_then = log.durable();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
+        let reached = log.durable() >= lsn;
         drop(held);
+        drop(log);
+        assert!(
+            matches!(first, IOResult::IO(_)),
+            "seed {seed}: reported durable to {lsn} with the log durable to {durable_then}"
+        );
+        assert!(reached, "seed {seed}");
     }
 }
 
@@ -1257,24 +1335,24 @@ fn every_caller_of_admit_and_wait_durable_calls_again() {
     );
 }
 
-/// Once the log has failed no preparation step begins work: a caller that takes the word reads
-/// the failure and lets it go where it stands, and creates no segment.
+/// Once the log has failed no preparation step begins work: the preparer reads the failure before
+/// it takes the word, creates no segment, and its task ends.
 #[test]
 fn a_failed_log_begins_no_preparation_step() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
-    let (log, _, held) = padding_with_no_preparation(&io, false);
-    assert!(log.short_of_segments(), "no step would run");
+    let (log, _, held) = padding_with_no_preparation(&io, true);
+    assert!(log.short_of_segments(), "no preparation would start");
     log.fail(CompletionError::Aborted);
-    // What a caller does past its own reads of the failure, which a failure landing after them
-    // races: take the word and run the step.
-    log.steps();
+    let ran = log.run_preparer();
     let next = log.segments.path(1);
-    assert!(
-        io.open_file(&next, OpenFlags::None, false).is_err(),
-        "a failed log created its next segment"
-    );
+    let created = io.open_file(&next, OpenFlags::None, false).is_ok();
+    let over = log.preparer().is_over();
     drop(held);
+    drop(log);
+    assert!(ran.is_none(), "a failed log's preparer waits on a request");
+    assert!(!created, "a failed log created its next segment");
+    assert!(over, "a failed log's preparer goes on");
 }
 
 /// A unit's wait for durability takes one turn of the flush, and a request made during that turn
@@ -1286,18 +1364,21 @@ fn a_units_durable_wait_takes_one_flush_turn_and_owes_one_asked_during_it() {
     let io: Arc<dyn IO> = crash.clone();
     let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
     let p = payload(0, 0);
-    let mut admitted = drive(&io, || log.admit(framed_len(p.len()))).unwrap();
+    let mut admitted = drive(&io, || {
+        log.admit(&mut LogWait::default(), framed_len(p.len()))
+    })
+    .unwrap();
     let lsn = log.append(&mut admitted, &header(0), &[&p]);
     drop(admitted);
     TURNS.with(|n| n.set(0));
     ASK_DURING_TURN.with(|a| a.set(true));
-    let (waited, owed) = log.wait_durable_turn(lsn).unwrap();
+    let (waited, owed) = log.wait_durable_turn(&mut LogWait::default(), lsn).unwrap();
     let turns = TURNS.with(|n| n.get());
     let waits = matches!(waited, IOResult::IO(_));
     // The next unit answers it, with one turn of its own, and owes nothing more.
     let owed_again = log.flush_one_turn();
     let turns_after = TURNS.with(|n| n.get());
-    drive(&io, || log.wait_durable(lsn)).unwrap();
+    drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
     // Asserted once the log is closed: a panic through it ends the process.
     drop(log);
     assert_eq!(turns, 1, "turns the unit took");
@@ -1307,266 +1388,560 @@ fn a_units_durable_wait_takes_one_flush_turn_and_owes_one_asked_during_it() {
     assert_eq!(turns_after, 2);
 }
 
-/// A log whose buffer is four segments, so one admission takes all the room prepared ahead, with
-/// records appended and durable until the reach is a little more than a segment from the prepared
-/// end: between `framed_len(0)` and that plus four blocks more, everything durable.
-fn a_little_more_than_a_segment_ahead(io: &Arc<dyn IO>) -> Arc<Log> {
-    let config = LogConfig {
-        buffer_bytes: 4 * small().segment_bytes,
-        ..small()
-    };
-    let segment = config.segment_bytes;
-    let largest = framed_len(config.buffer_bytes as usize / 2);
-    let least = framed_len(0);
-    let log = Log::open(io.clone(), BASE, config, 0).unwrap();
-    for seq in 0.. {
-        assert!(seq < 10_000, "never came within range");
-        let (ahead, _) = log.prepared_ahead();
-        let over = ahead.saturating_sub(segment);
-        if ahead > segment && (least..=least + 4 * BLOCK).contains(&over) {
-            return log;
-        }
-        // Far: a record leaving the range's middle, its padding included. Near or within a
-        // segment: the smallest, which in time brings the reach within a segment, where the
-        // admission prepares the next.
-        let framed = if over > least + 4 * BLOCK {
-            (over - least - 2 * BLOCK).min(largest).max(least)
-        } else {
-            least
-        };
-        let filler = vec![0u8; (framed - least) as usize];
-        assert_eq!(framed_len(filler.len()), framed);
-        let mut admitted = drive(io, || log.admit(framed)).unwrap();
-        let lsn = log.append(&mut admitted, &header(0), &[&filler]);
-        drive(io, || log.wait_durable(lsn)).unwrap();
+/// What [`HoldingIO`] holds: once armed, every write and sync to the one segment it holds is
+/// accepted and kept, its callback not run, until the test answers it and then lets it go, so the
+/// preparer's place is seen held past the answer, until the request retires.
+#[derive(Default)]
+struct Holding {
+    path: crate::storage::atoll::locks::Mutex<Option<String>>,
+    queue: crate::storage::atoll::locks::Mutex<std::collections::VecDeque<(Completion, i32)>>,
+    submitted: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl Holding {
+    fn hold(&self, c: Completion, result: i32) -> Result<Completion> {
+        c.accept();
+        let mut queue = self.queue.lock();
+        queue.push_back((c.clone(), result));
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+        self.most.fetch_max(queue.len(), Ordering::Relaxed);
+        Ok(c)
     }
-    unreachable!()
+
+    /// The oldest request held, taken out: the test answers it, then lets it go.
+    fn oldest(&self) -> Option<(Completion, i32)> {
+        self.queue.lock().pop_front()
+    }
 }
 
-/// A unit of a job's work starts at most one log segment (DESIGN.md 22.16 step 4's exception),
-/// however far other admissions take the reach while it prepares: here another thread's
-/// admission takes all the room prepared ahead as the unit starts its segment, so once that
-/// segment is ready it is all that is prepared ahead, short again. The unit starts no second;
-/// the next caller does, a writer's admission after it (mutant: no budget, the unit starts a
-/// second segment in the same call, which debug builds refuse as the unit ends).
-#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
-#[test]
-fn a_unit_starts_one_segment_however_far_another_admission_takes_the_reach() {
-    // In a child: past its budget a unit ends the process, which the parent reads.
-    let ended = crate::storage::atoll::testing::in_child(
-        concat!(
-            module_path!(),
-            "::a_unit_starts_one_segment_however_far_another_admission_takes_the_reach"
-        ),
-        || {
-            use crate::storage::atoll::unit;
-            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let log = a_little_more_than_a_segment_ahead(&io);
-            let segment = small().segment_bytes;
-            let (ahead, _) = log.prepared_ahead();
-            // The unit's admission, a little past what is a segment ahead: it comes within a segment.
-            let framed = ahead - segment + ALIGN;
-            let record = vec![2u8; (framed - framed_len(0)) as usize];
-            assert_eq!(framed_len(record.len()), framed);
-            let taken: Arc<crate::storage::atoll::locks::Mutex<Option<Admitted>>> = Arc::default();
-            DURING_START.with(|d| {
-                let (log, io, taken) = (log.clone(), io.clone(), taken.clone());
-                *d.borrow_mut() = Some(Box::new(move || {
-                    let (left, _) = log.prepared_ahead();
-                    let admitted = std::thread::scope(|s| {
-                        s.spawn(|| drive(&io, || log.admit(left)).unwrap())
-                            .join()
-                            .unwrap()
-                    });
-                    assert_eq!(log.prepared_ahead().0, 0, "the room left not all taken");
-                    *taken.lock() = Some(admitted);
-                }));
-            });
-            let _ = unit::segments();
-            {
-                let _unit = unit::Unit::enter();
-                let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
-                    panic!("the unit's admission waited");
-                };
-                log.append(&mut admitted, &header(1), &[&record]);
+/// A [`MemoryIO`] whose one held segment, once named, holds its writes and syncs ([`Holding`]).
+struct HoldingIO {
+    inner: Arc<MemoryIO>,
+    holding: Arc<Holding>,
+}
+
+impl crate::io::Clock for HoldingIO {
+    fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for HoldingIO {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        let held = self.holding.path.lock().as_deref() == Some(path);
+        Ok(Arc::new(HoldingFile {
+            file: self.inner.open_file(path, flags, direct)?,
+            holding: held.then(|| self.holding.clone()),
+        }))
+    }
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn sync_directory(&self, path: &str) -> Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        self.inner.rename_file(from, to)
+    }
+    fn delivery(&self) -> crate::io::Delivery {
+        self.inner.delivery()
+    }
+    fn step(&self) -> Result<()> {
+        self.inner.step()
+    }
+    fn try_step(
+        &self,
+        key: crate::io::ReadyKey,
+        ready: &std::task::Waker,
+    ) -> Result<crate::io::Stepped> {
+        self.inner.try_step(key, ready)
+    }
+    fn says_what_a_step_found(&self) -> bool {
+        self.inner.says_what_a_step_found()
+    }
+    fn withdraw(&self, key: crate::io::ReadyKey) {
+        self.inner.withdraw(key)
+    }
+}
+
+struct HoldingFile {
+    file: Arc<dyn File>,
+    holding: Option<Arc<Holding>>,
+}
+
+impl File for HoldingFile {
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
+        self.file.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> Result<()> {
+        self.file.unlock_file()
+    }
+    fn pread(&self, at: u64, c: Completion) -> Result<Completion> {
+        self.file.pread(at, c)
+    }
+    fn pwrite(&self, at: u64, bytes: Arc<crate::io::Buffer>, c: Completion) -> Result<Completion> {
+        match &self.holding {
+            Some(holding) => {
+                c.keep_write_buffer_alive(bytes.clone());
+                holding.hold(c, bytes.len() as i32)
             }
-            assert!(
-                DURING_START.with(|d| d.borrow().is_none()),
-                "the unit started no segment"
-            );
-            assert!(taken.lock().is_some(), "the other admission ran");
-            assert_eq!(unit::segments().0, 1, "the segments the unit started");
-            assert_eq!(
-                log.prepared_ahead().0,
-                segment,
-                "the unit's segment is not all that is prepared ahead"
-            );
-            // The start the unit left: the next caller's.
-            let mut next = drive(&io, || log.admit(framed_len(0))).unwrap();
-            let nothing: &[&[u8]] = &[];
-            log.append(&mut next, &header(2), nothing);
-            assert!(
-                log.prepared_ahead().0 > segment,
-                "the next caller started no segment"
-            );
-            drop(taken.lock().take());
-        },
-    );
-    let Some(ended) = ended else { return };
-    assert!(
-        !ended.aborted && !ended.hung && ended.code == Some(0),
-        "{:?}\n{}",
-        ended.code,
-        ended.stderr
-    );
+            None => self.file.pwrite(at, bytes, c),
+        }
+    }
+    fn sync(&self, c: Completion, how: crate::io::FileSyncType) -> Result<Completion> {
+        match &self.holding {
+            Some(holding) => holding.hold(c, 0),
+            None => self.file.sync(c, how),
+        }
+    }
+    fn size(&self) -> Result<u64> {
+        self.file.size()
+    }
+    fn truncate(&self, n: u64, c: Completion) -> Result<Completion> {
+        self.file.truncate(n, c)
+    }
 }
 
-/// A start needed while the unit asking has its one segment started (DESIGN.md 22.16 step 4) is
-/// left, and every waiter comes back to run it, the unit's own wait included: the move to needed
-/// may have woken them before they waited. Here the unit's admission starts its segment, another
-/// admission then holds all the room prepared ahead, and the unit's first durable turn finds its
-/// record's padding without room and moves the word to needed, waking that wait. Its next durable
-/// turn waits afresh: the start it may not run must wake it, else nothing runs the start and the
-/// wait stands for ever (mutant: the start left with no wake). Once out of the unit, a caller runs
-/// it and the record is durable.
-#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+/// The preparer's one request in flight holds its place until the request retires, not until its
+/// result is published (the auditor's #4345, DESIGN.md 22.5): a zero-fill write answered and
+/// still owned leaves the preparer, stepped again, waiting with nothing more submitted; let go,
+/// the next write goes, one at a time to the segment's data sync; and a sync answered with no
+/// success, then let go, fails the log and ends the preparer (mutant: the place let go at the
+/// answer, a second write submitted while the first is owned).
 #[test]
-fn a_start_a_unit_may_not_run_wakes_its_waiters() {
-    // In a child: past its budget a unit ends the process, which the parent reads.
-    let ended = crate::storage::atoll::testing::in_child(
-        concat!(
-            module_path!(),
-            "::a_start_a_unit_may_not_run_wakes_its_waiters"
-        ),
-        || {
-            use crate::storage::atoll::unit;
-            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let log = a_little_more_than_a_segment_ahead(&io);
-            let segment = small().segment_bytes;
-            let (ahead, _) = log.prepared_ahead();
-            // A little past what is a segment ahead, ending inside a block: its flush pads.
-            let framed = ahead - segment + ALIGN;
-            let record = vec![3u8; (framed - framed_len(0)) as usize];
-            assert_eq!(framed_len(record.len()), framed);
-            let _ = unit::segments();
-            let (lsn, held, second) = {
-                let _unit = unit::Unit::enter();
-                let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
-                    panic!("the unit's admission waited");
-                };
-                let lsn = log.append(&mut admitted, &header(1), &[&record]);
-                assert!(!lsn.is_multiple_of(BLOCK), "the record ends on a block");
-                assert!(
-                    !unit::may_start_segment(),
-                    "the admission started no segment"
-                );
-                let (left, _) = log.prepared_ahead();
-                let IOResult::Done(held) = log.admit(left).unwrap() else {
-                    panic!("the hold waited");
-                };
-                let (first, _) = log.wait_durable_turn(lsn).unwrap();
-                let IOResult::IO(IOCompletions(first)) = first else {
-                    panic!("durable with no room to pad");
-                };
-                assert!(log.preparation.needed(), "the padding needed no start");
-                assert!(first.finished(), "the move to needed woke nobody");
-                let (second, _) = log.wait_durable_turn(lsn).unwrap();
-                let IOResult::IO(IOCompletions(second)) = second else {
-                    panic!("durable with no room to pad");
-                };
-                assert!(log.preparation.needed(), "the unit ran the start");
-                (lsn, held, second)
-            };
-            assert_eq!(unit::segments().0, 1, "the segments the unit started");
-            assert!(
-                second.finished(),
-                "a wait made after the move to needed, the start left by the unit: never woken"
-            );
-            drive(&io, || log.wait_durable(lsn)).unwrap();
-            assert!(log.durable() >= lsn);
-            drop(held);
-        },
+fn the_preparers_request_holds_its_place_until_it_retires() {
+    let holding = Arc::new(Holding::default());
+    let io: Arc<dyn IO> = Arc::new(HoldingIO {
+        inner: Arc::new(MemoryIO::new()),
+        holding: holding.clone(),
+    });
+    let log = reopened_short(&io, true);
+    *holding.path.lock() = Some(log.segments.path(1));
+    let mut held_past_answer = 0;
+    let mut stepped_while_owned = 0;
+    let mut failed = None;
+    for _ in 0..10_000 {
+        if log.preparer().is_over() {
+            break;
+        }
+        let Some(wait) = log.run_preparer() else {
+            break;
+        };
+        let Some((request, result)) = holding.oldest() else {
+            continue;
+        };
+        let is_sync = result == 0;
+        if is_sync {
+            request.error(CompletionError::Aborted);
+        } else {
+            request.complete(result);
+        }
+        // Answered and still owned: the place is held, and a step meanwhile submits nothing.
+        if !wait.finished() {
+            held_past_answer += 1;
+        }
+        let before = holding.submitted.load(Ordering::Relaxed);
+        let _ = log.run_preparer();
+        if holding.submitted.load(Ordering::Relaxed) == before {
+            stepped_while_owned += 1;
+        }
+        request.retire();
+        if is_sync {
+            failed = log.failure();
+        }
+    }
+    let over = log.preparer().is_over();
+    let submitted = holding.submitted.load(Ordering::Relaxed);
+    let most = holding.most();
+    drop(log);
+    let writes = (small().segment_bytes / small().chunk_bytes) as usize;
+    assert_eq!(
+        most, 1,
+        "more than one of the preparer's requests owned at once"
     );
-    let Some(ended) = ended else { return };
-    assert!(
-        !ended.aborted && !ended.hung && ended.code == Some(0),
-        "{:?}\n{}",
-        ended.code,
-        ended.stderr
+    assert_eq!(submitted, writes + 1, "the zero fill's writes and its sync");
+    assert_eq!(held_past_answer, submitted, "a place let go at the answer");
+    assert_eq!(
+        stepped_while_owned, submitted,
+        "a request submitted while one was owned"
     );
+    assert_eq!(
+        failed,
+        Some(CompletionError::Aborted),
+        "the failed sync told no one"
+    );
+    assert!(over, "the preparer went on after the log failed");
 }
 
-/// A unit of a job's work finishes at most one segment (DESIGN.md 22.16 step 4), whoever's it is:
-/// here the unit starts a segment and finishes it, and another caller then starts one whose data
-/// sync lands, leaving a finish owed. The unit takes no second finish, and a wait registered
-/// before it gives the finish up is woken to run it (mutants: no finish budget, the unit finishes
-/// the other's segment, which debug builds refuse as the unit ends; the finish left with no wake).
-#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+impl Holding {
+    fn most(&self) -> usize {
+        self.most.load(Ordering::Relaxed)
+    }
+}
+
+/// A log opened alone owns an executor with no worker, whose one task is its preparer, stepped
+/// only by callers of the log's own calls, each holding the log: so the log is never dropped
+/// inside a step of its preparer, and dropped, it closes an executor with no step running
+/// (DESIGN.md 22.12, the auditor's #4345). Here the log is dropped while its preparer waits on a
+/// zero-fill write in flight; the write then lands for a log gone, and nothing is left holding
+/// the IO's requests.
 #[test]
-fn a_unit_finishes_one_segment_however_many_others_start_meanwhile() {
-    // In a child: past its budget a unit ends the process, which the parent reads.
-    let ended = crate::storage::atoll::testing::in_child(
-        concat!(
-            module_path!(),
-            "::a_unit_finishes_one_segment_however_many_others_start_meanwhile"
-        ),
-        || {
-            use crate::storage::atoll::unit;
-            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let log = a_little_more_than_a_segment_ahead(&io);
-            let segment = small().segment_bytes;
-            let (ahead, _) = log.prepared_ahead();
-            let framed = ahead - segment + ALIGN;
-            let record = vec![4u8; (framed - framed_len(0)) as usize];
-            assert_eq!(framed_len(record.len()), framed);
-            let waiting: Arc<crate::storage::atoll::locks::Mutex<Option<Completion>>> =
-                Arc::default();
-            AFTER_FINISH.with(|d| {
-                let (log, waiting) = (log.clone(), waiting.clone());
-                *d.borrow_mut() = Some(Box::new(move || {
-                    // Another caller's start, its data sync landed: the word is owed again.
-                    assert!(
-                        log.preparation.need(),
-                        "the unit's finish left no done word"
-                    );
-                    let started = log.preparation.take(|| true, || true, || false);
-                    assert_eq!(started, Some(Step::Start));
-                    log.preparation.hand_to_requests();
-                    log.preparation.owe();
-                    // A wait made as the finish became owed, before the unit gives it up.
-                    let wait = Completion::new_wait();
-                    room::wait_on(&log.admitters, wait.clone());
-                    *waiting.lock() = Some(wait);
-                }));
-            });
-            let _ = unit::segments();
-            let woken;
-            {
-                let _unit = unit::Unit::enter();
-                let IOResult::Done(mut admitted) = log.admit(framed).unwrap() else {
-                    panic!("the unit's admission waited");
-                };
-                // Before the append: its flush finishes waits of its own.
-                woken = waiting.lock().as_ref().unwrap().finished();
-                log.append(&mut admitted, &header(1), &[&record]);
+fn a_log_dropped_while_its_preparer_waits_on_a_request_leaves_nothing_behind() {
+    for seed in 0..4 {
+        let crash = Arc::new(CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let log = reopened_short(&io, true);
+        // A step a call: the fresh segment's create and allocation, then its first write.
+        let mut waiting = log.run_preparer();
+        for _ in 0..2 {
+            if crash.in_flight() > 0 {
+                break;
             }
-            assert!(
-                AFTER_FINISH.with(|d| d.borrow().is_none()),
-                "the unit finished no segment"
-            );
-            assert_eq!(unit::segments().1, 1, "the segments the unit finished");
-            assert!(log.preparation.owed(), "the other's finish was taken");
-            assert!(
-                woken,
-                "a wait made as the finish became owed, the finish left by the unit: never woken"
-            );
-        },
+            waiting = log.run_preparer();
+        }
+        let in_flight = crash.in_flight();
+        let on_request = waiting.is_some_and(|c| !c.finished());
+        let weak = Arc::downgrade(&log);
+        drop(log);
+        let gone = weak.upgrade().is_none();
+        while crash.in_flight() > 0 {
+            io.step().unwrap();
+        }
+        let calls = crash.file_work_in_callbacks();
+        assert!(on_request, "seed {seed}: the preparer waits on no request");
+        assert!(in_flight > 0, "seed {seed}: nothing in flight");
+        assert!(gone, "seed {seed}: the log outlived its last handle");
+        assert!(calls.is_empty(), "seed {seed}: callbacks made {calls:?}");
+    }
+}
+
+/// An admission whose room is granted makes no claim of the preparer while it waits on its
+/// request or rests, so its fast path takes no executor mutex (the auditor's #4345): only one
+/// that finds the preparer queued runs it, where no worker steps it. Here the first admissions
+/// within a segment of the prepared end make the preparer due and run it, a step each, to its
+/// first write; while that write is in flight a hundred more admissions are granted with no claim;
+/// once it lands, the next admission claims it again (mutant: a claim at every admission within a
+/// segment of the prepared end).
+#[test]
+fn an_admission_granted_claims_the_preparer_only_when_it_is_queued() {
+    use super::preparer::CLAIMS;
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let log = reopened_short(&io, true);
+    CLAIMS.with(|n| n.set(0));
+    // A step an admission: the fresh segment's create and allocation, then its first write.
+    for _ in 0..2 {
+        let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 64)).unwrap();
+        log.append(&mut admitted, &header(0), &[&[0u8; 36][..]]);
+        drop(admitted);
+        if crash.in_flight() > 0 {
+            break;
+        }
+    }
+    let first = CLAIMS.with(|n| n.replace(0));
+    let in_flight = crash.in_flight();
+    for _ in 0..100 {
+        let IOResult::Done(admitted) = log.admit(&mut LogWait::default(), 64).unwrap() else {
+            break;
+        };
+        drop(admitted);
+    }
+    let meanwhile = CLAIMS.with(|n| n.replace(0));
+    while crash.in_flight() > 0 {
+        io.step().unwrap();
+    }
+    let IOResult::Done(admitted) = log.admit(&mut LogWait::default(), 64).unwrap() else {
+        panic!("an admission with room waited");
+    };
+    drop(admitted);
+    let after = CLAIMS.with(|n| n.replace(0));
+    drop(log);
+    assert!(first > 0, "the first admission ran no preparer");
+    assert!(in_flight > 0, "no request of the preparer in flight");
+    assert_eq!(
+        meanwhile, 0,
+        "admissions claimed the preparer waiting on its request"
     );
-    let Some(ended) = ended else { return };
+    assert!(after > 0, "the preparer queued again was not claimed");
+}
+
+/// Every step of the preparer is a unit of a job's work (DESIGN.md 22.1, the auditor's #4356):
+/// what runs inside it runs inside a unit, where every park is refused (mutant: the step outside
+/// a unit).
+#[test]
+fn the_preparers_step_is_a_unit_of_a_jobs_work() {
+    use super::preparer::DURING_UNIT;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let log = reopened_short(&io, true);
+    let inside = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let inside = inside.clone();
+        DURING_UNIT.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                inside.store(
+                    crate::storage::atoll::unit::inside(),
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+            }))
+        });
+    }
+    let _ = log.run_preparer();
+    let ran = DURING_UNIT.with(|d| d.borrow().is_none());
+    drop(log);
+    assert!(ran, "no step of the preparer ran");
     assert!(
-        !ended.aborted && !ended.hung && ended.code == Some(0),
-        "{:?}\n{}",
-        ended.code,
-        ended.stderr
+        inside.load(std::sync::atomic::Ordering::SeqCst),
+        "the preparer's step ran outside a unit"
     );
+}
+
+/// The preparer's finish takes one turn of the log's flush, and a turn asked for during it is
+/// owed to the preparer's next unit, which takes it first (the auditor's #4356; mutant: the
+/// finish flushing turns until none is asked for).
+#[test]
+fn the_preparers_finish_takes_one_flush_turn_and_owes_one_asked_during_it() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    // The next segment from a spare: the preparer's first step renames it and finishes it.
+    let log = reopened_short(&io, false);
+    let before = log.prepared_ahead().0;
+    TURNS.with(|n| n.set(0));
+    ASK_DURING_TURN.with(|a| a.set(true));
+    let _ = log.run_preparer();
+    let finishing = TURNS.with(|n| n.replace(0));
+    let published = log.prepared_ahead().0 > before;
+    let _ = log.run_preparer();
+    let owed = TURNS.with(|n| n.replace(0));
+    drop(log);
+    assert!(published, "the first step published no segment");
+    assert_eq!(finishing, 1, "turns the finish took");
+    assert_eq!(owed, 1, "turns the next unit took for the one owed");
+}
+
+/// Durability waits made and given up while the log's durable position stands still never leave
+/// the waits' count of entries above one more than twice the most waits that stood (the
+/// auditor's #4356 and #4360): a wait given up is counted, and a registration made while those
+/// outnumber the rest takes the stack first. Once the last waiter is gone, the entries left are
+/// all given up, still within that bound, and the raise once the IO paused resumes takes every
+/// one (mutant: a wait given up left uncounted, every one kept until the position moves).
+#[test]
+fn waits_given_up_while_the_log_stands_still_never_outnumber_twice_the_most_that_stood() {
+    const STANDING: u64 = 4;
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let log = Log::open(io.clone(), BASE, small(), 0).unwrap();
+    let p = payload(0, 0);
+    let mut admitted = drive(&io, || {
+        log.admit(&mut LogWait::default(), framed_len(p.len()))
+    })
+    .unwrap();
+    let lsn = log.append(&mut admitted, &header(0), &[&p]);
+    drop(admitted);
+    // Nothing stepped from here on: the IO paused, the log stays short of `lsn`.
+    let mut standing = Vec::new();
+    for _ in 0..STANDING {
+        let mut wait = LogWait::default();
+        let waits = matches!(log.wait_durable(&mut wait, lsn), Ok(IOResult::IO(_)));
+        standing.push((wait, waits));
+    }
+    let mut most = 0;
+    for _ in 0..1000 {
+        let mut wait = LogWait::default();
+        let _ = log.wait_durable(&mut wait, lsn);
+        drop(wait);
+        most = most.max(log.durable_waits.counts().0);
+    }
+    let waited = standing.iter().all(|(_, waits)| *waits);
+    drop(standing);
+    let left = log.durable_waits.counts();
+    while crash.in_flight() > 0 {
+        io.step().unwrap();
+    }
+    drive(&io, || log.wait_durable(&mut LogWait::default(), lsn)).unwrap();
+    let after = log.durable_waits.counts();
+    drop(log);
+    assert!(waited, "a standing wait found the log durable");
+    assert!(
+        most <= 2 * STANDING + 1,
+        "{most} entries held for {STANDING} waits that stand"
+    );
+    assert!(
+        left.0 <= 2 * STANDING + 1 && left.1 == left.0,
+        "(entries, given up) {left:?} once every waiter was gone"
+    );
+    assert_eq!(
+        after,
+        (0, 0),
+        "(entries, given up) once the log was durable"
+    );
+}
+
+/// The auditor's configuration for P1-LOG-ADMIT1: a buffer four segments long.
+fn wide() -> LogConfig {
+    LogConfig {
+        segment_bytes: 64 << 10,
+        buffer_bytes: 256 << 10,
+        chunk_bytes: 8 << 10,
+        writes_in_flight: 3,
+        direct: true,
+    }
+}
+
+/// How an admission's calls are delivered: the backend's requests landing within their
+/// submission, or held until stepped; the preparer stepped by its callers, or by a worker.
+#[derive(Clone, Copy, Debug)]
+struct Delivery {
+    pumped: bool,
+    worker: bool,
+}
+
+/// One admission of `bytes` on a wide log, empty or, `near`, filled to three blocks short of its
+/// first segment's end and durable there: whether it was admitted, or stranded on a wait nothing
+/// can finish (in a caller's run, a wait left unfinished with no request in flight), or failed.
+fn admit_wide(delivery: Delivery, near: bool, bytes: u64) -> std::result::Result<bool, String> {
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = if delivery.pumped {
+        crash.clone()
+    } else {
+        Arc::new(MemoryIO::new())
+    };
+    let executor = delivery
+        .worker
+        .then(|| Executor::new(io.clone(), 1).unwrap());
+    let log = match &executor {
+        Some(ex) => Log::open_on(io.clone(), BASE, wide(), 0, ex).unwrap(),
+        None => Log::open(io.clone(), BASE, wide(), 0).unwrap(),
+    };
+    if near {
+        let filler = vec![7u8; 996];
+        let to = wide().segment_bytes - 3 * BLOCK;
+        while log.end() < to {
+            let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 1024)).unwrap();
+            log.append(&mut admitted, &header(0), &[&filler]);
+        }
+        let end = log.end();
+        drive(&io, || log.wait_durable(&mut LogWait::default(), end)).unwrap();
+    }
+    let mut wait = LogWait::default();
+    let got = if delivery.worker {
+        // A worker prepares: the caller waits, a wait nothing finishes hanging the test.
+        drive(&io, || log.admit(&mut wait, bytes))
+            .map(|a| a.left == bytes)
+            .map_err(|e| e.to_string())
+    } else {
+        let mut got = Err("never admitted".to_string());
+        for _ in 0..10_000 {
+            match log.admit(&mut wait, bytes) {
+                Ok(IOResult::Done(a)) => {
+                    got = Ok(a.left == bytes);
+                    break;
+                }
+                Ok(IOResult::IO(IOCompletions(c))) => {
+                    while !c.finished() && crash.in_flight() > 0 {
+                        io.step().unwrap();
+                    }
+                    if !c.finished() {
+                        got = Err("stranded on a wait nothing can finish".to_string());
+                        break;
+                    }
+                }
+                Err(e) => {
+                    got = Err(e.to_string());
+                    break;
+                }
+            }
+        }
+        got
+    };
+    drop(wait);
+    drop(log);
+    drop(executor);
+    got
+}
+
+/// An admission larger than what is prepared ahead, and within the log's buffer, is admitted: it
+/// has the preparer prepare to the end it needs, however many segments past the prepared end
+/// that is (the auditor's P1-LOG-ADMIT1: 192 KiB on an empty log of 64 KiB segments). Sizes past
+/// one segment, three, and the buffer whole; from an empty log and from three blocks short of a
+/// segment's end; requests landing inline and held until stepped; the preparer stepped by the
+/// caller and by a worker (mutant: the preparer's want read only as less than a segment prepared
+/// ahead, which strands the caller's). The caller's cases run first: a caller's strand is
+/// reported, where a worker's would leave the test waiting.
+#[test]
+fn an_admission_past_what_is_prepared_ahead_is_prepared_for() {
+    let segment = wide().segment_bytes;
+    let mut failures = Vec::new();
+    let mut cases = 0;
+    for worker in [false, true] {
+        for pumped in [false, true] {
+            let delivery = Delivery { pumped, worker };
+            for near in [false, true] {
+                for bytes in [segment + BLOCK, 3 * segment, wide().buffer_bytes] {
+                    cases += 1;
+                    match admit_wide(delivery, near, bytes) {
+                        Ok(true) => {}
+                        got => failures.push(format!("{delivery:?} near {near} {bytes}: {got:?}")),
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+    assert_eq!(cases, 24, "cases run");
+}
+
+/// An admission granted runs a step of the preparer it finds queued and returns, what the step
+/// left to do not waited on: the next admission runs it on, so admissions granted carry a fresh
+/// segment's preparation through to its publication with no admission refused and no caller
+/// waiting, nothing pumping the backend between them where its requests land inline, only its
+/// delivery where they land later (the auditor's #4360; mutant: a granted admission running no
+/// step, which leaves the preparation to the first admission refused).
+#[test]
+fn admissions_granted_carry_a_preparation_through_to_its_publication() {
+    for pumped in [false, true] {
+        let crash = Arc::new(CrashIO::new(0));
+        let io: Arc<dyn IO> = if pumped {
+            crash.clone()
+        } else {
+            Arc::new(MemoryIO::new())
+        };
+        let log = reopened_short(&io, true);
+        let before = log.room.prepared_end();
+        let filler = [5u8; 36];
+        super::preparer::GRANTED_MORE.with(|n| n.set(0));
+        let (mut granted, mut refused, mut published) = (0u64, 0u64, false);
+        for _ in 0..1000 {
+            match log
+                .admit(&mut LogWait::default(), framed_len(filler.len()))
+                .unwrap()
+            {
+                IOResult::Done(mut admitted) => {
+                    granted += 1;
+                    log.append(&mut admitted, &header(0), &[&filler]);
+                }
+                IOResult::IO(_) => refused += 1,
+            }
+            if log.room.prepared_end() > before {
+                published = true;
+                break;
+            }
+            while crash.in_flight() > 0 {
+                io.step().unwrap();
+            }
+        }
+        let more = super::preparer::GRANTED_MORE.with(|n| n.replace(0));
+        drop(log);
+        assert_eq!(refused, 0, "pumped {pumped}: admissions refused");
+        assert!(
+            published,
+            "pumped {pumped}: {granted} granted, no segment published"
+        );
+        assert!(
+            more > 0,
+            "pumped {pumped}: no granted admission's step left more to do"
+        );
+    }
 }

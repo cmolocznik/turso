@@ -20,7 +20,7 @@
 //! passes.
 
 use super::aligned::AlignedBlock;
-use super::log::{framed_len, Admitted, Header, Kind, Log, LogConfig, Lsn, BLOCK};
+use super::log::{framed_len, Admitted, Header, Kind, Log, LogConfig, LogWait, Lsn, BLOCK};
 use super::txn::changes::Chunks;
 use super::whole_write;
 use crate::io::{Completion, File, OpenFlags, IO};
@@ -200,6 +200,8 @@ pub struct Append {
     admitted: Option<Admitted>,
     /// Once published: its base offset, its count, and its record's LSN.
     published: Option<(u64, u32, Lsn)>,
+    /// Its waits on the log: the batch's admission, then its durability.
+    log_wait: LogWait,
 }
 
 impl Append {
@@ -208,6 +210,7 @@ impl Append {
             batch: Some(batch),
             admitted: None,
             published: None,
+            log_wait: LogWait::default(),
         }
     }
 }
@@ -413,7 +416,7 @@ impl Partition {
                     true => framed_len(payload).next_multiple_of(BLOCK) + BLOCK,
                     false => framed_len(payload),
                 };
-                op.admitted = Some(match self.log.admit(room)? {
+                op.admitted = Some(match self.log.admit(&mut op.log_wait, room)? {
                     IOResult::Done(a) => a,
                     IOResult::IO(io) => return Ok(IOResult::IO(io)),
                 });
@@ -447,7 +450,7 @@ impl Partition {
             op.published = Some((base, count, lsn));
         }
         let (base, count, lsn) = op.published.expect("published");
-        Ok(match self.log.wait_durable(lsn)? {
+        Ok(match self.log.wait_durable(&mut op.log_wait, lsn)? {
             IOResult::Done(()) => IOResult::Done((base, count)),
             IOResult::IO(io) => IOResult::IO(io),
         })

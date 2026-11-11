@@ -1,16 +1,9 @@
 //! A unit of a job's work (DESIGN.md 22.1): a step does at most one, and a unit visits at most one
 //! page and never waits, blocks or parks. A unit under way is marked on its thread while its guard
 //! lives: every park refuses it ([`super::park`]), and debug builds count the pages it visits
-//! ([`visit`]) and assert at most one as it ends. Tests read the most any unit visited.
-//!
-//! The one exception until the segment preparer is a task of its own (22.16 step 8): a log call a
-//! unit makes (an admission, a wait for durability) may run the log's segment preparation, the
-//! interim adapter any caller runs, within the unit's budget of one start and one finish, whoever's
-//! segments they are: a start is a file created and allocated (on an inline backend its whole
-//! zero-fill and data sync) or a spare renamed and its directory synced; a finish is the directory
-//! sync that publishes the segment. The budget is kept in every build ([`may_start_segment`],
-//! [`may_finish_segment`]): past it the log offers the unit no start and no finish and leaves the
-//! step to the next caller.
+//! ([`visit`]) and assert at most one as it ends. Tests read the most any unit visited. A log call
+//! a unit makes (an admission, a wait for durability) runs no preparation of the log's: that is
+//! its preparer's, a task of its own (DESIGN.md 22.9 item 2), which the unit's step waits on.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -18,9 +11,6 @@ use std::marker::PhantomData;
 crate::thread::thread_local! {
     /// Whether a unit is under way on this thread.
     static INSIDE: Cell<bool> = const { Cell::new(false) };
-    /// Whether the unit under way on this thread has started a log segment, and finished one.
-    static STARTED: Cell<bool> = const { Cell::new(false) };
-    static FINISHED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(debug_assertions)]
@@ -34,9 +24,6 @@ crate::thread::thread_local! {
     /// The most pages any unit visited on this thread, and the units run, since the last read.
     static MOST: Cell<u32> = const { Cell::new(0) };
     static UNITS: Cell<u64> = const { Cell::new(0) };
-    /// Log segments units on this thread started and finished preparing, since the last read.
-    static STARTS: Cell<u32> = const { Cell::new(0) };
-    static FINISHES: Cell<u32> = const { Cell::new(0) };
     /// The entries of bookkeeping walked on this thread, since the last read.
     static WALKED: Cell<usize> = const { Cell::new(0) };
 }
@@ -50,8 +37,6 @@ impl Unit {
             !INSIDE.with(|i| i.replace(true)),
             "a unit of a job's work entered inside another"
         );
-        STARTED.with(|s| s.set(false));
-        FINISHED.with(|f| f.set(false));
         #[cfg(debug_assertions)]
         VISITS.with(|v| v.set(0));
         Self(PhantomData)
@@ -81,43 +66,6 @@ pub(crate) fn inside() -> bool {
     INSIDE.with(Cell::get)
 }
 
-/// Whether this thread may start preparing a log segment: outside a unit always, inside one until
-/// it has started its one.
-pub(crate) fn may_start_segment() -> bool {
-    !inside() || !STARTED.with(Cell::get)
-}
-
-/// Whether this thread may finish preparing a log segment: outside a unit always, inside one until
-/// it has finished its one.
-pub(crate) fn may_finish_segment() -> bool {
-    !inside() || !FINISHED.with(Cell::get)
-}
-
-/// The unit under way on this thread, if any, starts preparing a log segment: its budget's start.
-pub(crate) fn segment_started() {
-    if inside() {
-        assert!(
-            !STARTED.with(|s| s.replace(true)),
-            "a unit of a job's work started preparing a second log segment"
-        );
-        #[cfg(test)]
-        STARTS.with(|s| s.set(s.get() + 1));
-    }
-}
-
-/// The unit under way on this thread, if any, finishes preparing a log segment: its budget's
-/// finish.
-pub(crate) fn segment_finished() {
-    if inside() {
-        assert!(
-            !FINISHED.with(|f| f.replace(true)),
-            "a unit of a job's work finished preparing a second log segment"
-        );
-        #[cfg(test)]
-        FINISHES.with(|f| f.set(f.get() + 1));
-    }
-}
-
 /// Counts a page the unit under way on this thread visits, if one is: read, written, imaged,
 /// freed, synced or erased, or reached while building an image (DESIGN.md 22.1).
 #[inline]
@@ -141,15 +89,6 @@ pub(crate) fn walked() {
 #[cfg(test)]
 pub(crate) fn take_walked() -> usize {
     WALKED.with(|w| w.replace(0))
-}
-
-/// The log segments units on this thread started and finished preparing, since the last call.
-#[cfg(test)]
-pub(crate) fn segments() -> (u32, u32) {
-    (
-        STARTS.with(|s| s.replace(0)),
-        FINISHES.with(|f| f.replace(0)),
-    )
 }
 
 /// The most pages any unit visited on this thread, and the units run, since the last call.

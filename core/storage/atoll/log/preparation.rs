@@ -1,22 +1,14 @@
-//! The preparation's word (DESIGN.md 22.5): where the segment being prepared stands, and who owns
-//! it at each point.
+//! The preparation's word (DESIGN.md 22.9 item 2): whether a flush's padding waits for a
+//! segment, and whether the log's preparer is preparing one. Two bits:
 //!
-//! - *done*: no preparation under way;
-//! - *needed*: a segment must be prepared and nobody has started it;
-//! - *in flight*: its zero-fill writes or its data sync are submitted, owned by those requests;
-//! - *owed*: its data sync landed, and the directory sync, the prepared end's publication and the
-//!   look for the next segment are owed.
+//! - *needed*: a flush met padding waiting for a segment, set until the preparer publishes one;
+//! - *preparing*: the preparer's, from taking the word until the segment's end is published.
 //!
-//! Starting a preparation (a spare's rename, a file's create and allocation) and finishing one (the
-//! directory sync) are synchronous file calls, so only a caller runs them, never a callback. A
-//! caller takes the word by compare-and-swap into a taken state, *starting* from done or needed,
-//! *finishing* from owed, so one caller owns each step and any other goes on. Taking it is no lock:
-//! no step waits for it.
-//!
-//! A move to needed or owed makes a step runnable, so its mover wakes every waiter: it stores the
-//! word and then, across a sequentially consistent fence, takes the waits; a waiter pushes its
-//! wait and then, across one, reads the word. So either the mover takes the wait, or the waiter
-//! reads the word and runs the step.
+//! Only the preparer takes the word, so nothing else ever runs a step of the preparation. A flush
+//! that meets padding sets *needed*; from nothing set it moves the word, and its mover triggers
+//! the preparer. Set while the preparer prepares, it says a flush waits on that segment; the
+//! preparer clears both bits as it publishes the segment and then flushes, and that flush looks at
+//! the padding again, setting *needed* anew if the next segment is wanted too.
 
 use self::sync::{AtomicU8, Ordering};
 
@@ -32,19 +24,7 @@ mod sync {
 
 const DONE: u8 = 0;
 const NEEDED: u8 = 1;
-const IN_FLIGHT: u8 = 2;
-const OWED: u8 = 3;
-const STARTING: u8 = 4;
-const FINISHING: u8 = 5;
-
-/// The step a caller took, which it owns until it moves the word on or lets it go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Step {
-    /// Make the segment: a spare's rename, or a file's create, allocation and zero fill.
-    Start,
-    /// Sync the directory, publish the prepared end.
-    Finish,
-}
+const PREPARING: u8 = 2;
 
 /// The word.
 pub(super) struct Word(AtomicU8);
@@ -56,99 +36,52 @@ impl Default for Word {
 }
 
 impl Word {
-    /// Moves done to needed, where a flush meets padding waiting for a segment nobody prepares:
-    /// whether it moved, which makes its mover wake every waiter.
+    /// Sets *needed*, where a flush meets padding waiting for a segment: whether it moved the word
+    /// from nothing set, which makes its mover trigger the preparer.
     pub(super) fn need(&self) -> bool {
-        self.0
-            .compare_exchange(DONE, NEEDED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        self.0.fetch_or(NEEDED, Ordering::SeqCst) == DONE
     }
 
-    /// Moves in flight to owed, as the data sync of the segment lands: its mover then wakes every
-    /// waiter.
-    pub(super) fn owe(&self) {
-        let was = self.0.swap(OWED, Ordering::SeqCst);
-        assert_eq!(
-            was, IN_FLIGHT,
-            "a data sync landed for no preparation in flight"
-        );
-    }
-
-    /// Whether a step is runnable for a caller: the word needed or owed. A word done with less than
-    /// a segment prepared ahead is runnable too, which the caller knows ([`take`](Self::take)).
-    pub(super) fn wants_a_caller(&self) -> bool {
-        matches!(self.0.load(Ordering::SeqCst), NEEDED | OWED)
-    }
-
-    /// Whether a start is needed: a flush's padding waits for the segment.
-    pub(super) fn needed(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == NEEDED
-    }
-
-    /// Whether a finish is owed: the segment's directory sync and the publishing of its end.
-    pub(super) fn owed(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == OWED
-    }
-
-    /// Takes the step a caller may run: finishing from owed, starting from needed, or from done
-    /// when `short` says less than a segment is prepared ahead of what is admitted; a start only
-    /// where `may_start` says the caller may start one, a finish only where `may_finish` says it
-    /// may finish one.
-    pub(super) fn take(
-        &self,
-        may_start: impl Fn() -> bool,
-        may_finish: impl Fn() -> bool,
-        short: impl Fn() -> bool,
-    ) -> Option<Step> {
+    /// The preparer takes the word, needed or, with nothing set, when `short` says less than a
+    /// segment is prepared ahead of what is admitted: whether it took it, which makes the
+    /// preparation its own until [`done`](Self::done).
+    pub(super) fn take(&self, short: impl Fn() -> bool) -> bool {
         loop {
-            let (from, to, step) = match self.0.load(Ordering::SeqCst) {
-                OWED if may_finish() => (OWED, FINISHING, Step::Finish),
-                NEEDED if may_start() => (NEEDED, STARTING, Step::Start),
-                DONE if short() && may_start() => (DONE, STARTING, Step::Start),
-                _ => return None,
+            let from = match self.0.load(Ordering::SeqCst) {
+                NEEDED => NEEDED,
+                DONE if short() => DONE,
+                _ => return false,
             };
             if self
                 .0
-                .compare_exchange(from, to, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(from, from | PREPARING, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return Some(step);
+                return true;
             }
         }
     }
 
-    /// Starting to in flight, before the first zero-fill write is submitted: the preparation is
-    /// then its requests'.
-    pub(super) fn hand_to_requests(&self) {
-        self.moved(STARTING, IN_FLIGHT);
-    }
-
-    /// Starting to finishing: a spare, renamed, needs only its directory synced, which its starter
-    /// runs too.
-    pub(super) fn start_to_finish(&self) {
-        self.moved(STARTING, FINISHING);
-    }
-
-    /// Finishing to done, once the prepared end is published: the finisher's ownership ends.
+    /// Both bits cleared once the prepared end is published: the preparer's ownership ends, and
+    /// the flush it runs next sets *needed* anew if padding still waits.
     pub(super) fn done(&self) {
-        self.moved(FINISHING, DONE);
-    }
-
-    /// Lets a taken step go where it stands, with nothing more done: starting back to needed,
-    /// finishing back to owed. What a step does on finding the log failed.
-    pub(super) fn let_go(&self, step: Step) {
-        match step {
-            Step::Start => self.moved(STARTING, NEEDED),
-            Step::Finish => self.moved(FINISHING, OWED),
-        }
-    }
-
-    fn moved(&self, from: u8, to: u8) {
-        let was = self.0.swap(to, Ordering::SeqCst);
-        assert_eq!(
-            was, from,
-            "the preparation's word moved from {was}, not {from}"
+        let was = self.0.swap(DONE, Ordering::SeqCst);
+        assert!(
+            was & PREPARING != 0,
+            "a preparation ended that was not taken"
         );
+    }
+
+    /// Whether a flush's padding waits for a segment: a wait on the log's durability then waits on
+    /// its preparer.
+    pub(super) fn needed(&self) -> bool {
+        self.0.load(Ordering::SeqCst) & NEEDED != 0
+    }
+
+    /// Whether the preparer is preparing a segment.
+    #[cfg(test)]
+    pub(super) fn preparing(&self) -> bool {
+        self.0.load(Ordering::SeqCst) & PREPARING != 0
     }
 }
 
@@ -165,66 +98,49 @@ mod loom_tests {
         model.check(f);
     }
 
-    /// Two callers race for a needed word: exactly one takes the step, and the other goes on.
+    /// Two flushes meet padding at once: exactly one moves the word to needed, so the preparer is
+    /// triggered once for it.
     #[test]
-    fn one_caller_takes_each_step() {
+    fn one_flush_moves_the_word_to_needed() {
         check(|| {
             let word = Arc::new(Word::default());
-            assert!(word.need());
-            let taken = Arc::new(AtomicUsize::new(0));
-            let callers: Vec<_> = (0..2)
+            let moved = Arc::new(AtomicUsize::new(0));
+            let flushes: Vec<_> = (0..2)
                 .map(|_| {
-                    let (word, taken) = (word.clone(), taken.clone());
+                    let (word, moved) = (word.clone(), moved.clone());
                     thread::spawn(move || {
-                        if let Some(step) = word.take(|| true, || true, || false) {
-                            assert_eq!(step, Step::Start);
-                            taken.fetch_add(1, Ordering::SeqCst);
+                        if word.need() {
+                            moved.fetch_add(1, Ordering::SeqCst);
                         }
                     })
                 })
                 .collect();
-            for c in callers {
-                c.join().unwrap();
+            for f in flushes {
+                f.join().unwrap();
             }
-            assert_eq!(
-                taken.load(Ordering::SeqCst),
-                1,
-                "a step taken twice or never"
-            );
+            assert_eq!(moved.load(Ordering::SeqCst), 1, "moved twice or never");
+            assert!(word.needed());
         });
     }
 
-    /// A waiter registers and then reads the word, as `admit` and `wait_durable` do; a mover makes
-    /// the word owed and then takes the waits, as the data sync's callback does: either the mover
-    /// takes the wait, or the waiter reads the word and takes the step. Never neither.
+    /// A flush meets padding while the preparer prepares and ends: either it set *needed* after
+    /// the end, moving the word and so triggering the preparer, or it set it before, in which
+    /// case the end cleared it and the preparer's own flush after the end looks again. Never a
+    /// trigger lost with the bit left set and nobody to read it.
     #[test]
-    fn a_move_to_owed_wakes_or_is_seen_by_a_waiter() {
-        use crate::storage::atoll::stack::Stack;
-        use loom::sync::atomic::{fence, AtomicBool};
+    fn a_need_during_a_preparation_triggers_after_it_or_is_left_to_its_flush() {
         check(|| {
             let word = Arc::new(Word::default());
-            assert_eq!(word.take(|| true, || true, || true), Some(Step::Start));
-            word.hand_to_requests();
-            let waiting = Arc::new(Stack::<Arc<AtomicBool>>::default());
-            let mover = {
-                let (word, waiting) = (word.clone(), waiting.clone());
-                thread::spawn(move || {
-                    word.owe();
-                    fence(Ordering::SeqCst);
-                    for w in waiting.take_all() {
-                        w.store(true, Ordering::Release);
-                    }
-                })
+            assert!(word.take(|| true), "a short log's word not taken");
+            let preparer = {
+                let word = word.clone();
+                thread::spawn(move || word.done())
             };
-            let woken = Arc::new(AtomicBool::new(false));
-            waiting.push(woken.clone());
-            fence(Ordering::SeqCst);
-            let took = word.take(|| true, || true, || false);
-            mover.join().unwrap();
-            assert!(
-                took == Some(Step::Finish) || woken.load(Ordering::Acquire),
-                "a waiter neither woken nor running the owed step"
-            );
+            let moved = word.need();
+            preparer.join().unwrap();
+            // Moved: set after the end, the preparer triggered. Not: set before, cleared by the end.
+            assert_eq!(word.needed(), moved, "the bit and the trigger disagree");
+            assert!(!word.preparing(), "a preparation left taken");
         });
     }
 }

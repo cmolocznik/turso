@@ -1083,6 +1083,66 @@ fn waits_for_a_full_checkpoint_share_one_registration_however_often_polled_or_dr
     );
 }
 
+/// A full checkpoint whose intent record needs a segment the preparer has not made, with no
+/// worker and no other caller (DESIGN.md 22.7, 22.15 proof 12): the checkpoint's step waits on
+/// the preparer (`Step::WaitOn`), and the writer that claimed it runs the preparer itself and
+/// waits on the preparer's request, until the segment is published and the checkpoint ends. The
+/// IO is stepped only while a returned wait stands (mutant: the claimant returning the step's
+/// wait without running the preparer, which nothing then finishes).
+#[test]
+fn a_checkpoints_intent_needing_a_segment_is_prepared_by_its_claimant_with_no_worker() {
+    let crash = Arc::new(CrashIO::new(0));
+    let mut config = config();
+    // Segments a quarter of the log's buffer: all the room before the prepared end can be held
+    // and the intent record still fit the buffer once the next segment is published.
+    config.log.segment_bytes = 64 << 10;
+    let db = Db::with(crash.clone(), Some(crash.clone()), config);
+    let tree = db.create(node_class());
+    for k in 0..64 {
+        db.put(&tree, k, value(k, 0));
+    }
+    let log = db.db.log().clone();
+    let cp = db.db.checkpointer();
+    let txns = db.db.transactions();
+    // Every byte before the prepared end taken: the intent's admission waits on the preparer.
+    let held = log.hold_prepared_room();
+    let mut wait = cp.request_full();
+    let (mut done, mut stuck, mut failed, mut published) = (false, false, None, false);
+    for _ in 0..1 << 16 {
+        match cp.step_full(&mut wait, txns) {
+            Ok(IOResult::Done(())) => {
+                done = true;
+                break;
+            }
+            Ok(IOResult::IO(IOCompletions(c))) => {
+                let mut steps = 0;
+                while !c.finished() && steps <= 64 {
+                    db.io.step().unwrap();
+                    steps += 1;
+                }
+                published |= log.prepared_ahead().0 > 0;
+                if !c.finished() {
+                    stuck = true;
+                    break;
+                }
+            }
+            Err(e) => {
+                failed = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    drop(held);
+    drop(wait);
+    drop(log);
+    // Every assertion with the database closed.
+    drop((tree, db));
+    assert!(failed.is_none(), "{failed:?}");
+    assert!(!stuck, "a claimant's wait that no IO in flight ends");
+    assert!(published, "no segment published past the room held");
+    assert!(done, "the full checkpoint not done");
+}
+
 /// The ends of transactions waiting for a full checkpoint are woken with no lock held: a waiter
 /// whose waker waits for the next full checkpoint again, from inside its wake on the
 /// checkpointing thread, is not blocked by the lock the wake would otherwise still hold.

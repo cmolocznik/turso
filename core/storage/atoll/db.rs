@@ -7,8 +7,8 @@ use super::checkpoint::{
 };
 use super::control::{Control, Superblock};
 use super::drive;
-use super::executor::{Class, Executor};
-use super::log::{Log, LogConfig};
+use super::executor::{rank, Class, Executor};
+use super::log::{Log, LogConfig, LogWait};
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
 use super::recovery::{self, Recovered};
@@ -144,8 +144,9 @@ impl Atoll {
         let end = self.log.end();
         let durable = crate::io::Completion::new_wait();
         // A failure the log tells is the durable end's; any other is kept beside it and
-        // returned once the close has ended.
-        let other = match drive(&self.io, || self.log.wait_durable(end)) {
+        // returned once the close has ended. With no worker, the wait runs the preparer itself.
+        let mut wait = LogWait::default();
+        let other = match drive(&self.io, || self.log.wait_durable(&mut wait, end)) {
             Ok(()) => {
                 durable.complete(0);
                 None
@@ -159,6 +160,7 @@ impl Atoll {
                 Some(e)
             }
         };
+        drop(wait);
         let closed = executor.close_after(&durable, &self.requests);
         match other {
             Some(e) => {
@@ -228,6 +230,10 @@ pub(in crate::storage::atoll) struct Opening {
     io: Arc<dyn IO>,
     requests: Arc<Requests>,
     checkpointing: Checkpointing,
+    /// The database's executor, made before its log is opened, so the log's preparer is one of
+    /// its tasks from the first (DESIGN.md 22.9 item 2): with one worker of its own
+    /// ([`Checkpointing::Thread`]) or none, its callers running its tasks.
+    executor: Executor,
 }
 
 enum How {
@@ -281,9 +287,11 @@ impl Opening {
             ring: super::log::ring_chunks(&config.log),
             bank,
         };
+        let worker = matches!(config.checkpointing, Checkpointing::Thread);
+        let executor = Executor::new(io.clone(), usize::from(worker))?;
         let (control, superblock) = Control::open(io.clone(), base)?;
         let Some(superblock) = superblock else {
-            return Self::create(io, requests, base, config, control);
+            return Self::create(io, requests, base, config, control, executor);
         };
         // What the database was created with holds, whatever this configuration says.
         config.log.segment_bytes = superblock.segment_bytes;
@@ -301,6 +309,7 @@ impl Opening {
             io: io.clone(),
             requests,
             checkpointing: config.checkpointing,
+            executor,
             how: Mutex::new(How::Recovering {
                 io,
                 base: base.to_string(),
@@ -318,6 +327,7 @@ impl Opening {
         base: &str,
         config: AtollConfig,
         control: Control,
+        executor: Executor,
     ) -> Result<Self> {
         // From the IO, so a simulation that seeds it creates the same database every time.
         let mut database_id = [0u8; 16];
@@ -350,7 +360,7 @@ impl Opening {
             store.clone(),
         )?;
         // Its ring in frames the pool lends: the pool first.
-        let log = Log::open_in(io.clone(), base, config.log.clone(), 0, &pool)?;
+        let log = Log::open_in(io.clone(), base, config.log.clone(), 0, &pool, &executor)?;
         let txns = Transactions::new(&config.txn, Arc::new(Clock::after(0)), log.clone());
         let checkpointer = Checkpointer::new(
             pool.clone(),
@@ -367,6 +377,7 @@ impl Opening {
             io,
             requests,
             checkpointing: config.checkpointing,
+            executor,
             how: Mutex::new(How::Created(Box::new(Recovered {
                 log,
                 pool,
@@ -398,6 +409,7 @@ impl Opening {
             self.store.clone(),
             control,
             self.superblock.clone(),
+            &self.executor,
         )?;
         *how = How::Recovered(Box::new(recovered));
         Ok(())
@@ -426,11 +438,14 @@ impl Opening {
         // A writer refused room for kept copies steps the checkpoint itself, or with a thread
         // stepping checkpoints waits for the room it frees.
         pool.set_relief(Arc::new(CheckpointRelief::new(&checkpointer, &txns)));
-        // The checkpoint's task, on one worker or on none, its writers claiming it.
+        // The checkpoint's task, on the executor the log's preparer already runs on, with one
+        // worker or none, its writers claiming it; before the preparer in the order jobs wait on
+        // each other (DESIGN.md 22.4).
         let worker = matches!(self.checkpointing, Checkpointing::Thread);
-        let executor = Executor::new(self.io.clone(), usize::from(worker))?;
-        let task = executor.spawn_watching(
+        let executor = self.executor;
+        let task = executor.spawn_ranked(
             Class::Maintenance,
+            rank::CHECKPOINT,
             Box::new(CheckpointTask::new(checkpointer.clone(), txns.clone())),
             &[checkpointer.due_signal(), checkpointer.erasure_signal()],
         );

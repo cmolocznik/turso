@@ -257,7 +257,12 @@ fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_p
     for i in 0..32 {
         if i % 2 == 1 {
             let run = super::txn::changes::Changes::new();
-            drive(&db.io, || db.db.transactions().publish_alone(&run)).unwrap();
+            drive(&db.io, || {
+                db.db
+                    .transactions()
+                    .publish_alone(&mut crate::storage::atoll::log::LogWait::default(), &run)
+            })
+            .unwrap();
         }
         db.put(&format!("k{i:02}"), &written(i));
         ends.push((format!("k{i:02}"), written(i), db.db.log().end()));
@@ -543,7 +548,13 @@ fn every_kind_of_io(crash: &CrashIO, io: &Arc<dyn IO>, left: &Cell<u64>) -> Opti
 fn appended_undurable(io: &Arc<dyn IO>, log: &Arc<Log>) -> Lsn {
     use super::log::{framed_len, Header, Kind};
     let payload = [7u8; 300];
-    let mut admitted = drive(io, || log.admit(framed_len(payload.len()))).unwrap();
+    let mut admitted = drive(io, || {
+        log.admit(
+            &mut crate::storage::atoll::log::LogWait::default(),
+            framed_len(payload.len()),
+        )
+    })
+    .unwrap();
     let header = Header {
         kind: Kind::new(1).unwrap(),
         flags: 0,
@@ -1139,6 +1150,7 @@ const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
     ("buffer/shortage.rs", "short", "Completion::new_yield", 1, "held: memory, reserved at the operation's top (the shortage queue)"),
     ("checkpoint.rs", "step_full", "Completion::new_yield", 1, "change: a step of its own done and more of the full checkpoint to do"),
     ("checkpoint.rs", "claim_full", "Completion::new_yield", 2, "change: a claimed step done and more of the full checkpoint to do, or the task over since the writer looked"),
+    ("log/mod.rs", "run_preparer", "Completion::new_yield", 1, "change: a step of the preparer done and more of it to do now"),
     ("meta.rs", "get", "Completion::new_yield", 1, "change: a load's phase moved before the wait was registered"),
     ("meta.rs", "wait_while_held", "Completion::new_yield", 2, "change: the hold let go or changed before the mark"),
     ("meta.rs", "write_for", "Completion::new_yield", 3, "change: the writing cell changed, a validation failed, a write put first by another"),

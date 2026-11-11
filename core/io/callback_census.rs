@@ -203,16 +203,16 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "records the write landed, wakes, starts the next sync and flush",
     ),
     (
-        "storage/atoll/log/mod.rs",
-        "zero_fill",
+        "storage/atoll/log/preparer.rs",
+        "prepare_unit",
         "new_sync",
-        "moves the preparation's word to owed and wakes every waiter",
+        "records the failure of a segment's data sync",
     ),
     (
-        "storage/atoll/log/mod.rs",
-        "zero_fill",
+        "storage/atoll/log/preparer.rs",
+        "prepare_unit",
         "new_write",
-        "submits the next zero-fill write",
+        "records the failure of a zero-fill write",
     ),
     (
         "storage/atoll/log/reader.rs",
@@ -694,12 +694,12 @@ fn every_callback_is_listed_and_none_makes_a_call_the_delivery_thread_refuses() 
         .collect();
     found.sort();
     listed.sort();
-    // The census sees the callbacks it must: the log's data-sync callback is one.
+    // The census sees the callbacks it must: the preparer's data-sync callback is one.
     assert!(
         found
             .iter()
-            .any(|(f, func, k)| f == "storage/atoll/log/mod.rs"
-                && func == "zero_fill"
+            .any(|(f, func, k)| f == "storage/atoll/log/preparer.rs"
+                && func == "prepare_unit"
                 && k == "new_sync"),
         "the census read no callback where one is: {} found",
         found.len()

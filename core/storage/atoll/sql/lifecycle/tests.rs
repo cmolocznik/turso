@@ -368,7 +368,10 @@ fn crashes_through_ddl_and_its_rollback_leave_every_tree_named_listed_or_free() 
         let (ten, eleven) = (db.table(&mut t, 10, 30), db.table(&mut t, 11, 30));
         db.commit(t);
         run(&db.io, || {
-            db.db.atoll().log().wait_durable(db.db.atoll().log().end())
+            db.db.atoll().log().wait_durable(
+                &mut crate::storage::atoll::log::LogWait::default(),
+                db.db.atoll().log().end(),
+            )
         });
         crash_io.capture(|path| path.starts_with(&format!("{BASE}.log.")), 3, seed);
         let mut t = db.begin();

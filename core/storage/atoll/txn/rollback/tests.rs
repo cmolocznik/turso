@@ -206,7 +206,12 @@ impl Db {
     }
 
     fn durable(&self) {
-        run(&self.io, || self.db.log().wait_durable(self.db.log().end()));
+        run(&self.io, || {
+            self.db.log().wait_durable(
+                &mut crate::storage::atoll::log::LogWait::default(),
+                self.db.log().end(),
+            )
+        });
     }
 
     /// What a transaction begun now reads of `keys` in each tree.

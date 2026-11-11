@@ -29,6 +29,7 @@ use self::rowid::Rowids;
 use super::btree::{Cursor, Drain, Mode};
 use super::db::{Atoll, AtollConfig};
 use super::drive;
+use super::log::LogWait;
 use super::page::PageId;
 use super::txn::versioned::{Get, VersionedTree, Versions, Write};
 use super::txn::{Commit, Isolation, Taken};
@@ -49,9 +50,10 @@ pub struct AtollDb {
     /// The dropped list, written by transactions.
     dropped: VersionedTree,
     stamps: self::trees::TreeStamps,
-    /// Trees handed over to drain, the one being drained, and whether a drainer is at work.
+    /// Trees handed over to drain, the one being drained with its wait on the log for its
+    /// publication's room, and whether a drainer is at work.
     draining: Mutex<Vec<PageId>>,
-    current: Mutex<Option<(PageId, Drain, bool)>>,
+    current: Mutex<Option<(PageId, Drain, bool, LogWait)>>,
     drainer: AtomicBool,
     /// The next tree id to draw, above every id the catalog held at open and every one drawn
     /// since. Not transactional: an id a rolled-back transaction drew is not drawn again while the
@@ -70,7 +72,8 @@ impl Drop for AtollDb {
     fn drop(&mut self) {
         let log = self.atoll.log().clone();
         let end = log.end();
-        if let Err(e) = drive(&self.io, || log.wait_durable(end)) {
+        let mut wait = LogWait::default();
+        if let Err(e) = drive(&self.io, || log.wait_durable(&mut wait, end)) {
             tracing::error!("flushing the log of a database closing failed: {e}");
         }
     }

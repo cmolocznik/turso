@@ -155,7 +155,13 @@ fn a_database_closes_once_every_request_on_its_files_has_retired() {
         let db = Atoll::open(io.clone(), "/db/close", AtollConfig::small()).unwrap();
         let log = db.log().clone();
         let payload = [7u8; 100];
-        let mut admitted = drive(&io, || log.admit(framed_len(payload.len()))).unwrap();
+        let mut admitted = drive(&io, || {
+            log.admit(
+                &mut crate::storage::atoll::log::LogWait::default(),
+                framed_len(payload.len()),
+            )
+        })
+        .unwrap();
         let header = Header {
             kind: Kind::new(1).unwrap(),
             flags: 0,
@@ -165,7 +171,10 @@ fn a_database_closes_once_every_request_on_its_files_has_retired() {
         let lsn = log.append(&mut admitted, &header, &[&payload]);
         drop(admitted);
         // Asked for and left: its writes are in flight, and nobody steps them.
-        let IOResult::IO(_) = log.wait_durable(lsn).unwrap() else {
+        let IOResult::IO(_) = log
+            .wait_durable(&mut crate::storage::atoll::log::LogWait::default(), lsn)
+            .unwrap()
+        else {
             panic!("seed {seed}: durable with nothing stepped");
         };
         assert!(crash.in_flight() > 0, "seed {seed}: nothing in flight");

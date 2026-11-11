@@ -265,6 +265,36 @@ mod native {
         }
     }
 
+    /// A task done reads done once its executor closes, whether or not its step's end has let its
+    /// job go yet: close marks closed only the tasks that have not ended (mutant: close storing
+    /// closed over every task its table holds, which turned a task a worker's end had set done,
+    /// its job not yet let go, into one closed; the test below met it once in 240 runs under load).
+    #[test]
+    fn a_task_done_before_its_job_goes_reads_done_after_close() {
+        let ex = executor(0);
+        let task = ex.spawn(
+            Class::Due,
+            Box::new(Forever {
+                steps: Default::default(),
+                stepping: Default::default(),
+                overlapped: Default::default(),
+                until: 1,
+            }),
+        );
+        // As a worker's end leaves it: its word set done, out of every list, its job in the table.
+        {
+            let mut queue = lock(&ex.shared.queue);
+            for list in &mut queue.lists {
+                list.retain(|h| !Arc::ptr_eq(h, &task.0));
+            }
+        }
+        task.0.state.store(DONE, O::Release);
+        ex.close();
+        let done = task.is_done();
+        drop(task);
+        assert!(done, "a task done read as closed once its executor closed");
+    }
+
     /// Many workers, many tasks, each asking again a fixed number of times while wakes come from
     /// outside: every task is stepped exactly that many times and never by two runners at once
     /// (22.3; proof 2 under real threads; mutant: a wake that links a task already queued, which
@@ -1185,6 +1215,25 @@ mod native {
         assert_eq!(woken.1, 1, "woken after the queue's mutex");
         assert!(stepped);
         assert_eq!(claimed, ["t"]);
+    }
+
+    /// A task says whether its executor's workers step it: with none, whoever waits on its work
+    /// runs it (22.7); with one, waiters only wait; once its executor is gone, nothing does.
+    #[test]
+    fn a_task_says_whether_workers_of_its_executor_step_it() {
+        let log = Arc::new(Lock::new(Vec::new()));
+        let callers = executor(0);
+        let task = callers.spawn(Class::Maintenance, recorded("a", 0, &log));
+        let without = task.driven();
+        let workers = executor(1);
+        let worked = workers.spawn(Class::Maintenance, recorded("b", 0, &log));
+        let with = worked.driven();
+        workers.close();
+        let closed = worked.driven();
+        callers.close();
+        assert!(!without, "a task with no worker called driven");
+        assert!(with, "a worker's task not called driven");
+        assert!(!closed, "a closed executor's task called driven");
     }
 
     /// A runner registering again swaps its new waker into its node: the link wakes that one, and
@@ -3121,6 +3170,7 @@ mod loom_tests {
             closed: AtomicBool::new(false),
             jobs: Mutex::new(Vec::new()),
             io: Arc::new(crate::io::MemoryIO::new()),
+            driven: false,
         })
     }
 

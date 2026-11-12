@@ -64,7 +64,7 @@ impl Rows {
         assert_send_sync!(Next);
 
         let next = Next {
-            columns: self.inner.inner.lock().unwrap().column_count(),
+            columns: self.inner.held()?.column_count(),
             stmt: self.inner.clone(),
         };
 

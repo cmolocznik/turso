@@ -399,7 +399,7 @@ impl Future for Execute {
             match self.stmt.step(0, cx)? {
                 Poll::Ready(Some(_)) => continue,
                 Poll::Ready(None) => {
-                    let n_change = self.stmt.inner.lock().unwrap().n_change();
+                    let n_change = self.stmt.held()?.n_change();
                     return Poll::Ready(Ok(n_change as u64));
                 }
                 Poll::Pending => return Poll::Pending,
@@ -409,8 +409,22 @@ impl Future for Execute {
 }
 
 impl Statement {
+    /// The statement, taken without waiting, as every future of the binding takes it (DESIGN.md
+    /// 22.18, ASYNC1: a poll never waits on a lock another holds across its work). Its mutex is
+    /// held only while the statement is reset, bound or stepped, so a holder means it is being used
+    /// from two places at once, which the SDK refuses as misuse: that is returned at once.
+    fn held(&self) -> Result<std::sync::MutexGuard<'_, Box<turso_sdk_kit::rsapi::TursoStatement>>> {
+        match self.inner.try_lock() {
+            Ok(stmt) => Ok(stmt),
+            Err(std::sync::TryLockError::WouldBlock) => Err(Error::Misuse(
+                "a statement used from two places at once".to_string(),
+            )),
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("{e}"),
+        }
+    }
+
     fn step(&self, columns: usize, cx: &mut std::task::Context<'_>) -> Poll<Result<Option<Row>>> {
-        let mut stmt = self.inner.lock().unwrap();
+        let mut stmt = self.held()?;
         match stmt.step(Some(cx.waker()))? {
             turso_sdk_kit::rsapi::TursoStatusCode::Row => {
                 let mut values = Vec::with_capacity(columns);
@@ -451,7 +465,7 @@ impl Statement {
     ) -> Result<Rows> {
         self.reset()?;
 
-        let mut stmt = self.inner.lock().unwrap();
+        let mut stmt = self.held()?;
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
@@ -492,20 +506,20 @@ impl Statement {
     ) -> Result<u64> {
         {
             // Reset the statement before executing
-            self.inner.lock().unwrap().reset()?;
+            self.held()?.reset()?;
         }
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
             params::Params::Positional(values) => {
                 for (i, value) in values.into_iter().enumerate() {
-                    let mut stmt = self.inner.lock().unwrap();
+                    let mut stmt = self.held()?;
                     stmt.bind_positional(i + 1, value.into())?;
                 }
             }
             params::Params::Named(values) => {
                 for (name, value) in values.into_iter() {
-                    let mut stmt = self.inner.lock().unwrap();
+                    let mut stmt = self.held()?;
                     let position = stmt.named_position(name)?;
                     stmt.bind_positional(position, value.into())?;
                 }
@@ -588,7 +602,7 @@ impl Statement {
 
     /// Reset internal statement state after previous execution so it can be reused again
     pub fn reset(&self) -> Result<()> {
-        let mut stmt = self.inner.lock().unwrap();
+        let mut stmt = self.held()?;
         stmt.reset()?;
         Ok(())
     }
@@ -650,6 +664,56 @@ pub struct Transaction {}
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// Runs `f` while another thread holds `stmt`'s mutex, as a step of it from another place does,
+    /// that thread letting go once `f` has returned, or after a bound if `f` waits for it instead.
+    fn while_held<T>(stmt: &Statement, f: impl FnOnce() -> T) -> T {
+        let inner = stmt.inner.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = inner.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        held_rx.recv().unwrap();
+        let out = f();
+        let _ = done_tx.send(());
+        holder.join().unwrap();
+        out
+    }
+
+    fn misused<T: std::fmt::Debug>(result: &Result<T>) -> bool {
+        matches!(result, Err(Error::Misuse(m)) if m == "a statement used from two places at once")
+    }
+
+    /// A statement held by another place: the binding's futures take its mutex without waiting
+    /// (DESIGN.md 22.18, ASYNC1) and return the misuse at once, the next row, an execute and a query
+    /// alike; let go, the same calls go on as before.
+    #[test]
+    fn a_statement_used_from_two_places_at_once_is_refused_at_once_never_waited_for() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = rt.block_on(Builder::new_local(":memory:").build()).unwrap();
+        let conn = db.connect().unwrap();
+        let mut stmt = rt.block_on(conn.prepare("SELECT 1")).unwrap();
+        // The same statement, its mutex shared, for the other place to hold.
+        let elsewhere = stmt.clone();
+        let mut rows = rt.block_on(stmt.query(())).unwrap();
+        let next_held = while_held(&elsewhere, || rt.block_on(rows.next()).map(|r| r.is_some()));
+        let next = rt.block_on(rows.next()).map(|r| r.is_some());
+        drop(rows);
+        let execute_held = while_held(&elsewhere, || rt.block_on(stmt.execute(())));
+        let execute = rt.block_on(stmt.execute(()));
+        let query_held = while_held(&elsewhere, || rt.block_on(stmt.query(())).map(|_| ()));
+        assert!(misused(&next_held), "the next row, held: {next_held:?}");
+        assert_eq!(next.ok(), Some(true), "the next row once let go");
+        assert!(misused(&execute_held), "an execute, held: {execute_held:?}");
+        assert_eq!(execute.ok(), Some(0), "an execute once let go");
+        assert!(misused(&query_held), "a query, held: {query_held:?}");
+    }
 
     #[tokio::test]
     async fn test_database_persistence() -> Result<()> {

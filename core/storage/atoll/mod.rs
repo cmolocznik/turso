@@ -31,6 +31,7 @@ mod btree;
 mod buffer;
 mod checkpoint;
 mod control;
+mod cooperative;
 mod crc;
 pub mod db;
 mod epoch;

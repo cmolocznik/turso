@@ -154,6 +154,81 @@ pub(crate) fn without_test_modules(code: &str) -> String {
     out
 }
 
+/// The methods the trait or impl block `header` opens in `code` declares at its own level, each
+/// with its body, braces included, or an empty one for a declaration with none: a method's own
+/// braces, and a default body's, are deeper and never read as the block's.
+pub(crate) fn methods_of<'a>(code: &'a str, header: &str) -> Vec<(String, &'a str)> {
+    let start = code
+        .find(header)
+        .unwrap_or_else(|| panic!("no {header:?} in the code read"));
+    let open = start + code[start..].find('{').unwrap();
+    let end = open + closing(&code[open..]);
+    let block = &code[open + 1..end - 1];
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let (mut methods, mut at) = (Vec::new(), 0);
+    while at < block.len() {
+        let rest = &block[at..];
+        let Some(c) = rest.chars().next() else { break };
+        match c {
+            // A nested item's braces at the block's level (an associated const's, say): passed over.
+            '{' => {
+                at += closing(rest);
+                continue;
+            }
+            'f' if rest.starts_with("fn ")
+                && !block[..at].chars().next_back().is_some_and(ident) =>
+            {
+                let name: String = rest[3..].chars().take_while(|&c| ident(c)).collect();
+                // The body opens at the first brace outside the signature's parentheses and
+                // brackets; a semicolon there first is a declaration with none.
+                let (mut depth, mut body) = (0i32, "");
+                let mut past = rest.len();
+                for (i, c) in rest.char_indices() {
+                    match c {
+                        '(' | '[' => depth += 1,
+                        ')' | ']' => depth -= 1,
+                        ';' if depth == 0 => {
+                            past = i + 1;
+                            break;
+                        }
+                        '{' if depth == 0 => {
+                            let length = closing(&rest[i..]);
+                            body = &rest[i..i + length];
+                            past = i + length;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                methods.push((name, body));
+                at += past;
+                continue;
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    methods
+}
+
+/// The length of the braced block `code` opens with, its closing brace included.
+fn closing(code: &str) -> usize {
+    let mut depth = 0usize;
+    for (i, c) in code.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("a block that never closes")
+}
+
 /// Every Rust source file under `dir`, sorted.
 pub(crate) fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

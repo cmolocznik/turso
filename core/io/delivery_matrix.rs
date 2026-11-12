@@ -1,14 +1,18 @@
-//! What each method of `File` and `IO` does on a ring's delivery thread (DESIGN.md 22.5). The
-//! thread never makes a call that can wait: nothing else would deliver what it waits for, and every
-//! delivery behind it would wait too. So every method that can wait (on the file system's data, its
-//! metadata or its names, on another holder of a lock, on time, or on a request) is refused there,
-//! and every other is allowed for the reason given. Every method of the two traits is ruled: one
-//! added to either fails the census below until it is. The ring's own test calls each on a thread
-//! marked as the delivery thread and holds the ring to these rulings
-//! (`io_uring::tests::each_method_on_the_delivery_thread_is_refused_or_allowed_as_ruled`), and the
-//! callback census refuses a callback that calls a refused method.
+//! What each method of `File` and `IO` does on a ring's delivery thread and on a database's IO
+//! thread (DESIGN.md 22.5; ASYNC1 D2a). The ring's delivery thread never makes a call that can
+//! wait: nothing else would deliver what it waits for, and every delivery behind it would wait too.
+//! So every method that can wait (on the file system's data, its metadata or its names, on another
+//! holder of a lock, on time, or on a request) is refused there, and every other is allowed for the
+//! reason given. A database's IO thread waits on the file system, which is its work, and on nothing
+//! else: a request may be one it delivers, a lock's other holder may be waiting on one of its
+//! requests, and every request queued behind it waits out the time with it. Every method of the two
+//! traits is ruled for both: one added to either fails the census below until it is. The ring's own
+//! tests call each on a thread marked for each role and hold the ring to these rulings
+//! (`io_uring::tests::each_method_on_the_delivery_thread_is_refused_or_allowed_as_ruled` and
+//! `each_method_on_a_databases_io_thread_is_refused_or_allowed_as_ruled`), and the callback census
+//! refuses a callback that calls a method the delivery thread refuses.
 
-use crate::source_test::code_of;
+use crate::source_test::{code_of, methods_of};
 
 /// How a method is ruled on the delivery thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +111,89 @@ pub(crate) const IO: &[(&str, Rule)] = &[
     ("file_id", Refused),
 ];
 
+const FILE_SYSTEM: &str = "a wait on the file system alone, which is the IO thread's work";
+const IO_SUBMISSION: &str = "a submission, or the file system's own call where the backend makes \
+                             one, which is the IO thread's work";
+const NON_BLOCKING_LOCK: &str = "a lock that never waits: it is taken, or refused, at once";
+
+/// Every method of `File`, ruled for a database's IO thread.
+pub(crate) const IO_THREAD_FILE: &[(&str, Rule)] = &[
+    ("lock_file", Allowed(NON_BLOCKING_LOCK)),
+    ("unlock_file", Allowed(RELEASE)),
+    ("pread", Allowed(IO_SUBMISSION)),
+    ("pwrite", Allowed(IO_SUBMISSION)),
+    ("sync", Allowed(IO_SUBMISSION)),
+    ("sync_data", Allowed(IO_SUBMISSION)),
+    ("supports_durable_writes", Allowed(NO_CALL)),
+    ("pwrite_durable", Allowed(IO_SUBMISSION)),
+    ("allocate", Allowed(FILE_SYSTEM)),
+    ("pwritev", Allowed(IO_SUBMISSION)),
+    ("size", Allowed(FILE_SYSTEM)),
+    ("truncate", Allowed(IO_SUBMISSION)),
+    ("has_hole", Allowed(FILE_SYSTEM)),
+    ("punch_hole", Allowed(FILE_SYSTEM)),
+    // Waits for the byte's other holder.
+    ("shared_wal_lock_byte", Refused),
+    ("shared_wal_try_lock_byte", Allowed(NON_BLOCKING_LOCK)),
+    (
+        "shared_wal_probe_exclusive_byte",
+        Allowed("a lock that never waits, let go at once"),
+    ),
+    // Takes its shared lock back with a wait for the byte's other holder.
+    ("shared_wal_probe_exclusive_while_shared_byte", Refused),
+    ("shared_wal_unlock_byte", Allowed(RELEASE)),
+    ("shared_wal_set_len", Allowed(FILE_SYSTEM)),
+    ("shared_wal_map", Allowed(FILE_SYSTEM)),
+];
+
+/// Every method of `IO`, ruled for a database's IO thread.
+pub(crate) const IO_THREAD_IO: &[(&str, Rule)] = &[
+    ("open_file", Allowed(FILE_SYSTEM)),
+    ("open_shared_wal_file", Allowed(FILE_SYSTEM)),
+    ("remove_file", Allowed(FILE_SYSTEM)),
+    ("sync_directory", Allowed(FILE_SYSTEM)),
+    ("rename_file", Allowed(FILE_SYSTEM)),
+    ("supports_shared_wal_coordination", Allowed(NO_CALL)),
+    ("delivery", Allowed(NO_CALL)),
+    (
+        "step",
+        Allowed("nothing to do on the ring: its delivery thread delivers"),
+    ),
+    (
+        "try_step",
+        Allowed("the trait's default: a step, which does nothing on the ring, answering Unsaid"),
+    ),
+    ("says_what_a_step_found", Allowed(NO_CALL)),
+    (
+        "withdraw",
+        Allowed("the trait's default: the ring registers no waiter, so takes none back"),
+    ),
+    (
+        "cancel",
+        Allowed(
+            "aborts, running the callbacks with the ring's mutex let go, then queues the \
+             kernel's cancels, never waited for",
+        ),
+    ),
+    ("wait", Refused),
+    ("wait_retired", Refused),
+    ("drain_completions", Refused),
+    ("wait_for_completion", Refused),
+    ("generate_random_number", Allowed(RANDOM)),
+    ("fill_bytes", Allowed(RANDOM)),
+    (
+        "get_memory_io",
+        Allowed("a memory backend, holding no file"),
+    ),
+    (
+        "register_fixed_buffer",
+        Allowed("an update of the kernel's table of buffers, which waits for no request"),
+    ),
+    ("yield_now", Allowed("a yield returns")),
+    ("sleep", Refused),
+    ("file_id", Allowed(FILE_SYSTEM)),
+];
+
 /// The names of the methods refused outright.
 pub(crate) fn refused() -> impl Iterator<Item = &'static str> {
     FILE.iter()
@@ -115,59 +202,21 @@ pub(crate) fn refused() -> impl Iterator<Item = &'static str> {
         .map(|(name, _)| *name)
 }
 
-/// The methods a trait of `core/io/mod.rs` declares, read from its source.
-fn methods_of(code: &str, header: &str) -> Vec<String> {
-    let start = code
-        .find(header)
-        .unwrap_or_else(|| panic!("no {header:?} in core/io/mod.rs"));
-    let open = start + code[start..].find('{').unwrap();
-    let mut depth = 0usize;
-    let mut end = open;
-    for (i, c) in code[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = open + i;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    // Only the trait's own level: a default body's braces are deeper.
-    let body = &code[open + 1..end];
-    let mut methods = Vec::new();
-    let mut depth = 0usize;
-    for (i, c) in body.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            'f' if depth == 0
-                && body[i..].starts_with("fn ")
-                && (i == 0 || !body.as_bytes()[i - 1].is_ascii_alphanumeric()) =>
-            {
-                methods.push(
-                    body[i + 3..]
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect(),
-                );
-            }
-            _ => {}
-        }
-    }
-    methods
-}
-
 #[test]
-fn every_method_of_file_and_io_is_ruled_for_the_delivery_thread() {
+fn every_method_of_file_and_io_is_ruled_for_the_delivery_thread_and_a_databases_io_thread() {
     let source =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/io/mod.rs")).unwrap();
     let code = code_of(&source);
-    for (header, ruled) in [("pub trait File", FILE), ("pub trait IO", IO)] {
-        let mut declared = methods_of(&code, header);
+    for (header, role, ruled) in [
+        ("pub trait File", "the delivery thread", FILE),
+        ("pub trait IO", "the delivery thread", IO),
+        ("pub trait File", "a database's IO thread", IO_THREAD_FILE),
+        ("pub trait IO", "a database's IO thread", IO_THREAD_IO),
+    ] {
+        let mut declared: Vec<String> = methods_of(&code, header)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         let mut listed: Vec<String> = ruled.iter().map(|(name, _)| name.to_string()).collect();
         // The scan reads what it must: `File`'s first method and `IO`'s wait are among them.
         assert!(
@@ -180,7 +229,7 @@ fn every_method_of_file_and_io_is_ruled_for_the_delivery_thread() {
         listed.sort();
         assert_eq!(
             declared, listed,
-            "{header}: a method not ruled for the delivery thread, or one ruled that is gone"
+            "{header}: a method not ruled for {role}, or one ruled that is gone"
         );
     }
 }

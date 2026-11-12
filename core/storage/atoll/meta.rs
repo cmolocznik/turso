@@ -37,7 +37,7 @@ use super::once::SetOnce;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT, MIN_PAGE_SIZE};
 use super::pins::{Cells, PinCell, Pinnable, Pinned, Pins};
 use super::radix;
-use super::requests::{Chain as WriteChain, Counted, CountedFile};
+use super::requests::{Chain as WriteChain, Counted, CountedFile, OpensFile, Source};
 use super::segmented::Segmented;
 use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::{Chain, Stack};
@@ -589,29 +589,52 @@ impl WriteChain for MetaWrite {
 /// returns IO, holding no credit and no frame; a give-back after its registration wakes it. That
 /// wait is of the stepped kind: what gives a credit back is a read's retirement at the backend, so
 /// a waiter on a pumped backend steps it, and the read of a caller that is not polling still comes
-/// in (the auditor's #4580).
+/// in (the auditor's #4580). Each credit is an index, one bit while free, so a queued read takes the
+/// record of the same index (ASYNC1 D2a §4): credits and records are one-to-one by construction.
 struct ReadCredits {
-    free: AtomicUsize,
+    /// One bit per credit, set while it is free.
+    free: Box<[AtomicU64]>,
+    count: usize,
     returned: crate::storage::atoll::notify::LetGo,
 }
 
 impl ReadCredits {
     fn new(credits: usize) -> Arc<Self> {
         Arc::new(Self {
-            free: AtomicUsize::new(credits),
+            free: (0..credits.div_ceil(64))
+                .map(|w| {
+                    let bits = (credits - w * 64).min(64);
+                    AtomicU64::new(if bits == 64 {
+                        u64::MAX
+                    } else {
+                        (1 << bits) - 1
+                    })
+                })
+                .collect(),
+            count: credits,
             // Given back at a read's retirement, which a waiter stepping a pumped backend brings.
             returned: crate::storage::atoll::notify::LetGo::stepped(),
         })
     }
 
-    /// A credit, if one is free. A compare-and-swap, tried again only past another take's or a
-    /// give-back's change of the count, each of which took or gave a credit (22.18, *Locks a poll
-    /// may take*: such a loop under contention stays, and its cost is measured).
+    /// A credit, if one is free: a bit seen set, then taken with `fetch_and`, looked at again only
+    /// past another take's or a give-back's change of its word, each of which took or gave a
+    /// credit (22.18, *Locks a poll may take*: such a loop under contention stays, and its cost is
+    /// measured).
     fn take(self: &Arc<Self>) -> Option<Credit> {
-        self.free
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .ok()
-            .map(|_| Credit(Some(self.clone())))
+        for (w, word) in self.free.iter().enumerate() {
+            let mut seen = word.load(Ordering::Acquire);
+            while seen != 0 {
+                let bit = seen & seen.wrapping_neg();
+                let was = word.fetch_and(!bit, Ordering::AcqRel);
+                if was & bit != 0 {
+                    let index = w * 64 + bit.trailing_zeros() as usize;
+                    return Some(Credit(Some((self.clone(), index))));
+                }
+                seen = was & !bit;
+            }
+        }
+        None
     }
 
     /// A credit, or the wait the next give-back finishes: registered, then tried again, so a
@@ -624,34 +647,48 @@ impl ReadCredits {
         self.take().ok_or(returned)
     }
 
-    fn give_back(&self) {
-        self.free.fetch_add(1, Ordering::AcqRel);
+    fn give_back(&self, index: usize) {
+        let was = self.free[index / 64].fetch_or(1 << (index % 64), Ordering::AcqRel);
+        debug_assert!(
+            was & (1 << (index % 64)) == 0,
+            "read credit {index} given back twice"
+        );
         self.returned.let_go();
     }
 
     /// Credits free.
     #[cfg(test)]
     fn free(&self) -> usize {
-        self.free.load(Ordering::Acquire)
+        self.free
+            .iter()
+            .map(|w| w.load(Ordering::Acquire).count_ones() as usize)
+            .sum()
     }
 }
 
-/// A read credit taken: given back as it drops, or at the retirement of the read handed it.
-struct Credit(Option<Arc<ReadCredits>>);
+/// A read credit taken: given back as it drops, or at the retirement of the read handed it. A
+/// queued read's record holds its credit and drops it after the record is let go (D2a §4). Made
+/// only by [`ReadCredits::take`], so a record is queued into only under its own credit.
+pub(in crate::storage::atoll) struct Credit(Option<(Arc<ReadCredits>, usize)>);
 
 impl Credit {
     /// Held until `request`, the read the backend accepted under it, retires: now, if it has.
     fn until_retired(mut self, request: &Completion) {
-        let credits = self.0.take().expect("a credit taken");
-        request.on_retired(move || credits.give_back());
+        let (credits, index) = self.0.take().expect("a credit taken");
+        request.on_retired(move || credits.give_back(index));
+    }
+
+    /// Its index, the record a queued read under it goes into.
+    pub(in crate::storage::atoll) fn index(&self) -> usize {
+        self.0.as_ref().expect("a credit taken").1
     }
 }
 
 impl Drop for Credit {
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        if let Some(credits) = self.0.take() {
-            credits.give_back();
+        if let Some((credits, index)) = self.0.take() {
+            credits.give_back(index);
         }
     }
 }
@@ -1024,6 +1061,14 @@ pub struct MetaCache {
     torn_ok: AtomicBool,
 }
 
+/// A queued read's first stage on a cold file (D2a §4): the file opened, its directory synced and
+/// the file installed in its slot, on an IO thread.
+impl OpensFile for MetaCache {
+    fn open_for(&self, key: u64) -> Result<Arc<CountedFile>> {
+        self.file(MetaId::from_number(key))
+    }
+}
+
 impl MetaCache {
     /// The cache of the metadata as checkpoint `in_charge` left it.
     pub fn new(
@@ -1033,12 +1078,22 @@ impl MetaCache {
         epochs: Arc<Epochs>,
         in_charge: u64,
     ) -> Self {
+        let credits = ReadCredits::new(budget.max(1));
+        // A database opened async queues each read in its credit's record.
+        if counted.opened_async() {
+            assert!(
+                credits.count <= counted.meta_read_records(),
+                "{} read credits over {} records",
+                credits.count,
+                counted.meta_read_records()
+            );
+        }
         Self {
             io: counted.clone(),
             counted,
             base: base.to_string(),
             budget,
-            credits: ReadCredits::new(budget.max(1)),
+            credits,
             files: (0..TREES * CLASS_COUNT * LEVELS)
                 .map(|_| FileSlot::default())
                 .collect(),
@@ -1196,13 +1251,19 @@ impl MetaCache {
     /// it; a read never issued gives the credit back at once.
     fn load(self: &Arc<Self>, frame: &MetaRef, credit: Credit) -> Result<()> {
         let id = frame.id;
-        let file = match self.file(id) {
-            Ok(file) => file,
-            Err(e) => {
-                drop(credit);
-                frame.fail(io_failure(&e));
-                self.finish_load(frame);
-                return Err(e);
+        // Queued (D2a §4): the file, if cold, opened by the read's first stage on an IO thread.
+        let queued = self.counted.queues();
+        let file = if queued {
+            None
+        } else {
+            match self.file(id) {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    drop(credit);
+                    frame.fail(io_failure(&e));
+                    self.finish_load(frame);
+                    return Err(e);
+                }
             }
         };
         let block = Arc::new(AlignedBlock::zeroed(2 * META_PAGE));
@@ -1248,18 +1309,30 @@ impl MetaCache {
             None
         });
         crate::race::point("meta.before_read_submit");
-        match file.pread(id.offset(), c) {
-            Ok(request) => {
+        let submitted = match file {
+            Some(file) => file.pread(id.offset(), c).map(|request| {
                 #[cfg(test)]
                 LAST_READ.with(|r| *r.borrow_mut() = Some(request.clone()));
                 credit.until_retired(&request);
+            }),
+            None => {
+                let source = match self.files[id.file_index()].file.get() {
+                    Some(file) => Source::Open(Arc::downgrade(&file)),
+                    None => {
+                        let weak = Arc::downgrade(self);
+                        let stage: Weak<dyn OpensFile> = weak;
+                        Source::Stage(stage, id.pid().number())
+                    }
+                };
+                #[cfg(test)]
+                LAST_READ.with(|r| *r.borrow_mut() = Some(c.clone()));
+                self.counted.queue_meta_read(credit, source, id.offset(), c)
             }
-            Err(e) => {
-                drop(credit);
-                frame.fail(io_failure(&e));
-                self.finish_load(frame);
-                return Err(e);
-            }
+        };
+        if let Err(e) = submitted {
+            frame.fail(io_failure(&e));
+            self.finish_load(frame);
+            return Err(e);
         }
         // The backend accepted the read. Its callback may already have published the page,
         // so only the preparing phase can become a queued read.
@@ -1626,3 +1699,6 @@ mod loom_tests {
 
 #[cfg(all(test, not(any(atoll_loom, shuttle))))]
 mod tests;
+
+#[cfg(all(test, not(any(atoll_loom, shuttle))))]
+mod queued_tests;

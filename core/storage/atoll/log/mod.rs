@@ -191,8 +191,9 @@ pub struct Log {
     input: CachePadded<AtomicBool>,
     /// Where the flush taking its turn writes from next: the turn's own.
     submitted: CachePadded<AtomicU64>,
-    /// Writes submitted and not landed. Moved by every write and its landing, so on a line of its
-    /// own.
+    /// Writes submitted and not yet retired: a place is taken at submission and given back at the
+    /// write's retirement ([`write_retired`](Self::write_retired)), never at its result's
+    /// publication. Moved by every write twice, so on a line of its own.
     in_flight: CachePadded<AtomicUsize>,
     /// Asked for by every commit, so on a line of its own.
     flushes: CachePadded<Solo>,

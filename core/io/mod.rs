@@ -52,34 +52,80 @@ cfg_block! {
     }
 }
 
+/// What a thread is for its whole life, as far as the calls that can wait are concerned
+/// (DESIGN.md 22.5; ASYNC1 D2a). The calls ruled for each role are listed in `delivery_matrix.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// Any call may wait.
+    Free,
+    /// A database's IO thread: it waits on the file system for the requests queued to it, which is
+    /// its work, and never on a request, which it or a ring delivers, on another holder of a lock,
+    /// who may be waiting on it, or on time, which every request queued behind it would wait on too.
+    Serving,
+    /// A ring's delivery thread: it makes no call that can wait, since nothing else would deliver
+    /// what it waits for, and every delivery behind it would wait too. Only the ring has one, and a
+    /// test a stand-in for it.
+    #[cfg(any(test, all(target_os = "linux", feature = "io_uring", not(miri))))]
+    Delivering,
+}
+
 crate::thread::thread_local! {
-    /// Set on a ring's delivery thread for its whole life (DESIGN.md 22.5).
-    static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ROLE: std::cell::Cell<Role> = const { std::cell::Cell::new(Role::Free) };
 }
 
-/// Marks this thread as a ring's delivery thread for the rest of its life, as the ring marks its
-/// own: for a test of what such a thread refuses.
-#[cfg(test)]
+/// Gives this thread `role` for the rest of its life. A thread takes one role at most.
+fn take_role(role: Role) {
+    let was = ROLE.with(|r| r.replace(role));
+    debug_assert!(
+        was == Role::Free || was == role,
+        "a {role:?} thread that was already {was:?}"
+    );
+}
+
+/// Marks this thread as a ring's delivery thread for the rest of its life: the ring marks its own,
+/// and a test marks one to see what such a thread refuses.
+#[cfg(any(test, all(target_os = "linux", feature = "io_uring", not(miri))))]
 pub(crate) fn deliver_on_this_thread() {
-    DELIVERING.with(|d| d.set(true));
+    take_role(Role::Delivering);
 }
 
-/// Marks this thread, a database's IO thread, as a delivering thread for the rest of its life: it
-/// runs the callbacks of the follow-ons it submits, and, like a ring's delivery thread, never
-/// makes a call that waits on what it would deliver (a close, an executor's wait).
-pub(crate) fn deliver_on_this_thread_for_life() {
-    DELIVERING.with(|d| d.set(true));
+/// Marks this thread, a database's IO thread, for the rest of its life (ASYNC1 D2a): it opens,
+/// syncs and reads for the requests queued to it, and runs the callbacks of what it submits, so it
+/// waits on the file system and on nothing it or a ring would deliver.
+pub(crate) fn serve_on_this_thread_for_life() {
+    take_role(Role::Serving);
 }
 
-/// Ends the thread with a panic if it is a ring's delivery thread, which never makes a call that can
-/// wait: nothing else would deliver what it waits for, and every delivery behind it would wait on
-/// the file system, on another holder of a lock, or on time (DESIGN.md 22.5; the calls ruled are
-/// listed in `delivery_matrix.rs`). A panic there ends the process.
+/// Ends the thread with a panic if it is a ring's delivery thread, for a call that waits on the file
+/// system (its data, its metadata or its names): nothing else would deliver what the ring holds, so
+/// every delivery behind the call would wait too (DESIGN.md 22.5). A database's IO thread makes such
+/// calls, which are its work. A panic there ends the process.
 pub(crate) fn refuse_on_delivery_thread(what: &str) {
+    #[cfg(any(test, all(target_os = "linux", feature = "io_uring", not(miri))))]
     assert!(
-        !DELIVERING.with(|d| d.get()),
+        ROLE.with(|r| r.get()) != Role::Delivering,
         "{what} on the ring's delivery thread, which never makes a call that can wait"
     );
+    #[cfg(not(any(test, all(target_os = "linux", feature = "io_uring", not(miri)))))]
+    let _ = what;
+}
+
+/// Ends the thread with a panic if it delivers, for a call that waits on a request, on another
+/// holder of a lock or on time: a ring's delivery thread makes no call that can wait, and a
+/// database's IO thread waits only on the file system, since the request it would wait on may be
+/// one it delivers, a lock's other holder may be waiting on one of its requests, and every request
+/// queued behind it waits out the time with it. A panic there ends the process.
+pub(crate) fn refuse_on_any_delivering_thread(what: &str) {
+    match ROLE.with(|r| r.get()) {
+        Role::Free => {}
+        #[cfg(any(test, all(target_os = "linux", feature = "io_uring", not(miri))))]
+        Role::Delivering => {
+            panic!("{what} on the ring's delivery thread, which never makes a call that can wait")
+        }
+        Role::Serving => {
+            panic!("{what} on a database's IO thread, which waits only on the file system")
+        }
+    }
 }
 
 /// Ends the process for an error of a backend's stepping itself, not of a request, which the
@@ -127,7 +173,7 @@ pub mod clock;
 mod common;
 mod completions;
 #[cfg(all(test, not(any(shuttle, atoll_loom))))]
-mod delivery_matrix;
+pub(crate) mod delivery_matrix;
 #[cfg(any(
     test,
     all(target_os = "windows", feature = "experimental_win_iocp", not(miri))
@@ -867,7 +913,7 @@ pub trait IO: Clock + Send + Sync {
     /// result is its owner's to read. A step that fails ends the process, the backend having lost
     /// what it accepted.
     fn wait(&self, c: &Completion) {
-        refuse_on_delivery_thread("a wait for a completion");
+        refuse_on_any_delivering_thread("a wait for a completion");
         if c.finished() {
             return;
         }
@@ -919,7 +965,7 @@ pub trait IO: Clock + Send + Sync {
     /// before the caller goes on. Only the completions passed are waited for: other threads keep
     /// submitting meanwhile.
     fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
-        refuse_on_delivery_thread("a wait for retirement");
+        refuse_on_any_delivering_thread("a wait for retirement");
         let pumped = self.delivery() == Delivery::Pumped;
         // One waker for the whole drain, taken back from the backend when the drain ends.
         let place = ReadyPlace::default();
@@ -1003,7 +1049,7 @@ pub trait IO: Clock + Send + Sync {
     /// Sleep for the specified duration.
     /// Used for progressive backoff in contended lock acquisition.
     fn sleep(&self, duration: std::time::Duration) {
-        refuse_on_delivery_thread("a sleep");
+        refuse_on_any_delivering_thread("a sleep");
         crate::thread::sleep(duration);
     }
 

@@ -412,6 +412,26 @@ mod tests {
             "child",
         ),
         (
+            "meta/queued_tests.rs",
+            "a_frames_metadata_load_on_a_cold_file_is_opened_synced_and_read_on_an_io_thread",
+            "child",
+        ),
+        (
+            "meta/queued_tests.rs",
+            "a_frames_cold_load_over_the_ring_is_opened_and_read_on_an_io_thread",
+            "child",
+        ),
+        (
+            "meta/queued_tests.rs",
+            "a_synchronous_databases_miss_in_a_frame_runs_in_place_and_the_census_ends_the_process",
+            "child",
+        ),
+        (
+            "meta/queued_tests.rs",
+            "a_backends_refusal_after_the_owners_cancel_touches_only_the_carrier",
+            "child",
+        ),
+        (
             "requests/followon_tests.rs",
             "a_chains_counts_are_each_let_go_once",
             "child",

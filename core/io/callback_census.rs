@@ -232,6 +232,12 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "new_sync",
         "records a chain's sync outcome in its record and tells its owner, submitting nothing",
     ),
+    (
+        "storage/atoll/requests/dispatch.rs",
+        "serve_queued",
+        "new_read",
+        "a queued read's carrier: finishes its owner's request with what it read, submitting nothing",
+    ),
     ("storage/atoll/store.rs", "erase_one", "new_sync", "nothing"),
     (
         "storage/atoll/store.rs",

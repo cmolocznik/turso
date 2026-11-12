@@ -18,7 +18,7 @@
 mod dispatch;
 
 use dispatch::Dispatch;
-pub(super) use dispatch::{Chain, Held, LogWork};
+pub(super) use dispatch::{Chain, Held, LogWork, OpensFile, Shape, Source};
 
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{
@@ -43,8 +43,8 @@ pub(super) struct Requests {
     /// The records follow-ons are made in, set once by [`Counted::new`]: owned here and by the IO
     /// thread while it runs, and reaching these requests back only weakly.
     dispatch: crate::sync::OnceLock<Arc<Dispatch>>,
-    /// The IO thread, stopped and joined by close's drain once it seals, or by the last drop.
-    io_thread: Mutex<Option<crate::thread::JoinHandle<()>>>,
+    /// The IO threads, stopped and joined by close's drain once it seals, or by the last drop.
+    io_threads: Mutex<Vec<crate::thread::JoinHandle<()>>>,
     /// What the embedder handed the database to drop once its files are closed: the IO that opens
     /// them, every file and every request on them holds these requests, and a file drops its
     /// descriptor before it lets them go ([`CountedFile`]), so the last of them drops this after the
@@ -77,7 +77,7 @@ impl Requests {
             word: AtomicU64::new(0),
             closer: crate::sync::OnceLock::new(),
             dispatch: crate::sync::OnceLock::new(),
-            io_thread: Mutex::new(None),
+            io_threads: Mutex::new(Vec::new()),
             _held: held,
         }
     }
@@ -191,9 +191,9 @@ impl Requests {
     /// that fails has lost the means to retire them, and ends the process (22.11): close can
     /// neither wait on nor return while the backend may still own its requests' buffers.
     pub(super) fn drain(&self, io: &dyn IO) {
-        // Close waits: never on a ring's delivery thread, the one that would deliver what it waits
-        // for (DESIGN.md 22.5).
-        crate::io::refuse_on_delivery_thread("a database's close");
+        // Close waits: never on a ring's delivery thread or a database's IO thread, the ones that
+        // would deliver what it waits for (DESIGN.md 22.5).
+        crate::io::refuse_on_any_delivering_thread("a database's close");
         let me = self.closer.get_or_init(crate::thread::current);
         assert_eq!(
             me.id(),
@@ -244,26 +244,30 @@ impl Requests {
         if registered {
             io.withdraw(place.key());
         }
-        // Sealed: nothing is counted again, so the IO thread has nothing left to submit. It stops
-        // here, inside close's step 4, before the executor drops its jobs.
-        self.stop_io_thread();
+        // Sealed: nothing is counted again, so the IO threads have nothing left to submit. They
+        // stop here, inside close's step 4, before the executor drops its jobs.
+        self.stop_io_threads();
     }
 
-    /// Stops the IO thread and joins it, or, on that thread itself (the last observer dropping
-    /// the last hold on these requests there), lets it end on its own once this returns. Once
-    /// stopped, a later call finds nothing.
-    fn stop_io_thread(&self) {
-        let Some(handle) = self.io_thread.lock().take() else {
+    /// Stops the IO threads and joins each, but the one this runs on (the last observer dropping
+    /// the last hold on these requests there), which ends on its own once this returns. Once
+    /// stopped, a later call finds none.
+    fn stop_io_threads(&self) {
+        let handles = std::mem::take(&mut *self.io_threads.lock());
+        if handles.is_empty() {
             return;
-        };
+        }
         if let Some(dispatch) = self.dispatch.get() {
             dispatch.stop();
         }
-        if handle.thread().id() != crate::thread::current().id() {
-            crate::race::point("requests.stopping");
-            // A panic on the IO thread ended the process (its loop is an Atoll entry): a join
-            // returns its loop's end.
-            let _ = handle.join();
+        crate::race::point("requests.stopping");
+        let me = crate::thread::current().id();
+        for handle in handles {
+            if handle.thread().id() != me {
+                // A panic on an IO thread ended the process (its loop is an Atoll entry): a join
+                // returns its loop's end.
+                let _ = handle.join();
+            }
         }
     }
 
@@ -280,10 +284,34 @@ impl Requests {
         self.dispatch().at_rest()
     }
 
+    /// The queued records at rest, for a test's exact count of them.
+    #[cfg(test)]
+    pub(super) fn queued_at_rest(&self) -> usize {
+        self.dispatch().queued_at_rest()
+    }
+
     /// Holds the IO thread before its next claim of a record, until the sender sends or drops.
     #[cfg(test)]
     pub(super) fn hold_io_thread(&self) -> std::sync::mpsc::Sender<()> {
         self.dispatch().hold_next_claim()
+    }
+
+    /// A note of an IO thread's next idle, sent once it has marked itself idle.
+    #[cfg(test)]
+    pub(super) fn on_io_idle(&self) -> std::sync::mpsc::Receiver<()> {
+        self.dispatch().on_idle()
+    }
+
+    /// Holds the next IO thread woken before its take, until the sender sends or drops.
+    #[cfg(test)]
+    pub(super) fn hold_next_take(&self) -> std::sync::mpsc::Sender<()> {
+        self.dispatch().hold_next_take()
+    }
+
+    /// Whether a request made on this thread is queued.
+    #[cfg(test)]
+    pub(super) fn queues_here(&self) -> bool {
+        self.dispatch().queues_here()
     }
 
     /// The dispatch, weakly, for a test's look after every owner has gone.
@@ -294,11 +322,11 @@ impl Requests {
 }
 
 impl Drop for Requests {
-    /// The last resort when no drain ran: the IO thread stopped and joined, every follow-on still
-    /// READY finished as `Aborted` by it on its way out, as nothing is left to count it.
+    /// The last resort when no drain ran: the IO threads stopped and joined, every request still
+    /// READY finished as `Aborted` by one on its way out, as nothing is left to count it.
     fn drop(&mut self) {
         crate::storage::atoll::unwind::abort_if_unwinding();
-        self.stop_io_thread();
+        self.stop_io_threads();
     }
 }
 
@@ -310,19 +338,73 @@ pub(super) struct Counted {
 }
 
 impl Counted {
-    /// Wraps `io`, counting in `requests`, whose records it makes and whose IO thread it starts:
-    /// a thread that does not start fails the open, before any file is opened.
+    /// Wraps `io` for a database opened synchronously: one IO thread and no queued records.
     pub(super) fn new(io: Arc<dyn IO>, requests: Arc<Requests>) -> Result<Self> {
-        let dispatch = Arc::new(Dispatch::new(&requests));
+        Self::with_shape(io, requests, Shape::default())
+    }
+
+    /// Wraps `io`, counting in `requests`, whose records it makes in `shape` and whose IO threads
+    /// it starts: a thread that does not start fails the open, before any file is opened, the
+    /// threads already started stopped and joined with the requests.
+    pub(super) fn with_shape(
+        io: Arc<dyn IO>,
+        requests: Arc<Requests>,
+        shape: Shape,
+    ) -> Result<Self> {
+        if !(1..=dispatch::MOST_THREADS).contains(&shape.io_threads) {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} IO threads: a database takes 1 to {}",
+                shape.io_threads,
+                dispatch::MOST_THREADS
+            )));
+        }
+        if shape.meta_reads > dispatch::MOST_RECORDS - dispatch::QUEUED {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} metadata read records: a database takes at most {}",
+                shape.meta_reads,
+                dispatch::MOST_RECORDS - dispatch::QUEUED
+            )));
+        }
+        let dispatch = Arc::new(Dispatch::new(&requests, shape));
         #[cfg(test)]
         MADE.with(|m| {
             *m.borrow_mut() = Some((Arc::downgrade(&dispatch), Arc::downgrade(&requests)))
         });
         let set = requests.dispatch.set(dispatch.clone());
         assert!(set.is_ok(), "one Counted per database's requests");
-        let handle = Dispatch::spawn(&dispatch)?;
-        *requests.io_thread.lock() = Some(handle);
+        for k in 0..dispatch.io_threads() {
+            let handle = Dispatch::spawn(&dispatch, k)?;
+            requests.io_threads.lock().push(handle);
+        }
         Ok(Self { io, requests })
+    }
+
+    /// Whether a request made on this thread is queued (D2a §1).
+    pub(super) fn queues(&self) -> bool {
+        self.requests.dispatch().queues()
+    }
+
+    /// Whether the database was opened async (D2a §1).
+    pub(super) fn opened_async(&self) -> bool {
+        self.requests.dispatch().opened_async()
+    }
+
+    /// The metadata reads' records: one per read credit the cache may make.
+    pub(super) fn meta_read_records(&self) -> usize {
+        self.requests.dispatch().meta_reads()
+    }
+
+    /// Queues the read `c` at `pos` of `source` under `credit`, in its record (D2a §3, §4).
+    pub(super) fn queue_meta_read(
+        &self,
+        credit: crate::storage::atoll::meta::Credit,
+        source: Source,
+        pos: u64,
+        c: Completion,
+    ) -> Result<()> {
+        self.requests
+            .dispatch()
+            .queue_read(&self.requests, credit, source, pos, c)
     }
 
     /// Opens `path` as a counted file its owner holds typed: the one kind of file a follow-on is
@@ -333,6 +415,7 @@ impl Counted {
         flags: OpenFlags,
         direct: bool,
     ) -> Result<Arc<CountedFile>> {
+        refuse_in_frame("a file's open");
         let file = self.io.open_file(path, flags, direct)?;
         Ok(Arc::new(CountedFile {
             file,
@@ -428,6 +511,7 @@ impl Clock for Counted {
 
 impl IO for Counted {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        refuse_in_frame("a file's open_file");
         let file = self.io.open_file(path, flags, direct)?;
         Ok(Arc::new(CountedFile {
             file,
@@ -436,6 +520,7 @@ impl IO for Counted {
     }
 
     fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        refuse_in_frame("a file's open_shared_wal_file");
         let file = self.io.open_shared_wal_file(path)?;
         Ok(Arc::new(CountedFile {
             file,
@@ -444,14 +529,17 @@ impl IO for Counted {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
+        refuse_in_frame("a file's remove_file");
         self.io.remove_file(path)
     }
 
     fn sync_directory(&self, path: &str) -> Result<()> {
+        refuse_in_frame("a file's sync_directory");
         self.io.sync_directory(path)
     }
 
     fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        refuse_in_frame("a file's rename_file");
         self.io.rename_file(from, to)
     }
 
@@ -460,10 +548,12 @@ impl IO for Counted {
     }
 
     fn step(&self) -> Result<()> {
+        refuse_in_frame("a blocking host's step");
         self.io.step()
     }
 
     fn try_step(&self, key: crate::io::ReadyKey, ready: &std::task::Waker) -> Result<Stepped> {
+        refuse_in_frame("a poll's step");
         self.io.try_step(key, ready)
     }
 
@@ -472,6 +562,7 @@ impl IO for Counted {
     }
 
     fn withdraw(&self, key: crate::io::ReadyKey) {
+        refuse_in_frame("a waker's withdrawal");
         self.io.withdraw(key)
     }
 
@@ -480,22 +571,31 @@ impl IO for Counted {
     }
 
     fn wait(&self, c: &Completion) {
+        refuse_in_frame("a wait for a completion");
+        crate::io::refuse_on_any_delivering_thread("a wait for a completion");
         self.io.wait(c)
     }
 
     fn cancel(&self, c: &[Completion]) -> Result<()> {
+        refuse_in_frame("a backend's cancel");
         self.io.cancel(c)
     }
 
     fn wait_retired(&self, c: &Completion) -> Result<()> {
+        refuse_in_frame("a wait for retirement");
+        crate::io::refuse_on_any_delivering_thread("a wait for retirement");
         self.io.wait_retired(c)
     }
 
     fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+        refuse_in_frame("a wait for retirement");
+        crate::io::refuse_on_any_delivering_thread("a wait for retirement");
         self.io.drain_completions(completions)
     }
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
+        refuse_in_frame("a wait for a completion");
+        crate::io::refuse_on_any_delivering_thread("a wait for a completion");
         self.io.wait_for_completion(c)
     }
 
@@ -512,6 +612,7 @@ impl IO for Counted {
     }
 
     fn register_fixed_buffer(&self, ptr: NonNull<u8>, len: usize) -> Result<u32> {
+        refuse_in_frame("a buffer's registration");
         self.io.register_fixed_buffer(ptr, len)
     }
 
@@ -520,10 +621,13 @@ impl IO for Counted {
     }
 
     fn sleep(&self, duration: std::time::Duration) {
+        refuse_in_frame("a sleep");
+        crate::io::refuse_on_any_delivering_thread("a sleep");
         self.io.sleep(duration)
     }
 
     fn file_id(&self, path: &str) -> Result<FileId> {
+        refuse_in_frame("a file's identity");
         self.io.file_id(path)
     }
 }
@@ -548,6 +652,7 @@ impl CountedFile {
         submit: impl FnOnce(&dyn File) -> Result<Completion>,
         then: impl FnOnce() + Send + 'static,
     ) -> Result<Completion> {
+        refuse_in_frame("a counted file's request");
         self.requests
             .submit_with(physical, || submit(&*self.file), then)
     }
@@ -567,6 +672,7 @@ impl CountedFile {
         durable: bool,
         chain: Arc<dyn Chain>,
     ) -> Result<Completion> {
+        refuse_in_frame("a counted file's write");
         let dispatch = self.requests.dispatch().clone();
         let i = held.index();
         dispatch.start(&held, chain, durable);
@@ -597,6 +703,30 @@ impl CountedFile {
     }
 }
 
+/// Ends the suite, in a test build, where a cooperative frame reaches `what` in place: a call that
+/// may wait on its caller's thread, in a system call, for a request or for time (DESIGN.md 22.18,
+/// *Which calls can block*; D2a §5; every method is ruled in `requests/frame_census.rs`). A route
+/// that reaches one is to be queued in its owner's record. A release build runs it.
+#[inline]
+fn refuse_in_frame(what: &str) {
+    #[cfg(test)]
+    assert!(
+        !crate::storage::atoll::cooperative::inside(),
+        "{what} run in place inside a cooperative frame, where it is queued (DESIGN.md 22.18)"
+    );
+    #[cfg(not(test))]
+    let _ = what;
+}
+
+impl Drop for CountedFile {
+    /// Its descriptor closes here (unlocked and closed by the file it wraps), never inside a
+    /// cooperative frame (DESIGN.md 22.18: every holder of a file drops on a blocking host).
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        refuse_in_frame("a counted file's close");
+    }
+}
+
 /// A submission's error, as a request's outcome.
 fn io_failure(e: &LimboError) -> CompletionError {
     match e {
@@ -607,28 +737,34 @@ fn io_failure(e: &LimboError) -> CompletionError {
 
 impl File for CountedFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
+        refuse_in_frame("a counted file's lock");
         self.file.lock_file(exclusive)
     }
 
     fn unlock_file(&self) -> Result<()> {
+        refuse_in_frame("a counted file's unlock");
         self.file.unlock_file()
     }
 
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        refuse_in_frame("a counted file's read");
         self.requests.submit(c.clone(), || self.file.pread(pos, c))
     }
 
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        refuse_in_frame("a counted file's write");
         self.requests
             .submit(c.clone(), || self.file.pwrite(pos, buffer, c))
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+        refuse_in_frame("a counted file's sync");
         self.requests
             .submit(c.clone(), || self.file.sync(c, sync_type))
     }
 
     fn sync_data(&self, c: Completion) -> Result<Completion> {
+        refuse_in_frame("a counted file's sync");
         self.requests.submit(c.clone(), || self.file.sync_data(c))
     }
 
@@ -637,33 +773,40 @@ impl File for CountedFile {
     }
 
     fn pwrite_durable(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        refuse_in_frame("a counted file's write");
         self.requests
             .submit(c.clone(), || self.file.pwrite_durable(pos, buffer, c))
     }
 
     fn allocate(&self, pos: u64, len: u64) -> Result<()> {
+        refuse_in_frame("a counted file's allocation");
         self.file.allocate(pos, len)
     }
 
     fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+        refuse_in_frame("a counted file's write");
         self.requests
             .submit(c.clone(), || self.file.pwritev(pos, buffers, c))
     }
 
     fn size(&self) -> Result<u64> {
+        refuse_in_frame("a counted file's size");
         self.file.size()
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        refuse_in_frame("a counted file's truncation");
         self.requests
             .submit(c.clone(), || self.file.truncate(len, c))
     }
 
     fn has_hole(&self, pos: usize, len: usize) -> Result<bool> {
+        refuse_in_frame("a counted file's hole probe");
         self.file.has_hole(pos, len)
     }
 
     fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+        refuse_in_frame("a counted file's hole punch");
         self.file.punch_hole(pos, len)
     }
 
@@ -673,6 +816,8 @@ impl File for CountedFile {
         exclusive: bool,
         kind: SharedWalLockKind,
     ) -> Result<()> {
+        refuse_in_frame("a counted file's shared WAL lock");
+        crate::io::refuse_on_any_delivering_thread("a shared WAL byte's lock");
         self.file.shared_wal_lock_byte(offset, exclusive, kind)
     }
 
@@ -682,6 +827,7 @@ impl File for CountedFile {
         exclusive: bool,
         kind: SharedWalLockKind,
     ) -> Result<bool> {
+        refuse_in_frame("a counted file's shared WAL lock");
         self.file.shared_wal_try_lock_byte(offset, exclusive, kind)
     }
 
@@ -690,6 +836,7 @@ impl File for CountedFile {
         offset: u64,
         kind: SharedWalLockKind,
     ) -> Result<bool> {
+        refuse_in_frame("a counted file's shared WAL probe");
         self.file.shared_wal_probe_exclusive_byte(offset, kind)
     }
 
@@ -698,19 +845,25 @@ impl File for CountedFile {
         offset: u64,
         kind: SharedWalLockKind,
     ) -> Result<bool> {
+        refuse_in_frame("a counted file's shared WAL probe");
+        // Takes its shared lock back with a wait for the byte's other holder.
+        crate::io::refuse_on_any_delivering_thread("a shared WAL byte's lock");
         self.file
             .shared_wal_probe_exclusive_while_shared_byte(offset, kind)
     }
 
     fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+        refuse_in_frame("a counted file's shared WAL unlock");
         self.file.shared_wal_unlock_byte(offset, kind)
     }
 
     fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        refuse_in_frame("a counted file's shared WAL resize");
         self.file.shared_wal_set_len(len)
     }
 
     fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        refuse_in_frame("a counted file's shared WAL map");
         self.file.shared_wal_map(offset, len)
     }
 }
@@ -720,6 +873,28 @@ impl File for CountedFile {
 #[cfg(test)]
 pub(super) fn counted_for_test(io: Arc<dyn IO>) -> Arc<Counted> {
     Arc::new(Counted::new(io, Arc::new(Requests::default())).expect("a test's IO thread"))
+}
+
+/// A counted IO over `io` for a database opened async (D2a): `meta_reads` metadata read records and
+/// `io_threads` IO threads, stopped and joined by its requests' last drop.
+#[cfg(test)]
+pub(super) fn counted_async_for_test(
+    io: Arc<dyn IO>,
+    meta_reads: usize,
+    io_threads: usize,
+) -> Arc<Counted> {
+    Arc::new(
+        Counted::with_shape(
+            io,
+            Arc::new(Requests::default()),
+            Shape {
+                opened_async: true,
+                io_threads,
+                meta_reads,
+            },
+        )
+        .expect("a test's IO threads"),
+    )
 }
 
 /// The owner of a counted IO a test builds on its own (DESIGN.md 22.18, D1a §4): its drop drains
@@ -762,5 +937,9 @@ crate::thread::thread_local! {
 
 #[cfg(all(test, not(any(shuttle, atoll_loom))))]
 mod followon_tests;
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod frame_census;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod tree_tests;

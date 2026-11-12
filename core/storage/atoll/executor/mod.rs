@@ -1465,8 +1465,8 @@ impl Executor {
     /// a step or a waker the executor invoked.
     #[turso_macros::atoll_entry]
     pub(crate) fn wait(&self, c: &Completion) {
-        // A wait, which the ring's delivery thread never makes (22.5).
-        crate::io::refuse_on_delivery_thread("a wait on executor work");
+        // A wait, which neither the ring's delivery thread nor a database's IO thread makes (22.5).
+        crate::io::refuse_on_any_delivering_thread("a wait on executor work");
         refuse_entry_from_inside();
         if c.finished() {
             return;
@@ -1545,9 +1545,9 @@ impl Executor {
     /// counts to retire, and drops every job, after the table's mutex. A second close finds
     /// nothing left to do.
     fn shut(&mut self, requests: Option<&Requests>) {
-        // A close joins workers and waits for calls, which the ring's delivery thread never does:
-        // what they wait for may be its own next delivery (22.5).
-        crate::io::refuse_on_delivery_thread("an executor's close");
+        // A close joins workers and waits for calls, which neither the ring's delivery thread nor a
+        // database's IO thread does: what they wait for may be its own next delivery (22.5).
+        crate::io::refuse_on_any_delivering_thread("an executor's close");
         let moved = {
             let mut queue = lock(&self.shared.queue);
             queue.closing = true;

@@ -690,7 +690,7 @@ impl IO for UringIO {
 /// lives and no request is outstanding. A delivery that panics ends the process: nothing else
 /// would deliver the ring's requests, so returning would strand every waiter on them.
 fn deliver(shared: Arc<Shared>) {
-    super::DELIVERING.with(|d| d.set(true));
+    super::deliver_on_this_thread();
     let _frame = DeliveryFrame;
     let mut batch = Vec::with_capacity(shared.pass);
     loop {
@@ -1139,7 +1139,8 @@ impl File for UringFile {
         exclusive: bool,
         kind: SharedWalLockKind,
     ) -> Result<()> {
-        super::refuse_on_delivery_thread("a shared WAL byte's lock");
+        // A lock that waits for the byte's other holder.
+        super::refuse_on_any_delivering_thread("a shared WAL byte's lock");
         unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, true, kind).map(|_| ())
     }
 
@@ -2108,17 +2109,53 @@ mod tests {
     /// call that could wait is made where it would not: on a finished request, for no time.
     #[test]
     fn each_method_on_the_delivery_thread_is_refused_or_allowed_as_ruled() {
-        use crate::io::delivery_matrix::{Rule, FILE, IO as IO_METHODS};
+        use crate::io::delivery_matrix::{FILE, IO as IO_METHODS};
+        let wrong = held_to(
+            crate::io::deliver_on_this_thread,
+            [("File", FILE), ("IO", IO_METHODS)],
+            "on the ring's delivery thread",
+        );
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Every method of the ring's IO and files, called on a thread marked as a database's IO
+    /// thread, is refused or allowed as `delivery_matrix.rs` rules for it: the calls that wait on
+    /// the file system alone return, and a wait on a request, on a lock's other holder or on time
+    /// ends in the refusal (ASYNC1 D2a, the auditor's #4839; mutants: the IO thread marked as the
+    /// ring's delivery thread; its refusal of a wait removed).
+    #[test]
+    fn each_method_on_a_databases_io_thread_is_refused_or_allowed_as_ruled() {
+        use crate::io::delivery_matrix::{IO_THREAD_FILE, IO_THREAD_IO};
+        let wrong = held_to(
+            crate::io::serve_on_this_thread_for_life,
+            [("File", IO_THREAD_FILE), ("IO", IO_THREAD_IO)],
+            "on a database's IO thread",
+        );
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Calls each method `ruled` on its own thread, given its role by `mark`, and names each whose
+    /// outcome is not as ruled: a refused one ends in a refusal saying `refused_on`, an allowed one
+    /// returns.
+    fn held_to(
+        mark: fn(),
+        ruled: [(
+            &'static str,
+            &'static [(&'static str, crate::io::delivery_matrix::Rule)],
+        ); 2],
+        refused_on: &str,
+    ) -> Vec<String> {
+        use crate::io::delivery_matrix::Rule;
         let dir = Arc::new(tempfile::tempdir().unwrap());
         let io = Arc::new(UringIO::new().unwrap());
         let file = file_of(&dir, &io, 4096);
         let opcode_truncates = io.shared.caps.ftruncate;
         let mut wrong = Vec::new();
-        for (kind, ruled) in [("File", FILE), ("IO", IO_METHODS)] {
+        for (kind, ruled) in ruled {
             for &(method, rule) in ruled {
                 let (io, file, dir) = (io.clone(), file.clone(), dir.clone());
                 let outcome = std::thread::spawn(move || {
-                    crate::io::DELIVERING.with(|d| d.set(true));
+                    mark();
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         call(method, &io, &file, &dir)
                     }))
@@ -2138,14 +2175,14 @@ mod tests {
                 };
                 let as_ruled = match &outcome {
                     Ok(()) => !refused,
-                    Err(said) => refused && said.contains("on the ring's delivery thread"),
+                    Err(said) => refused && said.contains(refused_on),
                 };
                 if !as_ruled {
                     wrong.push(format!("{kind}::{method} ({rule:?}): {outcome:?}"));
                 }
             }
         }
-        assert!(wrong.is_empty(), "{wrong:#?}");
+        wrong
     }
 
     /// Calls `method` on the ring's IO or `file`, as cheaply as it can be called.

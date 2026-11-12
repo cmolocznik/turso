@@ -746,15 +746,15 @@ fn a_ready_follow_on_is_served_once_the_io_thread_is_let_go() {
 #[test]
 fn a_stop_ends_an_io_thread_parked_idle() {
     let requests = Arc::new(Requests::default());
-    let dispatch = Arc::new(super::Dispatch::new(&requests));
+    let dispatch = Arc::new(super::Dispatch::new(&requests, Shape::default()));
     let idled = dispatch.on_idle();
     let exit = dispatch.on_exit();
-    let thread = super::Dispatch::spawn(&dispatch).unwrap();
+    let thread = super::Dispatch::spawn(&dispatch, 0).unwrap();
     let idle = idled.recv_timeout(BOUND).is_ok();
     dispatch.stop();
     let exited = exit.recv_timeout(BOUND).is_ok();
     if !exited {
-        dispatch.unpark();
+        dispatch.unpark(0);
     }
     let joined = thread.join().is_ok();
     drop((dispatch, requests));
@@ -867,7 +867,7 @@ fn a_failed_open_with_a_ready_sync_whose_file_is_gone_leaves_nothing() {
 /// (D1a §6.11 b).
 #[test]
 fn an_io_thread_that_does_not_start_fails_the_open() {
-    FAIL_SPAWN.with(|f| f.set(true));
+    FAIL_SPAWN.with(|f| f.set(Some(0)));
     let refused = Opening::new(ProbeIO::new(false), BASE, config(), None)
         .err()
         .map(|e| e.to_string());
@@ -977,7 +977,7 @@ fn a_close_on_the_io_thread_is_refused() {
             ended.aborted
                 && ended
                     .stderr
-                    .contains("a database's close on the ring's delivery thread"),
+                    .contains("a database's close on a database's IO thread"),
             "the child ended {:?} (aborted {}): {}",
             ended.code,
             ended.aborted,

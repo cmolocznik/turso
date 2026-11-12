@@ -1582,11 +1582,16 @@ pub struct Ending {
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Commit(Commit),
-    Rollback(Abort),
+    /// A rollback, with the failure of the commit it replaces: a commit that failed before it
+    /// published rolls its transaction back, and its failure is then the ending's outcome.
+    Rollback(Abort, Option<LimboError>),
     Drain,
     /// A full checkpoint, by the wait for it, which holds the end's demand on the checkpoint.
     Checkpoint(crate::storage::atoll::checkpoint::FullWait),
-    /// A published commit's ending whose IO failed: its next step returns the failure.
+    /// An ending that failed, whoever stepped it when it did: its next step returns the failure,
+    /// and it is over (DESIGN.md §17). A commit whose IO failed once its transaction ended,
+    /// published or having written nothing; a commit that failed before it published, its rollback
+    /// done; a rollback that could not finish (`Transactions::abandon`).
     Failed(LimboError),
     Done,
 }
@@ -1643,7 +1648,7 @@ impl Ending {
         }
         Self {
             db,
-            step: Step::Rollback(Abort::new(txn)),
+            step: Step::Rollback(Abort::new(txn), None),
             published: false,
             owner: crate::storage::atoll::buffer::Owner::of(conn),
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
@@ -1680,31 +1685,21 @@ impl Ending {
     /// transaction is over (its commit published, or ended having written nothing; its rollback's
     /// changes put back), its waits the sibling's, then the wait for the horizon to cover a
     /// commit, once a snapshot taken sees it. Never past: the wait for durability, the drain and a
-    /// full checkpoint's wait are the ending's own, and their IO and its failure are for the
-    /// statement that began it (the auditor's #4454).
+    /// full checkpoint's wait are the ending's own, and their IO is for the statement that began it
+    /// (the auditor's #4454, #4481). Nor does it return the ending's failure, whoever met it: a
+    /// commit failing before it published goes to its rollback, which the sibling steps on, and
+    /// the failure is kept in the ending for that statement (`Step::Failed`).
     #[turso_macros::atoll_entry]
     pub fn serve(&mut self) -> Result<IOResult<()>> {
         crate::storage::atoll::buffer::Owner::call_in(self, |e| &mut e.owner, Self::serve_owned)
     }
 
     fn serve_owned(&mut self) -> Result<IOResult<()>> {
-        let ended = match &self.step {
-            Step::Commit(op) => op.ended(),
-            Step::Rollback(op) => op.ended(),
-            _ => return Ok(IOResult::Done(())),
-        };
-        if !ended {
-            let io = match self.step {
-                Step::Commit(_) => self.step_commit()?,
-                _ => self.step_rollback()?,
-            };
-            match &self.step {
-                Step::Commit(op) if !op.ended() => return Ok(io),
-                Step::Rollback(_) => return Ok(io),
-                // The step that ended the transaction went on to a commit's waits: they are the
-                // ending's, its IO dropped here and waited on as the ending is stepped again.
-                _ => {}
-            }
+        if matches!(&self.step, Step::Commit(op) if !op.ended()) {
+            done!(self.step_commit_end());
+        }
+        if matches!(self.step, Step::Rollback(..)) {
+            return self.step_rollback();
         }
         let Step::Commit(op) = &self.step else {
             return Ok(IOResult::Done(()));
@@ -1720,6 +1715,26 @@ impl Ending {
         )
     }
 
+    /// The commit's step to its transaction's end and no further (`Transactions::end_commit`), a
+    /// sibling's: what is left is the commit's waits, the ending's own.
+    fn step_commit_end(&mut self) -> Result<IOResult<()>> {
+        let Step::Commit(op) = &mut self.step else {
+            unreachable!("a commit's step of an ending that commits")
+        };
+        #[cfg(test)]
+        if let Some(pause) = crate::storage::atoll::testing::pause_ending() {
+            return Ok(IOResult::IO(IOCompletions(pause)));
+        }
+        let stepped = self.db.atoll().transactions().end_commit(op);
+        match stepped {
+            Ok(io) => Ok(io),
+            Err(failure) => {
+                self.commit_failed(failure);
+                Ok(IOResult::Done(()))
+            }
+        }
+    }
+
     /// The commit's step, then the drain once it is done.
     fn step_commit(&mut self) -> Result<IOResult<()>> {
         let Step::Commit(op) = &mut self.step else {
@@ -1731,25 +1746,70 @@ impl Ending {
                 return Ok(IOResult::IO(IOCompletions(pause)));
             }
         }
-        done!(self.db.atoll().transactions().commit(op));
+        let stepped = self.db.atoll().transactions().commit(op);
+        match stepped {
+            Ok(IOResult::Done(_)) => {}
+            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+            Err(failure) => {
+                self.commit_failed(failure);
+                return Ok(IOResult::Done(()));
+            }
+        }
         self.db.abandoned(op.abandoned());
         self.published = op.published();
         self.step = Step::Drain;
         Ok(IOResult::Done(()))
     }
 
-    /// The rollback's step, then the drain once it is done.
+    /// A commit's step met `failure` (DESIGN.md §17). Before its transaction ended (its log refusing
+    /// a part's or the Commit's room, the auditor's #4468) nothing it wrote was published: its
+    /// transaction goes to a rollback, the ending's next step, and the failure is the ending's
+    /// outcome once that is done. After, its commit published or its transaction having written
+    /// nothing, the commit stands and the ending is over with the failure, what was left of it
+    /// (the wait for durability, the drain, a full checkpoint's wait) not stepped again.
+    fn commit_failed(&mut self, failure: LimboError) {
+        let Step::Commit(op) = &mut self.step else {
+            unreachable!("a commit's failure in an ending that commits")
+        };
+        self.step = match op.take_txn() {
+            Some(txn) => Step::Rollback(Abort::new(txn), Some(failure)),
+            None => {
+                self.published = op.published();
+                Step::Failed(failure)
+            }
+        };
+    }
+
+    /// The rollback's step, then the drain once it is done, or the failure of the commit it
+    /// replaces. A rollback that cannot finish (its undo unable to read back a part the log never
+    /// made durable, or to put a key back) leaves its transaction where it stands, its slot and
+    /// versions with it, and the database failed until it is reopened (`Transactions::abandon`):
+    /// never a slot freed while versions it wrote remain. Its failure is the ending's outcome.
     fn step_rollback(&mut self) -> Result<IOResult<()>> {
-        let Step::Rollback(op) = &mut self.step else {
+        let Step::Rollback(op, _) = &mut self.step else {
             unreachable!("a rollback's step of an ending that rolls back")
         };
-        done!(self
-            .db
-            .atoll()
-            .transactions()
-            .rollback(self.db.versions(), op));
+        let txns = self.db.atoll().transactions();
+        match txns.rollback(self.db.versions(), op) {
+            Ok(IOResult::Done(())) => {}
+            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+            Err(failure) => {
+                if let Some(txn) = op.take_txn() {
+                    txns.abandon(txn, failure.clone());
+                }
+                self.step = Step::Failed(failure);
+                return Ok(IOResult::Done(()));
+            }
+        }
         self.db.abandoned(op.abandoned());
-        self.step = Step::Drain;
+        let Step::Rollback(_, commit_failure) = std::mem::replace(&mut self.step, Step::Done)
+        else {
+            unreachable!("the step just matched")
+        };
+        self.step = match commit_failure {
+            Some(failure) => Step::Failed(failure),
+            None => Step::Drain,
+        };
         Ok(IOResult::Done(()))
     }
 
@@ -1757,7 +1817,7 @@ impl Ending {
         loop {
             match &mut self.step {
                 Step::Commit(_) => done!(self.step_commit()),
-                Step::Rollback(_) => done!(self.step_rollback()),
+                Step::Rollback(..) => done!(self.step_rollback()),
                 Step::Drain => {
                     done!(self.db.drain());
                     // A transaction's end steps the checkpointer, holding no latch. Past twice its
@@ -1820,7 +1880,7 @@ impl std::fmt::Debug for Ending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let step = match self.step {
             Step::Commit(_) => "committing",
-            Step::Rollback(_) => "rolling back",
+            Step::Rollback(..) => "rolling back",
             Step::Drain => "draining",
             Step::Checkpoint(_) => "checkpointing",
             Step::Failed(_) => "failed",
@@ -1984,7 +2044,7 @@ impl SqlCursor {
             return Ok(IOResult::Done(()));
         }
         loop {
-            let w = match self.resolve()?.unseen_hit() {
+            let w = match self.resolve()?.unseen_hit()? {
                 Guard::Clear => Write::Done(crate::storage::atoll::btree::Outcome::Unchanged),
                 Guard::Wait(blocker) => Write::Wait(blocker),
                 Guard::Conflict => Write::Conflict,

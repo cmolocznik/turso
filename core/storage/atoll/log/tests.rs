@@ -1256,10 +1256,10 @@ const CALLERS: &[(&str, &str, &str, &str, &str)] = &[
     ),
     (
         "txn/mod.rs",
-        "commit",
+        "end_commit",
         "admit",
         "returns the IO; the commit is stepped again",
-        "returns it: the commit fails",
+        "returns it: the commit fails before its transaction ended, and rolls back",
     ),
     (
         "txn/mod.rs",
@@ -1325,7 +1325,7 @@ fn every_caller_of_admit_and_wait_durable_calls_again() {
     assert!(
         found
             .iter()
-            .any(|(f, c, call)| f == "txn/mod.rs" && c == "commit" && call == "admit"),
+            .any(|(f, c, call)| f == "txn/mod.rs" && c == "end_commit" && call == "admit"),
         "the census found {found:?}"
     );
     assert_eq!(

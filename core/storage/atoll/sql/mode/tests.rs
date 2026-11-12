@@ -5883,6 +5883,372 @@ fn a_sibling_reads_on_only_once_the_horizon_covers_its_connections_commit() {
     assert_eq!(state, (true, crate::connection::TransactionState::None));
 }
 
+/// Steps `statement` to its end, stepping the IO it waits on, and says how it ended and whether its
+/// commit was ever published.
+fn step_to_end_published(
+    statement: &mut crate::Statement,
+    crash: &crate::io::crash::CrashIO,
+) -> (std::result::Result<(), String>, bool) {
+    let mut published = false;
+    loop {
+        let step = statement.step();
+        published |= statement.atoll_ending_published();
+        match step {
+            Ok(crate::StepResult::IO) => {
+                if let Err(e) = crash.step() {
+                    return (Err(e.to_string()), published);
+                }
+            }
+            Ok(crate::StepResult::Done) => return (Ok(()), published),
+            Ok(crate::StepResult::Row) => {}
+            Ok(other) => return (Err(format!("{other:?}")), published),
+            Err(e) => return (Err(e.to_string()), published),
+        }
+    }
+}
+
+/// Faults every write and sync of the database at `name`'s first log file.
+fn fail_the_log(crash: &crate::io::crash::CrashIO, name: &str) {
+    crash.set_faults_on(Some(&format!("{name}.log.{:016x}", 0)));
+    crash.set_faults(crate::io::crash::Faults {
+        read: 0.0,
+        write: 1.0,
+        sync: 1.0,
+        short_write: 0.0,
+    });
+}
+
+fn clear_faults(crash: &crate::io::crash::CrashIO) {
+    crash.set_faults(crate::io::crash::Faults::default());
+    crash.set_faults_on(None);
+}
+
+/// A `COMMIT` whose log fails before it publishes, its transaction small enough that every change
+/// is still in memory: the commit returns the failure, its transaction is rolled back whole, and
+/// its slot and its hold of the write gate go, the database itself not failed (the auditor's
+/// #4468: the transaction stayed seated with the gate held, and nothing owned it).
+#[test]
+fn a_commit_failing_before_it_publishes_rolls_back_and_lets_its_slot_and_gate_go() {
+    use crate::storage::atoll::txn::Isolation;
+    use crate::types::IOResult;
+    let name = "/db/commit-fails-before-publishing";
+    let crash = Arc::new(crate::io::crash::CrashIO::new(675));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, name);
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    let setup = [
+        "CREATE TABLE t(a INTEGER)",
+        "CREATE TABLE u(b INTEGER)",
+        "BEGIN",
+        "INSERT INTO t VALUES (1)",
+    ]
+    .iter()
+    .try_for_each(|sql| ran_on(&writer, &crash, sql));
+    // The log fails under another connection's commit.
+    fail_the_log(&crash, name);
+    let other_failed = ran_on(&other, &crash, "INSERT INTO u VALUES (1)").is_err();
+    let mut commit = writer.prepare("COMMIT").unwrap();
+    let (ended, published) = step_to_end_published(&mut commit, &crash);
+    drop(commit);
+    clear_faults(&crash);
+    let inner = writer.atoll().unwrap().db.clone();
+    let txns = inner.atoll().transactions();
+    let failure = txns.failure().map(|e| e.to_string());
+    let mut begun = Vec::new();
+    let mut begins = Vec::new();
+    for _ in 0..txns.slot_count() {
+        match txns.begin(Isolation::Snapshot) {
+            Ok(IOResult::Done(txn)) => {
+                begins.push("Done");
+                begun.push(txn);
+            }
+            Ok(IOResult::IO(_)) => begins.push("IO"),
+            Err(_) => begins.push("Err"),
+        }
+    }
+    let gate = match begun.first_mut() {
+        Some(txn) => format!(
+            "{:?}",
+            txns.take_exclusive(txn, &crate::io::Completion::new_wait())
+        ),
+        None => "no transaction".to_string(),
+    };
+    for txn in begun {
+        txns.abort(txn);
+    }
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((inner, writer, other, db));
+    drop(io);
+    let in_flight = crash.in_flight();
+    assert_eq!(setup, Ok(()));
+    assert!(
+        other_failed,
+        "the log did not fail under the other connection's commit"
+    );
+    assert!(
+        ended.is_err() && !published,
+        "the COMMIT did not fail before publishing: {ended:?}, published {published}"
+    );
+    assert_eq!(
+        failure, None,
+        "a commit rolled back whole failed the database"
+    );
+    assert_eq!(
+        begins, ["Done"; 4],
+        "the failed commit's transaction kept its slot"
+    );
+    assert_eq!(
+        gate, "Ok(Done)",
+        "the failed commit's transaction kept the gate"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+    assert_eq!(in_flight, 0);
+}
+
+/// A read-only transaction's `COMMIT` meeting a failed log: the commit ends its transaction at
+/// once, its slot freed, and only then waits for the log, so the failure it returns leaves nothing
+/// to roll back: every slot is free and the database has not failed (the auditor's #4479: a commit
+/// not published has not always kept its transaction).
+#[test]
+fn a_read_only_commit_meeting_a_failed_log_has_nothing_to_roll_back() {
+    use crate::storage::atoll::txn::Isolation;
+    use crate::types::IOResult;
+    let name = "/db/read-only-commit-failed-log";
+    let crash = Arc::new(crate::io::crash::CrashIO::new(678));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, name);
+    let reader = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    let setup = ["CREATE TABLE t(a INTEGER)", "INSERT INTO t VALUES (1)"]
+        .iter()
+        .try_for_each(|sql| ran_on(&reader, &crash, sql));
+    // The log fails under another connection's commit, past what is durable.
+    fail_the_log(&crash, name);
+    let other_failed = ran_on(&other, &crash, "INSERT INTO t VALUES (2)").is_err();
+    // A read transaction whose snapshot stands past what the log made durable.
+    let read = ["BEGIN", "SELECT a FROM t"]
+        .iter()
+        .try_for_each(|sql| ran_on(&reader, &crash, sql));
+    let mut commit = reader.prepare("COMMIT").unwrap();
+    let (ended, published) = step_to_end_published(&mut commit, &crash);
+    drop(commit);
+    clear_faults(&crash);
+    let inner = reader.atoll().unwrap().db.clone();
+    let txns = inner.atoll().transactions();
+    let failure = txns.failure().map(|e| e.to_string());
+    let mut begun = Vec::new();
+    for _ in 0..txns.slot_count() {
+        if let Ok(IOResult::Done(txn)) = txns.begin(Isolation::Snapshot) {
+            begun.push(txn);
+        }
+    }
+    let free = begun.len();
+    for txn in begun {
+        txns.abort(txn);
+    }
+    let state = (reader.get_auto_commit(), reader.get_tx_state());
+    drop((inner, reader, other, db));
+    drop(io);
+    let in_flight = crash.in_flight();
+    assert_eq!(setup, Ok(()));
+    assert!(
+        other_failed,
+        "the log did not fail under the other connection's commit"
+    );
+    assert_eq!(read, Ok(()));
+    assert!(
+        ended.is_err() && !published,
+        "the read-only COMMIT did not meet the failed log: {ended:?}"
+    );
+    assert_eq!(failure, None, "a read-only commit failed the database");
+    assert_eq!(free, 4, "the read-only commit's transaction kept its slot");
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+    assert_eq!(in_flight, 0);
+}
+
+/// A `COMMIT` whose log fails before it publishes, its transaction having spilled parts the log
+/// never made durable: its rollback cannot read them back, so it leaves the transaction where it
+/// stands, slot, gate and versions, and the database fails until it is reopened; whoever waited on
+/// it is woken to the failure, a writer on one of its keys, a begin on the slots and an exclusive
+/// take behind its hold, and a begin finds it even with a slot free. The reopened database has
+/// none of the transaction's rows (the auditor's #4468, #4466: no slot freed under its versions).
+/// Ended by the statement's drop, or by its reset if `reset`.
+fn a_commit_whose_rollback_cannot_read_its_parts(seed: u64, reset: bool) {
+    use crate::storage::atoll::txn::Isolation;
+    use crate::types::IOResult;
+    let name = format!(
+        "/db/commit-unreadable-rollback{}",
+        if reset { "-reset" } else { "" }
+    );
+    let crash = Arc::new(crate::io::crash::CrashIO::new(seed));
+    let io: Arc<dyn IO> = crash.clone();
+    let mut cfg = config();
+    cfg.log.buffer_bytes = 32 << 10;
+    cfg.log.chunk_bytes = 8 << 10;
+    cfg.log_budget = Some(16 << 20);
+    let db = open_with(&io, &name, cfg.clone());
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    let values = (0..100)
+        .map(|n| format!("({n}, zeroblob(2048))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let setup = [
+        "CREATE TABLE data(id INTEGER PRIMARY KEY, payload BLOB)".to_string(),
+        "BEGIN".to_string(),
+        format!("INSERT INTO data VALUES {values}"),
+    ]
+    .iter()
+    .try_for_each(|sql| ran_on(&writer, &crash, sql));
+    // Another connection's write waits on one of the transaction's keys, its waits unbounded.
+    other.atoll().unwrap().park_waits();
+    let began = ran_on(&other, &crash, "BEGIN");
+    let mut blocked = other.prepare("INSERT INTO data VALUES (5, x'01')").unwrap();
+    let blocked_step = format!("{:?}", blocked.step());
+    let inner = writer.atoll().unwrap().db.clone();
+    let txns = inner.atoll().transactions();
+    // The other slots taken, a begin waits for one, and an exclusive take waits behind the holds.
+    let mut held: Vec<_> = (0..2)
+        .filter_map(|_| match txns.begin(Isolation::Snapshot) {
+            Ok(IOResult::Done(txn)) => Some(txn),
+            _ => None,
+        })
+        .collect();
+    let slot_wait = match txns.begin(Isolation::Snapshot) {
+        Ok(IOResult::IO(crate::types::IOCompletions(c))) => Some(c),
+        _ => None,
+    };
+    let exclusive_wait = crate::io::Completion::new_wait();
+    let behind = held
+        .first_mut()
+        .map(|txn| format!("{:?}", txns.take_exclusive(txn, &exclusive_wait)));
+    // The spilled parts' writes fail: the log has failed with the transaction still open.
+    fail_the_log(&crash, &name);
+    let mut wait = crate::storage::atoll::log::LogWait::default();
+    drop(
+        inner
+            .atoll()
+            .log()
+            .wait_durable(&mut wait, inner.atoll().log().end()),
+    );
+    drop(wait);
+    while crash.in_flight() > 0 {
+        if crash.step().is_err() {
+            break;
+        }
+    }
+    let log_failed = inner.atoll().log().failure().is_some();
+    let mut commit = writer.prepare("COMMIT").unwrap();
+    let (ended, published) = step_to_end_published(&mut commit, &crash);
+    if reset {
+        let _ = commit.reset();
+    }
+    drop(commit);
+    clear_faults(&crash);
+    let failure = txns.failure().map(|e| e.to_string());
+    let slot_woken = slot_wait.as_ref().map(|c| c.finished());
+    let exclusive_woken = exclusive_wait.finished();
+    let retake = held.first_mut().map(|txn| {
+        txns.take_exclusive(txn, &crate::io::Completion::new_wait())
+            .is_err()
+    });
+    let blocked_after = match blocked.step() {
+        Err(e) => Ok(e.to_string()),
+        other => Err(format!("{other:?}")),
+    };
+    drop(blocked);
+    // A slot freed: a begin still finds the failure.
+    if let Some(txn) = held.pop() {
+        txns.abort(txn);
+    }
+    let begin_after = match txns.begin(Isolation::Snapshot) {
+        Err(e) => Ok(e.to_string()),
+        Ok(IOResult::Done(txn)) => {
+            txns.abort(txn);
+            Err("Done".to_string())
+        }
+        Ok(IOResult::IO(_)) => Err("IO".to_string()),
+    };
+    for txn in held {
+        txns.abort(txn);
+    }
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((inner, writer, other, db));
+    let in_flight = crash.in_flight();
+    let reopened = open_with(&io, &name, cfg);
+    let rows = reopened
+        .connect(ConnectOpts::new())
+        .and_then(|conn| {
+            conn.prepare("SELECT count(*) FROM data")
+                .and_then(|mut statement| statement.run_collect_rows())
+        })
+        .map_err(|e| e.to_string());
+    drop(reopened);
+    drop(io);
+    assert_eq!(setup, Ok(()));
+    assert_eq!(began, Ok(()));
+    assert_eq!(
+        blocked_step, "Ok(IO)",
+        "the other connection's write did not wait on the key"
+    );
+    assert!(slot_wait.is_some(), "no begin waited for a slot");
+    assert!(
+        behind
+            .as_deref()
+            .is_some_and(|b| b.starts_with("Ok(Holders(")),
+        "the exclusive take did not wait behind the holds: {behind:?}"
+    );
+    assert!(log_failed, "the log did not fail before the COMMIT");
+    assert!(
+        ended.is_err() && !published,
+        "the COMMIT did not fail before publishing: {ended:?}, published {published}"
+    );
+    assert!(
+        failure.is_some(),
+        "an unfinished rollback did not fail the database"
+    );
+    assert_eq!(
+        slot_woken,
+        Some(true),
+        "a begin waiting for a slot was not woken"
+    );
+    assert!(
+        exclusive_woken,
+        "an exclusive take waiting behind the holds was not woken"
+    );
+    assert_eq!(
+        retake,
+        Some(true),
+        "an exclusive take on a failed database did not fail"
+    );
+    assert!(
+        blocked_after.is_ok(),
+        "a write waiting on the left transaction's key did not fail: {blocked_after:?}"
+    );
+    assert!(
+        begin_after.is_ok(),
+        "a begin on a failed database with a slot free did not fail: {begin_after:?}"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+    assert_eq!(in_flight, 0);
+    assert_eq!(
+        rows,
+        Ok(vec![vec![Value::from_i64(0)]]),
+        "the reopened database kept rows of the left transaction"
+    );
+}
+
+#[test]
+fn a_commit_whose_rollback_cannot_read_its_parts_fails_the_database_and_wakes_its_waiters() {
+    a_commit_whose_rollback_cannot_read_its_parts(676, false);
+}
+
+#[test]
+fn a_commit_whose_rollback_cannot_read_its_parts_reset_fails_the_database_the_same() {
+    a_commit_whose_rollback_cannot_read_its_parts(677, true);
+}
+
 /// The end of a connection's transaction is one word that a close and an ending's start take by
 /// compare-and-swap, so they exclude each other on any threads: an ending holding it refuses a
 /// close, which goes ahead once the ending lets go, and a second ending; a close holding it keeps an
@@ -5924,4 +6290,386 @@ fn a_close_and_an_endings_start_exclude_each_other() {
         Err("Internal error: Connection closed".to_string()),
         "an ending began on a connection a close held"
     );
+}
+
+/// A scan stepping its connection's paused `COMMIT` after the log failed under another
+/// connection's commit: the commit fails before it publishes, and the failure is the `COMMIT`'s,
+/// never the scan's (DESIGN.md §17). Small, the commit's rollback undoes it whole in the scan's step
+/// and the scan reads on, every slot free and the database not failed; with parts the log never
+/// made durable (`spilled`), the rollback cannot read them back and the database fails, so the
+/// scan's read on finds the database's failure. Either way the `COMMIT` returns the failure and none
+/// of its rows is there (with the commit's failure only turned to a rollback, the scan's step
+/// returned it and the `COMMIT` then found the rollback done and returned success).
+fn a_sibling_meeting_its_connections_commit_failure(seed: u64, spilled: bool) {
+    use crate::storage::atoll::txn::Isolation;
+    use crate::types::IOResult;
+    let name = format!(
+        "/db/sibling-meets-commit-failure{}",
+        if spilled { "-spilled" } else { "" }
+    );
+    let crash = Arc::new(crate::io::crash::CrashIO::new(seed));
+    let io: Arc<dyn IO> = crash.clone();
+    let mut cfg = config();
+    if spilled {
+        cfg.log.buffer_bytes = 32 << 10;
+        cfg.log.chunk_bytes = 8 << 10;
+        cfg.log_budget = Some(16 << 20);
+    }
+    let db = open_with(&io, &name, cfg.clone());
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    let other = db.connect(ConnectOpts::new()).unwrap();
+    let values = (0..if spilled { 100 } else { 1 })
+        .map(|n| format!("({n}, zeroblob(2048))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let setup = [
+        "CREATE TABLE scanned(a INTEGER)".to_string(),
+        "INSERT INTO scanned VALUES (10), (20), (30)".to_string(),
+        "CREATE TABLE data(id INTEGER PRIMARY KEY, payload BLOB)".to_string(),
+        "CREATE TABLE side(b INTEGER)".to_string(),
+        "BEGIN".to_string(),
+        format!("INSERT INTO data VALUES {values}"),
+    ]
+    .iter()
+    .try_for_each(|sql| ran_on(&writer, &crash, sql));
+    let mut scan = writer.prepare("SELECT a FROM scanned").unwrap();
+    let first = scan_first(&mut scan, &crash);
+    // The log fails under another connection's commit, with the transaction's last parts.
+    fail_the_log(&crash, &name);
+    let other_failed = ran_on(&other, &crash, "INSERT INTO side VALUES (1)").is_err();
+    // The `COMMIT` pauses in its ending before it publishes, and the scan steps it on.
+    let pause = crate::io::Completion::new_wait();
+    crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = Some(pause.clone()));
+    let mut commit = writer.prepare("COMMIT").unwrap();
+    let waited = step_to_ending(&mut commit, &crash, false);
+    pause.complete(0);
+    crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
+    let mut read = Vec::new();
+    let scanned = scan_rest(&mut scan, &crash, &mut read);
+    drop(scan);
+    let ended = step_to_end(&mut commit, &crash);
+    drop(commit);
+    clear_faults(&crash);
+    let inner = writer.atoll().unwrap().db.clone();
+    let txns = inner.atoll().transactions();
+    let failure = txns.failure().map(|e| e.to_string());
+    let mut begun = Vec::new();
+    for _ in 0..txns.slot_count() {
+        if let Ok(IOResult::Done(txn)) = txns.begin(Isolation::Snapshot) {
+            begun.push(txn);
+        }
+    }
+    let free = begun.len();
+    for txn in begun {
+        txns.abort(txn);
+    }
+    let state = (writer.get_auto_commit(), writer.get_tx_state());
+    drop((inner, writer, other, db));
+    let in_flight = crash.in_flight();
+    let reopened = open_with(&io, &name, cfg);
+    let rows = reopened
+        .connect(ConnectOpts::new())
+        .and_then(|conn| {
+            conn.prepare("SELECT count(*) FROM data")
+                .and_then(|mut statement| statement.run_collect_rows())
+        })
+        .map_err(|e| e.to_string());
+    drop(reopened);
+    drop(io);
+    assert_eq!(setup, Ok(()));
+    assert_eq!(first, Ok(vec![Value::from_i64(10)]));
+    assert!(
+        other_failed,
+        "the log did not fail under the other connection's commit"
+    );
+    assert_eq!(waited, Ok(()));
+    if spilled {
+        assert!(
+            scanned.is_err(),
+            "the scan read on in a failed database: {read:?}"
+        );
+        assert!(failure.is_some(), "the commit's rollback finished");
+        assert_eq!(free, 0, "a begin went ahead in a failed database");
+    } else {
+        assert_eq!(scanned, Ok(()), "the scan met its connection's failure");
+        assert_eq!(
+            read,
+            vec![vec![Value::from_i64(20)], vec![Value::from_i64(30)]]
+        );
+        assert_eq!(failure, None, "an undone commit failed the database");
+        assert_eq!(free, 4, "the failed commit's transaction kept its slot");
+    }
+    assert!(
+        ended.is_err(),
+        "the COMMIT did not return its commit's failure: {ended:?}"
+    );
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+    assert_eq!(in_flight, 0);
+    assert_eq!(rows, Ok(vec![vec![Value::from_i64(0)]]));
+}
+
+#[test]
+fn a_sibling_meeting_its_connections_commit_failure_leaves_it_to_the_commit() {
+    a_sibling_meeting_its_connections_commit_failure(682, false);
+}
+
+#[test]
+fn a_sibling_meeting_its_connections_commit_failure_with_unreadable_parts_leaves_it_to_it() {
+    a_sibling_meeting_its_connections_commit_failure(683, true);
+}
+
+/// The log's IO failing in the call that issues it, as a file reports a failure: refused at
+/// submission, or delivered failed on the completion handed back.
+#[cfg(not(any(shuttle, atoll_loom, miri)))]
+mod log_failing_in_the_call {
+    use super::*;
+    use crate::io::{Clock, Completion, File, FileSyncType, ReadyKey, Stepped};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[repr(u8)]
+    enum Fault {
+        None = 0,
+        Refused = 1,
+        Delivered = 2,
+    }
+
+    /// What the log files' writes and syncs meet, and how many met a fault.
+    #[derive(Default)]
+    struct Faulting {
+        fault: AtomicU8,
+        hits: AtomicUsize,
+        db: std::sync::OnceLock<std::sync::Weak<Database>>,
+    }
+
+    impl Faulting {
+        /// The fault for a log file's write or sync, once one is set and the database's schema
+        /// holds `kept`, which the commit's publication puts there.
+        fn meet(&self, c: &Completion) -> Option<crate::Result<Completion>> {
+            let fault = self.fault.load(Ordering::Acquire);
+            if fault == Fault::None as u8 {
+                return None;
+            }
+            let published = self
+                .db
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|db| {
+                    db.clone_schema()
+                        .get_table(crate::namespace::NamespaceId::ROOT, "kept")
+                        .is_some()
+                });
+            if !published {
+                return None;
+            }
+            self.hits.fetch_add(1, Ordering::AcqRel);
+            let e = crate::error::CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "a log IO failing in its call",
+            );
+            Some(if fault == Fault::Refused as u8 {
+                Err(crate::LimboError::CompletionError(e))
+            } else {
+                c.deliver(Err(e));
+                Ok(c.clone())
+            })
+        }
+    }
+
+    struct FaultingIO {
+        inner: Arc<crate::io::crash::CrashIO>,
+        faulting: Arc<Faulting>,
+    }
+
+    impl Clock for FaultingIO {
+        fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for FaultingIO {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: OpenFlags,
+            direct: bool,
+        ) -> crate::Result<Arc<dyn File>> {
+            Ok(Arc::new(FaultingFile {
+                inner: self.inner.open_file(path, flags, direct)?,
+                faulting: path.contains(".log.").then(|| self.faulting.clone()),
+            }))
+        }
+        fn remove_file(&self, path: &str) -> crate::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn sync_directory(&self, path: &str) -> crate::Result<()> {
+            self.inner.sync_directory(path)
+        }
+        fn rename_file(&self, from: &str, to: &str) -> crate::Result<bool> {
+            self.inner.rename_file(from, to)
+        }
+        fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
+            self.inner.file_id(path)
+        }
+        fn step(&self) -> crate::Result<()> {
+            self.inner.step()
+        }
+        fn try_step(&self, key: ReadyKey, ready: &std::task::Waker) -> crate::Result<Stepped> {
+            self.inner.try_step(key, ready)
+        }
+        fn says_what_a_step_found(&self) -> bool {
+            self.inner.says_what_a_step_found()
+        }
+        fn withdraw(&self, key: ReadyKey) {
+            self.inner.withdraw(key)
+        }
+    }
+
+    struct FaultingFile {
+        inner: Arc<dyn File>,
+        /// For a log file.
+        faulting: Option<Arc<Faulting>>,
+    }
+
+    impl FaultingFile {
+        fn meet(&self, c: &Completion) -> Option<crate::Result<Completion>> {
+            self.faulting.as_ref().and_then(|f| f.meet(c))
+        }
+    }
+
+    impl File for FaultingFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            b: Arc<crate::Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            match self.meet(&c) {
+                Some(met) => met,
+                None => self.inner.pwrite(pos, b, c),
+            }
+        }
+        fn sync(&self, c: Completion, kind: FileSyncType) -> crate::Result<Completion> {
+            match self.meet(&c) {
+                Some(met) => met,
+                None => self.inner.sync(c, kind),
+            }
+        }
+        fn allocate(&self, pos: u64, len: u64) -> crate::Result<()> {
+            self.inner.allocate(pos, len)
+        }
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    /// A scan stepping its connection's paused `COMMIT` on to its publication, the log's next
+    /// write or sync then failing in the call that issues it (`fault`): the scan steps the commit
+    /// to its transaction's end and no further, never into its wait for durability, so it reads
+    /// on having issued no IO of the log; the `COMMIT` meets the failure in its own wait and
+    /// returns it, its table published and the attached database's row committed (the auditor's
+    /// #4481: the scan's step went on into the commit's wait for durability, met the failure there
+    /// and returned it).
+    fn a_sibling_publishing_its_connections_commit(seed: u64, fault: Fault) {
+        let name = format!("sibling-publishing-commit-{fault:?}");
+        let crash = Arc::new(crate::io::crash::CrashIO::new(seed));
+        let faulting = Arc::new(Faulting::default());
+        let io: Arc<dyn IO> = Arc::new(FaultingIO {
+            inner: crash.clone(),
+            faulting: faulting.clone(),
+        });
+        let db = open_attaching(&io, &name);
+        let _ = faulting.db.set(Arc::downgrade(&db));
+        let writer = db.connect(ConnectOpts::new()).unwrap();
+        let reader = db.connect(ConnectOpts::new()).unwrap();
+        let setup = [
+            "CREATE TABLE scanned(a INTEGER)".to_string(),
+            "INSERT INTO scanned VALUES (10), (20), (30)".to_string(),
+            format!("ATTACH '/db/{name}-aux' AS aux"),
+            "CREATE TABLE aux.side(b INTEGER)".to_string(),
+            "BEGIN".to_string(),
+            "CREATE TABLE kept(a INTEGER)".to_string(),
+            "INSERT INTO aux.side VALUES (1)".to_string(),
+        ]
+        .iter()
+        .try_for_each(|sql| ran_on(&writer, &crash, sql));
+        let mut scan = writer.prepare("SELECT a FROM scanned").unwrap();
+        let first = scan_first(&mut scan, &crash);
+        let pause = Completion::new_wait();
+        crate::storage::atoll::testing::ENDING_PAUSE
+            .with(|p| *p.borrow_mut() = Some(pause.clone()));
+        let mut commit = writer.prepare("COMMIT").unwrap();
+        let waited = step_to_ending(&mut commit, &crash, false);
+        let failed_before = writer.atoll().unwrap().db.atoll().log().failure().is_some();
+        pause.complete(0);
+        crate::storage::atoll::testing::ENDING_PAUSE.with(|p| *p.borrow_mut() = None);
+        faulting.fault.store(fault as u8, Ordering::Release);
+        let stepped = format!("{:?}", scan.step());
+        let published = commit.atoll_ending_published();
+        let hits_in_scan = faulting.hits.load(Ordering::Acquire);
+        drop(scan);
+        let ended = step_to_end(&mut commit, &crash);
+        drop(commit);
+        let hits = faulting.hits.load(Ordering::Acquire);
+        faulting.fault.store(Fault::None as u8, Ordering::Release);
+        let failed_after = writer.atoll().unwrap().db.atoll().log().failure().is_some();
+        let table = sees(&reader, "kept");
+        let state = (writer.get_auto_commit(), writer.get_tx_state());
+        drop((writer, reader, db));
+        let side = side_rows(&io, &name);
+        drop(io);
+        let in_flight = crash.in_flight();
+        let faulted = fault != Fault::None;
+        assert_eq!(setup, Ok(()));
+        assert_eq!(first, Ok(vec![Value::from_i64(10)]));
+        assert_eq!(waited, Ok(()));
+        assert!(!failed_before, "the log failed before the commit published");
+        assert!(published, "the scan's step did not publish the commit");
+        assert_eq!(
+            (stepped.as_str(), hits_in_scan),
+            ("Ok(Row)", 0),
+            "the scan stepped the commit into its wait for durability"
+        );
+        assert_eq!(hits > 0, faulted, "the COMMIT's wait met no fault");
+        assert_eq!(failed_after, faulted);
+        assert_eq!(
+            ended.is_err(),
+            faulted,
+            "the COMMIT's outcome is not its wait's: {ended:?}"
+        );
+        assert_eq!(table, Ok(()));
+        assert_eq!(side, Ok(vec![vec![Value::from_i64(1)]]));
+        assert_eq!(state, (true, crate::connection::TransactionState::None));
+        assert_eq!(in_flight, 0);
+    }
+
+    #[test]
+    fn a_sibling_publishing_its_connections_commit_issues_none_of_its_log_io() {
+        a_sibling_publishing_its_connections_commit(679, Fault::None);
+    }
+
+    #[test]
+    fn a_sibling_publishing_its_connections_commit_issues_none_of_its_log_io_refused() {
+        a_sibling_publishing_its_connections_commit(680, Fault::Refused);
+    }
+
+    #[test]
+    fn a_sibling_publishing_its_connections_commit_issues_none_of_its_log_io_failed_inline() {
+        a_sibling_publishing_its_connections_commit(681, Fault::Delivered);
+    }
 }

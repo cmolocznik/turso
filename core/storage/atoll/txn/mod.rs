@@ -276,6 +276,11 @@ pub struct Transactions {
     ends: Box<[CachePadded<ends::Ends>]>,
     /// Per slot, the group its transaction belongs to; 0 for none.
     owner: Box<[CachePadded<AtomicU64>]>,
+    /// Per slot, the start of the transaction left in it ([`abandon`](Self::abandon)); 0 for none.
+    abandoned: Box<[AtomicU64]>,
+    /// Why the database failed, for good until it is reopened: a transaction left where it stood,
+    /// its rollback unable to finish ([`abandon`](Self::abandon)).
+    failure: crate::storage::atoll::once::SetOnce<LimboError>,
     gate: gate::Gate,
     /// Whether every transaction that writes must hold the gate.
     gated: std::sync::atomic::AtomicBool,
@@ -340,6 +345,9 @@ pub enum Writer {
     Committed,
     /// Neither: it ended without committing, and its versions should be gone.
     Gone,
+    /// Left where it stood, its rollback unable to finish ([`Transactions::abandon`]): its
+    /// versions stay, never another's, and the database has failed.
+    Abandoned,
 }
 
 /// A transaction, from its begin to its commit or abort.
@@ -494,9 +502,10 @@ impl Abort {
         &self.abandoned
     }
 
-    /// Whether every change of the transaction is put back and its slot freed.
-    pub fn ended(&self) -> bool {
-        self.txn.is_none()
+    /// The transaction its rollback could not finish, to be left where it stands
+    /// ([`Transactions::abandon`]).
+    pub fn take_txn(&mut self) -> Option<Txn> {
+        self.txn.take()
     }
 }
 
@@ -525,16 +534,21 @@ impl Commit {
         }
     }
 
-    /// Runs `hook` with the commit timestamp of a commit that wrote, once the horizon covers it
-    /// and before the write gate is released: what a taker of the gate after the commit must see,
-    /// such as the stamps of the trees it wrote and the header fields it set (DESIGN.md §17).
+    /// Runs `hook` with the commit timestamp of a commit that wrote, once it is published and
+    /// before the write gate is released: what a taker of the gate after the commit must see, such
+    /// as the stamps of the trees it wrote and the header fields it set (DESIGN.md §17). Published
+    /// is not covered: the horizon may still be below the timestamp while a commit below it on
+    /// another slot draws, and a snapshot taken then misses the commit
+    /// ([`Transactions::wait_covered`]).
     pub fn on_published(mut self, hook: impl FnOnce(Ts) + Send + 'static) -> Self {
         self.published = Some(Box::new(hook));
         self
     }
 
-    /// Whether the commit has been published: what it wrote is visible to every transaction begun
-    /// since and stays so, whatever its wait for durability then meets.
+    /// Whether the commit has been published: its pair is in its slot's commit log, so what it
+    /// wrote is visible to every snapshot at or above its timestamp and stays so, whatever its wait
+    /// for durability then meets. A snapshot taken now is at or above it only once the horizon
+    /// covers it ([`Transactions::wait_covered`]).
     pub fn published(&self) -> bool {
         self.ts.is_some()
     }
@@ -549,6 +563,12 @@ impl Commit {
     /// written nothing, ended without one. What is left is the commit's waits.
     pub fn ended(&self) -> bool {
         self.txn.is_none()
+    }
+
+    /// The transaction of a commit that failed before it ended, to be rolled back
+    /// ([`Abort::new`]): nothing it wrote was published.
+    pub fn take_txn(&mut self) -> Option<Txn> {
+        self.txn.take()
     }
 
     /// Once the commit is done, the trees whose creation a statement rollback undid: each on its
@@ -612,6 +632,8 @@ impl Transactions {
             owner: (0..config.slots)
                 .map(|_| CachePadded::new(AtomicU64::new(0)))
                 .collect(),
+            abandoned: (0..config.slots).map(|_| AtomicU64::new(0)).collect(),
+            failure: Default::default(),
             gate: gate::Gate::new(config.slots),
             gated: std::sync::atomic::AtomicBool::new(false),
             kept: (0..config.slots)
@@ -747,17 +769,22 @@ impl Transactions {
     /// Begins a transaction of `group` once a slot is free, without a snapshot: an exclusive
     /// taker takes its slot before it marks itself pending, and its snapshot after the drain.
     pub fn begin_slot_in(&self, isolation: Isolation, group: u64) -> Result<IOResult<Txn>> {
+        self.refuse_if_failed()?;
         let slot = match self.take_slot() {
             Some(slot) => slot,
             None => {
                 let c = crate::storage::atoll::notify::remote_wait();
                 self.slot_waits.push(c.clone());
-                // Pairs with the fence of a slot freed: either it finds this waiting, or this
-                // finds the slot. A completion left behind is completed later, for no one.
+                // Pairs with the fence of a slot freed, or of the database failing: either it
+                // finds this waiting, or this finds the slot or the failure. A completion left
+                // behind is completed later, for no one.
                 fence(Ordering::SeqCst);
                 match self.take_slot() {
                     Some(slot) => slot,
-                    None => return Ok(IOResult::IO(IOCompletions(c))),
+                    None => {
+                        self.refuse_if_failed()?;
+                        return Ok(IOResult::IO(IOCompletions(c)));
+                    }
                 }
             }
         };
@@ -797,6 +824,7 @@ impl Transactions {
     /// A transaction whose snapshot is older than the schema timestamp fails with
     /// `SchemaConflict`.
     pub fn take_shared(&self, txn: &mut Txn, c: &Completion) -> Result<Taken> {
+        self.refuse_if_failed()?;
         match txn.hold {
             Hold::None => {}
             // Its own exclusive take, pending with no shared hold under it: a shared take would
@@ -816,6 +844,10 @@ impl Transactions {
                 return Err(LimboError::SchemaConflict);
             }
             txn.hold = Hold::Shared;
+        } else {
+            // Registered behind a take, which a failed database's abandoned transaction never
+            // lets go: the failure, read after the registration's fence, is the answer.
+            self.refuse_if_failed()?;
         }
         Ok(taken)
     }
@@ -826,6 +858,7 @@ impl Transactions {
     /// meanwhile ([`give_up`](Self::give_up)). A taker with no snapshot takes it once held; one
     /// with a snapshot older than the schema timestamp fails with `SchemaConflict`.
     pub fn take_exclusive(&self, txn: &mut Txn, c: &Completion) -> Result<Taken> {
+        self.refuse_if_failed()?;
         let (word, shared) = match txn.hold {
             Hold::Exclusive { .. } => return Ok(Taken::Done),
             Hold::Pending { word, shared } => (word, shared),
@@ -836,7 +869,10 @@ impl Transactions {
                         txn.hold = Hold::Pending { word, shared };
                         (word, shared)
                     }
-                    Err(taken) => return Ok(taken),
+                    Err(taken) => {
+                        self.refuse_if_failed()?;
+                        return Ok(taken);
+                    }
                 }
             }
         };
@@ -846,7 +882,11 @@ impl Transactions {
                 txn.hold = if shared { Hold::Shared } else { Hold::None };
                 return Ok(Taken::Lost);
             }
-            other => return Ok(other),
+            other => {
+                // As for a shared take: waiting on holders a failed database never lets go.
+                self.refuse_if_failed()?;
+                return Ok(other);
+            }
         }
         txn.hold = Hold::Exclusive { word, shared };
         if !txn.snapped {
@@ -1138,12 +1178,32 @@ impl Transactions {
             .is_some_and(|log| start <= log.last_at(at))
     }
 
-    /// Commits `op`'s transaction (DESIGN.md §11.4). It is visible to every snapshot taken after it
-    /// is done, which is once the horizon covers its commit timestamp and the log is durable up to
-    /// its Commit record. A transaction that wrote nothing appends nothing, and is done once the
-    /// log is durable up to where it stood at its snapshot. Returns the commit timestamp, `None`
-    /// for a transaction that wrote nothing.
+    /// Commits `op`'s transaction (DESIGN.md §11.4): ends it ([`end_commit`](Self::end_commit)),
+    /// then waits for the horizon to cover its commit timestamp and for the log to be durable up to
+    /// its Commit record, after which it is visible to every snapshot taken. A transaction that
+    /// wrote nothing appends nothing, and is done once the log is durable up to where it stood at
+    /// its snapshot. Returns the commit timestamp, `None` for a transaction that wrote nothing.
     pub fn commit(&self, op: &mut Commit) -> Result<IOResult<Option<Ts>>> {
+        if let IOResult::IO(io) = self.end_commit(op)? {
+            return Ok(IOResult::IO(io));
+        }
+        if let Some(ts) = op.ts {
+            if let Some(wait) = self.horizon.wait(ts, &self.clock) {
+                return Ok(IOResult::IO(IOCompletions(wait)));
+            }
+        }
+        Ok(match self.log.wait_durable(&mut op.log_wait, op.durable)? {
+            IOResult::Done(()) => IOResult::Done(op.ts),
+            IOResult::IO(io) => IOResult::IO(io),
+        })
+    }
+
+    /// The part of `op`'s commit that ends its transaction: a transaction that wrote has every
+    /// filled chunk go out and its Commit record appended, and is published; then its gate and slot
+    /// are let go. Done once [`Commit::ended`], the waits for coverage and durability left to
+    /// [`commit`](Self::commit). A failure is met before the transaction ended: nothing it wrote was
+    /// published, and the transaction is still in `op` ([`Commit::take_txn`]).
+    pub fn end_commit(&self, op: &mut Commit) -> Result<IOResult<()>> {
         if let Some(txn) = op.txn.as_mut() {
             if txn.wrote() {
                 // Every chunk filled goes out first, in parts; the last, in the Commit record.
@@ -1190,8 +1250,10 @@ impl Transactions {
                     lsn
                 }
             };
-            // The gate after the horizon covers the commit, and after what a taker of it after the
-            // commit must see, before the slot is freed.
+            // The gate after the commit is published and after what a taker of it after the
+            // commit must see, before the slot is freed. The horizon may not cover the commit yet
+            // (`Transactions::wait_covered`): a taker's snapshot below it misses its writes, and a
+            // write of a key it wrote then finds a version committed after the snapshot.
             if let (Some(ts), Some(hook)) = (op.ts, op.published.take()) {
                 hook(ts);
             }
@@ -1200,15 +1262,7 @@ impl Transactions {
             self.keep(txn.slot, txn.changes);
             self.release(txn.slot);
         }
-        if let Some(ts) = op.ts {
-            if let Some(wait) = self.horizon.wait(ts, &self.clock) {
-                return Ok(IOResult::IO(IOCompletions(wait)));
-            }
-        }
-        Ok(match self.log.wait_durable(&mut op.log_wait, op.durable)? {
-            IOResult::Done(()) => IOResult::Done(op.ts),
-            IOResult::IO(io) => IOResult::IO(io),
-        })
+        Ok(IOResult::Done(()))
     }
 
     /// `None` once every snapshot taken from now on sees the commit at `ts`, the horizon covering
@@ -1293,10 +1347,58 @@ impl Transactions {
         if self.slots[slot as usize].committed(start) {
             Writer::Committed
         } else if running == start {
-            Writer::Open
+            if self.abandoned[slot as usize].load(Ordering::Acquire) == start {
+                Writer::Abandoned
+            } else {
+                Writer::Open
+            }
         } else {
             Writer::Gone
         }
+    }
+
+    /// Why the database failed, once a transaction was left where it stood
+    /// ([`abandon`](Self::abandon)); `None` while it has not.
+    pub fn failure(&self) -> Option<LimboError> {
+        self.failure.get()
+    }
+
+    /// The failure a judgment of an abandoned transaction's version returns: set before the
+    /// abandoned start it read ([`abandon`](Self::abandon)).
+    pub fn failed(&self) -> LimboError {
+        self.failure.get().unwrap_or_else(|| {
+            LimboError::InternalError("an abandoned transaction with no failure".into())
+        })
+    }
+
+    fn refuse_if_failed(&self) -> Result<()> {
+        match self.failure.get() {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        }
+    }
+
+    /// Leaves `txn`, whose rollback could not finish (`failure`: an undo that could not read back
+    /// a part its log never made durable, or could not put a key back), where it stands
+    /// (DESIGN.md §11.5): its slot stays seated, its hold of the gate stays, and so do the versions
+    /// it wrote, which no later transaction of the slot can take for its own. The database has
+    /// failed from then on, for good until it is reopened, whose recovery has no commit of the
+    /// transaction to replay: every begin, take of the gate and judgment of a version the
+    /// transaction wrote returns the failure, and whoever waits on a slot, the gate or one of its
+    /// versions now is woken to find it.
+    pub fn abandon(&self, txn: Txn, failure: LimboError) {
+        let slot = txn.slot as usize;
+        // The failure first: whoever reads the abandoned start reads it ([`failed`](Self::failed)).
+        self.failure.set(failure);
+        self.abandoned[slot].store(txn.start, Ordering::SeqCst);
+        // Pairs with the fence after each waiter's registration: either the wake finds it, or it
+        // reads the failure or the abandoned start.
+        fence(Ordering::SeqCst);
+        for c in self.slot_waits.take_all() {
+            c.complete(0);
+        }
+        self.gate.wake_all();
+        self.ends[slot].wake();
     }
 
     /// Registers `c` to be completed at the end of `blocker`'s transaction, or when a statement

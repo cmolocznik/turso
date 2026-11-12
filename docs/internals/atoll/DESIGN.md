@@ -3200,6 +3200,16 @@ are not built yet.
 
     Every aborted version is gone before the slot is freed: once the slot's next transaction
     commits, the visibility rule would show one left behind as committed.
+  - **A rollback that cannot finish.** The undo reads back the parts the transaction spilled
+    (section 11.4.1), each once the log is durable past it; a part the log failed to make durable
+    cannot be read back, and an undo that fails to put a key back cannot go on. The transaction is
+    then left where it stands (`Transactions::abandon`): its slot stays seated, and its hold of the
+    gate and its versions stay, so no later transaction of the slot can make them look committed.
+    The database has failed until it is reopened: every begin, take of the gate and judgment of a
+    version the transaction wrote (`Writer::Abandoned`) returns the failure, and whoever waits on
+    a slot, the gate or one of those versions is woken to it. Recovery replays no commit of the
+    transaction, so the reopened database has none of it. A commit that fails before its
+    transaction ended goes to this rollback (section 17).
   - **Savepoints and statement rollback** stop at a statement. Statement numbers only rise: those
     rolled back are never used again, no arena entry is removed, since a reader may be following
     one, and the changes of the statements rolled back are dropped from the transaction's own.
@@ -3641,14 +3651,17 @@ MVCC plugs into the same places with 38 explicit branches in `core/vdbe/execute.
   starts (refused the same way at its start), so no second transaction begins, ends or rolls back
   under the first's ending. A statement already running goes on: the storage ending waits in the
   connection's place (`ConnTxn::place`), and a sibling that steps while it is there steps the
-  transaction's own step itself until the transaction is over (a commit published, a rollback's
-  changes put back), waiting on what that step waits on, then waits for the horizon to cover a
-  commit, and reads on in a read transaction begun for it, which sees what the commit left
+  transaction's own step itself and no further, until the transaction is over (a commit published
+  or, having written nothing, ended, `Transactions::end_commit`; a rollback's changes put back),
+  waiting on what that step waits on, then waits for the horizon to cover a commit, and reads on in a read transaction begun for it, which sees what the commit left
   (`ConnTxn::serve_sibling`, `Ending::serve`): a snapshot taken at the publication is below the
   commit while a commit under it on another slot is still drawing, as several connections' commits
   do at once, row writers holding the write gate shared. Never past: the wait for durability, the
-  drain and a full checkpoint's wait, their IO and its failure, are the ending's statement's. A
-  sibling holds no part of the transaction: its own end ends nothing, and whatever it meets, an
+  drain and a full checkpoint's wait are the ending's statement's, and the sibling issues none of
+  their IO (the auditor's #4481: a sibling's step went on into the wait for durability and returned
+  its failure). Nor is a failure of the ending the sibling's, whoever stepped it when it was met: it
+  is kept in the ending (`Step::Failed`), whose next step, the statement's, returns it. A sibling
+  holds no part of the transaction: its own end ends nothing, and whatever it meets, an
   error, a reset or a drop, ends and rolls back nothing (`Program::abort`). The read begun for
   siblings, marked so (`ConnTxn::served`), is ended as the last statement that can read in it lets
   go: at the one count of root statements every step, reset and drop goes through, once none is
@@ -3666,10 +3679,13 @@ MVCC plugs into the same places with 38 explicit branches in `core/vdbe/execute.
   its ending meets after (its wait for durability, its drain, a full checkpoint's wait) ends the
   ending, whose rest is never stepped again, the commit is finished whole, the attached databases'
   transactions committed, and the statement returns the failure in place of `Done`; one met before
-  rolls every part back. Across databases a commit is atomic per database, as SQLite's is in WAL
-  mode: the attached databases commit after the main database's commit is published, not after it is
-  durable. `ROLLBACK` drives its ending to its end inside its own step, so no statement is ever left
-  holding a rollback's ending.
+  rolls every part back: the commit's transaction goes to a rollback in the same ending, run on by
+  whoever stepped it, the failure the ending's outcome once it is done, and a rollback that cannot
+  finish fails the database (section 11.5; the auditor's
+  #4468: the transaction stayed seated with the gate held and no owner). Across databases a commit
+  is atomic per database, as SQLite's is in WAL mode: the attached databases commit after the main
+  database's commit is published, not after it is durable. `ROLLBACK` drives its ending to its end
+  inside its own step, so no statement is ever left holding a rollback's ending.
 ## 18. Concurrency inside the engine
 
 Turso runs a connection's statements on whatever thread steps them. IO completes either inside the

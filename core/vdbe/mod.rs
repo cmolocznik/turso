@@ -3631,10 +3631,13 @@ impl Program {
                 connection.set_tx_state(TransactionState::Read);
                 return Ok(IOResult::Done(()));
             }
-            // A read a sibling began meanwhile, which nothing reads in any more: ended here, driven
-            // to its end as the synchronous sites drive theirs (R19).
-            if let Some(mut ending) = atoll.end(false) {
-                ending.finish()?;
+            // A read a sibling began meanwhile, which nothing reads in any more, is let go as its
+            // last reader lets go of it (`Connection::end_served_atoll_read`): its slot and snapshot,
+            // with no ending of its own beside this one (the auditor's #4459). One that is not such
+            // a read stays open, and the connection's state says so.
+            if !atoll.end_served() {
+                connection.set_tx_state(TransactionState::Read);
+                return Ok(IOResult::Done(()));
             }
         }
         connection.set_tx_state(TransactionState::None);

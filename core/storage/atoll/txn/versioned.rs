@@ -578,6 +578,7 @@ impl VersionedTree {
                         };
                         return Ok(IOResult::Done(Probe::Wait(blocker)));
                     }
+                    Writer::Abandoned => return Err(txns.failed()),
                     Writer::Gone if gone != Some(v) => {
                         gone = Some(v);
                         continue;
@@ -642,6 +643,7 @@ impl VersionedTree {
                             start: v.ts,
                         })))
                     }
+                    Writer::Abandoned => return Err(txns.failed()),
                     Writer::Committed => return Ok(IOResult::Done(Guard::Conflict)),
                     // Rolled back since it was read: its undo put back the entry below it.
                     Writer::Gone if op.newest && op.gone != Some(v) => {
@@ -881,6 +883,7 @@ impl VersionedTree {
                         };
                         return Ok(IOResult::Done(Write::Wait(blocker)));
                     }
+                    Writer::Abandoned => return Err(txns.failed()),
                     // A rollback puts back every version before its slot is free: read again.
                     Writer::Gone if gone != Some(v) => {
                         gone = Some(v);

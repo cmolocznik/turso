@@ -223,6 +223,18 @@ impl Gate {
     }
 
     /// The word, as an exclusive taker's take reads in it: held or not.
+    /// Completes every take waiting, shared or exclusive: each looks again, and on a failed
+    /// database finds the failure (`Transactions::abandon`).
+    pub(super) fn wake_all(&self) {
+        fence(Ordering::SeqCst);
+        for c in self.turns.take_all() {
+            c.complete(0);
+        }
+        for c in self.drain.take_all() {
+            c.complete(0);
+        }
+    }
+
     pub(super) fn word(&self) -> u64 {
         self.word.load(Ordering::SeqCst)
     }

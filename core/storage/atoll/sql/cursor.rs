@@ -333,12 +333,13 @@ impl AtollCursor {
     /// What the unseen version the cursor rests on comes to for a foreign-key guard whose scan
     /// matched it (R10): a wait while its writer is open, a conflict once it has committed, and
     /// nothing once it was rolled back, its undo having put back the version below it, which the
-    /// walk reaches next.
-    pub fn unseen_hit(&self) -> Guard {
+    /// walk reaches next; the database's failure once its writer was left where it stood.
+    pub fn unseen_hit(&self) -> Result<Guard> {
         let Some(v) = self.cursor.unseen() else {
-            return Guard::Clear;
+            return Ok(Guard::Clear);
         };
-        match self.db.atoll().transactions().writer(v.slot, v.ts) {
+        let txns = self.db.atoll().transactions();
+        Ok(match txns.writer(v.slot, v.ts) {
             crate::storage::atoll::txn::Writer::Open => {
                 Guard::Wait(crate::storage::atoll::txn::Blocker {
                     slot: v.slot,
@@ -347,7 +348,8 @@ impl AtollCursor {
             }
             crate::storage::atoll::txn::Writer::Committed => Guard::Conflict,
             crate::storage::atoll::txn::Writer::Gone => Guard::Clear,
-        }
+            crate::storage::atoll::txn::Writer::Abandoned => return Err(txns.failed()),
+        })
     }
 
     fn step_unseen(&mut self, first: bool) -> Result<IOResult<()>> {

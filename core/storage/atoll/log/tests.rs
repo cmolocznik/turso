@@ -1388,9 +1388,10 @@ fn a_units_durable_wait_takes_one_flush_turn_and_owes_one_asked_during_it() {
     assert_eq!(turns_after, 2);
 }
 
-/// What [`HoldingIO`] holds: once armed, every write and sync to the one segment it holds is
-/// accepted and kept, its callback not run, until the test answers it and then lets it go, so the
-/// preparer's place is seen held past the answer, until the request retires.
+/// What [`HoldingIO`] holds: once armed, every write and sync made to the one segment it names from
+/// then on, through a file opened before or after, is accepted and kept, its callback not run,
+/// until the test answers it and then lets it go, so a place is seen held past the answer, until
+/// the request retires.
 #[derive(Default)]
 struct Holding {
     path: crate::storage::atoll::locks::Mutex<Option<String>>,
@@ -1413,9 +1414,15 @@ impl Holding {
     fn oldest(&self) -> Option<(Completion, i32)> {
         self.queue.lock().pop_front()
     }
+
+    /// What each request held asks for, oldest first: a write's length, or 0 for a sync.
+    fn queued(&self) -> Vec<i32> {
+        self.queue.lock().iter().map(|(_, r)| *r).collect()
+    }
 }
 
-/// A [`MemoryIO`] whose one held segment, once named, holds its writes and syncs ([`Holding`]).
+/// A [`MemoryIO`] whose one held segment, once named, holds the writes and syncs made to it from
+/// then on ([`Holding`]).
 struct HoldingIO {
     inner: Arc<MemoryIO>,
     holding: Arc<Holding>,
@@ -1432,10 +1439,10 @@ impl crate::io::Clock for HoldingIO {
 
 impl IO for HoldingIO {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
-        let held = self.holding.path.lock().as_deref() == Some(path);
         Ok(Arc::new(HoldingFile {
             file: self.inner.open_file(path, flags, direct)?,
-            holding: held.then(|| self.holding.clone()),
+            path: path.to_string(),
+            holding: self.holding.clone(),
         }))
     }
     fn remove_file(&self, path: &str) -> Result<()> {
@@ -1470,7 +1477,16 @@ impl IO for HoldingIO {
 
 struct HoldingFile {
     file: Arc<dyn File>,
-    holding: Option<Arc<Holding>>,
+    path: String,
+    holding: Arc<Holding>,
+}
+
+impl HoldingFile {
+    /// The holding, if it names this file now.
+    fn held(&self) -> Option<&Holding> {
+        let named = self.holding.path.lock().as_deref() == Some(self.path.as_str());
+        named.then_some(&*self.holding)
+    }
 }
 
 impl File for HoldingFile {
@@ -1484,7 +1500,7 @@ impl File for HoldingFile {
         self.file.pread(at, c)
     }
     fn pwrite(&self, at: u64, bytes: Arc<crate::io::Buffer>, c: Completion) -> Result<Completion> {
-        match &self.holding {
+        match self.held() {
             Some(holding) => {
                 c.keep_write_buffer_alive(bytes.clone());
                 holding.hold(c, bytes.len() as i32)
@@ -1493,7 +1509,7 @@ impl File for HoldingFile {
         }
     }
     fn sync(&self, c: Completion, how: crate::io::FileSyncType) -> Result<Completion> {
-        match &self.holding {
+        match self.held() {
             Some(holding) => holding.hold(c, 0),
             None => self.file.sync(c, how),
         }
@@ -1504,6 +1520,101 @@ impl File for HoldingFile {
     fn truncate(&self, n: u64, c: Completion) -> Result<Completion> {
         self.file.truncate(n, c)
     }
+}
+
+/// The log's writes in flight and its sync each hold their record until their request retires, not
+/// until their callback runs (ASYNC1 v3.8, a log write record and a log sync record): a write
+/// answered and still owned leaves a further flush making no write, and once it retires the next
+/// write goes; a sync answered and still owned leaves the next sync unstarted though writes landed
+/// past it, and once it retires the next sync goes (mutants: the write's place or the sync's token
+/// let go in its callback).
+#[test]
+fn a_log_write_and_its_sync_hold_their_records_until_they_retire() {
+    let holding = Arc::new(Holding::default());
+    let io: Arc<dyn IO> = Arc::new(HoldingIO {
+        inner: Arc::new(MemoryIO::new()),
+        holding: holding.clone(),
+    });
+    // One write in flight, so a write still owned is the one that keeps the next from being made.
+    let config = LogConfig {
+        writes_in_flight: 1,
+        ..small()
+    };
+    let filler = vec![7u8; 996];
+    let append = |log: &Arc<Log>| {
+        let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 1024)).unwrap();
+        log.append(&mut admitted, &header(0), &[&filler])
+    };
+    // A block written and made durable, then the first segment's writes and syncs held from there.
+    let log = Log::open(io.clone(), BASE, config, 0).unwrap();
+    while log.end() < BLOCK {
+        append(&log);
+    }
+    drive(&io, || log.wait_durable(&mut LogWait::default(), BLOCK)).unwrap();
+    *holding.path.lock() = Some(log.segments.path(0));
+    let a = append(&log);
+    let _ = log.wait_durable(&mut LogWait::default(), a);
+    let w1 = holding.oldest();
+    let len1 = w1.as_ref().map_or(0, |(_, r)| *r);
+    if let Some((c, r)) = &w1 {
+        c.complete(*r);
+    }
+    // W1 answered and still owned: its sync S1 started; a further flush makes no write.
+    let b = append(&log);
+    let _ = log.wait_durable(&mut LogWait::default(), b);
+    let while_write_owned = holding.queued();
+    if let Some((c, _)) = &w1 {
+        c.retire();
+    }
+    let once_write_retired = holding.queued();
+    let s1 = holding.oldest();
+    if let Some((c, _)) = &s1 {
+        c.complete(0);
+    }
+    let w2 = holding.oldest();
+    if let Some((c, r)) = &w2 {
+        c.complete(*r);
+        c.retire();
+    }
+    // S1 answered and still owned, W2 landed past it: no next sync.
+    let while_sync_owned = holding.queued();
+    if let Some((c, _)) = &s1 {
+        c.retire();
+    }
+    let once_sync_retired = holding.queued();
+    // Every request answered and let go before the assertions.
+    while let Some((c, r)) = holding.oldest() {
+        c.complete(r);
+        c.retire();
+    }
+    let durable = log.durable() >= b;
+    let failure = log.failure();
+    drop(log);
+    assert!(len1 > 0, "no first write held");
+    assert_eq!(
+        while_write_owned,
+        vec![0],
+        "a write made while the last one was owned"
+    );
+    assert_eq!(
+        once_write_retired.len(),
+        2,
+        "the next write not made once the last retired: {once_write_retired:?}"
+    );
+    assert!(once_write_retired[1] > 0);
+    assert!(w2.is_some());
+    assert_eq!(
+        while_sync_owned,
+        Vec::<i32>::new(),
+        "a sync started while the last one was owned"
+    );
+    assert_eq!(
+        once_sync_retired,
+        vec![0],
+        "the next sync not started once the last retired"
+    );
+    assert!(durable, "the log not durable past what was written");
+    assert_eq!(failure, None);
 }
 
 /// The preparer's one request in flight holds its place until the request retires, not until its

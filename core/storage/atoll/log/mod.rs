@@ -1261,8 +1261,19 @@ impl Log {
         } else {
             file.pwrite(at, buffer, c)
         };
-        if let Err(e) = submitted {
-            self.fail(io_failure(&e));
+        match submitted {
+            // Its place among the writes in flight is let go when it retires, not when its
+            // callback runs (ASYNC1 v3.8, a log write record): a write that count admits then
+            // finds its record free. The flush it owes the log is made there too.
+            Ok(c) => {
+                let me = self.held();
+                c.on_retired(move || {
+                    if let Some(me) = me.upgrade() {
+                        me.write_retired();
+                    }
+                });
+            }
+            Err(e) => self.fail(io_failure(&e)),
         }
     }
 
@@ -1277,7 +1288,6 @@ impl Log {
             return;
         }
         self.landed.complete(start, end);
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
         if self.durable_writes {
             self.room.raise_durable(self.landed.at());
             self.wake();
@@ -1287,8 +1297,14 @@ impl Log {
         self.flush();
     }
 
+    /// A write retired: its place among those in flight goes, and the flush it may admit is made.
+    fn write_retired(self: &Arc<Self>) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.flush();
+    }
+
     /// Starts syncing the writes landed and not yet durable, unless a sync is in flight, which
-    /// starts the next when it ends.
+    /// starts the next when its last member retires.
     fn start_sync(self: &Arc<Self>) {
         while self.sync.take() {
             let durable = self.durable();
@@ -1322,12 +1338,42 @@ impl Log {
             })
             .collect();
         let all = group.build();
+        // The sync's token is let go when its last member retires, not when the group's callback
+        // runs (ASYNC1 v3.8, a log sync record): the next sync then finds every record free. The
+        // count holds one more, the submitter's, let go once every member is submitted, so no
+        // member retiring early lets the token go with another still to submit; a failed
+        // submission keeps it, the log failed.
+        let members = Arc::new(AtomicUsize::new(syncs.len() + 1));
         for (segment, c) in segments.iter().zip(syncs) {
-            if let Err(e) = self.segments.file(*segment).sync_data(c) {
-                all.abort();
-                self.fail(io_failure(&e));
-                return;
+            match self.segments.file(*segment).sync_data(c) {
+                Ok(c) => {
+                    let (me, members) = (self.held(), members.clone());
+                    c.on_retired(move || {
+                        if let Some(me) = me.upgrade() {
+                            me.sync_member_retired(&members);
+                        }
+                    });
+                }
+                Err(e) => {
+                    all.abort();
+                    self.fail(io_failure(&e));
+                    return;
+                }
             }
+        }
+        self.sync_member_retired(&members);
+    }
+
+    /// One of a sync's members retired, or its submitter let its hold go: the last of them lets
+    /// the sync's token go and, the log not failed, starts the next sync.
+    fn sync_member_retired(self: &Arc<Self>, members: &AtomicUsize) {
+        if members.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        self.sync.release();
+        if !self.failed.load(Ordering::Acquire) {
+            self.start_sync();
+            self.flush();
         }
     }
 
@@ -1337,9 +1383,7 @@ impl Log {
             return;
         }
         self.room.raise_durable(covers);
-        self.sync.release();
         self.wake();
-        self.start_sync();
         self.flush();
     }
 

@@ -49,20 +49,45 @@ pub(crate) fn remote_wait() -> Completion {
 /// 9.1.3, *No retry without a change*): any number share one wait. A taker registers with
 /// [`wait`](Self::wait) and then tries again, so a let-go in between either finds the registration
 /// or is seen let go; the holder calls [`let_go`](Self::let_go) after it lets go. A let-go no one
-/// waits for is one swap, and takes no lock.
-#[derive(Default)]
+/// waits for is one swap, and takes no lock. The wait is of the remote kind, its let-go another
+/// caller's act, unless made [`stepped`](Self::stepped).
 pub(crate) struct LetGo {
     waiting: crate::storage::atoll::locks::Mutex<Option<Completion>>,
     waited: crate::sync::atomic::AtomicBool,
+    /// The wait's kind: [`remote_wait`], or [`wait`] for a let-go its taker's own steps of the
+    /// backend can bring.
+    make: fn() -> Completion,
     /// Let-goes that found a taker waiting, for a test.
     #[cfg(test)]
     woke: crate::sync::atomic::AtomicU64,
 }
 
+impl Default for LetGo {
+    fn default() -> Self {
+        Self {
+            waiting: Default::default(),
+            waited: Default::default(),
+            make: remote_wait,
+            #[cfg(test)]
+            woke: Default::default(),
+        }
+    }
+}
+
 impl LetGo {
+    /// One whose let-go is a backend's: a request's retirement, which a taker waiting on a pumped
+    /// backend brings by stepping it (the metadata cache's read credits, DESIGN.md 22.18). Its
+    /// wait is of the stepped kind.
+    pub(crate) fn stepped() -> Self {
+        Self {
+            make: wait,
+            ..Default::default()
+        }
+    }
+
     /// The wait the next let-go finishes, registered: try again after it.
     pub(crate) fn wait(&self) -> Completion {
-        let wait = self.waiting.lock().get_or_insert_with(remote_wait).clone();
+        let wait = self.waiting.lock().get_or_insert_with(self.make).clone();
         // Read by the let-go's swap: a let-go before it, its hold already released, is seen by
         // the taker's next try; one after it finds the wait.
         self.waited

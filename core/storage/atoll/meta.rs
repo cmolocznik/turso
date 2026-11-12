@@ -542,7 +542,10 @@ fn retired(unretired: &AtomicUsize, tell: &Tell) {
 /// one credit a read, as many as the cache's budget, taken before the read is issued and given back
 /// when the backend retires it, never when it finishes, so a cancelled load keeps its credit while
 /// the backend keeps its buffer. A miss that finds none free registers on their give-back and
-/// returns IO, holding no credit and no frame; a give-back after its registration wakes it.
+/// returns IO, holding no credit and no frame; a give-back after its registration wakes it. That
+/// wait is of the stepped kind: what gives a credit back is a read's retirement at the backend, so
+/// a waiter on a pumped backend steps it, and the read of a caller that is not polling still comes
+/// in (the auditor's #4580).
 struct ReadCredits {
     free: AtomicUsize,
     returned: crate::storage::atoll::notify::LetGo,
@@ -552,7 +555,8 @@ impl ReadCredits {
     fn new(credits: usize) -> Arc<Self> {
         Arc::new(Self {
             free: AtomicUsize::new(credits),
-            returned: Default::default(),
+            // Given back at a read's retirement, which a waiter stepping a pumped backend brings.
+            returned: crate::storage::atoll::notify::LetGo::stepped(),
         })
     }
 

@@ -1749,3 +1749,145 @@ fn a_cancelled_metadata_read_keeps_its_credit_until_its_backend_retires_it() {
     );
     assert!(served, "the second page not served");
 }
+
+/// A miss that finds the cache's one read credit taken by a read whose caller does not poll it
+/// again waits on the credits' give-back as a waiter that steps the backend, which is what gives a
+/// credit back: waited on alone, as a blocking caller waits, its steps bring that read in, its
+/// retirement wakes the miss, and the miss is then served (the auditor's #4580; mutant: the
+/// credits' wait of the remote kind, which no wait steps the backend for, so the read stays queued).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_miss_waiting_on_the_read_credits_steps_the_backend_that_gives_one_back() {
+    use crate::io::crash::CrashIO;
+    use crate::storage::atoll::testing::drive;
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let cache = Arc::new(MetaCache::new(
+        io.clone(),
+        "meta-credit-stepped",
+        1,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    // The first page's read takes the credit; its caller never polls it again.
+    let first = cache.get(id(0));
+    let second = match cache.get(id(1)) {
+        Ok(IOResult::IO(IOCompletions(c))) => Some(c),
+        _ => None,
+    };
+    let queued = crash.in_flight();
+    let stepped = second.as_ref().is_some_and(|c| !c.is_remote_wait());
+    // A wait of the remote kind would block here with the read queued: it is not waited on.
+    if let Some(c) = second.as_ref().filter(|_| stepped) {
+        io.wait(c);
+    }
+    let told = second.as_ref().is_some_and(Completion::finished);
+    let served = told && drive(&io, || cache.get(id(1))).is_ok();
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    // Every assertion with the cache dropped.
+    drop((first, second, cache));
+    assert_eq!(
+        queued, 1,
+        "reads with the backend while the second miss waited"
+    );
+    assert!(
+        stepped,
+        "the credits' wait is of the remote kind: no waiter steps the backend that gives one back"
+    );
+    assert!(told, "the second miss's wait stayed unfinished");
+    assert!(served, "the second page not served");
+}
+
+/// A miss waiting on the read credits while the credit's owner is paused before it submits its
+/// read, the backend holding nothing: the miss's wait looks at the backend once, finds it empty and
+/// parks registered, taking no further step; the owner's submission wakes it, its steps bring that
+/// read in, and the read's retirement gives it the credit (the auditor's #4583).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_miss_waiting_on_a_credit_whose_read_is_not_submitted_parks_until_the_submission() {
+    use crate::io::crash::CrashIO;
+    use crate::storage::atoll::testing::drive;
+    use std::time::{Duration, Instant};
+    const BOUND: Duration = Duration::from_secs(60);
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let cache = Arc::new(MetaCache::new(
+        io.clone(),
+        "meta-credit-unsubmitted",
+        1,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let owner = {
+        let cache = cache.clone();
+        std::thread::spawn(move || {
+            race::at("meta.before_read_submit", move || {
+                let _ = paused_tx.send(());
+                let _ = go_rx.recv_timeout(BOUND);
+            });
+            matches!(cache.get(id(0)), Ok(IOResult::IO(_)))
+        })
+    };
+    let paused = paused_rx.recv_timeout(BOUND).is_ok();
+    let second = match cache.get(id(1)) {
+        Ok(IOResult::IO(IOCompletions(c))) => Some(c),
+        _ => None,
+    };
+    let stepped = second.as_ref().is_some_and(|c| !c.is_remote_wait());
+    let steps = Arc::new(AtomicUsize::new(0));
+    {
+        let steps = steps.clone();
+        crash.on_step(Some(Arc::new(move || {
+            steps.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })));
+    }
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = second.clone().filter(|_| stepped).map(|c| {
+        let io = io.clone();
+        std::thread::spawn(move || {
+            io.wait(&c);
+            let _ = done_tx.send(());
+        })
+    });
+    // Parked: registered with the backend, which holds nothing.
+    let began = Instant::now();
+    while waiter.is_some() && crash.registered() == 0 && began.elapsed() < BOUND {
+        std::thread::yield_now();
+    }
+    let parked = (crash.registered(), steps.load(Ordering::Relaxed));
+    let _ = go_tx.send(());
+    let submitted = owner.join().unwrap_or(false);
+    let woken = done_rx.recv_timeout(BOUND).is_ok();
+    let joined = waiter.map_or(false, |w| w.join().is_ok());
+    crash.on_step(None);
+    let served = woken && drive(&io, || cache.get(id(1))).is_ok();
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    // Every assertion with the cache dropped.
+    drop((second, cache));
+    assert!(
+        paused,
+        "the credit's owner never paused before its submission"
+    );
+    assert!(
+        stepped,
+        "the credits' wait is of the remote kind: no waiter steps the backend that gives one back"
+    );
+    assert_eq!(
+        parked,
+        (1, 1),
+        "(registrations with the empty backend, steps taken) while the owner had not submitted"
+    );
+    assert!(submitted, "the owner's read was not submitted");
+    assert!(
+        woken && joined,
+        "the submission did not wake the miss's wait"
+    );
+    assert!(served, "the second page not served");
+}

@@ -6991,3 +6991,186 @@ fn a_commit_told_of_its_drivers_failure_before_it_ended_rolls_back() {
     );
     assert_eq!(in_flight, 0);
 }
+
+/// A commit waiting for the log's room, driven on by its ending's own driver (`Ending::finish`, or
+/// its drop) as the first to wait on the admission: the admission registered and flushed what the
+/// log held unflushed (a change published alone), and that write failing fails the log, which fails
+/// the admitters (`Log::fail`). The failure reaches the driver as its wait's completion, which
+/// tells the commit (`Ending::met`), and the commit, its transaction not ended, rolls it back: its
+/// slot and its hold of the gate let go, the database not failed, the failure the outcome (the
+/// auditor's #4499: the admission's own schedule, where the last slice's test told the ending
+/// directly). A statement's drop is no such driver: its reset waits on the statement's IO first and
+/// meets the failure there, the ending then stepping into the failed log. Without the fault, the
+/// held room let go after the first step, the same commit commits.
+fn a_commit_whose_admission_its_driver_sees_fail(seed: u64, fail: bool, by_drop: bool) {
+    use super::COMMITS_MET;
+    use crate::storage::atoll::btree::Mode;
+    use crate::storage::atoll::page::SizeClass;
+    use crate::storage::atoll::sql::AtollDb;
+    use crate::storage::atoll::testing::drive;
+    use crate::storage::atoll::txn::versioned::{VersionedTree, Write, WriteOp};
+    use crate::storage::atoll::txn::{Blocker, Commit, Isolation, Txn};
+    use crate::types::{IOResult, ImmutableRecord};
+    let name = format!(
+        "/db/commit-admission-{}{}",
+        if fail { "fails" } else { "control" },
+        if by_drop { "-drop" } else { "" }
+    );
+    let observed = (|| -> std::result::Result<_, String> {
+        let crash = Arc::new(crate::io::crash::CrashIO::new(seed));
+        let io: Arc<dyn IO> = crash.clone();
+        let mut cfg = config();
+        cfg.log.buffer_bytes = 32 << 10;
+        cfg.log.chunk_bytes = 8 << 10;
+        let db = Arc::new(AtollDb::open(io.clone(), &name, cfg).map_err(|e| e.to_string())?);
+        let txns = db.atoll().transactions();
+        let log = db.atoll().log().clone();
+        let begin = || -> std::result::Result<Txn, String> {
+            let mut txn =
+                drive(&io, || txns.begin(Isolation::Snapshot)).map_err(|e| e.to_string())?;
+            crate::storage::atoll::testing::share(txns, &mut txn);
+            txns.statement(&mut txn).map_err(|e| e.to_string())?;
+            Ok(txn)
+        };
+        let record = ImmutableRecord::from_values(&[Value::build_text("v".repeat(100))], 1)
+            .map_err(|e| e.to_string())?;
+        let mut txn = begin()?;
+        let root = drive(&io, || db.create_tree(&mut txn, SizeClass::new(0).unwrap()))
+            .map_err(|e| e.to_string())?;
+        let mut commit = Commit::new(txn);
+        drive(&io, || txns.commit(&mut commit)).map_err(|e| e.to_string())?;
+        drop(commit);
+        let tree = VersionedTree::open(
+            io.clone(),
+            db.atoll().pool().clone(),
+            db.atoll().store().clone(),
+            root,
+        );
+        let mut txn = begin()?;
+        let key = crate::storage::atoll::sql::key::rowid(1);
+        let mut op = WriteOp::put(&key, record.get_payload().to_vec(), Mode::Upsert);
+        match drive(&io, || tree.write(txns, db.versions(), &mut txn, &mut op)) {
+            Ok(Write::Done(_)) => {}
+            other => return Err(format!("write: {other:?}")),
+        }
+        let blocker = Blocker {
+            slot: txn.slot(),
+            start: txn.start(),
+        };
+        // A transaction's records stay its own until its commit: a change published alone (an
+        // empty `RUN`) is appended and not flushed, nobody waiting on the log, and the rest of the
+        // buffer is held, so the commit's admission registers and flushes that record.
+        drive(&io, || {
+            txns.publish_alone(
+                &mut crate::storage::atoll::log::LogWait::default(),
+                &crate::storage::atoll::txn::changes::Changes::new(),
+            )
+        })
+        .map_err(|e| e.to_string())?;
+        let unflushed = log.end() > log.durable();
+        let mut held = Some(log.hold_buffer_room());
+        if fail {
+            fail_the_log(&crash, &name);
+        }
+        let mut ending = super::Ending::commit(
+            db.clone(),
+            crate::storage::atoll::buffer::Conn::new(),
+            txn,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let first = format!("{:?}", ending.step().map(|r| r.is_io()));
+        let admitting = log.admitting();
+        let flushed = crash.in_flight();
+        // A fixture that did not arm the wait lets the room go before the drive, so that it ends
+        // and the assertions below report it.
+        if !fail || first != "Ok(true)" || !admitting || flushed == 0 {
+            drop(held.take());
+        }
+        let met_before = COMMITS_MET.with(|n| n.get());
+        let ended = if by_drop {
+            drop(ending);
+            None
+        } else {
+            let ended = ending.finish().map_err(|e| e.to_string());
+            drop(ending);
+            Some(ended)
+        };
+        let met = COMMITS_MET.with(|n| n.get()) - met_before;
+        drop(held);
+        clear_faults(&crash);
+        let log_failed = log.failure().is_some();
+        let gate_held = txns.holds_shared(blocker);
+        let failure = txns.failure().map(|e| e.to_string());
+        let mut begun = Vec::new();
+        for _ in 0..txns.slot_count() {
+            if let Ok(IOResult::Done(txn)) = txns.begin(Isolation::Snapshot) {
+                begun.push(txn);
+            }
+        }
+        let free = begun.len();
+        for txn in begun {
+            txns.abort(txn);
+        }
+        drop((tree, log, db, io));
+        let in_flight = crash.in_flight();
+        Ok((
+            unflushed, first, admitting, flushed, met, ended, log_failed, gate_held, failure, free,
+            in_flight,
+        ))
+    })();
+    let (
+        unflushed,
+        first,
+        admitting,
+        flushed,
+        met,
+        ended,
+        log_failed,
+        gate_held,
+        failure,
+        free,
+        in_flight,
+    ) = observed.expect("the fixture failed, every database dropped");
+    assert!(
+        unflushed,
+        "the record published alone was flushed before the commit"
+    );
+    assert_eq!(first, "Ok(true)", "the commit's first step did not wait");
+    assert!(admitting, "the commit did not wait for the log's room");
+    assert!(flushed > 0, "the commit's admission flushed nothing");
+    assert_eq!(
+        met,
+        u64::from(fail),
+        "the ending's driver told the commit of {met} failures"
+    );
+    assert_eq!(log_failed, fail);
+    match &ended {
+        Some(Err(e)) => assert!(fail, "the commit failed without a fault: {e}"),
+        Some(Ok(())) => assert!(!fail, "the commit whose log failed returned success"),
+        None => {}
+    }
+    assert!(!gate_held, "the ended commit kept its hold of the gate");
+    assert_eq!(free, 4, "the ended commit kept its transaction's slot");
+    assert_eq!(
+        failure, None,
+        "a commit undone in memory failed the database"
+    );
+    assert_eq!(in_flight, 0);
+}
+
+#[test]
+fn a_commit_whose_admission_its_driver_sees_fail_rolls_back() {
+    a_commit_whose_admission_its_driver_sees_fail(687, true, false);
+}
+
+#[test]
+fn a_commit_whose_admission_its_destructor_sees_fail_rolls_back() {
+    a_commit_whose_admission_its_driver_sees_fail(689, true, true);
+}
+
+#[test]
+fn a_commit_whose_admission_waited_commits_once_its_room_is_let_go() {
+    a_commit_whose_admission_its_driver_sees_fail(688, false, false);
+}

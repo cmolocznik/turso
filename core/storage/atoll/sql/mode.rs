@@ -510,6 +510,9 @@ crate::thread::thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     /// The header fields read on this thread, for the same.
     pub(crate) static HEADER_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The commits told on this thread of a failure their driver saw (`Ending::met`), for a test
+    /// to see that its schedule reached the driver.
+    pub(crate) static COMMITS_MET: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Copy)]
@@ -1897,6 +1900,8 @@ impl Ending {
     /// failures meets each step at most once.
     fn met(&mut self, failure: LimboError) {
         if matches!(self.step, Step::Commit(_)) {
+            #[cfg(test)]
+            COMMITS_MET.with(|n| n.set(n.get() + 1));
             return self.commit_failed(failure);
         }
         match &mut self.step {

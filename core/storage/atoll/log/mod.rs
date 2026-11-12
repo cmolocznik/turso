@@ -1101,6 +1101,27 @@ impl Log {
         }
     }
 
+    /// All the room left within the buffer, granted straight from the room as no admission is, so
+    /// that the next admission waits on a flush of what is appended, for a test.
+    #[cfg(test)]
+    pub(crate) fn hold_buffer_room(self: &Arc<Self>) -> Admitted {
+        let left = self.config.buffer_bytes - (self.room.reach() - self.room.durable());
+        assert!(
+            self.room.grant(left, true),
+            "the buffer's room left not granted"
+        );
+        Admitted {
+            log: self.clone(),
+            left,
+        }
+    }
+
+    /// Whether anyone waits to be admitted, for a test.
+    #[cfg(test)]
+    pub(crate) fn admitting(&self) -> bool {
+        self.admitters.waiting()
+    }
+
     /// Whether a turn of the flush is asked for and not taken, for a test.
     #[cfg(test)]
     pub(crate) fn flush_asked(&self) -> bool {

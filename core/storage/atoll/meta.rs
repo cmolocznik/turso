@@ -1038,6 +1038,7 @@ impl MetaCache {
 
     /// Checkpoint `n` has written every page it writes: changes no longer keep a page first, and
     /// what was kept goes, for the frames it wrote, `frames`.
+    #[cfg(test)]
     pub fn end_cut(&self, n: u64, frames: &[MetaRef]) {
         self.stop_keeping(n);
         self.uncut(n, frames);

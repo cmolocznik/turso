@@ -112,6 +112,7 @@ impl Requests {
     }
 
     /// The requests submitted and not retired.
+    #[cfg(test)]
     pub(super) fn outstanding(&self) -> usize {
         outstanding_in(self.word.load(Ordering::Acquire)) as usize
     }

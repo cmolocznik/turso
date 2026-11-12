@@ -92,6 +92,7 @@ pub struct FullWait {
 
 impl FullWait {
     /// The full checkpoints asked for when this wait was made.
+    #[cfg(test)]
     pub fn ticket(&self) -> u64 {
         self.ticket
     }

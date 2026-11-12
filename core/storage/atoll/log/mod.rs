@@ -931,6 +931,7 @@ impl Log {
     }
 
     /// Deletes the segments wholly before `lsn`, which nothing needs any more.
+    #[cfg(test)]
     pub fn release_before(&self, lsn: Lsn) -> Result<()> {
         let mut n = self.kept_from(lsn);
         let mut removed = false;

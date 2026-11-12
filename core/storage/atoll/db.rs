@@ -126,6 +126,7 @@ impl Atoll {
     /// Closes the database in DESIGN.md 22.12's order, as dropping it does, and says whether its
     /// log was made durable to the end it had when close began: a failure is returned after every
     /// later step of close.
+    #[cfg(test)]
     pub fn close(mut self) -> Result<()> {
         self.close_in_order()
     }
@@ -173,6 +174,7 @@ impl Atoll {
 
     /// Opens the database at `base`, creating it if it does not exist and recovering it on this
     /// thread if it does. To recover on several threads, use [`Opening`].
+    #[cfg(test)]
     pub fn open(io: Arc<dyn IO>, base: &str, config: AtollConfig) -> Result<Self> {
         Self::open_holding(io, base, config, None)
     }

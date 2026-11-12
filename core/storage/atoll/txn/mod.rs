@@ -1374,6 +1374,7 @@ impl Transactions {
 
     /// Why the database failed, once a transaction was left where it stood
     /// ([`abandon`](Self::abandon)); `None` while it has not.
+    #[cfg(test)]
     pub fn failure(&self) -> Option<LimboError> {
         self.failure.get()
     }

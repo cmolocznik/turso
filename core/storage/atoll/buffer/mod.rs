@@ -331,7 +331,9 @@ impl Drop for Outgoing {
         }
     }
 }
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// What a round of making room did: started work that makes room (a drain of a batch no drain had,
 /// an eviction, a write-out), and what it did about the resident pages it found latched (DESIGN.md
@@ -3040,6 +3042,7 @@ impl BufferPool {
     /// Checkpoint `n` has imaged every page its cut found owed: changes no longer keep pages.
     /// Whole, for a checkpoint abandoned and for tests; a checkpoint ends its cut a run a unit
     /// ([`end_cut_run`](Self::end_cut_run)).
+    #[cfg(test)]
     pub fn end_cut(&self, n: u64) {
         let mut at = EndCut::default();
         while !self.end_cut_run(n, &mut at) {}

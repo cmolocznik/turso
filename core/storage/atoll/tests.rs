@@ -22,9 +22,9 @@ use crate::Result;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
-const BASE: &str = "/db/atoll";
+pub(super) const BASE: &str = "/db/atoll";
 
-fn config() -> AtollConfig {
+pub(super) fn config() -> AtollConfig {
     AtollConfig {
         log: LogConfig {
             segment_bytes: 512 << 10,
@@ -69,12 +69,16 @@ fn try_open(io: Arc<dyn IO>, threads: usize) -> Result<Atoll> {
 
 /// The gaps the superblock in charge records.
 fn gaps(io: &Arc<dyn IO>) -> Vec<(Lsn, Lsn)> {
-    let (_, sb) = Control::open(io.clone(), BASE).unwrap();
+    let (_, sb) = Control::open(
+        crate::storage::atoll::requests::counted_for_test(io.clone()),
+        BASE,
+    )
+    .unwrap();
     sb.expect("a superblock in charge").continuations
 }
 
 /// A database and one versioned tree in it.
-struct Db {
+pub(super) struct Db {
     io: Arc<dyn IO>,
     db: Atoll,
     versions: Versions,
@@ -84,7 +88,7 @@ struct Db {
 impl Db {
     /// A new database with its tree, in a checkpoint before any write, as a database's creation
     /// has its system trees.
-    fn create(io: Arc<dyn IO>) -> Self {
+    pub(super) fn create(io: Arc<dyn IO>) -> Self {
         let db = try_open(io.clone(), 1).unwrap();
         let root = drive(&io, || Tree::create_versioned(db.pool(), class(0))).unwrap();
         let made = Self::with(io, db, root);
@@ -117,7 +121,7 @@ impl Db {
     }
 
     /// Commits `value` under `key` in a transaction of its own; durable once it returns.
-    fn put(&self, key: &str, value: &[u8]) {
+    pub(super) fn put(&self, key: &str, value: &[u8]) {
         let txns = self.db.transactions();
         let mut txn = self.begin();
         let mut op = WriteOp::put(key.as_bytes(), value.to_vec(), Mode::Upsert);
@@ -169,6 +173,50 @@ impl Db {
 }
 
 /// The value of commit `i` to its key: long enough, every few, to go out of line.
+/// A database whose log ends inside a block, as a crash that tore its last block leaves it: created,
+/// an empty run published with no wait so the next commit starts inside a block, one commit, a
+/// close, then that commit's bytes zeroed to its block's end. Its reopening records the gap to the
+/// next block with a superblock (D1a §6.11 a).
+pub(super) fn ending_inside_a_block(io: Arc<dyn IO>) {
+    let db = Db::create(io.clone());
+    let run = super::txn::changes::Changes::new();
+    drive(&db.io, || {
+        db.db
+            .transactions()
+            .publish_alone(&mut crate::storage::atoll::log::LogWait::default(), &run)
+    })
+    .unwrap();
+    let from = db.db.log().end();
+    db.put("k", &value(1));
+    let to = db.db.log().end();
+    drop(db);
+    let block_end = from.next_multiple_of(BLOCK);
+    assert!(
+        from % BLOCK != 0 && to <= block_end,
+        "the commit [{from}, {to}) is not inside one block"
+    );
+    let log = config().log;
+    let file = io
+        .open_file(
+            &format!("{BASE}.log.{:016x}", from / log.segment_bytes),
+            OpenFlags::None,
+            false,
+        )
+        .unwrap();
+    let len = (block_end - from) as usize;
+    let zeros = Arc::new(AlignedBlock::zeroed(len.next_multiple_of(BLOCK as usize)));
+    let c = file
+        .pwrite(
+            from % log.segment_bytes,
+            zeros.region(0, len),
+            Completion::new_write(|_| {}),
+        )
+        .unwrap();
+    io.wait_for_completion(c).unwrap();
+    let c = file.sync_data(Completion::new_sync(|_| {})).unwrap();
+    io.wait_for_completion(c).unwrap();
+}
+
 fn value(i: usize) -> Vec<u8> {
     let len = if i % 5 == 0 { 6000 } else { 120 };
     let mut v = format!("v{i}-").into_bytes();
@@ -335,7 +383,11 @@ fn a_crash_once_recovery_records_its_gap_never_reads_what_the_first_crash_left_p
         .err()
         .expect("a recovery with no room for its gap");
     assert!(refused.to_string().contains("gaps it holds"), "{refused}");
-    let (_, now) = Control::open(full.clone(), BASE).unwrap();
+    let (_, now) = Control::open(
+        crate::storage::atoll::requests::counted_for_test(full.clone()),
+        BASE,
+    )
+    .unwrap();
     assert_eq!(now, Some(held), "a refused recovery wrote a superblock");
     control::rewrite_in_charge(full.clone(), BASE, |sb| sb.continuations.clear());
     let db = Db::recover(full, root, 1).unwrap();

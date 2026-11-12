@@ -23,7 +23,9 @@ use super::log::Lsn;
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
 use super::radix::MAX_HEIGHT;
-use super::whole;
+#[cfg(test)]
+use super::requests::counted_for_test;
+use super::requests::{Chain, Counted, CountedFile};
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::Arc;
@@ -164,8 +166,11 @@ impl Superblock {
 }
 
 pub struct Control {
+    /// The counted IO its file is opened through, typed: a write's sync is a follow-on
+    /// ([`CountedFile::write_then`]).
+    counted: Arc<Counted>,
     io: Arc<dyn IO>,
-    file: Arc<dyn File>,
+    file: Arc<CountedFile>,
 }
 
 /// What a control file holds.
@@ -238,19 +243,21 @@ fn not_atoll(why: &str) -> LimboError {
 impl Control {
     /// Opens the control file at `path` and returns the superblock in charge, if any. A file that
     /// is no Atoll control file fails the open and is left as it is ([`judge`]).
-    pub fn open(io: Arc<dyn IO>, path: &str) -> Result<(Self, Option<Superblock>)> {
-        let file = io.open_file(path, OpenFlags::Create | OpenFlags::Direct, false)?;
+    pub fn open(counted: Arc<Counted>, path: &str) -> Result<(Self, Option<Superblock>)> {
+        let io: Arc<dyn IO> = counted.clone();
+        let file = counted.open_counted(path, OpenFlags::Create | OpenFlags::Direct, false)?;
         // The control file's creation must survive a crash as its superblocks do.
         let dir = std::path::Path::new(path)
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
         io.sync_directory(&dir)?;
-        let newest = match judge(&io, &file)? {
+        let any: Arc<dyn File> = file.clone();
+        let newest = match judge(&io, &any)? {
             Found::Nothing => None,
             Found::Database(sb) => Some(sb),
         };
-        Ok((Self { io, file }, newest))
+        Ok((Self { counted, io, file }, newest))
     }
 
     /// Writes `sb` over the superblock not in charge; done once it is durable.
@@ -258,41 +265,41 @@ impl Control {
         self.write_encoded(sb.seq, &sb.encode())
     }
 
-    /// Writes the encoded superblock `bytes` in the place of `seq`.
+    /// Writes the encoded superblock `bytes` in the place of `seq`; done once it is durable and
+    /// every request of the write has retired (DESIGN.md 22.18, D1a §2). Where the file does not
+    /// write durably, its sync is a follow-on made at the write's retirement and submitted by the
+    /// IO thread.
     fn write_encoded(&self, seq: u64, bytes: &[u8]) -> Result<Completion> {
         let block = Arc::new(AlignedBlock::zeroed(SIZE));
         // SAFETY: a fresh block of the superblock's size.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), block.as_ptr(), SIZE) };
         let at = (seq % 2) * SIZE as u64;
         let durable = crate::storage::atoll::notify::wait();
-        let done = durable.clone();
-        if self.file.supports_durable_writes() {
-            let c = Completion::new_write(move |res| finish(&done, whole(SIZE, res)));
-            drop(self.file.pwrite_durable(at, block.region(0, SIZE), c)?);
-        } else {
-            // The file weakly: it holds the IO the write waits in, so a strong hold would keep that
-            // IO alive for good once nothing steps it; a file closed before its sync leaves the
-            // superblock not durable.
-            let file = Arc::downgrade(&self.file);
-            let c = Completion::new_write(move |res| match (whole(SIZE, res), file.upgrade()) {
-                (Ok(()), Some(file)) => {
-                    let after = done.clone();
-                    let synced = Completion::new_sync(move |r| finish(&after, r.map(|_| ())));
-                    if let Err(e) = file.sync_data(synced) {
-                        finish(&done, Err(io_failure(&e)));
-                    }
-                }
-                (Ok(()), None) => finish(&done, Err(CompletionError::Aborted)),
-                (Err(e), _) => finish(&done, Err(e)),
-            });
-            drop(self.file.pwrite(at, block.region(0, SIZE), c)?);
-        }
+        let writes_durably = self.file.supports_durable_writes();
+        // Its one record: superblocks are written one at a time, at the open and at a checkpoint's
+        // end.
+        let held = self.counted.take_superblock_record()?;
+        let chain = Arc::new(SuperblockWrite {
+            durable: durable.clone(),
+            writes_durably,
+        });
+        drop(
+            self.file
+                .write_then(held, at, block.region(0, SIZE), writes_durably, chain)?,
+        );
         Ok(durable)
     }
 
     /// Writes `sb` and waits until it is durable, as opening a database does.
     pub fn write_and_wait(&self, sb: &Superblock) -> Result<()> {
+        crate::race::point("control.write_and_wait");
         let c = self.write(sb)?;
+        #[cfg(test)]
+        if FAIL_BEFORE_WAIT.with(|f| f.replace(false)) {
+            return Err(LimboError::InternalError(
+                "a failure injected after a superblock's write, before its wait".into(),
+            ));
+        }
         crate::storage::atoll::park::wait_for_completion(self.io.as_ref(), c)
     }
 
@@ -320,17 +327,36 @@ impl Control {
     }
 }
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// Set by a test: this thread's next [`Control::write_and_wait`] fails after its write and
+    /// before its wait, its sync still to come, as an open that fails then would.
+    pub(crate) static FAIL_BEFORE_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A superblock write's chain: its sync owed unless the file writes durably, and its waiter told
+/// once every request of it has retired, with the write's outcome or its sync's.
+struct SuperblockWrite {
+    durable: Completion,
+    writes_durably: bool,
+}
+
+impl Chain for SuperblockWrite {
+    fn written(&self, res: std::result::Result<(), CompletionError>) -> bool {
+        res.is_ok() && !self.writes_durably
+    }
+
+    fn synced(&self, _: std::result::Result<(), CompletionError>) {}
+
+    fn ended(&self, outcome: std::result::Result<(), CompletionError>) {
+        finish(&self.durable, outcome);
+    }
+}
+
 fn finish(c: &Completion, res: std::result::Result<(), CompletionError>) {
     match res {
         Ok(()) => c.complete(0),
         Err(e) => c.error(e),
-    }
-}
-
-fn io_failure(e: &LimboError) -> CompletionError {
-    match e {
-        LimboError::CompletionError(e) => *e,
-        _ => CompletionError::IOError(std::io::ErrorKind::Other, "superblock IO submission"),
     }
 }
 
@@ -348,7 +374,7 @@ pub(crate) fn rewrite_in_charge(
     base: &str,
     change: impl FnOnce(&mut Superblock),
 ) -> Superblock {
-    let (control, sb) = Control::open(io.clone(), base).unwrap();
+    let (control, sb) = Control::open(counted_for_test(io.clone()), base).unwrap();
     let mut sb = sb.expect("a superblock in charge");
     change(&mut sb);
     crate::storage::atoll::park::wait_for_completion(
@@ -363,6 +389,7 @@ pub(crate) fn rewrite_in_charge(
 mod tests {
     use super::*;
     use crate::io::crash::{CrashIO, Faults};
+    use crate::storage::atoll::requests::counted_for_test;
 
     /// A superblock naming a tree past `MAX_HEIGHT` levels is refused as corrupt, one naming
     /// `MAX_HEIGHT` is read, and one naming 0, a tree not yet begun, is read as 0 (the auditor's
@@ -446,14 +473,14 @@ mod tests {
     fn a_superblock_of_an_unknown_version_fails_the_open() {
         for unknown_seq in [6, 4] {
             let io: Arc<dyn IO> = Arc::new(CrashIO::new(3));
-            let (control, _) = Control::open(io.clone(), "/db/unknown").unwrap();
+            let (control, _) = Control::open(counted_for_test(io.clone()), "/db/unknown").unwrap();
             control.write_and_wait(&superblock(5)).unwrap();
             let mut bytes = superblock(unknown_seq).encode();
             bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
             seal(&mut bytes);
             io.wait_for_completion(control.write_encoded(unknown_seq, &bytes).unwrap())
                 .unwrap();
-            let err = Control::open(io, "/db/unknown")
+            let err = Control::open(counted_for_test(io), "/db/unknown")
                 .map(|(_, sb)| sb)
                 .unwrap_err();
             assert!(err.to_string().contains("version 3"), "{err}");
@@ -468,7 +495,8 @@ mod tests {
             let crash = Arc::new(CrashIO::new(5));
             crash.set_durable_writes(durable_writes);
             let io: Arc<dyn IO> = crash.clone();
-            let (control, newest) = Control::open(io.clone(), "/db/short").unwrap();
+            let (control, newest) =
+                Control::open(counted_for_test(io.clone()), "/db/short").unwrap();
             assert_eq!(newest, None);
             control.write_and_wait(&superblock(1)).unwrap();
             crash.set_faults(Faults {
@@ -480,7 +508,7 @@ mod tests {
                 "a short write counted as durable (durable writes: {durable_writes})"
             );
             crash.set_faults(Faults::default());
-            let (_, newest) = Control::open(io, "/db/short").unwrap();
+            let (_, newest) = Control::open(counted_for_test(io), "/db/short").unwrap();
             assert_eq!(newest, Some(superblock(1)));
         }
     }
@@ -536,7 +564,7 @@ mod tests {
             let c = Completion::new_write(|_| {});
             io.wait_for_completion(file.pwrite(0, buffer, c).unwrap())
                 .unwrap();
-            let err = match Control::open(io.clone(), path) {
+            let err = match Control::open(counted_for_test(io.clone()), path) {
                 Ok(_) => panic!("{path} opened as a control file"),
                 Err(e) => e,
             };

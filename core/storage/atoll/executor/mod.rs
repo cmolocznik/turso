@@ -1524,6 +1524,20 @@ impl Executor {
         self.shut(Some(requests));
     }
 
+    /// Closes the executor of a database whose open did not finish, in close's order from step 2
+    /// (22.12), with no log to make durable: closing published and every step ended, waits given
+    /// up, every request `requests` counts retired (which stops the IO thread), every job dropped
+    /// (DESIGN.md 22.18, D1a §4).
+    pub(crate) fn close_unopened(mut self, requests: &Requests) {
+        self.shut_unopened(requests);
+        drop(self);
+    }
+
+    #[turso_macros::atoll_entry]
+    fn shut_unopened(&mut self, requests: &Requests) {
+        self.shut(Some(requests));
+    }
+
     /// Closes every task, so none is claimed or linked again, wakes the idle workers and joins
     /// them once their steps in progress end, all but the calling thread when a step of its own
     /// dropped the executor (it leaves once that step ends); takes every job out of the table,

@@ -245,8 +245,42 @@ pub(in crate::storage::atoll) struct Opening {
     checkpointing: Checkpointing,
     /// The database's executor, made before its log is opened, so the log's preparer is one of
     /// its tasks from the first (DESIGN.md 22.9 item 2): with one worker of its own
-    /// ([`Checkpointing::Thread`]) or none, its callers running its tasks.
-    executor: Executor,
+    /// ([`Checkpointing::Thread`]) or none, its callers running its tasks. Taken by
+    /// [`finish`](Self::finish); an open that never finishes closes it as it drops.
+    executor: Unopened,
+}
+
+/// The executor of a database not yet open, with the requests its close drains: the one cleanup
+/// owner of an open that fails (DESIGN.md 22.18, D1a §4). It drops only with its owner, after every
+/// [`Opening::work`] caller has returned, and then closes the executor in close's order from step
+/// 2: tasks closed, workers joined, calls ended, waits given up, the requests drained (which stops
+/// the IO thread), the jobs dropped. A finished open took the executor, and its drop does nothing.
+struct Unopened {
+    executor: Option<Executor>,
+    requests: Arc<Requests>,
+}
+
+impl Unopened {
+    fn executor(&self) -> &Executor {
+        self.executor
+            .as_ref()
+            .expect("an opening's executor until it finishes")
+    }
+
+    fn take(&mut self) -> Executor {
+        self.executor
+            .take()
+            .expect("an opening's executor until it finishes")
+    }
+}
+
+impl Drop for Unopened {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        if let Some(executor) = self.executor.take() {
+            executor.close_unopened(&self.requests);
+        }
+    }
 }
 
 enum How {
@@ -288,7 +322,8 @@ impl Opening {
     ) -> Result<Self> {
         refuse_a_backend_that_would_poll(&*io)?;
         let requests = Arc::new(Requests::holding(held));
-        let io: Arc<dyn IO> = Arc::new(Counted::new(io, requests.clone()));
+        let counted = Arc::new(Counted::new(io, requests.clone())?);
+        let io: Arc<dyn IO> = counted.clone();
         // The log's ring and the image bank are lent from the pool for as long as it is open,
         // taken as it opens; the smallest pool is the budget beside them and the copies' worst
         // layout (DESIGN.md 9.1.1).
@@ -308,16 +343,20 @@ impl Opening {
             bank,
         };
         let worker = matches!(config.checkpointing, Checkpointing::Thread);
-        let executor = Executor::new(io.clone(), usize::from(worker))?;
-        let (control, superblock) = Control::open(io.clone(), base)?;
+        let executor = Unopened {
+            executor: Some(Executor::new(io.clone(), usize::from(worker))?),
+            requests: requests.clone(),
+        };
+        // From here an error drops `executor`, which closes it with the requests drained.
+        let (control, superblock) = Control::open(counted.clone(), base)?;
         let Some(superblock) = superblock else {
-            return Self::create(io, requests, base, config, control, executor);
+            return Self::create(io, counted, requests, base, config, control, executor);
         };
         // What the database was created with holds, whatever this configuration says.
         config.log.segment_bytes = superblock.segment_bytes;
         config.store.file_bytes = superblock.file_bytes;
         let store = PageStore::open(
-            io.clone(),
+            counted,
             base,
             config.store.clone(),
             superblock.heights,
@@ -343,11 +382,12 @@ impl Opening {
     /// written before anything is appended, so a log with no superblock is no database yet.
     fn create(
         io: Arc<dyn IO>,
+        counted: Arc<Counted>,
         requests: Arc<Requests>,
         base: &str,
         config: AtollConfig,
         control: Control,
-        executor: Executor,
+        executor: Unopened,
     ) -> Result<Self> {
         // From the IO, so a simulation that seeds it creates the same database every time.
         let mut database_id = [0u8; 16];
@@ -366,13 +406,7 @@ impl Opening {
             checkpoint: 0,
             continuations: Vec::new(),
         };
-        let store = PageStore::open(
-            io.clone(),
-            base,
-            config.store.clone(),
-            superblock.heights,
-            0,
-        );
+        let store = PageStore::open(counted, base, config.store.clone(), superblock.heights, 0);
         control.write_and_wait(&superblock)?;
         let pool = BufferPool::new(
             config.buffer.clone(),
@@ -380,7 +414,14 @@ impl Opening {
             store.clone(),
         )?;
         // Its ring in frames the pool lends: the pool first.
-        let log = Log::open_in(io.clone(), base, config.log.clone(), 0, &pool, &executor)?;
+        let log = Log::open_in(
+            io.clone(),
+            base,
+            config.log.clone(),
+            0,
+            &pool,
+            executor.executor(),
+        )?;
         let txns = Transactions::new(&config.txn, Arc::new(Clock::after(0)), log.clone());
         let checkpointer = Checkpointer::new(
             pool.clone(),
@@ -429,7 +470,7 @@ impl Opening {
             self.store.clone(),
             control,
             self.superblock.clone(),
-            &self.executor,
+            self.executor.executor(),
         )?;
         *how = How::Recovered(Box::new(recovered));
         Ok(())
@@ -462,7 +503,8 @@ impl Opening {
         // worker or none, its writers claiming it; before the preparer in the order jobs wait on
         // each other (DESIGN.md 22.4).
         let worker = matches!(self.checkpointing, Checkpointing::Thread);
-        let executor = self.executor;
+        let mut unopened = self.executor;
+        let executor = unopened.take();
         let task = executor.spawn_ranked(
             Class::Maintenance,
             rank::CHECKPOINT,

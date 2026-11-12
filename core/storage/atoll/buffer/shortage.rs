@@ -1458,7 +1458,7 @@ mod tests {
         use crate::sync::Arc;
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let store = PageStore::open(
-            io.clone(),
+            crate::storage::atoll::requests::counted_for_test(io.clone()),
             "/db/audit-handoff",
             StoreConfig {
                 file_bytes: 1 << 30,

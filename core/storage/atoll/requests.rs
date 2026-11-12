@@ -9,15 +9,26 @@
 //! pass through zero while a chain of requests goes on. Close waits for the count to reach zero
 //! ([`Requests::drain`]) and seals it there, so no request lands on a file after close returns:
 //! one submitted after is refused, whatever submits it.
+//!
+//! A request whose owner needs another after it, a metadata or superblock write's sync, is made
+//! through [`CountedFile::write_then`]: its follow-on is made at its retirement, counted before
+//! the write is uncounted, and submitted by the database's one IO thread ([`dispatch`]), so no
+//! callback submits.
+
+mod dispatch;
+
+use dispatch::Dispatch;
+pub(super) use dispatch::{Chain, Held};
 
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{
     Buffer, Completion, Delivery, File, FileId, FileSyncType, MemoryIO, OpenFlags,
     SharedWalLockKind, SharedWalMappedRegion, Stepped, IO,
 };
+use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
-use crate::Result;
+use crate::{CompletionError, LimboError, Result};
 use std::ptr::NonNull;
 
 /// The requests on a database's files submitted and not retired, in one word with close's marks:
@@ -29,6 +40,11 @@ pub(super) struct Requests {
     word: AtomicU64,
     /// The thread close waits on, set before it marks the word.
     closer: crate::sync::OnceLock<crate::thread::Thread>,
+    /// The records follow-ons are made in, set once by [`Counted::new`]: owned here and by the IO
+    /// thread while it runs, and reaching these requests back only weakly.
+    dispatch: crate::sync::OnceLock<Arc<Dispatch>>,
+    /// The IO thread, stopped and joined by close's drain once it seals, or by the last drop.
+    io_thread: Mutex<Option<crate::thread::JoinHandle<()>>>,
     /// What the embedder handed the database to drop once its files are closed: the IO that opens
     /// them, every file and every request on them holds these requests, and a file drops its
     /// descriptor before it lets them go ([`CountedFile`]), so the last of them drops this after the
@@ -60,8 +76,75 @@ impl Requests {
         Self {
             word: AtomicU64::new(0),
             closer: crate::sync::OnceLock::new(),
+            dispatch: crate::sync::OnceLock::new(),
+            io_thread: Mutex::new(None),
             _held: held,
         }
+    }
+
+    /// Counts the request `submit` submits, and runs `then` at its retirement before uncounting
+    /// it: Counted's one observer, registered at acceptance. A refused submission runs nothing
+    /// and leaves the count as it was.
+    fn submit_with(
+        self: &Arc<Self>,
+        physical: Completion,
+        submit: impl FnOnce() -> Result<Completion>,
+        then: impl FnOnce() + Send + 'static,
+    ) -> Result<Completion> {
+        if self.word.fetch_add(ONE, Ordering::AcqRel) & SEALED != 0 {
+            self.changed(self.word.fetch_sub(ONE, Ordering::AcqRel));
+            return Err(crate::LimboError::InternalError(
+                "a request on a file of a closed database".to_string(),
+            ));
+        }
+        crate::race::point("requests.counted");
+        match submit() {
+            Ok(c) => {
+                let requests = self.clone();
+                physical.on_retired(move || {
+                    then();
+                    requests.retired();
+                });
+                Ok(c)
+            }
+            Err(e) => {
+                self.changed(self.word.fetch_sub(ONE, Ordering::AcqRel));
+                Err(e)
+            }
+        }
+    }
+
+    /// Counts one request to be submitted later, as a follow-on is (D1a §3.2, count B): refused
+    /// once close has sealed the count.
+    fn count_one(&self) -> bool {
+        if self.word.fetch_add(ONE, Ordering::AcqRel) & SEALED != 0 {
+            self.changed(self.word.fetch_sub(ONE, Ordering::AcqRel));
+            return false;
+        }
+        true
+    }
+
+    /// Lets go a count [`count_one`](Self::count_one) took for a request never accepted.
+    fn uncount_one(&self) {
+        self.retired();
+    }
+
+    /// Submits a request already counted ([`count_one`](Self::count_one)), and runs `then` at its
+    /// retirement before uncounting it. Refused, the count stays for its caller to let go.
+    fn submit_counted(
+        self: &Arc<Self>,
+        submit: impl FnOnce() -> Result<Completion>,
+        then: impl FnOnce() + Send + 'static,
+        physical: Completion,
+    ) -> Result<()> {
+        let c = submit()?;
+        drop(c);
+        let requests = self.clone();
+        physical.on_retired(move || {
+            then();
+            requests.retired();
+        });
+        Ok(())
     }
 
     /// Counts the request `submit` submits for as long as its backend owns it; refused, never
@@ -71,28 +154,10 @@ impl Requests {
         physical: Completion,
         submit: impl FnOnce() -> Result<Completion>,
     ) -> Result<Completion> {
-        if self.word.fetch_add(ONE, Ordering::AcqRel) & SEALED != 0 {
-            // A close looking again meanwhile saw it counted, and looks once more.
-            self.changed(self.word.fetch_sub(ONE, Ordering::AcqRel));
-            return Err(crate::LimboError::InternalError(
-                "a request on a file of a closed database".to_string(),
-            ));
-        }
-        // Counted and not yet the backend's: a close that looks now finds the backend empty and
-        // parks, and the submission wakes it (`IO::try_step`).
-        crate::race::point("requests.counted");
-        let submitted = match submit() {
-            Ok(c) => {
-                let requests = self.clone();
-                physical.on_retired(move || requests.retired());
-                Ok(c)
-            }
-            Err(e) => {
-                self.changed(self.word.fetch_sub(ONE, Ordering::AcqRel));
-                Err(e)
-            }
-        };
-        submitted
+        // Refused once sealed: a close looking again meanwhile saw it counted, and looks once
+        // more. Counted and not yet the backend's: a close that looks now finds the backend empty
+        // and parks, and the submission wakes it (`IO::try_step`).
+        self.submit_with(physical, submit, || {})
     }
 
     /// A request counted has retired.
@@ -143,6 +208,7 @@ impl Requests {
         let mut registered = false;
         loop {
             let word = self.word.load(Ordering::SeqCst);
+            crate::race::point("requests.drain_looked");
             // At zero, sealed in the same step that ends the wait: a submission counted since the
             // read fails the exchange and is waited for.
             if outstanding_in(word) == 0 {
@@ -175,6 +241,60 @@ impl Requests {
         if registered {
             io.withdraw(place.key());
         }
+        // Sealed: nothing is counted again, so the IO thread has nothing left to submit. It stops
+        // here, inside close's step 4, before the executor drops its jobs.
+        self.stop_io_thread();
+    }
+
+    /// Stops the IO thread and joins it, or, on that thread itself (the last observer dropping
+    /// the last hold on these requests there), lets it end on its own once this returns. Once
+    /// stopped, a later call finds nothing.
+    fn stop_io_thread(&self) {
+        let Some(handle) = self.io_thread.lock().take() else {
+            return;
+        };
+        if let Some(dispatch) = self.dispatch.get() {
+            dispatch.stop();
+        }
+        if handle.thread().id() != crate::thread::current().id() {
+            // A panic on the IO thread ended the process (its loop is an Atoll entry): a join
+            // returns its loop's end.
+            let _ = handle.join();
+        }
+    }
+
+    /// The dispatch the records live in, once [`Counted::new`] made it.
+    fn dispatch(&self) -> &Arc<Dispatch> {
+        self.dispatch
+            .get()
+            .expect("the requests of a database opened through Counted")
+    }
+
+    /// The records at rest, for a test's exact count of them.
+    #[cfg(test)]
+    pub(super) fn records_at_rest(&self) -> usize {
+        self.dispatch().at_rest()
+    }
+
+    /// Holds the IO thread before its next claim of a record, until the sender sends or drops.
+    #[cfg(test)]
+    pub(super) fn hold_io_thread(&self) -> std::sync::mpsc::Sender<()> {
+        self.dispatch().hold_next_claim()
+    }
+
+    /// The dispatch, weakly, for a test's look after every owner has gone.
+    #[cfg(test)]
+    pub(super) fn dispatch_weak(&self) -> crate::sync::Weak<Dispatch> {
+        Arc::downgrade(self.dispatch())
+    }
+}
+
+impl Drop for Requests {
+    /// The last resort when no drain ran: the IO thread stopped and joined, every follow-on still
+    /// READY finished as `Aborted` by it on its way out, as nothing is left to count it.
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        self.stop_io_thread();
     }
 }
 
@@ -186,8 +306,50 @@ pub(super) struct Counted {
 }
 
 impl Counted {
-    pub(super) fn new(io: Arc<dyn IO>, requests: Arc<Requests>) -> Self {
-        Self { io, requests }
+    /// Wraps `io`, counting in `requests`, whose records it makes and whose IO thread it starts:
+    /// a thread that does not start fails the open, before any file is opened.
+    pub(super) fn new(io: Arc<dyn IO>, requests: Arc<Requests>) -> Result<Self> {
+        let dispatch = Arc::new(Dispatch::new(&requests));
+        #[cfg(test)]
+        MADE.with(|m| {
+            *m.borrow_mut() = Some((Arc::downgrade(&dispatch), Arc::downgrade(&requests)))
+        });
+        let set = requests.dispatch.set(dispatch.clone());
+        assert!(set.is_ok(), "one Counted per database's requests");
+        let handle = Dispatch::spawn(&dispatch)?;
+        *requests.io_thread.lock() = Some(handle);
+        Ok(Self { io, requests })
+    }
+
+    /// Opens `path` as a counted file its owner holds typed: the one kind of file a follow-on is
+    /// made on ([`CountedFile::write_then`]).
+    pub(super) fn open_counted(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> Result<Arc<CountedFile>> {
+        let file = self.io.open_file(path, flags, direct)?;
+        Ok(Arc::new(CountedFile {
+            file,
+            requests: self.requests.clone(),
+        }))
+    }
+
+    /// A record of the metadata cache's writes, taken at rest.
+    pub(super) fn take_meta_write_record(&self) -> Result<Held> {
+        self.requests.dispatch().take(dispatch::META_WRITES)
+    }
+
+    /// The superblock's record, taken at rest.
+    pub(super) fn take_superblock_record(&self) -> Result<Held> {
+        self.requests.dispatch().take(dispatch::SUPERBLOCK)
+    }
+
+    /// The requests it counts in.
+    #[cfg(test)]
+    pub(super) fn requests(&self) -> &Arc<Requests> {
+        &self.requests
     }
 }
 
@@ -305,11 +467,65 @@ impl IO for Counted {
 
 /// A file whose requests count in its database's [`Requests`]. Every other call goes to the file
 /// it wraps.
-struct CountedFile {
+pub(super) struct CountedFile {
     /// The only holder of the file it wraps, so its drop closes the descriptor: declared before
     /// `requests`, so the descriptor closes before the requests, and what they hold, go.
     file: Arc<dyn File>,
     requests: Arc<Requests>,
+}
+
+impl CountedFile {
+    /// Writes `buffer` at `pos` as the first request of a chain in `held` (DESIGN.md 22.18, D1a
+    /// §2), counted once and submitted through the file this wraps. At its retirement its sync,
+    /// when owed (the write not durable, and it and `chain` wanting one), is made into the same
+    /// record, counted before the write is uncounted, and submitted by the IO thread. `chain` is
+    /// told the write's outcome (a short write an error), the sync's, and the chain's end once
+    /// every request of it has retired; a write refused ends the chain with its error before this
+    /// returns it.
+    pub(super) fn write_then(
+        self: &Arc<Self>,
+        held: Held,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        durable: bool,
+        chain: Arc<dyn Chain>,
+    ) -> Result<Completion> {
+        let dispatch = self.requests.dispatch().clone();
+        let i = held.index();
+        dispatch.start(&held, chain, durable);
+        let len = buffer.len();
+        let weak = Arc::downgrade(&dispatch);
+        let c = Completion::new_write(move |res| {
+            if let Some(dispatch) = weak.upgrade() {
+                dispatch.written(i, crate::storage::atoll::whole(len, res));
+            }
+        });
+        let then = {
+            let (dispatch, file) = (dispatch.clone(), Arc::downgrade(self));
+            move || dispatch.after_write(i, &file)
+        };
+        let physical = c.clone();
+        let submitted = self.requests.submit_with(
+            physical,
+            || {
+                if durable {
+                    self.file.pwrite_durable(pos, buffer, c)
+                } else {
+                    self.file.pwrite(pos, buffer, c)
+                }
+            },
+            then,
+        );
+        submitted.inspect_err(|e| dispatch.refused(held, io_failure(e)))
+    }
+}
+
+/// A submission's error, as a request's outcome.
+fn io_failure(e: &LimboError) -> CompletionError {
+    match e {
+        LimboError::CompletionError(e) => *e,
+        _ => CompletionError::IOError(std::io::ErrorKind::Other, "a request's submission refused"),
+    }
 }
 
 impl File for CountedFile {
@@ -422,5 +638,52 @@ impl File for CountedFile {
     }
 }
 
+/// A counted IO over `io` for a test that builds an owner on its own, outside an open: its IO
+/// thread is stopped and joined by its requests' last drop.
+#[cfg(test)]
+pub(super) fn counted_for_test(io: Arc<dyn IO>) -> Arc<Counted> {
+    Arc::new(Counted::new(io, Arc::new(Requests::default())).expect("a test's IO thread"))
+}
+
+/// The owner of a counted IO a test builds on its own (DESIGN.md 22.18, D1a §4): its drop drains
+/// its requests, stepping a pumped backend until every counted request has retired, which seals
+/// them and stops the IO thread. Dropped after the owners built over it.
+#[cfg(test)]
+pub(super) struct Standalone {
+    pub(super) counted: Arc<Counted>,
+    pub(super) io: Arc<dyn IO>,
+}
+
+#[cfg(test)]
+impl Standalone {
+    pub(super) fn new(raw: Arc<dyn IO>) -> Self {
+        let counted = counted_for_test(raw);
+        let io: Arc<dyn IO> = counted.clone();
+        Self { counted, io }
+    }
+
+    pub(super) fn requests(&self) -> &Arc<Requests> {
+        self.counted.requests()
+    }
+}
+
+#[cfg(test)]
+impl Drop for Standalone {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        self.counted.requests().drain(&*self.io);
+    }
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The dispatch and the requests of this thread's last [`Counted`], for a test's look after
+    /// every owner has gone.
+    static MADE: std::cell::RefCell<Option<(crate::sync::Weak<Dispatch>, crate::sync::Weak<Requests>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod followon_tests;
 #[cfg(test)]
 mod tests;

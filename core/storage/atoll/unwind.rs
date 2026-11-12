@@ -397,6 +397,21 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "requests/followon_tests.rs",
+            "a_chains_counts_are_each_let_go_once",
+            "child",
+        ),
+        (
+            "requests/followon_tests.rs",
+            "a_panic_in_a_callback_the_io_thread_runs_ends_the_process",
+            "child",
+        ),
+        (
+            "requests/followon_tests.rs",
+            "a_close_on_the_io_thread_is_refused",
+            "child",
+        ),
+        (
             "epoch/tests.rs",
             "a_bounded_reclaim_takes_and_hands_back_a_run_and_leaves_the_rest",
             "child",

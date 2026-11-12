@@ -161,24 +161,6 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "records how many superblock bytes were read",
     ),
     (
-        "storage/atoll/control.rs",
-        "write_encoded",
-        "new_sync",
-        "finishes the superblock's write",
-    ),
-    (
-        "storage/atoll/control.rs",
-        "write_encoded",
-        "new_write",
-        "finishes the superblock's write, failed",
-    ),
-    (
-        "storage/atoll/control.rs",
-        "write_encoded",
-        "new_write",
-        "submits the superblock's sync",
-    ),
-    (
         "storage/atoll/log/mod.rs",
         "open_segments",
         "new_sync",
@@ -233,22 +215,22 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "chooses a metadata page's copy, fills its frame, finishes its load",
     ),
     (
-        "storage/atoll/meta.rs",
-        "write_for",
-        "new_sync",
-        "finishes a metadata page's write",
-    ),
-    (
-        "storage/atoll/meta.rs",
-        "write_for",
-        "new_write",
-        "submits a metadata page's sync, or finishes its write",
-    ),
-    (
         "storage/atoll/mod.rs",
         "whole_write",
         "new_write",
         "finishes the caller's completion with a whole write's result",
+    ),
+    (
+        "storage/atoll/requests.rs",
+        "write_then",
+        "new_write",
+        "records a chain's write outcome in its record and tells its owner, submitting nothing",
+    ),
+    (
+        "storage/atoll/requests/dispatch.rs",
+        "after_write",
+        "new_sync",
+        "records a chain's sync outcome in its record and tells its owner, submitting nothing",
     ),
     ("storage/atoll/store.rs", "erase_one", "new_sync", "nothing"),
     (

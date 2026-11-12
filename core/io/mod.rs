@@ -64,6 +64,13 @@ pub(crate) fn deliver_on_this_thread() {
     DELIVERING.with(|d| d.set(true));
 }
 
+/// Marks this thread, a database's IO thread, as a delivering thread for the rest of its life: it
+/// runs the callbacks of the follow-ons it submits, and, like a ring's delivery thread, never
+/// makes a call that waits on what it would deliver (a close, an executor's wait).
+pub(crate) fn deliver_on_this_thread_for_life() {
+    DELIVERING.with(|d| d.set(true));
+}
+
 /// Ends the thread with a panic if it is a ring's delivery thread, which never makes a call that can
 /// wait: nothing else would deliver what it waits for, and every delivery behind it would wait on
 /// the file system, on another holder of a lock, or on time (DESIGN.md 22.5; the calls ruled are

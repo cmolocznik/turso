@@ -2547,7 +2547,8 @@ mod native {
     fn a_failed_durable_end_is_returned_after_every_later_step_of_close() {
         let requests = Arc::new(Requests::default());
         let crash = Arc::new(CrashIO::new(1));
-        let io: Arc<dyn IO> = Arc::new(Counted::new(crash.clone(), requests.clone()));
+        let io: Arc<dyn IO> =
+            Arc::new(Counted::new(crash.clone(), requests.clone()).expect("a test's IO thread"));
         let ex = Executor::new(io.clone(), 0).unwrap();
         let (events, on) = (Events::default(), Arc::new(Lock::new(Vec::new())));
         let never = Completion::new_wait();
@@ -2785,7 +2786,8 @@ mod native {
     fn close_waits_for_a_removals_job_drop_and_what_it_submits() {
         let requests = Arc::new(Requests::default());
         let crash = Arc::new(CrashIO::new(51));
-        let io: Arc<dyn crate::io::IO> = Arc::new(Counted::new(crash.clone(), requests.clone()));
+        let io: Arc<dyn crate::io::IO> =
+            Arc::new(Counted::new(crash.clone(), requests.clone()).expect("a test's IO thread"));
         let file = io
             .open_file("/executor/remove-close", OpenFlags::Create, false)
             .unwrap();

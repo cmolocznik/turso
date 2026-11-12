@@ -6,6 +6,7 @@ use crate::io::MemoryIO;
 use crate::storage::atoll::buffer::{min_budget_beside, BufferConfig};
 use crate::storage::atoll::db::{Atoll, AtollConfig};
 use crate::storage::atoll::log::{ring_bytes, LogConfig};
+use crate::storage::atoll::requests::counted_for_test;
 use crate::storage::atoll::testing::drive;
 use crate::storage::atoll::txn::versioned::Versions;
 use std::collections::BTreeSet;
@@ -1731,7 +1732,13 @@ fn a_tree_is_one_to_max_height_levels_high_and_grows_no_further() {
     assert_eq!(MAX_HEIGHT, 7);
     assert!(leaves(MAX_HEIGHT) >= reaches && leaves(MAX_HEIGHT - 1) < reaches);
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let store = PageStore::open(io, BASE, config().store, [[0; CLASS_COUNT]; TREES], 0);
+    let store = PageStore::open(
+        counted_for_test(io),
+        BASE,
+        config().store,
+        [[0; CLASS_COUNT]; TREES],
+        0,
+    );
     let opened = store.height(Tree::Map, class(0));
     store.heights[Tree::Map as usize][1].store(MAX_HEIGHT, Ordering::Release);
     let refused = matches!(
@@ -1774,7 +1781,7 @@ fn a_growth_publishes_its_height_before_letting_go_of_its_roots() {
     use std::rc::Rc;
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let store = PageStore::open(
-        io.clone(),
+        counted_for_test(io.clone()),
         "/db/growth",
         StoreConfig::default(),
         [[1; CLASS_COUNT]; TREES],
@@ -2046,7 +2053,7 @@ fn a_copy_slot_past_the_cuts_free_space_is_in_the_free_space_reopened() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let base = "/db/cut-space";
         let store = PageStore::open(
-            io.clone(),
+            counted_for_test(io.clone()),
             base,
             StoreConfig::default(),
             [[1; CLASS_COUNT]; TREES],
@@ -2082,7 +2089,13 @@ fn a_copy_slot_past_the_cuts_free_space_is_in_the_free_space_reopened() {
         store.meta().durable_sides(1, &frames);
         store.meta().put_in_charge(1);
         drop((frames, store));
-        let reopened = PageStore::open(io.clone(), base, StoreConfig::default(), heights, 1);
+        let reopened = PageStore::open(
+            counted_for_test(io.clone()),
+            base,
+            StoreConfig::default(),
+            heights,
+            1,
+        );
         let entry = drive(&io, || reopened.entry(pid)).ok();
         let mut census = Census::new(Tree::Space, class);
         let read = drive(&io, || reopened.census(&mut census)).is_ok();

@@ -11,7 +11,10 @@ use crate::IOResult;
 
 fn counted(io: Arc<dyn IO>) -> (Arc<dyn IO>, Arc<Requests>) {
     let requests = Arc::new(Requests::default());
-    (Arc::new(Counted::new(io, requests.clone())), requests)
+    (
+        Arc::new(Counted::new(io, requests.clone()).expect("a test's IO thread")),
+        requests,
+    )
 }
 
 fn read(len: usize) -> Completion {

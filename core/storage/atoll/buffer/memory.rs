@@ -2473,15 +2473,15 @@ pub(super) mod tests {
     fn a_claim_parked_while_a_promise_holds_a_draining_batch_wakes_when_the_promise_releases_it() {
         use super::super::{BufferConfig, BufferPool, LocalSource, Purpose};
         use crate::io::{Completion, MemoryIO, IO};
-        use crate::storage::atoll::meta::TREES;
         use crate::race;
+        use crate::storage::atoll::meta::TREES;
         use crate::storage::atoll::store::{PageStore, StoreConfig};
         use crate::types::{IOCompletions, IOResult};
         use std::{cell::RefCell, rc::Rc};
 
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let store = PageStore::open(
-            io,
+            crate::storage::atoll::requests::counted_for_test(io),
             "/db/unpromise-supply",
             StoreConfig {
                 file_bytes: 1 << 30,
@@ -2582,7 +2582,7 @@ pub(super) mod tests {
         }
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let store = PageStore::open(
-            io,
+            crate::storage::atoll::requests::counted_for_test(io),
             "/db/release-under-token",
             StoreConfig {
                 file_bytes: 1 << 30,

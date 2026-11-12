@@ -419,12 +419,13 @@ impl Drop for Change<'_> {
 impl PageStore {
     /// A page store whose metadata is as checkpoint `in_charge` left it, its trees `heights` high.
     pub fn open(
-        io: Arc<dyn IO>,
+        counted: Arc<super::requests::Counted>,
         base: &str,
         config: StoreConfig,
         heights: [[u8; CLASS_COUNT]; TREES],
         in_charge: u64,
     ) -> Arc<Self> {
+        let io: Arc<dyn IO> = counted.clone();
         // The superblock's are refused past it, and a new store's trees are one level high.
         assert!(
             heights.iter().flatten().all(|&h| h <= MAX_HEIGHT),
@@ -432,7 +433,7 @@ impl PageStore {
         );
         let epochs = Arc::new(Epochs::new());
         let meta = Arc::new(MetaCache::new(
-            io.clone(),
+            counted,
             base,
             config.meta_pages,
             epochs.clone(),

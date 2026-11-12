@@ -1,6 +1,7 @@
 use super::*;
 use crate::io::{Buffer, Clock, Delivery, FileSyncType, MemoryIO};
 use crate::race;
+use crate::storage::atoll::requests::counted_for_test;
 use crate::{MonotonicInstant, WallClockInstant};
 use std::sync::mpsc;
 use std::task::{Wake, Waker};
@@ -290,7 +291,7 @@ fn receive<T>(rx: &mpsc::Receiver<T>) -> T {
 
 fn cache(io: Arc<TestIO>) -> Arc<MetaCache> {
     Arc::new(MetaCache::new(
-        io,
+        counted_for_test(io),
         "meta-lazy-test",
         16,
         Arc::new(Epochs::new()),
@@ -839,7 +840,7 @@ fn a_metadata_load_publication_hold_notifies_its_waiters() {
     drop(frame);
     drop(old);
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "meta-lazy-test",
         16,
         Arc::new(Epochs::new()),
@@ -941,10 +942,12 @@ fn finish_metadata_image(cache: &Arc<MetaCache>, frame: &MetaRef, n: u64) -> boo
         match cache.write_for(frame, n) {
             Ok(None) => return true,
             Ok(Some(c)) if c.finished() => {}
-            // Test IO delivers inline. Never wait on a missing producer in a negative build.
+            // Test IO delivers inline, and its files do not write durably: the write's sync runs
+            // on the IO thread, whose retirement ends the wait (DESIGN.md 22.18, D1a).
             Ok(Some(c)) => {
-                c.complete(0);
-                return false;
+                if crate::storage::atoll::park::wait_for_completion(cache.io.as_ref(), c).is_err() {
+                    return false;
+                }
             }
             Err(_) => return false,
         }
@@ -1008,7 +1011,7 @@ fn metadata_loading_wait_trace(at: &'static str) -> LoadTrace {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "/db/loading-async-audit",
         16,
         Arc::new(Epochs::new()),
@@ -1234,7 +1237,7 @@ fn a_metadata_callback_hands_its_waiters_from_io_to_its_own_publication() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "/db/publishing-audit",
         16,
         Arc::new(Epochs::new()),
@@ -1370,7 +1373,7 @@ fn registration_after_a_load_changes_phase_rechecks_its_new_producer() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "/db/phase-register-audit",
         16,
         Arc::new(Epochs::new()),
@@ -1490,7 +1493,7 @@ fn a_metadata_writes_wait_ends_when_its_request_retires() {
     let crash = Arc::new(crate::io::crash::CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "meta-retire-test",
         16,
         Arc::new(Epochs::new()),
@@ -1526,11 +1529,12 @@ fn a_metadata_writes_wait_ends_when_its_request_retires() {
     assert!(failed, "a cancelled write's wait ended without its failure");
 }
 
-/// A metadata write on a file not written durably ends at the retirement of its last request,
-/// whichever of the write's and its sync's that is: on a backend two threads step, the sync can
-/// retire while the write's own request is still owned, paused after its callback submitted the
-/// sync, and the write's place stays held until the write retires too (DESIGN.md 22.1, 22.13; the
-/// auditor's P2-META-R1 probe; mutant: the sync's retirement telling alone).
+/// A metadata write on a file not written durably ends at the retirement of its last request, its
+/// sync's: on a backend two threads step, the write's callback runs with its request still owned
+/// and makes nothing, the sync is made only at the write's retirement, counted before the write is
+/// uncounted, and submitted by the IO thread; the write's place stays held until the sync retires
+/// (DESIGN.md 22.18, a follow-on at retirement, restated by D1a; the auditor's P2-META-R1 probe;
+/// mutant: the sync made in the write's callback).
 #[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
 #[test]
 fn a_metadata_sync_cannot_end_the_write_while_the_writes_request_is_owned() {
@@ -1541,9 +1545,10 @@ fn a_metadata_sync_cannot_end_the_write_while_the_writes_request_is_owned() {
     let crash = Arc::new(crate::io::crash::CrashIO::new(0));
     crash.set_durable_writes(false);
     let requests = Arc::new(Requests::default());
-    let io: Arc<dyn IO> = Arc::new(Counted::new(crash.clone(), requests.clone()));
+    let counted = Arc::new(Counted::new(crash.clone(), requests.clone()).expect("an IO thread"));
+    let io: Arc<dyn IO> = counted.clone();
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted.clone(),
         "meta-sync-before-write",
         16,
         Arc::new(Epochs::new()),
@@ -1567,8 +1572,8 @@ fn a_metadata_sync_cannot_end_the_write_while_the_writes_request_is_owned() {
     let parent = {
         let crash = crash.clone();
         std::thread::spawn(move || {
-            // The write's callback has submitted the sync; its own request is still owned, its
-            // completion published before it retires.
+            // The write's callback has run; its own request is still owned, its completion
+            // published before it retires.
             crate::race::at("completion.published", move || {
                 let _ = paused_tx.send(());
                 let _ = resume_rx.recv_timeout(BOUND);
@@ -1584,36 +1589,32 @@ fn a_metadata_sync_cannot_end_the_write_while_the_writes_request_is_owned() {
         requests.outstanding(),
         crash.in_flight(),
     );
-    let synced = paused && before.4 == 1 && crash.step().is_ok();
-    let after_sync = (
-        write.is_owned(),
-        wait.finished(),
-        requests.outstanding(),
-        crash.in_flight(),
-    );
     let _ = resume_tx.send(());
     let parent_ended = parent.join().is_ok_and(|r| r.is_ok());
+    // The write retired: its sync, made then, is the IO thread's to submit and the drain's to
+    // step until it retires.
     requests.drain(&*io);
-    let after_both = (
+    let after = (
         !write.is_owned(),
         wait.finished(),
         wait.get_error(),
         requests.outstanding(),
+        frame.written_for.load(Ordering::Acquire),
     );
     cache.end_cut(1, std::slice::from_ref(&frame));
-    drop((write, wait, frame, cache, io, requests, crash));
-    assert!(paused && synced && parent_ended, "the steps did not run");
+    drop((write, wait, frame, cache, io, counted, requests, crash));
+    assert!(paused && parent_ended, "the steps did not run");
     assert_eq!(
         before,
-        (true, true, false, 2, 1),
-        "the write's callback published with its sync submitted"
+        (true, true, false, 1, 0),
+        "(the write finished, still owned, its wait finished, requests counted, in flight) at its \
+         callback: no sync made there"
     );
     assert_eq!(
-        after_sync,
-        (true, false, 1, 0),
-        "the sync retired with the write's request still owned"
+        after,
+        (true, true, None, 0, 1),
+        "(the write let go, its wait finished, its error, requests counted, written for)"
     );
-    assert_eq!(after_both, (true, true, None, 0), "both retired");
 }
 
 /// 128 metadata pages asked of a cache whose budget gives it one read credit: the first miss takes
@@ -1630,7 +1631,7 @@ fn metadata_loads_under_one_read_credit_keep_one_read_with_the_backend() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io,
+        counted_for_test(io),
         "meta-credits",
         1,
         Arc::new(Epochs::new()),
@@ -1699,7 +1700,7 @@ fn a_cancelled_metadata_read_keeps_its_credit_until_its_backend_retires_it() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io,
+        counted_for_test(io),
         "meta-credit-cancel",
         1,
         Arc::new(Epochs::new()),
@@ -1763,7 +1764,7 @@ fn a_miss_waiting_on_the_read_credits_steps_the_backend_that_gives_one_back() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "meta-credit-stepped",
         1,
         Arc::new(Epochs::new()),
@@ -1814,7 +1815,7 @@ fn a_miss_waiting_on_a_credit_whose_read_is_not_submitted_parks_until_the_submis
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "meta-credit-unsubmitted",
         1,
         Arc::new(Epochs::new()),
@@ -1913,7 +1914,7 @@ fn a_collection_keeps_its_frames_across_polls_so_no_eviction_between_takes_one()
     let io: Arc<dyn IO> = crash.clone();
     // Two pages kept, so two read credits.
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "meta-pins",
         2,
         Arc::new(Epochs::new()),
@@ -1977,7 +1978,7 @@ fn a_collection_wider_than_its_credits_looks_at_each_page_a_bounded_number_of_ti
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io,
+        counted_for_test(io),
         "meta-collection-looks",
         1,
         Arc::new(Epochs::new()),
@@ -2062,7 +2063,7 @@ fn a_set_aimed_again_keeps_a_loading_frame_owed_at_its_new_place() {
     let crash = Arc::new(CrashIO::new(0));
     let io: Arc<dyn IO> = crash.clone();
     let cache = Arc::new(MetaCache::new(
-        io.clone(),
+        counted_for_test(io.clone()),
         "meta-set-aim",
         2,
         Arc::new(Epochs::new()),

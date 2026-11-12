@@ -25,7 +25,7 @@ fn open_on(io: &Arc<dyn IO>, base: &str, budget: usize) -> Arc<BufferPool> {
 
 fn open_with(io: &Arc<dyn IO>, base: &str, config: BufferConfig) -> Arc<BufferPool> {
     let store = PageStore::open(
-        io.clone(),
+        crate::storage::atoll::requests::counted_for_test(io.clone()),
         base,
         StoreConfig {
             file_bytes: 1 << 30,
@@ -1874,7 +1874,7 @@ impl source::Located for DeferredLocated {
 fn a_claim_while_every_frame_loads_parks_and_wakes_when_the_reads_land() {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
     let store = PageStore::open(
-        io,
+        crate::storage::atoll::requests::counted_for_test(io),
         "/db/all-loading",
         StoreConfig {
             file_bytes: 1 << 30,
@@ -1947,7 +1947,7 @@ fn a_page_made_resident_tells_a_parked_claim_after_its_latch_is_let_go() {
     // A read landing.
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
     let store = PageStore::open(
-        io,
+        crate::storage::atoll::requests::counted_for_test(io),
         "/db/resident-loaded",
         StoreConfig {
             file_bytes: 1 << 30,
@@ -3884,7 +3884,7 @@ fn a_fix_of_a_page_whose_read_is_not_yet_submitted_waits_remote_until_the_submis
     use crate::race;
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
     let store = PageStore::open(
-        io,
+        crate::storage::atoll::requests::counted_for_test(io),
         "/db/pre-submit",
         StoreConfig {
             file_bytes: 1 << 30,
@@ -4141,7 +4141,7 @@ fn a_fix_while_a_reads_landing_is_paused_waits_on_the_pool_not_the_read() {
     use crate::race;
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
     let store = PageStore::open(
-        io,
+        crate::storage::atoll::requests::counted_for_test(io),
         "/db/landing",
         StoreConfig {
             file_bytes: 1 << 30,
@@ -4229,7 +4229,7 @@ fn initiating_fix_during_a_landing(pause: &'static str, fails: bool) -> Landing 
     use crate::race;
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
     let store = PageStore::open(
-        io,
+        crate::storage::atoll::requests::counted_for_test(io),
         "/db/initiating-error",
         StoreConfig {
             file_bytes: 1 << 30,
@@ -4596,7 +4596,7 @@ fn a_root_split_with_every_other_frame_written_out_waits_on_a_landing_not_its_ow
 fn the_fix_that_starts_a_read_waits_on_it_only_while_its_request_is_at_the_backend() {
     let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
     let store = PageStore::open(
-        io,
+        crate::storage::atoll::requests::counted_for_test(io),
         "/db/initial-read",
         StoreConfig {
             file_bytes: 1 << 30,
@@ -4647,7 +4647,7 @@ fn a_read_returned_neither_handed_over_nor_done_ends_the_process() {
         || {
             let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
             let store = PageStore::open(
-                io,
+                crate::storage::atoll::requests::counted_for_test(io),
                 "/db/breach",
                 StoreConfig {
                     file_bytes: 1 << 30,
@@ -7805,7 +7805,7 @@ fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, 
         "/db/frame-record-gave-up"
     };
     let store = PageStore::open(
-        io.clone(),
+        crate::storage::atoll::requests::counted_for_test(io.clone()),
         base,
         StoreConfig {
             file_bytes: 1 << 30,

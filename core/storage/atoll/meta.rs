@@ -33,14 +33,14 @@ use super::aligned::AlignedBlock;
 use super::buffer::cell::{Changed, CompletionCell, CompletionDomain};
 use super::epoch::Epochs;
 use super::latch::{Held, LatchRef, Look, Marked, VersionedLatch};
-use super::once::{SetOnce, TakeOnce};
+use super::once::SetOnce;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT, MIN_PAGE_SIZE};
 use super::pins::{Cells, PinCell, Pinnable, Pinned, Pins};
 use super::radix;
+use super::requests::{Chain as WriteChain, Counted, CountedFile};
 use super::segmented::Segmented;
 use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::{Chain, Stack};
-use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -525,22 +525,60 @@ crate::thread::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Tells a metadata write's waiter how it ended, once ([`MetaCache::write_for`]).
-type Tell = TakeOnce<Box<dyn FnOnce() + Send>>;
+/// A metadata write's chain (DESIGN.md 22.18, D1a §2): the copy written counts once it is
+/// durable, by its own durable write or by its sync, and its waiter (`writing`) is told once every
+/// request of the write has retired, no backend owning its buffer any more. A checkpoint counts
+/// the write in its flight set until then (DESIGN.md 22.1, 22.13).
+struct MetaWrite {
+    target: MetaRef,
+    /// Weakly: the write waits in the cache's own IO. Gone, the cache has no one left to tell.
+    me: Weak<MetaCache>,
+    side: u8,
+    n: u64,
+    count: Option<u64>,
+    durable: bool,
+}
 
-/// Runs a [`Tell`] if no one has yet.
-fn tell_once(tell: &Tell) {
-    if let Some(tell) = tell.take() {
-        tell();
+impl MetaWrite {
+    /// The copy written is durable: from now it is the one that counts.
+    fn landed(&self) {
+        if let Some(me) = self.me.upgrade() {
+            self.target
+                .written_side
+                .store(self.side + 1, Ordering::Release);
+            self.target.written_for.store(self.n, Ordering::Release);
+            self.target.written(&me, self.count);
+        }
     }
 }
 
-/// One request of a metadata write retired (or a sync refused): the last of `unretired` tells.
-fn retired(unretired: &AtomicUsize, tell: &Tell) {
-    let before = unretired.fetch_sub(1, Ordering::AcqRel);
-    debug_assert!(before > 0, "a metadata write's request retired twice");
-    if before == 1 {
-        tell_once(tell);
+impl WriteChain for MetaWrite {
+    fn written(&self, res: std::result::Result<(), CompletionError>) -> bool {
+        match res {
+            Ok(()) if self.durable => {
+                self.landed();
+                false
+            }
+            // Durable only once synced: until then the copy in charge is the one that counts.
+            Ok(()) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn synced(&self, res: std::result::Result<(), CompletionError>) {
+        if res.is_ok() {
+            self.landed();
+        }
+    }
+
+    fn ended(&self, outcome: std::result::Result<(), CompletionError>) {
+        let Some(me) = self.me.upgrade() else { return };
+        if let Some(c) = self.target.writing.take(&me.completions) {
+            match outcome {
+                Ok(()) => c.complete(0),
+                Err(e) => c.error(e),
+            }
+        }
     }
 }
 
@@ -621,7 +659,7 @@ impl Drop for Credit {
 /// One tree's file for a size class and level, and the cells of its pages.
 #[derive(Default)]
 struct FileSlot {
-    file: SetOnce<Arc<dyn File>>,
+    file: SetOnce<Arc<CountedFile>>,
     frames: Segmented<PinCell<MetaFrame>>,
 }
 
@@ -954,6 +992,9 @@ impl<'a, const N: usize> Ready<'a, N> {
 }
 
 pub struct MetaCache {
+    /// The counted IO its files are opened through, typed: a write's sync is a follow-on
+    /// ([`CountedFile::write_then`]).
+    counted: Arc<Counted>,
     io: Arc<dyn IO>,
     base: String,
     /// Pages kept before clean ones no one holds are dropped.
@@ -986,14 +1027,15 @@ pub struct MetaCache {
 impl MetaCache {
     /// The cache of the metadata as checkpoint `in_charge` left it.
     pub fn new(
-        io: Arc<dyn IO>,
+        counted: Arc<Counted>,
         base: &str,
         budget: usize,
         epochs: Arc<Epochs>,
         in_charge: u64,
     ) -> Self {
         Self {
-            io,
+            io: counted.clone(),
+            counted,
             base: base.to_string(),
             budget,
             credits: ReadCredits::new(budget.max(1)),
@@ -1025,13 +1067,13 @@ impl MetaCache {
         Arc::downgrade(self)
     }
 
-    fn file(&self, id: MetaId) -> Result<Arc<dyn File>> {
+    fn file(&self, id: MetaId) -> Result<Arc<CountedFile>> {
         let slot = &self.files[id.file_index()];
         if let Some(f) = slot.file.get() {
             return Ok(f);
         }
         // Two first users may both open it, and the first to set it is kept.
-        let f = self.io.open_file(
+        let f = self.counted.open_counted(
             &path(&self.base, id.file_key()),
             OpenFlags::Create | OpenFlags::Direct,
             false,
@@ -1369,106 +1411,33 @@ impl MetaCache {
             }
         };
         let at = frame.id.offset() + side as u64 * META_PAGE as u64;
-        let target = frame.clone();
-        let me = self.held();
         let durable = file.supports_durable_writes();
-        // The file weakly too: it holds the IO the write waits in. A file closed before its sync
-        // leaves the copy not durable.
-        let sync_file = Arc::downgrade(&file);
-        // How the write ended, as its callbacks found it. `writing` is told once every request of
-        // the write has retired, no backend owning its buffer any more: the write's own and, where
-        // the file is not written durably, its sync's, either of which may retire first on a
-        // backend stepped by several threads. A checkpoint counts the write in its flight set
-        // until then (DESIGN.md 22.1, 22.13).
-        let outcome = Arc::new(Mutex::new(None));
-        let tell: Arc<Tell> = {
-            let (target, me, outcome) = (target.clone(), me.clone(), outcome.clone());
-            Arc::new(TakeOnce::new(Box::new(move || {
-                // Gone, the cache has no one left to wait on the write.
-                let Some(me) = me.upgrade() else { return };
-                if let Some(c) = target.writing.take(&me.completions) {
-                    // A request let go with no outcome told never ran. Taken out of its lock
-                    // before the wait is finished, whose waker may run code.
-                    let told = outcome.lock().take();
-                    match told.unwrap_or(Err(CompletionError::Aborted)) {
-                        Ok(()) => c.complete(0),
-                        Err(e) => c.error(e),
-                    }
-                }
-            })))
-        };
-        let done = {
-            let outcome = outcome.clone();
-            move |res: std::result::Result<(), CompletionError>| {
-                if let Some(me) = me.upgrade() {
-                    if res.is_ok() {
-                        target.written_side.store(side + 1, Ordering::Release);
-                        target.written_for.store(n, Ordering::Release);
-                        target.written(&me, count);
-                    }
-                }
-                *outcome.lock() = Some(res);
-            }
-        };
-        let done = Arc::new(TakeOnce::new(done));
-        let finish = move |res| {
-            if let Some(done) = done.take() {
-                done(res);
-            }
-        };
-        // The write's requests not yet retired: its own, and its sync's, counted before the sync is
-        // submitted, which the write's own retirement, after its callback, cannot precede. The
-        // last to retire tells.
-        let unretired = Arc::new(AtomicUsize::new(1));
-        let c = {
-            let (tell, unretired) = (tell.clone(), unretired.clone());
-            Completion::new_write(move |res| {
-                let res = whole(META_PAGE, res);
-                match res {
-                    Ok(()) if !durable => {
-                        // Durable only once synced: until then the copy in charge is the one
-                        // that counts.
-                        let Some(sync_file) = sync_file.upgrade() else {
-                            return finish(Err(CompletionError::Aborted));
-                        };
-                        let after = finish.clone();
-                        let synced = Completion::new_sync(move |r| after(r.map(|_| ())));
-                        unretired.fetch_add(1, Ordering::AcqRel);
-                        match sync_file.sync_data(synced) {
-                            Ok(synced) => {
-                                let (tell, unretired) = (tell.clone(), unretired.clone());
-                                synced.on_retired(move || retired(&unretired, &tell));
-                            }
-                            // Refused, the sync never was a request.
-                            Err(e) => {
-                                finish(Err(io_failure(&e)));
-                                retired(&unretired, &tell);
-                            }
-                        }
-                    }
-                    res => finish(res),
-                }
-            })
-        };
-        let buffer = copy.region(0, META_PAGE);
-        let submitted = if durable {
-            file.pwrite_durable(at, buffer, c)
-        } else {
-            file.pwrite(at, buffer, c)
-        };
-        match submitted {
-            Ok(c) => {
-                #[cfg(test)]
-                LAST_WRITE.with(|w| *w.borrow_mut() = Some(c.clone()));
-                c.on_retired(move || retired(&unretired, &tell))
-            }
+        // Its record: the checkpoint's metadata unit keeps at most `WRITES` writes in flight until
+        // each one's wait is told, which is its chain's end (DESIGN.md 22.18, D1a §3.1.1).
+        let held = match self.counted.take_meta_write_record() {
+            Ok(held) => held,
             Err(e) => {
                 if let Some(c) = frame.writing.take(&self.completions) {
                     c.error(io_failure(&e));
                 }
                 return Err(e);
             }
-        }
+        };
+        let chain = Arc::new(MetaWrite {
+            target: frame.clone(),
+            me: self.held(),
+            side,
+            n,
+            count,
+            durable,
+        });
+        // The write counts once; where the file does not write durably, its sync is made at its
+        // retirement, counted before it is uncounted, and submitted by the IO thread. A refused
+        // write has ended its chain, which told `writing` its error.
+        let c = file.write_then(held, at, copy.region(0, META_PAGE), durable, chain)?;
+        #[cfg(test)]
+        LAST_WRITE.with(|w| *w.borrow_mut() = Some(c.clone()));
+        drop(c);
         Ok(Some(writing))
     }
 

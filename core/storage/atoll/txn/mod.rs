@@ -1202,9 +1202,14 @@ impl Transactions {
     /// filled chunk go out and its Commit record appended, and is published; then its gate and slot
     /// are let go. Done once [`Commit::ended`], the waits for coverage and durability left to
     /// [`commit`](Self::commit). A failure is met before the transaction ended: nothing it wrote was
-    /// published, and the transaction is still in `op` ([`Commit::take_txn`]).
+    /// published, and the transaction is still in `op` ([`Commit::take_txn`]). On a failed database
+    /// it is that failure ([`abandon`](Self::abandon)).
     pub fn end_commit(&self, op: &mut Commit) -> Result<IOResult<()>> {
         if let Some(txn) = op.txn.as_mut() {
+            // A failed database commits nothing until it is reopened: a transaction open when it
+            // failed, on keys of its own, is refused here and rolls back, as a begin is refused
+            // (the auditor's #4484). A commit past this look before the failure was set finishes.
+            self.refuse_if_failed()?;
             if txn.wrote() {
                 // Every chunk filled goes out first, in parts; the last, in the Commit record.
                 if let IOResult::IO(io) = self.spill(txn)? {

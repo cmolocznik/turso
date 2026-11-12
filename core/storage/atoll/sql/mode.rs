@@ -1870,8 +1870,45 @@ impl Ending {
     /// Drives the ending to its end, for the synchronous sites that end a transaction.
     #[turso_macros::atoll_entry]
     pub fn finish(&mut self) -> Result<()> {
+        self.drive_to_end()
+    }
+
+    /// Drives the ending to its end. An IO it waits on that fails is seen by the driver, which
+    /// returns the completion's error without stepping the ending again (`drive`): the ending takes
+    /// that failure as the step that waited on it would have (`Ending::met`), and is driven on, so
+    /// a rollback whose read failed leaves its transaction to `Transactions::abandon` rather than
+    /// dropped with its slot and gate held (the auditor's #4485, #4486).
+    fn drive_to_end(&mut self) -> Result<()> {
         let io = self.db.io().clone();
-        drive(&io, || self.step())
+        loop {
+            match drive(&io, || self.step()) {
+                Ok(()) => return Ok(()),
+                Err(failure) if matches!(self.step, Step::Done) => return Err(failure),
+                Err(failure) => self.met(failure),
+            }
+        }
+    }
+
+    /// An IO the ending waited on failed, the failure seen by its driver rather than returned by
+    /// its step: the step that waited takes it. A commit whose transaction has not ended goes to
+    /// its rollback, the failure its outcome (`commit_failed`); a rollback leaves its transaction
+    /// where it stands, the database failed (`Transactions::abandon`); the waits after a
+    /// transaction's end leave the ending failed. Each moves the ending on, so a driver taking
+    /// failures meets each step at most once.
+    fn met(&mut self, failure: LimboError) {
+        if matches!(self.step, Step::Commit(_)) {
+            return self.commit_failed(failure);
+        }
+        match &mut self.step {
+            Step::Rollback(op, _) => {
+                if let Some(txn) = op.take_txn() {
+                    self.db.atoll().transactions().abandon(txn, failure.clone());
+                }
+                self.step = Step::Failed(failure);
+            }
+            Step::Drain | Step::Checkpoint(_) => self.step = Step::Failed(failure),
+            Step::Commit(_) | Step::Failed(_) | Step::Done => {}
+        }
     }
 }
 
@@ -1896,8 +1933,7 @@ impl Drop for Ending {
         if matches!(self.step, Step::Done) {
             return;
         }
-        let io = self.db.io().clone();
-        if let Err(e) = drive(&io, || self.step()) {
+        if let Err(e) = self.drive_to_end() {
             tracing::error!("an Atoll transaction's ending, dropped unfinished, failed: {e}");
         }
     }

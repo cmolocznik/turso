@@ -3202,12 +3202,17 @@ are not built yet.
     commits, the visibility rule would show one left behind as committed.
   - **A rollback that cannot finish.** The undo reads back the parts the transaction spilled
     (section 11.4.1), each once the log is durable past it; a part the log failed to make durable
-    cannot be read back, and an undo that fails to put a key back cannot go on. The transaction is
-    then left where it stands (`Transactions::abandon`): its slot stays seated, and its hold of the
-    gate and its versions stay, so no later transaction of the slot can make them look committed.
-    The database has failed until it is reopened: every begin, take of the gate and judgment of a
-    version the transaction wrote (`Writer::Abandoned`) returns the failure, and whoever waits on
-    a slot, the gate or one of those versions is woken to it. Recovery replays no commit of the
+    cannot be read back, an undo whose read of a page fails cannot find its keys, and an undo that
+    fails to put a key back cannot go on. Whoever meets the failure, the undo's step or the driver
+    of an ending that waited on the failed read (the completion's error is the driver's to see, not
+    the step's: `Ending::met` hands it to the step that waited, the auditor's #4485), the
+    transaction is then left where it stands (`Transactions::abandon`): its slot stays seated, and
+    its hold of the gate and its versions stay, so no later transaction of the slot can make them
+    look committed. The database has failed until it is reopened: every begin, take of the gate,
+    commit and judgment of a version the transaction wrote (`Writer::Abandoned`) returns the
+    failure, a transaction already open when it failed rolling back at its commit, before it
+    publishes (the auditor's #4484), and whoever waits on a slot, the gate or one of those
+    versions is woken to it. Recovery replays no commit of the
     transaction, so the reopened database has none of it. A commit that fails before its
     transaction ended goes to this rollback (section 17).
   - **Savepoints and statement rollback** stop at a statement. Statement numbers only rise: those

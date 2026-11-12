@@ -3775,11 +3775,7 @@ fn every_drive_of_the_connections_facade_carries_its_identity() {
             "a full checkpoint, maintenance: no tenure, no connection",
         ),
         (
-            "finish",
-            "an ending's own owner carries the connection; the outer drive only parks",
-        ),
-        (
-            "drop",
+            "drive_to_end",
             "an ending's own owner carries the connection; the outer drive only parks",
         ),
     ];
@@ -6672,4 +6668,227 @@ mod log_failing_in_the_call {
     fn a_sibling_publishing_its_connections_commit_issues_none_of_its_log_io_failed_inline() {
         a_sibling_publishing_its_connections_commit(681, Fault::Delivered);
     }
+}
+
+/// A rollback's ending dropped before anything stepped it, its destructor the first and only
+/// driver, the tree's root evicted so its undo yields a read, with an exclusive take queued behind
+/// its hold of the gate (the auditor's #4485/#4486 probe). If `fail`, the reads fail, the log
+/// staying healthy: the driver sees the read's completion fail rather than the rollback's step, and
+/// the ending takes the failure as that step would have, leaving the transaction to
+/// `Transactions::abandon`: the database failed, the queued take woken to the failure and every
+/// begin refused (before, the transaction was dropped with its slot and gate held, the take asleep
+/// and nothing failed). Otherwise the rollback lets its slot and gate go. With `other`, a second
+/// transaction writing a key of its own is open beside it: on a failed database its commit is
+/// refused and it rolls back (the auditor's #4484), and otherwise it commits.
+fn a_rollback_ending_dropped_unstepped(fail: bool, other: bool) {
+    use crate::storage::atoll::btree::Mode;
+    use crate::storage::atoll::page::SizeClass;
+    use crate::storage::atoll::sql::AtollDb;
+    use crate::storage::atoll::testing::drive;
+    use crate::storage::atoll::txn::versioned::{VersionedTree, Write, WriteOp};
+    use crate::storage::atoll::txn::{Abort, Blocker, Commit, Isolation, Txn};
+    use crate::types::{IOResult, ImmutableRecord};
+    let observed = (|| -> std::result::Result<_, String> {
+        let crash = Arc::new(crate::io::crash::CrashIO::new(684));
+        let io: Arc<dyn IO> = crash.clone();
+        let path = format!("/db/rollback-dropped-unstepped-{fail}-{other}");
+        let db = Arc::new(AtollDb::open(io.clone(), &path, config()).map_err(|e| e.to_string())?);
+        let txns = db.atoll().transactions();
+        let begin = || -> std::result::Result<Txn, String> {
+            let mut txn =
+                drive(&io, || txns.begin(Isolation::Snapshot)).map_err(|e| e.to_string())?;
+            crate::storage::atoll::testing::share(txns, &mut txn);
+            txns.statement(&mut txn).map_err(|e| e.to_string())?;
+            Ok(txn)
+        };
+        let record = ImmutableRecord::from_values(&[Value::build_text("v".repeat(100))], 1)
+            .map_err(|e| e.to_string())?;
+        let write =
+            |tree: &VersionedTree, txn: &mut Txn, rowid: i64| -> std::result::Result<(), String> {
+                let key = crate::storage::atoll::sql::key::rowid(rowid);
+                let mut op = WriteOp::put(&key, record.get_payload().to_vec(), Mode::Upsert);
+                match drive(&io, || tree.write(txns, db.versions(), txn, &mut op)) {
+                    Ok(Write::Done(_)) => Ok(()),
+                    other => Err(format!("write: {other:?}")),
+                }
+            };
+        let mut txn = begin()?;
+        let root = drive(&io, || db.create_tree(&mut txn, SizeClass::new(0).unwrap()))
+            .map_err(|e| e.to_string())?;
+        let tree = VersionedTree::open(
+            io.clone(),
+            db.atoll().pool().clone(),
+            db.atoll().store().clone(),
+            root,
+        );
+        for rowid in 0..300 {
+            write(&tree, &mut txn, rowid)?;
+        }
+        let mut commit = Commit::new(txn);
+        drive(&io, || txns.commit(&mut commit)).map_err(|e| e.to_string())?;
+        drop(commit);
+        let mut txn = begin()?;
+        write(&tree, &mut txn, 150)?;
+        let blocker = Blocker {
+            slot: txn.slot(),
+            start: txn.start(),
+        };
+        let mut second = match other {
+            true => {
+                let mut second = begin()?;
+                write(&tree, &mut second, 400)?;
+                Some(second)
+            }
+            false => None,
+        };
+        super::full_checkpoint(&db).map_err(|e| e.to_string())?;
+        let pool = db.atoll().pool().clone();
+        let mut sweep = pool.sweep();
+        drive(&io, || sweep.step(&pool)).map_err(|e| e.to_string())?;
+        drop(sweep);
+        let evicted = pool.evict_clean(root);
+        let mut waiter =
+            drive(&io, || txns.begin(Isolation::Snapshot)).map_err(|e| e.to_string())?;
+        let waiting = crate::io::Completion::new_wait();
+        let queued = format!("{:?}", txns.take_exclusive(&mut waiter, &waiting));
+        let before = crash.completed();
+        if fail {
+            crash.set_faults(crate::io::crash::Faults {
+                read: 1.0,
+                write: 0.0,
+                sync: 0.0,
+                short_write: 0.0,
+            });
+        }
+        // Its first and only driver is its destructor.
+        drop(super::Ending::rollback(
+            db.clone(),
+            crate::storage::atoll::buffer::Conn::new(),
+            txn,
+        ));
+        let in_drop = crash.completed() - before;
+        crash.set_faults(crate::io::crash::Faults::default());
+        let log_failed = db.atoll().log().failure().is_some();
+        let failure = txns.failure().map(|e| e.to_string());
+        // The second transaction, open when the database failed or not, ends.
+        let second_ended = second.take().map(|txn| {
+            let mut commit = Commit::new(txn);
+            let committed = drive(&io, || txns.commit(&mut commit)).map(|ts| ts.is_some());
+            let published = commit.published();
+            let rolled_back = commit.take_txn().map(|txn| {
+                let mut abort = Abort::new(txn);
+                drive(&io, || txns.rollback(db.versions(), &mut abort)).is_ok()
+            });
+            (committed.map_err(|e| e.to_string()), published, rolled_back)
+        });
+        let held_after = txns.holds_shared(blocker);
+        let woken = waiting.finished();
+        let gate_after = format!(
+            "{:?}",
+            txns.take_exclusive(&mut waiter, &crate::io::Completion::new_wait())
+        );
+        txns.give_up(&mut waiter);
+        txns.abort(waiter);
+        let mut begun = Vec::new();
+        let mut begins = Vec::new();
+        for _ in 0..txns.slot_count() {
+            match txns.begin(Isolation::Snapshot) {
+                Ok(IOResult::Done(txn)) => {
+                    begins.push("Done".to_string());
+                    begun.push(txn);
+                }
+                Ok(IOResult::IO(_)) => begins.push("IO".to_string()),
+                Err(e) => begins.push(format!("Err({e})")),
+            }
+        }
+        for txn in begun {
+            txns.abort(txn);
+        }
+        drop((waiting, pool, tree, db, io));
+        let in_flight = crash.in_flight();
+        Ok((
+            evicted,
+            queued,
+            in_drop,
+            log_failed,
+            failure,
+            second_ended,
+            held_after,
+            woken,
+            gate_after,
+            begins,
+            in_flight,
+        ))
+    })();
+    let (
+        evicted,
+        queued,
+        in_drop,
+        log_failed,
+        failure,
+        second_ended,
+        held_after,
+        woken,
+        gate_after,
+        begins,
+        in_flight,
+    ) = observed.expect("the fixture failed, every database dropped");
+    assert!(evicted, "the tree's root was not evicted");
+    assert!(
+        queued.starts_with("Ok(Holders("),
+        "the exclusive take did not queue behind the hold: {queued}"
+    );
+    assert!(in_drop > 0, "the destructor's rollback issued no IO");
+    assert!(!log_failed, "the log failed: the reads alone were to fail");
+    assert_eq!(in_flight, 0);
+    if fail {
+        assert!(
+            failure.is_some(),
+            "the rollback whose read failed left the database not failed"
+        );
+        assert!(woken, "the queued exclusive take was not woken");
+        assert!(
+            gate_after.starts_with("Err("),
+            "an exclusive take went ahead on a failed database: {gate_after}"
+        );
+        assert!(
+            begins.iter().all(|b| b.starts_with("Err(")),
+            "a begin went ahead on a failed database: {begins:?}"
+        );
+        if other {
+            assert_eq!(
+                second_ended,
+                Some((Err(failure.clone().unwrap()), false, Some(true))),
+                "a transaction open when the database failed committed"
+            );
+        }
+    } else {
+        assert_eq!(failure, None);
+        assert!(!held_after && woken, "the rollback kept its hold");
+        assert_eq!(gate_after, "Ok(Done)");
+        assert_eq!(begins, ["Done"; 4]);
+        if other {
+            assert_eq!(second_ended, Some((Ok(true), true, None)));
+        }
+    }
+}
+
+#[test]
+fn a_rollback_ending_dropped_unstepped_lets_its_slot_and_gate_go() {
+    a_rollback_ending_dropped_unstepped(false, false);
+}
+
+#[test]
+fn a_rollback_ending_dropped_unstepped_whose_read_fails_fails_the_database() {
+    a_rollback_ending_dropped_unstepped(true, false);
+}
+
+#[test]
+fn a_rollback_ending_dropped_unstepped_beside_a_writer_lets_the_writer_commit() {
+    a_rollback_ending_dropped_unstepped(false, true);
+}
+
+#[test]
+fn a_writer_open_when_the_database_fails_cannot_commit() {
+    a_rollback_ending_dropped_unstepped(true, true);
 }

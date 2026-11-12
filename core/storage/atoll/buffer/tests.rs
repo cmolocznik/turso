@@ -7565,3 +7565,196 @@ fn a_frames_record_holds_its_load_and_its_write_out_until_each_retires() {
     assert_eq!(q_back, Some(Some(2)));
     assert!(failure.is_none(), "the pool failed: {failure:?}");
 }
+
+/// Counts the wakes a claim's wait gets.
+#[derive(Default)]
+struct WakeCount(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for WakeCount {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Two claims that pass over a frame for its record, its load delivered and its request still
+/// owned, each mark the record (the second over the first's mark) and wait; the request's
+/// retirement wakes both, once each (the auditor's #4556; mutant: the retirement telling no one).
+#[test]
+fn claims_passing_over_a_frame_for_its_record_are_woken_by_its_retirement() {
+    let held = Arc::new(HeldRequests::default());
+    let io: Arc<dyn IO> = Arc::new(HeldDataIO {
+        inner: Arc::new(crate::io::MemoryIO::new()),
+        held: held.clone(),
+    });
+    let base = "/db/frame-record-wake";
+    let pool = open_on(&io, base, MIN_BUDGET);
+    let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+    let (pid, frame) = (g.pid(), g.frame);
+    stamp(&mut g.page_mut(), pid, 1);
+    g.changed();
+    drop(g);
+    let out = pool.start_write_out(
+        pool.latch_to_evict(class(0), frame, || FrameLatch {
+            frames: pool.frames.clone(),
+            frame,
+        })
+        .unwrap(),
+    );
+    pool.write_out(class(0), vec![out]);
+    drive(&io, || pool.settle_writes()).unwrap();
+    *held.prefix.lock() = Some(format!("{base}.c0."));
+    let loading = matches!(pool.fix_optimistic(pid, None).unwrap(), IOResult::IO(_));
+    let frame = pool.table.find(&pool.frames.headers, pid.raw()).unwrap();
+    let read = held.all().first().cloned();
+    let mut delivered = std::collections::HashSet::new();
+    if let Some(r) = &read {
+        r.c.complete(r.result);
+        delivered.insert(0);
+    }
+    let counts = [
+        std::sync::Arc::new(WakeCount::default()),
+        std::sync::Arc::new(WakeCount::default()),
+    ];
+    let mut waits = Vec::new();
+    let mut looks = Vec::new();
+    for count in &counts {
+        let wait = pool.released_wait();
+        wait.set_waker(&std::task::Waker::from(count.clone()));
+        let mut outgoing = Vec::new();
+        let mut room = Room::default();
+        let took = pool.evict_or_write(class(0), frame, &mut outgoing, &mut room);
+        looks.push((took, room.marked, room.changed, outgoing.len()));
+        waits.push(wait);
+    }
+    let before: Vec<_> = waits.iter().map(Completion::finished).collect();
+    if let Some(r) = &read {
+        r.c.retire();
+    }
+    let after: Vec<_> = waits.iter().map(Completion::finished).collect();
+    let wakes: Vec<_> = counts
+        .iter()
+        .map(|c| c.0.load(std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    held.release_all(&mut delivered);
+    *held.prefix.lock() = None;
+    let failure = pool.failed().err();
+    drop((waits, read, pool));
+    assert!(loading, "the page was resident before its load");
+    assert_eq!(
+        looks,
+        vec![(false, true, false, 0); 2],
+        "each claim passed over the frame and marked its record"
+    );
+    assert_eq!(
+        before,
+        vec![false, false],
+        "a wait finished before the retirement"
+    );
+    assert_eq!(
+        after,
+        vec![true, true],
+        "the retirement left a claim waiting"
+    );
+    assert_eq!(wakes, vec![1, 1], "the claims' wakes");
+    assert!(failure.is_none(), "the pool failed: {failure:?}");
+}
+
+/// A frame its write-out's landing freed, the write still owned, goes to no other size class: a
+/// 2 MiB claim that only the frame's batch can serve waits, and once the write retires it takes
+/// that batch, the frame's memory among its own (the auditor's #4556; mutant: the frame given to
+/// the free frames at once).
+#[test]
+fn a_frame_freed_under_its_write_out_goes_to_another_class_only_once_the_write_retires() {
+    let held = Arc::new(HeldRequests::default());
+    let io: Arc<dyn IO> = Arc::new(HeldDataIO {
+        inner: Arc::new(crate::io::MemoryIO::new()),
+        held: held.clone(),
+    });
+    let base = "/db/frame-record-class";
+    let pool = open_on(&io, base, MIN_BUDGET);
+    let big = class(memory::BATCH_CLASS);
+    let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+    let (pid, frame) = (g.pid(), g.frame);
+    stamp(&mut g.page_mut(), pid, 1);
+    g.changed();
+    drop(g);
+    // 2 MiB pages kept resident over every other batch, and the class-0 page with them, so that
+    // filling the pool writes nothing out: a further one needs the class-0 batch.
+    let mut bigs = vec![pid.raw()];
+    pool.protect(&bigs);
+    loop {
+        match pool.allocate(big).unwrap() {
+            IOResult::Done(mut b) => {
+                let p = b.pid();
+                stamp(&mut b.page_mut(), p, 1);
+                b.changed();
+                bigs.push(p.raw());
+                drop(b);
+                pool.protect(&bigs);
+            }
+            IOResult::IO(_) => break,
+        }
+    }
+    // Still waiting: the class-0 batch holds a resident page.
+    *held.prefix.lock() = Some(format!("{base}.c0."));
+    let out = pool.start_write_out(
+        pool.latch_to_evict(class(0), frame, || FrameLatch {
+            frames: pool.frames.clone(),
+            frame,
+        })
+        .unwrap(),
+    );
+    pool.write_out(class(0), vec![out]);
+    let _ = pool.settle_writes().unwrap();
+    let write = held.all().first().cloned();
+    let mut delivered = std::collections::HashSet::new();
+    if let Some(w) = &write {
+        w.c.complete(w.result);
+        delivered.insert(0);
+    }
+    let settled = matches!(pool.settle_writes(), Ok(IOResult::Done(())));
+    let freed =
+        pool.header(frame).status() == FREE && !pool.memory.free_frames(class(0)).contains(&frame);
+    let waiting = match pool.allocate(big).unwrap() {
+        IOResult::IO(IOCompletions(c)) => Some(c),
+        IOResult::Done(_) => None,
+    };
+    let finished_before = waiting.as_ref().map(Completion::finished);
+    if let Some(w) = &write {
+        w.c.retire();
+    }
+    let finished_after = waiting.as_ref().map(Completion::finished);
+    let memory_of = |f: u32, size: usize| {
+        let at = pool.memory.region.buffer(f, size).as_ptr() as usize;
+        at..at + size
+    };
+    let freed_at = memory_of(frame, class(0).size()).start;
+    let got = drive(&io, || pool.allocate(big)).unwrap();
+    let reused = memory_of(got.frame, big.size()).contains(&freed_at);
+    drop(got);
+    held.release_all(&mut delivered);
+    *held.prefix.lock() = None;
+    pool.protect(&[]);
+    let failure = pool.failed().err();
+    drop((waiting, write, pool));
+    assert!(bigs.len() > 1, "no 2 MiB page fit beside the class-0 batch");
+    assert!(
+        settled && freed,
+        "the write-out's landing did not free its frame, deferred"
+    );
+    assert_eq!(
+        finished_before,
+        Some(false),
+        "a 2 MiB claim was served while the frame's write-out was owned"
+    );
+    assert_eq!(
+        finished_after,
+        Some(true),
+        "the write's retirement left the 2 MiB claim waiting"
+    );
+    assert!(
+        reused,
+        "the 2 MiB page took memory other than the freed frame's batch"
+    );
+    assert!(failure.is_none(), "the pool failed: {failure:?}");
+}

@@ -6,6 +6,13 @@ use super::memory::Zeroable;
 use super::watt::Tracker;
 use crate::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
+/// The record's word: the engine's atomic, or loom's, which explores the reorderings of the
+/// record's freeing, retirement and marks (a `Zeroed` is built from defaults under loom).
+#[cfg(not(atoll_loom))]
+type RecordWord = AtomicU8;
+#[cfg(atoll_loom)]
+type RecordWord = loom::sync::atomic::AtomicU8;
+
 /// The frame holds no page.
 pub const FREE: u8 = 0;
 /// A page is being read into the frame, which the load holds exclusively.
@@ -64,7 +71,7 @@ pub struct FrameHeader {
     pub flags: AtomicU8,
     /// The frame's request record, beside its kind: [`RECORD_HELD`] and the marks with it. One
     /// request at a time, the frame's latch held exclusively when one is made.
-    record: AtomicU8,
+    record: RecordWord,
     pub tracker: Tracker,
     /// The global epoch when a step last fixed the page, the highest any did: a page marked at
     /// or above the epochs' horizon may be held by a step under way. Relaxed: it only prices a
@@ -140,29 +147,46 @@ impl FrameHeader {
 
     /// Marks the record waited, for a claim that passed over the frame for it, after the claim's
     /// registration: [`Marked::Waits`] if it still holds the request, so its retirement tells the
-    /// pool's supply, else [`Marked::Changed`].
+    /// pool's supply, else [`Marked::Changed`]. Always a Release write when it reads Waits, even
+    /// with the mark already there, so this claim's registration comes before the retirement that
+    /// reads the mark. Two strong attempts at most: the only change a held record takes other than
+    /// its retirement and its frame's freeing is another claim's mark, which comes once; any other
+    /// change reads Changed, and the claim looks again.
     pub fn mark_record_waited(&self) -> Marked {
         let mut was = self.record.load(Ordering::Acquire);
-        while was & RECORD_HELD != 0 {
-            match self.record.compare_exchange_weak(
+        for _ in 0..2 {
+            if was & RECORD_HELD == 0 {
+                return Marked::Changed;
+            }
+            match self.record.compare_exchange(
                 was,
                 was | RECORD_WAITED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => return Marked::Waits,
-                Err(now) => was = now,
+                // Another claim's mark: once more, with it.
+                Err(now) if now == was | RECORD_WAITED => was = now,
+                Err(_) => return Marked::Changed,
             }
         }
         Marked::Changed
     }
 
     /// Defers the freed frame to its record's retirement: whether the record still holds a
-    /// request, which then hands the frame to the free frames. Otherwise the caller does.
+    /// request, which then hands the frame to the free frames. Otherwise the caller does. Called
+    /// once, by the frame's one freeing caller, which owns the frame until it or the retirement
+    /// hands it to the free frames, so no new request can start on it meanwhile: the only changes
+    /// it can meet are a claim's mark, which comes once, and the retirement. Two strong attempts at
+    /// most, and one load alone where no request is held.
     pub fn free_at_retirement(&self) -> bool {
         let mut was = self.record.load(Ordering::Acquire);
-        while was & RECORD_HELD != 0 {
-            match self.record.compare_exchange_weak(
+        for _ in 0..2 {
+            if was & RECORD_HELD == 0 {
+                return false;
+            }
+            crate::turso_assert!(was & RECORD_FREED == 0, "a frame freed twice");
+            match self.record.compare_exchange(
                 was,
                 was | RECORD_FREED,
                 Ordering::AcqRel,
@@ -172,6 +196,11 @@ impl FrameHeader {
                 Err(now) => was = now,
             }
         }
+        // Both attempts lost: the second could only lose to the retirement.
+        crate::turso_assert!(
+            was & RECORD_HELD == 0,
+            "a held record changed twice while its frame was freed: {was:#x}"
+        );
         false
     }
 
@@ -206,3 +235,97 @@ fn io_mark(version: u64) -> u64 {
 // Shuttle's and loom's atomics are larger than the hardware's.
 #[cfg(not(any(shuttle, atoll_loom)))]
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 128);
+
+/// A frame's record under loom: its freeing, its retirement and a claim's mark racing, in every
+/// interleaving and C11 reordering. Run with `RUSTFLAGS="--cfg atoll_loom" cargo test -p
+/// turso_core --lib --release frame::loom`.
+#[cfg(all(test, atoll_loom))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::atomic::AtomicBool;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    fn check(f: impl Fn() + Sync + Send + 'static) {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(f);
+    }
+
+    /// The frame freed while its request is held, the request retiring and a claim marking the
+    /// record, at once: the frame goes to the free frames exactly once, by whichever of the
+    /// freeing and the retirement came second, and the record ends free.
+    #[test]
+    fn a_freed_frame_goes_free_once_whatever_its_retirement_and_a_mark_race() {
+        check(|| {
+            let h = Arc::new(FrameHeader::default());
+            h.hold_record();
+            let freed = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+            let free = {
+                let (h, freed) = (h.clone(), freed.clone());
+                thread::spawn(move || {
+                    if !h.free_at_retirement() {
+                        assert!(!h.record_held(), "the freeing caller freed a held frame");
+                        freed.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            };
+            let retire = {
+                let (h, freed) = (h.clone(), freed.clone());
+                thread::spawn(move || {
+                    if h.retire_record().freed {
+                        freed.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            };
+            let mark = {
+                let h = h.clone();
+                thread::spawn(move || {
+                    let _ = h.mark_record_waited();
+                })
+            };
+            free.join().unwrap();
+            retire.join().unwrap();
+            mark.join().unwrap();
+            assert_eq!(
+                freed.load(Ordering::Relaxed),
+                1,
+                "the frame went free other than once"
+            );
+            assert_eq!(h.record.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// A second claim marking a record another already marked still writes, Release, so a
+    /// retirement that reads the mark sees what the claim registered before it.
+    #[test]
+    fn a_claim_marking_a_record_marked_already_is_seen_by_its_retirement() {
+        check(|| {
+            let h = Arc::new(FrameHeader::default());
+            h.hold_record();
+            assert_eq!(h.mark_record_waited(), Marked::Waits);
+            let registered = Arc::new(AtomicBool::new(false));
+            let claim = {
+                let (h, registered) = (h.clone(), registered.clone());
+                thread::spawn(move || {
+                    registered.store(true, Ordering::Relaxed);
+                    h.mark_record_waited()
+                })
+            };
+            let retire = {
+                let (h, registered) = (h.clone(), registered.clone());
+                thread::spawn(move || {
+                    let retired = h.retire_record();
+                    assert!(retired.waited);
+                    registered.load(Ordering::Relaxed)
+                })
+            };
+            let marked = claim.join().unwrap();
+            let seen = retire.join().unwrap();
+            assert!(
+                marked != Marked::Waits || seen,
+                "a claim waits on a retirement that did not see it register"
+            );
+        });
+    }
+}

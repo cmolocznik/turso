@@ -513,6 +513,10 @@ crate::thread::thread_local! {
     /// backend's cancel would.
     pub(crate) static LAST_WRITE: std::cell::RefCell<Option<Completion>> =
         const { std::cell::RefCell::new(None) };
+    /// The request of the last metadata read submitted on this thread, for a test to cancel as a
+    /// backend's cancel would.
+    pub(crate) static LAST_READ: std::cell::RefCell<Option<Completion>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Tells a metadata write's waiter how it ended, once ([`MetaCache::write_for`]).
@@ -534,6 +538,76 @@ fn retired(unretired: &AtomicUsize, tell: &Tell) {
     }
 }
 
+/// The metadata reads a cache leaves with its backend (DESIGN.md 22.18, a metadata read credit):
+/// one credit a read, as many as the cache's budget, taken before the read is issued and given back
+/// when the backend retires it, never when it finishes, so a cancelled load keeps its credit while
+/// the backend keeps its buffer. A miss that finds none free registers on their give-back and
+/// returns IO, holding no credit and no frame; a give-back after its registration wakes it.
+struct ReadCredits {
+    free: AtomicUsize,
+    returned: crate::storage::atoll::notify::LetGo,
+}
+
+impl ReadCredits {
+    fn new(credits: usize) -> Arc<Self> {
+        Arc::new(Self {
+            free: AtomicUsize::new(credits),
+            returned: Default::default(),
+        })
+    }
+
+    /// A credit, if one is free. A compare-and-swap, tried again only past another take's or a
+    /// give-back's change of the count, each of which took or gave a credit (22.18, *Locks a poll
+    /// may take*: such a loop under contention stays, and its cost is measured).
+    fn take(self: &Arc<Self>) -> Option<Credit> {
+        self.free
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .ok()
+            .map(|_| Credit(Some(self.clone())))
+    }
+
+    /// A credit, or the wait the next give-back finishes: registered, then tried again, so a
+    /// give-back between the two is either seen by the try or finds the registration.
+    fn take_or_wait(self: &Arc<Self>) -> std::result::Result<Credit, Completion> {
+        if let Some(credit) = self.take() {
+            return Ok(credit);
+        }
+        let returned = self.returned.wait();
+        self.take().ok_or(returned)
+    }
+
+    fn give_back(&self) {
+        self.free.fetch_add(1, Ordering::AcqRel);
+        self.returned.let_go();
+    }
+
+    /// Credits free.
+    #[cfg(test)]
+    fn free(&self) -> usize {
+        self.free.load(Ordering::Acquire)
+    }
+}
+
+/// A read credit taken: given back as it drops, or at the retirement of the read handed it.
+struct Credit(Option<Arc<ReadCredits>>);
+
+impl Credit {
+    /// Held until `request`, the read the backend accepted under it, retires: now, if it has.
+    fn until_retired(mut self, request: &Completion) {
+        let credits = self.0.take().expect("a credit taken");
+        request.on_retired(move || credits.give_back());
+    }
+}
+
+impl Drop for Credit {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        if let Some(credits) = self.0.take() {
+            credits.give_back();
+        }
+    }
+}
+
 /// One tree's file for a size class and level, and the cells of its pages.
 #[derive(Default)]
 struct FileSlot {
@@ -546,6 +620,8 @@ pub struct MetaCache {
     base: String,
     /// Pages kept before clean ones no one holds are dropped.
     budget: usize,
+    /// Its reads with the backend: as many as `budget`, one at least.
+    credits: Arc<ReadCredits>,
     epochs: Arc<Epochs>,
     /// By [`MetaId::file_index`].
     files: Box<[FileSlot]>,
@@ -582,6 +658,7 @@ impl MetaCache {
             io,
             base: base.to_string(),
             budget,
+            credits: ReadCredits::new(budget.max(1)),
             files: (0..TREES * CLASS_COUNT * LEVELS)
                 .map(|_| FileSlot::default())
                 .collect(),
@@ -636,6 +713,12 @@ impl MetaCache {
                 break frame;
             }
             drop(step);
+            // A miss takes its read's credit before it makes its frame, so one that finds none
+            // waits holding neither (DESIGN.md 22.18, a metadata read credit).
+            let credit = match self.credits.take_or_wait() {
+                Ok(credit) => credit,
+                Err(returned) => return Ok(IOResult::IO(IOCompletions(returned))),
+            };
             let fresh = Pinned::new(MetaFrame::new(
                 id,
                 self.cutting.clone(),
@@ -645,10 +728,11 @@ impl MetaCache {
             if cell.put(&fresh, &self.cells) {
                 self.arrivals.push(id);
                 crate::race::point("meta.before_load");
-                self.load(&fresh)?;
+                self.load(&fresh, credit)?;
                 self.evict_over_budget();
                 break fresh;
             }
+            // Another miss put its frame first, under a credit of its own: this one goes back.
         };
         let mut status = frame.status.load(Ordering::Acquire);
         let loaded = if status < READY {
@@ -707,12 +791,14 @@ impl MetaCache {
     }
 
     /// Reads both places of `frame`'s page and keeps the newest whole copy. The read holds the
-    /// page, which no one else is handed while it loads.
-    fn load(self: &Arc<Self>, frame: &MetaRef) -> Result<()> {
+    /// page, which no one else is handed while it loads, and `credit` until the backend retires
+    /// it; a read never issued gives the credit back at once.
+    fn load(self: &Arc<Self>, frame: &MetaRef, credit: Credit) -> Result<()> {
         let id = frame.id;
         let file = match self.file(id) {
             Ok(file) => file,
             Err(e) => {
+                drop(credit);
                 frame.fail(io_failure(&e));
                 self.finish_load(frame);
                 return Err(e);
@@ -761,10 +847,18 @@ impl MetaCache {
             None
         });
         crate::race::point("meta.before_read_submit");
-        if let Err(e) = file.pread(id.offset(), c) {
-            frame.fail(io_failure(&e));
-            self.finish_load(frame);
-            return Err(e);
+        match file.pread(id.offset(), c) {
+            Ok(request) => {
+                #[cfg(test)]
+                LAST_READ.with(|r| *r.borrow_mut() = Some(request.clone()));
+                credit.until_retired(&request);
+            }
+            Err(e) => {
+                drop(credit);
+                frame.fail(io_failure(&e));
+                self.finish_load(frame);
+                return Err(e);
+            }
         }
         // The backend accepted the read. Its callback may already have published the page,
         // so only the preparing phase can become a queued read.

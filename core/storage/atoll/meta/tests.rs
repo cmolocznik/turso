@@ -1615,3 +1615,137 @@ fn a_metadata_sync_cannot_end_the_write_while_the_writes_request_is_owned() {
     );
     assert_eq!(after_both, (true, true, None, 0), "both retired");
 }
+
+/// 128 metadata pages asked of a cache whose budget gives it one read credit: the first miss takes
+/// the credit and its read goes to the backend, the other 127 register on the credits' give-back
+/// and return IO, making no frame and issuing no read; the first read's retirement tells them all,
+/// and each page is then served in turn with never more than one read with the backend (DESIGN.md
+/// 22.18, a metadata read credit; the auditor's metadata probe; mutant: a miss reading with no
+/// credit).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn metadata_loads_under_one_read_credit_keep_one_read_with_the_backend() {
+    use crate::io::crash::CrashIO;
+    const PAGES: u64 = 128;
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let cache = Arc::new(MetaCache::new(
+        io,
+        "meta-credits",
+        1,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    let waits: Vec<Option<Completion>> = (0..PAGES)
+        .map(|i| match cache.get(id(i)) {
+            Ok(IOResult::IO(IOCompletions(c))) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let unfinished = |w: &Option<Completion>| w.as_ref().is_some_and(|c| !c.finished());
+    let at_asks = (
+        crash.in_flight(),
+        cache.resident(),
+        waits.iter().skip(1).filter(|w| unfinished(w)).count(),
+    );
+    // The first read lands and retires: its credit back, every miss told.
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let told = waits
+        .iter()
+        .skip(1)
+        .all(|w| w.as_ref().is_some_and(Completion::finished));
+    let (mut most, mut served) = (0, 0);
+    for i in 0..PAGES {
+        loop {
+            match cache.get(id(i)) {
+                Ok(IOResult::Done(frame)) => {
+                    served += 1;
+                    drop(frame);
+                    break;
+                }
+                Ok(IOResult::IO(_)) if crash.in_flight() > 0 => {
+                    most = most.max(crash.in_flight());
+                    crash.step().unwrap();
+                }
+                _ => break,
+            }
+        }
+    }
+    let free = cache.credits.free();
+    // Every assertion with the cache dropped.
+    drop((waits, cache));
+    assert_eq!(
+        at_asks,
+        (1, 1, 127),
+        "(reads with the backend, frames, misses waiting on the credits) after the asks"
+    );
+    assert!(told, "the first read's retirement left a miss waiting");
+    assert_eq!(served, PAGES, "pages served");
+    assert_eq!(most, 1, "reads with the backend at most while served");
+    assert_eq!(free, 1, "the credit not given back after the last read");
+}
+
+/// A metadata read cancelled, its callback run aborted while the backend still owns it, keeps its
+/// credit: a second page's miss finds none free and waits, issuing no read, until the backend
+/// retires the first; then its read goes to the backend and its page is served (DESIGN.md 22.18, a
+/// metadata read credit, given back at the retirement and never when the read finishes; mutant:
+/// given back as the read's callback runs).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_cancelled_metadata_read_keeps_its_credit_until_its_backend_retires_it() {
+    use crate::io::crash::CrashIO;
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let cache = Arc::new(MetaCache::new(
+        io,
+        "meta-credit-cancel",
+        1,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    let first = cache.get(id(0));
+    let read = LAST_READ
+        .with(|r| r.borrow_mut().take())
+        .expect("the first page's read");
+    read.abort();
+    let second = match cache.get(id(1)) {
+        Ok(IOResult::IO(IOCompletions(c))) => Some(c),
+        _ => None,
+    };
+    let at_cancel = (
+        read.is_owned(),
+        crash.in_flight(),
+        second.as_ref().is_some_and(|c| !c.finished()),
+    );
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let told = second.as_ref().is_some_and(Completion::finished);
+    let then = (
+        matches!(cache.get(id(1)), Ok(IOResult::IO(_))),
+        crash.in_flight(),
+    );
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let served = matches!(cache.get(id(1)), Ok(IOResult::Done(_)));
+    // Every assertion with the cache dropped.
+    drop((first, read, second, cache));
+    assert_eq!(
+        at_cancel,
+        (true, 1, true),
+        "(the cancelled read owned, reads with the backend, the second miss waiting)"
+    );
+    assert!(
+        told,
+        "the cancelled read's retirement left the second miss waiting"
+    );
+    assert_eq!(
+        then,
+        (true, 1),
+        "(the second miss reading, reads with the backend) after the retirement"
+    );
+    assert!(served, "the second page not served");
+}

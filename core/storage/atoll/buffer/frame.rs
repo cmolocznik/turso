@@ -232,9 +232,14 @@ fn io_mark(version: u64) -> u64 {
     (version + 1) << 1
 }
 
-// Shuttle's and loom's atomics are larger than the hardware's.
+/// A frame header's bytes in the engine's own build: what a page of the header table is counted by
+/// ([`super::CUT_RUN`]). Shuttle's and loom's atomics are larger than the hardware's, and so are
+/// their headers; counting by those would cut the table in runs the engine never makes, a schedule
+/// test then stepping a cut many times the units it has.
+pub const HEADER_BYTES: usize = 128;
+
 #[cfg(not(any(shuttle, atoll_loom)))]
-const _: () = assert!(std::mem::size_of::<FrameHeader>() == 128);
+const _: () = assert!(std::mem::size_of::<FrameHeader>() == HEADER_BYTES);
 
 /// A frame's record under loom: its freeing, its retirement and a claim's mark racing, in every
 /// interleaving and C11 reordering. Run with `RUSTFLAGS="--cfg atoll_loom" cargo test -p

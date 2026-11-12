@@ -3194,8 +3194,9 @@ fn sample_rng() -> impl rand::Rng {
 }
 
 /// The frames a cut's walk looks at in one run: the frame headers one page of the header table
-/// holds (DESIGN.md 22.1), and as many of the swapped pages looked at again.
-pub const CUT_RUN: usize = page::MIN_PAGE_SIZE / std::mem::size_of::<FrameHeader>();
+/// holds (DESIGN.md 22.1), as the engine lays them out ([`frame::HEADER_BYTES`]) whatever atomics a
+/// test build checks them with, and as many of the swapped pages looked at again.
+pub const CUT_RUN: usize = page::MIN_PAGE_SIZE / frame::HEADER_BYTES;
 
 /// Where the end of a cut stands ([`BufferPool::end_cut_run`]): whether the cut is stopped, and
 /// once the copies it kept are dropped, the next lend batch to sweep.

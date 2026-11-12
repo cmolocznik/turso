@@ -288,7 +288,7 @@ enum How {
     Created(Box<Recovered>),
     /// A database to recover from its superblock, and what recovery needs.
     Recovering {
-        io: Arc<dyn IO>,
+        counted: Arc<Counted>,
         base: String,
         config: Box<AtollConfig>,
         control: Option<Control>,
@@ -356,7 +356,7 @@ impl Opening {
         config.log.segment_bytes = superblock.segment_bytes;
         config.store.file_bytes = superblock.file_bytes;
         let store = PageStore::open(
-            counted,
+            counted.clone(),
             base,
             config.store.clone(),
             superblock.heights,
@@ -370,7 +370,7 @@ impl Opening {
             checkpointing: config.checkpointing,
             executor,
             how: Mutex::new(How::Recovering {
-                io,
+                counted,
                 base: base.to_string(),
                 config: Box::new(config),
                 control: Some(control),
@@ -406,7 +406,13 @@ impl Opening {
             checkpoint: 0,
             continuations: Vec::new(),
         };
-        let store = PageStore::open(counted, base, config.store.clone(), superblock.heights, 0);
+        let store = PageStore::open(
+            counted.clone(),
+            base,
+            config.store.clone(),
+            superblock.heights,
+            0,
+        );
         control.write_and_wait(&superblock)?;
         let pool = BufferPool::new(
             config.buffer.clone(),
@@ -415,7 +421,7 @@ impl Opening {
         )?;
         // Its ring in frames the pool lends: the pool first.
         let log = Log::open_in(
-            io.clone(),
+            counted.clone(),
             base,
             config.log.clone(),
             0,
@@ -452,7 +458,7 @@ impl Opening {
     pub fn work(&self) -> Result<()> {
         let mut how = self.how.lock();
         let How::Recovering {
-            io,
+            counted,
             base,
             config,
             control,
@@ -464,7 +470,7 @@ impl Opening {
             LimboError::InternalError("a recovery that failed is not tried again".into())
         })?;
         let recovered = recovery::recover(
-            io.clone(),
+            counted.clone(),
             base,
             config,
             self.store.clone(),

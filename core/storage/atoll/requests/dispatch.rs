@@ -191,6 +191,80 @@ impl Bitmap {
     }
 }
 
+/// The log's doorbell (D1b §1, §3): two bits on one byte, every operation on it a read-modify-write,
+/// so its order is one release sequence after each ring. RUNG: work owed, rung since the last
+/// unit began. SERVING: a unit runs. While it is not quiet the door holds one count on the
+/// requests (§3.4 names the windows where an old and a new one overlap).
+pub(super) struct Door(AtomicU8);
+
+const RUNG: u8 = 1 << 1;
+const SERVING: u8 = 1 << 0;
+
+/// What a unit's end leaves: the door quiet, its count to let go, or rung again, its count kept
+/// and its bit to set.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum End {
+    Quiet,
+    Again,
+}
+
+impl Door {
+    pub(super) fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    /// A ring: whether it found the door quiet, and so owes it a count and its bit. Whatever it
+    /// finds, the RMW releases what its caller wrote before it (§3.3).
+    pub(super) fn ring(&self) -> bool {
+        self.0.fetch_or(RUNG, sync::Ordering::AcqRel) == 0
+    }
+
+    /// A unit's start, from RUNG: the acquire that reads every ring before it. Whether the door
+    /// read RUNG; anything else breaks the protocol, as only the IO thread clears RUNG or sets
+    /// SERVING.
+    pub(super) fn start(&self) -> bool {
+        self.0
+            .compare_exchange(
+                RUNG,
+                SERVING,
+                sync::Ordering::AcqRel,
+                sync::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// A unit's end: quiet if nothing is owed and nothing rang during it, else rung again.
+    pub(super) fn end(&self, owed: bool) -> End {
+        if !owed
+            && self
+                .0
+                .compare_exchange(SERVING, 0, sync::Ordering::AcqRel, sync::Ordering::Relaxed)
+                .is_ok()
+        {
+            return End::Quiet;
+        }
+        self.0.swap(RUNG, sync::Ordering::AcqRel);
+        End::Again
+    }
+
+    /// Quiet, with nothing to let go: the requests are gone, and no producer is left to ring.
+    pub(super) fn quiet(&self) {
+        self.0.swap(0, sync::Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(super) fn read(&self) -> u8 {
+        self.0.load(sync::Ordering::Acquire)
+    }
+}
+
+/// The log's work for one unit (D1b §4), served by the IO thread: whether more is owed.
+pub(in crate::storage::atoll) trait LogWork:
+    Send + Sync + 'static
+{
+    fn unit(self: Arc<Self>) -> bool;
+}
+
 /// What a chain's owner is told of it (DESIGN.md 22.18, D1a §2): the write's outcome, the sync's,
 /// and the chain's end once every request of it has retired.
 pub(in crate::storage::atoll) trait Chain: Send + Sync + 'static {
@@ -224,6 +298,9 @@ struct Ready {
 pub(in crate::storage::atoll) struct Dispatch {
     records: Box<[Record<Link>]>,
     bits: Bitmap,
+    /// The log's doorbell, and the log it rings for, set once at the log's open.
+    door: Door,
+    log: crate::sync::OnceLock<Weak<dyn LogWork>>,
     thread: crate::sync::OnceLock<crate::thread::Thread>,
     requests: Weak<Requests>,
     /// The thread has left its loop, for a test's look after its owners are gone.
@@ -235,6 +312,12 @@ pub(in crate::storage::atoll) struct Dispatch {
     /// A test's notes: the thread's next idle, sent before its park, and its end.
     #[cfg(test)]
     notes: Mutex<Notes>,
+    /// The log units started and those wholly ended, their count let go, for a test's count and
+    /// its wait for every unit begun to be over.
+    #[cfg(test)]
+    units: crate::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    ended: crate::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -242,6 +325,14 @@ pub(in crate::storage::atoll) struct Dispatch {
 struct Notes {
     idle: Option<std::sync::mpsc::Sender<()>>,
     exit: Option<std::sync::mpsc::Sender<()>>,
+    /// Each log unit's end: the door then, and the requests counted.
+    unit: Option<std::sync::mpsc::Sender<(u8, usize)>>,
+    /// A pause inside a quiet unit's end, after the door went quiet and before its count is let
+    /// go: the door and the count there, and the release.
+    end_gap: Option<(
+        std::sync::mpsc::Sender<(u8, usize)>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 /// The records of the metadata cache's writes, `checkpoint::WRITES` of them (DESIGN.md 22.18: the
@@ -249,6 +340,8 @@ struct Notes {
 pub(super) const META_WRITES: std::ops::Range<usize> = 0..crate::storage::atoll::checkpoint::WRITES;
 pub(super) const SUPERBLOCK: std::ops::Range<usize> = META_WRITES.end..META_WRITES.end + 1;
 const RECORDS: usize = SUPERBLOCK.end;
+/// The log's doorbell bit, after the records.
+pub(super) const LOG: usize = RECORDS;
 
 /// A record taken for one chain, by its index.
 pub(in crate::storage::atoll) struct Held(usize);
@@ -263,7 +356,9 @@ impl Dispatch {
     pub(super) fn new(requests: &Arc<Requests>) -> Self {
         Self {
             records: (0..RECORDS).map(|_| Record::default()).collect(),
-            bits: Bitmap::new(RECORDS),
+            bits: Bitmap::new(LOG + 1),
+            door: Door::new(),
+            log: crate::sync::OnceLock::new(),
             thread: crate::sync::OnceLock::new(),
             requests: Arc::downgrade(requests),
             #[cfg(test)]
@@ -272,6 +367,10 @@ impl Dispatch {
             hold: Mutex::new(None),
             #[cfg(test)]
             notes: Mutex::new(Notes::default()),
+            #[cfg(test)]
+            units: crate::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            ended: crate::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -439,9 +538,75 @@ impl Dispatch {
         while word != 0 {
             let bit = word.trailing_zeros() as usize;
             word &= word - 1;
-            self.serve(bit);
+            if bit == LOG {
+                self.serve_log();
+            } else {
+                self.serve(bit);
+            }
         }
         (served, stopped)
+    }
+
+    /// The log this dispatch serves: one per database, set once at its open.
+    pub(super) fn attach_log(&self, log: Weak<dyn LogWork>) {
+        let set = self.log.set(log);
+        assert!(set.is_ok(), "a second log on one database's dispatch");
+    }
+
+    /// The log's ring, made at a request's retirement while that request is still counted (D1b
+    /// §3.1). The ring that finds the door quiet takes the door's count, which cannot be refused
+    /// while its own request is counted, then sets the bit.
+    pub(super) fn ring_log(&self, requests: &Requests) {
+        if !self.door.ring() {
+            return;
+        }
+        let counted = requests.count_one();
+        assert!(
+            counted,
+            "a log ring refused while its own request is counted"
+        );
+        if self.bits.set(LOG) {
+            self.unpark();
+        }
+    }
+
+    /// One unit of the log's work (D1b §3.2): started from RUNG, its requests and its log upgraded
+    /// in that order, each optional; ended quiet with the door's count let go, or rung again.
+    fn serve_log(self: &Arc<Self>) {
+        #[cfg(test)]
+        if let Some(hold) = self.hold.lock().take() {
+            let _ = hold.recv();
+        }
+        let started = self.door.start();
+        assert!(started, "the log's bit served with its door not rung");
+        #[cfg(test)]
+        self.units.fetch_add(1, Order::Relaxed);
+        let Some(requests) = self.requests.upgrade() else {
+            // The requests are being dropped: no counted request is left to ring, and the count
+            // goes with them.
+            self.door.quiet();
+            #[cfg(test)]
+            self.note_unit(None);
+            return;
+        };
+        let log = self.log.get().and_then(Weak::upgrade);
+        // The unit takes the log's hold and lets it go as it returns, before the door ends: a
+        // drain that reads zero meets no unit holding the log. Its last holder may be this thread;
+        // a log owns no executor and no thread, so its drop is one this thread may run.
+        let owed = log.is_some_and(|log| log.unit());
+        match self.door.end(owed) {
+            End::Quiet => {
+                #[cfg(test)]
+                self.pause_at_end_gap(&requests);
+                requests.uncount_one();
+            }
+            End::Again => {
+                self.bits.set(LOG);
+            }
+        }
+        #[cfg(test)]
+        self.note_unit(Some(&requests));
+        drop(requests);
     }
 
     /// Submits the follow-on in record `i` through its file, counted already, with Counted's
@@ -548,6 +713,67 @@ impl Dispatch {
         let set = dispatch.thread.set(handle.thread().clone());
         debug_assert!(set.is_ok(), "an IO thread started twice");
         Ok(handle)
+    }
+
+    /// The log units started so far.
+    #[cfg(test)]
+    pub(super) fn units(&self) -> usize {
+        self.units.load(Order::Relaxed)
+    }
+
+    /// The log units wholly ended so far, each one's count let go.
+    #[cfg(test)]
+    pub(super) fn units_ended(&self) -> usize {
+        self.ended.load(Order::Acquire)
+    }
+
+    /// The log door's bits.
+    #[cfg(test)]
+    pub(super) fn door(&self) -> u8 {
+        self.door.read()
+    }
+
+    /// A note of each log unit's end, from the next on: the door then and the requests counted.
+    #[cfg(test)]
+    pub(super) fn on_unit_end(&self) -> std::sync::mpsc::Receiver<(u8, usize)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.notes.lock().unit = Some(tx);
+        rx
+    }
+
+    /// Pauses the next quiet unit's end between its door going quiet and its count's release: the
+    /// door and the count there, and the sender that lets it go on.
+    #[cfg(test)]
+    pub(super) fn pause_end_gap(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<(u8, usize)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        self.notes.lock().end_gap = Some((seen_tx, go_rx));
+        (seen_rx, go_tx)
+    }
+
+    #[cfg(test)]
+    fn note_unit(&self, requests: Option<&Requests>) {
+        // After the end and its count's release: a reader that sees it sees the release.
+        self.ended.fetch_add(1, Order::Release);
+        let note = self.notes.lock().unit.clone();
+        if let Some(note) = note {
+            let counted = requests.map_or(0, Requests::outstanding);
+            let _ = note.send((self.door.read(), counted));
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_at_end_gap(&self, requests: &Requests) {
+        let gap = self.notes.lock().end_gap.take();
+        if let Some((seen, go)) = gap {
+            let _ = seen.send((self.door.read(), requests.outstanding()));
+            let _ = go.recv();
+        }
     }
 
     /// Holds the IO thread before its next claim, until the returned sender sends or drops.

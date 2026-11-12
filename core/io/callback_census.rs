@@ -182,7 +182,7 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "storage/atoll/log/mod.rs",
         "submit_write",
         "new_write",
-        "records the write landed, wakes, starts the next sync and flush",
+        "records the write landed and wakes, submitting nothing",
     ),
     (
         "storage/atoll/log/preparer.rs",

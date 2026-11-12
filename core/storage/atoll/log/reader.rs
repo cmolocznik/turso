@@ -11,7 +11,7 @@
 #[cfg(test)]
 use super::record::GroupStart;
 use super::record::{self, framed_len, Header, Lsn, Parsed, Place, BLOCK};
-use super::segment::Segments;
+use super::segment::{Opens, Segments};
 use crate::io::{Completion, File, IO};
 use crate::storage::atoll::aligned::AlignedBlock;
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -397,9 +397,9 @@ impl ReadBack {
     /// each segment's file found by `file`: its header and where its payload lies in
     /// [`bytes`](Self::bytes), once read and checked as a reader of the log checks it. A read of
     /// another record still under way, one asked for before and given up, is let go first.
-    pub(super) fn step(
+    pub(super) fn step<O: Opens>(
         &mut self,
-        segments: &Segments,
+        segments: &Segments<O>,
         at: Lsn,
         end: Lsn,
         mut file: impl FnMut(u64) -> Result<Arc<dyn File>>,

@@ -27,6 +27,7 @@ use super::meta::MetaId;
 use super::page::PageId;
 use super::radix::FREE;
 use super::replay::{Apply, Gather};
+use super::requests::Counted;
 use super::store::PageStore;
 use super::txn::changes::Change;
 use super::txn::{self, Clock, Transactions};
@@ -60,7 +61,7 @@ struct Scan {
 /// Recovers the database `superblock` is in charge of, its store opened on that superblock, its
 /// log's preparer a task of `executor`, the database's.
 pub fn recover(
-    io: Arc<dyn IO>,
+    counted: Arc<Counted>,
     base: &str,
     config: &AtollConfig,
     store: Arc<PageStore>,
@@ -68,6 +69,7 @@ pub fn recover(
     superblock: Superblock,
     executor: &Executor,
 ) -> Result<Recovered> {
+    let io: Arc<dyn IO> = counted.clone();
     let mut scan = scan(&io, base, &config.log, &superblock)?;
     let restart = Log::resumes_at(scan.end);
     if restart > scan.end && superblock.continuations.len() >= MAX_CONTINUATIONS {
@@ -135,7 +137,7 @@ pub fn recover(
     // Reopening zeroes everything a crash left from `restart` on, durably. The gap is recorded
     // only then, and before anything is appended: a reader that follows it finds nothing past it
     // but what this recovery appends, never records the crash left there.
-    let log = Log::open_in(io.clone(), base, config.log.clone(), end, &pool, executor)?;
+    let log = Log::open_in(counted, base, config.log.clone(), end, &pool, executor)?;
     assert_eq!(log.end(), restart, "the log reopened elsewhere");
     let mut in_charge = superblock;
     if restart > end {

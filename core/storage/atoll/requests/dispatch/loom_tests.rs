@@ -4,7 +4,7 @@
 //! payload happens after the one before it; each actor of the idle models returns its decision,
 //! judged once all have joined, so a lost wake fails an assertion and no thread is left parked.
 
-use super::{Bitmap, Record};
+use super::{Bitmap, Door, End, Record};
 use loom::sync::Arc;
 use loom::thread;
 
@@ -144,5 +144,85 @@ fn an_io_thread_that_idles_before_the_stop_is_owed_its_unpark() {
             !idled || unparked,
             "the thread idled before the stop and no unpark was owed it"
         );
+    });
+}
+
+/// The log's door under loom, over the real `Door` and `Bitmap` (D1b §7.12), the requests' count
+/// beside them: two producers each write a piece of log state Relaxed, count their own request,
+/// ring, and only then let their own count go, as a retirement observer does; the IO thread takes
+/// the bit, starts a unit, reads both pieces and ends it, setting the bit again when the door says
+/// so. Judged once all have joined: the last unit read both pieces, so every ring was followed by a
+/// unit started after it that saw its write; the door ends `00`; the count ends at zero (mutants:
+/// a load-only coalescing return; the door's RMWs `Relaxed`; the end's swap to `RUNG` a store of
+/// `00`).
+#[test]
+fn every_ring_is_followed_by_a_unit_that_reads_what_its_producer_wrote() {
+    use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    check(|| {
+        let door = Arc::new(Door::new());
+        let bits = Arc::new(Bitmap::new(1));
+        let count = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let finished = Arc::new(AtomicUsize::new(0));
+        let producers: Vec<_> = (0..2)
+            .map(|i| {
+                let (door, bits, count, state, finished) = (
+                    door.clone(),
+                    bits.clone(),
+                    count.clone(),
+                    state.clone(),
+                    finished.clone(),
+                );
+                thread::spawn(move || {
+                    state[i].store(1, Ordering::Relaxed);
+                    count.fetch_add(1, Ordering::AcqRel);
+                    if door.ring() {
+                        count.fetch_add(1, Ordering::AcqRel);
+                        bits.set(0);
+                    }
+                    count.fetch_sub(1, Ordering::AcqRel);
+                    finished.fetch_add(1, Ordering::Release);
+                })
+            })
+            .collect();
+        let mut last = None;
+        let mut serve = || {
+            assert!(door.start(), "the log's bit served with its door not rung");
+            last = Some([0, 1].map(|i| state[i].load(Ordering::Relaxed)));
+            match door.end(false) {
+                End::Quiet => {
+                    count.fetch_sub(1, Ordering::AcqRel);
+                }
+                End::Again => {
+                    bits.set(0);
+                }
+            }
+        };
+        loop {
+            if bits.take().0 != 0 {
+                serve();
+                continue;
+            }
+            // Every ring set its bit before its producer finished: past both, an empty take
+            // leaves nothing to serve, and a taken bit is served.
+            if finished.load(Ordering::Acquire) == 2 {
+                if bits.take().0 == 0 {
+                    break;
+                }
+                serve();
+                continue;
+            }
+            thread::yield_now();
+        }
+        for p in producers {
+            p.join().unwrap();
+        }
+        assert_eq!(
+            last,
+            Some([1, 1]),
+            "what the last unit read of each producer's write"
+        );
+        assert_eq!(door.read(), 0, "the door at the end");
+        assert_eq!(count.load(Ordering::Acquire), 0, "the count at the end");
     });
 }

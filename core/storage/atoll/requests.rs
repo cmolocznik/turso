@@ -18,7 +18,7 @@
 mod dispatch;
 
 use dispatch::Dispatch;
-pub(super) use dispatch::{Chain, Held};
+pub(super) use dispatch::{Chain, Held, LogWork};
 
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{
@@ -217,11 +217,13 @@ impl Requests {
                     .compare_exchange(word, SEALED, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
+                    crate::race::point("requests.drain_sealed");
                     break;
                 }
                 continue;
             }
             if !pumped {
+                crate::race::point("requests.drain_parks");
                 crate::storage::atoll::park::thread();
                 continue;
             }
@@ -234,6 +236,7 @@ impl Requests {
                 }
                 Ok(Stepped::Empty) => {
                     registered = true;
+                    crate::race::point("requests.drain_parks");
                     crate::storage::atoll::park::thread();
                 }
             }
@@ -257,6 +260,7 @@ impl Requests {
             dispatch.stop();
         }
         if handle.thread().id() != crate::thread::current().id() {
+            crate::race::point("requests.stopping");
             // A panic on the IO thread ended the process (its loop is an Atoll entry): a join
             // returns its loop's end.
             let _ = handle.join();
@@ -336,6 +340,17 @@ impl Counted {
         }))
     }
 
+    /// The log these requests' dispatch serves (D1b): one per database, set once at its open.
+    pub(super) fn attach_log(&self, log: crate::sync::Weak<dyn LogWork>) {
+        self.requests.dispatch().attach_log(log);
+    }
+
+    /// The log's ring (D1b §3.1), from a retirement observer running before its request is
+    /// uncounted.
+    pub(super) fn ring_log(&self) {
+        self.requests.dispatch().ring_log(&self.requests);
+    }
+
     /// A record of the metadata cache's writes, taken at rest.
     pub(super) fn take_meta_write_record(&self) -> Result<Held> {
         self.requests.dispatch().take(dispatch::META_WRITES)
@@ -350,6 +365,54 @@ impl Counted {
     #[cfg(test)]
     pub(super) fn requests(&self) -> &Arc<Requests> {
         &self.requests
+    }
+
+    /// A note of the IO thread's end.
+    #[cfg(test)]
+    pub(super) fn on_io_exit(&self) -> std::sync::mpsc::Receiver<()> {
+        self.requests.dispatch().on_exit()
+    }
+
+    /// The log's doorbell bit in the IO thread's word, after the records (D1b §3.1).
+    #[cfg(test)]
+    pub(super) fn log_bit() -> usize {
+        dispatch::LOG
+    }
+
+    /// The log door's bits now (D1b §3.1): `RUNG` 2, `SERVING` 1.
+    #[cfg(test)]
+    pub(super) fn log_door(&self) -> u8 {
+        self.requests.dispatch().door()
+    }
+
+    /// The log units the IO thread has run, counted there (D1b §4).
+    #[cfg(test)]
+    pub(super) fn log_units(&self) -> usize {
+        self.requests.dispatch().units()
+    }
+
+    /// The log units wholly ended, each one's count let go (D1b §4).
+    #[cfg(test)]
+    pub(super) fn log_units_ended(&self) -> usize {
+        self.requests.dispatch().units_ended()
+    }
+
+    /// A note of each log unit's end from the next on: the door then, and the requests counted.
+    #[cfg(test)]
+    pub(super) fn on_log_unit_end(&self) -> std::sync::mpsc::Receiver<(u8, usize)> {
+        self.requests.dispatch().on_unit_end()
+    }
+
+    /// Pauses the next quiet log unit's end between its door going quiet and its count's release:
+    /// the door and the count there, and the sender that lets it go on.
+    #[cfg(test)]
+    pub(super) fn pause_log_end_gap(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<(u8, usize)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.requests.dispatch().pause_end_gap()
     }
 }
 
@@ -475,6 +538,20 @@ pub(super) struct CountedFile {
 }
 
 impl CountedFile {
+    /// Submits `submit`'s request through the file this wraps, counted once; `then` runs at the
+    /// request's retirement, before it is uncounted (D1b §2): the log's writes and sync members,
+    /// whose retirement observers ring the log's doorbell while their request still counts. A
+    /// refused submission runs nothing and is uncounted, never accepted.
+    pub(super) fn submit_then(
+        &self,
+        physical: Completion,
+        submit: impl FnOnce(&dyn File) -> Result<Completion>,
+        then: impl FnOnce() + Send + 'static,
+    ) -> Result<Completion> {
+        self.requests
+            .submit_with(physical, || submit(&*self.file), then)
+    }
+
     /// Writes `buffer` at `pos` as the first request of a chain in `held` (DESIGN.md 22.18, D1a
     /// §2), counted once and submitted through the file this wraps. At its retirement its sync,
     /// when owed (the write not durable, and it and `chain` wanting one), is made into the same

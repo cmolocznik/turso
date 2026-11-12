@@ -288,7 +288,7 @@ pub struct Partition {
     io: Arc<dyn IO>,
     base: String,
     config: LogConfig,
-    log: Arc<Log>,
+    log: super::log::AloneLog,
     chunks: Arc<Chunks>,
     file: Arc<dyn File>,
     state: Mutex<State>,
@@ -604,7 +604,10 @@ fn write_kept(io: &Arc<dyn IO>, file: &Arc<dyn File>, kept: &Kept) -> Result<()>
     let (write, written) = whole_write(KEPT_SIZE);
     drop(file.pwrite(at, block.region(0, KEPT_SIZE), write)?);
     crate::storage::atoll::park::wait_for_completion(io.as_ref(), written)?;
-    crate::storage::atoll::park::wait_for_completion(io.as_ref(), file.sync_data(Completion::new_sync(|_| {}))?)?;
+    crate::storage::atoll::park::wait_for_completion(
+        io.as_ref(),
+        file.sync_data(Completion::new_sync(|_| {}))?,
+    )?;
     Ok(())
 }
 

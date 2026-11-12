@@ -397,6 +397,21 @@ mod tests {
     /// guard of shared state, which ends the process, else as an ordinary test.
     const PANICKING: &[(&str, &str, &str)] = &[
         (
+            "log/unit_tests.rs",
+            "a_refused_sync_member_fails_the_log_and_leaves_nothing_counted",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
+            "the_requests_dropped_with_only_the_doors_work_left_leave_nothing",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
+            "a_unit_that_is_its_logs_last_owner_drops_it_on_the_io_thread_before_its_count_goes",
+            "child",
+        ),
+        (
             "requests/followon_tests.rs",
             "a_chains_counts_are_each_let_go_once",
             "child",

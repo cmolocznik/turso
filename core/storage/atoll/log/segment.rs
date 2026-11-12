@@ -11,6 +11,7 @@
 
 use super::super::arc_cell::{ArcCell, Releasing};
 use super::super::epoch::Epochs;
+use super::super::requests::{Counted, CountedFile};
 use super::super::segmented::Segmented;
 use crate::io::{File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicU8, Ordering};
@@ -32,21 +33,77 @@ const FULL: u8 = 2;
 /// Its spare is being renamed to a segment.
 const TAKING: u8 = 3;
 
-pub(super) struct Segments {
+/// How a set of segments opens its files: plainly, for a reader, or counted and typed, for the log
+/// that writes them, whose writes and syncs run their retirement observers before they are
+/// uncounted (D1b §2).
+pub(super) trait Opens: Send + Sync + 'static {
+    type File: File + ?Sized + Send + Sync + 'static;
+    fn io(&self) -> &Arc<dyn IO>;
+    fn open(&self, path: &str, flags: OpenFlags) -> Result<Arc<Self::File>>;
+}
+
+/// A reader's segments, opened through any IO.
+pub(super) struct Plain(Arc<dyn IO>);
+
+impl Opens for Plain {
+    type File = dyn File;
+    fn io(&self) -> &Arc<dyn IO> {
+        &self.0
+    }
+    fn open(&self, path: &str, flags: OpenFlags) -> Result<Arc<dyn File>> {
+        self.0.open_file(path, flags, false)
+    }
+}
+
+/// The writing log's segments, opened through the database's counted IO.
+pub(super) struct Typed {
+    counted: Arc<Counted>,
     io: Arc<dyn IO>,
+}
+
+impl Opens for Typed {
+    type File = CountedFile;
+    fn io(&self) -> &Arc<dyn IO> {
+        &self.io
+    }
+    fn open(&self, path: &str, flags: OpenFlags) -> Result<Arc<CountedFile>> {
+        self.counted.open_counted(path, flags, false)
+    }
+}
+
+pub(super) struct Segments<O: Opens = Plain> {
+    opens: O,
     base: String,
     pub size: u64,
     direct: bool,
-    files: Segmented<ArcCell<Arc<dyn File>>>,
-    releasing: Releasing<Arc<dyn File>>,
+    files: Segmented<ArcCell<Arc<O::File>>>,
+    releasing: Releasing<Arc<O::File>>,
     /// Each spare name's state: one renamer of it at a time, by compare-and-swap.
     spares: [AtomicU8; SPARES],
 }
 
-impl Segments {
+impl Segments<Plain> {
     pub fn new(io: Arc<dyn IO>, base: &str, size: u64, direct: bool) -> Self {
+        Self::with(Plain(io), base, size, direct)
+    }
+}
+
+impl Segments<Typed> {
+    pub fn counted(counted: Arc<Counted>, base: &str, size: u64, direct: bool) -> Self {
+        let io: Arc<dyn IO> = counted.clone();
+        Self::with(Typed { counted, io }, base, size, direct)
+    }
+
+    /// The counted IO the segments are opened through.
+    pub fn counted_io(&self) -> &Arc<Counted> {
+        &self.opens.counted
+    }
+}
+
+impl<O: Opens> Segments<O> {
+    fn with(opens: O, base: &str, size: u64, direct: bool) -> Self {
         Self {
-            io,
+            opens,
             base: base.to_string(),
             size,
             direct,
@@ -84,21 +141,25 @@ impl Segments {
             .unwrap_or_else(|| ".".to_string())
     }
 
+    fn io(&self) -> &Arc<dyn IO> {
+        self.opens.io()
+    }
+
     /// The open file of segment `number`, if it is open.
-    pub fn get(&self, number: u64) -> Option<Arc<dyn File>> {
+    pub fn get(&self, number: u64) -> Option<Arc<O::File>> {
         let cell = self.files.get(number)?;
         let step = self.releasing.epochs().enter();
         cell.get(&step).map(|file| (*file).clone())
     }
 
     /// Segment `number`, or `None` if it does not exist.
-    pub fn open(&self, number: u64) -> Result<Option<Arc<dyn File>>> {
+    pub fn open(&self, number: u64) -> Result<Option<Arc<O::File>>> {
         if let Some(file) = self.get(number) {
             return Ok(Some(file));
         }
         #[cfg(test)]
         super::SEGMENTS_OPENED.with(|n| n.set(n.get() + 1));
-        match self.io.open_file(&self.path(number), self.flags(), false) {
+        match self.opens.open(&self.path(number), self.flags()) {
             Ok(file) => {
                 // Opened by two at once, the first kept.
                 let step = self.releasing.epochs().enter();
@@ -117,10 +178,10 @@ impl Segments {
     }
 
     /// Creates segment `number`, empty.
-    pub fn create(&self, number: u64) -> Result<Arc<dyn File>> {
-        let file =
-            self.io
-                .open_file(&self.path(number), self.flags() | OpenFlags::Create, false)?;
+    pub fn create(&self, number: u64) -> Result<Arc<O::File>> {
+        let file = self
+            .opens
+            .open(&self.path(number), self.flags() | OpenFlags::Create)?;
         self.files
             .get_or_make(number)
             .replace(Some(Arc::new(file.clone())), &self.releasing);
@@ -128,7 +189,7 @@ impl Segments {
     }
 
     /// The open file of segment `number`, which must have been opened or created.
-    pub fn file(&self, number: u64) -> Arc<dyn File> {
+    pub fn file(&self, number: u64) -> Arc<O::File> {
         self.get(number)
             .unwrap_or_else(|| panic!("log segment {number} is not open"))
     }
@@ -137,7 +198,7 @@ impl Segments {
         if let Some(cell) = self.files.get(number) {
             cell.replace(None, &self.releasing);
         }
-        self.io.remove_file(&self.path(number))
+        self.io().remove_file(&self.path(number))
     }
 
     fn spare_path(&self, k: usize) -> String {
@@ -147,10 +208,13 @@ impl Segments {
     /// Takes in the spares a crash or an earlier process left: each whole, as a segment is.
     pub fn adopt_spares(&self) -> Result<()> {
         for (k, state) in self.spares.iter().enumerate() {
-            match self.io.open_file(&self.spare_path(k), self.flags(), false) {
+            match self
+                .io()
+                .open_file(&self.spare_path(k), self.flags(), false)
+            {
                 Ok(file) if file.size()? == self.size => state.store(FULL, Ordering::Release),
                 // Torn on its way, never a segment's.
-                Ok(_) => self.io.remove_file(&self.spare_path(k))?,
+                Ok(_) => self.io().remove_file(&self.spare_path(k))?,
                 Err(LimboError::CompletionError(CompletionError::IOError(
                     std::io::ErrorKind::NotFound,
                     _,
@@ -173,7 +237,10 @@ impl Segments {
             if let Some(cell) = self.files.get(number) {
                 cell.replace(None, &self.releasing);
             }
-            match self.io.rename_file(&self.path(number), &self.spare_path(k)) {
+            match self
+                .io()
+                .rename_file(&self.path(number), &self.spare_path(k))
+            {
                 Ok(true) => {
                     // Release: the rename happened before anyone takes the spare.
                     state.store(FULL, Ordering::Release);
@@ -191,7 +258,7 @@ impl Segments {
 
     /// Segment `number` made of a spare, if there is one: its file, whole, its old bytes never the
     /// log where they now lie. Durable once the directory is synced.
-    pub fn reuse(&self, number: u64) -> Result<Option<Arc<dyn File>>> {
+    pub fn reuse(&self, number: u64) -> Result<Option<Arc<O::File>>> {
         let Some((k, state)) = self.spares.iter().enumerate().find(|(_, s)| {
             // Acquire: pairs with the release that made it full, after its rename.
             s.compare_exchange(FULL, TAKING, Ordering::AcqRel, Ordering::Relaxed)
@@ -199,12 +266,14 @@ impl Segments {
         }) else {
             return Ok(None);
         };
-        let renamed = self.io.rename_file(&self.spare_path(k), &self.path(number));
+        let renamed = self
+            .io()
+            .rename_file(&self.spare_path(k), &self.path(number));
         state.store(EMPTY, Ordering::Release);
         if !renamed? {
             return Ok(None);
         }
-        let file = self.io.open_file(&self.path(number), self.flags(), false)?;
+        let file = self.opens.open(&self.path(number), self.flags())?;
         self.files
             .get_or_make(number)
             .replace(Some(Arc::new(file.clone())), &self.releasing);

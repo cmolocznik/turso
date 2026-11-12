@@ -73,9 +73,10 @@ use super::buffer::BufferPool;
 use super::once::SetOnce;
 use super::page::SizeClass;
 use super::prefix::Prefix;
+use super::requests::{Counted, LogWork};
 use super::solo::{Claim, Solo};
 use super::{whole, whole_write};
-use crate::io::{Completion, CompletionGroup, IO};
+use crate::io::{Completion, CompletionGroup, File, IO};
 use crate::storage::atoll::executor::{self, rank, Class, Executor, Signal, TaskRef};
 use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
@@ -85,7 +86,7 @@ use crossbeam_utils::CachePadded;
 use preparation::Word;
 use preparer::{PreparerTask, Told};
 use room::{Pad, Room};
-use segment::Segments;
+use segment::{Segments, Typed};
 use waits::{Look, Waits};
 
 #[cfg(test)]
@@ -171,7 +172,7 @@ struct Slot {
 
 pub struct Log {
     io: Arc<dyn IO>,
-    segments: Segments,
+    segments: Segments<Typed>,
     config: LogConfig,
     durable_writes: bool,
     ring: Box<[Slot]>,
@@ -219,10 +220,6 @@ pub struct Log {
     /// Let go by a caller once its run of the preparer has stepped it, where no worker steps it: a
     /// caller that found it stepped by another waits on this (DESIGN.md 22.7).
     stepped: crate::storage::atoll::notify::LetGo,
-    /// The executor of a log opened alone, which steps its preparer, with no worker: dropped with
-    /// the log, so it closes as the log goes.
-    #[cfg(test)]
-    own: Option<Executor>,
     /// Waiting for the log to be durable to a mark. Pushed onto by every commit that waits, so on a
     /// line of its own.
     durable_waits: CachePadded<Waits>,
@@ -236,6 +233,94 @@ pub struct Log {
     extents: crate::storage::atoll::locks::Mutex<std::collections::VecDeque<Extent>>,
     /// How many: a flush with none looks at no lock.
     extent_count: AtomicUsize,
+    /// What its plans and units did, for the tests, on whichever thread ran them.
+    #[cfg(test)]
+    pub(crate) counts: Counts,
+    /// The holds a test sets at named points of its plans and units, on whichever thread passes.
+    #[cfg(test)]
+    pub(crate) holds: Holds,
+    /// What a test keeps with the log, dropped with it on whichever thread drops the log last.
+    #[cfg(test)]
+    pub(crate) keepsake: crate::storage::atoll::locks::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+/// The counts a test reads of a log's plans and units (D1b §4), atomics so that work on the IO
+/// thread is seen, and the outcomes a test forces.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Counts {
+    /// Each `copied` load in `complete_from`.
+    pub(crate) chunk_loads: AtomicUsize,
+    pub(crate) pads_to: AtomicUsize,
+    pub(crate) pads_raced: AtomicUsize,
+    /// The extents lock taken by a plan, and the extents a plan's cursor passed.
+    pub(crate) extent_locks: AtomicUsize,
+    pub(crate) extent_visits: AtomicUsize,
+    pub(crate) writes: AtomicUsize,
+    pub(crate) turns: AtomicUsize,
+    /// The most members a sync group had.
+    pub(crate) sync_members_max: AtomicUsize,
+    /// `pad` returns `Raced` this many times first.
+    pub(crate) force_raced: AtomicUsize,
+    /// This many turns, the next ones taken, each ask for another inside themselves.
+    pub(crate) ask_in_turns: AtomicUsize,
+}
+
+/// A test's holds at named points of the log's plans and units: the thread that passes a point
+/// first, the IO thread's unit or a caller's flush, tells the test it arrived and waits there until
+/// let go. Unset, a point is one load.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Holds {
+    armed: AtomicUsize,
+    set: crate::storage::atoll::locks::Mutex<Vec<Hold>>,
+}
+
+/// A hold's point, the sender that tells the test it arrived, and the receiver it waits on.
+#[cfg(test)]
+type Hold = (
+    &'static str,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(test)]
+impl Holds {
+    /// Holds the next thread to pass `point`: the receiver hears it arrive, and the sender lets it
+    /// go on when it sends or drops.
+    pub(crate) fn set(
+        &self,
+        point: &'static str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived_tx, arrived) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        self.set.lock().push((point, arrived_tx, go_rx));
+        self.armed.fetch_add(1, Ordering::Release);
+        (arrived, go)
+    }
+
+    fn at(&self, point: &'static str) {
+        if self.armed.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let held = {
+            let mut set = self.set.lock();
+            set.iter()
+                .position(|(p, ..)| *p == point)
+                .map(|i| set.remove(i))
+        };
+        if let Some((_, arrived, go)) = held {
+            self.armed.fetch_sub(1, Ordering::Release);
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+}
+
+#[cfg(test)]
+fn take_one(n: &AtomicUsize) -> bool {
+    n.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+        .is_ok()
 }
 
 /// Space an operation may append into, taken from [`Log::admit`]; what it does not use goes back
@@ -259,11 +344,25 @@ impl Drop for Admitted {
 /// write starts, or, for `None`, the ring.
 type WriteSource = Option<(Arc<AlignedBlock>, usize)>;
 
-/// The executor a log is opened on: its database's, or, for a log opened alone, one of its own.
-enum Owner<'a> {
-    Shared(&'a Executor),
-    #[cfg(test)]
-    Own(Executor),
+/// A log opened alone, and the executor of its own that steps its preparer, with no worker, its
+/// callers running it (DESIGN.md 22.7). The executor is the opener's, never the log's: a log owns
+/// no executor and no thread, so whichever holder drops it last drops it lawfully, the IO thread's
+/// unit included (D1b §3.2), and an executor's close is never made on that thread. The log goes
+/// first, then the executor, as in close (22.12): a unit still holding the log meets the
+/// executor's tasks closed, as it does between close's steps 2 and 4.
+#[cfg(test)]
+pub(crate) struct AloneLog {
+    log: Arc<Log>,
+    /// Held for its drop alone, after the log's.
+    _executor: Executor,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for AloneLog {
+    type Target = Arc<Log>;
+    fn deref(&self) -> &Arc<Log> {
+        &self.log
+    }
 }
 
 impl Log {
@@ -285,10 +384,16 @@ impl Log {
     /// Opened alone, the log has an executor of its own with no worker, which steps its preparer,
     /// its callers running it (DESIGN.md 22.7).
     #[cfg(test)]
-    pub fn open(io: Arc<dyn IO>, base: &str, config: LogConfig, end: Lsn) -> Result<Arc<Self>> {
-        let own = Executor::new(io.clone(), 0)?;
-        Self::open_with(io, base, config, end, Owner::Own(own), |len| {
+    pub fn open(io: Arc<dyn IO>, base: &str, config: LogConfig, end: Lsn) -> Result<AloneLog> {
+        // Its own counted IO, whose IO thread serves its follow-on work (D1b).
+        let counted = super::requests::counted_for_test(io);
+        let executor = Executor::new(counted.clone(), 0)?;
+        let log = Self::open_with(counted, base, config, end, &executor, |len| {
             Ok(AlignedBlock::zeroed(len))
+        })?;
+        Ok(AloneLog {
+            log,
+            _executor: executor,
         })
     }
 
@@ -301,7 +406,8 @@ impl Log {
         end: Lsn,
         executor: &Executor,
     ) -> Result<Arc<Self>> {
-        Self::open_with(io, base, config, end, Owner::Shared(executor), |len| {
+        let counted = super::requests::counted_for_test(io);
+        Self::open_with(counted, base, config, end, executor, |len| {
             Ok(AlignedBlock::zeroed(len))
         })
     }
@@ -310,14 +416,14 @@ impl Log {
     /// open, so the log's memory is the pool's (one memory, Clay's ruling of 2026-11-05), and its
     /// preparer a task of the database's `executor`.
     pub fn open_in(
-        io: Arc<dyn IO>,
+        counted: Arc<Counted>,
         base: &str,
         config: LogConfig,
         end: Lsn,
         pool: &Arc<BufferPool>,
         executor: &Executor,
     ) -> Result<Arc<Self>> {
-        Self::open_with(io, base, config, end, Owner::Shared(executor), |len| {
+        Self::open_with(counted, base, config, end, executor, |len| {
             let class = SizeClass::fitting(len).ok_or_else(|| {
                 LimboError::InternalError(format!("a log chunk of {len} bytes fits no page class"))
             })?;
@@ -329,11 +435,11 @@ impl Log {
     }
 
     fn open_with(
-        io: Arc<dyn IO>,
+        counted: Arc<Counted>,
         base: &str,
         config: LogConfig,
         end: Lsn,
-        executor: Owner<'_>,
+        executor: &Executor,
         mut chunk: impl FnMut(usize) -> Result<AlignedBlock>,
     ) -> Result<Arc<Self>> {
         assert!(
@@ -348,18 +454,12 @@ impl Log {
             config.buffer_bytes >= config.chunk_bytes,
             "a log buffer smaller than one chunk"
         );
-        let segments = Segments::new(io.clone(), base, config.segment_bytes, config.direct);
+        let io: Arc<dyn IO> = counted.clone();
+        let segments = Segments::counted(counted, base, config.segment_bytes, config.direct);
         segments.adopt_spares()?;
         let start = Self::resumes_at(end);
         let current = segments.number(start);
         let durable_writes = Self::open_segments(&io, &segments, end, start)?;
-        #[cfg(test)]
-        let (own, shared) = match executor {
-            Owner::Shared(executor) => (None, Some(executor)),
-            Owner::Own(executor) => (Some(executor), None),
-        };
-        #[cfg(not(test))]
-        let Owner::Shared(shared) = executor;
         let slots = ring_slots(&config);
         let span = slots as u64 * config.chunk_bytes;
         let ring = (0..slots)
@@ -390,8 +490,6 @@ impl Log {
             triggered_for: AtomicU64::new(0),
             wanted_end: AtomicU64::new(0),
             stepped: Default::default(),
-            #[cfg(test)]
-            own,
             durable_waits: CachePadded::default(),
             admitters: CachePadded::default(),
             failed: AtomicBool::new(false),
@@ -399,18 +497,21 @@ impl Log {
             zeros: Arc::new(AlignedBlock::zeroed(config.chunk_bytes as usize)),
             extents: crate::storage::atoll::locks::Mutex::new(std::collections::VecDeque::new()),
             extent_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            counts: Counts::default(),
+            #[cfg(test)]
+            holds: Holds::default(),
+            #[cfg(test)]
+            keepsake: crate::storage::atoll::locks::Mutex::new(None),
             segments,
             config,
         });
         log.account_resumed(start);
+        // Its follow-on work is the dispatch's to serve, the log held weakly (D1b §5).
+        let work: Weak<dyn LogWork> = Arc::downgrade(&log) as Weak<dyn LogWork>;
+        log.segments.counted_io().attach_log(work);
         // The preparer, after the checkpoint in the order jobs wait on each other (DESIGN.md 22.4),
         // holding the log weakly: nothing the executor holds keeps the log alive.
-        #[cfg(test)]
-        let executor = shared
-            .or(log.own.as_ref())
-            .expect("a log opened on an executor or with its own");
-        #[cfg(not(test))]
-        let executor = shared;
         let task = executor.spawn_ranked(
             Class::Maintenance,
             rank::PREPARER,
@@ -426,7 +527,12 @@ impl Log {
 
     /// Readies the segment holding `start` to append into and removes every segment after it:
     /// they hold nothing of the log. Returns whether its writes are durable on completion.
-    fn open_segments(io: &Arc<dyn IO>, segments: &Segments, end: Lsn, start: Lsn) -> Result<bool> {
+    fn open_segments(
+        io: &Arc<dyn IO>,
+        segments: &Segments<Typed>,
+        end: Lsn,
+        start: Lsn,
+    ) -> Result<bool> {
         let current = segments.number(start);
         let mut later = current + 1;
         while segments.open(later)?.is_some() {
@@ -750,28 +856,6 @@ impl Log {
         (GroupStart::at(start), start + len)
     }
 
-    /// The record published in place that ends past `at`, the first by where it lies.
-    fn extent_from(&self, at: Lsn) -> Option<(Lsn, Lsn, Arc<AlignedBlock>)> {
-        if self.extent_count.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let extents = self.extents.lock();
-        extents
-            .iter()
-            .find(|e| e.end > at)
-            .map(|e| (e.start, e.end, e.block.clone()))
-    }
-
-    /// Lets go of every record published in place that lies wholly before `at`: its writes are
-    /// submitted, and they hold its block.
-    fn extents_written_to(&self, at: Lsn) {
-        let mut extents = self.extents.lock();
-        while extents.front().is_some_and(|e| e.end <= at) {
-            extents.pop_front();
-            self.extent_count.fetch_sub(1, Ordering::Release);
-        }
-    }
-
     /// Appends `records` as one group: contiguous in the log, and replayed by recovery all
     /// together or not at all, so a change spanning several pages survives a crash whole or not
     /// at all. Returns where the group starts and each record's LSN. As with
@@ -1046,6 +1130,8 @@ impl Log {
             let end = (start + chunk_bytes).min(insert);
             let slot = &self.ring[(chunk % ring) as usize];
             let expected = (chunk / ring) * chunk_bytes + (end - start);
+            #[cfg(test)]
+            self.counts.chunk_loads.fetch_add(1, Ordering::Relaxed);
             if slot.copied.load(Ordering::Acquire) != expected {
                 return start.max(from);
             }
@@ -1060,7 +1146,18 @@ impl Log {
     /// pushes no record granted past the prepared segments ([`Room::pad`]); padding waiting for a
     /// segment flushes again once it is prepared.
     fn pad(&self, at: Lsn) -> Pad {
+        #[cfg(test)]
+        if take_one(&self.counts.force_raced) {
+            self.counts.pads_raced.fetch_add(1, Ordering::Relaxed);
+            return Pad::Raced;
+        }
         let padded = self.room.pad(at);
+        #[cfg(test)]
+        match padded {
+            Pad::To(_) => self.counts.pads_to.fetch_add(1, Ordering::Relaxed),
+            Pad::Raced => self.counts.pads_raced.fetch_add(1, Ordering::Relaxed),
+            Pad::Unprepared => 0,
+        };
         match padded {
             Pad::To(to) => {
                 self.copy_in(at, &record::padding(at));
@@ -1149,6 +1246,10 @@ impl Log {
             if ASK_DURING_TURN.with(|a| a.replace(false)) {
                 self.flushes.ask();
             }
+            self.counts.turns.fetch_add(1, Ordering::Relaxed);
+            if take_one(&self.counts.ask_in_turns) {
+                self.flushes.ask();
+            }
         }
         let (writes, unprepared) = self.plan_writes();
         drop(turn);
@@ -1163,7 +1264,11 @@ impl Log {
     }
 
     /// The writes to start, from where the last ended, and whether padding waits for a segment:
-    /// for the flush under way.
+    /// for the flush under way. Bounded by the configuration alone (D1b §4): the horizon is
+    /// captured once, at most `ring_slots` chunk loads, and never refreshed within the plan; at
+    /// most one padding attempt, its padded block the plan's last; the in-place extents read only
+    /// after the capture, locked once when there are any and passed once by a cursor; at most
+    /// `writes_in_flight` writes.
     fn plan_writes(&self) -> (Vec<(Lsn, Lsn, WriteSource)>, bool) {
         let mut writes = Vec::new();
         if self.failed.load(Ordering::Acquire) {
@@ -1176,24 +1281,50 @@ impl Log {
         } else {
             1
         };
+        // No write can start: nothing is scanned or locked.
+        if self.in_flight.load(Ordering::Acquire) >= limit {
+            return (writes, false);
+        }
         // The turn's own, handed from turn to turn by the turns themselves.
         let mut start = self.submitted.load(Ordering::Relaxed);
         let mut unprepared = false;
+        #[cfg(test)]
+        self.holds.at("plan.capture");
+        let insert = self.room.end();
+        let mut complete = self.complete_from(start, insert);
+        // Only after the capture: an extent whose bytes the capture acquired was inserted and
+        // counted before them, so a zero here means none lies inside it. The publisher takes the
+        // lock only to insert, and nothing here waits while it is held.
+        let mut extents = (self.extent_count.load(Ordering::Acquire) > 0).then(|| {
+            #[cfg(test)]
+            self.counts.extent_locks.fetch_add(1, Ordering::Relaxed);
+            self.extents.lock()
+        });
+        let mut cursor = 0;
         while self.in_flight.load(Ordering::Acquire) < limit {
-            let insert = self.room.end();
-            let complete = self.complete_from(start, insert);
             let mut end = complete - complete % BLOCK;
             let someone_waits = wanted > start || admitting;
             if end <= start {
                 // No whole block is ready. Pad the partial one if someone waits on it and every
-                // byte reserved so far is in.
+                // byte reserved so far is in. A padded horizon is no longer the insert position,
+                // so this is reached at most once.
                 if !(someone_waits && complete == insert && insert > start) {
                     break;
                 }
+                // No extent lies in the partial block: one would be whole and complete.
+                drop(extents.take());
                 match self.pad(insert) {
-                    Pad::To(padded) => end = padded,
-                    // Someone reserved more meanwhile: look again.
-                    Pad::Raced => continue,
+                    Pad::To(padded) => {
+                        complete = padded;
+                        end = padded;
+                        #[cfg(test)]
+                        self.holds.at("plan.padded");
+                    }
+                    // Someone reserved more meanwhile: the next turn, asked for here, looks again.
+                    Pad::Raced => {
+                        self.flushes.ask();
+                        break;
+                    }
                     Pad::Unprepared => {
                         unprepared = true;
                         break;
@@ -1202,7 +1333,16 @@ impl Log {
             }
             // A record published in place is written from its block, at once: it is one write
             // already, and its block goes back once it lands. The ring's writes stop at its start.
-            let extent = self.extent_from(start);
+            // Each extent the cursor examines is one visit, the one it stops at included.
+            let extent = extents.as_deref().and_then(|queue| loop {
+                let e = queue.get(cursor)?;
+                #[cfg(test)]
+                self.counts.extent_visits.fetch_add(1, Ordering::Relaxed);
+                if e.end > start {
+                    break Some((e.start, e.end, e.block.clone()));
+                }
+                cursor += 1;
+            });
             let in_place = extent.as_ref().is_some_and(|&(s, ..)| s <= start);
             if !someone_waits && !in_place && end - start < self.config.chunk_bytes {
                 // Nobody waits: let a chunk's worth gather.
@@ -1214,7 +1354,13 @@ impl Log {
                 Some((s, e, block)) if s <= start => {
                     let write_end = end.min(e).min(segment_end);
                     if write_end == e {
-                        self.extents_written_to(e);
+                        // Every extent up to this one is wholly submitted: let them go.
+                        let queue = extents.as_mut().expect("an extent read under the lock");
+                        while queue.front().is_some_and(|x| x.end <= e) {
+                            queue.pop_front();
+                            self.extent_count.fetch_sub(1, Ordering::Release);
+                            cursor = cursor.saturating_sub(1);
+                        }
                     }
                     (write_end, Some((block, s)))
                 }
@@ -1222,6 +1368,8 @@ impl Log {
                 None => (end.min(chunk_end).min(segment_end), None),
             };
             self.in_flight.fetch_add(1, Ordering::AcqRel);
+            #[cfg(test)]
+            self.counts.writes.fetch_add(1, Ordering::Relaxed);
             writes.push((
                 start,
                 write_end,
@@ -1236,13 +1384,20 @@ impl Log {
     /// The hold a completion keeps on the log, weak: the completion waits in the log's own IO, so
     /// a strong hold would keep a dropped log, its ring and its files alive while it is in flight,
     /// and for good once nothing steps that IO. A write that lands after the log is gone leaves
-    /// what a crash then would.
+    /// what a crash then would, and its retirement rings nothing (D1b §6).
     fn held(self: &Arc<Self>) -> Weak<Self> {
         Arc::downgrade(self)
     }
 
+    /// Rings the log's doorbell (D1b §3.1), from a retirement observer before its request is
+    /// uncounted, or from the unit itself (the sync submitter's hold, D1b §2).
+    fn ring(&self) {
+        self.segments.counted_io().ring_log();
+    }
+
     /// Writes `[start, end)`: from a record published in place, its block and where in it
-    /// `start` lies, or from the ring.
+    /// `start` lies, or from the ring. Its retirement, before it is uncounted, lets its place
+    /// among the writes in flight go and rings the log's doorbell (D1b §2).
     fn submit_write(self: &Arc<Self>, start: Lsn, end: Lsn, from: WriteSource) {
         let segment = self.segments.number(start);
         let file = self.segments.file(segment);
@@ -1261,27 +1416,30 @@ impl Log {
             }
         });
         let at = start - self.segments.start(segment);
-        let submitted = if self.durable_writes {
-            file.pwrite_durable(at, buffer, c)
-        } else {
-            file.pwrite(at, buffer, c)
-        };
-        match submitted {
-            // Its place among the writes in flight is let go when it retires, not when its
-            // callback runs (ASYNC1 v3.8, a log write record): a write that count admits then
-            // finds its record free. The flush it owes the log is made there too.
-            Ok(c) => {
-                let me = self.held();
-                c.on_retired(move || {
-                    if let Some(me) = me.upgrade() {
-                        me.write_retired();
-                    }
-                });
-            }
-            Err(e) => self.fail(io_failure(&e)),
+        let durable = self.durable_writes;
+        let retired = self.held();
+        let submitted = file.submit_then(
+            c.clone(),
+            |f| {
+                if durable {
+                    f.pwrite_durable(at, buffer, c)
+                } else {
+                    f.pwrite(at, buffer, c)
+                }
+            },
+            move || {
+                if let Some(me) = retired.upgrade() {
+                    me.write_retired();
+                }
+            },
+        );
+        if let Err(e) = submitted {
+            self.fail(io_failure(&e));
         }
     }
 
+    /// A write's callback: its landing recorded, and with durable writes the durable position
+    /// raised and its waiters woken. It submits and rings nothing (D1b §2).
     fn written(
         self: &Arc<Self>,
         start: Lsn,
@@ -1293,38 +1451,52 @@ impl Log {
             return;
         }
         self.landed.complete(start, end);
+        crate::race::point("log.written.landed");
         if self.durable_writes {
             self.room.raise_durable(self.landed.at());
             self.wake();
-        } else {
-            self.start_sync();
         }
-        self.flush();
     }
 
-    /// A write retired: its place among those in flight goes, and the flush it may admit is made.
+    /// A write retired, before it is uncounted: its place among those in flight goes, and the
+    /// work that may now be owed rings the doorbell.
     fn write_retired(self: &Arc<Self>) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
-        self.flush();
+        self.ring();
+        crate::race::point("log.write_retired.rang");
     }
 
-    /// Starts syncing the writes landed and not yet durable, unless a sync is in flight, which
-    /// starts the next when its last member retires.
-    fn start_sync(self: &Arc<Self>) {
-        while self.sync.take() {
-            let durable = self.durable();
-            let landed = self.landed.at();
-            if landed > durable {
-                return self.submit_sync(durable, landed);
-            }
-            self.sync.release();
-            if self.landed.at() <= self.durable() {
-                return;
-            }
+    /// The unit's sync start (D1b §4 step 1), for files that do not write durably: one take of the
+    /// sync claim; a group covering the landed bytes past the durable position, capped at `M`
+    /// segments; or, nothing to sync, the claim released and owed reported if a write landed
+    /// meanwhile. A claim held by a group is that group's: its last member rings at its release.
+    fn sync_start(self: &Arc<Self>) -> bool {
+        if !self.sync.take() {
+            return false;
         }
+        let durable = self.durable();
+        let landed = self.landed.at();
+        if landed > durable {
+            let cap = self
+                .segments
+                .start(self.segments.number(durable) + self.sync_members_bound());
+            self.submit_sync(durable, landed.min(cap));
+            return false;
+        }
+        self.sync.release();
+        self.landed.at() > self.durable()
     }
 
-    /// Syncs the segments the writes from `from` to `covers` went to.
+    /// The members a sync group has at most, `M = ceil(buffer_bytes / segment_bytes) + 1`: a
+    /// bound by construction, since its covers is capped at `M` segments from the durable
+    /// position's (D1b §4). Padding is granted outside the buffer (`Room::pad`), so the bytes
+    /// landed and not durable can exceed the buffer, and no bound may rest on that.
+    fn sync_members_bound(&self) -> u64 {
+        self.config.buffer_bytes.div_ceil(self.segments.size) + 1
+    }
+
+    /// Syncs the segments the writes from `from` to `covers` went to, `covers` capped by
+    /// [`sync_start`](Self::sync_start).
     fn submit_sync(self: &Arc<Self>, from: Lsn, covers: Lsn) {
         let me = self.held();
         let mut group = CompletionGroup::new(move |res| {
@@ -1334,6 +1506,10 @@ impl Log {
         });
         let segments: Vec<u64> =
             (self.segments.number(from)..=self.segments.number(covers - 1)).collect();
+        #[cfg(test)]
+        self.counts
+            .sync_members_max
+            .fetch_max(segments.len(), Ordering::Relaxed);
         let syncs: Vec<_> = segments
             .iter()
             .map(|_| {
@@ -1342,7 +1518,7 @@ impl Log {
                 c
             })
             .collect();
-        let all = group.build();
+        drop(group.build());
         // The sync's token is let go when its last member retires, not when the group's callback
         // runs (ASYNC1 v3.8, a log sync record): the next sync then finds every record free. The
         // count holds one more, the submitter's, let go once every member is submitted, so no
@@ -1350,39 +1526,50 @@ impl Log {
         // submit; a failed submission keeps it, the log failed. Set under the token, which the
         // last group's last decrement let go after it: no member of that group is left to count.
         self.sync_members.store(syncs.len() + 1, Ordering::Release);
-        for (segment, c) in segments.iter().zip(syncs) {
-            match self.segments.file(*segment).sync_data(c) {
-                Ok(c) => {
-                    let me = self.held();
-                    c.on_retired(move || {
-                        if let Some(me) = me.upgrade() {
-                            me.sync_member_retired();
-                        }
-                    });
+        let mut members = segments.iter().zip(syncs);
+        for (segment, c) in members.by_ref() {
+            let retired = self.held();
+            let member = c.clone();
+            let submitted = self.segments.file(*segment).submit_then(
+                c.clone(),
+                |f| f.sync_data(c),
+                move || {
+                    if let Some(me) = retired.upgrade() {
+                        me.sync_member_retired();
+                    }
+                },
+            );
+            if let Err(e) = submitted {
+                // The log fails; the refused member and those never submitted finish here with
+                // the refusal, and the group ends once the members a backend holds finish too:
+                // its callback runs only with every member finished. The token stays held, as a
+                // failed log syncs nothing more.
+                self.fail(io_failure(&e));
+                member.abort();
+                for (_, unsent) in members {
+                    unsent.abort();
                 }
-                Err(e) => {
-                    all.abort();
-                    self.fail(io_failure(&e));
-                    return;
-                }
+                return;
             }
         }
         self.sync_member_retired();
     }
 
-    /// One of the sync's members retired, or its submitter let its hold go: the last of them lets
-    /// the sync's token go and, the log not failed, starts the next sync.
+    /// One of the sync's members retired, before it is uncounted, or its submitter let its hold
+    /// go inside the unit: the last of them lets the sync's token go and, the log not failed,
+    /// rings the doorbell, whose unit starts the next group (D1b §2).
     fn sync_member_retired(self: &Arc<Self>) {
         if self.sync_members.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
         self.sync.release();
         if !self.failed.load(Ordering::Acquire) {
-            self.start_sync();
-            self.flush();
+            self.ring();
         }
     }
 
+    /// The group's callback: the durable position raised to `covers` and its waiters woken. It
+    /// submits and rings nothing, and releases nothing: the claim is its members' (D1b §2).
     fn synced(self: &Arc<Self>, covers: Lsn, res: std::result::Result<i32, CompletionError>) {
         if let Err(e) = res {
             self.fail(e);
@@ -1390,7 +1577,6 @@ impl Log {
         }
         self.room.raise_durable(covers);
         self.wake();
-        self.flush();
     }
 
     /// Wakes those waiting for the durable position raised, and those waiting to be admitted.
@@ -1552,11 +1738,12 @@ impl Log {
     ) -> Result<IOResult<(Header, std::ops::Range<usize>)>> {
         let segments = &self.segments;
         back.step(segments, at.get(), end, |number| {
-            segments.get(number).ok_or_else(|| {
+            let file: Arc<dyn crate::io::File> = segments.get(number).ok_or_else(|| {
                 LimboError::InternalError(format!(
                     "log segment {number}, which a running transaction's part lies in, is not open"
                 ))
-            })
+            })?;
+            Ok(file)
         })
     }
 
@@ -1574,6 +1761,23 @@ impl Log {
             Arc::new(Segments::new(io, base, config.segment_bytes, config.direct)),
             at,
         )
+    }
+}
+
+impl LogWork for Log {
+    /// One unit of the log's follow-on work (D1b §4), on the IO thread: the sync start, for files
+    /// that do not write durably, then one flush turn. Whether more is owed.
+    fn unit(self: Arc<Self>) -> bool {
+        #[cfg(test)]
+        self.holds.at("unit.started");
+        if self.failed.load(Ordering::Acquire) {
+            return false;
+        }
+        let synced = !self.durable_writes && self.sync_start();
+        let flushed = self.flush_one_turn();
+        #[cfg(test)]
+        self.holds.at("unit.ended");
+        synced || flushed
     }
 }
 
@@ -1602,3 +1806,5 @@ fn io_failure(e: &LimboError) -> CompletionError {
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+mod unit_tests;

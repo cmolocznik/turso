@@ -28,6 +28,70 @@ fn header(txn: u64) -> Header {
     }
 }
 
+/// The bound on a test's whole wait for the IO thread's log units: past it, the wait reports that
+/// they never ended.
+pub(super) const SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Waits until the log's door is quiet and every unit begun has wholly ended, its count let go:
+/// every ring made so far served (D1b §3.1). A quiet door alone is not that, as a unit goes quiet
+/// before its count goes. Bounded by [`SETTLE`], however many units end meanwhile: whether it got
+/// there. A ring comes from a retirement, so with the test the only one retiring a request
+/// meanwhile, a quiet door stays quiet.
+pub(super) fn settled(log: &Log) -> bool {
+    settled_by(log, std::time::Instant::now() + SETTLE)
+}
+
+/// [`settled`], ending at `deadline`.
+pub(super) fn settled_by(log: &Log, deadline: std::time::Instant) -> bool {
+    let counted = log.segments.counted_io();
+    // Armed before the first read: a unit ending after it is noted to this receiver.
+    let ended = counted.on_log_unit_end();
+    loop {
+        if counted.log_door() == 0 && counted.log_units_ended() == counted.log_units() {
+            return true;
+        }
+        // Read before each receive: a receive returns a queued note however short its bound.
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        if ended.recv_timeout(deadline - now).is_err() {
+            return false;
+        }
+    }
+}
+
+/// Answers and lets go of every request `holding` holds, `seen` told what each asks for first,
+/// then of every one the log's units make once those retire, until the units, quiet, make none:
+/// whether that ended within one [`SETTLE`] for the whole of it.
+fn answer_all_seeing(log: &Log, holding: &Holding, mut seen: impl FnMut(i32)) -> bool {
+    let deadline = std::time::Instant::now() + SETTLE;
+    loop {
+        while let Some((c, r)) = holding.oldest() {
+            seen(r);
+            c.complete(r);
+            c.retire();
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
+        if !settled_by(log, deadline) {
+            return false;
+        }
+        if holding.queued().is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+/// [`answer_all_seeing`], seeing nothing.
+fn answer_all(log: &Log, holding: &Holding) -> bool {
+    answer_all_seeing(log, holding, |_| {})
+}
+
 /// Who appended a record, its number, and filler of a length that varies with both.
 fn payload(writer: u64, seq: u64) -> Vec<u8> {
     let filler = 1 + ((writer * 7_919 + seq * 104_729) % 600) as usize;
@@ -982,7 +1046,7 @@ fn a_waiter_runs_the_preparer_where_no_worker_steps_it_and_waits_on_its_requests
 /// A log opened three blocks before its first segment's end, nothing granted, less than a segment
 /// prepared ahead: the preparer's next step prepares the next segment. With `fresh_next`, the
 /// next segment the log before it prepared is gone, so it is created fresh, not made of a spare.
-fn reopened_short(io: &Arc<dyn IO>, fresh_next: bool) -> Arc<Log> {
+fn reopened_short(io: &Arc<dyn IO>, fresh_next: bool) -> AloneLog {
     let config = small();
     let segment = config.segment_bytes;
     let filler = vec![7u8; 996];
@@ -1006,7 +1070,7 @@ fn reopened_short(io: &Arc<dyn IO>, fresh_next: bool) -> Arc<Log> {
 /// block waits for the next segment while the preparer has not begun it: the state a flush meets
 /// only if the preparer has not run since less than a segment was prepared ahead. Returns the
 /// log, the record's LSN and the room still held.
-fn padding_with_no_preparation(io: &Arc<dyn IO>, fresh_next: bool) -> (Arc<Log>, Lsn, Admitted) {
+fn padding_with_no_preparation(io: &Arc<dyn IO>, fresh_next: bool) -> (AloneLog, Lsn, Admitted) {
     let segment = small().segment_bytes;
     let log = reopened_short(io, fresh_next);
     let record = vec![1u8; 36];
@@ -1523,11 +1587,13 @@ impl File for HoldingFile {
 }
 
 /// The log's writes in flight and its sync each hold their record until their request retires, not
-/// until their callback runs (ASYNC1 v3.8, a log write record and a log sync record): a write
-/// answered and still owned leaves a further flush making no write, and once it retires the next
-/// write goes; a sync answered and still owned leaves the next sync unstarted though writes landed
-/// past it, and once it retires the next sync goes (mutants: the write's place or the sync's token
-/// let go in its callback).
+/// until their callback runs (ASYNC1 v3.8, a log write record and a log sync record), and the sync
+/// starts at the write's retirement, on the IO thread's unit (D1b §2): a write answered and still
+/// owned starts no sync and leaves a further flush making no write; once it retires, the unit
+/// starts the sync and makes the next write; a sync answered and still owned leaves the next sync
+/// unstarted though a write landed past it, and once it retires the next sync goes (mutants: the
+/// write's place or the sync's token let go in its callback). Each read of what is held follows
+/// the units' end (`settled`).
 #[test]
 fn a_log_write_and_its_sync_hold_their_records_until_they_retire() {
     let holding = Arc::new(Holding::default());
@@ -1551,6 +1617,7 @@ fn a_log_write_and_its_sync_hold_their_records_until_they_retire() {
         append(&log);
     }
     drive(&io, || log.wait_durable(&mut LogWait::default(), BLOCK)).unwrap();
+    let mut quiet = settled(&log);
     *holding.paths.lock() = vec![log.segments.path(0)];
     let a = append(&log);
     let _ = log.wait_durable(&mut LogWait::default(), a);
@@ -1559,13 +1626,15 @@ fn a_log_write_and_its_sync_hold_their_records_until_they_retire() {
     if let Some((c, r)) = &w1 {
         c.complete(*r);
     }
-    // W1 answered and still owned: its sync S1 started; a further flush makes no write.
+    // W1 answered and still owned: no sync started, and a further flush makes no write.
     let b = append(&log);
     let _ = log.wait_durable(&mut LogWait::default(), b);
     let while_write_owned = holding.queued();
     if let Some((c, _)) = &w1 {
         c.retire();
     }
+    quiet &= settled(&log);
+    // W1 retired: its unit started the sync S1 and made the next write W2.
     let once_write_retired = holding.queued();
     let s1 = holding.oldest();
     if let Some((c, _)) = &s1 {
@@ -1576,32 +1645,33 @@ fn a_log_write_and_its_sync_hold_their_records_until_they_retire() {
         c.complete(*r);
         c.retire();
     }
+    quiet &= settled(&log);
     // S1 answered and still owned, W2 landed past it: no next sync.
     let while_sync_owned = holding.queued();
     if let Some((c, _)) = &s1 {
         c.retire();
     }
+    quiet &= settled(&log);
     let once_sync_retired = holding.queued();
     // Every request answered and let go before the assertions.
-    while let Some((c, r)) = holding.oldest() {
-        c.complete(r);
-        c.retire();
-    }
+    quiet &= answer_all(&log, &holding);
     let durable = log.durable() >= b;
     let failure = log.failure();
     drop(log);
+    assert!(quiet, "the log's units did not end within {SETTLE:?}");
     assert!(len1 > 0, "no first write held");
     assert_eq!(
         while_write_owned,
-        vec![0],
-        "a write made while the last one was owned"
+        Vec::<i32>::new(),
+        "a sync started at the write's answer, or a write made while it was owned"
     );
     assert_eq!(
         once_write_retired.len(),
         2,
-        "the next write not made once the last retired: {once_write_retired:?}"
+        "the sync and the next write not made once the last write retired: {once_write_retired:?}"
     );
-    assert!(once_write_retired[1] > 0);
+    assert_eq!(once_write_retired[0], 0, "{once_write_retired:?}");
+    assert!(once_write_retired[1] > 0, "{once_write_retired:?}");
     assert!(w2.is_some());
     assert_eq!(
         while_sync_owned,
@@ -1622,7 +1692,8 @@ fn a_log_write_and_its_sync_hold_their_records_until_they_retire() {
 /// segment's end land while an earlier sync is owned, so the next group syncs both segments; its
 /// first member retired and the second still owned, a write landing after leaves the next sync
 /// unstarted, and once the second retires it goes (mutant: the token let go at the first member's
-/// retirement, a group counted as one).
+/// retirement, a group counted as one). The syncs start on the IO thread's units (D1b §2), so each
+/// read of what is held follows the units' end (`settled`).
 #[test]
 fn a_sync_spanning_two_segments_holds_the_token_until_its_last_member_retires() {
     let holding = Arc::new(Holding::default());
@@ -1651,8 +1722,10 @@ fn a_sync_spanning_two_segments_holds_the_token_until_its_last_member_retires() 
             break;
         }
     }
+    let mut quiet = settled(&log);
     *holding.paths.lock() = vec![log.segments.path(0), log.segments.path(1)];
-    // An earlier sync answered and still owned, its token held.
+    // An earlier sync answered and still owned, its token held: started by the unit the first
+    // write's retirement rang.
     let a = append(&log);
     let _ = log.wait_durable(&mut LogWait::default(), a);
     let answer = |r: (Completion, i32)| {
@@ -1664,26 +1737,26 @@ fn a_sync_spanning_two_segments_holds_the_token_until_its_last_member_retires() 
     if let Some(w) = first_write {
         answer(w);
     }
+    quiet &= settled(&log);
     let earlier = holding.oldest();
     let earlier_is_sync = earlier.as_ref().is_some_and(|(_, r)| *r == 0);
     if let Some((c, _)) = &earlier {
         c.complete(0);
     }
-    // Writes across the first segment's end, landed while the earlier sync is owned.
+    // Writes across the first segment's end, landed while the earlier sync is owned: the caller's
+    // flush makes the first, and each retirement's unit the next.
     while log.end() < segment + 1024 {
         append(&log);
     }
     let b = log.end();
     let _ = log.wait_durable(&mut LogWait::default(), b);
     let mut sync_meanwhile = false;
-    while let Some((c, r)) = holding.oldest() {
-        sync_meanwhile |= r == 0;
-        answer((c, r));
-    }
+    quiet &= answer_all_seeing(&log, &holding, |r| sync_meanwhile |= r == 0);
     // The earlier sync retired: the next group syncs both segments.
     if let Some((c, _)) = &earlier {
         c.retire();
     }
+    quiet &= settled(&log);
     let group = holding.queued();
     let first = holding.oldest();
     let second = holding.oldest();
@@ -1697,27 +1770,26 @@ fn a_sync_spanning_two_segments_holds_the_token_until_its_last_member_retires() 
     let c_end = append(&log);
     let _ = log.wait_durable(&mut LogWait::default(), c_end);
     let mut late_writes = 0;
-    while let Some((c, r)) = holding.oldest() {
+    // A sync made meanwhile is answered and let go, so the log is left whole, and counted.
+    quiet &= answer_all_seeing(&log, &holding, |r| {
         if r == 0 {
-            // A sync made meanwhile: answered and let go, so the log is left whole, and counted.
             sync_meanwhile = true;
         } else {
             late_writes += 1;
         }
-        answer((c, r));
-    }
+    });
     let while_last_owned = holding.queued();
     if let Some((c, _)) = &second {
         c.retire();
     }
+    quiet &= settled(&log);
     let once_last_retired = holding.queued();
     // Every request answered and let go before the assertions.
-    while let Some(r) = holding.oldest() {
-        answer(r);
-    }
+    quiet &= answer_all(&log, &holding);
     let durable = log.durable() >= c_end;
     let failure = log.failure();
     drop(log);
+    assert!(quiet, "the log's units did not end within {SETTLE:?}");
     assert!(
         wrote_first && earlier_is_sync,
         "no earlier write and sync held"
@@ -1831,10 +1903,12 @@ fn a_log_dropped_while_its_preparer_waits_on_a_request_leaves_nothing_behind() {
         let crash = Arc::new(CrashIO::new(seed));
         let io: Arc<dyn IO> = crash.clone();
         let log = reopened_short(&io, true);
-        // A step a call: the fresh segment's create and allocation, then its first write.
+        // A step a call: the fresh segment's create and allocation, then its first write. Whether
+        // the preparer waits on a request is read off its own completion: a request a log's unit
+        // left in flight on the IO is none of its (D1b).
         let mut waiting = log.run_preparer();
         for _ in 0..2 {
-            if crash.in_flight() > 0 {
+            if waiting.as_ref().is_some_and(|c| !c.finished()) {
                 break;
             }
             waiting = log.run_preparer();
@@ -1869,14 +1943,14 @@ fn an_admission_granted_claims_the_preparer_only_when_it_is_queued() {
     let io: Arc<dyn IO> = crash.clone();
     let log = reopened_short(&io, true);
     CLAIMS.with(|n| n.set(0));
-    // A step an admission: the fresh segment's create and allocation, then its first write.
+    // A step an admission: the fresh segment's create and allocation, then its first write. Both
+    // are taken whatever the IO holds meanwhile: a request a log's unit left in flight is none of
+    // the preparer's (D1b), and an admission finding the preparer already waiting on its write
+    // only takes its room.
     for _ in 0..2 {
         let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 64)).unwrap();
         log.append(&mut admitted, &header(0), &[&[0u8; 36][..]]);
         drop(admitted);
-        if crash.in_flight() > 0 {
-            break;
-        }
     }
     let first = CLAIMS.with(|n| n.replace(0));
     let in_flight = crash.in_flight();
@@ -2047,9 +2121,11 @@ fn admit_wide(delivery: Delivery, near: bool, bytes: u64) -> std::result::Result
     let executor = delivery
         .worker
         .then(|| Executor::new(io.clone(), 1).unwrap());
-    let log = match &executor {
-        Some(ex) => Log::open_on(io.clone(), BASE, wide(), 0, ex).unwrap(),
-        None => Log::open(io.clone(), BASE, wide(), 0).unwrap(),
+    // On the worker's executor, or alone with an executor of its own.
+    let (mut shared, mut alone) = (None, None);
+    let log: &Arc<Log> = match &executor {
+        Some(ex) => shared.insert(Log::open_on(io.clone(), BASE, wide(), 0, ex).unwrap()),
+        None => alone.insert(Log::open(io.clone(), BASE, wide(), 0).unwrap()),
     };
     if near {
         let filler = vec![7u8; 996];
@@ -2093,7 +2169,8 @@ fn admit_wide(delivery: Delivery, near: bool, bytes: u64) -> std::result::Result
         got
     };
     drop(wait);
-    drop(log);
+    drop(shared);
+    drop(alone);
     drop(executor);
     got
 }

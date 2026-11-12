@@ -7758,3 +7758,171 @@ fn a_frame_freed_under_its_write_out_goes_to_another_class_only_once_the_write_r
     );
     assert!(failure.is_none(), "the pool failed: {failure:?}");
 }
+
+/// A source whose read hands no request over: it fills the page itself, or gives up for a moment
+/// (an IO), the frame going back free as its read is dropped.
+struct AnnouncingNothing(bool);
+struct AnnouncingNothingLocated(bool);
+
+impl source::PageSource for AnnouncingNothing {
+    fn locate(&self, _pid: PageId) -> Result<IOResult<Box<dyn source::Located>>> {
+        Ok(IOResult::Done(Box::new(AnnouncingNothingLocated(self.0))))
+    }
+}
+
+impl source::Located for AnnouncingNothingLocated {
+    fn read(
+        self: Box<Self>,
+        into: Arc<crate::io::Buffer>,
+        done: source::ReadDone,
+        _submitting: source::Submitting<'_>,
+    ) -> Result<IOResult<Option<Completion>>> {
+        if self.0 {
+            into.as_mut_slice().fill(0);
+            done(Ok(()));
+            Ok(IOResult::Done(None))
+        } else {
+            Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
+        }
+    }
+}
+
+/// A load whose read announced no request, the read returned and its frame let go, meeting the
+/// frame given to another page whose write-out's request is held, before the load judges its
+/// read: whether that other request's record was still held once the load returned, and whether
+/// the setup reached it (the auditor's #4562).
+fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, bool) {
+    let held = Arc::new(HeldRequests::default());
+    let io: Arc<dyn IO> = Arc::new(HeldDataIO {
+        inner: Arc::new(crate::io::MemoryIO::new()),
+        held: held.clone(),
+    });
+    let base = if fills {
+        "/db/frame-record-fill"
+    } else {
+        "/db/frame-record-gave-up"
+    };
+    let store = PageStore::open(
+        io.clone(),
+        base,
+        StoreConfig {
+            file_bytes: 1 << 30,
+            meta_pages: 1 << 10,
+        },
+        [[1; CLASS_COUNT]; crate::storage::atoll::meta::TREES],
+        0,
+    );
+    let pool = BufferPool::new(
+        BufferConfig::with_budget(MIN_BUDGET),
+        Arc::new(AnnouncingNothing(fills)),
+        store,
+    )
+    .unwrap();
+    let big = class(memory::BATCH_CLASS);
+    // 2 MiB pages held resident over every batch but one: the load and the page after it take
+    // that one's frame.
+    let mut kept = Vec::new();
+    loop {
+        match pool.allocate(big).unwrap() {
+            IOResult::Done(mut b) => {
+                let p = b.pid();
+                stamp(&mut b.page_mut(), p, 1);
+                b.changed();
+                kept.push(p.raw());
+                drop(b);
+                pool.protect(&kept);
+            }
+            IOResult::IO(_) => break,
+        }
+    }
+    let last = kept.pop();
+    if let Some(p) = last {
+        // The last 2 MiB page given back, so its batch is the one left.
+        let f = pool.table.find(&pool.frames.headers, p).unwrap();
+        pool.protect(&kept);
+        let hold = pool.latch_to_evict(big, f, || pool.frame_ref(f)).unwrap();
+        pool.table.remove(&pool.frames.headers, p, f);
+        pool.free_frame(big, f, hold);
+    }
+    let other = std::rc::Rc::new(std::cell::Cell::new(None));
+    {
+        let (pool, io, held, other) = (pool.clone(), io.clone(), held.clone(), other.clone());
+        crate::race::at("buffer.read_returned", move || {
+            let z = PageId::new(big, 1 << 20);
+            if fills {
+                pool.evict_clean(z);
+            }
+            let mut y = drive(&io, || pool.allocate(big)).unwrap();
+            let (ypid, yframe) = (y.pid(), y.frame);
+            stamp(&mut y.page_mut(), ypid, 1);
+            y.changed();
+            drop(y);
+            *held.prefix.lock() = Some(format!("{base}.c{}.", big.index()));
+            let out = pool.start_write_out(
+                pool.latch_to_evict(big, yframe, || FrameLatch {
+                    frames: pool.frames.clone(),
+                    frame: yframe,
+                })
+                .unwrap(),
+            );
+            pool.write_out(big, vec![out]);
+            let _ = pool.settle_writes();
+            other.set(Some((yframe, pool.header(yframe).record_held())));
+        });
+    }
+    let _ = pool
+        .fix_optimistic(PageId::new(big, 1 << 20), None)
+        .unwrap();
+    let reached = !crate::race::pending("buffer.read_returned")
+        && other.get().is_some_and(|(_, held_then)| held_then);
+    let still_held = other
+        .get()
+        .is_some_and(|(f, _)| pool.header(f).record_held());
+    // A record let go before its request retired is held again for that retirement, which the
+    // cleanup still owes it: the cleanup then finds the record it lets go, and the assertion
+    // reports rather than the retirement ending the process.
+    if let Some((f, _)) = other.get().filter(|_| !still_held) {
+        pool.header(f).hold_record();
+    }
+    // Every request delivered and let go before the assertions, and nothing held from here.
+    let mut delivered = std::collections::HashSet::new();
+    held.release_all(&mut delivered);
+    *held.prefix.lock() = None;
+    let _ = pool.settle_writes();
+    pool.protect(&[]);
+    drop(pool);
+    (reached, still_held)
+}
+
+/// A load whose read gave up with no request announced, its frame freed and given to another
+/// page whose write-out is held before the load judges its read: the load lets no record go,
+/// the other request's held as long as it is owned (the auditor's #4562; mutant: the record let
+/// go on the frame's header, as 8a3787a72 judged it).
+#[test]
+fn a_load_whose_read_gave_up_lets_go_no_record_of_its_frames_next_page() {
+    let (reached, still_held) = a_load_judging_its_read_after_its_frame_changed_hands(false);
+    assert!(
+        reached,
+        "the frame was not given to another page's held write-out"
+    );
+    assert!(
+        still_held,
+        "the load let go the record of a request on its frame's next page"
+    );
+}
+
+/// A load whose read filled its page itself, the page evicted and its frame given to another page
+/// whose write-out is held before the load judges its read: the load judges its own read, none
+/// announced, and the other request's record stays held (the auditor's #4562).
+#[test]
+fn a_load_whose_read_filled_its_page_judges_its_own_read_not_its_frames_next_page() {
+    let (reached, still_held) = a_load_judging_its_read_after_its_frame_changed_hands(true);
+    assert!(
+        reached,
+        "the frame was not given to another page's held write-out"
+    );
+    assert!(
+        still_held,
+        "the record of a request on the frame's next page was let go"
+    );
+}

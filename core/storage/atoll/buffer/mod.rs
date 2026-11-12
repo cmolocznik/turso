@@ -998,6 +998,8 @@ impl BufferPool {
         // taken before the mark is finished. On an error or a yield the read never starts, and
         // dropping it frees the frame, which is a change too.
         crate::race::point("buffer.read_submit");
+        // Whether this read announced a request, which only its `submitting` says.
+        let announced = std::cell::Cell::new(false);
         let read = self.frames.supply.change(|event| {
             // Counted in flight and marked submitted by the source right before its request, so
             // before the read can land; the read ends, landed or given up, exactly once, through
@@ -1006,6 +1008,7 @@ impl BufferPool {
             // 22.18, a frame).
             let submitting = || {
                 h.hold_record();
+                announced.set(true);
                 self.requests.fetch_add(1, Ordering::AcqRel);
                 h.submitted_at(version);
             };
@@ -1013,6 +1016,11 @@ impl BufferPool {
             event.arm();
             read
         });
+        crate::race::point("buffer.read_returned");
+        // Judged on this read's own announcement, never the frame's header: a read that held no
+        // record let the frame go when it filled the page or gave up, and the frame may hold
+        // another page, and another request, by now. One it announced holds the frame until its
+        // record is let go here or at its retirement.
         let read = match read {
             // Held until the request retires, which may come after the read landed and the page is
             // resident and unlatched: the frame is neither evicted nor reused before.
@@ -1022,14 +1030,14 @@ impl BufferPool {
             }
             Ok(IOResult::Done(None)) => {
                 crate::turso_assert!(
-                    !h.record_held(),
+                    !announced.get(),
                     "a page source's read filled the page after it announced a request"
                 );
                 Ok(IOResult::Done(()))
             }
             // No request was handed over: one announced and then refused leaves the record free.
             other => {
-                if h.record_held() {
+                if announced.get() {
                     self.record_retired(pid.class(), frame);
                 }
                 other.map(|r| match r {

@@ -277,6 +277,51 @@ enum Claimed {
     Stepped(Result<Unit>),
 }
 
+/// One writer's claims of the checkpoint's task, made one after another (DESIGN.md 22.7). A step
+/// that held the state has ended when its claim returns, its own let-go waking no writer (the
+/// task's), so whoever waits on the room, the gate or the state's let-go is owed a look: a writer
+/// that found the task claimed registered its wait first, and that step's let-go may have come
+/// before it looked. Paid once this writer stops claiming, as it drops these or before it
+/// registers a wait of its own ([`settle`](Self::settle)), never between two of its claims, when
+/// a waiter would find the task claimed again: a run of units, the cut's a run of frame headers
+/// each (step 4), woke every waiting writer at each unit only to be refused. A claim that stepped
+/// nothing, or whose step only contended for the state another holds, owes nothing: that holder's
+/// let-go wakes them.
+struct Claims<'a> {
+    checkpointer: &'a Checkpointer,
+    owed: bool,
+}
+
+impl<'a> Claims<'a> {
+    fn new(checkpointer: &'a Checkpointer) -> Self {
+        Self {
+            checkpointer,
+            owed: false,
+        }
+    }
+
+    fn claim(&mut self, task: &TaskRef) -> Claimed {
+        let claimed = self.checkpointer.claim(task);
+        self.owed |= matches!(claimed, Claimed::Stepped(_));
+        claimed
+    }
+
+    /// Pays the wake the claims so far owe: before this writer registers a wait of its own, which
+    /// the wake would otherwise finish.
+    fn settle(&mut self) {
+        if std::mem::take(&mut self.owed) {
+            self.checkpointer.wake_writers();
+        }
+    }
+}
+
+impl Drop for Claims<'_> {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        self.settle();
+    }
+}
+
 /// Tells a writer whose claim runs the step on this thread what the step came to; a step on a
 /// worker has no claimant to tell.
 fn tell_claimant(claimed: Claimed) {
@@ -929,12 +974,8 @@ impl Checkpointer {
     }
 
     /// A writer's named claim of the checkpoint's task (DESIGN.md 22.7): one step, on this
-    /// thread, unless another writer is stepping it or the task is over; what it came to. A step
-    /// that held the state has ended here, so whoever waits on the room, the gate or the state's
-    /// let-go looks again: a claim that found the task running registered its wait first, and
-    /// that step's own let-go may have come before the claim looked. A claim that stepped nothing,
-    /// or whose step only contended for the state another holds, wakes no one, itself included:
-    /// that holder's let-go does.
+    /// thread, unless another writer is stepping it or the task is over; what it came to. Made
+    /// only through [`Claims`], which owes the wake a step that held the state leaves.
     fn claim(&self, task: &TaskRef) -> Claimed {
         CLAIMING.with(|c| *c.borrow_mut() = Claiming::Made);
         let ran = task.run_once();
@@ -947,9 +988,6 @@ impl Checkpointer {
         let Claiming::Told(claimed) = claiming else {
             unreachable!("a claimed step did not tell its claimant what it came to")
         };
-        if matches!(claimed, Claimed::Stepped(_)) {
-            self.wake_writers();
-        }
         claimed
     }
 
@@ -1083,16 +1121,18 @@ impl Checkpointer {
     /// while another writer's claim or a holder of the state steps it, whose end wakes the room's
     /// waiters; `None` once the task is over, the writer then stepping the state.
     fn claim_relief(&self, task: &TaskRef, retry: Retry<'_>) -> Option<Relieved> {
+        let mut claims = Claims::new(self);
         loop {
             if self.pool.may_retry(retry) {
                 return Some(Relieved::Stepped(Ok(IOResult::Done(()))));
             }
-            return Some(match self.claim(task) {
+            return Some(match claims.claim(task) {
                 Claimed::Stepped(Ok(Unit::Again)) => continue,
                 Claimed::Stepped(Ok(Unit::Wait(c))) => {
                     Relieved::Stepped(Ok(IOResult::IO(IOCompletions(c))))
                 }
                 Claimed::Stepped(Ok(Unit::WaitOn(_, c))) => {
+                    claims.settle();
                     Relieved::Stepped(Ok(IOResult::IO(IOCompletions(self.run_awaited(c)))))
                 }
                 Claimed::Stepped(Ok(Unit::Done)) => Relieved::Stepped(Ok(IOResult::Done(()))),
@@ -1137,21 +1177,25 @@ impl Checkpointer {
                 return Ok(IOResult::Done(()));
             }
             // Its units claimed one at a time, as far as they go now.
-            Stepper::Caller(task) => loop {
-                match self.claim(task) {
-                    Claimed::Stepped(Ok(Unit::Again)) => {}
-                    Claimed::Stepped(Ok(Unit::Wait(c))) => {
-                        return Ok(IOResult::IO(IOCompletions(c)))
+            Stepper::Caller(task) => {
+                let mut claims = Claims::new(self);
+                loop {
+                    match claims.claim(task) {
+                        Claimed::Stepped(Ok(Unit::Again)) => {}
+                        Claimed::Stepped(Ok(Unit::Wait(c))) => {
+                            return Ok(IOResult::IO(IOCompletions(c)))
+                        }
+                        Claimed::Stepped(Ok(Unit::WaitOn(_, c))) => {
+                            claims.settle();
+                            return Ok(IOResult::IO(IOCompletions(self.run_awaited(c))));
+                        }
+                        Claimed::Stepped(Ok(Unit::Done)) => return Ok(IOResult::Done(())),
+                        Claimed::Stepped(Err(e)) => return Err(e),
+                        // Another writer or holder steps it now: nothing is owed here.
+                        Claimed::Refused | Claimed::Held => return Ok(IOResult::Done(())),
                     }
-                    Claimed::Stepped(Ok(Unit::WaitOn(_, c))) => {
-                        return Ok(IOResult::IO(IOCompletions(self.run_awaited(c))))
-                    }
-                    Claimed::Stepped(Ok(Unit::Done)) => return Ok(IOResult::Done(())),
-                    Claimed::Stepped(Err(e)) => return Err(e),
-                    // Another writer or holder steps it now: nothing is owed here.
-                    Claimed::Refused | Claimed::Held => return Ok(IOResult::Done(())),
                 }
-            },
+            }
             Stepper::Writer => {}
         }
         let Some(mut state) = self.try_hold() else {
@@ -1355,20 +1399,24 @@ impl Checkpointer {
         if done(self) {
             return Ok(IOResult::Done(()));
         }
+        let mut claims = Claims::new(self);
         let mut released: Option<Completion> = None;
         loop {
             crate::race::point("checkpoint.claiming");
-            return match self.claim(task) {
+            return match claims.claim(task) {
                 Claimed::Stepped(Err(e)) => Err(e),
                 Claimed::Stepped(Ok(Unit::Wait(c))) => Ok(IOResult::IO(IOCompletions(c))),
                 Claimed::Stepped(Ok(Unit::WaitOn(_, c))) => {
+                    claims.settle();
                     Ok(IOResult::IO(IOCompletions(self.run_awaited(c))))
                 }
                 Claimed::Stepped(Ok(Unit::Again | Unit::Done)) if done(self) => {
                     Ok(IOResult::Done(()))
                 }
                 Claimed::Stepped(Ok(Unit::Again)) => {
-                    // The claim's own let-go finished any wait registered before it.
+                    // A wait registered before this claim stepped goes: the wake its step owes is
+                    // paid before this writer registers again, so it never finishes this
+                    // writer's own wait.
                     released = None;
                     continue;
                 }
@@ -1388,6 +1436,7 @@ impl Checkpointer {
                         Ok(IOResult::IO(IOCompletions(released)))
                     }
                     None => {
+                        claims.settle();
                         released = Some(self.released.wait());
                         continue;
                     }
@@ -1461,7 +1510,7 @@ impl Checkpointer {
     #[cfg(test)]
     pub(crate) fn claim_one(&self) -> bool {
         let task = self.task.get().expect("the checkpoint's task");
-        !matches!(self.claim(task), Claimed::Refused)
+        !matches!(Claims::new(self).claim(task), Claimed::Refused)
     }
 }
 

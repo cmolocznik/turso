@@ -1372,7 +1372,7 @@ fn a_claim_left_to_another_writers_step_is_woken_once_that_step_ends() {
     let joined = other.join().is_ok();
     let woken = wait.as_ref().is_some_and(Completion::finished);
     // Every assertion with the database closed.
-    drop((tree, cp, txns, db));
+    drop((ticket, tree, cp, txns, db));
     assert!(joined, "the other writer panicked");
     assert!(paused, "the other writer's step never paused");
     assert!(
@@ -1432,7 +1432,7 @@ fn a_claim_refused_is_woken_by_a_step_that_ends_before_the_claim_returns() {
     let refused = wait.is_some();
     let ended = ended.load(std::sync::atomic::Ordering::Acquire);
     // Every assertion with the database closed.
-    drop((tree, cp, txns, db));
+    drop((ticket, tree, cp, txns, db));
     assert!(joined, "the other writer panicked");
     assert!(paused, "the other writer's step never paused");
     assert!(
@@ -1510,7 +1510,7 @@ fn a_claim_refused_by_a_task_that_failed_before_its_wait_does_not_wait() {
     let _ = go_tx.send(());
     let (first, next_failed) = other.join().unwrap_or((None, false));
     // Every assertion with the database closed.
-    drop((tree, cp, txns, db));
+    drop((ticket, tree, cp, txns, db));
     assert!(paused, "the other writer never paused before its claim");
     assert!(
         failed && over,
@@ -1556,6 +1556,70 @@ fn a_holders_let_go_wakes_the_room_only_where_the_writers_step_checkpoints() {
         threaded,
         (false, false),
         "the let-go woke a writer that waits on the room the worker frees"
+    );
+}
+
+/// A writer claiming the checkpoint's task unit after unit, the cut a run of frame headers a unit,
+/// wakes the writers the gate refused once it stops claiming, not after each of its claims: a wait
+/// on the gate's reopening registered while the cut holds the gate is not finished while the gate
+/// is still held (each refused writer woken at each of the cut's runs ran its operation again only
+/// to be refused). The claims made with the gate closed are counted, so the cut spanned several
+/// (DESIGN.md 22.7).
+#[test]
+fn a_writer_claiming_the_cut_wakes_the_gate_refused_once_it_stops_claiming() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    /// At each claim: the claims made with the gate closed, and the waits registered with it
+    /// closed that were finished while it still was.
+    fn watch(
+        store: crate::sync::Weak<PageStore>,
+        wait: Option<Completion>,
+        seen: Rc<Cell<(usize, usize)>>,
+    ) {
+        crate::race::at("checkpoint.claiming", move || {
+            let Some(s) = store.upgrade() else { return };
+            let (mut closed, mut woken) = seen.get();
+            let mut wait = wait;
+            if s.gate_closed() {
+                closed += 1;
+                if wait.as_ref().is_some_and(Completion::finished) {
+                    woken += 1;
+                    wait = None;
+                }
+                if wait.is_none() {
+                    wait = s.gate_wait();
+                }
+            } else {
+                wait = None;
+            }
+            drop(s);
+            seen.set((closed, woken));
+            watch(store, wait, seen);
+        });
+    }
+    let db = Db::memory();
+    let tree = db.create(node_class());
+    for k in 0..100 {
+        db.put(&tree, k, value(k, 0));
+    }
+    let cp = db.db.checkpointer_arc().clone();
+    let txns = db.db.transactions_arc().clone();
+    let seen = Rc::new(Cell::new((0, 0)));
+    watch(Arc::downgrade(db.store()), None, seen.clone());
+    let mut ticket = cp.request_full();
+    let done = drive(&db.io, || cp.step_full(&mut ticket, &txns)).is_ok();
+    let (closed, woken) = seen.get();
+    // Every assertion with the database closed.
+    drop((ticket, tree, cp, txns, db));
+    assert!(done, "the full checkpoint failed");
+    assert!(
+        closed >= 2,
+        "the cut spanned {closed} claims with the gate closed, not several"
+    );
+    assert_eq!(
+        woken, 0,
+        "a wait on the gate's reopening was finished while the cut still held the gate \
+         ({closed} claims with it closed)"
     );
 }
 

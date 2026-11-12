@@ -4147,10 +4147,11 @@ registers a waker on a completion while it holds an executor mutex.
      queue's mutex and invokes the external runners it moves. The checkpointer's hold, let go,
      also wakes the writers waiting for room, under `Checkpointing::Writers` only and by a holder
      other than the task's own step: a writer refused room whose relief found the state held steps
-     the checkpoint itself once it is let go, and a writer's claim of the task wakes them itself
-     once the step it claimed has ended. With a worker stepping the task no writer steps it, and the
-     room's releases alone wake those waiting: the task lets the state go after every unit (step
-     4), and a wake at each woke a refused writer only to be refused again.
+     the checkpoint itself once it is let go, and a writer claiming the task wakes them itself
+     once it stops claiming. With a worker stepping the task no writer steps it, and the room's
+     releases alone wake those waiting: the task lets the state go after every unit (step 4), and
+     a wake at each woke a refused writer only to be refused again; a writer's claims a unit each
+     are the same run, so a wake after each of them did the same.
    - **A release** lets the state go, then takes the contenders off the list under its mutex and
      wakes each after it. The lock order is the state, then its contenders' mutex; no other
      executor mutex is taken under it.
@@ -5581,10 +5582,14 @@ compose, the real `Completion`, latch and backends included where named.
    stepped by another writer, or the state held, registers on the state's let-go and claims once
    more, and waits only if that claim is refused too, so a claim that steps registers nothing (the
    auditor's P2-CP-W1: a registration a unit cost a wait's allocation and two visits of its mutex);
-   a claim whose step held the state
-   wakes the writers waiting on the room, the gate and the let-go once that step has ended, since
-   the step's own let-go may come before another writer looks; one whose step only contended for a
-   state another holds wakes no one, and that holder's let-go does. Another holder's let-go (an
+   a writer whose claims stepped a unit that held the state
+   wakes the writers waiting on the room, the gate and the let-go once it stops claiming (`Claims`:
+   as it returns, or before it registers a wait of its own, which the wake would otherwise
+   finish), since the step's own let-go may come before another writer looks; never between two of
+   its claims, where a waiter would find the task claimed again (a cut a run of frame headers a
+   unit woke each refused writer at every run, to run its operation again and be refused). A claim
+   whose step only contended for a state another holds owes no one a wake, and that holder's
+   let-go wakes them. Another holder's let-go (an
    integrity check, a writer's relief) wakes those writers only where the writers step checkpoints:
    with a worker, they wait on the room the worker frees and the gate it opens. A transaction's end
    waiting for a full checkpoint holds the wait as a value it owns across its polls

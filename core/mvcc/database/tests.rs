@@ -728,7 +728,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     // Reader pinned below the materialization frame: keep both current and delete.
     for mut v in [stamped_insert(), stamped_delete()] {
         let dropped =
-            MvStore::<MvccClock>::gc_version_chain(&mut v, 10, 10, true, frame(50), false);
+            MvStore::<MvccClock>::gc_version_chain(&mut v, 10, 10, true, frame(50), false, 0);
         assert_eq!(
             dropped, 0,
             "version needed by a reader pinned below frame 100 must be kept"
@@ -740,7 +740,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     // currents unless drop_current_if_in_btree (Truncate).
     let mut deleted = stamped_delete();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut deleted, 10, 10, true, frame(100), false);
+        MvStore::<MvccClock>::gc_version_chain(&mut deleted, 10, 10, true, frame(100), false, 0);
     assert_eq!(
         dropped, 1,
         "materialized + reader-reachable superseded delete must be reclaimed"
@@ -749,7 +749,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     let mut current = stamped_insert();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), false);
+        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), false, 0);
     assert_eq!(
         dropped, 0,
         "Passive keeps the current SkipMap version when drop_current_if_in_btree is false"
@@ -758,7 +758,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     let mut current = stamped_insert();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), true);
+        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), true, 0);
     assert_eq!(
         dropped, 0,
         "Passive keeps a live copy while a snapshot is open, even when materialized"
@@ -766,8 +766,15 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     assert_eq!(current.len(), 1);
 
     let mut current = stamped_insert();
-    let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, u64::MAX, 10, true, frame(100), true);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(
+        &mut current,
+        u64::MAX,
+        10,
+        true,
+        frame(100),
+        true,
+        0,
+    );
     assert_eq!(
         dropped, 1,
         "Passive Rule 3 drops a materialized current once no snapshot is open"
@@ -784,6 +791,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
             true,
             WalPos::STAGED,
             drop_current_if_in_btree,
+            0,
         );
         assert_eq!(
             dropped, 0,
@@ -8375,6 +8383,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         state,
         tx_id,
         begin_ts,
+        durable_at_begin: 0,
         write_set: Mutex::new(WriteSet::new()),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
@@ -10212,6 +10221,7 @@ fn transaction_display() {
         state,
         tx_id,
         begin_ts,
+        durable_at_begin: 0,
         write_set,
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
@@ -11737,6 +11747,7 @@ fn test_gc_rule1_aborted_garbage_removed() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -11759,6 +11770,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     // Only aborted removed; superseded has e=5 > lwm=2 so retained
     assert_eq!(dropped, 1);
@@ -11787,6 +11799,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 1);
@@ -11808,6 +11821,7 @@ fn test_gc_rule2_superseded_above_lwm_retained() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -11832,6 +11846,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     // e=5 > ckpt_max=2, no current → tombstone guard retains it
     assert_eq!(dropped, 0);
@@ -11852,6 +11867,7 @@ fn test_gc_rule2_tombstone_guard_checkpointed() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     // e=5 <= ckpt_max=5, e=5 <= lwm=10 → removable
     assert_eq!(dropped, 1);
@@ -11875,6 +11891,7 @@ fn test_gc_rule3_drop_current_when_in_btree() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -11892,6 +11909,7 @@ fn test_gc_rule3_truncate_idle_only() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0, "open snapshot must block Truncate Rule 3 clear");
     assert_eq!(versions.len(), 1);
@@ -11903,6 +11921,7 @@ fn test_gc_rule3_truncate_idle_only() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -11925,6 +11944,7 @@ fn test_gc_rule3_not_checkpointed_retained() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -11946,6 +11966,7 @@ fn test_gc_rule3_visible_to_active_tx_retained() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     // lwm=5 != u64::MAX, so a transaction is open and Rule 3 must not fire.
     assert_eq!(dropped, 0);
@@ -11965,6 +11986,7 @@ fn test_gc_rule3_current_retained_before_first_checkpoint() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -11983,6 +12005,7 @@ fn test_gc_rule3_current_collected_after_checkpoint() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 0);
@@ -12006,6 +12029,7 @@ fn test_gc_rule3_after_history_reclaimed() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
@@ -12023,6 +12047,7 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -12038,6 +12063,7 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1);
     assert!(versions.is_empty());
@@ -12057,6 +12083,7 @@ fn test_gc_txid_refs_retained() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -12076,6 +12103,7 @@ fn test_gc_txid_end_retained() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 1);
@@ -12102,6 +12130,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     // Tombstone must be retained: e=5 > ckpt_max=2, and pending insert doesn't count.
     // Only nothing changes (pending insert is not aborted garbage either).
@@ -12129,6 +12158,7 @@ fn test_gc_rule2_committed_current_disables_non_btree_tombstone_guard() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     // Superseded removed (has_current=true for committed version), current remains.
     assert_eq!(dropped, 1);
@@ -12154,6 +12184,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -12166,6 +12197,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
@@ -12181,6 +12213,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -12193,6 +12226,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
@@ -12220,6 +12254,7 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -12233,6 +12268,7 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
@@ -12256,6 +12292,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0, "tombstone retained: e=5 > ckpt_max=3");
     assert_eq!(versions.len(), 1);
@@ -12268,6 +12305,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1, "tombstone collected: e=5 <= ckpt_max=5");
     assert_eq!(versions.len(), 0);
@@ -12294,6 +12332,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
@@ -12311,6 +12350,7 @@ fn test_gc_noop_on_empty() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 0);
 }
@@ -12336,6 +12376,7 @@ fn test_gc_combined_rules() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 4);
     assert!(versions.is_empty());
@@ -12607,6 +12648,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1023);
     assert_eq!(versions.len(), 1);
@@ -12629,6 +12671,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert_eq!(dropped, 1024);
     assert!(versions.is_empty());
@@ -12652,6 +12695,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     assert!(small.is_empty());
     // A `Vec` keeps a small allocation. The stable build keeps one version
@@ -14405,6 +14449,7 @@ fn prop_gc_never_increases_version_count(chain: ArbitraryVersionChain) -> bool {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     versions.len() <= before
 }
@@ -14423,6 +14468,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     let snapshot = v1.clone();
     MvStore::<MvccClock>::gc_version_chain(
@@ -14432,6 +14478,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     // Compare content, not just length — a swap bug would pass a length-only check.
     v1.len() == snapshot.len()
@@ -14454,6 +14501,7 @@ fn prop_gc_removes_all_aborted_garbage(chain: ArbitraryVersionChain) -> bool {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     versions
         .iter()
@@ -14478,6 +14526,7 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     let txid_begins_after: usize = versions
         .iter()
@@ -14507,6 +14556,7 @@ fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     let txid_ends_after: usize = versions.iter().filter(filter).count();
     txid_ends_after == txid_ends_before
@@ -14535,6 +14585,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
     let current_after: usize = versions
         .iter()
@@ -14566,6 +14617,7 @@ fn prop_gc_tombstone_guard_preserves_btree_safety(chain: ArbitraryVersionChain) 
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
 
     // Check: if pre-GC chain had no committed current version AND had a
@@ -14610,6 +14662,7 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
+        0,
     );
 
     let has_committed_current = versions
@@ -25935,4 +25988,281 @@ fn passive_checkpoint_publishes_no_schema_cookie_older_than_a_schema_change_it_o
     writer
         .execute("COMMIT")
         .expect("no schema changed after the writer began");
+}
+
+/// Passive Rule 3 under an open scan: a scan that began after a checkpoint published its rows reads
+/// them from the B-tree (they are B-tree-equivalent for it), so the GC that drops their lone current
+/// SkipMap copies while it runs neither repeats nor loses a row. A reader that began before that
+/// checkpoint pins the copies (it is not covered), so the first checkpoint leaves them in place.
+fn passive_scan_survives_rule3_drop_mid_scan(sql: &str, expected: &[String]) {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..200 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+    setup.execute("COMMIT").unwrap();
+
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let pinned = mv.debug_gc_snapshot();
+    assert!(
+        pinned.rows_versions >= 200 && pinned.index_versions >= 200,
+        "a reader that began before the checkpoint keeps the copies: {pinned:?}"
+    );
+    pin.execute("COMMIT").unwrap();
+
+    let scanner = db.connect();
+    let mut stmt = scanner.prepare(sql).unwrap();
+    let io = stmt.get_pager().io.clone();
+    let mut seen: Vec<String> = Vec::new();
+    let mut step = |stmt: &mut crate::Statement, seen: &mut Vec<String>, limit: usize| loop {
+        if seen.len() >= limit {
+            return false;
+        }
+        match stmt.step().unwrap() {
+            crate::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                seen.push(row.get_value(0).to_string());
+            }
+            crate::StepResult::IO | crate::StepResult::Yield => io.step().unwrap(),
+            crate::StepResult::Done => return true,
+            other => panic!("unexpected step {other:?}"),
+        }
+    };
+    assert!(!step(&mut stmt, &mut seen, 50), "the scan is still open");
+
+    // A write since the last checkpoint gives it something to do; its Finalize GC runs under
+    // the open scan.
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("INSERT INTO t VALUES (1000, 'v01000')")
+        .unwrap();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    let dropped = mv.debug_gc_snapshot();
+    assert!(
+        dropped.rows_versions < pinned.rows_versions - 150
+            && dropped.index_versions < pinned.index_versions - 150,
+        "the lone current copies drop under the open scan: before {pinned:?}, after {dropped:?}"
+    );
+
+    assert!(step(&mut stmt, &mut seen, usize::MAX), "the scan completes");
+    assert_eq!(seen, expected, "every row exactly once, in order");
+}
+
+#[test]
+fn passive_forward_scan_survives_rule3_drop_mid_scan() {
+    let expected: Vec<String> = (0..200).map(|i| i.to_string()).collect();
+    passive_scan_survives_rule3_drop_mid_scan("SELECT id FROM t ORDER BY id", &expected);
+}
+
+#[test]
+fn passive_backward_scan_survives_rule3_drop_mid_scan() {
+    let expected: Vec<String> = (0..200).rev().map(|i| i.to_string()).collect();
+    passive_scan_survives_rule3_drop_mid_scan("SELECT id FROM t ORDER BY id DESC", &expected);
+}
+
+#[test]
+fn passive_index_scan_survives_rule3_drop_mid_scan() {
+    let expected: Vec<String> = (0..200).map(|i| format!("v{i:05}")).collect();
+    passive_scan_survives_rule3_drop_mid_scan("SELECT v FROM t ORDER BY v", &expected);
+}
+
+/// Passive Rule 3 no longer waits for quiescence: under an open snapshot that began after the
+/// checkpoint published its rows, the checkpoint's GC drops their materialized lone currents.
+#[test]
+fn passive_gc_drops_materialized_currents_under_an_open_snapshot() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..300 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'x')"))
+            .unwrap();
+    }
+    setup.execute("COMMIT").unwrap();
+    // A reader that began before the publish keeps the copies through the first checkpoint.
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    pin.execute("COMMIT").unwrap();
+
+    // A snapshot opened after the publish, and a fresh write for the next checkpoint.
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    reader.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("INSERT INTO t VALUES (1000, 'y')").unwrap();
+    let before = mv.debug_gc_snapshot().rows_versions;
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let after = mv.debug_gc_snapshot().rows_versions;
+    assert!(
+        before >= 300 && after + 300 <= before,
+        "the open snapshot no longer pins the materialized currents: {before} -> {after}"
+    );
+    let rows = get_rows(&reader, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].to_string(),
+        "300",
+        "the snapshot still sees every row"
+    );
+    reader.execute("COMMIT").unwrap();
+}
+
+/// A passive checkpoint that publishes between a reader's WAL mark capture and its begin: the
+/// reader's mark predates the checkpoint's frames, so it takes the bound its own mark reaches (the
+/// earlier one) and reads the newly checkpointed rows from the version store, each exactly once.
+#[test]
+fn passive_reader_takes_the_bound_its_mark_reaches_when_a_publish_lands_before_its_begin() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..100 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let first_bound = mv.durable_txid_max.load(Ordering::SeqCst);
+    assert!(first_bound > 0, "the first checkpoint published a bound");
+
+    // Holds the GC floor at the first bound, so the second checkpoint drops no current copy.
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    for i in 100..200 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+
+    let db_arc = db.get_db();
+    let published = Arc::new(AtomicU64::new(0));
+    let published_in_hook = published.clone();
+    let mv_in_hook = mv.clone();
+    *mv.after_read_mark_hook.lock().unwrap() = Some(ReadMarkHook(Box::new(move || {
+        let checkpointer = db_arc.connect(ConnectOpts::new()).unwrap();
+        checkpointer
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        published_in_hook.store(
+            mv_in_hook.durable_txid_max.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+    })));
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let seen: Vec<String> = get_rows(&reader, "SELECT id FROM t ORDER BY id")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert!(
+        mv.after_read_mark_hook.lock().unwrap().is_none(),
+        "the publish ran inside the reader's begin"
+    );
+    let second_bound = published.load(Ordering::SeqCst);
+    assert!(
+        second_bound > first_bound,
+        "the checkpoint inside the begin published a newer bound ({second_bound} <= {first_bound})"
+    );
+    let expected: Vec<String> = (0..200).map(|i| i.to_string()).collect();
+    assert_eq!(seen, expected, "every row exactly once");
+    let tx_id = reader
+        .get_mv_tx_id()
+        .expect("the reader holds a transaction");
+    assert_eq!(
+        mv.durable_at_begin_of(tx_id),
+        Some(first_bound),
+        "the reader takes the bound its own mark reaches"
+    );
+    reader.execute("COMMIT").unwrap();
+    pin.execute("COMMIT").unwrap();
+}
+
+/// A writer whose rows' lone current copies Passive Rule 3 drops while it is open still commits
+/// its update of one of them: the drop takes no committed event past its begin.
+#[test]
+fn passive_writer_commits_an_update_of_a_row_whose_copy_dropped_while_it_was_open() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..200 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    pin.execute("COMMIT").unwrap();
+    let kept = mv.debug_gc_snapshot();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&writer, "SELECT v FROM t WHERE id = 5"),
+        vec![vec![Value::from_text("v00005")]]
+    );
+
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("INSERT INTO t VALUES (1000, 'v01000')")
+        .unwrap();
+    checkpointer
+        .execute("PRAGMA wal_checkpoint(PASSIVE)")
+        .unwrap();
+    let dropped = mv.debug_gc_snapshot();
+    assert!(
+        dropped.rows_versions < kept.rows_versions - 150,
+        "the lone current copies drop under the open writer: before {kept:?}, after {dropped:?}"
+    );
+
+    writer
+        .execute("UPDATE t SET v = 'w00005' WHERE id = 5")
+        .unwrap();
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT v FROM t WHERE id = 5"),
+        vec![vec![Value::from_text("w00005")]]
+    );
+    assert_eq!(
+        get_rows(&setup, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(201)]]
+    );
 }

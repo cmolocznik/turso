@@ -2346,8 +2346,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .publish_rootpage_visible(table_id, materialized_at);
         }
         self.mvstore
-            .durable_txid_max
-            .store(self.durable_txid_max_new, Ordering::SeqCst);
+            .publish_durable_bound(self.durable_txid_max_new, materialized_at);
         self.state = CheckpointState::CheckpointWal;
         self.lock_states.pager_read_tx = false;
         self.lock_states.pager_write_tx = false;
@@ -3757,9 +3756,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     self.created_btrees.is_empty() && self.staged_roots.is_empty(),
                     "checkpoint finalized with un-published staged schema roots"
                 );
+                let at = WalPos::from_pair(self.pager.wal_pos());
                 self.mvstore
-                    .durable_txid_max
-                    .store(self.durable_txid_max_new, Ordering::SeqCst);
+                    .publish_durable_bound(self.durable_txid_max_new, at);
                 // Publish the WAL backfill boundary as the passive checkpoint GC floor: a version
                 // materialized at or below it is durable in the DB file, hence reachable by
                 // every snapshot. Un-backfilled ones stay retained for low-frame readers.

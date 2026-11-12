@@ -1028,6 +1028,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
     /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
     read_mark: WalPos,
+    /// `MvStore::durable_txid_max` captured at `begin_tx`, under the clock the passive publish
+    /// window holds: every version committed at or below it is in the B-tree this transaction's
+    /// read mark reaches. A passive reader serves such a version's lone current copy from the
+    /// B-tree, so the answer never changes while the transaction runs.
+    durable_at_begin: u64,
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
@@ -1042,6 +1047,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         begin_ts: u64,
         header: DatabaseHeader,
         read_mark: WalPos,
+        durable_at_begin: u64,
         schema_generation_at_begin: u64,
         portable_logical_changes: bool,
     ) -> Transaction<A> {
@@ -1050,6 +1056,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             tx_id,
             begin_ts,
             read_mark,
+            durable_at_begin,
             schema_generation_at_begin,
             portable_logical_changes,
             write_set: Mutex::new(WriteSet::new()),
@@ -4442,11 +4449,39 @@ pub struct WalPos {
     pub frame: u64,
 }
 
+/// The test seam's hook (see `MvStore::after_read_mark_hook`).
+#[cfg(test)]
+pub(crate) struct ReadMarkHook(pub(crate) Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl Debug for ReadMarkHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadMarkHook")
+    }
+}
+
+/// `durable_txid_max` values paired with the WAL position at which their rows are in the B-tree.
+#[derive(Debug, Clone, Copy)]
+struct DurableBound {
+    latest: (u64, WalPos),
+    previous: (u64, WalPos),
+}
+
+impl Default for DurableBound {
+    fn default() -> Self {
+        Self {
+            latest: (0, WalPos::ORIGIN),
+            previous: (0, WalPos::ORIGIN),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MvccReadSnapshot {
     pub(crate) tx_id: TxID,
     pub(crate) begin_ts: u64,
     pub(crate) read_mark: WalPos,
+    pub(crate) durable_at_begin: u64,
 }
 
 impl<A: RowVersionAllocator> From<&Transaction<A>> for MvccReadSnapshot {
@@ -4455,6 +4490,7 @@ impl<A: RowVersionAllocator> From<&Transaction<A>> for MvccReadSnapshot {
             tx_id: tx.tx_id,
             begin_ts: tx.begin_ts,
             read_mark: tx.read_mark,
+            durable_at_begin: tx.durable_at_begin,
         }
     }
 }
@@ -4838,6 +4874,14 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// cannot reach the un-backfilled WAL frame still needs the version-store copy. See
     /// `gc_version_chain` / `gc_floor_reader_mark`. `RwLock<WalPos>` mirrors `global_header`.
     backfill_floor: Arc<RwLock<WalPos>>,
+    /// The last two `durable_txid_max` values with the WAL position each became reachable at. A
+    /// reader captures its WAL mark before the clock and its durable bound under it, so a publish
+    /// can land between the two; the reader then takes the newest bound its own mark reaches.
+    durable_bound: RwLock<DurableBound>,
+    /// Test seam: runs once in the begin path between the reader's WAL mark capture and its clock
+    /// publication, where a checkpoint publish can land.
+    #[cfg(test)]
+    pub(crate) after_read_mark_hook: std::sync::Mutex<Option<ReadMarkHook>>,
     /// The timestamp of the last committed schema change.
     /// Schema changes always cause a [SchemaUpdated] error.
     last_committed_schema_change_ts: AtomicU64,
@@ -5027,6 +5071,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
+            durable_bound: RwLock::new(DurableBound::default()),
+            #[cfg(test)]
+            after_read_mark_hook: std::sync::Mutex::new(None),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpoint_publish_in_progress: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
@@ -5292,6 +5339,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             tx_id,
             begin_ts: tx.begin_ts,
             read_mark: tx.read_mark,
+            durable_at_begin: tx.durable_at_begin,
         })
     }
 
@@ -6646,12 +6694,118 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         false
     }
 
+    /// Whether a passive reader reads this chain's row from the B-tree: the version the reader sees
+    /// committed at or below the durable bound its read mark reaches (`durable_at_begin`). The
+    /// B-tree at that mark reflects a checkpoint snapshot at or past the bound and before the
+    /// reader began, and the key has no committed event between the two, so it holds exactly that
+    /// version. The answer turns on the reader's snapshot visibility and two values fixed at its
+    /// begin, never on the chain's shape, so it never changes under the reader whatever a
+    /// checkpoint stamps or a GC drops meanwhile: a scan sees the row from one side, once.
+    fn passive_chain_is_btree_equivalent(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &[RowVersion],
+    ) -> bool {
+        let mut resolved = None;
+        for version in versions.iter().rev() {
+            match version.is_visible_at(snapshot.begin_ts) {
+                Some(true) => {
+                    resolved = Some(version);
+                    break;
+                }
+                Some(false) => {}
+                None => {
+                    let Some(tx) = self.txs.get(&snapshot.tx_id) else {
+                        return false;
+                    };
+                    let tx = tx.value();
+                    resolved = versions.iter().rev().find(|version| {
+                        version.is_visible_to(tx, &self.txs, &self.finalized_tx_states)
+                    });
+                    break;
+                }
+            }
+        }
+        let Some(visible) = resolved else {
+            return false;
+        };
+        let begin = match visible.begin() {
+            Some(TxTimestampOrID::Timestamp(ts)) => ts,
+            Some(TxTimestampOrID::TxID(id)) => {
+                match lookup_tx_state(&self.txs, &self.finalized_tx_states, id) {
+                    Some(TransactionState::Committed(ts)) => ts,
+                    _ => return false,
+                }
+            }
+            None => return false,
+        };
+        begin <= snapshot.durable_at_begin
+    }
+
+    /// The least `durable_at_begin` over the active and preparing transactions (`u64::MAX` when
+    /// none): a version committed at or below it is B-tree-equivalent for every live reader. A
+    /// reader that begins after this is sampled sees a durable maximum at least as large.
+    /// Advance `durable_txid_max` to `txid`, whose rows a reader reaches once its WAL mark is at or
+    /// past `at`. A repeat of the current value keeps its earlier, smaller position.
+    pub(crate) fn publish_durable_bound(&self, txid: u64, at: WalPos) {
+        let mut bound = self.durable_bound.write();
+        if txid != bound.latest.0 {
+            bound.previous = bound.latest;
+            bound.latest = (txid, at);
+        }
+        self.durable_txid_max.store(txid, Ordering::SeqCst);
+    }
+
+    /// The newest durable bound whose rows a reader at WAL `mark` reaches in the B-tree; 0 when
+    /// its mark predates both recorded bounds, so it reads every row from the version store.
+    #[inline]
+    fn run_after_read_mark_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.after_read_mark_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                (hook.0)();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_at_begin_of(&self, tx_id: TxID) -> Option<u64> {
+        self.txs.get(&tx_id).map(|tx| tx.value().durable_at_begin)
+    }
+
+    fn durable_txid_for_mark(&self, mark: WalPos) -> u64 {
+        let bound = self.durable_bound.read();
+        if mark >= bound.latest.1 {
+            bound.latest.0
+        } else if mark >= bound.previous.1 {
+            bound.previous.0
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn compute_min_durable_at_begin(&self) -> u64 {
+        self.txs
+            .iter()
+            .filter_map(|entry| {
+                let tx = entry.value();
+                match tx.state.load() {
+                    TransactionState::Active | TransactionState::Preparing(_) => {
+                        Some(tx.durable_at_begin)
+                    }
+                    _ => None,
+                }
+            })
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
     /// True when `tx` should ignore this SkipMap chain and read the key from B-tree.
     ///
-    /// Passive never falls through: it reclaims a chain only when no snapshot
-    /// is open, so a live passive reader always finds its row in the SkipMap.
-    /// Truncate may fall through for a sole materialized current when no
-    /// checkpoint is in progress.
+    /// Passive falls through for a chain that is B-tree-equivalent for the reader
+    /// ([`Self::passive_chain_is_btree_equivalent`]); Truncate for a sole materialized
+    /// current when no checkpoint is in progress.
     fn btree_covers_chain_for_tx(
         &self,
         tx: &Transaction<A>,
@@ -6668,7 +6822,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         versions: &[RowVersion],
     ) -> bool {
         if self.experimental_mvcc_passive_checkpoint {
-            return false;
+            return self.passive_chain_is_btree_equivalent(snapshot, versions)
+                && self.is_btree_readable_at(&table_id, snapshot.begin_ts, snapshot.read_mark);
         }
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return false;
@@ -7114,6 +7269,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.get_new_transaction_database_header(&pager);
             pager.mvcc_refresh_if_db_changed();
             let read_mark = WalPos::from_pair(pager.wal_pos());
+            self.run_after_read_mark_hook();
             let mut schema_stale = false;
             let begin_ts = self.clock.get_timestamp(|ts| {
                 let schema_generation = self.schema_generation();
@@ -7132,6 +7288,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         ts,
                         header,
                         read_mark,
+                        self.durable_txid_for_mark(read_mark),
                         schema_generation,
                         portable_logical_changes,
                     ),
@@ -7349,6 +7506,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // simply observes the bumped `schema_generation` and reprepares (below).
         pager.mvcc_refresh_if_db_changed();
         let read_mark = WalPos::from_pair(pager.wal_pos());
+        self.run_after_read_mark_hook();
         let mut schema_stale = false;
         let mut schema_change_unpublished = false;
         let begin_ts = self.clock.get_timestamp(|ts| {
@@ -7381,6 +7539,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     ts,
                     header,
                     read_mark,
+                    self.durable_txid_for_mark(read_mark),
                     schema_generation,
                     portable_logical_changes,
                 ),
@@ -7795,6 +7954,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     ts,
                     header,
                     tx.read_mark,
+                    // The successor keeps its predecessor's view, so the B-tree it may read too.
+                    tx.durable_at_begin,
                     self.schema_generation(),
                     tx.portable_logical_changes,
                 ),
@@ -8899,6 +9060,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             lwm
         };
+        let covered_through = if self.experimental_mvcc_passive_checkpoint && lwm != u64::MAX {
+            self.compute_min_durable_at_begin()
+        } else {
+            u64::MAX
+        };
         Self::gc_version_chain(
             versions,
             lwm,
@@ -8906,6 +9072,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             self.experimental_mvcc_passive_checkpoint,
             min_reader_mark,
             drop_current_if_in_btree,
+            covered_through,
         )
     }
 
@@ -9320,6 +9487,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         passive: bool,
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
+        covered_through: u64,
     ) -> usize {
         let before = versions.len();
 
@@ -9356,18 +9524,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         });
 
         // Rule 3: drop the last current when the B-tree already has it.
-        // Idle-only for both Passive and Truncate: a dual-cursor scan can lose
-        // the row if the SkipMap empties mid-scan while the B-tree side has
-        // already skipped the key as shadowed. `lwm == MAX` is the proof that
-        // no snapshot (hence no dual-cursor) is open. Under load, Rule 2 still
-        // reclaims superseded history; last currents wait for quiescence.
+        // A dual-cursor scan loses a row if its SkipMap copy empties mid-scan
+        // while the B-tree side skipped the key as shadowed. Truncate stays
+        // idle-only (`lwm == MAX`: no snapshot, hence no dual cursor, is open).
+        // Passive drops it under open snapshots too once it is committed at or
+        // below every live reader's `durable_at_begin` (`covered_through`):
+        // each of them already treats this copy as B-tree-equivalent and reads
+        // the row from the B-tree, never shadowing it, so no scan can tell the
+        // copy is gone.
         if drop_current_if_in_btree && versions.len() == 1 {
             if let (Some(TxTimestampOrID::Timestamp(b)), None) =
                 (&versions[0].begin(), &versions[0].end())
             {
                 let stamped_for_readers = materialized_for_readers(&versions[0]);
                 let in_durable_bound = passive || *b <= ckpt_max;
-                let removable = lwm == u64::MAX && stamped_for_readers && in_durable_bound;
+                let unseen = lwm == u64::MAX || (passive && *b <= covered_through);
+                let removable = unseen && stamped_for_readers && in_durable_bound;
                 if removable {
                     versions.clear();
                 }
@@ -10440,8 +10612,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     } else {
                         0
                     };
-                    self.durable_txid_max
-                        .store(persistent_tx_ts_max, Ordering::SeqCst);
+                    self.publish_durable_bound(persistent_tx_ts_max, WalPos::ORIGIN);
                     self.clock.reset(persistent_tx_ts_max + 1);
 
                     reader.plan(persistent_tx_ts_max)?;

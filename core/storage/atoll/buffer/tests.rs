@@ -7871,11 +7871,11 @@ fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, 
             other.set(Some((yframe, pool.header(yframe).record_held())));
         });
     }
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let panicked = crate::storage::atoll::testing::catch_test_panic(|| {
         let _ = pool
             .fix_optimistic(PageId::new(big, 1 << 20), None)
             .unwrap();
-    }))
+    })
     .is_err();
     let reached = !crate::race::pending("buffer.read_returned")
         && other.get().is_some_and(|(_, held_then)| held_then);

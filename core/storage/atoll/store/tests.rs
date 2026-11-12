@@ -438,34 +438,25 @@ fn a_copy_slot_claimed_by_a_step_that_waits_is_given_back() {
     );
 }
 
-/// A copy slot claimed by a step that then waits on a read of the free-space leaf it marks, the
-/// leaf evicted and its read kept by the backend, is given back as the step returns; the read in,
-/// the next call takes a slot and leaves no claim (the auditor's #4578; mutant: the claim kept on
-/// the wait's return, as before).
+/// A copy slot's take whose walk waits on a read of the free-space leaf it searches, the leaf out of
+/// memory and its read kept by the backend, holds no claim while it waits: it claims only once its
+/// walk finds the slot, and its mark then needs no read, its pages being the walk's (M2b 1c). The
+/// read in, the next call takes the slot and leaves no claim (the auditor's #4578, restated now
+/// that a mark cannot wait on a read after its claim; mutant: the claim kept past its call).
 #[test]
-fn a_copy_slot_claimed_by_a_step_waiting_on_a_metadata_read_is_given_back() {
-    use std::cell::Cell;
-    use std::rc::Rc;
+fn a_copy_slot_take_whose_walk_waits_on_a_metadata_read_holds_no_claim() {
     let crash = Arc::new(crate::io::crash::CrashIO::new(0));
     let db = Db::open_on(crash.clone());
     let store = db.store().clone();
-    // A class nothing has used: its free-space pages read in clean, held by no one, so the
-    // step's search finds them in memory and its leaf may then be evicted.
+    // A class nothing has used: its free-space leaf reads in clean, held by no one, so it may be
+    // evicted before the take.
     let class = class(1);
     let path = radix::path(Tree::Space, class, store.height(Tree::Space, class), 0);
     drop(drive(&db.io, || store.meta().get_all(&path)).unwrap());
     // The last read's request, kept for a test to cancel, holds its page through its callback.
     drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
-    let evicted = Rc::new(Cell::new(None));
-    {
-        let (store, evicted) = (store.clone(), evicted.clone());
-        crate::race::at("store.copy_slot_claimed", move || {
-            let claimed = store.claimed[class.index()].ones();
-            let Some(&slot) = claimed.first() else { return };
-            let leaf = radix::path(Tree::Space, class, store.height(Tree::Space, class), slot)[0];
-            evicted.set(Some(store.meta().evict(leaf)));
-        });
-    }
+    store.meta().evict(path[0]);
+    let out = !store.meta().in_memory(path[0]);
     let before = crash.in_flight();
     let mut mark = MarkEdit::default();
     let waited = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
@@ -474,19 +465,16 @@ fn a_copy_slot_claimed_by_a_step_waiting_on_a_metadata_read_is_given_back() {
     let next = drive(&db.io, || store.take_copy_slot(class, &mut mark)).is_ok();
     let left_after = store.claimed[class.index()].ones();
     // Every assertion with the database closed.
+    drop(mark);
     drop((store, db));
-    assert_eq!(
-        evicted.get(),
-        Some(true),
-        "the step's claim was not reached, or the free-space leaf not evicted"
-    );
+    assert!(out, "the free-space leaf in memory before the take");
     assert!(
         waited && reading,
-        "the step did not wait on the leaf's read with the backend"
+        "the take did not wait on the leaf's read with the backend"
     );
     assert!(
         left.is_empty(),
-        "the step waiting on the read left its claim behind: {left:?}"
+        "the take waiting on its walk's read holds a claim: {left:?}"
     );
     assert!(next, "the next call took no slot");
     assert!(
@@ -2612,53 +2600,62 @@ fn a_copy_slot_whose_free_space_grows_under_its_mark_counts_it_in_the_new_root()
     assert!(claimed.is_empty(), "a claim left: {claimed:?}");
 }
 
-/// A copy slot's take whose mark waited on its two pages' reads, two read credits admitting both
-/// in its first call and the reads retiring before its next, claims the next slot in that call,
-/// in the same leaf: the mark aims again, keeps both pages, reads none again, and takes it. The
-/// pages are still the take's as its next claim is made: none can be evicted at that point. The
-/// first slot stays free and no claim is left (the auditor's #4651, #4653 and #4666: its claim is
-/// the class's, its slot its layout; mutant: the pages let go as the next claim is made).
+/// A copy slot's take whose mark waited on a latch another change held, every page of its path
+/// held: its claim given back as it returned, its next call's walk goes on where it was and takes
+/// the same slot again, over the same pages, reading none. The pages are still the take's as that
+/// next claim is made: none can be evicted at that point. No claim is left (the auditor's #4651,
+/// #4653 and #4666; M2b 1c: the walk keeps its place, so the slot is its own again; mutant: the
+/// pages let go as the next claim is made).
 #[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
 #[test]
-fn a_copy_slot_take_claiming_another_slot_keeps_its_pages_and_reads_none_again() {
-    use std::cell::Cell;
+fn a_copy_slot_take_claiming_again_after_a_latch_keeps_its_pages_and_reads_none_again() {
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+    use std::sync::mpsc;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
     let (crash, db) = reads_at_once(2);
     let store = db.store().clone();
     let class = class(0);
     drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
-    // Every metadata page written, so clean and evictable.
+    // Every metadata page written, so clean: a page let go could be evicted.
     db.checkpoint();
     db.checkpoint();
     let before = space_units(&db, class);
     let first = Rc::new(Cell::new(None));
-    let out = Rc::new(Cell::new(0));
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let holder = Rc::new(RefCell::new(None));
     {
-        let (store, first, out) = (store.clone(), first.clone(), out.clone());
+        let (store, io, first, holder) =
+            (store.clone(), db.io.clone(), first.clone(), holder.clone());
         crate::race::at("store.copy_slot_claimed", move || {
             let Some(&slot) = store.claimed[class.index()].ones().first() else {
                 return;
             };
             first.set(Some(slot));
-            drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
-            let path = radix::path(Tree::Space, class, store.height(Tree::Space, class), slot);
-            for &id in path.iter() {
-                store.meta().evict(id);
-            }
-            out.set(
-                path.iter()
-                    .filter(|&&id| !store.meta().in_memory(id))
-                    .count(),
-            );
+            let leaf = radix::path(Tree::Space, class, store.height(Tree::Space, class), slot)[0];
+            let (held_tx, held_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let frame = drive(&io, || store.meta().get(leaf)).unwrap();
+                let hold = frame.try_lock();
+                let _ = held_tx.send(hold.is_some());
+                let _ = go_rx.recv_timeout(BOUND);
+                if let Some(hold) = hold {
+                    hold.release_unchanged();
+                }
+            });
+            let held = held_rx.recv_timeout(BOUND).unwrap_or(false);
+            *holder.borrow_mut() = Some((thread, held));
         });
     }
     let mut mark = MarkEdit::default();
     let waited = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
-    let (held, reading) = (mark.state.pages.held_ids(), crash.in_flight());
-    while crash.in_flight() > 0 {
-        crash.step().unwrap();
-    }
-    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    let held = mark.state.pages.held_ids();
+    let left = store.claimed[class.index()].ones();
+    let _ = go_tx.send(());
+    let (joined, latched) = holder
+        .borrow_mut()
+        .take()
+        .map_or((false, false), |(t, held)| (t.join().is_ok(), held));
     let evicted_at_claim = Rc::new(Cell::new(None));
     {
         let (store, evicted_at_claim) = (store.clone(), evicted_at_claim.clone());
@@ -2672,12 +2669,11 @@ fn a_copy_slot_take_claiming_another_slot_keeps_its_pages_and_reads_none_again()
         });
     }
     let reads = crash.completed();
-    let next = store.take_copy_slot(class, &mut mark);
-    let read_after = crash.completed() - reads;
-    let next = match next {
+    let next = match store.take_copy_slot(class, &mut mark) {
         Ok(IOResult::Done(slot)) => Some(slot),
         _ => None,
     };
+    let read_after = crash.completed() - reads;
     let units = space_units(&db, class);
     let claimed = store.claimed[class.index()].ones();
     let first = first.get();
@@ -2687,22 +2683,17 @@ fn a_copy_slot_take_claiming_another_slot_keeps_its_pages_and_reads_none_again()
     drop(mark);
     drop(store);
     drop(db);
-    assert_eq!(
-        out.get(),
-        2,
-        "the mark's pages out of memory after the claim"
+    assert!(
+        joined && latched,
+        "(the latch thread joined, the leaf latched)"
     );
-    assert!(waited, "the first call did not wait on the reads");
-    assert_eq!(
-        (held.len(), reading),
-        (2, 2),
-        "(pages held, reads with the backend)"
+    assert!(waited, "the first call did not wait on the latch");
+    assert_eq!(held.len(), 2, "pages held as the first call returned");
+    assert!(
+        left.is_empty(),
+        "a claim left by the waiting call: {left:?}"
     );
-    assert_eq!(
-        next,
-        first.map(|s| s + 1),
-        "the next call's slot, of the first claim {first:?}"
-    );
+    assert_eq!(next, first, "the next call's slot, of the first claim");
     assert_eq!(
         evicted_at_claim.get(),
         Some(0),
@@ -2713,100 +2704,118 @@ fn a_copy_slot_take_claiming_another_slot_keeps_its_pages_and_reads_none_again()
     assert!(claimed.is_empty(), "a claim left: {claimed:?}");
 }
 
-/// A copy slot's take whose mark waited on a read, under one read credit, keeps its page across
-/// its next calls' claims, whatever they return: while the next claim waits on a read of its own
-/// the page stays held, and when that read fails the take ends with the error and lets the page
-/// go (the auditor's #4651: the whole call is the edit's; mutant: only the mark under the edit, so
-/// a claim's error returns with the old mark's pages still held).
+/// A copy slot's take whose mark waited on a latch, under one read credit, keeps its pages across
+/// its next calls' claims, whatever they return: when the next claim's walk moves past its leaf,
+/// every free slot there now held for erasure, and waits on the next leaf's read, the root stays
+/// held; when that read fails, the take ends with the error and lets every page go (the auditor's
+/// #4651: the whole call is the edit's; M2b 1c; mutant: the claim outside the edit, so a claim's
+/// error returns with the old mark's pages still held).
 #[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
 #[test]
 fn a_copy_slot_take_whose_claim_fails_after_its_mark_waited_lets_its_pages_go() {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::mpsc;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
     let (crash, db) = one_read();
     let store = db.store().clone();
     let class = class(0);
     drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
     db.checkpoint();
     db.checkpoint();
-    // The claim walk's pages held in memory by the test until the claim is made: its cold walk is
-    // slice 1c's.
-    let path = radix::path(Tree::Space, class, 2, 0).to_vec();
-    let warm: Vec<_> = path
+    let root = radix::root(Tree::Space, class, 2);
+    let leaf = |index| MetaId {
+        tree: Tree::Space,
+        class,
+        level: 0,
+        index,
+    };
+    let (first, second) = (leaf(0), leaf(1));
+    // The root and the first leaf held in memory by the test for the first call; the second leaf
+    // out of memory.
+    let warm: Vec<_> = [root, first]
         .iter()
         .map(|&id| drive(&db.io, || store.meta().get(id)).unwrap())
         .collect();
-    let warm = Rc::new(RefCell::new(warm));
-    let out = Rc::new(Cell::new(0));
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    store.meta().evict(second);
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let holder = Rc::new(RefCell::new(None));
     {
-        let (store, warm, out, path) = (store.clone(), warm.clone(), out.clone(), path.clone());
+        let (store, io, holder) = (store.clone(), db.io.clone(), holder.clone());
         crate::race::at("store.copy_slot_claimed", move || {
-            warm.borrow_mut().clear();
-            drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
-            for &id in &path {
-                store.meta().evict(id);
-            }
-            out.set(
-                path.iter()
-                    .filter(|&&id| !store.meta().in_memory(id))
-                    .count(),
-            );
+            let (held_tx, held_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let frame = drive(&io, || store.meta().get(first)).unwrap();
+                let hold = frame.try_lock();
+                let _ = held_tx.send(hold.is_some());
+                let _ = go_rx.recv_timeout(BOUND);
+                if let Some(hold) = hold {
+                    hold.release_unchanged();
+                }
+            });
+            let held = held_rx.recv_timeout(BOUND).unwrap_or(false);
+            *holder.borrow_mut() = Some((thread, held));
         });
     }
-    let (leaf, root) = (path[0], path[1]);
-    let settle = || {
-        while crash.in_flight() > 0 {
-            crash.step().unwrap();
-        }
-        drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
-    };
     let mut mark = MarkEdit::default();
-    let first = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
+    let latch_wait = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
     let held_first = mark.state.pages.held_ids();
-    settle();
+    let _ = go_tx.send(());
+    let (joined, latched) = holder
+        .borrow_mut()
+        .take()
+        .map_or((false, false), |(t, held)| (t.join().is_ok(), held));
+    drop(warm);
+    for u in 0..radix::SPACE_BITS {
+        store.unerased[class.index()].set(u);
+    }
     crash.set_faults(crate::io::crash::Faults {
         read: 1.0,
         ..Default::default()
     });
-    let second = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
-    let root_reading = crash.in_flight();
-    let kept_waiting = !store.meta().evict(leaf);
-    settle();
+    // A leaf a poll: the first leaf scanned past, then the second's read.
+    let scanned = match store.take_copy_slot(class, &mut mark) {
+        Ok(IOResult::IO(IOCompletions(c))) => c.finished(),
+        _ => false,
+    };
+    let second_wait = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
+    let reading = crash.in_flight();
+    let root_kept = !store.meta().evict(root);
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
     crash.set_faults(Default::default());
     let failed = store.take_copy_slot(class, &mut mark).is_err();
     let (pending, held) = (mark.pending(), mark.state.pages.held());
-    let let_go = store.meta().evict(leaf) || !store.meta().in_memory(leaf);
-    let warm_left = warm.borrow().len();
+    let root_let_go = store.meta().evict(root) || !store.meta().in_memory(root);
     drop(mark);
-    drop(warm);
     drop(store);
     drop(db);
-    assert_eq!(
-        (out.get(), warm_left),
-        (2, 0),
-        "(path pages out after the claim, test holds)"
-    );
-    assert!(first, "the first call did not wait on its mark's read");
-    assert_eq!(held_first, vec![leaf], "pages held after the first call");
     assert!(
-        second,
-        "the second call's claim did not wait on the root's read"
+        joined && latched,
+        "(the latch thread joined, the leaf latched)"
     );
-    assert_eq!(
-        root_reading, 1,
-        "reads with the backend as the claim waits: {root:?}"
+    assert!(latch_wait, "the first call did not wait on the latch");
+    assert_eq!(held_first.len(), 2, "pages held after the first call");
+    assert!(
+        scanned,
+        "the next poll did not end its work with the first leaf"
     );
     assert!(
-        kept_waiting,
-        "the mark's page let go while the next claim waited"
+        second_wait,
+        "the next claim did not wait on the second leaf's read"
     );
+    assert_eq!(reading, 1, "reads with the backend as the claim waits");
+    assert!(root_kept, "the root let go while the next claim waited");
     assert!(failed, "the take did not end with the claim's failed read");
     assert_eq!(
         (pending, held),
         (None, 0),
         "(the take under way, pages held)"
     );
-    assert!(let_go, "the leaf still held after the take failed");
+    assert!(root_let_go, "the root still held after the take failed");
 }
 
 /// A copy slot's take of one class whose mark waited holding its page, followed by a take of
@@ -2990,4 +2999,717 @@ fn a_checkpoints_deferred_free_that_waits_on_its_reads_stays_owed_until_it_is_ma
         "the slot not in use before its free"
     );
     assert_eq!(units, expected, "the slots in use after the checkpoint");
+}
+
+/// Sets the counts below `children` of the metadata page `id` of a store, under the page's latch,
+/// as a test's forging of a free space's occupancy.
+fn forge_counts(db: &Db, id: MetaId, children: impl IntoIterator<Item = (u64, u64)>) {
+    let store = db.store();
+    let frame = drive(&db.io, || store.meta().get(id)).unwrap();
+    let mut hold = frame.try_lock().expect("a forged page's latch free");
+    for (child, used) in children {
+        radix::set_used_below(hold.page(), child, used);
+    }
+    hold.commit(store.meta());
+}
+
+/// A copy slot's take over a free space two levels high whose root and leaf are both out of
+/// memory, under one read credit, keeps its walk's place and pages across its waits: three polls,
+/// two reads, no page of the path evictable after any poll or once its reads retire, and none let
+/// go as the walk goes on where it waited. The cold control: both pages out of memory first (the
+/// auditor's #4664 probe, whose walk without them alternates root and leaf for twelve polls; M2b
+/// 1c; mutants: the walk's pages let go at a wait, the walk going down again from the root).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_copy_slot_take_over_a_cold_free_space_keeps_its_walk_and_reads_each_page_once() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (crash, db) = one_read();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    db.checkpoint();
+    db.checkpoint();
+    let cursor = store.cursors[class.index()].load(crate::sync::atomic::Ordering::Relaxed);
+    let pages = radix::path(Tree::Space, class, 2, cursor).to_vec();
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    for &id in &pages {
+        store.meta().evict(id);
+    }
+    let out = pages
+        .iter()
+        .filter(|&&id| !store.meta().in_memory(id))
+        .count();
+    let settle = || {
+        while crash.in_flight() > 0 {
+            crash.step().unwrap();
+        }
+        drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    };
+    let before = crash.completed();
+    let mut mark = MarkEdit::default();
+    let (mut polls, mut evicted) = (0, Vec::new());
+    let resumed_evicted = Rc::new(Cell::new(None));
+    let slot = loop {
+        polls += 1;
+        match store.take_copy_slot(class, &mut mark) {
+            Ok(IOResult::Done(slot)) => break Some(slot),
+            Ok(IOResult::IO(_)) => {}
+            Err(_) => break None,
+        }
+        // No page of the path is in memory but by the take: any evicted is one it let go.
+        for &id in &pages {
+            if store.meta().evict(id) {
+                evicted.push(id);
+            }
+        }
+        settle();
+        for &id in &pages {
+            if store.meta().evict(id) {
+                evicted.push(id);
+            }
+        }
+        // As the next poll aims again, before it looks: its pages are still the take's.
+        if polls == 2 {
+            let (store, pages, resumed_evicted) =
+                (store.clone(), pages.clone(), resumed_evicted.clone());
+            crate::race::at("store.walk_aimed", move || {
+                let n = pages.iter().filter(|&&id| store.meta().evict(id)).count();
+                resumed_evicted.set(Some(n));
+            });
+        }
+        if polls >= 12 {
+            break None;
+        }
+    };
+    let reads = crash.completed() - before;
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert_eq!(out, 2, "the path's pages out of memory before the take");
+    assert!(
+        evicted.is_empty(),
+        "pages the take held evicted: {evicted:?}"
+    );
+    assert_eq!(
+        resumed_evicted.get(),
+        Some(0),
+        "pages evicted as the walk went on where it waited"
+    );
+    assert_eq!(
+        (slot.is_some(), polls, reads),
+        (true, 3, 2),
+        "(a slot taken, polls, metadata reads)"
+    );
+}
+
+/// A copy slot's take whose walk moves past a leaf with nothing takeable, every free slot in it
+/// still to be erased, and waits on the next leaf's read, goes on from that leaf: the leaf it
+/// moved past, let go and evicted meanwhile, is not read again, and the take claims the next
+/// leaf's first slot (M2b 1c, its first finding; mutant: the walk's place not kept, so the next
+/// poll starts at the cursor again).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_copy_slot_take_whose_walk_waits_past_a_leaf_goes_on_from_there() {
+    let (crash, db) = one_read();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    db.checkpoint();
+    db.checkpoint();
+    let cursor = store.cursors[class.index()].load(crate::sync::atomic::Ordering::Relaxed);
+    let root = radix::root(Tree::Space, class, 2);
+    let leaf = |index| MetaId {
+        tree: Tree::Space,
+        class,
+        level: 0,
+        index,
+    };
+    let (first, second) = (leaf(0), leaf(1));
+    for u in cursor..radix::SPACE_BITS {
+        store.unerased[class.index()].set(u);
+    }
+    // The root and the first leaf held in memory by the test; the second out of it.
+    let warm: Vec<_> = [root, first]
+        .iter()
+        .map(|&id| drive(&db.io, || store.meta().get(id)).unwrap())
+        .collect();
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    store.meta().evict(second);
+    let second_out = !store.meta().in_memory(second);
+    let mut mark = MarkEdit::default();
+    // A leaf a poll: the first leaf scanned, the poll's work done; then the second leaf's read.
+    let scanned = match store.take_copy_slot(class, &mut mark) {
+        Ok(IOResult::IO(IOCompletions(c))) => c.finished(),
+        _ => false,
+    };
+    let waited = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)))
+        && crash.in_flight() == 1;
+    drop(warm);
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    let first_let_go = store.meta().evict(first) || !store.meta().in_memory(first);
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    let reads = crash.completed();
+    let taken = match store.take_copy_slot(class, &mut mark) {
+        Ok(IOResult::Done(slot)) => Some(slot),
+        _ => None,
+    };
+    let read_after = crash.completed() - reads;
+    let first_out = !store.meta().in_memory(first);
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert!(second_out, "the second leaf in memory before the take");
+    assert!(
+        scanned,
+        "the first poll did not end its work with the first leaf"
+    );
+    assert!(waited, "the take did not wait on the second leaf's read");
+    assert!(
+        first_let_go,
+        "the first leaf held after the walk moved past it"
+    );
+    assert_eq!(taken, Some(radix::SPACE_BITS), "the slot taken");
+    assert_eq!(read_after, 0, "reads by the take's next poll");
+    assert!(first_out, "the first leaf read again");
+}
+
+/// A free space three levels high, its cursor in the root's first subtree, that subtree's room
+/// all before the cursor and none of it takeable (every free slot of its first leaf still to be
+/// erased, its other leaves counted full): a copy slot's take goes on past the subtree to the next
+/// one, takes its first slot, and the free space does not grow. Wrapping round from the
+/// subtree's node instead spends the walk's one wrap there, finds nothing, and grows the free
+/// space a level each time until it grows no further (M2b 1c, its second finding; mutant: the
+/// wrap from an internal node).
+#[test]
+fn a_copy_slot_take_goes_on_past_a_subtree_with_no_room_after_its_cursor() {
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    store.cursors[class.index()].store(radix::SPACE_BITS, crate::sync::atomic::Ordering::Relaxed);
+    for u in 0..radix::SPACE_BITS {
+        store.unerased[class.index()].set(u);
+    }
+    let first_subtree = MetaId {
+        tree: Tree::Space,
+        class,
+        level: 1,
+        index: 0,
+    };
+    forge_counts(
+        &db,
+        first_subtree,
+        (1..radix::FANOUT).map(|c| (c, radix::SPACE_BITS)),
+    );
+    let mut mark = MarkEdit::default();
+    let taken = drive(&db.io, || store.take_copy_slot(class, &mut mark)).ok();
+    let height = store.height(Tree::Space, class);
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert_eq!(
+        (taken, height),
+        (Some(radix::span(Tree::Space, 1)), 3),
+        "(the slot taken, the free space's height)"
+    );
+}
+
+/// The same layout for a swap slot's take and for a page number's allocation, whose walks are
+/// their call's alone: each goes on past the subtree with no room after its cursor, and neither
+/// tree grows (M2b 1c; mutant: the wrap from an internal node).
+#[test]
+fn a_swap_slot_and_a_page_number_go_on_past_a_subtree_with_no_room_after_their_cursor() {
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    for tree in [Tree::Space, Tree::Map] {
+        drive(&db.io, || store.grow(tree, class)).unwrap();
+        drive(&db.io, || store.grow(tree, class)).unwrap();
+    }
+    store.cursors[class.index()].store(radix::SPACE_BITS, crate::sync::atomic::Ordering::Relaxed);
+    store.numbers[class.index()].store(radix::MAP_ENTRIES, crate::sync::atomic::Ordering::Relaxed);
+    for u in 0..radix::SPACE_BITS {
+        store.unerased[class.index()].set(u);
+    }
+    for n in 0..radix::MAP_ENTRIES {
+        store.unreusable[class.index()].set(n);
+    }
+    for tree in [Tree::Space, Tree::Map] {
+        let subtree = MetaId {
+            tree,
+            class,
+            level: 1,
+            index: 0,
+        };
+        let units = radix::leaf_units(tree);
+        forge_counts(&db, subtree, (1..radix::FANOUT).map(|c| (c, units)));
+    }
+    let swap = drive(&db.io, || store.take_swap_slot(class)).ok();
+    let number = drive(&db.io, || store.allocate(class))
+        .ok()
+        .map(|p| p.number());
+    let heights = (
+        store.height(Tree::Space, class),
+        store.height(Tree::Map, class),
+    );
+    drop(store);
+    drop(db);
+    assert_eq!(
+        (swap, number, heights),
+        (
+            Some(radix::span(Tree::Space, 1)),
+            Some(radix::span(Tree::Map, 1)),
+            (3, 3)
+        ),
+        "(the swap slot, the page number, the trees' heights)"
+    );
+}
+
+/// A free space `MAX_HEIGHT` levels high whose units a metadata id names are all counted in use:
+/// a copy slot's take answers the full free space's error, and no walk looks for a page past the
+/// ones a metadata id names, which the cache would refuse (M2b 1c, its third finding; mutant: no
+/// bound on the children a walk may go down to).
+#[test]
+fn a_free_space_whose_nameable_units_are_all_in_use_is_full() {
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    for _ in 1..MAX_HEIGHT {
+        drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    }
+    let height = store.height(Tree::Space, class);
+    let root = radix::root(Tree::Space, class, height);
+    let span = radix::span(Tree::Space, height - 2);
+    let nameable_children = radix::nameable(Tree::Space).div_ceil(span);
+    forge_counts(&db, root, (0..nameable_children).map(|c| (c, span)));
+    let mut mark = MarkEdit::default();
+    let refused = match drive(&db.io, || store.take_copy_slot(class, &mut mark)) {
+        Err(e) => Some(e.to_string()),
+        Ok(_) => None,
+    };
+    drop(mark);
+    // The partly nameable child counted with room, its own node's nameable children all in use:
+    // the bound holds below the root too, relative to the node.
+    forge_counts(&db, root, [(nameable_children - 1, 0)]);
+    let partial = MetaId {
+        tree: Tree::Space,
+        class,
+        level: height - 2,
+        index: nameable_children - 1,
+    };
+    let below = radix::span(Tree::Space, height - 3);
+    let partial_first = (nameable_children - 1) * span;
+    let partial_children = (radix::nameable(Tree::Space) - partial_first).div_ceil(below);
+    forge_counts(&db, partial, (0..partial_children).map(|c| (c, below)));
+    let mut mark = MarkEdit::default();
+    let refused_below = match drive(&db.io, || store.take_copy_slot(class, &mut mark)) {
+        Err(e) => Some(e.to_string()),
+        Ok(_) => None,
+    };
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert!(
+        partial_children > 0 && partial_children < radix::FANOUT,
+        "the partly nameable node's nameable children: {partial_children}"
+    );
+    let refused_below = refused_below.expect("a take from a full free space, below the root");
+    assert!(
+        refused_below.contains("grows no further"),
+        "the take's error below the root: {refused_below}"
+    );
+    assert_eq!(height, MAX_HEIGHT, "the free space's height");
+    assert_eq!(
+        nameable_children, 3,
+        "the root's children a metadata id reaches"
+    );
+    let refused = refused.expect("a take from a full free space");
+    assert!(
+        refused.contains("grows no further"),
+        "the take's error: {refused}"
+    );
+}
+
+/// A copy slot's take over a free space whose free slots are all held for erasure, every page in
+/// memory, scans one node or leaf a poll, its place and its one wrap kept across the polls: two
+/// leaves past the cursor, the root with no room past them, the wrap, the two leaves and the root
+/// again, then the free space full at its height, so it grows a level, and the take claims the
+/// first slot of the new subtree. Seven yields, eight polls (the auditor's #4681 W2 and #4685: a
+/// stated quantum, one descent a poll; mutants: no quantum for a leaf, so one poll walks every
+/// leaf; a growth not charged; the wrap forgotten between polls, so the walk wraps again and
+/// never ends).
+#[test]
+fn a_copy_slot_take_scans_a_leaf_a_poll_and_wraps_once() {
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    store.cursors[class.index()].store(0, crate::sync::atomic::Ordering::Relaxed);
+    for u in 0..2 * radix::SPACE_BITS {
+        store.unerased[class.index()].set(u);
+    }
+    let root = radix::root(Tree::Space, class, 2);
+    forge_counts(
+        &db,
+        root,
+        (2..radix::FANOUT).map(|c| (c, radix::SPACE_BITS)),
+    );
+    let mut mark = MarkEdit::default();
+    let (mut polls, mut yields) = (0, 0);
+    let taken = loop {
+        polls += 1;
+        match store.take_copy_slot(class, &mut mark) {
+            Ok(IOResult::Done(slot)) => break Some(slot),
+            Ok(IOResult::IO(IOCompletions(c))) if c.finished() => yields += 1,
+            _ => break None,
+        }
+        if polls >= 12 {
+            break None;
+        }
+    };
+    let height = store.height(Tree::Space, class);
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert_eq!(
+        (taken, height, polls, yields),
+        (Some(radix::capacity(Tree::Space, 2)), 3, 8, 7),
+        "(the slot taken, the free space's height, polls, yields)"
+    );
+}
+
+/// A copy slot's take over a full free space one level high, every page out of memory, under one
+/// read credit: its walk finds none, and its growth's new root is read while the take holds the old
+/// one. Once that read retires, neither root can be evicted; the take's next poll grows the free
+/// space once, its walk going on at the new height, reads the new leaf, and takes its first slot:
+/// three reads, one growth (the auditor's #4681 W3; mutant: the growth's pages let go at its wait,
+/// as `get_all` lets them go).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_copy_slot_take_whose_free_space_grows_keeps_both_roots_across_the_growths_read() {
+    let (crash, db) = one_read();
+    let store = db.store().clone();
+    let class = class(0);
+    db.checkpoint();
+    db.checkpoint();
+    for u in 0..radix::SPACE_BITS {
+        store.unerased[class.index()].set(u);
+    }
+    let (old_root, new_root) = (
+        radix::root(Tree::Space, class, 1),
+        radix::root(Tree::Space, class, 2),
+    );
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    store.meta().evict(old_root);
+    let out = !store.meta().in_memory(old_root) && !store.meta().in_memory(new_root);
+    let settle = || {
+        while crash.in_flight() > 0 {
+            crash.step().unwrap();
+        }
+        drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    };
+    let before = crash.completed();
+    let mut mark = MarkEdit::default();
+    let (mut polls, mut evicted_at_growth) = (0, None);
+    let taken = loop {
+        polls += 1;
+        match store.take_copy_slot(class, &mut mark) {
+            Ok(IOResult::Done(slot)) => break Some(slot),
+            Ok(IOResult::IO(_)) => {}
+            Err(_) => break None,
+        }
+        // The growth's read made: the new root's frame in its cell, its read with the backend.
+        let growing = store.meta().in_memory(new_root);
+        settle();
+        if growing && evicted_at_growth.is_none() {
+            let n = [old_root, new_root]
+                .iter()
+                .filter(|&&id| store.meta().evict(id))
+                .count();
+            evicted_at_growth = Some(n);
+        }
+        if polls >= 12 {
+            break None;
+        }
+    };
+    let reads = crash.completed() - before;
+    let height = store.height(Tree::Space, class);
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert!(out, "the roots in memory before the take");
+    assert_eq!(
+        evicted_at_growth,
+        Some(0),
+        "roots evicted as the growth's read retired"
+    );
+    assert_eq!(
+        (taken, height, reads),
+        (Some(radix::SPACE_BITS), 2, 3),
+        "(the slot taken, the free space's height, metadata reads)"
+    );
+}
+
+/// A walk that found the free space's last searchable unit, whose claim another then took, wraps
+/// to the start and goes down again from the root: the leaf it found the unit in no longer holds
+/// its place, so the first leaf's free units are found (the auditor's #4684; mutant: the node the
+/// walk stopped at kept across the wrap, so it scans that leaf alone again and finds the free
+/// space full).
+#[test]
+fn a_walk_whose_last_unit_is_claimed_by_another_wraps_from_the_root() {
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    let end = radix::searchable(Tree::Space, 2);
+    let last_leaf = radix::FANOUT - 1;
+    // In the last leaf only its last unit is takeable; the first leaf is free.
+    for u in last_leaf * radix::SPACE_BITS..end - 1 {
+        store.unerased[class.index()].set(u);
+    }
+    let root = radix::root(Tree::Space, class, 2);
+    forge_counts(&db, root, (1..last_leaf).map(|c| (c, radix::SPACE_BITS)));
+    let (mut walk, mut pages) = (Walk::default(), PageSet::default());
+    walk.from = Some(end - 1);
+    let found = match store.walk(Tree::Space, class, true, &mut walk, &mut pages, true) {
+        Ok(IOResult::Done(found)) => found,
+        _ => None,
+    };
+    // Another claims it first, and the claim goes on past it as `claim_slot` does.
+    store.claimed[class.index()].set(end - 1);
+    walk.from = Some(end);
+    let (mut polls, mut again) = (0, None);
+    while polls < 4 {
+        polls += 1;
+        match store.walk(Tree::Space, class, true, &mut walk, &mut pages, true) {
+            Ok(IOResult::Done(found)) => {
+                again = Some(found);
+                break;
+            }
+            Ok(IOResult::IO(_)) => {}
+            Err(_) => break,
+        }
+    }
+    drop(pages);
+    drop(store);
+    drop(db);
+    assert_eq!(found, Some(end - 1), "the unit the first walk found");
+    assert_eq!(
+        (again, polls),
+        (Some(Some(0)), 1),
+        "(what the walk found once the claim was lost, polls)"
+    );
+}
+
+/// A copy slot's take whose free space's root counts room in children whose own counts show none,
+/// as a walk reads them when other changes fill those children between its reads, scans one such
+/// node a poll: three nodes passed, a yield each, and the fourth's first slot taken in the fourth
+/// poll (the auditor's #4685; mutant: a node with nothing past the place goes down again from the
+/// root in the same poll, so one poll passes every node).
+#[test]
+fn a_copy_slot_take_scans_a_node_a_poll_when_counts_above_it_promised_room() {
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    store.cursors[class.index()].store(0, crate::sync::atomic::Ordering::Relaxed);
+    for index in 0..3 {
+        let node = MetaId {
+            tree: Tree::Space,
+            class,
+            level: 1,
+            index,
+        };
+        forge_counts(
+            &db,
+            node,
+            (0..radix::FANOUT).map(|c| (c, radix::SPACE_BITS)),
+        );
+    }
+    let mut mark = MarkEdit::default();
+    let (mut polls, mut yields) = (0, 0);
+    let taken = loop {
+        polls += 1;
+        match store.take_copy_slot(class, &mut mark) {
+            Ok(IOResult::Done(slot)) => break Some(slot),
+            Ok(IOResult::IO(IOCompletions(c))) if c.finished() => yields += 1,
+            _ => break None,
+        }
+        if polls >= 12 {
+            break None;
+        }
+    };
+    let height = store.height(Tree::Space, class);
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert_eq!(
+        (taken, height, polls, yields),
+        (Some(3 * radix::span(Tree::Space, 1)), 3, 4, 3),
+        "(the slot taken, the free space's height, polls, yields)"
+    );
+}
+
+/// A copy slot's take whose claim another takes first, between its walk finding the slot and its
+/// claim, ends the poll there with a yield, and the next poll goes on in the same leaf and claims
+/// the next slot (the auditor's #4685: a lost claim charged as a restart; mutant: the claim goes
+/// on to search again in the same poll).
+#[test]
+fn a_copy_slot_take_whose_claim_is_lost_yields_and_goes_on_in_the_same_leaf() {
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    store.cursors[class.index()].store(0, crate::sync::atomic::Ordering::Relaxed);
+    {
+        let store = store.clone();
+        crate::race::at("store.slot_found", move || {
+            store.claimed[class.index()].set(0);
+        });
+    }
+    let mut mark = MarkEdit::default();
+    let (mut polls, mut yields) = (0, 0);
+    let taken = loop {
+        polls += 1;
+        match store.take_copy_slot(class, &mut mark) {
+            Ok(IOResult::Done(slot)) => break Some(slot),
+            Ok(IOResult::IO(IOCompletions(c))) if c.finished() => yields += 1,
+            _ => break None,
+        }
+        if polls >= 12 {
+            break None;
+        }
+    };
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert_eq!(
+        (taken, polls, yields),
+        (Some(1), 2, 1),
+        "(the slot taken, polls, yields)"
+    );
+}
+
+/// A copy slot's take whose walk passes children the root counts full and waits on the read of the
+/// next, under one read credit, goes on at that child: its place moved to the child's start as
+/// the walk went down, the child holds it, so the next poll aims the child and the root and
+/// neither can be evicted as it does, and nothing is read again (M2b 1c, with #4684's rule that a
+/// node holds the place it saves; mutant: the place left behind as the walk goes down, so the
+/// next poll goes down again from the root, the child let go and read again).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_copy_slot_take_waiting_at_a_child_past_full_siblings_goes_on_there() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (crash, db) = one_read();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    store.cursors[class.index()].store(0, crate::sync::atomic::Ordering::Relaxed);
+    let root = radix::root(Tree::Space, class, 2);
+    forge_counts(&db, root, (0..2).map(|c| (c, radix::SPACE_BITS)));
+    db.checkpoint();
+    db.checkpoint();
+    let child = MetaId {
+        tree: Tree::Space,
+        class,
+        level: 0,
+        index: 2,
+    };
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    store.meta().evict(child);
+    let out = !store.meta().in_memory(child);
+    let settle = || {
+        while crash.in_flight() > 0 {
+            crash.step().unwrap();
+        }
+        drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    };
+    let before = crash.completed();
+    let mut mark = MarkEdit::default();
+    let resumed_evicted = Rc::new(Cell::new(None));
+    let mut polls = 0;
+    let taken = loop {
+        polls += 1;
+        match store.take_copy_slot(class, &mut mark) {
+            Ok(IOResult::Done(slot)) => break Some(slot),
+            Ok(IOResult::IO(_)) => {}
+            Err(_) => break None,
+        }
+        settle();
+        // As the next poll aims, before it looks: the child is still the take's.
+        if polls == 1 {
+            let (store, resumed_evicted) = (store.clone(), resumed_evicted.clone());
+            crate::race::at("store.walk_aimed", move || {
+                let n = [child, root]
+                    .iter()
+                    .filter(|&&id| store.meta().evict(id))
+                    .count();
+                resumed_evicted.set(Some(n));
+            });
+        }
+        if polls >= 12 {
+            break None;
+        }
+    };
+    let reads = crash.completed() - before;
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert!(out, "the child out of memory before the take");
+    assert_eq!(
+        resumed_evicted.get(),
+        Some(0),
+        "pages evicted as the walk went on at the child"
+    );
+    assert_eq!(
+        (taken, polls, reads),
+        (Some(2 * radix::SPACE_BITS), 2, 1),
+        "(the slot taken, polls, metadata reads)"
+    );
+}
+
+/// A metadata page whose first unit is past the last a metadata id names is refused, as an
+/// error, before its cell is made: a free-space leaf past `INDEX_BITS`, and a level-5 node with no
+/// nameable unit below it, whose index, 3, is far below that, beside the last level-5 node that
+/// has one (the third finding's guard, made exact when a walk without its bound reached a level-1
+/// node near `1 << 46` and its cell was asked for; the table it reads is checked for every tree
+/// and level in `radix`; mutant: the guard by index alone, so the level-5 node is made and read).
+#[test]
+fn a_metadata_page_with_no_nameable_unit_is_refused_as_a_leaf_and_as_a_node() {
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    let at = |level: u8, index: u64| MetaId {
+        tree: Tree::Space,
+        class,
+        level,
+        index,
+    };
+    let first_past =
+        |level: u8| radix::nameable(Tree::Space).div_ceil(radix::span(Tree::Space, level));
+    let refused = |id: MetaId| match drive(&db.io, || store.meta().get(id)) {
+        Err(e) => e.to_string().contains("past the pages a metadata id names"),
+        Ok(_) => false,
+    };
+    let results = (
+        refused(at(5, first_past(5) - 1)),
+        refused(at(5, first_past(5))),
+        refused(at(0, first_past(0))),
+        first_past(5),
+    );
+    drop(store);
+    drop(db);
+    assert_eq!(
+        results,
+        (false, true, true, 3),
+        "(the last level-5 node with a nameable unit refused, the first without, the first leaf \
+         past, the first level-5 index past)"
+    );
 }

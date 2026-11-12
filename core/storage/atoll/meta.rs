@@ -36,6 +36,7 @@ use super::latch::{Held, LatchRef, Look, Marked, VersionedLatch};
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT, MIN_PAGE_SIZE};
 use super::pins::{Cells, PinCell, Pinnable, Pinned, Pins};
+use super::radix;
 use super::segmented::Segmented;
 use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::{Chain, Stack};
@@ -1052,6 +1053,16 @@ impl MetaCache {
     /// One look at the page `id`: in memory, loading (this look's load or another's, its frame
     /// held and the wait its load finishes), or refused a read credit, holding nothing.
     fn join(self: &Arc<Self>, id: MetaId) -> Result<Joined> {
+        // A page whose first unit is past the last a metadata id names is never looked for: a
+        // search stops short of it (`radix::searchable`). Refused here, as an error, before its
+        // cell is made, rather than by `MetaId::pid`'s assert in a read's callback; a leaf so
+        // refused is one whose index is past `INDEX_BITS`, a node one with no nameable unit below
+        // it, which its index alone does not say.
+        if id.index >= radix::first_unnameable(id.tree, id.level) {
+            return Err(LimboError::InternalError(format!(
+                "metadata page {id:?} past the pages a metadata id names"
+            )));
+        }
         let cell = self.files[id.file_index()].frames.get_or_make(id.index);
         let frame = loop {
             let step = self.epochs.enter();

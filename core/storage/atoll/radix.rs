@@ -12,7 +12,7 @@
 //! level and index; a tree grows by a level at the top, the old root becoming child 0 of the new
 //! one.
 
-use super::meta::{MetaId, Tree, INDEX_BITS, LEVELS, META_PAGE};
+use super::meta::{MetaId, Tree, INDEX_BITS, LEVELS, META_PAGE, TREES};
 use super::page::{SizeClass, HEADER_SIZE};
 use super::shared::{Bytes, BytesMut};
 
@@ -42,6 +42,50 @@ pub fn span(tree: Tree, level: u8) -> u64 {
 /// Units a tree of `height` levels holds.
 pub fn capacity(tree: Tree, height: u8) -> u64 {
     span(tree, height - 1)
+}
+
+/// Units below the leaves a metadata id can name, those whose index is below `1 << INDEX_BITS`
+/// ([`MetaId::pid`]): a tree `MAX_HEIGHT` levels high holds more, which are never used.
+pub const fn nameable(tree: Tree) -> u64 {
+    let leaf = match tree {
+        Tree::Map => MAP_ENTRIES,
+        Tree::Space => SPACE_BITS,
+    };
+    leaf << INDEX_BITS
+}
+
+/// The first index at `level` of `tree` whose node holds no unit a metadata id names
+/// ([`nameable`]): a page at or past it is never looked for ([`MetaCache::join`]'s guard, read on
+/// every look, so a table made at compile time).
+pub fn first_unnameable(tree: Tree, level: u8) -> u64 {
+    FIRST_UNNAMEABLE[tree as usize][level as usize]
+}
+
+/// `nameable(tree).div_ceil(span(tree, level))` for every tree and level an id has room for.
+const FIRST_UNNAMEABLE: [[u64; LEVELS]; TREES] = {
+    let mut table = [[0u64; LEVELS]; TREES];
+    let trees = [Tree::Map, Tree::Space];
+    let mut t = 0;
+    while t < TREES {
+        let tree = trees[t];
+        let mut span = match tree {
+            Tree::Map => MAP_ENTRIES,
+            Tree::Space => SPACE_BITS,
+        };
+        let mut level = 0;
+        while level < LEVELS {
+            table[tree as usize][level] = nameable(tree).div_ceil(span);
+            span = span.saturating_mul(FANOUT);
+            level += 1;
+        }
+        t += 1;
+    }
+    table
+};
+
+/// The units a search of a tree `height` levels high may find: its capacity, up to the nameable.
+pub fn searchable(tree: Tree, height: u8) -> u64 {
+    capacity(tree, height).min(nameable(tree))
 }
 
 /// Levels a tree ever has: the fewest whose root reaches every leaf a metadata id can name, one
@@ -181,15 +225,17 @@ pub fn free_in_leaf<P: Bytes + ?Sized>(
     (start..first + leaf_units(tree)).find(|&u| !used(tree, leaf, u))
 }
 
-/// The first child at or after `from_child` of a node at `level` with a free unit below it.
+/// The first child at or after `from_child` and before `to_child` of a node at `level` with a free
+/// unit below it.
 pub fn child_with_room<P: Bytes + ?Sized>(
     tree: Tree,
     node: &P,
     level: u8,
     from_child: u64,
+    to_child: u64,
 ) -> Option<u64> {
     let room = span(tree, level - 1);
-    (from_child..FANOUT).find(|&c| used_below(node, c) < room)
+    (from_child..to_child.min(FANOUT)).find(|&c| used_below(node, c) < room)
 }
 
 #[cfg(test)]
@@ -224,6 +270,45 @@ mod tests {
         assert_eq!(map_entry(&leaf, 4), SLOT_BASE + 9);
         let mut node = vec![0u8; META_PAGE];
         add_used_below(&mut node, 0, MAP_ENTRIES as i64);
-        assert_eq!(child_with_room(Tree::Map, &node, 1, 0), Some(1));
+        assert_eq!(child_with_room(Tree::Map, &node, 1, 0, FANOUT), Some(1));
+    }
+
+    /// A search stops short of the leaves no metadata id names, at every level: a child that
+    /// starts at or past its bound has no room, whatever its count (M2b 1c).
+    /// The guard's table, for every tree and every level an id has room for: the first index whose
+    /// node starts at or past the last nameable unit, the one before it holding some.
+    #[test]
+    fn the_first_unnameable_index_is_where_a_node_starts_past_every_nameable_unit() {
+        for tree in [Tree::Map, Tree::Space] {
+            for level in 0..LEVELS as u8 {
+                let (first, span) = (first_unnameable(tree, level), span(tree, level));
+                assert!(
+                    first >= 1
+                        && first.saturating_mul(span) >= nameable(tree)
+                        && (first - 1).saturating_mul(span) < nameable(tree),
+                    "{tree:?} level {level}: first unnameable index {first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_search_never_reaches_a_unit_no_metadata_id_names() {
+        let node = vec![0u8; META_PAGE];
+        for level in 1..MAX_HEIGHT {
+            assert_eq!(child_with_room(Tree::Space, &node, level, 0, 3), Some(0));
+            assert_eq!(child_with_room(Tree::Space, &node, level, 3, 3), None);
+        }
+        for tree in [Tree::Map, Tree::Space] {
+            assert_eq!(
+                nameable(tree) % leaf_units(tree),
+                0,
+                "{tree:?} bound mid-leaf"
+            );
+            assert_eq!(nameable(tree) / leaf_units(tree), 1 << INDEX_BITS);
+            assert!(searchable(tree, MAX_HEIGHT) == nameable(tree));
+            assert!(searchable(tree, MAX_HEIGHT - 1) == capacity(tree, MAX_HEIGHT - 1));
+            assert!(capacity(tree, MAX_HEIGHT - 1) < nameable(tree));
+        }
     }
 }

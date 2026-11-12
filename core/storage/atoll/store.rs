@@ -355,9 +355,29 @@ pub struct SlotPages {
 /// stays the front of its list until the free is done.
 pub type FreeEdit = Edit<(SizeClass, u64), SlotPages>;
 
+/// A search of a tree for a free unit, its place kept across its waits: where it goes on from,
+/// whether it has wrapped round to the start once already, and the node it waited at, as the
+/// tree's height, the node's level and its index, so the next poll goes on there over the pages it
+/// holds rather than down again from the root.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Walk {
+    from: Option<u64>,
+    wrapped: bool,
+    at: Option<(u8, u8, u64)>,
+}
+
+/// A take of a copy slot under way: its claim's walk and the pages of its path, which the mark of
+/// the slot it claims then takes over.
+#[derive(Default)]
+pub struct MarkState {
+    walk: Walk,
+    pages: PageSet<SLOT_PAGES>,
+}
+
 /// A take of a copy slot under way ([`PageStore::take_copy_slot`]): keyed by its class. The slot is
-/// its layout: each call claims afresh, as no claim outlives its call, and marks the slot it found.
-pub type MarkEdit = Edit<SizeClass, SlotPages>;
+/// its layout: each call claims afresh, as no claim outlives its call, and marks the slot it found;
+/// the claim's walk goes on from where it waited.
+pub type MarkEdit = Edit<SizeClass, MarkState>;
 
 /// The metadata pages an edit of a cut latched and changed, each once, in id order, and the
 /// height of the cut's free space for its page's class as the edit left it.
@@ -1045,32 +1065,63 @@ impl PageStore {
 
     // ---------------------------------------------------------------- slots
 
-    /// A free slot of `class`, claimed: in no free space, claimed by no one, not being erased.
-    fn claim_slot(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<u64>> {
+    /// A free slot of `class`, claimed: in no free space, claimed by no one, not being erased. Its
+    /// search goes on from `walk`'s place, the class's cursor when it starts, with its path's pages
+    /// in `pages`, both kept across its waits by a caller that keeps them. With `quantum`, a claim
+    /// lost to another and a growth made each end the poll with a yield, as the walk's restarts
+    /// do, so a poll makes one descent at most. The swap slots given back that it reclaims first
+    /// are not under that bound: each is reclaimed once, by the first claim after its epoch.
+    fn claim_slot(
+        self: &Arc<Self>,
+        class: SizeClass,
+        walk: &mut Walk,
+        pages: &mut PageSet<SLOT_PAGES>,
+        quantum: bool,
+    ) -> Result<IOResult<u64>> {
         for (c, slot) in self.swap_freed.reclaim(&self.epochs) {
             self.claimed[c.index()].clear(slot);
         }
+        if walk.from.is_none() {
+            walk.from = Some(self.cursors[class.index()].load(Ordering::Relaxed));
+        }
         loop {
-            let from = self.cursors[class.index()].load(Ordering::Relaxed);
-            let slot = match self.find_free(Tree::Space, class, from, true)? {
+            let slot = match self.walk(Tree::Space, class, true, walk, pages, quantum)? {
                 IOResult::Done(Some(s)) => s,
-                IOResult::Done(None) => match self.grow(Tree::Space, class)? {
-                    IOResult::Done(()) => continue,
+                // A full search, then the growth, over the same pages: a growth that waits keeps
+                // both roots, and its next poll finds the search over at once.
+                IOResult::Done(None) => match self.grow_with(Tree::Space, class, pages)? {
+                    // The units the tree held before are as they were: the walk goes on past them.
+                    IOResult::Done(()) => {
+                        walk.wrapped = false;
+                        if quantum {
+                            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+                        }
+                        continue;
+                    }
                     IOResult::IO(io) => return Ok(IOResult::IO(io)),
                 },
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
             self.cursors[class.index()].store(slot + 1, Ordering::Relaxed);
+            crate::race::point("store.slot_found");
             if self.claimed[class.index()].set(slot) {
                 return Ok(IOResult::Done(slot));
+            }
+            // Claimed by another since the walk found it: on past it.
+            walk.from = Some(slot + 1);
+            if quantum {
+                return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
             }
         }
     }
 
     /// A slot for a swap copy of a page of `class`: claimed in memory alone, so a crash frees it.
-    /// [`set_swap`](Self::set_swap) names it once the copy is written. Step it until done.
+    /// [`set_swap`](Self::set_swap) names it once the copy is written. Step it until done. Its
+    /// walk is this call's alone, and starts again at the cursor after a wait: NOT-DONE, the pool's
+    /// swap write keeps it once ASYNC1 gives that write its record.
     pub fn take_swap_slot(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<u64>> {
-        self.claim_slot(class)
+        let (mut walk, mut pages) = (Walk::default(), PageSet::default());
+        self.claim_slot(class, &mut walk, &mut pages, false)
     }
 
     /// A slot claimed for a swap copy whose write failed: given up.
@@ -1088,7 +1139,7 @@ impl PageStore {
         edit: &mut MarkEdit,
     ) -> Result<IOResult<u64>> {
         edit.poll(class, |state| {
-            let slot = match self.claim_slot(class)? {
+            let slot = match self.claim_slot(class, &mut state.walk, &mut state.pages, true)? {
                 IOResult::Done(s) => s,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -1592,6 +1643,17 @@ impl PageStore {
     /// Adds a level to `tree` of `class`, the old root the new one's first child. Step it until
     /// done.
     fn grow(self: &Arc<Self>, tree: Tree, class: SizeClass) -> Result<IOResult<()>> {
+        self.grow_with(tree, class, &mut PageSet::default())
+    }
+
+    /// [`grow`](Self::grow) over `pages`, its two roots kept across its waits by a caller that
+    /// keeps them: a claim's walk, which goes on at the new height over the same pages.
+    fn grow_with(
+        self: &Arc<Self>,
+        tree: Tree,
+        class: SizeClass,
+        pages: &mut PageSet<SLOT_PAGES>,
+    ) -> Result<IOResult<()>> {
         // Only tried: it is ownership of the growth. A caller that finds another growing waits for
         // its let-go (DESIGN.md 9.1.3, *No retry without a change*), registered before it tries
         // again; the growth it waited for may be the one it needed, which the height says.
@@ -1609,11 +1671,12 @@ impl PageStore {
         }
         let old_root = radix::root(tree, class, height);
         let new_root = radix::root(tree, class, height + 1);
-        let frames = match self.meta.get_all(&[old_root, new_root])? {
-            IOResult::Done(f) => f,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        pages.aim([old_root, new_root])?;
+        let ready = match pages.poll(&self.meta)? {
+            Polled::Ready(ready) => ready,
+            Polled::Wait(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
-        let mut locked = match Locked::new(&frames) {
+        let mut locked = match Locked::of(ready) {
             Ok(locked) => locked,
             Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
@@ -1712,7 +1775,9 @@ impl PageStore {
 
     /// The first unit of `tree` at or after `from` free as it stands that may be taken: no slot
     /// claimed or not yet erased (with `skip_unerased`), no number freed and not yet reusable or
-    /// kept for replay. Wraps to the start once.
+    /// kept for replay. Wraps to the start once. Its walk is this call's alone, and starts again at
+    /// `from` after a wait: NOT-DONE, the page table's allocations keep theirs once ASYNC1 gives
+    /// their owners records.
     fn find_free(
         self: &Arc<Self>,
         tree: Tree,
@@ -1720,12 +1785,62 @@ impl PageStore {
         from: u64,
         skip_unerased: bool,
     ) -> Result<IOResult<Option<u64>>> {
+        let mut walk = Walk {
+            from: Some(from),
+            ..Walk::default()
+        };
+        self.walk(
+            tree,
+            class,
+            skip_unerased,
+            &mut walk,
+            &mut PageSet::default(),
+            false,
+        )
+    }
+
+    /// One poll of a search of `tree` for a unit `find_free` would take, from `walk`'s place, its
+    /// path's pages in `pages`: both kept across its waits by a caller that keeps them, so a wait
+    /// loses neither the leaves it moved past nor the pages it read (M2b 1c). It goes down from the
+    /// root along the place; a node or leaf with nothing takeable past the place moves the place to
+    /// its end, and the search goes down again from the root it holds. Only the end of what a
+    /// search may find (`radix::searchable`, never a leaf no metadata id names) wraps it to the
+    /// start, once; a second end finds none. Each restart moves the place on or wraps, so the
+    /// search ends. With `quantum`, for a caller that keeps its walk, a poll makes one descent at
+    /// most: a node or a leaf with nothing takeable moves the place past it and returns a yield
+    /// rather than going down again, so a free space whose free units are all held for erasure is
+    /// walked a leaf a poll, and one whose counts other changes fill as it reads them a node a
+    /// poll (the auditor's #4685); a caller that keeps no walk scans on in the same call, as it
+    /// would start again at its place otherwise.
+    fn walk(
+        &self,
+        tree: Tree,
+        class: SizeClass,
+        skip_unerased: bool,
+        walk: &mut Walk,
+        pages: &mut PageSet<SLOT_PAGES>,
+        quantum: bool,
+    ) -> Result<IOResult<Option<u64>>> {
         let height = self.height(tree, class);
-        let mut from = from.min(radix::capacity(tree, height));
-        let mut wrapped = from == 0;
+        let end = radix::searchable(tree, height);
+        let mut from = walk.from.unwrap_or(0).min(end);
         'search: loop {
-            let mut level = height - 1;
-            let mut index = 0u64;
+            if from >= end {
+                if walk.wrapped {
+                    walk.from = Some(from);
+                    return Ok(IOResult::Done(None));
+                }
+                walk.wrapped = true;
+                from = 0;
+            }
+            walk.from = Some(from);
+            // Where it waited, if at this height and its node still holds the place, else the
+            // root: a place moved past the node (a claim lost on its last unit) or wrapped back
+            // to the start goes down again from the root.
+            let (mut level, mut index) = match walk.at.take() {
+                Some((h, l, i)) if h == height && holds(tree, l, i, from) => (l, i),
+                _ => (height - 1, 0u64),
+            };
             loop {
                 let id = MetaId {
                     tree,
@@ -1733,16 +1848,37 @@ impl PageStore {
                     level,
                     index,
                 };
-                let frame = match self.meta.get(id)? {
-                    IOResult::Done(f) => f,
-                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                // The node and its ancestors, the pages the walk holds.
+                let mut path = [id; SLOT_PAGES];
+                let (mut up, mut depth) = (id, 1usize);
+                while up.level < height - 1 {
+                    up = MetaId {
+                        level: up.level + 1,
+                        index: up.index / radix::FANOUT,
+                        ..up
+                    };
+                    path[depth] = up;
+                    depth += 1;
+                }
+                pages.aim(path[..depth].iter().copied())?;
+                crate::race::point("store.walk_aimed");
+                let ready = match pages.poll(&self.meta)? {
+                    Polled::Ready(ready) => ready,
+                    Polled::Wait(wait) => {
+                        walk.at = Some((height, level, index));
+                        return Ok(IOResult::IO(IOCompletions(wait)));
+                    }
                 };
+                let frame = ready
+                    .frame(id)
+                    .expect("a ready set holds every page it names");
                 let node_first = index * radix::span(tree, level);
                 if level == 0 {
                     let mut at = from.max(node_first);
                     let found = loop {
                         let Some(free) = frame.read(|b| radix::free_in_leaf(tree, b, index, at))
                         else {
+                            walk.at = Some((height, level, index));
                             return Ok(IOResult::IO(IOCompletions(frame.wait_while_held())));
                         };
                         let Some(u) = free else {
@@ -1765,16 +1901,18 @@ impl PageStore {
                         break Some(u);
                     };
                     match found {
-                        Some(u) => return Ok(IOResult::Done(Some(u))),
-                        // Everything free here is still being erased: move past this leaf.
+                        // Kept at its leaf: a take whose mark then waits goes on there.
+                        Some(u) => {
+                            walk.at = Some((height, level, index));
+                            return Ok(IOResult::Done(Some(u)));
+                        }
+                        // Everything free here is still being erased: on past this leaf, the next
+                        // poll's work for a caller that keeps its walk.
                         None => {
                             from = node_first + radix::leaf_units(tree);
-                            if from >= radix::capacity(tree, height) {
-                                if wrapped {
-                                    return Ok(IOResult::Done(None));
-                                }
-                                wrapped = true;
-                                from = 0;
+                            if quantum {
+                                walk.from = Some(from);
+                                return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
                             }
                             continue 'search;
                         }
@@ -1785,21 +1923,34 @@ impl PageStore {
                 } else {
                     0
                 };
-                let Some(room) = frame.read(|b| radix::child_with_room(tree, b, level, from_child))
+                // Children that start at or past the end hold nothing a search may find.
+                let to_child = (end - node_first).div_ceil(radix::span(tree, level - 1));
+                let Some(room) =
+                    frame.read(|b| radix::child_with_room(tree, b, level, from_child, to_child))
                 else {
+                    walk.at = Some((height, level, index));
                     return Ok(IOResult::IO(IOCompletions(frame.wait_while_held())));
                 };
                 match room {
+                    // The children it passed have no room: the place moves on to the child's
+                    // start, so the node a wait saves always holds it.
                     Some(c) => {
                         index = index * radix::FANOUT + c;
                         level -= 1;
+                        from = from.max(index * radix::span(tree, level));
+                        walk.from = Some(from);
                     }
-                    None if !wrapped => {
-                        wrapped = true;
-                        from = 0;
+                    // Nothing past the place under this node: on past it, never round from here,
+                    // as a sibling to its right may have room; the next poll's work for a caller
+                    // that keeps its walk, as for a leaf.
+                    None => {
+                        from = node_first + radix::span(tree, level);
+                        if quantum {
+                            walk.from = Some(from);
+                            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+                        }
                         continue 'search;
                     }
-                    None => return Ok(IOResult::Done(None)),
                 }
             }
         }
@@ -1834,8 +1985,16 @@ impl<T> Drop for Owned<'_, T> {
     }
 }
 
+/// Whether the node at `level` and `index` of `tree` holds the unit `unit`.
+fn holds(tree: Tree, level: u8, index: u64, unit: u64) -> bool {
+    let span = radix::span(tree, level);
+    let first = index.saturating_mul(span);
+    first <= unit && unit < first.saturating_add(span)
+}
+
 /// `lock`, if no one holds it; else the wait its holder's let-go finishes, registered before it
 /// is tried again.
+
 fn own<'a, T>(
     lock: &'a Mutex<T>,
     let_go: &'a LetGo,

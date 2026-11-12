@@ -1154,6 +1154,8 @@ const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
     ("meta.rs", "join", "Completion::new_yield", 1, "change: a load's phase moved before the wait was registered"),
     ("meta.rs", "wait_while_held", "Completion::new_yield", 2, "change: the hold let go or changed before the mark"),
     ("meta.rs", "write_for", "Completion::new_yield", 3, "change: the writing cell changed, a validation failed, a write put first by another"),
+    ("store.rs", "claim_slot", "Completion::new_yield", 2, "change: a kept claim's poll lost its slot to another claim or grew the free space, its walk's place kept, and the search to go on"),
+    ("store.rs", "walk", "Completion::new_yield", 2, "change: a node or leaf of a kept walk scanned with nothing takeable past its place, the place moved past it, and more of the walk to do"),
     ("txn/mod.rs", "wait_for_reservation", "Completion::new_yield", 1, "change: the reservation changed after the look"),
 ];
 

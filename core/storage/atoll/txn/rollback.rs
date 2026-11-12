@@ -25,10 +25,11 @@ use super::changes::{starts, Keyed, Source};
 use super::versioned::{decode_entry, restored_reserve, Version, Versions};
 use super::{Statement, Transactions, Ts, Txn};
 use crate::storage::atoll::btree::{Mode, Outcome, Put, Remove};
-use crate::storage::atoll::log::LogWait;
+use crate::storage::atoll::log::{LogWait, ReadBack};
 use crate::storage::atoll::page::PageId;
 use crate::types::IOResult;
 use crate::{LimboError, Result};
+use std::ops::Range;
 
 macro_rules! done {
     ($e:expr) => {
@@ -70,11 +71,14 @@ pub struct Rollback {
     /// The changes of the source being walked still to put back, oldest first, by where each
     /// starts in the transaction's changes.
     left: Vec<u64>,
-    /// The part being walked, read back from the log: where it begins, and its bytes.
-    read: Option<(u64, Vec<u8>)>,
+    /// The part being walked, read back from the log: where it begins, and where its bytes lie in
+    /// `back`.
+    read: Option<(u64, Range<usize>)>,
     working: Option<Working>,
     /// Its wait on the log while a part it reads back is not yet durable (DESIGN.md 22.4).
     log_wait: LogWait,
+    /// Its read-back of the parts it walks, one at a time, through the log's open segments.
+    back: ReadBack,
 }
 
 impl Rollback {
@@ -88,12 +92,19 @@ impl Rollback {
             read: None,
             working: None,
             log_wait: LogWait::default(),
+            back: ReadBack::default(),
         }
     }
 
     /// The last statement kept.
     pub fn to(&self) -> Statement {
         self.to
+    }
+
+    /// Whether it is reading a part back from the log.
+    #[cfg(test)]
+    pub fn reading_back(&self) -> bool {
+        self.back.reading()
     }
 }
 
@@ -154,7 +165,9 @@ pub fn undo(
         let at = *op.left.last().expect("a change being put back");
         let statement = txn.changes.statement_at(at);
         let keyed = match &op.read {
-            Some((base, bytes)) => Keyed::decode(&bytes[(at - base) as usize..])?,
+            Some((base, part)) => {
+                Keyed::decode(&op.back.bytes(part.clone())[(at - base) as usize..])?
+            }
             None => txn.changes.keyed_at(at)?,
         };
         let (root, key) = match keyed {
@@ -250,8 +263,8 @@ fn walk_on(txns: &Transactions, txn: &Txn, op: &mut Rollback) -> Result<IOResult
             }
             Source::Spilled(part) => {
                 done!(txns.log.wait_durable(&mut op.log_wait, part.lsn));
-                let record = txns.log.read_record(part.at)?;
-                let payload = &record.payload;
+                let (header, range) = done!(txns.log.read_record(&mut op.back, part.at, part.lsn));
+                let payload = op.back.bytes(range.clone());
                 let word = |at: usize| {
                     payload
                         .get(at..at + 8)
@@ -265,7 +278,7 @@ fn walk_on(txns: &Transactions, txn: &Txn, op: &mut Rollback) -> Result<IOResult
                         part.at.get()
                     )));
                 };
-                if record.header.kind != super::SPILL || start != txn.start || begins != part.from {
+                if header.kind != super::SPILL || start != txn.start || begins != part.from {
                     return Err(LimboError::Corrupt(format!(
                         "transaction {}'s part at {} read back as another's",
                         txn.start,
@@ -273,7 +286,10 @@ fn walk_on(txns: &Transactions, txn: &Txn, op: &mut Rollback) -> Result<IOResult
                     )));
                 }
                 op.left = starts(bytes, part.from, part.first, from)?;
-                op.read = Some((part.from, bytes.to_vec()));
+                op.read = Some((
+                    part.from,
+                    range.start + 16..range.start + 16 + part.len as usize,
+                ));
             }
         }
         op.sources.pop();

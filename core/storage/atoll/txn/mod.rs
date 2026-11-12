@@ -507,6 +507,12 @@ impl Abort {
     pub fn take_txn(&mut self) -> Option<Txn> {
         self.txn.take()
     }
+
+    /// Whether its rollback is reading a part back from the log.
+    #[cfg(test)]
+    pub fn reading_back(&self) -> bool {
+        self.undo.reading_back()
+    }
 }
 
 /// A commit in progress: step it with [`Transactions::commit`].

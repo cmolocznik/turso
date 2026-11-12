@@ -63,7 +63,9 @@ mod segment;
 mod waits;
 
 pub use preparer::LogWait;
-pub use reader::{LogReader, OwnedRecord, Rereader};
+#[cfg(test)]
+pub use reader::OwnedRecord;
+pub use reader::{LogReader, ReadBack, Rereader};
 pub use record::{framed_len, GroupStart, Header, Kind, Lsn, Place, BLOCK, MAX_PAYLOAD};
 
 use super::aligned::AlignedBlock;
@@ -94,6 +96,8 @@ crate::thread::thread_local! {
     pub(crate) static TURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Segments released on this thread.
     pub(crate) static SEGMENTS_RELEASED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Segment files opened by name on this thread ([`segment::Segments::open`]).
+    pub(crate) static SEGMENTS_OPENED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Set by a test: the next turn taken on this thread asks for another while it runs, as
     /// another thread's flush would.
     pub(crate) static ASK_DURING_TURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1481,18 +1485,28 @@ impl Log {
         )
     }
 
-    /// The record that starts at `at`, outside any group, read back from its segment: a part of a
-    /// running transaction's changes, for its rollback. The log must be durable past it.
-    pub fn read_record(&self, at: GroupStart) -> Result<OwnedRecord> {
-        let mut records =
-            LogReader::group_at(self.io.clone(), Arc::new(self.segments.fresh()), at)?;
-        match (records.pop(), records.is_empty()) {
-            (Some(r), true) if !r.place.grouped() => Ok(r),
-            _ => Err(LimboError::Corrupt(format!(
-                "a record read back at {} is in a group",
-                at.get()
-            ))),
-        }
+    /// Steps the read-back of the record outside any group that starts at `at` and ends at `end`, a
+    /// part of a running transaction's changes, for its rollback: read through the log's own open
+    /// segment files into `back`, its read queued and returned as `IO` while it is in flight, never
+    /// waited for in place (DESIGN.md 22.18). Its header and where its payload lies in `back` once
+    /// read and checked. The log must be durable past it; the segments it lies in stay open while
+    /// the transaction runs, since the log is held back for its parts ([`Transactions::held_from`]).
+    ///
+    /// [`Transactions::held_from`]: super::txn::Transactions::held_from
+    pub fn read_record(
+        &self,
+        back: &mut ReadBack,
+        at: GroupStart,
+        end: Lsn,
+    ) -> Result<IOResult<(Header, std::ops::Range<usize>)>> {
+        let segments = &self.segments;
+        back.step(segments, at.get(), end, |number| {
+            segments.get(number).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "log segment {number}, which a running transaction's part lies in, is not open"
+                ))
+            })
+        })
     }
 
     /// The group of this database's log that starts at `at`, read whole and checked: what a

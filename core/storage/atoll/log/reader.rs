@@ -8,13 +8,17 @@
 //! record that does not continue the group being read ends it the same way; that is what a crash
 //! leaves when the log restarted past part of a group and later records follow.
 
-use super::record::{self, framed_len, GroupStart, Header, Lsn, Parsed, Place, BLOCK};
+#[cfg(test)]
+use super::record::GroupStart;
+use super::record::{self, framed_len, Header, Lsn, Parsed, Place, BLOCK};
 use super::segment::Segments;
-use crate::io::{Completion, IO};
+use crate::io::{Completion, File, IO};
 use crate::storage::atoll::aligned::AlignedBlock;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
+use crate::types::{IOCompletions, IOResult};
 use crate::{LimboError, Result};
+use std::ops::Range;
 
 /// The largest read the reader makes at once.
 const READ: usize = 1 << 20;
@@ -85,6 +89,7 @@ impl LogReader {
 
     /// The group that starts at `at`, read whole and checked to start there: one record outside
     /// any group, or every record of one. Read a block at a time, for a walk from group to group.
+    #[cfg(test)]
     pub(super) fn group_at(
         io: Arc<dyn IO>,
         segments: Arc<Segments>,
@@ -299,18 +304,14 @@ impl LogReader {
     }
 }
 
-/// Reads back records a reader of the log found, each by where it starts and its payload's length:
-/// in one read of exactly the blocks it lies in, into a buffer kept from one record to the next,
-/// each segment's file opened once. Recovery reads a transaction's spilled parts back so at its
-/// Commit, holding one part at a time.
+/// Reads back records a reader of the log found, each by where it starts and its payload's length,
+/// through a [`ReadBack`] over a set of segment files of its own, each opened once, waiting for
+/// each read in place: recovery, a blocking host's, reads a transaction's spilled parts back so at
+/// its Commit, holding one part at a time.
 pub struct Rereader {
     io: Arc<dyn IO>,
     segments: Segments,
-    /// The blocks read last, from the start of the one the record starts in. Grown to a power of
-    /// two past the largest record read: as few reallocations as doublings, under twice its size.
-    buffer: Arc<AlignedBlock>,
-    /// Bytes read so far.
-    read: u64,
+    back: ReadBack,
 }
 
 impl Rereader {
@@ -318,59 +319,183 @@ impl Rereader {
         Self {
             io,
             segments,
-            buffer: Arc::new(AlignedBlock::zeroed(BLOCK as usize)),
-            read: 0,
+            back: ReadBack::default(),
         }
     }
 
     /// The payload of the record outside any group that starts at `at`, `len` bytes long, checked
     /// as a reader of the log checks it.
     pub fn payload(&mut self, at: Lsn, len: usize) -> Result<&[u8]> {
-        let corrupt = |what: String| LimboError::Corrupt(format!("the record at {at} {what}"));
-        let from = at - at % BLOCK;
-        let want = ((at + framed_len(len)).next_multiple_of(BLOCK) - from) as usize;
-        if self.buffer.len() < want {
-            self.buffer = Arc::new(AlignedBlock::zeroed(want.next_power_of_two()));
+        let end = at + framed_len(len);
+        let segments = &self.segments;
+        let open = |number: u64| {
+            segments.open(number)?.ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "the record at {at} reads back from a missing segment"
+                ))
+            })
+        };
+        let (_, payload) = loop {
+            match self.back.step(segments, at, end, open)? {
+                IOResult::Done(read) => break read,
+                // Its outcome, an error included, is the read-back's next step's to read.
+                IOResult::IO(io) => crate::storage::atoll::park::wait(self.io.as_ref(), &io.0),
+            }
+        };
+        let payload = self.back.bytes(payload);
+        if payload.len() != len {
+            return Err(LimboError::Corrupt(format!(
+                "the record at {at} reads back as no record of {len} bytes outside a group"
+            )));
         }
-        let mut done = 0;
-        while done < want {
-            let pos = from + done as u64;
-            let number = self.segments.number(pos);
-            let file = self
-                .segments
-                .open(number)?
-                .ok_or_else(|| corrupt("reads back from a missing segment".into()))?;
-            let len = ((self.segments.start(number + 1) - pos) as usize).min(want - done);
+        Ok(payload)
+    }
+
+    /// Bytes read so far.
+    #[cfg(test)]
+    pub fn read(&self) -> u64 {
+        self.back.bytes_read
+    }
+}
+
+/// A read-back of records outside any group, one at a time, each by where it starts and ends (its
+/// LSN): exactly the blocks it lies in, read a segment at a time, one read in flight, each queued at
+/// a step and waited for by its caller between steps (DESIGN.md 22.18, ASYNC1: never a wait in place
+/// inside a cooperative frame; a transaction slot's read-back block is one request record). Its
+/// buffer is kept from one record to the next, and given up once a read is abandoned or fails: a
+/// read finished by an abort may still land in it. A rollback's read-back of a spilled part reads
+/// through the log's own open segments ([`super::Log::read_record`]); recovery's, through a set of
+/// its own ([`Rereader`]).
+#[derive(Default)]
+pub struct ReadBack {
+    /// The blocks read last, from the start of the one the record starts in. Grown to a power of
+    /// two past the largest record read: as few reallocations as doublings, under twice its size.
+    buffer: Option<Arc<AlignedBlock>>,
+    /// The record whose blocks are being read or were read last: where it starts and ends.
+    of: Option<(Lsn, Lsn)>,
+    /// Its blocks' bytes read so far.
+    done: usize,
+    /// Its read in flight, or landed and not yet checked.
+    read: Option<Read>,
+    /// Bytes read so far.
+    #[cfg(test)]
+    bytes_read: u64,
+}
+
+/// A read of the log's bytes into a read-back's buffer: its completion, the bytes it asked for, and
+/// the bytes it read, set once it lands.
+struct Read {
+    c: Completion,
+    len: usize,
+    got: Arc<AtomicU64>,
+}
+
+impl ReadBack {
+    /// Steps the read-back of the record outside any group that starts at `at` and ends at `end`,
+    /// each segment's file found by `file`: its header and where its payload lies in
+    /// [`bytes`](Self::bytes), once read and checked as a reader of the log checks it.
+    pub(super) fn step(
+        &mut self,
+        segments: &Segments,
+        at: Lsn,
+        end: Lsn,
+        mut file: impl FnMut(u64) -> Result<Arc<dyn File>>,
+    ) -> Result<IOResult<(Header, Range<usize>)>> {
+        let from = at - at % BLOCK;
+        let want = (end.next_multiple_of(BLOCK) - from) as usize;
+        if self.of != Some((at, end)) {
+            if self.read.take().is_some() {
+                // An abandoned record's read keeps the buffer it lands in alive; this one takes
+                // another.
+                self.buffer = None;
+            }
+            if self.buffer.as_ref().is_none_or(|b| b.len() < want) {
+                self.buffer = Some(Arc::new(AlignedBlock::zeroed(want.next_power_of_two())));
+            }
+            self.of = Some((at, end));
+            self.done = 0;
+        }
+        let buffer = self.buffer.clone().expect("a read-back's buffer");
+        loop {
+            if let Some(r) = &self.read {
+                if !r.c.finished() {
+                    return Ok(IOResult::IO(IOCompletions(r.c.clone())));
+                }
+                let r = self.read.take().expect("a read");
+                if let Some(e) = r.c.get_error() {
+                    return Err(self.failed(LimboError::CompletionError(e)));
+                }
+                let n = r.got.load(Ordering::Acquire) as usize;
+                #[cfg(test)]
+                {
+                    self.bytes_read += n as u64;
+                }
+                if n < r.len {
+                    return Err(self.failed(LimboError::Corrupt(format!(
+                        "the record at {at} reads back short of its {} bytes",
+                        r.len
+                    ))));
+                }
+                self.done += r.len;
+            }
+            if self.done == want {
+                break;
+            }
+            let pos = from + self.done as u64;
+            let number = segments.number(pos);
+            let len = ((segments.start(number + 1) - pos) as usize).min(want - self.done);
             let got = Arc::new(AtomicU64::new(0));
             let out = got.clone();
-            let c = Completion::new_read(self.buffer.region(done, len), move |res| match res {
+            let c = Completion::new_read(buffer.region(self.done, len), move |res| match res {
                 Ok((_, n)) => {
                     out.store(n.max(0) as u64, Ordering::Release);
                     None
                 }
                 Err(e) => Some(e),
             });
-            let c = file.pread(pos - self.segments.start(number), c)?;
-            crate::storage::atoll::park::wait_for_completion(self.io.as_ref(), c)?;
-            let n = got.load(Ordering::Acquire) as usize;
-            self.read += n as u64;
-            if n < len {
-                return Err(corrupt(format!("reads back short of its {len} bytes")));
+            match file(number).and_then(|f| f.pread(pos - segments.start(number), c)) {
+                Ok(c) => self.read = Some(Read { c, len, got }),
+                Err(e) => return Err(self.failed(e)),
             }
-            done += len;
         }
-        let bytes = &self.buffer.bytes()[(at - from) as usize..want];
-        match record::parse(at, bytes) {
-            Parsed::Record(r) if r.payload.len() == len && !r.place.grouped() => Ok(r.payload),
-            _ => Err(corrupt(format!(
-                "reads back as no record of {len} bytes outside a group"
-            ))),
+        let head = (at - from) as usize;
+        match record::parse(at, &buffer.bytes()[head..want]) {
+            Parsed::Record(r) if r.lsn == end && !r.place.grouped() => {
+                let payload = head + record::HEADER;
+                Ok(IOResult::Done((
+                    r.header,
+                    payload..payload + r.payload.len(),
+                )))
+            }
+            _ => Err(self.failed(LimboError::Corrupt(format!(
+                "the record at {at} reads back as no record outside a group ending at {end}"
+            )))),
         }
     }
 
-    /// Bytes read so far.
+    /// `e`, the read-back having given up its record and its buffer.
+    fn failed(&mut self, e: LimboError) -> LimboError {
+        self.of = None;
+        self.read = None;
+        self.buffer = None;
+        e
+    }
+
+    /// The bytes at `range` of the record read last: its payload, as [`step`](Self::step) placed
+    /// it.
+    pub fn bytes(&self, range: Range<usize>) -> &[u8] {
+        &self.buffer.as_ref().expect("a record read back").bytes()[range]
+    }
+
+    /// Whether a read of a record is in flight or landed and not yet checked.
     #[cfg(test)]
-    pub fn read(&self) -> u64 {
-        self.read
+    pub fn reading(&self) -> bool {
+        self.read.is_some()
+    }
+
+    /// Where its buffer lies, if it holds one.
+    #[cfg(test)]
+    pub(super) fn buffer_at(&self) -> Option<usize> {
+        self.buffer.as_ref().map(|b| b.as_ptr() as usize)
     }
 }

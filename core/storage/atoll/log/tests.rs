@@ -1945,3 +1945,60 @@ fn admissions_granted_carry_a_preparation_through_to_its_publication() {
         );
     }
 }
+
+/// A read-back whose read failed gives up its buffer: a read its cancellation finished may still be
+/// the backend's, so the next record's read lands in another buffer. A record abandoned with its read
+/// still pending does the same. (The auditor's #4525 probe, kept as a test; every request is drained
+/// and every holder dropped before the assertions.)
+fn a_read_back_after(cancelled: bool) {
+    let crash = Arc::new(CrashIO::new(819));
+    let io: Arc<dyn IO> = crash.clone();
+    let file = io
+        .open_file("/db/readback-buffers", OpenFlags::Create, false)
+        .unwrap();
+    let segments =
+        super::segment::Segments::new(io.clone(), "/db/readback-buffers", 16 * BLOCK, false);
+    let mut back = ReadBack::default();
+    let first = match back.step(&segments, 0, 32, |_| Ok(file.clone())) {
+        Ok(IOResult::IO(c)) => Some(c.0),
+        _ => None,
+    };
+    let before = back.buffer_at();
+    let failed = match (&first, cancelled) {
+        (Some(c), true) => {
+            io.cancel(std::slice::from_ref(c)).unwrap();
+            back.step(&segments, 0, 32, |_| Ok(file.clone())).is_err()
+        }
+        _ => false,
+    };
+    let owned = first.as_ref().is_some_and(|c| c.is_owned());
+    let second = match back.step(&segments, BLOCK, BLOCK + 32, |_| Ok(file.clone())) {
+        Ok(IOResult::IO(c)) => Some(c.0),
+        _ => None,
+    };
+    let after = back.buffer_at();
+    let requests: Vec<_> = first.iter().chain(second.iter()).cloned().collect();
+    let drained = io.drain_completions(&requests);
+    drop((first, second, requests, back, segments, file, io));
+    let in_flight = crash.in_flight();
+    assert!(before.is_some(), "the first read was not left pending");
+    assert!(after.is_some(), "the second read was not left pending");
+    assert_eq!(failed, cancelled, "the cancelled read's step did not fail");
+    assert!(owned, "the first read was not still the backend's");
+    assert!(drained.is_ok(), "{drained:?}");
+    assert_eq!(in_flight, 0);
+    assert_ne!(
+        before, after,
+        "the next record's read went into a buffer the first read's backend still owns"
+    );
+}
+
+#[test]
+fn a_record_abandoned_with_its_read_pending_leaves_its_buffer_to_that_read() {
+    a_read_back_after(false);
+}
+
+#[test]
+fn a_read_back_whose_read_was_cancelled_reads_the_next_record_into_another_buffer() {
+    a_read_back_after(true);
+}

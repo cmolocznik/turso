@@ -216,15 +216,15 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "storage/atoll/log/reader.rs",
-        "payload",
+        "read_more",
         "new_read",
         "records how many bytes were read",
     ),
     (
         "storage/atoll/log/reader.rs",
-        "read_more",
+        "step",
         "new_read",
-        "records how many bytes were read",
+        "records how many bytes a read-back's read read",
     ),
     (
         "storage/atoll/meta.rs",

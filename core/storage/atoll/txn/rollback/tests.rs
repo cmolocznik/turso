@@ -906,3 +906,76 @@ fn a_transaction_spills_as_it_goes_and_a_checkpoint_between_keeps_its_parts() {
         recovered.check_whole(label);
     }
 }
+
+/// A transaction's rollback reads each part it spilled back through the log's own open segment
+/// files, a segment's blocks at a time, its step returning `IO` while each read is in flight: one
+/// read in flight, never waited for in place, and no segment file opened by name (DESIGN.md 22.18,
+/// ASYNC1: a transaction slot's read-back block is one request record). Its keys are then as they
+/// were. With `segment_bytes` small, parts lie across segments, each such part read in two reads.
+fn rolled_back_reading_its_parts_back(seed: u64, segment_bytes: u64) {
+    let crash_io = Arc::new(CrashIO::new(seed));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let mut small = config();
+    small.log.segment_bytes = segment_bytes;
+    let db = Db::create_with(io.clone(), small);
+    let keys: Vec<String> = (0..120).map(|i| format!("k{i:03}")).collect();
+    committed(&db, &keys[..20]);
+    let before = db.state(&keys);
+    let mut t = db.begin();
+    for (i, key) in keys.iter().enumerate() {
+        db.put(&mut t, i % 2, key, &value("spilled", i));
+    }
+    let parts = t.changes().parts().len();
+    // A read for each segment a part's record lies in.
+    let reads: u64 = t
+        .changes()
+        .parts()
+        .iter()
+        .map(|p| (p.lsn - 1) / segment_bytes - p.at.get() / segment_bytes + 1)
+        .sum();
+    // Durable past every part, so the rollback waits on no flush to read one back.
+    db.durable();
+    let opened = || crate::storage::atoll::log::SEGMENTS_OPENED.with(std::cell::Cell::get);
+    let opened_before = opened();
+    let mut op = Abort::new(t);
+    let mut reading = 0;
+    run(&io, || {
+        let step = db.txns().rollback(&db.versions, &mut op)?;
+        if matches!(step, IOResult::IO(_)) && op.reading_back() {
+            reading += 1;
+        }
+        Ok(step)
+    });
+    let opened_after = opened();
+    let after = db.state(&keys);
+    db.check_whole("rolled back");
+    // Every Atoll object gone before an assertion can unwind.
+    drop((op, db));
+    assert!(parts > 1, "{parts} parts spilled");
+    if segment_bytes < config().log.segment_bytes {
+        assert!(
+            reads > parts as u64,
+            "no part of the {parts} lies across segments"
+        );
+    }
+    assert!(
+        reading >= reads,
+        "{reading} steps returned IO while reading back {parts} parts in {reads} reads: \
+         a read waited for in place, or two in flight at once"
+    );
+    assert_eq!(
+        opened_after, opened_before,
+        "a part read back through a segment file opened by name"
+    );
+    assert_eq!(after, before);
+}
+
+#[test]
+fn a_rollback_reads_its_spilled_parts_back_through_the_logs_open_segments_returning_their_io() {
+    rolled_back_reading_its_parts_back(693, config().log.segment_bytes);
+}
+
+#[test]
+fn a_rollback_reads_a_part_across_segments_back_a_segment_at_a_time() {
+    rolled_back_reading_its_parts_back(694, 64 << 10);
+}

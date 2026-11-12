@@ -56,11 +56,6 @@ impl Segments {
         }
     }
 
-    /// Another set over the same files, with handles of its own: for a reader beside the log.
-    pub fn fresh(&self) -> Self {
-        Self::new(self.io.clone(), &self.base, self.size, self.direct)
-    }
-
     pub fn number(&self, lsn: u64) -> u64 {
         lsn / self.size
     }
@@ -90,7 +85,7 @@ impl Segments {
     }
 
     /// The open file of segment `number`, if it is open.
-    fn get(&self, number: u64) -> Option<Arc<dyn File>> {
+    pub fn get(&self, number: u64) -> Option<Arc<dyn File>> {
         let cell = self.files.get(number)?;
         let step = self.releasing.epochs().enter();
         cell.get(&step).map(|file| (*file).clone())
@@ -101,6 +96,8 @@ impl Segments {
         if let Some(file) = self.get(number) {
             return Ok(Some(file));
         }
+        #[cfg(test)]
+        super::SEGMENTS_OPENED.with(|n| n.set(n.get() + 1));
         match self.io.open_file(&self.path(number), self.flags(), false) {
             Ok(file) => {
                 // Opened by two at once, the first kept.

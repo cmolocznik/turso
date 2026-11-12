@@ -630,76 +630,131 @@ enum Joined {
 }
 
 /// The metadata pages a caller collects across its polls (DESIGN.md 22.18: a `get_all` keeps the
-/// frames it has pinned, so it finishes whatever its width): each page's frame from the look that
-/// found it in memory or loading, a load this collection started or joined included, so that no
-/// eviction takes one between the caller's polls; none for a page refused a read credit, which
-/// holds nothing while it waits. It holds frames, never a latch or a credit. For one list of
-/// pages: a caller whose list changes (a tree grew, its path moved) collects anew.
-#[derive(Default)]
+/// frames it has pinned, so it finishes whatever its width): its own list of pages, fixed when it is
+/// made, and each page's frame from the look that found it in memory or loading, a load this
+/// collection started or joined included, so that no eviction takes one between the caller's polls.
+/// It holds frames, never a latch or a credit. Each poll looks again only at the pages it found
+/// loading, as many at most as the cache's reads with the backend, and admits the next pages until
+/// one is refused a read credit, which holds nothing while it waits: a page is looked at once to be
+/// admitted and once more each poll it is still loading, whatever the list's width.
 pub struct Collection {
     ids: Vec<MetaId>,
+    /// The frame of every page admitted.
     frames: Vec<Option<MetaRef>>,
+    /// Pages admitted, from the list's start.
+    admitted: usize,
+    /// The admitted pages a look found loading, not yet seen in memory.
+    loading: Vec<usize>,
+    /// Looks made, for a test.
+    #[cfg(test)]
+    looks: usize,
 }
 
 impl Collection {
-    /// Every page in `ids`, once all are in memory: the frames found so far kept across calls,
-    /// handed over, and the collection begun again, when the last is in.
-    pub fn collect(
-        &mut self,
-        cache: &Arc<MetaCache>,
-        ids: &[MetaId],
-    ) -> Result<IOResult<Vec<MetaRef>>> {
-        if self.ids != ids {
-            self.ids = ids.to_vec();
-            self.frames = (0..ids.len()).map(|_| None).collect();
+    pub fn new(ids: Vec<MetaId>) -> Self {
+        let frames = (0..ids.len()).map(|_| None).collect();
+        Self {
+            ids,
+            frames,
+            admitted: 0,
+            loading: Vec::new(),
+            #[cfg(test)]
+            looks: 0,
         }
-        let mut wait = None;
-        for (frame, &id) in self.frames.iter_mut().zip(ids) {
-            if frame
-                .as_ref()
-                .is_some_and(|f| f.status.load(Ordering::Acquire) == READY)
-            {
-                continue;
-            }
-            match cache.join(id) {
-                Ok(Joined::Ready(found)) => *frame = Some(found),
-                Ok(Joined::Loading(found, loaded)) => {
-                    *frame = Some(found);
-                    wait.get_or_insert(loaded);
-                }
-                Ok(Joined::Refused(returned)) => {
-                    wait.get_or_insert(returned);
-                }
-                Err(e) => {
-                    self.release();
-                    return Err(e);
-                }
-            }
-        }
-        match wait {
-            Some(c) => Ok(IOResult::IO(IOCompletions(c))),
-            None => {
-                self.ids.clear();
-                Ok(IOResult::Done(
-                    std::mem::take(&mut self.frames)
-                        .into_iter()
-                        .map(|f| f.expect("every page in memory"))
-                        .collect(),
-                ))
+    }
+
+    /// Every page of the list, once all are in memory, the frames found so far kept across calls
+    /// and handed over when the last is in; a poll after that collects anew.
+    pub fn collect(&mut self, cache: &Arc<MetaCache>) -> Result<IOResult<Vec<MetaRef>>> {
+        match self.poll(cache) {
+            Ok(Some(wait)) => Ok(IOResult::IO(IOCompletions(wait))),
+            Ok(None) => Ok(IOResult::Done(
+                std::mem::take(&mut self.frames)
+                    .into_iter()
+                    .map(|f| f.expect("every page in memory"))
+                    .collect(),
+            )),
+            Err(e) => {
+                self.release();
+                Err(e)
             }
         }
     }
 
-    /// Lets go of every frame held, as a caller abandoning its collection does.
+    /// The wait a page still owes, or none once every page is in memory.
+    fn poll(&mut self, cache: &Arc<MetaCache>) -> Result<Option<Completion>> {
+        // Handed over or let go: collected anew.
+        if self.frames.len() != self.ids.len() {
+            self.frames = (0..self.ids.len()).map(|_| None).collect();
+            self.admitted = 0;
+            self.loading.clear();
+        }
+        let mut wait = None;
+        let mut i = 0;
+        while i < self.loading.len() {
+            let at = self.loading[i];
+            match self.look(cache, at)? {
+                Joined::Ready(frame) => {
+                    self.frames[at] = Some(frame);
+                    self.loading.swap_remove(i);
+                }
+                Joined::Loading(frame, loaded) => {
+                    self.frames[at] = Some(frame);
+                    wait.get_or_insert(loaded);
+                    i += 1;
+                }
+                // Not met while the frame is held; its wait all the same.
+                Joined::Refused(returned) => {
+                    wait.get_or_insert(returned);
+                    i += 1;
+                }
+            }
+        }
+        while self.admitted < self.ids.len() {
+            let at = self.admitted;
+            match self.look(cache, at)? {
+                Joined::Ready(frame) => self.frames[at] = Some(frame),
+                Joined::Loading(frame, loaded) => {
+                    self.frames[at] = Some(frame);
+                    self.loading.push(at);
+                    wait.get_or_insert(loaded);
+                }
+                // The credits are out: the next pages wait for one, holding nothing.
+                Joined::Refused(returned) => {
+                    wait.get_or_insert(returned);
+                    break;
+                }
+            }
+            self.admitted += 1;
+        }
+        Ok(wait)
+    }
+
+    fn look(&mut self, cache: &Arc<MetaCache>, at: usize) -> Result<Joined> {
+        #[cfg(test)]
+        {
+            self.looks += 1;
+        }
+        cache.join(self.ids[at])
+    }
+
+    /// Lets go of every frame held, as a caller abandoning its collection does; a later poll
+    /// collects anew.
     pub fn release(&mut self) {
-        self.ids.clear();
         self.frames.clear();
+        self.loading.clear();
     }
 
     /// Frames held, for a test.
     #[cfg(test)]
     pub fn held(&self) -> usize {
         self.frames.iter().flatten().count()
+    }
+
+    /// Looks made at its pages, for a test.
+    #[cfg(test)]
+    pub fn looks(&self) -> usize {
+        self.looks
     }
 }
 
@@ -873,7 +928,20 @@ impl MetaCache {
     /// Every page in `ids`, once all are in memory, for a caller that keeps nothing across its
     /// polls: what it found is let go when it waits ([`Collection`] keeps it).
     pub fn get_all(self: &Arc<Self>, ids: &[MetaId]) -> Result<IOResult<Vec<MetaRef>>> {
-        Collection::default().collect(self, ids)
+        let mut out = Vec::with_capacity(ids.len());
+        let mut wait = None;
+        for &id in ids {
+            match self.get(id)? {
+                IOResult::Done(frame) => out.push(frame),
+                IOResult::IO(io) => {
+                    wait.get_or_insert(io);
+                }
+            }
+        }
+        match wait {
+            Some(io) => Ok(IOResult::IO(io)),
+            None => Ok(IOResult::Done(out)),
+        }
     }
 
     /// Reads both places of `frame`'s page and keeps the newest whole copy. The read holds the

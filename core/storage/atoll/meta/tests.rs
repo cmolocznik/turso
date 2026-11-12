@@ -1863,6 +1863,13 @@ fn a_miss_waiting_on_a_credit_whose_read_is_not_submitted_parks_until_the_submis
     let _ = go_tx.send(());
     let submitted = owner.join().unwrap_or(false);
     let woken = done_rx.recv_timeout(BOUND).is_ok();
+    // A wake lost would leave the waiter parked: its wait finished here so it can be joined, the
+    // failure kept for the assertion.
+    if !woken {
+        if let Some(c) = &second {
+            crate::storage::atoll::notify::finish(c, Ok(0));
+        }
+    }
     let joined = waiter.map_or(false, |w| w.join().is_ok());
     crash.on_step(None);
     let served = woken && drive(&io, || cache.get(id(1))).is_ok();
@@ -1912,10 +1919,9 @@ fn a_collection_keeps_its_frames_across_polls_so_no_eviction_between_takes_one()
         Arc::new(Epochs::new()),
         0,
     ));
-    let ids = [id(0), id(1), id(2)];
-    let mut pins = Collection::default();
+    let mut pins = Collection::new(vec![id(0), id(1), id(2)]);
     // The first two read under the credits, the third refused one.
-    let first = matches!(pins.collect(&cache, &ids), Ok(IOResult::IO(_)));
+    let first = matches!(pins.collect(&cache), Ok(IOResult::IO(_)));
     let while_loading = (pins.held(), crash.in_flight());
     while crash.in_flight() > 0 {
         crash.step().unwrap();
@@ -1924,12 +1930,12 @@ fn a_collection_keeps_its_frames_across_polls_so_no_eviction_between_takes_one()
     let other = drive(&io, || cache.get(id(3))).is_ok();
     let resident = cache.resident();
     // The third page's read, the only one.
-    let second = matches!(pins.collect(&cache, &ids), Ok(IOResult::IO(_)));
+    let second = matches!(pins.collect(&cache), Ok(IOResult::IO(_)));
     let reading = crash.in_flight();
     while crash.in_flight() > 0 {
         crash.step().unwrap();
     }
-    let collected = match pins.collect(&cache, &ids) {
+    let collected = match pins.collect(&cache) {
         Ok(IOResult::Done(frames)) => Some(frames.len()),
         _ => None,
     };
@@ -1955,5 +1961,58 @@ fn a_collection_keeps_its_frames_across_polls_so_no_eviction_between_takes_one()
     assert_eq!(
         left, 0,
         "the collection kept frames after it handed them over"
+    );
+}
+
+/// A collection wider than the cache's read credits, one credit here, looks at each page once to
+/// admit it and once more each poll the page is still loading, and stops admitting at the first page
+/// refused a credit: 64 pages are collected in 65 polls and 3 x 64 - 1 looks, never a look again at
+/// every page each poll (the auditor's #4595; mutants: admitting on past a refusal, and looking again
+/// at every admitted page).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_collection_wider_than_its_credits_looks_at_each_page_a_bounded_number_of_times() {
+    use crate::io::crash::CrashIO;
+    const PAGES: u64 = 64;
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let cache = Arc::new(MetaCache::new(
+        io,
+        "meta-collection-looks",
+        1,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    let mut pins = Collection::new((0..PAGES).map(id).collect());
+    let (mut polls, mut collected) = (0, None);
+    while collected.is_none() && polls <= PAGES {
+        polls += 1;
+        match pins.collect(&cache) {
+            Ok(IOResult::Done(frames)) => collected = Some(frames.len()),
+            Ok(IOResult::IO(_)) => {
+                while crash.in_flight() > 0 {
+                    crash.step().unwrap();
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let looks = pins.looks();
+    // Every assertion with the cache dropped.
+    drop((pins, cache));
+    assert_eq!(
+        collected,
+        Some(PAGES as usize),
+        "the collection did not finish"
+    );
+    assert_eq!(
+        polls,
+        PAGES + 1,
+        "polls to collect {PAGES} pages under one credit"
+    );
+    assert_eq!(
+        looks,
+        3 * PAGES as usize - 1,
+        "looks to collect {PAGES} pages under one credit"
     );
 }

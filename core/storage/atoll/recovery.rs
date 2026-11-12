@@ -87,8 +87,8 @@ pub fn recover(
     if !scan.intents.is_empty() {
         store.meta().set_torn_ok(true);
         // Collected across the drive's polls, so no page read in is evicted before the last is.
-        let mut pins = crate::storage::atoll::meta::Collection::default();
-        let frames = drive(&io, || pins.collect(store.meta(), &scan.intents));
+        let mut pins = crate::storage::atoll::meta::Collection::new(scan.intents.clone());
+        let frames = drive(&io, || pins.collect(store.meta()));
         store.meta().set_torn_ok(false);
         #[cfg(test)]
         if frames

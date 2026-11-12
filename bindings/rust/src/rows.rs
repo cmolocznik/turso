@@ -43,6 +43,11 @@ impl Rows {
         self.inner.columns()
     }
 
+    /// [`columns`](Self::columns), for a future: the statement taken without waiting.
+    pub(crate) fn columns_held(&self) -> Result<Vec<Column>> {
+        self.inner.columns_held()
+    }
+
     /// Fetch the next row of this result set.
     pub async fn next(&mut self) -> Result<Option<Row>> {
         struct Next {

@@ -583,21 +583,13 @@ impl Statement {
 
     /// Returns columns of the result of this prepared statement.
     pub fn columns(&self) -> Vec<Column> {
-        let stmt = self.inner.lock().unwrap();
+        columns_of(&self.inner.lock().unwrap())
+    }
 
-        let n = stmt.column_count();
-
-        let mut cols = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let name = stmt
-                .column_name(i)
-                .expect("column index must be within valid range");
-            let decl_type = stmt.column_decltype(i);
-            cols.push(Column { name, decl_type });
-        }
-
-        cols
+    /// [`columns`](Self::columns), for a future: taken as [`held`](Self::held) takes it.
+    pub(crate) fn columns_held(&self) -> Result<Vec<Column>> {
+        let stmt = self.held()?;
+        Ok(columns_of(&stmt))
     }
 
     /// Reset internal statement state after previous execution so it can be reused again
@@ -660,6 +652,20 @@ pub enum Params {
 
 pub struct Transaction {}
 
+/// The columns of `stmt`'s result.
+fn columns_of(stmt: &turso_sdk_kit::rsapi::TursoStatement) -> Vec<Column> {
+    let n = stmt.column_count();
+    let mut cols = Vec::with_capacity(n);
+    for i in 0..n {
+        let name = stmt
+            .column_name(i)
+            .expect("column index must be within valid range");
+        let decl_type = stmt.column_decltype(i);
+        cols.push(Column { name, decl_type });
+    }
+    cols
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +687,48 @@ mod tests {
         let _ = done_tx.send(());
         holder.join().unwrap();
         out
+    }
+
+    /// A step of a statement and a poll of an execute, reached directly with the statement's mutex
+    /// held elsewhere, each return the misuse at once (DESIGN.md 22.18, ASYNC1), not only past the
+    /// guards `query`, `execute` and the next row take first (the auditor's #4536); let go, the step
+    /// yields its row and the execute ends.
+    #[test]
+    fn a_step_and_an_execute_poll_met_with_the_statement_held_return_the_misuse_at_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = rt.block_on(Builder::new_local(":memory:").build()).unwrap();
+        let conn = db.connect().unwrap();
+        let stmt = rt.block_on(conn.prepare("SELECT 1")).unwrap();
+        let elsewhere = stmt.clone();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let stepped = |cx: &mut std::task::Context<'_>| match stmt.step(1, cx) {
+            Poll::Ready(r) => r.map(|row| row.is_some()),
+            Poll::Pending => Err(Error::Error("pending".to_string())),
+        };
+        let step_held = while_held(&elsewhere, || stepped(&mut cx));
+        let step = stepped(&mut cx);
+        let mut execute = Execute {
+            stmt: elsewhere.clone(),
+            _operation_guard: None,
+        };
+        let mut polled =
+            |cx: &mut std::task::Context<'_>| match std::pin::Pin::new(&mut execute).poll(cx) {
+                Poll::Ready(r) => r,
+                Poll::Pending => Err(Error::Error("pending".to_string())),
+            };
+        let poll_held = while_held(&elsewhere, || polled(&mut cx));
+        stmt.reset().unwrap();
+        let poll = polled(&mut cx);
+        assert!(misused(&step_held), "a step, held: {step_held:?}");
+        assert_eq!(step.ok(), Some(true), "a step once let go");
+        assert!(
+            misused(&poll_held),
+            "an execute's poll, held: {poll_held:?}"
+        );
+        assert_eq!(poll.ok(), Some(0), "an execute's poll once let go");
     }
 
     fn misused<T: std::fmt::Debug>(result: &Result<T>) -> bool {

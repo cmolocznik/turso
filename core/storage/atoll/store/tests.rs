@@ -410,14 +410,15 @@ fn a_copy_slot_claimed_by_a_step_that_waits_is_given_back() {
             *holder.borrow_mut() = Some((thread, held));
         });
     }
-    let waited = matches!(store.take_copy_slot(class), Ok(IOResult::IO(_)));
+    let mut mark = MarkEdit::default();
+    let waited = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
     let left = store.claimed[class.index()].ones();
     let _ = go_tx.send(());
     let (joined, held) = holder
         .borrow_mut()
         .take()
         .map_or((false, false), |(t, held)| (t.join().is_ok(), held));
-    let next = drive(&db.io, || store.take_copy_slot(class)).is_ok();
+    let next = drive(&db.io, || store.take_copy_slot(class, &mut mark)).is_ok();
     let left_after = store.claimed[class.index()].ones();
     // Every assertion with the database closed.
     drop((store, db));
@@ -466,10 +467,11 @@ fn a_copy_slot_claimed_by_a_step_waiting_on_a_metadata_read_is_given_back() {
         });
     }
     let before = crash.in_flight();
-    let waited = matches!(store.take_copy_slot(class), Ok(IOResult::IO(_)));
+    let mut mark = MarkEdit::default();
+    let waited = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
     let reading = crash.in_flight() > before;
     let left = store.claimed[class.index()].ones();
-    let next = drive(&db.io, || store.take_copy_slot(class)).is_ok();
+    let next = drive(&db.io, || store.take_copy_slot(class, &mut mark)).is_ok();
     let left_after = store.claimed[class.index()].ones();
     // Every assertion with the database closed.
     drop((store, db));
@@ -505,8 +507,9 @@ fn a_yield_while_doing_the_frees_a_checkpoint_let_go_keeps_every_one_still_owed(
         .collect();
     let n = db.db.checkpointer().superblock().checkpoint + 1;
     let (_, heights) = store.begin_cut(n);
+    let mut mark = MarkEdit::default();
     for &pid in &pages {
-        let slot = drive(&db.io, || store.take_copy_slot(class)).unwrap();
+        let slot = drive(&db.io, || store.take_copy_slot(class, &mut mark)).unwrap();
         let mut edit = CutEdit::default();
         drive(&db.io, || store.copied(n, &heights, pid, slot, &mut edit)).unwrap();
     }
@@ -524,13 +527,14 @@ fn a_yield_while_doing_the_frees_a_checkpoint_let_go_keeps_every_one_still_owed(
     };
     let frame = drive(&db.io, || store.meta().get(leaf)).unwrap();
     let hold = frame.try_lock().expect("the free-space leaf is free");
+    let mut freeing = FreeEdit::default();
     assert!(
-        matches!(store.after(n + 1).unwrap(), IOResult::IO(_)),
+        matches!(store.after(n + 1, &mut freeing).unwrap(), IOResult::IO(_)),
         "a free went on under a held latch"
     );
     assert_eq!(store.deferred_slots(), owed, "a free dropped by the yield");
     hold.release_unchanged();
-    drive(&db.io, || store.after(n + 1)).unwrap();
+    drive(&db.io, || store.after(n + 1, &mut freeing)).unwrap();
     assert!(
         store.deferred_slots().is_empty(),
         "{:?}",
@@ -1322,9 +1326,16 @@ fn a_swap_shard_is_listed_a_run_at_a_time_from_where_the_last_ended() {
 /// (DESIGN.md 22.18, a metadata read credit), over `CrashIO`, whose reads wait until it is stepped.
 #[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
 fn one_read() -> (Arc<crate::io::crash::CrashIO>, Db) {
+    reads_at_once(1)
+}
+
+/// A database whose metadata cache keeps `pages` pages, and so as many reads with its backend at
+/// a time, over `CrashIO`.
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+fn reads_at_once(pages: usize) -> (Arc<crate::io::crash::CrashIO>, Db) {
     let crash = Arc::new(crate::io::crash::CrashIO::new(0));
     let mut config = config();
-    config.store.meta_pages = 1;
+    config.store.meta_pages = pages;
     let db = Db::open_with(crash.clone(), config);
     (crash, db)
 }
@@ -2056,15 +2067,16 @@ fn a_copy_slot_past_the_cuts_free_space_is_in_the_free_space_reopened() {
         let class = class(0);
         let pid = drive(&io, || store.allocate(class)).unwrap();
         let mut last = None;
+        let mut mark = MarkEdit::default();
         for _ in 0..radix::SPACE_BITS {
-            last = Some(drive(&io, || store.take_copy_slot(class)).unwrap());
+            last = Some(drive(&io, || store.take_copy_slot(class, &mut mark)).unwrap());
         }
         if grow_before_cut {
             drive(&io, || store.grow(Tree::Space, class)).unwrap();
         }
         let (dirty, mut heights) = store.begin_cut(1);
         let mut ids: BTreeSet<_> = dirty.collect();
-        let slot = drive(&io, || store.take_copy_slot(class)).unwrap();
+        let slot = drive(&io, || store.take_copy_slot(class, &mut mark)).unwrap();
         let mut edit = CutEdit::default();
         let edited = drive(&io, || store.copied(1, &heights, pid, slot, &mut edit)).unwrap();
         ids.extend(edited.iter().copied());
@@ -2230,4 +2242,752 @@ fn a_waiting_left_out_keeps_its_pages_across_a_growth_of_the_cuts_free_space() {
         (Some(2), Some(1), Some(false)),
         "(the new root's counts below its first and second children, the old slot's bit) at the cut"
     );
+}
+
+/// The units of `class`'s free space in use, as a census walks it from its root as it stands.
+fn space_units(db: &Db, class: SizeClass) -> Vec<u64> {
+    let mut census = Census::new(Tree::Space, class);
+    drive(&db.io, || db.store().census(&mut census)).unwrap();
+    census.units.iter().map(|&(unit, _)| unit).collect()
+}
+
+/// The counts below each child of `class`'s first free-space node at `level`, as it stands.
+fn node_counts(db: &Db, class: SizeClass, level: u8) -> Vec<u64> {
+    let id = MetaId {
+        tree: Tree::Space,
+        class,
+        level,
+        index: 0,
+    };
+    let frame = drive(&db.io, || db.store().meta().get(id)).unwrap();
+    let counts = frame.read(|b| {
+        (0..radix::FANOUT)
+            .map(|child| radix::used_below(b, child))
+            .collect()
+    });
+    counts.unwrap_or_default()
+}
+
+/// The counts below each child of the first free-space node at `level` that `units` in use make.
+fn counts_of(units: &[u64], level: u8) -> Vec<u64> {
+    let mut counts = vec![0; radix::FANOUT as usize];
+    for &unit in units {
+        counts[radix::child(Tree::Space, level, unit) as usize] += 1;
+    }
+    counts
+}
+
+/// A slot in use in a free space two levels high, its free deferred for a checkpoint made
+/// durable, its leaf and root out of memory, under one read credit.
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+struct SlotCase {
+    crash: Arc<crate::io::crash::CrashIO>,
+    db: Db,
+    store: Arc<PageStore>,
+    class: SizeClass,
+    /// The durable checkpoint the free waited for.
+    n: u64,
+    slot: u64,
+    /// The units in use before the free, the slot among them.
+    units: Vec<u64>,
+    /// The slot's path, its leaf first, as ids order them.
+    pages: Vec<MetaId>,
+    /// How many of them are out of memory before the free.
+    evicted: usize,
+}
+
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+fn slot_case() -> SlotCase {
+    let (crash, db) = one_read();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    let mut mark = MarkEdit::default();
+    let slot = drive(&db.io, || store.take_copy_slot(class, &mut mark)).unwrap();
+    // Every metadata page written, so clean and evictable.
+    db.checkpoint();
+    db.checkpoint();
+    let n = db.db.checkpointer().superblock().checkpoint;
+    let units = space_units(&db, class);
+    store
+        .deferred
+        .lock()
+        .entry(n)
+        .or_default()
+        .push_back(Deferred::Slot(class, slot));
+    let pages = radix::path(Tree::Space, class, 2, slot).to_vec();
+    // The last read's request, kept for a test to cancel, holds its page through its callback.
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    for &id in &pages {
+        store.meta().evict(id);
+    }
+    let evicted = pages
+        .iter()
+        .filter(|&&id| !store.meta().in_memory(id))
+        .count();
+    SlotCase {
+        crash,
+        db,
+        store,
+        class,
+        n,
+        slot,
+        units,
+        pages,
+        evicted,
+    }
+}
+
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+impl SlotCase {
+    fn after_one(&self, edit: &mut FreeEdit) -> Result<IOResult<bool>> {
+        self.store.after_one(self.n, edit)
+    }
+
+    /// Every read with the backend retired, and the last one's request let go.
+    fn settle(&self) {
+        while self.crash.in_flight() > 0 {
+            self.crash.step().unwrap();
+        }
+        drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    }
+
+    /// The units in use the free should leave: those before it but its slot.
+    fn freed(&self) -> Vec<u64> {
+        self.units
+            .iter()
+            .copied()
+            .filter(|&u| u != self.slot)
+            .collect()
+    }
+}
+
+/// A deferred free of a slot two levels deep, its leaf and root out of memory, under one read
+/// credit, keeps each page it found from its look on across every poll: each read once, one read
+/// with the backend at a time, three polls, no page of its path evictable after any poll or once
+/// its reads retire. The free space then lists exactly the slots in use before it but the slot,
+/// and its root counts exactly those (DESIGN.md 22.18; the auditor's #4651 and #4653; mutant: the
+/// pages let go at every wait).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_deferred_free_wider_than_its_read_credits_keeps_its_pages_and_reads_each_once() {
+    let case = slot_case();
+    let clean = (case.evicted, case.pages.len());
+    let mut edit = FreeEdit::default();
+    let before = case.crash.completed();
+    let (mut polls, mut most) = (0, 0);
+    let mut evicted = Vec::new();
+    let freed = loop {
+        polls += 1;
+        match case.after_one(&mut edit) {
+            Ok(IOResult::Done(none_left)) => break Some(none_left),
+            Ok(IOResult::IO(_)) => {}
+            Err(_) => break None,
+        }
+        most = most.max(case.crash.in_flight());
+        // No page of its path is in memory but by the edit: any evicted is one it let go.
+        for &id in &case.pages {
+            if case.store.meta().evict(id) {
+                evicted.push(id);
+            }
+        }
+        case.settle();
+        for &id in &case.pages {
+            if case.store.meta().evict(id) {
+                evicted.push(id);
+            }
+        }
+        if polls > case.pages.len() + 2 {
+            break None;
+        }
+    };
+    let reads = case.crash.completed() - before;
+    let units = space_units(&case.db, case.class);
+    let root = node_counts(&case.db, case.class, 1);
+    let expected = case.freed();
+    let (was_used, pages, owed) = (
+        case.units.contains(&case.slot),
+        case.pages.len(),
+        case.store
+            .deferred_slots()
+            .contains(&(case.class, case.slot)),
+    );
+    drop(edit);
+    drop(case);
+    assert_eq!(
+        clean.0, clean.1,
+        "pages out of memory before the free, of its pages"
+    );
+    assert_eq!(pages, 2, "the slot's path: its leaf and its root");
+    assert!(was_used, "the slot was not in use before its free");
+    assert_eq!(freed, Some(false), "the free not made");
+    assert!(
+        evicted.is_empty(),
+        "pages the free held evicted: {evicted:?}"
+    );
+    assert_eq!((reads, polls), (2, 3), "(metadata reads, polls)");
+    assert!(most <= 1, "{most} reads with the backend at once");
+    assert_eq!(units, expected, "the slots in use after the free");
+    assert_eq!(
+        root,
+        counts_of(&expected, 1),
+        "the root's counts after the free"
+    );
+    assert!(!owed, "the free still owed");
+}
+
+/// A deferred free whose root another change holds latches its leaf first, as ids order a leaf
+/// before its root, then meets the root: it lets the leaf's latch go, so another change takes the
+/// leaf while it waits, and keeps both pages, so the leaf cannot be evicted. Once the root is let
+/// go the free is made with no read (the auditor's #4651; mutant: the pages let go at a latch's
+/// wait).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_deferred_free_meeting_its_root_held_lets_its_leaf_go_and_keeps_its_pages() {
+    let case = slot_case();
+    let (leaf, root) = (case.pages[0], case.pages[1]);
+    let mut edit = FreeEdit::default();
+    let (mut polls, mut early) = (0, false);
+    // Both pages held, the last read retired. A free made is not polled again.
+    while !early && edit.state.pages.held() < case.pages.len() && polls <= case.pages.len() + 2 {
+        polls += 1;
+        early = matches!(case.after_one(&mut edit), Ok(IOResult::Done(_)));
+        case.settle();
+    }
+    let held = edit.state.pages.held();
+    let reads = case.crash.completed();
+    // The root's frame and latch held in a scope of their own, let go before anything more.
+    let (latched, waited, leaf_free, leaf_kept, held_waiting) = {
+        let root_frame = drive(&case.db.io, || case.store.meta().get(root)).unwrap();
+        let hold = root_frame.try_lock();
+        let latched = hold.is_some();
+        let waited = !early && latched && matches!(case.after_one(&mut edit), Ok(IOResult::IO(_)));
+        let leaf_free = {
+            let frame = drive(&case.db.io, || case.store.meta().get(leaf)).unwrap();
+            let taken = frame.try_lock();
+            let free = taken.is_some();
+            if let Some(taken) = taken {
+                taken.release_unchanged();
+            }
+            free
+        };
+        let leaf_kept = !case.store.meta().evict(leaf);
+        let held_waiting = edit.state.pages.held();
+        if let Some(hold) = hold {
+            hold.release_unchanged();
+        }
+        (latched, waited, leaf_free, leaf_kept, held_waiting)
+    };
+    let done = !early && matches!(case.after_one(&mut edit), Ok(IOResult::Done(false)));
+    let read_after = case.crash.completed() - reads;
+    let units = space_units(&case.db, case.class);
+    let expected = case.freed();
+    let pages = case.pages.len();
+    drop(edit);
+    drop(case);
+    assert!(!early, "the free was made before both pages were held");
+    assert_eq!(held, pages, "pages held before the root was taken");
+    assert!(latched, "the root's latch not free for the test");
+    assert!(waited, "the free did not wait on the root held");
+    assert!(leaf_free, "the leaf's latch kept while the free waited");
+    assert!(leaf_kept, "the leaf evicted while the free waited");
+    assert_eq!(held_waiting, pages, "pages held while the free waited");
+    assert!(done, "the free not made once the root was let go");
+    assert_eq!(read_after, 0, "reads after both pages were in memory");
+    assert_eq!(units, expected, "the slots in use after the free");
+}
+
+/// A deferred free whose free space grows a level after its pages are ready and before it latches
+/// them reads the height again under its latches, lets them go and goes round: it latches the new
+/// root too and counts the free in it. Anchored on the occupancy before it, N, the free space then
+/// lists exactly N - 1 slots, and the old and new roots count exactly those (the auditor's #4651
+/// and #4653; mutant: no height read under the latches, so the new root still counts the slot).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_deferred_free_whose_free_space_grows_under_it_counts_the_free_in_the_new_root() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let case = slot_case();
+    let grown = Rc::new(Cell::new(None));
+    {
+        let (store, io, grown, class) = (
+            case.store.clone(),
+            case.db.io.clone(),
+            grown.clone(),
+            case.class,
+        );
+        crate::race::at("store.slot_ready", move || {
+            grown.set(Some(drive(&io, || store.grow(Tree::Space, class)).is_ok()));
+        });
+    }
+    let mut edit = FreeEdit::default();
+    let mut freed = None;
+    for _ in 0..=case.pages.len() + 3 {
+        match case.after_one(&mut edit) {
+            Ok(IOResult::Done(none_left)) => {
+                freed = Some(none_left);
+                break;
+            }
+            Ok(IOResult::IO(_)) => case.settle(),
+            Err(_) => break,
+        }
+    }
+    let unreached = crate::race::pending("store.slot_ready");
+    let height = case.store.height(Tree::Space, case.class);
+    let units = space_units(&case.db, case.class);
+    let (low, high) = (
+        node_counts(&case.db, case.class, 1),
+        node_counts(&case.db, case.class, 2),
+    );
+    let (before, expected) = (case.units.len(), case.freed());
+    drop(edit);
+    drop(case);
+    assert!(!unreached, "the free never reached its pages ready");
+    assert_eq!(
+        grown.get(),
+        Some(true),
+        "the free space did not grow at the hook"
+    );
+    assert_eq!(height, 3, "the free space's height after the growth");
+    assert_eq!(freed, Some(false), "the free not made");
+    assert_eq!(units.len() + 1, before, "slots in use: N - 1 of N");
+    assert_eq!(units, expected, "the slots in use after the free");
+    assert_eq!(low, counts_of(&expected, 1), "the old root's counts");
+    assert_eq!(high, counts_of(&expected, 2), "the new root's counts");
+}
+
+/// A copy slot's take whose free space grows a level after its mark's pages are ready and before
+/// it latches them goes round the same way: the new root counts the slot. Anchored on the
+/// occupancy before it, N, the free space then lists exactly N + 1 slots, and both roots count
+/// exactly those. Its claim walk finds its pages in memory: a cold claim walk is slice 1c's (the
+/// auditor's #4651 and #4653; mutant: no height read under the latches).
+#[test]
+fn a_copy_slot_whose_free_space_grows_under_its_mark_counts_it_in_the_new_root() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    let before = space_units(&db, class);
+    let grown = Rc::new(Cell::new(None));
+    {
+        let (store, io, grown) = (store.clone(), db.io.clone(), grown.clone());
+        crate::race::at("store.slot_ready", move || {
+            grown.set(Some(drive(&io, || store.grow(Tree::Space, class)).is_ok()));
+        });
+    }
+    // Called directly, so the hook's growth is an operation of its own rather than one inside it.
+    let mut mark = MarkEdit::default();
+    let slot = match store.take_copy_slot(class, &mut mark) {
+        Ok(IOResult::Done(slot)) => Some(slot),
+        _ => None,
+    };
+    let unreached = crate::race::pending("store.slot_ready");
+    let height = store.height(Tree::Space, class);
+    let units = space_units(&db, class);
+    let (low, high) = (node_counts(&db, class, 1), node_counts(&db, class, 2));
+    let claimed = store.claimed[class.index()].ones();
+    let mut expected = before.clone();
+    expected.extend(slot);
+    expected.sort_unstable();
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert!(!unreached, "the mark never reached its pages ready");
+    assert_eq!(
+        grown.get(),
+        Some(true),
+        "the free space did not grow at the hook"
+    );
+    assert_eq!(height, 3, "the free space's height after the growth");
+    assert!(
+        slot.is_some_and(|s| !before.contains(&s)),
+        "the slot taken: {slot:?}, of {before:?} in use before"
+    );
+    assert_eq!(units.len(), before.len() + 1, "slots in use: N + 1 of N");
+    assert_eq!(units, expected, "the slots in use after the take");
+    assert_eq!(low, counts_of(&expected, 1), "the old root's counts");
+    assert_eq!(high, counts_of(&expected, 2), "the new root's counts");
+    assert!(claimed.is_empty(), "a claim left: {claimed:?}");
+}
+
+/// A copy slot's take whose mark waited on its two pages' reads, two read credits admitting both
+/// in its first call and the reads retiring before its next, claims the next slot in that call,
+/// in the same leaf: the mark aims again, keeps both pages, reads none again, and takes it. The
+/// pages are still the take's as its next claim is made: none can be evicted at that point. The
+/// first slot stays free and no claim is left (the auditor's #4651, #4653 and #4666: its claim is
+/// the class's, its slot its layout; mutant: the pages let go as the next claim is made).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_copy_slot_take_claiming_another_slot_keeps_its_pages_and_reads_none_again() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (crash, db) = reads_at_once(2);
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    // Every metadata page written, so clean and evictable.
+    db.checkpoint();
+    db.checkpoint();
+    let before = space_units(&db, class);
+    let first = Rc::new(Cell::new(None));
+    let out = Rc::new(Cell::new(0));
+    {
+        let (store, first, out) = (store.clone(), first.clone(), out.clone());
+        crate::race::at("store.copy_slot_claimed", move || {
+            let Some(&slot) = store.claimed[class.index()].ones().first() else {
+                return;
+            };
+            first.set(Some(slot));
+            drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+            let path = radix::path(Tree::Space, class, store.height(Tree::Space, class), slot);
+            for &id in path.iter() {
+                store.meta().evict(id);
+            }
+            out.set(
+                path.iter()
+                    .filter(|&&id| !store.meta().in_memory(id))
+                    .count(),
+            );
+        });
+    }
+    let mut mark = MarkEdit::default();
+    let waited = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
+    let (held, reading) = (mark.state.pages.held_ids(), crash.in_flight());
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    let evicted_at_claim = Rc::new(Cell::new(None));
+    {
+        let (store, evicted_at_claim) = (store.clone(), evicted_at_claim.clone());
+        crate::race::at("store.copy_slot_claimed", move || {
+            let Some(&slot) = store.claimed[class.index()].ones().first() else {
+                return;
+            };
+            let path = radix::path(Tree::Space, class, store.height(Tree::Space, class), slot);
+            let evicted = path.iter().filter(|&&id| store.meta().evict(id)).count();
+            evicted_at_claim.set(Some(evicted));
+        });
+    }
+    let reads = crash.completed();
+    let next = store.take_copy_slot(class, &mut mark);
+    let read_after = crash.completed() - reads;
+    let next = match next {
+        Ok(IOResult::Done(slot)) => Some(slot),
+        _ => None,
+    };
+    let units = space_units(&db, class);
+    let claimed = store.claimed[class.index()].ones();
+    let first = first.get();
+    let mut expected = before.clone();
+    expected.extend(next);
+    expected.sort_unstable();
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert_eq!(
+        out.get(),
+        2,
+        "the mark's pages out of memory after the claim"
+    );
+    assert!(waited, "the first call did not wait on the reads");
+    assert_eq!(
+        (held.len(), reading),
+        (2, 2),
+        "(pages held, reads with the backend)"
+    );
+    assert_eq!(
+        next,
+        first.map(|s| s + 1),
+        "the next call's slot, of the first claim {first:?}"
+    );
+    assert_eq!(
+        evicted_at_claim.get(),
+        Some(0),
+        "pages evicted as the next claim was made"
+    );
+    assert_eq!(read_after, 0, "reads by the next call");
+    assert_eq!(units, expected, "the slots in use after the take");
+    assert!(claimed.is_empty(), "a claim left: {claimed:?}");
+}
+
+/// A copy slot's take whose mark waited on a read, under one read credit, keeps its page across
+/// its next calls' claims, whatever they return: while the next claim waits on a read of its own
+/// the page stays held, and when that read fails the take ends with the error and lets the page
+/// go (the auditor's #4651: the whole call is the edit's; mutant: only the mark under the edit, so
+/// a claim's error returns with the old mark's pages still held).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_copy_slot_take_whose_claim_fails_after_its_mark_waited_lets_its_pages_go() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    let (crash, db) = one_read();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    db.checkpoint();
+    db.checkpoint();
+    // The claim walk's pages held in memory by the test until the claim is made: its cold walk is
+    // slice 1c's.
+    let path = radix::path(Tree::Space, class, 2, 0).to_vec();
+    let warm: Vec<_> = path
+        .iter()
+        .map(|&id| drive(&db.io, || store.meta().get(id)).unwrap())
+        .collect();
+    let warm = Rc::new(RefCell::new(warm));
+    let out = Rc::new(Cell::new(0));
+    {
+        let (store, warm, out, path) = (store.clone(), warm.clone(), out.clone(), path.clone());
+        crate::race::at("store.copy_slot_claimed", move || {
+            warm.borrow_mut().clear();
+            drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+            for &id in &path {
+                store.meta().evict(id);
+            }
+            out.set(
+                path.iter()
+                    .filter(|&&id| !store.meta().in_memory(id))
+                    .count(),
+            );
+        });
+    }
+    let (leaf, root) = (path[0], path[1]);
+    let settle = || {
+        while crash.in_flight() > 0 {
+            crash.step().unwrap();
+        }
+        drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    };
+    let mut mark = MarkEdit::default();
+    let first = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
+    let held_first = mark.state.pages.held_ids();
+    settle();
+    crash.set_faults(crate::io::crash::Faults {
+        read: 1.0,
+        ..Default::default()
+    });
+    let second = matches!(store.take_copy_slot(class, &mut mark), Ok(IOResult::IO(_)));
+    let root_reading = crash.in_flight();
+    let kept_waiting = !store.meta().evict(leaf);
+    settle();
+    crash.set_faults(Default::default());
+    let failed = store.take_copy_slot(class, &mut mark).is_err();
+    let (pending, held) = (mark.pending(), mark.state.pages.held());
+    let let_go = store.meta().evict(leaf) || !store.meta().in_memory(leaf);
+    let warm_left = warm.borrow().len();
+    drop(mark);
+    drop(warm);
+    drop(store);
+    drop(db);
+    assert_eq!(
+        (out.get(), warm_left),
+        (2, 0),
+        "(path pages out after the claim, test holds)"
+    );
+    assert!(first, "the first call did not wait on its mark's read");
+    assert_eq!(held_first, vec![leaf], "pages held after the first call");
+    assert!(
+        second,
+        "the second call's claim did not wait on the root's read"
+    );
+    assert_eq!(
+        root_reading, 1,
+        "reads with the backend as the claim waits: {root:?}"
+    );
+    assert!(
+        kept_waiting,
+        "the mark's page let go while the next claim waited"
+    );
+    assert!(failed, "the take did not end with the claim's failed read");
+    assert_eq!(
+        (pending, held),
+        (None, 0),
+        "(the take under way, pages held)"
+    );
+    assert!(let_go, "the leaf still held after the take failed");
+}
+
+/// A copy slot's take of one class whose mark waited holding its page, followed by a take of
+/// another class whose claim waits on a read, has let the first take's page go before that claim
+/// runs: the first class's leaf is evictable while the second waits (the auditor's #4651; mutant:
+/// only the mark under the edit, so a claim that waits returns before the edit sees the class).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_copy_slot_take_of_another_class_lets_the_first_classs_pages_go_before_its_claim() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::mpsc;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+    let (crash, db) = reads_at_once(2);
+    let store = db.store().clone();
+    let (a, b) = (class(0), class(1));
+    // A slot of class B taken first, so its free space's leaf is a page the checkpoints write.
+    let mut setup = MarkEdit::default();
+    drive(&db.io, || store.take_copy_slot(b, &mut setup)).unwrap();
+    db.checkpoint();
+    db.checkpoint();
+    let leaf_of = |class: SizeClass| radix::path(Tree::Space, class, 1, 0)[0];
+    let (leaf_a, leaf_b) = (leaf_of(a), leaf_of(b));
+    // Class A's leaf held in memory by the test for its claim walk until class B's take; class
+    // B's out, so its claim waits on a read.
+    let warm_a = drive(&db.io, || store.meta().get(leaf_a)).unwrap();
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    store.meta().evict(leaf_b);
+    let b_out = !store.meta().in_memory(leaf_b);
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let holder = Rc::new(RefCell::new(None));
+    {
+        let (store, io, holder) = (store.clone(), db.io.clone(), holder.clone());
+        crate::race::at("store.slot_ready", move || {
+            let (held_tx, held_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let frame = drive(&io, || store.meta().get(leaf_a)).unwrap();
+                let hold = frame.try_lock();
+                let _ = held_tx.send(hold.is_some());
+                let _ = go_rx.recv_timeout(BOUND);
+                if let Some(hold) = hold {
+                    hold.release_unchanged();
+                }
+            });
+            let held = held_rx.recv_timeout(BOUND).unwrap_or(false);
+            *holder.borrow_mut() = Some((thread, held));
+        });
+    }
+    let mut mark = MarkEdit::default();
+    let waited_a = matches!(store.take_copy_slot(a, &mut mark), Ok(IOResult::IO(_)));
+    let held_a = mark.state.pages.held_ids();
+    let _ = go_tx.send(());
+    let (joined, latched) = holder
+        .borrow_mut()
+        .take()
+        .map_or((false, false), |(t, held)| (t.join().is_ok(), held));
+    drop(warm_a);
+    let waited_b = matches!(store.take_copy_slot(b, &mut mark), Ok(IOResult::IO(_)));
+    let b_reading = crash.in_flight();
+    let a_let_go = store.meta().evict(leaf_a) || !store.meta().in_memory(leaf_a);
+    let pending = mark.pending();
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let done_b = drive(&db.io, || store.take_copy_slot(b, &mut mark)).is_ok();
+    let claimed = (
+        store.claimed[a.index()].ones(),
+        store.claimed[b.index()].ones(),
+    );
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert!(b_out, "class B's leaf in memory before its take");
+    assert!(
+        joined && latched,
+        "(the latch thread joined, class A's leaf latched)"
+    );
+    assert!(waited_a, "class A's take did not wait on its leaf's latch");
+    assert_eq!(held_a, vec![leaf_a], "pages held by class A's take");
+    assert!(waited_b, "class B's claim did not wait on its leaf's read");
+    assert_eq!(
+        b_reading, 1,
+        "reads with the backend as class B's claim waits"
+    );
+    assert!(a_let_go, "class A's leaf held while class B's claim waited");
+    assert_eq!(
+        pending,
+        Some(b),
+        "the take under way as class B's claim waits"
+    );
+    assert!(done_b, "class B's take not made");
+    assert!(
+        claimed.0.is_empty() && claimed.1.is_empty(),
+        "claims left: {claimed:?}"
+    );
+}
+
+/// A checkpoint's After phase over a deferred free whose leaf and root it finds out of memory,
+/// under one read credit, waits on their reads across its units, the free kept at the front of
+/// its list meanwhile, and then makes it: each page read once, the free space then lists exactly
+/// the slots in use before it but the slot, and no free is owed (the auditor's #4650: the run
+/// owns the free's edit).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_checkpoints_deferred_free_that_waits_on_its_reads_stays_owed_until_it_is_made() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let (crash, db) = one_read();
+    let store = db.store().clone();
+    let class = class(0);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    let mut mark = MarkEdit::default();
+    let slot = drive(&db.io, || store.take_copy_slot(class, &mut mark)).unwrap();
+    db.checkpoint();
+    db.checkpoint();
+    let before = space_units(&db, class);
+    let n = db.db.checkpointer().superblock().checkpoint + 1;
+    store
+        .deferred
+        .lock()
+        .entry(n)
+        .or_default()
+        .push_back(Deferred::Slot(class, slot));
+    let path = radix::path(Tree::Space, class, 2, slot).to_vec();
+    let out = Rc::new(Cell::new(None));
+    let at_ready = Rc::new(Cell::new(None));
+    {
+        let (store, crash, out, at_ready, path) = (
+            store.clone(),
+            crash.clone(),
+            out.clone(),
+            at_ready.clone(),
+            path.clone(),
+        );
+        crate::race::at("checkpoint.after_free", move || {
+            drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+            for &id in &path {
+                store.meta().evict(id);
+            }
+            out.set(Some(
+                path.iter()
+                    .filter(|&&id| !store.meta().in_memory(id))
+                    .count(),
+            ));
+            let reads = crash.completed();
+            crate::race::at("store.slot_ready", move || {
+                let owed = store.deferred_slots().contains(&(class, slot));
+                at_ready.set(Some((crash.completed() - reads, owed)));
+            });
+        });
+    }
+    db.checkpoint();
+    let unreached = (
+        crate::race::pending("checkpoint.after_free"),
+        crate::race::pending("store.slot_ready"),
+    );
+    let owed = store.deferred_slots().contains(&(class, slot));
+    let units = space_units(&db, class);
+    let expected: Vec<u64> = before.iter().copied().filter(|&u| u != slot).collect();
+    drop(mark);
+    drop(store);
+    drop(db);
+    assert_eq!(
+        unreached,
+        (false, false),
+        "(the After phase, the free's pages ready) unreached"
+    );
+    assert_eq!(
+        out.get(),
+        Some(2),
+        "the free's pages out of memory as the After phase began"
+    );
+    assert_eq!(
+        at_ready.get(),
+        Some((2, true)),
+        "(reads, the free owed) as its pages were ready"
+    );
+    assert!(!owed, "the free still owed after the checkpoint");
+    assert!(
+        before.contains(&slot),
+        "the slot not in use before its free"
+    );
+    assert_eq!(units, expected, "the slots in use after the checkpoint");
 }

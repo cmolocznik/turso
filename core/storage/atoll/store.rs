@@ -341,6 +341,24 @@ pub struct CutState {
 /// A checkpoint's edit of its cut under way, kept across its polls by the checkpoint.
 pub type CutEdit = Edit<CutKey, CutState>;
 
+/// The metadata pages an edit of one slot of the free space as it stands latches: its path,
+/// `MAX_HEIGHT` pages at most.
+pub const SLOT_PAGES: usize = MAX_HEIGHT as usize;
+
+/// An edit of one slot of the free space as it stands under way: its pages.
+#[derive(Default)]
+pub struct SlotPages {
+    pages: PageSet<SLOT_PAGES>,
+}
+
+/// A deferred free of a slot under way ([`PageStore::after_one`]): keyed by the slot freed, which
+/// stays the front of its list until the free is done.
+pub type FreeEdit = Edit<(SizeClass, u64), SlotPages>;
+
+/// A take of a copy slot under way ([`PageStore::take_copy_slot`]): keyed by its class. The slot is
+/// its layout: each call claims afresh, as no claim outlives its call, and marks the slot it found.
+pub type MarkEdit = Edit<SizeClass, SlotPages>;
+
 /// The metadata pages an edit of a cut latched and changed, each once, in id order, and the
 /// height of the cut's free space for its page's class as the edit left it.
 #[derive(Clone, Copy, Debug)]
@@ -1061,28 +1079,64 @@ impl PageStore {
     }
 
     /// A slot for a checkpoint copy of a page of `class`, in use in the free space as it stands:
-    /// the checkpoint marks it in its cut too. Step it until done.
-    pub fn take_copy_slot(self: &Arc<Self>, class: SizeClass) -> Result<IOResult<u64>> {
-        let slot = match self.claim_slot(class)? {
-            IOResult::Done(s) => s,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-        };
-        // Claimed in memory until this call returns, whatever it returns: taken, the free space
-        // holds it by then; not, it is free again, so a step that waits leaves no claim for its
-        // next call to pass over (the auditor's #4573).
-        let _claim = Claim {
-            claimed: &self.claimed[class.index()],
-            slot,
-        };
-        crate::race::point("store.copy_slot_claimed");
-        loop {
-            let height = self.height(Tree::Space, class);
-            let ids = radix::path(Tree::Space, class, height, slot);
-            let frames = match self.meta.get_all(&ids)? {
-                IOResult::Done(f) => f,
+    /// the checkpoint marks it in its cut too. Step it until done, `edit` kept across its polls:
+    /// the whole call is the edit's, so a claim that waits keeps its pages for the class, one that
+    /// fails lets them go, and a call for another class lets them go first (the auditor's #4651).
+    pub fn take_copy_slot(
+        self: &Arc<Self>,
+        class: SizeClass,
+        edit: &mut MarkEdit,
+    ) -> Result<IOResult<u64>> {
+        edit.poll(class, |state| {
+            let slot = match self.claim_slot(class)? {
+                IOResult::Done(s) => s,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            let mut locked = match Locked::new(&frames) {
+            // Claimed in memory until this call returns, whatever it returns: taken, the free
+            // space holds it by then; not, it is free again, so a step that waits leaves no claim
+            // for its next call to pass over (the auditor's #4573).
+            let _claim = Claim {
+                claimed: &self.claimed[class.index()],
+                slot,
+            };
+            crate::race::point("store.copy_slot_claimed");
+            let marked = self.edit_slot(class, slot, &mut state.pages, |locked| {
+                set_space(locked, class, slot, true)
+            })?;
+            Ok(match marked {
+                IOResult::Done(()) => IOResult::Done(slot),
+                IOResult::IO(io) => IOResult::IO(io),
+            })
+        })
+    }
+
+    /// One poll of an edit of `slot` of the free space as it stands: its path at the height as it
+    /// stands, latched, `apply` run under the latches, then committed. Its pages are kept in
+    /// `pages` across its waits for a read and for a latch (DESIGN.md 22.18). The height is read
+    /// again under the latches: a growth makes its height known while it holds both roots, so an
+    /// edit that latched the old root since reads the new height, and goes round, keeping every
+    /// page both paths name; one that latched it first holds the growth off. Heights only rise,
+    /// so a call goes round at most `MAX_HEIGHT - 1` times.
+    fn edit_slot(
+        &self,
+        class: SizeClass,
+        slot: u64,
+        pages: &mut PageSet<SLOT_PAGES>,
+        apply: impl FnOnce(&mut Locked<'_>),
+    ) -> Result<IOResult<()>> {
+        loop {
+            let height = self.height(Tree::Space, class);
+            pages.aim(
+                radix::path(Tree::Space, class, height, slot)
+                    .iter()
+                    .copied(),
+            )?;
+            let ready = match pages.poll(&self.meta)? {
+                Polled::Ready(ready) => ready,
+                Polled::Wait(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
+            };
+            crate::race::point("store.slot_ready");
+            let mut locked = match Locked::of(ready) {
                 Ok(locked) => locked,
                 Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
             };
@@ -1090,9 +1144,9 @@ impl PageStore {
                 locked.release_unchanged();
                 continue;
             }
-            set_space(&mut locked, class, slot, true);
+            apply(&mut locked);
             locked.commit(&self.meta);
-            return Ok(IOResult::Done(slot));
+            return Ok(IOResult::Done(()));
         }
     }
 
@@ -1283,8 +1337,8 @@ impl PageStore {
     /// Checkpoint `n` is durable: one free that waited for it is done, its number reusable once no
     /// step holds it, its slot erased before it is taken again: a unit (DESIGN.md 22.9 item 1). A
     /// free leaves the list only once it is done, so a wait leaves it listed, to be taken up on the
-    /// next call. Done(true) once none is left.
-    pub fn after_one(self: &Arc<Self>, n: u64) -> Result<IOResult<bool>> {
+    /// next call, and its pages kept in `edit`. Done(true) once none is left.
+    pub fn after_one(self: &Arc<Self>, n: u64, edit: &mut FreeEdit) -> Result<IOResult<bool>> {
         let next = {
             let deferred = self.deferred.lock();
             deferred
@@ -1299,7 +1353,9 @@ impl PageStore {
         match d {
             Deferred::Number(pid) => self.freed_numbers.retire(&self.epochs, pid),
             Deferred::Slot(class, slot) => {
-                if let IOResult::IO(io) = self.free_slot(class, slot)? {
+                let freed =
+                    edit.poll((class, slot), |s| self.free_slot(class, slot, &mut s.pages))?;
+                if let IOResult::IO(io) = freed {
                     return Ok(IOResult::IO(io));
                 }
             }
@@ -1316,11 +1372,12 @@ impl PageStore {
         Ok(IOResult::Done(false))
     }
 
-    /// Every free that waited for durable checkpoint `n`, for a test. Step it until done.
+    /// Every free that waited for durable checkpoint `n`, for a test. Step it until done, `edit`
+    /// kept across its polls.
     #[cfg(test)]
-    pub fn after(self: &Arc<Self>, n: u64) -> Result<IOResult<()>> {
+    pub fn after(self: &Arc<Self>, n: u64, edit: &mut FreeEdit) -> Result<IOResult<()>> {
         loop {
-            match self.after_one(n)? {
+            match self.after_one(n, edit)? {
                 IOResult::Done(true) => return Ok(IOResult::Done(())),
                 IOResult::Done(false) => {}
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -1329,26 +1386,21 @@ impl PageStore {
     }
 
     /// `slot` holds no copy any durable checkpoint names: free in the free space as it stands,
-    /// and erased before it is taken again.
-    fn free_slot(self: &Arc<Self>, class: SizeClass, slot: u64) -> Result<IOResult<()>> {
-        let height = self.height(Tree::Space, class);
-        let ids = radix::path(Tree::Space, class, height, slot);
-        let frames = match self.meta.get_all(&ids)? {
-            IOResult::Done(f) => f,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-        };
-        let mut locked = match Locked::new(&frames) {
-            Ok(locked) => locked,
-            Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
-        };
-        if self.height(Tree::Space, class) != height {
-            locked.release_unchanged();
-            return Ok(busy());
+    /// and erased before it is taken again. Its pages are kept in `pages` across its polls.
+    fn free_slot(
+        &self,
+        class: SizeClass,
+        slot: u64,
+        pages: &mut PageSet<SLOT_PAGES>,
+    ) -> Result<IOResult<()>> {
+        let freed = self.edit_slot(class, slot, pages, |locked| {
+            // Marked unerased before it is free, so no taker finds it between.
+            self.unerased[class.index()].set(slot);
+            set_space(locked, class, slot, false);
+        })?;
+        if let IOResult::IO(io) = freed {
+            return Ok(IOResult::IO(io));
         }
-        // Marked unerased before it is free, so no taker finds it between.
-        self.unerased[class.index()].set(slot);
-        set_space(&mut locked, class, slot, false);
-        locked.commit(&self.meta);
         self.erase_owed.fetch_add(1, Ordering::AcqRel);
         self.to_erase.retire(&self.epochs, (class, slot));
         Ok(IOResult::Done(()))
@@ -1795,10 +1847,6 @@ fn own<'a, T>(
     lock.try_lock()
         .map(|held| Owned(Some(held), let_go))
         .ok_or(wait)
-}
-
-fn busy<T>() -> IOResult<T> {
-    IOResult::IO(IOCompletions(Completion::new_yield()))
 }
 
 /// The directory the files named from `base` are in.

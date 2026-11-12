@@ -44,7 +44,7 @@ use super::log::{framed_len, Admitted, Header, Kind, Log, LogWait, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
 use super::stack::Chain;
-use super::store::{CutEdit, Erasing, PageStore};
+use super::store::{CutEdit, Erasing, FreeEdit, MarkEdit, PageStore};
 use super::txn::versioned::AsOf;
 use super::txn::{Cut, Transactions, Ts};
 use super::unit;
@@ -612,6 +612,10 @@ struct Run {
     /// The edit under way of a page left out: an orphan, a page of a tree set aside, or a value
     /// no image names, one at a time.
     leaving: CutEdit,
+    /// The take of a copy slot under way, for the page being imaged.
+    copying: MarkEdit,
+    /// The deferred free of a slot under way, the front of its list until it is done.
+    freeing: FreeEdit,
     /// Pages named by nothing whose free waited for the checkpointer, taken before the cut, and
     /// those freed: left out, never imaged.
     orphans: Vec<PageId>,
@@ -1703,6 +1707,8 @@ impl Run {
             released: false,
             landing: CutEdit::default(),
             leaving: CutEdit::default(),
+            copying: MarkEdit::default(),
+            freeing: FreeEdit::default(),
         }
     }
 
@@ -1908,6 +1914,10 @@ impl Run {
                 },
                 Phase::Values => match self.image_unit(cp, txns, true)? {
                     Unit::Done => {
+                        debug_assert!(
+                            self.copying.pending().is_none(),
+                            "a copy slot's take still under way as the last image is written"
+                        );
                         self.phase = Phase::EndCut;
                         return Ok(Unit::Again);
                     }
@@ -2081,9 +2091,14 @@ impl Run {
                 Phase::After => {
                     // A deferred free a unit.
                     unit::visit();
-                    if !unit!(cp.store.after_one(self.n)) {
+                    crate::race::point("checkpoint.after_free");
+                    if !unit!(cp.store.after_one(self.n, &mut self.freeing)) {
                         return Ok(Unit::Again);
                     }
+                    debug_assert!(
+                        self.freeing.pending().is_none(),
+                        "a deferred free still under way with none left"
+                    );
                     self.phase = Phase::Forget;
                     return Ok(Unit::Again);
                 }
@@ -2472,7 +2487,7 @@ impl Run {
                 return Ok(Unit::Wait(c));
             }
         };
-        let slot = match cp.store.take_copy_slot(pid.class())? {
+        let slot = match cp.store.take_copy_slot(pid.class(), &mut self.copying)? {
             IOResult::Done(s) => s,
             IOResult::IO(IOCompletions(c)) => {
                 // The image stays built; its frame goes back meanwhile.
@@ -3144,9 +3159,10 @@ mod tests {
         use std::mem::needs_drop;
         const A_RUN_A_UNIT: &[&str] = &["frames", "meta", "dirty"];
         // `writing`, `flying` and `syncing` are held to `WRITES`; `imaging` to one page;
-        // `landing` and `leaving` to one edit of the cut each, `CUT_PAGES` frames at most.
+        // `landing` and `leaving` to one edit of the cut each, `CUT_PAGES` frames at most;
+        // `copying` and `freeing` to one slot's path each, `SLOT_PAGES` frames at most.
         const BOUNDED: &[&str] = &[
-            "writing", "flying", "syncing", "imaging", "landing", "leaving",
+            "writing", "flying", "syncing", "imaging", "landing", "leaving", "copying", "freeing",
         ];
         const ONE_FREE: &[&str] = &[
             "set_aside",

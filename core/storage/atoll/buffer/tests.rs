@@ -1685,7 +1685,8 @@ fn checkpoint_meta(io: &Arc<dyn IO>, store: &Arc<PageStore>) {
     }
     store.meta().end_cut(n, &frames);
     store.meta().checkpointed(n, &frames);
-    drive(io, || store.after(n)).unwrap();
+    let mut freeing = crate::storage::atoll::store::FreeEdit::default();
+    drive(io, || store.after(n, &mut freeing)).unwrap();
 }
 
 /// An eviction round whose threshold every candidate is over, as a cold value in the threshold's

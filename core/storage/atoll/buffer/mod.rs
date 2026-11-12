@@ -1002,7 +1002,10 @@ impl BufferPool {
             // Counted in flight and marked submitted by the source right before its request, so
             // before the read can land; the read ends, landed or given up, exactly once, through
             // `reading`, which counts it out if it was counted in, under the same hold.
+            // The frame's record holds the request from before it is handed over (DESIGN.md
+            // 22.18, a frame).
             let submitting = || {
+                h.hold_record();
                 self.requests.fetch_add(1, Ordering::AcqRel);
                 h.submitted_at(version);
             };
@@ -1010,6 +1013,31 @@ impl BufferPool {
             event.arm();
             read
         });
+        let read = match read {
+            // Held until the request retires, which may come after the read landed and the page is
+            // resident and unlatched: the frame is neither evicted nor reused before.
+            Ok(IOResult::Done(Some(request))) => {
+                self.record_until_retired(pid.class(), frame, &request);
+                Ok(IOResult::Done(()))
+            }
+            Ok(IOResult::Done(None)) => {
+                crate::turso_assert!(
+                    !h.record_held(),
+                    "a page source's read filled the page after it announced a request"
+                );
+                Ok(IOResult::Done(()))
+            }
+            // No request was handed over: one announced and then refused leaves the record free.
+            other => {
+                if h.record_held() {
+                    self.record_retired(pid.class(), frame);
+                }
+                other.map(|r| match r {
+                    IOResult::IO(io) => IOResult::IO(io),
+                    IOResult::Done(_) => unreachable!("matched above"),
+                })
+            }
+        };
         Ok(match read? {
             IOResult::Done(()) => {
                 // A read returned done handed its request over or filled the page, so the fix that
@@ -1139,6 +1167,17 @@ impl BufferPool {
         for grain in &self.frames.given_up[grains(frame, class)] {
             grain.store(stamp, Ordering::Release);
         }
+        // A frame whose record still holds its load's or write-out's request (a cancelled read, a
+        // write-out landed and not yet let go) goes to the free frames when the request retires:
+        // the backend may still read or write its memory until then (DESIGN.md 22.18, a frame).
+        if h.free_at_retirement() {
+            return;
+        }
+        self.release_free(class, frame);
+    }
+
+    /// Hands the free `frame` of `class` to a claim: the shortage gate's holder or the free lists.
+    fn release_free(&self, class: SizeClass, frame: u32) {
         // The shortage gate's holder waiting for a frame of this class takes it, its batch not
         // draining, rather than the free lists, where a fast claim would take it first
         // (DESIGN.md 9.1.3, phase A).
@@ -1149,6 +1188,29 @@ impl BufferPool {
             self.memory.put(class, frame);
         }
         self.signal_released();
+    }
+
+    /// Keeps `frame`'s record, holding its load's or write-out's `request`, until the request
+    /// retires (DESIGN.md 22.18, a frame).
+    fn record_until_retired(self: &Arc<Self>, class: SizeClass, frame: u32, request: &Completion) {
+        // Weakly, as the request's own callback holds the pool.
+        let pool = Arc::downgrade(self);
+        request.on_retired(move || {
+            if let Some(pool) = pool.upgrade() {
+                pool.record_retired(class, frame);
+            }
+        });
+    }
+
+    /// `frame`'s record let its request go: a frame freed meanwhile goes to the free frames, and a
+    /// claim that passed over it is told, as an unpin tells it (DESIGN.md 22.18, a frame).
+    fn record_retired(&self, class: SizeClass, frame: u32) {
+        let retired = self.header(frame).retire_record();
+        if retired.freed {
+            self.release_free(class, frame);
+        } else if retired.waited {
+            self.signal_released();
+        }
     }
 
     /// Marks the page in `frame` held by the step under way, with the global epoch now: at or above
@@ -2081,7 +2143,15 @@ impl BufferPool {
                 && PageId::from_raw(h.pid()).class() == class
                 && !h.has(WRITING);
             if theirs {
-                match h.latch.mark_waited() {
+                // Passed over for its record, it is the record's retirement that frees it, not the
+                // latch's release: the record is marked (a free latch's mark would read changed
+                // and send the claim straight back).
+                let marked = if h.record_held() {
+                    h.mark_record_waited()
+                } else {
+                    h.latch.mark_waited()
+                };
+                match marked {
                     Marked::Waits => room.marked = true,
                     Marked::Changed => room.changed = true,
                 }
@@ -2153,6 +2223,12 @@ impl BufferPool {
         let version = h.latch.optimistic()?;
         let holds = h.status() == RESIDENT && PageId::from_raw(h.pid()).class() == class;
         if !holds || !h.latch.validate(version) {
+            return None;
+        }
+        // Its load's request not yet retired: passed over as a pinned page is, until it retires
+        // (DESIGN.md 22.18, a frame). Only a load leaves a resident frame's record held, and only
+        // its retirement frees it.
+        if h.record_held() {
             return None;
         }
         crate::race::point("buffer.evict_take");
@@ -3186,9 +3262,10 @@ impl Located for TempLocated {
         into: Arc<Buffer>,
         done: ReadDone,
         submitting: source::Submitting<'_>,
-    ) -> Result<IOResult<()>> {
-        self.temp.read(self.pid, into, done, submitting)?;
-        Ok(IOResult::Done(()))
+    ) -> Result<IOResult<Option<Completion>>> {
+        Ok(IOResult::Done(
+            self.temp.read(self.pid, into, done, submitting)?,
+        ))
     }
 }
 

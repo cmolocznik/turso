@@ -1809,13 +1809,16 @@ fn a_temporary_read_counts_a_request_only_for_its_files_copy() {
     let written = Arc::new(Mutex::new(None));
     {
         let w = written.clone();
-        pool.temp
-            .write(
-                pid,
-                Arc::new(crate::io::Buffer::new(vec![7; c.size()])),
-                move |res| *w.lock() = Some(res.is_ok()),
-            )
-            .unwrap();
+        // The write's request, stepped below until it lands.
+        drop(
+            pool.temp
+                .write(
+                    pid,
+                    Arc::new(crate::io::Buffer::new(vec![7; c.size()])),
+                    move |res| *w.lock() = Some(res.is_ok()),
+                )
+                .unwrap(),
+        );
     }
     let mut steps = 0;
     while written.lock().is_none() && steps < 64 {
@@ -1857,9 +1860,9 @@ impl source::Located for DeferredLocated {
         into: Arc<crate::io::Buffer>,
         done: source::ReadDone,
         _submitting: source::Submitting<'_>,
-    ) -> Result<IOResult<()>> {
+    ) -> Result<IOResult<Option<Completion>>> {
         self.0.lock().push((into, done));
-        Ok(IOResult::Done(()))
+        Ok(IOResult::Done(None))
     }
 }
 
@@ -3862,10 +3865,12 @@ impl source::Located for SubmittingLocated {
         into: Arc<crate::io::Buffer>,
         done: source::ReadDone,
         submitting: source::Submitting<'_>,
-    ) -> Result<IOResult<()>> {
+    ) -> Result<IOResult<Option<Completion>>> {
         submitting();
-        self.0.lock().push((into, done));
-        Ok(IOResult::Done(()))
+        self.0.lock().push((into.clone(), done));
+        // The request as an inline backend leaves it once its submission returns, owned by none:
+        // the frame's record is let go at once, the landing still the test's.
+        Ok(IOResult::Done(Some(Completion::new_read(into, |_| None))))
     }
 }
 
@@ -7203,4 +7208,360 @@ fn a_cuts_end_drops_its_copies_and_sweeps_its_batches_a_run_a_call() {
         copies * size,
         "the room the copies gave back"
     );
+}
+
+/// What [`HeldDataIO`] holds: once armed with a path prefix, every read and write made to a file
+/// under it is carried out on the memory it wraps at once, then accepted and kept, its callback not
+/// run, until the test delivers it and then lets it go: a backend that delivers a request before it
+/// retires it.
+#[derive(Default)]
+struct HeldRequests {
+    prefix: crate::storage::atoll::locks::Mutex<Option<String>>,
+    queue: crate::storage::atoll::locks::Mutex<Vec<HeldRequest>>,
+}
+
+#[derive(Clone)]
+struct HeldRequest {
+    c: Completion,
+    /// What its delivery reports: the bytes read or written.
+    result: i32,
+    /// Where the memory it reads into or writes from begins.
+    memory: usize,
+}
+
+impl HeldRequests {
+    fn hold(&self, c: Completion, result: i32, memory: usize) -> Result<Completion> {
+        c.accept();
+        self.queue.lock().push(HeldRequest {
+            c: c.clone(),
+            result,
+            memory,
+        });
+        Ok(c)
+    }
+
+    /// The requests held so far, oldest first.
+    fn all(&self) -> Vec<HeldRequest> {
+        self.queue.lock().clone()
+    }
+
+    /// The requests a backend still owns over the memory beginning at `memory`.
+    fn owned_over(&self, memory: usize) -> usize {
+        self.all()
+            .iter()
+            .filter(|r| r.memory == memory && r.c.is_owned())
+            .count()
+    }
+
+    /// Delivers every request held not yet delivered, and lets every one go.
+    fn release_all(&self, delivered: &mut std::collections::HashSet<usize>) {
+        for (i, r) in self.all().into_iter().enumerate() {
+            if delivered.insert(i) {
+                r.c.complete(r.result);
+            }
+            if r.c.is_owned() {
+                r.c.retire();
+            }
+        }
+    }
+}
+
+/// A [`MemoryIO`] whose files under a prefix, once named, hold their reads and writes
+/// ([`HeldRequests`]).
+struct HeldDataIO {
+    inner: Arc<crate::io::MemoryIO>,
+    held: Arc<HeldRequests>,
+}
+
+impl crate::io::Clock for HeldDataIO {
+    fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for HeldDataIO {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> Result<Arc<dyn crate::io::File>> {
+        Ok(Arc::new(HeldDataFile {
+            file: self.inner.open_file(path, flags, direct)?,
+            path: path.to_string(),
+            held: self.held.clone(),
+        }))
+    }
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn sync_directory(&self, path: &str) -> Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        self.inner.rename_file(from, to)
+    }
+    fn delivery(&self) -> crate::io::Delivery {
+        self.inner.delivery()
+    }
+    fn step(&self) -> Result<()> {
+        self.inner.step()
+    }
+    fn try_step(
+        &self,
+        key: crate::io::ReadyKey,
+        ready: &std::task::Waker,
+    ) -> Result<crate::io::Stepped> {
+        self.inner.try_step(key, ready)
+    }
+    fn says_what_a_step_found(&self) -> bool {
+        self.inner.says_what_a_step_found()
+    }
+    fn withdraw(&self, key: crate::io::ReadyKey) {
+        self.inner.withdraw(key)
+    }
+}
+
+struct HeldDataFile {
+    file: Arc<dyn crate::io::File>,
+    path: String,
+    held: Arc<HeldRequests>,
+}
+
+impl HeldDataFile {
+    fn holding(&self) -> bool {
+        self.held
+            .prefix
+            .lock()
+            .as_deref()
+            .is_some_and(|prefix| self.path.starts_with(prefix))
+    }
+}
+
+impl crate::io::File for HeldDataFile {
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
+        self.file.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> Result<()> {
+        self.file.unlock_file()
+    }
+    fn pread(&self, at: u64, c: Completion) -> Result<Completion> {
+        if !self.holding() {
+            return self.file.pread(at, c);
+        }
+        let into = c.as_read().buf_arc();
+        let memory = into.as_ptr() as usize;
+        let read = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        let n = read.clone();
+        // The memory it wraps reads at once, into the request's own memory.
+        drop(self.file.pread(
+            at,
+            Completion::new_read(into, move |res| {
+                n.store(
+                    res.map_or(-1, |(_, n)| n),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                None
+            }),
+        )?);
+        self.held
+            .hold(c, read.load(std::sync::atomic::Ordering::Relaxed), memory)
+    }
+    fn pwrite(&self, at: u64, bytes: Arc<crate::io::Buffer>, c: Completion) -> Result<Completion> {
+        if !self.holding() {
+            return self.file.pwrite(at, bytes, c);
+        }
+        let (memory, len) = (bytes.as_ptr() as usize, bytes.len() as i32);
+        c.keep_write_buffer_alive(bytes.clone());
+        drop(self.file.pwrite(at, bytes, Completion::new_write(|_| {}))?);
+        self.held.hold(c, len, memory)
+    }
+    fn sync(&self, c: Completion, how: crate::io::FileSyncType) -> Result<Completion> {
+        self.file.sync(c, how)
+    }
+    fn size(&self) -> Result<u64> {
+        self.file.size()
+    }
+    fn truncate(&self, n: u64, c: Completion) -> Result<Completion> {
+        self.file.truncate(n, c)
+    }
+}
+
+/// A frame's record holds its load's and its write-out's request until the backend retires it,
+/// not until its callback runs (DESIGN.md 22.18, a frame; the auditor's frame-record schedule):
+/// a page loaded and delivered, its read still owned, is not evicted; a frame its write-out's
+/// landing freed, the write still owned, is given to no claim, a load of another page taking
+/// another frame; a cancelled read's frame the same; each given back once its request retires,
+/// and never two requests outstanding over one frame's memory (mutant: the record let go at
+/// delivery).
+#[test]
+fn a_frames_record_holds_its_load_and_its_write_out_until_each_retires() {
+    let held = Arc::new(HeldRequests::default());
+    let io: Arc<dyn IO> = Arc::new(HeldDataIO {
+        inner: Arc::new(crate::io::MemoryIO::new()),
+        held: held.clone(),
+    });
+    let base = "/db/frame-record";
+    let pool = open_on(&io, base, MIN_BUDGET);
+    let latch = |frame: u32| FrameLatch {
+        frames: pool.frames.clone(),
+        frame,
+    };
+    let memory_of =
+        |frame: u32| pool.memory.region.buffer(frame, class(0).size()).as_ptr() as usize;
+    // Two pages written out of their frames, nothing held: each in its copy alone.
+    let mut pages = Vec::new();
+    for version in 1..=2 {
+        let mut g = drive(&io, || pool.allocate(class(0))).unwrap();
+        let (pid, frame) = (g.pid(), g.frame);
+        stamp(&mut g.page_mut(), pid, version);
+        g.changed();
+        drop(g);
+        let out = pool.start_write_out(
+            pool.latch_to_evict(class(0), frame, || latch(frame))
+                .unwrap(),
+        );
+        pool.write_out(class(0), vec![out]);
+        drive(&io, || pool.settle_writes()).unwrap();
+        pages.push(pid);
+    }
+    let (p, q) = (pages[0], pages[1]);
+    *held.prefix.lock() = Some(format!("{base}.c0."));
+    let mut delivered = std::collections::HashSet::new();
+    let mut most_over_one_frame = 0;
+    let watch = |frames: &[u32], most: &mut usize| {
+        for &f in frames {
+            *most = (*most).max(held.owned_over(memory_of(f)));
+        }
+    };
+
+    // A load whose read is delivered and still owned: resident, and not evicted until it retires.
+    let first = matches!(pool.fix_optimistic(p, None).unwrap(), IOResult::IO(_));
+    let first_requests = held.all().len();
+    let f = pool.table.find(&pool.frames.headers, p.raw()).unwrap();
+    let read = held.all()[0].clone();
+    read.c.complete(read.result);
+    delivered.insert(0);
+    watch(&[f], &mut most_over_one_frame);
+    let evicted_while_owned = pool.evict_clean(p);
+    // Fixed again: resident, or, evicted, loaded again into whichever frame a claim takes.
+    let again = pool.fix_optimistic(p, None).unwrap();
+    let resident_while_owned = matches!(again, IOResult::Done(_));
+    drop(again);
+    watch(&[f], &mut most_over_one_frame);
+    held.release_all(&mut delivered);
+    let read_back = match pool.fix_optimistic(p, None).unwrap() {
+        IOResult::Done(g) => g.read(|page| stamped(page, p)),
+        IOResult::IO(_) => None,
+    };
+    let f = pool.table.find(&pool.frames.headers, p.raw()).unwrap();
+
+    // The page written out of its frame, the write delivered and still owned: the frame, freed by
+    // the landing, is given to no claim, and a load of another page takes another frame.
+    let mut g = drive(&io, || pool.fix_exclusive(p, None)).unwrap();
+    stamp(&mut g.page_mut(), p, 3);
+    g.changed();
+    drop(g);
+    let writes_before = held.all().len();
+    let out = pool.start_write_out(pool.latch_to_evict(class(0), f, || latch(f)).unwrap());
+    pool.write_out(class(0), vec![out]);
+    let _ = pool.settle_writes();
+    let write = held.all().get(writes_before).cloned();
+    let write_held = write.is_some();
+    if let Some(w) = &write {
+        w.c.complete(w.result);
+        delivered.insert(writes_before);
+    }
+    let settled = matches!(pool.settle_writes(), Ok(IOResult::Done(())));
+    let freed_while_written = pool.header(f).status() == FREE;
+    let free_while_written = pool.memory.free_frames(class(0)).contains(&f);
+    let _ = pool.fix_optimistic(q, None).unwrap();
+    let q_frame = pool.table.find(&pool.frames.headers, q.raw());
+    watch(&[f], &mut most_over_one_frame);
+    if let Some(w) = &write {
+        w.c.retire();
+    }
+    let free_once_written = pool.memory.free_frames(class(0)).contains(&f);
+    held.release_all(&mut delivered);
+
+    // A read cancelled while its request is still owned: its frame is freed and given to no claim
+    // until the request retires.
+    let evicted_q = pool.evict_clean(q);
+    let reads_before = held.all().len();
+    let _ = pool.fix_optimistic(q, None).unwrap();
+    let g_frame = pool.table.find(&pool.frames.headers, q.raw());
+    let cancelled = held.all().get(reads_before).cloned();
+    if let Some(r) = &cancelled {
+        r.c.abort();
+        delivered.insert(reads_before);
+    }
+    let free_while_cancelled =
+        g_frame.is_some_and(|g| pool.memory.free_frames(class(0)).contains(&g));
+    if let Some(g) = g_frame {
+        watch(&[g], &mut most_over_one_frame);
+    }
+    if let Some(r) = &cancelled {
+        r.c.retire();
+    }
+    let free_once_cancelled =
+        g_frame.is_some_and(|g| pool.memory.free_frames(class(0)).contains(&g));
+
+    // Every request delivered and let go before the assertions, and nothing held from here.
+    held.release_all(&mut delivered);
+    *held.prefix.lock() = None;
+    let q_back = drive(&io, || pool.fix_optimistic(q, None))
+        .unwrap()
+        .read(|page| stamped(page, q));
+    let failure = pool.failed().err();
+    drop(pool);
+    assert!(first, "the first fix found the page resident");
+    assert_eq!(first_requests, 1, "the first fix held other than its read");
+    assert!(
+        !evicted_while_owned,
+        "a page evicted while its read was owned"
+    );
+    assert!(
+        resident_while_owned,
+        "the page not resident while its read was owned"
+    );
+    assert_eq!(read_back, Some(Some(1)));
+    assert!(
+        write_held && settled,
+        "the write-out not held, or not settled once delivered"
+    );
+    assert!(
+        freed_while_written,
+        "the write-out's landing did not free its frame"
+    );
+    assert!(
+        !free_while_written,
+        "a frame given to the free frames while its write-out was owned"
+    );
+    assert_ne!(
+        q_frame,
+        Some(f),
+        "a load took a frame whose write-out was owned"
+    );
+    assert!(
+        free_once_written,
+        "the frame not given back once its write-out retired"
+    );
+    assert!(evicted_q && g_frame.is_some() && cancelled.is_some());
+    assert!(
+        !free_while_cancelled,
+        "a frame given to the free frames while its cancelled read was owned"
+    );
+    assert!(
+        free_once_cancelled,
+        "the frame not given back once its cancelled read retired"
+    );
+    assert_eq!(
+        most_over_one_frame, 1,
+        "requests outstanding at once over one frame's memory"
+    );
+    assert_eq!(q_back, Some(Some(2)));
+    assert!(failure.is_none(), "the pool failed: {failure:?}");
 }

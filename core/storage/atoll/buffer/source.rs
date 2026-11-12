@@ -16,7 +16,7 @@ use super::super::meta::MetaRef;
 use super::super::page::PageId;
 use super::super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
 use super::super::store::{PageRead, PageStore};
-use crate::io::Buffer;
+use crate::io::{Buffer, Completion};
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
 use crate::{CompletionError, LimboError, Result};
@@ -37,19 +37,21 @@ pub type Submitting<'a> = &'a dyn Fn();
 
 pub trait Located: Send {
     /// Reads the page into `into`, exactly its size. Returning `Done`, the read has either run
-    /// `done` (a page it filled itself) or called `submitting` and handed its request to the pool's
-    /// IO, whose landing runs `done` once; a page whose landing another party brings is no read
-    /// of a source, and the pool refuses one by ending the process: the fix that started the read
-    /// keeps its result only so (DESIGN.md 9.1.3, wait kinds). Returning an error or IO, `done`
-    /// never runs and no request was submitted; dropping it lets the pool free the frame before
-    /// waiting. A dependency already held at [`PageSource::locate`] is waited for there. `read`
-    /// may return a pending wait when that dependency was taken after `locate`.
+    /// `done` (a page it filled itself, `None`) or called `submitting` and handed its request to
+    /// the pool's IO, whose landing runs `done` once (`Some`, the request, which the frame's
+    /// record holds until it retires: DESIGN.md 22.18, a frame); a page whose landing another
+    /// party brings is no read of a source, and the pool refuses one by ending the process: the
+    /// fix that started the read keeps its result only so (DESIGN.md 9.1.3, wait kinds).
+    /// Returning an error or IO, `done` never runs and no request was handed over; dropping it
+    /// lets the pool free the frame before waiting. A dependency already held at
+    /// [`PageSource::locate`] is waited for there. `read` may return a pending wait when that
+    /// dependency was taken after `locate`.
     fn read(
         self: Box<Self>,
         into: Arc<Buffer>,
         done: ReadDone,
         submitting: Submitting<'_>,
-    ) -> Result<IOResult<()>>;
+    ) -> Result<IOResult<Option<Completion>>>;
 }
 
 /// Pages of the local page store.
@@ -98,7 +100,7 @@ impl Located for LocalLocated {
         into: Arc<Buffer>,
         done: ReadDone,
         submitting: Submitting<'_>,
-    ) -> Result<IOResult<()>> {
+    ) -> Result<IOResult<Option<Completion>>> {
         let pid = self.pid;
         if let Some(slot) = self.store.swap_slot(pid) {
             return self.read_copy(slot, into, done, submitting);
@@ -118,7 +120,7 @@ impl Located for LocalLocated {
                 // A page with no copy yet has never been written back: it is all zeros.
                 into.as_mut_slice().fill(0);
                 done(Ok(()));
-                Ok(IOResult::Done(()))
+                Ok(IOResult::Done(None))
             }
             entry => self.read_copy(entry - SLOT_BASE, into, done, submitting),
         }
@@ -133,7 +135,7 @@ impl LocalLocated {
         into: Arc<Buffer>,
         done: ReadDone,
         submitting: Submitting<'_>,
-    ) -> Result<IOResult<()>> {
+    ) -> Result<IOResult<Option<Completion>>> {
         let pid = self.pid;
         submitting();
         let c = self.store.read_slot_into(pid, slot, into, move |read| {
@@ -143,7 +145,6 @@ impl LocalLocated {
                 PageRead::Failed(e) => Err(e),
             })
         })?;
-        drop(c);
-        Ok(IOResult::Done(()))
+        Ok(IOResult::Done(Some(c)))
     }
 }

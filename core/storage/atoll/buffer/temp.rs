@@ -147,15 +147,16 @@ impl TempPages {
         pid.temporary_number() * pid.class().size() as u64
     }
 
-    /// Reads `pid` into `into`, exactly its size: its copy, or zeros if it has none. `submitting`
-    /// is called right before the file's read only, never for the zeros (source.rs).
+    /// Reads `pid` into `into`, exactly its size: its copy, the file's read returned, or zeros if
+    /// it has none, `None`. `submitting` is called right before the file's read only, never for
+    /// the zeros (source.rs).
     pub fn read(
         &self,
         pid: PageId,
         into: Arc<Buffer>,
         done: ReadDone,
         submitting: super::source::Submitting<'_>,
-    ) -> Result<()> {
+    ) -> Result<Option<Completion>> {
         let class = pid.class();
         if !self.classes[class.index()]
             .written
@@ -163,7 +164,7 @@ impl TempPages {
         {
             into.as_mut_slice().fill(0);
             done(Ok(()));
-            return Ok(());
+            return Ok(None);
         }
         let size = class.size();
         let done = TakeOnce::new(done);
@@ -191,12 +192,12 @@ impl TempPages {
         });
         let file = self.file(class)?;
         submitting();
-        drop(file.pread(Self::at(pid), c)?);
-        Ok(())
+        Ok(Some(file.pread(Self::at(pid), c)?))
     }
 
     /// Writes `copy` as `pid`'s copy; `done` runs once it is in the file, or the write failed.
-    pub fn write<F>(self: &Arc<Self>, pid: PageId, copy: Arc<Buffer>, done: F) -> Result<()>
+    /// The write, as submitted.
+    pub fn write<F>(self: &Arc<Self>, pid: PageId, copy: Arc<Buffer>, done: F) -> Result<Completion>
     where
         F: FnOnce(std::result::Result<(), CompletionError>) + Send + 'static,
     {
@@ -218,7 +219,6 @@ impl TempPages {
             }
             done(res);
         });
-        drop(self.file(pid.class())?.pwrite(Self::at(pid), copy, c)?);
-        Ok(())
+        self.file(pid.class())?.pwrite(Self::at(pid), copy, c)
     }
 }

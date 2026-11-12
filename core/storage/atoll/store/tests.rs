@@ -547,7 +547,7 @@ fn local_source_waits_before_claim_and_rechecks_before_read() {
                     }),
                     &submit
                 ),
-                Ok(IOResult::Done(()))
+                Ok(IOResult::Done(None))
             )
         }
         _ => false,

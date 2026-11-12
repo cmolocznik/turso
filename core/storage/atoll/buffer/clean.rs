@@ -293,25 +293,34 @@ impl Writeback {
                 // A request at the backend from here, so before it can land; one that never
                 // started leaves the count at once.
                 pool.requests.fetch_add(1, Ordering::AcqRel);
+                // A write-out writes from the frame's memory: the frame's record holds its
+                // request from before it is handed over until it retires, the frame freed by its
+                // landing given to a claim only then (DESIGN.md 22.18, a frame).
+                if write_out.is_some() {
+                    pool.header(frame).hold_record();
+                }
                 let written = match slot {
-                    Some(slot) => pool
-                        .store
-                        .write_slot(self.class, slot, buffer, ended)
-                        .map(drop),
+                    Some(slot) => pool.store.write_slot(self.class, slot, buffer, ended),
                     None => pool.temp.write(self.pids[i], buffer, ended),
                 };
                 match (&written, write_out) {
-                    (Ok(()), Some(version)) => pool.header(frame).submitted_at(version),
-                    (Ok(()), None) => {}
+                    (Ok(request), Some(version)) => {
+                        pool.header(frame).submitted_at(version);
+                        pool.record_until_retired(self.class, frame, request);
+                    }
+                    (Ok(_), None) => {}
                     // Counted and never at the backend: a stepped waiter that read the count in
-                    // between is sent back to look.
+                    // between is sent back to look, and a write-out's record is free again.
                     (Err(_), _) => {
+                        if write_out.is_some() {
+                            pool.record_retired(self.class, frame);
+                        }
                         pool.requests.fetch_sub(1, Ordering::AcqRel);
                         event.land();
                     }
                 }
                 event.arm();
-                written
+                written.map(drop)
             });
             if let Err(e) = written {
                 // It never started: settled as failed, which fails the pool.

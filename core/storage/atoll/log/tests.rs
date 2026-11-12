@@ -1388,13 +1388,13 @@ fn a_units_durable_wait_takes_one_flush_turn_and_owes_one_asked_during_it() {
     assert_eq!(turns_after, 2);
 }
 
-/// What [`HoldingIO`] holds: once armed, every write and sync made to the one segment it names from
+/// What [`HoldingIO`] holds: once armed, every write and sync made to the segments it names from
 /// then on, through a file opened before or after, is accepted and kept, its callback not run,
 /// until the test answers it and then lets it go, so a place is seen held past the answer, until
 /// the request retires.
 #[derive(Default)]
 struct Holding {
-    path: crate::storage::atoll::locks::Mutex<Option<String>>,
+    paths: crate::storage::atoll::locks::Mutex<Vec<String>>,
     queue: crate::storage::atoll::locks::Mutex<std::collections::VecDeque<(Completion, i32)>>,
     submitted: std::sync::atomic::AtomicUsize,
     most: std::sync::atomic::AtomicUsize,
@@ -1421,8 +1421,8 @@ impl Holding {
     }
 }
 
-/// A [`MemoryIO`] whose one held segment, once named, holds the writes and syncs made to it from
-/// then on ([`Holding`]).
+/// A [`MemoryIO`] whose held segments, once named, hold the writes and syncs made to them from then
+/// on ([`Holding`]).
 struct HoldingIO {
     inner: Arc<MemoryIO>,
     holding: Arc<Holding>,
@@ -1484,7 +1484,7 @@ struct HoldingFile {
 impl HoldingFile {
     /// The holding, if it names this file now.
     fn held(&self) -> Option<&Holding> {
-        let named = self.holding.path.lock().as_deref() == Some(self.path.as_str());
+        let named = self.holding.paths.lock().contains(&self.path);
         named.then_some(&*self.holding)
     }
 }
@@ -1551,7 +1551,7 @@ fn a_log_write_and_its_sync_hold_their_records_until_they_retire() {
         append(&log);
     }
     drive(&io, || log.wait_durable(&mut LogWait::default(), BLOCK)).unwrap();
-    *holding.path.lock() = Some(log.segments.path(0));
+    *holding.paths.lock() = vec![log.segments.path(0)];
     let a = append(&log);
     let _ = log.wait_durable(&mut LogWait::default(), a);
     let w1 = holding.oldest();
@@ -1617,6 +1617,131 @@ fn a_log_write_and_its_sync_hold_their_records_until_they_retire() {
     assert_eq!(failure, None);
 }
 
+/// A sync whose group spans two segments holds the log's token until the last of its members
+/// retires (ASYNC1 v3.8, a log sync record; the auditor's #4546): the writes across the first
+/// segment's end land while an earlier sync is owned, so the next group syncs both segments; its
+/// first member retired and the second still owned, a write landing after leaves the next sync
+/// unstarted, and once the second retires it goes (mutant: the token let go at the first member's
+/// retirement, a group counted as one).
+#[test]
+fn a_sync_spanning_two_segments_holds_the_token_until_its_last_member_retires() {
+    let holding = Arc::new(Holding::default());
+    let io: Arc<dyn IO> = Arc::new(HoldingIO {
+        inner: Arc::new(MemoryIO::new()),
+        holding: holding.clone(),
+    });
+    let config = LogConfig {
+        writes_in_flight: 4,
+        ..small()
+    };
+    let segment = config.segment_bytes;
+    let filler = vec![7u8; 996];
+    let append = |log: &Arc<Log>| {
+        let mut admitted = drive(&io, || log.admit(&mut LogWait::default(), 1024)).unwrap();
+        log.append(&mut admitted, &header(0), &[&filler])
+    };
+    let log = Log::open(io.clone(), BASE, config, 0).unwrap();
+    while log.end() < segment - 2 * BLOCK {
+        append(&log);
+    }
+    drive(&io, || log.wait_durable(&mut LogWait::default(), log.end())).unwrap();
+    // The next segment prepared before it is held: the preparer's own writes are no part of this.
+    for _ in 0..10_000 {
+        if log.run_preparer().is_none() {
+            break;
+        }
+    }
+    *holding.paths.lock() = vec![log.segments.path(0), log.segments.path(1)];
+    // An earlier sync answered and still owned, its token held.
+    let a = append(&log);
+    let _ = log.wait_durable(&mut LogWait::default(), a);
+    let answer = |r: (Completion, i32)| {
+        r.0.complete(r.1);
+        r.0.retire();
+    };
+    let first_write = holding.oldest();
+    let wrote_first = first_write.as_ref().is_some_and(|(_, r)| *r > 0);
+    if let Some(w) = first_write {
+        answer(w);
+    }
+    let earlier = holding.oldest();
+    let earlier_is_sync = earlier.as_ref().is_some_and(|(_, r)| *r == 0);
+    if let Some((c, _)) = &earlier {
+        c.complete(0);
+    }
+    // Writes across the first segment's end, landed while the earlier sync is owned.
+    while log.end() < segment + 1024 {
+        append(&log);
+    }
+    let b = log.end();
+    let _ = log.wait_durable(&mut LogWait::default(), b);
+    let mut sync_meanwhile = false;
+    while let Some((c, r)) = holding.oldest() {
+        sync_meanwhile |= r == 0;
+        answer((c, r));
+    }
+    // The earlier sync retired: the next group syncs both segments.
+    if let Some((c, _)) = &earlier {
+        c.retire();
+    }
+    let group = holding.queued();
+    let first = holding.oldest();
+    let second = holding.oldest();
+    for (c, _) in first.iter().chain(second.iter()) {
+        c.complete(0);
+    }
+    if let Some((c, _)) = &first {
+        c.retire();
+    }
+    // Its first member retired, its second still owned: a write landing after starts no sync.
+    let c_end = append(&log);
+    let _ = log.wait_durable(&mut LogWait::default(), c_end);
+    let mut late_writes = 0;
+    while let Some((c, r)) = holding.oldest() {
+        if r == 0 {
+            // A sync made meanwhile: answered and let go, so the log is left whole, and counted.
+            sync_meanwhile = true;
+        } else {
+            late_writes += 1;
+        }
+        answer((c, r));
+    }
+    let while_last_owned = holding.queued();
+    if let Some((c, _)) = &second {
+        c.retire();
+    }
+    let once_last_retired = holding.queued();
+    // Every request answered and let go before the assertions.
+    while let Some(r) = holding.oldest() {
+        answer(r);
+    }
+    let durable = log.durable() >= c_end;
+    let failure = log.failure();
+    drop(log);
+    assert!(
+        wrote_first && earlier_is_sync,
+        "no earlier write and sync held"
+    );
+    assert!(!sync_meanwhile, "a sync started while another was owned");
+    assert_eq!(group, vec![0, 0], "the group did not span both segments");
+    assert!(
+        late_writes > 0,
+        "no write landed while the last member was owned"
+    );
+    assert_eq!(
+        while_last_owned,
+        Vec::<i32>::new(),
+        "a sync started while the group's last member was owned"
+    );
+    assert_eq!(
+        once_last_retired,
+        vec![0],
+        "the next sync not started once the last member retired"
+    );
+    assert!(durable, "the log not durable past what was written");
+    assert_eq!(failure, None);
+}
+
 /// The preparer's one request in flight holds its place until the request retires, not until its
 /// result is published (the auditor's #4345, DESIGN.md 22.5): a zero-fill write answered and
 /// still owned leaves the preparer, stepped again, waiting with nothing more submitted; let go,
@@ -1631,7 +1756,7 @@ fn the_preparers_request_holds_its_place_until_it_retires() {
         holding: holding.clone(),
     });
     let log = reopened_short(&io, true);
-    *holding.path.lock() = Some(log.segments.path(1));
+    *holding.paths.lock() = vec![log.segments.path(1)];
     let mut held_past_answer = 0;
     let mut stepped_while_owned = 0;
     let mut failed = None;

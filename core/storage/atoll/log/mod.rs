@@ -197,6 +197,10 @@ pub struct Log {
     flushes: CachePadded<Solo>,
     /// The sync in flight, without durable writes.
     sync: CachePadded<Claim>,
+    /// The members of the sync in flight still to retire, and its submitter's hold: set by the
+    /// holder of the sync's token as it submits a group, the last decrement letting the token go,
+    /// so the one group at a time has the count to itself (ASYNC1 v3.8, a log sync record).
+    sync_members: AtomicUsize,
     /// Whether a flush's padding waits for a segment, and whether the preparer prepares one.
     preparation: CachePadded<Word>,
     /// The log's preparer (DESIGN.md 22.9 item 2), named once the log is made, on the executor it
@@ -379,6 +383,7 @@ impl Log {
             in_flight: CachePadded::new(AtomicUsize::new(0)),
             flushes: CachePadded::default(),
             sync: CachePadded::default(),
+            sync_members: AtomicUsize::new(0),
             preparation: CachePadded::default(),
             preparer: std::sync::OnceLock::new(),
             due: Arc::new(Signal::default()),
@@ -1341,16 +1346,17 @@ impl Log {
         // The sync's token is let go when its last member retires, not when the group's callback
         // runs (ASYNC1 v3.8, a log sync record): the next sync then finds every record free. The
         // count holds one more, the submitter's, let go once every member is submitted, so no
-        // member retiring early lets the token go with another still to submit; a failed
-        // submission keeps it, the log failed.
-        let members = Arc::new(AtomicUsize::new(syncs.len() + 1));
+        // member retiring at once, inside its submission, lets the token go with another still to
+        // submit; a failed submission keeps it, the log failed. Set under the token, which the
+        // last group's last decrement let go after it: no member of that group is left to count.
+        self.sync_members.store(syncs.len() + 1, Ordering::Release);
         for (segment, c) in segments.iter().zip(syncs) {
             match self.segments.file(*segment).sync_data(c) {
                 Ok(c) => {
-                    let (me, members) = (self.held(), members.clone());
+                    let me = self.held();
                     c.on_retired(move || {
                         if let Some(me) = me.upgrade() {
-                            me.sync_member_retired(&members);
+                            me.sync_member_retired();
                         }
                     });
                 }
@@ -1361,13 +1367,13 @@ impl Log {
                 }
             }
         }
-        self.sync_member_retired(&members);
+        self.sync_member_retired();
     }
 
-    /// One of a sync's members retired, or its submitter let its hold go: the last of them lets
+    /// One of the sync's members retired, or its submitter let its hold go: the last of them lets
     /// the sync's token go and, the log not failed, starts the next sync.
-    fn sync_member_retired(self: &Arc<Self>, members: &AtomicUsize) {
-        if members.fetch_sub(1, Ordering::AcqRel) != 1 {
+    fn sync_member_retired(self: &Arc<Self>) {
+        if self.sync_members.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
         self.sync.release();

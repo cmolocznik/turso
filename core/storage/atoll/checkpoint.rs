@@ -2529,11 +2529,14 @@ impl Run {
         }
         if !f.edited {
             unit::visit();
-            let edited = match cp.store.copied(self.n, &self.heights, f.pid, f.slot)? {
-                IOResult::Done(edited) => edited,
+            let (edited, space) = match cp.store.copied(self.n, &self.heights, f.pid, f.slot)? {
+                IOResult::Done(done) => done,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
             self.meta.extend(edited);
+            // The cut's free space as the edit left it, grown to reach the copy's slot if it had
+            // to: the height every later edit and the superblock take.
+            self.heights[super::meta::Tree::Space as usize][f.pid.class().index()] = space;
             f.edited = true;
             if let Some(count) = f.settles {
                 cp.pool.settled(f.pid, count);

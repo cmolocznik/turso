@@ -1369,3 +1369,282 @@ fn a_growth_publishes_its_height_before_letting_go_of_its_roots() {
     );
     assert_eq!(used, Some(1), "pages in use as the new root counts them");
 }
+
+/// The count `id` keeps of the units in use below its `child`, as checkpoint `n`'s cut found it.
+fn cut_count(db: &Db, n: u64, id: MetaId, child: u64) -> Option<u64> {
+    let frame = drive(&db.io, || db.store().meta().get(id)).ok()?;
+    frame.read_cut(
+        n,
+        |live| radix::used_below(live, child),
+        |cut| radix::used_below(cut, child),
+    )
+}
+
+/// Whether `slot` is in use in its free-space leaf `id`, as checkpoint `n`'s cut found it.
+fn cut_bit(db: &Db, n: u64, id: MetaId, slot: u64) -> Option<bool> {
+    let frame = drive(&db.io, || db.store().meta().get(id)).ok()?;
+    frame.read_cut(
+        n,
+        |live| radix::space_bit(live, slot),
+        |cut| radix::space_bit(cut, slot),
+    )
+}
+
+/// A page taken in `class`, with `slots` in use in its free space, and checkpoint `n`'s cut
+/// begun: the cut's heights.
+fn cut_with_slots(
+    db: &Db,
+    class: SizeClass,
+    slots: &[u64],
+) -> (PageId, u64, [[u8; CLASS_COUNT]; TREES]) {
+    let store = db.store();
+    for &s in slots {
+        drive(&db.io, || store.plant_slot(class, s, true)).unwrap();
+    }
+    let pid = drive(&db.io, || store.allocate(class)).unwrap();
+    let n = db.db.checkpointer().superblock().checkpoint + 1;
+    let (_, heights) = store.begin_cut(n);
+    (pid, n, heights)
+}
+
+/// A copy's slot taken past the cut's free space, the free space as it stands grown since the cut,
+/// grows the cut's own tree a level to reach it: its new root counts below its first child the two
+/// units in use under the cut's root, the one leaf, and below its second the slot (the auditor's
+/// #4620 and #4625; mutants: no cut root grown, and the root's count not carried).
+#[test]
+fn a_copy_slot_past_the_cuts_free_space_grows_the_cuts_tree_a_level() {
+    let db = Db::open();
+    let class = class(1);
+    let (pid, n, heights) = cut_with_slots(&db, class, &[3, 4]);
+    drive(&db.io, || db.store().grow(Tree::Space, class)).unwrap();
+    let slot = radix::SPACE_BITS + 5;
+    let done = drive(&db.io, || db.store().copied(n, &heights, pid, slot)).ok();
+    let root = radix::root(Tree::Space, class, 2);
+    let leaf = radix::path(Tree::Space, class, 2, slot)[0];
+    let counts = (
+        cut_count(&db, n, root, 0),
+        cut_count(&db, n, root, 1),
+        cut_bit(&db, n, leaf, slot),
+    );
+    drop(db);
+    let (edited, space) = done.expect("the edit failed");
+    assert_eq!(space, 2, "the cut's free-space height the edit ended at");
+    assert!(
+        edited.contains(&root) && edited.contains(&radix::root(Tree::Space, class, 1)),
+        "the cut's old and new roots among the pages edited: {edited:?}"
+    );
+    assert_eq!(
+        counts,
+        (Some(2), Some(1), Some(true)),
+        "(the new root's counts below its first and second children, the slot's bit) at the cut"
+    );
+}
+
+/// A copy's slot past the cut's free space by two levels grows the cut's tree two levels, each new
+/// root counting below its first child what the root under it counts (the auditor's #4625, its
+/// multi-level case).
+#[test]
+fn a_copy_slot_two_levels_past_the_cuts_free_space_grows_the_cuts_tree_two_levels() {
+    let db = Db::open();
+    let class = class(2);
+    let (pid, n, heights) = cut_with_slots(&db, class, &[3, 4]);
+    drive(&db.io, || db.store().grow(Tree::Space, class)).unwrap();
+    drive(&db.io, || db.store().grow(Tree::Space, class)).unwrap();
+    let slot = radix::capacity(Tree::Space, 2) + 7;
+    let done = drive(&db.io, || db.store().copied(n, &heights, pid, slot)).ok();
+    let (middle, top) = (
+        radix::root(Tree::Space, class, 2),
+        radix::root(Tree::Space, class, 3),
+    );
+    let path = radix::path(Tree::Space, class, 3, slot);
+    let counts = (
+        cut_count(&db, n, middle, 0),
+        cut_count(&db, n, top, 0),
+        cut_count(&db, n, top, 1),
+        cut_count(&db, n, path[1], radix::child(Tree::Space, 1, slot)),
+        cut_bit(&db, n, path[0], slot),
+    );
+    drop(db);
+    let (_, space) = done.expect("the edit failed");
+    assert_eq!(path[1].index, 1, "the slot's node of level 1");
+    assert_eq!(space, 3, "the cut's free-space height the edit ended at");
+    assert_eq!(
+        counts,
+        (Some(2), Some(2), Some(1), Some(1), Some(true)),
+        "(level-1 root's first count, the top root's first and second, the slot's node's count, \
+         the slot's bit) at the cut"
+    );
+}
+
+/// A page with a copy in the cut's free-space leaf, copied again to a slot past the cut's free
+/// space, frees its old slot in the grown tree: the new root counts the leaf's units less the old
+/// slot, the old slot's bit is clear and its free waits for the checkpoint (the auditor's #4625).
+#[test]
+fn a_copy_past_the_cuts_free_space_frees_its_old_slot_in_the_grown_tree() {
+    let db = Db::open();
+    let store = db.store();
+    let class = class(3);
+    let old = 10;
+    let (pid, first, heights) = cut_with_slots(&db, class, &[3, 4]);
+    // Its first copy, in the leaf: in use as it stands too, as its take marks it.
+    drive(&db.io, || store.plant_slot(class, old, true)).unwrap();
+    drive(&db.io, || store.copied(first, &heights, pid, old)).unwrap();
+    store.meta().end_cut(first, &[]);
+    let n = first + 1;
+    let (_, heights) = store.begin_cut(n);
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    let slot = radix::SPACE_BITS + 9;
+    let done = drive(&db.io, || store.copied(n, &heights, pid, slot)).ok();
+    let root = radix::root(Tree::Space, class, 2);
+    let leaf = radix::root(Tree::Space, class, 1);
+    let counts = (
+        cut_count(&db, n, root, 0),
+        cut_count(&db, n, root, 1),
+        cut_bit(&db, n, leaf, old),
+    );
+    let owed = store.deferred_slots().contains(&(class, old));
+    drop(db);
+    let (_, space) = done.expect("the edit failed");
+    assert_eq!(space, 2, "the cut's free-space height the edit ended at");
+    assert_eq!(
+        counts,
+        (Some(2), Some(1), Some(false)),
+        "(the new root's counts below its first and second children, the old slot's bit) at the cut"
+    );
+    assert!(owed, "the old slot's free does not wait for the checkpoint");
+}
+
+/// A checkpoint whose copy's slot lies past the free space its cut found writes a free space that
+/// reaches it: here every slot of the one leaf is in use, so the checkpoint's copies go to the
+/// second, and once reopened the free space is two levels high and names every unit it named
+/// before the close, the copy's slot among them (the auditor's #4620; mutant: the checkpoint's
+/// height not advanced past the edit).
+#[test]
+fn a_checkpoint_whose_copy_slot_is_past_its_cut_writes_a_free_space_that_reaches_it() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let class = class(0);
+    let (slot, before) = {
+        let db = Db::open_on(io.clone());
+        let store = db.store();
+        let node = db.node();
+        let leaf = radix::root(Tree::Space, class, 1);
+        let frame = drive(&db.io, || store.meta().get(leaf)).unwrap();
+        let free: Vec<u64> = frame
+            .read(|b| {
+                (0..radix::SPACE_BITS)
+                    .filter(|&s| !radix::space_bit(b, s))
+                    .collect()
+            })
+            .expect("the leaf read");
+        drop(frame);
+        for s in free {
+            drive(&db.io, || store.plant_slot(class, s, true)).unwrap();
+        }
+        db.checkpoint();
+        let slot = db.slot_of(node);
+        let mut census = Census::new(Tree::Space, class);
+        drive(&db.io, || store.census(&mut census)).unwrap();
+        (slot, census.units)
+    };
+    let db = Db::open_on(io.clone());
+    let height = db.store().height(Tree::Space, class);
+    let mut census = Census::new(Tree::Space, class);
+    let read = drive(&db.io, || db.store().census(&mut census)).is_ok();
+    drop(db);
+    assert!(
+        slot >= radix::SPACE_BITS,
+        "the copy went to slot {slot}, in the first leaf"
+    );
+    assert!(read, "the reopened free space's census failed");
+    assert_eq!(height, 2, "the reopened free space's height");
+    assert!(census.miscounts().is_empty(), "{:?}", census.miscounts());
+    assert!(
+        census.units.iter().any(|&(u, _)| u == slot),
+        "the copy's slot {slot} is not in the reopened free space"
+    );
+    assert_eq!(
+        census.units.len(),
+        before.len(),
+        "units in use reopened against before the close"
+    );
+}
+
+/// The auditor's reproduction of #4620, as a test: a copy slot taken after the cut past the cut's
+/// free space, with the free space's one leaf full, its live tree grown by the take. The edit's
+/// metadata pages written as a checkpoint writes them, and the store reopened at the heights the
+/// checkpoint's superblock records (the one the edit returned for the free space): the page table
+/// names the slot, and the reopened free space lists it with every slot of the full leaf, the
+/// leaf's units and the one past it in use. The same with the growth before the cut, the control
+/// (mutants: no cut root grown, the root's count not carried).
+#[test]
+fn a_copy_slot_past_the_cuts_free_space_is_in_the_free_space_reopened() {
+    for grow_before_cut in [true, false] {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let base = "/db/cut-space";
+        let store = PageStore::open(
+            io.clone(),
+            base,
+            StoreConfig::default(),
+            [[1; CLASS_COUNT]; TREES],
+            0,
+        );
+        let class = class(0);
+        let pid = drive(&io, || store.allocate(class)).unwrap();
+        let mut last = None;
+        for _ in 0..radix::SPACE_BITS {
+            last = Some(drive(&io, || store.take_copy_slot(class)).unwrap());
+        }
+        if grow_before_cut {
+            drive(&io, || store.grow(Tree::Space, class)).unwrap();
+        }
+        let (dirty, mut heights) = store.begin_cut(1);
+        let mut ids: BTreeSet<_> = dirty.collect();
+        let slot = drive(&io, || store.take_copy_slot(class)).unwrap();
+        let (edited, space) = drive(&io, || store.copied(1, &heights, pid, slot)).unwrap();
+        ids.extend(edited);
+        // The height the checkpoint takes from the edit, for its superblock.
+        heights[Tree::Space as usize][class.index()] = space;
+        let ids: Vec<_> = ids.into_iter().collect();
+        let frames = drive(&io, || store.meta().get_all(&ids)).unwrap();
+        for frame in &frames {
+            while let Some(wait) = store.meta().write_for(frame, 1).unwrap() {
+                io.wait_for_completion(wait).unwrap();
+            }
+        }
+        store.meta().end_cut(1, &frames);
+        store.meta().durable_sides(1, &frames);
+        store.meta().put_in_charge(1);
+        drop((frames, store));
+        let reopened = PageStore::open(io.clone(), base, StoreConfig::default(), heights, 1);
+        let entry = drive(&io, || reopened.entry(pid)).ok();
+        let mut census = Census::new(Tree::Space, class);
+        let read = drive(&io, || reopened.census(&mut census)).is_ok();
+        let listed = census.units.iter().any(|&(unit, _)| unit == slot);
+        let (used, miscounts) = (census.units.len(), census.miscounts());
+        drop((census, reopened, io));
+        let case = if grow_before_cut {
+            "grown before the cut"
+        } else {
+            "grown after the cut"
+        };
+        assert_eq!(
+            last,
+            Some(radix::SPACE_BITS - 1),
+            "{case}: the full leaf's setup"
+        );
+        assert_eq!(slot, radix::SPACE_BITS, "{case}: the slot past the leaf");
+        assert_eq!(space, 2, "{case}: the cut's free-space height");
+        assert_eq!(
+            entry,
+            Some(slot + SLOT_BASE),
+            "{case}: the page table's entry"
+        );
+        assert!(read && miscounts.is_empty(), "{case}: {miscounts:?}");
+        assert!(listed, "{case}: the slot is not in the free space reopened");
+        assert_eq!(
+            used as u64,
+            radix::SPACE_BITS + 1,
+            "{case}: slots in use reopened"
+        );
+    }
+}

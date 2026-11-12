@@ -66,6 +66,18 @@ pub fn root(tree: Tree, class: SizeClass, height: u8) -> MetaId {
     }
 }
 
+/// Units in use below the root of a tree `height` levels high, as the root itself counts them: its
+/// units in use if it is a leaf, its children's counts summed if not.
+pub fn in_use<P: Bytes + ?Sized>(tree: Tree, height: u8, root: &P) -> u64 {
+    if height == 1 {
+        (0..leaf_units(tree))
+            .filter(|&u| used(tree, root, u))
+            .count() as u64
+    } else {
+        (0..FANOUT).map(|c| used_below(root, c)).sum()
+    }
+}
+
 /// Which child of the node at `level` holds `unit`.
 pub fn child(tree: Tree, level: u8, unit: u64) -> u64 {
     (unit / span(tree, level - 1)) % FANOUT

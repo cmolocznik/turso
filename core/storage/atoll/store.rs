@@ -1007,15 +1007,17 @@ impl PageStore {
 
     /// Checkpoint `n`, cut at `heights`, wrote `pid`'s copy to `slot`: the page table names it as
     /// of the cut, and as it stands unless `pid` was freed since; the copy it replaces is freed
-    /// as of the cut, and as it stands once `n` is durable. Returns the metadata pages edited.
-    /// Step it until done.
+    /// as of the cut, and as it stands once `n` is durable. Returns the metadata pages edited, and
+    /// the height of the cut's free space for `pid`'s class once it reaches `slot`: a slot taken
+    /// since the cut can lie past it, and the cut's tree grows to reach it (#4620). Step it until
+    /// done.
     pub fn copied(
         self: &Arc<Self>,
         n: u64,
         heights: &[[u8; CLASS_COUNT]; TREES],
         pid: PageId,
         slot: u64,
-    ) -> Result<IOResult<Vec<MetaId>>> {
+    ) -> Result<IOResult<(Vec<MetaId>, u8)>> {
         self.edit_cut(n, heights, pid, Some(slot))
     }
 
@@ -1028,7 +1030,10 @@ impl PageStore {
         heights: &[[u8; CLASS_COUNT]; TREES],
         pid: PageId,
     ) -> Result<IOResult<Vec<MetaId>>> {
-        self.edit_cut(n, heights, pid, None)
+        Ok(match self.edit_cut(n, heights, pid, None)? {
+            IOResult::Done((edited, _)) => IOResult::Done(edited),
+            IOResult::IO(io) => IOResult::IO(io),
+        })
     }
 
     fn edit_cut(
@@ -1037,10 +1042,25 @@ impl PageStore {
         heights: &[[u8; CLASS_COUNT]; TREES],
         pid: PageId,
         slot: Option<u64>,
-    ) -> Result<IOResult<Vec<MetaId>>> {
+    ) -> Result<IOResult<(Vec<MetaId>, u8)>> {
         let (class, number) = (pid.class(), pid.number());
         let cut_map = heights[Tree::Map as usize][class.index()];
         let cut_space = heights[Tree::Space as usize][class.index()];
+        // A new copy's slot is taken from the free space as it stands, which may have grown since
+        // the cut: the cut's own tree grows to reach it, from the root it had, a level at a time.
+        let space = match slot {
+            Some(s) if s >= radix::capacity(Tree::Space, cut_space) => {
+                let live = self.height(Tree::Space, class);
+                (cut_space + 1..=live)
+                    .find(|&h| s < radix::capacity(Tree::Space, h))
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "slot {s} of {class:?} copied, past the free space {live} levels high"
+                        ))
+                    })?
+            }
+            _ => cut_space,
+        };
         // The entry as of the cut names the slot to free; read first, then everything latched.
         let old = match self.cut_entry(n, cut_map, pid)? {
             IOResult::Done(e) => e,
@@ -1051,7 +1071,11 @@ impl PageStore {
         let mut ids = radix::path(Tree::Map, class, cut_map, number);
         ids.extend(radix::path(Tree::Map, class, live_map, number));
         for s in [slot, old_slot].into_iter().flatten() {
-            ids.extend(radix::path(Tree::Space, class, cut_space, s));
+            ids.extend(radix::path(Tree::Space, class, space, s));
+        }
+        // The cut's roots, from the one it had up: each new one counts what the one below counts.
+        if space > cut_space {
+            ids.extend((cut_space..=space).map(|h| radix::root(Tree::Space, class, h)));
         }
         let frames = match self.meta.get_all(&ids)? {
             IOResult::Done(f) => f,
@@ -1073,13 +1097,23 @@ impl PageStore {
                 "{pid:?}'s entry as of the cut of checkpoint {n} moved under it"
             )));
         }
+        // Each new root's cut copy is the page as a growth since the cut first made it, zeros: it
+        // counts below its first child the units in use under the root below it, as a growth of
+        // the free space as it stands does.
+        for h in cut_space..space {
+            let below = radix::root(Tree::Space, class, h);
+            let in_use = locked.cut_of(below, |b| radix::in_use(Tree::Space, h, &*b));
+            locked.cut_of(radix::root(Tree::Space, class, h + 1), |b| {
+                radix::set_used_below(b, 0, in_use)
+            });
+        }
         let to = slot.map_or(FREE, |s| s + SLOT_BASE);
         set_map_cut(&mut locked, Tree::Map, class, cut_map, number, to);
         if let Some(s) = slot {
-            set_space_cut(&mut locked, class, cut_space, s, true);
+            set_space_cut(&mut locked, class, space, s, true);
         }
         if let Some(o) = old_slot {
-            set_space_cut(&mut locked, class, cut_space, o, false);
+            set_space_cut(&mut locked, class, space, o, false);
         }
         let live_path = radix::path(Tree::Map, class, live_map, number);
         let live = radix::map_entry(locked.page_of(live_path[0]), number);
@@ -1105,7 +1139,7 @@ impl PageStore {
         drop(deferred);
         let edited = locked.ids.clone();
         locked.commit(&self.meta);
-        Ok(IOResult::Done(edited))
+        Ok(IOResult::Done((edited, space)))
     }
 
     /// `pid`'s page-table entry as of checkpoint `n`'s cut, at map height `height`.
@@ -1425,14 +1459,7 @@ impl PageStore {
             locked.release_unchanged();
             return Ok(IOResult::Done(()));
         }
-        let old = locked.page_of(old_root);
-        let used = if height == 1 {
-            (0..radix::leaf_units(tree))
-                .filter(|&u| radix::used(tree, old, u))
-                .count() as u64
-        } else {
-            (0..radix::FANOUT).map(|c| radix::used_below(old, c)).sum()
-        };
+        let used = radix::in_use(tree, height, locked.page_of(old_root));
         radix::set_used_below(locked.page_of(new_root), 0, used);
         // Published while both roots are latched: a change that latches the old path once they
         // are let go reads the new height and looks again, never counting a unit under the old

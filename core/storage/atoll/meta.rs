@@ -619,6 +619,90 @@ struct FileSlot {
     frames: Segmented<PinCell<MetaFrame>>,
 }
 
+/// What one look at a metadata page came to ([`MetaCache::join`]).
+enum Joined {
+    /// In memory.
+    Ready(MetaRef),
+    /// Loading, by this look's load or another's: its frame, held, and the wait the load finishes.
+    Loading(MetaRef, Completion),
+    /// Not in memory and no read credit free: the wait a credit's give-back finishes.
+    Refused(Completion),
+}
+
+/// The metadata pages a caller collects across its polls (DESIGN.md 22.18: a `get_all` keeps the
+/// frames it has pinned, so it finishes whatever its width): each page's frame from the look that
+/// found it in memory or loading, a load this collection started or joined included, so that no
+/// eviction takes one between the caller's polls; none for a page refused a read credit, which
+/// holds nothing while it waits. It holds frames, never a latch or a credit. For one list of
+/// pages: a caller whose list changes (a tree grew, its path moved) collects anew.
+#[derive(Default)]
+pub struct Collection {
+    ids: Vec<MetaId>,
+    frames: Vec<Option<MetaRef>>,
+}
+
+impl Collection {
+    /// Every page in `ids`, once all are in memory: the frames found so far kept across calls,
+    /// handed over, and the collection begun again, when the last is in.
+    pub fn collect(
+        &mut self,
+        cache: &Arc<MetaCache>,
+        ids: &[MetaId],
+    ) -> Result<IOResult<Vec<MetaRef>>> {
+        if self.ids != ids {
+            self.ids = ids.to_vec();
+            self.frames = (0..ids.len()).map(|_| None).collect();
+        }
+        let mut wait = None;
+        for (frame, &id) in self.frames.iter_mut().zip(ids) {
+            if frame
+                .as_ref()
+                .is_some_and(|f| f.status.load(Ordering::Acquire) == READY)
+            {
+                continue;
+            }
+            match cache.join(id) {
+                Ok(Joined::Ready(found)) => *frame = Some(found),
+                Ok(Joined::Loading(found, loaded)) => {
+                    *frame = Some(found);
+                    wait.get_or_insert(loaded);
+                }
+                Ok(Joined::Refused(returned)) => {
+                    wait.get_or_insert(returned);
+                }
+                Err(e) => {
+                    self.release();
+                    return Err(e);
+                }
+            }
+        }
+        match wait {
+            Some(c) => Ok(IOResult::IO(IOCompletions(c))),
+            None => {
+                self.ids.clear();
+                Ok(IOResult::Done(
+                    std::mem::take(&mut self.frames)
+                        .into_iter()
+                        .map(|f| f.expect("every page in memory"))
+                        .collect(),
+                ))
+            }
+        }
+    }
+
+    /// Lets go of every frame held, as a caller abandoning its collection does.
+    pub fn release(&mut self) {
+        self.ids.clear();
+        self.frames.clear();
+    }
+
+    /// Frames held, for a test.
+    #[cfg(test)]
+    pub fn held(&self) -> usize {
+        self.frames.iter().flatten().count()
+    }
+}
+
 pub struct MetaCache {
     io: Arc<dyn IO>,
     base: String,
@@ -710,6 +794,15 @@ impl MetaCache {
     /// The page `id`, once it is in memory. It stays in the cache while the frame returned, or a
     /// clone of it, is held, so every change to the page reaches that frame.
     pub fn get(self: &Arc<Self>, id: MetaId) -> Result<IOResult<MetaRef>> {
+        Ok(match self.join(id)? {
+            Joined::Ready(frame) => IOResult::Done(frame),
+            Joined::Loading(_, wait) | Joined::Refused(wait) => IOResult::IO(IOCompletions(wait)),
+        })
+    }
+
+    /// One look at the page `id`: in memory, loading (this look's load or another's, its frame
+    /// held and the wait its load finishes), or refused a read credit, holding nothing.
+    fn join(self: &Arc<Self>, id: MetaId) -> Result<Joined> {
         let cell = self.files[id.file_index()].frames.get_or_make(id.index);
         let frame = loop {
             let step = self.epochs.enter();
@@ -721,7 +814,7 @@ impl MetaCache {
             // waits holding neither (DESIGN.md 22.18, a metadata read credit).
             let credit = match self.credits.take_or_wait() {
                 Ok(credit) => credit,
-                Err(returned) => return Ok(IOResult::IO(IOCompletions(returned))),
+                Err(returned) => return Ok(Joined::Refused(returned)),
             };
             let fresh = Pinned::new(MetaFrame::new(
                 id,
@@ -755,43 +848,32 @@ impl MetaCache {
             // sees the new phase here and never waits on the signal whose producer has left.
             status = frame.status.load(Ordering::Acquire);
             if status < READY && status != seen {
-                return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+                return Ok(Joined::Loading(frame, Completion::new_yield()));
             }
             Some(wait)
         } else {
             None
         };
         match status {
-            READY => Ok(IOResult::Done(frame)),
+            READY => Ok(Joined::Ready(frame)),
             FAILED => {
                 // Forgotten, so the next to look loads it again.
                 let _ = cell.forget(&frame, &self.cells);
                 let e = frame.failure.get().expect("a failed page's error");
                 Err(LimboError::CompletionError(e))
             }
-            LOADING | READING | PUBLISHING => Ok(IOResult::IO(IOCompletions(
+            LOADING | READING | PUBLISHING => Ok(Joined::Loading(
+                frame,
                 loaded.expect("a loading page registered before its status was checked again"),
-            ))),
+            )),
             _ => unreachable!("invalid metadata frame status {status}"),
         }
     }
 
-    /// Every page in `ids`, once all are in memory.
+    /// Every page in `ids`, once all are in memory, for a caller that keeps nothing across its
+    /// polls: what it found is let go when it waits ([`Collection`] keeps it).
     pub fn get_all(self: &Arc<Self>, ids: &[MetaId]) -> Result<IOResult<Vec<MetaRef>>> {
-        let mut out = Vec::with_capacity(ids.len());
-        let mut wait = None;
-        for &id in ids {
-            match self.get(id)? {
-                IOResult::Done(frame) => out.push(frame),
-                IOResult::IO(io) => {
-                    wait.get_or_insert(io);
-                }
-            }
-        }
-        match wait {
-            Some(io) => Ok(IOResult::IO(io)),
-            None => Ok(IOResult::Done(out)),
-        }
+        Collection::default().collect(self, ids)
     }
 
     /// Reads both places of `frame`'s page and keeps the newest whole copy. The read holds the

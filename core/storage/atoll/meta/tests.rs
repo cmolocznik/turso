@@ -1891,3 +1891,69 @@ fn a_miss_waiting_on_a_credit_whose_read_is_not_submitted_parks_until_the_submis
     );
     assert!(served, "the second page not served");
 }
+
+/// A collection of metadata pages keeps each frame it found across its caller's polls, the ones
+/// still loading among them: another operation's miss between two polls, putting the cache over its
+/// budget, evicts none of them, and the collection then finishes reading only the page it had no
+/// credit for (DESIGN.md 22.18: a get_all keeps the frames it has pinned; the auditor's #4573 and
+/// #4578; mutant: a collection that lets its frames go when it waits).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_collection_keeps_its_frames_across_polls_so_no_eviction_between_takes_one() {
+    use crate::io::crash::CrashIO;
+    use crate::storage::atoll::testing::drive;
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    // Two pages kept, so two read credits.
+    let cache = Arc::new(MetaCache::new(
+        io.clone(),
+        "meta-pins",
+        2,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    let ids = [id(0), id(1), id(2)];
+    let mut pins = Collection::default();
+    // The first two read under the credits, the third refused one.
+    let first = matches!(pins.collect(&cache, &ids), Ok(IOResult::IO(_)));
+    let while_loading = (pins.held(), crash.in_flight());
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    // Another operation between the polls: a page outside the collection, its put over the budget.
+    let other = drive(&io, || cache.get(id(3))).is_ok();
+    let resident = cache.resident();
+    // The third page's read, the only one.
+    let second = matches!(pins.collect(&cache, &ids), Ok(IOResult::IO(_)));
+    let reading = crash.in_flight();
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let collected = match pins.collect(&cache, &ids) {
+        Ok(IOResult::Done(frames)) => Some(frames.len()),
+        _ => None,
+    };
+    let left = pins.held();
+    // Every assertion with the cache dropped.
+    drop((pins, cache));
+    assert!(first, "the first poll did not wait");
+    assert_eq!(
+        while_loading,
+        (2, 2),
+        "(frames held, reads with the backend) while the first two loaded"
+    );
+    assert!(other, "the other operation's page not served");
+    assert_eq!(
+        resident, 3,
+        "the other operation's miss evicted a page the collection had found"
+    );
+    assert!(
+        second && reading == 1,
+        "the second poll read something but the page it had no credit for"
+    );
+    assert_eq!(collected, Some(3), "the collection did not finish");
+    assert_eq!(
+        left, 0,
+        "the collection kept frames after it handed them over"
+    );
+}

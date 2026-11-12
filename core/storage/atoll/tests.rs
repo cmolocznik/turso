@@ -1151,7 +1151,7 @@ const YIELDS: &[(&str, &str, &str, usize, &str)] = &[
     ("checkpoint.rs", "step_full", "Completion::new_yield", 1, "change: a step of its own done and more of the full checkpoint to do"),
     ("checkpoint.rs", "claim_full", "Completion::new_yield", 2, "change: a claimed step done and more of the full checkpoint to do, or the task over since the writer looked"),
     ("log/mod.rs", "run_preparer", "Completion::new_yield", 1, "change: a step of the preparer done and more of it to do now"),
-    ("meta.rs", "get", "Completion::new_yield", 1, "change: a load's phase moved before the wait was registered"),
+    ("meta.rs", "join", "Completion::new_yield", 1, "change: a load's phase moved before the wait was registered"),
     ("meta.rs", "wait_while_held", "Completion::new_yield", 2, "change: the hold let go or changed before the mark"),
     ("meta.rs", "write_for", "Completion::new_yield", 3, "change: the writing cell changed, a validation failed, a write put first by another"),
     ("store.rs", "busy", "Completion::new_yield", 1, "the helper itself"),

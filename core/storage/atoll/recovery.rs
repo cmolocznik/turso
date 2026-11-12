@@ -86,7 +86,9 @@ pub fn recover(
     // Owed a write: the next checkpoint takes the number that wrote them.
     if !scan.intents.is_empty() {
         store.meta().set_torn_ok(true);
-        let frames = drive(&io, || store.meta().get_all(&scan.intents));
+        // Collected across the drive's polls, so no page read in is evicted before the last is.
+        let mut pins = crate::storage::atoll::meta::Collection::default();
+        let frames = drive(&io, || pins.collect(store.meta(), &scan.intents));
         store.meta().set_torn_ok(false);
         #[cfg(test)]
         if frames

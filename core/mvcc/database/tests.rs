@@ -26266,3 +26266,67 @@ fn passive_writer_commits_an_update_of_a_row_whose_copy_dropped_while_it_was_ope
         vec![vec![Value::from_i64(201)]]
     );
 }
+
+/// A writer that overwrites a row through a cursor positioned on it (the index method's staging
+/// does, with no delete first) asks the version store whether it holds a version the writer sees,
+/// and supersedes it when it does. The answer must hold for a lone current copy that is
+/// B-tree-equivalent for the writer: answering "none" there makes the cursor add a B-tree-resident
+/// version beside the live copy, and every commit of the row then conflicts with it.
+#[test]
+fn passive_overwrite_of_a_covered_row_supersedes_its_live_copy() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..20 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+    // The pin's bound predates the checkpoint, so no GC drops a copy while the writers run.
+    let pin = db.connect();
+    pin.execute("BEGIN CONCURRENT").unwrap();
+    pin.execute("SELECT count(*) FROM t").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let id = mv
+        .rows
+        .iter()
+        .map(|entry| entry.key().clone())
+        .find(|id| {
+            id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID && id.row_id == RowKey::Int(5)
+        })
+        .expect("row 5 keeps its lone current copy");
+
+    for round in 0..3 {
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute("SELECT count(*) FROM t").unwrap();
+        let tx_id = writer.get_mv_tx_id().expect("the writer holds a transaction");
+        let found = mv.read_from_table_or_index(tx_id, &id, None).unwrap();
+        assert!(
+            found.is_some(),
+            "round {round}: the version store answers the row the writer sees"
+        );
+        let updated = mv
+            .update_to_table_or_index(
+                tx_id,
+                generate_simple_string_row(id.table_id, 5, &format!("w{round}")),
+                None,
+            )
+            .unwrap();
+        assert!(updated, "round {round}: the update supersedes the live copy");
+        writer
+            .execute("COMMIT")
+            .unwrap_or_else(|e| panic!("round {round}: the overwrite commits: {e:?}"));
+    }
+    pin.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&setup, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(20)]]
+    );
+}

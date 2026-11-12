@@ -6518,7 +6518,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// SkipMap payload for `tx` while B-tree fallthrough is not allowed.
+    /// SkipMap payload for `tx` while B-tree fallthrough is not allowed. Under Passive a covered
+    /// chain's visible version is the very row the reader's B-tree holds, so the version store
+    /// answers it: a caller that takes "none" as "the row is not in the version store" (the
+    /// cursor's overwrite) then supersedes the live copy instead of adding a B-tree-resident one
+    /// beside it. Truncate falls through, as its B-tree may be newer than the chain.
     fn skipmap_row_while_uncovered(
         &self,
         tx: &Transaction<A>,
@@ -6528,7 +6532,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if versions.is_empty() {
             return None;
         }
-        if self.btree_covers_chain_for_tx(tx, id.table_id, versions) {
+        if !self.experimental_mvcc_passive_checkpoint
+            && self.btree_covers_chain_for_tx(tx, id.table_id, versions)
+        {
             return None;
         }
         versions

@@ -2047,8 +2047,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     /// Fsync the logical log file
+    /// The truncate's sync runs beside commits' appends: none waits out its fsyncs.
     fn fsync_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.sync(self.pager.get_sync_type())
+        self.mvstore
+            .storage
+            .sync_beside_appends(self.pager.get_sync_type())
     }
 
     fn truncate_logical_log(&self) -> Result<Completion> {

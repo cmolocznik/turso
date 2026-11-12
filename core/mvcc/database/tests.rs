@@ -26330,3 +26330,64 @@ fn passive_overwrite_of_a_covered_row_supersedes_its_live_copy() {
         vec![vec![Value::from_i64(20)]]
     );
 }
+
+/// A commit lands while a passive checkpoint is parked at the fsyncs of its logical-log truncate:
+/// the checkpoint holds the log against no append across them, so no commit waits out its sync.
+#[test]
+fn a_commit_lands_while_a_passive_checkpoint_is_parked_in_its_log_sync() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    for i in 0..50 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({i}, 'v{i:05}')"))
+            .unwrap();
+    }
+
+    let (parked_tx, parked_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    mv.storage.park_next_sync_beside_appends(Box::new(move || {
+        parked_tx.send(()).unwrap();
+        // Bounded, so a regression fails the test instead of hanging it.
+        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+    }));
+
+    let db_arc = db.get_db();
+    let checkpointer_db = db_arc.clone();
+    let checkpointer = std::thread::spawn(move || {
+        let conn = checkpointer_db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    });
+    parked_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the checkpoint reaches its log sync");
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let writer_db = db_arc.clone();
+    let writer = std::thread::spawn(move || {
+        let conn = writer_db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("INSERT INTO t VALUES (1000, 'v01000')").unwrap();
+        done_tx.send(()).unwrap();
+    });
+    let landed = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    checkpointer.join().unwrap();
+    assert!(
+        landed,
+        "a commit waited on a checkpoint parked in its log sync"
+    );
+    assert_eq!(
+        get_rows(&setup, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(51)]]
+    );
+}

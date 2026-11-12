@@ -1489,29 +1489,31 @@ impl LogicalLog {
     /// Fsyncs the segment being written, and the sealed ones that may hold frames no fsync has
     /// covered: a frame written before a roll is in its sealed segment's file.
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
-        let mut group = CompletionGroup::new(|_| {});
+        sync_files(self.sync_targets(), sync_type)
+    }
+
+    /// The files a sync of the log covers: each sealed segment not yet synced, then the active
+    /// file. Taken under the log's lock; [`sync_files`] then needs none, as an fsync covers every
+    /// byte written to its file before the call, whatever is appended meanwhile.
+    pub(crate) fn sync_targets(&self) -> Vec<SyncTarget> {
+        let mut targets = Vec::new();
         if let Some(ring) = self.ring.as_deref() {
             for sealed in ring
                 .sealed
                 .iter()
                 .filter(|sealed| sealed.unsynced.load(crate::sync::atomic::Ordering::Acquire))
             {
-                let unsynced = sealed.unsynced.clone();
-                let c = Completion::new_sync(move |result| {
-                    if result.is_ok() {
-                        unsynced.store(false, crate::sync::atomic::Ordering::Release);
-                    }
+                targets.push(SyncTarget {
+                    file: ring.file(sealed.slot).clone(),
+                    unsynced: Some(sealed.unsynced.clone()),
                 });
-                group.add(&c);
-                let _sealed_c = ring.file(sealed.slot).sync(c, sync_type)?;
             }
         }
-        let completion = Completion::new_sync(move |_| {
-            tracing::debug!("logical_log_sync finish");
+        targets.push(SyncTarget {
+            file: self.file.clone(),
+            unsynced: None,
         });
-        group.add(&completion);
-        let _active_c = self.file.sync(completion, sync_type)?;
-        Ok(group.build())
+        targets
     }
 
     fn current_or_new_header(&self) -> Result<LogHeader> {
@@ -9198,4 +9200,30 @@ mod tests {
         // Keep the last chunk variable used so the compiler notices if the range math changes.
         assert!(last_chunk.end > last_chunk.start);
     }
+}
+
+/// A file a log sync covers, with the sealed segment's not-yet-synced mark it clears.
+pub(crate) struct SyncTarget {
+    file: Arc<dyn File>,
+    unsynced: Option<Arc<crate::sync::atomic::AtomicBool>>,
+}
+
+/// Fsync `targets`; a sealed segment's mark clears once its fsync succeeds.
+pub(crate) fn sync_files(targets: Vec<SyncTarget>, sync_type: FileSyncType) -> Result<Completion> {
+    let mut group = CompletionGroup::new(|_| {});
+    for target in targets {
+        let c = match target.unsynced {
+            Some(unsynced) => Completion::new_sync(move |result| {
+                if result.is_ok() {
+                    unsynced.store(false, crate::sync::atomic::Ordering::Release);
+                }
+            }),
+            None => Completion::new_sync(move |_| {
+                tracing::debug!("logical_log_sync finish");
+            }),
+        };
+        group.add(&c);
+        let _c = target.file.sync(c, sync_type)?;
+    }
+    Ok(group.build())
 }

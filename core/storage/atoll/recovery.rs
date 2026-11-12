@@ -68,7 +68,7 @@ pub fn recover(
     superblock: Superblock,
     executor: &Executor,
 ) -> Result<Recovered> {
-    let scan = scan(&io, base, &config.log, &superblock)?;
+    let mut scan = scan(&io, base, &config.log, &superblock)?;
     let restart = Log::resumes_at(scan.end);
     if restart > scan.end && superblock.continuations.len() >= MAX_CONTINUATIONS {
         return Err(LimboError::InternalError(format!(
@@ -87,15 +87,13 @@ pub fn recover(
     if !scan.intents.is_empty() {
         store.meta().set_torn_ok(true);
         // Collected across the drive's polls, so no page read in is evicted before the last is.
-        let mut pins = crate::storage::atoll::meta::Collection::new(scan.intents.clone());
+        let mut pins =
+            crate::storage::atoll::meta::Collection::new(std::mem::take(&mut scan.intents));
         let frames = drive(&io, || pins.collect(store.meta()));
         store.meta().set_torn_ok(false);
         #[cfg(test)]
-        if frames
-            .as_ref()
-            .is_ok_and(|frames| frames.len() == scan.intents.len())
-        {
-            INTENTS_PINNED.with(|p| *p.borrow_mut() = scan.intents.clone());
+        if let Ok(frames) = &frames {
+            INTENTS_PINNED.with(|p| *p.borrow_mut() = frames.iter().map(|f| f.id).collect());
         }
         for frame in frames? {
             while store.meta().owe(&frame).is_none() {

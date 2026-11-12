@@ -22,6 +22,7 @@ use super::aligned::AlignedBlock;
 use super::log::Lsn;
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
+use super::radix::MAX_HEIGHT;
 use super::whole;
 use crate::io::{Completion, File, OpenFlags, IO};
 use crate::sync::atomic::{AtomicUsize, Ordering};
@@ -135,6 +136,17 @@ impl Superblock {
         for (t, heights) in heights.iter_mut().enumerate() {
             let at = HEIGHTS + t * CLASS_COUNT;
             heights.copy_from_slice(&bytes[at..at + CLASS_COUNT]);
+        }
+        // A stored 0 is a tree not yet begun, opened one level high (`PageStore::open`).
+        for (t, heights) in heights.iter().enumerate() {
+            for (class, &height) in heights.iter().enumerate() {
+                if height > MAX_HEIGHT {
+                    return Err(LimboError::Corrupt(format!(
+                        "a superblock naming tree {t} of class {class} {height} levels high, past \
+                         the {MAX_HEIGHT} levels a tree has"
+                    )));
+                }
+            }
         }
         Ok(Some(Self {
             seq: word(16),
@@ -339,8 +351,11 @@ pub(crate) fn rewrite_in_charge(
     let (control, sb) = Control::open(io.clone(), base).unwrap();
     let mut sb = sb.expect("a superblock in charge");
     change(&mut sb);
-    crate::storage::atoll::park::wait_for_completion(io.as_ref(), control.write_encoded(sb.seq, &sb.encode()).unwrap())
-        .unwrap();
+    crate::storage::atoll::park::wait_for_completion(
+        io.as_ref(),
+        control.write_encoded(sb.seq, &sb.encode()).unwrap(),
+    )
+    .unwrap();
     sb
 }
 
@@ -348,6 +363,26 @@ pub(crate) fn rewrite_in_charge(
 mod tests {
     use super::*;
     use crate::io::crash::{CrashIO, Faults};
+
+    /// A superblock naming a tree past `MAX_HEIGHT` levels is refused as corrupt, one naming
+    /// `MAX_HEIGHT` is read, and one naming 0, a tree not yet begun, is read as 0 (the auditor's
+    /// #4606 and #4613; mutant: one level past it read).
+    #[test]
+    fn a_superblock_naming_a_tree_past_max_height_is_refused() {
+        let mut sb = superblock(1);
+        sb.heights[0][0] = MAX_HEIGHT;
+        let at_most = Superblock::decode(&sb.encode()).map(|read| read.is_some());
+        sb.heights[0][0] = 0;
+        let zero = Superblock::decode(&sb.encode())
+            .ok()
+            .flatten()
+            .map(|read| read.heights[0][0]);
+        sb.heights[1][3] = MAX_HEIGHT + 1;
+        let past = Superblock::decode(&sb.encode());
+        assert!(matches!(at_most, Ok(true)), "{at_most:?}");
+        assert_eq!(zero, Some(0), "a tree stored as 0 levels high");
+        assert!(matches!(past, Err(LimboError::Corrupt(_))), "{past:?}");
+    }
 
     fn superblock(seq: u64) -> Superblock {
         Superblock {

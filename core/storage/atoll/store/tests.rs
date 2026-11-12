@@ -60,7 +60,11 @@ impl Db {
     }
 
     fn open_on(io: Arc<dyn IO>) -> Self {
-        let db = Atoll::open(io.clone(), BASE, config()).unwrap();
+        Self::open_with(io, config())
+    }
+
+    fn open_with(io: Arc<dyn IO>, config: AtollConfig) -> Self {
+        let db = Atoll::open(io.clone(), BASE, config).unwrap();
         let versions = Versions::new(io.clone(), db.pool().clone(), db.store().clone(), 1);
         Self { io, db, versions }
     }
@@ -503,7 +507,8 @@ fn a_yield_while_doing_the_frees_a_checkpoint_let_go_keeps_every_one_still_owed(
     let (_, heights) = store.begin_cut(n);
     for &pid in &pages {
         let slot = drive(&db.io, || store.take_copy_slot(class)).unwrap();
-        drive(&db.io, || store.copied(n, &heights, pid, slot)).unwrap();
+        let mut edit = CutEdit::default();
+        drive(&db.io, || store.copied(n, &heights, pid, slot, &mut edit)).unwrap();
     }
     store.meta().end_cut(n, &[]);
     for &pid in &pages {
@@ -1313,6 +1318,451 @@ fn a_swap_shard_is_listed_a_run_at_a_time_from_where_the_last_ended() {
     assert_eq!(runs, [RUN, RUN, RUN, 2]);
 }
 
+/// A database whose metadata cache keeps one page, and so one read with its backend at a time
+/// (DESIGN.md 22.18, a metadata read credit), over `CrashIO`, whose reads wait until it is stepped.
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+fn one_read() -> (Arc<crate::io::crash::CrashIO>, Db) {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(0));
+    let mut config = config();
+    config.store.meta_pages = 1;
+    let db = Db::open_with(crash.clone(), config);
+    (crash, db)
+}
+
+/// A checkpoint's edit of its cut over six metadata pages, none in memory: a tree's root page,
+/// its page table three levels high, its copy's slot in the free space's first leaf and the new
+/// one in its second, the free space two levels high.
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+struct CutCase {
+    crash: Arc<crate::io::crash::CrashIO>,
+    db: Db,
+    store: Arc<PageStore>,
+    n: u64,
+    heights: [[u8; CLASS_COUNT]; TREES],
+    /// The root page, a node a checkpoint imaged, and a second.
+    node: PageId,
+    second: PageId,
+    /// A number the page table reaches only at three levels, in a leaf of its own.
+    far: PageId,
+    new: u64,
+    /// The edit's pages, in id order.
+    pages: Vec<MetaId>,
+    /// How many of them are out of memory before the edit, evicted clean or never read: every
+    /// one, so none is kept in memory but by the edit itself.
+    evicted: usize,
+}
+
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+fn cut_case() -> CutCase {
+    let (crash, db) = one_read();
+    let store = db.store().clone();
+    let class = class(0);
+    let far = PageId::new(class, radix::MAP_ENTRIES * radix::FANOUT + 7);
+    drive(&db.io, || store.allocate_at(far)).unwrap();
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    let (node, second) = (db.node(), db.node());
+    // The nodes' copies named; then every metadata page written, so clean and evictable: the first
+    // checkpoint's edits of the page table as it stands are the second's to write.
+    db.checkpoint();
+    db.checkpoint();
+    let old = db.slot_of(node);
+    let new = radix::SPACE_BITS + 5;
+    let n = db.db.checkpointer().superblock().checkpoint + 1;
+    let (_, heights) = store.begin_cut(n);
+    let mut pages: Vec<MetaId> = radix::path(Tree::Map, class, 3, node.number())
+        .iter()
+        .chain(radix::path(Tree::Space, class, 2, old).iter())
+        .chain(radix::path(Tree::Space, class, 2, new).iter())
+        .copied()
+        .collect();
+    pages.sort();
+    pages.dedup();
+    // The last read's request, kept for a test to cancel, holds its page through its callback.
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    for &id in &pages {
+        store.meta().evict(id);
+    }
+    let evicted = pages
+        .iter()
+        .filter(|&&id| !store.meta().in_memory(id))
+        .count();
+    CutCase {
+        crash,
+        db,
+        store,
+        n,
+        heights,
+        node,
+        second,
+        far,
+        new,
+        pages,
+        evicted,
+    }
+}
+
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+impl CutCase {
+    fn copied(&self, edit: &mut CutEdit) -> Result<IOResult<Edited>> {
+        self.store
+            .copied(self.n, &self.heights, self.node, self.new, edit)
+    }
+
+    /// Whether no one holds `id`'s page: evicted now, or out of memory already, as the cache's
+    /// budget evicts a page no one holds.
+    fn let_go(&self, id: MetaId) -> bool {
+        self.store.meta().evict(id) || !self.store.meta().in_memory(id)
+    }
+
+    /// Every read with the backend retired, and the last one's request, which a test hook keeps
+    /// and which holds its page through its callback, let go: only the edit holds its pages then.
+    fn settle(&self) {
+        while self.crash.in_flight() > 0 {
+            self.crash.step().unwrap();
+        }
+        drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    }
+}
+
+/// A checkpoint's edit of its cut over six metadata pages, under one read credit, keeps each page
+/// it found from its look on, loading or in memory, across every poll, so none is evicted between
+/// them and each is read once: six reads, one with the backend at a time, seven polls, and the
+/// page table names the new copy. Every one of its pages is tried for eviction after each poll and
+/// again once its reads retire, so a page the edit let go is caught whether or not it is held at
+/// that moment (DESIGN.md 22.18; the auditor's #4597; mutant: the edit's pages let go at every
+/// wait).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_cut_edit_wider_than_its_read_credits_keeps_its_pages_and_reads_each_once() {
+    let case = cut_case();
+    let clean = (case.evicted, case.pages.len());
+    let mut edit = CutEdit::default();
+    let before = case.crash.completed();
+    let (mut polls, mut most) = (0, 0);
+    let mut evicted_held = Vec::new();
+    let edited = loop {
+        polls += 1;
+        match case.copied(&mut edit) {
+            Ok(IOResult::Done(edited)) => break Some(edited.to_vec()),
+            Ok(IOResult::IO(_)) => {}
+            Err(_) => break None,
+        }
+        most = most.max(case.crash.in_flight());
+        // Each page the edit found stays, loading and once read, before the next poll: none of its
+        // pages is in memory but by the edit, so any page evicted is one it let go.
+        for &id in &case.pages {
+            if case.store.meta().evict(id) {
+                evicted_held.push(id);
+            }
+        }
+        case.settle();
+        for &id in &case.pages {
+            if case.store.meta().evict(id) {
+                evicted_held.push(id);
+            }
+        }
+        if polls > case.pages.len() + 2 {
+            break None;
+        }
+    };
+    let reads = case.crash.completed() - before;
+    let entry = drive(&case.db.io, || case.store.entry(case.node)).ok();
+    let (pages, new) = (case.pages.clone(), case.new);
+    drop(edit);
+    drop(case);
+    assert_eq!(
+        clean.0, clean.1,
+        "pages out of memory before the edit, of its pages"
+    );
+    assert_eq!(pages.len(), 6, "the fixture's pages: {pages:?}");
+    assert_eq!(edited, Some(pages), "the pages the edit latched and named");
+    assert!(
+        evicted_held.is_empty(),
+        "pages the edit held evicted: {evicted_held:?}"
+    );
+    assert_eq!((reads, polls), (6, 7), "(metadata reads, polls)");
+    assert!(most <= 1, "{most} reads with the backend at once");
+    assert_eq!(entry, Some(new + SLOT_BASE), "the page table's entry");
+}
+
+/// A cut edit whose every page is in memory and held, refused a latch another change holds,
+/// waits holding no latch and every frame: none is evicted while it waits, and once the latch is
+/// let go it is made with no read (the auditor's #4597; mutant: the pages let go at a latch's
+/// wait).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_cut_edit_waiting_on_a_latch_keeps_every_page_and_reads_none_again() {
+    let case = cut_case();
+    let clean = (case.evicted, case.pages.len());
+    let mut edit = CutEdit::default();
+    let (mut polls, mut early) = (0, false);
+    // Every page held, the last read retired and not yet seen. An edit made is not polled again:
+    // a second mark of its slot is refused under its latches, which ends the process.
+    while !early && edit.state.pages.held() < case.pages.len() && polls <= case.pages.len() + 2 {
+        polls += 1;
+        early = matches!(case.copied(&mut edit), Ok(IOResult::Done(_)));
+        case.settle();
+    }
+    let held = edit.state.pages.held();
+    let reads = case.crash.completed();
+    let (waited, kept) = match early {
+        true => (false, 0),
+        false => case.store.with_map_latched(case.node, || {
+            let waited = matches!(case.copied(&mut edit), Ok(IOResult::IO(_)));
+            let kept = case
+                .pages
+                .iter()
+                .filter(|&&id| !case.store.meta().evict(id))
+                .count();
+            (waited, kept)
+        }),
+    };
+    let held_waiting = edit.state.pages.held();
+    let done = !early && matches!(case.copied(&mut edit), Ok(IOResult::Done(_)));
+    let read_after = case.crash.completed() - reads;
+    let pages = case.pages.len();
+    drop(edit);
+    drop(case);
+    assert_eq!(
+        clean.0, clean.1,
+        "pages out of memory before the edit, of its pages"
+    );
+    assert!(!early, "the edit was made before every page was held");
+    assert_eq!(held, pages, "pages held before the latch was taken");
+    assert!(waited, "the edit did not wait on the latch held");
+    assert_eq!(
+        (kept, held_waiting),
+        (pages, pages),
+        "(pages not evicted, pages held) while it waited"
+    );
+    assert!(done, "the edit was not made once the latch was let go");
+    assert_eq!(read_after, 0, "reads after its pages were all in memory");
+}
+
+/// The page table growing a level between two polls of a cut edit changes nothing it needs: the
+/// cut's heights are its own, and the leaf it edits as the page stands is the cut's, at every
+/// height. It reads no page of the new root and names none (the auditor's #4617).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_cut_edit_whose_page_table_grows_between_its_polls_needs_no_page_more() {
+    let case = cut_case();
+    let mut edit = CutEdit::default();
+    let first = matches!(case.copied(&mut edit), Ok(IOResult::IO(_)));
+    case.settle();
+    let grown = drive(&case.db.io, || case.store.grow(Tree::Map, class(0))).is_ok();
+    let mut edited = None;
+    for _ in 0..=case.pages.len() + 2 {
+        match case.copied(&mut edit) {
+            Ok(IOResult::Done(e)) => {
+                edited = Some(e.to_vec());
+                break;
+            }
+            Ok(IOResult::IO(_)) => case.settle(),
+            Err(_) => break,
+        }
+    }
+    let entry = drive(&case.db.io, || case.store.entry(case.node)).ok();
+    let (pages, new) = (case.pages.clone(), case.new);
+    drop(edit);
+    drop(case);
+    assert!(first && grown, "(the edit waited, the page table grew)");
+    assert_eq!(
+        edited,
+        Some(pages),
+        "the pages edited, the new root not among them"
+    );
+    assert_eq!(entry, Some(new + SLOT_BASE), "the page table's entry");
+}
+
+/// One edit's state given another edit's key lets go of every page of the first before the second
+/// looks at any: here the first page's leaf, of no use to the second, is evictable at once (the
+/// auditor's #4597; mutant: the state kept for another key).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_cut_edit_given_another_page_lets_go_of_the_first_ones_pages() {
+    let case = cut_case();
+    let clean = (case.evicted, case.pages.len());
+    let mut edit = CutEdit::default();
+    let first = matches!(case.copied(&mut edit), Ok(IOResult::IO(_)));
+    case.settle();
+    let first_held = edit.state.pages.held_ids();
+    let other = case
+        .store
+        .left_out(case.n, &case.heights, case.far, &mut edit)
+        .is_ok();
+    let other_held = edit.state.pages.held_ids();
+    let pending = edit.pending();
+    case.settle();
+    let leaf = radix::path(Tree::Map, class(0), 3, case.node.number())[0];
+    let evicted = case.let_go(leaf);
+    let far_key = CutKey::of(case.n, case.far, None);
+    drop(edit);
+    drop(case);
+    assert_eq!(
+        clean.0, clean.1,
+        "pages out of memory before the edit, of its pages"
+    );
+    assert!(first && other, "(the first edit waited, the second polled)");
+    assert_eq!(first_held, vec![leaf], "the first edit's page held");
+    assert!(
+        !other_held.contains(&leaf),
+        "the second edit holds the first's leaf: {other_held:?}"
+    );
+    assert_eq!(pending, Some(far_key), "the edit under way");
+    assert!(evicted, "the first edit's leaf was not let go");
+}
+
+/// A cut edit whose read fails ends with the failure and lets go of every page it held: the page
+/// read before it is evictable at once (the auditor's #4597).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_cut_edit_whose_read_fails_lets_go_of_every_page() {
+    let case = cut_case();
+    let clean = (case.evicted, case.pages.len());
+    let mut edit = CutEdit::default();
+    let (mut polls, mut early) = (0, false);
+    // An edit made is not polled again: a second mark of its slot ends the process.
+    while !early && edit.state.pages.held() < 2 && polls <= case.pages.len() {
+        polls += 1;
+        early = matches!(case.copied(&mut edit), Ok(IOResult::Done(_)));
+        if edit.state.pages.held() < 2 {
+            case.settle();
+        }
+    }
+    let read_first = edit.state.pages.held_ids();
+    case.crash.set_faults(crate::io::crash::Faults {
+        read: 1.0,
+        ..Default::default()
+    });
+    case.settle();
+    case.crash.set_faults(Default::default());
+    let failed = !early && case.copied(&mut edit).is_err();
+    let (pending, held) = (edit.pending(), edit.state.pages.held());
+    let evicted = read_first.first().is_some_and(|&id| case.let_go(id));
+    drop(edit);
+    drop(case);
+    assert_eq!(
+        clean.0, clean.1,
+        "pages out of memory before the edit, of its pages"
+    );
+    assert!(!early, "the edit was made before its second read");
+    assert_eq!(read_first.len(), 2, "pages held as the second read failed");
+    assert!(failed, "the edit did not end with the read's failure");
+    assert_eq!(
+        (pending, held),
+        (None, 0),
+        "(the edit under way, pages held)"
+    );
+    assert!(evicted, "the page read before the failure was not let go");
+}
+
+/// A cut edit abandoned while a read of its is with the backend lets go of every page: the one
+/// read and the one loading are evictable once the read retires (the auditor's #4597).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn an_abandoned_cut_edit_lets_go_of_every_page() {
+    let case = cut_case();
+    let clean = (case.evicted, case.pages.len());
+    let mut edit = CutEdit::default();
+    let (mut polls, mut early) = (0, false);
+    // An edit made is not polled again: a second mark of its slot ends the process.
+    while !early && edit.state.pages.held() < 2 && polls <= case.pages.len() {
+        polls += 1;
+        early = matches!(case.copied(&mut edit), Ok(IOResult::Done(_)));
+        if edit.state.pages.held() < 2 {
+            case.settle();
+        }
+    }
+    let held = edit.state.pages.held_ids();
+    let loading = case.crash.in_flight();
+    drop(edit);
+    case.settle();
+    let evicted = held.iter().filter(|&&id| case.let_go(id)).count();
+    drop(case);
+    assert_eq!(
+        clean.0, clean.1,
+        "pages out of memory before the edit, of its pages"
+    );
+    assert_eq!(
+        (held.len(), loading),
+        (2, 1),
+        "(pages held, reads with the backend)"
+    );
+    assert_eq!(evicted, 2, "pages let go by the edit abandoned");
+}
+
+/// A page left out over the metadata pages a first edit of the cut already latched, their cut
+/// copies kept and in memory, its latches free and no free deferred, allocates nothing: the
+/// edit's own set, latch group, paths and pages named are inline, the count made printed (the
+/// auditor's #4606 and #4646: a copy's edit may still allocate a deferred free's entry, and a
+/// page's first change in a cut its cut copy; mutant: the latch group collected into a vector).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_page_left_out_over_pages_a_cut_edit_kept_allocates_nothing() {
+    let case = cut_case();
+    let mut edit = CutEdit::default();
+    let first = drive(&case.db.io, || case.copied(&mut edit)).is_ok();
+    let before = crate::storage::atoll::testing::allocations();
+    let second = case
+        .store
+        .left_out(case.n, &case.heights, case.second, &mut edit);
+    let made = crate::storage::atoll::testing::allocations() - before;
+    let done = matches!(second, Ok(IOResult::Done(_)));
+    drop(second);
+    drop(edit);
+    drop(case);
+    eprintln!("a page left out over pages a cut edit kept: {made} allocations");
+    assert!(
+        first && done,
+        "(the first edit made, the second made at once)"
+    );
+    assert!(
+        made == 0,
+        "{made} allocations by a page left out over pages a cut edit kept"
+    );
+}
+
+/// A tree is 1 to `MAX_HEIGHT` levels high: the fewest whose root reaches every leaf a metadata
+/// id names; a store's tree stored as 0 opens 1 high; a growth past `MAX_HEIGHT` is refused before
+/// it reads or changes anything (the auditor's #4606 and #4613; mutant: a growth past it).
+#[test]
+fn a_tree_is_one_to_max_height_levels_high_and_grows_no_further() {
+    let leaves = |height: u8| (radix::FANOUT as u128).pow(u32::from(height) - 1);
+    let reaches = 1u128 << crate::storage::atoll::meta::INDEX_BITS;
+    assert_eq!(MAX_HEIGHT, 7);
+    assert!(leaves(MAX_HEIGHT) >= reaches && leaves(MAX_HEIGHT - 1) < reaches);
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let store = PageStore::open(io, BASE, config().store, [[0; CLASS_COUNT]; TREES], 0);
+    let opened = store.height(Tree::Map, class(0));
+    store.heights[Tree::Map as usize][1].store(MAX_HEIGHT, Ordering::Release);
+    let refused = matches!(
+        store.grow(Tree::Map, class(1)),
+        Err(LimboError::InternalError(_))
+    );
+    let after = store.height(Tree::Map, class(1));
+    let resident = store.meta().resident();
+    drop(store);
+    assert_eq!(opened, 1, "a tree stored as 0 levels high opened");
+    assert!(refused, "a growth past MAX_HEIGHT was not refused");
+    assert_eq!(
+        (after, resident),
+        (MAX_HEIGHT, 0),
+        "(height, pages read) after the refusal"
+    );
+}
+
+/// The size of each owner of a store edit's state, printed for the record (the auditor's #4606).
+#[test]
+fn the_sizes_of_a_store_edits_state() {
+    eprintln!(
+        "PageSet<CUT_PAGES>={} CutEdit={} Locked={} Edited={}",
+        std::mem::size_of::<PageSet<CUT_PAGES>>(),
+        std::mem::size_of::<CutEdit>(),
+        std::mem::size_of::<Locked<'static>>(),
+        std::mem::size_of::<Edited>(),
+    );
+}
+
 /// A growth publishes its height before it lets go of the two roots: a page number taken in the
 /// gap a release before the publication would leave, under the old root's latch with the old
 /// height read, would be counted by the old root alone and missed by the new one's count, copied
@@ -1418,7 +1868,11 @@ fn a_copy_slot_past_the_cuts_free_space_grows_the_cuts_tree_a_level() {
     let (pid, n, heights) = cut_with_slots(&db, class, &[3, 4]);
     drive(&db.io, || db.store().grow(Tree::Space, class)).unwrap();
     let slot = radix::SPACE_BITS + 5;
-    let done = drive(&db.io, || db.store().copied(n, &heights, pid, slot)).ok();
+    let mut edit = CutEdit::default();
+    let done = drive(&db.io, || {
+        db.store().copied(n, &heights, pid, slot, &mut edit)
+    })
+    .ok();
     let root = radix::root(Tree::Space, class, 2);
     let leaf = radix::path(Tree::Space, class, 2, slot)[0];
     let counts = (
@@ -1427,8 +1881,11 @@ fn a_copy_slot_past_the_cuts_free_space_grows_the_cuts_tree_a_level() {
         cut_bit(&db, n, leaf, slot),
     );
     drop(db);
-    let (edited, space) = done.expect("the edit failed");
-    assert_eq!(space, 2, "the cut's free-space height the edit ended at");
+    let edited = done.expect("the edit failed");
+    assert_eq!(
+        edited.space, 2,
+        "the cut's free-space height the edit ended at"
+    );
     assert!(
         edited.contains(&root) && edited.contains(&radix::root(Tree::Space, class, 1)),
         "the cut's old and new roots among the pages edited: {edited:?}"
@@ -1451,7 +1908,11 @@ fn a_copy_slot_two_levels_past_the_cuts_free_space_grows_the_cuts_tree_two_level
     drive(&db.io, || db.store().grow(Tree::Space, class)).unwrap();
     drive(&db.io, || db.store().grow(Tree::Space, class)).unwrap();
     let slot = radix::capacity(Tree::Space, 2) + 7;
-    let done = drive(&db.io, || db.store().copied(n, &heights, pid, slot)).ok();
+    let mut edit = CutEdit::default();
+    let done = drive(&db.io, || {
+        db.store().copied(n, &heights, pid, slot, &mut edit)
+    })
+    .ok();
     let (middle, top) = (
         radix::root(Tree::Space, class, 2),
         radix::root(Tree::Space, class, 3),
@@ -1465,7 +1926,7 @@ fn a_copy_slot_two_levels_past_the_cuts_free_space_grows_the_cuts_tree_two_level
         cut_bit(&db, n, path[0], slot),
     );
     drop(db);
-    let (_, space) = done.expect("the edit failed");
+    let space = done.expect("the edit failed").space;
     assert_eq!(path[1].index, 1, "the slot's node of level 1");
     assert_eq!(space, 3, "the cut's free-space height the edit ended at");
     assert_eq!(
@@ -1488,13 +1949,17 @@ fn a_copy_past_the_cuts_free_space_frees_its_old_slot_in_the_grown_tree() {
     let (pid, first, heights) = cut_with_slots(&db, class, &[3, 4]);
     // Its first copy, in the leaf: in use as it stands too, as its take marks it.
     drive(&db.io, || store.plant_slot(class, old, true)).unwrap();
-    drive(&db.io, || store.copied(first, &heights, pid, old)).unwrap();
+    let mut edit = CutEdit::default();
+    drive(&db.io, || {
+        store.copied(first, &heights, pid, old, &mut edit)
+    })
+    .unwrap();
     store.meta().end_cut(first, &[]);
     let n = first + 1;
     let (_, heights) = store.begin_cut(n);
     drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
     let slot = radix::SPACE_BITS + 9;
-    let done = drive(&db.io, || store.copied(n, &heights, pid, slot)).ok();
+    let done = drive(&db.io, || store.copied(n, &heights, pid, slot, &mut edit)).ok();
     let root = radix::root(Tree::Space, class, 2);
     let leaf = radix::root(Tree::Space, class, 1);
     let counts = (
@@ -1504,7 +1969,7 @@ fn a_copy_past_the_cuts_free_space_frees_its_old_slot_in_the_grown_tree() {
     );
     let owed = store.deferred_slots().contains(&(class, old));
     drop(db);
-    let (_, space) = done.expect("the edit failed");
+    let space = done.expect("the edit failed").space;
     assert_eq!(space, 2, "the cut's free-space height the edit ended at");
     assert_eq!(
         counts,
@@ -1600,8 +2065,10 @@ fn a_copy_slot_past_the_cuts_free_space_is_in_the_free_space_reopened() {
         let (dirty, mut heights) = store.begin_cut(1);
         let mut ids: BTreeSet<_> = dirty.collect();
         let slot = drive(&io, || store.take_copy_slot(class)).unwrap();
-        let (edited, space) = drive(&io, || store.copied(1, &heights, pid, slot)).unwrap();
-        ids.extend(edited);
+        let mut edit = CutEdit::default();
+        let edited = drive(&io, || store.copied(1, &heights, pid, slot, &mut edit)).unwrap();
+        ids.extend(edited.iter().copied());
+        let space = edited.space;
         // The height the checkpoint takes from the edit, for its superblock.
         heights[Tree::Space as usize][class.index()] = space;
         let ids: Vec<_> = ids.into_iter().collect();
@@ -1647,4 +2114,120 @@ fn a_copy_slot_past_the_cuts_free_space_is_in_the_free_space_reopened() {
             "{case}: slots in use reopened"
         );
     }
+}
+
+/// A page left out whose edit waited on a latch, its pages all held, keeps them when another page's
+/// copy grows the cut's free space meanwhile: polled again at the new height, it looks only at the
+/// new root, and frees its old slot in the grown tree, the new root counting the leaf's units less
+/// it (the auditor's #4627; mutant: the frames let go at an aim).
+#[test]
+fn a_waiting_left_out_keeps_its_pages_across_a_growth_of_the_cuts_free_space() {
+    let db = Db::open();
+    let store = db.store();
+    let class = class(4);
+    let old = 10;
+    let (pid, first, heights) = cut_with_slots(&db, class, &[3, 4]);
+    drive(&db.io, || store.plant_slot(class, old, true)).unwrap();
+    let mut edit = CutEdit::default();
+    drive(&db.io, || {
+        store.copied(first, &heights, pid, old, &mut edit)
+    })
+    .unwrap();
+    store.meta().end_cut(first, &[]);
+    // Another page, in a page-table leaf of its own.
+    let other = PageId::new(class, radix::MAP_ENTRIES + 3);
+    drive(&db.io, || store.allocate_at(other)).unwrap();
+    let n = first + 1;
+    let (_, mut heights) = store.begin_cut(n);
+    let mut leaving = CutEdit::default();
+    // The free space's leaf latched, as another change holds it: the edit reads its entry as of
+    // the cut, then waits on that latch with every page held.
+    let space_leaf = radix::root(Tree::Space, class, 1);
+    let frame = drive(&db.io, || store.meta().get(space_leaf)).unwrap();
+    let hold = frame.try_lock().expect("the leaf's latch free");
+    let waited = matches!(
+        store.left_out(n, &heights, pid, &mut leaving),
+        Ok(IOResult::IO(_))
+    );
+    // The page table's pages come before the leaf in id order: latched first, and let go when the
+    // leaf was refused, so none is held as the edit returns.
+    let map = radix::path(
+        Tree::Map,
+        class,
+        heights[Tree::Map as usize][class.index()],
+        pid.number(),
+    );
+    let free_latches = |map: &[MetaId]| {
+        map.iter()
+            .filter(|&&id| {
+                let page = drive(&db.io, || store.meta().get(id)).unwrap();
+                let hold = page.try_lock();
+                let free = hold.is_some();
+                if let Some(hold) = hold {
+                    hold.release_unchanged();
+                }
+                free
+            })
+            .count()
+    };
+    let free_first = free_latches(&map);
+    hold.release_unchanged();
+    let held = leaving.state.pages.held();
+    // The other page's copy, past the cut's free space: the cut's tree grows.
+    drive(&db.io, || store.grow(Tree::Space, class)).unwrap();
+    let mut landing = CutEdit::default();
+    let slot = radix::SPACE_BITS + 5;
+    let landed = drive(&db.io, || {
+        store.copied(n, &heights, other, slot, &mut landing)
+    })
+    .ok();
+    if let Some(landed) = &landed {
+        heights[Tree::Space as usize][class.index()] = landed.space;
+    }
+    let looks = leaving.state.pages.looks();
+    let hold = frame.try_lock().expect("the leaf's latch free");
+    let rewaited = matches!(
+        store.left_out(n, &heights, pid, &mut leaving),
+        Ok(IOResult::IO(_))
+    );
+    let free_second = free_latches(&map);
+    hold.release_unchanged();
+    let looked = leaving.state.pages.looks() - looks;
+    let held_grown = leaving.state.pages.held();
+    let done = drive(&db.io, || store.left_out(n, &heights, pid, &mut leaving)).is_ok();
+    let root = radix::root(Tree::Space, class, 2);
+    let leaf = radix::root(Tree::Space, class, 1);
+    let counts = (
+        cut_count(&db, n, root, 0),
+        cut_count(&db, n, root, 1),
+        cut_bit(&db, n, leaf, old),
+    );
+    drop(frame);
+    drop(db);
+    assert!(
+        waited && rewaited,
+        "(the first poll waited, the second waited)"
+    );
+    assert_eq!(
+        (free_first, free_second),
+        (map.len(), map.len()),
+        "the page table's latches free as each poll returned waiting on the leaf, of {}",
+        map.len()
+    );
+    assert_eq!(
+        landed.map(|l| l.space),
+        Some(2),
+        "the cut's free-space height"
+    );
+    assert_eq!(
+        (looked, held_grown),
+        (1, held + 1),
+        "(looks at the new height, pages held) by the edit polled again"
+    );
+    assert!(done, "the edit was not made");
+    assert_eq!(
+        counts,
+        (Some(2), Some(1), Some(false)),
+        "(the new root's counts below its first and second children, the old slot's bit) at the cut"
+    );
 }

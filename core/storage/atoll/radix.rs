@@ -12,7 +12,7 @@
 //! level and index; a tree grows by a level at the top, the old root becoming child 0 of the new
 //! one.
 
-use super::meta::{MetaId, Tree, META_PAGE};
+use super::meta::{MetaId, Tree, INDEX_BITS, LEVELS, META_PAGE};
 use super::page::{SizeClass, HEADER_SIZE};
 use super::shared::{Bytes, BytesMut};
 
@@ -44,16 +44,54 @@ pub fn capacity(tree: Tree, height: u8) -> u64 {
     span(tree, height - 1)
 }
 
-/// The leaf holding `unit`, then each ancestor up to the root of a tree of `height` levels.
-pub fn path(tree: Tree, class: SizeClass, height: u8, unit: u64) -> Vec<MetaId> {
-    (0..height)
-        .map(|level| MetaId {
+/// Levels a tree ever has: the fewest whose root reaches every leaf a metadata id can name, one
+/// whose index is below `1 << INDEX_BITS` ([`MetaId::pid`]), as FANOUT^(h - 1) >= 2^46 first holds
+/// at h = 7. Both trees' leaves are counted alike, so it bounds either; a taller tree reaches no
+/// leaf a shorter one does not, and the store refuses a growth past it.
+pub const MAX_HEIGHT: u8 = {
+    let (mut height, mut leaves) = (1u8, 1u128);
+    while leaves < 1u128 << INDEX_BITS {
+        leaves *= FANOUT as u128;
+        height += 1;
+    }
+    height
+};
+const _: () = assert!(MAX_HEIGHT as usize <= LEVELS);
+
+/// The leaf holding a unit, then each ancestor up to the root, held inline.
+#[derive(Clone, Copy, Debug)]
+pub struct Path {
+    ids: [MetaId; MAX_HEIGHT as usize],
+    len: u8,
+}
+
+impl std::ops::Deref for Path {
+    type Target = [MetaId];
+
+    fn deref(&self) -> &[MetaId] {
+        &self.ids[..usize::from(self.len)]
+    }
+}
+
+/// The leaf holding `unit`, then each ancestor up to the root of a tree of `height` levels: the one
+/// door from a height to its pages, so a height is 1 to [`MAX_HEIGHT`] wherever a path is made (the
+/// superblock's heights are refused past it, and a growth past it is refused).
+pub fn path(tree: Tree, class: SizeClass, height: u8, unit: u64) -> Path {
+    assert!(
+        (1..=MAX_HEIGHT).contains(&height),
+        "a {tree:?} tree of class {} {height} levels high: a tree has 1 to {MAX_HEIGHT}",
+        class.index()
+    );
+    let mut ids = [root(tree, class, 1); MAX_HEIGHT as usize];
+    for level in 0..height {
+        ids[usize::from(level)] = MetaId {
             tree,
             class,
             level,
             index: unit / span(tree, level),
-        })
-        .collect()
+        };
+    }
+    Path { ids, len: height }
 }
 
 /// The root of a tree of `height` levels.

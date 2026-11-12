@@ -44,7 +44,7 @@ use super::log::{framed_len, Admitted, Header, Kind, Log, LogWait, Lsn};
 use super::meta::{MetaId, MetaRef, TREES};
 use super::page::{self, PageId, CLASS_COUNT};
 use super::stack::Chain;
-use super::store::{Erasing, PageStore};
+use super::store::{CutEdit, Erasing, PageStore};
 use super::txn::versioned::AsOf;
 use super::txn::{Cut, Transactions, Ts};
 use super::unit;
@@ -607,6 +607,11 @@ struct Run {
     flying: Vec<Flying>,
     /// Bytes of the image writes in flight.
     flying_bytes: usize,
+    /// The page table edit of a landed write under way: its page's flight is the next landed.
+    landing: CutEdit,
+    /// The edit under way of a page left out: an orphan, a page of a tree set aside, or a value
+    /// no image names, one at a time.
+    leaving: CutEdit,
     /// Pages named by nothing whose free waited for the checkpointer, taken before the cut, and
     /// those freed: left out, never imaged.
     orphans: Vec<PageId>,
@@ -719,8 +724,6 @@ struct Flying {
     /// The change count of the page the image settles, if it does: the page as it stood then,
     /// or what reads to every reader as it does.
     settles: Option<u64>,
-    /// Its page table edit made once it landed.
-    edited: bool,
 }
 
 impl Checkpointer {
@@ -1698,6 +1701,8 @@ impl Run {
             letting: Letting::Gate,
             release: None,
             released: false,
+            landing: CutEdit::default(),
+            leaving: CutEdit::default(),
         }
     }
 
@@ -1881,8 +1886,11 @@ impl Run {
                     // out only once its edit is made, so a wait in the edit makes it again.
                     unit::visit();
                     if !self.freed.contains(&pid) {
-                        let edited = unit!(cp.store.left_out(self.n, &self.heights, pid));
-                        self.meta.extend(edited);
+                        let edited =
+                            unit!(cp
+                                .store
+                                .left_out(self.n, &self.heights, pid, &mut self.leaving));
+                        self.meta.extend(edited.iter().copied());
                         self.freed.insert(pid);
                         return Ok(Unit::Again);
                     }
@@ -2057,6 +2065,12 @@ impl Run {
                     return Ok(Unit::Again);
                 }
                 Phase::LetGo => {
+                    // Every edit's site is done before its phase ends: an edit holds pages only
+                    // while its site waits.
+                    debug_assert!(
+                        self.landing.pending().is_none() && self.leaving.pending().is_none(),
+                        "an edit of the cut still under way as the checkpoint lets go"
+                    );
                     #[cfg(test)]
                     HELD_AT_LET_GO.with(|h| h.set(h.get().max(self.holds())));
                     if !self.release_run() {
@@ -2285,8 +2299,11 @@ impl Run {
                     // No image written names it: a value no committed version at or below the
                     // snapshot reaches.
                     unit::visit();
-                    match cp.store.left_out(self.n, &self.heights, pid)? {
-                        IOResult::Done(edited) => self.meta.extend(edited),
+                    match cp
+                        .store
+                        .left_out(self.n, &self.heights, pid, &mut self.leaving)?
+                    {
+                        IOResult::Done(edited) => self.meta.extend(edited.iter().copied()),
                         IOResult::IO(IOCompletions(c)) => {
                             self.queue.push_front(pid);
                             return Ok(Unit::Wait(c));
@@ -2345,8 +2362,11 @@ impl Run {
                     if self.set_aside.contains(&v.root()) {
                         // A tree whose creation the snapshot does not see: left out whole.
                         unit::visit();
-                        let edited = unit!(cp.store.left_out(self.n, &self.heights, pid));
-                        self.meta.extend(edited);
+                        let edited =
+                            unit!(cp
+                                .store
+                                .left_out(self.n, &self.heights, pid, &mut self.leaving));
+                        self.meta.extend(edited.iter().copied());
                         self.imaging = None;
                         return Ok(Unit::Again);
                     }
@@ -2502,7 +2522,6 @@ impl Run {
             outcome,
             bytes: image.len(),
             settles,
-            edited: false,
         });
         counters
             .flying_writes_peak
@@ -2511,10 +2530,23 @@ impl Run {
     }
 
     /// Names in the page table one image write that has landed, its place in the flight set
-    /// freed: whether there was one. Fails on one that failed.
+    /// freed: whether there was one. Fails on one that failed. A landing whose edit waited is the
+    /// next one made, whatever lands meanwhile, so no other replaces the pages its edit keeps.
     fn land_one(&mut self, cp: &Checkpointer) -> Result<IOResult<bool>> {
-        let Some(i) = self.flying.iter().position(|f| f.landed.finished()) else {
-            return Ok(IOResult::Done(false));
+        let i = match self.landing.pending() {
+            Some(key) => self
+                .flying
+                .iter()
+                .position(|f| key.landing(f.pid, f.slot))
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "the landed write whose edit waited, {key:?}, left the flight set"
+                    ))
+                })?,
+            None => match self.flying.iter().position(|f| f.landed.finished()) {
+                Some(i) => i,
+                None => return Ok(IOResult::Done(false)),
+            },
         };
         let f = &mut self.flying[i];
         match *f.outcome.lock() {
@@ -2527,20 +2559,21 @@ impl Run {
                 )))
             }
         }
-        if !f.edited {
-            unit::visit();
-            let (edited, space) = match cp.store.copied(self.n, &self.heights, f.pid, f.slot)? {
-                IOResult::Done(done) => done,
+        unit::visit();
+        let edited =
+            match cp
+                .store
+                .copied(self.n, &self.heights, f.pid, f.slot, &mut self.landing)?
+            {
+                IOResult::Done(edited) => edited,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
-            self.meta.extend(edited);
-            // The cut's free space as the edit left it, grown to reach the copy's slot if it had
-            // to: the height every later edit and the superblock take.
-            self.heights[super::meta::Tree::Space as usize][f.pid.class().index()] = space;
-            f.edited = true;
-            if let Some(count) = f.settles {
-                cp.pool.settled(f.pid, count);
-            }
+        self.meta.extend(edited.iter().copied());
+        // The cut's free space as the edit left it, grown to reach the copy's slot if it had to:
+        // the height every later edit and the superblock take.
+        self.heights[super::meta::Tree::Space as usize][f.pid.class().index()] = edited.space;
+        if let Some(count) = f.settles {
+            cp.pool.settled(f.pid, count);
         }
         self.flying_bytes -= f.bytes;
         self.flying.swap_remove(i);
@@ -2617,6 +2650,15 @@ mod tests {
 
     /// A database whose writers step its checkpoints, on `io`.
     fn open(io: &Arc<dyn crate::io::IO>) -> crate::storage::atoll::db::Atoll {
+        open_meta(io, 1 << 10)
+    }
+
+    /// A database whose metadata cache keeps `meta_pages` pages, and so as many reads with its
+    /// backend at a time.
+    fn open_meta(
+        io: &Arc<dyn crate::io::IO>,
+        meta_pages: usize,
+    ) -> crate::storage::atoll::db::Atoll {
         use crate::storage::atoll::buffer::{BufferConfig, MIN_DB_BUDGET, WRITEBACK_BYTES};
         use crate::storage::atoll::db::{Atoll, AtollConfig};
         use crate::storage::atoll::log::LogConfig;
@@ -2631,7 +2673,7 @@ mod tests {
             },
             store: StoreConfig {
                 file_bytes: 1 << 30,
-                meta_pages: 1 << 10,
+                meta_pages,
             },
             buffer: BufferConfig {
                 budget: MIN_DB_BUDGET,
@@ -3013,6 +3055,84 @@ mod tests {
         assert_eq!(at_end, Some(0), "held element by element as it ended");
     }
 
+    /// A landed write whose page table edit waited is the next one landed, whatever lands
+    /// meanwhile: a write landed ahead of it in the flight set does not take its place, so the
+    /// pages its edit keeps are never let go for another's (the auditor's #4606; mutant: the first
+    /// landed write taken again). The run's size is printed for the record.
+    #[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+    #[test]
+    fn a_landing_whose_edit_waited_is_the_next_one_made() {
+        use crate::io::IO as _;
+        use crate::storage::atoll::testing::drive;
+        let crash = Arc::new(crate::io::crash::CrashIO::new(0));
+        let io: Arc<dyn crate::io::IO> = crash.clone();
+        let db = open_meta(&io, 1);
+        let store = db.store().clone();
+        let class = page::SizeClass::new(0).unwrap();
+        let a = drive(&io, || store.allocate(class)).unwrap();
+        let b = drive(&io, || store.allocate(class)).unwrap();
+        // Every metadata page written, so clean and evictable.
+        let cp = db.checkpointer();
+        let mut ticket = cp.request_full();
+        let checkpointed = drive(&io, || cp.step_full(&mut ticket, db.transactions())).is_ok();
+        drop(ticket);
+        let n = cp.superblock().checkpoint + 1;
+        let (_, heights) = store.begin_cut(n);
+        let leaf = super::super::radix::path(
+            super::super::meta::Tree::Map,
+            class,
+            heights[super::super::meta::Tree::Map as usize][0],
+            a.number(),
+        )[0];
+        store.meta().evict(leaf);
+        let flight = |pid, slot| {
+            let landed = crate::storage::atoll::notify::wait();
+            landed.complete(0);
+            Flying {
+                pid,
+                slot,
+                write: Completion::new_yield(),
+                landed,
+                outcome: Arc::new(Mutex::new(Some(Ok(())))),
+                bytes: 0,
+                settles: None,
+            }
+        };
+        let mut run = Run::new(n, None);
+        run.heights = heights;
+        run.flying.push(flight(a, 1000));
+        let first = matches!(run.land_one(cp), Ok(IOResult::IO(_)));
+        // A write landed ahead of it in the flight set.
+        run.flying.insert(0, flight(b, 1001));
+        let mut landed = false;
+        for _ in 0..8 {
+            match run.land_one(cp) {
+                Ok(IOResult::Done(true)) => {
+                    landed = true;
+                    break;
+                }
+                Ok(IOResult::IO(_)) => {
+                    while crash.in_flight() > 0 {
+                        crash.step().unwrap();
+                    }
+                }
+                _ => break,
+            }
+        }
+        let left: Vec<PageId> = run.flying.iter().map(|f| f.pid).collect();
+        let size = std::mem::size_of::<Run>();
+        drop(run);
+        drop((store, db));
+        eprintln!(
+            "Run={size} bytes, of which two edits of the cut {}",
+            2 * std::mem::size_of::<CutEdit>()
+        );
+        assert!(checkpointed, "the fixture's checkpoint failed");
+        assert!(first, "the first landing's edit did not wait");
+        assert!(landed, "no landing made");
+        assert_eq!(left, vec![b], "the write left in flight once one landed");
+    }
+
     /// Every field of a checkpoint's run is let go of within a unit's budget (DESIGN.md 22.1, the
     /// auditor's #4350): released a run a unit before the run ends, whether it finishes or fails;
     /// a bound's worth at most; one free whatever its length, its elements needing no drop; or
@@ -3023,8 +3143,11 @@ mod tests {
         use std::collections::{HashSet, VecDeque};
         use std::mem::needs_drop;
         const A_RUN_A_UNIT: &[&str] = &["frames", "meta", "dirty"];
-        // `writing`, `flying` and `syncing` are held to `WRITES`; `imaging` to one page.
-        const BOUNDED: &[&str] = &["writing", "flying", "syncing", "imaging"];
+        // `writing`, `flying` and `syncing` are held to `WRITES`; `imaging` to one page;
+        // `landing` and `leaving` to one edit of the cut each, `CUT_PAGES` frames at most.
+        const BOUNDED: &[&str] = &[
+            "writing", "flying", "syncing", "imaging", "landing", "leaving",
+        ];
         const ONE_FREE: &[&str] = &[
             "set_aside",
             "queue",

@@ -40,10 +40,10 @@ use super::bits::GrowBits;
 use super::buffer::Exclusive;
 use super::checkpoint::WRITES;
 use super::epoch::{Epochs, HeldBack, Retired};
-use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, Tree, TREES};
+use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, PageSet, Polled, Ready, Tree, TREES};
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
-use super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
+use super::radix::{self, ALLOCATED, FREE, MAX_HEIGHT, SLOT_BASE};
 use super::segmented::{Next, Segmented};
 use super::shared::Writer;
 use super::stack::Chain;
@@ -259,6 +259,105 @@ impl Drop for Claim<'_> {
     }
 }
 
+/// The metadata pages a checkpoint's edit of its cut latches, before any is found twice: the page
+/// table's path to the page as of the cut, the free space's to its new slot and its old one, and
+/// the cut's free-space roots from the one it had up, where its new slot lies past it, each
+/// `MAX_HEIGHT` pages at most. The page as it stands needs only its leaf, the same page at every
+/// height and so on the cut's path: its entry moves from one in use to another, which no count
+/// above it sees.
+pub const CUT_PAGES: usize = 4 * MAX_HEIGHT as usize;
+
+/// An owner's store edit under way (DESIGN.md 22.18): its state kept only while its last call
+/// waited, and only for that call's key. A call for another key drops it first, every frame it
+/// held with it, and a call done or failed drops it after, so an edit never takes over an older
+/// one's pages.
+pub struct Edit<K: Copy + Eq, S: Default> {
+    key: Option<K>,
+    state: S,
+}
+
+impl<K: Copy + Eq, S: Default> Default for Edit<K, S> {
+    fn default() -> Self {
+        Self {
+            key: None,
+            state: S::default(),
+        }
+    }
+}
+
+impl<K: Copy + Eq, S: Default> Edit<K, S> {
+    /// The key of the edit whose last call waited, if one did.
+    pub fn pending(&self) -> Option<K> {
+        self.key
+    }
+
+    fn poll<R>(
+        &mut self,
+        key: K,
+        step: impl FnOnce(&mut S) -> Result<IOResult<R>>,
+    ) -> Result<IOResult<R>> {
+        if self.key != Some(key) {
+            self.state = S::default();
+            self.key = Some(key);
+        }
+        let out = step(&mut self.state);
+        if !matches!(out, Ok(IOResult::IO(_))) {
+            self.state = S::default();
+            self.key = None;
+        }
+        out
+    }
+}
+
+/// What makes one edit of a checkpoint's cut that edit: the checkpoint, the page and the slot of
+/// its new copy (none for a page left out). The cut's heights are its layout, read on every poll:
+/// the free space's may grow while it waits (the auditor's #4627).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CutKey {
+    n: u64,
+    pid: PageId,
+    slot: Option<u64>,
+}
+
+impl CutKey {
+    /// Whether this is the edit of the landed write of `pid`'s copy to `slot`.
+    pub fn landing(&self, pid: PageId, slot: u64) -> bool {
+        self.pid == pid && self.slot == Some(slot)
+    }
+
+    fn of(n: u64, pid: PageId, slot: Option<u64>) -> Self {
+        Self { n, pid, slot }
+    }
+}
+
+/// An edit of a checkpoint's cut under way: its pages, and its page's entry as of the cut once
+/// read, checked again under the latches.
+#[derive(Default)]
+pub struct CutState {
+    old: Option<u64>,
+    pages: PageSet<CUT_PAGES>,
+}
+
+/// A checkpoint's edit of its cut under way, kept across its polls by the checkpoint.
+pub type CutEdit = Edit<CutKey, CutState>;
+
+/// The metadata pages an edit of a cut latched and changed, each once, in id order, and the
+/// height of the cut's free space for its page's class as the edit left it.
+#[derive(Clone, Copy, Debug)]
+pub struct Edited {
+    ids: [MetaId; CUT_PAGES],
+    len: usize,
+    pub space: u8,
+}
+
+impl std::ops::Deref for Edited {
+    type Target = [MetaId];
+
+    fn deref(&self) -> &[MetaId] {
+        &self.ids[..self.len]
+    }
+}
+
 /// A change of several pages inside the change gate ([`PageStore::change`]): it leaves the gate
 /// when dropped.
 pub struct Change<'a> {
@@ -288,6 +387,11 @@ impl PageStore {
         heights: [[u8; CLASS_COUNT]; TREES],
         in_charge: u64,
     ) -> Arc<Self> {
+        // The superblock's are refused past it, and a new store's trees are one level high.
+        assert!(
+            heights.iter().flatten().all(|&h| h <= MAX_HEIGHT),
+            "tree heights {heights:?} past the {MAX_HEIGHT} levels a tree has"
+        );
         let epochs = Arc::new(Epochs::new());
         let meta = Arc::new(MetaCache::new(
             io.clone(),
@@ -1007,42 +1111,44 @@ impl PageStore {
 
     /// Checkpoint `n`, cut at `heights`, wrote `pid`'s copy to `slot`: the page table names it as
     /// of the cut, and as it stands unless `pid` was freed since; the copy it replaces is freed
-    /// as of the cut, and as it stands once `n` is durable. Returns the metadata pages edited, and
-    /// the height of the cut's free space for `pid`'s class once it reaches `slot`: a slot taken
-    /// since the cut can lie past it, and the cut's tree grows to reach it (#4620). Step it until
-    /// done.
+    /// as of the cut, and as it stands once `n` is durable. Returns the metadata pages edited.
+    /// Step it until done, `edit` kept across its polls.
     pub fn copied(
         self: &Arc<Self>,
         n: u64,
         heights: &[[u8; CLASS_COUNT]; TREES],
         pid: PageId,
         slot: u64,
-    ) -> Result<IOResult<(Vec<MetaId>, u8)>> {
-        self.edit_cut(n, heights, pid, Some(slot))
+        edit: &mut CutEdit,
+    ) -> Result<IOResult<Edited>> {
+        let key = CutKey::of(n, pid, Some(slot));
+        edit.poll(key, |state| self.edit_cut(key, heights, state))
     }
 
     /// Checkpoint `n`, cut at `heights`, leaves `pid` out: free as of the cut, and its copy's slot
     /// with it; as it stands, nothing changes. Returns the metadata pages edited. Step it until
-    /// done.
+    /// done, `edit` kept across its polls.
     pub fn left_out(
         self: &Arc<Self>,
         n: u64,
         heights: &[[u8; CLASS_COUNT]; TREES],
         pid: PageId,
-    ) -> Result<IOResult<Vec<MetaId>>> {
-        Ok(match self.edit_cut(n, heights, pid, None)? {
-            IOResult::Done((edited, _)) => IOResult::Done(edited),
-            IOResult::IO(io) => IOResult::IO(io),
-        })
+        edit: &mut CutEdit,
+    ) -> Result<IOResult<Edited>> {
+        let key = CutKey::of(n, pid, None);
+        edit.poll(key, |state| self.edit_cut(key, heights, state))
     }
 
+    /// One poll of the edit `key` names, at the cut's heights as they stand, its pages kept in
+    /// `state` across its waits for a page's read and for a latch (DESIGN.md 22.18): pages both
+    /// heights name are kept where the cut's free space grew between two polls.
     fn edit_cut(
-        self: &Arc<Self>,
-        n: u64,
+        &self,
+        key: CutKey,
         heights: &[[u8; CLASS_COUNT]; TREES],
-        pid: PageId,
-        slot: Option<u64>,
-    ) -> Result<IOResult<(Vec<MetaId>, u8)>> {
+        state: &mut CutState,
+    ) -> Result<IOResult<Edited>> {
+        let CutKey { n, pid, slot } = key;
         let (class, number) = (pid.class(), pid.number());
         let cut_map = heights[Tree::Map as usize][class.index()];
         let cut_space = heights[Tree::Space as usize][class.index()];
@@ -1061,36 +1167,55 @@ impl PageStore {
             }
             _ => cut_space,
         };
-        // The entry as of the cut names the slot to free; read first, then everything latched.
-        let old = match self.cut_entry(n, cut_map, pid)? {
-            IOResult::Done(e) => e,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        // The entry as of the cut names the slot to free: read first, off its leaf held, then kept
+        // for the edit and checked again under the latches.
+        let old = match state.old {
+            Some(old) => old,
+            None if number >= radix::capacity(Tree::Map, cut_map) => *state.old.insert(FREE),
+            None => {
+                let path = radix::path(Tree::Map, class, cut_map, number);
+                state.pages.aim(path.iter().copied())?;
+                let ready = match state.pages.poll(&self.meta)? {
+                    Polled::Ready(ready) => ready,
+                    Polled::Wait(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
+                };
+                let leaf = ready
+                    .frame(path[0])
+                    .expect("a ready set holds every page it names");
+                match leaf.read_cut(
+                    n,
+                    |b| radix::map_entry(b, number),
+                    |b| radix::map_entry(b, number),
+                ) {
+                    Some(old) => *state.old.insert(old),
+                    None => return Ok(IOResult::IO(IOCompletions(leaf.wait_while_held()))),
+                }
+            }
         };
         let old_slot = old.checked_sub(SLOT_BASE);
-        let live_map = self.height(Tree::Map, class);
-        let mut ids = radix::path(Tree::Map, class, cut_map, number);
-        ids.extend(radix::path(Tree::Map, class, live_map, number));
-        for s in [slot, old_slot].into_iter().flatten() {
-            ids.extend(radix::path(Tree::Space, class, space, s));
-        }
+        let cut_path = radix::path(Tree::Map, class, cut_map, number);
+        let spaces = [slot, old_slot].map(|s| s.map(|s| radix::path(Tree::Space, class, space, s)));
         // The cut's roots, from the one it had up: each new one counts what the one below counts.
-        if space > cut_space {
-            ids.extend((cut_space..=space).map(|h| radix::root(Tree::Space, class, h)));
-        }
-        let frames = match self.meta.get_all(&ids)? {
-            IOResult::Done(f) => f,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        let roots = (cut_space..=space)
+            .filter(|_| space > cut_space)
+            .map(|h| radix::root(Tree::Space, class, h));
+        state.pages.aim(
+            cut_path
+                .iter()
+                .chain(spaces.iter().flatten().flat_map(|path| path.iter()))
+                .copied()
+                .chain(roots),
+        )?;
+        let ready = match state.pages.poll(&self.meta)? {
+            Polled::Ready(ready) => ready,
+            Polled::Wait(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
-        let mut locked = match Locked::new(&frames) {
+        let mut locked = match Locked::of(ready) {
             Ok(locked) => locked,
             Err(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
         };
-        if self.height(Tree::Map, class) != live_map {
-            locked.release_unchanged();
-            return Ok(busy());
-        }
-        let path = radix::path(Tree::Map, class, cut_map, number);
-        if locked.cut_of(path[0], |b| radix::map_entry(b, number)) != old {
+        let leaf = cut_path[0];
+        if locked.cut_of(leaf, |b| radix::map_entry(b, number)) != old {
             // A free since the read cannot change the cut: only this checkpoint edits it.
             locked.release_unchanged();
             return Err(LimboError::InternalError(format!(
@@ -1115,8 +1240,7 @@ impl PageStore {
         if let Some(o) = old_slot {
             set_space_cut(&mut locked, class, space, o, false);
         }
-        let live_path = radix::path(Tree::Map, class, live_map, number);
-        let live = radix::map_entry(locked.page_of(live_path[0]), number);
+        let live = radix::map_entry(locked.page_of(leaf), number);
         let mut deferred = self.deferred.lock();
         match (slot, live) {
             // Freed since the cut: the free waits for checkpoint n + 1, and so does the copy.
@@ -1124,8 +1248,9 @@ impl PageStore {
                 .entry(n + 1)
                 .or_default()
                 .push_back(Deferred::Slot(class, s)),
-            (Some(s), live) => {
-                set_map(&mut locked, Tree::Map, number, live, s + SLOT_BASE);
+            (Some(s), _) => {
+                // From one entry in use to another: no count above the leaf moves.
+                radix::set_map_entry(locked.page_of(leaf), number, s + SLOT_BASE);
                 if let Some(o) = old_slot {
                     deferred
                         .entry(n)
@@ -1137,31 +1262,9 @@ impl PageStore {
             (None, _) => {}
         }
         drop(deferred);
-        let edited = locked.ids.clone();
+        let edited = locked.edited(space);
         locked.commit(&self.meta);
-        Ok(IOResult::Done((edited, space)))
-    }
-
-    /// `pid`'s page-table entry as of checkpoint `n`'s cut, at map height `height`.
-    fn cut_entry(self: &Arc<Self>, n: u64, height: u8, pid: PageId) -> Result<IOResult<u64>> {
-        let (class, number) = (pid.class(), pid.number());
-        if number >= radix::capacity(Tree::Map, height) {
-            return Ok(IOResult::Done(FREE));
-        }
-        let leaf = radix::path(Tree::Map, class, height, number)[0];
-        let frame = match self.meta.get(leaf)? {
-            IOResult::Done(f) => f,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
-        };
-        let read = frame.read_cut(
-            n,
-            |b| radix::map_entry(b, number),
-            |b| radix::map_entry(b, number),
-        );
-        Ok(match read {
-            Some(e) => IOResult::Done(e),
-            None => IOResult::IO(IOCompletions(frame.wait_while_held())),
-        })
+        Ok(IOResult::Done(edited))
     }
 
     /// Every slot whose free waits for a checkpoint: in use in the free space until then.
@@ -1445,6 +1548,13 @@ impl PageStore {
             Err(grown) => return Ok(IOResult::IO(IOCompletions(grown))),
         };
         let height = self.height(tree, class);
+        if height >= MAX_HEIGHT {
+            return Err(LimboError::InternalError(format!(
+                "the {tree:?} tree of class {} is {height} levels high, the most a tree has: it \
+                 grows no further",
+                class.index()
+            )));
+        }
         let old_root = radix::root(tree, class, height);
         let new_root = radix::root(tree, class, height + 1);
         let frames = match self.meta.get_all(&[old_root, new_root])? {
@@ -1699,68 +1809,127 @@ pub(super) fn directory(base: &str) -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
-/// Metadata pages latched together, in the order of their ids, or none of them.
+/// The widest group of metadata pages latched at once: an edit of a cut's.
+const LOCKED: usize = CUT_PAGES;
+
+/// Metadata pages latched together, in the order of their ids, each once, or none of them. It
+/// borrows the frames an edit or a call holds, so no latch outlives the call that took it.
 struct Locked<'a> {
-    ids: Vec<MetaId>,
-    holds: Vec<MetaHold<'a>>,
-    frames: Vec<&'a MetaRef>,
+    /// `holds[..len]`, each held, in id order.
+    holds: [Option<MetaHold<'a>>; LOCKED],
+    len: usize,
 }
 
 impl<'a> Locked<'a> {
-    /// Latches every page of `frames`, or returns the held page's release signal with all
-    /// earlier holds released, so the caller waits while holding none of them.
+    /// Latches every page of `ready`, held in id order, or returns the held page's release signal
+    /// with all earlier holds released: the caller waits holding no latch, its frames kept.
+    fn of<const N: usize>(ready: Ready<'a, N>) -> std::result::Result<Self, Completion> {
+        const { assert!(N <= LOCKED, "a set of pages wider than a latch group") };
+        Self::latch(ready.frames())
+    }
+
+    /// Latches every page of `frames`, as `get_all` handed them over to a caller that keeps
+    /// nothing across its polls (a path, or a growth's two roots), or returns the held page's
+    /// release signal with all earlier holds released.
     fn new(frames: &'a [MetaRef]) -> std::result::Result<Self, Completion> {
-        let mut order: Vec<&MetaRef> = frames.iter().collect();
-        order.sort_by_key(|f| f.id);
-        order.dedup_by_key(|f| f.id);
-        let mut holds = Vec::with_capacity(order.len());
-        for f in &order {
-            match f.try_lock() {
-                Some(hold) => holds.push(hold),
+        assert!(
+            frames.len() <= LOCKED,
+            "{} metadata pages latched at once, past the {LOCKED} a group holds",
+            frames.len()
+        );
+        let mut order: [Option<&'a MetaRef>; LOCKED] = [None; LOCKED];
+        for (at, frame) in frames.iter().enumerate() {
+            order[at] = Some(frame);
+        }
+        let order = &mut order[..frames.len()];
+        order.sort_unstable_by_key(|frame| frame.map(|f| f.id));
+        let mut last = None;
+        Self::latch(order.iter().flatten().copied().filter(move |frame| {
+            let fresh = last != Some(frame.id);
+            last = Some(frame.id);
+            fresh
+        }))
+    }
+
+    /// Latches `frames`, in id order and each once.
+    fn latch(frames: impl Iterator<Item = &'a MetaRef>) -> std::result::Result<Self, Completion> {
+        let mut holds: [Option<MetaHold<'a>>; LOCKED] = std::array::from_fn(|_| None);
+        let mut len = 0;
+        for frame in frames {
+            match frame.try_lock() {
+                Some(hold) => {
+                    holds[len] = Some(hold);
+                    len += 1;
+                }
                 None => {
-                    let wait = f.wait_while_held();
+                    let wait = frame.wait_while_held();
                     // Nothing was written: readers are not sent back. All earlier holds go
                     // before the caller waits, and none of them can finish this frame's signal.
-                    holds.into_iter().for_each(MetaHold::release_unchanged);
+                    holds
+                        .into_iter()
+                        .flatten()
+                        .for_each(MetaHold::release_unchanged);
                     return Err(wait);
                 }
             }
         }
-        Ok(Self {
-            ids: order.iter().map(|f| f.id).collect(),
-            holds,
-            frames: order,
-        })
+        Ok(Self { holds, len })
     }
 
     /// Lets every latch go, nothing written.
     fn release_unchanged(self) {
-        self.holds.into_iter().for_each(MetaHold::release_unchanged);
+        self.holds
+            .into_iter()
+            .flatten()
+            .for_each(MetaHold::release_unchanged);
+    }
+
+    /// The pages latched, in id order.
+    fn ids(&self) -> impl Iterator<Item = MetaId> + '_ {
+        self.holds[..self.len].iter().flatten().map(MetaHold::id)
     }
 
     fn index(&self, id: MetaId) -> usize {
-        self.ids
-            .iter()
-            .position(|&x| x == id)
-            .unwrap_or_else(|| panic!("{id:?} is not latched"))
+        self.holds[..self.len]
+            .binary_search_by_key(&Some(id), |hold| hold.as_ref().map(MetaHold::id))
+            .unwrap_or_else(|_| panic!("{id:?} is not latched"))
+    }
+
+    fn hold(&mut self, id: MetaId) -> &mut MetaHold<'a> {
+        let i = self.index(id);
+        self.holds[i]
+            .as_mut()
+            .expect("every hold of a group below its length")
     }
 
     fn page_of(&mut self, id: MetaId) -> &mut Writer<'a> {
-        let i = self.index(id);
-        self.holds[i].page()
+        self.hold(id).page()
     }
 
     /// `f` over page `id` as it stood at the cut in effect, which a hold taken during a cut keeps.
     fn cut_of<R>(&mut self, id: MetaId, f: impl FnOnce(&mut [u8]) -> R) -> R {
-        let i = self.index(id);
-        self.holds[i]
+        self.hold(id)
             .with_cut(f)
             .unwrap_or_else(|| panic!("{id:?} has no copy as of the cut"))
     }
 
+    /// The pages latched, for an edit of a cut to name as edited, the cut's free space `space`
+    /// levels high as it leaves it.
+    fn edited(&self, space: u8) -> Edited {
+        let mut ids = [self.ids().next().expect("a group latches a page"); CUT_PAGES];
+        for (at, id) in self.ids().enumerate() {
+            ids[at] = id;
+        }
+        Edited {
+            ids,
+            len: self.len,
+            space,
+        }
+    }
+
     /// Marks every page dirty and lets the latches go.
     fn commit(self, cache: &MetaCache) {
-        for hold in self.holds {
+        for hold in self.holds.into_iter().flatten() {
             hold.commit(cache);
         }
     }
@@ -1769,10 +1938,9 @@ impl<'a> Locked<'a> {
 /// Sets `number`'s page-table entry from `from` to `to` as it stands, counting it in or out of use
 /// above.
 fn set_map(locked: &mut Locked<'_>, tree: Tree, number: u64, from: u64, to: u64) {
-    let class = locked.frames[0].id.class;
+    let class = locked.ids().next().expect("a group latches a page").class;
     let height = locked
-        .ids
-        .iter()
+        .ids()
         .filter(|id| id.tree == tree)
         .map(|id| id.level + 1)
         .max()
@@ -1794,8 +1962,7 @@ fn set_map(locked: &mut Locked<'_>, tree: Tree, number: u64, from: u64, to: u64)
 /// Marks `slot` in use or free as it stands, counting it above.
 fn set_space(locked: &mut Locked<'_>, class: SizeClass, slot: u64, used: bool) {
     let height = locked
-        .ids
-        .iter()
+        .ids()
         .filter(|id| id.tree == Tree::Space && id.class == class)
         .map(|id| id.level + 1)
         .max()

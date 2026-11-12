@@ -85,9 +85,9 @@ pub struct MetaId {
 const META_BIT: u64 = 1 << 55;
 const TREE_SHIFT: u32 = 53;
 const CLASS_SHIFT: u32 = 49;
-const INDEX_BITS: u32 = 46;
+pub(super) const INDEX_BITS: u32 = 46;
 /// Levels an id has room for, in the bits between its index and its class.
-const LEVELS: usize = 1 << (CLASS_SHIFT - INDEX_BITS);
+pub(super) const LEVELS: usize = 1 << (CLASS_SHIFT - INDEX_BITS);
 
 impl MetaId {
     /// The id sealed into the page: a class-0 page id in a number range data pages never use.
@@ -482,6 +482,11 @@ pub struct MetaHold<'a> {
 }
 
 impl<'a> MetaHold<'a> {
+    /// The page latched.
+    pub fn id(&self) -> MetaId {
+        self.frame.id
+    }
+
     pub fn page(&mut self) -> &mut Writer<'a> {
         &mut self.page
     }
@@ -634,16 +639,20 @@ enum Joined {
 /// made, and each page's frame from the look that found it in memory or loading, a load this
 /// collection started or joined included, so that no eviction takes one between the caller's polls.
 /// It holds frames, never a latch or a credit. Each poll looks again only at the pages it found
-/// loading, as many at most as the cache's reads with the backend, and admits the next pages until
-/// one is refused a read credit, which holds nothing while it waits: a page is looked at once to be
-/// admitted and once more each poll it is still loading, whatever the list's width.
+/// loading and has not yet seen in memory, as many at most as the pages it has admitted (a read
+/// that lands between two polls leaves its page on that list, so it can outnumber the reads with
+/// the backend), and admits the next pages until one is refused a read credit, which holds nothing
+/// while it waits. A page is looked at once to be admitted and once more each poll it is still on
+/// that list: under one credit, polled once each read lands, a list of N pages is collected in
+/// N + 1 polls and 3N - 1 looks.
 pub struct Collection {
     ids: Vec<MetaId>,
     /// The frame of every page admitted.
     frames: Vec<Option<MetaRef>>,
     /// Pages admitted, from the list's start.
     admitted: usize,
-    /// The admitted pages a look found loading, not yet seen in memory.
+    /// The admitted pages a look found loading and no look has yet seen in memory, whether or not
+    /// their reads have landed since.
     loading: Vec<usize>,
     /// Looks made, for a test.
     #[cfg(test)]
@@ -755,6 +764,191 @@ impl Collection {
     #[cfg(test)]
     pub fn looks(&self) -> usize {
         self.looks
+    }
+}
+
+/// The metadata pages one store edit latches together, kept across its polls and its latch waits
+/// (DESIGN.md 22.18): `N` at most, in id order, each once, held inline. It holds frames, never a
+/// latch or a credit. [`PageSet::aim`] names its pages, a frame of a page still named kept and
+/// every other let go. A poll looks again at each page it found loading and has not yet seen in
+/// memory, and admits each page it holds no frame of, in id order, until one is refused a read
+/// credit, which holds nothing while it waits: a page held and seen in memory is not looked at
+/// again.
+pub struct PageSet<const N: usize> {
+    /// Its pages, `ids[..len]`, in id order, each once.
+    ids: [MetaId; N],
+    /// The frame of each page admitted, at its page's place.
+    frames: [Option<MetaRef>; N],
+    len: usize,
+    /// A bit a place: a page a look found loading and no look has yet seen in memory.
+    loading: u64,
+    /// Looks made, for a test.
+    #[cfg(test)]
+    looks: usize,
+}
+
+/// What a poll of a [`PageSet`] came to.
+pub enum Polled<'a, const N: usize> {
+    /// A page still owed: the wait its load, or a read credit's give-back, finishes.
+    Wait(Completion),
+    /// Every page in memory and held.
+    Ready(Ready<'a, N>),
+}
+
+/// Every page of a [`PageSet`] in memory and held: made only by its poll.
+#[derive(Clone, Copy)]
+pub struct Ready<'a, const N: usize>(&'a PageSet<N>);
+
+impl<const N: usize> Default for PageSet<N> {
+    fn default() -> Self {
+        const { assert!(N <= u64::BITS as usize, "a set's places have a bit each") };
+        let unset = MetaId {
+            tree: Tree::Map,
+            class: SizeClass::new(0).expect("class 0"),
+            level: 0,
+            index: 0,
+        };
+        Self {
+            ids: [unset; N],
+            frames: std::array::from_fn(|_| None),
+            len: 0,
+            loading: 0,
+            #[cfg(test)]
+            looks: 0,
+        }
+    }
+}
+
+impl<const N: usize> PageSet<N> {
+    /// Names the set's pages, each once whatever `pages` repeats: the frame of a page still named
+    /// is kept, moved to its place, every other frame is let go, and no page is looked at. More
+    /// than `N` pages is refused.
+    pub fn aim(&mut self, pages: impl IntoIterator<Item = MetaId>) -> Result<()> {
+        let mut ids = self.ids;
+        let mut len = 0;
+        for id in pages {
+            let at = match ids[..len].binary_search(&id) {
+                Ok(_) => continue,
+                Err(at) => at,
+            };
+            if len == N {
+                return Err(LimboError::InternalError(format!(
+                    "a set of {N} metadata pages aimed at more, {id:?} among them"
+                )));
+            }
+            ids.copy_within(at..len, at + 1);
+            ids[at] = id;
+            len += 1;
+        }
+        if ids[..len] == self.ids[..self.len] {
+            return Ok(());
+        }
+        let mut frames: [Option<MetaRef>; N] = std::array::from_fn(|_| None);
+        let mut loading = 0;
+        for (at, id) in ids[..len].iter().enumerate() {
+            if let Ok(was) = self.ids[..self.len].binary_search(id) {
+                frames[at] = self.frames[was].take();
+                loading |= ((self.loading >> was) & 1) << at;
+            }
+        }
+        // The frames of pages no longer named go with the old places.
+        self.frames = frames;
+        self.ids = ids;
+        self.len = len;
+        self.loading = loading;
+        Ok(())
+    }
+
+    /// One poll: every page in memory and held, or the wait a page still owes. An error lets go of
+    /// every frame held.
+    pub fn poll(&mut self, cache: &Arc<MetaCache>) -> Result<Polled<'_, N>> {
+        match self.owed(cache) {
+            Ok(Some(wait)) => Ok(Polled::Wait(wait)),
+            Ok(None) => Ok(Polled::Ready(Ready(self))),
+            Err(e) => {
+                self.release();
+                Err(e)
+            }
+        }
+    }
+
+    fn owed(&mut self, cache: &Arc<MetaCache>) -> Result<Option<Completion>> {
+        let mut wait = None;
+        let mut refused = false;
+        for at in 0..self.len {
+            let held = self.frames[at].is_some();
+            if (held && (self.loading >> at) & 1 == 0) || (!held && refused) {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.looks += 1;
+            }
+            match cache.join(self.ids[at])? {
+                Joined::Ready(frame) => {
+                    self.frames[at] = Some(frame);
+                    self.loading &= !(1 << at);
+                }
+                Joined::Loading(frame, loaded) => {
+                    self.frames[at] = Some(frame);
+                    self.loading |= 1 << at;
+                    wait.get_or_insert(loaded);
+                }
+                // The credits are out: the pages after it wait for one, holding nothing. Met for
+                // a page held only once its frame failed and another look forgot it.
+                Joined::Refused(returned) => {
+                    self.frames[at] = None;
+                    self.loading &= !(1 << at);
+                    wait.get_or_insert(returned);
+                    refused = true;
+                }
+            }
+        }
+        Ok(wait)
+    }
+
+    /// Lets go of every frame held, its pages still named.
+    pub fn release(&mut self) {
+        self.frames = std::array::from_fn(|_| None);
+        self.loading = 0;
+    }
+
+    /// Frames held, for a test.
+    #[cfg(test)]
+    pub fn held(&self) -> usize {
+        self.frames.iter().flatten().count()
+    }
+
+    /// Looks made at its pages, for a test.
+    #[cfg(test)]
+    pub fn looks(&self) -> usize {
+        self.looks
+    }
+
+    /// The pages it holds a frame of, for a test.
+    #[cfg(test)]
+    pub fn held_ids(&self) -> Vec<MetaId> {
+        (0..self.len)
+            .filter(|&at| self.frames[at].is_some())
+            .map(|at| self.ids[at])
+            .collect()
+    }
+}
+
+impl<'a, const N: usize> Ready<'a, N> {
+    /// Its frames in id order, each once.
+    pub fn frames(self) -> impl Iterator<Item = &'a MetaRef> {
+        let set = self.0;
+        set.frames[..set.len]
+            .iter()
+            .map(|frame| frame.as_ref().expect("every page of a ready set held"))
+    }
+
+    /// `id`'s frame, if the set names it.
+    pub fn frame(self, id: MetaId) -> Option<&'a MetaRef> {
+        let set = self.0;
+        let at = set.ids[..set.len].binary_search(&id).ok()?;
+        set.frames[at].as_ref()
     }
 }
 
@@ -1276,6 +1470,16 @@ impl MetaCache {
     #[cfg(test)]
     pub fn resident(&self) -> usize {
         self.cells.count()
+    }
+
+    /// Whether `id`'s page is in memory, for a test.
+    #[cfg(test)]
+    pub fn in_memory(&self, id: MetaId) -> bool {
+        let Some(cell) = self.files[id.file_index()].frames.get(id.index) else {
+            return false;
+        };
+        let step = self.epochs.enter();
+        cell.get(&step, &self.cells).is_some()
     }
 
     /// Drops `id`'s page if it is in memory, clean and held by no one, as an eviction over the

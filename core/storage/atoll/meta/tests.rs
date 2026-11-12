@@ -1966,9 +1966,9 @@ fn a_collection_keeps_its_frames_across_polls_so_no_eviction_between_takes_one()
 
 /// A collection wider than the cache's read credits, one credit here, looks at each page once to
 /// admit it and once more each poll the page is still loading, and stops admitting at the first page
-/// refused a credit: 64 pages are collected in 65 polls and 3 x 64 - 1 looks, never a look again at
-/// every page each poll (the auditor's #4595; mutants: admitting on past a refusal, and looking again
-/// at every admitted page).
+/// refused a credit: 64 pages are collected in 65 polls and 3 x 64 - 1 looks at most, the count made
+/// printed, never a look again at every page each poll (the auditor's #4595 and #4614; mutants:
+/// admitting on past a refusal, and looking again at every admitted page).
 #[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
 #[test]
 fn a_collection_wider_than_its_credits_looks_at_each_page_a_bounded_number_of_times() {
@@ -2010,9 +2010,84 @@ fn a_collection_wider_than_its_credits_looks_at_each_page_a_bounded_number_of_ti
         PAGES + 1,
         "polls to collect {PAGES} pages under one credit"
     );
-    assert_eq!(
-        looks,
-        3 * PAGES as usize - 1,
-        "looks to collect {PAGES} pages under one credit"
+    eprintln!("{PAGES} pages under one credit: {polls} polls, {looks} looks");
+    assert!(
+        looks <= 3 * PAGES as usize - 1,
+        "{looks} looks to collect {PAGES} pages under one credit"
     );
+}
+
+/// A `get_all` whose pages are all in memory allocates no more than its result, whatever its
+/// width: 64 calls over 1, 4 and 16 pages make 64 allocations at most each, the count made printed
+/// (the auditor's #4605 and #4614; mutant: the helper copying its ids, as 1c11df555's did).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_get_all_over_pages_in_memory_allocates_only_its_result() {
+    for width in [1u64, 4, 16] {
+        let cache = cache(Arc::new(TestIO::new(0)));
+        let ids: Vec<_> = (0..width).map(id).collect();
+        for &id in &ids {
+            drop(cache.get(id).unwrap());
+        }
+        let before = crate::storage::atoll::testing::allocations();
+        let mut ready = 0;
+        for _ in 0..64 {
+            if let Ok(IOResult::Done(frames)) = cache.get_all(&ids) {
+                ready += usize::from(frames.len() == ids.len());
+            }
+        }
+        let made = crate::storage::atoll::testing::allocations() - before;
+        // Every assertion with the cache dropped.
+        drop(cache);
+        eprintln!("get_all over {width} pages in memory: 64 calls, {made} allocations");
+        assert_eq!(
+            ready, 64,
+            "calls over {width} pages in memory that were served"
+        );
+        assert!(
+            made <= 64,
+            "{made} allocations of 64 calls over {width} pages in memory"
+        );
+    }
+}
+
+/// A set aimed again keeps a frame still loading at its page's new place, still owed a look: here
+/// a page loading at the first place moves to the second once a page before it, in memory, is
+/// named, and the set is not ready until a look sees the moved page in memory (the auditor's review
+/// of M2b; mutants: the loading marks left at their old places, and the frames let go at an aim).
+#[cfg(all(not(shuttle), not(atoll_loom), not(miri)))]
+#[test]
+fn a_set_aimed_again_keeps_a_loading_frame_owed_at_its_new_place() {
+    use crate::io::crash::CrashIO;
+    let crash = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash.clone();
+    let cache = Arc::new(MetaCache::new(
+        io.clone(),
+        "meta-set-aim",
+        2,
+        Arc::new(Epochs::new()),
+        0,
+    ));
+    let before = crate::storage::atoll::testing::drive(&io, || cache.get(id(1))).is_ok();
+    let mut set = PageSet::<4>::default();
+    let aimed = set.aim([id(5)]).is_ok();
+    let first = matches!(set.poll(&cache), Ok(Polled::Wait(_)));
+    // A page before it named: the loading page moves from the first place to the second.
+    let again = set.aim([id(1), id(5)]).is_ok();
+    let held_aimed = set.held();
+    let waits = matches!(set.poll(&cache), Ok(Polled::Wait(_)));
+    while crash.in_flight() > 0 {
+        crash.step().unwrap();
+    }
+    let ready = matches!(set.poll(&cache), Ok(Polled::Ready(_)));
+    let held = set.held();
+    // Every assertion with the cache dropped.
+    drop(set);
+    drop(cache);
+    assert!(before && aimed && again, "(the first page read, the aims)");
+    assert!(first, "the loading page's poll did not wait");
+    assert_eq!(held_aimed, 1, "frames kept by the second aim");
+    assert!(waits, "the set was ready while a page it held still loaded");
+    assert!(ready, "the set was not ready once its page was read");
+    assert_eq!(held, 2, "frames held once ready");
 }

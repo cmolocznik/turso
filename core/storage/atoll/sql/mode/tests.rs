@@ -7184,7 +7184,10 @@ fn a_commit_whose_admission_waited_commits_once_its_room_is_let_go() {
 /// `Connection::rollback_atoll`, its step never returning `IO`). With the root resident (`evict`
 /// false) the ending is done in the instruction's first call, which returns no `IO`, and the
 /// rollback's own work runs there, the transaction's read-only mark let go among it (mutants: that
-/// work skipped on the first call, or on the re-entry).
+/// work skipped on the first call, or on the re-entry). Ended on the first call or on the re-entry,
+/// the transaction is let go whole: its deferred foreign-key violation and its CDC transaction id
+/// are gone, so the next transaction commits (the auditor's #4518; mutant: the re-entry arm as it
+/// was, which kept a rollback's violations and every end's CDC id).
 fn a_rollback_statement_steps_its_ending(seed: u64, dropped: bool, evict: bool) {
     use crate::storage::atoll::sql::catalog::key;
     use crate::storage::atoll::txn::versioned::Get;
@@ -7202,6 +7205,12 @@ fn a_rollback_statement_steps_its_ending(seed: u64, dropped: bool, evict: bool) 
     let setup = [
         "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)".to_string(),
         format!("INSERT INTO t VALUES {values}"),
+        "CREATE TABLE p(id INTEGER PRIMARY KEY)".to_string(),
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, \
+         pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)"
+            .to_string(),
+        "PRAGMA foreign_keys = ON".to_string(),
+        "PRAGMA capture_data_changes_conn('id')".to_string(),
     ]
     .iter()
     .try_for_each(|sql| ran_on(&conn, &crash, sql));
@@ -7226,11 +7235,13 @@ fn a_rollback_statement_steps_its_ending(seed: u64, dropped: bool, evict: bool) 
         txns.abort(txn);
         entry.unwrap().expect("t's catalog row").root
     };
-    // A row rewritten and a table created in the transaction, then the tree written back and its
-    // root evicted: the undo reaches the row's leaf through the root, read in again.
+    // A row rewritten, a child without its parent and a table created in the transaction, then the
+    // tree written back and its root evicted: the undo reaches the row's leaf through the root,
+    // read in again.
     let began = [
         "BEGIN",
         "UPDATE t SET b = zeroblob(50) WHERE a = 150",
+        "INSERT INTO c VALUES (1, 99)",
         "CREATE TABLE u(x)",
         "CREATE TEMP TABLE v(x)",
     ]
@@ -7244,6 +7255,10 @@ fn a_rollback_statement_steps_its_ending(seed: u64, dropped: bool, evict: bool) 
     let evicted = !evict || pool.evict_clean(root);
     // As `BEGIN READ ONLY` marks its transaction: the rollback's own work lets the mark go.
     conn.set_tx_read_only(true);
+    let held = (
+        conn.get_deferred_foreign_key_violations(),
+        conn.get_cdc_transaction_id(),
+    );
     let mut rollback = conn.prepare("ROLLBACK").unwrap();
     let mut ios = 0;
     let ended = loop {
@@ -7263,7 +7278,14 @@ fn a_rollback_statement_steps_its_ending(seed: u64, dropped: bool, evict: bool) 
     };
     drop(rollback);
     let read_only = conn.is_tx_read_only();
+    let let_go = (
+        conn.get_deferred_foreign_key_violations(),
+        conn.get_cdc_transaction_id(),
+    );
     let state = (conn.get_auto_commit(), conn.get_tx_state());
+    let next = ["BEGIN", "INSERT INTO p VALUES (7)", "COMMIT"]
+        .iter()
+        .try_for_each(|sql| ran_on(&conn, &crash, sql));
     let kept = rows(&conn, "SELECT count(*), length(b) FROM t WHERE a = 150");
     let count = rows(&conn, "SELECT count(*) FROM t");
     let u_gone = conn.prepare("SELECT x FROM u").is_err();
@@ -7307,6 +7329,16 @@ fn a_rollback_statement_steps_its_ending(seed: u64, dropped: bool, evict: bool) 
         !read_only,
         "the rolled-back transaction's read-only mark stayed"
     );
+    assert!(
+        held.0 > 0 && held.1 != -1,
+        "the transaction held no deferred violation or no CDC id: {held:?}"
+    );
+    assert_eq!(
+        let_go,
+        (0, -1),
+        "the rolled-back transaction's deferred violations or CDC id stayed"
+    );
+    assert_eq!(next, Ok(()), "the next transaction did not commit");
     assert_eq!(
         kept,
         vec![vec![Value::from_i64(1), Value::from_i64(100)]],

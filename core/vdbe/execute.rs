@@ -5447,27 +5447,15 @@ pub fn op_auto_commit(
     if !matches!(state.commit_state, CommitState::Ready) {
         let res = program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback);
         let res = state.done_or_suspend(res);
-        // Only clear after a final, successful non-rollback COMMIT.
-        if fk_on
-            && !*rollback
-            && matches!(
-                res,
-                Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-            )
-        {
-            conn.clear_deferred_foreign_key_violations();
-        }
+        // Ended on a re-entry after a yield, the transaction is let go as on the first call.
         if matches!(
             res,
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
-            if !*rollback {
-                conn.index_methods_on_transaction_committed();
-            } else if conn.atoll().is_some() {
+            if *rollback && conn.atoll().is_some() {
                 atoll_rolled_back(&conn)?;
             }
-            conn.clear_tx_poison();
-            conn.clear_named_savepoints();
+            transaction_ended(&conn, pager, mv_store.is_none(), fk_on, !*rollback)?;
         }
         return res;
     }
@@ -5644,8 +5632,28 @@ pub fn op_auto_commit(
     if matches!(tx_op, TxOp::Rollback) && conn.atoll().is_some() {
         atoll_rolled_back(&conn)?;
     }
+    transaction_ended(
+        &conn,
+        pager,
+        mv_store.is_none(),
+        fk_on,
+        matches!(tx_op, TxOp::Commit),
+    )?;
+    Ok(res)
+}
 
-    if mv_store.is_none() {
+/// What a COMMIT or ROLLBACK does once its transaction has ended, whether the instruction's first
+/// call ended it or its re-entry after a yield did: the pagers' savepoints, the deferred foreign-key
+/// violations, the CDC transaction id, the rollback-only mark and the named savepoints let go, and
+/// a commit's index methods told. Only after the end's final success.
+fn transaction_ended(
+    conn: &Arc<Connection>,
+    pager: &Arc<Pager>,
+    paged: bool,
+    fk_on: bool,
+    committed: bool,
+) -> crate::Result<()> {
+    if paged {
         pager.clear_savepoints()?;
         // Non-main pagers (temp + attached) accumulate savepoints from the
         // mirror path; they're not cleared by the main pager's commit/
@@ -5660,21 +5668,16 @@ pub fn op_auto_commit(
             Ok(())
         })?;
     }
-
-    // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
     if fk_on {
         conn.clear_deferred_foreign_key_violations();
     }
-
-    // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
-    if matches!(tx_op, TxOp::Commit) {
+    if committed {
         conn.index_methods_on_transaction_committed();
     }
     conn.clear_tx_poison();
     conn.clear_named_savepoints();
-
-    Ok(res)
+    Ok(())
 }
 
 pub fn op_savepoint(

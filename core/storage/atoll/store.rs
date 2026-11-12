@@ -245,6 +245,20 @@ pub enum Erasing {
     HeldBack(u64),
 }
 
+/// A slot of the free space claimed in memory ([`PageStore::take_copy_slot`]): its claim cleared as
+/// this drops.
+struct Claim<'a> {
+    claimed: &'a GrowBits,
+    slot: u64,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        self.claimed.clear(self.slot);
+    }
+}
+
 /// A change of several pages inside the change gate ([`PageStore::change`]): it leaves the gate
 /// when dropped.
 pub struct Change<'a> {
@@ -949,6 +963,14 @@ impl PageStore {
             IOResult::Done(s) => s,
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
         };
+        // Claimed in memory until this call returns, whatever it returns: taken, the free space
+        // holds it by then; not, it is free again, so a step that waits leaves no claim for its
+        // next call to pass over (the auditor's #4573).
+        let _claim = Claim {
+            claimed: &self.claimed[class.index()],
+            slot,
+        };
+        crate::race::point("store.copy_slot_claimed");
         loop {
             let height = self.height(Tree::Space, class);
             let ids = radix::path(Tree::Space, class, height, slot);
@@ -966,8 +988,6 @@ impl PageStore {
             }
             set_space(&mut locked, class, slot, true);
             locked.commit(&self.meta);
-            // The free space holds it now.
-            self.claimed[class.index()].clear(slot);
             return Ok(IOResult::Done(slot));
         }
     }

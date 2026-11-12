@@ -1124,6 +1124,17 @@ impl MetaCache {
         self.cells.count()
     }
 
+    /// Drops `id`'s page if it is in memory, clean and held by no one, as an eviction over the
+    /// budget drops it: whether it did, for a test.
+    #[cfg(test)]
+    pub fn evict(&self, id: MetaId) -> bool {
+        let Some(cell) = self.files[id.file_index()].frames.get(id.index) else {
+            return false;
+        };
+        let step = self.epochs.enter();
+        cell.evict(&step, &self.cells)
+    }
+
     /// Bytes of the pages kept as a cut found them, now and at most.
     #[cfg(test)]
     pub fn cut_stats(&self) -> (usize, usize) {

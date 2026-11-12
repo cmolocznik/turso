@@ -366,6 +366,129 @@ fn a_latched_metadata_page_parks_its_users_until_release() {
     );
 }
 
+/// A copy slot claimed by a step that then waits, the free-space leaf it marks held by another
+/// change, is given back as the step returns: no claim is left behind for the next call to pass
+/// over, and the next call takes a slot once the leaf is let go (the auditor's #4573; mutant: the
+/// claim kept on the wait's return, as before).
+#[test]
+fn a_copy_slot_claimed_by_a_step_that_waits_is_given_back() {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::mpsc;
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+    let db = Db::open();
+    let store = db.store().clone();
+    let class = class(0);
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let claimed_then = Rc::new(Cell::new(None));
+    let holder = Rc::new(RefCell::new(None));
+    {
+        let (store, io, claimed_then, holder) = (
+            store.clone(),
+            db.io.clone(),
+            claimed_then.clone(),
+            holder.clone(),
+        );
+        crate::race::at("store.copy_slot_claimed", move || {
+            let claimed = store.claimed[class.index()].ones();
+            claimed_then.set(claimed.first().copied());
+            let Some(&slot) = claimed.first() else { return };
+            let leaf = radix::path(Tree::Space, class, store.height(Tree::Space, class), slot)[0];
+            let (held_tx, held_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let frame = drive(&io, || store.meta().get(leaf)).unwrap();
+                let hold = frame.try_lock().expect("the free-space leaf is free");
+                let _ = held_tx.send(());
+                let _ = go_rx.recv_timeout(BOUND);
+                hold.release_unchanged();
+            });
+            let held = held_rx.recv_timeout(BOUND).is_ok();
+            *holder.borrow_mut() = Some((thread, held));
+        });
+    }
+    let waited = matches!(store.take_copy_slot(class), Ok(IOResult::IO(_)));
+    let left = store.claimed[class.index()].ones();
+    let _ = go_tx.send(());
+    let (joined, held) = holder
+        .borrow_mut()
+        .take()
+        .map_or((false, false), |(t, held)| (t.join().is_ok(), held));
+    let next = drive(&db.io, || store.take_copy_slot(class)).is_ok();
+    let left_after = store.claimed[class.index()].ones();
+    // Every assertion with the database closed.
+    drop((store, db));
+    assert!(
+        claimed_then.get().is_some() && held && joined,
+        "the step's claim was not reached, or the leaf not held"
+    );
+    assert!(waited, "the step did not wait on the held leaf");
+    assert!(
+        left.is_empty(),
+        "the waiting step left its claim behind: {left:?}"
+    );
+    assert!(next, "the next call took no slot");
+    assert!(
+        left_after.is_empty(),
+        "a claim left after the next call: {left_after:?}"
+    );
+}
+
+/// A copy slot claimed by a step that then waits on a read of the free-space leaf it marks, the
+/// leaf evicted and its read kept by the backend, is given back as the step returns; the read in,
+/// the next call takes a slot and leaves no claim (the auditor's #4578; mutant: the claim kept on
+/// the wait's return, as before).
+#[test]
+fn a_copy_slot_claimed_by_a_step_waiting_on_a_metadata_read_is_given_back() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let crash = Arc::new(crate::io::crash::CrashIO::new(0));
+    let db = Db::open_on(crash.clone());
+    let store = db.store().clone();
+    // A class nothing has used: its free-space pages read in clean, held by no one, so the
+    // step's search finds them in memory and its leaf may then be evicted.
+    let class = class(1);
+    let path = radix::path(Tree::Space, class, store.height(Tree::Space, class), 0);
+    drop(drive(&db.io, || store.meta().get_all(&path)).unwrap());
+    // The last read's request, kept for a test to cancel, holds its page through its callback.
+    drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+    let evicted = Rc::new(Cell::new(None));
+    {
+        let (store, evicted) = (store.clone(), evicted.clone());
+        crate::race::at("store.copy_slot_claimed", move || {
+            let claimed = store.claimed[class.index()].ones();
+            let Some(&slot) = claimed.first() else { return };
+            let leaf = radix::path(Tree::Space, class, store.height(Tree::Space, class), slot)[0];
+            evicted.set(Some(store.meta().evict(leaf)));
+        });
+    }
+    let before = crash.in_flight();
+    let waited = matches!(store.take_copy_slot(class), Ok(IOResult::IO(_)));
+    let reading = crash.in_flight() > before;
+    let left = store.claimed[class.index()].ones();
+    let next = drive(&db.io, || store.take_copy_slot(class)).is_ok();
+    let left_after = store.claimed[class.index()].ones();
+    // Every assertion with the database closed.
+    drop((store, db));
+    assert_eq!(
+        evicted.get(),
+        Some(true),
+        "the step's claim was not reached, or the free-space leaf not evicted"
+    );
+    assert!(
+        waited && reading,
+        "the step did not wait on the leaf's read with the backend"
+    );
+    assert!(
+        left.is_empty(),
+        "the step waiting on the read left its claim behind: {left:?}"
+    );
+    assert!(next, "the next call took no slot");
+    assert!(
+        left_after.is_empty(),
+        "a claim left after the next call: {left_after:?}"
+    );
+}
+
 /// Frees waiting for a checkpoint that a yield interrupts are all still waiting: freeing the first
 /// slot yields on its free-space leaf, and the second slot's free is kept, then done.
 #[test]

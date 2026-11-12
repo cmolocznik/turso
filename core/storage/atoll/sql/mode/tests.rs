@@ -6892,3 +6892,102 @@ fn a_rollback_ending_dropped_unstepped_beside_a_writer_lets_the_writer_commit() 
 fn a_writer_open_when_the_database_fails_cannot_commit() {
     a_rollback_ending_dropped_unstepped(true, true);
 }
+
+/// A commit told of a failure its driver saw before its transaction ended (`Ending::met`), as
+/// `Log::fail` tells a commit waiting for the log's room by failing its admission: the ending rolls
+/// the transaction back, its slot and its hold of the gate let go and the database not failed, and
+/// its outcome is the failure.
+#[test]
+fn a_commit_told_of_its_drivers_failure_before_it_ended_rolls_back() {
+    use crate::storage::atoll::btree::Mode;
+    use crate::storage::atoll::page::SizeClass;
+    use crate::storage::atoll::sql::AtollDb;
+    use crate::storage::atoll::testing::drive;
+    use crate::storage::atoll::txn::versioned::{VersionedTree, Write, WriteOp};
+    use crate::storage::atoll::txn::{Blocker, Commit, Isolation, Txn};
+    use crate::types::{IOResult, ImmutableRecord};
+    let observed = (|| -> std::result::Result<_, String> {
+        let crash = Arc::new(crate::io::crash::CrashIO::new(686));
+        let io: Arc<dyn IO> = crash.clone();
+        let db = Arc::new(
+            AtollDb::open(io.clone(), "/db/commit-told-of-a-failure", config())
+                .map_err(|e| e.to_string())?,
+        );
+        let txns = db.atoll().transactions();
+        let begin = || -> std::result::Result<Txn, String> {
+            let mut txn =
+                drive(&io, || txns.begin(Isolation::Snapshot)).map_err(|e| e.to_string())?;
+            crate::storage::atoll::testing::share(txns, &mut txn);
+            txns.statement(&mut txn).map_err(|e| e.to_string())?;
+            Ok(txn)
+        };
+        let record = ImmutableRecord::from_values(&[Value::build_text("v".repeat(100))], 1)
+            .map_err(|e| e.to_string())?;
+        let mut txn = begin()?;
+        let root = drive(&io, || db.create_tree(&mut txn, SizeClass::new(0).unwrap()))
+            .map_err(|e| e.to_string())?;
+        let mut commit = Commit::new(txn);
+        drive(&io, || txns.commit(&mut commit)).map_err(|e| e.to_string())?;
+        drop(commit);
+        let tree = VersionedTree::open(
+            io.clone(),
+            db.atoll().pool().clone(),
+            db.atoll().store().clone(),
+            root,
+        );
+        let mut txn = begin()?;
+        let key = crate::storage::atoll::sql::key::rowid(1);
+        let mut op = WriteOp::put(&key, record.get_payload().to_vec(), Mode::Upsert);
+        match drive(&io, || tree.write(txns, db.versions(), &mut txn, &mut op)) {
+            Ok(Write::Done(_)) => {}
+            other => return Err(format!("write: {other:?}")),
+        }
+        let blocker = Blocker {
+            slot: txn.slot(),
+            start: txn.start(),
+        };
+        let mut ending = super::Ending::commit(
+            db.clone(),
+            crate::storage::atoll::buffer::Conn::new(),
+            txn,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        ending.met(crate::LimboError::InternalError(
+            "the log failed under an admission".to_string(),
+        ));
+        let ended = ending.finish().map_err(|e| e.to_string());
+        drop(ending);
+        let held = txns.holds_shared(blocker);
+        let failure = txns.failure().map(|e| e.to_string());
+        let mut begun = Vec::new();
+        for _ in 0..txns.slot_count() {
+            if let Ok(IOResult::Done(txn)) = txns.begin(Isolation::Snapshot) {
+                begun.push(txn);
+            }
+        }
+        let free = begun.len();
+        for txn in begun {
+            txns.abort(txn);
+        }
+        drop((tree, db, io));
+        let in_flight = crash.in_flight();
+        Ok((ended, held, failure, free, in_flight))
+    })();
+    let (ended, held, failure, free, in_flight) =
+        observed.expect("the fixture failed, every database dropped");
+    assert!(
+        ended
+            .as_ref()
+            .is_err_and(|e| e.contains("the log failed under an admission")),
+        "the commit's outcome is not the failure it was told: {ended:?}"
+    );
+    assert!(!held, "the told commit kept its hold of the gate");
+    assert_eq!(free, 4, "the told commit kept its transaction's slot");
+    assert_eq!(
+        failure, None,
+        "a commit undone in memory failed the database"
+    );
+    assert_eq!(in_flight, 0);
+}

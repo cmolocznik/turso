@@ -876,6 +876,10 @@ impl Transactions {
                 }
             }
         };
+        #[cfg(test)]
+        if let Some((txn, failure)) = crate::storage::atoll::testing::abandon_before_drain() {
+            self.abandon(txn, failure);
+        }
         match self.gate.drain(txn.slot, word, c) {
             Taken::Done => {}
             Taken::Lost => {

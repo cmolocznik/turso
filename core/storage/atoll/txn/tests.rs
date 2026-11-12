@@ -1198,3 +1198,58 @@ fn a_checkpoint_once_due_stays_due_until_the_next_begins() {
         "at rest, after a commit, after an own record, after the next checkpoint"
     );
 }
+
+/// An exclusive take of the gate whose first look finds the database not failed, and which meets
+/// the failure only after that, before it registers on the gate's drain (a rollback that could not
+/// finish leaving its transaction, `Transactions::abandon`, which wakes whoever waits then, the
+/// take not yet among them): it looks again once registered and returns the failure, rather than
+/// wait on holders a failed database never lets go. With no failure the same take waits behind the
+/// holder.
+fn an_exclusive_take_meeting_a_failure_before_its_drain(fail: bool) {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open(&io, 4);
+    let txns = db.transactions();
+    let mut holder = begin(&io, &db, Isolation::Snapshot);
+    crate::storage::atoll::testing::share(txns, &mut holder);
+    let left = begin(&io, &db, Isolation::Snapshot);
+    let mut taker = begin(&io, &db, Isolation::Snapshot);
+    if fail {
+        let failure = LimboError::InternalError("an undo that could not finish".to_string());
+        crate::storage::atoll::testing::ABANDON_BEFORE_DRAIN
+            .with(|h| *h.borrow_mut() = Some((left, failure)));
+    } else {
+        txns.abort(left);
+    }
+    let wait = Completion::new_wait();
+    let taken = format!("{:?}", txns.take_exclusive(&mut taker, &wait));
+    let unreached = crate::storage::atoll::testing::abandon_before_drain().is_some();
+    let failure = txns.failure().map(|e| e.to_string());
+    txns.give_up(&mut taker);
+    txns.abort(taker);
+    txns.abort(holder);
+    drop(db);
+    assert!(!unreached, "the take did not reach its drain: {taken}");
+    if fail {
+        assert!(
+            taken.starts_with("Err("),
+            "an exclusive take waited on holders of a failed database: {taken}"
+        );
+        assert!(failure.is_some());
+    } else {
+        assert!(
+            taken.starts_with("Ok(Holders("),
+            "the take did not wait behind the holder: {taken}"
+        );
+        assert_eq!(failure, None);
+    }
+}
+
+#[test]
+fn an_exclusive_take_waits_behind_a_holder() {
+    an_exclusive_take_meeting_a_failure_before_its_drain(false);
+}
+
+#[test]
+fn an_exclusive_take_meeting_a_failure_before_its_drain_returns_it() {
+    an_exclusive_take_meeting_a_failure_before_its_drain(true);
+}

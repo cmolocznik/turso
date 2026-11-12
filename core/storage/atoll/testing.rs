@@ -309,6 +309,15 @@ crate::thread::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+crate::thread::thread_local! {
+    /// A transaction to abandon with its failure, taken by an exclusive take of the gate on this
+    /// thread after its first look at the database's failure and before it registers on the gate's
+    /// drain: a test's failure landing between the two.
+    pub(crate) static ABANDON_BEFORE_DRAIN: std::cell::RefCell<
+        Option<(super::txn::Txn, crate::LimboError)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
 thread_local! {
     /// How many transaction endings were made on this thread.
     static ENDINGS_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -327,6 +336,11 @@ pub(crate) fn endings_made() -> usize {
 /// The pause a test set on this thread before a commit's publication, while it is unfinished.
 pub(crate) fn pause_ending() -> Option<crate::io::Completion> {
     ENDING_PAUSE.with(|p| p.borrow().clone().filter(|c| !c.finished()))
+}
+
+/// The transaction a test set on this thread to abandon before an exclusive take's drain, taken.
+pub(crate) fn abandon_before_drain() -> Option<(super::txn::Txn, crate::LimboError)> {
+    ABANDON_BEFORE_DRAIN.with(|h| h.borrow_mut().take())
 }
 
 /// Runs the pause a test set on this thread for a database's close, if it set one.

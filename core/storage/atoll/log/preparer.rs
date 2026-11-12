@@ -16,7 +16,7 @@
 //! told, and the task ends.
 
 use super::waits::Registration;
-use super::{io_failure, whole, Log};
+use super::{io_failure, retirement, whole, Log};
 use crate::io::{Completion, File};
 use crate::storage::atoll::executor::{self, Cx, Signal, Step, Task, TaskRef, Watched};
 use crate::sync::{Arc, Weak};
@@ -142,15 +142,6 @@ pub(super) enum Unit {
     Rest,
     /// The log failed: nothing more is prepared.
     Failed,
-}
-
-/// A wait finished once no backend owns `request` (DESIGN.md 22.5, *Retirement is not
-/// finishing*): the preparer's place for it is held until then.
-fn retirement(request: &Completion) -> Completion {
-    let retired = crate::storage::atoll::notify::wait();
-    let place = retired.clone();
-    request.on_retired(move || place.complete(0));
-    retired
 }
 
 /// The preparer as its log's executor task. It holds the log weakly: nothing the executor holds

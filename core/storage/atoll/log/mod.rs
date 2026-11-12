@@ -1527,6 +1527,16 @@ impl Log {
     }
 }
 
+/// A wait finished once no backend owns `request` (DESIGN.md 22.5, *Retirement is not
+/// finishing*): the place its owner holds for it, the preparer's or a read-back's, is held until
+/// then.
+fn retirement(request: &Completion) -> Completion {
+    let retired = crate::storage::atoll::notify::wait();
+    let place = retired.clone();
+    request.on_retired(move || place.complete(0));
+    retired
+}
+
 fn payload_len(payload: &[&[u8]]) -> usize {
     let len = payload.iter().map(|p| p.len()).sum();
     assert!(len <= MAX_PAYLOAD, "a {len} byte log record");

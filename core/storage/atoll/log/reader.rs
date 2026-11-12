@@ -359,13 +359,14 @@ impl Rereader {
 }
 
 /// A read-back of records outside any group, one at a time, each by where it starts and ends (its
-/// LSN): exactly the blocks it lies in, read a segment at a time, one read in flight, each queued at
-/// a step and waited for by its caller between steps (DESIGN.md 22.18, ASYNC1: never a wait in place
-/// inside a cooperative frame; a transaction slot's read-back block is one request record). Its
-/// buffer is kept from one record to the next, and given up once a read is abandoned or fails: a
-/// read finished by an abort may still land in it. A rollback's read-back of a spilled part reads
-/// through the log's own open segments ([`super::Log::read_record`]); recovery's, through a set of
-/// its own ([`Rereader`]).
+/// LSN): exactly the blocks it lies in, read a segment at a time, each read queued at a step and
+/// waited for by its caller between steps (DESIGN.md 22.18, ASYNC1: never a wait in place inside a
+/// cooperative frame). A read is let go only once no backend owns its request, which is not when it
+/// finishes (22.5, *Retirement is not finishing*): the next read, of the same record or of another,
+/// is made only then, so a read-back holds one request at a time (v3.8: a transaction slot's
+/// read-back block is one request record), and its buffer, which is that read's until then, is kept
+/// from one record to the next. A rollback's read-back of a spilled part reads through the log's own
+/// open segments ([`super::Log::read_record`]); recovery's, through a set of its own ([`Rereader`]).
 #[derive(Default)]
 pub struct ReadBack {
     /// The blocks read last, from the start of the one the record starts in. Grown to a power of
@@ -375,25 +376,27 @@ pub struct ReadBack {
     of: Option<(Lsn, Lsn)>,
     /// Its blocks' bytes read so far.
     done: usize,
-    /// Its read in flight, or landed and not yet checked.
+    /// The read whose request is not yet let go.
     read: Option<Read>,
     /// Bytes read so far.
     #[cfg(test)]
     bytes_read: u64,
 }
 
-/// A read of the log's bytes into a read-back's buffer: its completion, the bytes it asked for, and
-/// the bytes it read, set once it lands.
+/// A read of the log's bytes into a read-back's buffer: its completion, the bytes it asked for, the
+/// bytes it read, set once it lands, and once it has, the wait for its request's retirement.
 struct Read {
     c: Completion,
     len: usize,
     got: Arc<AtomicU64>,
+    retired: Option<Completion>,
 }
 
 impl ReadBack {
     /// Steps the read-back of the record outside any group that starts at `at` and ends at `end`,
     /// each segment's file found by `file`: its header and where its payload lies in
-    /// [`bytes`](Self::bytes), once read and checked as a reader of the log checks it.
+    /// [`bytes`](Self::bytes), once read and checked as a reader of the log checks it. A read of
+    /// another record still under way, one asked for before and given up, is let go first.
     pub(super) fn step(
         &mut self,
         segments: &Segments,
@@ -403,44 +406,49 @@ impl ReadBack {
     ) -> Result<IOResult<(Header, Range<usize>)>> {
         let from = at - at % BLOCK;
         let want = (end.next_multiple_of(BLOCK) - from) as usize;
-        if self.of != Some((at, end)) {
-            if self.read.take().is_some() {
-                // An abandoned record's read keeps the buffer it lands in alive; this one takes
-                // another.
-                self.buffer = None;
-            }
-            if self.buffer.as_ref().is_none_or(|b| b.len() < want) {
-                self.buffer = Some(Arc::new(AlignedBlock::zeroed(want.next_power_of_two())));
-            }
-            self.of = Some((at, end));
-            self.done = 0;
-        }
-        let buffer = self.buffer.clone().expect("a read-back's buffer");
         loop {
-            if let Some(r) = &self.read {
+            if let Some(r) = &mut self.read {
                 if !r.c.finished() {
                     return Ok(IOResult::IO(IOCompletions(r.c.clone())));
                 }
+                // Finished, a request is never owned again: one no backend owns is let go now,
+                // and only an owned one is waited for.
+                if r.c.is_owned() {
+                    let retired = r.retired.get_or_insert_with(|| super::retirement(&r.c));
+                    if !retired.finished() {
+                        return Ok(IOResult::IO(IOCompletions(retired.clone())));
+                    }
+                }
                 let r = self.read.take().expect("a read");
-                if let Some(e) = r.c.get_error() {
-                    return Err(self.failed(LimboError::CompletionError(e)));
+                if self.of == Some((at, end)) {
+                    if let Some(e) = r.c.get_error() {
+                        return Err(self.failed(LimboError::CompletionError(e)));
+                    }
+                    let n = r.got.load(Ordering::Acquire) as usize;
+                    #[cfg(test)]
+                    {
+                        self.bytes_read += n as u64;
+                    }
+                    if n < r.len {
+                        return Err(self.failed(LimboError::Corrupt(format!(
+                            "the record at {at} reads back short of its {} bytes",
+                            r.len
+                        ))));
+                    }
+                    self.done += r.len;
                 }
-                let n = r.got.load(Ordering::Acquire) as usize;
-                #[cfg(test)]
-                {
-                    self.bytes_read += n as u64;
+            }
+            if self.of != Some((at, end)) {
+                if self.buffer.as_ref().is_none_or(|b| b.len() < want) {
+                    self.buffer = Some(Arc::new(AlignedBlock::zeroed(want.next_power_of_two())));
                 }
-                if n < r.len {
-                    return Err(self.failed(LimboError::Corrupt(format!(
-                        "the record at {at} reads back short of its {} bytes",
-                        r.len
-                    ))));
-                }
-                self.done += r.len;
+                self.of = Some((at, end));
+                self.done = 0;
             }
             if self.done == want {
                 break;
             }
+            let buffer = self.buffer.as_ref().expect("a read-back's buffer");
             let pos = from + self.done as u64;
             let number = segments.number(pos);
             let len = ((segments.start(number + 1) - pos) as usize).min(want - self.done);
@@ -454,11 +462,19 @@ impl ReadBack {
                 Err(e) => Some(e),
             });
             match file(number).and_then(|f| f.pread(pos - segments.start(number), c)) {
-                Ok(c) => self.read = Some(Read { c, len, got }),
+                Ok(c) => {
+                    self.read = Some(Read {
+                        c,
+                        len,
+                        got,
+                        retired: None,
+                    })
+                }
                 Err(e) => return Err(self.failed(e)),
             }
         }
         let head = (at - from) as usize;
+        let buffer = self.buffer.as_ref().expect("a read-back's buffer");
         match record::parse(at, &buffer.bytes()[head..want]) {
             Parsed::Record(r) if r.lsn == end && !r.place.grouped() => {
                 let payload = head + record::HEADER;
@@ -467,17 +483,18 @@ impl ReadBack {
                     payload..payload + r.payload.len(),
                 )))
             }
-            _ => Err(self.failed(LimboError::Corrupt(format!(
-                "the record at {at} reads back as no record outside a group ending at {end}"
-            )))),
+            _ => {
+                self.of = None;
+                Err(LimboError::Corrupt(format!(
+                    "the record at {at} reads back as no record outside a group ending at {end}"
+                )))
+            }
         }
     }
 
-    /// `e`, the read-back having given up its record and its buffer.
+    /// `e`, the read-back having given up its record, every read of it let go.
     fn failed(&mut self, e: LimboError) -> LimboError {
         self.of = None;
-        self.read = None;
-        self.buffer = None;
         e
     }
 
@@ -487,15 +504,9 @@ impl ReadBack {
         &self.buffer.as_ref().expect("a record read back").bytes()[range]
     }
 
-    /// Whether a read of a record is in flight or landed and not yet checked.
+    /// Whether a read of a record is in flight or landed and not yet let go.
     #[cfg(test)]
     pub fn reading(&self) -> bool {
         self.read.is_some()
-    }
-
-    /// Where its buffer lies, if it holds one.
-    #[cfg(test)]
-    pub(super) fn buffer_at(&self) -> Option<usize> {
-        self.buffer.as_ref().map(|b| b.as_ptr() as usize)
     }
 }

@@ -1946,59 +1946,220 @@ fn admissions_granted_carry_a_preparation_through_to_its_publication() {
     }
 }
 
-/// A read-back whose read failed gives up its buffer: a read its cancellation finished may still be
-/// the backend's, so the next record's read lands in another buffer. A record abandoned with its read
-/// still pending does the same. (The auditor's #4525 probe, kept as a test; every request is drained
-/// and every holder dropped before the assertions.)
-fn a_read_back_after(cancelled: bool) {
-    let crash = Arc::new(CrashIO::new(819));
-    let io: Arc<dyn IO> = crash.clone();
-    let file = io
-        .open_file("/db/readback-buffers", OpenFlags::Create, false)
-        .unwrap();
-    let segments =
-        super::segment::Segments::new(io.clone(), "/db/readback-buffers", 16 * BLOCK, false);
-    let mut back = ReadBack::default();
-    let first = match back.step(&segments, 0, 32, |_| Ok(file.clone())) {
-        Ok(IOResult::IO(c)) => Some(c.0),
-        _ => None,
-    };
-    let before = back.buffer_at();
-    let failed = match (&first, cancelled) {
-        (Some(c), true) => {
-            io.cancel(std::slice::from_ref(c)).unwrap();
-            back.step(&segments, 0, 32, |_| Ok(file.clone())).is_err()
+/// A file of a log segment whose reads a test finishes and retires by hand: each read it takes is
+/// accepted and kept, so a test can deliver its bytes and keep the request the backend's (the
+/// auditor's #4529 fixture).
+struct HeldReads {
+    bytes: Vec<u8>,
+    taken: crate::storage::atoll::locks::Mutex<Vec<(usize, Completion)>>,
+}
+
+struct HeldSegment {
+    number: u64,
+    reads: Arc<HeldReads>,
+}
+
+impl File for HeldSegment {
+    fn lock_file(&self, _: bool) -> Result<()> {
+        Ok(())
+    }
+    fn unlock_file(&self) -> Result<()> {
+        Ok(())
+    }
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        c.accept();
+        let at = (self.number * BLOCK + pos) as usize;
+        self.reads.taken.lock().push((at, c.clone()));
+        Ok(c)
+    }
+    fn pwrite(&self, _: u64, _: Arc<crate::io::Buffer>, _: Completion) -> Result<Completion> {
+        unreachable!("a read-back writes nothing")
+    }
+    fn sync(&self, _: Completion, _: crate::io::FileSyncType) -> Result<Completion> {
+        unreachable!("a read-back syncs nothing")
+    }
+    fn size(&self) -> Result<u64> {
+        Ok(BLOCK)
+    }
+    fn truncate(&self, _: u64, _: Completion) -> Result<Completion> {
+        unreachable!("a read-back truncates nothing")
+    }
+}
+
+impl HeldReads {
+    /// Reads over segments of one block each holding `records`, one after another, each a
+    /// record outside any group: the log's bytes and where each record ends.
+    fn of(records: &[usize]) -> (Arc<Self>, Vec<Lsn>) {
+        let mut bytes = Vec::new();
+        let mut ends = Vec::new();
+        for &len in records {
+            let at = bytes.len() as Lsn;
+            bytes.extend(super::record::encode(
+                at,
+                &header(1),
+                Place::ALONE,
+                &vec![17; len],
+            ));
+            ends.push(bytes.len() as Lsn);
+            bytes.resize((bytes.len() as Lsn).next_multiple_of(BLOCK) as usize, 0);
         }
-        _ => false,
-    };
-    let owned = first.as_ref().is_some_and(|c| c.is_owned());
-    let second = match back.step(&segments, BLOCK, BLOCK + 32, |_| Ok(file.clone())) {
-        Ok(IOResult::IO(c)) => Some(c.0),
+        let reads = Arc::new(Self {
+            bytes,
+            taken: crate::storage::atoll::locks::Mutex::new(Vec::new()),
+        });
+        (reads, ends)
+    }
+
+    fn file(self: &Arc<Self>) -> impl FnMut(u64) -> Result<Arc<dyn File>> + '_ {
+        move |number| {
+            Ok(Arc::new(HeldSegment {
+                number,
+                reads: self.clone(),
+            }) as Arc<dyn File>)
+        }
+    }
+
+    fn taken(&self) -> Vec<Completion> {
+        self.taken.lock().iter().map(|(_, c)| c.clone()).collect()
+    }
+
+    /// The reads taken so far, and those of them a backend still owns.
+    fn counts(&self) -> (usize, usize) {
+        let taken = self.taken();
+        (taken.len(), taken.iter().filter(|c| c.is_owned()).count())
+    }
+
+    /// Delivers read `i`'s bytes, the request kept the backend's.
+    fn deliver(&self, i: usize) {
+        let (at, c) = self.taken.lock()[i].clone();
+        let len = c.as_read().buf().len();
+        c.as_read()
+            .buf()
+            .as_mut_slice()
+            .copy_from_slice(&self.bytes[at..at + len]);
+        c.complete(len as i32);
+    }
+
+    /// Delivers and retires every read still owned, before any assertion.
+    fn settle(&self) {
+        for (i, c) in self.taken().into_iter().enumerate() {
+            if !c.finished() {
+                self.deliver(i);
+            }
+            if c.is_owned() {
+                c.retire();
+            }
+        }
+    }
+}
+
+/// What a step of `back` came to: "io", "done" or "err".
+fn read_back_step(
+    back: &mut ReadBack,
+    segments: &super::segment::Segments,
+    reads: &Arc<HeldReads>,
+    at: Lsn,
+    end: Lsn,
+) -> &'static str {
+    match back.step(segments, at, end, reads.file()) {
+        Ok(IOResult::IO(_)) => "io",
+        Ok(IOResult::Done(_)) => "done",
+        Err(_) => "err",
+    }
+}
+
+/// A read-back's read delivered while its backend still owns the request holds the next segment's
+/// read back until the request retires: one request at a time (DESIGN.md 22.18, v3.8, the
+/// auditor's #4527 and #4529); retired, the next is made and the record read whole.
+#[test]
+fn a_read_back_makes_its_next_read_only_once_the_last_one_retired() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let segments = super::segment::Segments::new(io, "/held-reads", BLOCK, false);
+    // One record across two segments of a block each.
+    let (reads, ends) = HeldReads::of(&[BLOCK as usize]);
+    let mut back = ReadBack::default();
+    let first = read_back_step(&mut back, &segments, &reads, 0, ends[0]);
+    reads.deliver(0);
+    let delivered = read_back_step(&mut back, &segments, &reads, 0, ends[0]);
+    let held = reads.counts();
+    reads.taken()[0].retire();
+    let retired = read_back_step(&mut back, &segments, &reads, 0, ends[0]);
+    let next = reads.counts();
+    reads.deliver(1);
+    reads.taken()[1].retire();
+    let payload = match back.step(&segments, 0, ends[0], reads.file()) {
+        Ok(IOResult::Done((_, range))) => Some(back.bytes(range).to_vec()),
         _ => None,
     };
-    let after = back.buffer_at();
-    let requests: Vec<_> = first.iter().chain(second.iter()).cloned().collect();
-    let drained = io.drain_completions(&requests);
-    drop((first, second, requests, back, segments, file, io));
-    let in_flight = crash.in_flight();
-    assert!(before.is_some(), "the first read was not left pending");
-    assert!(after.is_some(), "the second read was not left pending");
-    assert_eq!(failed, cancelled, "the cancelled read's step did not fail");
-    assert!(owned, "the first read was not still the backend's");
-    assert!(drained.is_ok(), "{drained:?}");
-    assert_eq!(in_flight, 0);
-    assert_ne!(
-        before, after,
-        "the next record's read went into a buffer the first read's backend still owns"
+    reads.settle();
+    let remaining = reads.counts().1;
+    drop((back, segments));
+    assert_eq!((first, delivered), ("io", "io"));
+    assert_eq!(
+        held,
+        (1, 1),
+        "the next segment's read was made before the last one retired"
     );
+    assert_eq!(retired, "io");
+    assert_eq!(
+        next,
+        (2, 1),
+        "the next read was not made once the last retired"
+    );
+    assert_eq!(payload, Some(vec![17; BLOCK as usize]));
+    assert_eq!(remaining, 0);
 }
 
+/// A record asked for while another's read is still the backend's lets that read go only once it
+/// retires, and only then reads, so the two records never hold two requests at once.
 #[test]
-fn a_record_abandoned_with_its_read_pending_leaves_its_buffer_to_that_read() {
-    a_read_back_after(false);
+fn a_read_back_of_another_record_waits_for_the_last_ones_read_to_retire() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let segments = super::segment::Segments::new(io, "/held-reads", BLOCK, false);
+    let (reads, ends) = HeldReads::of(&[64, 64]);
+    let mut back = ReadBack::default();
+    let _ = read_back_step(&mut back, &segments, &reads, 0, ends[0]);
+    let other = read_back_step(&mut back, &segments, &reads, BLOCK, ends[1]);
+    let pending = reads.counts();
+    reads.deliver(0);
+    let delivered = read_back_step(&mut back, &segments, &reads, BLOCK, ends[1]);
+    let held = reads.counts();
+    reads.taken()[0].retire();
+    let retired = read_back_step(&mut back, &segments, &reads, BLOCK, ends[1]);
+    let next = reads.counts();
+    reads.settle();
+    let remaining = reads.counts().1;
+    drop((back, segments));
+    assert_eq!((other, delivered, retired), ("io", "io", "io"));
+    assert_eq!(pending, (1, 1), "another record read beside a pending read");
+    assert_eq!(held, (1, 1), "another record read beside an unretired read");
+    assert_eq!(
+        next,
+        (2, 1),
+        "the other record was not read once the read retired"
+    );
+    assert_eq!(remaining, 0);
 }
 
+/// A read that failed is the read-back's failure only once its request retired: until then the
+/// step waits, making no other read.
 #[test]
-fn a_read_back_whose_read_was_cancelled_reads_the_next_record_into_another_buffer() {
-    a_read_back_after(true);
+fn a_read_back_whose_read_failed_reports_it_once_the_read_retired() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let segments = super::segment::Segments::new(io, "/held-reads", BLOCK, false);
+    let (reads, ends) = HeldReads::of(&[64]);
+    let mut back = ReadBack::default();
+    let _ = read_back_step(&mut back, &segments, &reads, 0, ends[0]);
+    reads.taken()[0].error(crate::CompletionError::Aborted);
+    let failed = read_back_step(&mut back, &segments, &reads, 0, ends[0]);
+    let held = reads.counts();
+    reads.taken()[0].retire();
+    let retired = read_back_step(&mut back, &segments, &reads, 0, ends[0]);
+    reads.settle();
+    let remaining = reads.counts().1;
+    drop((back, segments));
+    assert_eq!(failed, "io", "a failed read reported before it retired");
+    assert_eq!(held, (1, 1));
+    assert_eq!(retired, "err", "the retired read's failure not reported");
+    assert_eq!(remaining, 0);
 }

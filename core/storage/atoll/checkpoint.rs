@@ -2496,7 +2496,7 @@ impl Run {
 }
 
 /// The intent record's payload: the checkpoint's number, then each metadata page's id.
-fn intent_payload(n: u64, meta: &BTreeSet<MetaId>) -> Vec<u8> {
+pub(super) fn intent_payload(n: u64, meta: &BTreeSet<MetaId>) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + 8 * meta.len());
     out.extend_from_slice(&n.to_le_bytes());
     for id in meta {

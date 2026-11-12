@@ -1288,3 +1288,97 @@ fn a_flush_asked_during_the_checkpoints_turn_is_answered() {
         "a flush asked for during the checkpoint's turn was left unanswered"
     );
 }
+
+/// A recovery whose replay window names one metadata page in many intent records, as checkpoints
+/// cut short one after another leave it, pins that page once: one frame a distinct page, at most
+/// the database's metadata pages (DESIGN.md 22.18, *What bounds the queue*; mutant: every record's
+/// ids kept, duplicates included). The window holds the last checkpoint's own intent record too,
+/// so the pages pinned are those it names and the two these records name, each once.
+#[test]
+fn a_recovery_pins_a_page_many_intent_records_name_once() {
+    use super::checkpoint::{intent_payload, META_INTENT};
+    use super::log::{framed_len, Header, LogWait};
+    use super::meta::{MetaId, Tree as MetaTree};
+    use super::recovery::INTENTS_PINNED;
+    use std::collections::BTreeSet;
+    let crash_io = Arc::new(CrashIO::new(0));
+    let io: Arc<dyn IO> = crash_io.clone();
+    let db = Db::create(io.clone());
+    let root = db.tree.root();
+    for i in 0..20 {
+        db.put(&format!("k{i:02}"), &value(i));
+    }
+    // The records follow the last checkpoint, in the replay window; nothing makes another due.
+    db.checkpoint();
+    // A page the database's class uses, named by every record, and one of a class no page of the
+    // database is in, named by every other record.
+    let used = MetaId {
+        tree: MetaTree::Map,
+        class: class(0),
+        level: 0,
+        index: 0,
+    };
+    let unused = MetaId {
+        class: class(11),
+        ..used
+    };
+    let log = db.db.log().clone();
+    let records = 8u64;
+    for n in 0..records {
+        let ids: BTreeSet<MetaId> = if n % 2 == 0 {
+            [used].into()
+        } else {
+            [used, unused].into()
+        };
+        let payload = intent_payload(1_000 + n, &ids);
+        let mut admitted = drive(&io, || {
+            log.admit(&mut LogWait::default(), framed_len(payload.len()))
+        })
+        .unwrap();
+        let header = Header {
+            kind: META_INTENT,
+            flags: 0,
+            txn: 0,
+            prev: None,
+        };
+        log.append_own(&mut admitted, &header, &[&payload]);
+    }
+    let mut wait = LogWait::default();
+    let durable = drive(&io, || log.wait_durable(&mut wait, log.end())).map_err(|e| e.to_string());
+    drop(wait);
+    let image = crash_io.crash(0);
+    drop(log);
+    drop(db);
+    INTENTS_PINNED.with(|p| p.borrow_mut().clear());
+    let recovered = Db::recover(Arc::new(image), root, 1);
+    let pinned = INTENTS_PINNED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    let distinct: BTreeSet<MetaId> = pinned.iter().copied().collect();
+    let named = |id| pinned.iter().filter(|&&p| p == id).count();
+    let state = recovered
+        .as_ref()
+        .map(|db| db.state(&["k00".to_string(), "k19".to_string()]))
+        .map_err(|e| e.to_string());
+    drop(recovered);
+    assert_eq!(durable, Ok(()));
+    assert_eq!(
+        state,
+        Ok(BTreeMap::from([
+            ("k00".to_string(), Some(value(0))),
+            ("k19".to_string(), Some(value(19))),
+        ]))
+    );
+    assert_eq!(
+        (named(used), named(unused)),
+        (1, 1),
+        "{records} intent records naming 2 pages: {} and {} frames pinned for them",
+        named(used),
+        named(unused)
+    );
+    assert_eq!(
+        pinned.len(),
+        distinct.len(),
+        "{} frames pinned for {} distinct pages: {pinned:?}",
+        pinned.len(),
+        distinct.len()
+    );
+}

@@ -88,6 +88,13 @@ pub fn recover(
         store.meta().set_torn_ok(true);
         let frames = drive(&io, || store.meta().get_all(&scan.intents));
         store.meta().set_torn_ok(false);
+        #[cfg(test)]
+        if frames
+            .as_ref()
+            .is_ok_and(|frames| frames.len() == scan.intents.len())
+        {
+            INTENTS_PINNED.with(|p| *p.borrow_mut() = scan.intents.clone());
+        }
         for frame in frames? {
             while store.meta().owe(&frame).is_none() {
                 let wait = frame.wait_while_held();
@@ -158,6 +165,14 @@ pub fn recover(
     })
 }
 
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// The metadata pages the last recovery on this thread pinned for its intents, a frame each,
+    /// for a test.
+    pub(crate) static INTENTS_PINNED: std::cell::RefCell<Vec<MetaId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The first pass: what the second needs before it applies anything.
 fn scan(io: &Arc<dyn IO>, base: &str, config: &LogConfig, superblock: &Superblock) -> Result<Scan> {
     let mut out = Scan {
@@ -168,6 +183,7 @@ fn scan(io: &Arc<dyn IO>, base: &str, config: &LogConfig, superblock: &Superbloc
         Log::reader(io.clone(), base, config, superblock.redo).following(&superblock.continuations);
     let mut gather = Gather::new(superblock.snapshot);
     let mut parts = Log::rereader(io.clone(), base, config);
+    let mut named = HashSet::new();
     while let Some(r) = reader.next_record()? {
         // A record's transaction is named by its start timestamp, and a spilled part's too.
         out.clock = out.clock.max(r.header.txn);
@@ -177,7 +193,11 @@ fn scan(io: &Arc<dyn IO>, base: &str, config: &LogConfig, superblock: &Superbloc
             }
         }
         if r.header.kind == META_INTENT {
-            out.intents.extend(decode_intent(&r.payload)?);
+            // One frame a distinct page: a page many intent records name, as checkpoints cut short
+            // one after another leave it, is pinned once (DESIGN.md 22.18).
+            let ids = decode_intent(&r.payload)?;
+            out.intents
+                .extend(ids.into_iter().filter(|&id| named.insert(id)));
             continue;
         }
         let Some((ts, body)) = gather.record(r.header.kind, r.header.txn, r.start, &r.payload)?

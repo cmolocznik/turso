@@ -1434,8 +1434,12 @@ impl PageStore {
             (0..radix::FANOUT).map(|c| radix::used_below(old, c)).sum()
         };
         radix::set_used_below(locked.page_of(new_root), 0, used);
-        locked.commit(&self.meta);
+        // Published while both roots are latched: a change that latches the old path once they
+        // are let go reads the new height and looks again, never counting a unit under the old
+        // root alone that the new root's count, copied above, has missed.
         self.heights[tree as usize][class.index()].store(height + 1, Ordering::Release);
+        locked.commit(&self.meta);
+        crate::race::point("store.grown");
         Ok(IOResult::Done(()))
     }
 

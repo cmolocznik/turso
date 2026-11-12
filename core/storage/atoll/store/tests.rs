@@ -1312,3 +1312,60 @@ fn a_swap_shard_is_listed_a_run_at_a_time_from_where_the_last_ended() {
     assert_eq!(listed, pages, "the pages listed against those swapped");
     assert_eq!(runs, [RUN, RUN, RUN, 2]);
 }
+
+/// A growth publishes its height before it lets go of the two roots: a page number taken in the
+/// gap a release before the publication would leave, under the old root's latch with the old
+/// height read, would be counted by the old root alone and missed by the new one's count, copied
+/// from it before. Here one is taken just after the roots are let go and is counted in the new
+/// root (the auditor's #4617.2 and #4619, whose reproduction this is; mutant: the height published
+/// after the roots are let go).
+#[test]
+fn a_growth_publishes_its_height_before_letting_go_of_its_roots() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let store = PageStore::open(
+        io.clone(),
+        "/db/growth",
+        StoreConfig::default(),
+        [[1; CLASS_COUNT]; TREES],
+        0,
+    );
+    let class = class(0);
+    let leaf = radix::root(Tree::Map, class, 1);
+    let new_root = radix::root(Tree::Map, class, 2);
+    // Both roots in memory, so the take in the gap never waits on a read.
+    let warmed = drive(&io, || store.meta().get_all(&[leaf, new_root])).unwrap();
+    let (ran, taken, seen) = (
+        Rc::new(Cell::new(false)),
+        Rc::new(Cell::new(false)),
+        Rc::new(Cell::new(0)),
+    );
+    let pid = PageId::new(class, 1);
+    {
+        let (ran, taken, seen, store) = (ran.clone(), taken.clone(), seen.clone(), store.clone());
+        crate::race::at("store.grown", move || {
+            ran.set(true);
+            seen.set(store.height(Tree::Map, class));
+            taken.set(matches!(
+                store.take_number_at(pid, true),
+                Ok(IOResult::Done(true))
+            ));
+        });
+    }
+    let grown = drive(&io, || store.grow(Tree::Map, class)).is_ok();
+    let entry = drive(&io, || store.entry(pid)).ok();
+    let used = drive(&io, || store.pages_in_use(class)).ok();
+    let height = store.height(Tree::Map, class);
+    drop((warmed, store, io));
+    assert!(
+        ran.get() && taken.get(),
+        "the take just after the roots were let go was not made"
+    );
+    assert_eq!(seen.get(), 2, "the height the take read");
+    assert!(
+        grown && height == 2 && entry == Some(ALLOCATED),
+        "(grown, height, entry): ({grown}, {height}, {entry:?})"
+    );
+    assert_eq!(used, Some(1), "pages in use as the new root counts them");
+}

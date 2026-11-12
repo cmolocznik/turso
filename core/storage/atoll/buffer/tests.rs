@@ -7789,9 +7789,10 @@ impl source::Located for AnnouncingNothingLocated {
 
 /// A load whose read announced no request, the read returned and its frame let go, meeting the
 /// frame given to another page whose write-out's request is held, before the load judges its
-/// read: whether that other request's record was still held once the load returned, and whether
-/// the setup reached it (the auditor's #4562).
-fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, bool) {
+/// read: whether the setup reached it, whether that other request's record was still held once
+/// the load returned, and whether the load's judgement panicked, caught so that every request is
+/// let go and the pool dropped before a test asserts (the auditor's #4562 and #4568).
+fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, bool, bool) {
     let held = Arc::new(HeldRequests::default());
     let io: Arc<dyn IO> = Arc::new(HeldDataIO {
         inner: Arc::new(crate::io::MemoryIO::new()),
@@ -7870,9 +7871,12 @@ fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, 
             other.set(Some((yframe, pool.header(yframe).record_held())));
         });
     }
-    let _ = pool
-        .fix_optimistic(PageId::new(big, 1 << 20), None)
-        .unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = pool
+            .fix_optimistic(PageId::new(big, 1 << 20), None)
+            .unwrap();
+    }))
+    .is_err();
     let reached = !crate::race::pending("buffer.read_returned")
         && other.get().is_some_and(|(_, held_then)| held_then);
     let still_held = other
@@ -7891,7 +7895,7 @@ fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, 
     let _ = pool.settle_writes();
     pool.protect(&[]);
     drop(pool);
-    (reached, still_held)
+    (reached, still_held, panicked)
 }
 
 /// A load whose read gave up with no request announced, its frame freed and given to another
@@ -7900,11 +7904,13 @@ fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, 
 /// go on the frame's header, as 8a3787a72 judged it).
 #[test]
 fn a_load_whose_read_gave_up_lets_go_no_record_of_its_frames_next_page() {
-    let (reached, still_held) = a_load_judging_its_read_after_its_frame_changed_hands(false);
+    let (reached, still_held, panicked) =
+        a_load_judging_its_read_after_its_frame_changed_hands(false);
     assert!(
         reached,
         "the frame was not given to another page's held write-out"
     );
+    assert!(!panicked, "the load's judgement panicked");
     assert!(
         still_held,
         "the load let go the record of a request on its frame's next page"
@@ -7916,10 +7922,15 @@ fn a_load_whose_read_gave_up_lets_go_no_record_of_its_frames_next_page() {
 /// announced, and the other request's record stays held (the auditor's #4562).
 #[test]
 fn a_load_whose_read_filled_its_page_judges_its_own_read_not_its_frames_next_page() {
-    let (reached, still_held) = a_load_judging_its_read_after_its_frame_changed_hands(true);
+    let (reached, still_held, panicked) =
+        a_load_judging_its_read_after_its_frame_changed_hands(true);
     assert!(
         reached,
         "the frame was not given to another page's held write-out"
+    );
+    assert!(
+        !panicked,
+        "the load judged the next page's record as its own read's: its judgement panicked"
     );
     assert!(
         still_held,

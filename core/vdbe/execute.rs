@@ -4275,6 +4275,22 @@ fn has_index_method_work(state: &ProgramState) -> bool {
             .any(|cursor| matches!(cursor, Some(Cursor::IndexMethod(_))))
 }
 
+/// What a `ROLLBACK` of an Atoll transaction does once its ending, stepped by the commit path, is
+/// done: the attached databases', temp's and the virtual tables' transactions rolled back, the index
+/// methods and the hooks told, the read-only mark let go. Its schema was put back and its state
+/// set by the commit path (DESIGN.md 22.18: `ROLLBACK` steps its ending).
+fn atoll_rolled_back(conn: &Arc<Connection>) -> crate::Result<()> {
+    conn.rollback_attached_wal_txns();
+    conn.rollback_temp_schema();
+    vtab_rollback_all(conn)?;
+    conn.index_methods_on_transaction_rolled_back();
+    if let Some(hooks) = conn.hooks() {
+        hooks.transaction_rolled_back(conn);
+    }
+    conn.set_tx_read_only(false);
+    Ok(())
+}
+
 /// Rollback all virtual tables that are part of the current transaction.
 pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
@@ -5447,6 +5463,8 @@ pub fn op_auto_commit(
         ) {
             if !*rollback {
                 conn.index_methods_on_transaction_committed();
+            } else if conn.atoll().is_some() {
+                atoll_rolled_back(&conn)?;
             }
             conn.clear_tx_poison();
             conn.clear_named_savepoints();
@@ -5507,6 +5525,16 @@ pub fn op_auto_commit(
         }
 
         match tx_op {
+            // The ending is the connection's place's, stepped by the commit path below as
+            // COMMIT's is, never driven here; what follows a rollback runs once it is done
+            // (`atoll_rolled_back`; DESIGN.md 22.18). The connection's state, still the
+            // transaction's, tells the commit path whether a schema change is put back.
+            TxOp::Rollback if conn.atoll().is_some() => {
+                conn.auto_commit.store(true, Ordering::SeqCst);
+                // Reset or dropped with its ending under way, the statement rolls the
+                // transaction's connection state back as a COMMIT's does.
+                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+            }
             TxOp::Rollback => {
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = conn.get_mv_tx_id() {
@@ -5514,9 +5542,6 @@ pub fn op_auto_commit(
                     }
                     pager.end_read_tx();
                     conn.rollback_attached_mvcc_txs(true);
-                } else if conn.atoll().is_some() {
-                    // Driven to its end here, a synchronous site (R19).
-                    conn.rollback_atoll();
                 } else {
                     pager.rollback_tx(&conn);
                 }
@@ -5616,6 +5641,9 @@ pub fn op_auto_commit(
         IOResult::Done(_) => InsnFunctionStepResult::Done,
         IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
     };
+    if matches!(tx_op, TxOp::Rollback) && conn.atoll().is_some() {
+        atoll_rolled_back(&conn)?;
+    }
 
     if mv_store.is_none() {
         pager.clear_savepoints()?;

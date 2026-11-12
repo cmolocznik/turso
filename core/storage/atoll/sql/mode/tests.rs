@@ -7174,3 +7174,174 @@ fn a_commit_whose_admission_its_destructor_sees_fail_rolls_back() {
 fn a_commit_whose_admission_waited_commits_once_its_room_is_let_go() {
     a_commit_whose_admission_its_driver_sees_fail(688, false, false);
 }
+
+/// A `ROLLBACK` steps its transaction's ending as `COMMIT` does, never driving it in place
+/// (DESIGN.md 22.18): its undo, meeting a page written back and evicted, returns `IO` from the
+/// statement's step, and once done the transaction's write is undone, the tables it created gone
+/// from the schema and from temp's, the connection out of its transaction, every slot free and the gate free. The
+/// same `ROLLBACK` dropped after its first `IO`: its ending, in the connection's place, is driven to
+/// its end by the drop, with the same outcome (mutant: the rollback driven in place,
+/// `Connection::rollback_atoll`, its step never returning `IO`). With the root resident (`evict`
+/// false) the ending is done in the instruction's first call, which returns no `IO`, and the
+/// rollback's own work runs there, the transaction's read-only mark let go among it (mutants: that
+/// work skipped on the first call, or on the re-entry).
+fn a_rollback_statement_steps_its_ending(seed: u64, dropped: bool, evict: bool) {
+    use crate::storage::atoll::sql::catalog::key;
+    use crate::storage::atoll::txn::versioned::Get;
+    use crate::storage::atoll::txn::Isolation;
+    use crate::types::IOResult;
+    let name = format!("/db/rollback-steps-{dropped}-{evict}");
+    let crash = Arc::new(crate::io::crash::CrashIO::new(seed));
+    let io: Arc<dyn IO> = crash.clone();
+    let db = open(&io, &name);
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let values = (0..300)
+        .map(|n| format!("({n}, zeroblob(100))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let setup = [
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b BLOB)".to_string(),
+        format!("INSERT INTO t VALUES {values}"),
+    ]
+    .iter()
+    .try_for_each(|sql| ran_on(&conn, &crash, sql));
+    let id = match rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")
+        .first()
+        .and_then(|r| r.first())
+    {
+        Some(Value::Numeric(crate::numeric::Numeric::Integer(id))) => *id as u64,
+        other => panic!("a root page of {other:?}"),
+    };
+    let inner = conn.atoll().unwrap().db.clone();
+    let txns = inner.atoll().transactions();
+    let root = {
+        let mut txn =
+            crate::storage::atoll::drive(inner.io(), || txns.begin(Isolation::Snapshot)).unwrap();
+        let mut get = Get::new(&key(id));
+        let entry = crate::storage::atoll::drive(inner.io(), || {
+            inner
+                .catalog()
+                .get(txns, inner.versions(), &mut txn, &mut get)
+        });
+        txns.abort(txn);
+        entry.unwrap().expect("t's catalog row").root
+    };
+    // A row rewritten and a table created in the transaction, then the tree written back and its
+    // root evicted: the undo reaches the row's leaf through the root, read in again.
+    let began = [
+        "BEGIN",
+        "UPDATE t SET b = zeroblob(50) WHERE a = 150",
+        "CREATE TABLE u(x)",
+        "CREATE TEMP TABLE v(x)",
+    ]
+    .iter()
+    .try_for_each(|sql| ran_on(&conn, &crash, sql));
+    super::full_checkpoint(&inner).unwrap();
+    let pool = inner.atoll().pool().clone();
+    let mut sweep = pool.sweep();
+    crate::storage::atoll::drive(inner.io(), || sweep.step(&pool)).unwrap();
+    drop(sweep);
+    let evicted = !evict || pool.evict_clean(root);
+    // As `BEGIN READ ONLY` marks its transaction: the rollback's own work lets the mark go.
+    conn.set_tx_read_only(true);
+    let mut rollback = conn.prepare("ROLLBACK").unwrap();
+    let mut ios = 0;
+    let ended = loop {
+        match rollback.step() {
+            Ok(crate::StepResult::IO) => {
+                ios += 1;
+                if dropped {
+                    break Ok(());
+                }
+                if let Err(e) = crash.step() {
+                    break Err(e.to_string());
+                }
+            }
+            Ok(crate::StepResult::Done) => break Ok(()),
+            other => break Err(format!("{other:?}")),
+        }
+    };
+    drop(rollback);
+    let read_only = conn.is_tx_read_only();
+    let state = (conn.get_auto_commit(), conn.get_tx_state());
+    let kept = rows(&conn, "SELECT count(*), length(b) FROM t WHERE a = 150");
+    let count = rows(&conn, "SELECT count(*) FROM t");
+    let u_gone = conn.prepare("SELECT x FROM u").is_err();
+    let v_gone = conn.prepare("SELECT x FROM v").is_err();
+    let u_rows = rows(&conn, "SELECT count(*) FROM sqlite_schema WHERE name = 'u'");
+    let mut begun = Vec::new();
+    for _ in 0..txns.slot_count() {
+        if let Ok(IOResult::Done(txn)) = txns.begin(Isolation::Snapshot) {
+            begun.push(txn);
+        }
+    }
+    let free = begun.len();
+    let gate = match begun.first_mut() {
+        Some(txn) => format!(
+            "{:?}",
+            txns.take_exclusive(txn, &crate::io::Completion::new_wait())
+        ),
+        None => "no transaction".to_string(),
+    };
+    for txn in begun {
+        txns.abort(txn);
+    }
+    let failure = txns.failure().map(|e| e.to_string());
+    drop((pool, inner, conn, db));
+    drop(io);
+    let in_flight = crash.in_flight();
+    assert_eq!(setup, Ok(()));
+    assert_eq!(began, Ok(()));
+    assert!(evicted, "t's root was not evicted");
+    assert_eq!(ended, Ok(()));
+    if evict {
+        assert!(
+            ios > 0,
+            "the ROLLBACK's step never returned IO: its ending was driven in place"
+        );
+    } else {
+        assert_eq!(ios, 0, "a ROLLBACK with every page resident returned IO");
+    }
+    assert_eq!(state, (true, crate::connection::TransactionState::None));
+    assert!(
+        !read_only,
+        "the rolled-back transaction's read-only mark stayed"
+    );
+    assert_eq!(
+        kept,
+        vec![vec![Value::from_i64(1), Value::from_i64(100)]],
+        "the rolled-back update is still there"
+    );
+    assert_eq!(count, vec![vec![Value::from_i64(300)]]);
+    assert!(
+        u_gone,
+        "the rolled-back table is still in the connection's schema"
+    );
+    assert_eq!(u_rows, vec![vec![Value::from_i64(0)]]);
+    assert!(
+        v_gone,
+        "the rolled-back temporary table is still in temp's schema"
+    );
+    assert_eq!(free, 4, "the rolled-back transaction kept its slot");
+    assert_eq!(
+        gate, "Ok(Done)",
+        "the rolled-back transaction kept the gate"
+    );
+    assert_eq!(failure, None);
+    assert_eq!(in_flight, 0);
+}
+
+#[test]
+fn a_rollback_statement_steps_its_ending_and_returns_its_io() {
+    a_rollback_statement_steps_its_ending(690, false, true);
+}
+
+#[test]
+fn a_rollback_statement_dropped_mid_ending_finishes_it() {
+    a_rollback_statement_steps_its_ending(691, true, true);
+}
+
+#[test]
+fn a_rollback_statement_whose_ending_needs_no_io_is_done_in_its_first_call() {
+    a_rollback_statement_steps_its_ending(692, false, false);
+}

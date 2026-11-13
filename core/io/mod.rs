@@ -89,6 +89,13 @@ pub(crate) fn deliver_on_this_thread() {
     take_role(Role::Delivering);
 }
 
+/// Whether this thread is a ring's delivery thread (RING-FD1 §2: a file's last drop there with
+/// requests outstanding could only wait for itself).
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+pub(crate) fn delivering() -> bool {
+    ROLE.with(|r| r.get()) == Role::Delivering
+}
+
 /// Marks this thread, a database's IO thread, for the rest of its life (ASYNC1 D2a): it opens,
 /// syncs and reads for the requests queued to it, and runs the callbacks of what it submits, so it
 /// waits on the file system and on nothing it or a ring would deliver.

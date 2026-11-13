@@ -1,7 +1,7 @@
 //! A database: its control file, log, page store, buffer pool and checkpointer, created new or
 //! recovered from what a crash left.
 
-use super::buffer::{BufferConfig, BufferPool, LocalSource};
+use super::buffer::{BufferConfig, BufferPool};
 use super::checkpoint::{
     CheckpointRelief, CheckpointTask, Checkpointer, Checkpointing, WRITE_BYTES,
 };
@@ -11,10 +11,10 @@ use super::executor::{rank, Class, Executor};
 use super::log::{Log, LogConfig, LogWait};
 use super::meta::TREES;
 use super::page::CLASS_COUNT;
-use super::recovery::{self, Recovered};
+use super::recovery::{self, Partial, Recovered};
 use super::requests::{Counted, Requests};
 use super::store::{PageStore, StoreConfig};
-use super::txn::{Clock, Transactions, TxnConfig};
+use super::txn::{Transactions, TxnConfig};
 use crate::io::IO;
 use crate::storage::atoll::locks::Mutex;
 use crate::sync::Arc;
@@ -274,16 +274,26 @@ impl Unopened {
     }
 }
 
-impl Drop for Unopened {
-    fn drop(&mut self) {
-        crate::storage::atoll::unwind::abort_if_unwinding();
+impl Unopened {
+    /// Closes the executor in close's order from step 2, the requests drained, if the open has not
+    /// taken it; a second call finds nothing.
+    fn close(&mut self) {
         if let Some(executor) = self.executor.take() {
             executor.close_unopened(&self.requests);
         }
     }
 }
 
+impl Drop for Unopened {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        self.close();
+    }
+}
+
 enum How {
+    /// A new database being made, what it made so far held here (RING-FD1 §5).
+    Creating(Partial),
     /// A new database, ready to open.
     Created(Box<Recovered>),
     /// A database to recover from its superblock, and what recovery needs.
@@ -292,6 +302,8 @@ enum How {
         base: String,
         config: Box<AtollConfig>,
         control: Option<Control>,
+        /// What a recovery made so far, kept here if it fails (RING-FD1 §5).
+        partial: Partial,
     },
     Recovered(Box<Recovered>),
     Taken,
@@ -374,6 +386,7 @@ impl Opening {
                 base: base.to_string(),
                 config: Box::new(config),
                 control: Some(control),
+                partial: Partial::default(),
             }),
         })
     }
@@ -413,45 +426,33 @@ impl Opening {
             superblock.heights,
             0,
         );
-        control.write_and_wait(&superblock)?;
-        let pool = BufferPool::new(
-            config.buffer.clone(),
-            Arc::new(LocalSource::new(store.clone())),
-            store.clone(),
-        )?;
-        // Its ring in frames the pool lends: the pool first.
-        let log = Log::open_in(
-            counted.clone(),
-            base,
-            config.log.clone(),
-            0,
-            &pool,
-            executor.executor(),
-        )?;
-        let txns = Transactions::new(&config.txn, Arc::new(Clock::after(0)), log.clone());
-        let checkpointer = Checkpointer::new(
-            pool.clone(),
-            store.clone(),
-            log.clone(),
-            control,
-            superblock.clone(),
-            config.log_budget(),
-            config.checkpoint_write_bytes(),
-        );
-        Ok(Self {
+        // The open first, holding what the creation makes as it makes it, so a creation that fails
+        // drops it all through the open's own drop, the drain before any owner (RING-FD1 §5).
+        let opening = Self {
             store,
             superblock,
             io,
             requests,
             checkpointing: config.checkpointing,
             executor,
-            how: Mutex::new(How::Created(Box::new(Recovered {
-                log,
-                pool,
-                checkpointer,
-                txns,
-            }))),
-        })
+            how: Mutex::new(How::Creating(Partial::default())),
+        };
+        let mut how = opening.how.lock();
+        if let How::Creating(partial) = &mut *how {
+            let created = recovery::create(
+                counted,
+                base,
+                &config,
+                opening.store.clone(),
+                control,
+                &opening.superblock,
+                opening.executor.executor(),
+                partial,
+            )?;
+            *how = How::Created(Box::new(created));
+        }
+        drop(how);
+        Ok(opening)
     }
 
     /// Recovers, if this open recovers and no one has yet; returns once recovery is done.
@@ -462,6 +463,7 @@ impl Opening {
             base,
             config,
             control,
+            partial,
         } = &mut *how
         else {
             return Ok(());
@@ -477,21 +479,25 @@ impl Opening {
             control,
             self.superblock.clone(),
             self.executor.executor(),
+            partial,
         )?;
         *how = How::Recovered(Box::new(recovered));
         Ok(())
     }
 
-    pub fn finish(self) -> Result<Atoll> {
+    pub fn finish(mut self) -> Result<Atoll> {
         let how = std::mem::replace(&mut *self.how.lock(), How::Taken);
         #[cfg(test)]
         let recovered = matches!(how, How::Recovered(_));
         let r = match how {
             How::Created(r) | How::Recovered(r) => r,
-            How::Recovering { .. } | How::Taken => {
+            unfinished @ (How::Creating(_) | How::Recovering { .. } | How::Taken) => {
+                // Put back: what an unfinished open holds drops with it, after its own drop's
+                // drain (RING-FD1 §5), never as this function's local before it.
+                *self.how.lock() = unfinished;
                 return Err(LimboError::InternalError(
                     "finishing an open before recovery is done".into(),
-                ))
+                ));
             }
         };
         let Recovered {
@@ -509,8 +515,8 @@ impl Opening {
         // worker or none, its writers claiming it; before the preparer in the order jobs wait on
         // each other (DESIGN.md 22.4).
         let worker = matches!(self.checkpointing, Checkpointing::Thread);
-        let mut unopened = self.executor;
-        let executor = unopened.take();
+        // Taken, so the open's own drop finds nothing to close.
+        let executor = self.executor.take();
         let task = executor.spawn_ranked(
             Class::Maintenance,
             rank::CHECKPOINT,
@@ -525,12 +531,23 @@ impl Opening {
             recovered,
             txns,
             log,
-            store: self.store,
+            store: self.store.clone(),
             pool,
             checkpointer,
             executor,
-            io: self.io,
-            requests: self.requests,
+            io: self.io.clone(),
+            requests: self.requests.clone(),
         })
+    }
+}
+
+impl Drop for Opening {
+    /// An open dropped unfinished, its recovery failed or never run, closes its executor in close's
+    /// order before any of its fields drops (RING-FD1 §5): the requests drained, so the store, the
+    /// pool, the log, a recovery's partial owners and their files all go after every request on
+    /// the database's files has retired. A finished open took the executor, and this does nothing.
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        self.executor.close();
     }
 }

@@ -7,6 +7,7 @@ use super::*;
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{Delivery, FileSyncType, MemoryIO, OpenFlags, Stepped, IO};
 use crate::storage::atoll::cooperative::Frame;
+use crate::storage::atoll::db::Opening;
 use crate::storage::atoll::page::{HEADER_SIZE, MIN_PAGE_SIZE};
 use crate::storage::atoll::requests::{
     counted_async_with_frames_for_test, counted_for_test, Counted, Requests,
@@ -15,6 +16,7 @@ use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
 #[cfg(all(unix, not(miri)))]
 use crate::storage::atoll::testing::in_child;
+use crate::storage::atoll::tests::{config, ending_inside_a_block, BASE};
 use crate::LimboError;
 use std::thread::ThreadId;
 
@@ -63,6 +65,8 @@ struct Probe {
     refuse_open: Mutex<Option<String>>,
     rule: Mutex<Option<(String, Rule)>>,
     held: Mutex<Vec<Completion>>,
+    /// The files it opened and that have not yet dropped, by path.
+    live: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl Probe {
@@ -127,6 +131,11 @@ impl Probe {
         self.held.lock().iter().filter(|c| c.is_owned()).count()
     }
 
+    /// The files it opened at `path` that have not yet dropped.
+    fn live(&self, path: &str) -> usize {
+        self.live.lock().get(path).copied().unwrap_or(0)
+    }
+
     /// Retires every request whose retirement it holds.
     fn let_go(&self) {
         let held = std::mem::take(&mut *self.held.lock());
@@ -160,8 +169,10 @@ impl IO for Probe {
                 "a probe's open refused".to_string(),
             ));
         }
+        let file = self.inner.open_file(path, flags, direct)?;
+        *self.live.lock().entry(path.to_string()).or_default() += 1;
         Ok(Arc::new(ProbeFile {
-            file: self.inner.open_file(path, flags, direct)?,
+            file,
             path: path.to_string(),
             probe: self as *const Probe as usize,
         }))
@@ -202,6 +213,16 @@ impl ProbeFile {
     fn probe(&self) -> &Probe {
         // SAFETY: each test holds its probe until every file it opened has dropped.
         unsafe { &*(self.probe as *const Probe) }
+    }
+}
+
+impl Drop for ProbeFile {
+    fn drop(&mut self) {
+        let mut live = self.probe().live.lock();
+        let open = live
+            .get_mut(&self.path)
+            .expect("a probe's file counted at its open");
+        *open -= 1;
     }
 }
 
@@ -1480,4 +1501,104 @@ fn a_queued_failure_holds_its_records_until_its_carrier_retires() {
         (0, records, 0),
         "the write-out let go more than once"
     );
+}
+
+/// The log's own segment 0 of the database at [`BASE`]: once a recovery has opened its log, only
+/// the log, its transactions and its checkpointer hold it, none of the open's other owners.
+fn log_segment() -> String {
+    format!("{BASE}.log.{:016x}", 0)
+}
+
+/// A database that ends inside a block, reopened over `probe`, whose recovery fails at its full
+/// checkpoint's write to the log (RING-FD1 §5, test 9). The log's reads and writes fail and stay
+/// held from recovery's superblock write on, which comes after its scan has read the log and the
+/// log has opened its segment: the checkpoint's log write ends in an error the probe still owns.
+/// The open, and its `work()`'s error.
+fn a_recovery_failing_at_its_logs_write(probe: &Arc<Probe>) -> (Opening, Option<String>) {
+    let io: Arc<dyn IO> = probe.clone();
+    ending_inside_a_block(io.clone());
+    let opening = Opening::new(io, BASE, config(), None).unwrap();
+    {
+        let probe = probe.clone();
+        crate::race::at("control.write_and_wait", move || {
+            probe.rule_under(&format!("{BASE}.log."), Some(Rule::HoldFail));
+        });
+    }
+    let failed = opening.work().err().map(|e| e.to_string());
+    (opening, failed)
+}
+
+/// `close`, which drops an open on this thread, with the log's segment looked at when the open's
+/// drain first looks at its requests; the probe then lets its held requests go, so the drain ends.
+/// The segment's files open then and after `close`, and `close`'s value.
+fn the_log_segment_across_the_drain<T>(
+    probe: &Arc<Probe>,
+    close: impl FnOnce() -> T,
+) -> (Option<usize>, usize, T) {
+    let at_drain = std::rc::Rc::new(std::cell::Cell::new(None));
+    {
+        let (probe, at_drain) = (probe.clone(), at_drain.clone());
+        crate::race::at("requests.drain_looked", move || {
+            at_drain.set(Some(probe.live(&log_segment())));
+            probe.let_go();
+        });
+    }
+    let value = close();
+    (at_drain.get(), probe.live(&log_segment()), value)
+}
+
+/// RING-FD1 §5, test 9 (a, b): a recovery that fails with its log's write held keeps its owners in
+/// the open, whose drop drains first. The log's segment is open after the failure and at the
+/// drain's look, and closed once the open has dropped (mutants: `opening-fields-first`, the open
+/// without its drop, its fields dropped before its executor's drain; `partial-locals`, recovery's
+/// owners its locals, gone as it returns. Each closes the segment before the drain).
+#[test]
+fn a_failed_recoverys_owners_drop_only_after_the_opens_drain() {
+    let probe = Probe::new();
+    let (opening, failed) = a_recovery_failing_at_its_logs_write(&probe);
+    let (held, open) = (probe.holding(), probe.live(&log_segment()));
+    let (at_drain, after, ()) = the_log_segment_across_the_drain(&probe, || drop(opening));
+    let left = probe.holding();
+    assert_eq!(
+        (failed.is_some(), held > 0),
+        (true, true),
+        "(the recovery failed, a log request held): {failed:?}"
+    );
+    assert_eq!(
+        (open, at_drain, after),
+        (1, Some(1), 0),
+        "(the log's segment open after the failure, at the drain's look, after the drop)"
+    );
+    assert_eq!(left, 0, "a held request left after the drop");
+}
+
+/// RING-FD1 §5, test 9 (c): `finish` after the failed recovery returns its error and puts the
+/// unfinished recovery back in the open, whose drop drains before the recovery's owners go: the
+/// log's segment is open at the drain's look, and closed after (mutant `finish-unrestored`: the
+/// unfinished recovery dropped as `finish`'s local before the open's drain).
+#[test]
+fn a_finish_after_a_failed_recovery_drops_its_owners_only_after_the_drain() {
+    let probe = Probe::new();
+    let (opening, failed) = a_recovery_failing_at_its_logs_write(&probe);
+    let (held, open) = (probe.holding(), probe.live(&log_segment()));
+    let (at_drain, after, finished) =
+        the_log_segment_across_the_drain(&probe, || opening.finish().err().map(|e| e.to_string()));
+    let left = probe.holding();
+    assert_eq!(
+        (failed.is_some(), held > 0),
+        (true, true),
+        "(the recovery failed, a log request held): {failed:?}"
+    );
+    assert!(
+        finished
+            .as_deref()
+            .is_some_and(|e| e.contains("before recovery is done")),
+        "finish after the failed recovery: {finished:?}"
+    );
+    assert_eq!(
+        (open, at_drain, after),
+        (1, Some(1), 0),
+        "(the log's segment open after the failure, at the drain's look, after the drop)"
+    );
+    assert_eq!(left, 0, "a held request left after the drop");
 }

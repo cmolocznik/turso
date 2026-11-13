@@ -312,6 +312,11 @@ pub(super) struct CompletionInner {
     /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
     /// where pwrite returns before the kernel has consumed the buffer.
     write_buffer: OnceLock<Arc<Buffer>>,
+    /// The accepting backend's own word for this request, from its acceptance to its last entry:
+    /// written and read only by that backend, under the exclusion it holds for both (the ring's
+    /// file slot, RING-FD1). Zero for none.
+    #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+    backend_word: AtomicUsize,
     /// For a wait the engine makes ([`Completion::new_engine_wait`]), where its wakers go: every way
     /// of running them (a finish, a late registration, a nudge) hands them to this function
     /// instead of waking them in place (DESIGN.md 9.1.3). Never counted into a group. Set at
@@ -539,8 +544,23 @@ impl CompletionInner {
             context: ContextState::new(),
             parent: Mutex::new(None),
             write_buffer: OnceLock::new(),
+            #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+            backend_word: AtomicUsize::new(0),
             engine: None,
         }
+    }
+
+    /// Sets the accepting backend's word for this request (RING-FD1). Only that backend reads it,
+    /// under the same exclusion it writes it under, so the order is that exclusion's.
+    #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+    pub(super) fn set_backend_word(&self, word: usize) {
+        self.backend_word.store(word, Ordering::Relaxed);
+    }
+
+    /// The accepting backend's word for this request: zero if it set none.
+    #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+    pub(super) fn backend_word(&self) -> usize {
+        self.backend_word.load(Ordering::Relaxed)
     }
 }
 

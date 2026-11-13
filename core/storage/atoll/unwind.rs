@@ -141,6 +141,11 @@ mod tests {
             "OnDrop",
             "a test's owned destructor callback, which changes no database state",
         ),
+        (
+            "buffer/frame_tests.rs",
+            "ProbeFile",
+            "a test's count of its probe's live files",
+        ),
         ("buffer/memory.rs", "Mapping", "unmaps its own memory"),
         ("epoch.rs", "Registry", "frees its own chunks"),
         (

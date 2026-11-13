@@ -18,9 +18,10 @@ use std::ptr::NonNull;
 use std::{
     collections::{HashMap, VecDeque},
     io::ErrorKind,
+    mem::ManuallyDrop,
     ops::Deref,
     os::{
-        fd::{AsFd, FromRawFd, OwnedFd},
+        fd::{AsFd, FromRawFd, OwnedFd, RawFd},
         unix::io::AsRawFd,
     },
     sync::atomic::{AtomicUsize, Ordering},
@@ -46,6 +47,11 @@ const CANCEL_TAG: u64 = 1;
 
 /// user_data tag of the standing poll on the ring's eventfd: not a request, never counted as one.
 const EVENTFD_TAG: u64 = 2;
+
+/// The fatal site of a file's last drop on the delivery thread with requests outstanding (RING-FD1
+/// §2): that thread would wait for entries only it can reap.
+const REFUSED_DROP_ON_DELIVERY: &str =
+    "io_uring: a file's last drop on the delivery thread, requests unretired";
 
 /// Probed io_uring opcode support. Opcodes that are not supported by the
 /// running kernel fall back to synchronous POSIX syscalls.
@@ -82,6 +88,9 @@ struct Shared {
     /// An error number the delivery thread's next wait returns instead of waiting, for a test.
     #[cfg(test)]
     injected_wait: std::sync::atomic::AtomicI32,
+    /// Where a file's last drop on this ring says it parked, waiting for its requests, for a test.
+    #[cfg(test)]
+    closer_notes: Mutex<Option<std::sync::mpsc::Sender<&'static str>>>,
 }
 
 unsafe impl Send for Shared {}
@@ -136,6 +145,104 @@ struct RingState {
     overflow: VecDeque<io_uring::squeue::Entry>,
     iov_pool: IovecPool,
     free_arenas: [Option<(NonNull<u8>, usize)>; ARENA_COUNT],
+    /// The open files, one slot each: the requests each accepted and has not yet reaped the last
+    /// entry of, and the thread its last handle's drop waits on (RING-FD1 §1).
+    files: FileSlots,
+    /// The ring's eventfd, which a refusal to enter that may pass writes, so that the delivery
+    /// thread's wait ends and its next one enters what is queued (RING-FD1 §2). Owned by
+    /// [`Shared`], which outlives this state.
+    wake: RawFd,
+    /// Entering held, for a test (RING-FD1 §7): no `enter` enters anything, and the delivery
+    /// thread's wait enters nothing. Set only before the delivery thread starts.
+    #[cfg(test)]
+    entry_held: bool,
+    /// Where `take` tells each request entry it reaps, for a test.
+    #[cfg(test)]
+    take_notes: Option<std::sync::mpsc::Sender<tests::TakeNote>>,
+}
+
+/// The ring's open files, one slot each (RING-FD1 §1). A slot is taken at the file's open and freed
+/// by its last handle's drop once no request the file accepted remains unreaped, so no accepted
+/// request ever names a slot freed or reused.
+#[derive(Default)]
+struct FileSlots {
+    slots: Vec<FileUsers>,
+    free: Vec<usize>,
+}
+
+#[derive(Default)]
+struct FileUsers {
+    /// Requests accepted on the file whose last entry is not yet reaped.
+    requests: usize,
+    /// The thread the file's last handle's drop parked, waiting for `requests` to reach zero.
+    closer: Option<std::thread::Thread>,
+    /// Whether a file holds the slot.
+    open: bool,
+}
+
+/// A file's slot among the ring's, made only by [`FileSlots::take`]. A request carries it in its
+/// completion's backend word as `index + 1`, so zero is none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileSlot(usize);
+
+impl FileSlot {
+    fn word(self) -> usize {
+        self.0 + 1
+    }
+
+    fn of_word(word: usize) -> Self {
+        Self(word - 1)
+    }
+}
+
+impl FileSlots {
+    fn take(&mut self) -> FileSlot {
+        let at = match self.free.pop() {
+            Some(at) => at,
+            None => {
+                self.slots.push(FileUsers::default());
+                self.slots.len() - 1
+            }
+        };
+        self.slots[at].open = true;
+        FileSlot(at)
+    }
+
+    fn count(&mut self, slot: FileSlot) {
+        self.slots[slot.0].requests += 1;
+    }
+
+    /// One request of `slot`'s file reaped at its last entry: its closer, if the file has no
+    /// request left and one waits.
+    fn uncount(&mut self, slot: FileSlot) -> Option<std::thread::Thread> {
+        let users = &mut self.slots[slot.0];
+        turso_assert!(users.requests > 0, "a ring file's request reaped twice");
+        users.requests -= 1;
+        if users.requests == 0 {
+            users.closer.take()
+        } else {
+            None
+        }
+    }
+
+    fn requests(&self, slot: FileSlot) -> usize {
+        self.slots[slot.0].requests
+    }
+
+    fn wait_as_closer(&mut self, slot: FileSlot, closer: std::thread::Thread) {
+        self.slots[slot.0].closer = Some(closer);
+    }
+
+    fn free(&mut self, slot: FileSlot) {
+        let users = &mut self.slots[slot.0];
+        turso_assert!(
+            users.requests == 0 && users.open,
+            "a ring file's slot freed while its requests remain"
+        );
+        users.open = false;
+        users.closer = None;
+        self.free.push(slot.0);
+    }
 }
 
 impl RingState {
@@ -172,7 +279,72 @@ impl RingState {
         if !pushed {
             self.overflow.push_back(entry.clone());
         }
-        enter(ring);
+        self.enter(ring);
+    }
+
+    /// Queues `entry`, a request of the file in `slot` whose completion is `c`, as
+    /// [`submit_entry`](Self::submit_entry) does, counted on its file and its completion marked with
+    /// the slot first: so the file's descriptor stays its own until the delivery thread reaps the
+    /// request's last entry (RING-FD1 §1). SAFETY: same contract as `submit_entry`.
+    unsafe fn submit_request(
+        &mut self,
+        ring: &io_uring::IoUring,
+        entry: &io_uring::squeue::Entry,
+        slot: FileSlot,
+        c: &Completion,
+    ) {
+        self.mark_request(slot, c);
+        self.submit_entry(ring, entry);
+    }
+
+    /// Counts a request of the file in `slot` and marks its completion with the slot, before the
+    /// request's first entry is queued (RING-FD1 §1).
+    fn mark_request(&mut self, slot: FileSlot, c: &Completion) {
+        self.files.count(slot);
+        c.get_inner().set_backend_word(slot.word());
+    }
+
+    /// Tells a test each request entry `take` reaps: its key, whether it was the request's last, its
+    /// file's count after `take`'s decision, and the raw result.
+    #[cfg(test)]
+    fn note_take(&self, key: u64, last: bool, result: i32) {
+        if let Some(notes) = &self.take_notes {
+            // SAFETY: the kernel's reference to the completion is still held, as in `reaped_last`.
+            let inner = unsafe { &*(key as *const CompletionInner) };
+            let word = inner.backend_word();
+            let count = if word == 0 {
+                0
+            } else {
+                self.files.requests(FileSlot::of_word(word))
+            };
+            let _ = notes.send(tests::TakeNote {
+                key,
+                last,
+                count,
+                result,
+            });
+        }
+    }
+
+    /// Whether a test holds entering (RING-FD1 §7); never outside a test build.
+    fn entry_held(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.entry_held
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Enters what is queued, as [`enter`] does, unless a test holds entering.
+    fn enter(&self, ring: &io_uring::IoUring) {
+        #[cfg(test)]
+        if self.entry_held {
+            return;
+        }
+        enter(ring, self.wake);
     }
 
     /// SAFETY: same contract as `submit_entry`.
@@ -188,7 +360,7 @@ impl RingState {
         if !pushed {
             self.overflow.push_front(entry.clone());
         }
-        enter(ring);
+        self.enter(ring);
     }
 
     /// Queues the standing poll on the eventfd, rearmed after each time it fires. SAFETY: same
@@ -206,17 +378,35 @@ impl RingState {
 
 /// Enters the requests queued in the submission queue into the kernel. Entries already queued are
 /// accepted requests: a refusal the kernel says may pass (interrupted, out of resources, a full
-/// completion queue) leaves them queued for the next entry, which the next submission or wait
-/// makes. Any other means the ring can no longer deliver or retire what it accepted, and ends the
-/// process (DESIGN.md 22.11): returning would leave every waiter on those requests waiting.
-fn enter(ring: &io_uring::IoUring) {
+/// completion queue) leaves them queued for the next entry, which the delivery thread's next wait
+/// makes. So that wait comes even with nothing else in flight, such a refusal writes `wake`, the
+/// eventfd the delivery thread's standing poll watches (RING-FD1 §2). Any other refusal means the
+/// ring can no longer deliver or retire what it accepted, and ends the process (DESIGN.md 22.11):
+/// returning would leave every waiter on those requests waiting.
+fn enter(ring: &io_uring::IoUring, wake: RawFd) {
     #[cfg(test)]
     if tests::ENTER_HELD.with(|h| h.get()) {
         return;
     }
-    if let Err(e) = ring.submit() {
+    #[cfg(test)]
+    let refused = tests::ENTER_REFUSED.with(|r| r.take());
+    #[cfg(not(test))]
+    let refused = None;
+    let entered = match refused {
+        Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+        None => ring.submit().map(|_| ()),
+    };
+    if let Err(e) = entered {
         match e.raw_os_error() {
-            Some(libc::EINTR | libc::EAGAIN | libc::EBUSY) => {}
+            Some(libc::EINTR | libc::EAGAIN | libc::EBUSY) => {
+                let one = 1u64.to_ne_bytes();
+                // SAFETY: an 8-byte write from a live buffer to the eventfd the ring holds open. A
+                // write that fails leaves the counter as it was: it cannot, short of the counter
+                // reaching its maximum, which one write per refusal never does before a read.
+                unsafe { libc::write(wake, one.as_ptr().cast(), one.len()) };
+                #[cfg(test)]
+                tests::REFUSALS_RUNG.fetch_add(1, Ordering::Relaxed);
+            }
             _ => ring_lost("io_uring: io_uring_enter failed"),
         }
     }
@@ -269,7 +459,27 @@ impl UringIO {
     /// A ring of `entries` submission entries, its delivery thread started. If the thread or its
     /// eventfd cannot be set up, the ring is torn down whole and the error says so.
     fn with_entries(entries: u32) -> Result<Self> {
+        Self::starting(entries, false)
+    }
+
+    /// A ring of `entries` whose entering is held from before its delivery thread starts, for a
+    /// test (RING-FD1 §7): its eventfd's standing poll is entered first, by [`Shared::new`], so
+    /// the delivery thread's held wait ends at a write to it.
+    #[cfg(test)]
+    pub(super) fn held_for_test(entries: u32) -> Result<Self> {
+        Self::starting(entries, true)
+    }
+
+    /// A ring of `entries`, and its delivery thread started; with entering held from the first if
+    /// `held`, which only a test asks for.
+    fn starting(entries: u32, held: bool) -> Result<Self> {
         let shared = Shared::new(entries)?;
+        #[cfg(test)]
+        {
+            shared.state.lock().entry_held = held;
+        }
+        #[cfg(not(test))]
+        let _ = held;
         let io = Self {
             shared: Handle::new(&shared),
         };
@@ -314,6 +524,10 @@ impl Shared {
         } else {
             UringCapabilities { ftruncate: false }
         };
+        #[cfg(test)]
+        let caps = UringCapabilities {
+            ftruncate: caps.ftruncate && !tests::NO_FTRUNCATE_OPCODE.with(|n| n.get()),
+        };
         if !caps.ftruncate {
             warn!("io_uring: IORING_OP_FTRUNCATE not supported by kernel, using POSIX fallback");
         }
@@ -330,6 +544,7 @@ impl Shared {
         // SAFETY: `fd` is a fresh descriptor nothing else owns.
         let eventfd = unsafe { OwnedFd::from_raw_fd(fd) };
         let pass = ring.params().cq_entries() as usize;
+        let wake = eventfd.as_raw_fd();
         let shared = Arc::new(Shared {
             ring,
             state: Mutex::new(RingState {
@@ -337,6 +552,12 @@ impl Shared {
                 writev_states: HashMap::default(),
                 iov_pool: IovecPool::new(),
                 free_arenas: [const { None }; ARENA_COUNT],
+                files: FileSlots::default(),
+                wake,
+                #[cfg(test)]
+                entry_held: false,
+                #[cfg(test)]
+                take_notes: None,
             }),
             caps,
             handles: AtomicUsize::new(0),
@@ -345,6 +566,8 @@ impl Shared {
             pass,
             #[cfg(test)]
             injected_wait: std::sync::atomic::AtomicI32::new(0),
+            #[cfg(test)]
+            closer_notes: Mutex::new(None),
         });
         {
             let mut state = shared.state.lock();
@@ -581,6 +804,9 @@ enum Taken {
     /// whose own completion fires only on the last part. Without it, a future parked on the
     /// write is never polled while the parts complete.
     Progress(u64),
+    /// A file's last request reaped while its last handle's drop waits for it: that thread, to
+    /// unpark (RING-FD1 §1).
+    Closer(std::thread::Thread),
 }
 
 impl IO for UringIO {
@@ -592,9 +818,11 @@ impl IO for UringIO {
         trace!("open_file(path = {})", path);
         super::refuse_on_delivery_thread("a file's open");
         let file = common::open_unix(path, flags)?;
+        let slot = self.shared.state.lock().files.take();
         let uring_file = Arc::new(UringFile {
             shared: Handle::new(&self.shared.0),
-            file,
+            file: ManuallyDrop::new(file),
+            slot,
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
@@ -694,23 +922,18 @@ fn deliver(shared: Arc<Shared>) {
     let _frame = DeliveryFrame;
     let mut batch = Vec::with_capacity(shared.pass);
     loop {
-        {
+        let held = {
             let mut state = shared.state.lock();
             // SAFETY: holding `state` Mutex.
             unsafe { state.flush_overflow(&shared.ring) };
-        }
+            state.entry_held()
+        };
         if shared.handles.load(Ordering::Acquire) == 0
             && shared.requests.load(Ordering::Acquire) == 0
         {
             return;
         }
-        #[cfg(test)]
-        let waited = match shared.injected_wait.swap(0, Ordering::AcqRel) {
-            0 => shared.ring.submit_and_wait(1),
-            errno => Err(std::io::Error::from_raw_os_error(errno)),
-        };
-        #[cfg(not(test))]
-        let waited = shared.ring.submit_and_wait(1);
+        let waited = shared.wait_for_one(held);
         if let Err(e) = waited {
             match e.raw_os_error() {
                 // A signal cut the wait short.
@@ -731,6 +954,7 @@ fn deliver(shared: Arc<Shared>) {
                 // SAFETY: the kernel's reference is still held: the write's own delivery, the
                 // only thing that lets it go, is made by this thread after this entry.
                 Taken::Progress(key) => unsafe { wake_user_data(key) },
+                Taken::Closer(closer) => closer.unpark(),
             }
         }
     }
@@ -749,6 +973,33 @@ impl Drop for DeliveryFrame {
 }
 
 impl Shared {
+    /// The delivery thread's wait in the kernel: what is queued entered, and one completion waited
+    /// for; with entering `held` for a test (RING-FD1 §7), only the completion, nothing entered.
+    fn wait_for_one(&self, held: bool) -> std::io::Result<usize> {
+        #[cfg(test)]
+        {
+            match self.injected_wait.swap(0, Ordering::AcqRel) {
+                // SAFETY: nothing is entered, so no queue object is in use; this thread is the
+                // ring's only waiter in the kernel.
+                0 if held => unsafe {
+                    self.ring.submitter().enter::<libc::sigset_t>(
+                        0,
+                        1,
+                        tests::IORING_ENTER_GETEVENTS,
+                        None,
+                    )
+                },
+                0 => self.ring.submit_and_wait(1),
+                errno => Err(std::io::Error::from_raw_os_error(errno)),
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = held;
+            self.ring.submit_and_wait(1)
+        }
+    }
+
     /// Takes the completion queue's entries under the mutex, at most [`Shared::pass`] of them.
     fn take_batch(&self, batch: &mut Vec<Taken>) {
         let mut state = self.state.lock();
@@ -795,11 +1046,22 @@ impl Shared {
             );
             if let Some(wstate) = state.writev_states.remove(&user_data) {
                 // SAFETY: still holding `state` Mutex.
-                batch.push(unsafe {
+                let taken = unsafe {
                     state.handle_writev_completion(&self.ring, wstate, user_data, result)
-                });
+                };
+                // A part whose rest was resubmitted keeps its file: the rest names its descriptor.
+                let last = matches!(taken, Taken::Ended(..));
+                if last {
+                    Self::reaped_last(state, user_data, batch);
+                }
+                #[cfg(test)]
+                state.note_take(user_data, last, result);
+                batch.push(taken);
                 continue;
             }
+            Self::reaped_last(state, user_data, batch);
+            #[cfg(test)]
+            state.note_take(user_data, true, result);
             batch.push(Taken::Ended(
                 user_data,
                 if result < 0 {
@@ -809,6 +1071,22 @@ impl Shared {
                     Ok(result)
                 },
             ));
+        }
+    }
+}
+
+impl Shared {
+    /// The request `user_data` names had its last entry reaped: its file's count let go, and if
+    /// that was the file's last request and its last handle's drop waits, that thread is unparked
+    /// once the mutex is let go (RING-FD1 §1).
+    fn reaped_last(state: &mut RingState, user_data: u64, batch: &mut Vec<Taken>) {
+        // SAFETY: the kernel's reference to the completion is still held: its delivery, the only
+        // thing that lets it go, comes later in this batch.
+        let inner = unsafe { &*(user_data as *const CompletionInner) };
+        let word = inner.backend_word();
+        turso_assert!(word != 0, "a ring request reaped with no file slot");
+        if let Some(closer) = state.files.uncount(FileSlot::of_word(word)) {
+            batch.push(Taken::Closer(closer));
         }
     }
 }
@@ -862,7 +1140,10 @@ unsafe fn wake_user_data(key: u64) {
 
 pub struct UringFile {
     shared: Handle,
-    file: std::fs::File,
+    /// Closed by the drop itself, once no request it accepted remains (RING-FD1 §2).
+    file: ManuallyDrop<std::fs::File>,
+    /// Its slot among the ring's files, which counts its requests.
+    slot: FileSlot,
 }
 
 impl Deref for UringFile {
@@ -948,7 +1229,7 @@ impl File for UringFile {
         self.shared.accept(&c);
         let mut state = self.shared.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.shared.ring, &read_e) };
+        unsafe { state.submit_request(&self.shared.ring, &read_e, self.slot, &c) };
         Ok(c)
     }
 
@@ -988,7 +1269,7 @@ impl File for UringFile {
         self.shared.accept(&c);
         let mut state = self.shared.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.shared.ring, &write) };
+        unsafe { state.submit_request(&self.shared.ring, &write, self.slot, &c) };
         Ok(c)
     }
 
@@ -1001,7 +1282,7 @@ impl File for UringFile {
         self.shared.accept(&c);
         let mut state = self.shared.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.shared.ring, &sync) };
+        unsafe { state.submit_request(&self.shared.ring, &sync, self.slot, &c) };
         Ok(c)
     }
 
@@ -1015,7 +1296,7 @@ impl File for UringFile {
         self.shared.accept(&c);
         let mut state = self.shared.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.shared.ring, &sync) };
+        unsafe { state.submit_request(&self.shared.ring, &sync, self.slot, &c) };
         Ok(c)
     }
 
@@ -1059,7 +1340,7 @@ impl File for UringFile {
         self.shared.accept(&c);
         let mut state = self.shared.state.lock();
         // SAFETY: holding `state` Mutex.
-        unsafe { state.submit_entry(&self.shared.ring, &write) };
+        unsafe { state.submit_request(&self.shared.ring, &write, self.slot, &c) };
         Ok(c)
     }
 
@@ -1079,6 +1360,9 @@ impl File for UringFile {
         let wstate = WritevState::new(self, pos, bufs);
         self.shared.accept(&c);
         let mut state = self.shared.state.lock();
+        // Counted once, for the first part: its continuations name the same descriptor, which the
+        // count keeps its file's until the last part's entry is reaped.
+        state.mark_request(self.slot, &c);
         // SAFETY: holding `state` Mutex.
         unsafe { state.submit_writev(&self.shared.ring, get_key(c.clone()), wstate) };
         Ok(c)
@@ -1100,7 +1384,7 @@ impl File for UringFile {
         super::refuse_on_delivery_thread("a hole's punch");
         use rustix::fs::{fallocate, FallocateFlags};
         fallocate(
-            &self.file,
+            &*self.file,
             FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
             pos as u64,
             len as u64,
@@ -1117,7 +1401,7 @@ impl File for UringFile {
             self.shared.accept(&c);
             let mut state = self.shared.state.lock();
             // SAFETY: holding `state` Mutex.
-            unsafe { state.submit_entry(&self.shared.ring, &truncate) };
+            unsafe { state.submit_request(&self.shared.ring, &truncate, self.slot, &c) };
             Ok(c)
         } else {
             super::refuse_on_delivery_thread("a truncation without the ring's opcode");
@@ -1172,8 +1456,37 @@ impl File for UringFile {
 }
 
 impl Drop for UringFile {
+    /// Closes the descriptor only once no request this file accepted remains unreaped (RING-FD1 §2):
+    /// waits for that, on this thread, then unlocks and closes before the file's handle on the ring
+    /// goes, so whatever follows the drop follows the close. Each pass reads the count under the
+    /// ring's mutex and parks only while it is not zero, registered for the unpark of the delivery
+    /// thread that reaps the last. On that delivery thread, which would wait for entries only it can
+    /// reap, a drop with requests outstanding ends the process.
     fn drop(&mut self) {
+        loop {
+            let mut state = self.shared.state.lock();
+            if state.files.requests(self.slot) == 0 {
+                state.files.free(self.slot);
+                break;
+            }
+            if super::delivering() {
+                #[cfg(test)]
+                tests::say_refused(REFUSED_DROP_ON_DELIVERY);
+                super::fatal(REFUSED_DROP_ON_DELIVERY);
+            }
+            state
+                .files
+                .wait_as_closer(self.slot, std::thread::current());
+            drop(state);
+            #[cfg(test)]
+            if let Some(notes) = self.shared.closer_notes.lock().as_ref() {
+                let _ = notes.send("parked");
+            }
+            std::thread::park();
+        }
         self.unlock_file().expect("Failed to unlock file");
+        // SAFETY: dropped once, here, and nothing reads `file` after.
+        unsafe { ManuallyDrop::drop(&mut self.file) };
     }
 }
 
@@ -1255,7 +1568,7 @@ mod tests {
     fn a_request_finished_while_the_kernel_holds_it_is_owned_until_delivered() {
         let dir = tempfile::tempdir().unwrap();
         let io = crate::io::wait_tests::StepCounting::new(Arc::new(UringIO::new().unwrap()));
-        let (c, fifo) = held_read(&dir, &*io);
+        let (c, fifo, _pipe) = held_read(&dir, &*io);
         c.abort();
         assert!(c.finished());
         assert!(c.is_owned(), "let go while the kernel holds it");
@@ -1345,7 +1658,12 @@ mod tests {
 
     /// A read from an empty pipe on `io`, which the kernel holds until [`write_to`] writes to the
     /// pipe: nothing else can end it.
-    fn held_read(dir: &tempfile::TempDir, io: &dyn IO) -> (Completion, std::path::PathBuf) {
+    /// The pipe's file comes back too: its last drop waits for the read's last entry (RING-FD1), so
+    /// a caller keeps it until it has written to the pipe.
+    fn held_read(
+        dir: &tempfile::TempDir,
+        io: &dyn IO,
+    ) -> (Completion, std::path::PathBuf, Arc<dyn File>) {
         let fifo = dir.path().join("fifo");
         let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         // SAFETY: a plain mkfifo(3) on a fresh path.
@@ -1354,7 +1672,7 @@ mod tests {
             .open_file(fifo.to_str().unwrap(), OpenFlags::NoLock, false)
             .unwrap();
         let c = Completion::new_read(Arc::new(crate::Buffer::new_temporary(1)), |_| None);
-        (pipe.pread(0, c).unwrap(), fifo)
+        (pipe.pread(0, c).unwrap(), fifo, pipe)
     }
 
     /// Ends a [`held_read`].
@@ -1380,7 +1698,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         drop(file.pread(0, read_telling(&tx)).unwrap());
         assert_eq!(rx.recv_timeout(BOUND), Ok(512));
-        let (c, fifo) = held_read(&dir, &*io);
+        let (c, fifo, _pipe) = held_read(&dir, &*io);
         let (done_tx, done_rx) = mpsc::channel();
         let waiter = {
             let (io, c) = (io.clone(), c.clone());
@@ -1430,7 +1748,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         drop(file.pread(0, read_telling(&tx)).unwrap());
         assert_eq!(rx.recv_timeout(BOUND), Ok(512));
-        let (c, fifo) = held_read(&dir, &*io);
+        let (c, fifo, _pipe) = held_read(&dir, &*io);
         let waker = unparking();
         let mut cx = std::task::Context::from_waker(&waker);
         let mut wait = std::pin::pin!(crate::types::IOCompletions(c.clone()).wait_async(&*io));
@@ -2028,8 +2346,10 @@ mod tests {
         }
         let (tx, rx) = mpsc::channel();
         let w = Completion::new_write(|_| {});
+        // The test keeps the file's own handle: the waker's, dropped on the delivery thread, is
+        // then never the file's last while the read it submits is unreaped (RING-FD1 §2).
         w.set_waker(&std::task::Waker::from(Arc::new(SubmitOnWake {
-            file,
+            file: file.clone(),
             tx: std::sync::Mutex::new(Some(tx)),
         })));
         let parts = (0..2)
@@ -2343,5 +2663,645 @@ mod tests {
             permission_denied_message(None),
             "io_uring_setup: permission denied"
         );
+    }
+
+    // RING-FD1: a ring file's descriptor stays its own until every request it accepted is reaped.
+
+    crate::thread::thread_local! {
+        /// Set by a test on its own thread: the error number its next `enter` reports instead of
+        /// entering.
+        pub(super) static ENTER_REFUSED: Cell<Option<i32>> = const { Cell::new(None) };
+        /// Set by a test on its own thread: the rings it makes take the kernel's truncate opcode as
+        /// unsupported, so a truncation takes the synchronous fallback.
+        pub(super) static NO_FTRUNCATE_OPCODE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Refusals to enter that may pass and wrote the ring's eventfd, every ring's, for a test's
+    /// difference across one call.
+    pub(super) static REFUSALS_RUNG: AtomicUsize = AtomicUsize::new(0);
+
+    /// `IORING_ENTER_GETEVENTS` of `linux/io_uring.h`: the enter waits for completions.
+    pub(super) const IORING_ENTER_GETEVENTS: u32 = 1;
+
+    /// What `take` tells a test of each request entry it reaps (RING-FD1 §7).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct TakeNote {
+        pub(super) key: u64,
+        pub(super) last: bool,
+        pub(super) count: usize,
+        pub(super) result: i32,
+    }
+
+    /// Writes a refusal's site to standard error just before the process ends there, for a child
+    /// test's parent to read: two plain writes, nothing formatted.
+    pub(super) fn say_refused(site: &'static str) {
+        // SAFETY: writes from live buffers to the process's standard error.
+        unsafe {
+            libc::write(2, site.as_ptr().cast(), site.len());
+            libc::write(2, b"\n".as_ptr().cast(), 1);
+        }
+    }
+
+    impl UringIO {
+        /// Enters exactly `n` of the queued entries while entering is held: the test's one-shot entry.
+        fn enter_once_for_test(&self, n: u32) -> usize {
+            let _state = self.shared.state.lock();
+            // SAFETY: holding the mutex, so no other submission queue object exists.
+            unsafe {
+                self.shared
+                    .ring
+                    .submitter()
+                    .enter::<libc::sigset_t>(n, 0, 0, None)
+            }
+            .unwrap()
+        }
+
+        /// Lets entering go: the flag cleared, and the eventfd written so that the delivery
+        /// thread's held wait ends and its next wait enters what is queued.
+        fn release_entry_for_test(&self) {
+            self.shared.state.lock().entry_held = false;
+            let one = 1u64.to_ne_bytes();
+            // SAFETY: an 8-byte write from a live buffer to the eventfd the ring holds open.
+            unsafe { libc::write(self.shared.eventfd.as_raw_fd(), one.as_ptr().cast(), 8) };
+        }
+
+        /// The entries queued and not yet consumed by the kernel, and those past it in the overflow.
+        fn pending_for_test(&self) -> (usize, usize) {
+            let state = self.shared.state.lock();
+            // SAFETY: holding the mutex.
+            let sq = unsafe { self.shared.ring.submission_shared() };
+            (sq.len(), state.overflow.len())
+        }
+
+        /// The requests each open file counts, by slot.
+        fn file_requests_for_test(&self) -> Vec<usize> {
+            let state = self.shared.state.lock();
+            state
+                .files
+                .slots
+                .iter()
+                .filter(|u| u.open)
+                .map(|u| u.requests)
+                .collect()
+        }
+
+        fn on_take_for_test(&self) -> mpsc::Receiver<TakeNote> {
+            let (tx, rx) = mpsc::channel();
+            self.shared.state.lock().take_notes = Some(tx);
+            rx
+        }
+
+        fn on_closer_for_test(&self, tx: mpsc::Sender<&'static str>) {
+            *self.shared.closer_notes.lock() = Some(tx);
+        }
+    }
+
+    /// A ring file over `path`, as `open_file` makes one but unlocked and of its own type, so a
+    /// test reads its descriptor's number.
+    fn ring_file(io: &UringIO, path: &std::path::Path) -> Arc<UringFile> {
+        let file = common::open_unix(path.to_str().unwrap(), OpenFlags::NoLock).unwrap();
+        let slot = io.shared.state.lock().files.take();
+        Arc::new(UringFile {
+            shared: Handle::new(&io.shared.0),
+            file: ManuallyDrop::new(file),
+            slot,
+        })
+    }
+
+    fn filled(dir: &tempfile::TempDir, name: &str, byte: u8, len: usize) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, vec![byte; len]).unwrap();
+        path
+    }
+
+    /// Drops `file` on a helper thread, which says `returned` once the drop has returned.
+    fn drop_on_helper(
+        file: Arc<UringFile>,
+        tx: mpsc::Sender<&'static str>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            drop(file);
+            let _ = tx.send("returned");
+        })
+    }
+
+    /// Whether `c` finished within [`BOUND`], looked at once a millisecond.
+    fn finished_within(c: &Completion) -> bool {
+        let since = std::time::Instant::now();
+        while !c.finished() {
+            if since.elapsed() > BOUND {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// The next note of `key`'s entries, within [`BOUND`].
+    fn note_of(notes: &mpsc::Receiver<TakeNote>, key: u64) -> Option<TakeNote> {
+        let since = std::time::Instant::now();
+        while since.elapsed() < BOUND {
+            match notes.recv_timeout(BOUND) {
+                Ok(n) if n.key == key => return Some(n),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// The pending read's file's last drop, a file opened meanwhile, then the entry: the read's bytes,
+    /// the two descriptors' numbers, and the drop's two notes (RING-FD1 §7.1-2).
+    fn drop_reopen_enter(
+        ring: &UringIO,
+        a: Arc<UringFile>,
+        b_path: &std::path::Path,
+        c: &Completion,
+        into: &Arc<crate::Buffer>,
+    ) -> (
+        Vec<u8>,
+        i32,
+        i32,
+        Option<&'static str>,
+        Option<&'static str>,
+        bool,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        ring.on_closer_for_test(tx.clone());
+        let fd_a = a.as_raw_fd();
+        let helper = drop_on_helper(a, tx);
+        let first = rx.recv_timeout(BOUND).ok();
+        let b = std::fs::File::open(b_path).unwrap();
+        let fd_b = b.as_raw_fd();
+        ring.release_entry_for_test();
+        let finished = finished_within(c);
+        // A drop that returned without parking sends nothing more.
+        let second = match first {
+            Some("parked") => rx.recv_timeout(BOUND).ok(),
+            _ => None,
+        };
+        helper.join().unwrap();
+        drop(b);
+        (
+            into.as_slice().to_vec(),
+            fd_a,
+            fd_b,
+            first,
+            second,
+            finished,
+        )
+    }
+
+    /// RING-FD1 §7.1: a read held unentered in the submission queue keeps its file's descriptor its
+    /// own: the file's last drop waits until the read's entry is reaped, so a file opened meanwhile
+    /// takes another number, and the read reads its own file's bytes (mutant `close-at-once`: the
+    /// drop closes at once, the next open takes the number, and the read returns the other file's).
+    #[test]
+    fn a_read_pending_in_the_queue_keeps_its_files_descriptor_until_its_entry_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = UringIO::held_for_test(ENTRIES).unwrap();
+        let a = ring_file(&ring, &filled(&dir, "a", b'O', 512));
+        let b_path = filled(&dir, "b", b'S', 512);
+        let into = Arc::new(crate::Buffer::new_temporary(512));
+        let c = a
+            .pread(0, Completion::new_read(into.clone(), |_| None))
+            .unwrap();
+        let pending = ring.pending_for_test();
+        let (bytes, fd_a, fd_b, first, second, finished) =
+            drop_reopen_enter(&ring, a, &b_path, &c, &into);
+        drop(ring);
+        assert_eq!(
+            pending,
+            (1, 0),
+            "the read unconsumed in the queue before the drop"
+        );
+        assert!(finished, "the read never finished");
+        assert!(
+            bytes.iter().all(|&x| x == b'O'),
+            "the read's bytes are its own file's: {:?}",
+            &bytes[..8]
+        );
+        assert_ne!(
+            fd_b, fd_a,
+            "the file opened meanwhile took the read's descriptor number"
+        );
+        assert_eq!(
+            (first, second),
+            (Some("parked"), Some("returned")),
+            "the drop parked, and returned only after the read's entry"
+        );
+    }
+
+    /// RING-FD1 §7.2: the same with the read past a full submission queue, in the overflow, until
+    /// the delivery thread's loop moves and enters it (mutant `close-at-once`).
+    #[test]
+    fn a_read_in_the_overflow_keeps_its_files_descriptor_until_its_entry_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = UringIO::held_for_test(4).unwrap();
+        let c_file = ring_file(&ring, &filled(&dir, "c", b'C', 512));
+        let fill: Vec<Completion> = (0..4)
+            .map(|_| {
+                let into = Arc::new(crate::Buffer::new_temporary(512));
+                c_file
+                    .pread(0, Completion::new_read(into, |_| None))
+                    .unwrap()
+            })
+            .collect();
+        let a = ring_file(&ring, &filled(&dir, "a", b'O', 512));
+        let b_path = filled(&dir, "b", b'S', 512);
+        let into = Arc::new(crate::Buffer::new_temporary(512));
+        let c = a
+            .pread(0, Completion::new_read(into.clone(), |_| None))
+            .unwrap();
+        let pending = ring.pending_for_test();
+        let (bytes, fd_a, fd_b, first, second, finished) =
+            drop_reopen_enter(&ring, a, &b_path, &c, &into);
+        let filled_finished = fill.iter().all(finished_within);
+        drop((c_file, ring));
+        assert_eq!(
+            pending,
+            (4, 1),
+            "the queue full and the read in the overflow before the drop"
+        );
+        assert!(finished && filled_finished, "a read never finished");
+        assert!(
+            bytes.iter().all(|&x| x == b'O'),
+            "the read's bytes are its own file's: {:?}",
+            &bytes[..8]
+        );
+        assert_ne!(
+            fd_b, fd_a,
+            "the file opened meanwhile took the read's descriptor number"
+        );
+        assert_eq!(
+            (first, second),
+            (Some("parked"), Some("returned")),
+            "the drop parked, and returned only after the read's entry"
+        );
+    }
+
+    /// RING-FD1 §7.3: a vectored write too long for one entry keeps its file counted through its
+    /// continuation: `take`, reaping the first part with the continuation held unentered, finds the
+    /// file still counting the write, and lets it go only at the last part (mutant
+    /// `continuation-lets-go`: the count let go at the partial entry).
+    #[test]
+    fn a_partial_writes_continuation_keeps_its_file_counted_until_its_last_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = UringIO::held_for_test(ENTRIES).unwrap();
+        let path = filled(&dir, "w", 0, 0);
+        let file = ring_file(&ring, &path);
+        // Every other buffer of twice as many, so no two written are adjacent in memory.
+        let all: Vec<Arc<crate::Buffer>> = (0..2 * (MAX_IOVEC_ENTRIES + 1))
+            .map(|i| {
+                let b = Arc::new(crate::Buffer::new_temporary(512));
+                b.as_mut_slice().fill(i as u8);
+                b
+            })
+            .collect();
+        let bufs: Vec<Arc<crate::Buffer>> = all.iter().step_by(2).cloned().collect();
+        let notes = ring.on_take_for_test();
+        let c = file
+            .pwritev(0, bufs.clone(), Completion::new_write(|_| {}))
+            .unwrap();
+        let key = Arc::as_ptr(c.get_inner()) as u64;
+        let entered = ring.enter_once_for_test(1);
+        let first = note_of(&notes, key).map(|n| (n.last, n.count));
+        let pending = ring.pending_for_test();
+        // Everything is looked at before entering is let go, and asserted only once the write
+        // has ended and its file has dropped, so a failure never leaves the file's drop waiting
+        // on an entry the hold keeps unentered.
+        ring.release_entry_for_test();
+        let last = note_of(&notes, key).map(|n| (n.last, n.count));
+        let finished = finished_within(&c);
+        let written = std::fs::read(&path).unwrap();
+        drop((file, ring));
+        let expected: Vec<u8> = bufs.iter().flat_map(|b| b.as_slice().to_vec()).collect();
+        assert_eq!(entered, 1, "the first part entered alone");
+        assert_eq!(
+            first,
+            Some((false, 1)),
+            "the first part's entry: partial, and the file still counting the write"
+        );
+        assert_eq!(
+            pending.0, 1,
+            "the continuation unentered while entering is held"
+        );
+        assert_eq!(
+            last,
+            Some((true, 0)),
+            "the last part's entry: the write let go"
+        );
+        assert!(finished, "the write never finished");
+        assert!(written == expected, "the file's bytes are the buffers'");
+    }
+
+    /// RING-FD1 §7.4: a read cancelled while it is still unentered keeps its file's descriptor until
+    /// its own entry is reaped: the file's last drop is still parked while entering is held (mutant
+    /// `cancel-lets-go`: the count let go at the abort, so the drop returns at once). The buffer is
+    /// read only after the read's own raw entry, and holds the file's bytes or the untouched fill.
+    #[test]
+    fn a_cancelled_reads_file_keeps_its_descriptor_until_the_reads_own_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = UringIO::held_for_test(ENTRIES).unwrap();
+        let a = ring_file(&ring, &filled(&dir, "a", b'O', 512));
+        let b_path = filled(&dir, "b", b'S', 512);
+        let into = Arc::new(crate::Buffer::new_temporary(512));
+        into.as_mut_slice().fill(b'F');
+        let notes = ring.on_take_for_test();
+        let c = a
+            .pread(0, Completion::new_read(into.clone(), |_| None))
+            .unwrap();
+        let key = Arc::as_ptr(c.get_inner()) as u64;
+        ring.cancel(std::slice::from_ref(&c)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        ring.on_closer_for_test(tx.clone());
+        let helper = drop_on_helper(a, tx);
+        // The drop's first note, taken while entering is still held, so the read's entry cannot
+        // have been reaped; asserted only once the hold is let go and the helper has joined.
+        let first = rx.recv_timeout(BOUND).ok();
+        let b = std::fs::File::open(&b_path).unwrap();
+        ring.release_entry_for_test();
+        let reaped = note_of(&notes, key);
+        // A drop that returned without parking sends nothing more.
+        let second = match first {
+            Some("parked") => rx.recv_timeout(BOUND).ok(),
+            _ => None,
+        };
+        helper.join().unwrap();
+        let bytes = into.as_slice().to_vec();
+        drop((b, ring));
+        assert_eq!(
+            first,
+            Some("parked"),
+            "the drop parked while the cancelled read was unconsumed"
+        );
+        let reaped = reaped.expect("the read's own entry reaped");
+        assert!(
+            reaped.last && (reaped.result == 512 || reaped.result == -libc::ECANCELED),
+            "the read's raw result: {}",
+            reaped.result
+        );
+        assert!(
+            bytes.iter().all(|&x| x == b'O') || bytes.iter().all(|&x| x == b'F'),
+            "the buffer holds the file's bytes or the untouched fill: {:?}",
+            &bytes[..8]
+        );
+        assert_eq!(
+            second,
+            Some("returned"),
+            "the drop returned after the read's entry"
+        );
+    }
+
+    /// RING-FD1 §7.5 (child): each of the ten request variants counts on its file while it is
+    /// unreaped, and all are let go once reaped (mutant `sync-uncounted`: the sync queued without its
+    /// count). The variants are pread, pwrite and pwrite_durable, each also from a fixed buffer, sync,
+    /// sync_data, the truncate opcode and pwritev. The child prints the counts before it lets entering
+    /// go, for a mutant whose later reap ends the process, and whether the kernel has the truncate
+    /// opcode: without it the opcode is not covered here, and the parent says so.
+    #[cfg(not(miri))]
+    #[test]
+    fn every_request_opcode_counts_on_its_file_until_reaped() {
+        let ended = crate::child_test::in_child(
+            concat!(
+                module_path!(),
+                "::every_request_opcode_counts_on_its_file_until_reaped"
+            ),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let ring = Arc::new(UringIO::held_for_test(ENTRIES).unwrap());
+                let io: Arc<dyn IO> = ring.clone();
+                let pool = crate::storage::buffer_pool::BufferPool::begin_init(
+                    &io,
+                    crate::storage::buffer_pool::BufferPool::TEST_ARENA_SIZE,
+                );
+                pool.finalize_with_page_size(4096).unwrap();
+                let file = ring_file(&ring, &filled(&dir, "f", 1, 4096));
+                let plain = || Arc::new(crate::Buffer::new_temporary(4096));
+                let fixed: Vec<Arc<crate::Buffer>> =
+                    (0..3).map(|_| Arc::new(pool.get_page())).collect();
+                let count = |ring: &UringIO| ring.file_requests_for_test()[0];
+                let mut cs = Vec::new();
+                let mut counts = Vec::new();
+                cs.push(
+                    file.pread(0, Completion::new_read(plain(), |_| None))
+                        .unwrap(),
+                );
+                counts.push(("pread", count(&ring)));
+                cs.push(
+                    file.pread(0, Completion::new_read(fixed[0].clone(), |_| None))
+                        .unwrap(),
+                );
+                counts.push(("pread fixed", count(&ring)));
+                cs.push(
+                    file.pwrite(0, plain(), Completion::new_write(|_| {}))
+                        .unwrap(),
+                );
+                counts.push(("pwrite", count(&ring)));
+                cs.push(
+                    file.pwrite(0, fixed[1].clone(), Completion::new_write(|_| {}))
+                        .unwrap(),
+                );
+                counts.push(("pwrite fixed", count(&ring)));
+                cs.push(
+                    file.pwrite_durable(0, plain(), Completion::new_write(|_| {}))
+                        .unwrap(),
+                );
+                counts.push(("pwrite_durable", count(&ring)));
+                cs.push(
+                    file.pwrite_durable(0, fixed[2].clone(), Completion::new_write(|_| {}))
+                        .unwrap(),
+                );
+                counts.push(("pwrite_durable fixed", count(&ring)));
+                cs.push(
+                    file.sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+                        .unwrap(),
+                );
+                counts.push(("sync", count(&ring)));
+                cs.push(file.sync_data(Completion::new_sync(|_| {})).unwrap());
+                counts.push(("sync_data", count(&ring)));
+                cs.push(file.truncate(4096, Completion::new_trunc(|_| {})).unwrap());
+                counts.push(("truncate", count(&ring)));
+                cs.push(
+                    file.pwritev(0, vec![plain()], Completion::new_write(|_| {}))
+                        .unwrap(),
+                );
+                counts.push(("pwritev", count(&ring)));
+                let ftruncate = ring.shared.caps.ftruncate;
+                let ids: Vec<Option<u32>> = fixed.iter().map(|b| b.fixed_id()).collect();
+                eprintln!("FIXED {ids:?}");
+                eprintln!("COUNTS ftruncate={ftruncate} {counts:?}");
+                ring.release_entry_for_test();
+                let finished = cs.iter().all(finished_within);
+                eprintln!(
+                    "AFTER finished={finished} {:?}",
+                    ring.file_requests_for_test()
+                );
+                drop((cs, fixed, file, pool, io, ring));
+            },
+        );
+        let Some(ended) = ended else { return };
+        let line = |prefix: &str| {
+            ended
+                .stderr
+                .lines()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or("none")
+                .to_string()
+        };
+        let (fixed, counts, after) = (line("FIXED"), line("COUNTS"), line("AFTER"));
+        assert_eq!(
+            fixed, "FIXED [Some(0), Some(0), Some(0)]",
+            "each fixed variant's buffer is the ring's registered arena's"
+        );
+        // Without the kernel's truncate opcode the truncation is the synchronous fallback, which
+        // counts nothing; whether the opcode was covered is the child's COUNTS line's to say.
+        let t = if counts.contains("ftruncate=true") {
+            9
+        } else {
+            8
+        };
+        let want = format!(
+            "[(\"pread\", 1), (\"pread fixed\", 2), (\"pwrite\", 3), (\"pwrite fixed\", 4), \
+             (\"pwrite_durable\", 5), (\"pwrite_durable fixed\", 6), (\"sync\", 7), \
+             (\"sync_data\", 8), (\"truncate\", {t}), (\"pwritev\", {})]",
+            t + 1
+        );
+        assert!(
+            counts.ends_with(&want),
+            "each variant counted once on its file while unreaped: {counts}, child: {:?}",
+            ended.code
+        );
+        assert_eq!(
+            after, "AFTER finished=true [0]",
+            "every request let go once reaped"
+        );
+        assert!(
+            !ended.aborted && !ended.hung && ended.code == Some(0),
+            "the child ended cleanly"
+        );
+    }
+
+    /// RING-FD1 §7.5: a truncation on a ring without the kernel's opcode is the synchronous
+    /// fallback, not a ring request, and counts nothing on its file.
+    #[test]
+    fn a_truncation_without_the_rings_opcode_counts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        NO_FTRUNCATE_OPCODE.with(|n| n.set(true));
+        let ring = UringIO::held_for_test(ENTRIES);
+        NO_FTRUNCATE_OPCODE.with(|n| n.set(false));
+        let ring = ring.unwrap();
+        let path = filled(&dir, "f", 1, 4096);
+        let file = ring_file(&ring, &path);
+        let c = file.truncate(512, Completion::new_trunc(|_| {})).unwrap();
+        let counted = ring.file_requests_for_test();
+        let (opcode, finished, succeeded) =
+            (ring.shared.caps.ftruncate, c.finished(), c.succeeded());
+        drop((file, ring));
+        assert!(!opcode, "the ring took the truncate opcode as supported");
+        assert_eq!(counted, [0], "the synchronous truncate counted on its file");
+        assert!(
+            finished && succeeded,
+            "the synchronous truncate finished at once"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            512,
+            "the file truncated"
+        );
+    }
+
+    /// RING-FD1 §7.6: a file with no request outstanding, and one whose request was reaped, closes
+    /// at once on its last drop, without parking.
+    #[test]
+    fn a_file_with_no_request_outstanding_closes_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = UringIO::new().unwrap();
+        let (tx, rx) = mpsc::channel();
+        ring.on_closer_for_test(tx.clone());
+        let fresh = ring_file(&ring, &filled(&dir, "a", b'O', 512));
+        drop_on_helper(fresh, tx.clone()).join().unwrap();
+        let used = ring_file(&ring, &filled(&dir, "b", b'O', 512));
+        let c = used.pread(0, read_telling(&mpsc::channel().0)).unwrap();
+        let finished = finished_within(&c);
+        drop_on_helper(used, tx).join().unwrap();
+        let seen: Vec<_> = rx.try_iter().collect();
+        assert!(finished, "the read never finished");
+        assert_eq!(seen, ["returned", "returned"], "neither drop parked");
+    }
+
+    /// RING-FD1 §7.7 (child): a file's last handle dropped on the ring's delivery thread, by a
+    /// callback, while another of its requests is unreaped ends the process at its named refusal:
+    /// the thread could only wait for entries it alone reaps (mutant `delivery-drop-unrefused`: the
+    /// drop parks on the delivery thread, which the child reports by name).
+    #[cfg(not(miri))]
+    #[test]
+    fn a_files_last_drop_on_the_delivery_thread_with_requests_unreaped_ends_the_process() {
+        let ended = crate::child_test::in_child(
+            concat!(
+                module_path!(),
+                "::a_files_last_drop_on_the_delivery_thread_with_requests_unreaped_ends_the_process"
+            ),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let ring = UringIO::new().unwrap();
+                let (_held, _fifo, pipe) = held_read(&dir, &ring);
+                let (tx, rx) = mpsc::channel();
+                ring.on_closer_for_test(tx);
+                let other = file_of(&dir, &ring, 512);
+                let last = crate::sync::Mutex::new(Some(pipe));
+                let c =
+                    Completion::new_read(Arc::new(crate::Buffer::new_temporary(512)), move |_| {
+                        drop(last.lock().take());
+                        None
+                    });
+                drop(other.pread(0, c).unwrap());
+                if rx.recv_timeout(BOUND).is_ok() {
+                    eprintln!("PARKED ON THE DELIVERY THREAD");
+                    std::process::exit(3);
+                }
+                eprintln!("THE DROP NEITHER PARKED NOR ENDED THE PROCESS");
+                std::process::exit(4);
+            },
+        );
+        let Some(ended) = ended else { return };
+        assert!(
+            ended.aborted && ended.stderr.contains(REFUSED_DROP_ON_DELIVERY),
+            "the child ended {:?} (aborted {}, hung {}): {}",
+            ended.code,
+            ended.aborted,
+            ended.hung,
+            ended.stderr
+        );
+    }
+
+    /// RING-FD1 §7.8: a refusal to enter that may pass, with nothing else in flight, wakes the
+    /// delivery thread through its eventfd, whose next wait enters the request (mutant
+    /// `refusal-unrung`: no eventfd write, and the request waits unentered).
+    #[test]
+    fn a_refusal_to_enter_that_may_pass_wakes_the_delivery_thread_to_enter() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = UringIO::new().unwrap();
+        let file = file_of(&dir, &ring, 512);
+        let before = REFUSALS_RUNG.load(Ordering::Relaxed);
+        ENTER_REFUSED.with(|r| r.set(Some(libc::EAGAIN)));
+        let c = file
+            .pread(
+                0,
+                Completion::new_read(Arc::new(crate::Buffer::new_temporary(512)), |_| None),
+            )
+            .unwrap();
+        let rung = REFUSALS_RUNG.load(Ordering::Relaxed) - before;
+        if rung == 0 {
+            // So the read is reaped whatever came of the refusal, and the file's drop returns.
+            ring.enter_once_for_test(1);
+        }
+        let finished = finished_within(&c);
+        drop((file, ring));
+        assert_eq!(
+            rung, 1,
+            "the refusal wrote the delivery thread's eventfd once"
+        );
+        assert!(finished, "the read never finished");
     }
 }

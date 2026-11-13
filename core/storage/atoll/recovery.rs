@@ -44,6 +44,79 @@ pub struct Recovered {
     pub txns: Transactions,
 }
 
+/// The owners a recovery makes, each held here from the moment it is made (RING-FD1 §5): an open
+/// whose recovery fails keeps them in itself, so they and their files drop only after the open's
+/// drain, never as a recovery's locals before it.
+#[derive(Default)]
+pub struct Partial {
+    pool: Option<Arc<BufferPool>>,
+    log: Option<Arc<Log>>,
+    checkpointer: Option<Checkpointer>,
+    txns: Option<Transactions>,
+}
+
+impl Partial {
+    /// The owners a finished recovery made, taken out whole.
+    fn recovered(&mut self) -> Result<Recovered> {
+        match (
+            self.log.take(),
+            self.pool.take(),
+            self.checkpointer.take(),
+            self.txns.take(),
+        ) {
+            (Some(log), Some(pool), Some(checkpointer), Some(txns)) => Ok(Recovered {
+                log,
+                pool,
+                checkpointer,
+                txns,
+            }),
+            _ => Err(LimboError::InternalError(
+                "a recovery ended without each of its owners made".into(),
+            )),
+        }
+    }
+}
+
+/// Makes a new database's owners (`Opening`'s creation), each held in `partial` as it is made:
+/// its first superblock written, then the pool, the log, the transactions and the checkpointer.
+#[allow(clippy::too_many_arguments)]
+pub fn create(
+    counted: Arc<Counted>,
+    base: &str,
+    config: &AtollConfig,
+    store: Arc<PageStore>,
+    control: Control,
+    superblock: &Superblock,
+    executor: &Executor,
+    partial: &mut Partial,
+) -> Result<Recovered> {
+    control.write_and_wait(superblock)?;
+    let pool = BufferPool::new(
+        config.buffer.clone(),
+        Arc::new(LocalSource::new(store.clone())),
+        store.clone(),
+    )?;
+    partial.pool = Some(pool.clone());
+    // Its ring in frames the pool lends: the pool first.
+    let log = Log::open_in(counted, base, config.log.clone(), 0, &pool, executor)?;
+    partial.log = Some(log.clone());
+    partial.txns = Some(Transactions::new(
+        &config.txn,
+        Arc::new(Clock::after(0)),
+        log.clone(),
+    ));
+    partial.checkpointer = Some(Checkpointer::new(
+        pool,
+        store,
+        log,
+        control,
+        superblock.clone(),
+        config.log_budget(),
+        config.checkpoint_write_bytes(),
+    ));
+    partial.recovered()
+}
+
 /// What the first pass over the log found.
 #[derive(Default)]
 struct Scan {
@@ -60,6 +133,7 @@ struct Scan {
 
 /// Recovers the database `superblock` is in charge of, its store opened on that superblock, its
 /// log's preparer a task of `executor`, the database's.
+#[allow(clippy::too_many_arguments)]
 pub fn recover(
     counted: Arc<Counted>,
     base: &str,
@@ -68,6 +142,7 @@ pub fn recover(
     control: Control,
     superblock: Superblock,
     executor: &Executor,
+    partial: &mut Partial,
 ) -> Result<Recovered> {
     let io: Arc<dyn IO> = counted.clone();
     let mut scan = scan(&io, base, &config.log, &superblock)?;
@@ -85,6 +160,7 @@ pub fn recover(
         Arc::new(LocalSource::new(store.clone())),
         store.clone(),
     )?;
+    partial.pool = Some(pool.clone());
     // Owed a write: the next checkpoint takes the number that wrote them.
     if !scan.intents.is_empty() {
         store.meta().set_torn_ok(true);
@@ -138,6 +214,7 @@ pub fn recover(
     // only then, and before anything is appended: a reader that follows it finds nothing past it
     // but what this recovery appends, never records the crash left there.
     let log = Log::open_in(counted, base, config.log.clone(), end, &pool, executor)?;
+    partial.log = Some(log.clone());
     assert_eq!(log.end(), restart, "the log reopened elsewhere");
     let mut in_charge = superblock;
     if restart > end {
@@ -146,25 +223,22 @@ pub fn recover(
         control.write_and_wait(&in_charge)?;
     }
     let clock = Arc::new(Clock::after(scan.clock.max(in_charge.clock)));
-    let txns = Transactions::new(&config.txn, clock, log.clone());
-    let checkpointer = Checkpointer::new(
-        pool.clone(),
-        store.clone(),
-        log.clone(),
+    let txns = &*partial
+        .txns
+        .insert(Transactions::new(&config.txn, clock, log.clone()));
+    let checkpointer = &*partial.checkpointer.insert(Checkpointer::new(
+        pool,
+        store,
+        log,
         control,
         in_charge,
         config.log_budget(),
         config.checkpoint_write_bytes(),
-    );
+    ));
     // What was recovered is in memory alone until a checkpoint writes it.
     let mut ticket = checkpointer.request_full();
-    drive(&io, || checkpointer.step_full(&mut ticket, &txns))?;
-    Ok(Recovered {
-        log,
-        pool,
-        checkpointer,
-        txns,
-    })
+    drive(&io, || checkpointer.step_full(&mut ticket, txns))?;
+    partial.recovered()
 }
 
 #[cfg(test)]

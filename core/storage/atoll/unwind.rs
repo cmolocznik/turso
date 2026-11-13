@@ -412,6 +412,31 @@ mod tests {
             "child",
         ),
         (
+            "buffer/frame_tests.rs",
+            "a_frames_miss_on_a_cold_data_file_is_opened_synced_and_read_on_an_io_thread",
+            "child",
+        ),
+        (
+            "buffer/frame_tests.rs",
+            "a_synchronous_databases_frame_miss_on_a_data_page_ends_the_process_at_its_open",
+            "child",
+        ),
+        (
+            "buffer/frame_tests.rs",
+            "a_write_out_in_a_frame_is_queued_and_its_frame_freed_at_the_writes_retirement",
+            "child",
+        ),
+        (
+            "buffer/frame_tests.rs",
+            "a_temporary_pages_first_write_out_and_read_back_in_frames_run_on_an_io_thread",
+            "child",
+        ),
+        (
+            "buffer/frame_tests.rs",
+            "a_frames_cold_load_and_write_out_over_the_ring_run_on_an_io_thread",
+            "child",
+        ),
+        (
             "meta/queued_tests.rs",
             "a_frames_metadata_load_on_a_cold_file_is_opened_synced_and_read_on_an_io_thread",
             "child",

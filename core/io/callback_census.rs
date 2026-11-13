@@ -149,7 +149,7 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "storage/atoll/buffer/temp.rs",
-        "write",
+        "write_request",
         "new_write",
         "records a temporary page written and hands the result on",
     ),
@@ -234,6 +234,18 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "storage/atoll/requests/dispatch.rs",
+        "serve_frame",
+        "new_read",
+        "a queued frame read's carrier: finishes the pool's request with what it read, submitting nothing",
+    ),
+    (
+        "storage/atoll/requests/dispatch.rs",
+        "serve_frame",
+        "new_write",
+        "a queued frame write's carrier: finishes the pool's request with what it wrote, submitting nothing",
+    ),
+    (
+        "storage/atoll/requests/dispatch.rs",
         "serve_queued",
         "new_read",
         "a queued read's carrier: finishes its owner's request with what it read, submitting nothing",
@@ -241,13 +253,13 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
     ("storage/atoll/store.rs", "erase_one", "new_sync", "nothing"),
     (
         "storage/atoll/store.rs",
-        "read_slot_into",
+        "read_request",
         "new_read",
         "verifies a page read and hands it to its waiter",
     ),
     (
         "storage/atoll/store.rs",
-        "write_slot",
+        "write_request",
         "new_write",
         "hands a page write's result to its waiter",
     ),
@@ -527,7 +539,7 @@ const REFUSED: &[&str] = &[
 /// reads names, not types: each such call is ruled here, and a row the scan no longer meets fails.
 const NOT_REFUSED: &[(&str, &str, &str, &str)] = &[(
     "storage/atoll/store.rs",
-    "read_slot_into",
+    "read_request",
     "class.size(",
     "a page class's size, a constant of the class",
 )];

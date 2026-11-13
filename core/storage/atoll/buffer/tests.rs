@@ -1786,16 +1786,13 @@ fn a_temporary_read_counts_a_request_only_for_its_files_copy() {
     let c = class(0);
     let pid = pool.temp.allocate(c);
     let read = |pool: &Arc<BufferPool>| {
-        let submitted = std::cell::Cell::new(0);
+        let files = |place| pool.file_for(place);
+        let submitted = source::Counting::new(Some(&files));
         let result = Arc::new(Mutex::new(None));
         let into = Arc::new(crate::io::Buffer::new_temporary(c.size()));
         let r = result.clone();
         let done: source::ReadDone = Box::new(move |res| *r.lock() = Some(res.is_ok()));
-        pool.temp
-            .read(pid, into.clone(), done, &|| {
-                submitted.set(submitted.get() + 1)
-            })
-            .unwrap();
+        pool.temp.read(pid, into.clone(), done, &submitted).unwrap();
         let inline = *result.lock();
         let mut steps = 0;
         while result.lock().is_none() && steps < 64 {
@@ -1804,21 +1801,24 @@ fn a_temporary_read_counts_a_request_only_for_its_files_copy() {
         }
         let first = into.as_slice()[0];
         let landed = *result.lock();
-        (submitted.get(), inline, landed, first)
+        (submitted.handed.get(), inline, landed, first)
     };
     let unwritten = read(&pool);
     let written = Arc::new(Mutex::new(None));
     {
         let w = written.clone();
         // The write's request, stepped below until it lands.
+        let (place, request) = pool
+            .temp
+            .write_request(pid, c.size(), move |res| *w.lock() = Some(res.is_ok()));
+        let (file, at) = pool.file_for(place).unwrap();
         drop(
-            pool.temp
-                .write(
-                    pid,
-                    Arc::new(crate::io::Buffer::new(vec![7; c.size()])),
-                    move |res| *w.lock() = Some(res.is_ok()),
-                )
-                .unwrap(),
+            file.pwrite(
+                at,
+                Arc::new(crate::io::Buffer::new(vec![7; c.size()])),
+                request,
+            )
+            .unwrap(),
         );
     }
     let mut steps = 0;
@@ -3867,7 +3867,7 @@ impl source::Located for SubmittingLocated {
         done: source::ReadDone,
         submitting: source::Submitting<'_>,
     ) -> Result<IOResult<Option<Completion>>> {
-        submitting();
+        submitting.announce();
         self.0.lock().push((into.clone(), done));
         // The request as an inline backend leaves it once its submission returns, owned by none:
         // the frame's record is let go at once, the landing still the test's.
@@ -7887,7 +7887,8 @@ fn a_load_judging_its_read_after_its_frame_changed_hands(fills: bool) -> (bool, 
     // cleanup still owes it: the cleanup then finds the record it lets go, and the assertion
     // reports rather than the retirement ending the process.
     if let Some((f, _)) = other.get().filter(|_| !still_held) {
-        pool.header(f).hold_record();
+        // The cleanup's own hold: no request of the pool's is handed this record.
+        let _ = pool.header(f).hold_record(f, pool.memory.class_of(f));
     }
     // Every request delivered and let go before the assertions, and nothing held from here.
     let mut delivered = std::collections::HashSet::new();

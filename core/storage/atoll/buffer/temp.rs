@@ -8,10 +8,11 @@ use super::super::bits::GrowBits;
 use super::super::epoch::{Epochs, Retired};
 use super::super::once::{SetOnce, TakeOnce};
 use super::super::page::{PageId, SizeClass, CLASS_COUNT};
+use super::super::requests::{Counted, CountedFile, Place};
 use super::super::stack::FreeList;
 use super::super::whole;
 use super::source::ReadDone;
-use crate::io::{Buffer, Completion, File, OpenFlags, IO};
+use crate::io::{Buffer, Completion, OpenFlags, IO};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::{CompletionError, Result};
@@ -21,10 +22,12 @@ use std::collections::HashSet;
 /// Lock-free: a class's numbers are a counter and a free list, the copies written a bitmap, and
 /// each file is set once, the first opened kept.
 pub struct TempPages {
-    io: Arc<dyn IO>,
+    /// Typed: its files are counted files, whose inner file a queued request's IO thread submits
+    /// to (D2b §2).
+    counted: Arc<Counted>,
     base: String,
     classes: [Class; CLASS_COUNT],
-    files: [SetOnce<Arc<dyn File>>; CLASS_COUNT],
+    files: [SetOnce<Arc<CountedFile>>; CLASS_COUNT],
     epochs: Arc<Epochs>,
     /// Numbers freed and not yet reusable: a step that could hold one may still run.
     retired: Retired<PageId>,
@@ -49,15 +52,15 @@ fn path(base: &str, class: SizeClass) -> String {
 
 impl TempPages {
     /// Temporary pages in files beside `base`. Whatever an earlier process left there is deleted.
-    pub fn new(io: Arc<dyn IO>, base: &str, epochs: Arc<Epochs>) -> Result<Self> {
+    pub fn new(counted: Arc<Counted>, base: &str, epochs: Arc<Epochs>) -> Result<Self> {
         for class in SizeClass::all() {
             let path = path(base, class);
             // Created first, so the removal finds it whether or not an earlier process left one.
-            drop(io.open_file(&path, OpenFlags::Create, false)?);
-            io.remove_file(&path)?;
+            drop(counted.open_file(&path, OpenFlags::Create, false)?);
+            counted.remove_file(&path)?;
         }
         Ok(Self {
-            io,
+            counted,
             base: base.to_string(),
             classes: Default::default(),
             files: Default::default(),
@@ -65,6 +68,14 @@ impl TempPages {
             retired: Retired::default(),
             live: AtomicU64::new(0),
         })
+    }
+
+    /// Whether `pid` has a copy in its class's file, for the frame tests (native only).
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub fn has_copy(&self, pid: PageId) -> bool {
+        self.classes[pid.class().index()]
+            .written
+            .get(pid.temporary_number())
     }
 
     /// Bytes of the temporary pages allocated and not freed.
@@ -129,13 +140,15 @@ impl TempPages {
         out
     }
 
-    fn file(&self, class: SizeClass) -> Result<Arc<dyn File>> {
+    /// `class`'s file, opened here when cold, which is a queued request's first stage on its IO
+    /// thread (D2b §0).
+    fn file(&self, class: SizeClass) -> Result<Arc<CountedFile>> {
         let cell = &self.files[class.index()];
         if let Some(f) = cell.get() {
             return Ok(f);
         }
         // Two first users may both open it; the first to set it is kept.
-        let file = self.io.open_file(
+        let file = self.counted.open_counted(
             &path(&self.base, class),
             OpenFlags::Create | OpenFlags::Direct,
             false,
@@ -143,13 +156,24 @@ impl TempPages {
         Ok(cell.set(file))
     }
 
-    fn at(pid: PageId) -> u64 {
-        pid.temporary_number() * pid.class().size() as u64
+    fn place(pid: PageId, write: bool) -> Place {
+        Place::new(write, true, pid.class(), pid.temporary_number())
     }
 
-    /// Reads `pid` into `into`, exactly its size: its copy, the file's read returned, or zeros if
-    /// it has none, `None`. `submitting` is called right before the file's read only, never for
-    /// the zeros (source.rs).
+    /// The file and offset of `place`, a temporary page's, its file opened when cold (D2b §5).
+    pub fn file_at(&self, place: Place) -> Result<(Arc<CountedFile>, u64)> {
+        crate::turso_assert!(
+            place.temporary(),
+            "a page store's place at the temporary pages"
+        );
+        let class = place.class();
+        Ok((self.file(class)?, place.number() * class.size() as u64))
+    }
+
+    /// Reads `pid` into `into`, exactly its size: its copy, the read handed to `submitting`
+    /// returned, or zeros if it has none, `None`. The zeros are never announced, and no file is
+    /// opened or read here: the pool's hook does both once the frame's record is held (source.rs,
+    /// D2b §3).
     pub fn read(
         &self,
         pid: PageId,
@@ -190,18 +214,21 @@ impl TempPages {
                 }
             }
         });
-        let file = self.file(class)?;
-        submitting();
-        Ok(Some(file.pread(Self::at(pid), c)?))
+        Ok(Some(submitting.read(Self::place(pid, false), c)?))
     }
 
-    /// Writes `copy` as `pid`'s copy; `done` runs once it is in the file, or the write failed.
-    /// The write, as submitted.
-    pub fn write<F>(self: &Arc<Self>, pid: PageId, copy: Arc<Buffer>, done: F) -> Result<Completion>
+    /// The write of a copy of `len` bytes as `pid`'s copy, built and not submitted, and its place
+    /// (D2b §4): `done` runs once it is in the file, or the write failed, the copy marked written
+    /// before it runs.
+    pub fn write_request<F>(
+        self: &Arc<Self>,
+        pid: PageId,
+        len: usize,
+        done: F,
+    ) -> (Place, Completion)
     where
         F: FnOnce(std::result::Result<(), CompletionError>) + Send + 'static,
     {
-        let len = copy.len();
         // Weakly: the completion waits in our own IO, so a strong hold would keep pages dropped
         // with the write in flight alive, and for good once nothing steps that IO.
         let me = Arc::downgrade(self);
@@ -219,6 +246,6 @@ impl TempPages {
             }
             done(res);
         });
-        self.file(pid.class())?.pwrite(Self::at(pid), copy, c)
+        (Self::place(pid, true), c)
     }
 }

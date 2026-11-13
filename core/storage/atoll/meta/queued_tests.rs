@@ -815,6 +815,7 @@ fn a_queued_read_keeps_its_requests_alive_until_its_carrier_retires() {
                 opened_async: true,
                 io_threads: 1,
                 meta_reads: 4,
+                frames: 0,
             },
         )
         .expect("a test's IO thread"),

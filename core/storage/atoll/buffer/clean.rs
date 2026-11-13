@@ -17,9 +17,10 @@
 use super::super::page::{self, PageId, SizeClass};
 use super::super::shared::Bytes;
 use super::super::stack::Stack;
+use super::super::store::PageStore;
 use super::frame::{EVICT_AFTER, RESIDENT, WRITING};
 use super::{BufferPool, Outgoing};
-use crate::io::Completion;
+use crate::io::{Completion, File};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
@@ -232,7 +233,9 @@ impl Writeback {
             let sealed = !self.temporary;
             // The buffer's room, given back when the write lands, or if it never starts.
             let mut held = None;
-            let buffer = if outgoing {
+            // A copy's buffer; a write-out's is its frame's memory, made only where the write is
+            // submitted in place (a queued one's IO thread asks the pool for it at the take).
+            let copy = if outgoing {
                 // Held by its write-out until the write ends, so nothing changes it: written
                 // straight from its frame, sealed there.
                 if sealed {
@@ -240,7 +243,7 @@ impl Writeback {
                     page::seal(&mut unsafe { pool.writer(frame, self.class) }, self.pids[i]);
                 }
                 self.counts[i] = h.changes.load(Ordering::Acquire);
-                pool.memory.region.buffer(frame, size)
+                None
             } else {
                 // The frame keeps its page, which may change while it is written: a copy, whole
                 // once nothing was written under the latch while it was taken.
@@ -266,7 +269,7 @@ impl Writeback {
                 }
                 self.counts[i] = count;
                 held = Some(copy);
-                held.as_ref().map(|c| c.buffer()).expect("just leased")
+                held.as_ref().map(|c| c.buffer())
             };
             self.next += 1;
             self.unsettled += 1;
@@ -296,31 +299,55 @@ impl Writeback {
                 // A write-out writes from the frame's memory: the frame's record holds its
                 // request from before it is handed over until it retires, the frame freed by its
                 // landing given to a claim only then (DESIGN.md 22.18, a frame).
-                if write_out.is_some() {
-                    pool.header(frame).hold_record();
-                }
-                let written = match slot {
-                    Some(slot) => pool.store.write_slot(self.class, slot, buffer, ended),
-                    None => pool.temp.write(self.pids[i], buffer, ended),
+                let record = write_out.map(|_| pool.header(frame).hold_record(frame, self.class));
+                let (place, c) = match slot {
+                    Some(slot) => PageStore::write_request(self.class, slot, size, ended),
+                    None => pool.temp.write_request(self.pids[i], size, ended),
                 };
-                match (&written, write_out) {
-                    (Ok(request), Some(version)) => {
-                        pool.header(frame).submitted_at(version);
-                        pool.record_until_retired(self.class, frame, request);
-                    }
-                    (Ok(_), None) => {}
-                    // Counted and never at the backend: a stepped waiter that read the count in
-                    // between is sent back to look, and a write-out's record is free again.
-                    (Err(_), _) => {
-                        if write_out.is_some() {
-                            pool.record_retired(self.class, frame);
+                let written = match (record, write_out) {
+                    // A write-out in a cooperative frame of a database opened async: queued in
+                    // its frame's record for the IO threads (D2b §4).
+                    (Some(record), Some(version)) if pool.store.counted().queues() => {
+                        match pool.store.counted().queue_frame(record, place, c) {
+                            Ok(()) => {
+                                pool.header(frame).submitted_at(version);
+                                Ok(())
+                            }
+                            Err(refused) => {
+                                pool.give_back(refused.held);
+                                Err(refused.error)
+                            }
                         }
-                        pool.requests.fetch_sub(1, Ordering::AcqRel);
-                        event.land();
                     }
+                    (record, write_out) => {
+                        let buffer = copy.unwrap_or_else(|| pool.memory.region.buffer(frame, size));
+                        let submitted = pool
+                            .file_for(place)
+                            .and_then(|(file, at)| file.pwrite(at, buffer, c));
+                        match (submitted, record, write_out) {
+                            (Ok(request), Some(record), Some(version)) => {
+                                pool.header(frame).submitted_at(version);
+                                pool.until_retired(record, &request);
+                                Ok(())
+                            }
+                            (Ok(_), _, _) => Ok(()),
+                            (Err(e), record, _) => {
+                                if let Some(record) = record {
+                                    pool.give_back(record);
+                                }
+                                Err(e)
+                            }
+                        }
+                    }
+                };
+                // Counted and never at the backend: a stepped waiter that read the count in
+                // between is sent back to look, and a write-out's record is free again.
+                if written.is_err() {
+                    pool.requests.fetch_sub(1, Ordering::AcqRel);
+                    event.land();
                 }
                 event.arm();
-                written.map(drop)
+                written
             });
             if let Err(e) = written {
                 // It never started: settled as failed, which fails the pool.

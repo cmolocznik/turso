@@ -18,7 +18,9 @@
 mod dispatch;
 
 use dispatch::Dispatch;
-pub(super) use dispatch::{Chain, Held, LogWork, OpensFile, Shape, Source};
+pub(super) use dispatch::{
+    Chain, FrameOwner, FrameRefused, Held, LogWork, OpensFile, Place, Shape, Source,
+};
 
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{
@@ -290,6 +292,12 @@ impl Requests {
         self.dispatch().queued_at_rest()
     }
 
+    /// The frame records at rest, for a test's exact count of them.
+    #[cfg(test)]
+    pub(super) fn frames_at_rest(&self) -> usize {
+        self.dispatch().frames_at_rest()
+    }
+
     /// Holds the IO thread before its next claim of a record, until the sender sends or drops.
     #[cfg(test)]
     pub(super) fn hold_io_thread(&self) -> std::sync::mpsc::Sender<()> {
@@ -365,6 +373,14 @@ impl Counted {
                 dispatch::MOST_RECORDS - dispatch::QUEUED
             )));
         }
+        if shape.frames > dispatch::MOST_RECORDS - dispatch::QUEUED - shape.meta_reads {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} frame records beside {} metadata read records: a database takes at most {} in all",
+                shape.frames,
+                shape.meta_reads,
+                dispatch::MOST_RECORDS - dispatch::QUEUED
+            )));
+        }
         let dispatch = Arc::new(Dispatch::new(&requests, shape));
         #[cfg(test)]
         MADE.with(|m| {
@@ -392,6 +408,29 @@ impl Counted {
     /// The metadata reads' records: one per read credit the cache may make.
     pub(super) fn meta_read_records(&self) -> usize {
         self.requests.dispatch().meta_reads()
+    }
+
+    /// The frame records: one per grain of the pool the database was opened with (D2b §1).
+    pub(super) fn frame_records(&self) -> usize {
+        self.requests.dispatch().frame_records()
+    }
+
+    /// The pool, as its frame records' owner: set once at its open, before any frame can queue.
+    pub(super) fn attach_frames_owner(&self, owner: crate::sync::Weak<dyn FrameOwner>) {
+        self.requests.dispatch().attach_frames_owner(owner);
+    }
+
+    /// Queues the pool's request `c` for `place` in the record of `held`'s frame (D2b §3, §4);
+    /// refused before accepting it, the held record back.
+    pub(super) fn queue_frame(
+        &self,
+        held: crate::storage::atoll::buffer::HeldRecord,
+        place: Place,
+        c: Completion,
+    ) -> std::result::Result<(), FrameRefused> {
+        self.requests
+            .dispatch()
+            .queue_frame(&self.requests, held, place, c)
     }
 
     /// Queues the read `c` at `pos` of `source` under `credit`, in its record (D2a §3, §4).
@@ -891,6 +930,31 @@ pub(super) fn counted_async_for_test(
                 opened_async: true,
                 io_threads,
                 meta_reads,
+                frames: 0,
+            },
+        )
+        .expect("a test's IO threads"),
+    )
+}
+
+/// [`counted_async_for_test`] with `frames` frame records, for a pool of that many grains (D2b):
+/// the frame tests' own, native only.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(super) fn counted_async_with_frames_for_test(
+    io: Arc<dyn IO>,
+    meta_reads: usize,
+    frames: usize,
+    io_threads: usize,
+) -> Arc<Counted> {
+    Arc::new(
+        Counted::with_shape(
+            io,
+            Arc::new(Requests::default()),
+            Shape {
+                opened_async: true,
+                io_threads,
+                meta_reads,
+                frames,
             },
         )
         .expect("a test's IO threads"),
@@ -932,6 +996,10 @@ crate::thread::thread_local! {
     /// The dispatch and the requests of this thread's last [`Counted`], for a test's look after
     /// every owner has gone.
     static MADE: std::cell::RefCell<Option<(crate::sync::Weak<Dispatch>, crate::sync::Weak<Requests>)>> =
+        const { std::cell::RefCell::new(None) };
+    /// The pool's request in the last frame record queued on this thread, for a test to cancel
+    /// as a backend's cancel would (D2b §7).
+    pub(super) static LAST_FRAME_REQUEST: std::cell::RefCell<Option<Completion>> =
         const { std::cell::RefCell::new(None) };
 }
 

@@ -11,6 +11,7 @@
 
 use super::{io_failure, CountedFile, Requests};
 use crate::io::Completion;
+use crate::storage::atoll::buffer::HeldRecord;
 #[cfg(test)]
 use crate::storage::atoll::locks::Mutex;
 use crate::sync::{Arc, Weak};
@@ -622,6 +623,100 @@ pub(in crate::storage::atoll) struct Queued {
     _credit: crate::storage::atoll::meta::Credit,
 }
 
+/// Where a queued frame request goes and what it does (D2b §1), in one word that is never zero:
+/// whether it writes, whether its page is temporary, its size class plus one, and the slot or the
+/// temporary number. The file and the offset in it follow from it ([`FrameOwner::file_for`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::storage::atoll) struct Place(std::num::NonZeroU64);
+
+impl Place {
+    const WRITE: u64 = 1 << 63;
+    const TEMPORARY: u64 = 1 << 62;
+    const CLASS_SHIFT: u32 = 58;
+    const CLASS: u64 = 0xf << Self::CLASS_SHIFT;
+    /// The slots and temporary numbers a place holds.
+    const NUMBER: u64 = (1 << Self::CLASS_SHIFT) - 1;
+
+    /// The place of slot or temporary number `number` of `class`. A number past the place's bits
+    /// is a page store past any size a radix tree of the store's height reaches: an invariant.
+    pub(in crate::storage::atoll) fn new(
+        write: bool,
+        temporary: bool,
+        class: crate::storage::atoll::page::SizeClass,
+        number: u64,
+    ) -> Self {
+        crate::turso_assert!(
+            number <= Self::NUMBER,
+            "a slot or temporary number past a queued request's place"
+        );
+        let word = if write { Self::WRITE } else { 0 }
+            | if temporary { Self::TEMPORARY } else { 0 }
+            | ((class.index() as u64 + 1) << Self::CLASS_SHIFT)
+            | number;
+        Self(std::num::NonZeroU64::new(word).expect("a class plus one is never zero"))
+    }
+
+    pub(in crate::storage::atoll) fn writes(self) -> bool {
+        self.0.get() & Self::WRITE != 0
+    }
+
+    pub(in crate::storage::atoll) fn temporary(self) -> bool {
+        self.0.get() & Self::TEMPORARY != 0
+    }
+
+    pub(in crate::storage::atoll) fn class(self) -> crate::storage::atoll::page::SizeClass {
+        let index = ((self.0.get() & Self::CLASS) >> Self::CLASS_SHIFT) as usize - 1;
+        crate::storage::atoll::page::SizeClass::new(index).expect("a place's class")
+    }
+
+    pub(in crate::storage::atoll) fn number(self) -> u64 {
+        self.0.get() & Self::NUMBER
+    }
+}
+
+// The class plus one fits the place's four class bits.
+const _: () = assert!(crate::storage::atoll::page::CLASS_COUNT < 16);
+
+/// A queued frame request (D2b §1), from its acceptance to its retirement: its place and the
+/// completion the pool made, which a read's region rides in. A write's region is its frame's own
+/// memory, asked of the owner at the take, so the record carries no buffer. Admitted only by the
+/// frame's held record ([`HeldRecord`]), whose frame is the record's index.
+pub(in crate::storage::atoll) struct FrameQueued {
+    place: Place,
+    completion: Completion,
+}
+
+// A place's niche keeps the record at its state byte and two words (D2b §1, the auditor's #4872).
+#[cfg(not(any(shuttle, atoll_loom)))]
+const _: () = assert!(
+    std::mem::size_of::<Option<FrameQueued>>() == std::mem::size_of::<FrameQueued>()
+        && std::mem::size_of::<Record<FrameQueued>>() == 24
+);
+
+/// The owner of the frame records, the pool, registered once at its open (D2b §1).
+pub(in crate::storage::atoll) trait FrameOwner:
+    Send + Sync + 'static
+{
+    /// The counted file `place` is in and the offset in it, the file opened as this request's
+    /// first stage when cold (a data file's open and its directory's sync; a temporary file's
+    /// open), installed where its store keeps it, the first to set it kept.
+    fn file_for(&self, place: Place) -> Result<(Arc<CountedFile>, u64)>;
+    /// A write-out's region: `frame`'s memory at `place`'s class, which the write-out holds
+    /// outgoing and the frame's record holds to the retirement, so it is the write's alone. The
+    /// buffer keeps the memory mapped, not the owner.
+    fn region(&self, frame: u32, place: Place) -> Arc<crate::io::Buffer>;
+    /// `frame`'s record let its request go: a frame freed meanwhile goes to the free frames, and a
+    /// claim that passed over it is told.
+    fn record_retired(&self, frame: u32, class: crate::storage::atoll::page::SizeClass);
+}
+
+/// A frame request [`Dispatch::queue_frame`] refused before accepting it: its frame's held record
+/// back, for its owner's one give-back, and why.
+pub(in crate::storage::atoll) struct FrameRefused {
+    pub(in crate::storage::atoll) held: HeldRecord,
+    pub(in crate::storage::atoll) error: crate::LimboError,
+}
+
 /// How many records of each kind a database's dispatch makes, and its IO threads (D2a §1, §2).
 #[derive(Clone, Copy, Debug)]
 pub(in crate::storage::atoll) struct Shape {
@@ -631,6 +726,8 @@ pub(in crate::storage::atoll) struct Shape {
     pub(in crate::storage::atoll) io_threads: usize,
     /// The metadata cache's read credits, one record each.
     pub(in crate::storage::atoll) meta_reads: usize,
+    /// The pool's grains, one frame record each, by the grain's number (D2b §1).
+    pub(in crate::storage::atoll) frames: usize,
 }
 
 impl Default for Shape {
@@ -639,6 +736,7 @@ impl Default for Shape {
             opened_async: false,
             io_threads: 1,
             meta_reads: 0,
+            frames: 0,
         }
     }
 }
@@ -649,6 +747,10 @@ pub(in crate::storage::atoll) struct Dispatch {
     records: Box<[Record<Link>]>,
     /// The queued requests' records, one per metadata read credit, by the credit's index.
     queued: Box<[Record<Queued>]>,
+    /// The pool's frame records, one per grain, by the frame's number (D2b §1).
+    frames: Box<[Record<FrameQueued>]>,
+    /// The frame records' owner, the pool, set once at its open before any frame can queue.
+    frames_owner: crate::sync::OnceLock<Weak<dyn FrameOwner>>,
     bits: Bitmap,
     /// The log's doorbell, and the log it rings for, set once at the log's open.
     door: Door,
@@ -717,7 +819,9 @@ impl Dispatch {
         Self {
             records: (0..RECORDS).map(|_| Record::default()).collect(),
             queued: (0..shape.meta_reads).map(|_| Record::default()).collect(),
-            bits: Bitmap::new(QUEUED + shape.meta_reads, shape.io_threads),
+            frames: (0..shape.frames).map(|_| Record::default()).collect(),
+            frames_owner: crate::sync::OnceLock::new(),
+            bits: Bitmap::new(QUEUED + shape.meta_reads + shape.frames, shape.io_threads),
             door: Door::new(),
             log: crate::sync::OnceLock::new(),
             threads: (0..shape.io_threads)
@@ -899,13 +1003,20 @@ impl Dispatch {
         }
     }
 
-    /// Serves bit `bit` the IO thread took: the log's door, a follow-on's record or a queued one.
+    /// Serves bit `bit` the IO thread took: the log's door, a follow-on's record, a queued
+    /// metadata read's or a queued frame request's.
     fn serve_bit(self: &Arc<Self>, bit: usize) {
         match bit {
             LOG => self.serve_log(),
             b if b < RECORDS => self.serve(b),
-            b => self.serve_queued(b - QUEUED),
+            b if b < self.frames_bit() => self.serve_queued(b - QUEUED),
+            b => self.serve_frame(b - self.frames_bit()),
         }
+    }
+
+    /// The frame records' first bit, after the metadata reads' (D2b §1).
+    fn frames_bit(&self) -> usize {
+        QUEUED + self.shape.meta_reads
     }
 
     /// The log this dispatch serves: one per database, set once at its open.
@@ -1282,6 +1393,186 @@ impl Dispatch {
         }
     }
 
+    /// The frame records' owner, the pool, set once at its open before any frame can queue.
+    pub(super) fn attach_frames_owner(&self, owner: Weak<dyn FrameOwner>) {
+        let set = self.frames_owner.set(owner);
+        assert!(set.is_ok(), "a second pool on one database's dispatch");
+    }
+
+    /// The frame records: one per grain of the pool the database was opened with.
+    pub(super) fn frame_records(&self) -> usize {
+        self.shape.frames
+    }
+
+    /// Queues the pool's request `c` for `place` in the record of `held`'s frame (D2b §1, §3, §4),
+    /// all before this returns, as [`queue_read`](Self::queue_read) does: the record taken; the
+    /// request counted; accepted; its payload written; its bit set. The held record is the
+    /// admission, so its frame's dispatch record is at rest whenever the frame's own record is
+    /// free (§5): one not at rest is a broken end order, and a sealed count a closed database's,
+    /// each refused before the request is accepted, with the held record back for its owner's one
+    /// give-back.
+    pub(super) fn queue_frame(
+        self: &Arc<Self>,
+        requests: &Arc<Requests>,
+        held: HeldRecord,
+        place: Place,
+        c: Completion,
+    ) -> std::result::Result<(), FrameRefused> {
+        let j = held.frame() as usize;
+        crate::turso_assert!(
+            held.class() == place.class(),
+            "a frame request queued at a place of another class than its frame's"
+        );
+        let Some(record) = self.frames.get(j) else {
+            let error = crate::LimboError::InternalError(format!(
+                "frame record {j} of {}: a frame past the pool the database was opened with",
+                self.frames.len()
+            ));
+            return Err(FrameRefused { held, error });
+        };
+        if !record.take() {
+            let error = crate::LimboError::InternalError(format!(
+                "frame record {j} not at rest while its frame's record was free"
+            ));
+            return Err(FrameRefused { held, error });
+        }
+        if !requests.count_one() {
+            // SAFETY: just taken, and never published.
+            drop(unsafe { record.finish() });
+            let error = crate::LimboError::InternalError(
+                "a request on a file of a closed database".to_string(),
+            );
+            return Err(FrameRefused { held, error });
+        }
+        c.accept();
+        #[cfg(test)]
+        super::LAST_FRAME_REQUEST.with(|r| *r.borrow_mut() = Some(c.clone()));
+        // SAFETY: just taken.
+        unsafe {
+            record.with(|p| {
+                *p = Some(FrameQueued {
+                    place,
+                    completion: c,
+                })
+            })
+        };
+        // The dispatch's release lets the frame's record go from here (`release_frame`).
+        held.queued();
+        crate::race::point("requests.frame_writing");
+        if let Some(k) = record.publish(&self.bits, self.frames_bit() + j) {
+            self.unpark(k);
+        }
+        Ok(())
+    }
+
+    /// Serves frame record `j` as [`serve_queued`](Self::serve_queued) serves a metadata read's
+    /// (D2b §5): a request cancelled before its take ended with no syscall; one whose owner has
+    /// gone, whose file cannot be had or whose backend refuses it finished with that error and
+    /// ended; any other carried to its backend by a request of the IO thread's own, a read into the
+    /// pool's region or a write out of the frame's memory, which finishes the pool's request from
+    /// its callback and ends it at its own retirement. The owner is held only for the stage and the
+    /// region, never across the submission.
+    fn serve_frame(self: &Arc<Self>, j: usize) {
+        #[cfg(test)]
+        if let Some(hold) = self.hold.lock().take() {
+            let _ = hold.recv();
+        }
+        let record = &self.frames[j];
+        let claimed = record.claim();
+        assert!(claimed, "a bit set for a frame record not READY");
+        // SAFETY: claimed. The payload stays in the record until the request retires.
+        let (place, c) = unsafe {
+            record.with(|p| {
+                let q = p.as_ref().expect("a READY frame record's request");
+                (q.place, q.completion.clone())
+            })
+        };
+        // The request's strong hold on its requests from its take to its release, as a metadata
+        // read's (#4831).
+        let requests = self.requests.upgrade();
+        if c.finished() {
+            crate::race::point("requests.frame_cancelled");
+            return self.end_frame(j, &c, requests);
+        }
+        let staged = match self.frames_owner.get().and_then(Weak::upgrade) {
+            None => Err(crate::LimboError::InternalError(
+                "a queued frame request's pool dropped".to_string(),
+            )),
+            Some(owner) => owner.file_for(place).map(|(file, at)| {
+                let region = place.writes().then(|| owner.region(j as u32, place));
+                (file, at, region)
+            }),
+        };
+        let (file, at, region) = match staged {
+            Ok(staged) => staged,
+            Err(e) => {
+                c.error(io_failure(&e));
+                return self.end_frame(j, &c, requests);
+            }
+        };
+        let owner = c.clone();
+        crate::race::point("requests.frame_submitting");
+        let (carrier, submitted) = match region {
+            None => {
+                let carrier = Completion::new_read(c.as_read().buf_arc(), move |res| {
+                    match res {
+                        Ok((_, n)) => owner.complete(n),
+                        Err(e) => owner.error(e),
+                    }
+                    None
+                });
+                let submitted = file.file.pread(at, carrier.clone());
+                (carrier, submitted)
+            }
+            Some(region) => {
+                let carrier = Completion::new_write(move |res| match res {
+                    Ok(n) => owner.complete(n),
+                    Err(e) => owner.error(e),
+                });
+                let submitted = file.file.pwrite(at, region, carrier.clone());
+                (carrier, submitted)
+            }
+        };
+        match submitted {
+            Ok(_) => {
+                let me = self.clone();
+                carrier.on_retired(move || me.end_frame(j, &c, requests));
+            }
+            // Refused: the backend took nothing, and the carrier's callback never ran.
+            Err(e) => {
+                c.error(io_failure(&e));
+                self.end_frame(j, &c, requests);
+            }
+        }
+    }
+
+    /// Ends the queued frame request `c` in record `j` as [`end_queued`](Self::end_queued) ends a
+    /// metadata read's: `c` retired, then the release once it has wholly retired.
+    fn end_frame(self: &Arc<Self>, j: usize, c: &Completion, requests: Option<Arc<Requests>>) {
+        c.retire();
+        let me = self.clone();
+        c.on_retired(move || me.release_frame(j, requests));
+    }
+
+    /// The queued frame request in record `j` has wholly retired (D2b §5): the record let go, its
+    /// payload dropped, then the frame's own record let go by its owner, so the frame's record is
+    /// never free while its dispatch record is held; the count let go, and the requests' hold with
+    /// it, last. With its owner gone there is no frame to let go.
+    fn release_frame(&self, j: usize, requests: Option<Arc<Requests>>) {
+        // SAFETY: the request's retirement, the record's last holder.
+        let payload = unsafe { self.frames[j].finish() }.expect("a queued frame request");
+        crate::race::point("requests.frame_rest");
+        let class = payload.place.class();
+        drop(payload);
+        if let Some(owner) = self.frames_owner.get().and_then(Weak::upgrade) {
+            owner.record_retired(j as u32, class);
+        }
+        crate::race::point("requests.frame_retired");
+        if let Some(requests) = requests {
+            requests.uncount_one();
+        }
+    }
+
     /// The log units started so far.
     #[cfg(test)]
     pub(super) fn units(&self) -> usize {
@@ -1393,6 +1684,12 @@ impl Dispatch {
     #[cfg(test)]
     pub(super) fn queued_at_rest(&self) -> usize {
         self.queued.iter().filter(|r| r.at_rest()).count()
+    }
+
+    /// The frame records at rest, by count.
+    #[cfg(test)]
+    pub(super) fn frames_at_rest(&self) -> usize {
+        self.frames.iter().filter(|r| r.at_rest()).count()
     }
 }
 

@@ -49,6 +49,9 @@ mod temp;
 mod upkeep;
 mod watt;
 
+// A native harness, never built under shuttle or loom.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+mod frame_tests;
 #[cfg(test)]
 mod tests;
 
@@ -90,6 +93,9 @@ pub fn min_budget_beside(ring: usize, bank: u32) -> usize {
         + (bank as usize).div_ceil(memory::frames_per_batch(lend::bank_class()) as usize)
             * memory::BATCH
 }
+pub(in crate::storage::atoll) use frame::HeldRecord;
+#[cfg(all(test, not(atoll_loom)))]
+pub use source::Counting;
 pub use source::{LocalSource, Located, PageSource, ReadDone};
 
 use super::aligned::AlignedBlock;
@@ -98,6 +104,7 @@ use super::epoch::Step;
 use super::latch::{Held, HeldWord, LatchRef, Look, Marked, VersionedLatch};
 use super::once::SetOnce;
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
+use super::requests::{CountedFile, FrameOwner, Place};
 use super::shared::{Bytes, BytesMut, Shared, Writer};
 use super::stack::Stack;
 use super::store::PageStore;
@@ -113,7 +120,7 @@ use memory::{Memory, Take, Zeroed};
 use table::Table;
 use temp::TempPages;
 
-use crate::io::{Buffer, Completion};
+use crate::io::{Buffer, Completion, File};
 use crate::storage::atoll::locks::Mutex;
 use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
@@ -329,6 +336,70 @@ impl Drop for Outgoing {
             let frames = hold.latch().frames.clone();
             frames.kept(hold);
         }
+    }
+}
+
+/// The load's hook (D2b §3): the pool's side of [`source::Submit`] for one load of `frame`.
+struct LoadSubmit<'a> {
+    pool: &'a Arc<BufferPool>,
+    frame: u32,
+    class: SizeClass,
+    version: u64,
+    announced: &'a std::cell::Cell<bool>,
+    /// The frame's record held for a request submitted in place, or given back by a refused
+    /// queueing: the load's result arms let it go, once.
+    parked: &'a std::cell::Cell<Option<HeldRecord>>,
+}
+
+impl LoadSubmit<'_> {
+    /// The frame's record held, then the read counted in flight and marked submitted.
+    fn hold(&self) -> HeldRecord {
+        let h = self.pool.header(self.frame);
+        let held = h.hold_record(self.frame, self.class);
+        self.announced.set(true);
+        self.pool.requests.fetch_add(1, Ordering::AcqRel);
+        h.submitted_at(self.version);
+        held
+    }
+}
+
+impl source::Submit for LoadSubmit<'_> {
+    fn read(&self, place: Place, c: Completion) -> Result<Completion> {
+        let held = self.hold();
+        let counted = self.pool.store.counted();
+        if counted.queues() {
+            return match counted.queue_frame(held, place, c.clone()) {
+                Ok(()) => Ok(c),
+                Err(refused) => {
+                    self.parked.set(Some(refused.held));
+                    Err(refused.error)
+                }
+            };
+        }
+        self.parked.set(Some(held));
+        let (file, at) = self.pool.file_for(place)?;
+        file.pread(at, c)
+    }
+
+    #[cfg(test)]
+    fn announce(&self) {
+        let held = self.hold();
+        self.parked.set(Some(held));
+    }
+}
+
+/// The pool owns its frames' records in its database's dispatch (D2b §1, §5).
+impl FrameOwner for BufferPool {
+    fn file_for(&self, place: Place) -> Result<(Arc<CountedFile>, u64)> {
+        BufferPool::file_for(self, place)
+    }
+
+    fn region(&self, frame: u32, place: Place) -> Arc<Buffer> {
+        self.memory.region.buffer(frame, place.class().size())
+    }
+
+    fn record_retired(&self, frame: u32, class: SizeClass) {
+        BufferPool::record_retired(self, class, frame);
     }
 }
 #[cfg(test)]
@@ -625,7 +696,7 @@ impl BufferPool {
             relief: SetOnce::default(),
             cut_owed: Mutex::new(HashSet::new()),
             temp: Arc::new(TempPages::new(
-                store.io().clone(),
+                store.counted().clone(),
                 store.base(),
                 store.epochs().clone(),
             )?),
@@ -637,6 +708,20 @@ impl BufferPool {
             stepped: Mutex::new(HashMap::new()),
         });
         pool.lends.set_pool(&pool);
+        // A database opened async queues a frame's requests in its record, one per grain, and the
+        // pool owns those records (D2b §1), registered before any frame can queue.
+        let counted = pool.store.counted();
+        if counted.opened_async() {
+            let grains = pool.memory.grains() as usize;
+            assert!(
+                grains <= counted.frame_records(),
+                "{grains} grains over {} frame records",
+                counted.frame_records()
+            );
+            let pool_weak = Arc::downgrade(&pool);
+            let owner: Weak<dyn FrameOwner> = pool_weak;
+            counted.attach_frames_owner(owner);
+        }
         pool.lend_at_open(config.lent_at_open)?;
         Ok(pool)
     }
@@ -998,19 +1083,23 @@ impl BufferPool {
         // taken before the mark is finished. On an error or a yield the read never starts, and
         // dropping it frees the frame, which is a change too.
         crate::race::point("buffer.read_submit");
-        // Whether this read announced a request, which only its `submitting` says.
+        // Whether this read announced a request, which only its hook says; and the frame's record
+        // it held for a request submitted in place, which the arms below let go (D2b §1).
         let announced = std::cell::Cell::new(false);
+        let parked = std::cell::Cell::new(None);
         let read = self.frames.supply.change(|event| {
-            // Counted in flight and marked submitted by the source right before its request, so
+            // Counted in flight and marked submitted by the hook right before the request, so
             // before the read can land; the read ends, landed or given up, exactly once, through
             // `reading`, which counts it out if it was counted in, under the same hold.
             // The frame's record holds the request from before it is handed over (DESIGN.md
             // 22.18, a frame).
-            let submitting = || {
-                h.hold_record();
-                announced.set(true);
-                self.requests.fetch_add(1, Ordering::AcqRel);
-                h.submitted_at(version);
+            let submitting = LoadSubmit {
+                pool: self,
+                frame,
+                class: pid.class(),
+                version,
+                announced: &announced,
+                parked: &parked,
             };
             let read = located.read(into, Box::new(move |res| reading.end(res)), &submitting);
             event.arm();
@@ -1024,8 +1113,12 @@ impl BufferPool {
         let read = match read {
             // Held until the request retires, which may come after the read landed and the page is
             // resident and unlatched: the frame is neither evicted nor reused before.
+            // Submitted in place, its record kept until it retires; queued, the dispatch's release
+            // lets the record go.
             Ok(IOResult::Done(Some(request))) => {
-                self.record_until_retired(pid.class(), frame, &request);
+                if let Some(held) = parked.take() {
+                    self.until_retired(held, &request);
+                }
                 Ok(IOResult::Done(()))
             }
             Ok(IOResult::Done(None)) => {
@@ -1037,8 +1130,8 @@ impl BufferPool {
             }
             // No request was handed over: one announced and then refused leaves the record free.
             other => {
-                if announced.get() {
-                    self.record_retired(pid.class(), frame);
+                if let Some(held) = parked.take() {
+                    self.give_back(held);
                 }
                 other.map(|r| match r {
                     IOResult::IO(io) => IOResult::IO(io),
@@ -1198,9 +1291,10 @@ impl BufferPool {
         self.signal_released();
     }
 
-    /// Keeps `frame`'s record, holding its load's or write-out's `request`, until the request
-    /// retires (DESIGN.md 22.18, a frame).
-    fn record_until_retired(self: &Arc<Self>, class: SizeClass, frame: u32, request: &Completion) {
+    /// Keeps the frame's record `held`, holding its load's or write-out's `request`, handed over
+    /// in place, until the request retires (DESIGN.md 22.18, a frame).
+    fn until_retired(self: &Arc<Self>, held: HeldRecord, request: &Completion) {
+        let (class, frame) = (held.class(), held.frame());
         // Weakly, as the request's own callback holds the pool.
         let pool = Arc::downgrade(self);
         request.on_retired(move || {
@@ -1208,6 +1302,21 @@ impl BufferPool {
                 pool.record_retired(class, frame);
             }
         });
+    }
+
+    /// Gives back the frame's record `held` for a request never handed over (D2b §1).
+    fn give_back(&self, held: HeldRecord) {
+        self.record_retired(held.class(), held.frame());
+    }
+
+    /// The file and offset of `place`, its file opened when cold: a queued request's first stage
+    /// on its IO thread, or an in-place request's after its frame's record is held (D2b §0).
+    fn file_for(&self, place: Place) -> Result<(Arc<CountedFile>, u64)> {
+        if place.temporary() {
+            self.temp.file_at(place)
+        } else {
+            self.store.file_at(place)
+        }
     }
 
     /// `frame`'s record let its request go: a frame freed meanwhile goes to the free frames, and a

@@ -619,20 +619,17 @@ fn local_source_waits_before_claim_and_rechecks_before_read() {
         }
     }
     let allocations = crate::storage::atoll::testing::allocations() - start;
-    let submits = Arc::new(AtomicUsize::new(0));
+    let submits = crate::storage::atoll::buffer::Counting::new(None);
     let callbacks = Arc::new(AtomicUsize::new(0));
     let buffer = Arc::new(crate::io::Buffer::new_temporary(class.size()));
     let raced = before_hold.map(|located| {
         let callbacks = callbacks.clone();
-        let submit = || {
-            submits.fetch_add(1, Ordering::Relaxed);
-        };
         located.read(
             buffer.clone(),
             Box::new(move |_| {
                 callbacks.fetch_add(1, Ordering::Relaxed);
             }),
-            &submit,
+            &submits,
         )
     });
     let raced_wait = match raced {
@@ -644,8 +641,7 @@ fn local_source_waits_before_claim_and_rechecks_before_read() {
         .as_ref()
         .zip(raced_wait.as_ref())
         .is_some_and(|(a, b)| a.ptr_eq(b));
-    let no_submission =
-        submits.load(Ordering::Relaxed) == 0 && callbacks.load(Ordering::Relaxed) == 0;
+    let no_submission = submits.handed.get() == 0 && callbacks.load(Ordering::Relaxed) == 0;
     hold.release_unchanged();
     let finished = first.as_ref().is_some_and(Completion::finished)
         && raced_wait.as_ref().is_some_and(Completion::finished);
@@ -657,23 +653,20 @@ fn local_source_waits_before_claim_and_rechecks_before_read() {
     let after = match source.locate(pid).unwrap() {
         IOResult::Done(located) => {
             let callbacks = callbacks.clone();
-            let submit = || {
-                submits.fetch_add(1, Ordering::Relaxed);
-            };
             matches!(
                 located.read(
                     buffer.clone(),
                     Box::new(move |_| {
                         callbacks.fetch_add(1, Ordering::Relaxed);
                     }),
-                    &submit
+                    &submits
                 ),
                 Ok(IOResult::Done(None))
             )
         }
         _ => false,
     };
-    let done_once = callbacks.load(Ordering::Relaxed) == 1 && submits.load(Ordering::Relaxed) == 0;
+    let done_once = callbacks.load(Ordering::Relaxed) == 1 && submits.handed.get() == 0;
     drop(buffer);
     drop(first);
     drop(raced_wait);

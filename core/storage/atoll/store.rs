@@ -44,6 +44,7 @@ use super::meta::{MetaCache, MetaHold, MetaId, MetaRef, PageSet, Polled, Ready, 
 use super::once::{SetOnce, TakeOnce};
 use super::page::{self, PageId, SizeClass, CLASS_COUNT};
 use super::radix::{self, ALLOCATED, FREE, MAX_HEIGHT, SLOT_BASE};
+use super::requests::{CountedFile, Place};
 use super::segmented::{Next, Segmented};
 use super::shared::Writer;
 use super::stack::Chain;
@@ -102,7 +103,8 @@ const SWAP_SHARDS: usize = 64;
 
 /// The places of a class's data files a walk of them looks at a call, at most: as many as one page
 /// of their cells holds (DESIGN.md 22.1).
-const FILE_RUN: u64 = (page::MIN_PAGE_SIZE / std::mem::size_of::<SetOnce<Arc<dyn File>>>()) as u64;
+const FILE_RUN: u64 =
+    (page::MIN_PAGE_SIZE / std::mem::size_of::<SetOnce<Arc<CountedFile>>>()) as u64;
 
 /// The slots an erasure batch takes, at most: as many as one page of them holds (DESIGN.md 22.1,
 /// the auditor's P2-CP-U1).
@@ -113,11 +115,14 @@ const CUT: u64 = 1 << 63;
 
 pub struct PageStore {
     io: Arc<dyn IO>,
+    /// The same IO, typed: its files are counted files, whose inner file a queued request's IO
+    /// thread submits to (D2b §2).
+    counted: Arc<super::requests::Counted>,
     base: String,
     config: StoreConfig,
     meta: Arc<MetaCache>,
     /// Per class, its data files by number, each opened once.
-    files: [Segmented<SetOnce<Arc<dyn File>>>; CLASS_COUNT],
+    files: [Segmented<SetOnce<Arc<CountedFile>>>; CLASS_COUNT],
     /// Levels of the page table (`[0]`) and free space (`[1]`) per class: written by the one
     /// growing a tree, and only rising.
     heights: [[AtomicU8; CLASS_COUNT]; TREES],
@@ -433,7 +438,7 @@ impl PageStore {
         );
         let epochs = Arc::new(Epochs::new());
         let meta = Arc::new(MetaCache::new(
-            counted,
+            counted.clone(),
             base,
             config.meta_pages,
             epochs.clone(),
@@ -441,6 +446,7 @@ impl PageStore {
         ));
         Arc::new(Self {
             io,
+            counted,
             base: base.to_string(),
             config,
             meta,
@@ -480,6 +486,11 @@ impl PageStore {
 
     pub fn io(&self) -> &Arc<dyn IO> {
         &self.io
+    }
+
+    /// The store's IO, typed (D2b §2).
+    pub fn counted(&self) -> &Arc<super::requests::Counted> {
+        &self.counted
     }
 
     pub fn epochs(&self) -> &Arc<Epochs> {
@@ -614,8 +625,10 @@ impl PageStore {
         (self.config.file_bytes / class.size() as u64).max(1)
     }
 
-    /// The data file holding `slot` of `class`, and where in it the slot is.
-    fn data_file(&self, class: SizeClass, slot: u64) -> Result<(Arc<dyn File>, u64)> {
+    /// The data file holding `slot` of `class`, and where in it the slot is: the file opened and
+    /// its directory synced here when cold, which is a queued request's first stage on its IO
+    /// thread (D2b §0).
+    pub(super) fn data_file(&self, class: SizeClass, slot: u64) -> Result<(Arc<CountedFile>, u64)> {
         let per_file = self.slots_per_file(class);
         let (n, at) = (slot / per_file, (slot % per_file) * class.size() as u64);
         let cell = self.files[class.index()].get_or_make(n);
@@ -623,9 +636,9 @@ impl PageStore {
             return Ok((f, at));
         }
         let path = format!("{}.c{}.{n}", self.base, class.index());
-        let file = self
-            .io
-            .open_file(&path, OpenFlags::Create | OpenFlags::Direct, false)?;
+        let file =
+            self.counted
+                .open_counted(&path, OpenFlags::Create | OpenFlags::Direct, false)?;
         // A checkpoint may name a slot in this file only once the file's creation is durable. Two
         // first users may both open it; the first to set it is kept.
         self.io.sync_directory(&directory(&self.base))?;
@@ -675,7 +688,9 @@ impl PageStore {
     }
 
     /// Reads `slot` as a copy of `pid` into `into`, which is exactly the page's size and aligned
-    /// for direct IO; `done` gets `into` once it holds a whole copy, `Invalid`, or the IO error.
+    /// for direct IO; `done` gets `into` once it holds a whole copy, `Invalid`, or the IO error. A
+    /// test's own read of a slot: the pool's reads go through [`read_request`](Self::read_request).
+    #[cfg(test)]
     pub fn read_slot_into<F>(
         &self,
         pid: PageId,
@@ -686,13 +701,34 @@ impl PageStore {
     where
         F: FnOnce(PageRead) + Send + 'static,
     {
+        let (place, c) = Self::read_request(pid, slot, into, done);
+        let (file, at) = self.file_at(place)?;
+        file.pread(at, c)
+    }
+
+    /// The file and offset of `place`, a data page's slot, its file opened when cold (D2b §5).
+    pub fn file_at(&self, place: Place) -> Result<(Arc<CountedFile>, u64)> {
+        crate::turso_assert!(!place.temporary(), "a temporary place at the page store");
+        self.data_file(place.class(), place.number())
+    }
+
+    /// The read of `slot` as a copy of `pid` into `into`, built and not submitted, and its place:
+    /// `done` as [`read_slot_into`](Self::read_slot_into)'s (D2b §3).
+    pub fn read_request<F>(
+        pid: PageId,
+        slot: u64,
+        into: Arc<Buffer>,
+        done: F,
+    ) -> (Place, Completion)
+    where
+        F: FnOnce(PageRead) + Send + 'static,
+    {
         let class = pid.class();
         assert_eq!(
             into.len(),
             class.size(),
             "a read into a buffer not the page's size"
         );
-        let (file, at) = self.data_file(class, slot)?;
         let done = TakeOnce::new(done);
         let keep = into.clone();
         let c = Completion::new_read(into, move |res| {
@@ -713,7 +749,7 @@ impl PageStore {
                 }
             }
         });
-        file.pread(at, c)
+        (Place::new(false, false, class, slot), c)
     }
 
     /// Writes `copy`, a whole page, to `slot` of `class`, not made durable: `landed` gets the
@@ -728,8 +764,22 @@ impl PageStore {
     where
         F: FnOnce(std::result::Result<(), CompletionError>) + Send + 'static,
     {
-        let (file, at) = self.data_file(class, slot)?;
-        let len = copy.len();
+        let (place, c) = Self::write_request(class, slot, copy.len(), landed);
+        let (file, at) = self.file_at(place)?;
+        file.pwrite(at, copy, c)
+    }
+
+    /// The write of a whole page of `len` bytes to `slot` of `class`, built and not submitted,
+    /// and its place: `landed` as [`write_slot`](Self::write_slot)'s (D2b §4).
+    pub fn write_request<F>(
+        class: SizeClass,
+        slot: u64,
+        len: usize,
+        landed: F,
+    ) -> (Place, Completion)
+    where
+        F: FnOnce(std::result::Result<(), CompletionError>) + Send + 'static,
+    {
         let landed = TakeOnce::new(landed);
         let c = Completion::new_write(move |res| {
             if let Some(landed) = landed.take() {
@@ -740,7 +790,7 @@ impl PageStore {
                 });
             }
         });
-        file.pwrite(at, copy, c)
+        (Place::new(true, false, class, slot), c)
     }
 
     // ---------------------------------------------------------------- swap copies
@@ -1484,11 +1534,16 @@ impl PageStore {
                 continue;
             }
             let files = &self.files[class];
-            let wanted = |cell: &SetOnce<Arc<dyn File>>| cell.get_ref().is_some();
+            let wanted = |cell: &SetOnce<Arc<CountedFile>>| cell.get_ref().is_some();
             match files.next_from(index, FILE_RUN.min(end - index), wanted) {
                 Next::At(i) if i < end => {
                     *at = (class, i + 1);
-                    return Some(files.get(i).and_then(|cell| cell.get()));
+                    return Some(
+                        files
+                            .get(i)
+                            .and_then(|cell| cell.get())
+                            .map(|f| f as Arc<dyn File>),
+                    );
                 }
                 Next::Passed(i) if i < end => {
                     *at = (class, i);

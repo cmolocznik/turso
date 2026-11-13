@@ -2,6 +2,7 @@
 //! hint, however stale, always reads a header.
 
 use super::super::latch::{Marked, VersionedLatch};
+use super::super::page::SizeClass;
 use super::memory::Zeroable;
 use super::watt::Tracker;
 use crate::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -134,8 +135,16 @@ impl FrameHeader {
 
     /// The frame's record takes the request about to be handed over: by the holder of the frame's
     /// exclusive latch, before the request is made, so the request is never at the backend with
-    /// the record free.
-    pub fn hold_record(&self) {
+    /// the record free. `frame` is this header's frame, of `class`. The one maker of a
+    /// [`HeldRecord`], which its caller hands to exactly one of the three that let it go: the
+    /// queueing of a frame request, the pool's keeping of the record until a request handed over
+    /// retires, or the pool's give-back for one never handed over (D2b §1).
+    pub fn hold_record(&self, frame: u32, class: SizeClass) -> HeldRecord {
+        self.take_record();
+        HeldRecord { frame, class }
+    }
+
+    fn take_record(&self) {
         let was = self.record.swap(RECORD_HELD, Ordering::AcqRel);
         crate::turso_assert!(was == 0, "a frame's record held twice");
     }
@@ -219,6 +228,30 @@ impl FrameHeader {
     }
 }
 
+/// A frame's record, held for the request about to be handed over (D2b §1): made only by
+/// [`FrameHeader::hold_record`], so every one names a record taken, and let go by value exactly
+/// once: queued (`Counted::queue_frame`, whose release then lets the record go), kept until the
+/// request handed over in place retires, or given back for a request never handed over, a refused
+/// queueing's included.
+#[must_use = "a held record is queued, kept until its request retires, or given back"]
+pub(in crate::storage::atoll) struct HeldRecord {
+    frame: u32,
+    class: SizeClass,
+}
+
+impl HeldRecord {
+    pub(in crate::storage::atoll) fn frame(&self) -> u32 {
+        self.frame
+    }
+
+    pub(in crate::storage::atoll) fn class(&self) -> SizeClass {
+        self.class
+    }
+
+    /// Let go into its frame request's dispatch record, whose release lets the frame's record go.
+    pub(in crate::storage::atoll) fn queued(self) {}
+}
+
 /// What a frame's record found as its request retired.
 pub struct Retired {
     /// The frame was freed meanwhile: it goes to the free frames now.
@@ -264,7 +297,7 @@ mod loom_tests {
     fn a_freed_frame_goes_free_once_whatever_its_retirement_and_a_mark_race() {
         check(|| {
             let h = Arc::new(FrameHeader::default());
-            h.hold_record();
+            h.take_record();
             let freed = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
             let free = {
                 let (h, freed) = (h.clone(), freed.clone());
@@ -307,7 +340,7 @@ mod loom_tests {
     fn a_claim_marking_a_record_marked_already_is_seen_by_its_retirement() {
         check(|| {
             let h = Arc::new(FrameHeader::default());
-            h.hold_record();
+            h.take_record();
             assert_eq!(h.mark_record_waited(), Marked::Waits);
             let registered = Arc::new(AtomicBool::new(false));
             let claim = {

@@ -15,6 +15,9 @@
 use super::super::meta::MetaRef;
 use super::super::page::PageId;
 use super::super::radix::{self, ALLOCATED, FREE, SLOT_BASE};
+#[cfg(test)]
+use super::super::requests::CountedFile;
+use super::super::requests::Place;
 use super::super::store::{PageRead, PageStore};
 use crate::io::{Buffer, Completion};
 use crate::sync::Arc;
@@ -29,16 +32,64 @@ pub trait PageSource: Send + Sync {
     fn locate(&self, pid: PageId) -> Result<IOResult<Box<dyn Located>>>;
 }
 
-/// Called by a read once, right before it hands its request to the pool's IO, and never by one
-/// that fills the page itself: from then on the read is the pool's IO in flight, which a fix of
-/// the page waits on by stepping (DESIGN.md 9.1.3, wait kinds). Before the request, so the read is
-/// counted in flight before it can land.
-pub type Submitting<'a> = &'a dyn Fn();
+/// The pool's hook a read hands its request to, once, and never one that fills the page itself
+/// (D2b §3): the read is counted in flight and marked submitted before it can land, from then on
+/// the pool's IO in flight, which a fix of the page waits on (DESIGN.md 9.1.3, wait kinds); the
+/// frame's record is held first; then the request is queued in that record for the database's IO
+/// threads, in a cooperative frame of a database opened async, or else submitted to its file, the
+/// file opened there when cold. A source builds the request and opens no file itself.
+pub trait Submit {
+    /// Hands over the read `c` of the copy at `place`: the request as handed over.
+    fn read(&self, place: Place, c: Completion) -> Result<Completion>;
+    /// A test source's announcement of a request it lands itself, which no backend holds.
+    #[cfg(test)]
+    fn announce(&self);
+}
+
+pub type Submitting<'a> = &'a dyn Submit;
+
+/// A test's hook: counts what it is handed, announcements included. A read goes to the file
+/// `files` names for its place, or comes back unsubmitted, owned by no backend, where it names
+/// none.
+#[cfg(test)]
+pub struct Counting<'a> {
+    pub files: Option<&'a dyn Fn(Place) -> Result<(Arc<CountedFile>, u64)>>,
+    pub handed: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+impl<'a> Counting<'a> {
+    pub fn new(files: Option<&'a dyn Fn(Place) -> Result<(Arc<CountedFile>, u64)>>) -> Self {
+        Self {
+            files,
+            handed: std::cell::Cell::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Submit for Counting<'_> {
+    fn read(&self, place: Place, c: Completion) -> Result<Completion> {
+        use crate::io::File;
+        self.handed.set(self.handed.get() + 1);
+        match self.files {
+            Some(files) => {
+                let (file, at) = files(place)?;
+                file.pread(at, c)
+            }
+            None => Ok(c),
+        }
+    }
+
+    fn announce(&self) {
+        self.handed.set(self.handed.get() + 1);
+    }
+}
 
 pub trait Located: Send {
     /// Reads the page into `into`, exactly its size. Returning `Done`, the read has either run
-    /// `done` (a page it filled itself, `None`) or called `submitting` and handed its request to
-    /// the pool's IO, whose landing runs `done` once (`Some`, the request, which the frame's
+    /// `done` (a page it filled itself, `None`) or handed its request to the pool through
+    /// `submitting`, whose landing runs `done` once (`Some`, the request, which the frame's
     /// record holds until it retires: DESIGN.md 22.18, a frame); a page whose landing another
     /// party brings is no read of a source, and the pool refuses one by ending the process: the
     /// fix that started the read keeps its result only so (DESIGN.md 9.1.3, wait kinds).
@@ -137,14 +188,13 @@ impl LocalLocated {
         submitting: Submitting<'_>,
     ) -> Result<IOResult<Option<Completion>>> {
         let pid = self.pid;
-        submitting();
-        let c = self.store.read_slot_into(pid, slot, into, move |read| {
+        let (place, c) = PageStore::read_request(pid, slot, into, move |read| {
             done(match read {
                 PageRead::Valid => Ok(()),
                 PageRead::Invalid => Err(CompletionError::CorruptPage { page: pid.raw() }),
                 PageRead::Failed(e) => Err(e),
             })
-        })?;
-        Ok(IOResult::Done(Some(c)))
+        });
+        Ok(IOResult::Done(Some(submitting.read(place, c)?)))
     }
 }

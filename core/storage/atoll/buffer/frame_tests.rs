@@ -9,7 +9,7 @@ use crate::io::{Delivery, FileSyncType, MemoryIO, OpenFlags, Stepped, IO};
 use crate::storage::atoll::cooperative::Frame;
 use crate::storage::atoll::page::{HEADER_SIZE, MIN_PAGE_SIZE};
 use crate::storage::atoll::requests::{
-    counted_async_with_frames_for_test, counted_for_test, Counted,
+    counted_async_with_frames_for_test, counted_for_test, Counted, Requests,
 };
 use crate::storage::atoll::store::StoreConfig;
 use crate::storage::atoll::testing::drive;
@@ -222,16 +222,18 @@ impl File for ProbeFile {
                 c.deliver(Err(INJECTED));
                 Ok(c)
             }
+            // Held before it is finished: a look that finds `c` finished finds it held (#4900).
             Some(Rule::HoldFail) => {
                 c.accept();
-                c.error(INJECTED);
                 probe.held.lock().push(c.clone());
+                c.error(INJECTED);
                 Ok(c)
             }
             Some(Rule::Hold) => {
-                // The read now, its callback through `c`; `c`'s retirement when the probe lets it
-                // go.
+                // Held, then the read now, its callback through `c`; `c`'s retirement when the
+                // probe lets it go.
                 c.accept();
+                probe.held.lock().push(c.clone());
                 let owner = c.clone();
                 let inner = Completion::new_read(c.as_read().buf_arc(), move |res| {
                     match res {
@@ -240,8 +242,10 @@ impl File for ProbeFile {
                     }
                     None
                 });
-                drop(self.file.pread(at, inner)?);
-                probe.held.lock().push(c.clone());
+                if let Err(e) = self.file.pread(at, inner) {
+                    c.retire();
+                    return Err(e);
+                }
                 Ok(c)
             }
         }
@@ -258,19 +262,22 @@ impl File for ProbeFile {
             }
             Some(Rule::HoldFail) => {
                 c.accept();
-                c.error(INJECTED);
                 probe.held.lock().push(c.clone());
+                c.error(INJECTED);
                 Ok(c)
             }
             Some(Rule::Hold) => {
                 c.accept();
+                probe.held.lock().push(c.clone());
                 let owner = c.clone();
                 let inner = Completion::new_write(move |res| match res {
                     Ok(n) => owner.complete(n),
                     Err(e) => owner.error(e),
                 });
-                drop(self.file.pwrite(at, buffer, inner)?);
-                probe.held.lock().push(c.clone());
+                if let Err(e) = self.file.pwrite(at, buffer, inner) {
+                    c.retire();
+                    return Err(e);
+                }
                 Ok(c)
             }
         }
@@ -1317,12 +1324,28 @@ fn a_frames_cold_load_and_write_out_over_the_ring_run_on_an_io_thread() {
     child_ended_cleanly(ended);
 }
 
+/// Runs `ask` with the next queued frame request paused between its backend call's return and the
+/// branch after it, then lets the IO thread on and waits until that branch has run, whichever arm it
+/// took (#4900): `ask` returns while the IO thread has not yet run it, and a look after this sees
+/// what it left. `ask`'s result, and whether the IO thread reached the pause and then the branch's
+/// end, each within [`SETTLE`].
+fn past_the_branch<T>(requests: &Requests, ask: impl FnOnce() -> T) -> (T, bool, bool) {
+    let (returned, go) = requests.pause_frame_returned();
+    let served = requests.on_frame_served();
+    let out = ask();
+    let paused = returned.recv_timeout(SETTLE).is_ok();
+    let _ = go.send(());
+    let ran = served.recv_timeout(SETTLE).is_ok();
+    (out, paused, ran)
+}
+
 /// D2b §7.14, held (#4890): a queued load and a queued write-out whose backend fails them and still
 /// owns their carrier. The load's waiter has the injected error and the frame unloads; the
 /// write-out's settlement fails the pool and keeps the page; meanwhile the dispatch record, the
 /// frame's record and the database's count of the request all stay held, until the carrier retires,
 /// when each is let go once (mutant `early-release-on-error`: a request whose carrier failed ended
-/// at its submission's return, before the carrier retired).
+/// at its submission's return, before the carrier retired). Each look waits for the IO thread to
+/// have run the branch after its backend call, the waiter having returned first (#4900).
 #[test]
 fn a_queued_failure_holds_its_records_until_its_carrier_retires() {
     let records = MIN_BUDGET / MIN_PAGE_SIZE;
@@ -1333,8 +1356,10 @@ fn a_queued_failure_holds_its_records_until_its_carrier_retires() {
     let io: Arc<dyn IO> = counted.clone();
     let leaf = drive(&io, || pool.store.leaf(pid)).unwrap();
     probe.rule_under(&data(base), Some(Rule::HoldFail));
-    let read = in_frames(&io, || pool.fix_exclusive(pid, None)).map(|_| ());
     let requests = counted.requests().clone();
+    let (read, load_paused, load_ran) = past_the_branch(&requests, || {
+        in_frames(&io, || pool.fix_exclusive(pid, None)).map(|_| ())
+    });
     let held = |pool: &Arc<BufferPool>| {
         (0..pool.memory.grains())
             .filter(|&f| pool.header(f).record_held())
@@ -1371,8 +1396,9 @@ fn a_queued_failure_holds_its_records_until_its_carrier_retires() {
     let (pid, frame) = dirty_page(&pool, &io, false);
     probe.rule_under(&data(base), Some(Rule::HoldFail));
     start_writing_out(&pool, frame);
-    let settled = settle_in_frames(&pool, &io);
     let requests = counted.requests().clone();
+    let (settled, write_paused, write_ran) =
+        past_the_branch(&requests, || settle_in_frames(&pool, &io));
     let h = pool.header(frame);
     let write_held = (
         probe.holding(),
@@ -1396,6 +1422,12 @@ fn a_queued_failure_holds_its_records_until_its_carrier_retires() {
         held(&pool),
     );
     drop((pool, io, counted, requests));
+    assert_eq!(
+        (load_paused, load_ran, write_paused, write_ran),
+        (true, true, true, true),
+        "the IO thread reached the pause after each backend call, then the branch's end: (load \
+         paused, load's branch run, write-out paused, write-out's branch run)"
+    );
     assert_eq!(
         load_error,
         Some(INJECTED),

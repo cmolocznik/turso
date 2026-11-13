@@ -793,6 +793,16 @@ struct Notes {
         std::sync::mpsc::Sender<(u8, usize)>,
         std::sync::mpsc::Receiver<()>,
     )>,
+    /// A pause of the next queued frame request between its backend call's return and the branch
+    /// after it: its record there, and the release the IO thread waits for.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    frame_returned: Option<(
+        std::sync::mpsc::Sender<usize>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    /// The next queued frame request's branch after its backend call, once run: its record.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    frame_served: Option<std::sync::mpsc::Sender<usize>>,
 }
 
 /// The records of the metadata cache's writes, `checkpoint::WRITES` of them (DESIGN.md 22.18: the
@@ -1533,6 +1543,8 @@ impl Dispatch {
                 (carrier, submitted)
             }
         };
+        #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+        self.pause_at_frame_returned(j);
         match submitted {
             Ok(_) => {
                 let me = self.clone();
@@ -1544,6 +1556,8 @@ impl Dispatch {
                 self.end_frame(j, &c, requests);
             }
         }
+        #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+        self.note_frame_served(j);
     }
 
     /// Ends the queued frame request `c` in record `j` as [`end_queued`](Self::end_queued) ends a
@@ -1622,6 +1636,47 @@ impl Dispatch {
         if let Some(note) = note {
             let counted = requests.map_or(0, Requests::outstanding);
             let _ = note.send((self.door.read(), counted));
+        }
+    }
+
+    /// Pauses the next queued frame request between its backend call's return and the branch
+    /// after it: its record there, and the sender that lets it go on.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn pause_frame_returned(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        self.notes.lock().frame_returned = Some((seen_tx, go_rx));
+        (seen_rx, go_tx)
+    }
+
+    /// A note of the next queued frame request's branch after its backend call, once run, whichever
+    /// arm it took.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn on_frame_served(&self) -> std::sync::mpsc::Receiver<usize> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.notes.lock().frame_served = Some(tx);
+        rx
+    }
+
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    fn pause_at_frame_returned(&self, j: usize) {
+        let gap = self.notes.lock().frame_returned.take();
+        if let Some((seen, go)) = gap {
+            let _ = seen.send(j);
+            let _ = go.recv();
+        }
+    }
+
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    fn note_frame_served(&self, j: usize) {
+        let note = self.notes.lock().frame_served.take();
+        if let Some(note) = note {
+            let _ = note.send(j);
         }
     }
 

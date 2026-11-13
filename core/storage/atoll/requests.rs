@@ -298,6 +298,24 @@ impl Requests {
         self.dispatch().frames_at_rest()
     }
 
+    /// Pauses the next queued frame request between its backend call's return and the branch
+    /// after it, for a test that orders its own look after that branch (#4900).
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn pause_frame_returned(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.dispatch().pause_frame_returned()
+    }
+
+    /// A note of the next queued frame request's branch after its backend call, once run.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn on_frame_served(&self) -> std::sync::mpsc::Receiver<usize> {
+        self.dispatch().on_frame_served()
+    }
+
     /// Holds the IO thread before its next claim of a record, until the sender sends or drops.
     #[cfg(test)]
     pub(super) fn hold_io_thread(&self) -> std::sync::mpsc::Sender<()> {

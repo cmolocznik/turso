@@ -307,6 +307,9 @@ pub struct VectorSparseInvertedIndexMethodCursor {
     inverted_index_cursor: Option<Box<dyn CursorTrait>>,
     stats_cursor: Option<Box<dyn CursorTrait>>,
     main_btree: Option<Box<dyn CursorTrait>>,
+    /// An open of its cursors under way, returned for the IO an Atoll cursor's catalog read waits
+    /// for in a cooperative frame: entered again, it goes on with the cursors it made.
+    opening: bool,
     pending_store_ops: VecDeque<BackingStoreOp>,
     insert_state: VectorSparseInvertedIndexInsertState,
     delete_state: VectorSparseInvertedIndexDeleteState,
@@ -388,6 +391,7 @@ impl VectorSparseInvertedIndexMethodCursor {
             inverted_index_cursor: None,
             stats_cursor: None,
             main_btree: None,
+            opening: false,
             pending_store_ops: VecDeque::new(),
             search_result: VecDeque::new(),
             insert_state: VectorSparseInvertedIndexInsertState::Init,
@@ -404,10 +408,38 @@ impl VectorSparseInvertedIndexMethodCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn open_store_cursors(&mut self, context: &IndexMethodContext) -> Result<()> {
-        self.inverted_index_cursor = Some(open_store_cursor(context, &self.schema.indexes[0])?);
-        self.stats_cursor = Some(open_store_cursor(context, &self.schema.indexes[1])?);
-        Ok(())
+    /// Opens its cursors, the main table's too for a read, each one's open finished before this
+    /// is done, so an Atoll cursor is bound here. Its catalog read returns the IO it waits for in a
+    /// cooperative frame: the call entered again goes on with the cursors it made, and a new open
+    /// makes them afresh. Done or failed, the open under way ends.
+    fn open_cursors(&mut self, context: &IndexMethodContext, read: bool) -> IOResultOr<()> {
+        let out = self.open_cursors_inner(context, read);
+        if !matches!(out, Ok(IOResult::IO(_))) {
+            self.opening = false;
+        }
+        out
+    }
+
+    fn open_cursors_inner(&mut self, context: &IndexMethodContext, read: bool) -> IOResultOr<()> {
+        if !self.opening {
+            self.inverted_index_cursor = Some(open_store_cursor(context, &self.schema.indexes[0])?);
+            self.stats_cursor = Some(open_store_cursor(context, &self.schema.indexes[1])?);
+            if read {
+                self.main_btree = Some(context.open_table_cursor(&self.configuration.table_name)?);
+            }
+            self.opening = true;
+        }
+        for cursor in [
+            &mut self.inverted_index_cursor,
+            &mut self.stats_cursor,
+            &mut self.main_btree,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            return_if_io!(cursor.finish_open());
+        }
+        Ok(IOResult::Done(()))
     }
 }
 
@@ -476,14 +508,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
-        self.open_store_cursors(context)?;
-        self.main_btree = Some(context.open_table_cursor(&self.configuration.table_name)?);
-        Ok(IOResult::Done(()))
+        self.open_cursors(context, true)
     }
 
     fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
-        self.open_store_cursors(context)?;
-        Ok(IOResult::Done(()))
+        self.open_cursors(context, false)
     }
 
     fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
@@ -502,6 +531,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         self.inverted_index_cursor = None;
         self.stats_cursor = None;
         self.main_btree = None;
+        self.opening = false;
     }
 
     fn insert(&mut self, values: &[Register]) -> IOResultOr<()> {

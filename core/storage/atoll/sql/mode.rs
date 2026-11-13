@@ -455,8 +455,9 @@ type FieldRead = (u32, (u16, u64), u64);
 /// opcode's for a begin's read set. So a read that returns IO in a cooperative frame goes on where
 /// it stopped, with its shortage tenure and the page it keeps. Dropped unfinished, at its
 /// statement's reset or drop, it lets both go. Its caller keeps it boxed, as an
-/// `Option<Box<FacadeRead>>` that is none until a read returns IO in a frame, so a caller that
-/// never meets one pays one word and no allocation.
+/// `Option<Box<FacadeRead>>`: the box is made by a call in a frame that reads, before its first
+/// step, even one that then finishes at once; a call outside a frame, or one answered without a
+/// read, makes none. Only a return for IO keeps it.
 pub(crate) struct FacadeRead {
     owner: crate::storage::atoll::buffer::Owner,
     /// The transaction it reads in, by slot and start; `None` outside one. A read kept from
@@ -490,6 +491,13 @@ enum ReadAt {
         next: usize,
         get: Option<Get>,
     },
+    /// A tree's catalog row (ASYNC1 D2e (ii)): `get`, its read under way, made at its first step;
+    /// `changes`, the catalog's changes when the read started, which its row is tagged with.
+    Row {
+        id: u64,
+        changes: u64,
+        get: Option<Get>,
+    },
 }
 
 impl ReadAt {
@@ -517,14 +525,31 @@ impl ReadAt {
         }
     }
 
+    fn row(id: u64, changes: u64) -> Self {
+        Self::Row {
+            id,
+            changes,
+            get: None,
+        }
+    }
+
     /// Whether a read kept as `self` is the one `fresh` would start: the same kind, of the same
-    /// field or read set.
+    /// field or read set; a catalog row's of the same tree while the catalog counts no change
+    /// since it started.
     fn continues(&self, fresh: &ReadAt) -> bool {
         match (self, fresh) {
             (Self::Field { field: a, .. }, Self::Field { field: b, .. }) => a == b,
             (Self::Header { .. }, Self::Header { .. })
             | (Self::Pages { .. }, Self::Pages { .. }) => true,
             (Self::Since { set: a, .. }, Self::Since { set: b, .. }) => a == b,
+            (
+                Self::Row {
+                    id: a, changes: c, ..
+                },
+                Self::Row {
+                    id: b, changes: d, ..
+                },
+            ) => a == b && c == d,
             _ => false,
         }
     }
@@ -543,6 +568,10 @@ impl FacadeRead {
             .as_ref()
             .is_some_and(|r| r.txn == txn && r.at.continues(&fresh))
         {
+            #[cfg(test)]
+            if let ReadAt::Row { .. } = fresh {
+                RESOLVER_BOXES.with(|n| n.set(n.get() + 1));
+            }
             *read = Some(Box::new(FacadeRead {
                 owner: crate::storage::atoll::buffer::Owner::of(conn.clone()),
                 txn,
@@ -642,6 +671,14 @@ crate::thread::thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     /// The header fields read on this thread, for the same.
     pub(crate) static HEADER_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The catalog-row `Get`s a cursor's resolution made on this thread ([`row_get`]).
+    pub(crate) static ROW_GETS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The boxes a cursor's resolution was kept in, made on this thread ([`FacadeRead::kept`]).
+    pub(crate) static RESOLVER_BOXES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Each step of a cursor's open on this thread: its tree, and whether the step returned for IO
+    /// ([`SqlCursor::finish_open`]), for a test to see an open return at its own boundary.
+    pub(crate) static OPEN_STEPS: std::cell::RefCell<Vec<(u64, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// The commits told on this thread of a failure their driver saw (`Ending::met`), for a test
     /// to see that its schedule reached the driver.
     pub(crate) static COMMITS_MET: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -695,6 +732,79 @@ fn row_in(
     };
     known.lock().entry(id).or_default().row = Some(row);
     Ok((row, near))
+}
+
+/// [`row_in`] for a caller that keeps `read` across its returns (ASYNC1 D2e (ii)): in a
+/// cooperative frame the catalog row's read returns the IO it waits for, and goes on where it
+/// stopped when entered again, its look resuming at the page its owner keeps. Outside a frame the
+/// row is read here as `row_in` reads it, a read kept from a frame driven to its end if it is still
+/// this one, else let go. The caller lets `read` go at every end but a return for IO.
+fn row_in_kept(
+    db: &Arc<AtollDb>,
+    conn: &Arc<crate::storage::atoll::buffer::Conn>,
+    known: &Mutex<HashMap<u64, Known>>,
+    id: u64,
+    txn: &mut Txn,
+    read: &mut Option<Box<FacadeRead>>,
+) -> Result<IOResult<(KnownRow, Near)>> {
+    let inside = crate::storage::atoll::cooperative::inside();
+    if !inside && read.is_none() {
+        return row_in(db, conn, known, id, txn).map(IOResult::Done);
+    }
+    let changes = db.catalog().changes();
+    if let Some(k) = known.lock().get(&id) {
+        if let Some(row) = k.row.filter(|r| r.holds(txn, changes)) {
+            return Ok(IOResult::Done((row, k.near)));
+        }
+    }
+    let identity = Some((txn.slot(), txn.start()));
+    let fresh = ReadAt::row(id, changes);
+    let continues = read
+        .as_ref()
+        .is_some_and(|r| r.txn == identity && r.at.continues(&fresh));
+    if !continues && !inside {
+        // Kept from a frame for another identity: let go, its owner's keeps with it.
+        *read = None;
+        return row_in(db, conn, known, id, txn).map(IOResult::Done);
+    }
+    #[cfg(test)]
+    if !continues {
+        CATALOG_READS.with(|r| r.borrow_mut().push(id));
+    }
+    let FacadeRead { owner, at, .. } = FacadeRead::kept(read, conn, identity, fresh);
+    let ReadAt::Row {
+        changes: started,
+        get,
+        ..
+    } = at
+    else {
+        unreachable!("a catalog row's read over another read");
+    };
+    let started = *started;
+    let entry = done!(drive_or_io(owner, db.io(), || {
+        let get = get.get_or_insert_with(|| row_get(id));
+        get.resume_at_kept();
+        db.catalog()
+            .get(db.atoll().transactions(), db.versions(), txn, get)
+    }))
+    .ok_or_else(|| LimboError::InternalError(format!("no tree {id} in the catalog")))?;
+    // Tagged with the changes the catalog counted when the read started, never later ones.
+    let row = KnownRow {
+        entry,
+        txn: (txn.slot(), txn.start()),
+        changes: started,
+    };
+    let mut known = known.lock();
+    let k = known.entry(id).or_default();
+    k.row = Some(row);
+    Ok(IOResult::Done((row, k.near)))
+}
+
+/// The `Get` of a tree's catalog row for a cursor's resolution: the one place it is made.
+fn row_get(id: u64) -> Get {
+    #[cfg(test)]
+    ROW_GETS.with(|n| n.set(n.get() + 1));
+    Get::new(&catalog::key(id))
 }
 
 /// Whether `txn`'s current statement created the tree `entry` names.
@@ -990,9 +1100,10 @@ impl ConnTxn {
         self.cell.lock().as_ref().is_some_and(Txn::wrote)
     }
 
-    /// A cursor over the tree whose id Turso holds as the root page `root`, opened as OpenRead and
+    /// A cursor over the tree whose id Turso holds as the root page `root`, as OpenRead and
     /// OpenWrite open one: an index's or a WITHOUT ROWID table's with `index`, a rowid table's
-    /// without.
+    /// without. Its open is under way: the caller steps it with
+    /// [`finish_open`](CursorTrait::finish_open) until done, as the instruction does.
     #[turso_macros::atoll_entry]
     pub fn open_cursor(
         &self,
@@ -1000,11 +1111,13 @@ impl ConnTxn {
         root: i64,
         index: Option<Arc<IndexInfo>>,
     ) -> Result<SqlCursor> {
-        SqlCursor::new(self, pager, tree_id(root)?, index).opened()
+        Ok(SqlCursor::new(self, pager, tree_id(root)?, index).opening_fresh())
     }
 
     /// [`open_cursor`](Self::open_cursor) for an index method's backing tree, whose writes fail
-    /// at once on another writer's key instead of waiting for it ([`SqlCursor::no_wait`]).
+    /// at once on another writer's key instead of waiting for it ([`SqlCursor::no_wait`]). Outside
+    /// a cooperative frame its open is finished here, so it is bound when made; in one it is left
+    /// under way, for the index method's own open to finish before it is done (ASYNC1 D2e (ii)).
     #[turso_macros::atoll_entry]
     pub fn open_cursor_no_wait(
         &self,
@@ -1012,9 +1125,18 @@ impl ConnTxn {
         root: i64,
         index: Option<Arc<IndexInfo>>,
     ) -> Result<SqlCursor> {
-        Ok(SqlCursor::new(self, pager, tree_id(root)?, index)
-            .opened()?
-            .no_wait())
+        let mut cursor = SqlCursor::new(self, pager, tree_id(root)?, index)
+            .no_wait()
+            .opening_fresh();
+        if !crate::storage::atoll::cooperative::inside() {
+            // Outside a frame the catalog read drives in place: the open ends in this call.
+            let opened = cursor.finish_open().map_err(|e| *e)?;
+            crate::turso_assert!(
+                matches!(opened, IOResult::Done(())),
+                "an open outside a cooperative frame returned for IO"
+            );
+        }
+        Ok(cursor)
     }
 
     /// The snapshot timestamp of the open transaction's current statement, once it has one.
@@ -2338,8 +2460,21 @@ pub struct SqlCursor {
     /// The catalog row of its tree it last went by, which holds as the connection's [`Known`]
     /// row does: its statement's next execution takes it up with no lookup.
     row: Option<KnownRow>,
+    /// Its resolution's catalog read, kept across its returns for IO in a cooperative frame
+    /// (ASYNC1 D2e (ii)): let go at every other end of the call that reads.
+    resolving: Option<Box<FacadeRead>>,
+    /// An open begun and not finished ([`SqlCursor::finish_open`]).
+    opening: Option<Opening>,
     /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
     _frame: crate::storage::atoll::unwind::FrameEnd,
+}
+
+/// What an open under way finishes: a new cursor's resolution, or a parked one's taking up again
+/// ([`SqlCursor::reopened`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    Fresh,
+    Reopen,
 }
 
 /// A cursor leaves the leaf it stood at to the next over its tree.
@@ -2386,6 +2521,8 @@ impl SqlCursor {
             unseen: false,
             known: ct.known.clone(),
             row: None,
+            resolving: None,
+            opening: None,
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }
@@ -2399,11 +2536,12 @@ impl SqlCursor {
     #[turso_macros::atoll_entry]
     pub fn probe(&mut self, key: GuardKey<'_>) -> IOResultOr<()> {
         use crate::storage::atoll::txn::versioned::Probe;
+        self.usable();
         if self.vacant {
             return Ok(IOResult::Done(()));
         }
         loop {
-            let cursor = self.resolve()?;
+            let cursor = done!(self.resolve());
             let prefix = cursor.guard_prefix(&key)?;
             let w = match cursor.probe(&prefix)? {
                 IOResult::Done(Probe::Present | Probe::Absent) => {
@@ -2437,11 +2575,12 @@ impl SqlCursor {
     /// `WriteWriteConflict` once it has committed.
     #[turso_macros::atoll_entry]
     pub fn unseen_hit(&mut self) -> IOResultOr<()> {
+        self.usable();
         if self.vacant {
             return Ok(IOResult::Done(()));
         }
         loop {
-            let w = match self.resolve()?.unseen_hit()? {
+            let w = match done!(self.resolve()).unseen_hit()? {
                 Guard::Clear => Write::Done(crate::storage::atoll::btree::Outcome::Unchanged),
                 Guard::Wait(blocker) => Write::Wait(blocker),
                 Guard::Conflict => Write::Conflict,
@@ -2471,7 +2610,7 @@ impl SqlCursor {
         if let Some(key) = self.rebinding.clone() {
             if let Some(key) = key {
                 // Resolved without letting go: the rebinding is this catch-up's, under way.
-                done!(self.resolved()?.refresh(Some(key)));
+                done!(done!(self.resolved()).refresh(Some(key)));
             }
             self.rebinding = None;
         } else if behind != Behind::Nothing {
@@ -2517,7 +2656,7 @@ impl SqlCursor {
     /// The tree's rowid counter, seeded from the tree's largest key once it is (DESIGN.md §17,
     /// §8). Step it until done.
     fn counter(&mut self) -> Result<IOResult<&Counter>> {
-        self.resolve()?;
+        done!(self.resolve());
         let cursor = self.open.as_mut().expect("resolved");
         cursor.hold_counter(self.db.rowids());
         let seed = self.seeding.get_or_insert_with(Seed::default);
@@ -2533,23 +2672,24 @@ impl SqlCursor {
     /// rowids.
     #[turso_macros::atoll_entry]
     pub fn new_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+        self.usable();
         Ok(IOResult::Done(done!(self.counter()).draw()))
     }
 
-    /// Takes the cursor up again for its statement's next open of its tree (DESIGN.md §17), as
-    /// [`opened`](Self::opened) opens one, in `ct`'s transaction: its tree cursor is kept, at no
-    /// row, its buffers and its last look with it, where the catalog row the statement reads is
-    /// the one it was over; else it resolves afresh. `false` for a cursor of another connection,
-    /// which the caller drops.
+    /// Takes the cursor up again for its statement's next open of its tree (DESIGN.md §17), in
+    /// `ct`'s transaction, an open under way until [`finish_open`](CursorTrait::finish_open) is
+    /// done: its tree cursor is kept, at no row, its buffers and its last look with it, where the
+    /// catalog row the statement reads is the one it was over; else it resolves afresh. `false`
+    /// for a cursor of another connection, which the caller drops.
     #[turso_macros::atoll_entry]
     pub fn reopened(
         &mut self,
         ct: &ConnTxn,
         pager: &Arc<Pager>,
         index: Option<Arc<IndexInfo>>,
-    ) -> Result<bool> {
+    ) -> bool {
         if !Arc::ptr_eq(&self.cell, &ct.cell) || !Arc::ptr_eq(&self.db, &ct.db) {
-            return Ok(false);
+            return false;
         }
         // The connection's pager, nearly always the one it kept: no count taken then.
         if !Arc::ptr_eq(&self.pager, pager) {
@@ -2560,78 +2700,117 @@ impl SqlCursor {
         self.has_record = false;
         self.no_wait = false;
         self.seen = self.changes.epoch();
-        let row = {
+        self.opening = Some(Opening::Reopen);
+        true
+    }
+
+    /// A new cursor's open under way, which [`finish_open`](CursorTrait::finish_open) finishes.
+    pub(in crate::storage::atoll) fn opening_fresh(mut self) -> Self {
+        self.opening = Some(Opening::Fresh);
+        self
+    }
+
+    /// Steps the open under way, its catalog read returning the IO it waits for in a cooperative
+    /// frame (ASYNC1 D2e (ii)). The cursor is bound to the tree its id names at the call that
+    /// finishes the open, as a b-tree cursor is to its root, so a Destroy later in its statement
+    /// leaves it on the tree it opened (R22); one opened on a tree its statement had destroyed is
+    /// vacant: it reads as empty, as SQLite's cursor on a freed root does, and a write through it
+    /// fails. Done or failed, the open and its read are let go; only a return for IO keeps them.
+    fn open_step(&mut self, opening: Opening) -> Result<IOResult<()>> {
+        let out = self.open_inner(opening);
+        if !matches!(out, Ok(IOResult::IO(_))) {
+            self.opening = None;
+            self.resolving = None;
+        }
+        out
+    }
+
+    fn open_inner(&mut self, opening: Opening) -> Result<IOResult<()>> {
+        let taken_up = {
             let mut guard = self.cell.lock();
             let txn = guard.as_mut().ok_or_else(outside)?;
             if self.changes.destroyed_in(self.id, txn.command()) {
-                None
-            } else {
-                let changes = self.db.catalog().changes();
-                let row = match self.row.filter(|r| r.holds(txn, changes)) {
-                    Some(row) => row,
-                    None => row_in(&self.db, self.cell.conn(), &self.known, self.id, txn)?.0,
-                };
-                Some((row, created_now(txn, row.entry)))
+                drop(guard);
+                self.open = None;
+                self.vacant = true;
+                return Ok(IOResult::Done(()));
+            }
+            match opening {
+                Opening::Fresh => None,
+                Opening::Reopen => {
+                    let changes = self.db.catalog().changes();
+                    let row = match self.row.filter(|r| r.holds(txn, changes)) {
+                        Some(row) => row,
+                        None => {
+                            done!(row_in_kept(
+                                &self.db,
+                                self.cell.conn(),
+                                &self.known,
+                                self.id,
+                                txn,
+                                &mut self.resolving
+                            ))
+                            .0
+                        }
+                    };
+                    Some((row, created_now(txn, row.entry)))
+                }
             }
         };
-        let Some((row, plain)) = row else {
-            self.open = None;
-            self.vacant = true;
-            return Ok(true);
+        let Some((row, plain)) = taken_up else {
+            done!(self.resolve());
+            return Ok(IOResult::Done(()));
         };
         self.row = Some(row);
         self.vacant = false;
-        let entry = row.entry;
         match self.open.as_mut() {
-            Some(cursor) if cursor.entry() == entry => {
+            Some(cursor) if cursor.entry() == row.entry => {
                 cursor.reuse(self.index.clone(), plain);
             }
             _ => {
                 self.open = None;
-                self.resolved()?;
+                done!(self.resolved());
             }
         }
-        Ok(true)
-    }
-
-    /// The cursor with its tree resolved, as OpenRead and OpenWrite open it: bound to the tree its
-    /// id names when it opens, as a b-tree cursor is to its root, so a Destroy later in its
-    /// statement leaves it on the tree it opened (R22). One opened on a tree its statement had
-    /// destroyed is vacant: it reads as empty, as SQLite's cursor on a freed root does, and a
-    /// write through it fails.
-    pub(in crate::storage::atoll) fn opened(mut self) -> Result<Self> {
-        let destroyed = {
-            let guard = self.cell.lock();
-            let txn = guard.as_ref().ok_or_else(outside)?;
-            self.changes.destroyed_in(self.id, txn.command())
-        };
-        if destroyed {
-            self.vacant = true;
-            return Ok(self);
-        }
-        self.resolve()?;
-        Ok(self)
+        Ok(IOResult::Done(()))
     }
 
     /// The tree's catalog row as the transaction's current statement reads it, and a cursor over
     /// it, writing plainly where the current statement created the tree: the tree a Clear made, if
     /// one replaced the tree since the cursor took its position.
-    fn resolve(&mut self) -> Result<&mut AtollCursor> {
+    fn resolve(&mut self) -> Result<IOResult<&mut AtollCursor>> {
         self.bound();
         self.resolved()
     }
 
     /// The tree's catalog row as the transaction's current statement reads it, whether that
     /// statement created the tree, and the leaf a cursor of the connection last stood at in it.
-    fn entry_now(&self) -> Result<(Entry, bool, Near)> {
+    /// Done or failed, its read is let go; only a return for IO keeps it.
+    fn entry_now(&mut self) -> Result<IOResult<(Entry, bool, Near)>> {
+        let out = self.entry_inner();
+        FacadeRead::settle(&mut self.resolving, out)
+    }
+
+    fn entry_inner(&mut self) -> Result<IOResult<(Entry, bool, Near)>> {
         let mut guard = self.cell.lock();
         let txn = guard.as_mut().ok_or_else(outside)?;
-        let (row, near) = row_in(&self.db, self.cell.conn(), &self.known, self.id, txn)?;
-        Ok((row.entry, created_now(txn, row.entry), near))
+        let (row, near) = done!(row_in_kept(
+            &self.db,
+            self.cell.conn(),
+            &self.known,
+            self.id,
+            txn,
+            &mut self.resolving
+        ));
+        Ok(IOResult::Done((
+            row.entry,
+            created_now(txn, row.entry),
+            near,
+        )))
     }
 
     /// The cursor over the tree it holds, or over the tree its catalog row names if it holds none.
-    fn resolved(&mut self) -> Result<&mut AtollCursor> {
+    fn resolved(&mut self) -> Result<IOResult<&mut AtollCursor>> {
         if self.vacant {
             return Err(LimboError::InternalError(format!(
                 "a write into tree {}, which its statement destroyed",
@@ -2639,7 +2818,7 @@ impl SqlCursor {
             )));
         }
         if self.open.is_none() {
-            let (entry, plain, near) = self.entry_now()?;
+            let (entry, plain, near) = done!(self.entry_now());
             let mut cursor = Box::new(AtollCursor::new(
                 self.db.clone(),
                 self.cell.clone(),
@@ -2658,13 +2837,45 @@ impl SqlCursor {
             cursor.set_null_flag(self.null_row);
             self.open = Some(cursor);
         }
-        Ok(self.open.as_deref_mut().expect("resolved"))
+        // A read is kept beside the tree cursor only while a Reopen's open is under way, its old
+        // tree cursor held for the reuse test alone.
+        debug_assert!(
+            self.resolving.is_none() || self.opening.is_some(),
+            "a cursor's resolution kept beside its tree cursor"
+        );
+        Ok(IOResult::Done(self.open.as_deref_mut().expect("resolved")))
+    }
+
+    /// Whether its resolution's read is kept, and the frame and metadata page its owner keeps,
+    /// for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn resolving_for_test(
+        &self,
+    ) -> Option<(Option<u32>, Option<crate::storage::atoll::meta::MetaId>)> {
+        self.resolving.as_ref().map(|r| r.keeps_for_test())
+    }
+
+    /// Its tree cursor's address, if it holds one, for a test to see it reused.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn tree_cursor_for_test(&self) -> Option<usize> {
+        self.open
+            .as_deref()
+            .map(|c| c as *const AtollCursor as usize)
+    }
+
+    /// No open under way: a cursor's tree is reached only once its open is done.
+    fn usable(&self) {
+        debug_assert!(
+            self.opening.is_none(),
+            "tree {}'s cursor used while its open is under way",
+            self.id
+        );
     }
 
     /// A write's step: done, a park on its blocker, or the write judged again after registering.
     fn wrote(&mut self, delete: bool, key: Option<&BTreeKey<'_>>) -> IOResultOr<()> {
         loop {
-            let cursor = self.resolve()?;
+            let cursor = done!(self.resolve());
             let w = match (delete, key) {
                 (true, _) => cursor.delete()?,
                 (false, Some(key)) => cursor.insert(key)?,
@@ -2711,11 +2922,12 @@ impl SqlCursor {
     /// `WriteWriteConflict` once it has committed. A tree its statement destroyed has no keys.
     #[turso_macros::atoll_entry]
     pub fn guard(&mut self, key: GuardKey<'_>, guarded: Guarded) -> IOResultOr<()> {
+        self.usable();
         if self.vacant {
             return Ok(IOResult::Done(()));
         }
         loop {
-            let cursor = self.resolve()?;
+            let cursor = done!(self.resolve());
             let prefix = cursor.guard_prefix(&key)?;
             let w = match cursor.guard(&prefix, guarded)? {
                 IOResult::Done(Guard::Clear) => {
@@ -2760,6 +2972,10 @@ impl CursorTrait for SqlCursor {
         self.seeding = None;
         self.counting = None;
         self.rebinding = None;
+        // An open or a resolution under way ends with its statement, its read's owner letting go
+        // of its tenure and its keeps, whether or not a tree cursor was made.
+        self.opening = None;
+        self.resolving = None;
         if let Some(cursor) = self.open.as_mut() {
             // Its operation ends with the statement: its memory-shortage tenure is let go.
             cursor.end_operation();
@@ -2775,11 +2991,33 @@ impl CursorTrait for SqlCursor {
     }
 
     #[turso_macros::atoll_entry]
+    fn opening(&self) -> bool {
+        self.opening.is_some()
+    }
+
+    #[turso_macros::atoll_entry]
+    fn finish_open(&mut self) -> IOResultOr<()> {
+        let Some(opening) = self.opening else {
+            return Ok(IOResult::Done(()));
+        };
+        let out = self.open_step(opening);
+        #[cfg(test)]
+        if let Ok(stepped) = &out {
+            OPEN_STEPS.with(|s| {
+                s.borrow_mut()
+                    .push((self.id, matches!(stepped, IOResult::IO(_))))
+            });
+        }
+        Ok(out?)
+    }
+
+    #[turso_macros::atoll_entry]
     fn last(&mut self) -> IOResultOr<()> {
+        self.usable();
         if self.vacant {
             return Ok(IOResult::Done(()));
         }
-        let out = self.resolve()?.last();
+        let out = done!(self.resolve()).last();
         self.moved(out)
     }
 
@@ -2788,6 +3026,7 @@ impl CursorTrait for SqlCursor {
     #[inline]
     #[turso_macros::atoll_entry]
     fn next_row(&mut self) -> crate::storage::btree::CursorStep {
+        self.usable();
         use crate::storage::btree::CursorStep;
         if !self.vacant && self.rebinding.is_none() && self.changes.epoch() == self.seen {
             if let Some(open) = self.open.as_mut() {
@@ -2824,27 +3063,30 @@ impl CursorTrait for SqlCursor {
 
     #[turso_macros::atoll_entry]
     fn next(&mut self) -> IOResultOr<()> {
+        self.usable();
         if self.vacant {
             return Ok(IOResult::Done(()));
         }
         crate::return_if_io!(self.caught_up());
-        let out = self.resolve()?.next();
+        let out = done!(self.resolve()).next();
         self.moved(out)
     }
 
     #[turso_macros::atoll_entry]
     fn prev(&mut self) -> IOResultOr<()> {
+        self.usable();
         if self.vacant {
             return Ok(IOResult::Done(()));
         }
         crate::return_if_io!(self.caught_up());
-        let out = self.resolve()?.prev();
+        let out = done!(self.resolve()).prev();
         self.moved(out)
     }
 
     #[inline]
     #[turso_macros::atoll_entry]
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
+        self.usable();
         if self.changes.epoch() != self.seen {
             crate::return_if_io!(self.caught_up());
         }
@@ -2859,6 +3101,7 @@ impl CursorTrait for SqlCursor {
     #[inline]
     #[turso_macros::atoll_entry]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        self.usable();
         if self.changes.epoch() == self.seen
             && self.open.as_ref().is_some_and(|o| o.lends_payload())
         {
@@ -2876,6 +3119,7 @@ impl CursorTrait for SqlCursor {
     #[inline]
     #[turso_macros::atoll_entry]
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
+        self.usable();
         if self.changes.epoch() != self.seen {
             crate::return_if_io!(self.caught_up());
         }
@@ -2887,10 +3131,11 @@ impl CursorTrait for SqlCursor {
 
     #[turso_macros::atoll_entry]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        self.usable();
         if self.vacant {
             return Ok(IOResult::Done(SeekResult::NotFound));
         }
-        let out = self.resolve()?.seek(key, op)?;
+        let out = done!(self.resolve()).seek(key, op)?;
         if let IOResult::Done(_) = out {
             self.has_record = !self.is_empty();
             self.positioned();
@@ -2906,6 +3151,7 @@ impl CursorTrait for SqlCursor {
 
     #[turso_macros::atoll_entry]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
+        self.usable();
         // A row's rowid, drawn or explicit, raises its table's counter past it: seeded first, so
         // it never hides the tree's larger keys from the seed (R30).
         if key.maybe_rowid().is_some() {
@@ -2924,12 +3170,14 @@ impl CursorTrait for SqlCursor {
 
     #[turso_macros::atoll_entry]
     fn delete(&mut self) -> IOResultOr<()> {
+        self.usable();
         crate::return_if_io!(self.caught_up());
         self.wrote(true, None)
     }
 
     #[turso_macros::atoll_entry]
     fn set_null_flag(&mut self, flag: bool) {
+        self.usable();
         match self.open.as_mut() {
             Some(c) => c.set_null_flag(flag),
             None => self.null_row = flag,
@@ -2970,6 +3218,7 @@ impl CursorTrait for SqlCursor {
 
     #[turso_macros::atoll_entry]
     fn count(&mut self) -> IOResultOr<usize> {
+        self.usable();
         // A move IO cut short is stepped again before any other: the cursor resumes it, so a
         // rewind after it would land where it went, not at the first row.
         loop {
@@ -3005,10 +3254,11 @@ impl CursorTrait for SqlCursor {
 
     #[turso_macros::atoll_entry]
     fn rewind(&mut self) -> IOResultOr<()> {
+        self.usable();
         if self.vacant {
             return Ok(IOResult::Done(()));
         }
-        let out = self.resolve()?.rewind();
+        let out = done!(self.resolve()).rewind();
         self.moved(out)
     }
 
@@ -3039,6 +3289,7 @@ impl CursorTrait for SqlCursor {
 
     #[turso_macros::atoll_entry]
     fn invalidate_record(&mut self) {
+        self.usable();
         if let Some(c) = self.open.as_mut() {
             c.invalidate_record();
         }

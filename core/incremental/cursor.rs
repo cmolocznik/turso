@@ -228,6 +228,14 @@ impl CursorTrait for MaterializedViewCursor {
         self.btree_cursor.register_with_pager()
     }
 
+    fn opening(&self) -> bool {
+        self.btree_cursor.opening()
+    }
+
+    fn finish_open(&mut self) -> IOResultOr<()> {
+        self.btree_cursor.finish_open()
+    }
+
     fn recycle(self: Box<Self>) {
         self.btree_cursor.recycle()
     }

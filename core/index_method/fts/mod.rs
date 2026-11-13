@@ -1409,6 +1409,16 @@ impl FtsCursor {
         }
     }
 
+    /// Finishes the backing cursor's open, so an Atoll cursor is bound before its first use: its
+    /// catalog read returns the IO it waits for in a cooperative frame, and the call entered again
+    /// goes on with the cursor kept in `fts_dir_cursor`.
+    fn finish_cursor_open(&mut self) -> IOResultOr<()> {
+        match self.fts_dir_cursor.as_mut() {
+            Some(cursor) => cursor.finish_open(),
+            None => Ok(IOResult::Done(())),
+        }
+    }
+
     /// Open the backing B-tree cursor for the FTS row store.
     fn open_cursor(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<()> {
         if self.fts_dir_cursor.is_some() {
@@ -1596,6 +1606,7 @@ impl FtsCursor {
             match &mut self.state {
                 FtsState::Init => {
                     self.open_cursor(&conn, database_id)?;
+                    return_if_io!(self.finish_cursor_open());
                     self.scan_descriptors.clear();
                     self.scan_tombs.clear();
                     self.scan_data.clear();
@@ -3005,6 +3016,7 @@ impl IndexMethodCursor for FtsCursor {
         }
         return_if_io!(self.ensure_backing_store(context));
         self.open_cursor(&conn, database_id)?;
+        return_if_io!(self.finish_cursor_open());
         self.claim_writer_slot()?;
         let control = FtsControl::new(self.mint_index_incarnation());
         self.publish = Some(PendingPublish {
@@ -3045,6 +3057,7 @@ impl IndexMethodCursor for FtsCursor {
         );
 
         self.open_cursor(&conn, database_id)?;
+        return_if_io!(self.finish_cursor_open());
         self.claim_writer_slot()?;
 
         // Drop in-memory state and shared caches. The drop is not committed

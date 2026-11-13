@@ -1348,20 +1348,18 @@ pub fn op_open_read(
         program.connection.atoll_for_db(*db),
         matches!(cursor_type, CursorType::ViewDelta { .. }),
     ) {
-        let cursor = open_atoll_cursor_in(
+        return_if_io!(
             state,
-            *cursor_id,
-            atoll,
-            &program.connection,
-            &pager,
-            *root_page,
-            cursor_type,
-        )?;
-        state
-            .cursors
-            .get_mut(*cursor_id)
-            .expect("cursor_id should be valid")
-            .replace(cursor);
+            open_atoll_cursor_in(
+                state,
+                *cursor_id,
+                atoll,
+                &program.connection,
+                &pager,
+                *root_page,
+                cursor_type,
+            )
+        );
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -14629,9 +14627,13 @@ fn atoll_index_info(cursor_type: &CursorType) -> Result<Option<Arc<IndexInfo>>> 
     })
 }
 
-/// The Atoll cursor slot `cursor_id` opens over tree `root`: the one its statement's last
-/// execution parked there, taken up again where it was over that tree (DESIGN.md §17), else a new
-/// one.
+/// Opens Atoll cursor slot `cursor_id` over tree `root` for OpenRead and OpenWrite (ASYNC1 D2e
+/// (ii)): an open under way in the slot goes on; else the cursor its statement's last execution
+/// parked there is taken up again where it was over that tree (DESIGN.md §17), or a new one made,
+/// and its open begun in the slot. The open's catalog read returns the IO it waits for in a
+/// cooperative frame, the cursor left in its slot, bare, as opening; the instruction run again
+/// goes on with it. Done, a view's cursor is wrapped.
+#[allow(clippy::too_many_arguments)]
 fn open_atoll_cursor_in(
     state: &mut ProgramState,
     cursor_id: usize,
@@ -14640,7 +14642,56 @@ fn open_atoll_cursor_in(
     pager: &Arc<Pager>,
     root: i64,
     cursor_type: &CursorType,
-) -> Result<Cursor> {
+) -> Result<IOResult<()>> {
+    if !atoll_opening(state, cursor_id) {
+        let cursor = atoll_cursor_shell(state, cursor_id, atoll, pager, root, cursor_type)?;
+        state
+            .cursors
+            .get_mut(cursor_id)
+            .expect("cursor_id should be valid")
+            .replace(Cursor::new_btree_dyn(cursor));
+    }
+    let Some(Cursor::Dyn(cursor, ..)) = state.cursors.get_mut(cursor_id).and_then(Option::as_mut)
+    else {
+        unreachable!("an Atoll cursor's open in a slot holding another cursor");
+    };
+    if let IOResult::IO(io) = cursor.finish_open().map_err(|e| *e)? {
+        return Ok(IOResult::IO(io));
+    }
+    if let CursorType::MaterializedView(..) = cursor_type {
+        let Some(Cursor::Dyn(cursor, ..)) = state.cursors[cursor_id].take() else {
+            unreachable!("a view's cursor opened in its slot");
+        };
+        state.cursors[cursor_id] = Some(Cursor::new_btree_dyn(Box::new(
+            crate::incremental::cursor::MaterializedViewCursor::new(
+                cursor,
+                pager.clone(),
+                connection.clone(),
+            ),
+        )));
+    }
+    Ok(IOResult::Done(()))
+}
+
+/// Whether slot `cursor_id` holds a cursor whose open is under way.
+fn atoll_opening(state: &ProgramState, cursor_id: usize) -> bool {
+    matches!(
+        state.cursors.get(cursor_id),
+        Some(Some(Cursor::Dyn(cursor, ..))) if cursor.opening()
+    )
+}
+
+/// The Atoll cursor slot `cursor_id` opens over tree `root`, its open under way: the one its
+/// statement's last execution parked there, taken up again, else a new one. Bare: a view's is
+/// wrapped once its open is done.
+fn atoll_cursor_shell(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    atoll: &crate::storage::atoll::sql::mode::ConnTxn,
+    pager: &Arc<Pager>,
+    root: i64,
+    cursor_type: &CursorType,
+) -> Result<Box<dyn CursorTrait>> {
     let parked = state
         .parked_cursors
         .get_mut(cursor_id)
@@ -14653,34 +14704,14 @@ fn open_atoll_cursor_in(
             if let Some(sql) = (parked.as_mut() as &mut dyn Any)
                 .downcast_mut::<crate::storage::atoll::sql::mode::SqlCursor>()
             {
-                if sql.reopened(atoll, pager, index)? {
-                    return Ok(Cursor::new_btree_dyn(parked));
+                if sql.reopened(atoll, pager, index) {
+                    return Ok(parked);
                 }
             }
         }
     }
-    open_atoll_cursor(atoll, connection, pager, root, cursor_type)
-}
-
-fn open_atoll_cursor(
-    atoll: &crate::storage::atoll::sql::mode::ConnTxn,
-    connection: &Arc<Connection>,
-    pager: &Arc<Pager>,
-    root: i64,
-    cursor_type: &CursorType,
-) -> Result<Cursor> {
     let index = atoll_index_info(cursor_type)?;
-    let cursor = Box::new(atoll.open_cursor(pager.clone(), root, index)?);
-    Ok(Cursor::new_btree_dyn(match cursor_type {
-        CursorType::MaterializedView(..) => {
-            Box::new(crate::incremental::cursor::MaterializedViewCursor::new(
-                cursor,
-                pager.clone(),
-                connection.clone(),
-            ))
-        }
-        _ => cursor,
-    }))
+    Ok(Box::new(atoll.open_cursor(pager.clone(), root, index)?))
 }
 
 pub fn op_open_write(
@@ -14744,25 +14775,26 @@ pub fn op_open_write(
             .cursor_ref
             .get(*cursor_id)
             .expect("cursor_id should exist in cursor_ref");
+        // A finished cursor over the same tree serves again; one whose open is under way is
+        // stepped first, never taken as ready.
         let reuse = matches!(
             state.cursors.get(*cursor_id),
-            Some(Some(Cursor::Dyn(cursor, ..))) if cursor.root_page() == root_page
+            Some(Some(Cursor::Dyn(cursor, ..)))
+                if cursor.root_page() == root_page && !cursor.opening()
         );
         if !reuse {
-            let cursor = open_atoll_cursor_in(
+            return_if_io!(
                 state,
-                *cursor_id,
-                atoll,
-                &program.connection,
-                &pager,
-                root_page,
-                cursor_type,
-            )?;
-            state
-                .cursors
-                .get_mut(*cursor_id)
-                .expect("cursor_id should be valid")
-                .replace(cursor);
+                open_atoll_cursor_in(
+                    state,
+                    *cursor_id,
+                    atoll,
+                    &program.connection,
+                    &pager,
+                    root_page,
+                    cursor_type,
+                )
+            );
         }
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);

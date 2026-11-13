@@ -830,6 +830,31 @@ impl Statement {
         self.state.atoll_read.as_deref()
     }
 
+    /// The Atoll cursor over tree `id` in this statement's slots, bare or wrapped, by slot, for a
+    /// test: `(slot, its cursor if bare, whether the slot's cursor is opening)`.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn atoll_cursor_for_test(
+        &self,
+        id: u64,
+    ) -> Option<(
+        usize,
+        Option<&crate::storage::atoll::sql::mode::SqlCursor>,
+        bool,
+    )> {
+        self.state
+            .cursors
+            .iter()
+            .enumerate()
+            .find_map(|(slot, cursor)| match cursor {
+                Some(crate::types::Cursor::Dyn(c, ..)) if c.root_page() == id as i64 => {
+                    let bare = (c.as_ref() as &dyn std::any::Any)
+                        .downcast_ref::<crate::storage::atoll::sql::mode::SqlCursor>();
+                    Some((slot, bare, c.opening()))
+                }
+                _ => None,
+            })
+    }
+
     /// The pending completion, for tests that count this statement's waiter registrations.
     #[cfg(test)]
     pub(crate) fn pending_io_for_test(&self) -> Option<crate::Completion> {

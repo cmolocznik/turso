@@ -1,4 +1,6 @@
 use crate::SqliteDialect;
+#[cfg(feature = "fts")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::io::{MemoryIO, PlatformIO, IO};

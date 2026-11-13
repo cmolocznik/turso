@@ -3369,7 +3369,10 @@ impl IvfRqCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn open_stores(&mut self, context: &IndexMethodContext) -> Result<()> {
+    /// Opens the stores' cursors and the main table's, each made once, and each one's open finished
+    /// before this is done, so an Atoll cursor is bound here; its catalog read returns the IO it
+    /// waits for in a cooperative frame, and the call entered again goes on with the cursors made.
+    fn open_stores(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         if self.stores.is_empty() {
             for table in &self.schema.tables {
                 let mut cursor = context.open_table_cursor(&table.table_name())?;
@@ -3383,7 +3386,10 @@ impl IvfRqCursor {
         if self.main.is_none() {
             self.main = Some(context.open_table_cursor(&self.configuration.table_name)?);
         }
-        Ok(())
+        for cursor in self.stores.iter_mut().chain(self.main.as_mut()) {
+            crate::return_if_io!(cursor.finish_open());
+        }
+        Ok(IOResult::Done(()))
     }
 
     fn rotation(&mut self, dims: usize) -> Rotation {
@@ -3932,14 +3938,14 @@ impl IndexMethodCursor for IvfRqCursor {
     fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let _timer = timer(&OPEN_NANOS);
         self.note_snapshot(context);
-        self.open_stores(context)?;
+        crate::return_if_io!(self.open_stores(context));
         self.share(context)?;
         self.load()
     }
 
     fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         self.note_snapshot(context);
-        self.open_stores(context)?;
+        crate::return_if_io!(self.open_stores(context));
         self.share(context)?;
         self.load()
     }
@@ -4124,7 +4130,7 @@ impl IndexMethodCursor for IvfRqCursor {
     fn optimize_step(&mut self, context: &IndexMethodContext, first: bool) -> IOResultOr<OptimizeProgress> {
         if self.run.is_none() {
             self.note_snapshot(context);
-            self.open_stores(context)?;
+            crate::return_if_io!(self.open_stores(context));
             if self.sharing.is_none() {
                 self.share(context)?;
             }
@@ -4627,7 +4633,8 @@ impl IvfRqCursor {
             match std::mem::replace(&mut self.upkeep, Upkeep::Idle) {
                 Upkeep::Idle => {
                     self.note_snapshot(context);
-                    self.open_stores(context)?;
+                    // `mem::replace` put `Idle` back: a return for IO comes back to this arm.
+                    crate::return_if_io!(self.open_stores(context));
                     // OPTIMIZE INDEX opens no cursor before it maintains, and its writes are
                     // recorded like any other.
                     if self.sharing.is_none() {

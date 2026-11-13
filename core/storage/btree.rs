@@ -877,6 +877,17 @@ pub trait CursorTrait: Any + Send + Sync {
     fn park(&mut self) -> bool {
         false
     }
+    /// Whether an open its maker began is under way, which [`finish_open`](Self::finish_open)
+    /// finishes before the cursor's first use: an Atoll cursor's in a cooperative frame, whose
+    /// catalog read returns the IO it waits for. False for every other cursor.
+    fn opening(&self) -> bool {
+        false
+    }
+    /// Steps the open under way to its end, returning the IO it waits for; done at once with
+    /// none under way, as for every other cursor.
+    fn finish_open(&mut self) -> IOResultOr<()> {
+        Ok(IOResult::Done(()))
+    }
     /// Mirror of SQLite's BTCF_Multiple flag; toggled by Pager when a bucket
     /// crosses the 1↔2 threshold.
     fn set_has_peers_for_external_writes(&self, _has_peers: bool) {}

@@ -1059,9 +1059,8 @@ fn a_cursor_stays_on_the_tree_it_opened_through_a_destroy_in_its_statement() {
     let ct = conn.atoll().expect("Atoll mode");
     drive(&io, || ct.begin(Begin::Write { schema: true })).unwrap();
     ct.start_statement().unwrap();
-    let mut cursor = SqlCursor::new(ct, conn.pager.load().clone(), id, None)
-        .opened()
-        .unwrap();
+    let mut cursor = SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+    drive(&io, || cursor.finish_open().map_err(|e| *e)).unwrap();
     let mut op = None;
     drive(&io, || ct.retire_tree(&mut op, id, false)).unwrap();
     assert!(!catalogued_in(ct, id), "the Destroy took the catalog row");
@@ -7962,6 +7961,1419 @@ mod in_frames {
             },
         );
     }
+
+    // ------------------------------------------- a cursor's resolution in a frame (ASYNC1 D2e (ii))
+
+    mod resolution {
+        use super::*;
+        use crate::storage::atoll::sql::mode::{
+            Begin, SqlCursor, CATALOG_READS, OPEN_STEPS, RESOLVER_BOXES, ROW_GETS,
+        };
+        use crate::storage::btree::CursorTrait;
+        use crate::types::{IOCompletions, IOResult};
+
+        /// A database opened async with index methods and views on, and 700 tables made, so the
+        /// catalog's rows span leaves and the last tables' rows lie past the first page-table page's
+        /// pages.
+        fn seven_hundred(path: &str) -> (Arc<dyn IO>, Arc<Database>, Arc<Connection>) {
+            seven_hundred_after(path, &[])
+        }
+
+        /// [`seven_hundred`], `first` run before the 700 tables are made: a table made there has its
+        /// catalog row far from those made after them.
+        fn seven_hundred_after(
+            path: &str,
+            first: &[&str],
+        ) -> (Arc<dyn IO>, Arc<Database>, Arc<Connection>) {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = crate::storage::atoll::requests::opened_async(|| {
+                Database::open(
+                    io.clone(),
+                    path,
+                    OpenOptions::new(Arc::new(SqliteDialect))
+                        .atoll(config())
+                        .db_opts(
+                            DatabaseOpts::default()
+                                .with_index_method(true)
+                                .with_views(true),
+                        ),
+                )
+                .unwrap()
+            });
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in first {
+                conn.execute(*sql).unwrap();
+            }
+            for i in 0..700 {
+                conn.execute(format!("CREATE TABLE t{i} (a)")).unwrap();
+            }
+            (io, db, conn)
+        }
+
+        /// Tree `name`'s id, its root page as Turso holds it.
+        fn tree(conn: &Arc<Connection>, name: &str) -> u64 {
+            match &rows(
+                conn,
+                &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{name}'"),
+            )[..]
+            {
+                [row] => match row[0] {
+                    Value::Numeric(crate::Numeric::Integer(id)) => id as u64,
+                    ref other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// What a statement stepped in frames did around its cursor's open over a tree.
+        struct Opened {
+            rows: Vec<Vec<Value>>,
+            /// Returns for IO with the cursor's open under way after them.
+            opening_returns: usize,
+            calls: usize,
+            /// The pool's and the metadata cache's pages loaded by those calls, in order.
+            pool: Vec<u64>,
+            meta: Vec<crate::storage::atoll::meta::MetaId>,
+            /// Whether the slot held the bare cursor at every return with the open under way.
+            bare_while_opening: bool,
+            /// At the first return after the open was done: whether the slot's cursor was bare,
+            /// and its tree cursor's address if so.
+            after_open: Option<(bool, Option<usize>)>,
+        }
+
+        /// Steps `stmt` in test frames until it is done, each return for IO waited for outside the
+        /// frame in I6's order: the idle note armed, the held IO thread let go, the requests landed
+        /// and retired, the IO thread idle. Until the statement's cursor over tree `id` has opened,
+        /// every page nothing keeps is evicted at each return, so its open's catalog read goes on only
+        /// from what it keeps; a page that open loads twice fails at once. Once the open is done
+        /// nothing is evicted, the statement's later steps not kept across their returns yet (slice
+        /// (iii)).
+        fn opened_in_frames(
+            io: &Arc<dyn IO>,
+            db: &Database,
+            stmt: &mut crate::Statement,
+            id: u64,
+        ) -> Opened {
+            let atoll = db.atoll.as_ref().unwrap().atoll();
+            let mut out = Opened {
+                rows: Vec::new(),
+                opening_returns: 0,
+                calls: 0,
+                pool: Vec::new(),
+                meta: Vec::new(),
+                bare_while_opening: true,
+                after_open: None,
+            };
+            let mut seen_opening = false;
+            loop {
+                out.calls += 1;
+                let (p0, m0) = (
+                    atoll.pool().loaded_pages().len(),
+                    atoll.store().meta().loaded_pages().len(),
+                );
+                let held = held_io(db);
+                let stepped = {
+                    let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                    stmt.step().unwrap()
+                };
+                let idle = atoll.io_idle_for_test();
+                drop(held);
+                let slot = stmt.atoll_cursor_for_test(id);
+                let under_way = slot.is_some_and(|(_, _, opening)| opening);
+                if under_way {
+                    seen_opening = true;
+                    out.bare_while_opening &= slot.is_some_and(|(_, bare, _)| bare.is_some());
+                    out.pool
+                        .extend_from_slice(&atoll.pool().loaded_pages()[p0..]);
+                    out.meta
+                        .extend_from_slice(&atoll.store().meta().loaded_pages()[m0..]);
+                    for pages in [
+                        out.pool.iter().map(|p| format!("{p}")).collect::<Vec<_>>(),
+                        out.meta
+                            .iter()
+                            .map(|m| format!("{m:?}"))
+                            .collect::<Vec<_>>(),
+                    ] {
+                        let mut seen = std::collections::HashSet::new();
+                        for p in &pages {
+                            assert!(
+                                seen.insert(p.clone()),
+                                "call {}: the open loaded {p} again on re-entry: {pages:?}",
+                                out.calls
+                            );
+                        }
+                    }
+                } else if seen_opening && out.after_open.is_none() {
+                    out.after_open = slot.map(|(_, bare, _)| {
+                        (
+                            bare.is_some(),
+                            bare.and_then(SqlCursor::tree_cursor_for_test),
+                        )
+                    });
+                }
+                let opened = seen_opening && !under_way;
+                match stepped {
+                    crate::StepResult::Row => out
+                        .rows
+                        .push(stmt.row().unwrap().get_values().cloned().collect()),
+                    crate::StepResult::Done => break,
+                    crate::StepResult::IO => {
+                        let c = stmt.pending_io_for_test().expect("the statement's wait");
+                        assert!(
+                            waited(io, &c),
+                            "call {}: its wait never finished",
+                            out.calls
+                        );
+                        assert!(retired(db), "call {}: a request outstanding", out.calls);
+                        assert!(
+                            idled(&idle),
+                            "call {}: the IO thread never went idle",
+                            out.calls
+                        );
+                        if under_way {
+                            out.opening_returns += 1;
+                        }
+                        if !opened {
+                            chill(db);
+                        }
+                    }
+                    other => panic!("call {}: {other:?}", out.calls),
+                }
+                assert!(
+                    out.calls < 512,
+                    "the statement did not finish within {} calls",
+                    out.calls
+                );
+            }
+            out
+        }
+
+        /// The bound on an open's calls: at most one for each page it loaded, and one more.
+        fn opened_within_its_loads(what: &str, opened: &Opened) {
+            let loads = opened.pool.len() + opened.meta.len();
+            assert!(
+                opened.opening_returns >= 1,
+                "{what}: the open never returned for IO, its catalog row not cold at the resolver"
+            );
+            assert!(
+                opened.opening_returns <= loads + 1,
+                "{what}: {} returns for {loads} loads",
+                opened.opening_returns
+            );
+            assert!(
+                !opened.pool.is_empty() && !opened.meta.is_empty(),
+                "{what}: the open's catalog read loaded pool pages {:?} and metadata pages {:?}",
+                opened.pool,
+                opened.meta
+            );
+        }
+
+        /// An OpenRead over a tree whose catalog row, its leaf and the page-table page locating
+        /// it, are cold at the resolver, stepped in frames with every page not kept evicted at each
+        /// return: the open returns IO with the cursor in its slot as opening, goes on from what
+        /// its read keeps, loads no page twice, takes at most a call for each page it loaded and one
+        /// more, and the statement reads what it reads outside any frame (mutants `row-in-parks`,
+        /// `resolver-fresh-each-call`, `resume-hint-unused`).
+        #[test]
+        fn an_open_read_in_a_frame_returns_io_with_its_cursor_opening_and_reads_its_rows() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_open_read_in_a_frame_returns_io_with_its_cursor_opening_and_reads_its_rows"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-read");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)").unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let expected = rows(&conn, "SELECT a FROM t699");
+                    let mut stmt = conn.prepare("SELECT a FROM t699").unwrap();
+                    chill(&db);
+                    CATALOG_READS.with(|r| r.borrow_mut().clear());
+                    let opened = opened_in_frames(&io, &db, &mut stmt, id);
+                    let read = CATALOG_READS.with(|r| r.borrow().clone());
+                    drop(stmt);
+                    assert_eq!(opened.rows, expected, "the rows read in frames");
+                    assert!(
+                        read.contains(&id),
+                        "the open read no catalog row of tree {id}: {read:?}"
+                    );
+                    opened_within_its_loads("the OpenRead", &opened);
+                    assert!(opened.bare_while_opening, "the opening cursor was wrapped");
+                },
+            );
+        }
+
+        /// An OpenWrite of an INSERT over a tree whose catalog row is cold, in frames: its open
+        /// returns IO with the cursor opening and is stepped again before the instruction moves on,
+        /// and the row is written as outside any frame (mutant `write-reuses-opening`, the reuse of a
+        /// cursor over the same tree taking the opening one as ready).
+        #[test]
+        fn an_open_write_in_a_frame_finishes_its_open_before_it_writes() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_open_write_in_a_frame_finishes_its_open_before_it_writes"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-write");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)")
+                        .unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let mut stmt = conn.prepare("INSERT INTO t699 VALUES (4)").unwrap();
+                    chill(&db);
+                    let opened = opened_in_frames(&io, &db, &mut stmt, id);
+                    drop(stmt);
+                    assert_eq!(
+                        rows(&conn, "SELECT a FROM t699 ORDER BY a"),
+                        (1..=4)
+                            .map(|a| vec![Value::from_i64(a)])
+                            .collect::<Vec<_>>(),
+                        "the rows after the INSERT in frames"
+                    );
+                    opened_within_its_loads("the OpenWrite", &opened);
+                },
+            );
+        }
+
+        /// A statement run again, in a new transaction with its catalog pages evicted, takes up the
+        /// cursor it parked: the reopen's catalog read returns IO in a frame and finishes, the cursor's
+        /// tree cursor reused, its entry the same, and the rows are read as before.
+        #[test]
+        fn a_parked_cursors_reopen_in_a_frame_returns_io_and_keeps_its_tree_cursor() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_parked_cursors_reopen_in_a_frame_returns_io_and_keeps_its_tree_cursor"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/reopen");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)")
+                        .unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let mut stmt = conn.prepare("SELECT a FROM t699").unwrap();
+                    let mut expected = Vec::new();
+                    loop {
+                        match stmt.step().unwrap() {
+                            crate::StepResult::Row => expected.push(
+                                stmt.row()
+                                    .unwrap()
+                                    .get_values()
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            ),
+                            crate::StepResult::Done => break,
+                            crate::StepResult::IO => stmt._io().step().unwrap(),
+                            other => panic!("{other:?}"),
+                        }
+                    }
+                    let first = stmt
+                        .atoll_cursor_for_test(id)
+                        .and_then(|(_, bare, _)| bare.and_then(SqlCursor::tree_cursor_for_test));
+                    stmt.reset().unwrap();
+                    chill(&db);
+                    let opened = opened_in_frames(&io, &db, &mut stmt, id);
+                    drop(stmt);
+                    assert!(first.is_some(), "the first run left no tree cursor");
+                    assert_eq!(opened.rows, expected, "the rows read again in frames");
+                    opened_within_its_loads("the reopen", &opened);
+                    assert_eq!(
+                        opened.after_open,
+                        Some((true, first)),
+                        "the reopened cursor's tree cursor, against the first run's"
+                    );
+                },
+            );
+        }
+
+        /// A materialized view's OpenRead over a cold catalog row, in frames: the slot holds the bare
+        /// cursor while its open is under way, the view's cursor wraps it once the open is done, and
+        /// the view reads as outside any frame (mutant `mv-wrapped-while-opening`).
+        #[test]
+        fn a_views_open_in_a_frame_keeps_its_cursor_bare_until_the_open_is_done() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_views_open_in_a_frame_keeps_its_cursor_bare_until_the_open_is_done"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-view");
+                    conn.execute("CREATE TABLE tv (g)").unwrap();
+                    conn.execute("INSERT INTO tv VALUES ('a'), ('a'), ('b')")
+                        .unwrap();
+                    conn.execute(
+                        "CREATE MATERIALIZED VIEW v AS SELECT g, count(*) AS c FROM tv GROUP BY g",
+                    )
+                    .unwrap();
+                    let id = tree(&conn, "v");
+                    checkpointed(&conn);
+                    let expected = rows(&conn, "SELECT g, c FROM v");
+                    let mut stmt = conn.prepare("SELECT g, c FROM v").unwrap();
+                    chill(&db);
+                    let opened = opened_in_frames(&io, &db, &mut stmt, id);
+                    drop(stmt);
+                    assert_eq!(opened.rows, expected, "the view read in frames");
+                    assert!(
+                        opened.opening_returns >= 1,
+                        "the view's open never returned for IO"
+                    );
+                    assert!(
+                        opened.bare_while_opening,
+                        "the slot's opening cursor was wrapped before its open finished"
+                    );
+                    assert_eq!(
+                        opened.after_open.map(|(bare, _)| bare),
+                        Some(false),
+                        "the view's cursor not wrapped once its open was done"
+                    );
+                },
+            );
+        }
+
+        /// One call of `call` in a test frame, the IO thread held while it runs: a return for IO is
+        /// waited for outside the frame in I6's order, its load landed, its requests retired and the
+        /// IO thread idle after them.
+        fn in_frame<T>(
+            io: &Arc<dyn IO>,
+            db: &Database,
+            call: impl FnOnce() -> crate::Result<IOResult<T>>,
+        ) -> crate::Result<IOResult<T>> {
+            let atoll = db.atoll.as_ref().unwrap().atoll();
+            let held = held_io(db);
+            let out = {
+                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                call()
+            };
+            let idle = atoll.io_idle_for_test();
+            drop(held);
+            if let Ok(IOResult::IO(IOCompletions(c))) = &out {
+                assert!(waited(io, c), "its wait never finished");
+                assert!(retired(db), "a request outstanding after its return");
+                assert!(idled(&idle), "the IO thread never went idle after its work");
+            }
+            out
+        }
+
+        /// How the frame and metadata page a kept resolution holds are kept now: whether the frame
+        /// is kept, the metadata page's pins. The test build's last metadata request is dropped
+        /// first, so its callback's hold on its page is not counted (#5231).
+        fn kept_now(
+            db: &Database,
+            keeps: (Option<u32>, Option<crate::storage::atoll::meta::MetaId>),
+        ) -> (Option<bool>, Option<u64>) {
+            drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+            let atoll = db.atoll.as_ref().unwrap().atoll();
+            (
+                keeps.0.map(|f| atoll.pool().frame_kept_for_test(f)),
+                keeps.1.and_then(|id| atoll.store().meta().pins_of(id)),
+            )
+        }
+
+        /// Asserts the keeps `keeps` were let go between `before` and `after`: the frame no longer
+        /// kept, the metadata page one pin fewer.
+        fn let_go(
+            what: &str,
+            keeps: (Option<u32>, Option<crate::storage::atoll::meta::MetaId>),
+            before: (Option<bool>, Option<u64>),
+            after: (Option<bool>, Option<u64>),
+        ) {
+            assert!(
+                keeps.0.is_some() || keeps.1.is_some(),
+                "{what}: the kept read kept nothing"
+            );
+            assert_eq!(
+                (before.0, after.0),
+                (keeps.0.map(|_| true), keeps.0.map(|_| false)),
+                "{what}: the kept frame, before and after"
+            );
+            assert_eq!(
+                keeps.1.map(|_| after.1.unwrap_or(0)),
+                keeps.1.map(|_| before.1.unwrap_or(0) - 1),
+                "{what}: the metadata page's pins after, one fewer than before {:?}",
+                before.1
+            );
+        }
+
+        /// A transaction of `conn` writing, with a statement begun, and a cursor over tree `id`.
+        fn writing<'c>(
+            io: &Arc<dyn IO>,
+            conn: &'c Arc<Connection>,
+            id: u64,
+        ) -> (&'c crate::storage::atoll::sql::mode::ConnTxn, SqlCursor) {
+            let ct = conn.atoll().expect("Atoll mode");
+            crate::storage::atoll::drive(io, || ct.begin(Begin::Write { schema: true })).unwrap();
+            ct.start_statement().unwrap();
+            let cursor = SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+            (ct, cursor)
+        }
+
+        /// A cursor positioned in its tree, whose tree its transaction then Clears: its next move
+        /// rebinds through the new tree's catalog row, cold, and returns IO in a frame with the read
+        /// kept. Another cursor of the connection then opens on the tree outside any frame, so the
+        /// connection knows the row; the first's next move, entered again in a frame, takes the row
+        /// from what the connection knows and is done, and its kept read is let go there: none kept,
+        /// its frame no longer kept and its metadata page one pin fewer, while the cursor lives on
+        /// (II-1; mutant `cache-hit-keeps-resolving`, the cache's answer leaving the read kept, on a
+        /// path no open's end runs on).
+        #[test]
+        fn a_rebinding_answered_from_what_the_connection_knows_lets_its_kept_read_go() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_rebinding_answered_from_what_the_connection_knows_lets_its_kept_read_go"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/rebind-known");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)")
+                        .unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let (ct, mut a) = writing(&io, &conn, id);
+                    crate::storage::atoll::drive(&io, || a.finish_open().map_err(|e| *e)).unwrap();
+                    crate::storage::atoll::drive(&io, || a.rewind().map_err(|e| *e)).unwrap();
+                    let mut op = None;
+                    crate::storage::atoll::drive(&io, || ct.retire_tree(&mut op, id, true))
+                        .unwrap();
+                    drop(op);
+                    chill(&db);
+                    let first = in_frame(&io, &db, || a.next().map_err(|e| *e)).unwrap();
+                    let keeps = a.resolving_for_test();
+                    let before = kept_now(&db, keeps.unwrap_or_default());
+                    let mut b =
+                        SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                    crate::storage::atoll::drive(&io, || b.finish_open().map_err(|e| *e)).unwrap();
+                    drop(b);
+                    let second = in_frame(&io, &db, || a.next().map_err(|e| *e)).unwrap();
+                    let kept_after = a.resolving_for_test();
+                    let after = kept_now(&db, keeps.unwrap_or_default());
+                    drop(a);
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    assert!(
+                        matches!(first, IOResult::IO(_)),
+                        "the rebinding never returned for IO"
+                    );
+                    assert!(
+                        keeps.is_some(),
+                        "the rebinding's read not kept across its return"
+                    );
+                    assert!(
+                        matches!(second, IOResult::Done(())),
+                        "the move after the connection knew the row"
+                    );
+                    assert_eq!(
+                        kept_after, None,
+                        "the read was kept after its move was done"
+                    );
+                    let_go("the rebinding's read", keeps.unwrap(), before, after);
+                },
+            );
+        }
+
+        /// The same, through an open under way: its read kept across a return for IO, the row then
+        /// known to the connection, its open's next call done from it, and its read let go (II-1).
+        #[test]
+        fn an_open_answered_from_what_the_connection_knows_lets_its_kept_read_go() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_open_answered_from_what_the_connection_knows_lets_its_kept_read_go"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-known");
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let (ct, mut a) = writing(&io, &conn, id);
+                    chill(&db);
+                    let first = in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap();
+                    let keeps = a.resolving_for_test();
+                    let before = kept_now(&db, keeps.unwrap_or_default());
+                    let mut b =
+                        SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                    crate::storage::atoll::drive(&io, || b.finish_open().map_err(|e| *e)).unwrap();
+                    drop(b);
+                    let second = in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap();
+                    let (kept_after, opening) = (a.resolving_for_test(), a.opening());
+                    let after = kept_now(&db, keeps.unwrap_or_default());
+                    drop(a);
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    assert!(
+                        matches!(first, IOResult::IO(_)),
+                        "the open never returned for IO"
+                    );
+                    assert!(matches!(second, IOResult::Done(())), "the open's next call");
+                    assert_eq!((kept_after, opening), (None, false), "the open done");
+                    let_go("the open's read", keeps.unwrap(), before, after);
+                },
+            );
+        }
+
+        /// An open whose read returned IO, its tree then destroyed by its statement between its
+        /// calls: the open's next call finds the destroy and ends the open vacant, the cursor reading
+        /// as empty, and its kept read is let go (II-1; mutants `vacant-keeps-resolving` and
+        /// `destroyed-checked-once`, which binds to the destroyed tree).
+        #[test]
+        fn an_open_whose_tree_its_statement_destroys_between_its_calls_ends_vacant() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_open_whose_tree_its_statement_destroys_between_its_calls_ends_vacant"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-destroyed");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)")
+                        .unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let (ct, mut a) = writing(&io, &conn, id);
+                    chill(&db);
+                    let first = in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap();
+                    let keeps = a.resolving_for_test();
+                    let before = kept_now(&db, keeps.unwrap_or_default());
+                    let mut op = None;
+                    crate::storage::atoll::drive(&io, || ct.retire_tree(&mut op, id, false))
+                        .unwrap();
+                    drop(op);
+                    let second = in_frame(&io, &db, || a.finish_open().map_err(|e| *e));
+                    let (kept_after, opening) = (a.resolving_for_test(), a.opening());
+                    let after = kept_now(&db, keeps.unwrap_or_default());
+                    // The branch first: the open ended vacant, and only then its cleanup.
+                    assert!(
+                        matches!(first, IOResult::IO(_)),
+                        "the open never returned for IO"
+                    );
+                    assert!(
+                        matches!(second, Ok(IOResult::Done(()))),
+                        "the open's call after the destroy: {:?}",
+                        second.map(|r| matches!(r, IOResult::Done(())))
+                    );
+                    assert_eq!(
+                        (kept_after, opening),
+                        (None, false),
+                        "the open ended vacant"
+                    );
+                    let_go("the vacant open's read", keeps.unwrap(), before, after);
+                    let counted =
+                        crate::storage::atoll::drive(&io, || a.count().map_err(|e| *e)).unwrap();
+                    drop(a);
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    assert_eq!(
+                        counted, 0,
+                        "the cursor opened after its tree's destroy read rows"
+                    );
+                },
+            );
+        }
+
+        /// An open whose read returned IO, its transaction then ended: the open's next call fails,
+        /// with no transaction to read in, before any read, and its kept read is let go (II-1;
+        /// mutant `error-keeps-resolving`).
+        #[test]
+        fn an_open_whose_transaction_ends_between_its_calls_fails_and_lets_its_read_go() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_open_whose_transaction_ends_between_its_calls_fails_and_lets_its_read_go"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-ended");
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let (ct, mut a) = writing(&io, &conn, id);
+                    chill(&db);
+                    let first = in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap();
+                    let keeps = a.resolving_for_test();
+                    let before = kept_now(&db, keeps.unwrap_or_default());
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    let second = in_frame(&io, &db, || a.finish_open().map_err(|e| *e));
+                    let (kept_after, opening) = (a.resolving_for_test(), a.opening());
+                    let after = kept_now(&db, keeps.unwrap_or_default());
+                    drop(a);
+                    assert!(
+                        matches!(first, IOResult::IO(_)),
+                        "the open never returned for IO"
+                    );
+                    assert!(
+                        second.is_err(),
+                        "the open's call with no transaction did not fail"
+                    );
+                    assert_eq!((kept_after, opening), (None, false), "the failed open");
+                    let_go("the failed open's read", keeps.unwrap(), before, after);
+                },
+            );
+        }
+
+        /// An open whose read returned IO in a frame, called again outside any frame: the same read,
+        /// still this open's, is driven to its end there and let go; with the catalog changed in
+        /// between, the kept read is let go unused and the row read as outside a frame, no resolver
+        /// box made outside it (mutant `outside-frame-boxes`).
+        #[test]
+        fn an_open_kept_in_a_frame_and_called_again_outside_one_ends_there() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_open_kept_in_a_frame_and_called_again_outside_one_ends_there"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-outside");
+                    conn.execute("INSERT INTO t0 VALUES (1)").unwrap();
+                    let (id, other) = (tree(&conn, "t699"), tree(&conn, "t0"));
+                    checkpointed(&conn);
+                    let mut ends = Vec::new();
+                    for changed in [false, true] {
+                        let (ct, mut a) = writing(&io, &conn, id);
+                        chill(&db);
+                        let first = in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap();
+                        let kept = a.resolving_for_test().is_some();
+                        if changed {
+                            // A Clear of another tree: the catalog counts a change.
+                            let mut op = None;
+                            crate::storage::atoll::drive(&io, || {
+                                ct.retire_tree(&mut op, other, true)
+                            })
+                            .unwrap();
+                        }
+                        let boxes = RESOLVER_BOXES.with(|n| n.get());
+                        let second = a.finish_open().map_err(|e| *e).unwrap();
+                        let made = RESOLVER_BOXES.with(|n| n.get()) - boxes;
+                        ends.push((
+                            changed,
+                            matches!(first, IOResult::IO(_)),
+                            kept,
+                            matches!(second, IOResult::Done(())),
+                            a.resolving_for_test().is_none() && !a.opening(),
+                            made,
+                        ));
+                        drop(a);
+                        ct.end(false)
+                            .expect("a transaction to end")
+                            .finish()
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        ends,
+                        vec![(false, true, true, true, true, 0), (true, true, true, true, true, 0)],
+                        "(catalog changed, returned IO in the frame, kept, done outside it, let go, \
+                         resolver boxes made outside the frame)"
+                    );
+                },
+            );
+        }
+
+        /// R22 in frames: an open that returned IO and then finished binds its cursor to the tree it
+        /// opened, and a Destroy later in its statement leaves the cursor on that tree, its rows read.
+        #[test]
+        fn a_cursor_opened_in_frames_stays_on_its_tree_through_a_later_destroy() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_cursor_opened_in_frames_stays_on_its_tree_through_a_later_destroy"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-r22");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)")
+                        .unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let (ct, mut a) = writing(&io, &conn, id);
+                    chill(&db);
+                    let mut returns = 0;
+                    while let IOResult::IO(_) =
+                        in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap()
+                    {
+                        returns += 1;
+                        assert!(
+                            returns < 64,
+                            "the open did not finish within {returns} returns"
+                        );
+                        chill(&db);
+                    }
+                    let mut op = None;
+                    crate::storage::atoll::drive(&io, || ct.retire_tree(&mut op, id, false))
+                        .unwrap();
+                    drop(op);
+                    let counted =
+                        crate::storage::atoll::drive(&io, || a.count().map_err(|e| *e)).unwrap();
+                    drop(a);
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    assert!(returns >= 1, "the open never returned for IO");
+                    assert_eq!(counted, 3, "the rows of the tree the cursor opened");
+                },
+            );
+        }
+
+        /// What a resolution allocates (II-2): in a frame, one `Get` and one resolver box for each
+        /// read it starts, however many times it returns for IO; none for a row the connection knows;
+        /// a box even for a read that finishes at its first call, its pages resident; and no box
+        /// outside a frame (mutant `row-get-each-call`).
+        #[test]
+        fn a_resolution_makes_one_get_and_one_box_a_read_and_none_outside_a_frame() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_resolution_makes_one_get_and_one_box_a_read_and_none_outside_a_frame"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-allocations");
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let counts = || (ROW_GETS.with(|n| n.get()), RESOLVER_BOXES.with(|n| n.get()));
+                    let mut seen = Vec::new();
+                    // Cold, in frames: several returns, one read.
+                    let (ct, mut a) = writing(&io, &conn, id);
+                    chill(&db);
+                    let start = counts();
+                    let mut returns = 0;
+                    while let IOResult::IO(_) =
+                        in_frame(&io, &db, || a.finish_open().map_err(|e| *e)).unwrap()
+                    {
+                        returns += 1;
+                        assert!(
+                            returns < 64,
+                            "the open did not finish within {returns} returns"
+                        );
+                        chill(&db);
+                    }
+                    let end = counts();
+                    seen.push((
+                        "cold in frames",
+                        returns > 1,
+                        end.0 - start.0,
+                        end.1 - start.1,
+                    ));
+                    // The row known to the connection now: no read.
+                    let mut b =
+                        SqlCursor::new(ct, conn.pager.load().clone(), id, None).opening_fresh();
+                    let start = counts();
+                    let out = in_frame(&io, &db, || b.finish_open().map_err(|e| *e)).unwrap();
+                    let end = counts();
+                    seen.push((
+                        "known in a frame",
+                        matches!(out, IOResult::IO(_)),
+                        end.0 - start.0,
+                        end.1 - start.1,
+                    ));
+                    drop((a, b));
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    // A new transaction, its pages resident, as a read in a transaction before it left
+                    // them: a read that finishes at its first call.
+                    let (ct, mut warm) = writing(&io, &conn, id);
+                    while let IOResult::IO(_) =
+                        in_frame(&io, &db, || warm.finish_open().map_err(|e| *e)).unwrap()
+                    {
+                    }
+                    drop(warm);
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    let (ct, mut c) = writing(&io, &conn, id);
+                    let start = counts();
+                    let out = in_frame(&io, &db, || c.finish_open().map_err(|e| *e)).unwrap();
+                    let end = counts();
+                    seen.push((
+                        "resident in a frame",
+                        matches!(out, IOResult::IO(_)),
+                        end.0 - start.0,
+                        end.1 - start.1,
+                    ));
+                    drop(c);
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    // Outside any frame, cold.
+                    let (ct, mut d) = writing(&io, &conn, id);
+                    chill(&db);
+                    let start = counts();
+                    let out = d.finish_open().map_err(|e| *e).unwrap();
+                    let end = counts();
+                    seen.push((
+                        "cold outside a frame",
+                        matches!(out, IOResult::IO(_)),
+                        0,
+                        end.1 - start.1,
+                    ));
+                    drop(d);
+                    ct.end(false)
+                        .expect("a transaction to end")
+                        .finish()
+                        .unwrap();
+                    assert_eq!(
+                        seen,
+                        vec![
+                            ("cold in frames", true, 1, 1),
+                            ("known in a frame", false, 0, 0),
+                            ("resident in a frame", false, 1, 1),
+                            ("cold outside a frame", false, 0, 0),
+                        ],
+                        "(case, returned IO (more than once in frames), Gets made, resolver boxes made)"
+                    );
+                },
+            );
+        }
+
+        /// Steps `stmt` in test frames until it returns IO with its cursor over tree `id` opening,
+        /// every page nothing keeps evicted at each return before then, each return waited for in
+        /// I6's order. The calls it took.
+        fn stepped_to_opening(
+            io: &Arc<dyn IO>,
+            db: &Database,
+            stmt: &mut crate::Statement,
+            id: u64,
+        ) -> usize {
+            let atoll = db.atoll.as_ref().unwrap().atoll();
+            for calls in 1..64 {
+                let held = held_io(db);
+                let stepped = {
+                    let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                    stmt.step().unwrap()
+                };
+                let idle = atoll.io_idle_for_test();
+                drop(held);
+                assert!(
+                    matches!(stepped, crate::StepResult::IO),
+                    "call {calls}: the statement went on to {stepped:?} without its open returning IO"
+                );
+                let c = stmt.pending_io_for_test().expect("the statement's wait");
+                assert!(waited(io, &c), "call {calls}: its wait never finished");
+                assert!(retired(db), "call {calls}: a request outstanding");
+                assert!(idled(&idle), "call {calls}: the IO thread never went idle");
+                if stmt
+                    .atoll_cursor_for_test(id)
+                    .is_some_and(|(_, _, opening)| opening)
+                {
+                    return calls;
+                }
+                chill(db);
+            }
+            panic!("the statement's open never returned IO within 64 calls");
+        }
+
+        /// Steps `stmt` outside any frame until it is done: its rows.
+        fn finished(stmt: &mut crate::Statement) -> Vec<Vec<Value>> {
+            let mut out = Vec::new();
+            loop {
+                match stmt.step().unwrap() {
+                    crate::StepResult::Row => {
+                        out.push(stmt.row().unwrap().get_values().cloned().collect())
+                    }
+                    crate::StepResult::Done => return out,
+                    crate::StepResult::IO => stmt._io().step().unwrap(),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+
+        /// What each call of a statement stepped in frames did: the steps of its cursors' opens,
+        /// each a tree and whether that step returned for IO, and whether the call returned for IO.
+        struct Calls {
+            rows: Vec<Vec<Value>>,
+            calls: Vec<(Vec<(u64, bool)>, bool)>,
+        }
+
+        /// Steps `stmt` in test frames until it is done, each return for IO waited for outside the
+        /// frame in I6's order and nothing evicted between calls, recording each call.
+        fn finished_in_frames(
+            io: &Arc<dyn IO>,
+            db: &Database,
+            stmt: &mut crate::Statement,
+        ) -> Calls {
+            let atoll = db.atoll.as_ref().unwrap().atoll();
+            let mut out = Calls {
+                rows: Vec::new(),
+                calls: Vec::new(),
+            };
+            loop {
+                let steps = OPEN_STEPS.with(|s| s.borrow().len());
+                let held = held_io(db);
+                let stepped = {
+                    let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                    stmt.step().unwrap()
+                };
+                let idle = atoll.io_idle_for_test();
+                drop(held);
+                let started = OPEN_STEPS.with(|s| s.borrow()[steps..].to_vec());
+                let n = out.calls.len() + 1;
+                assert!(n < 100_000, "the statement did not finish within {n} calls");
+                match stepped {
+                    crate::StepResult::Row => {
+                        out.rows
+                            .push(stmt.row().unwrap().get_values().cloned().collect());
+                        out.calls.push((started, false));
+                    }
+                    crate::StepResult::Done => {
+                        out.calls.push((started, false));
+                        return out;
+                    }
+                    crate::StepResult::Yield => out.calls.push((started, false)),
+                    crate::StepResult::Sleep { duration } => {
+                        out.calls.push((started, false));
+                        std::thread::sleep(duration);
+                    }
+                    crate::StepResult::IO => {
+                        let c = stmt.pending_io_for_test().expect("the statement's wait");
+                        assert!(waited(io, &c), "call {n}: its wait never finished");
+                        assert!(retired(db), "call {n}: a request outstanding");
+                        assert!(idled(&idle), "call {n}: the IO thread never went idle");
+                        out.calls.push((started, true));
+                    }
+                    other => panic!("call {n}: {other:?}"),
+                }
+            }
+        }
+
+        /// A cursor positioned in its tree when a sibling statement of its connection Clears the
+        /// tree: its next step rebinds through the new tree's catalog row, cold, returning IO in a
+        /// frame with the read kept, and lands at its key in the new tree, empty, as outside any frame.
+        #[test]
+        fn a_cursors_rebinding_after_a_siblings_clear_returns_io_and_lands_in_the_new_tree() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_cursors_rebinding_after_a_siblings_clear_returns_io_and_lands_in_the_new_tree"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/rebind-clear");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)").unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    conn.execute("BEGIN").unwrap();
+                    let mut a = conn.prepare("SELECT a FROM t699").unwrap();
+                    let first = loop {
+                        match a.step().unwrap() {
+                            crate::StepResult::Row => {
+                                break a.row().unwrap().get_values().cloned().collect::<Vec<_>>()
+                            }
+                            crate::StepResult::IO => a._io().step().unwrap(),
+                            other => panic!("{other:?}"),
+                        }
+                    };
+                    conn.execute("DELETE FROM t699").unwrap();
+                    chill(&db);
+                    let atoll = db.atoll.as_ref().unwrap().atoll();
+                    let (mut kept_returns, mut after) = (0, Vec::new());
+                    for calls in 1..512 {
+                        let held = held_io(&db);
+                        let stepped = {
+                            let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                            a.step().unwrap()
+                        };
+                        let idle = atoll.io_idle_for_test();
+                        drop(held);
+                        match stepped {
+                            crate::StepResult::Row => after
+                                .push(a.row().unwrap().get_values().cloned().collect::<Vec<_>>()),
+                            crate::StepResult::Done => break,
+                            crate::StepResult::IO => {
+                                let c = a.pending_io_for_test().expect("the statement's wait");
+                                assert!(waited(&io, &c), "call {calls}: its wait never finished");
+                                assert!(retired(&db), "call {calls}: a request outstanding");
+                                assert!(idled(&idle), "call {calls}: the IO thread never went idle");
+                                if a.atoll_cursor_for_test(id).is_some_and(|(_, bare, _)| {
+                                    bare.is_some_and(|c| c.resolving_for_test().is_some())
+                                }) {
+                                    kept_returns += 1;
+                                    chill(&db);
+                                }
+                            }
+                            other => panic!("call {calls}: {other:?}"),
+                        }
+                    }
+                    drop(a);
+                    conn.execute("COMMIT").unwrap();
+                    assert_eq!(first, vec![Value::from_i64(1)], "the row before the Clear");
+                    assert!(
+                        kept_returns >= 1,
+                        "the rebinding never returned for IO with its read kept"
+                    );
+                    assert_eq!(after, Vec::<Vec<Value>>::new(), "the rows after the Clear");
+                },
+            );
+        }
+
+        /// An open whose read returned IO, the catalog then changed by a sibling statement of its
+        /// connection between its calls (a Clear of another table): the open's next call starts its
+        /// read again, a second read and a second `Get`, and the statement reads its rows as outside
+        /// any frame (mutant `continues-ignores-changes`).
+        #[test]
+        fn an_open_starts_its_read_again_when_the_catalog_changes_between_its_calls() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_open_starts_its_read_again_when_the_catalog_changes_between_its_calls"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-changed");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)")
+                        .unwrap();
+                    conn.execute("INSERT INTO t0 VALUES (1)").unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let expected = rows(&conn, "SELECT a FROM t699");
+                    conn.execute("BEGIN").unwrap();
+                    let mut a = conn.prepare("SELECT a FROM t699").unwrap();
+                    chill(&db);
+                    CATALOG_READS.with(|r| r.borrow_mut().clear());
+                    let gets = ROW_GETS.with(|n| n.get());
+                    stepped_to_opening(&io, &db, &mut a, id);
+                    conn.execute("DELETE FROM t0").unwrap();
+                    let got = finished_in_frames(&io, &db, &mut a).rows;
+                    let reads =
+                        CATALOG_READS.with(|r| r.borrow().iter().filter(|r| **r == id).count());
+                    let made = ROW_GETS.with(|n| n.get()) - gets;
+                    drop(a);
+                    conn.execute("COMMIT").unwrap();
+                    assert_eq!(got, expected, "the rows read after the restart");
+                    assert_eq!(
+                        (reads, made),
+                        (2, 2),
+                        "(the open's reads of its catalog row, the Gets made)"
+                    );
+                },
+            );
+        }
+
+        /// A statement reset while its cursor's open waits in a frame: the cursor is parked alive, its
+        /// kept read let go there, its frame no longer kept and its metadata page one pin fewer; the
+        /// statement run again reads its rows (mutant `park-keeps-resolving`).
+        #[test]
+        fn a_statement_reset_while_its_open_waits_lets_the_opens_read_go() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_statement_reset_while_its_open_waits_lets_the_opens_read_go"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-reset");
+                    conn.execute("INSERT INTO t699 VALUES (1), (2), (3)")
+                        .unwrap();
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let expected = rows(&conn, "SELECT a FROM t699");
+                    let mut a = conn.prepare("SELECT a FROM t699").unwrap();
+                    chill(&db);
+                    stepped_to_opening(&io, &db, &mut a, id);
+                    let keeps = a
+                        .atoll_cursor_for_test(id)
+                        .and_then(|(_, bare, _)| bare.and_then(SqlCursor::resolving_for_test));
+                    let before = kept_now(&db, keeps.unwrap_or_default());
+                    a.reset().unwrap();
+                    let after = kept_now(&db, keeps.unwrap_or_default());
+                    let got = finished(&mut a);
+                    drop(a);
+                    assert!(
+                        keeps.is_some(),
+                        "the open's read not kept across its return"
+                    );
+                    let_go("the reset's", keeps.unwrap(), before, after);
+                    assert_eq!(got, expected, "the rows read after the reset");
+                },
+            );
+        }
+
+        /// A statement dropped while its cursor's open waits in a frame lets the open's kept read go.
+        #[test]
+        fn a_statement_dropped_while_its_open_waits_lets_the_opens_read_go() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_statement_dropped_while_its_open_waits_lets_the_opens_read_go"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred("/db/open-drop");
+                    let id = tree(&conn, "t699");
+                    checkpointed(&conn);
+                    let mut a = conn.prepare("SELECT a FROM t699").unwrap();
+                    chill(&db);
+                    stepped_to_opening(&io, &db, &mut a, id);
+                    let keeps = a
+                        .atoll_cursor_for_test(id)
+                        .and_then(|(_, bare, _)| bare.and_then(SqlCursor::resolving_for_test));
+                    let before = kept_now(&db, keeps.unwrap_or_default());
+                    drop(a);
+                    let after = kept_now(&db, keeps.unwrap_or_default());
+                    assert!(
+                        keeps.is_some(),
+                        "the open's read not kept across its return"
+                    );
+                    let_go("the drop's", keeps.unwrap(), before, after);
+                },
+            );
+        }
+
+        /// The trees an index method keeps its rows in, by their names' prefix `index`.
+        fn backing_trees(conn: &Arc<Connection>, index: &str) -> Vec<u64> {
+            rows(
+                conn,
+                &format!(
+                    "SELECT rootpage FROM sqlite_schema WHERE name LIKE '%{index}%' \
+                     AND name != '{index}' AND rootpage > 0"
+                ),
+            )
+            .into_iter()
+            .map(|row| match row[0] {
+                Value::Numeric(crate::Numeric::Integer(id)) => id as u64,
+                ref other => panic!("{other:?}"),
+            })
+            .collect()
+        }
+
+        /// Asserts an open of an Atoll cursor over one of `trees` returned for IO at its own step as
+        /// the last thing its call did, the call returning that IO; that the next call began by
+        /// stepping that same open, its boundary entered again going on with it before anything
+        /// else; and that a later step finished it. So an index method's open waited for its cursor's
+        /// catalog read at its own boundary, and was done there before the method went on.
+        fn an_open_returned_io(what: &str, calls: &Calls, trees: &[u64]) {
+            assert!(!trees.is_empty(), "{what}: no backing tree");
+            let waited =
+                calls
+                    .calls
+                    .iter()
+                    .enumerate()
+                    .find_map(|(n, (steps, io))| match steps.last() {
+                        Some(&(id, true)) if *io && trees.contains(&id) => Some((n, id)),
+                        _ => None,
+                    });
+            let Some((n, id)) = waited else {
+                panic!(
+                    "{what}: no call's last open step, over a backing tree {trees:?}, returned the \
+                     call's IO: {:?}",
+                    calls.calls
+                );
+            };
+            let next = calls.calls.get(n + 1).map(|(steps, _)| steps);
+            assert_eq!(
+                next.and_then(|steps| steps.first()).map(|(first, _)| *first),
+                Some(id),
+                "{what}: the open over tree {id} that returned for IO at call {n} was not the first \
+                 stepped at the next call, its boundary going on without it: {next:?}"
+            );
+            assert!(
+                calls.calls[n + 1..]
+                    .iter()
+                    .any(|(steps, _)| steps.iter().any(|&(other, io)| other == id && !io)),
+                "{what}: the open over tree {id} that returned for IO at call {n} never finished"
+            );
+        }
+
+        /// The index methods' cursor maker binds an Atoll cursor when it makes it outside a
+        /// cooperative frame, and leaves its open under way for the index method's open in one
+        /// (II-3; mutant `no-wait-lazy-outside-frame`).
+        #[test]
+        fn an_index_methods_cursor_is_bound_when_made_outside_a_frame_and_opening_in_one() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_index_methods_cursor_is_bound_when_made_outside_a_frame_and_opening_in_one"
+                ),
+                || {
+                    let (io, _db, conn) = seven_hundred("/db/no-wait-maker");
+                    let ct = conn.atoll().expect("Atoll mode");
+                    crate::storage::atoll::drive(&io, || ct.begin(Begin::Read)).unwrap();
+                    let outside = crate::index_method::open_table_cursor(&conn, 0, "t699")
+                        .unwrap()
+                        .opening();
+                    let inside = {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        crate::index_method::open_table_cursor(&conn, 0, "t699")
+                            .unwrap()
+                            .opening()
+                    };
+                    ct.end(false).map(|mut e| e.finish().unwrap());
+                    assert_eq!(
+                        (outside, inside),
+                        (false, true),
+                        "(opening when made outside a frame, in one)"
+                    );
+                },
+            );
+        }
+
+        /// A query through a backing-store index method (`toy_vector_sparse_ivf`) stepped in frames,
+        /// its backing trees' catalog rows cold: its index method's open returns IO at its own
+        /// boundary, its cursors' opens finished there, and the query answers as outside any frame
+        /// (mutant `index-method-open-unfinished`).
+        #[test]
+        fn a_backing_store_index_methods_open_in_a_frame_finishes_its_cursors() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::a_backing_store_index_methods_open_in_a_frame_finishes_its_cursors"
+                ),
+                || {
+                    // The table first and its index after the 700 tables, so the index's backing
+                    // trees' catalog rows lie in other leaves than the table's, which the query's
+                    // own open reads first.
+                    let (io, db, conn) = seven_hundred_after(
+                        "/db/toy-open",
+                        &["CREATE TABLE vectors(id INTEGER PRIMARY KEY, embedding)"],
+                    );
+                    conn.execute(
+                        "CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)",
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO vectors VALUES (1, vector32_sparse('[1, 0, 0]')), \
+                         (2, vector32_sparse('[0, 1, 0]'))",
+                    )
+                    .unwrap();
+                    checkpointed(&conn);
+                    let sql = "SELECT id FROM vectors ORDER BY \
+                               vector_distance_jaccard(embedding, vector32_sparse('[0, 1, 0]')) LIMIT 1";
+                    let expected = rows(&conn, sql);
+                    let trees = backing_trees(&conn, "vectors_idx");
+                    let mut stmt = conn.prepare(sql).unwrap();
+                    chill(&db);
+                    let calls = finished_in_frames(&io, &db, &mut stmt);
+                    drop(stmt);
+                    assert_eq!(calls.rows, expected, "the query in frames");
+                    an_open_returned_io("the toy index's open", &calls, &trees);
+                },
+            );
+        }
+
+        /// `ivf_rq` stepped in frames, its backing trees' catalog rows cold: a query, whose
+        /// `open_read` finishes its stores' opens; an `OPTIMIZE INDEX` inside a transaction, optimized
+        /// whole in its statement, which opens no cursor before its maintenance, whose idle state
+        /// finishes them; and one outside a transaction, in steps on a connection beside this one,
+        /// whose `optimize_step` does: each returns IO at that boundary and goes on with that open
+        /// at its next call (mutants `ivf-maintain-unfinished`, `ivf-optimize-unfinished`).
+        #[test]
+        fn an_ivf_rq_index_opens_its_stores_in_a_frame_for_a_query_and_an_optimize() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_ivf_rq_index_opens_its_stores_in_a_frame_for_a_query_and_an_optimize"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred_after(
+                        "/db/ivf-open",
+                        &["CREATE TABLE v(id INTEGER PRIMARY KEY, e BLOB NOT NULL)"],
+                    );
+                    conn.execute(
+                        "CREATE INDEX v_ivf ON v USING ivf_rq (e) WITH (nprobes = 64, refine = 4)",
+                    )
+                    .unwrap();
+                    for id in 1..=20i64 {
+                        let v: Vec<String> = (0..4)
+                            .map(|d| format!("{}", ((id * 7 + d) % 11) as f32))
+                            .collect();
+                        conn.execute(format!(
+                            "INSERT INTO v VALUES ({id}, vector32('[{}]'))",
+                            v.join(",")
+                        ))
+                        .unwrap();
+                    }
+                    checkpointed(&conn);
+                    let trees = backing_trees(&conn, "v_ivf");
+                    let sql = "SELECT id FROM v ORDER BY \
+                               vector_distance_dot(e, vector32('[1,2,3,4]')) LIMIT 3";
+                    let expected = rows(&conn, sql);
+                    let mut query = conn.prepare(sql).unwrap();
+                    chill(&db);
+                    let queried = finished_in_frames(&io, &db, &mut query);
+                    drop(query);
+                    // Inside a transaction an OPTIMIZE INDEX is optimized whole in this statement:
+                    // its maintenance, whose idle state opens the stores.
+                    conn.execute("BEGIN").unwrap();
+                    let mut optimize = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
+                    chill(&db);
+                    let optimized = finished_in_frames(&io, &db, &mut optimize);
+                    drop(optimize);
+                    conn.execute("COMMIT").unwrap();
+                    // Outside one, in steps, on a connection beside this one: through
+                    // `optimize_step`, whose first branch opens the stores.
+                    let mut steps = conn.prepare("OPTIMIZE INDEX v_ivf").unwrap();
+                    chill(&db);
+                    let stepped = finished_in_frames(&io, &db, &mut steps);
+                    drop(steps);
+                    assert_eq!(queried.rows, expected, "the query in frames");
+                    an_open_returned_io("the query's open", &queried, &trees);
+                    an_open_returned_io("the optimize's opening of its stores", &optimized, &trees);
+                    an_open_returned_io(
+                        "the optimize step's opening of its stores",
+                        &stepped,
+                        &trees,
+                    );
+                    assert_eq!(rows(&conn, sql), expected, "the query after the optimize");
+                },
+            );
+        }
+
+        /// FTS stepped in frames, its backing tree's catalog row cold: a query, whose open's first
+        /// state finishes its cursor's open, and a DROP INDEX, whose destroy does, each return IO at
+        /// that boundary and finish as outside any frame. A CREATE INDEX opens a store its own
+        /// statement wrote, whose open is done at its first call (mutant `fts-open-unfinished`).
+        #[cfg(feature = "fts")]
+        #[test]
+        fn an_fts_index_finishes_its_cursors_open_in_a_frame_for_a_query_and_a_drop() {
+            crate::storage::atoll::testing::cleanly(
+                concat!(
+                    module_path!(),
+                    "::an_fts_index_finishes_its_cursors_open_in_a_frame_for_a_query_and_a_drop"
+                ),
+                || {
+                    let (io, db, conn) = seven_hundred_after(
+                        "/db/fts-open",
+                        &["CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)"],
+                    );
+                    let mut create = conn
+                        .prepare("CREATE INDEX docs_fts ON docs USING fts(body)")
+                        .unwrap();
+                    let created = finished_in_frames(&io, &db, &mut create);
+                    drop(create);
+                    conn.execute("INSERT INTO docs VALUES (1, 'hello world'), (2, 'other words')")
+                        .unwrap();
+                    checkpointed(&conn);
+                    let trees = backing_trees(&conn, "docs_fts");
+                    let sql = "SELECT id FROM docs WHERE fts_match(body, 'hello') ORDER BY id";
+                    let expected = rows(&conn, sql);
+                    let mut query = conn.prepare(sql).unwrap();
+                    chill(&db);
+                    let queried = finished_in_frames(&io, &db, &mut query);
+                    drop(query);
+                    checkpointed(&conn);
+                    let mut drop_index = conn.prepare("DROP INDEX docs_fts").unwrap();
+                    chill(&db);
+                    let dropped = finished_in_frames(&io, &db, &mut drop_index);
+                    drop(drop_index);
+                    assert!(!created.calls.is_empty(), "the CREATE INDEX in frames");
+                    assert_eq!(queried.rows, expected, "the query in frames");
+                    assert_eq!(
+                        expected,
+                        vec![vec![Value::from_i64(1)]],
+                        "the query's answer"
+                    );
+                    an_open_returned_io("the query's open", &queried, &trees);
+                    an_open_returned_io("the drop's destroy", &dropped, &trees);
+                    assert!(
+                        backing_trees(&conn, "docs_fts").is_empty(),
+                        "the DROP INDEX left its backing trees"
+                    );
+                },
+            );
+        }
+    }
 }
 
 /// Every site in the SQL facade that drives an operation to its end, by the function it is in,
@@ -7993,7 +9405,11 @@ const DRIVE_SITES: &[(&str, &str, &str)] = &[
         "drop_unnamed_sequences",
         "D3: the open phase",
     ),
-    ("mode.rs", "row_in", "slice (ii): the cursor's resolution"),
+    (
+        "mode.rs",
+        "row_in",
+        "blocking hosts only: a catalog row outside a frame; row_in_kept in one",
+    ),
     (
         "mode.rs",
         "pin",
@@ -8040,6 +9456,15 @@ const CONVERTED: &[&str] = &[
     "pages_step",
     "since_step",
     "begin_reading",
+    "row_in_kept",
+    "entry_now",
+    "entry_inner",
+    "resolve",
+    "resolved",
+    "open_step",
+    "open_inner",
+    "finish_open",
+    "reopened",
 ];
 
 /// A file's production code: up to its inline test module, which by the house layout comes last.
@@ -8135,6 +9560,201 @@ fn every_drive_site_of_the_facade_is_ruled_and_no_converted_read_drives() {
         wrong.is_empty(),
         "the facade's drive sites:\n{}",
         wrong.join("\n")
+    );
+}
+
+/// How an index method's function that makes Atoll cursors is ruled (ASYNC1 D2e (ii) §5): one that
+/// makes them for its callers, followed to theirs; an `IOResultOr` boundary that finishes their
+/// opens before it is done; or a blocking host, never reached from a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Opens {
+    Makes,
+    Finishes,
+    Blocking,
+}
+
+/// Every function of `core/index_method/` that makes an Atoll cursor or calls one that does, by
+/// file and name, and its ruling.
+const INDEX_METHOD_OPENS: &[(&str, &str, Opens)] = &[
+    ("backing_store.rs", "open_cursor", Opens::Makes),
+    ("mod.rs", "open_table_cursor", Opens::Makes),
+    (
+        "toy_vector_sparse_ivf.rs",
+        "open_store_cursor",
+        Opens::Makes,
+    ),
+    (
+        "toy_vector_sparse_ivf.rs",
+        "open_cursors_inner",
+        Opens::Finishes,
+    ),
+    ("toy_vector_sparse_ivf.rs", "open_cursors", Opens::Finishes),
+    ("toy_vector_sparse_ivf.rs", "open_read", Opens::Finishes),
+    ("toy_vector_sparse_ivf.rs", "open_write", Opens::Finishes),
+    ("ivf_rq.rs", "open_stores", Opens::Finishes),
+    ("ivf_rq.rs", "open_read", Opens::Finishes),
+    ("ivf_rq.rs", "open_write", Opens::Finishes),
+    ("ivf_rq.rs", "optimize_step", Opens::Finishes),
+    ("ivf_rq.rs", "maintain", Opens::Finishes),
+    ("fts/mod.rs", "open_cursor", Opens::Makes),
+    ("fts/mod.rs", "drive_open", Opens::Finishes),
+    ("fts/mod.rs", "create", Opens::Finishes),
+    ("fts/mod.rs", "destroy", Opens::Finishes),
+    // `FtsBackingRowWiper::new` and `FtsBackingRowDumper::new`: `test_helper` tools, built
+    // outside a frame, where the constructor binds their cursor when made.
+    ("fts/mod.rs", "new", Opens::Blocking),
+];
+
+/// The names whose calls make an Atoll cursor, or call a function that does.
+const OPEN_MAKERS: &[&str] = &[
+    "open_cursor_no_wait",
+    "open_cursor",
+    "open_table_cursor",
+    "open_store_cursor",
+    "open_stores",
+    "open_cursors",
+    "open_cursors_inner",
+];
+
+/// The functions of `code` and the lines of each, its production code alone.
+fn function_lines(code: &str) -> Vec<(String, usize, String)> {
+    let mut out = Vec::new();
+    let mut within = String::new();
+    for (n, line) in production_of(code).lines().enumerate() {
+        let words: Vec<&str> = line
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        if let Some(i) = words.iter().position(|w| *w == "fn") {
+            if let Some(name) = words.get(i + 1) {
+                let t = line.trim_start();
+                if t.starts_with("fn ") || t.starts_with("pub") || t.starts_with("unsafe fn") {
+                    within = name.to_string();
+                }
+            }
+        }
+        out.push((within.clone(), n + 1, line.to_string()));
+    }
+    out
+}
+
+/// Whether `line` calls `name`, a definition of it aside.
+fn calls_on(line: &str, name: &str) -> bool {
+    line.match_indices(&format!("{name}(")).any(|(i, _)| {
+        let before = line[..i].chars().last();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !line[..i].trim_end().ends_with("fn")
+    })
+}
+
+/// The census's findings over `files`, each a file's name and its code: every function that calls
+/// a maker is ruled, every ruling names such a function, and every boundary finishes its opens,
+/// itself or through a boundary it calls.
+fn index_method_opens(files: &[(String, String)], rules: &[(&str, &str, Opens)]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let mut found = std::collections::BTreeSet::new();
+    let finishers: Vec<&str> = rules
+        .iter()
+        .filter(|(_, _, r)| *r == Opens::Finishes)
+        .map(|(_, n, _)| *n)
+        .collect();
+    for (file, code) in files {
+        let lines = function_lines(code);
+        for (within, n, line) in &lines {
+            if OPEN_MAKERS.iter().any(|m| calls_on(line, m)) {
+                match rules
+                    .iter()
+                    .find(|(f, name, _)| f == file && name == within)
+                {
+                    None => wrong.push(format!(
+                        "{file}:{n}: {within} makes a cursor, ruled nowhere"
+                    )),
+                    Some((_, _, rule)) => {
+                        found.insert((file.clone(), within.clone(), *rule));
+                    }
+                }
+            }
+        }
+        for (f, name, rule) in rules {
+            if f != file || *rule != Opens::Finishes {
+                continue;
+            }
+            let finishes = lines
+                .iter()
+                .filter(|(w, _, _)| w == name)
+                .any(|(_, _, line)| {
+                    calls_on(line, "finish_open")
+                        || calls_on(line, "finish_cursor_open")
+                        || finishers.iter().any(|b| b != name && calls_on(line, b))
+                });
+            if !finishes {
+                wrong.push(format!(
+                    "{file}: {name} is a boundary that finishes no open"
+                ));
+            }
+        }
+    }
+    for (f, name, rule) in rules {
+        if !found.contains(&(f.to_string(), name.to_string(), *rule)) {
+            wrong.push(format!("{f}: {name} is ruled but makes no cursor"));
+        }
+    }
+    wrong
+}
+
+/// The census of the index methods' Atoll cursors (ASYNC1 D2e (ii) §5): every function of
+/// `core/index_method/` that makes one, or calls one that does, is ruled, and every boundary
+/// finishes the opens before it is done, so a cursor made in a cooperative frame is bound by its
+/// index method's own open.
+#[test]
+fn every_index_method_open_of_an_atoll_cursor_is_finished_at_its_boundary() {
+    use crate::storage::atoll::testing::{atoll_dir, code_of};
+    let dir = atoll_dir().join("../../index_method");
+    let mut files = Vec::new();
+    for (sub, prefix) in [(dir.clone(), ""), (dir.join("fts"), "fts/")] {
+        for entry in std::fs::read_dir(&sub).unwrap() {
+            let path = entry.unwrap().path();
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            if !file.ends_with(".rs") || file == "tests.rs" {
+                continue;
+            }
+            let code = code_of(&std::fs::read_to_string(&path).unwrap());
+            files.push((format!("{prefix}{file}"), code));
+        }
+    }
+    assert!(
+        files.iter().any(|(f, _)| f == "ivf_rq.rs"),
+        "the census read no index method: {:?}",
+        files.iter().map(|(f, _)| f).collect::<Vec<_>>()
+    );
+    let wrong = index_method_opens(&files, INDEX_METHOD_OPENS);
+    assert!(
+        wrong.is_empty(),
+        "the index methods' opens:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The index-method census's control: a new caller of a maker is found by name, and a boundary
+/// that does not finish its opens is found.
+#[test]
+fn the_index_method_census_sees_a_new_caller_and_an_unfinished_boundary() {
+    let code = "fn open_read(&mut self) {\n    let c = open_table_cursor(&ctx)?;\n}\n\
+                fn helper(&mut self) {\n    self.open_stores(&ctx)?;\n}\n"
+        .to_string();
+    let files = vec![("x.rs".to_string(), code)];
+    let rules = [
+        ("x.rs", "open_read", Opens::Finishes),
+        ("x.rs", "open_stores", Opens::Finishes),
+    ];
+    let wrong = index_method_opens(&files, &rules);
+    assert!(
+        wrong.contains(&"x.rs:5: helper makes a cursor, ruled nowhere".to_string()),
+        "the new caller: {wrong:?}"
+    );
+    assert!(
+        wrong.contains(&"x.rs: open_read is a boundary that finishes no open".to_string()),
+        "the unfinished boundary: {wrong:?}"
     );
 }
 

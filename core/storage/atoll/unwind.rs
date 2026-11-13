@@ -403,6 +403,36 @@ mod tests {
     const PANICKING: &[(&str, &str, &str)] = &[
         (
             "log/unit_tests.rs",
+            "over_the_ring_an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
+            "over_the_ring_an_append_a_group_and_a_publish_in_a_frame_ring_and_submit_nothing",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
+            "an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted_once_its_flush_lands",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
+            "a_durability_wait_in_a_frame_rings_the_log_and_is_done_once_its_sync_lands",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
+            "an_append_a_group_and_a_publish_in_a_frame_with_a_waiter_ring_and_submit_nothing",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
+            "an_undriven_preparer_found_in_a_frame_is_an_error_and_never_a_step",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
             "a_refused_sync_member_fails_the_log_and_leaves_nothing_counted",
             "child",
         ),

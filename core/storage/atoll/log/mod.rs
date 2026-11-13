@@ -413,6 +413,27 @@ impl Log {
         })
     }
 
+    /// [`open`](Self::open) in a database opened async (D2c): its counted IO with one IO thread,
+    /// which queues what a cooperative frame asks, and an executor of its own with `workers`
+    /// workers, which step its preparer when there are any.
+    #[cfg(test)]
+    pub(crate) fn open_async(
+        io: Arc<dyn IO>,
+        base: &str,
+        config: LogConfig,
+        workers: usize,
+    ) -> Result<AloneLog> {
+        let counted = super::requests::counted_async_for_test(io, 1, 1);
+        let executor = Executor::new(counted.clone(), workers)?;
+        let log = Self::open_with(counted, base, config, 0, &executor, |len| {
+            Ok(AlignedBlock::zeroed(len))
+        })?;
+        Ok(AloneLog {
+            log,
+            _executor: executor,
+        })
+    }
+
     /// [`open`](Self::open), its ring's chunks in frames `pool` lends for as long as the log is
     /// open, so the log's memory is the pool's (one memory, Clay's ruling of 2026-11-05), and its
     /// preparer a task of the database's `executor`.
@@ -662,13 +683,13 @@ impl Log {
         // it, then reads again. The completion it returns means only that it should be called
         // again. One left behind is finished by the next wake, for no one.
         let c = self.admitters.wait();
-        self.flush();
+        self.flush_or_ring()?;
         let on = match self.room.unprepared_for(bytes) {
             Some(wanted) => {
                 // The preparer prepares to where this admission fits, raised before its trigger.
                 self.wanted_end.fetch_max(wanted, Ordering::SeqCst);
                 self.preparer().trigger(&self.due);
-                self.wait_on_preparer(wait)
+                self.wait_on_preparer(wait)?
             }
             None => None,
         };
@@ -702,6 +723,10 @@ impl Log {
                 && !crate::storage::atoll::unit::inside()
                 && !preparer.driven()
             {
+                if self.segments.counted_io().queues() {
+                    drop(admitted);
+                    return Err(Self::undriven_in_a_frame());
+                }
                 // What the run would have the caller wait on is no concern of an admission
                 // granted: the next caller runs the preparer on.
                 let _more = self.run_preparer();
@@ -780,7 +805,7 @@ impl Log {
         let lsn = self.write_record(start, header, Place::ALONE, payload);
         self.count_copied(start, lsn);
         if self.flush_wanted() {
-            self.flush();
+            self.flush_or_fail();
         }
         (GroupStart::at(start), lsn)
     }
@@ -853,7 +878,7 @@ impl Log {
         }
         self.count_copied(start, start + whole);
         // Written at once, so its block goes back as soon as it can.
-        self.flush();
+        self.flush_or_fail();
         (GroupStart::at(start), start + len)
     }
 
@@ -909,7 +934,7 @@ impl Log {
             .collect();
         self.count_copied(start, at);
         if self.flush_wanted() {
-            self.flush();
+            self.flush_or_fail();
         }
         (GroupStart::at(start), lsns)
     }
@@ -976,6 +1001,11 @@ impl Log {
         if let Some(e) = self.failure() {
             return Err(LimboError::CompletionError(e));
         }
+        if one && self.segments.counted_io().queues() {
+            return Err(LimboError::InternalError(
+                "a job's turn of the log's flush asked in a cooperative frame".to_string(),
+            ));
+        }
         self.wanted.fetch_max(lsn, Ordering::SeqCst);
         let c = match &wait.durability {
             // Still standing for the same mark: registered by an earlier call of this wait.
@@ -1001,12 +1031,12 @@ impl Log {
         let owed = if one {
             self.flush_one_turn()
         } else {
-            self.flush();
+            self.flush_or_ring()?;
             false
         };
         // Padding waiting for a segment: the wait stands on the preparer.
         let on = if self.preparation.needed() {
-            self.wait_on_preparer(wait)
+            self.wait_on_preparer(wait)?
         } else {
             None
         };
@@ -1169,6 +1199,30 @@ impl Log {
             Pad::Unprepared => {}
         }
         padded
+    }
+
+    /// A caller's flush (D2c §1): in place outside a cooperative frame, as ever; inside one, in a
+    /// database opened async, the log's door rung, and its IO thread's unit takes the turns, so
+    /// no caller in a frame submits a write. A ring refused, the database closing, is that error.
+    fn flush_or_ring(self: &Arc<Self>) -> Result<()> {
+        let counted = self.segments.counted_io();
+        if counted.queues() {
+            return counted.ring_log_from_frame();
+        }
+        self.flush();
+        Ok(())
+    }
+
+    /// [`flush_or_ring`](Self::flush_or_ring) for an append that returns its position, not a
+    /// `Result`: a refused ring fails the log, so every waiter on its durability and every
+    /// admitter is told, and the next admission refuses (D2c §1).
+    fn flush_or_fail(self: &Arc<Self>) {
+        if self.flush_or_ring().is_err() {
+            self.fail(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "the log's ring refused at a closed database",
+            ));
+        }
     }
 
     /// Starts writing what is complete, as far as the writes allowed in flight go: a turn at a
@@ -1640,19 +1694,32 @@ impl Log {
     /// preparer, and where no worker steps it, the caller runs it, a step a call
     /// ([`run_preparer`](Self::run_preparer)): what the caller then waits on, if not its own
     /// registration.
-    fn wait_on_preparer(&self, wait: &mut LogWait) -> Option<Completion> {
+    fn wait_on_preparer(&self, wait: &mut LogWait) -> Result<Option<Completion>> {
         let preparer = self.preparer();
         if executor::inside() || crate::storage::atoll::unit::inside() {
             wait.on = Some(preparer.clone());
-            return None;
+            return Ok(None);
         }
         if wait.demand.is_none() {
             wait.demand = Some(preparer.ticket(Class::Relief));
         }
         if preparer.driven() {
-            return None;
+            return Ok(None);
         }
-        self.run_preparer()
+        // A frame never steps the preparer in place (D2c §0): an async database always has a
+        // worker to drive it, so one undriven there is a broken open.
+        if self.segments.counted_io().queues() {
+            return Err(Self::undriven_in_a_frame());
+        }
+        Ok(self.run_preparer())
+    }
+
+    /// The error of a preparer found undriven by a caller in a cooperative frame, which never
+    /// steps it in place (D2c §0).
+    fn undriven_in_a_frame() -> LimboError {
+        LimboError::InternalError(
+            "the log's preparer has no worker driving it, found in a cooperative frame".to_string(),
+        )
     }
 
     /// A caller's run of the preparer where no worker steps it (DESIGN.md 22.7), one step a call:

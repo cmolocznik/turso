@@ -491,6 +491,12 @@ impl Counted {
         self.requests.dispatch().ring_log(&self.requests);
     }
 
+    /// The log's ring by a caller inside a cooperative frame (D2c §1): refused once the database
+    /// is closing.
+    pub(super) fn ring_log_from_frame(&self) -> Result<()> {
+        self.requests.dispatch().ring_log_from_frame(&self.requests)
+    }
+
     /// A record of the metadata cache's writes, taken at rest.
     pub(super) fn take_meta_write_record(&self) -> Result<Held> {
         self.requests.dispatch().take(dispatch::META_WRITES)

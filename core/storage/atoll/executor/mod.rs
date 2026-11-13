@@ -1252,6 +1252,13 @@ impl TaskRef {
         self.0.state.load(Ordering::Acquire) == QUEUED
     }
 
+    /// Whether it is idle: neither queued nor running, so resting or waiting on a request. For the
+    /// log's unit tests, built where they are.
+    #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+    pub(crate) fn idle(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) == IDLE
+    }
+
     /// Whether workers of its executor's own step it: with none, whoever waits on its work runs
     /// the executor (22.7). False once the executor is gone.
     pub(crate) fn driven(&self) -> bool {

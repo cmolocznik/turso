@@ -1052,6 +1052,26 @@ impl Dispatch {
         }
     }
 
+    /// A ring of the log's door by a caller inside a cooperative frame (D2c §1), which has no
+    /// request of its own counted: its count is taken first, so a door moved to RUNG always holds
+    /// one. A count refused, the database closing, is that error, and the door never moved. A
+    /// door already rung or serving lets the count go: the ring before this one owns the unit.
+    pub(super) fn ring_log_from_frame(&self, requests: &Requests) -> Result<()> {
+        if !requests.count_one() {
+            return Err(crate::LimboError::InternalError(
+                "a closed database's log".to_string(),
+            ));
+        }
+        if !self.door.ring() {
+            requests.uncount_one();
+            return Ok(());
+        }
+        if let Some(k) = self.bits.set(LOG) {
+            self.unpark(k);
+        }
+        Ok(())
+    }
+
     /// One unit of the log's work (D1b §3.2): started from RUNG, its requests and its log upgraded
     /// in that order, each optional; ended quiet with the door's count let go, or rung again.
     fn serve_log(self: &Arc<Self>) {

@@ -1689,3 +1689,708 @@ impl Drop for DropsOn {
         let _ = self.0.send(this_thread());
     }
 }
+
+// D2c (i): the log's caller roads in a cooperative frame of a database opened async. A caller's
+// flush there rings the log's door, and its IO thread's unit takes the turns.
+
+/// A log opened in a database opened async, its probe watching its IO thread's units, with an
+/// executor of `workers` workers.
+fn open_async(io: &Arc<UnitIO>, config: LogConfig, workers: usize) -> AloneLog {
+    let log = Log::open_async(io.clone(), BASE, config, workers).unwrap();
+    *io.probe.counted.lock() = Some(Arc::downgrade(log.segments.counted_io()));
+    log
+}
+
+/// `f` polled once inside a cooperative frame.
+fn in_frame<T>(f: impl FnOnce() -> T) -> T {
+    let _frame = crate::storage::atoll::cooperative::Frame::enter();
+    f()
+}
+
+/// `f` polled inside a frame until done, each wait waited for outside it.
+fn in_frames<T>(io: &Arc<dyn IO>, mut f: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
+    loop {
+        match in_frame(&mut f)? {
+            IOResult::Done(t) => return Ok(t),
+            IOResult::IO(c) => io.wait(&c.0),
+        }
+    }
+}
+
+/// A first block appended and made durable outside any frame, in place as ever, and the units
+/// ended: whether they ended. The executor's worker prepares the segments.
+fn durable_start_async(log: &Arc<Log>, io: &Arc<dyn IO>) -> bool {
+    while log.end() < BLOCK {
+        append(log, io, 996);
+    }
+    let end = log.end();
+    drive(io, || log.wait_durable(&mut LogWait::default(), end)).unwrap();
+    settled(log)
+}
+
+/// Whether `calls` hold a call named `what`.
+fn has(calls: &[(&'static str, usize)], what: &str) -> bool {
+    calls.iter().any(|(w, _)| *w == what)
+}
+
+/// The child's end, which must be clean: run to its end with no abort and code 0.
+fn child_ended_cleanly(ended: Option<crate::storage::atoll::testing::Ended>) {
+    if let Some(ended) = ended {
+        assert!(
+            !ended.aborted && !ended.hung && ended.code == Some(0),
+            "the child ended {:?} (aborted {}, hung {}): {}",
+            ended.code,
+            ended.aborted,
+            ended.hung,
+            ended.stderr
+        );
+    }
+}
+
+/// D2c §3.1 (child): an admission in a frame that must wait for the buffer's room rings the log's
+/// door: it returns IO with no backend call on the polling thread, the IO thread's unit syncs what
+/// is appended, and the admission is granted once that lands (mutant `admit-flushes-in-place`: the
+/// admission flushes in the frame, and the frame census ends the child at the segment's write).
+#[cfg(all(unix, not(miri)))]
+#[test]
+fn an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted_once_its_flush_lands() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted_once_its_flush_lands"
+        ),
+        || {
+            let io = UnitIO::new(false);
+            let dyn_io: Arc<dyn IO> = io.clone();
+            let log = open_async(&io, small(), 1);
+            let quiet = durable_start_async(&log, &dyn_io);
+            append(&log, &dyn_io, 100);
+            let held = log.hold_buffer_room();
+            let units = log.segments.counted_io().log_units();
+            io.probe.clear();
+            let mut wait = LogWait::default();
+            // The IO thread held across the first poll: the log's sync, which alone advances
+            // durability, is its unit's, so nothing that poll rechecks can be granted yet.
+            let hold = log.segments.counted_io().requests().hold_io_thread();
+            let first = in_frame(|| log.admit(&mut wait, framed_len(100)));
+            let first_is_io = matches!(first, Ok(IOResult::IO(_)));
+            let in_place = on(&io.probe.calls(), &this_thread());
+            drop(hold);
+            let granted = in_frames(&dyn_io, || log.admit(&mut wait, framed_len(100))).is_ok();
+            let settled_after = settled(&log);
+            let calls = io.probe.calls();
+            let ran = log.segments.counted_io().log_units() > units;
+            drop((first, held, wait));
+            drop(log);
+            assert!(quiet && settled_after, "the units did not end within {SETTLE:?}");
+            assert!(first_is_io, "the admission did not return its wait");
+            assert_eq!(in_place, vec![], "the polling thread's backend calls in the frame");
+            assert!(granted, "the admission never granted");
+            assert!(ran, "no unit of the log's ran");
+            assert!(
+                has(&on(&calls, IO_THREAD), "sync"),
+                "the IO thread made no sync: {calls:?}"
+            );
+            assert!(
+                on(&calls, &this_thread()).is_empty(),
+                "the polling thread made backend calls: {calls:?}"
+            );
+        },
+    );
+    child_ended_cleanly(ended);
+}
+
+/// D2c §3.2 (child): `wait_durable` in a frame rings the log's door and returns its registration;
+/// it is done once the unit's sync lands, and the polling thread makes no backend call (mutant
+/// `wait-flushes-in-place`: the frame census ends the child at the segment's write).
+#[cfg(all(unix, not(miri)))]
+#[test]
+fn a_durability_wait_in_a_frame_rings_the_log_and_is_done_once_its_sync_lands() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_durability_wait_in_a_frame_rings_the_log_and_is_done_once_its_sync_lands"
+        ),
+        || {
+            let io = UnitIO::new(false);
+            let dyn_io: Arc<dyn IO> = io.clone();
+            let log = open_async(&io, small(), 1);
+            let quiet = durable_start_async(&log, &dyn_io);
+            let lsn = append(&log, &dyn_io, 100);
+            io.probe.clear();
+            let mut wait = LogWait::default();
+            // The IO thread held across the first poll: the log's sync, which alone advances
+            // durability, is its unit's, so nothing that poll rechecks can be granted yet.
+            let hold = log.segments.counted_io().requests().hold_io_thread();
+            let first = in_frame(|| log.wait_durable(&mut wait, lsn));
+            let first_is_io = matches!(first, Ok(IOResult::IO(_)));
+            let in_place = on(&io.probe.calls(), &this_thread());
+            drop(hold);
+            let done = in_frames(&dyn_io, || log.wait_durable(&mut wait, lsn)).is_ok();
+            let durable = log.durable() >= lsn;
+            let settled_after = settled(&log);
+            let calls = io.probe.calls();
+            drop((first, wait));
+            drop(log);
+            assert!(
+                quiet && settled_after,
+                "the units did not end within {SETTLE:?}"
+            );
+            assert!(first_is_io, "the wait did not return its registration");
+            assert_eq!(
+                in_place,
+                vec![],
+                "the polling thread's backend calls in the frame"
+            );
+            assert!(
+                done && durable,
+                "the wait never done, or done short of its mark"
+            );
+            assert!(
+                has(&on(&calls, IO_THREAD), "sync"),
+                "the IO thread made no sync: {calls:?}"
+            );
+            assert!(
+                on(&calls, &this_thread()).is_empty(),
+                "the polling thread made backend calls: {calls:?}"
+            );
+        },
+    );
+    child_ended_cleanly(ended);
+}
+
+/// D2c §1: a job's one turn of the flush, asked in a frame with its mark not yet durable, is
+/// refused by name: units run on workers, never in a frame.
+#[test]
+fn a_jobs_turn_of_the_flush_asked_in_a_frame_is_refused_by_name() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    let lsn = append(&log, &dyn_io, 100);
+    let pending = log.durable() < lsn && log.failure().is_none();
+    let mut wait = LogWait::default();
+    let refused = in_frame(|| log.wait_durable_turn(&mut wait, lsn))
+        .err()
+        .map(|e| e.to_string());
+    let outside = drive(&dyn_io, || log.wait_durable(&mut wait, lsn)).is_ok();
+    let settled_after = settled(&log);
+    drop(wait);
+    drop(log);
+    assert!(
+        quiet && settled_after,
+        "the units did not end within {SETTLE:?}"
+    );
+    assert!(
+        pending,
+        "the mark already durable, or the log failed, before the turn"
+    );
+    assert!(
+        refused.as_deref().is_some_and(
+            |e| e.contains("a job's turn of the log's flush asked in a cooperative frame")
+        ),
+        "the turn in a frame: {refused:?}"
+    );
+    assert!(outside, "the same wait outside a frame never done");
+}
+
+/// The room of one append, one group of two and one publish, each of `payload` bytes, admitted
+/// outside any frame.
+fn three_admissions(log: &Arc<Log>, io: &Arc<dyn IO>, payload: usize) -> [Admitted; 3] {
+    let one = framed_len(payload);
+    let publish = framed_len(payload).next_multiple_of(BLOCK) + BLOCK;
+    [one, 2 * one, publish]
+        .map(|bytes| drive(io, || log.admit(&mut LogWait::default(), bytes)).unwrap())
+}
+
+/// An append, a group of two and a publish of `p`, each in its own room of `rooms`: their last
+/// positions.
+fn the_three_appends(
+    log: &Arc<Log>,
+    rooms: &mut [Admitted; 3],
+    p: &[u8],
+    config: &LogConfig,
+) -> [Lsn; 3] {
+    let [one, group, publish] = rooms;
+    let appended = log.append(one, &header(), &[p]);
+    let (_, grouped) = log.append_group_with(group, &[(header(), &[p]), (header(), &[p])], |_| {});
+    let mut block = AlignedBlock::zeroed(config.chunk_bytes as usize);
+    block.bytes_mut()[record::HEADER..record::HEADER + p.len()].copy_from_slice(p);
+    let (_, published) = log.publish(publish, &header(), block, p.len(), |_| {});
+    [appended, *grouped.last().unwrap(), published]
+}
+
+/// D2c §3.3 (child): with a waiter present, an append, a group and a publish in a frame each ring
+/// the log's door and submit nothing on the polling thread; the IO thread's unit, once let go,
+/// writes and syncs them, and the waiter is done (mutant `publish-flushes-in-place`: the frame
+/// census ends the child at the publish's write).
+#[cfg(all(unix, not(miri)))]
+#[test]
+fn an_append_a_group_and_a_publish_in_a_frame_with_a_waiter_ring_and_submit_nothing() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::an_append_a_group_and_a_publish_in_a_frame_with_a_waiter_ring_and_submit_nothing"
+        ),
+        || {
+            let io = UnitIO::new(false);
+            let dyn_io: Arc<dyn IO> = io.clone();
+            let config = small();
+            let log = open_async(&io, config.clone(), 1);
+            let quiet = durable_start_async(&log, &dyn_io);
+            let mut rooms = three_admissions(&log, &dyn_io, 100);
+            let lsn = append(&log, &dyn_io, 100);
+            let counted = log.segments.counted_io().clone();
+            let hold = counted.requests().hold_io_thread();
+            io.probe.clear();
+            let mut waiter = LogWait::default();
+            let registered = matches!(
+                in_frame(|| log.wait_durable(&mut waiter, lsn)),
+                Ok(IOResult::IO(_))
+            );
+            let p = vec![9u8; 100];
+            let ends = in_frame(|| the_three_appends(&log, &mut rooms, &p, &config));
+            let in_place = on(&io.probe.calls(), &this_thread());
+            let door = counted.log_door();
+            let failure = log.failure();
+            drop(hold);
+            let last = *ends.iter().max().unwrap();
+            let done = in_frames(&dyn_io, || log.wait_durable(&mut waiter, last)).is_ok();
+            let settled_after = settled(&log);
+            let calls = io.probe.calls();
+            drop((rooms, waiter, counted));
+            drop(log);
+            assert!(
+                quiet && settled_after,
+                "the units did not end within {SETTLE:?}"
+            );
+            assert!(registered, "the waiter did not register");
+            assert_eq!(
+                in_place,
+                vec![],
+                "the polling thread's backend calls in the frame"
+            );
+            assert_eq!(door, RUNG, "the door while its unit is held");
+            assert_eq!(failure, None, "the log failed");
+            assert!(done, "the waiter never done");
+            assert!(
+                has(&on(&calls, IO_THREAD), "sync"),
+                "the IO thread made no sync: {calls:?}"
+            );
+            assert!(
+                on(&calls, &this_thread()).is_empty(),
+                "the polling thread made backend calls: {calls:?}"
+            );
+        },
+    );
+    child_ended_cleanly(ended);
+}
+
+/// D2c §3.4: with the database's count sealed, an append, a group and a publish in a frame, each
+/// with a waiter present, return their positions and fail the log: the next `wait_durable` and
+/// the next admission return that failure. The waiter is an admission whose own ring was refused.
+/// No worker, so nothing but the test's calls makes the log's IO after the seal (mutant
+/// `ring-error-dropped`: the refusal ignored, and nothing fails).
+#[test]
+fn a_refused_ring_of_an_append_a_group_or_a_publish_fails_the_log() {
+    let mut seen = Vec::new();
+    for which in 0..3 {
+        let io = UnitIO::new(false);
+        let dyn_io: Arc<dyn IO> = io.clone();
+        let config = small();
+        let log = open_async(&io, config.clone(), 0);
+        let quiet = durable_start_async(&log, &dyn_io);
+        let mut rooms = three_admissions(&log, &dyn_io, 100);
+        let quiet = quiet && settled(&log);
+        let counted = log.segments.counted_io().clone();
+        let counted_io: Arc<dyn IO> = counted.clone();
+        counted.requests().drain(&*counted_io);
+        let held = log.hold_buffer_room();
+        let refused = in_frame(|| log.admit(&mut LogWait::default(), framed_len(100)))
+            .err()
+            .map(|e| e.to_string());
+        let waiting = log.admitting();
+        let p = vec![5u8; 100];
+        let [one, group, publish] = &mut rooms;
+        let at = in_frame(|| match which {
+            0 => log.append(one, &header(), &[&p]),
+            1 => *log
+                .append_group_with(group, &[(header(), &[&p]), (header(), &[&p])], |_| {})
+                .1
+                .last()
+                .unwrap(),
+            _ => {
+                let mut block = AlignedBlock::zeroed(config.chunk_bytes as usize);
+                block.bytes_mut()[record::HEADER..record::HEADER + p.len()].copy_from_slice(&p);
+                log.publish(publish, &header(), block, p.len(), |_| {}).1
+            }
+        });
+        let failed = log.failure().is_some();
+        let durable = in_frame(|| log.wait_durable(&mut LogWait::default(), at))
+            .err()
+            .map(|e| e.to_string());
+        let admit = in_frame(|| log.admit(&mut LogWait::default(), framed_len(10)))
+            .err()
+            .map(|e| e.to_string());
+        drop((rooms, held, counted, counted_io));
+        drop(log);
+        seen.push((which, quiet, refused, waiting, failed, durable, admit));
+    }
+    for (which, quiet, refused, waiting, failed, durable, admit) in seen {
+        assert!(quiet, "{which}: the units did not end within {SETTLE:?}");
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|e| e.contains("a closed database's log")),
+            "{which}: the waiter's own admission: {refused:?}"
+        );
+        assert!(waiting, "{which}: no admitter left waiting");
+        let refusal = "the log's ring refused at a closed database";
+        assert_eq!(
+            (
+                failed,
+                durable.as_deref().is_some_and(|e| e.contains(refusal)),
+                admit.as_deref().is_some_and(|e| e.contains(refusal))
+            ),
+            (true, true, true),
+            "{which}: (the log failed, wait_durable refused, the next admission refused): {durable:?} {admit:?}"
+        );
+    }
+}
+
+/// D2c §3.5: a caller's ring takes its count before it moves the door. While the door is rung,
+/// a ring takes one count and lets it go, the requests' count back as it was; on a sealed count
+/// a ring returns the closed error and leaves the door quiet (mutant `ring-before-count`: the
+/// door moved first, left rung with no count after the refusal).
+#[test]
+fn a_callers_ring_counts_before_the_door_and_a_refused_one_leaves_the_door_quiet() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    // The preparer at rest first: a request of the preparation the first block made due, in
+    // flight, would count among the requests' outstanding; with everything appended already
+    // durable, its finish's turn of the flush writes nothing.
+    let rested = preparer_resting_within(&log);
+    let counted = log.segments.counted_io().clone();
+    let requests = counted.requests().clone();
+    let hold = requests.hold_io_thread();
+    let first = counted.ring_log_from_frame().is_ok();
+    let (door_rung, count_rung) = (counted.log_door(), requests.outstanding());
+    let second = counted.ring_log_from_frame().is_ok();
+    let (door_again, count_again) = (counted.log_door(), requests.outstanding());
+    drop(hold);
+    let quiet = quiet && settled(&log);
+    let counted_io: Arc<dyn IO> = counted.clone();
+    requests.drain(&*counted_io);
+    let refused = counted.ring_log_from_frame().err().map(|e| e.to_string());
+    let (door_refused, count_refused) = (counted.log_door(), requests.outstanding());
+    drop((requests, counted, counted_io));
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(rested, "the preparer did not rest within {SETTLE:?}");
+    assert!(first && second, "a ring on an open database refused");
+    assert_eq!(door_rung, RUNG, "the door after the first ring");
+    assert_eq!(
+        (door_again, count_again),
+        (RUNG, count_rung),
+        "(the door, the count) after a ring of a rung door"
+    );
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("a closed database's log")),
+        "the ring on a sealed count: {refused:?}"
+    );
+    assert_eq!(
+        (door_refused, count_refused),
+        (0, 0),
+        "(the door, the count) after the refused ring"
+    );
+}
+
+/// D2c §3.6: an admission in a frame at the prepared end waits on the preparer: its first poll is
+/// IO with the preparer's demand registered, while the worker's preparation is held at its first
+/// write or sync; once that is answered, the worker's step moves the prepared end and finishes the
+/// admission's wait, and the admission is then granted. This thread steps the preparer never.
+#[test]
+fn an_admission_in_a_frame_waits_on_the_preparer_its_worker_steps() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    // The preparer at rest first: the preparation the first block made due published and its
+    // finish over, so the next one it starts is the test's to hold.
+    let rested = preparer_resting_within(&log);
+    // Every write and sync held; the room left before the prepared end taken; one admission past
+    // it, outside any frame, makes the preparer due, and the worker's step is held at its first
+    // write or sync, so the prepared end cannot move until the test answers.
+    io.probe.hold_all(true);
+    let held = log.hold_prepared_room();
+    let prepared_held = log.room.prepared_end();
+    let mut outside = LogWait::default();
+    let made_due = matches!(
+        log.admit(&mut outside, framed_len(100)),
+        Ok(IOResult::IO(_))
+    );
+    let preparing = held_within(&io.probe);
+    let claims = super::preparer::CLAIMS.with(|n| n.get());
+    let mut wait = LogWait::default();
+    let first = in_frame(|| log.admit(&mut wait, framed_len(100)));
+    let first_is_io = matches!(first, Ok(IOResult::IO(_)));
+    let first_wait = match &first {
+        Ok(IOResult::IO(c)) => Some(c.0.clone()),
+        _ => None,
+    };
+    let demanded = wait.demand.is_some();
+    let stepped_in_frame = super::preparer::CLAIMS.with(|n| n.get()) - claims;
+    let prepared_before = log.room.prepared_end();
+    // Let go: the worker's preparation ends, moves the prepared end and wakes the admitters, with
+    // the room still held; the buffer's own bound keeps that room's grant from fitting, so the
+    // room goes back only after, and then the admission is granted.
+    io.probe.hold_all(false);
+    let answered = answer_all(&log, &io.probe);
+    // The wait first: the worker's step publishes the prepared end before it wakes the
+    // admitters, so a wait seen finished orders the read of the prepared end after it.
+    let woke = first_wait.as_ref().is_some_and(finished_within);
+    let prepared_after = log.room.prepared_end();
+    drop(held);
+    let granted = in_frames(&dyn_io, || log.admit(&mut wait, framed_len(100))).is_ok();
+    let stepped_here = super::preparer::CLAIMS.with(|n| n.get()) - claims;
+    let settled_after = settled(&log);
+    drop((first, first_wait, wait, outside));
+    drop(log);
+    assert!(
+        quiet && settled_after,
+        "the units did not end within {SETTLE:?}"
+    );
+    assert!(rested, "the preparer did not rest within {SETTLE:?}");
+    assert!(
+        made_due && preparing,
+        "the worker's preparation not held: (made due {made_due}, held {preparing})"
+    );
+    assert_eq!(
+        prepared_before, prepared_held,
+        "the prepared end moved before the test answered"
+    );
+    assert!(
+        first_is_io && demanded,
+        "the frame's admission did not wait on the preparer: (IO {first_is_io}, demand {demanded})"
+    );
+    assert_eq!(stepped_in_frame, 0, "the preparer stepped in the frame");
+    assert!(answered, "the held requests not answered within {SETTLE:?}");
+    assert!(
+        woke,
+        "the frame's wait not finished by the worker's preparation"
+    );
+    assert!(
+        prepared_after > prepared_before,
+        "the worker's step did not move the prepared end: {prepared_before} then {prepared_after}"
+    );
+    assert!(granted, "the admission never granted");
+    assert_eq!(
+        stepped_here, 0,
+        "the preparer stepped on the polling thread"
+    );
+}
+
+/// Whether the log's preparer rests within [`SETTLE`], looked at once a millisecond: more than a
+/// segment prepared ahead of what is admitted, and then its task idle. The prepared end is
+/// published inside a running step, and a step with more to do is queued again without passing
+/// idle, so idle read after it comes after that finish's turn of the flush was taken. With more
+/// than a segment prepared ahead and no admission waiting past the prepared end, no later step
+/// starts a preparation: the task rests, and no worker writes or moves the prepared end until an
+/// admission brings the reach within a segment of it.
+fn preparer_resting_within(log: &Log) -> bool {
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let (ahead, segment) = log.prepared_ahead();
+        if ahead > segment && log.preparer().idle() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Whether `c` finished within [`SETTLE`], looked at once a millisecond: for a wait another thread
+/// finishes.
+fn finished_within(c: &Completion) -> bool {
+    let deadline = Instant::now() + SETTLE;
+    while !c.finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
+/// Whether the probe holds a request within [`SETTLE`], looked at once a millisecond: for a
+/// request another thread makes.
+fn held_within(probe: &Probe) -> bool {
+    let deadline = Instant::now() + SETTLE;
+    while probe.queued().is_empty() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
+/// D2c §3.6 (child): in a frame, a log whose preparer no worker drives is the named error, never
+/// a step in place: the preparer's steps on this thread are unchanged (mutant
+/// `frame-runs-preparer`: the step runs, and the frame census ends the child at the segment
+/// file's open).
+#[cfg(all(unix, not(miri)))]
+#[test]
+fn an_undriven_preparer_found_in_a_frame_is_an_error_and_never_a_step() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::an_undriven_preparer_found_in_a_frame_is_an_error_and_never_a_step"
+        ),
+        || {
+            let io = UnitIO::new(false);
+            let dyn_io: Arc<dyn IO> = io.clone();
+            let log = open_async(&io, small(), 0);
+            let quiet = durable_start_async(&log, &dyn_io);
+            let held = log.hold_prepared_room();
+            let claims = super::preparer::CLAIMS.with(|n| n.get());
+            let refused = in_frame(|| log.admit(&mut LogWait::default(), framed_len(100)))
+                .err()
+                .map(|e| e.to_string());
+            let stepped_here = super::preparer::CLAIMS.with(|n| n.get()) - claims;
+            drop(held);
+            let settled_after = settled(&log);
+            drop(log);
+            assert!(
+                quiet && settled_after,
+                "the units did not end within {SETTLE:?}"
+            );
+            assert!(
+                refused.as_deref().is_some_and(|e| e.contains(
+                    "the log's preparer has no worker driving it, found in a cooperative frame"
+                )),
+                "the admission in a frame: {refused:?}"
+            );
+            assert_eq!(stepped_here, 0, "the preparer stepped in the frame");
+        },
+    );
+    child_ended_cleanly(ended);
+}
+
+/// A log in a database opened async over the real ring, its files under `dir` and written
+/// buffered, with one worker.
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+fn open_async_on_the_ring(dir: &tempfile::TempDir) -> (Arc<dyn IO>, AloneLog) {
+    let ring: Arc<dyn IO> = Arc::new(crate::io::UringIO::new().unwrap());
+    let base = dir.path().join("ring");
+    let config = LogConfig {
+        direct: false,
+        ..small()
+    };
+    let log = Log::open_async(ring.clone(), base.to_str().unwrap(), config, 1).unwrap();
+    (ring, log)
+}
+
+/// D2c §3.10 (child): §3.1 over the real ring: an admission in a frame that must wait returns IO,
+/// the frame census holds, and it is granted once the IO thread's flush lands.
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+#[test]
+fn over_the_ring_an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::over_the_ring_an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted"
+        ),
+        || {
+            let dir = tempfile::tempdir().unwrap();
+            let (ring, log) = open_async_on_the_ring(&dir);
+            let quiet = durable_start_async(&log, &ring);
+            // On the ring a write is durable once delivered, so any flush's write raises
+            // durability, the IO thread's or a worker's. The preparer at rest first, its finish's
+            // turn of the flush taken with everything appended already durable, and then the IO
+            // thread held across the first poll: nothing writes, so nothing that poll rechecks
+            // can be granted yet.
+            let rested = preparer_resting_within(&log);
+            append(&log, &ring, 100);
+            let held = log.hold_buffer_room();
+            let mut wait = LogWait::default();
+            let hold = log.segments.counted_io().requests().hold_io_thread();
+            let first = in_frame(|| log.admit(&mut wait, framed_len(100)));
+            let first_is_io = matches!(first, Ok(IOResult::IO(_)));
+            drop(hold);
+            let granted = in_frames(&ring, || log.admit(&mut wait, framed_len(100))).is_ok();
+            let settled_after = settled(&log);
+            drop((first, held, wait));
+            drop(log);
+            assert!(
+                quiet && settled_after,
+                "the units did not end within {SETTLE:?}"
+            );
+            assert!(rested, "the preparer did not rest within {SETTLE:?}");
+            assert!(first_is_io, "the admission did not return its wait");
+            assert!(granted, "the admission never granted");
+        },
+    );
+    child_ended_cleanly(ended);
+}
+
+/// D2c §3.10 (child): §3.3 over the real ring: with a waiter present and the IO thread held, an
+/// append, a group and a publish in a frame ring the door and the frame census holds; let go, the
+/// unit makes them durable and the waiter is done.
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+#[test]
+fn over_the_ring_an_append_a_group_and_a_publish_in_a_frame_ring_and_submit_nothing() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::over_the_ring_an_append_a_group_and_a_publish_in_a_frame_ring_and_submit_nothing"
+        ),
+        || {
+            let dir = tempfile::tempdir().unwrap();
+            let (ring, log) = open_async_on_the_ring(&dir);
+            let config = LogConfig {
+                direct: false,
+                ..small()
+            };
+            let quiet = durable_start_async(&log, &ring);
+            // The preparer at rest first, as in §3.1 over the ring: no worker's flush writes, and
+            // so makes nothing durable, while the IO thread is held.
+            let rested = preparer_resting_within(&log);
+            let mut rooms = three_admissions(&log, &ring, 100);
+            let lsn = append(&log, &ring, 100);
+            let counted = log.segments.counted_io().clone();
+            let hold = counted.requests().hold_io_thread();
+            let mut waiter = LogWait::default();
+            let registered = matches!(
+                in_frame(|| log.wait_durable(&mut waiter, lsn)),
+                Ok(IOResult::IO(_))
+            );
+            let p = vec![9u8; 100];
+            let ends = in_frame(|| the_three_appends(&log, &mut rooms, &p, &config));
+            let door = counted.log_door();
+            let failure = log.failure();
+            drop(hold);
+            let last = *ends.iter().max().unwrap();
+            let done = in_frames(&ring, || log.wait_durable(&mut waiter, last)).is_ok();
+            let settled_after = settled(&log);
+            drop((rooms, waiter, counted));
+            drop(log);
+            assert!(
+                quiet && settled_after,
+                "the units did not end within {SETTLE:?}"
+            );
+            assert!(rested, "the preparer did not rest within {SETTLE:?}");
+            assert!(registered, "the waiter did not register");
+            assert_eq!(door, RUNG, "the door while its unit is held");
+            assert_eq!(failure, None, "the log failed");
+            assert!(done, "the waiter never done");
+        },
+    );
+    child_ended_cleanly(ended);
+}

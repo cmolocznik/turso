@@ -7377,3 +7377,772 @@ fn a_rollback_statement_dropped_mid_ending_finishes_it() {
 fn a_rollback_statement_whose_ending_needs_no_io_is_done_in_its_first_call() {
     a_rollback_statement_steps_its_ending(692, false, false);
 }
+
+/// Facade reads in a frame of a database opened async (ASYNC1 D2e §2.2): each test's body in a
+/// child of its own.
+#[cfg(all(unix, not(miri)))]
+mod in_frames {
+    use super::*;
+
+    // ---------------------------------------------- facade reads in a frame (ASYNC1 D2e §2.2)
+
+    /// A database opened async (ASYNC1 D2a): a cold read inside a cooperative frame is queued for
+    /// its IO thread and returns IO, and the test waits for it outside the frame.
+    fn deferred(path: &str) -> (Arc<dyn IO>, Arc<Database>, Arc<Connection>) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = crate::storage::atoll::requests::opened_async(|| open(&io, path));
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        (io, db, conn)
+    }
+
+    /// Checkpoints everything written so far, so the pages written are clean and can be evicted:
+    /// twice, the second writing the page-table pages the first changed as it placed the pages.
+    fn checkpointed(conn: &Arc<Connection>) {
+        rows(conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+        rows(conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+
+    /// The database's IO thread held before its next idle, until the sender returned drops.
+    fn held_io(db: &Database) -> std::sync::mpsc::Sender<()> {
+        let atoll = db.atoll.as_ref().unwrap().atoll();
+        crate::storage::atoll::testing::io_thread_held_before_idle_unregistered(
+            atoll.requests_for_test(),
+        )
+        .expect("the IO thread held before its idle")
+    }
+
+    /// Waits for the IO thread's idle note `idle` armed before the work: whether it came.
+    fn idled(idle: &std::sync::mpsc::Receiver<()>) -> bool {
+        idle.recv_timeout(std::time::Duration::from_secs(20))
+            .is_ok()
+    }
+
+    /// Waits until every request on the database's files has retired: whether they did.
+    fn retired(db: &Database) -> bool {
+        let atoll = db.atoll.as_ref().unwrap().atoll();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while atoll.outstanding_requests() != 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// Waits outside any frame for `c`, which the IO thread finishes: whether it finished.
+    fn waited(io: &Arc<dyn IO>, c: &crate::Completion) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !c.finished() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            let _ = io.step();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// Evicts every page nothing holds or keeps, the pool's and the metadata cache's. The last
+    /// metadata read's request a test build keeps on this thread (`meta::LAST_READ`), whose callback
+    /// holds its page, is dropped first, so only what the read itself keeps stays (#5231).
+    fn chill(db: &Database) {
+        drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+        let atoll = db.atoll.as_ref().unwrap().atoll();
+        atoll.pool().evict_all_clean();
+        atoll.store().meta().evict_all();
+    }
+
+    /// What a facade read kept across its calls did.
+    struct Framed<T> {
+        value: T,
+        calls: usize,
+        /// The pool's pages and the metadata pages loaded meanwhile, in order.
+        pool: Vec<u64>,
+        meta: Vec<crate::storage::atoll::meta::MetaId>,
+    }
+
+    /// Calls `read` in a test frame until it is done. Each return for IO is checked to hold no guard
+    /// of the connection's transaction and to keep the read's state; it is delivered outside the
+    /// frame, its load landed and its request retired, and every page nothing keeps is evicted
+    /// before the next call.
+    fn in_frames_chilled<T>(
+        io: &Arc<dyn IO>,
+        db: &Database,
+        ct: &crate::storage::atoll::sql::mode::ConnTxn,
+        mut read: impl FnMut(
+            &mut Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
+        ) -> crate::Result<crate::types::IOResult<T>>,
+    ) -> Framed<T> {
+        use crate::types::{IOCompletions, IOResult};
+        let atoll = db.atoll.as_ref().unwrap().atoll();
+        let (pool_before, meta_before) = (
+            atoll.pool().loaded_pages().len(),
+            atoll.store().meta().loaded_pages().len(),
+        );
+        let mut kept = None;
+        let mut calls = 0;
+        let value = loop {
+            calls += 1;
+            // The IO thread held before its idle while the call runs, so whatever the call
+            // queues is still waiting when it returns (#5249); let go once it has, the idle
+            // note armed first so it is of the idle after that work.
+            let held = held_io(db);
+            let out = {
+                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                read(&mut kept).unwrap()
+            };
+            let idle = atoll.io_idle_for_test();
+            drop(held);
+            assert!(
+                ct.cell.try_lock().is_some(),
+                "call {calls}: a guard of the transaction held across the return"
+            );
+            match out {
+                IOResult::Done(value) => {
+                    assert!(kept.is_none(), "a finished read's state kept");
+                    break value;
+                }
+                IOResult::IO(IOCompletions(c)) => {
+                    assert!(
+                        kept.is_some(),
+                        "call {calls}: the read's state not kept across its return"
+                    );
+                    assert!(waited(io, &c), "call {calls}: its wait never finished");
+                    // Every request retired, so no record of one holds a frame the eviction below
+                    // would otherwise take, and the IO thread idle again, so no capture of its own
+                    // holds a page either (#5248).
+                    assert!(
+                        retired(db),
+                        "call {calls}: a request still outstanding before the eviction"
+                    );
+                    assert!(
+                        idled(&idle),
+                        "call {calls}: the IO thread never went idle after its work"
+                    );
+                    chill(db);
+                }
+            }
+            assert!(calls < 64, "the read did not finish within {calls} calls");
+        };
+        Framed {
+            value,
+            calls,
+            pool: atoll.pool().loaded_pages()[pool_before..].to_vec(),
+            meta: atoll.store().meta().loaded_pages()[meta_before..].to_vec(),
+        }
+    }
+
+    /// Asserts no page was loaded twice, the pool's and the metadata cache's counted apart, and that
+    /// the read took at most a call for each page it loaded and one more.
+    fn loaded_once<T>(what: &str, framed: &Framed<T>) {
+        loaded_at_most(what, framed, 1);
+    }
+
+    /// Asserts no page was loaded more than `times` times, the pool's and the metadata cache's
+    /// counted apart, and that the read took at most a call for each page it loaded and one more. A
+    /// read of `times` keys whose descents share pages above their leaves loads a shared page again
+    /// only for a later key's descent, once that page was let go for the page below it: at most once
+    /// a key (ASYNC1 D2e §2.2b, #5216).
+    fn loaded_at_most<T>(what: &str, framed: &Framed<T>, times: usize) {
+        fn most<P: std::hash::Hash + Eq>(pages: &[P]) -> usize {
+            let mut counts = std::collections::HashMap::new();
+            for p in pages {
+                *counts.entry(p).or_insert(0) += 1;
+            }
+            counts.into_values().max().unwrap_or(0)
+        }
+        assert!(
+            most(&framed.pool) <= times && most(&framed.meta) <= times,
+            "{what}: the page loaded again on re-entry, past {times} a page: pool {:?}, metadata {:?}",
+            framed.pool,
+            framed.meta
+        );
+        let loads = framed.pool.len() + framed.meta.len();
+        assert!(
+            framed.calls <= loads + 1,
+            "{what}: {} calls for {loads} loads",
+            framed.calls
+        );
+        assert!(loads > 0, "{what}: nothing was cold");
+    }
+
+    /// A transaction begun on `conn` for a read, and its connection's facade.
+    fn reading<'c>(
+        io: &Arc<dyn IO>,
+        conn: &'c Arc<Connection>,
+    ) -> &'c crate::storage::atoll::sql::mode::ConnTxn {
+        let ct = conn.atoll().expect("Atoll mode");
+        crate::storage::atoll::drive(io, || {
+            ct.begin(crate::storage::atoll::sql::mode::Begin::Read)
+        })
+        .unwrap();
+        ct
+    }
+
+    /// The schema cookie and the header, read in a frame of a transaction whose header pages and
+    /// the metadata pages that locate them are cold: each returns IO holding no guard of the
+    /// transaction, goes on where it stopped when called again, every page not kept evicted between
+    /// calls, and finishes with the synchronous value, no page loaded twice (mutants `field-parks`,
+    /// `no-keep`, the metadata keep removed).
+    #[test]
+    fn a_cold_header_read_in_a_frame_returns_io_and_finishes_with_its_synchronous_value() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_cold_header_read_in_a_frame_returns_io_and_finishes_with_its_synchronous_value"
+            ),
+            || {
+                let (io, db, conn) = deferred("/db/frame-header");
+                conn.execute("CREATE TABLE t (a)").unwrap();
+                checkpointed(&conn);
+                let other = db.connect(ConnectOpts::new()).unwrap();
+                let (cookie, header) = {
+                    // Read once synchronously, which opens every file the reads reach.
+                    let ct = reading(&io, &other);
+                    (ct.schema_cookie().unwrap(), ct.header().unwrap())
+                };
+                let ct = reading(&io, &conn);
+                // The pages the begins changed, written, so the eviction below takes them too.
+                let ck = db.connect(ConnectOpts::new()).unwrap();
+                checkpointed(&ck);
+                chill(&db);
+                let framed = in_frames_chilled(&io, &db, ct, |read| ct.schema_cookie_in(read));
+                assert_eq!(framed.value, cookie, "the schema cookie read in frames");
+                loaded_once("the schema cookie", &framed);
+                assert!(
+                    framed.calls > 1,
+                    "the schema cookie's read never returned IO"
+                );
+                assert!(
+                    !framed.pool.is_empty(),
+                    "the header's tree pages were never cold: metadata {:?}",
+                    framed.meta
+                );
+                let third = db.connect(ConnectOpts::new()).unwrap();
+                let ct = reading(&io, &third);
+                checkpointed(&ck);
+                chill(&db);
+                let framed = in_frames_chilled(&io, &db, ct, |read| ct.header_in(read));
+                assert_eq!(
+                    (
+                        framed.value.schema_cookie.get(),
+                        framed.value.user_version.get()
+                    ),
+                    (header.schema_cookie.get(), header.user_version.get()),
+                    "the header read in frames: (schema cookie, user version)"
+                );
+                loaded_once("the header", &framed);
+                assert!(
+                    !framed.pool.is_empty(),
+                    "the header's tree pages were never cold for the header: metadata {:?}",
+                    framed.meta
+                );
+            },
+        );
+    }
+
+    /// The page store's pages in use, read in a frame with every class's metadata root cold: one
+    /// class's root a call, each kept until the next call, the classes counted so far kept with the
+    /// read; it finishes within a call for each root and one more, with the synchronous count
+    /// (mutants `pages-restarts`, the class loop starting again at the first class each call, and
+    /// `pages-parks`).
+    #[test]
+    fn the_pages_in_use_read_in_a_frame_goes_on_from_the_class_it_stopped_at() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::the_pages_in_use_read_in_a_frame_goes_on_from_the_class_it_stopped_at"
+            ),
+            || {
+                let (io, db, conn) = deferred("/db/frame-pages");
+                conn.execute("CREATE TABLE t (a)").unwrap();
+                conn.execute("INSERT INTO t VALUES (randomblob(100000))")
+                    .unwrap();
+                checkpointed(&conn);
+                let ct = reading(&io, &conn);
+                let pages = ct.pages().unwrap();
+                chill(&db);
+                let framed = in_frames_chilled(&io, &db, ct, |read| ct.pages_in(read));
+                assert_eq!(framed.value, pages, "the pages in use read in frames");
+                loaded_once("the pages in use", &framed);
+                assert!(
+                    framed.meta.len() > 1,
+                    "only {} metadata roots were cold: {:?}",
+                    framed.meta.len(),
+                    framed.meta
+                );
+            },
+        );
+    }
+
+    /// A schema writer's begin whose read set names two trees whose catalog rows are in different
+    /// leaves, both cold, in a frame: the check returns IO at each leaf, goes on from the row it
+    /// stopped at, and finishes with the synchronous answer, each leaf loaded once (mutants
+    /// `since-restarts`, the read set's loop starting again each call, and `since-parks`).
+    #[test]
+    fn a_begins_read_set_check_in_a_frame_goes_on_from_the_row_it_stopped_at() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_begins_read_set_check_in_a_frame_goes_on_from_the_row_it_stopped_at"
+            ),
+            || {
+                use crate::storage::atoll::sql::mode::Begin;
+                let (io, db, conn) = deferred("/db/frame-since");
+                // Enough tables that the catalog's rows span leaves, the last past the first page-table
+                // page's pages.
+                for i in 0..700 {
+                    conn.execute(format!("CREATE TABLE t{i} (a)")).unwrap();
+                }
+                let id = |name: &str| match &rows(
+                    &conn,
+                    &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{name}'"),
+                )[..]
+                {
+                    [row] => match row[0] {
+                        Value::Numeric(crate::Numeric::Integer(id)) => id as u64,
+                        ref other => panic!("{other:?}"),
+                    },
+                    other => panic!("{other:?}"),
+                };
+                checkpointed(&conn);
+                let reads = vec![id("t0"), id("t699")];
+                // A transaction with a snapshot, holding the gate exclusive already, so the begin's check
+                // after its take is its one read of the set.
+                let ct = reading(&io, &conn);
+                crate::storage::atoll::drive(&io, || {
+                    ct.begin_reading(Begin::Write { schema: true }, &[], &mut None)
+                })
+                .unwrap();
+                chill(&db);
+                let framed = in_frames_chilled(&io, &db, ct, |read| {
+                    ct.begin_reading(Begin::Write { schema: true }, &reads, read)
+                });
+                assert!(
+                    !framed.value,
+                    "the begin found itself beginning a transaction"
+                );
+                // Two keys: a page above the leaves loaded again for the second key's descent, at most.
+                loaded_at_most("the read set's check", &framed, reads.len());
+                // The page-table pages that locate the catalog's pages were cold too, and the read crossed
+                // two of them, so a descent waited on a page-table page of its own between a kept node and
+                // its child (#5220, #5226): a page-table page maps `MAP_ENTRIES` pages.
+                let mapped: std::collections::HashSet<_> = framed.meta.iter().collect();
+                assert!(
+                    mapped.len() >= 2,
+                    "the read crossed {} page-table pages, past {} pages a page: pool {:?}, metadata {:?}",
+                    mapped.len(),
+                    crate::storage::atoll::radix::MAP_ENTRIES,
+                    framed.pool,
+                    framed.meta
+                );
+                assert!(
+                    framed.pool.len() > 1,
+                    "the read set's rows were in {} cold leaves",
+                    framed.pool.len()
+                );
+            },
+        );
+    }
+
+    /// A statement reset while its header read waits in a frame (#5219, #5225): `PRAGMA
+    /// schema_version` stepped in a frame of a transaction whose header pages are cold returns IO,
+    /// its read kept in the statement's program state with the exact page it waits for, a pool
+    /// frame in a load's group or a metadata page. `Statement::reset` drops that state, its owner
+    /// and so that keep: the frame no group keeps any more, or the metadata page evictable, once
+    /// the request retired; and the statement stepped again outside any frame finishes with the
+    /// synchronous value (mutant `reset-keeps-read`, the reset leaving the read in place).
+    #[test]
+    fn a_statement_reset_while_its_header_read_waits_lets_the_reads_page_go() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_statement_reset_while_its_header_read_waits_lets_the_reads_page_go"
+            ),
+            || {
+                let (io, db, conn) = deferred("/db/frame-reset");
+                conn.execute("CREATE TABLE t (a)").unwrap();
+                checkpointed(&conn);
+                let expected = rows(&conn, "PRAGMA schema_version");
+                let atoll = db.atoll.as_ref().unwrap().atoll();
+                conn.execute("BEGIN").unwrap();
+                // The transaction begun outside any frame, so the statement's own begin finds it.
+                assert_eq!(
+                    rows(&conn, "SELECT count(*) FROM t"),
+                    vec![vec![Value::from_i64(0)]]
+                );
+                let mut stmt = conn.prepare("PRAGMA schema_version").unwrap();
+                chill(&db);
+                let held = held_io(&db);
+                let stepped = {
+                    let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                    stmt.step().map(|r| matches!(r, crate::StepResult::IO))
+                };
+                let idle = atoll.io_idle_for_test();
+                drop(held);
+                // The load it waits for landed and retired, and the test build's handle on the last
+                // metadata request dropped, so only the read's keep is left of it (#5231).
+                let landed = stmt.pending_io_for_test().is_some_and(|c| waited(&io, &c))
+                    && retired(&db)
+                    && idled(&idle);
+                drop(crate::storage::atoll::meta::LAST_READ.with(|r| r.borrow_mut().take()));
+                let before = stmt.atoll_read_for_test().map(|r| r.keeps_for_test());
+                let (frame, meta) = before.unwrap_or_default();
+                let kept_before = (
+                    frame.map(|f| atoll.pool().frame_kept_for_test(f)),
+                    meta.and_then(|id| atoll.store().meta().pins_of(id)),
+                );
+                stmt.reset().unwrap();
+                let after = stmt.atoll_read_for_test().map(|r| r.keeps_for_test());
+                let all_retired = retired(&db);
+                let kept_after = (
+                    frame.map(|f| atoll.pool().frame_kept_for_test(f)),
+                    meta.and_then(|id| atoll.store().meta().pins_of(id)),
+                );
+                let mut value = None;
+                for _ in 0..1000 {
+                    match stmt.step().unwrap() {
+                        crate::StepResult::Row => {
+                            value = Some(
+                                stmt.row()
+                                    .unwrap()
+                                    .get_values()
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            )
+                        }
+                        crate::StepResult::Done => break,
+                        crate::StepResult::IO => stmt._io().step().unwrap(),
+                        other => panic!("{other:?}"),
+                    }
+                }
+                drop(stmt);
+                conn.execute("COMMIT").unwrap();
+                drop((conn, db));
+                assert_eq!(
+                    stepped.ok(),
+                    Some(true),
+                    "the statement's step in a frame returned IO"
+                );
+                assert!(landed, "the statement's wait never landed and retired");
+                assert!(
+                    before.is_some_and(|(f, m)| f.is_some() || m.is_some()),
+                    "the statement's waiting read kept nothing: {before:?}"
+                );
+                assert_eq!(
+                    kept_before.0,
+                    frame.map(|_| true),
+                    "before the reset, the frame kept for {before:?}"
+                );
+                assert!(
+                    meta.is_none() || kept_before.1.is_some_and(|pins| pins >= 1),
+                    "before the reset, the metadata page's pins {:?} for {before:?}",
+                    kept_before.1
+                );
+                assert_eq!(after, None, "the statement's kept read survived its reset");
+                assert!(all_retired, "a request outstanding after the reset");
+                assert_eq!(
+                    kept_after.0,
+                    frame.map(|_| false),
+                    "after the reset, the frame kept for {before:?}"
+                );
+                // The read's own pin let go: one fewer, whatever else holds the page.
+                assert_eq!(
+                    meta.map(|_| kept_after.1.unwrap_or(0)),
+                    meta.map(|_| kept_before.1.unwrap_or(0) - 1),
+                    "after the reset, the metadata page's pins, one fewer than before, for {before:?}"
+                );
+                assert_eq!(
+                    value.map(|row| vec![row]),
+                    Some(expected),
+                    "the schema version read after the reset"
+                );
+            },
+        );
+    }
+
+    /// A read in a frame whose owner comes short of memory keeps its place in the shortage queue
+    /// across its return (#5180 E1). Memory scarce for every call, the read's calls go on until one
+    /// comes short: after that return the owner it keeps is still queued, holding the frame reserved
+    /// for it, and its next call, still scarce, goes on at that place, its load started in the frame
+    /// reserved; the read then finishes with the synchronous value. A read dropped unfinished gives
+    /// its place back (mutant `read-owner-fresh`, a fresh owner each call, which loses the place and
+    /// its frame at its return and comes short again).
+    #[test]
+    fn a_read_short_of_memory_in_a_frame_keeps_its_place_across_its_return() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_read_short_of_memory_in_a_frame_keeps_its_place_across_its_return"
+            ),
+            || {
+                use crate::types::{IOCompletions, IOResult};
+                let (io, db, conn) = deferred("/db/frame-short");
+                conn.execute("CREATE TABLE t (a)").unwrap();
+                checkpointed(&conn);
+                let other = db.connect(ConnectOpts::new()).unwrap();
+                let cookie = reading(&io, &other).schema_cookie().unwrap();
+                let ct = reading(&io, &conn);
+                let pool = db.atoll.as_ref().unwrap().atoll().pool().clone();
+                chill(&db);
+                let deliver =
+                    |c: crate::Completion| assert!(waited(&io, &c), "a wait never finished");
+                type Kept = Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>;
+                let scarce_call = |ct: &crate::storage::atoll::sql::mode::ConnTxn,
+                                   kept: &mut Kept| {
+                    crate::storage::atoll::buffer::scarce(|| {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        ct.schema_cookie_in(kept).unwrap()
+                    })
+                };
+                let mut kept: Kept = None;
+                // Until a call comes short: the metadata pages it reads first take no frame.
+                let mut short = false;
+                for _ in 0..8 {
+                    match scarce_call(ct, &mut kept) {
+                        IOResult::IO(IOCompletions(c)) => {
+                            if kept.as_ref().is_some_and(|r| r.queued_for_test()) {
+                                short = true;
+                                break;
+                            }
+                            deliver(c);
+                        }
+                        IOResult::Done(_) => break,
+                    }
+                }
+                let place_after_return = pool.shortage_len_for_test();
+                let loads = pool.loaded_pages().len();
+                let mut out = scarce_call(ct, &mut kept);
+                let loaded_at_its_place = pool.loaded_pages().len() > loads;
+                let value = loop {
+                    match out {
+                        IOResult::Done(v) => break v,
+                        IOResult::IO(IOCompletions(c)) => deliver(c),
+                    }
+                    out = {
+                        let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                        ct.schema_cookie_in(&mut kept).unwrap()
+                    };
+                };
+                // A second read short of memory, dropped unfinished: its place goes back.
+                let third = db.connect(ConnectOpts::new()).unwrap();
+                let ct3 = reading(&io, &third);
+                chill(&db);
+                let mut dropped: Kept = None;
+                let mut queued_before_drop = 0;
+                for _ in 0..8 {
+                    match scarce_call(ct3, &mut dropped) {
+                        IOResult::IO(IOCompletions(c)) => {
+                            if dropped.as_ref().is_some_and(|r| r.queued_for_test()) {
+                                queued_before_drop = pool.shortage_len_for_test();
+                                break;
+                            }
+                            deliver(c);
+                        }
+                        IOResult::Done(_) => break,
+                    }
+                }
+                drop(dropped);
+                let queued_after_drop = pool.shortage_len_for_test();
+                drop(pool);
+                drop((third, other, conn, db));
+                assert!(short, "no call of the read came short of memory");
+                assert_eq!(place_after_return, 1, "the read's place after its return");
+                assert!(
+                    loaded_at_its_place,
+                    "the call after the shortage did not go on at its place: no load started"
+                );
+                assert_eq!(value, cookie, "the schema cookie read across the shortage");
+                assert_eq!(
+                    (queued_before_drop, queued_after_drop),
+                    (1, 0),
+                    "the places of a read dropped unfinished, (before, after) the drop"
+                );
+            },
+        );
+    }
+}
+
+/// Every site in the SQL facade that drives an operation to its end, by the function it is in,
+/// and why that function may block its thread (ASYNC1 D2e §1 (i)): each later slice, or D3, that
+/// converts it, or the one condition under which it drives.
+const DRIVE_SITES: &[(&str, &str, &str)] = &[
+    (
+        "integrity.rs",
+        "roots",
+        "slice (iii): the integrity check's walk",
+    ),
+    (
+        "integrity.rs",
+        "reached",
+        "slice (iii): the integrity check's walk",
+    ),
+    (
+        "integrity.rs",
+        "account",
+        "slice (iii): the integrity check's walk",
+    ),
+    ("lifecycle.rs", "drain_lists", "D3: the open phase"),
+    ("mod.rs", "drop", "D3: the database's drop"),
+    ("mod.rs", "open_holding", "D3: the open phase"),
+    ("mod.rs", "ensure_schema_row", "D3: the open phase"),
+    ("mod.rs", "load_committed_header", "D3: the open phase"),
+    (
+        "sequence.rs",
+        "drop_unnamed_sequences",
+        "D3: the open phase",
+    ),
+    ("mode.rs", "row_in", "slice (ii): the cursor's resolution"),
+    (
+        "mode.rs",
+        "pin",
+        "slice (iii): the reparse's pin, with its cookie read",
+    ),
+    (
+        "mode.rs",
+        "read_since_snapshot",
+        "outside a frame only, its own condition: in one, the read is kept",
+    ),
+    (
+        "mode.rs",
+        "rollback_statement",
+        "slice (iii): a statement's rollback",
+    ),
+    (
+        "mode.rs",
+        "read_now",
+        "blocking hosts only: the header's and pages' synchronous forms",
+    ),
+    ("mode.rs", "count_rows", "slice (iii): a Clear's count"),
+    (
+        "mode.rs",
+        "full_checkpoint",
+        "slice (iii): the checkpoint task's work",
+    ),
+    ("mode.rs", "drive_to_end", "D3: an ending's finish and drop"),
+];
+
+/// The facade's reads converted in slice (i): each returns what it waits for, and drives nothing.
+const CONVERTED: &[&str] = &[
+    "schema_cookie_in",
+    "header_in",
+    "pages_in",
+    "read_in",
+    "field_step",
+    "header_step",
+    "field_at",
+    "pages_step",
+    "since_step",
+    "begin_reading",
+];
+
+/// A file's production code: up to its inline test module, which by the house layout comes last.
+fn production_of(code: &str) -> &str {
+    let mut at = 0;
+    while let Some(i) = code[at..].find("#[cfg(") {
+        let start = at + i;
+        let line_end = code[start..].find('\n').map_or(code.len(), |e| start + e);
+        if code[start..line_end].contains("test")
+            && code[line_end..].trim_start().starts_with("mod tests {")
+        {
+            return &code[..start];
+        }
+        at = line_end;
+    }
+    code
+}
+
+/// The functions of `code` that drive an operation to its end, by name, with each site's line.
+fn drive_sites(code: &str) -> Vec<(String, usize)> {
+    let mut sites = Vec::new();
+    let mut within = String::new();
+    for (n, line) in production_of(code).lines().enumerate() {
+        let words: Vec<&str> = line
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        if let Some(i) = words.iter().position(|w| *w == "fn") {
+            if let Some(name) = words.get(i + 1) {
+                if line.trim_start().starts_with("fn ")
+                    || line.trim_start().starts_with("pub")
+                    || line.trim_start().starts_with("unsafe fn")
+                {
+                    within = name.to_string();
+                }
+            }
+        }
+        let calls = |name: &str| {
+            line.match_indices(&format!("{name}(")).any(|(i, _)| {
+                let before = line[..i].chars().last();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    && !line[..i].trim_end().ends_with("fn")
+            })
+        };
+        if calls("drive") || calls("drive_for") {
+            sites.push((within.clone(), n + 1));
+        }
+    }
+    sites
+}
+
+/// The census of the facade's drive sites (ASYNC1 D2e §1 (i)): every function of `sql` that
+/// drives an operation to its end is ruled, every rule names a function that does, and no read
+/// slice (i) converted drives anything (mutant `census-converted-drives`, a drive in a converted
+/// read).
+#[test]
+fn every_drive_site_of_the_facade_is_ruled_and_no_converted_read_drives() {
+    use crate::storage::atoll::testing::{atoll_dir, code_of};
+    let dir = atoll_dir().join("sql");
+    let mut found = std::collections::BTreeSet::new();
+    let mut wrong = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+        if !file.ends_with(".rs") {
+            continue;
+        }
+        let code = code_of(&std::fs::read_to_string(&path).unwrap());
+        for (within, line) in drive_sites(&code) {
+            if CONVERTED.contains(&within.as_str()) {
+                wrong.push(format!(
+                    "sql/{file}:{line}: {within} drives, a converted read"
+                ));
+            } else if !DRIVE_SITES
+                .iter()
+                .any(|(f, name, _)| *f == file && *name == within)
+            {
+                wrong.push(format!("sql/{file}:{line}: {within} drives, ruled nowhere"));
+            }
+            found.insert((file.clone(), within));
+        }
+    }
+    for (file, name, _) in DRIVE_SITES {
+        if !found.contains(&(file.to_string(), name.to_string())) {
+            wrong.push(format!("sql/{file}: {name} is ruled but drives nothing"));
+        }
+    }
+    assert!(
+        found.len() >= DRIVE_SITES.len(),
+        "the census found {found:?}"
+    );
+    assert!(
+        wrong.is_empty(),
+        "the facade's drive sites:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The census's control: a planted drive in a converted read is found, by its function; one in a
+/// test module, or a function named for one, is not.
+#[test]
+fn the_drive_census_sees_a_planted_drive() {
+    let planted = "fn field_step(&self) {\n    let w = drive_for(conn, io, || op())?;\n}\n\
+                   fn drive_for() {}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() { drive(io, || op()); }\n}\n";
+    assert_eq!(
+        drive_sites(planted),
+        vec![("field_step".to_string(), 2)],
+        "the census's sites in the planted code"
+    );
+}

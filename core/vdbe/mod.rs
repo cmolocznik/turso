@@ -1350,6 +1350,9 @@ pub struct ProgramState {
     pub(crate) atoll_create: Option<crate::storage::atoll::sql::mode::CreateOp>,
     /// In Atoll mode, a Destroy or ClearBtree under way (DESIGN.md §17).
     pub(crate) atoll_retire: Option<crate::storage::atoll::sql::mode::RetireOp>,
+    /// In Atoll mode, a facade read under way: a header or schema cookie read, the page count, or
+    /// a Transaction opcode's read-set check (ASYNC1 D2e §2.2).
+    pub(crate) atoll_read: Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
     /// Write activity on the main database when this statement became an
@@ -1480,6 +1483,7 @@ impl ProgramState {
             atoll_commit_failure: None,
             atoll_create: None,
             atoll_retire: None,
+            atoll_read: None,
             is_active_write: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
@@ -1700,6 +1704,7 @@ impl ProgramState {
         if self.atoll_retire.is_some() {
             self.atoll_retire = None;
         }
+        self.atoll_read = None;
         self.is_active_write = false;
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;

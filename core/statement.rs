@@ -822,6 +822,14 @@ impl Statement {
         self._step(None).map_err(|error| self.format_error(error))
     }
 
+    /// The Atoll read this statement keeps across its returns, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn atoll_read_for_test(
+        &self,
+    ) -> Option<&crate::storage::atoll::sql::mode::FacadeRead> {
+        self.state.atoll_read.as_deref()
+    }
+
     /// The pending completion, for tests that count this statement's waiter registrations.
     #[cfg(test)]
     pub(crate) fn pending_io_for_test(&self) -> Option<crate::Completion> {

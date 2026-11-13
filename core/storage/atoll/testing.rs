@@ -199,6 +199,24 @@ pub(super) use crate::source_test::code_of;
 #[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
 pub(super) use crate::child_test::{in_child, record, recorded, Ended};
 
+/// Runs `test`'s body in a child of its own, and fails unless the child ended cleanly: a body
+/// whose assertion fails while an Atoll value is alive ends its process (DESIGN.md 22.11), so the
+/// parent's failure is the ordinary one, showing the child's own words (`test` is the test's full
+/// path, as `in_child` takes it).
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+pub(super) fn cleanly(test: &str, body: impl FnOnce()) {
+    if let Some(ended) = in_child(test, body) {
+        assert!(
+            !ended.aborted && !ended.hung && ended.code == Some(0),
+            "the child ended {:?} (aborted {}, hung {}): {}",
+            ended.code,
+            ended.aborted,
+            ended.hung,
+            ended.stderr
+        );
+    }
+}
+
 /// A mutant's pre-clone check can stop before a freed pointer is read. Catch that test panic
 /// only in this test harness; production Atoll frames and checked guards still abort.
 pub(super) fn catch_test_panic<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {

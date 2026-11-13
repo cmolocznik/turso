@@ -7939,3 +7939,523 @@ fn a_load_whose_read_filled_its_page_judges_its_own_read_not_its_frames_next_pag
         "the record of a request on the frame's next page was let go"
     );
 }
+
+// ------------------------------------------------- a load's group (ASYNC1 D2e §2.2b)
+
+/// A load's group (ASYNC1 D2e §2.2b), natively: each test's body in a child of its own.
+#[cfg(all(unix, not(any(shuttle, atoll_loom, miri))))]
+mod group {
+    use super::*;
+
+    /// A pool over a source whose reads land only when the test lands them, each request leaving the
+    /// backend as soon as it is submitted.
+    fn held_reads_pool(base: &str) -> (Arc<BufferPool>, PendingReads) {
+        let io: Arc<dyn IO> = Arc::new(crate::io::MemoryIO::new());
+        let store = PageStore::open(
+            crate::storage::atoll::requests::counted_for_test(io),
+            base,
+            StoreConfig {
+                file_bytes: 1 << 30,
+                meta_pages: 1 << 10,
+            },
+            [[1; CLASS_COUNT]; crate::storage::atoll::meta::TREES],
+            0,
+        );
+        let reads: PendingReads = Arc::new(crate::storage::atoll::locks::Mutex::new(Vec::new()));
+        let pool = BufferPool::new(
+            BufferConfig::with_budget(MIN_BUDGET),
+            Arc::new(SubmittingSource(reads.clone())),
+            store,
+        )
+        .unwrap();
+        (pool, reads)
+    }
+
+    /// Lands every read the source holds with `result`: how many.
+    fn land(reads: &PendingReads, result: std::result::Result<(), CompletionError>) -> usize {
+        let landed = std::mem::take(&mut *reads.lock());
+        let n = landed.len();
+        for (buffer, done) in landed {
+            buffer.as_mut_slice().fill(0);
+            done(result.clone());
+        }
+        n
+    }
+
+    /// One call of a fix of `pid` as `owner`'s, the page let go at once: whether it was done.
+    fn fixed_as(owner: &mut Owner, pool: &Arc<BufferPool>, pid: PageId) -> bool {
+        let out = owner.call(|| {
+            Ok(match pool.fix_optimistic(pid, None)? {
+                IOResult::Done(_) => IOResult::Done(()),
+                IOResult::IO(io) => IOResult::IO(io),
+            })
+        });
+        matches!(out, Ok(IOResult::Done(())))
+    }
+
+    /// A fix of `pid` outside any owner, the page let go at once: whether it was done.
+    fn fixed_unowned(pool: &Arc<BufferPool>, pid: PageId) -> bool {
+        matches!(pool.fix_optimistic(pid, None), Ok(IOResult::Done(_)))
+    }
+
+    fn frame_of(pool: &BufferPool, pid: PageId) -> u32 {
+        pool.table
+            .find(&pool.frames.headers, pid.raw())
+            .expect("the page's frame")
+    }
+
+    /// How many times `frame` is among `class`'s free frames.
+    fn free_times(pool: &BufferPool, class: SizeClass, frame: u32) -> usize {
+        pool.memory
+            .free_frames(class)
+            .into_iter()
+            .filter(|&f| f == frame)
+            .count()
+    }
+
+    /// Two owners on one load (#5188): A's miss loads the page, and B's fix joins the load while its
+    /// frame is loading and latched. Once the read lands and its request retires, A's next call fixes
+    /// the page and lets its reference go; an eviction forced then passes the frame over for B's
+    /// reference, and B's next call fixes the page without reading it again. Both let go, the page
+    /// is evictable (mutant `joiner-no-keep`, a joiner taking no reference).
+    #[test]
+    fn a_joiner_keeps_the_page_it_waited_for_until_its_next_call() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_joiner_keeps_the_page_it_waited_for_until_its_next_call"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/group-two");
+                let pid = PageId::new(class(0), 1);
+                let (mut a, mut b) = (Owner::new(), Owner::new());
+                assert!(!fixed_as(&mut a, &pool, pid), "A's miss waits for its load");
+                assert!(!fixed_as(&mut b, &pool, pid), "B waits for A's load");
+                let frame = frame_of(&pool, pid);
+                let kept = (a.kept_frame(), b.kept_frame());
+                assert_eq!(land(&reads, Ok(())), 1, "the reads of the page");
+                assert!(fixed_as(&mut a, &pool, pid), "A fixes the page");
+                assert_eq!(a.kept_frame(), None, "A's reference after its call");
+                assert!(
+                    !pool.evict_clean(pid),
+                    "B's page was evicted while B waited for it"
+                );
+                assert!(fixed_as(&mut b, &pool, pid), "B fixes the page");
+                assert_eq!(reads.lock().len(), 0, "B's call read the page again");
+                assert_eq!(b.kept_frame(), None, "B's reference after its call");
+                assert!(
+                    pool.evict_clean(pid),
+                    "the page stayed kept after both let go"
+                );
+                assert!(pool.group(frame).released(), "the group after both let go");
+                assert_eq!(
+                    kept,
+                    (Some(frame), Some(frame)),
+                    "(A, B) keep the loading frame"
+                );
+            },
+        );
+    }
+
+    /// A joiner whose owner is dropped while the load is held lets its reference go then: the
+    /// loader's guard and its own reference keep the frame, and once the loader lets go after its
+    /// next call the frame is evictable, one read made.
+    #[test]
+    fn a_joiner_dropped_while_the_load_is_held_lets_its_reference_go() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_joiner_dropped_while_the_load_is_held_lets_its_reference_go"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/group-dropped");
+                let pid = PageId::new(class(0), 1);
+                let (mut a, mut b) = (Owner::new(), Owner::new());
+                assert!(!fixed_as(&mut a, &pool, pid));
+                assert!(!fixed_as(&mut b, &pool, pid));
+                let frame = frame_of(&pool, pid);
+                drop(b);
+                assert!(
+                    !pool.group(frame).released() && pool.header(frame).record_keeps(),
+                    "the guard and the loader's reference keep the frame"
+                );
+                assert_eq!(land(&reads, Ok(())), 1);
+                assert!(fixed_as(&mut a, &pool, pid), "A fixes the page");
+                assert!(
+                    pool.evict_clean(pid),
+                    "the page stayed kept once both let go"
+                );
+                assert!(pool.group(frame).released());
+            },
+        );
+    }
+
+    /// A joiner's release on either side of the loader's close, which a loader with no owner makes
+    /// with the joiner's the only other reference: before it, the close takes the word to zero and
+    /// lets the group's keep go; just after its subtraction, under the loader's latch, the joiner's
+    /// release does. Either way the keep goes once (a second would fail `ungroup`'s assert), never
+    /// while the joiner holds its reference, and the page is evictable after.
+    #[test]
+    fn a_joiners_release_on_either_side_of_the_close_lets_the_group_go_once() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_joiners_release_on_either_side_of_the_close_lets_the_group_go_once"
+            ),
+            || {
+                for after_the_close in [false, true] {
+                    let (pool, reads) = held_reads_pool("/db/group-close");
+                    let pid = PageId::new(class(0), 1);
+                    assert!(!fixed_unowned(&pool, pid), "the load waits");
+                    let mut b = Owner::new();
+                    assert!(!fixed_as(&mut b, &pool, pid), "B joins the load");
+                    let frame = frame_of(&pool, pid);
+                    assert_eq!(b.kept_frame(), Some(frame));
+                    let kept_at_release = Arc::new(crate::storage::atoll::locks::Mutex::new(None));
+                    if after_the_close {
+                        let (pool, kept_at_release) = (pool.clone(), kept_at_release.clone());
+                        crate::race::at("buffer.group_closed", move || {
+                            *kept_at_release.lock() = Some(pool.header(frame).record_keeps());
+                            drop(b);
+                        });
+                    } else {
+                        *kept_at_release.lock() = Some(pool.header(frame).record_keeps());
+                        drop(b);
+                    }
+                    assert_eq!(land(&reads, Ok(())), 1);
+                    assert!(
+                        !crate::race::pending("buffer.group_closed"),
+                        "the landing never reached the close"
+                    );
+                    assert_eq!(
+                        *kept_at_release.lock(),
+                        Some(true),
+                        "after the close {after_the_close}: the frame was not kept when B let go"
+                    );
+                    assert!(
+                        !pool.header(frame).record_keeps(),
+                        "after the close {after_the_close}: the group's keep stayed"
+                    );
+                    assert!(pool.group(frame).released());
+                    assert!(pool.evict_clean(pid), "after the close {after_the_close}");
+                }
+            },
+        );
+    }
+
+    /// A join refused: a loader with no owner, and B's fix paused just after its probe found the page
+    /// loading. The load lands meanwhile, its close the group's last reference, so B's join finds the
+    /// word at zero: it holds nothing, finishes with the page, and the page is evictable (mutant
+    /// `join-at-zero`, an admission at zero: B's finished call lets that reference go as the group's
+    /// last, and its release fails in the child at "a frame let go by a load's group that did not keep
+    /// it", the keep long gone).
+    #[test]
+    fn a_join_refused_once_its_group_is_released_keeps_nothing() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_join_refused_once_its_group_is_released_keeps_nothing"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/group-refused");
+                let pid = PageId::new(class(0), 1);
+                assert!(!fixed_unowned(&pool, pid), "the load waits");
+                let frame = frame_of(&pool, pid);
+                {
+                    let reads = reads.clone();
+                    crate::race::at("buffer.join_probed", move || {
+                        assert_eq!(land(&reads, Ok(())), 1);
+                    });
+                }
+                let mut b = Owner::new();
+                let done = fixed_as(&mut b, &pool, pid) || fixed_as(&mut b, &pool, pid);
+                assert!(pool.group(frame).released(), "the group after its close");
+                assert!(
+                    !crate::race::pending("buffer.join_probed"),
+                    "B's fix never found the load"
+                );
+                assert!(done, "B's fix of the landed page");
+                assert_eq!(b.kept_frame(), None, "B kept a page its group had let go");
+                assert!(
+                    pool.evict_clean(pid),
+                    "the page was kept after its group let go"
+                );
+            },
+        );
+    }
+
+    /// A late admission: B's fix paused just after its probe found the page loading, and the load
+    /// lands meanwhile with the loader A's reference still held. B's join finds the closed group with
+    /// a reference left and is admitted, two references then, A's and B's, seen right after the join;
+    /// B's fix then finds the page resident and finishes in that call, which lets its reference go.
+    /// The page is read once, and kept until A lets go.
+    #[test]
+    fn a_late_join_is_admitted_to_a_closed_group_with_a_reference_left() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_late_join_is_admitted_to_a_closed_group_with_a_reference_left"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/group-late");
+                let pid = PageId::new(class(0), 1);
+                let mut a = Owner::new();
+                assert!(!fixed_as(&mut a, &pool, pid), "A's load waits");
+                let frame = frame_of(&pool, pid);
+                {
+                    let reads = reads.clone();
+                    crate::race::at("buffer.join_probed", move || {
+                        assert_eq!(land(&reads, Ok(())), 1);
+                    });
+                }
+                let at_join = Arc::new(crate::storage::atoll::locks::Mutex::new(None));
+                {
+                    let (pool, at_join) = (pool.clone(), at_join.clone());
+                    crate::race::at("buffer.joined", move || {
+                        *at_join.lock() = Some(pool.group(frame).references());
+                    });
+                }
+                let mut b = Owner::new();
+                let finished = fixed_as(&mut b, &pool, pid);
+                assert!(
+                    !crate::race::pending("buffer.joined"),
+                    "B's fix never joined"
+                );
+                assert_eq!(
+                    *at_join.lock(),
+                    Some(2),
+                    "the closed group's references right after B's join: A's and B's"
+                );
+                assert!(finished, "B's fix of the resident page");
+                assert_eq!(
+                    b.kept_frame(),
+                    None,
+                    "B's reference after its finished call"
+                );
+                assert_eq!(pool.group(frame).references(), 1, "A's reference left");
+                assert!(!pool.evict_clean(pid), "the page evicted while A kept it");
+                assert!(fixed_as(&mut a, &pool, pid), "A fixes the page");
+                assert_eq!(reads.lock().len(), 0, "the page read again");
+                assert!(pool.evict_clean(pid));
+            },
+        );
+    }
+
+    /// A failed load with a joiner: B's owner dropped before the read fails, and after. The unload
+    /// closes the group and frees the frame, deferred while a reference is left; the last reference's
+    /// release hands the frame to the free frames, exactly once, with nothing of its record or group
+    /// left.
+    #[test]
+    fn a_failed_load_with_a_joiner_frees_its_frame_once_after_its_last_reference() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_failed_load_with_a_joiner_frees_its_frame_once_after_its_last_reference"
+            ),
+            || {
+                for joiner_first in [true, false] {
+                    let (pool, reads) = held_reads_pool("/db/group-failed");
+                    let pid = PageId::new(class(0), 1);
+                    let (mut a, mut b) = (Owner::new(), Owner::new());
+                    assert!(!fixed_as(&mut a, &pool, pid));
+                    assert!(!fixed_as(&mut b, &pool, pid));
+                    let frame = frame_of(&pool, pid);
+                    if joiner_first {
+                        drop(b);
+                        assert_eq!(land(&reads, Err(CompletionError::Aborted)), 1);
+                    } else {
+                        assert_eq!(land(&reads, Err(CompletionError::Aborted)), 1);
+                        assert_eq!(
+                            free_times(&pool, class(0), frame),
+                            0,
+                            "the failed load's frame was freed while B kept it"
+                        );
+                        drop(b);
+                    }
+                    assert_eq!(
+                        free_times(&pool, class(0), frame),
+                        0,
+                        "joiner first {joiner_first}: the frame was freed while the loader kept it"
+                    );
+                    drop(a);
+                    assert_eq!(
+                        free_times(&pool, class(0), frame),
+                        1,
+                        "joiner first {joiner_first}: the frame's frees once its references went"
+                    );
+                    assert!(!pool.header(frame).record_keeps());
+                    assert!(pool.group(frame).released());
+                }
+            },
+        );
+    }
+
+    /// Every frame of a class kept by an owner's reference after its load: a claim of the class
+    /// passes each over and parks, the frames marked waited; one owner dropped tells the claim
+    /// (mutant `keep-forever`, references never released: the claim is never told).
+    #[test]
+    fn an_owner_dropped_while_keeping_tells_a_claim_that_passed_its_frame_over() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::an_owner_dropped_while_keeping_tells_a_claim_that_passed_its_frame_over"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/group-claim");
+                let c = class(9);
+                let mut owners = Vec::new();
+                for i in 0..pool.memory.batches {
+                    let mut owner = Owner::new();
+                    assert!(!fixed_as(&mut owner, &pool, PageId::new(c, i as u64 + 1)));
+                    owners.push(owner);
+                }
+                assert_eq!(land(&reads, Ok(())), pool.memory.batches as usize);
+                let parked = match pool.allocate(c).unwrap() {
+                    IOResult::IO(IOCompletions(wait)) => wait,
+                    IOResult::Done(_) => panic!("a frame its group keeps was evicted"),
+                };
+                assert!(!parked.finished(), "the claim parks behind the kept frames");
+                drop(owners.pop());
+                assert!(
+                    parked.finished(),
+                    "the claim waiting on a kept frame was not told of its release"
+                );
+                drop(parked);
+                drop(owners);
+            },
+        );
+    }
+
+    /// A call that keeps a page it loaded and then comes short of memory in the same call (#5196): the
+    /// read lands while its loader follows it, so the fix is done in the call and its owner keeps the
+    /// page; the call's allocation then comes short. The owner lets its keeps go before it reserves,
+    /// the current call's included, so the shortage waits holding nothing: the page's frame is
+    /// evictable, and the operation's next calls, each handed a wait already finished, finish it
+    /// (mutant `keep-current-on-shortage`).
+    #[test]
+    fn a_shortage_after_a_load_in_the_same_call_keeps_nothing() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_shortage_after_a_load_in_the_same_call_keeps_nothing"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/group-short");
+                let cold = PageId::new(class(0), 1);
+                {
+                    let reads = reads.clone();
+                    crate::race::at("buffer.loader_follows", move || {
+                        assert_eq!(land(&reads, Ok(())), 1);
+                    });
+                }
+                let allocate = || {
+                    Ok(match pool.allocate(class(0))? {
+                        IOResult::Done(_) => IOResult::Done(()),
+                        IOResult::IO(io) => IOResult::IO(io),
+                    })
+                };
+                let mut owner = Owner::new();
+                let out = owner.call(|| {
+                    match pool.fix_optimistic(cold, None)? {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(_) => {
+                            panic!("the read landed while its loader followed it, and it waited")
+                        }
+                    }
+                    crate::storage::atoll::buffer::scarce(allocate)
+                });
+                assert!(!crate::race::pending("buffer.loader_follows"));
+                assert!(matches!(out, Ok(IOResult::IO(_))), "the call came short");
+                assert!(owner.queued(), "the shortage's place after the return");
+                assert_eq!(
+                    (owner.kept_frame(), owner.keeps_meta()),
+                    (None, false),
+                    "the owner kept a page across its shortage: (pool frame, metadata page)"
+                );
+                let frame = frame_of(&pool, cold);
+                assert!(!pool.header(frame).record_keeps(), "the page's frame kept");
+                let mut calls = 0;
+                loop {
+                    calls += 1;
+                    match owner.call(allocate).unwrap() {
+                        IOResult::Done(()) => break,
+                        IOResult::IO(IOCompletions(wait)) => {
+                            assert!(
+                                wait.finished(),
+                                "call {calls} handed back a wait not yet finished"
+                            );
+                            assert!(
+                                calls < 3,
+                                "the reserved operation did not finish in {calls} calls"
+                            );
+                        }
+                    }
+                }
+                assert!(!owner.queued(), "the place after the operation ended");
+            },
+        );
+    }
+
+    /// Generation (#5219): a joiner B paused in its step right after its probe found load L under
+    /// way. Meanwhile L lands with no reference left, its page is evicted and its frame freed:
+    /// while B's step lasts, neither the frame in its class nor the frame of a larger class over
+    /// the same memory is quiet for a read, so no later load can open a group there, and every
+    /// read claim route waits for that (the quiet-memory tests). B's join then finds L's word at
+    /// zero and is refused, touching nothing, and its fix goes on to a load of its own elsewhere.
+    /// Once B's step has ended, the frame is quiet again.
+    #[test]
+    fn a_joiners_step_keeps_every_later_load_off_the_frame_it_probed() {
+        crate::storage::atoll::testing::cleanly(
+            concat!(
+                module_path!(),
+                "::a_joiners_step_keeps_every_later_load_off_the_frame_it_probed"
+            ),
+            || {
+                let (pool, reads) = held_reads_pool("/db/group-generation");
+                let pid = PageId::new(class(0), 1);
+                assert!(!fixed_unowned(&pool, pid), "the load waits");
+                let frame = frame_of(&pool, pid);
+                let large = class(9);
+                let over = memory::frame_at(large, frame / memory::GRAINS, 0);
+                assert!(grains(over, large).contains(&(frame as usize)));
+                let seen = Arc::new(crate::storage::atoll::locks::Mutex::new(None));
+                {
+                    let (pool, reads, seen) = (pool.clone(), reads.clone(), seen.clone());
+                    crate::race::at("buffer.join_probed", move || {
+                        assert_eq!(land(&reads, Ok(())), 1);
+                        let evicted = pool.evict_clean(pid);
+                        let horizon = pool.store.epochs().horizon();
+                        *seen.lock() = Some((
+                            evicted,
+                            pool.quiet_at(frame, class(0)) > horizon,
+                            pool.quiet_at(over, large) > horizon,
+                            pool.group(frame).released(),
+                        ));
+                    });
+                }
+                let mut b = Owner::new();
+                let _ = fixed_as(&mut b, &pool, pid);
+                let probed = !crate::race::pending("buffer.join_probed");
+                let after_join = (pool.group(frame).released(), b.kept_frame());
+                let quiet_after = pool.quiet_at(frame, class(0)) <= pool.store.epochs().horizon();
+                land(&reads, Ok(()));
+                drop(b);
+                drop((pool, reads));
+                assert!(probed, "B's fix never found the load");
+                assert_eq!(
+                    *seen.lock(),
+                    Some((true, true, true, true)),
+                    "in B's step: (L's page evicted, its frame unquiet, the larger frame over it \
+                     unquiet, L's group released)"
+                );
+                assert!(after_join.0, "L's word after B's refused join");
+                assert_ne!(
+                    after_join.1,
+                    Some(frame),
+                    "B kept the frame L's group had let go"
+                );
+                assert!(quiet_after, "the frame stayed unquiet after B's step ended");
+            },
+        );
+    }
+}

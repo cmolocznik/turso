@@ -42,11 +42,17 @@ pub const NO_PAGE: u64 = u64::MAX;
 /// handed over until the backend retires it, which may come after its callback ran and the frame
 /// is resident and unlatched again (DESIGN.md 22.18, ASYNC1 v3.8, a frame).
 const RECORD_HELD: u8 = 1;
-/// The frame was freed while its record held a request: it goes to the free frames once the
-/// request retires, never before, as the backend may still read or write its memory.
+/// The frame was freed while its record held a request or its load's group kept it: it goes to the
+/// free frames once neither does, never before, as the backend may still read or write its memory
+/// and a waiter of its load may still come back for its page.
 const RECORD_FREED: u8 = 2;
-/// A claim passed over the frame for its record: the retirement tells the pool's supply.
+/// A claim passed over the frame for its record or its group: whichever lets the frame go last
+/// tells the pool's supply.
 const RECORD_WAITED: u8 = 4;
+/// The frame's load group keeps it (ASYNC1 D2e §2.2b, [`super::group`]): set by the loader under
+/// its exclusive latch before it publishes the load, cleared by whoever takes the group's word to
+/// zero.
+const RECORD_GROUP: u8 = 8;
 
 #[derive(Debug, Default)]
 pub struct FrameHeader {
@@ -145,26 +151,48 @@ impl FrameHeader {
     }
 
     fn take_record(&self) {
-        let was = self.record.swap(RECORD_HELD, Ordering::AcqRel);
-        crate::turso_assert!(was == 0, "a frame's record held twice");
+        // The load's group may keep the frame already, and a claim may have marked it for that.
+        let was = self.record.fetch_or(RECORD_HELD, Ordering::AcqRel);
+        assert!(
+            was & (RECORD_HELD | RECORD_FREED) == 0,
+            "a frame's record held twice: {was:#x}"
+        );
     }
 
     /// Whether the frame's record holds a request.
+    #[cfg(test)]
     pub fn record_held(&self) -> bool {
         self.record.load(Ordering::Acquire) & RECORD_HELD != 0
     }
 
-    /// Marks the record waited, for a claim that passed over the frame for it, after the claim's
-    /// registration: [`Marked::Waits`] if it still holds the request, so its retirement tells the
-    /// pool's supply, else [`Marked::Changed`]. Always a Release write when it reads Waits, even
-    /// with the mark already there, so this claim's registration comes before the retirement that
-    /// reads the mark. Two strong attempts at most: the only change a held record takes other than
-    /// its retirement and its frame's freeing is another claim's mark, which comes once; any other
-    /// change reads Changed, and the claim looks again.
+    /// Whether the frame's record holds a request or its load's group keeps it: either way an
+    /// eviction passes it over.
+    pub fn record_keeps(&self) -> bool {
+        self.record.load(Ordering::Acquire) & (RECORD_HELD | RECORD_GROUP) != 0
+    }
+
+    /// The load's group keeps the frame from here ([`super::group`]): by the loader, under its
+    /// exclusive latch, before it publishes the load. A frame claimed for a load holds no request
+    /// and no group, and no claim marks a frame that holds neither.
+    pub fn group_kept(&self) {
+        let was = self.record.swap(RECORD_GROUP, Ordering::AcqRel);
+        assert!(
+            was == 0,
+            "a frame claimed for a load was held or kept: {was:#x}"
+        );
+    }
+
+    /// Marks the record waited, for a claim that passed over the frame for its record or its
+    /// group, after the claim's registration: [`Marked::Waits`] while either still keeps the
+    /// frame, so whichever lets it go last tells the pool's supply, else [`Marked::Changed`].
+    /// Always a Release write when it reads Waits, even with the mark already there, so this
+    /// claim's registration comes before the release that reads the mark. A lost
+    /// compare-and-swap is another party's change (the retirement, the group's release, the
+    /// freeing or another claim's mark), and the word is looked at again.
     pub fn mark_record_waited(&self) -> Marked {
         let mut was = self.record.load(Ordering::Acquire);
-        for _ in 0..2 {
-            if was & RECORD_HELD == 0 {
+        loop {
+            if was & (RECORD_HELD | RECORD_GROUP) == 0 {
                 return Marked::Changed;
             }
             match self.record.compare_exchange(
@@ -174,24 +202,22 @@ impl FrameHeader {
                 Ordering::Acquire,
             ) {
                 Ok(_) => return Marked::Waits,
-                // Another claim's mark: once more, with it.
-                Err(now) if now == was | RECORD_WAITED => was = now,
-                Err(_) => return Marked::Changed,
+                Err(now) => was = now,
             }
         }
-        Marked::Changed
     }
 
-    /// Defers the freed frame to its record's retirement: whether the record still holds a
-    /// request, which then hands the frame to the free frames. Otherwise the caller does. Called
-    /// once, by the frame's one freeing caller, which owns the frame until it or the retirement
-    /// hands it to the free frames, so no new request can start on it meanwhile: the only changes
-    /// it can meet are a claim's mark, which comes once, and the retirement. Two strong attempts at
-    /// most, and one load alone where no request is held.
-    pub fn free_at_retirement(&self) -> bool {
+    /// Defers the freed frame while its record holds a request or its load's group keeps it:
+    /// whether either does, whichever then lets the frame go last handing it to the free frames.
+    /// Otherwise the caller does. Called once, by the frame's one freeing caller, which owns the
+    /// frame until it or that release hands it to the free frames, so no request starts and no
+    /// group opens on it meanwhile: the word changes only by the retirement, the group's release
+    /// and claims' marks, and a lost compare-and-swap looks at it again. One load alone where
+    /// nothing keeps the frame.
+    pub fn free_deferred(&self) -> bool {
         let mut was = self.record.load(Ordering::Acquire);
-        for _ in 0..2 {
-            if was & RECORD_HELD == 0 {
+        loop {
+            if was & (RECORD_HELD | RECORD_GROUP) == 0 {
                 return false;
             }
             crate::turso_assert!(was & RECORD_FREED == 0, "a frame freed twice");
@@ -205,25 +231,61 @@ impl FrameHeader {
                 Err(now) => was = now,
             }
         }
-        // Both attempts lost: the second could only lose to the retirement.
-        crate::turso_assert!(
-            was & RECORD_HELD == 0,
-            "a held record changed twice while its frame was freed: {was:#x}"
-        );
-        false
     }
 
     /// The record's request retired, or was never handed over: the record is free, and what was
-    /// marked on it while it held the request.
+    /// marked on it while it held the request, unless the load's group still keeps the frame,
+    /// whose release then lets it go.
     pub fn retire_record(&self) -> Retired {
-        let was = self.record.swap(0, Ordering::AcqRel);
-        crate::turso_assert!(
-            was & RECORD_HELD != 0,
-            "a frame's record retired with no request"
-        );
-        Retired {
-            freed: was & RECORD_FREED != 0,
-            waited: was & RECORD_WAITED != 0,
+        self.let_go(
+            RECORD_HELD,
+            RECORD_GROUP,
+            "a frame's record retired with no request",
+        )
+    }
+
+    /// The load's group let its keep go, its last reference released ([`super::group`]): what was
+    /// marked on the frame while the group kept it, unless the record still holds a request, whose
+    /// retirement then lets it go.
+    pub fn ungroup(&self) -> Retired {
+        self.let_go(
+            RECORD_GROUP,
+            RECORD_HELD,
+            "a frame let go by a load's group that did not keep it",
+        )
+    }
+
+    /// Clears `mine`, which the word holds: with `other` still keeping the frame, only that, and
+    /// nothing found; otherwise the whole word, and whether the frame was freed meanwhile and a
+    /// claim passed over it. A lost compare-and-swap is another party's change, looked at again.
+    fn let_go(&self, mine: u8, other: u8, missing: &'static str) -> Retired {
+        let mut was = self.record.load(Ordering::Acquire);
+        loop {
+            assert!(was & mine != 0, "{missing}: {was:#x}");
+            let (now, found) = if was & other != 0 {
+                (
+                    was & !mine,
+                    Retired {
+                        freed: false,
+                        waited: false,
+                    },
+                )
+            } else {
+                (
+                    0,
+                    Retired {
+                        freed: was & RECORD_FREED != 0,
+                        waited: was & RECORD_WAITED != 0,
+                    },
+                )
+            };
+            match self
+                .record
+                .compare_exchange(was, now, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return found,
+                Err(w) => was = w,
+            }
         }
     }
 }
@@ -252,7 +314,7 @@ impl HeldRecord {
     pub(in crate::storage::atoll) fn queued(self) {}
 }
 
-/// What a frame's record found as its request retired.
+/// What a frame's record found as the last of its request and its load's group let the frame go.
 pub struct Retired {
     /// The frame was freed meanwhile: it goes to the free frames now.
     pub freed: bool,
@@ -302,7 +364,7 @@ mod loom_tests {
             let free = {
                 let (h, freed) = (h.clone(), freed.clone());
                 thread::spawn(move || {
-                    if !h.free_at_retirement() {
+                    if !h.free_deferred() {
                         assert!(!h.record_held(), "the freeing caller freed a held frame");
                         freed.fetch_add(1, Ordering::Relaxed);
                     }

@@ -78,6 +78,12 @@ impl Pins {
     fn evicted(&self) -> bool {
         self.0.load(Ordering::Acquire) & EVICTED != 0
     }
+
+    /// The pins holding the value, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub fn holders(&self) -> u64 {
+        self.0.load(Ordering::Acquire) & !EVICTED
+    }
 }
 
 /// A value cells hold by pins.

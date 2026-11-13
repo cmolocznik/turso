@@ -117,7 +117,8 @@ enum Route {
 
 /// A leaf a caller reached last, kept by the caller and tried before a descent
 /// ([`Tree::descend_to_leaf`]): its page and frame hint, or none. The caller's own, so no thread
-/// writes what another reads.
+/// writes what another reads. A node above the leaves is where the descent goes on from, when it
+/// covers the key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Near(Option<(PageId, u32)>);
 
@@ -144,6 +145,13 @@ crate::thread::thread_local! {
 
 impl Near {
     pub const NONE: Self = Self(None);
+
+    /// The page the running operation's owner keeps, the one its last call waited for: where a
+    /// descent that comes back for it goes on, the pages above it no longer needed (ASYNC1 D2e
+    /// §2.2b). None outside an owner's call, or with nothing kept.
+    pub(crate) fn kept() -> Self {
+        Self(crate::storage::atoll::buffer::kept_page())
+    }
 
     fn of(leaf: &Optimistic<'_>) -> Self {
         Self(Some((leaf.pid(), leaf.hint())))
@@ -385,24 +393,28 @@ impl Tree {
         #[cfg(test)]
         LEAF_REACHES.with(|n| n.set(n.get() + 1));
         if let Some((pid, hint)) = near.0 {
-            if let Some(leaf) = self.pool.fix_optimistic_at(pid, hint) {
-                let answers = leaf.read(|p| -> Option<bool> {
+            if let Some(node) = self.pool.fix_optimistic_at(pid, hint) {
+                // A node of this tree whose fences cover the key: a leaf, the answer; a node above
+                // the leaves, where the descent goes on from, as one that waited for it does.
+                let answers = node.read(|p| -> Option<bool> {
                     let v = View::new(p);
-                    if !(v.is_node() && v.root() == self.root && v.is_leaf()) {
-                        return Some(false);
+                    if !(v.is_node() && v.root() == self.root) {
+                        return None;
                     }
-                    match route {
-                        Route::At => v.covers(key),
-                        Route::Above => v.covers_above(key),
-                    }
+                    let covers = match route {
+                        Route::At => v.covers(key)?,
+                        Route::Above => v.covers_above(key)?,
+                    };
+                    covers.then(|| v.is_leaf())
                 });
-                if answers == Some(Some(true)) {
-                    #[cfg(test)]
-                    NEAR_TAKEN.with(|n| n.set(n.get() + 1));
-                    return Ok(Found::Node {
-                        node: leaf,
-                        parent: None,
-                    });
+                match answers {
+                    Some(Some(true)) => {
+                        #[cfg(test)]
+                        NEAR_TAKEN.with(|n| n.set(n.get() + 1));
+                        return Ok(Found::Node { node, parent: None });
+                    }
+                    Some(Some(false)) => return self.descend_from(node, key, 0, route),
+                    _ => {}
                 }
             }
         }
@@ -411,10 +423,22 @@ impl Tree {
 
     /// Descends optimistically to the node at `level` covering `key`.
     fn descend(&self, key: &[u8], level: u8, route: Route) -> Result<Found<'_>> {
-        let mut node = match self.pool.fix_optimistic(self.root, Some(&self.root_hint))? {
+        let node = match self.pool.fix_optimistic(self.root, Some(&self.root_hint))? {
             IOResult::Done(n) => n,
             IOResult::IO(io) => return Ok(Found::Io(io)),
         };
+        self.descend_from(node, key, level, route)
+    }
+
+    /// Descends optimistically from `node`, the root or a node whose fences were found to cover
+    /// `key`, to the node at `level` covering it.
+    fn descend_from<'a>(
+        &'a self,
+        mut node: Optimistic<'a>,
+        key: &[u8],
+        level: u8,
+        route: Route,
+    ) -> Result<Found<'a>> {
         let mut parent = None;
         loop {
             let read = node.read(|p| {

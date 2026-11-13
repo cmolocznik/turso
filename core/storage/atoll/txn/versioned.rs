@@ -360,6 +360,9 @@ impl GuardOp {
 /// [`VersionedTree::get`] until done.
 pub struct Get {
     key: Vec<u8>,
+    /// Where its look goes on: the page its owner keeps for it, set each call by a read that
+    /// returns for IO and is entered again ([`resume_at_kept`](Self::resume_at_kept)).
+    near: Near,
     /// The newest version, seen and visible, holding its value out of line: read through the
     /// leaf, which tells whether that version is still the newest, by its head.
     newest: Option<(Lookup, Vec<u8>)>,
@@ -386,9 +389,17 @@ impl Get {
     pub fn new(key: &[u8]) -> Self {
         Self {
             key: key.to_vec(),
+            near: Near::NONE,
             newest: None,
             chain: None,
         }
+    }
+
+    /// Its look goes on, at its next step, from the page its owner keeps for it: for a read
+    /// entered again after it returned for IO, whose last call waited for that page (ASYNC1 D2e
+    /// §2.2b).
+    pub fn resume_at_kept(&mut self) {
+        self.near = Near::kept();
     }
 }
 
@@ -721,7 +732,7 @@ impl VersionedTree {
             if let Some(chain) = &mut op.chain {
                 return self.follow(txns, versions, txn, chain);
             }
-            let Some(stored) = done!(self.tree.stored(&op.key)) else {
+            let Some(stored) = done!(self.tree.stored_near(&op.key, op.near)) else {
                 return Ok(IOResult::Done(None));
             };
             let v = Version::decode(&stored.head).ok_or_else(corrupt_header)?;

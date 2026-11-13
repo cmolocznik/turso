@@ -123,6 +123,25 @@ impl Drop for Atoll {
 }
 
 impl Atoll {
+    /// The database's requests, for a test that holds or follows its IO thread.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn requests_for_test(&self) -> &Arc<Requests> {
+        &self.requests
+    }
+
+    /// A note of the database's IO thread's next idle, sent once it has marked itself idle: every
+    /// request it served by then has left its hands, its captures dropped, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn io_idle_for_test(&self) -> std::sync::mpsc::Receiver<()> {
+        self.requests.on_io_idle()
+    }
+
+    /// The requests on the database's files submitted and not yet retired, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn outstanding_requests(&self) -> usize {
+        self.requests.outstanding()
+    }
+
     /// Closes the database in DESIGN.md 22.12's order, as dropping it does, and says whether its
     /// log was made durable to the end it had when close began: a failure is returned after every
     /// later step of close.
@@ -334,7 +353,13 @@ impl Opening {
     ) -> Result<Self> {
         refuse_a_backend_that_would_poll(&*io)?;
         let requests = Arc::new(Requests::holding(held));
-        let counted = Arc::new(Counted::new(io, requests.clone())?);
+        let counted = Arc::new(Counted::for_open(
+            io,
+            requests.clone(),
+            config.store.meta_pages.max(1),
+            config.buffer.budget / super::page::MIN_PAGE_SIZE,
+            config.txn.slots,
+        )?);
         let io: Arc<dyn IO> = counted.clone();
         // The log's ring and the image bank are lent from the pool for as long as it is open,
         // taken as it opens; the smallest pool is the budget beside them and the copies' worst

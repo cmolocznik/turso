@@ -4846,7 +4846,11 @@ pub fn op_transaction_inner(
                         // connection's state says: in autocommit, it ends it at its halt. A take
                         // of the write gate left waiting, parked or Busy, is this statement's
                         // until it is taken or given up (R15).
-                        let begins = match atoll.begin_reading(wants, &program.schema_reads) {
+                        let begins = match atoll.begin_reading(
+                            wants,
+                            &program.schema_reads,
+                            &mut state.atoll_read,
+                        ) {
                             Ok(IOResult::Done(began)) => {
                                 state.atoll_taking = false;
                                 began
@@ -5222,7 +5226,13 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
-                let res = get_schema_cookie(&pager, mv_store.as_ref(), program, *db);
+                let res = get_schema_cookie(
+                    &pager,
+                    mv_store.as_ref(),
+                    program,
+                    &mut state.atoll_read,
+                    *db,
+                );
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
                         if header_schema_cookie != *schema_cookie {
@@ -16327,15 +16337,24 @@ pub fn op_page_count(
     load_insn!(PageCount { db, dest }, insn);
     if let Some(atoll) = program.connection.atoll_for_db(*db) {
         // Atoll mode: the page store's pages in use (DESIGN.md §17, §12).
-        state.registers[*dest].set_int(atoll.pages()?.into());
+        let pages = match atoll.pages_in(&mut state.atoll_read)? {
+            IOResult::Done(pages) => pages,
+            IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+        };
+        state.registers[*dest].set_int(pages.into());
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
-    let count = match with_header(&pager, mv_store.as_ref(), program, *db, |header| {
-        header.database_size.get()
-    }) {
+    let count = match with_header(
+        &pager,
+        mv_store.as_ref(),
+        program,
+        &mut state.atoll_read,
+        *db,
+        |header| header.database_size.get(),
+    ) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v.into(),
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
@@ -16981,35 +17000,35 @@ pub fn op_read_cookie(
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
 
-    let cookie_value =
-        match with_header(
-            &pager,
-            mv_store.as_ref(),
-            program,
-            *db,
-            |header| match cookie {
-                Cookie::ApplicationId => header.application_id.get().into(),
-                Cookie::DatabaseFormat => header.schema_format.get().into(),
-                Cookie::DatabaseTextEncoding => match header.text_encoding {
-                    crate::storage::sqlite3_ondisk::TextEncoding::Unset
-                    | crate::storage::sqlite3_ondisk::TextEncoding::Utf8 => 1,
-                    crate::storage::sqlite3_ondisk::TextEncoding::Utf16Le => 2,
-                    crate::storage::sqlite3_ondisk::TextEncoding::Utf16Be => 3,
-                    _ => 0,
-                },
-                Cookie::DefaultPageCacheSize => header.default_page_cache_size.get() as i64,
-                Cookie::UserVersion => header.user_version.get().into(),
-                Cookie::SchemaVersion => header.schema_cookie.get().into(),
-                Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
-                Cookie::PageSize => header.page_size.get().into(),
-                Cookie::FreePageCount => header.freelist_pages.get().into(),
-                cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
+    let cookie_value = match with_header(
+        &pager,
+        mv_store.as_ref(),
+        program,
+        &mut state.atoll_read,
+        *db,
+        |header| match cookie {
+            Cookie::ApplicationId => header.application_id.get().into(),
+            Cookie::DatabaseFormat => header.schema_format.get().into(),
+            Cookie::DatabaseTextEncoding => match header.text_encoding {
+                crate::storage::sqlite3_ondisk::TextEncoding::Unset
+                | crate::storage::sqlite3_ondisk::TextEncoding::Utf8 => 1,
+                crate::storage::sqlite3_ondisk::TextEncoding::Utf16Le => 2,
+                crate::storage::sqlite3_ondisk::TextEncoding::Utf16Be => 3,
+                _ => 0,
             },
-        ) {
-            Err(_) => 0.into(),
-            Ok(IOResult::Done(v)) => v,
-            Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
-        };
+            Cookie::DefaultPageCacheSize => header.default_page_cache_size.get() as i64,
+            Cookie::UserVersion => header.user_version.get().into(),
+            Cookie::SchemaVersion => header.schema_cookie.get().into(),
+            Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
+            Cookie::PageSize => header.page_size.get().into(),
+            Cookie::FreePageCount => header.freelist_pages.get().into(),
+            cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
+        },
+    ) {
+        Err(_) => 0.into(),
+        Ok(IOResult::Done(v)) => v,
+        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+    };
 
     state.registers[*dest].set_int(cookie_value);
     state.pc += 1;
@@ -17409,9 +17428,14 @@ pub fn op_open_ephemeral(
             // regardless of which database triggered the ephemeral allocation.
             let page_size = return_if_io!(
                 state,
-                with_header(pager, mv_store.as_ref(), program, 0, |header| {
-                    header.page_size
-                })
+                with_header(
+                    pager,
+                    mv_store.as_ref(),
+                    program,
+                    &mut state.atoll_read,
+                    0,
+                    |header| { header.page_size }
+                )
             );
             let conn = program.connection.clone();
             let io = conn.pager.load().io.clone();
@@ -17925,6 +17949,7 @@ pub fn op_integrity_check(
                     &target_pager,
                     physical_header_store,
                     program,
+                    &mut state.atoll_read,
                     *db,
                     |header| (header.freelist_trunk_page.get(), header.database_size.get())
                 )
@@ -17940,6 +17965,7 @@ pub fn op_integrity_check(
                         &target_pager,
                         physical_header_store,
                         program,
+                        &mut state.atoll_read,
                         *db,
                         |header| { header.freelist_pages.get() }
                     )
@@ -20369,9 +20395,14 @@ fn op_journal_mode_inner(
             OpJournalModeSubState::Start => {
                 // Read header to get current mode
                 let mv_store = program.connection.mv_store_for_db(*db);
-                let header_result = with_header(pager, mv_store.as_ref(), program, *db, |header| {
-                    header.read_version
-                });
+                let header_result = with_header(
+                    pager,
+                    mv_store.as_ref(),
+                    program,
+                    &mut state.atoll_read,
+                    *db,
+                    |header| header.read_version,
+                );
 
                 let prev_mode_raw = return_if_io!(state, header_result);
 
@@ -21226,6 +21257,7 @@ fn with_header<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
+    atoll_read: &mut Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
     db: usize,
     f: F,
 ) -> IOResultOr<T>
@@ -21233,8 +21265,7 @@ where
     F: Fn(&DatabaseHeader) -> T,
 {
     if let Some(atoll) = program.connection.atoll_for_db(db) {
-        let header = atoll.header()?;
-        return Ok(IOResult::Done(f(&header)));
+        return Ok(atoll.header_in(atoll_read)?.map(|header| f(&header)));
     }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);
@@ -21275,10 +21306,11 @@ fn get_schema_cookie(
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
+    atoll_read: &mut Option<Box<crate::storage::atoll::sql::mode::FacadeRead>>,
     db: usize,
 ) -> IOResultOr<u32> {
     if let Some(atoll) = program.connection.atoll_for_db(db) {
-        return Ok(IOResult::Done(atoll.schema_cookie()?));
+        return Ok(atoll.schema_cookie_in(atoll_read)?);
     }
     if let Some(mv_store) = mv_store {
         let tx_id = program.connection.get_mv_tx_id_for_db(db);

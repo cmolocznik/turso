@@ -2422,3 +2422,121 @@ fn over_the_ring_a_cold_frame_load_is_not_offered() {
     );
     child_ended_cleanly(ended);
 }
+
+/// ASYNC1 D2e §2.2b over a backend that still owns a load's request after its callback (#5206,
+/// #5211): a loader A and a joiner B enter frames of a database opened async while its IO thread
+/// is held, so both find the load queued; released, the IO thread makes the read, its callback at
+/// once and its retirement held, and the test goes on only once the IO thread has run the branch
+/// after its backend call, which registers the request's retirement. Landed or failed, the frame
+/// is then kept both by its record and by its load's group, and either order of their two releases
+/// lets it go exactly once: the frame evictable, or the failed load's frame freed, only after the
+/// second.
+#[cfg(all(unix, not(miri)))]
+#[test]
+fn a_loads_group_and_its_held_request_let_the_frame_go_in_either_order() {
+    let ended = in_child(
+        concat!(
+            module_path!(),
+            "::a_loads_group_and_its_held_request_let_the_frame_go_in_either_order"
+        ),
+        || {
+            for (fails, group_first) in [(false, true), (false, false), (true, true), (true, false)]
+            {
+                let probe = Probe::new();
+                let base = format!("/db/group-held-{fails}-{group_first}");
+                let (pid, counted, pool) = page_in_a_cold_file(&probe, &base, true);
+                let io: Arc<dyn IO> = counted.clone();
+                // The page-table leaf resident, so a frame's first miss is the data page's.
+                let leaf = drive(&io, || pool.store.leaf(pid)).unwrap();
+                probe.rule_under(
+                    &data(&base),
+                    Some(if fails { Rule::HoldFail } else { Rule::Hold }),
+                );
+                let requests = counted.requests().clone();
+                let held_thread = io_thread_held_before_idle_unregistered(&requests);
+                let reached = held_thread.is_some();
+                let fix = |owner: &mut Owner| {
+                    let _frame = Frame::enter();
+                    owner
+                        .call(|| {
+                            Ok(match pool.fix_optimistic(pid, None)? {
+                                IOResult::Done(_) => IOResult::Done(()),
+                                IOResult::IO(io) => IOResult::IO(io),
+                            })
+                        })
+                        .map(|r| matches!(r, IOResult::IO(_)))
+                };
+                let (mut a, mut b) = (Owner::new(), Owner::new());
+                let waited = (fix(&mut a).ok(), fix(&mut b).ok());
+                let frame = pool
+                    .table
+                    .find(&pool.frames.headers, pid.raw())
+                    .expect("the loading page's frame");
+                let kept = (a.kept_frame(), b.kept_frame());
+                let ((), returned, served) = past_the_branch(&requests, || drop(held_thread));
+                let ended_load = settle(|| {
+                    probe.holding() == 1
+                        && pool.header(frame).status() == if fails { FREE } else { RESIDENT }
+                });
+                let held = pool.header(frame).record_held();
+                let free_times = |pool: &BufferPool| {
+                    pool.memory
+                        .free_frames(class0())
+                        .into_iter()
+                        .filter(|&f| f == frame)
+                        .count()
+                };
+                let group_release = |a: Owner, b: Owner| drop((a, b));
+                let first = if group_first {
+                    group_release(a, b);
+                    (pool.header(frame).record_keeps(), free_times(&pool))
+                } else {
+                    probe.let_go();
+                    let seen = (pool.header(frame).record_keeps(), free_times(&pool));
+                    group_release(a, b);
+                    seen
+                };
+                if group_first {
+                    probe.let_go();
+                }
+                let last = (pool.header(frame).record_keeps(), free_times(&pool));
+                let evicted = !fails && pool.evict_clean(pid);
+                drop((leaf, pool, io, counted, requests));
+                let case = format!("failed {fails}, group first {group_first}");
+                assert!(
+                    reached,
+                    "{case}: the IO thread never reached its pause before idle"
+                );
+                assert!(
+                    returned && served,
+                    "{case}: the IO thread's branch after its backend call, (returned, served)"
+                );
+                assert_eq!(waited, (Some(true), Some(true)), "{case}: (A, B) waited");
+                assert_eq!(kept, (Some(frame), Some(frame)), "{case}: (A, B) kept");
+                assert!(
+                    ended_load,
+                    "{case}: the load never ended at its held request"
+                );
+                assert!(
+                    held,
+                    "{case}: the request's record let go before its retirement"
+                );
+                assert_eq!(
+                    first,
+                    (true, 0),
+                    "{case}: after the first release, (kept, frees)"
+                );
+                assert_eq!(
+                    last,
+                    (false, usize::from(fails)),
+                    "{case}: after the second release, (kept, frees)"
+                );
+                assert_eq!(
+                    evicted, !fails,
+                    "{case}: the landed page evicted at the end"
+                );
+            }
+        },
+    );
+    child_ended_cleanly(ended);
+}

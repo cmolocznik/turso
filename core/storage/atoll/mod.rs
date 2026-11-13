@@ -128,8 +128,32 @@ pub(in crate::storage::atoll) fn drive_for<T>(
     drive_as(buffer::Owner::of(conn.clone()), io, op)
 }
 
+/// One call of `op` as `owner`'s, returning what it returned, inside a cooperative frame, which
+/// never blocks its thread; outside one, `op` driven to its end over `owner` as [`drive_for`]
+/// drives it (ASYNC1 D2e §2.2). `owner` is the operation's top, kept with the operation's own
+/// state by whatever enters it again, so its shortage tenure and the pages it keeps survive the
+/// return.
+pub(in crate::storage::atoll) fn drive_or_io<T>(
+    owner: &mut buffer::Owner,
+    io: &Arc<dyn IO>,
+    mut op: impl FnMut() -> Result<IOResult<T>>,
+) -> Result<IOResult<T>> {
+    if cooperative::inside() {
+        return owner.call(&mut op);
+    }
+    drive_over(owner, io, op).map(IOResult::Done)
+}
+
 fn drive_as<T>(
     mut owner: buffer::Owner,
+    io: &Arc<dyn IO>,
+    op: impl FnMut() -> Result<IOResult<T>>,
+) -> Result<T> {
+    drive_over(&mut owner, io, op)
+}
+
+fn drive_over<T>(
+    owner: &mut buffer::Owner,
     io: &Arc<dyn IO>,
     mut op: impl FnMut() -> Result<IOResult<T>>,
 ) -> Result<T> {
@@ -140,7 +164,7 @@ fn drive_as<T>(
             IOResult::IO(IOCompletions(c)) => {
                 if c.finished() {
                     // A yield: give the processor to whoever holds what the operation needs.
-                    crate::thread::yield_now();
+                    crate::storage::atoll::park::yield_now();
                 } else {
                     crate::storage::atoll::park::wait(io.as_ref(), &c);
                 }

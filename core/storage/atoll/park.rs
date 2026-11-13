@@ -18,6 +18,14 @@ fn before(what: &'static str) {
         !crate::storage::atoll::unit::inside(),
         "{what}: a park inside a unit of a job's work"
     );
+    // A cooperative frame never blocks its thread: what it would wait for it returns (ASYNC1 D2e
+    // §2.1). Asserted in a test build, where frames are entered, so a facade site that parks
+    // in a frame fails wherever a test reaches it.
+    #[cfg(test)]
+    assert!(
+        !crate::storage::atoll::cooperative::inside(),
+        "{what}: a park inside a cooperative frame"
+    );
     debug_assert!(
         !notify::scope_open(),
         "a thread parked with a change scope open, its wakers held across the park"
@@ -85,6 +93,13 @@ pub(crate) fn wait(io: &dyn IO, c: &Completion) {
 pub(crate) fn wait_for_completion(io: &dyn IO, c: Completion) -> Result<()> {
     before("a wait for a completion on a thread delivering held wakers");
     io.wait_for_completion(c)
+}
+
+/// Gives the processor to whoever holds what the caller needs: a yield, which a cooperative frame
+/// returns instead.
+pub(crate) fn yield_now() {
+    before("a yield on a thread delivering held wakers");
+    crate::thread::yield_now()
 }
 
 /// Parks this thread until it is unparked.

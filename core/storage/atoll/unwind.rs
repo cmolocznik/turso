@@ -564,6 +564,81 @@ mod tests {
         ),
         ("notify.rs", "a_waker_that_parks_ends_the_process", "child"),
         (
+            "buffer/frame_tests.rs",
+            "a_loads_group_and_its_held_request_let_the_frame_go_in_either_order",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_joiner_keeps_the_page_it_waited_for_until_its_next_call",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_joiner_dropped_while_the_load_is_held_lets_its_reference_go",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_joiners_release_on_either_side_of_the_close_lets_the_group_go_once",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_join_refused_once_its_group_is_released_keeps_nothing",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_late_join_is_admitted_to_a_closed_group_with_a_reference_left",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_failed_load_with_a_joiner_frees_its_frame_once_after_its_last_reference",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "an_owner_dropped_while_keeping_tells_a_claim_that_passed_its_frame_over",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_shortage_after_a_load_in_the_same_call_keeps_nothing",
+            "child",
+        ),
+        (
+            "buffer/tests.rs",
+            "a_joiners_step_keeps_every_later_load_off_the_frame_it_probed",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_statement_reset_while_its_header_read_waits_lets_the_reads_page_go",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_cold_header_read_in_a_frame_returns_io_and_finishes_with_its_synchronous_value",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "the_pages_in_use_read_in_a_frame_goes_on_from_the_class_it_stopped_at",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_begins_read_set_check_in_a_frame_goes_on_from_the_row_it_stopped_at",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_read_short_of_memory_in_a_frame_keeps_its_place_across_its_return",
+            "child",
+        ),
+        (
             "executor/tests.rs",
             "a_step_watching_a_signal_its_job_did_not_declare_ends_the_process",
             "child",
@@ -784,7 +859,12 @@ mod tests {
         for path in atoll_sources() {
             let file = path.strip_prefix(&dir).unwrap().display().to_string();
             let code = code_of(&std::fs::read_to_string(&path).unwrap());
-            for marker in ["should_panic", "catch_unwind", "in_child("] {
+            for marker in [
+                "should_panic",
+                "catch_unwind",
+                "in_child(",
+                "testing::cleanly(",
+            ] {
                 let mut rest = code.as_str();
                 while let Some(at) = rest.find(marker) {
                     let after = &rest[at..];
@@ -823,19 +903,20 @@ mod tests {
                 .map(|(_, _, kind)| *kind);
             match (*marker, listed) {
                 ("catch_unwind", _) => wrong.push(format!("{file}: {name} catches an unwind")),
-                ("in_child(", Some("child")) | ("should_panic", Some("ordinary")) => {}
+                ("in_child(" | "testing::cleanly(", Some("child"))
+                | ("should_panic", Some("ordinary")) => {}
                 _ => wrong.push(format!("{file}: {name} ({marker}) is not listed as such")),
             }
         }
         for (file, name, kind) in PANICKING {
-            let marker = if *kind == "child" {
-                "in_child("
+            let markers: &[&str] = if *kind == "child" {
+                &["in_child(", "testing::cleanly("]
             } else {
-                "should_panic"
+                &["should_panic"]
             };
             if !found
                 .iter()
-                .any(|(f, m, n)| f == file && *m == marker && n == name)
+                .any(|(f, m, n)| f == file && markers.contains(m) && n == name)
             {
                 wrong.push(format!("{file}: {name} is listed as {kind} but is not one"));
             }
@@ -861,6 +942,7 @@ mod tests {
         "Ending",
         "CreateOp",
         "RetireOp",
+        "FacadeRead",
         "RefusingStorage",
     ];
 
@@ -872,6 +954,7 @@ mod tests {
         "Ending",
         "CreateOp",
         "RetireOp",
+        "FacadeRead",
     ];
 
     /// Plain data the facade passes in or out, which code outside Atoll may name: it holds no

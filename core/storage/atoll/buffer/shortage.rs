@@ -11,6 +11,7 @@ use super::supply::{Handoff, Supply};
 use super::{BufferPool, PageId, Purpose, SizeClass};
 use crate::io::{Completion, WakerKey};
 use crate::storage::atoll::locks::Mutex;
+use crate::storage::atoll::meta::MetaRef;
 use crate::storage::atoll::notify;
 use crate::sync::Arc;
 use crate::types::{IOCompletions, IOResult};
@@ -670,13 +671,52 @@ impl Queue {
 // ------------------------------------------------------------------------------------ owner
 
 /// An operation's top: what calls it again until it is done, holding nothing of the pool
-/// between calls. It keeps the operation's tenure across those calls, and its connection's
-/// identity, if it has one (none for open, recovery, the cut, close and the checkpointer, which
-/// no embedder suspends).
+/// between calls but the pages it keeps for the one it comes back for. It keeps the operation's
+/// tenure across those calls, and its connection's identity, if it has one (none for open,
+/// recovery, the cut, close and the checkpointer, which no embedder suspends).
 #[derive(Default)]
 pub(crate) struct Owner {
     tenure: Option<Box<Tenure>>,
     conn: Option<Arc<Conn>>,
+    keeps: Keeps,
+}
+
+/// What an operation's top keeps between its calls (ASYNC1 D2e §2.2b): at most one reference in a
+/// load's group and one metadata page, each for the page a call of the operation last loaded or
+/// waited for, so the call that comes back for it finds it in memory, and a descent goes on from
+/// it. Set only while the owner's call runs, by its operation's claims and gets ([`OWNER`]); each
+/// is let go when another load or metadata miss of the operation takes its place, at a shortage
+/// or a gate wait, and when the operation ends.
+#[derive(Default)]
+struct Keeps {
+    pool: Option<Kept>,
+    meta: Option<MetaRef>,
+}
+
+impl Keeps {
+    /// Everything kept, taken out to be let go.
+    fn all(&mut self) -> (Option<Kept>, Option<MetaRef>) {
+        (self.pool.take(), self.meta.take())
+    }
+
+    fn empty(&self) -> bool {
+        self.pool.is_none() && self.meta.is_none()
+    }
+}
+
+/// A reference in a load's group (ASYNC1 D2e §2.2b): the frame the load reads `pid` into, kept
+/// while the reference lives. Released exactly once, by its drop.
+pub(super) struct Kept {
+    pool: Arc<BufferPool>,
+    frame: u32,
+    pid: PageId,
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        self.pool.release_kept(self.frame, self.pid);
+    }
 }
 
 /// An operation's place in the shortage queue (DESIGN.md 9.1.3, *Tenure*): one demand per tenure.
@@ -730,6 +770,7 @@ impl Owner {
         Self {
             tenure: None,
             conn: Some(conn),
+            keeps: Keeps::default(),
         }
     }
 
@@ -764,17 +805,18 @@ impl Owner {
             }
         }
         let out = {
-            // Read through only by `take_reserved` while `op` runs, which reaches nothing else of
-            // this owner.
+            // Reached only by `take_reserved`, which reads its tenure, and the keeps' setters, which
+            // write its keeps, while `op` runs: nothing else of this owner.
             let _installed = Installed(OWNER.with(|o| o.replace(self as *mut Owner)));
             op()
         };
         match out {
             Ok(IOResult::IO(c)) => {
                 if let Some(pool) = GATE.with(|g| g.borrow_mut().take()) {
-                    // Holding nothing now: the gate's reopening waited for, the cut stepped here
-                    // if no one else steps it.
+                    // Holding nothing now, its keeps this call's included: the gate's reopening
+                    // waited for, the cut stepped here if no one else steps it.
                     debug_assert!(SHORT.with(|s| s.borrow().is_none()));
+                    drop(self.keeps.all());
                     return match pool.wait_for_gate()? {
                         IOResult::Done(()) => {
                             Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
@@ -783,7 +825,14 @@ impl Owner {
                     };
                 }
                 match SHORT.with(|s| s.borrow_mut().take()) {
-                    Some(short) => self.reserve(short),
+                    // A shortage waits holding nothing of the pool: a page this call kept, loaded
+                    // in place before it came short, goes too, as its frame may be the one the
+                    // reservation needs (ASYNC1 D2e §2.2b). What the step still needs it named
+                    // in its claim, which phase B keeps resident.
+                    Some(short) => {
+                        drop(self.keeps.all());
+                        self.reserve(short)
+                    }
                     None => Ok(IOResult::IO(c)),
                 }
             }
@@ -838,9 +887,11 @@ impl Owner {
     }
 
     /// Ends the tenure, if any: the unused frame given back, the set retired, the place left, the
-    /// gate passed on. Also where the operation it served is dropped unfinished (a cursor parked
-    /// at its statement's reset). A tenure revoked or cancelled meanwhile was let go there.
+    /// gate passed on, and the pages kept let go. Also where the operation it served is dropped
+    /// unfinished (a cursor parked at its statement's reset). A tenure revoked or cancelled
+    /// meanwhile was let go there.
     pub(crate) fn end(&mut self) {
+        drop(self.keeps.all());
         if let Some(t) = self.tenure.take() {
             if let Some(released) = t.pool.shortage.end(t.place) {
                 released.let_go(&t.pool);
@@ -865,6 +916,24 @@ impl Owner {
         self.tenure.is_some()
     }
 
+    /// The frame whose load's group the owner holds a reference in, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn kept_frame(&self) -> Option<u32> {
+        self.keeps.pool.as_ref().map(|k| k.frame)
+    }
+
+    /// Whether the owner keeps a metadata page, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn keeps_meta(&self) -> bool {
+        self.keeps.meta.is_some()
+    }
+
+    /// The metadata page the owner keeps, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn kept_meta(&self) -> Option<crate::storage::atoll::meta::MetaId> {
+        self.keeps.meta.as_ref().map(|m| m.id)
+    }
+
     /// Runs one call of `op` on `this` as the operation of the owner `this` keeps at `slot`,
     /// [`call`](Self::call) as a top that keeps its owner among its own state does: the owner is
     /// moved out of `this` while `op` runs, which never reaches it, and back after.
@@ -877,10 +946,10 @@ impl Owner {
         let out = owner.call(|| op(this));
         let placeholder = std::mem::replace(slot(this), owner);
         debug_assert!(
-            placeholder.tenure.is_none(),
+            placeholder.tenure.is_none() && placeholder.keeps.empty(),
             "an operation reached its own owner"
         );
-        // It holds no tenure and no connection: nothing to end or let go.
+        // It holds no tenure, no connection and no keep: nothing to end or let go.
         std::mem::forget(placeholder);
         out
     }
@@ -1071,6 +1140,85 @@ pub(crate) fn unowned<T>(f: impl FnOnce() -> T) -> T {
 /// rather than waiting on memory.
 pub(super) fn owned() -> bool {
     OWNER.with(|o| !o.get().is_null())
+}
+
+/// Whether the claim running on this thread runs for an owner, which keeps the page it loads.
+pub(super) fn keeping() -> bool {
+    owned()
+}
+
+/// Runs `f` on the running owner's keeps, while its call runs: `None` outside any owner's call.
+/// Whatever `f` lets go it returns, dropped after, so no release runs while the keeps are borrowed.
+fn running_keeps<R>(f: impl FnOnce(&mut Keeps) -> R) -> Option<R> {
+    let owner = OWNER.with(Cell::get);
+    if owner.is_null() {
+        return None;
+    }
+    // SAFETY: the owner installed itself for the duration of its call, which is still running
+    // and touches the owner only after the operation returns; nothing else reaches its keeps
+    // meanwhile, and the borrow ends with `f`.
+    Some(f(unsafe { &mut (*owner).keeps }))
+}
+
+/// Lets go the reference the running owner keeps in a load's group: at a miss, once its page is
+/// located and its frame claimed, right before its own load takes the reference's place, so it
+/// keeps one at most; and by a loader whose page another frame holds.
+pub(super) fn let_go_kept() {
+    drop(running_keeps(|k| k.pool.take()));
+}
+
+/// The running owner's reference in the group its loader just opened for `pid` in `frame`, its
+/// slot empty since its miss.
+pub(super) fn keep_loaded(pool: &Arc<BufferPool>, frame: u32, pid: PageId) {
+    let old = running_keeps(|k| {
+        k.pool.replace(Kept {
+            pool: pool.clone(),
+            frame,
+            pid,
+        })
+    });
+    crate::turso_assert!(old.flatten().is_none(), "a loader kept two loads' pages");
+}
+
+/// A fix of the running owner found `pid` loading in `frame`: it keeps the page in that load's
+/// group, `join` adding its reference, unless it holds that reference already. Another it holds
+/// is let go first. A refused join keeps nothing.
+pub(super) fn keep_joined(
+    pool: &Arc<BufferPool>,
+    frame: u32,
+    pid: PageId,
+    join: impl FnOnce() -> bool,
+) {
+    // The same load: a frame its group keeps is neither freed nor loaded again meanwhile.
+    let held = running_keeps(|k| match &k.pool {
+        Some(kept) if kept.frame == frame && kept.pid == pid => Ok(()),
+        _ => Err(k.pool.take()),
+    });
+    let Some(Err(other)) = held else {
+        return;
+    };
+    drop(other);
+    if join() {
+        running_keeps(|k| {
+            k.pool = Some(Kept {
+                pool: pool.clone(),
+                frame,
+                pid,
+            })
+        });
+    }
+}
+
+/// The page the running owner keeps in a load's group, and its frame's hint (the frame plus one),
+/// while its call runs: the page its last call waited for (ASYNC1 D2e §2.2b).
+pub(crate) fn kept_page() -> Option<(PageId, u32)> {
+    running_keeps(|k| k.pool.as_ref().map(|kept| (kept.pid, kept.frame + 1))).flatten()
+}
+
+/// The running owner keeps the metadata page `frame` its call found loading, in place of any
+/// other (ASYNC1 D2e §2.2b): the cache keeps a page while a reference to it lives.
+pub(crate) fn keep_meta(frame: &MetaRef) {
+    drop(running_keeps(|k| k.meta.replace(frame.clone())));
 }
 
 /// The frame reserved for this exact claim by the running operation's owner, taken.

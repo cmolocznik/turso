@@ -14,8 +14,10 @@
 //! - **Trees.** [`ConnTxn::create_btree`] is CreateBtree: a tree id, the tree, its catalog row.
 //!   [`SqlCursor`] is a Turso cursor over one SQL tree, resolving its catalog row at its first step.
 //!
-//! Reads (the header, the catalog) are driven to their end here: a read waits only on IO, never
-//! on another transaction. Writes wait on other transactions, so they come back to the VDBE.
+//! Reads (the header, the catalog) wait only on IO, never on another transaction. Outside a
+//! cooperative frame they are driven to their end here; inside one, a read whose caller keeps its
+//! state ([`FacadeRead`]) returns the IO it waits for and goes on where it stopped when entered
+//! again. Writes wait on other transactions, so they come back to the VDBE.
 
 use super::catalog::{self, Catalog, Entry, Layout, System};
 use super::cursor::{AtollCursor, TxnCell};
@@ -31,7 +33,7 @@ use crate::storage::atoll::btree::{Mode, Near, Outcome};
 use crate::storage::atoll::buffer::MIN_DB_BUDGET;
 use crate::storage::atoll::control::{self, Found};
 use crate::storage::atoll::db::AtollConfig;
-use crate::storage::atoll::{drive, drive_for};
+use crate::storage::atoll::{drive, drive_for, drive_or_io};
 // Plain data the facade passes in or out, defined where Atoll uses it and named through here.
 pub(crate) use super::catalog::SCHEMA_ID;
 pub(crate) use super::cursor::GuardKey;
@@ -446,6 +448,136 @@ pub enum Begin {
 /// A header field as a transaction read it: the word, the transaction's slot and start, and the
 /// header's changes when it read it.
 type FieldRead = (u32, (u16, u64), u64);
+
+/// A facade read in flight (ASYNC1 D2e §2.2): its owner, the operation's top, and where it
+/// stands, which are the locals [`drive_for`] keeps across its loop. Kept by whatever enters the
+/// read again, from its first call to its end: a VDBE instruction's state, or a Transaction
+/// opcode's for a begin's read set. So a read that returns IO in a cooperative frame goes on where
+/// it stopped, with its shortage tenure and the page it keeps. Dropped unfinished, at its
+/// statement's reset or drop, it lets both go. Its caller keeps it boxed, as an
+/// `Option<Box<FacadeRead>>` that is none until a read returns IO in a frame, so a caller that
+/// never meets one pays one word and no allocation.
+pub(crate) struct FacadeRead {
+    owner: crate::storage::atoll::buffer::Owner,
+    /// The transaction it reads in, by slot and start; `None` outside one. A read kept from
+    /// another transaction starts again.
+    txn: Option<(u16, u64)>,
+    at: ReadAt,
+    /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
+    _frame: crate::storage::atoll::unwind::FrameEnd,
+}
+
+/// Where a facade read stands.
+enum ReadAt {
+    /// One header field, and its read under way with the header's changes when it started.
+    Field {
+        field: Field,
+        get: Option<(Get, u64)>,
+    },
+    /// The header's fields in order: `next` the one under way, `words` those read.
+    Header {
+        next: usize,
+        words: [u32; 7],
+        get: Option<(Get, u64)>,
+    },
+    /// The page store's classes in order: `class` the one under way, `bytes` the sum so far.
+    Pages { class: usize, bytes: u64 },
+    /// A begin's read set: each tree's catalog row in order, `next` the one under way. The set
+    /// is the caller's, named by its address and length: a statement's, fixed while the statement
+    /// and so its kept read live.
+    Since {
+        set: (usize, usize),
+        next: usize,
+        get: Option<Get>,
+    },
+}
+
+impl ReadAt {
+    fn field(field: Field) -> Self {
+        Self::Field { field, get: None }
+    }
+
+    fn header() -> Self {
+        Self::Header {
+            next: 0,
+            words: [0; 7],
+            get: None,
+        }
+    }
+
+    fn pages() -> Self {
+        Self::Pages { class: 0, bytes: 0 }
+    }
+
+    fn since(reads: &[u64]) -> Self {
+        Self::Since {
+            set: (reads.as_ptr() as usize, reads.len()),
+            next: 0,
+            get: None,
+        }
+    }
+
+    /// Whether a read kept as `self` is the one `fresh` would start: the same kind, of the same
+    /// field or read set.
+    fn continues(&self, fresh: &ReadAt) -> bool {
+        match (self, fresh) {
+            (Self::Field { field: a, .. }, Self::Field { field: b, .. }) => a == b,
+            (Self::Header { .. }, Self::Header { .. })
+            | (Self::Pages { .. }, Self::Pages { .. }) => true,
+            (Self::Since { set: a, .. }, Self::Since { set: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl FacadeRead {
+    /// The read kept in `read` if it is the one `fresh` would start, in transaction `txn`; else
+    /// `fresh`, started with an owner of connection `conn`, in its place.
+    fn kept<'r>(
+        read: &'r mut Option<Box<FacadeRead>>,
+        conn: &Arc<crate::storage::atoll::buffer::Conn>,
+        txn: Option<(u16, u64)>,
+        fresh: ReadAt,
+    ) -> &'r mut FacadeRead {
+        if !read
+            .as_ref()
+            .is_some_and(|r| r.txn == txn && r.at.continues(&fresh))
+        {
+            *read = Some(Box::new(FacadeRead {
+                owner: crate::storage::atoll::buffer::Owner::of(conn.clone()),
+                txn,
+                at: fresh,
+                _frame: crate::storage::atoll::unwind::FrameEnd::default(),
+            }));
+        }
+        read.as_mut().expect("a read in flight")
+    }
+
+    /// The frame and the metadata page the read's owner keeps, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn keeps_for_test(
+        &self,
+    ) -> (Option<u32>, Option<crate::storage::atoll::meta::MetaId>) {
+        (self.owner.kept_frame(), self.owner.kept_meta())
+    }
+
+    /// Whether the read's owner waits in the shortage queue or holds its gate, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn queued_for_test(&self) -> bool {
+        self.owner.queued()
+    }
+
+    /// Lets the read go once it is done or failed: only a return for IO keeps it.
+    fn settle<T>(
+        read: &mut Option<Box<FacadeRead>>,
+        out: Result<IOResult<T>>,
+    ) -> Result<IOResult<T>> {
+        if !matches!(out, Ok(IOResult::IO(_))) {
+            *read = None;
+        }
+        out
+    }
+}
 
 /// A connection's Atoll transaction: the `Txn` its cursors read and write in, and the header
 /// fields it wrote, by statement.
@@ -901,7 +1033,7 @@ impl ConnTxn {
     /// goes on. A take the gate lost to a victim's clearing is `Busy`.
     #[turso_macros::atoll_entry]
     pub fn begin(&self, wants: Begin) -> Result<IOResult<()>> {
-        Ok(self.begin_reading(wants, &[])?.map(|_| ()))
+        Ok(self.begin_reading(wants, &[], &mut None)?.map(|_| ()))
     }
 
     /// [`begin`](Self::begin) for a schema writer that reads rows of the trees `reads` names: in a
@@ -910,9 +1042,15 @@ impl ConnTxn {
     /// the gate (DESIGN.md §17, §3, defect 4). Its build or rewrite would read the tree at that
     /// snapshot and miss the rows committed since, as no write conflict tells. Done, it says
     /// whether this call found no transaction open, so began it: the Transaction opcode's one
-    /// look at the connection's transaction.
+    /// look at the connection's transaction. The check's read is kept in `read`, the opcode's,
+    /// across the begin's returns.
     #[turso_macros::atoll_entry]
-    pub fn begin_reading(&self, wants: Begin, reads: &[u64]) -> Result<IOResult<bool>> {
+    pub fn begin_reading(
+        &self,
+        wants: Begin,
+        reads: &[u64],
+        read: &mut Option<Box<FacadeRead>>,
+    ) -> Result<IOResult<bool>> {
         let txns = self.db.atoll().transactions();
         if let Begin::Write { .. } = wants {
             // A writing statement steps the checkpointer first, holding no latch, while a
@@ -955,7 +1093,7 @@ impl ConnTxn {
             let checks = schema && !reads.is_empty() && txn.snapped();
             if checks
                 && !matches!(txn.hold(), Hold::Pending { .. } | Hold::Exclusive { .. })
-                && self.read_since_snapshot(txn, reads)?
+                && done!(self.read_since_snapshot(txn, reads, read))
             {
                 return Err(LimboError::BusySnapshot);
             }
@@ -980,7 +1118,7 @@ impl ConnTxn {
             match taken {
                 Taken::Done => {
                     self.begin_wait.lock().over()?;
-                    if checks && self.read_since_snapshot(txn, reads)? {
+                    if checks && done!(self.read_since_snapshot(txn, reads, read)) {
                         txns.hand_back_exclusive(txn);
                         return Err(LimboError::BusySnapshot);
                     }
@@ -1035,19 +1173,50 @@ impl ConnTxn {
 
     /// Whether a commit raised the stamp of a tree `reads` names past `txn`'s snapshot: the tree
     /// as the catalog names it at the transaction's view, one created since unnamed and skipped.
-    fn read_since_snapshot(&self, txn: &mut Txn, reads: &[u64]) -> Result<bool> {
+    /// Kept in `read` across its returns: in a cooperative frame, the IO it waits for, and it goes
+    /// on where it stopped when the begin comes back (ASYNC1 D2e §2.2).
+    fn read_since_snapshot(
+        &self,
+        txn: &mut Txn,
+        reads: &[u64],
+        read: &mut Option<Box<FacadeRead>>,
+    ) -> Result<IOResult<bool>> {
+        let fresh = ReadAt::since(reads);
+        // Outside a frame the read ends in this call: its state stays a local.
+        if read.is_none() && !crate::storage::atoll::cooperative::inside() {
+            let mut at = fresh;
+            return drive_for(self.cell.conn(), self.db.io(), || {
+                self.since_step(txn, reads, &mut at)
+            })
+            .map(IOResult::Done);
+        }
+        let identity = Some((txn.slot(), txn.start()));
+        let FacadeRead { owner, at, .. } =
+            FacadeRead::kept(read, self.cell.conn(), identity, fresh);
+        let out = drive_or_io(owner, self.db.io(), || self.since_step(txn, reads, at));
+        FacadeRead::settle(read, out)
+    }
+
+    /// One call's worth of a begin's read set: each tree's catalog row in order, until one was
+    /// written since the snapshot.
+    fn since_step(&self, txn: &mut Txn, reads: &[u64], at: &mut ReadAt) -> Result<IOResult<bool>> {
+        let ReadAt::Since { next, get, .. } = at else {
+            unreachable!("a read set's step over another read");
+        };
         let db = &self.db;
-        for id in reads {
-            let mut get = Get::new(&catalog::key(*id));
-            let entry = drive_for(self.cell.conn(), db.io(), || {
-                db.catalog()
-                    .get(db.atoll().transactions(), db.versions(), txn, &mut get)
-            })?;
+        while let Some(&id) = reads.get(*next) {
+            let op = get.get_or_insert_with(|| Get::new(&catalog::key(id)));
+            op.resume_at_kept();
+            let entry = done!(db
+                .catalog()
+                .get(db.atoll().transactions(), db.versions(), txn, op));
+            *get = None;
+            *next += 1;
             if entry.is_some_and(|e| db.stamps().written_since(e.root, txn.snapshot())) {
-                return Ok(true);
+                return Ok(IOResult::Done(true));
             }
         }
-        Ok(false)
+        Ok(IOResult::Done(false))
     }
 
     /// Ends a transaction a failed begin left with nothing done: no snapshot, or no write.
@@ -1259,67 +1428,213 @@ impl ConnTxn {
         self.served.store(true, Ordering::Release);
     }
 
-    /// The schema cookie: at the transaction's view, or committed outside one.
+    /// The schema cookie: at the transaction's view, or committed outside one. Driven to its end
+    /// here, for a blocking host.
     #[turso_macros::atoll_entry]
     pub fn schema_cookie(&self) -> Result<u32> {
-        self.field(Field::SchemaCookie)
+        if let Some(word) = self.field_known(Field::SchemaCookie) {
+            return Ok(word);
+        }
+        self.read_now(ReadAt::field(Field::SchemaCookie), Self::field_step)
     }
 
-    fn field(&self, field: Field) -> Result<u32> {
-        let mut guard = self.cell.lock();
-        let Some(txn) = guard.as_mut() else {
-            return Ok(self.db.header().committed(field));
-        };
-        let (db, io) = (&self.db, self.db.io());
-        let (identity, changes) = ((txn.slot(), txn.start()), db.header().changes());
-        if let Some((word, t, c)) = self.fields.lock()[field.index()] {
-            if t == identity && c == changes {
-                return Ok(word);
+    /// [`schema_cookie`](Self::schema_cookie) for a caller that keeps `read` across its returns:
+    /// in a cooperative frame, the IO it waits for, and it goes on where it stopped when called
+    /// again with the same `read` (ASYNC1 D2e §2.2).
+    #[turso_macros::atoll_entry]
+    pub fn schema_cookie_in(&self, read: &mut Option<Box<FacadeRead>>) -> Result<IOResult<u32>> {
+        if read.is_none() {
+            if let Some(word) = self.field_known(Field::SchemaCookie) {
+                return Ok(IOResult::Done(word));
             }
         }
-        #[cfg(test)]
-        HEADER_READS.with(|r| r.set(r.get() + 1));
-        let mut get = Header::get_op(field);
-        let word = drive_for(self.cell.conn(), io, || {
-            db.header().get(
-                db.atoll().transactions(),
-                db.versions(),
-                txn,
-                field,
-                &mut get,
-            )
-        })?;
-        self.fields.lock()[field.index()] = Some((word, identity, changes));
-        Ok(word)
+        self.read_in(read, ReadAt::field(Field::SchemaCookie), Self::field_step)
     }
 
     /// The header as SQLite lays it out: every field's word at the transaction's view, or
     /// committed outside one. Its database size and free-list count are the main pager's, which
     /// holds no pages: what reads them walks the pager's pages. `PRAGMA page_count` reads the page
     /// store ([`pages`](Self::pages)); `freelist_count` stays 0, which is so, Atoll keeping no free
-    /// list in its files, a freed slot being erased and taken again.
+    /// list in its files, a freed slot being erased and taken again. Driven to its end here, for a
+    /// blocking host.
     #[turso_macros::atoll_entry]
     pub fn header(&self) -> Result<DatabaseHeader> {
-        let mut words = [0u32; 7];
-        for field in Field::ALL {
-            words[field as usize - 1] = self.field(field)?;
+        if let Some(header) = self.header_known() {
+            return Ok(header);
         }
-        Ok(header_of(&words))
+        self.read_now(ReadAt::header(), Self::header_step)
+    }
+
+    /// [`header`](Self::header) for a caller that keeps `read` across its returns, as
+    /// [`schema_cookie_in`](Self::schema_cookie_in).
+    #[turso_macros::atoll_entry]
+    pub fn header_in(
+        &self,
+        read: &mut Option<Box<FacadeRead>>,
+    ) -> Result<IOResult<DatabaseHeader>> {
+        if read.is_none() {
+            if let Some(header) = self.header_known() {
+                return Ok(IOResult::Done(header));
+            }
+        }
+        self.read_in(read, ReadAt::header(), Self::header_step)
     }
 
     /// The pages the page store holds in use (DESIGN.md §17, §12), every class's in node-size
     /// units, rounded up, as `PRAGMA page_count` reports them; past `u32::MAX`, the most a header
-    /// word holds.
+    /// word holds. Driven to its end here, for a blocking host.
     #[turso_macros::atoll_entry]
     pub fn pages(&self) -> Result<u32> {
-        let store = self.db.atoll().store();
-        let mut bytes: u64 = 0;
-        for class in 0..crate::storage::atoll::page::CLASS_COUNT {
-            let class = crate::storage::atoll::page::SizeClass::new(class).expect("a class");
-            let n = drive_for(self.cell.conn(), self.db.io(), || store.pages_in_use(class))?;
-            bytes = bytes.saturating_add(n.saturating_mul(class.size() as u64));
+        self.read_now(ReadAt::pages(), Self::pages_step)
+    }
+
+    /// [`pages`](Self::pages) for a caller that keeps `read` across its returns, as
+    /// [`schema_cookie_in`](Self::schema_cookie_in).
+    #[turso_macros::atoll_entry]
+    pub fn pages_in(&self, read: &mut Option<Box<FacadeRead>>) -> Result<IOResult<u32>> {
+        self.read_in(read, ReadAt::pages(), Self::pages_step)
+    }
+
+    /// Header field `field` known without a read: committed outside a transaction, else as this
+    /// transaction read it while the header counts no change.
+    fn field_known(&self, field: Field) -> Option<u32> {
+        let guard = self.cell.lock();
+        let Some(txn) = guard.as_ref() else {
+            return Some(self.db.header().committed(field));
+        };
+        self.known_at(txn, field, self.db.header().changes())
+    }
+
+    /// The header known without a read, as [`field_known`](Self::field_known) knows each field.
+    fn header_known(&self) -> Option<DatabaseHeader> {
+        let guard = self.cell.lock();
+        let mut words = [0u32; 7];
+        let changes = self.db.header().changes();
+        for field in Field::ALL {
+            words[field as usize - 1] = match guard.as_ref() {
+                None => self.db.header().committed(field),
+                Some(txn) => self.known_at(txn, field, changes)?,
+            };
         }
-        Ok(u32::try_from(bytes.div_ceil(PAGE as u64)).unwrap_or(u32::MAX))
+        Some(header_of(&words))
+    }
+
+    /// Header field `field` as `txn` read it, while the header counts `changes`.
+    fn known_at(&self, txn: &Txn, field: Field, changes: u64) -> Option<u32> {
+        let identity = (txn.slot(), txn.start());
+        match self.fields.lock()[field.index()] {
+            Some((word, t, c)) if t == identity && c == changes => Some(word),
+            _ => None,
+        }
+    }
+
+    /// A read driven to its end at once, its owner its drive's.
+    fn read_now<T>(
+        &self,
+        mut at: ReadAt,
+        step: impl Fn(&Self, Option<&mut Txn>, &mut ReadAt) -> Result<IOResult<T>>,
+    ) -> Result<T> {
+        drive_for(self.cell.conn(), self.db.io(), || {
+            let mut guard = self.cell.lock();
+            step(self, guard.as_mut(), &mut at)
+        })
+    }
+
+    /// A read kept in `read` across its returns: the one there goes on if it is of `fresh`'s kind
+    /// and transaction, else `fresh` starts. Done or failed, it is let go.
+    fn read_in<T>(
+        &self,
+        read: &mut Option<Box<FacadeRead>>,
+        fresh: ReadAt,
+        step: impl Fn(&Self, Option<&mut Txn>, &mut ReadAt) -> Result<IOResult<T>>,
+    ) -> Result<IOResult<T>> {
+        // Outside a frame the read ends in this call: its state stays a local.
+        if read.is_none() && !crate::storage::atoll::cooperative::inside() {
+            return self.read_now(fresh, step).map(IOResult::Done);
+        }
+        let txn = self.cell.lock().as_ref().map(|t| (t.slot(), t.start()));
+        let FacadeRead { owner, at, .. } = FacadeRead::kept(read, self.cell.conn(), txn, fresh);
+        let out = drive_or_io(owner, self.db.io(), || {
+            let mut guard = self.cell.lock();
+            step(self, guard.as_mut(), at)
+        });
+        FacadeRead::settle(read, out)
+    }
+
+    /// One call's worth of a header field: from the fields read already, else its read stepped.
+    fn field_step(&self, txn: Option<&mut Txn>, at: &mut ReadAt) -> Result<IOResult<u32>> {
+        let ReadAt::Field { field, get } = at else {
+            unreachable!("a field's step over another read");
+        };
+        Ok(IOResult::Done(match txn {
+            None => self.db.header().committed(*field),
+            Some(txn) => done!(self.field_at(txn, *field, get)),
+        }))
+    }
+
+    /// One call's worth of the header: its fields in order, each as [`field_step`] reads it.
+    fn header_step(
+        &self,
+        mut txn: Option<&mut Txn>,
+        at: &mut ReadAt,
+    ) -> Result<IOResult<DatabaseHeader>> {
+        let ReadAt::Header { next, words, get } = at else {
+            unreachable!("the header's step over another read");
+        };
+        while let Some(&field) = Field::ALL.get(*next) {
+            words[field as usize - 1] = match txn.as_deref_mut() {
+                None => self.db.header().committed(field),
+                Some(txn) => done!(self.field_at(txn, field, get)),
+            };
+            *next += 1;
+        }
+        Ok(IOResult::Done(header_of(words)))
+    }
+
+    /// Header field `field` at `txn`'s view: the word this transaction read already while the
+    /// header counts no change, else `get` stepped, made first for the field, and the word kept.
+    fn field_at(
+        &self,
+        txn: &mut Txn,
+        field: Field,
+        get: &mut Option<(Get, u64)>,
+    ) -> Result<IOResult<u32>> {
+        let db = &self.db;
+        let identity = (txn.slot(), txn.start());
+        if get.is_none() {
+            let changes = db.header().changes();
+            if let Some(word) = self.known_at(txn, field, changes) {
+                return Ok(IOResult::Done(word));
+            }
+            #[cfg(test)]
+            HEADER_READS.with(|r| r.set(r.get() + 1));
+            *get = Some((Header::get_op(field), changes));
+        }
+        let (op, changes) = get.as_mut().expect("a field read under way");
+        op.resume_at_kept();
+        let word = done!(db
+            .header()
+            .get(db.atoll().transactions(), db.versions(), txn, field, op));
+        self.fields.lock()[field.index()] = Some((word, identity, *changes));
+        *get = None;
+        Ok(IOResult::Done(word))
+    }
+
+    /// One call's worth of the page store's pages in use: its classes in order.
+    fn pages_step(&self, _txn: Option<&mut Txn>, at: &mut ReadAt) -> Result<IOResult<u32>> {
+        let ReadAt::Pages { class, bytes } = at else {
+            unreachable!("the pages' step over another read");
+        };
+        let store = self.db.atoll().store();
+        while *class < crate::storage::atoll::page::CLASS_COUNT {
+            let size = crate::storage::atoll::page::SizeClass::new(*class).expect("a class");
+            let n = done!(store.pages_in_use(size));
+            *bytes = bytes.saturating_add(n.saturating_mul(size.size() as u64));
+            *class += 1;
+        }
+        Ok(IOResult::Done(
+            u32::try_from(bytes.div_ceil(PAGE as u64)).unwrap_or(u32::MAX),
+        ))
     }
 
     /// Applies `f` to the header and writes every field it changed, in the open transaction's
@@ -1554,6 +1869,13 @@ impl Drop for CreateOp {
 
 /// An operation's state the VDBE held, dropped inside a frame (DESIGN.md 22.11).
 impl Drop for RetireOp {
+    #[turso_macros::atoll_entry]
+    fn drop(&mut self) {}
+}
+
+/// A read's state the VDBE held, its owner's tenure and keeps let go inside a frame (DESIGN.md
+/// 22.11).
+impl Drop for FacadeRead {
     #[turso_macros::atoll_entry]
     fn drop(&mut self) {}
 }

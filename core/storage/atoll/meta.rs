@@ -1059,6 +1059,9 @@ pub struct MetaCache {
     /// Pages a checkpoint cut short by a crash may have written, as recovery found them in the
     /// log: their bytes past a copy in charge may be torn, which is no corruption.
     torn_ok: AtomicBool,
+    /// Every page a load began reading, in order, for a test.
+    #[cfg(test)]
+    loaded: Mutex<Vec<MetaId>>,
 }
 
 /// A queued read's first stage on a cold file (D2a §4): the file opened, its directory synced and
@@ -1107,6 +1110,8 @@ impl MetaCache {
             cutting: Arc::new(crate::sync::atomic::AtomicU64::new(0)),
             cut_bytes: Arc::default(),
             torn_ok: AtomicBool::new(false),
+            #[cfg(test)]
+            loaded: Mutex::new(Vec::new()),
         }
     }
 
@@ -1143,7 +1148,13 @@ impl MetaCache {
     pub fn get(self: &Arc<Self>, id: MetaId) -> Result<IOResult<MetaRef>> {
         Ok(match self.join(id)? {
             Joined::Ready(frame) => IOResult::Done(frame),
-            Joined::Loading(_, wait) | Joined::Refused(wait) => IOResult::IO(IOCompletions(wait)),
+            Joined::Loading(frame, wait) => {
+                // The operation's owner keeps the page until the call that comes back for it
+                // (ASYNC1 D2e §2.2b).
+                crate::storage::atoll::buffer::keep_meta(&frame);
+                IOResult::IO(IOCompletions(wait))
+            }
+            Joined::Refused(wait) => IOResult::IO(IOCompletions(wait)),
         })
     }
 
@@ -1251,6 +1262,8 @@ impl MetaCache {
     /// it; a read never issued gives the credit back at once.
     fn load(self: &Arc<Self>, frame: &MetaRef, credit: Credit) -> Result<()> {
         let id = frame.id;
+        #[cfg(test)]
+        self.loaded.lock().push(id);
         // Queued (D2a §4): the file, if cold, opened by the read's first stage on an IO thread.
         let queued = self.counted.queues();
         let file = if queued {
@@ -1533,6 +1546,44 @@ impl MetaCache {
         };
         let step = self.epochs.enter();
         cell.get(&step, &self.cells).is_some()
+    }
+
+    /// The pins holding `id`'s page while it is in memory, this look's own not counted, for a
+    /// test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub fn pins_of(&self, id: MetaId) -> Option<u64> {
+        let cell = self.files[id.file_index()].frames.get(id.index)?;
+        let step = self.epochs.enter();
+        let frame = cell.get(&step, &self.cells)?;
+        Some(frame.pins().holders() - 1)
+    }
+
+    /// Every page a load began reading, in order, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub fn loaded_pages(&self) -> Vec<MetaId> {
+        self.loaded.lock().clone()
+    }
+
+    /// Drops every page in memory that is clean and held by no one, as an eviction over the
+    /// budget drops it, for a test: how many.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub fn evict_all(&self) -> usize {
+        let mut order = self.order.lock();
+        order.extend(self.arrivals.take_all());
+        let step = self.epochs.enter();
+        let mut evicted = 0;
+        for _ in 0..order.len() {
+            let Some(id) = order.pop_front() else { break };
+            let Some(cell) = self.files[id.file_index()].frames.get(id.index) else {
+                continue;
+            };
+            if cell.evict(&step, &self.cells) {
+                evicted += 1;
+            } else if cell.occupied() {
+                order.push_back(id);
+            }
+        }
+        evicted
     }
 
     /// Drops `id`'s page if it is in memory, clean and held by no one, as an eviction over the

@@ -33,6 +33,7 @@
 pub(super) mod cell;
 mod clean;
 mod frame;
+mod group;
 mod kept;
 mod lend;
 mod lent;
@@ -67,7 +68,9 @@ pub use memory::MIN_BUDGET;
 #[cfg(test)]
 pub(crate) use shortage::scarce;
 pub(crate) use shortage::unowned;
-pub(crate) use shortage::{cancel as cancel_shortage, gate_closed, Conn, Owner};
+pub(crate) use shortage::{
+    cancel as cancel_shortage, gate_closed, keep_meta, kept_page, Conn, Owner,
+};
 pub(crate) use upkeep::{scope as upkeep_scope, Upkeep};
 
 /// Batches the copies' worst layout takes (DESIGN.md 9.1.1, Minimum budget): one for each of the
@@ -165,6 +168,9 @@ struct Frames {
     /// Per 4 KiB grain: the IO in flight for a loading or outgoing frame that begins there. Put
     /// and taken by whoever holds the frame, read by anyone in a step.
     transits: Zeroed<CompletionCell>,
+    /// Per 4 KiB grain: the group of the load of the frame that begins there, which keeps the
+    /// frame for the load's waiters (ASYNC1 D2e §2.2b, [`group`]).
+    groups: Zeroed<group::GroupWord>,
     /// Waiters for a resident frame's held latch. Only that frame's release or a queued write-out
     /// finishes its cell, so another frame or the checkpoint's state cannot finish the wait.
     released: Zeroed<CompletionCell>,
@@ -580,6 +586,9 @@ pub struct BufferPool {
     /// does, whose end is an event. Up inside the submission's event, before the request, so
     /// before it can land; down inside the landing's event.
     requests: AtomicUsize,
+    /// Every page a load began reading, in order, for a test.
+    #[cfg(test)]
+    loaded: Mutex<Vec<u64>>,
     /// Bytes of swap copies written since the pool opened. Relaxed: a count.
     swap_written: AtomicU64,
     failure: SetOnce<CompletionError>,
@@ -681,6 +690,7 @@ impl BufferPool {
                 headers: Zeroed::new(grains as usize)?,
                 given_up: Zeroed::new(grains as usize)?,
                 transits: Zeroed::new(grains as usize)?,
+                groups: Zeroed::new(grains as usize)?,
                 released: Zeroed::new(grains as usize)?,
                 completions: CompletionDomain::new(store.epochs().clone()),
                 supply: supply.clone(),
@@ -697,6 +707,8 @@ impl BufferPool {
             staging: Arc::new(staging::Staging::new(config.writeback_bytes)),
             writes_in_flight: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
+            #[cfg(test)]
+            loaded: Mutex::new(Vec::new()),
             swap_written: AtomicU64::new(0),
             failure: SetOnce::default(),
             kept: Mutex::new(BTreeMap::new()),
@@ -744,6 +756,10 @@ impl BufferPool {
         &self.frames.transits[frame as usize]
     }
 
+    fn group(&self, frame: u32) -> &group::GroupWord {
+        &self.frames.groups[frame as usize]
+    }
+
     fn now(&self) -> u32 {
         self.epoch.load(Ordering::Relaxed)
     }
@@ -789,19 +805,21 @@ impl BufferPool {
         holder: &dyn Fn() -> bool,
     ) -> Result<IOResult<Option<Optimistic<'_>>>> {
         let step = self.store.epochs().enter();
-        Ok(match self.fix(pid, hint, Mode::Optimistic, holder)? {
-            IOResult::Done(Some(Fixed { frame, version, .. })) => {
-                IOResult::Done(Some(Optimistic {
-                    pool: self,
-                    frame,
-                    pid,
-                    version,
-                    _step: step,
-                }))
-            }
-            IOResult::Done(None) => IOResult::Done(None),
-            IOResult::IO(io) => IOResult::IO(io),
-        })
+        Ok(
+            match self.fix(pid, hint, Mode::Optimistic, holder, &step)? {
+                IOResult::Done(Some(Fixed { frame, version, .. })) => {
+                    IOResult::Done(Some(Optimistic {
+                        pool: self,
+                        frame,
+                        pid,
+                        version,
+                        _step: step,
+                    }))
+                }
+                IOResult::Done(None) => IOResult::Done(None),
+                IOResult::IO(io) => IOResult::IO(io),
+            },
+        )
     }
 
     pub fn fix_exclusive(
@@ -810,17 +828,19 @@ impl BufferPool {
         hint: Option<&AtomicU32>,
     ) -> Result<IOResult<Exclusive<'_>>> {
         let step = self.store.epochs().enter();
-        Ok(match self.fix(pid, hint, Mode::Exclusive, &|| true)? {
-            IOResult::Done(Some(Fixed { frame, hold, .. })) => IOResult::Done(Exclusive {
-                pool: self,
-                frame,
-                pid,
-                hold: hold.expect("an exclusive fix holds the latch"),
-                step,
-            }),
-            IOResult::Done(None) => unreachable!("held without a holder"),
-            IOResult::IO(io) => IOResult::IO(io),
-        })
+        Ok(
+            match self.fix(pid, hint, Mode::Exclusive, &|| true, &step)? {
+                IOResult::Done(Some(Fixed { frame, hold, .. })) => IOResult::Done(Exclusive {
+                    pool: self,
+                    frame,
+                    pid,
+                    hold: hold.expect("an exclusive fix holds the latch"),
+                    step,
+                }),
+                IOResult::Done(None) => unreachable!("held without a holder"),
+                IOResult::IO(io) => IOResult::IO(io),
+            },
+        )
     }
 
     /// The frame holding `pid`, latched in `mode`, and the version an optimistic fix saw; `None`
@@ -831,6 +851,7 @@ impl BufferPool {
         hint: Option<&AtomicU32>,
         mode: Mode,
         holder: &dyn Fn() -> bool,
+        step: &Step<'_>,
     ) -> Result<IOResult<Option<Fixed<'_>>>> {
         loop {
             // Relaxed, read and written: a hint, the probe checks the frame it names.
@@ -847,7 +868,7 @@ impl BufferPool {
                 .take(1),
             );
             for (frame, from_hint) in found {
-                let Some((version, hold)) = (match self.follow(frame, pid, mode)? {
+                let Some((version, hold)) = (match self.follow(frame, pid, mode, step)? {
                     Followed::Fixed(fixed) => fixed,
                     Followed::Wait(wait) => return Ok(IOResult::IO(IOCompletions(wait))),
                 }) else {
@@ -878,6 +899,12 @@ impl BufferPool {
                 IOResult::Done(f) => f,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
+            // The page located and its frame claimed: the reference the running operation keeps
+            // in another load's group goes before this load takes its place, so it keeps one at
+            // most, and kept the page it came back for through the location's and the claim's
+            // waits, its descent going on from there (ASYNC1 D2e §2.2b, #5220). A claim that
+            // came short let it go with the rest at its reservation.
+            shortage::let_go_kept();
             let loaded = match self.load(pid, frame, located)? {
                 IOResult::Done(loaded) => loaded,
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
@@ -893,7 +920,7 @@ impl BufferPool {
                     // waited on remote, which its landing finishes. A read whose landing has begun
                     // has published its result before it was seen landed, so the loader keeps it.
                     crate::race::point("buffer.loader_follows");
-                    if let Followed::Wait(wait) = self.wait_or_fix(frame, pid, mode)? {
+                    if let Followed::Wait(wait) = self.wait_or_fix(frame, pid, mode, step)? {
                         if !loaded.finished() {
                             return Ok(IOResult::IO(IOCompletions(wait)));
                         }
@@ -911,12 +938,18 @@ impl BufferPool {
     /// [`wait_or_fix`](Self::wait_or_fix) with its first look inline: a frame free or latched as
     /// asked, or not holding `pid`, decided without the call.
     #[inline(always)]
-    fn follow(self: &Arc<Self>, frame: u32, pid: PageId, mode: Mode) -> Result<Followed<'_>> {
+    fn follow(
+        self: &Arc<Self>,
+        frame: u32,
+        pid: PageId,
+        mode: Mode,
+        step: &Step<'_>,
+    ) -> Result<Followed<'_>> {
         match self.probe(frame, pid, mode) {
             Probe::Hit(version) => Ok(Followed::Fixed(Some((version, None)))),
             Probe::Held(hold) => Ok(Followed::Fixed(Some((hold.version(), Some(hold))))),
             Probe::Miss => Ok(Followed::Fixed(None)),
-            _ => self.wait_or_fix(frame, pid, mode),
+            _ => self.wait_or_fix(frame, pid, mode, step),
         }
     }
 
@@ -930,10 +963,24 @@ impl BufferPool {
     /// act, so the loop is lock-free, never a wait on anyone paused.
     #[cold]
     #[inline(never)]
-    fn wait_or_fix(self: &Arc<Self>, frame: u32, pid: PageId, mode: Mode) -> Result<Followed<'_>> {
+    fn wait_or_fix(
+        self: &Arc<Self>,
+        frame: u32,
+        pid: PageId,
+        mode: Mode,
+        step: &Step<'_>,
+    ) -> Result<Followed<'_>> {
         let mut ticket = None;
         loop {
-            match self.probe(frame, pid, mode) {
+            let probe = self.probe(frame, pid, mode);
+            if let Probe::Loading(..) = probe {
+                // A waiter of the load: the running operation keeps the page in the load's group
+                // until it comes back, if it is an owner's (ASYNC1 D2e §2.2b).
+                crate::race::point("buffer.join_probed");
+                shortage::keep_joined(self, frame, pid, || self.group(frame).join(step));
+                crate::race::point("buffer.joined");
+            }
+            match probe {
                 Probe::Hit(version) => return Ok(Followed::Fixed(Some((version, None)))),
                 Probe::Held(hold) => {
                     return Ok(Followed::Fixed(Some((hold.version(), Some(hold)))))
@@ -1064,6 +1111,17 @@ impl BufferPool {
         h.tracker.read(self.now());
         self.mark_held(frame);
         h.status.store(LOADING, Ordering::Release);
+        #[cfg(test)]
+        self.loaded.lock().push(pid.raw());
+        // The load's group, opened before the load is published, so every fix that finds the
+        // load under way finds its group open: the frame kept for the load's waiters until its
+        // last reference goes, the loader's own if it runs for an owner (ASYNC1 D2e §2.2b).
+        h.group_kept();
+        let loader_keeps = shortage::keeping();
+        self.group(frame).open(loader_keeps);
+        if loader_keeps {
+            shortage::keep_loaded(self, frame, pid);
+        }
         let loaded = crate::storage::atoll::notify::wait();
         self.transit(frame).put(loaded.clone());
         if self
@@ -1072,7 +1130,11 @@ impl BufferPool {
             .is_err()
         {
             self.frames.end_transit(frame);
+            self.close_group(frame);
             self.free_frame(pid.class(), frame, hold);
+            // The loader's own reference, for a page another frame holds: let go now, which frees
+            // the frame unless a fix that followed a hint here joined the group meanwhile.
+            shortage::let_go_kept();
             // A reader may have followed a hint here meanwhile: send it to the other frame.
             notify::finish(&loaded, Ok(0));
             return Ok(IOResult::Done(None));
@@ -1187,6 +1249,7 @@ impl BufferPool {
                 let pending = n != 0 && owed && self.cut_owed.lock().contains(&pid);
                 h.pending
                     .store(if pending { n } else { 0 }, Ordering::Release);
+                self.close_group(frame);
                 h.status.store(RESIDENT, Ordering::Release);
                 crate::race::point("buffer.loaded_published");
                 drop(hold);
@@ -1207,6 +1270,7 @@ impl BufferPool {
         let frame = hold.latch().frame;
         let waiting = self.frames.end_transit(frame);
         self.table.remove(&self.frames.headers, pid.raw(), frame);
+        self.close_group(frame);
         self.free_frame(pid.class(), frame, hold);
         match (waiting, error) {
             (Some(c), Some(e)) => notify::finish(&c, Err(e)),
@@ -1281,7 +1345,8 @@ impl BufferPool {
         // A frame whose record still holds its load's or write-out's request (a cancelled read, a
         // write-out landed and not yet let go) goes to the free frames when the request retires:
         // the backend may still read or write its memory until then (DESIGN.md 22.18, a frame).
-        if h.free_at_retirement() {
+        // One its load's group still keeps goes when the group's last reference is released.
+        if h.free_deferred() {
             return;
         }
         self.release_free(class, frame);
@@ -1336,6 +1401,40 @@ impl BufferPool {
         if retired.freed {
             self.release_free(class, frame);
         } else if retired.waited {
+            self.signal_released();
+        }
+    }
+
+    /// Closes the group of the load of `frame`, whose latch the loader holds, before the page is
+    /// published or the frame freed: its guard dropped and, if that was its last reference, its
+    /// keep let go here. A claim that marked the frame meanwhile is told by the publication's or
+    /// the free's signal that follows, or by the retirement of a request still held.
+    fn close_group(&self, frame: u32) {
+        let last = self.group(frame).close();
+        crate::race::point("buffer.group_closed");
+        if last {
+            let found = self.header(frame).ungroup();
+            crate::turso_assert!(!found.freed, "a loading frame freed before its load ended");
+        }
+    }
+
+    /// Releases a reference in the group of the load of `frame`, which read `pid` into it, holding
+    /// no latch: the last one lets the group's keep go, and the frame goes free or a claim is told
+    /// if nothing else keeps it (ASYNC1 D2e §2.2b).
+    fn release_kept(&self, frame: u32, pid: PageId) {
+        if !self.group(frame).release() {
+            return;
+        }
+        // Read before the keep goes, while nothing can open the word again or join the group.
+        #[cfg(test)]
+        crate::turso_assert!(
+            self.group(frame).released(),
+            "a group's reference outlived its keep"
+        );
+        let found = self.header(frame).ungroup();
+        if found.freed {
+            self.release_free(pid.class(), frame);
+        } else if found.waited {
             self.signal_released();
         }
     }
@@ -2270,10 +2369,10 @@ impl BufferPool {
                 && PageId::from_raw(h.pid()).class() == class
                 && !h.has(WRITING);
             if theirs {
-                // Passed over for its record, it is the record's retirement that frees it, not the
-                // latch's release: the record is marked (a free latch's mark would read changed
-                // and send the claim straight back).
-                let marked = if h.record_held() {
+                // Passed over for its record or its group, it is the record's retirement or the
+                // group's release that frees it, not the latch's release: the record is marked (a
+                // free latch's mark would read changed and send the claim straight back).
+                let marked = if h.record_keeps() {
                     h.mark_record_waited()
                 } else {
                     h.latch.mark_waited()
@@ -2352,14 +2451,23 @@ impl BufferPool {
         if !holds || !h.latch.validate(version) {
             return None;
         }
-        // Its load's request not yet retired: passed over as a pinned page is, until it retires
-        // (DESIGN.md 22.18, a frame). Only a load leaves a resident frame's record held, and only
-        // its retirement frees it.
-        if h.record_held() {
+        // Its load's request not yet retired, or its load's group still keeping it: passed over as
+        // a pinned page is, until it retires and the group's last reference goes (DESIGN.md
+        // 22.18, a frame; ASYNC1 D2e §2.2b). Only a load leaves a resident frame's record held or
+        // grouped, and the group's keep is set only under the loader's latch: once read clear at
+        // this version, it is not set again unless the frame is freed and loaded anew, which the
+        // take at this version refuses.
+        if h.record_keeps() {
             return None;
         }
         crate::race::point("buffer.evict_take");
         let hold = Held::try_take_at(latch(), version)?;
+        // Held, its group's keep gone: no group can open or take a reference on it now.
+        #[cfg(test)]
+        crate::turso_assert!(
+            self.group(frame).released(),
+            "a group's reference outlived its keep"
+        );
         // WRITING is set under the latch by a pass claiming a dirty page, and cleared without it
         // when a write ends: look again later.
         if h.has(WRITING) {
@@ -3216,6 +3324,36 @@ impl BufferPool {
     #[cfg(test)]
     pub(crate) fn shortage_len(&self) -> usize {
         self.shortage.len()
+    }
+
+    /// Whether a load's group keeps `frame`, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn frame_kept_for_test(&self, frame: u32) -> bool {
+        self.header(frame).record_keeps()
+    }
+
+    /// The places in the pool's shortage queue, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn shortage_len_for_test(&self) -> usize {
+        self.shortage.len()
+    }
+
+    /// Every page a load began reading, in order, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn loaded_pages(&self) -> Vec<u64> {
+        self.loaded.lock().clone()
+    }
+
+    /// Evicts every resident page that is clean and that nothing holds or keeps, for a test: how
+    /// many.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn evict_all_clean(&self) -> usize {
+        (0..self.memory.grains())
+            .filter(|&frame| {
+                let h = self.header(frame);
+                h.status() == RESIDENT && self.evict_clean(PageId::from_raw(h.pid()))
+            })
+            .count()
     }
 
     /// Evicts `pid`, resident, clean and unheld, for a test: the page is then in its copies alone.

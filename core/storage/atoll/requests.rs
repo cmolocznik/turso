@@ -460,6 +460,34 @@ impl Counted {
         Self::with_shape(io, requests, Shape::default())
     }
 
+    /// Wraps `io` for a database being opened: synchronously, or, in a test that opens it async
+    /// ([`opened_async`]), with a record for each of its `meta_reads` metadata read credits, its
+    /// pool's `frames` grains and its `slots` transaction slots, and one IO thread.
+    pub(super) fn for_open(
+        io: Arc<dyn IO>,
+        requests: Arc<Requests>,
+        meta_reads: usize,
+        frames: usize,
+        slots: usize,
+    ) -> Result<Self> {
+        #[cfg(test)]
+        if OPEN_ASYNC.with(std::cell::Cell::get) {
+            return Self::with_shape(
+                io,
+                requests,
+                Shape {
+                    opened_async: true,
+                    io_threads: 1,
+                    meta_reads,
+                    frames,
+                    slots,
+                },
+            );
+        }
+        let _ = (meta_reads, frames, slots);
+        Self::new(io, requests)
+    }
+
     /// Wraps `io`, counting in `requests`, whose records it makes in `shape` and whose IO threads
     /// it starts: a thread that does not start fails the open, before any file is opened, the
     /// threads already started stopped and joined with the requests.
@@ -1075,6 +1103,28 @@ impl File for CountedFile {
         refuse_in_frame("a counted file's shared WAL map");
         self.file.shared_wal_map(offset, len)
     }
+}
+
+#[cfg(test)]
+crate::thread::thread_local! {
+    /// For a test: whether a database opened on this thread now is opened async.
+    static OPEN_ASYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with every database it opens on this thread opened async (ASYNC1 D2a), so a test's
+/// cooperative frame over a whole database queues its requests for the IO thread; a production
+/// database opens async only through D2e (v)'s builder.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(crate) fn opened_async<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::storage::atoll::unwind::abort_if_unwinding();
+            OPEN_ASYNC.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(OPEN_ASYNC.with(|o| o.replace(true)));
+    f()
 }
 
 /// A counted IO over `io` for a test that builds an owner on its own, outside an open: its IO

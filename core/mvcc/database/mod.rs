@@ -9061,45 +9061,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
     ) -> usize {
-        self.gc_chain_at_floor(versions, lwm, ckpt_max, min_reader_mark, drop_current_if_in_btree, true)
-    }
-
-    /// [`Self::gc_chain_now`] for an index chain. Its lone current copy is dropped only while no
-    /// snapshot is open, as Truncate does: an index read under an open snapshot has missed
-    /// entries whose copies were still present while the open-snapshot drop unlinked emptied index
-    /// slots beside it (vector staging, a covering-index count of 0 over 64 committed rows).
-    /// Containment only: the read path that misses them is not found yet.
-    pub(crate) fn gc_index_chain_now(
-        &self,
-        versions: &mut RowVersionChain<A>,
-        lwm: u64,
-        ckpt_max: u64,
-        min_reader_mark: WalPos,
-        drop_current_if_in_btree: bool,
-    ) -> usize {
-        self.gc_chain_at_floor(versions, lwm, ckpt_max, min_reader_mark, drop_current_if_in_btree, false)
-    }
-
-    fn gc_chain_at_floor(
-        &self,
-        versions: &mut RowVersionChain<A>,
-        lwm: u64,
-        ckpt_max: u64,
-        min_reader_mark: WalPos,
-        drop_current_if_in_btree: bool,
-        drops_under_open_snapshots: bool,
-    ) -> usize {
         let lwm = if lwm == u64::MAX {
             self.compute_lwm()
         } else {
             lwm
         };
-        let covered_through = if !self.experimental_mvcc_passive_checkpoint || lwm == u64::MAX {
-            u64::MAX
-        } else if drops_under_open_snapshots {
+        let covered_through = if self.experimental_mvcc_passive_checkpoint && lwm != u64::MAX {
             self.compute_min_durable_at_begin()
         } else {
-            0
+            u64::MAX
         };
         Self::gc_version_chain(
             versions,
@@ -9321,7 +9291,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     break 'outer;
                 }
                 let mut versions = inner_entry.value().write();
-                dropped += self.gc_index_chain_now(
+                dropped += self.gc_chain_now(
                     &mut versions,
                     lwm,
                     ckpt_max,
@@ -9448,7 +9418,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
             for inner_entry in inner_map.iter() {
                 let mut versions = inner_entry.value().write();
-                dropped += self.gc_index_chain_now(
+                dropped += self.gc_chain_now(
                     &mut versions,
                     lwm,
                     ckpt_max,
@@ -9456,7 +9426,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     drop_current_if_in_btree,
                 );
                 Self::collect_referenced_txids(&versions, referenced_tx_ids);
-                if remove_empty_slots && versions.is_empty() {
+                // An emptied index slot is unlinked only while no snapshot is open (the sampled
+                // lwm, checked again for a reader that began after the sample): under an open
+                // snapshot a covering-index prefix count missed entries still present beside slots
+                // unlinked under it. The emptied chain holds no versions, so a slot left in place
+                // costs its key alone, and an index scan skips it as it skips an invisible chain.
+                if remove_empty_slots
+                    && versions.is_empty()
+                    && lwm == u64::MAX
+                    && self.compute_lwm() == u64::MAX
+                {
                     self.bump_index_rows_epoch();
                     // Inner key only — the outer per-index map stays (bounded by index count).
                     inner_entry.remove();

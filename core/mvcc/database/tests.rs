@@ -25994,7 +25994,7 @@ fn passive_checkpoint_publishes_no_schema_cookie_older_than_a_schema_change_it_o
 /// them from the B-tree (they are B-tree-equivalent for it), so the GC that drops their lone current
 /// SkipMap copies while it runs neither repeats nor loses a row. A reader that began before that
 /// checkpoint pins the copies (it is not covered), so the first checkpoint leaves them in place.
-/// Only the table's copies drop under the open scan; the index's wait for no snapshot to be open.
+/// The index's emptied slots stay linked under the open scan; only the versions go.
 fn passive_scan_survives_rule3_drop_mid_scan(sql: &str, expected: &[String]) {
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let mv = db.get_mvcc_store();
@@ -26056,13 +26056,14 @@ fn passive_scan_survives_rule3_drop_mid_scan(sql: &str, expected: &[String]) {
         .unwrap();
     let dropped = mv.debug_gc_snapshot();
     assert!(
-        dropped.rows_versions < pinned.rows_versions - 150,
-        "the table's lone current copies drop under the open scan: before {pinned:?}, after {dropped:?}"
+        dropped.rows_versions < pinned.rows_versions - 150
+            && dropped.index_versions < pinned.index_versions - 150,
+        "the lone current copies drop under the open scan: before {pinned:?}, after {dropped:?}"
     );
-    // An index chain's lone current copy is dropped only while no snapshot is open.
+    // An emptied index slot stays linked while a snapshot is open; the next idle pass unlinks it.
     assert!(
-        dropped.index_versions >= pinned.index_versions,
-        "the index's lone current copies stay under the open scan: before {pinned:?}, after {dropped:?}"
+        dropped.index_slots >= pinned.index_slots,
+        "the index's emptied slots stay linked under the open scan: before {pinned:?}, after {dropped:?}"
     );
 
     assert!(step(&mut stmt, &mut seen, usize::MAX), "the scan completes");

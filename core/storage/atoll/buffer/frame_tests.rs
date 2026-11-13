@@ -242,9 +242,10 @@ impl File for ProbeFile {
                     }
                     None
                 });
-                if let Err(e) = self.file.pread(at, inner) {
-                    c.retire();
-                    return Err(e);
+                // The probe's own backend refuses nothing: a refusal here is the fixture broken,
+                // and no request it accepted may be finished or retired as though it ended.
+                if self.file.pread(at, inner).is_err() {
+                    crate::io::fatal("frame_tests: the probe's memory backend refused a read");
                 }
                 Ok(c)
             }
@@ -274,9 +275,8 @@ impl File for ProbeFile {
                     Ok(n) => owner.complete(n),
                     Err(e) => owner.error(e),
                 });
-                if let Err(e) = self.file.pwrite(at, buffer, inner) {
-                    c.retire();
-                    return Err(e);
+                if self.file.pwrite(at, buffer, inner).is_err() {
+                    crate::io::fatal("frame_tests: the probe's memory backend refused a write");
                 }
                 Ok(c)
             }
@@ -559,7 +559,9 @@ fn a_synchronous_databases_frame_miss_on_a_data_page_ends_the_process_at_its_ope
 /// the write's retirement, which the probe holds: until then its record is held and a claim's wait
 /// on the pool's room is not finished, and the retirement frees it and finishes that wait (mutant
 /// `write-out-in-place`: the write-out submits in place in the frame, and the census ends the
-/// child).
+/// child). The write is let go only once the IO thread has run the branch after its backend call,
+/// which installs the release on the write's retirement, so the release and its wake run on the
+/// test thread inside `let_go` (#4922).
 #[cfg(all(unix, not(miri)))]
 #[test]
 fn a_write_out_in_a_frame_is_queued_and_its_frame_freed_at_the_writes_retirement() {
@@ -579,7 +581,9 @@ fn a_write_out_in_a_frame_is_queued_and_its_frame_freed_at_the_writes_retirement
             probe.forget_calls();
             let me = crate::thread::current().id();
             start_writing_out(&pool, frame);
-            let settled = settle_in_frames(&pool, &io);
+            let requests = counted.requests().clone();
+            let (settled, paused, ran) =
+                past_the_branch(&requests, || settle_in_frames(&pool, &io));
             let polled = probe.on(me);
             let writes: Vec<_> = probe
                 .calls()
@@ -599,8 +603,13 @@ fn a_write_out_in_a_frame_is_queued_and_its_frame_freed_at_the_writes_retirement
             let swap = pool.store.swap_slot(pid);
             let at_rest = counted.requests().frames_at_rest();
             let failure = pool.failed().err();
-            drop((wait, pool, io, counted));
+            drop((wait, pool, io, counted, requests));
             assert!(settled.is_ok(), "the writeback did not settle: {settled:?}");
+            assert_eq!(
+                (paused, ran),
+                (true, true),
+                "the IO thread reached the pause after the write's backend call, then the branch's end"
+            );
             assert!(
                 polled.is_empty(),
                 "backend calls on the polling thread: {polled:?}"
@@ -1088,7 +1097,9 @@ fn a_queued_write_outs_stage_or_backend_failure_fails_the_pool_and_keeps_the_pag
 /// request into the same record at once, from inside that release, just after the frame's record
 /// is let go: the dispatch record is already at rest then, so the queueing is accepted, and the
 /// new request runs to its own end (mutant `frame-retired-first`: the frame's record let go before
-/// the dispatch record, so the queueing finds the record held and is refused).
+/// the dispatch record, so the queueing finds the record held and is refused). The carrier is let
+/// go only once the IO thread has run the branch after its backend call, which installs the
+/// release on its retirement, the write's waiter having returned first (#4918).
 #[test]
 fn a_frame_freed_at_its_requests_release_queues_a_new_request_into_the_same_record_at_once() {
     use crate::storage::atoll::requests::Place;
@@ -1100,7 +1111,8 @@ fn a_frame_freed_at_its_requests_release_queues_a_new_request_into_the_same_reco
     let (pid, frame) = dirty_page(&pool, &io, false);
     probe.rule_under(&data(base), Some(Rule::Hold));
     start_writing_out(&pool, frame);
-    let settled = settle_in_frames(&pool, &io);
+    let requests = counted.requests().clone();
+    let (settled, paused, ran) = past_the_branch(&requests, || settle_in_frames(&pool, &io));
     let slot = pool.store.swap_slot(pid);
     // From inside the release, once the frame's record is let go: a new request into its record.
     let queued: Arc<Mutex<Option<(std::result::Result<(), String>, Completion)>>> =
@@ -1129,7 +1141,6 @@ fn a_frame_freed_at_its_requests_release_queues_a_new_request_into_the_same_reco
         .as_ref()
         .is_some_and(|(_, c)| settle(|| c.finished()));
     probe.let_go();
-    let requests = counted.requests().clone();
     let records = MIN_BUDGET / MIN_PAGE_SIZE;
     let let_go = settle(|| {
         requests.outstanding() == 0
@@ -1140,6 +1151,11 @@ fn a_frame_freed_at_its_requests_release_queues_a_new_request_into_the_same_reco
     let failure = pool.failed().err();
     drop((pool, io, counted, requests));
     assert!(settled.is_ok(), "the writeback did not settle: {settled:?}");
+    assert_eq!(
+        (paused, ran),
+        (true, true),
+        "the IO thread reached the pause after the write's backend call, then the branch's end"
+    );
     assert!(slot.is_some(), "the page has no swap copy");
     assert!(reached, "the release never let the frame's record go");
     assert_eq!(

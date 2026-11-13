@@ -1862,10 +1862,37 @@ impl ConnTxn {
             destroy: Destroy::new(id),
             waiting: Waiting::default(),
             counted: None,
+            count: None,
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         });
         if clear && op.counted.is_none() {
-            op.counted = Some(self.count_rows(id)?);
+            let inside = crate::storage::atoll::cooperative::inside();
+            if op.count.is_none() && !inside {
+                // A blocking host with no count kept: the count as before, its cursor on the stack.
+                op.counted = Some(self.count_rows(id)?);
+            } else {
+                let count = op.count.get_or_insert_with(Count::new);
+                let out = if inside {
+                    self.count_step(id, count)
+                } else {
+                    // A count kept from a frame, entered outside one: driven to its end here.
+                    drive_for(self.cell.conn(), self.db.io(), || self.count_step(id, count))
+                        .map(IOResult::Done)
+                };
+                match out {
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Ok(IOResult::Done(n)) => {
+                        op.count = None;
+                        op.counted = Some(n);
+                    }
+                    Err(e) => {
+                        // Failed, the count is let go at this return: its read's owner and its
+                        // cursor's.
+                        op.count = None;
+                        return Err(e);
+                    }
+                }
+            }
         }
         loop {
             let mut guard = self.cell.lock();
@@ -1923,6 +1950,58 @@ impl ConnTxn {
         Ok(n)
     }
 
+    /// One call's worth of a Clear's count in a cooperative frame (ASYNC1 D2e (iii-a)), its
+    /// progress kept in `count` across its returns for IO: the tree's catalog row, read as a
+    /// cursor's resolution reads it (D2e (ii)); a cursor over the tree from its first row; and each
+    /// row counted as the cursor leaves it, never again when a move past it is entered again.
+    fn count_step(&self, id: u64, count: &mut Count) -> Result<IOResult<u64>> {
+        loop {
+            match count.at {
+                CountAt::Resolving => {
+                    let entry = {
+                        let mut guard = self.cell.lock();
+                        let txn = guard.as_mut().ok_or_else(outside)?;
+                        let out = row_in_kept(
+                            &self.db,
+                            self.cell.conn(),
+                            &self.known,
+                            id,
+                            txn,
+                            &mut count.read,
+                        );
+                        match FacadeRead::settle(&mut count.read, out)? {
+                            IOResult::Done((row, _)) => row.entry,
+                            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        }
+                    };
+                    count.cursor = Some(Box::new(AtollCursor::new(
+                        self.db.clone(),
+                        self.cell.clone(),
+                        id,
+                        entry,
+                        None,
+                        key::ENCODING,
+                    )));
+                    count.at = CountAt::Rewinding;
+                }
+                CountAt::Rewinding => {
+                    done!(count.cursor.as_mut().expect("a count's cursor").rewind());
+                    count.at = CountAt::At(0);
+                }
+                CountAt::At(n) => {
+                    if count.cursor.as_ref().expect("a count's cursor").is_empty() {
+                        return Ok(IOResult::Done(n));
+                    }
+                    count.at = CountAt::Moving(n + 1);
+                }
+                CountAt::Moving(n) => {
+                    done!(count.cursor.as_mut().expect("a count's cursor").next());
+                    count.at = CountAt::At(n);
+                }
+            }
+        }
+    }
+
     /// CreateBtree (DESIGN.md §17, §5): draws a tree id, creates its tree in the current
     /// statement and writes its catalog row, an index's (or a WITHOUT ROWID table's, R29) or a
     /// table's. Step it with the same `op` until done; returns the tree id, which Turso calls the
@@ -1977,8 +2056,79 @@ pub struct RetireOp {
     waiting: Waiting,
     /// For a Clear, the rows the tree held at the view.
     counted: Option<u64>,
+    /// For a Clear in a cooperative frame, its count under way (ASYNC1 D2e (iii-a)).
+    count: Option<Count>,
     /// Dropped last: the end of the frame its `Drop` opens (DESIGN.md 22.11).
     _frame: crate::storage::atoll::unwind::FrameEnd,
+}
+
+/// A Clear's count of its tree's rows under way in a cooperative frame (ASYNC1 D2e (iii-a)): what
+/// its steps keep across their returns for IO.
+struct Count {
+    /// The tree's catalog row's read, kept across its returns (D2e (ii)'s).
+    read: Option<Box<FacadeRead>>,
+    cursor: Option<Box<AtollCursor>>,
+    at: CountAt,
+}
+
+/// Where a count stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountAt {
+    /// The tree's catalog row is being read.
+    Resolving,
+    /// The cursor goes to the first row.
+    Rewinding,
+    /// At a row, `n` counted before it; or past the last, `n` rows in all.
+    At(u64),
+    /// Moving past a row, which `n` counts already.
+    Moving(u64),
+}
+
+impl Count {
+    fn new() -> Self {
+        Self {
+            read: None,
+            cursor: None,
+            at: CountAt::Resolving,
+        }
+    }
+}
+
+impl RetireOp {
+    /// Where its count stands, if one is under way, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn count_at_for_test(&self) -> Option<&'static str> {
+        self.count.as_ref().map(|c| match c.at {
+            CountAt::Resolving => "resolving",
+            CountAt::Rewinding => "rewinding",
+            CountAt::At(_) => "at",
+            CountAt::Moving(_) => "moving",
+        })
+    }
+
+    /// The frame and metadata page its count's catalog read keeps, and its cursor's owner, for a
+    /// test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn count_keeps_for_test(
+        &self,
+    ) -> (
+        Option<(Option<u32>, Option<crate::storage::atoll::meta::MetaId>)>,
+        Option<(Option<u32>, Option<crate::storage::atoll::meta::MetaId>)>,
+    ) {
+        match &self.count {
+            Some(c) => (
+                c.read.as_ref().map(|r| r.keeps_for_test()),
+                c.cursor.as_ref().map(|c| c.keeps_for_test()),
+            ),
+            None => (None, None),
+        }
+    }
+
+    /// Whether its Clear has counted, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(in crate::storage::atoll) fn counted_for_test(&self) -> Option<u64> {
+        self.counted
+    }
 }
 
 /// A full checkpoint (DESIGN.md §17, §11): one begun now, done, for `PRAGMA wal_checkpoint` and

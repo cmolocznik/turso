@@ -822,6 +822,14 @@ impl Statement {
         self._step(None).map_err(|error| self.format_error(error))
     }
 
+    /// The Atoll Destroy or Clear this statement keeps across its returns, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn atoll_retire_for_test(
+        &self,
+    ) -> Option<&crate::storage::atoll::sql::mode::RetireOp> {
+        self.state.atoll_retire.as_ref()
+    }
+
     /// The Atoll read this statement keeps across its returns, for a test.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(crate) fn atoll_read_for_test(

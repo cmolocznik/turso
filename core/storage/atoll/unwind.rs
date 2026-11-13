@@ -734,6 +734,31 @@ mod tests {
             "child",
         ),
         (
+            "sql/mode/tests.rs",
+            "a_clear_in_frames_counts_through_returns_in_its_read_and_its_moves",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_clears_count_counts_each_row_once_through_its_returns_in_its_moves",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_count_that_fails_lets_its_read_or_its_cursor_go_at_that_return",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_statement_reset_while_its_clears_count_waits_lets_the_count_go",
+            "child",
+        ),
+        (
+            "sql/mode/tests.rs",
+            "a_count_kept_in_a_frame_and_entered_outside_one_ends_there",
+            "child",
+        ),
+        (
             "executor/tests.rs",
             "a_step_watching_a_signal_its_job_did_not_declare_ends_the_process",
             "child",

@@ -9373,6 +9373,374 @@ mod in_frames {
                 },
             );
         }
+
+        // ------------------------------------- a Clear's count in a frame (ASYNC1 D2e (iii-a))
+
+        mod counting {
+            use super::*;
+            use crate::storage::atoll::sql::cursor::CURSORS_BUILT;
+
+            /// A table `big` made past the 700 tables, its `rows` rows spanning many leaves, written
+            /// and checkpointed; its tree id.
+            fn big(path: &str, rows: i64) -> (Arc<dyn IO>, Arc<Database>, Arc<Connection>, u64) {
+                let (io, db, conn) = seven_hundred(path);
+                conn.execute("CREATE TABLE big (a INTEGER PRIMARY KEY, b BLOB)")
+                    .unwrap();
+                conn.execute("BEGIN").unwrap();
+                for a in 1..=rows {
+                    conn.execute(format!("INSERT INTO big VALUES ({a}, zeroblob(120))"))
+                        .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
+                let id = tree(&conn, "big");
+                checkpointed(&conn);
+                (io, db, conn, id)
+            }
+
+            /// The `AtollCursor`s and the resolutions' `Get`s made on this thread so far.
+            fn made() -> (u64, u64) {
+                (CURSORS_BUILT.with(|n| n.get()), ROW_GETS.with(|n| n.get()))
+            }
+
+            /// The construction witness after a call (IIIA-2): a count makes at most one cursor and,
+            /// in a frame, at most one `Get` for its catalog row.
+            fn witnessed(calls: usize, start: (u64, u64)) {
+                let now = made();
+                assert!(
+                    now.0 - start.0 <= 1,
+                    "call {calls}: the count built a second cursor"
+                );
+                assert!(
+                    now.1 - start.1 <= 1,
+                    "call {calls}: the count made a second Get"
+                );
+            }
+
+            /// Steps `retire_tree(op, id, true)` in test frames until it is done, every page not kept
+            /// evicted at each return while its count reads its catalog row; the count and the phases
+            /// its returns came in, the witness checked after every call. The leaves are left as they
+            /// are once the cursor moves: cold from before, each loaded once.
+            fn cleared_in_frames(
+                io: &Arc<dyn IO>,
+                db: &Database,
+                ct: &crate::storage::atoll::sql::mode::ConnTxn,
+                op: &mut Option<crate::storage::atoll::sql::mode::RetireOp>,
+                id: u64,
+            ) -> (u64, Vec<&'static str>) {
+                let start = made();
+                let mut phases = Vec::new();
+                for calls in 1..100_000 {
+                    let out = in_frame(io, db, || ct.retire_tree(op, id, true)).unwrap();
+                    witnessed(calls, start);
+                    match out {
+                        IOResult::Done(n) => return (n, phases),
+                        IOResult::IO(_) => {
+                            if let Some(at) = op.as_ref().and_then(|o| o.count_at_for_test()) {
+                                phases.push(at);
+                                // Evicted while its catalog row is read alone: the cursor's own
+                                // descents go on from the root, not from a kept page.
+                                if at == "resolving" {
+                                    chill(db);
+                                }
+                            }
+                        }
+                    }
+                }
+                panic!("the Clear did not finish within 100000 calls");
+            }
+
+            /// A Clear through SQL in frames (`DELETE FROM big`, a `ClearBtree` that counts), its
+            /// tree's catalog row and leaves cold, every page not kept evicted at each return until its
+            /// count has read its catalog row: it returns IO while that row is read and while it moves
+            /// past rows, builds one cursor and makes one `Get`, and, its writes then done outside the
+            /// frames, finishes as outside any frame, `changes()` the rows and the table empty (mutants
+            /// `count-parks`, `count-fresh`).
+            #[test]
+            fn a_clear_in_frames_counts_through_returns_in_its_read_and_its_moves() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_clear_in_frames_counts_through_returns_in_its_read_and_its_moves"
+                    ),
+                    || {
+                        let (io, db, conn, _) = big("/db/clear-count", 2000);
+                        let atoll = db.atoll.as_ref().unwrap().atoll();
+                        let mut stmt = conn.prepare("DELETE FROM big").unwrap();
+                        chill(&db);
+                        let start = made();
+                        let (mut phases, mut counted) = (Vec::new(), false);
+                        for calls in 1..100_000 {
+                            let held = held_io(&db);
+                            let stepped = {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                stmt.step().unwrap()
+                            };
+                            let idle = atoll.io_idle_for_test();
+                            drop(held);
+                            witnessed(calls, start);
+                            let op = stmt.atoll_retire_for_test();
+                            let at = op.and_then(|o| o.count_at_for_test());
+                            counted |= op.and_then(|o| o.counted_for_test()).is_some();
+                            // Once counted, the Clear's writes go on outside the frames: a write that large
+                            // reaches the log's preparer, which a frame refuses without a worker.
+                            if counted {
+                                assert!(
+                                    !matches!(stepped, crate::StepResult::Done),
+                                    "the statement finished in the call that counted"
+                                );
+                                break;
+                            }
+                            match stepped {
+                                crate::StepResult::Done => break,
+                                crate::StepResult::IO => {
+                                    let c =
+                                        stmt.pending_io_for_test().expect("the statement's wait");
+                                    assert!(
+                                        waited(&io, &c),
+                                        "call {calls}: its wait never finished"
+                                    );
+                                    assert!(retired(&db), "call {calls}: a request outstanding");
+                                    assert!(
+                                        idled(&idle),
+                                        "call {calls}: the IO thread never went idle"
+                                    );
+                                    if let Some(at) = at {
+                                        phases.push(at);
+                                    }
+                                    // Evicted before the count and while it reads its catalog row;
+                                    // the cursor's moves then load each cold leaf once.
+                                    if !counted && at.is_none_or(|a| a == "resolving") {
+                                        chill(&db);
+                                    }
+                                }
+                                other => panic!("call {calls}: {other:?}"),
+                            }
+                        }
+                        let rest = finished(&mut stmt);
+                        drop(stmt);
+                        assert!(rest.is_empty(), "the DELETE returned rows");
+                        let built = made().0 - start.0;
+                        assert!(
+                            phases.contains(&"resolving"),
+                            "no return while the count read its row: {phases:?}"
+                        );
+                        assert!(
+                            phases.contains(&"moving"),
+                            "no return while the count moved: {phases:?}"
+                        );
+                        assert_eq!(built, 1, "the cursors the count built");
+                        assert_eq!(
+                            rows(&conn, "SELECT changes()"),
+                            vec![vec![Value::from_i64(2000)]],
+                            "the Clear's changes"
+                        );
+                        assert_eq!(
+                            rows(&conn, "SELECT count(*) FROM big"),
+                            vec![vec![Value::from_i64(0)]],
+                            "the rows after the Clear"
+                        );
+                    },
+                );
+            }
+
+            /// A Clear's count through the facade, its leaves cold: it returns IO while moving past
+            /// rows, and each row is counted once, through every such return (mutant `count-double`).
+            #[test]
+            fn a_clears_count_counts_each_row_once_through_its_returns_in_its_moves() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_clears_count_counts_each_row_once_through_its_returns_in_its_moves"
+                    ),
+                    || {
+                        let (io, db, conn, id) = big("/db/clear-moves", 2000);
+                        let (ct, opening) = writing(&io, &conn, id);
+                        drop(opening);
+                        chill(&db);
+                        let mut op = None;
+                        let (n, phases) = cleared_in_frames(&io, &db, ct, &mut op, id);
+                        drop(op);
+                        ct.end(false)
+                            .expect("a transaction to end")
+                            .finish()
+                            .unwrap();
+                        let moving = phases.iter().filter(|p| **p == "moving").count();
+                        assert!(moving >= 1, "no return while the count moved: {phases:?}");
+                        assert_eq!(
+                            n, 2000,
+                            "the rows counted through {moving} returns in its moves"
+                        );
+                    },
+                );
+            }
+
+            /// A count that fails before it is done, before any reset or drop of its operation
+            /// (IIIA-1): its read kept across a return in `Resolving`, or its cursor across one in
+            /// `Moving`, then its transaction ended; the next call fails in the count, the Clear not
+            /// counted, and the count is let go at that return, its keeps with it, its operation still
+            /// alive (mutant `count-kept-on-error`).
+            #[test]
+            fn a_count_that_fails_lets_its_read_or_its_cursor_go_at_that_return() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_count_that_fails_lets_its_read_or_its_cursor_go_at_that_return"
+                    ),
+                    || {
+                        let (io, db, conn, id) = big("/db/clear-fails", 2000);
+                        for phase in ["resolving", "moving"] {
+                            let (ct, opening) = writing(&io, &conn, id);
+                            drop(opening);
+                            chill(&db);
+                            let mut op = None;
+                            // Stepped to a return for IO in the phase, every page not kept evicted.
+                            let mut keeps = None;
+                            for calls in 1..100_000 {
+                                let out = in_frame(&io, &db, || ct.retire_tree(&mut op, id, true))
+                                    .unwrap();
+                                assert!(
+                                    matches!(out, IOResult::IO(_)),
+                                    "{phase}: the count finished at call {calls} without a return in it"
+                                );
+                                let o = op.as_ref().expect("the Clear's state");
+                                if o.count_at_for_test() == Some(phase) {
+                                    let (read, cursor) = o.count_keeps_for_test();
+                                    keeps = if phase == "resolving" { read } else { cursor };
+                                    break;
+                                }
+                                if o.count_at_for_test() == Some("resolving") {
+                                    chill(&db);
+                                }
+                            }
+                            let keeps = keeps.expect("the count's keeps at its return");
+                            let before = kept_now(&db, keeps);
+                            ct.end(false)
+                                .expect("a transaction to end")
+                                .finish()
+                                .unwrap();
+                            let failed = in_frame(&io, &db, || ct.retire_tree(&mut op, id, true));
+                            let o = op.as_ref().expect("the Clear's state, alive");
+                            let (counted, at) = (o.counted_for_test(), o.count_at_for_test());
+                            let after = kept_now(&db, keeps);
+                            assert!(
+                                failed.is_err(),
+                                "{phase}: the call with no transaction did not fail"
+                            );
+                            assert_eq!(counted, None, "{phase}: the failure came after the count");
+                            assert_eq!(at, None, "{phase}: the count kept after the failure");
+                            let_go(&format!("the count failed {phase}"), keeps, before, after);
+                            drop(op);
+                        }
+                    },
+                );
+            }
+
+            /// A statement reset while its Clear's count waits in a frame: the count's keeps are let
+            /// go with its operation, and the statement run again clears and counts as outside a frame.
+            #[test]
+            fn a_statement_reset_while_its_clears_count_waits_lets_the_count_go() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_statement_reset_while_its_clears_count_waits_lets_the_count_go"
+                    ),
+                    || {
+                        let (io, db, conn, _) = big("/db/clear-reset", 2000);
+                        let atoll = db.atoll.as_ref().unwrap().atoll();
+                        let mut stmt = conn.prepare("DELETE FROM big").unwrap();
+                        chill(&db);
+                        let mut keeps = None;
+                        for calls in 1..100_000 {
+                            let held = held_io(&db);
+                            let stepped = {
+                                let _frame = crate::storage::atoll::cooperative::Frame::enter();
+                                stmt.step().unwrap()
+                            };
+                            let idle = atoll.io_idle_for_test();
+                            drop(held);
+                            assert!(
+                                matches!(stepped, crate::StepResult::IO),
+                                "call {calls}: the statement went on to {stepped:?} without its count returning IO"
+                            );
+                            let c = stmt.pending_io_for_test().expect("the statement's wait");
+                            assert!(
+                                waited(&io, &c) && retired(&db) && idled(&idle),
+                                "call {calls}: its wait"
+                            );
+                            if let Some(o) = stmt.atoll_retire_for_test() {
+                                if o.count_at_for_test().is_some() {
+                                    let (read, cursor) = o.count_keeps_for_test();
+                                    keeps =
+                                        read.or(cursor).filter(|(f, m)| f.is_some() || m.is_some());
+                                    if keeps.is_some() {
+                                        break;
+                                    }
+                                }
+                            }
+                            chill(&db);
+                        }
+                        let keeps = keeps.expect("the count's keeps at its return");
+                        let before = kept_now(&db, keeps);
+                        stmt.reset().unwrap();
+                        let after = kept_now(&db, keeps);
+                        let got = finished(&mut stmt);
+                        drop(stmt);
+                        let_go("the reset's", keeps, before, after);
+                        assert!(got.is_empty(), "the DELETE returned rows");
+                        assert_eq!(
+                            rows(&conn, "SELECT changes()"),
+                            vec![vec![Value::from_i64(2000)]],
+                            "the Clear's changes after the reset"
+                        );
+                    },
+                );
+            }
+
+            /// A count kept in a frame and entered outside one is driven to its end there, with the
+            /// cursor it built, and let go.
+            #[test]
+            fn a_count_kept_in_a_frame_and_entered_outside_one_ends_there() {
+                crate::storage::atoll::testing::cleanly(
+                    concat!(
+                        module_path!(),
+                        "::a_count_kept_in_a_frame_and_entered_outside_one_ends_there"
+                    ),
+                    || {
+                        let (io, db, conn, id) = big("/db/clear-outside", 2000);
+                        let (ct, opening) = writing(&io, &conn, id);
+                        drop(opening);
+                        chill(&db);
+                        let start = made();
+                        let mut op = None;
+                        let first =
+                            in_frame(&io, &db, || ct.retire_tree(&mut op, id, true)).unwrap();
+                        let kept = op.as_ref().and_then(|o| o.count_at_for_test());
+                        let n =
+                            crate::storage::atoll::drive(&io, || ct.retire_tree(&mut op, id, true))
+                                .unwrap();
+                        let (built, after) = (
+                            made().0 - start.0,
+                            op.as_ref().and_then(|o| o.count_at_for_test()),
+                        );
+                        drop(op);
+                        ct.end(false)
+                            .expect("a transaction to end")
+                            .finish()
+                            .unwrap();
+                        assert!(
+                            matches!(first, IOResult::IO(_)),
+                            "the count never returned for IO in the frame"
+                        );
+                        assert!(kept.is_some(), "the count not kept across its return");
+                        assert_eq!(
+                            (n, built, after),
+                            (2000, 1, None),
+                            "(the count, its cursors, the count kept after)"
+                        );
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -9435,7 +9803,16 @@ const DRIVE_SITES: &[(&str, &str, &str)] = &[
         "pages",
         "blocking hosts only: the pages' synchronous form",
     ),
-    ("mode.rs", "count_rows", "slice (iii): a Clear's count"),
+    (
+        "mode.rs",
+        "count_rows",
+        "blocking hosts only: a Clear's count outside a frame, no count kept",
+    ),
+    (
+        "mode.rs",
+        "retire_tree",
+        "blocking hosts only: a Clear's count kept from a frame, entered outside one",
+    ),
     (
         "mode.rs",
         "full_checkpoint",
@@ -9465,6 +9842,7 @@ const CONVERTED: &[&str] = &[
     "open_inner",
     "finish_open",
     "reopened",
+    "count_step",
 ];
 
 /// A file's production code: up to its inline test module, which by the house layout comes last.

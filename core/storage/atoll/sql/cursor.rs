@@ -421,6 +421,14 @@ impl AtollCursor {
         self.owner.queued()
     }
 
+    /// The frame and metadata page its operation's owner keeps, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn keeps_for_test(
+        &self,
+    ) -> (Option<u32>, Option<crate::storage::atoll::meta::MetaId>) {
+        (self.owner.kept_frame(), self.owner.kept_meta())
+    }
+
     /// Ends the operation under way, as its statement's reset does to a cursor it keeps: the
     /// memory-shortage tenure it held let go, its place and the gate passed on.
     pub fn end_operation(&mut self) {

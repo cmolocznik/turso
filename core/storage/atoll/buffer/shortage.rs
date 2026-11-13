@@ -694,9 +694,15 @@ struct Keeps {
 }
 
 impl Keeps {
-    /// Everything kept, taken out to be let go.
-    fn all(&mut self) -> (Option<Kept>, Option<MetaRef>) {
-        (self.pool.take(), self.meta.take())
+    /// Lets go everything kept. Each slot is dropped only when it holds a page, so an empty one
+    /// costs its test alone: every operation's end comes here.
+    fn let_go(&mut self) {
+        if let Some(kept) = self.pool.take() {
+            drop(kept);
+        }
+        if let Some(meta) = self.meta.take() {
+            drop(meta);
+        }
     }
 
     fn empty(&self) -> bool {
@@ -816,7 +822,7 @@ impl Owner {
                     // Holding nothing now, its keeps this call's included: the gate's reopening
                     // waited for, the cut stepped here if no one else steps it.
                     debug_assert!(SHORT.with(|s| s.borrow().is_none()));
-                    drop(self.keeps.all());
+                    self.keeps.let_go();
                     return match pool.wait_for_gate()? {
                         IOResult::Done(()) => {
                             Ok(IOResult::IO(IOCompletions(Completion::new_yield())))
@@ -830,7 +836,7 @@ impl Owner {
                     // reservation needs (ASYNC1 D2e §2.2b). What the step still needs it named
                     // in its claim, which phase B keeps resident.
                     Some(short) => {
-                        drop(self.keeps.all());
+                        self.keeps.let_go();
                         self.reserve(short)
                     }
                     None => Ok(IOResult::IO(c)),
@@ -891,7 +897,7 @@ impl Owner {
     /// unfinished (a cursor parked at its statement's reset). A tenure revoked or cancelled
     /// meanwhile was let go there.
     pub(crate) fn end(&mut self) {
-        drop(self.keeps.all());
+        self.keeps.let_go();
         if let Some(t) = self.tenure.take() {
             if let Some(released) = t.pool.shortage.end(t.place) {
                 released.let_go(&t.pool);

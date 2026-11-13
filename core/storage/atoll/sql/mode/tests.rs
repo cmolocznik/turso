@@ -8011,8 +8011,13 @@ const DRIVE_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "mode.rs",
-        "read_now",
-        "blocking hosts only: the header's and pages' synchronous forms",
+        "field_in",
+        "blocking hosts only: the header's synchronous forms",
+    ),
+    (
+        "mode.rs",
+        "pages",
+        "blocking hosts only: the pages' synchronous form",
     ),
     ("mode.rs", "count_rows", "slice (iii): a Clear's count"),
     (

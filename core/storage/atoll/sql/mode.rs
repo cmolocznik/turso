@@ -1432,10 +1432,11 @@ impl ConnTxn {
     /// here, for a blocking host.
     #[turso_macros::atoll_entry]
     pub fn schema_cookie(&self) -> Result<u32> {
-        if let Some(word) = self.field_known(Field::SchemaCookie) {
-            return Ok(word);
+        let mut guard = self.cell.lock();
+        match guard.as_mut() {
+            None => Ok(self.db.header().committed(Field::SchemaCookie)),
+            Some(txn) => self.field_in(txn, Field::SchemaCookie),
         }
-        self.read_now(ReadAt::field(Field::SchemaCookie), Self::field_step)
     }
 
     /// [`schema_cookie`](Self::schema_cookie) for a caller that keeps `read` across its returns:
@@ -1444,6 +1445,10 @@ impl ConnTxn {
     #[turso_macros::atoll_entry]
     pub fn schema_cookie_in(&self, read: &mut Option<Box<FacadeRead>>) -> Result<IOResult<u32>> {
         if read.is_none() {
+            // Outside a frame the read ends in this call, as the synchronous form drives it.
+            if !crate::storage::atoll::cooperative::inside() {
+                return self.schema_cookie().map(IOResult::Done);
+            }
             if let Some(word) = self.field_known(Field::SchemaCookie) {
                 return Ok(IOResult::Done(word));
             }
@@ -1459,10 +1464,15 @@ impl ConnTxn {
     /// blocking host.
     #[turso_macros::atoll_entry]
     pub fn header(&self) -> Result<DatabaseHeader> {
-        if let Some(header) = self.header_known() {
-            return Ok(header);
+        let mut guard = self.cell.lock();
+        let mut words = [0u32; 7];
+        for field in Field::ALL {
+            words[field as usize - 1] = match guard.as_mut() {
+                None => self.db.header().committed(field),
+                Some(txn) => self.field_in(txn, field)?,
+            };
         }
-        self.read_now(ReadAt::header(), Self::header_step)
+        Ok(header_of(&words))
     }
 
     /// [`header`](Self::header) for a caller that keeps `read` across its returns, as
@@ -1473,6 +1483,10 @@ impl ConnTxn {
         read: &mut Option<Box<FacadeRead>>,
     ) -> Result<IOResult<DatabaseHeader>> {
         if read.is_none() {
+            // Outside a frame the read ends in this call, as the synchronous form drives it.
+            if !crate::storage::atoll::cooperative::inside() {
+                return self.header().map(IOResult::Done);
+            }
             if let Some(header) = self.header_known() {
                 return Ok(IOResult::Done(header));
             }
@@ -1485,14 +1499,49 @@ impl ConnTxn {
     /// word holds. Driven to its end here, for a blocking host.
     #[turso_macros::atoll_entry]
     pub fn pages(&self) -> Result<u32> {
-        self.read_now(ReadAt::pages(), Self::pages_step)
+        let store = self.db.atoll().store();
+        let mut bytes: u64 = 0;
+        for class in 0..crate::storage::atoll::page::CLASS_COUNT {
+            let class = crate::storage::atoll::page::SizeClass::new(class).expect("a class");
+            let n = drive_for(self.cell.conn(), self.db.io(), || store.pages_in_use(class))?;
+            bytes = bytes.saturating_add(n.saturating_mul(class.size() as u64));
+        }
+        Ok(u32::try_from(bytes.div_ceil(PAGE as u64)).unwrap_or(u32::MAX))
     }
 
     /// [`pages`](Self::pages) for a caller that keeps `read` across its returns, as
     /// [`schema_cookie_in`](Self::schema_cookie_in).
     #[turso_macros::atoll_entry]
     pub fn pages_in(&self, read: &mut Option<Box<FacadeRead>>) -> Result<IOResult<u32>> {
+        // Outside a frame the read ends in this call, as the synchronous form drives it.
+        if read.is_none() && !crate::storage::atoll::cooperative::inside() {
+            return self.pages().map(IOResult::Done);
+        }
         self.read_in(read, ReadAt::pages(), Self::pages_step)
+    }
+
+    /// Header field `field` at `txn`'s view, driven to its end here, for a blocking host: as the
+    /// transaction read it already while the header counts no change, else read and kept.
+    fn field_in(&self, txn: &mut Txn, field: Field) -> Result<u32> {
+        let (db, io) = (&self.db, self.db.io());
+        let (identity, changes) = ((txn.slot(), txn.start()), db.header().changes());
+        if let Some(word) = self.known_at(txn, field, changes) {
+            return Ok(word);
+        }
+        #[cfg(test)]
+        HEADER_READS.with(|r| r.set(r.get() + 1));
+        let mut get = Header::get_op(field);
+        let word = drive_for(self.cell.conn(), io, || {
+            db.header().get(
+                db.atoll().transactions(),
+                db.versions(),
+                txn,
+                field,
+                &mut get,
+            )
+        })?;
+        self.fields.lock()[field.index()] = Some((word, identity, changes));
+        Ok(word)
     }
 
     /// Header field `field` known without a read: committed outside a transaction, else as this
@@ -1528,30 +1577,15 @@ impl ConnTxn {
         }
     }
 
-    /// A read driven to its end at once, its owner its drive's.
-    fn read_now<T>(
-        &self,
-        mut at: ReadAt,
-        step: impl Fn(&Self, Option<&mut Txn>, &mut ReadAt) -> Result<IOResult<T>>,
-    ) -> Result<T> {
-        drive_for(self.cell.conn(), self.db.io(), || {
-            let mut guard = self.cell.lock();
-            step(self, guard.as_mut(), &mut at)
-        })
-    }
-
     /// A read kept in `read` across its returns: the one there goes on if it is of `fresh`'s kind
-    /// and transaction, else `fresh` starts. Done or failed, it is let go.
+    /// and transaction, else `fresh` starts. Done or failed, it is let go. A read kept from a frame
+    /// and entered again outside one is driven to its end, its kept state going on.
     fn read_in<T>(
         &self,
         read: &mut Option<Box<FacadeRead>>,
         fresh: ReadAt,
         step: impl Fn(&Self, Option<&mut Txn>, &mut ReadAt) -> Result<IOResult<T>>,
     ) -> Result<IOResult<T>> {
-        // Outside a frame the read ends in this call: its state stays a local.
-        if read.is_none() && !crate::storage::atoll::cooperative::inside() {
-            return self.read_now(fresh, step).map(IOResult::Done);
-        }
         let txn = self.cell.lock().as_ref().map(|t| (t.slot(), t.start()));
         let FacadeRead { owner, at, .. } = FacadeRead::kept(read, self.cell.conn(), txn, fresh);
         let out = drive_or_io(owner, self.db.io(), || {

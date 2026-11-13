@@ -308,10 +308,20 @@ impl Region {
     /// `frame`'s `len` bytes as an IO buffer that keeps the region alive: for a read into a quiet
     /// frame, or a write out of one, that the caller holds exclusively while the IO is in flight.
     pub fn buffer(self: &Arc<Self>, frame: u32, len: usize) -> Arc<Buffer> {
-        assert!(frame as usize * MIN_PAGE_SIZE + len <= self.len);
-        // SAFETY: inside the region, which the buffer keeps alive.
+        self.buffer_from(frame, 0, len)
+    }
+
+    /// [`buffer`](Self::buffer)'s bytes from `from` on, short of `len`: the rest of a write a
+    /// short part left (ASYNC1 D2d §3).
+    pub fn buffer_from(self: &Arc<Self>, frame: u32, from: usize, len: usize) -> Arc<Buffer> {
+        assert!(from < len && frame as usize * MIN_PAGE_SIZE + len <= self.len);
+        // SAFETY: inside the region, which the buffer keeps alive: `from` is short of `len`.
         let region = unsafe {
-            RegionBuffer::new(self.clone(), NonNull::new_unchecked(self.ptr(frame)), len)
+            RegionBuffer::new(
+                self.clone(),
+                NonNull::new_unchecked(self.ptr(frame).add(from)),
+                len - from,
+            )
         };
         Arc::new(Buffer::new_region(region))
     }

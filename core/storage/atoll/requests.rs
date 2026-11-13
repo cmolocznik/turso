@@ -20,11 +20,11 @@ mod dispatch;
 use dispatch::Dispatch;
 #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
 pub(super) use dispatch::SlotPause;
-#[cfg(all(test, not(any(shuttle, atoll_loom))))]
-pub(super) use dispatch::Turn;
 pub(super) use dispatch::{
     Chain, FrameOwner, FrameRefused, Held, LogWork, OpensFile, Place, Shape, Source,
 };
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(super) use dispatch::{FrameService, Turn};
 
 use crate::io::clock::{Clock, MonotonicInstant, WallClockInstant};
 use crate::io::{
@@ -372,6 +372,15 @@ impl Requests {
         withdrawn: bool,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         self.dispatch().pause_before_idle(withdrawn)
+    }
+
+    /// Pauses the IO thread before its next step of a pumped backend: a note once there, and the
+    /// sender that lets it go (ASYNC1 D2d §6.2).
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn pause_io_before_step(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.dispatch().pause_before_step()
     }
 
     /// Wakes the IO thread as its pumped backend's wake does: it then owes a step.

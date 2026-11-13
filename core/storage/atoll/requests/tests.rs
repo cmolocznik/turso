@@ -776,3 +776,101 @@ fn a_pumped_backend_takes_one_io_thread() {
         "two IO threads over CrashIO: {refused:?}"
     );
 }
+
+/// D2d §6.5: the dispatch calls a file, and enters a record's service, only in the IO thread's own
+/// service of a record. Every backend call sits in one of the services (a follow-on's, a metadata
+/// read's, a frame request's, a read-back's) and outside every callback and observer (a closure
+/// handed to `on_retired` or to a completion's making); a service is entered only by the loop's
+/// one dispatcher, `serve_bit`, which only `run` calls. So no callback or observer submits, nor
+/// serves a record itself; whatever breaks either is named.
+#[cfg(not(any(shuttle, atoll_loom)))]
+#[test]
+fn the_dispatch_calls_files_and_serves_records_only_in_the_io_threads_own_service() {
+    let path = crate::storage::atoll::testing::atoll_dir().join("requests/dispatch.rs");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let code = crate::source_test::without_test_modules(&crate::source_test::code_of(&text));
+    // The function each byte of the code is in, by the last `fn ` before it.
+    let caller = |at: usize| -> String {
+        code[..at]
+            .rfind("fn ")
+            .map(|i| {
+                code[i + 3..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The spans of the closures handed over as callbacks and observers: each argument list of
+    // `on_retired(` or of a completion's making, to its closing parenthesis.
+    let mut handed = Vec::new();
+    for opener in [
+        "on_retired(",
+        "Completion::new_read(",
+        "Completion::new_write(",
+        "Completion::new_sync(",
+    ] {
+        for (at, _) in code.match_indices(opener) {
+            let open = at + opener.len();
+            let mut depth = 1;
+            let mut end = open;
+            for (i, ch) in code[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    end = open + i;
+                    break;
+                }
+            }
+            handed.push(open..end);
+        }
+    }
+    let mut wrong = Vec::new();
+    let mut files = 0;
+    for call in [
+        ".pread(",
+        ".pwrite(",
+        ".pwritev(",
+        ".pwrite_durable(",
+        ".sync(",
+        ".sync_data(",
+        ".truncate(",
+    ] {
+        for (at, _) in code.match_indices(call) {
+            files += 1;
+            let site = caller(at);
+            let services = ["serve", "serve_queued", "serve_frame", "serve_slot_read"];
+            if !services.contains(&site.as_str()) {
+                wrong.push(format!("{call} in {site}, no service of a record"));
+            }
+            if handed.iter().any(|span| span.contains(&at)) {
+                wrong.push(format!(
+                    "{call} in {site}, inside a callback or an observer"
+                ));
+            }
+        }
+    }
+    for (entry, entered_by) in [
+        (".serve(", "serve_bit"),
+        (".serve_queued(", "serve_bit"),
+        (".serve_frame(", "serve_bit"),
+        (".serve_slot_read(", "serve_bit"),
+        (".serve_log(", "serve_bit"),
+        (".serve_bit(", "run"),
+    ] {
+        for (at, _) in code.match_indices(entry) {
+            let site = caller(at);
+            if site != entered_by {
+                wrong.push(format!("{entry} entered in {site}, not by {entered_by}"));
+            }
+        }
+    }
+    assert!(
+        files > 0 && wrong.is_empty(),
+        "backend calls or record services reached off the IO thread's own service of a record: \
+         {wrong:#?} ({files} file calls)"
+    );
+}

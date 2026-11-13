@@ -62,6 +62,10 @@ const READY: u8 = 2;
 /// acquires; whoever lets it go touches it no more.
 pub(super) struct Record<P> {
     state: AtomicU8,
+    /// The bytes its write has written so far, a write continued part by part (ASYNC1 D2d §3): its
+    /// holder's, as the payload is, and 0 at rest. It sits in the padding after the state byte, so
+    /// no record is larger for it.
+    written: Plain<u32>,
     payload: Plain<Option<P>>,
 }
 
@@ -74,6 +78,7 @@ impl<P> Default for Record<P> {
     fn default() -> Self {
         Self {
             state: AtomicU8::new(REST),
+            written: Plain::new(0),
             payload: Plain::new(None),
         }
     }
@@ -96,6 +101,26 @@ impl<P> Record<P> {
     pub(super) unsafe fn with<R>(&self, f: impl FnOnce(&mut Option<P>) -> R) -> R {
         // SAFETY: the caller's holding, above, makes this the only access.
         self.payload.with_mut(|p| f(unsafe { &mut *p }))
+    }
+
+    /// The bytes its write has written so far, to its holder.
+    ///
+    /// # Safety
+    ///
+    /// As [`with`](Self::with): the caller holds the record.
+    pub(super) unsafe fn written(&self) -> u32 {
+        // SAFETY: the caller's holding makes this the only access.
+        self.written.with_mut(|w| unsafe { *w })
+    }
+
+    /// Records that its write has written `n` bytes so far, by its holder.
+    ///
+    /// # Safety
+    ///
+    /// As [`with`](Self::with): the caller holds the record.
+    pub(super) unsafe fn set_written(&self, n: u32) {
+        // SAFETY: the caller's holding makes this the only access.
+        self.written.with_mut(|w| unsafe { *w = n })
     }
 
     /// Publishes its request, already written, as bit `i` of `bits`: READY, `Relaxed`, then its
@@ -128,6 +153,8 @@ impl<P> Record<P> {
     pub(super) unsafe fn finish(&self) -> Option<P> {
         // SAFETY: the caller holds it, and lets it go only below.
         let payload = unsafe { self.with(Option::take) };
+        // SAFETY: as above; the next holder finds 0.
+        unsafe { self.set_written(0) };
         let was = self.state.swap(REST, sync::Ordering::Release);
         debug_assert_eq!(was, HELD, "a record let go that was not held");
         payload
@@ -693,6 +720,20 @@ const _: () = assert!(
         && std::mem::size_of::<Record<FrameQueued>>() == 24
 );
 
+// Every record is its payload and one word, its state byte and its write's progress (D2d §3.1).
+#[cfg(not(any(shuttle, atoll_loom)))]
+const _: () = assert!(
+    std::mem::size_of::<Record<Link>>() == std::mem::size_of::<Option<Link>>() + 8
+        && std::mem::size_of::<Record<Queued>>() == std::mem::size_of::<Option<Queued>>() + 8
+        && std::mem::size_of::<Record<FrameQueued>>()
+            == std::mem::size_of::<Option<FrameQueued>>() + 8
+        && std::mem::size_of::<Record<SlotQueued>>()
+            == std::mem::size_of::<Option<SlotQueued>>() + 8
+);
+
+// A write's progress fits its word: no region is larger than the largest page.
+const _: () = assert!(crate::storage::atoll::page::MAX_PAGE_SIZE <= u32::MAX as usize);
+
 /// A queued read of a rollback's read-back (D2c §2), from its acceptance to its retirement: the log
 /// segment's counted file, held from the take to the release, the position in it, and the
 /// completion the read-back made, which holds the region it reads into. Admitted only by its
@@ -713,10 +754,11 @@ pub(in crate::storage::atoll) trait FrameOwner:
     /// first stage when cold (a data file's open and its directory's sync; a temporary file's
     /// open), installed where its store keeps it, the first to set it kept.
     fn file_for(&self, place: Place) -> Result<(Arc<CountedFile>, u64)>;
-    /// A write-out's region: `frame`'s memory at `place`'s class, which the write-out holds
-    /// outgoing and the frame's record holds to the retirement, so it is the write's alone. The
-    /// buffer keeps the memory mapped, not the owner.
-    fn region(&self, frame: u32, place: Place) -> Arc<crate::io::Buffer>;
+    /// A write-out's region from byte `from` on: `frame`'s memory at `place`'s class, which the
+    /// write-out holds outgoing and the frame's record holds to the retirement, so it is the
+    /// write's alone; past `from` when the write continues a short part (D2d §3). The buffer keeps
+    /// the memory mapped, not the owner.
+    fn region(&self, frame: u32, place: Place, from: usize) -> Arc<crate::io::Buffer>;
     /// `frame`'s record let its request go: a frame freed meanwhile goes to the free frames, and a
     /// claim that passed over it is told.
     fn record_retired(&self, frame: u32, class: crate::storage::atoll::page::SizeClass);
@@ -836,6 +878,10 @@ struct Notes {
     /// The bits the IO thread serves and the steps it makes, in its order, while a test records
     /// them.
     turns: Option<Vec<Turn>>,
+    /// A pause of the IO thread before its next step of a pumped backend: the note it is there,
+    /// and the release it waits for (D2d §6.2).
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    before_step: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     /// A pause at one point of a slot record's take or release (D2c §3.8): where, the record
     /// there, and the release the paused thread waits for.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
@@ -1293,6 +1339,8 @@ impl Dispatch {
             // One step per pass while one is owed, so a step comes between any two records served
             // and a record between any two steps.
             if let Some(pump) = pump.as_mut().filter(|pump| pump.owed) {
+                #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+                self.pause_at_before_step();
                 pump.step();
                 #[cfg(test)]
                 self.note_turn(Turn::Stepped);
@@ -1624,15 +1672,19 @@ impl Dispatch {
         if let Some(hold) = self.hold.lock().take() {
             let _ = hold.recv();
         }
+        #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+        let _serving = FrameService::enter();
         let record = &self.frames[j];
         let claimed = record.claim();
         assert!(claimed, "a bit set for a frame record not READY");
-        // SAFETY: claimed. The payload stays in the record until the request retires.
-        let (place, c) = unsafe {
-            record.with(|p| {
+        // SAFETY: claimed. The payload stays in the record until the request retires, and a
+        // write's progress, past 0 when this serves the rest of a short part, with it.
+        let (place, c, written) = unsafe {
+            let (place, c) = record.with(|p| {
                 let q = p.as_ref().expect("a READY frame record's request");
                 (q.place, q.completion.clone())
-            })
+            });
+            (place, c, record.written() as usize)
         };
         // The request's strong hold on its requests from its take to its release, as a metadata
         // read's (#4831).
@@ -1646,8 +1698,10 @@ impl Dispatch {
                 "a queued frame request's pool dropped".to_string(),
             )),
             Some(owner) => owner.file_for(place).map(|(file, at)| {
-                let region = place.writes().then(|| owner.region(j as u32, place));
-                (file, at, region)
+                let region = place
+                    .writes()
+                    .then(|| owner.region(j as u32, place, written));
+                (file, at + written as u64, region)
             }),
         };
         let (file, at, region) = match staged {
@@ -1672,10 +1726,9 @@ impl Dispatch {
                 (carrier, submitted)
             }
             Some(region) => {
-                let carrier = Completion::new_write(move |res| match res {
-                    Ok(n) => owner.complete(n),
-                    Err(e) => owner.error(e),
-                });
+                let (me, len) = (self.clone(), place.class().size());
+                let carrier =
+                    Completion::new_write(move |res| me.frame_written(j, len, &owner, res));
                 let submitted = file.file.pwrite(at, region, carrier.clone());
                 (carrier, submitted)
             }
@@ -1685,7 +1738,7 @@ impl Dispatch {
         match submitted {
             Ok(_) => {
                 let me = self.clone();
-                carrier.on_retired(move || me.end_frame(j, &c, requests));
+                carrier.on_retired(move || me.frame_part_retired(j, &c, requests));
             }
             // Refused: the backend took nothing, and the carrier's callback never ran.
             Err(e) => {
@@ -1695,6 +1748,61 @@ impl Dispatch {
         }
         #[cfg(all(test, not(any(shuttle, atoll_loom))))]
         self.note_frame_served(j);
+    }
+
+    /// A write-out part's callback (D2d §3), the record's holder after the part's submission by the
+    /// chain's order: the whole of the region's `len` bytes written, the pool's request finished; a
+    /// part short of the rest, its progress kept in the record for the part after it, which the
+    /// part's retirement makes; nothing written, or more than asked, a short write's error. An
+    /// intermediate part finishes nothing public.
+    fn frame_written(
+        &self,
+        j: usize,
+        len: usize,
+        owner: &Completion,
+        res: std::result::Result<i32, CompletionError>,
+    ) {
+        let n = match res {
+            Ok(n) => n,
+            Err(e) => return owner.error(e),
+        };
+        let record = &self.frames[j];
+        // SAFETY: the part's callback, after its submission.
+        let before = unsafe { record.written() } as usize;
+        let after = usize::try_from(n).map_or(usize::MAX, |n| before.saturating_add(n));
+        match after.cmp(&len) {
+            std::cmp::Ordering::Equal => owner.complete(len as i32),
+            std::cmp::Ordering::Less if after > before => {
+                // SAFETY: as above. `after` is short of `len`, a region's size, which fits.
+                unsafe { record.set_written(after as u32) }
+            }
+            _ => owner.error(CompletionError::ShortWrite),
+        }
+    }
+
+    /// A frame request's part has retired (D2d §3), its record held by this observer after the
+    /// part's callback: a write short of its region, its pool's request unfinished, has its
+    /// record published again for the IO thread to submit the rest, the count and the record held
+    /// across; anything else ends as [`end_frame`](Self::end_frame) ends it. It never touches the
+    /// file. The part's hold on the requests goes with it: no backend owns a carrier now, and the
+    /// next part's service takes its own, as the first part's did.
+    fn frame_part_retired(
+        self: &Arc<Self>,
+        j: usize,
+        c: &Completion,
+        requests: Option<Arc<Requests>>,
+    ) {
+        let record = &self.frames[j];
+        // SAFETY: the part's observer, after its callback.
+        if unsafe { record.written() } > 0 && !c.finished() {
+            drop(requests);
+            crate::race::point("requests.frame_continued");
+            if let Some(k) = record.publish(&self.bits, self.frames_bit() + j) {
+                self.unpark(k);
+            }
+            return;
+        }
+        self.end_frame(j, c, requests);
     }
 
     /// Ends the queued frame request `c` in record `j` as [`end_queued`](Self::end_queued) ends a
@@ -2057,6 +2165,28 @@ impl Dispatch {
         }
     }
 
+    /// Pauses the IO thread before its next step of a pumped backend: a note once it is there, and
+    /// the sender whose send or drop lets it go.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(super) fn pause_before_step(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (at, there) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        self.notes.lock().before_step = Some((at, held));
+        (there, release)
+    }
+
+    /// The IO thread at its pause before a step, if a test set one: it waits there for the test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    fn pause_at_before_step(&self) {
+        let pause = self.notes.lock().before_step.take();
+        if let Some((at, held)) = pause {
+            let _ = at.send(());
+            let _ = held.recv();
+        }
+    }
+
     /// Sets the pump's bit, as the backend's wake does: the IO thread then owes a step.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(super) fn wake_pump(&self) {
@@ -2129,6 +2259,39 @@ crate::thread::thread_local! {
 
 fn closed() -> CompletionError {
     CompletionError::Aborted
+}
+
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+crate::thread::thread_local! {
+    /// The frame services under way on this thread, nested or not.
+    static FRAME_SERVICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A frame record's service under way on this thread, for a test's look at what a backend call
+/// was made inside of (D2d §6.2): one part of a write submitted inside the service of another is
+/// one made from that part's callback or observer.
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+pub(in crate::storage::atoll) struct FrameService(());
+
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+impl FrameService {
+    fn enter() -> Self {
+        FRAME_SERVICES.with(|n| n.set(n.get() + 1));
+        Self(())
+    }
+
+    /// The frame services under way on this thread.
+    pub(in crate::storage::atoll) fn here() -> usize {
+        FRAME_SERVICES.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+impl Drop for FrameService {
+    fn drop(&mut self) {
+        crate::storage::atoll::unwind::abort_if_unwinding();
+        FRAME_SERVICES.with(|n| n.set(n.get() - 1));
+    }
 }
 
 /// What an IO thread over a pumped backend keeps for its life (ASYNC1 D2d §2.3): the backend, the

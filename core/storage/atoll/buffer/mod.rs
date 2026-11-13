@@ -394,8 +394,10 @@ impl FrameOwner for BufferPool {
         BufferPool::file_for(self, place)
     }
 
-    fn region(&self, frame: u32, place: Place) -> Arc<Buffer> {
-        self.memory.region.buffer(frame, place.class().size())
+    fn region(&self, frame: u32, place: Place, from: usize) -> Arc<Buffer> {
+        self.memory
+            .region
+            .buffer_from(frame, from, place.class().size())
     }
 
     fn record_retired(&self, frame: u32, class: SizeClass) {

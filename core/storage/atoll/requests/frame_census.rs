@@ -194,6 +194,11 @@ const QUEUED_SITES: &[(&str, &str)] = &[
         "a frame request, under its frame's held record",
     ),
     (
+        "frame_part_retired",
+        "a write-out's rest, made at its short part's retirement in the frame request's own \
+         record, held from the first part to the last (D2d §3)",
+    ),
+    (
         "queue_slot_read",
         "a rollback's read-back read, under its transaction slot's record taken at rest",
     ),

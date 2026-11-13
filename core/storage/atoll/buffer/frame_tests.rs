@@ -1788,3 +1788,508 @@ fn over_a_pumped_backend_the_io_thread_steps_between_any_two_records_it_serves()
         "two records served with no step of the backend between them: {turns:?}"
     );
 }
+
+// ASYNC1 D2d (iii): a frame's write-out its backend writes short is continued in its record, part
+// by part, by the IO thread, from the same region.
+
+/// One write a halving backend took under its prefix.
+#[derive(Clone, Debug)]
+struct Part {
+    path: String,
+    pos: u64,
+    wrote: usize,
+    /// The thread that submitted it.
+    thread: String,
+    /// The frame services under way on that thread then: 1 for a part the IO thread's own service
+    /// of the record submits.
+    services: usize,
+    /// The frame records at rest then.
+    at_rest: usize,
+}
+
+/// A backend over `inner` whose files under its prefix write half of each write they are asked, in
+/// whole direct-IO blocks and a block at least, as a direct file's short write lands; or nothing
+/// once `zero_from` such writes have been taken. Each recorded, and the first one's bytes kept.
+struct Halving {
+    /// Itself, for each file it opens to hold.
+    me: Weak<Halving>,
+    inner: Arc<dyn IO>,
+    prefix: String,
+    zero_from: Mutex<Option<usize>>,
+    parts: Mutex<Vec<Part>>,
+    /// The bytes the first write under the prefix was asked to write.
+    first_asked: Mutex<Option<Vec<u8>>>,
+    requests: Mutex<Option<Weak<Requests>>>,
+}
+
+/// What a halving backend writes of a write of `len` bytes: half, in whole direct-IO blocks, a
+/// block at least.
+fn halved(len: usize) -> usize {
+    let block = crate::io::DIRECT_IO_ALIGNMENT;
+    (len / 2 / block * block).max(block).min(len)
+}
+
+/// The parts a halving backend writes a region of `len` bytes in.
+fn halved_parts(len: usize) -> Vec<usize> {
+    let mut parts = Vec::new();
+    let mut rest = len;
+    while rest > 0 {
+        parts.push(halved(rest));
+        rest -= halved(rest);
+    }
+    parts
+}
+
+/// The page class the halving tests write: 16 KiB, so every part and its rest stay whole blocks.
+fn halving_class() -> SizeClass {
+    SizeClass::new(2).unwrap()
+}
+
+impl Halving {
+    fn new(inner: Arc<dyn IO>, prefix: &str) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            inner,
+            prefix: prefix.to_string(),
+            zero_from: Mutex::new(None),
+            parts: Mutex::new(Vec::new()),
+            first_asked: Mutex::new(None),
+            requests: Mutex::new(None),
+        })
+    }
+
+    /// The requests whose frame records each part's record reads.
+    fn watch(&self, requests: &Arc<Requests>) {
+        *self.requests.lock() = Some(Arc::downgrade(requests));
+    }
+
+    fn parts(&self) -> Vec<Part> {
+        self.parts.lock().clone()
+    }
+
+    fn first_asked(&self) -> Option<Vec<u8>> {
+        self.first_asked.lock().clone()
+    }
+
+    /// Forgets every write taken so far, and writes nothing from the `zero_from`th write on.
+    fn forget(&self, zero_from: Option<usize>) {
+        self.parts.lock().clear();
+        *self.first_asked.lock() = None;
+        *self.zero_from.lock() = zero_from;
+    }
+}
+
+impl Clock for Halving {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for Halving {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        let file = self.inner.open_file(path, flags, direct)?;
+        Ok(Arc::new(HalvingFile {
+            file,
+            path: path.to_string(),
+            io: self
+                .me
+                .upgrade()
+                .expect("a backend opening a file is alive"),
+        }))
+    }
+    fn sync_directory(&self, path: &str) -> Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn delivery(&self) -> Delivery {
+        self.inner.delivery()
+    }
+    fn step(&self) -> Result<()> {
+        self.inner.step()
+    }
+    fn try_step(&self, key: crate::io::ReadyKey, ready: &std::task::Waker) -> Result<Stepped> {
+        self.inner.try_step(key, ready)
+    }
+    fn says_what_a_step_found(&self) -> bool {
+        self.inner.says_what_a_step_found()
+    }
+    fn withdraw(&self, key: crate::io::ReadyKey) {
+        self.inner.withdraw(key)
+    }
+}
+
+struct HalvingFile {
+    file: Arc<dyn File>,
+    path: String,
+    io: Arc<Halving>,
+}
+
+impl File for HalvingFile {
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
+        self.file.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> Result<()> {
+        self.file.unlock_file()
+    }
+    fn pread(&self, at: u64, c: Completion) -> Result<Completion> {
+        self.file.pread(at, c)
+    }
+    fn pwrite(
+        &self,
+        pos: u64,
+        buffer: Arc<crate::io::Buffer>,
+        c: Completion,
+    ) -> Result<Completion> {
+        if !self.path.starts_with(&self.io.prefix) {
+            return self.file.pwrite(pos, buffer, c);
+        }
+        let at_rest = self
+            .io
+            .requests
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map_or(usize::MAX, |requests| requests.frames_at_rest());
+        let wrote = {
+            let mut parts = self.io.parts.lock();
+            let zero_from = *self.io.zero_from.lock();
+            let wrote = if zero_from.is_some_and(|z| parts.len() >= z) {
+                0
+            } else {
+                halved(buffer.len())
+            };
+            if parts.is_empty() {
+                *self.io.first_asked.lock() = Some(buffer.as_slice().to_vec());
+            }
+            parts.push(Part {
+                path: self.path.clone(),
+                pos,
+                wrote,
+                thread: crate::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_string(),
+                services: crate::storage::atoll::requests::FrameService::here(),
+                at_rest,
+            });
+            wrote
+        };
+        if wrote == 0 {
+            c.accept();
+            c.deliver(Ok(0));
+            return Ok(c);
+        }
+        // Aligned, as a direct file's write must be: `wrote` is whole blocks.
+        let half =
+            Arc::new(crate::storage::atoll::aligned::AlignedBlock::zeroed(wrote)).region(0, wrote);
+        half.as_mut_slice()
+            .copy_from_slice(&buffer.as_slice()[..wrote]);
+        self.file.pwrite(pos, half, c)
+    }
+    fn sync(&self, c: Completion, how: FileSyncType) -> Result<Completion> {
+        self.file.sync(c, how)
+    }
+    fn size(&self) -> Result<u64> {
+        self.file.size()
+    }
+    fn truncate(&self, n: u64, c: Completion) -> Result<Completion> {
+        self.file.truncate(n, c)
+    }
+}
+
+/// A pool over a halving backend over `inner`, opened async, and a page of the halving class
+/// written and changed with its write-out started: the backend (its writes so far forgotten, and
+/// writing nothing from the `zero_from`th write on), the counted IO and the pool. A first page's
+/// write-out has run to its end before, in frames, so the second's first poll queues the write
+/// itself, every file and page it needs at hand.
+fn halving_write_out(
+    inner: Arc<dyn IO>,
+    base: &str,
+    zero_from: Option<usize>,
+) -> (Arc<Halving>, Arc<Counted>, Arc<BufferPool>) {
+    let halving = Halving::new(inner, &format!("{base}.c{}.", halving_class().index()));
+    let (counted, pool) = pool_on(halving.clone(), base, true);
+    halving.watch(counted.requests());
+    let io: Arc<dyn IO> = counted.clone();
+    let first = dirty_page_of(&pool, &io, halving_class());
+    let second = dirty_page_of(&pool, &io, halving_class());
+    start_writing_out_of(&pool, halving_class(), first);
+    settle_in_frames(&pool, &io).expect("the first write-out settles");
+    drop(crate::storage::atoll::testing::io_thread_held_before_idle(
+        counted.requests(),
+    ));
+    halving.forget(zero_from);
+    start_writing_out_of(&pool, halving_class(), second);
+    (halving, counted, pool)
+}
+
+/// A new page of `class`, stamped and changed, left resident and dirty: its frame.
+fn dirty_page_of(pool: &Arc<BufferPool>, io: &Arc<dyn IO>, class: SizeClass) -> u32 {
+    let mut g = drive(io, || pool.allocate(class)).unwrap();
+    let pid = g.pid();
+    stamp(&mut g.page_mut(), pid, 1);
+    g.changed();
+    g.frame
+}
+
+/// [`start_writing_out`] for a page of `class`.
+fn start_writing_out_of(pool: &Arc<BufferPool>, class: SizeClass, frame: u32) {
+    let hold = pool
+        .latch_to_evict(class, frame, || FrameLatch {
+            frames: pool.frames.clone(),
+            frame,
+        })
+        .expect("the page is held by no one");
+    let out = pool.start_write_out(hold);
+    pool.write_out(class, vec![out]);
+}
+
+/// The `len` bytes at `pos` of `path`, read from `backend` itself and stepped to their end.
+fn read_back(backend: &Arc<dyn IO>, path: &str, pos: u64, len: usize) -> Vec<u8> {
+    let file = backend.open_file(path, OpenFlags::None, false).unwrap();
+    let into = Arc::new(crate::io::Buffer::new_temporary(len));
+    let c = file
+        .pread(pos, Completion::new_read(into.clone(), |_| None))
+        .unwrap();
+    while !c.finished() {
+        backend.step().unwrap();
+    }
+    into.as_slice().to_vec()
+}
+
+/// D2d §6.2, over `inner`: a write-out queued in a frame, which a backend writes half of at each
+/// call. Asserted: the page's bytes whole in its file; the parts contiguous, each submitted by the
+/// IO thread's own service of the record, never inside another part's, with the record held from
+/// the first to the last; and the record and the count let go at the end (mutants
+/// `short-forwarded`, the callback finishing the pool's request with a part's count: the page's
+/// rest is not written; `continue-from-observer` inline, the part's observer serving the rest
+/// itself: the next part is submitted inside its service).
+fn a_short_write_out_is_continued_in_its_record(inner: Arc<dyn IO>, name: &str) {
+    let records = MIN_BUDGET / MIN_PAGE_SIZE;
+    let base = &format!("/db/frame-halving-{name}");
+    let (halving, counted, pool) = halving_write_out(inner.clone(), base, None);
+    let io: Arc<dyn IO> = counted.clone();
+    let settled = settle_in_frames(&pool, &io);
+    let failure = pool.failed().err();
+    let requests = counted.requests().clone();
+    // Read with the IO thread held before its idle, owing no step and finding no bit: the last
+    // part's branch has run, and its retirement's observer with it.
+    let held = crate::storage::atoll::testing::io_thread_held_before_idle(&requests);
+    let end = (
+        held.is_some(),
+        requests.frames_at_rest(),
+        requests.outstanding(),
+    );
+    drop(held);
+    let parts = halving.parts();
+    let page = halving.first_asked().unwrap_or_default();
+    let written = parts
+        .first()
+        .map(|p| read_back(&inner, &p.path, p.pos, page.len()));
+    drop((pool, io, counted, requests));
+    assert_eq!(
+        (
+            settled.is_ok(),
+            failure.is_none(),
+            written.as_ref() == Some(&page)
+        ),
+        (true, true, true),
+        "(the write-out settled, the pool unfailed, the page's bytes whole in its file): a short \
+         part's rest not written ({settled:?}, {failure:?}, {} parts)",
+        parts.len()
+    );
+    let first = parts[0].pos;
+    let mut at = first;
+    for p in &parts {
+        assert_eq!(p.pos, at, "the parts are not contiguous: {parts:?}");
+        at += p.wrote as u64;
+    }
+    assert_eq!(at - first, page.len() as u64, "the parts' bytes: {parts:?}");
+    assert_eq!(
+        parts.iter().map(|p| p.wrote).collect::<Vec<_>>(),
+        halved_parts(halving_class().size()),
+        "the page halved to its end: {parts:?}"
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|p| (p.thread.as_str(), p.services) == ("atoll-io", 1)),
+        "(the thread, the frame services under way) of each part: a part submitted off the IO \
+         thread's own service of the record: {parts:?}"
+    );
+    assert!(
+        parts.iter().all(|p| p.at_rest == records - 1),
+        "the record not held from the first part to the last: {parts:?}"
+    );
+    assert_eq!(
+        end,
+        (true, records, 0),
+        "(the IO thread held before its idle, frame records at rest, requests counted) at the end"
+    );
+}
+
+#[test]
+fn over_an_inline_backend_a_short_write_out_is_continued_in_its_record() {
+    a_short_write_out_is_continued_in_its_record(Arc::new(MemoryIO::new()), "inline");
+}
+
+#[test]
+fn over_a_pumped_backend_a_short_write_out_is_continued_in_its_record() {
+    a_short_write_out_is_continued_in_its_record(
+        Arc::new(crate::io::crash::CrashIO::new(31)),
+        "pumped",
+    );
+}
+
+/// The first part of a write-out over a halving CrashIO submitted by the IO thread, the thread
+/// then paused before its step, and that part delivered by the test thread's own step, so its
+/// callback and its retirement run there; `between` runs next, before the thread is let go. What
+/// the IO thread's next idle finds: the parts, the frame records at rest, the requests counted,
+/// whether the thread reached its pause, and whether the idle came.
+fn first_part_delivered_by_the_test(
+    base: &str,
+    between: impl FnOnce(),
+) -> (Vec<Part>, usize, usize, bool, bool) {
+    let crash = Arc::new(crate::io::crash::CrashIO::new(32));
+    let (halving, counted, pool) = halving_write_out(crash.clone(), base, None);
+    let requests = counted.requests().clone();
+    let (there, release) = requests.pause_io_before_step();
+    let _ = {
+        let _frame = Frame::enter();
+        pool.settle_writes().map(|r| matches!(r, IOResult::IO(_)))
+    };
+    let reached = there.recv_timeout(SETTLE).is_ok();
+    crash.step().unwrap();
+    between();
+    let idle = requests.on_io_idle();
+    drop(release);
+    let idled = idle.recv_timeout(SETTLE).is_ok();
+    let seen = (
+        halving.parts(),
+        requests.frames_at_rest(),
+        requests.outstanding(),
+        reached,
+        idled,
+    );
+    drop((pool, counted, requests));
+    seen
+}
+
+/// D2d §6.2, the part-thread oracle over a pumped backend: the first part delivered on the test
+/// thread, its callback and observer run there; every part is still submitted by the IO thread's
+/// own service, and the pool's request, unfinished once that short part has retired, finishes at
+/// the whole with no error (mutant `continue-from-observer`, the observer serving the rest itself:
+/// the second part is submitted on the test thread).
+#[test]
+fn a_short_parts_rest_is_submitted_by_the_io_thread_whoever_delivered_the_part() {
+    let records = MIN_BUDGET / MIN_PAGE_SIZE;
+    let request = std::cell::RefCell::new(None);
+    let after_first = std::cell::Cell::new(None);
+    let (parts, at_rest, counted, reached, idled) =
+        first_part_delivered_by_the_test("/db/frame-halving-thread", || {
+            let c = last_frame_request();
+            after_first.set(c.as_ref().map(Completion::finished));
+            *request.borrow_mut() = c;
+        });
+    let at_end = request
+        .borrow()
+        .as_ref()
+        .map(|c| (c.finished(), c.get_error()));
+    assert!(reached && idled, "(paused before its step, idle again)");
+    assert_eq!(
+        (after_first.get(), at_end),
+        (Some(false), Some((true, None))),
+        "(the pool's request finished once its first, short part retired; finished, and its \
+         error, at the end): a short part finished the request"
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|p| (p.thread.as_str(), p.services) == ("atoll-io", 1)),
+        "(the thread, the frame services under way) of each part: a part submitted off the IO \
+         thread's own service of the record: {parts:?}"
+    );
+    assert_eq!(
+        parts.iter().map(|p| p.wrote).collect::<Vec<_>>(),
+        halved_parts(halving_class().size()),
+        "the page halved to its end: {parts:?}"
+    );
+    assert_eq!(
+        (at_rest, counted),
+        (records, 0),
+        "(frame records at rest, requests counted) at the end"
+    );
+}
+
+/// D2d §6.2: a write-out whose pool request is cancelled once its first part has retired short,
+/// the record published again for the rest: the IO thread's service of it submits nothing more,
+/// and the record and the count come back (mutant `rest-after-cancel`: the rest is submitted all
+/// the same).
+#[test]
+fn a_write_out_cancelled_between_its_parts_submits_no_more() {
+    let records = MIN_BUDGET / MIN_PAGE_SIZE;
+    let cancelled = std::cell::Cell::new(false);
+    let (parts, at_rest, counted, reached, idled) =
+        first_part_delivered_by_the_test("/db/frame-halving-cancel", || {
+            if let Some(c) = last_frame_request() {
+                c.abort();
+                cancelled.set(c.finished());
+            }
+        });
+    assert!(reached && idled, "(paused before its step, idle again)");
+    assert!(cancelled.get(), "the write-out's request was not cancelled");
+    assert_eq!(
+        parts.len(),
+        1,
+        "the parts of a write-out cancelled after its first: a part submitted after its request \
+         was cancelled: {parts:?}"
+    );
+    assert_eq!(
+        (at_rest, counted),
+        (records, 0),
+        "(frame records at rest, requests counted) at the end"
+    );
+}
+
+/// D2d §6.2, over an inline backend whose second part writes nothing: the write-out ends with a
+/// short write's error, finished once, and its record and count come back.
+#[test]
+fn a_part_that_writes_nothing_ends_the_write_out_with_a_short_writes_error() {
+    let records = MIN_BUDGET / MIN_PAGE_SIZE;
+    let (halving, counted, pool) =
+        halving_write_out(Arc::new(MemoryIO::new()), "/db/frame-halving-zero", Some(1));
+    let io: Arc<dyn IO> = counted.clone();
+    let settled = settle_in_frames(&pool, &io).is_ok();
+    let failure = pool.failed().err().map(|e| format!("{e:?}"));
+    let requests = counted.requests().clone();
+    // As above: read once the IO thread is held before its idle.
+    let held = crate::storage::atoll::testing::io_thread_held_before_idle(&requests);
+    let end = (
+        held.is_some(),
+        requests.frames_at_rest(),
+        requests.outstanding(),
+    );
+    drop(held);
+    let parts = halving.parts();
+    drop((pool, io, counted, requests));
+    assert!(settled, "the write-out's settlement");
+    assert!(
+        failure.as_deref().is_some_and(|e| e.contains("ShortWrite")),
+        "the pool's failure: {failure:?}"
+    );
+    assert_eq!(
+        parts.iter().map(|p| p.wrote).collect::<Vec<_>>(),
+        [halved(halving_class().size()), 0],
+        "the parts: {parts:?}"
+    );
+    assert_eq!(
+        end,
+        (true, records, 0),
+        "(the IO thread held before its idle, frame records at rest, requests counted) at the end"
+    );
+}

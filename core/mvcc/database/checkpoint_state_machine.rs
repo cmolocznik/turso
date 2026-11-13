@@ -2560,7 +2560,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         snapshot_ts,
                     );
                 }
-                let dropped = self.mvstore.gc_chain_now(
+                let dropped = self.mvstore.gc_index_chain_now(
                     &mut versions,
                     lwm,
                     ckpt_max,

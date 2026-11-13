@@ -1793,6 +1793,206 @@ mod native {
         assert!(third, "ready once it finished");
     }
 
+    /// D2d §1: a cooperative wait with no workers, its own runner stepping a pumped backend
+    /// (CrashIO) outside any frame, registers its completion's key there at its Pending poll and
+    /// gives it back once: at its Ready, and not again at its later drop. A wait dropped while
+    /// Pending gives back its own (#4860; mutant `wait-never-withdraws`: the release withdraws
+    /// nothing, and the registration is left at the Ready).
+    #[test]
+    fn a_wait_whose_runner_stepped_a_pumped_backend_withdraws_its_key_once() {
+        use std::future::Future;
+        let crash = Arc::new(CrashIO::new(1));
+        let io = crate::io::wait_tests::StepCounting::new(crash.clone());
+        let ex = Executor::new(io.clone(), 0).unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let looks = |crash: &CrashIO| (crash.registered(), io.withdrawals());
+        let c = Completion::new_wait();
+        let mut wait = Box::pin(ex.wait_async(c.clone()));
+        let pending = wait.as_mut().poll(&mut cx).is_pending();
+        let while_pending = looks(&crash);
+        c.complete(0);
+        let ready = wait.as_mut().poll(&mut cx).is_ready();
+        let at_ready = looks(&crash);
+        drop(wait);
+        let after_drop = looks(&crash);
+        let d = Completion::new_wait();
+        let mut dropped = Box::pin(ex.wait_async(d.clone()));
+        let pending_again = dropped.as_mut().poll(&mut cx).is_pending();
+        let while_pending_again = looks(&crash);
+        drop(dropped);
+        let dropped_pending = looks(&crash);
+        ex.close();
+        assert!(
+            pending,
+            "the wait not pending before its completion finished"
+        );
+        assert_eq!(
+            while_pending,
+            (1, 0),
+            "(the backend's registrations, the withdrawals) while the wait is pending"
+        );
+        assert!(ready, "the wait not ready once its completion finished");
+        assert_eq!(
+            at_ready,
+            (0, 1),
+            "(the backend's registrations, the withdrawals) at the Ready"
+        );
+        assert_eq!(
+            after_drop,
+            (0, 1),
+            "(the backend's registrations, the withdrawals) once the ready wait dropped"
+        );
+        assert!(pending_again, "the second wait not pending");
+        assert_eq!(
+            while_pending_again,
+            (1, 1),
+            "(the backend's registrations, the withdrawals) while the second wait is pending"
+        );
+        assert_eq!(
+            dropped_pending,
+            (0, 2),
+            "(the backend's registrations, the withdrawals) once the pending wait dropped"
+        );
+    }
+
+    /// D2d §1 (child): a cooperative wait with workers, polled in a cooperative frame on a pumped
+    /// backend (CrashIO), Pending and then Ready once what it waits for finishes, gives nothing back
+    /// to the backend: with workers it never steps the backend, so it holds no registration there
+    /// (#4860; mutant `wait-withdraws-unregistered`: the release withdraws the completion's key all
+    /// the same, and the frame census ends the child at the withdrawal).
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    #[test]
+    fn a_wait_with_workers_ready_in_a_frame_withdraws_nothing_from_a_pumped_backend() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_wait_with_workers_ready_in_a_frame_withdraws_nothing_from_a_pumped_backend"
+            ),
+            || wait_with_workers_in_a_frame(Arc::new(CrashIO::new(1)), Ends::Ready),
+        );
+        child_ended_cleanly(ended);
+    }
+
+    /// D2d §1 (child): the same wait polled Pending in a frame and dropped in a frame, before it
+    /// was ever ready, gives nothing back to the backend (#4860; mutant
+    /// `wait-withdraws-unregistered`).
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    #[test]
+    fn a_wait_with_workers_dropped_in_a_frame_withdraws_nothing_from_a_pumped_backend() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_wait_with_workers_dropped_in_a_frame_withdraws_nothing_from_a_pumped_backend"
+            ),
+            || wait_with_workers_in_a_frame(Arc::new(CrashIO::new(1)), Ends::Dropped),
+        );
+        child_ended_cleanly(ended);
+    }
+
+    /// D2d §1 (child): the ready case on the pumped memory backend (memory-deferred).
+    #[cfg(all(unix, feature = "io_memory_yield", not(any(shuttle, miri))))]
+    #[test]
+    fn a_wait_with_workers_ready_in_a_frame_withdraws_nothing_from_deferred_memory() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_wait_with_workers_ready_in_a_frame_withdraws_nothing_from_deferred_memory"
+            ),
+            || wait_with_workers_in_a_frame(Arc::new(crate::io::MemoryYieldIO::new()), Ends::Ready),
+        );
+        child_ended_cleanly(ended);
+    }
+
+    /// D2d §1 (child): the dropped case on the pumped memory backend (memory-deferred).
+    #[cfg(all(unix, feature = "io_memory_yield", not(any(shuttle, miri))))]
+    #[test]
+    fn a_wait_with_workers_dropped_in_a_frame_withdraws_nothing_from_deferred_memory() {
+        let ended = crate::storage::atoll::testing::in_child(
+            concat!(
+                module_path!(),
+                "::a_wait_with_workers_dropped_in_a_frame_withdraws_nothing_from_deferred_memory"
+            ),
+            || {
+                wait_with_workers_in_a_frame(
+                    Arc::new(crate::io::MemoryYieldIO::new()),
+                    Ends::Dropped,
+                )
+            },
+        );
+        child_ended_cleanly(ended);
+    }
+
+    /// How a wait polled Pending in a frame ends: polled Ready in a frame once what it waits for
+    /// finishes, or dropped in a frame before that.
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    enum Ends {
+        Ready,
+        Dropped,
+    }
+
+    /// A cooperative wait with workers, on an executor over a database's counted IO opened async
+    /// on the pumped backend `backend`, polled Pending in a cooperative frame and then ended there
+    /// as `ends` says. A withdrawal from the backend in the frame is refused, which ends the child.
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn wait_with_workers_in_a_frame(backend: Arc<dyn IO>, ends: Ends) {
+        use std::future::Future;
+        assert_eq!(
+            backend.delivery(),
+            Delivery::Pumped,
+            "the backend is not pumped"
+        );
+        let counted = crate::storage::atoll::requests::counted_async_for_test(backend, 1, 1);
+        let ex = Executor::new(counted, 1).unwrap();
+        let c = Completion::new_wait();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let frame = crate::storage::atoll::cooperative::Frame::enter;
+        let mut wait = Box::pin(ex.wait_async(c.clone()));
+        let pending = {
+            let _frame = frame();
+            wait.as_mut().poll(&mut cx).is_pending()
+        };
+        let ready = match ends {
+            Ends::Ready => {
+                c.complete(0);
+                let ready = {
+                    let _frame = frame();
+                    wait.as_mut().poll(&mut cx).is_ready()
+                };
+                drop(wait);
+                ready
+            }
+            Ends::Dropped => {
+                let _frame = frame();
+                drop(wait);
+                false
+            }
+        };
+        ex.close();
+        assert!(
+            pending,
+            "the wait not pending before its completion finished"
+        );
+        assert!(
+            ready || matches!(ends, Ends::Dropped),
+            "the wait not ready once its completion finished"
+        );
+    }
+
+    /// The child's end, which must be clean: run to its end with no abort and code 0.
+    #[cfg(all(unix, not(any(shuttle, miri))))]
+    fn child_ended_cleanly(ended: Option<crate::storage::atoll::testing::Ended>) {
+        if let Some(ended) = ended {
+            assert!(
+                !ended.aborted && !ended.hung && ended.code == Some(0),
+                "the child ended {:?} (aborted {}, hung {}): {}",
+                ended.code,
+                ended.aborted,
+                ended.hung,
+                ended.stderr
+            );
+        }
+    }
+
     /// Steps by its signal: clears its own level against the count it read, then rests on it.
     struct Sleeps {
         signal: Arc<Signal>,

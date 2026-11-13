@@ -639,6 +639,26 @@ mod tests {
             "child",
         ),
         (
+            "executor/tests.rs",
+            "a_wait_with_workers_ready_in_a_frame_withdraws_nothing_from_a_pumped_backend",
+            "child",
+        ),
+        (
+            "executor/tests.rs",
+            "a_wait_with_workers_dropped_in_a_frame_withdraws_nothing_from_a_pumped_backend",
+            "child",
+        ),
+        (
+            "executor/tests.rs",
+            "a_wait_with_workers_ready_in_a_frame_withdraws_nothing_from_deferred_memory",
+            "child",
+        ),
+        (
+            "executor/tests.rs",
+            "a_wait_with_workers_dropped_in_a_frame_withdraws_nothing_from_deferred_memory",
+            "child",
+        ),
+        (
             "notify.rs",
             "a_park_inside_an_open_change_scope_ends_the_process",
             "child",

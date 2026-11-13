@@ -1085,20 +1085,22 @@ pub(crate) struct Wait<'a> {
     /// executor: none with workers, and none once the wait is ready, so a link after that wakes
     /// a live runner rather than this finished one.
     runner: Option<Runner>,
+    /// The key the runner stepped a pumped backend under, so the backend may hold a registration
+    /// of the wait's under it to give back: none with workers, where the wait only waits (#4860).
+    registered: Option<crate::io::ReadyKey>,
     /// Dropped last: the end of the frame its `Drop` opens, so the host's wakers the completion
     /// and the runner held drop inside it, the completion's after the body (22.11).
     _frame: crate::storage::atoll::unwind::FrameEnd,
 }
 
 impl Wait<'_> {
-    /// Gives the runner's node and the backend registration back, the wait's own and no longer
-    /// needed: at its ready, and at its drop if it never was.
+    /// Gives the runner's node back, and the backend registration if its runner made one, the
+    /// wait's own and no longer needed: at its ready, and at its drop if it never was. A wait that
+    /// never stepped the backend withdraws nothing from it.
     fn release(&mut self) {
         drop(self.runner.take());
-        if let Some(key) = self.completion.ready_key() {
-            if self.executor.shared.io.delivery() == Delivery::Pumped {
-                self.executor.shared.io.withdraw(key);
-            }
+        if let Some(key) = self.registered.take() {
+            self.executor.shared.io.withdraw(key);
         }
     }
 }
@@ -1134,6 +1136,7 @@ impl std::future::Future for Wait<'_> {
                 .completion
                 .ready_key()
                 .expect("a pending completion future without its key");
+            this.registered = Some(key);
             match shared.io.try_step(key, cx.waker()) {
                 Err(_) => crate::io::stepping_failed("a wait on executor work"),
                 Ok(Stepped::Delivered) => true,
@@ -1496,6 +1499,7 @@ impl Executor {
             executor: self,
             completion: std::future::IntoFuture::into_future(c),
             runner: self.workers.is_empty().then(|| self.runner()),
+            registered: None,
             _frame: crate::storage::atoll::unwind::FrameEnd::default(),
         }
     }

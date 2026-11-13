@@ -10,6 +10,8 @@ use crate::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) struct StepCounting {
     pub(crate) io: Arc<dyn IO>,
     pub(crate) steps: AtomicUsize,
+    /// The registrations taken back from the backend, each `withdraw` called.
+    withdrawals: AtomicUsize,
 }
 
 impl StepCounting {
@@ -17,11 +19,18 @@ impl StepCounting {
         Arc::new(Self {
             io,
             steps: AtomicUsize::new(0),
+            withdrawals: AtomicUsize::new(0),
         })
     }
 
     pub(crate) fn steps(&self) -> usize {
         self.steps.load(Ordering::SeqCst)
+    }
+
+    /// Read by the executor's native tests only, which loom does not build.
+    #[cfg(not(atoll_loom))]
+    pub(crate) fn withdrawals(&self) -> usize {
+        self.withdrawals.load(Ordering::SeqCst)
     }
 }
 
@@ -95,6 +104,7 @@ impl IO for StepCounting {
     }
 
     fn withdraw(&self, key: crate::io::ReadyKey) {
+        self.withdrawals.fetch_add(1, Ordering::SeqCst);
         self.io.withdraw(key)
     }
 

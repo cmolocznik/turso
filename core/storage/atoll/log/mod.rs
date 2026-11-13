@@ -102,6 +102,9 @@ crate::thread::thread_local! {
     /// Set by a test: the next turn taken on this thread asks for another while it runs, as
     /// another thread's flush would.
     pub(crate) static ASK_DURING_TURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The log's count of turns, on whatever thread, at the last turn on this thread that asked
+    /// for another while it ran ([`ASK_DURING_TURN`]): the turns past it are the ones taken since.
+    pub(crate) static ASKED_AT_TURN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The chunks of the ring of `config`: room for the admitted bytes, a padded block per write in
@@ -1301,6 +1304,18 @@ impl Log {
         self.admitters.waiting()
     }
 
+    /// The requests of the database the log is in, for a test's look at its IO thread.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn requests_for_test(&self) -> &Arc<super::requests::Requests> {
+        self.segments.counted_io().requests()
+    }
+
+    /// The turns of the flush taken so far, on whatever thread, for a test.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn turns_taken(&self) -> usize {
+        self.counts.turns.load(Ordering::SeqCst)
+    }
+
     /// Whether a turn of the flush is asked for and not taken, for a test.
     #[cfg(test)]
     pub(crate) fn flush_asked(&self) -> bool {
@@ -1315,10 +1330,11 @@ impl Log {
         #[cfg(test)]
         {
             TURNS.with(|n| n.set(n.get() + 1));
+            let turns = self.counts.turns.fetch_add(1, Ordering::Relaxed) + 1;
             if ASK_DURING_TURN.with(|a| a.replace(false)) {
                 self.flushes.ask();
+                ASKED_AT_TURN.with(|a| a.set(turns));
             }
-            self.counts.turns.fetch_add(1, Ordering::Relaxed);
             if take_one(&self.counts.ask_in_turns) {
                 self.flushes.ask();
             }

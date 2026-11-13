@@ -2293,3 +2293,132 @@ fn a_part_that_writes_nothing_ends_the_write_out_with_a_short_writes_error() {
         "(the IO thread held before its idle, frame records at rest, requests counted) at the end"
     );
 }
+
+// ASYNC1 D2d (iv): over the ring, a frame's request whose file is open goes in from the polling
+// thread when the ring's lock is free (the ring offer), and takes the hop to the IO thread
+// otherwise; a request whose file is cold is never offered.
+
+/// `n` pages of class 0 written by a first, synchronous pool over a ring at a fresh directory, and
+/// a pool opened async over the same ring with the pages' page-table leaves resident: the
+/// directory, the ring, the pages, the leaves, the counted IO and the pool.
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+#[allow(clippy::type_complexity)]
+fn ring_pages(
+    n: usize,
+) -> (
+    tempfile::TempDir,
+    Arc<crate::io::UringIO>,
+    Vec<PageId>,
+    Vec<Option<crate::storage::atoll::meta::MetaRef>>,
+    Arc<Counted>,
+    Arc<BufferPool>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("db").to_str().unwrap().to_string();
+    let ring = Arc::new(crate::io::UringIO::new().unwrap());
+    let (pids, counted, pool) = pages_in_a_cold_file(ring.clone(), &base, true, n);
+    let io: Arc<dyn IO> = counted.clone();
+    let leaves = pids
+        .iter()
+        .map(|&pid| drive(&io, || pool.store.leaf(pid)).unwrap())
+        .collect();
+    (dir, ring, pids, leaves, counted, pool)
+}
+
+/// D2d §6.3, over the ring: a frame's load whose data file the first load opened, made with the
+/// ring's lock free, goes in from the polling thread: the ring takes it at its offer and the IO
+/// thread serves no record for it; the page reads back (mutant `hop-always`: nothing is offered,
+/// and the IO thread serves it).
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+#[test]
+fn over_the_ring_a_warm_frame_load_goes_in_from_the_polling_thread() {
+    let (_dir, _ring, pids, leaves, counted, pool) = ring_pages(2);
+    let io: Arc<dyn IO> = counted.clone();
+    let requests = counted.requests().clone();
+    let first =
+        in_frames(&io, || pool.fix_exclusive(pids[0], None)).map(|g| stamped(g.page(), pids[0]));
+    let before = requests.frame_roads();
+    let second =
+        in_frames(&io, || pool.fix_exclusive(pids[1], None)).map(|g| stamped(g.page(), pids[1]));
+    let after = requests.frame_roads();
+    drop((leaves, pool, io, counted, requests));
+    assert_eq!(
+        (first.ok(), second.ok()),
+        (Some(Some(1)), Some(Some(1))),
+        "the pages read back"
+    );
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 0),
+        "(offered, served by the IO thread) for a warm frame load over a free ring: the request \
+         took the hop"
+    );
+}
+
+/// D2d §6.3, over the ring: the same load made while the ring's lock is held: the offer is
+/// declined and the request takes the hop, served by the IO thread once the lock is let go; the
+/// page reads back.
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+#[test]
+fn over_the_ring_a_warm_frame_load_takes_the_hop_while_the_rings_lock_is_held() {
+    let (_dir, ring, pids, leaves, counted, pool) = ring_pages(2);
+    let io: Arc<dyn IO> = counted.clone();
+    let requests = counted.requests().clone();
+    let first =
+        in_frames(&io, || pool.fix_exclusive(pids[0], None)).map(|g| stamped(g.page(), pids[0]));
+    let before = requests.frame_roads();
+    let polled = ring.with_lock_held(|| {
+        let _frame = Frame::enter();
+        pool.fix_exclusive(pids[1], None)
+            .map(|r| matches!(r, IOResult::IO(_)))
+    });
+    let offered_while_held = requests.frame_roads().0 - before.0;
+    let second =
+        in_frames(&io, || pool.fix_exclusive(pids[1], None)).map(|g| stamped(g.page(), pids[1]));
+    let after = requests.frame_roads();
+    drop((leaves, pool, io, counted, requests));
+    assert_eq!(polled.ok(), Some(true), "the frame's miss returned no wait");
+    assert_eq!(
+        (first.ok(), second.ok()),
+        (Some(Some(1)), Some(Some(1))),
+        "the pages read back"
+    );
+    assert_eq!(
+        (offered_while_held, after.0 - before.0, after.1 - before.1),
+        (0, 0, 1),
+        "(offered while the lock was held, offered, served by the IO thread): a held ring took the \
+         request at its offer"
+    );
+}
+
+/// D2d §6.3, over the ring (child): a frame's load whose data file is still cold is not offered:
+/// the IO thread opens the file and serves the load; the page reads back (mutant `cold-opens`: the
+/// offer looks the file up as the IO thread's first stage does, opening it in the frame, and the
+/// frame census ends the child).
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+#[test]
+fn over_the_ring_a_cold_frame_load_is_not_offered() {
+    let ended = in_child(
+        concat!(
+            module_path!(),
+            "::over_the_ring_a_cold_frame_load_is_not_offered"
+        ),
+        || {
+            let (_dir, _ring, pids, leaves, counted, pool) = ring_pages(1);
+            let io: Arc<dyn IO> = counted.clone();
+            let requests = counted.requests().clone();
+            let before = requests.frame_roads();
+            let read = in_frames(&io, || pool.fix_exclusive(pids[0], None))
+                .map(|g| stamped(g.page(), pids[0]));
+            let after = requests.frame_roads();
+            drop((leaves, pool, io, counted, requests));
+            assert_eq!(read.ok(), Some(Some(1)), "the page read back");
+            assert_eq!(
+                (after.0 - before.0, after.1 - before.1),
+                (0, 1),
+                "(offered, served by the IO thread) for a cold frame load: a cold file offered"
+            );
+        },
+    );
+    child_ended_cleanly(ended);
+}

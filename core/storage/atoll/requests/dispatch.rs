@@ -754,6 +754,11 @@ pub(in crate::storage::atoll) trait FrameOwner:
     /// first stage when cold (a data file's open and its directory's sync; a temporary file's
     /// open), installed where its store keeps it, the first to set it kept.
     fn file_for(&self, place: Place) -> Result<(Arc<CountedFile>, u64)>;
+    /// The file and offset of `place` when its file is already open, with no open, lock or sync of
+    /// a file and no wait of any kind, for a ring offer from a frame (D2d §4); `None` when it is
+    /// cold.
+    fn warm_file_for(&self, place: Place) -> Option<(Arc<CountedFile>, u64)>;
+
     /// A write-out's region from byte `from` on: `frame`'s memory at `place`'s class, which the
     /// write-out holds outgoing and the frame's record holds to the retirement, so it is the
     /// write's alone; past `from` when the write continues a short part (D2d §3). The buffer keeps
@@ -822,6 +827,9 @@ pub(in crate::storage::atoll) struct Dispatch {
     /// can find it idle before it can be unparked.
     threads: Box<[crate::sync::OnceLock<crate::thread::Thread>]>,
     shape: Shape,
+    /// The backend delivers on a thread of its own (the ring) and the database was opened async:
+    /// a queued request whose file is open is offered to it at once (D2d §4).
+    offers: bool,
     requests: Weak<Requests>,
     /// The thread has left its loop, for a test's look after its owners are gone.
     #[cfg(test)]
@@ -835,6 +843,12 @@ pub(in crate::storage::atoll) struct Dispatch {
     /// A test's notes: the thread's next idle, sent before its park, and its end.
     #[cfg(test)]
     notes: Mutex<Notes>,
+    /// The queued requests the ring took at their offer, and the frame records the IO thread
+    /// served, for a test's count of each road (D2d §4).
+    #[cfg(test)]
+    offers_taken: crate::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    frames_served: crate::sync::atomic::AtomicUsize,
     /// The log units started and those wholly ended, their count let go, for a test's count and
     /// its wait for every unit begun to be over.
     #[cfg(test)]
@@ -935,7 +949,7 @@ impl Held {
 }
 
 impl Dispatch {
-    pub(super) fn new(requests: &Arc<Requests>, shape: Shape) -> Self {
+    pub(super) fn new(requests: &Arc<Requests>, shape: Shape, offers: bool) -> Self {
         Self {
             records: (0..RECORDS).map(|_| Record::default()).collect(),
             queued: (0..shape.meta_reads).map(|_| Record::default()).collect(),
@@ -955,6 +969,7 @@ impl Dispatch {
                 .map(|_| crate::sync::OnceLock::new())
                 .collect(),
             shape,
+            offers,
             requests: Arc::downgrade(requests),
             #[cfg(test)]
             exited: AtomicBool::new(false),
@@ -964,6 +979,10 @@ impl Dispatch {
             take_holds: Mutex::new(Vec::new()),
             #[cfg(test)]
             notes: Mutex::new(Notes::default()),
+            #[cfg(test)]
+            offers_taken: crate::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            frames_served: crate::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             units: crate::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1468,6 +1487,12 @@ impl Dispatch {
             ));
         }
         c.accept();
+        // A file already open is offered to the ring at once (D2d §4); a cold one's open is the
+        // IO thread's first stage.
+        let offered = match &source {
+            Source::Open(file) if self.offers => file.upgrade().map(|file| (file, c.clone())),
+            _ => None,
+        };
         // SAFETY: just taken.
         unsafe {
             record.with(|p| {
@@ -1480,6 +1505,14 @@ impl Dispatch {
             })
         };
         crate::race::point("requests.queued_writing");
+        if let Some((file, c)) = offered {
+            let carrier = read_carrier(&c);
+            let (me, requests) = (self.clone(), Some(requests.clone()));
+            let observer = move || me.end_queued(j, &c, requests);
+            if Self::offer(&file, pos, None, &carrier, observer) {
+                return Ok(());
+            }
+        }
         if let Some(k) = record.publish(&self.bits, QUEUED + j) {
             self.unpark(k);
         }
@@ -1539,14 +1572,7 @@ impl Dispatch {
                 return self.end_queued(j, &c, requests);
             }
         };
-        let owner = c.clone();
-        let carrier = Completion::new_read(c.as_read().buf_arc(), move |res| {
-            match res {
-                Ok((_, n)) => owner.complete(n),
-                Err(e) => owner.error(e),
-            }
-            None
-        });
+        let carrier = read_carrier(&c);
         crate::race::point("requests.queued_submitting");
         match file.file.pread(pos, carrier.clone()) {
             Ok(_) => {
@@ -1642,6 +1668,7 @@ impl Dispatch {
         c.accept();
         #[cfg(test)]
         super::LAST_FRAME_REQUEST.with(|r| *r.borrow_mut() = Some(c.clone()));
+        let offered = self.offers.then(|| c.clone());
         // SAFETY: just taken.
         unsafe {
             record.with(|p| {
@@ -1654,10 +1681,65 @@ impl Dispatch {
         // The dispatch's release lets the frame's record go from here (`release_frame`).
         held.queued();
         crate::race::point("requests.frame_writing");
+        if let Some(c) = offered {
+            if self.offer_frame(j, place, c, requests) {
+                return Ok(());
+            }
+        }
         if let Some(k) = record.publish(&self.bits, self.frames_bit() + j) {
             self.unpark(k);
         }
         Ok(())
+    }
+
+    /// Frame request `c` in record `j` at `place` offered to the ring (D2d §4), its file already
+    /// open (a cold one's open is the IO thread's first stage): the IO thread's own carrier, the
+    /// same as its service would make, with the same observer.
+    fn offer_frame(
+        self: &Arc<Self>,
+        j: usize,
+        place: Place,
+        c: Completion,
+        requests: &Arc<Requests>,
+    ) -> bool {
+        let Some(owner) = self.frames_owner.get().and_then(Weak::upgrade) else {
+            return false;
+        };
+        let Some((file, at)) = owner.warm_file_for(place) else {
+            return false;
+        };
+        let region = place.writes().then(|| owner.region(j as u32, place, 0));
+        let carrier = self.frame_carrier(j, place, &c);
+        let (me, requests) = (self.clone(), Some(requests.clone()));
+        let observer = move || me.frame_part_retired(j, &c, requests);
+        let taken = Self::offer(&file, at, region.as_ref(), &carrier, observer);
+        #[cfg(test)]
+        self.offers_taken
+            .fetch_add(usize::from(taken), Order::Relaxed);
+        taken
+    }
+
+    /// The ring offer of a queued request (D2d §4), made by its queue on the polling thread once
+    /// its record is written: `carrier`, reading into its owner's region or writing `region`,
+    /// offered at `at` to `file`'s backend. Taken, the carrier's observer is `observer`, as the IO
+    /// thread's service would have registered it; the record stays held from its take to that
+    /// observer, and its bit is never set. Not taken, nothing is done, and the queue publishes.
+    fn offer(
+        file: &CountedFile,
+        at: u64,
+        region: Option<&Arc<crate::io::Buffer>>,
+        carrier: &Completion,
+        observer: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        let taken = match region {
+            None => file.file.try_pread_now(at, carrier),
+            Some(region) => file.file.try_pwrite_now(at, region, carrier),
+        };
+        if taken {
+            crate::race::point("requests.offered");
+            carrier.on_retired(observer);
+        }
+        taken
     }
 
     /// Serves frame record `j` as [`serve_queued`](Self::serve_queued) serves a metadata read's
@@ -1674,6 +1756,8 @@ impl Dispatch {
         }
         #[cfg(all(test, not(any(shuttle, atoll_loom))))]
         let _serving = FrameService::enter();
+        #[cfg(test)]
+        self.frames_served.fetch_add(1, Order::Relaxed);
         let record = &self.frames[j];
         let claimed = record.claim();
         assert!(claimed, "a bit set for a frame record not READY");
@@ -1711,27 +1795,11 @@ impl Dispatch {
                 return self.end_frame(j, &c, requests);
             }
         };
-        let owner = c.clone();
+        let carrier = self.frame_carrier(j, place, &c);
         crate::race::point("requests.frame_submitting");
-        let (carrier, submitted) = match region {
-            None => {
-                let carrier = Completion::new_read(c.as_read().buf_arc(), move |res| {
-                    match res {
-                        Ok((_, n)) => owner.complete(n),
-                        Err(e) => owner.error(e),
-                    }
-                    None
-                });
-                let submitted = file.file.pread(at, carrier.clone());
-                (carrier, submitted)
-            }
-            Some(region) => {
-                let (me, len) = (self.clone(), place.class().size());
-                let carrier =
-                    Completion::new_write(move |res| me.frame_written(j, len, &owner, res));
-                let submitted = file.file.pwrite(at, region, carrier.clone());
-                (carrier, submitted)
-            }
+        let submitted = match region {
+            None => file.file.pread(at, carrier.clone()),
+            Some(region) => file.file.pwrite(at, region, carrier.clone()),
         };
         #[cfg(all(test, not(any(shuttle, atoll_loom))))]
         self.pause_at_frame_returned(j);
@@ -1748,6 +1816,17 @@ impl Dispatch {
         }
         #[cfg(all(test, not(any(shuttle, atoll_loom))))]
         self.note_frame_served(j);
+    }
+
+    /// The request of the IO thread's own that carries frame request `c` in record `j` at `place`
+    /// to its backend (D2b §5): a read into the pool's region, or a write of the frame's memory,
+    /// whose callback finishes `c`, a write only at the whole (D2d §3).
+    fn frame_carrier(self: &Arc<Self>, j: usize, place: Place, c: &Completion) -> Completion {
+        if !place.writes() {
+            return read_carrier(c);
+        }
+        let (me, len, owner) = (self.clone(), place.class().size(), c.clone());
+        Completion::new_write(move |res| me.frame_written(j, len, &owner, res))
     }
 
     /// A write-out part's callback (D2d §3), the record's holder after the part's submission by the
@@ -1875,6 +1954,8 @@ impl Dispatch {
             ));
         }
         c.accept();
+        // Its segment's file is open while its transaction runs: offered to the ring at once.
+        let offered = self.offers.then(|| (file.clone(), c.clone()));
         // SAFETY: just taken.
         unsafe {
             record.with(|p| {
@@ -1886,6 +1967,14 @@ impl Dispatch {
             })
         };
         crate::race::point("requests.slot_writing");
+        if let Some((file, c)) = offered {
+            let carrier = read_carrier(&c);
+            let (me, requests) = (self.clone(), Some(requests.clone()));
+            let observer = move || me.end_slot_read(slot, &c, requests);
+            if Self::offer(&file, pos, None, &carrier, observer) {
+                return Ok(crate::types::IOResult::Done(()));
+            }
+        }
         if let Some(k) = record.publish(&self.bits, self.slots_bit() + slot) {
             self.unpark(k);
         }
@@ -1920,14 +2009,7 @@ impl Dispatch {
             crate::race::point("requests.slot_cancelled");
             return self.end_slot_read(j, &c, requests);
         }
-        let owner = c.clone();
-        let carrier = Completion::new_read(c.as_read().buf_arc(), move |res| {
-            match res {
-                Ok((_, n)) => owner.complete(n),
-                Err(e) => owner.error(e),
-            }
-            None
-        });
+        let carrier = read_carrier(&c);
         crate::race::point("requests.slot_submitting");
         match file.file.pread(pos, carrier.clone()) {
             Ok(_) => {
@@ -2195,6 +2277,16 @@ impl Dispatch {
         }
     }
 
+    /// (The queued frame requests the ring took at their offer, the frame records the IO thread
+    /// served.)
+    #[cfg(all(test, target_os = "linux", feature = "io_uring"))]
+    pub(super) fn frame_roads(&self) -> (usize, usize) {
+        (
+            self.offers_taken.load(Order::Relaxed),
+            self.frames_served.load(Order::Relaxed),
+        )
+    }
+
     /// Starts recording the IO thread's turns, from none.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(super) fn record_turns(&self) {
@@ -2259,6 +2351,19 @@ crate::thread::thread_local! {
 
 fn closed() -> CompletionError {
     CompletionError::Aborted
+}
+
+/// The request of the IO thread's own that carries the queued read `c` to its backend: a read into
+/// `c`'s buffer, whose callback finishes `c` with its result.
+fn read_carrier(c: &Completion) -> Completion {
+    let owner = c.clone();
+    Completion::new_read(c.as_read().buf_arc(), move |res| {
+        match res {
+            Ok((_, n)) => owner.complete(n),
+            Err(e) => owner.error(e),
+        }
+        None
+    })
 }
 
 #[cfg(all(test, not(any(shuttle, atoll_loom))))]

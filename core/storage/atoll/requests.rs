@@ -120,6 +120,23 @@ impl Requests {
         }
     }
 
+    /// Counts the request `offer` offers to its backend (D2d §4) for as long as the backend owns
+    /// it, as [`submit`](Self::submit) counts one: counted first, and let go at once when the
+    /// backend does not take it, or at its retirement when it does. Refused once sealed, with
+    /// nothing offered.
+    fn offer(self: &Arc<Self>, physical: &Completion, offer: impl FnOnce() -> bool) -> bool {
+        if !self.count_one() {
+            return false;
+        }
+        if !offer() {
+            self.uncount_one();
+            return false;
+        }
+        let requests = self.clone();
+        physical.on_retired(move || requests.retired());
+        true
+    }
+
     /// Counts one request to be submitted later, as a follow-on is (D1a §3.2, count B): refused
     /// once close has sealed the count.
     fn count_one(&self) -> bool {
@@ -389,6 +406,13 @@ impl Requests {
         self.dispatch().wake_pump()
     }
 
+    /// (The queued frame requests the ring took at their offer, the frame records the IO thread
+    /// served), for a test (ASYNC1 D2d §4).
+    #[cfg(all(test, target_os = "linux", feature = "io_uring"))]
+    pub(super) fn frame_roads(&self) -> (usize, usize) {
+        self.dispatch().frame_roads()
+    }
+
     /// Starts recording the IO thread's turns.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     pub(super) fn record_io_turns(&self) {
@@ -487,7 +511,10 @@ impl Counted {
                 dispatch::MOST_RECORDS - dispatch::QUEUED
             )));
         }
-        let dispatch = Arc::new(Dispatch::new(&requests, shape));
+        // A ring's queued request whose file is open goes in at once from a frame when its lock is
+        // free (ASYNC1 D2d §4).
+        let offers = shape.opened_async && io.delivery() == Delivery::Thread;
+        let dispatch = Arc::new(Dispatch::new(&requests, shape, offers));
         #[cfg(test)]
         MADE.with(|m| {
             *m.borrow_mut() = Some((Arc::downgrade(&dispatch), Arc::downgrade(&requests)))
@@ -928,6 +955,15 @@ impl File for CountedFile {
         refuse_in_frame("a counted file's write");
         self.requests
             .submit(c.clone(), || self.file.pwrite(pos, buffer, c))
+    }
+
+    fn try_pread_now(&self, pos: u64, c: &Completion) -> bool {
+        self.requests.offer(c, || self.file.try_pread_now(pos, c))
+    }
+
+    fn try_pwrite_now(&self, pos: u64, buffer: &Arc<Buffer>, c: &Completion) -> bool {
+        self.requests
+            .offer(c, || self.file.try_pwrite_now(pos, buffer, c))
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {

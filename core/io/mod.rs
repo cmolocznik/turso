@@ -284,6 +284,19 @@ pub trait File: Send + Sync {
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
+    /// Offers [`pread`](Self::pread) of `c` at `pos` to a backend that can take it at once, with
+    /// nothing waited for: true once the request is the backend's, as `pread` would make it; false
+    /// with nothing done (no acceptance, no count, nothing queued) when it cannot be taken without
+    /// a wait. The caller then submits it as ever. A backend that makes no such offer says false.
+    fn try_pread_now(&self, pos: u64, c: &Completion) -> bool {
+        let _ = (pos, c);
+        false
+    }
+    /// [`try_pread_now`](Self::try_pread_now) for [`pwrite`](Self::pwrite) of `buffer` at `pos`.
+    fn try_pwrite_now(&self, pos: u64, buffer: &Arc<Buffer>, c: &Completion) -> bool {
+        let _ = (pos, buffer, c);
+        false
+    }
     /// Sync file data&metadata to disk.
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     /// Makes the data written so far durable, and the metadata only as far as reading that data

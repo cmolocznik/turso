@@ -482,6 +482,11 @@ mod tests {
             "child",
         ),
         (
+            "buffer/frame_tests.rs",
+            "over_the_ring_a_cold_frame_load_is_not_offered",
+            "child",
+        ),
+        (
             "meta/queued_tests.rs",
             "a_frames_metadata_load_on_a_cold_file_is_opened_synced_and_read_on_an_io_thread",
             "child",

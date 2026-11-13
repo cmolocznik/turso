@@ -1477,6 +1477,13 @@ impl Checkpointer {
             .is_some_and(|run| run.phase == Phase::IntentDurable && !run.turn_owed)
     }
 
+    /// Whether the checkpoint's next unit takes a turn of the log's flush it owes.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    pub(crate) fn owes_a_turn(&self) -> bool {
+        let state = self.try_hold().expect("the state free");
+        state.run.as_ref().is_some_and(|run| run.turn_owed)
+    }
+
     /// The image writes of the checkpoint under way that hold a place in its flight set.
     #[cfg(test)]
     pub(crate) fn image_writes_in_flight(&self) -> usize {

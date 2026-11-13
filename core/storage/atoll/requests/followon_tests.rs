@@ -746,7 +746,7 @@ fn a_ready_follow_on_is_served_once_the_io_thread_is_let_go() {
 #[test]
 fn a_stop_ends_an_io_thread_parked_idle() {
     let requests = Arc::new(Requests::default());
-    let dispatch = Arc::new(super::Dispatch::new(&requests, Shape::default()));
+    let dispatch = Arc::new(super::Dispatch::new(&requests, Shape::default(), false));
     let idled = dispatch.on_idle();
     let exit = dispatch.on_exit();
     let thread = super::Dispatch::spawn(&dispatch, 0, None).unwrap();

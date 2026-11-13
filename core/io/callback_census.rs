@@ -234,27 +234,15 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "storage/atoll/requests/dispatch.rs",
-        "serve_frame",
-        "new_read",
-        "a queued frame read's carrier: finishes the pool's request with what it read, submitting nothing",
-    ),
-    (
-        "storage/atoll/requests/dispatch.rs",
-        "serve_frame",
+        "frame_carrier",
         "new_write",
-        "a queued frame write's carrier: finishes the pool's request with what it wrote, submitting nothing",
+        "a queued frame write's carrier: records a short part's progress in its record, or finishes the pool's request at the whole or with its error, submitting nothing",
     ),
     (
         "storage/atoll/requests/dispatch.rs",
-        "serve_queued",
+        "read_carrier",
         "new_read",
-        "a queued read's carrier: finishes its owner's request with what it read, submitting nothing",
-    ),
-    (
-        "storage/atoll/requests/dispatch.rs",
-        "serve_slot_read",
-        "new_read",
-        "a queued read-back read's carrier: finishes the read-back's request with what it read, submitting nothing",
+        "a queued read's carrier (a metadata read's, a frame load's, a read-back's), on the IO thread's road or the ring offer's: finishes its owner's request with what it read, submitting nothing",
     ),
     ("storage/atoll/store.rs", "erase_one", "new_sync", "nothing"),
     (

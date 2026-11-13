@@ -394,6 +394,14 @@ impl FrameOwner for BufferPool {
         BufferPool::file_for(self, place)
     }
 
+    fn warm_file_for(&self, place: Place) -> Option<(Arc<CountedFile>, u64)> {
+        if place.temporary() {
+            self.temp.warm_file_at(place)
+        } else {
+            self.store.warm_file_at(place)
+        }
+    }
+
     fn region(&self, frame: u32, place: Place, from: usize) -> Arc<Buffer> {
         self.memory
             .region

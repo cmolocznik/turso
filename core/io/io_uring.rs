@@ -156,6 +156,10 @@ struct RingState {
     /// thread's wait enters nothing. Set only before the delivery thread starts.
     #[cfg(test)]
     entry_held: bool,
+    /// The overflow held where it is, for a test (ASYNC1 D2d §4): no flush moves it into the
+    /// submission queue, so a queue the kernel has emptied stays empty beside it.
+    #[cfg(test)]
+    flush_held: bool,
     /// Where `take` tells each request entry it reaps, for a test.
     #[cfg(test)]
     take_notes: Option<std::sync::mpsc::Sender<tests::TakeNote>>,
@@ -249,6 +253,10 @@ impl RingState {
     /// SAFETY: caller must guarantee no other `SubmissionQueue` exists for
     /// `ring`. Holding the `RingState` Mutex satisfies that invariant.
     unsafe fn flush_overflow(&mut self, ring: &io_uring::IoUring) {
+        #[cfg(test)]
+        if self.flush_held {
+            return;
+        }
         if self.overflow.is_empty() {
             return;
         }
@@ -263,6 +271,14 @@ impl RingState {
                 break;
             }
         }
+    }
+
+    /// Whether an entry submitted now goes straight into the submission queue (ASYNC1 D2d §4): no
+    /// overflow waits before it, and the queue has room. Under the mutex, which every pusher holds,
+    /// so the answer holds until the caller lets it go.
+    fn takes_an_entry_now(&self, ring: &io_uring::IoUring) -> bool {
+        // SAFETY: the caller holds the `RingState` Mutex, so no other `SubmissionQueue` exists.
+        self.overflow.is_empty() && !unsafe { ring.submission_shared() }.is_full()
     }
 
     /// Queues `entry`, in the submission queue or past it in the overflow, and enters what is
@@ -295,6 +311,31 @@ impl RingState {
     ) {
         self.mark_request(slot, c);
         self.submit_entry(ring, entry);
+    }
+
+    /// Queues the ring offer's `entry`, a request of the file in `slot` whose completion is `c`,
+    /// straight into the submission queue and enters it once (ASYNC1 D2d §4): counted on its file
+    /// and marked first, as [`submit_request`](Self::submit_request) does, then one push and one
+    /// enter, no overflow touched. SAFETY: the caller holds the `RingState` Mutex and found under
+    /// it that the queue takes an entry now ([`takes_an_entry_now`](Self::takes_an_entry_now)), so
+    /// the push cannot be refused.
+    unsafe fn submit_offered(
+        &mut self,
+        ring: &io_uring::IoUring,
+        entry: &io_uring::squeue::Entry,
+        slot: FileSlot,
+        c: &Completion,
+    ) {
+        self.mark_request(slot, c);
+        let pushed = {
+            let mut sq = ring.submission_shared();
+            sq.push(entry).is_ok()
+        };
+        turso_assert!(
+            pushed,
+            "an offered entry refused by a queue found to have room"
+        );
+        self.enter(ring);
     }
 
     /// Counts a request of the file in `slot` and marks its completion with the slot, before the
@@ -470,6 +511,31 @@ impl UringIO {
         Self::starting(entries, true)
     }
 
+    /// (The requests the ring has accepted and not yet delivered, the requests its files count and
+    /// have not yet reaped), for a test (ASYNC1 D2d §4).
+    #[cfg(test)]
+    pub(crate) fn counts_for_test(&self) -> (usize, usize) {
+        let accepted = self.shared.requests.load(Ordering::SeqCst);
+        let counted = self
+            .shared
+            .state
+            .lock()
+            .files
+            .slots
+            .iter()
+            .map(|f| f.requests)
+            .sum();
+        (accepted, counted)
+    }
+
+    /// Runs `f` with the ring's lock held, for a test: a submission waits for it meanwhile, and an
+    /// offer is declined (ASYNC1 D2d §4).
+    #[cfg(test)]
+    pub(crate) fn with_lock_held<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _held = self.shared.state.lock();
+        f()
+    }
+
     /// A ring of `entries`, and its delivery thread started; with entering held from the first if
     /// `held`, which only a test asks for.
     fn starting(entries: u32, held: bool) -> Result<Self> {
@@ -556,6 +622,8 @@ impl Shared {
                 wake,
                 #[cfg(test)]
                 entry_held: false,
+                #[cfg(test)]
+                flush_held: false,
                 #[cfg(test)]
                 take_notes: None,
             }),
@@ -1197,35 +1265,12 @@ impl File for UringFile {
     }
 
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
-        let r = c.as_read();
-        let read_e = {
-            let buf = r.buf();
-            let ptr = buf.as_mut_ptr();
-            let fd = io_uring::types::Fd(self.file.as_raw_fd());
-            let len = buf.len();
-            if let Some(idx) = buf.fixed_id() {
-                trace!(
-                    "pread_fixed(pos = {}, length = {}, idx = {})",
-                    pos,
-                    len,
-                    idx
-                );
-                #[cfg(debug_assertions)]
-                {
-                    self.shared.state.lock().debug_check_fixed(idx, ptr, len);
-                }
-                io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
-                    .offset(pos)
-                    .build()
-                    .user_data(get_key(c.clone()))
-            } else {
-                trace!("pread(pos = {}, length = {})", pos, len);
-                io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
-                    .offset(pos)
-                    .build()
-                    .user_data(get_key(c.clone()))
-            }
-        };
+        let read_e = self.read_entry(pos, &c, |idx, ptr, len| {
+            #[cfg(debug_assertions)]
+            self.shared.state.lock().debug_check_fixed(idx, ptr, len);
+            #[cfg(not(debug_assertions))]
+            let _ = (idx, ptr, len);
+        });
         self.shared.accept(&c);
         let mut state = self.shared.state.lock();
         // SAFETY: holding `state` Mutex.
@@ -1234,33 +1279,12 @@ impl File for UringFile {
     }
 
     fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
-        let write = {
-            let ptr = buffer.as_ptr();
-            let len = buffer.len();
-            let fd = io_uring::types::Fd(self.file.as_raw_fd());
-            if let Some(idx) = buffer.fixed_id() {
-                trace!(
-                    "pwrite_fixed(pos = {}, length = {}, idx= {})",
-                    pos,
-                    len,
-                    idx
-                );
-                #[cfg(debug_assertions)]
-                {
-                    self.shared.state.lock().debug_check_fixed(idx, ptr, len);
-                }
-                io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
-                    .offset(pos)
-                    .build()
-                    .user_data(get_key(c.clone()))
-            } else {
-                trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
-                io_uring::opcode::Write::new(fd, ptr, len as u32)
-                    .offset(pos)
-                    .build()
-                    .user_data(get_key(c.clone()))
-            }
-        };
+        let write = self.write_entry(pos, &buffer, &c, |idx, ptr, len| {
+            #[cfg(debug_assertions)]
+            self.shared.state.lock().debug_check_fixed(idx, ptr, len);
+            #[cfg(not(debug_assertions))]
+            let _ = (idx, ptr, len);
+        });
 
         // Keep the buffer alive until the completion is processed. For non-fixed
         // buffers the SQE holds a raw pointer; without this the Arc would drop
@@ -1271,6 +1295,50 @@ impl File for UringFile {
         // SAFETY: holding `state` Mutex.
         unsafe { state.submit_request(&self.shared.ring, &write, self.slot, &c) };
         Ok(c)
+    }
+
+    /// The ring offer (ASYNC1 D2d §4): the read goes in on the calling thread only if the ring's
+    /// lock is free and its submission queue takes the entry at once, with no overflow before it;
+    /// otherwise nothing is done, no key made, nothing accepted or counted.
+    fn try_pread_now(&self, pos: u64, c: &Completion) -> bool {
+        let Some(mut state) = self.shared.state.try_lock() else {
+            return false;
+        };
+        if !state.takes_an_entry_now(&self.shared.ring) {
+            return false;
+        }
+        let entry = self.read_entry(pos, c, |idx, ptr, len| {
+            #[cfg(debug_assertions)]
+            state.debug_check_fixed(idx, ptr, len);
+            #[cfg(not(debug_assertions))]
+            let _ = (idx, ptr, len);
+        });
+        self.shared.accept(c);
+        // SAFETY: holding `state` Mutex, under which the queue was found to take the entry.
+        unsafe { state.submit_offered(&self.shared.ring, &entry, self.slot, c) };
+        true
+    }
+
+    /// [`try_pread_now`](Self::try_pread_now) for a write: the ring keeps `buffer` alive until the
+    /// write's delivery, as `pwrite` does.
+    fn try_pwrite_now(&self, pos: u64, buffer: &Arc<crate::Buffer>, c: &Completion) -> bool {
+        let Some(mut state) = self.shared.state.try_lock() else {
+            return false;
+        };
+        if !state.takes_an_entry_now(&self.shared.ring) {
+            return false;
+        }
+        let entry = self.write_entry(pos, buffer, c, |idx, ptr, len| {
+            #[cfg(debug_assertions)]
+            state.debug_check_fixed(idx, ptr, len);
+            #[cfg(not(debug_assertions))]
+            let _ = (idx, ptr, len);
+        });
+        c.keep_write_buffer_alive(buffer.clone());
+        self.shared.accept(c);
+        // SAFETY: as in `try_pread_now`.
+        unsafe { state.submit_offered(&self.shared.ring, &entry, self.slot, c) };
+        true
     }
 
     fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
@@ -1452,6 +1520,75 @@ impl File for UringFile {
     fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
         super::refuse_on_delivery_thread("a shared WAL file's map");
         unix_shared_wal_map(offset, len, self.file.as_raw_fd())
+    }
+}
+
+impl UringFile {
+    /// The entry of a read of `c`'s buffer at `pos`, its key made from `c`; `check_fixed` is told a
+    /// fixed buffer's index, address and length first.
+    fn read_entry(
+        &self,
+        pos: u64,
+        c: &Completion,
+        check_fixed: impl FnOnce(u32, *const u8, usize),
+    ) -> io_uring::squeue::Entry {
+        let r = c.as_read();
+        let buf = r.buf();
+        let ptr = buf.as_mut_ptr();
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let len = buf.len();
+        if let Some(idx) = buf.fixed_id() {
+            trace!(
+                "pread_fixed(pos = {}, length = {}, idx = {})",
+                pos,
+                len,
+                idx
+            );
+            check_fixed(idx, ptr, len);
+            io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
+                .offset(pos)
+                .build()
+                .user_data(get_key(c.clone()))
+        } else {
+            trace!("pread(pos = {}, length = {})", pos, len);
+            io_uring::opcode::Read::new(fd, ptr, len as u32)
+                .offset(pos)
+                .build()
+                .user_data(get_key(c.clone()))
+        }
+    }
+
+    /// The entry of a write of `buffer` at `pos`, as [`read_entry`](Self::read_entry) makes a
+    /// read's.
+    fn write_entry(
+        &self,
+        pos: u64,
+        buffer: &Arc<crate::Buffer>,
+        c: &Completion,
+        check_fixed: impl FnOnce(u32, *const u8, usize),
+    ) -> io_uring::squeue::Entry {
+        let ptr = buffer.as_ptr();
+        let len = buffer.len();
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        if let Some(idx) = buffer.fixed_id() {
+            trace!(
+                "pwrite_fixed(pos = {}, length = {}, idx= {})",
+                pos,
+                len,
+                idx
+            );
+            check_fixed(idx, ptr, len);
+            io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
+                .offset(pos)
+                .build()
+                .user_data(get_key(c.clone()))
+        } else {
+            trace!("pwrite(pos = {}, length = {})", pos, len);
+            io_uring::opcode::Write::new(fd, ptr, len as u32)
+                .offset(pos)
+                .build()
+                .user_data(get_key(c.clone()))
+        }
     }
 }
 
@@ -2532,6 +2669,12 @@ mod tests {
             "pwrite" => {
                 let _ = file.pwrite(0, page(), write());
             }
+            "try_pread_now" => {
+                let _ = file.try_pread_now(0, &Completion::new_read(page(), |_| None));
+            }
+            "try_pwrite_now" => {
+                let _ = file.try_pwrite_now(0, &page(), &write());
+            }
             "sync" => {
                 let _ = file.sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync);
             }
@@ -2718,6 +2861,18 @@ mod tests {
 
         /// Lets entering go: the flag cleared, and the eventfd written so that the delivery
         /// thread's held wait ends and its next wait enters what is queued.
+        /// Holds the overflow where it is, or lets it go.
+        fn hold_flush_for_test(&self, held: bool) {
+            self.shared.state.lock().flush_held = held;
+        }
+
+        /// Enters what the submission queue holds, as the kernel's own consumption of it would,
+        /// past the entering held and with no flush of the overflow.
+        fn enter_queue_for_test(&self) -> usize {
+            let _state = self.shared.state.lock();
+            self.shared.ring.submit().unwrap()
+        }
+
         fn release_entry_for_test(&self) {
             self.shared.state.lock().entry_held = false;
             let one = 1u64.to_ne_bytes();
@@ -2937,6 +3092,125 @@ mod tests {
             (first, second),
             (Some("parked"), Some("returned")),
             "the drop parked, and returned only after the read's entry"
+        );
+    }
+
+    /// D2d §4.2: the ring offer takes a read only with its lock free, no overflow waiting and room
+    /// in its queue; declined, it has done nothing: the ring's accepted requests, its files'
+    /// counts, its queue and its overflow as they were, and the request not the ring's. The cases:
+    /// its lock held; its queue full; an overflow behind the full queue; and an overflow beside a
+    /// queue the kernel has emptied, its flush held (mutants `accept-before-try`, the request
+    /// accepted before the lock is tried; `full-overflows`, the queue's room not looked at and the
+    /// entry put past a full queue into the overflow, as the blocking road does;
+    /// `past-the-overflow`, the overflow not looked at).
+    #[test]
+    fn the_ring_offer_takes_a_read_only_with_its_lock_free_and_room_in_its_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = UringIO::held_for_test(4).unwrap();
+        let file = ring_file(&ring, &filled(&dir, "o", b'O', 512));
+        let read = || Completion::new_read(Arc::new(crate::Buffer::new_temporary(512)), |_| None);
+        let seen = || {
+            (
+                ring.counts_for_test(),
+                ring.pending_for_test(),
+                ring.file_requests_for_test(),
+            )
+        };
+        let declined = |offer: &dyn Fn(&Completion) -> bool| {
+            let before = seen();
+            let c = read();
+            (offer(&c), c.is_owned(), seen() == before)
+        };
+        let held = declined(&|c| ring.with_lock_held(|| file.try_pread_now(0, c)));
+        // The queue full, entering held: four reads fill it.
+        let fill: Vec<Completion> = (0..4).map(|_| file.pread(0, read()).unwrap()).collect();
+        let full = declined(&|c| file.try_pread_now(0, c));
+        // One more read waits in the overflow.
+        let over = file.pread(0, read()).unwrap();
+        let behind = declined(&|c| file.try_pread_now(0, c));
+        // The kernel takes the queue's four, the overflow held beside the emptied queue.
+        ring.hold_flush_for_test(true);
+        let entered = ring.enter_queue_for_test();
+        let emptied = fill.iter().all(finished_within);
+        // The four let go by the delivery thread: the ring then counts the overflow's read alone.
+        let since = std::time::Instant::now();
+        while ring.counts_for_test() != (1, 1) && since.elapsed() < BOUND {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let counts = ring.counts_for_test();
+        let pending = ring.pending_for_test();
+        let beside = declined(&|c| file.try_pread_now(0, c));
+        // The overflow and entering let go: the last read delivered; then an offer with the lock
+        // free, room and no overflow goes in.
+        ring.hold_flush_for_test(false);
+        ring.release_entry_for_test();
+        let delivered = finished_within(&over);
+        let c = read();
+        let free = (file.try_pread_now(0, &c), finished_within(&c));
+        drop((file, ring));
+        assert_eq!(
+            [held, full, behind, beside],
+            [(false, false, true); 4],
+            "(taken, the request the ring's, the ring as it was) with its lock held, its queue \
+             full, an overflow behind the full queue, and an overflow beside an empty one: an \
+             offer it declined moved the ring"
+        );
+        assert_eq!(
+            (entered, emptied, counts, pending),
+            (4, true, (1, 1), (0, 1)),
+            "(entered, the four reads delivered, (accepted, counted), (queued, overflow)) once the \
+             kernel took the queue"
+        );
+        assert!(delivered, "the overflow's read never finished");
+        assert_eq!(
+            free,
+            (true, true),
+            "(taken, delivered) with its lock free and room"
+        );
+    }
+
+    /// D2d §4.2: an offered write, taken with the ring's lock free and room in its queue, entering
+    /// held: accepted by the ring and counted on its file until its delivery, its buffer held by
+    /// the ring once the caller has let go of its own, and its bytes in the file once entering is
+    /// let go (mutant `offered-write-unkept`: the ring keeps no hold on the buffer). The test keeps
+    /// a hold of its own on the buffer to the write's delivery, so that no write, a mutant's
+    /// included, reads freed memory; the ring's hold is the one besides it.
+    #[test]
+    fn the_ring_offer_writes_a_buffer_it_keeps_until_its_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = filled(&dir, "w", b'O', 4096);
+        let ring = UringIO::held_for_test(4).unwrap();
+        let file = ring_file(&ring, &path);
+        let buffer = Arc::new(crate::Buffer::new_temporary(4096));
+        buffer.as_mut_slice().fill(b'W');
+        // The test's own hold, to the write's delivery.
+        let safety = buffer.clone();
+        let c = Completion::new_write(|_| {});
+        let taken = file.try_pwrite_now(0, &buffer, &c);
+        drop(buffer);
+        let in_flight = (
+            Arc::strong_count(&safety),
+            c.is_owned(),
+            ring.counts_for_test(),
+            ring.pending_for_test(),
+        );
+        ring.release_entry_for_test();
+        let delivered = finished_within(&c);
+        let bytes = std::fs::read(&path).unwrap();
+        drop((c, safety, file, ring));
+        assert!(taken, "the offered write was not taken");
+        assert_eq!(
+            in_flight,
+            (2, true, (1, 1), (1, 0)),
+            "(the buffer's holds, the test's and the ring's; the request the ring's; (accepted, \
+             counted); (queued, overflow)) before entering: the ring did not keep the offered \
+             write and its buffer"
+        );
+        assert!(delivered, "the offered write never finished");
+        assert!(
+            bytes.iter().all(|&b| b == b'W'),
+            "the offered write's bytes: {:?}",
+            &bytes[..8]
         );
     }
 

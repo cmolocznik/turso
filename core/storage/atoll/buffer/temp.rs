@@ -160,6 +160,14 @@ impl TempPages {
         Place::new(write, true, pid.class(), pid.temporary_number())
     }
 
+    /// [`file_at`](Self::file_at) only when the class's file is already open, with nothing opened
+    /// or waited for (ASYNC1 D2d §4).
+    pub fn warm_file_at(&self, place: Place) -> Option<(Arc<CountedFile>, u64)> {
+        let class = place.class();
+        let file = self.files[class.index()].get()?;
+        Some((file, place.number() * class.size() as u64))
+    }
+
     /// The file and offset of `place`, a temporary page's, its file opened when cold (D2b §5).
     pub fn file_at(&self, place: Place) -> Result<(Arc<CountedFile>, u64)> {
         crate::turso_assert!(

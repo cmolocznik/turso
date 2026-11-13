@@ -1285,13 +1285,20 @@ fn a_cancelled_image_write_holds_its_place_until_it_retires() {
 }
 
 /// A flush asked for during the checkpoint's own turn of it, as another thread's commit would, is
-/// answered by the checkpoint's next unit: no request made during a turn is left for nobody
-/// (DESIGN.md 22.1, `Solo`). Asked during each turn toward the intent record's durability, so
-/// during the last, after which the checkpoint takes no turn of its own: the log's end is durable
-/// by then (mutant: the owed turn dropped, the request still asked for once the checkpoint is done).
+/// answered by a turn after it: no request made during a turn is left for nobody (DESIGN.md 22.1,
+/// `Solo`). Asked during each turn toward the intent record's durability, so during the last,
+/// after which the checkpoint takes no turn of its own: the log's end is durable by then. Each of
+/// those units runs with the database's IO thread held before its idle, so no turn but the
+/// checkpoint's is taken in it, and the checkpoint, the turn's holder, owes a turn when the unit
+/// ends (mutant: the checkpoint's owed turn dropped, which the IO thread's later turns would
+/// otherwise hide, its unit rung by the intent write's retirement). The turns after the last ask
+/// are the log's own count of them, whatever thread took them: once let go, the IO thread takes
+/// the owed turn as often as the checkpoint's next unit does. Real threads only: it holds the IO
+/// thread at a pause no model build makes.
+#[cfg(not(any(shuttle, atoll_loom)))]
 #[test]
 fn a_flush_asked_during_the_checkpoints_turn_is_answered() {
-    use super::log::{ASK_DURING_TURN, TURNS};
+    use super::log::{ASKED_AT_TURN, ASK_DURING_TURN};
     let crash = Arc::new(CrashIO::new(7));
     let io: Arc<dyn IO> = crash.clone();
     let db = Db::create(io.clone());
@@ -1300,35 +1307,56 @@ fn a_flush_asked_during_the_checkpoints_turn_is_answered() {
     }
     let cp = db.db.checkpointer();
     let txns = db.db.transactions();
+    let log = db.db.log();
     let ticket = cp.request_full();
-    let (mut asked, mut turns_after) = (0, 0);
+    let mut asked = 0;
+    let mut unowed = 0;
+    let mut reached = true;
     while cp.fulls_done() < ticket.ticket() {
         // The next turn the checkpoint takes toward its intent's durability is asked for again
-        // while it runs.
+        // while it runs, the IO thread held until the unit has ended.
         let armed = cp.next_turn_for_intent();
-        if armed {
+        let held = if armed {
+            let held =
+                crate::storage::atoll::testing::io_thread_held_before_idle(log.requests_for_test());
+            reached &= held.is_some();
             ASK_DURING_TURN.with(|a| a.set(true));
+            held
+        } else {
+            None
+        };
+        let unit = cp.one_unit(txns).unwrap();
+        if armed && !ASK_DURING_TURN.with(|a| a.replace(false)) {
+            asked += 1;
+            if !cp.owes_a_turn() {
+                unowed += 1;
+            }
         }
-        let turns = TURNS.with(|n| n.get());
-        match cp.one_unit(txns).unwrap() {
+        drop(held);
+        match unit {
             Some(c) => io.wait(&c),
             // The commit that asked waits for its own record, stepping this backend as it does.
             None if armed => io.step().unwrap(),
             None => {}
         }
-        if armed && !ASK_DURING_TURN.with(|a| a.replace(false)) {
-            asked += 1;
-            turns_after = 0;
-        } else {
-            turns_after += TURNS.with(|n| n.get()) - turns;
-        }
     }
-    let left = db.db.log().flush_asked();
+    // Read with the database's IO thread held before its idle, owing nothing and finding no bit:
+    // a turn its unit took has ended, and been counted, by then.
+    let held = crate::storage::atoll::testing::io_thread_held_before_idle(log.requests_for_test());
+    reached &= held.is_some();
+    let left = log.flush_asked();
+    let turns_after = log.turns_taken() - ASKED_AT_TURN.with(|a| a.get());
+    drop(held);
     // Asserted once the database is closed: a panic through it ends the process.
     drop(db);
+    assert!(reached, "the IO thread never reached its pause before idle");
     assert!(
         asked > 0,
         "no turn toward the intent's durability was asked for again"
+    );
+    assert_eq!(
+        unowed, 0,
+        "the checkpoint did not owe a turn for the flush asked for during its own"
     );
     assert!(
         turns_after > 0,

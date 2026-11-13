@@ -829,6 +829,21 @@ fn the_dispatch_calls_files_and_serves_records_only_in_the_io_threads_own_servic
         }
     }
     let mut wrong = Vec::new();
+    // The ring offer, from a queue on the polling thread (D2d §4): only in the one `offer`, and
+    // never inside a callback or an observer.
+    for call in [".try_pread_now(", ".try_pwrite_now("] {
+        for (at, _) in code.match_indices(call) {
+            let site = caller(at);
+            if site != "offer" {
+                wrong.push(format!("{call} in {site}, not the ring offer"));
+            }
+            if handed.iter().any(|span| span.contains(&at)) {
+                wrong.push(format!(
+                    "{call} in {site}, inside a callback or an observer"
+                ));
+            }
+        }
+    }
     let mut files = 0;
     for call in [
         ".pread(",

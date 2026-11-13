@@ -21,6 +21,8 @@ enum InFrame {
 use InFrame::*;
 
 const NO_CALL: &str = "answers from what the IO holds, making no system call";
+const OFFER: &str = "the ring offer: a try of the ring's lock, and one submission and one \
+                     non-waiting enter only when it is free and its queue has room (ASYNC1 D2d §4)";
 const RANDOM: &str = "the thread's own generator, seeded once from the kernel's entropy, which \
                       waits only before the system's first seeding at boot";
 
@@ -30,6 +32,8 @@ const FILE: &[(&str, InFrame)] = &[
     ("unlock_file", Refused),
     ("pread", Refused),
     ("pwrite", Refused),
+    ("try_pread_now", Allowed(OFFER)),
+    ("try_pwrite_now", Allowed(OFFER)),
     ("sync", Refused),
     ("sync_data", Refused),
     ("supports_durable_writes", Allowed(NO_CALL)),

@@ -712,6 +712,17 @@ impl PageStore {
         self.data_file(place.class(), place.number())
     }
 
+    /// [`file_at`](Self::file_at) only when the data file is already open: an `Acquire` load of
+    /// its segment and of its cell, and the file's reference count, with nothing opened, made or
+    /// waited for (ASYNC1 D2d §4).
+    pub fn warm_file_at(&self, place: Place) -> Option<(Arc<CountedFile>, u64)> {
+        let (class, slot) = (place.class(), place.number());
+        let per_file = self.slots_per_file(class);
+        let (n, at) = (slot / per_file, (slot % per_file) * class.size() as u64);
+        let file = self.files[class.index()].get(n)?.get()?;
+        Some((file, at))
+    }
+
     /// The read of `slot` as a copy of `pid` into `into`, built and not submitted, and its place:
     /// `done` as [`read_slot_into`](Self::read_slot_into)'s (D2b §3).
     pub fn read_request<F>(

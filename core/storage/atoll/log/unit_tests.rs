@@ -1,5 +1,5 @@
 //! The log's follow-on work on the IO thread's unit (D1b §7), over a probe whose files record each
-//! write and sync at their own methods, with the thread, the depth of backend calls on it and the
+//! read, write and sync at their own methods, with the thread, the depth of backend calls on it and the
 //! IO thread's unit then, and hold what a test names until it answers. Every wait is bounded, and
 //! every Atoll object is let go before an assertion.
 
@@ -7,7 +7,7 @@ use super::tests::{settled, settled_by, SETTLE};
 use super::*;
 use crate::io::{Buffer, Completion, File, FileSyncType, MemoryIO, OpenFlags, IO};
 use crate::storage::atoll::locks::Mutex;
-use crate::storage::atoll::requests::Requests;
+use crate::storage::atoll::requests::{Requests, SlotPause};
 use crate::storage::atoll::testing::drive;
 use crate::sync::atomic::AtomicBool;
 use std::collections::VecDeque;
@@ -43,7 +43,12 @@ struct Probe {
     hold_syncs: AtomicBool,
     /// Holds the syncs the IO thread makes alone: a unit's groups, never the preparer's.
     hold_io_syncs: AtomicBool,
+    /// Holds the reads the IO thread makes: each delivered at once, and still owned until the test
+    /// lets it go.
+    hold_io_reads: AtomicBool,
     queue: Mutex<VecDeque<(Completion, i32)>>,
+    /// The reads delivered and still owned, oldest first.
+    held_reads: Mutex<Vec<Completion>>,
     calls: Mutex<Vec<Call>>,
     refuse_sync_of: Mutex<Option<String>>,
     counted: Mutex<Option<Weak<Counted>>>,
@@ -59,6 +64,25 @@ impl Probe {
         c.accept();
         self.queue.lock().push_back((c.clone(), result));
         Ok(c)
+    }
+
+    /// The reads delivered and still owned.
+    fn reads_held(&self) -> usize {
+        self.held_reads
+            .lock()
+            .iter()
+            .filter(|c| c.is_owned())
+            .count()
+    }
+
+    /// Retires every read delivered and still owned.
+    fn let_reads_go(&self) {
+        let held = std::mem::take(&mut *self.held_reads.lock());
+        for c in held {
+            if c.is_owned() {
+                c.retire();
+            }
+        }
     }
 
     /// The oldest request held, taken out: the test answers it, then lets it go.
@@ -112,7 +136,9 @@ impl UnitIO {
                 hold_writes: AtomicBool::new(false),
                 hold_syncs: AtomicBool::new(false),
                 hold_io_syncs: AtomicBool::new(false),
+                hold_io_reads: AtomicBool::new(false),
                 queue: Mutex::new(VecDeque::new()),
+                held_reads: Mutex::new(Vec::new()),
                 calls: Mutex::new(Vec::new()),
                 refuse_sync_of: Mutex::new(None),
                 counted: Mutex::new(None),
@@ -203,7 +229,31 @@ impl File for UnitFile {
         self.file.unlock_file()
     }
     fn pread(&self, at: u64, c: Completion) -> Result<Completion> {
-        self.file.pread(at, c)
+        self.call("pread", || {
+            if !(self.probe.hold_io_reads.load(Ordering::SeqCst) && this_thread() == IO_THREAD) {
+                return self.file.pread(at, c);
+            }
+            // Delivered now, its callback through `c`, and `c` still owned until the test lets it
+            // go: a backend that owns a request after delivering it, as a ring's entry is owned
+            // until it is reaped. Listed only once delivered, so a test that finds it listed finds
+            // the delivery's callbacks run.
+            c.accept();
+            let owner = c.clone();
+            let inner = Completion::new_read(c.as_read().buf_arc(), move |res| {
+                match res {
+                    Ok((_, n)) => owner.complete(n),
+                    Err(e) => owner.error(e),
+                }
+                None
+            });
+            // The probe's memory backend refuses nothing: a refusal here is the fixture broken, and
+            // no request it accepted may be finished or retired as though it ended.
+            if self.file.pread(at, inner).is_err() {
+                crate::io::fatal("log unit tests: the probe's memory backend refused a read");
+            }
+            self.probe.held_reads.lock().push(c.clone());
+            Ok(c)
+        })
     }
     fn pwrite(&self, at: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
         let len = buffer.len();
@@ -2241,6 +2291,19 @@ fn held_within(probe: &Probe) -> bool {
     true
 }
 
+/// Whether the probe holds a delivered read within [`SETTLE`], looked at once a millisecond: for a
+/// read the IO thread makes.
+fn read_held_within(probe: &Probe) -> bool {
+    let deadline = Instant::now() + SETTLE;
+    while probe.reads_held() == 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
 /// D2c §3.6 (child): in a frame, a log whose preparer no worker drives is the named error, never
 /// a step in place: the preparer's steps on this thread are unchanged (mutant
 /// `frame-runs-preparer`: the step runs, and the frame census ends the child at the segment
@@ -2393,4 +2456,785 @@ fn over_the_ring_an_append_a_group_and_a_publish_in_a_frame_ring_and_submit_noth
         },
     );
     child_ended_cleanly(ended);
+}
+
+/// D2c §3.7 (child): a rollback's read-back in a frame of a database opened async: its read queued
+/// in the transaction slot's record and made on the IO thread, the polling thread making no backend
+/// call, its bytes exact. The record is held until the read's request has wholly retired, the
+/// request still counted, and is then at rest with the count let go (mutants `readback-in-place`:
+/// the read made in place, which the frame census ends the child at; `uncount-before-rest`: the
+/// count let go before the record rests).
+#[test]
+fn a_rollbacks_read_back_in_a_frame_is_queued_in_its_slots_record_and_read_on_the_io_thread() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::a_rollbacks_read_back_in_a_frame_is_queued_in_its_slots_record_and_read_on_the_io_thread"
+        ),
+        || {
+            let io = UnitIO::new(false);
+            let dyn_io: Arc<dyn IO> = io.clone();
+            let log = open_async(&io, small(), 1);
+            let quiet = durable_start_async(&log, &dyn_io);
+            let (at, end, payload) = durable_record(&log, &dyn_io, 300, 1);
+            // The preparer at rest and the log's units over once the record is durable: no
+            // request but the test's own is counted from here.
+            let rested = preparer_resting_within(&log) && settled(&log);
+            let requests = log.segments.counted_io().requests().clone();
+            io.probe.clear();
+            let mut back = ReadBack::default();
+            // The IO thread held across the first poll, so the read is still queued when it
+            // returns; the read's release paused before its record rests.
+            let hold = requests.hold_io_thread();
+            let (paused, go) = requests.pause_slot(SlotPause::BeforeRest);
+            let first = in_frame(|| log.read_record(&mut back, 1, at, end));
+            let read = queued_wait(&first);
+            drop(hold);
+            let at_pause = paused.recv_timeout(SETTLE).ok();
+            let retired = read
+                .as_ref()
+                .is_some_and(|c| c.finished() && !c.is_owned());
+            let held = (requests.slots_at_rest(), requests.outstanding());
+            let _ = go.send(());
+            let got = in_frames(&dyn_io, || log.read_record(&mut back, 1, at, end))
+                .map(|(_, range)| back.bytes(range).to_vec());
+            let let_go = slots_let_go(&requests);
+            let calls = io.probe.calls();
+            drop((first, read, back, requests));
+            drop(log);
+            assert!(quiet, "the units did not end within {SETTLE:?}");
+            assert!(
+                rested,
+                "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+            );
+            assert_eq!(
+                at_pause,
+                Some(1),
+                "the release of slot 1's record never came before its rest"
+            );
+            assert!(
+                retired,
+                "the read's request not wholly retired at its record's release"
+            );
+            assert_eq!(
+                held,
+                (Log::ASYNC_SLOTS - 1, 1),
+                "(the slot records at rest, the requests counted) while the record is held"
+            );
+            assert_eq!(
+                got.as_deref().ok(),
+                Some(&payload[..]),
+                "the record's payload read back"
+            );
+            assert!(
+                let_go,
+                "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+            );
+            assert!(
+                has(&on(&calls, IO_THREAD), "pread"),
+                "the IO thread made no read: {calls:?}"
+            );
+            assert!(
+                on(&calls, &this_thread()).is_empty(),
+                "the polling thread made backend calls: {calls:?}"
+            );
+        },
+    );
+    child_ended_cleanly(ended);
+}
+
+/// D2c §3.7, the record held until the read physically ends: a read-back's read that its backend
+/// has delivered and still owns keeps its slot record held, its request counted and unretired, and
+/// the read-back on that read, reading no other region. Only the backend's letting the read go
+/// retires the request, rests the record and lets the read-back read on, the record's bytes exact
+/// (mutant `slot-ends-at-delivery`: the request ended from the read's callback, at its delivery).
+/// The backend is MemoryIO behind the probe, which delivers the read inline and holds its
+/// retirement as a backend that still owns a delivered request, as a ring does until its reap; no
+/// kernel ring is involved.
+#[test]
+fn a_slot_record_stays_held_until_the_backend_lets_go_of_its_delivered_read() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    let (at, end, payload) = durable_record_across_a_segment(&log, &dyn_io);
+    // The preparer at rest and the log's units over once the record is durable: no
+    // request but the test's own is counted from here.
+    let rested = preparer_resting_within(&log) && settled(&log);
+    let segment = small().segment_bytes;
+    let across = at.get() / segment != (end - 1) / segment;
+    let requests = log.segments.counted_io().requests().clone();
+    io.probe.clear();
+    io.probe.hold_io_reads.store(true, Ordering::SeqCst);
+    let mut back = ReadBack::default();
+    let first = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let read = queued_wait(&first);
+    let delivered = read_held_within(&io.probe);
+    // Only the first read held: a later one is never held, so the one let-go below leaves no read
+    // owned.
+    io.probe.hold_io_reads.store(false, Ordering::SeqCst);
+    let owned = read.as_ref().is_some_and(|c| c.finished() && c.is_owned());
+    let held = (requests.slots_at_rest(), requests.outstanding());
+    let next = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let next_said = said(&next);
+    let wait = queued_wait(&next);
+    let on_its_read = wait.as_ref().is_some_and(|w| !w.finished()) && back.reading();
+    let reads_while_owned = io
+        .probe
+        .calls()
+        .iter()
+        .filter(|c| c.what == "pread")
+        .count();
+    io.probe.let_reads_go();
+    // The request retires from the carrier's retirement, which the IO thread may register on only
+    // after this let-go: it is looked at once the read-back's wait for it has finished.
+    let woke = wait.as_ref().is_some_and(finished_within);
+    let retired = read.as_ref().is_some_and(|c| c.finished() && !c.is_owned());
+    let let_go_then = slots_let_go(&requests);
+    let got = in_frames(&dyn_io, || log.read_record(&mut back, 0, at, end))
+        .map(|(_, range)| back.bytes(range).to_vec());
+    let let_go = slots_let_go(&requests);
+    drop((first, read, next, wait, back, requests));
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(
+        rested,
+        "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+    );
+    assert!(
+        across,
+        "the record from {} to {end} lies in one segment",
+        at.get()
+    );
+    assert!(
+        delivered,
+        "the backend held no delivered read within {SETTLE:?}"
+    );
+    assert!(
+        owned,
+        "the read's request retired, or not finished, while its backend still owns its delivered \
+         read"
+    );
+    assert_eq!(
+        held,
+        (Log::ASYNC_SLOTS - 1, 1),
+        "(the slot records at rest, the requests counted) while the backend owns the delivered read"
+    );
+    assert!(
+        on_its_read,
+        "the read-back's next poll while its delivered read is owned: {next_said}"
+    );
+    assert_eq!(
+        reads_while_owned, 1,
+        "the reads that reached the backend while the delivered read is owned"
+    );
+    assert!(
+        woke,
+        "the read-back's wait not finished once the backend let its read go"
+    );
+    assert!(
+        retired,
+        "the read's request not retired once the backend let its read go"
+    );
+    assert!(
+        let_go_then,
+        "the slot records not at rest, or the count not let go, once the backend let the read go"
+    );
+    assert_eq!(
+        got.as_deref().ok(),
+        Some(&payload[..]),
+        "the record's payload read back"
+    );
+    assert!(
+        let_go,
+        "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+    );
+}
+
+/// D2c §3.8 (a): a read-back's next read, made once its last read's request has retired and before
+/// that read's slot record rests, is never admitted by the retirement: its queue returns the
+/// record's rest wait, which the release finishes once the record rests, and the read is then
+/// queued and served, the record's bytes exact (mutant `admit-at-retirement`: the take refused
+/// with an error, which the queue returns there).
+#[test]
+fn a_read_backs_next_read_waits_for_its_slot_record_to_rest_not_for_its_last_reads_retirement() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    let (at, end, payload) = durable_record_across_a_segment(&log, &dyn_io);
+    // The preparer at rest and the log's units over once the record is durable: no
+    // request but the test's own is counted from here.
+    let rested = preparer_resting_within(&log) && settled(&log);
+    let segment = small().segment_bytes;
+    let across = at.get() / segment != (end - 1) / segment;
+    let requests = log.segments.counted_io().requests().clone();
+    let mut back = ReadBack::default();
+    let hold = requests.hold_io_thread();
+    let (paused, go) = requests.pause_slot(SlotPause::BeforeRest);
+    let first = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let first_queued = queued_wait(&first).is_some();
+    drop(hold);
+    let at_pause = paused.recv_timeout(SETTLE).ok();
+    let next = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let next_said = said(&next);
+    let wait = queued_wait(&next);
+    let waiting = wait.as_ref().is_some_and(|w| !w.finished()) && !back.reading();
+    let held = (
+        requests.slots_at_rest(),
+        requests.outstanding(),
+        requests.slot_rest_woke(0),
+    );
+    let _ = go.send(());
+    let woke = wait.as_ref().is_some_and(finished_within);
+    let got = in_frames(&dyn_io, || log.read_record(&mut back, 0, at, end))
+        .map(|(_, range)| back.bytes(range).to_vec());
+    let let_go = slots_let_go(&requests);
+    let let_goes = requests.slot_rest_woke(0);
+    drop((first, next, wait, back, requests));
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(
+        rested,
+        "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+    );
+    assert!(
+        across,
+        "the record from {} to {end} lies in one segment",
+        at.get()
+    );
+    assert!(first_queued, "the first read not returned queued");
+    assert_eq!(
+        at_pause,
+        Some(0),
+        "the release of slot 0's record never came before its rest"
+    );
+    assert!(
+        waiting,
+        "the next read's queue while its record is held: {next_said}"
+    );
+    assert_eq!(
+        held,
+        (Log::ASYNC_SLOTS - 1, 1, 0),
+        "(the slot records at rest, the requests counted, the let-goes that woke a taker) while \
+         the record is held"
+    );
+    assert!(woke, "the rest wait not finished once the record rested");
+    assert_eq!(let_goes, 1, "the rest wait's let-goes that woke a taker");
+    assert_eq!(
+        got.as_deref().ok(),
+        Some(&payload[..]),
+        "the record's payload read back"
+    );
+    assert!(
+        let_go,
+        "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+    );
+}
+
+/// D2c §3.8 (b): a read-back dropped with its read in flight leaves its slot record held until that
+/// read's release makes it rest: a new transaction's read-back in the same slot, its first read
+/// queued while the release is paused before the rest, is returned the record's rest wait, and is
+/// queued and served once the record rests (mutant `admit-at-retirement`).
+#[test]
+fn a_read_back_dropped_with_its_read_in_flight_leaves_its_slot_to_the_next_once_its_record_rests() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    let (at, end, payload) = durable_record(&log, &dyn_io, 300, 7);
+    // The preparer at rest and the log's units over once the record is durable: no
+    // request but the test's own is counted from here.
+    let rested = preparer_resting_within(&log) && settled(&log);
+    let requests = log.segments.counted_io().requests().clone();
+    let hold = requests.hold_io_thread();
+    let mut dropped = ReadBack::default();
+    let first = in_frame(|| log.read_record(&mut dropped, 0, at, end));
+    let first_queued = queued_wait(&first).is_some();
+    drop((first, dropped));
+    let (paused, go) = requests.pause_slot(SlotPause::BeforeRest);
+    drop(hold);
+    let at_pause = paused.recv_timeout(SETTLE).ok();
+    let mut back = ReadBack::default();
+    let next = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let next_said = said(&next);
+    let wait = queued_wait(&next);
+    let waiting = wait.as_ref().is_some_and(|w| !w.finished()) && !back.reading();
+    let held = (requests.slots_at_rest(), requests.outstanding());
+    let _ = go.send(());
+    let woke = wait.as_ref().is_some_and(finished_within);
+    let got = in_frames(&dyn_io, || log.read_record(&mut back, 0, at, end))
+        .map(|(_, range)| back.bytes(range).to_vec());
+    let let_go = slots_let_go(&requests);
+    drop((next, wait, back, requests));
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(
+        rested,
+        "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+    );
+    assert!(
+        first_queued,
+        "the dropped read-back's read not returned queued"
+    );
+    assert_eq!(
+        at_pause,
+        Some(0),
+        "the release of slot 0's record never came before its rest"
+    );
+    assert!(
+        waiting,
+        "the next read-back's queue while the record is held: {next_said}"
+    );
+    assert_eq!(
+        held,
+        (Log::ASYNC_SLOTS - 1, 1),
+        "(the slot records at rest, the requests counted) while the record is held"
+    );
+    assert!(woke, "the rest wait not finished once the record rested");
+    assert_eq!(
+        got.as_deref().ok(),
+        Some(&payload[..]),
+        "the record's payload read back"
+    );
+    assert!(
+        let_go,
+        "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+    );
+}
+
+/// D2c §3.8 (c): a read-back whose read is cancelled before an IO thread takes it gives the record
+/// up once that read's request retires, and the read's release is paused before the record rests:
+/// the slot's next read-back is returned the record's rest wait, and is queued and served once the
+/// record rests; the cancelled read reached no backend (mutant `admit-at-retirement`).
+#[test]
+fn a_read_back_given_up_after_a_cancel_leaves_its_slot_to_the_next_once_its_record_rests() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    let (at, end, payload) = durable_record(&log, &dyn_io, 300, 9);
+    // The preparer at rest and the log's units over once the record is durable: no
+    // request but the test's own is counted from here.
+    let rested = preparer_resting_within(&log) && settled(&log);
+    let requests = log.segments.counted_io().requests().clone();
+    io.probe.clear();
+    let hold = requests.hold_io_thread();
+    let mut cancelled = ReadBack::default();
+    let first = in_frame(|| log.read_record(&mut cancelled, 0, at, end));
+    let read = queued_wait(&first);
+    if let Some(c) = &read {
+        c.abort();
+    }
+    let (paused, go) = requests.pause_slot(SlotPause::BeforeRest);
+    drop(hold);
+    let at_pause = paused.recv_timeout(SETTLE).ok();
+    let given_up = in_frame(|| log.read_record(&mut cancelled, 0, at, end))
+        .err()
+        .map(|e| e.to_string());
+    let mut back = ReadBack::default();
+    let next = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let next_said = said(&next);
+    let wait = queued_wait(&next);
+    let waiting = wait.as_ref().is_some_and(|w| !w.finished()) && !back.reading();
+    let held = (requests.slots_at_rest(), requests.outstanding());
+    let _ = go.send(());
+    let woke = wait.as_ref().is_some_and(finished_within);
+    let got = in_frames(&dyn_io, || log.read_record(&mut back, 0, at, end))
+        .map(|(_, range)| back.bytes(range).to_vec());
+    let let_go = slots_let_go(&requests);
+    let reads = io
+        .probe
+        .calls()
+        .iter()
+        .filter(|c| c.what == "pread")
+        .count();
+    drop((first, read, cancelled, next, wait, back, requests));
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(
+        rested,
+        "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+    );
+    assert_eq!(
+        at_pause,
+        Some(0),
+        "the release of slot 0's record never came before its rest"
+    );
+    assert!(
+        given_up.is_some(),
+        "the read-back whose read was cancelled did not give its record up"
+    );
+    assert!(
+        waiting,
+        "the next read-back's queue while the record is held: {next_said}"
+    );
+    assert_eq!(
+        held,
+        (Log::ASYNC_SLOTS - 1, 1),
+        "(the slot records at rest, the requests counted) while the record is held"
+    );
+    assert!(woke, "the rest wait not finished once the record rested");
+    assert_eq!(
+        got.as_deref().ok(),
+        Some(&payload[..]),
+        "the record's payload read back"
+    );
+    assert!(
+        let_go,
+        "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+    );
+    assert_eq!(reads, 1, "the reads that reached the backend");
+}
+
+/// D2c §3.8, the rest wait's order: a taker registered on a slot's rest wait while its record is
+/// held is not finished before the record rests. At a pause in the release just before the rest,
+/// its wait is unfinished and a take tried there is refused with a wait, admitting nothing; once
+/// the record rests the wait is finished and the read is queued and served (mutant
+/// `rest-wait-before-rest`: the let-go before the rest, which finishes the wait before the pause).
+#[test]
+fn a_slots_rest_wait_is_finished_only_once_its_record_rests() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    let (at, end, payload) = durable_record(&log, &dyn_io, 300, 13);
+    // The preparer at rest and the log's units over once the record is durable: no
+    // request but the test's own is counted from here.
+    let rested = preparer_resting_within(&log) && settled(&log);
+    let requests = log.segments.counted_io().requests().clone();
+    let hold = requests.hold_io_thread();
+    let mut dropped = ReadBack::default();
+    let first = in_frame(|| log.read_record(&mut dropped, 0, at, end));
+    let first_queued = queued_wait(&first).is_some();
+    drop((first, dropped));
+    let mut back = ReadBack::default();
+    let registered = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let wait = queued_wait(&registered);
+    let registered_waiting = wait.as_ref().is_some_and(|w| !w.finished()) && !back.reading();
+    let (paused, go) = requests.pause_slot(SlotPause::BeforeRest);
+    drop(hold);
+    let at_pause = paused.recv_timeout(SETTLE).ok();
+    let early = wait.as_ref().is_some_and(Completion::finished);
+    let retried = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let refused = queued_wait(&retried).is_some() && !back.reading();
+    let held = (requests.slots_at_rest(), requests.outstanding());
+    let _ = go.send(());
+    let woke = wait.as_ref().is_some_and(finished_within);
+    // Each wait bounded: the mutant's lost let-go would leave this read-back's wait unfinished.
+    let got = in_frames_within(|| log.read_record(&mut back, 0, at, end))
+        .map(|got| got.map(|(_, range)| back.bytes(range).to_vec()));
+    let let_go = slots_let_go(&requests);
+    drop((registered, retried, wait, back, requests));
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(
+        rested,
+        "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+    );
+    assert!(
+        first_queued,
+        "the dropped read-back's read not returned queued"
+    );
+    assert!(
+        registered_waiting,
+        "the read-back's take while the record is held not returned a wait"
+    );
+    assert_eq!(
+        at_pause,
+        Some(0),
+        "the release of slot 0's record never came before its rest"
+    );
+    assert!(
+        !early,
+        "the rest wait finished while the record is not at rest"
+    );
+    assert!(
+        refused,
+        "a take while the record is not at rest not refused with a wait"
+    );
+    assert_eq!(
+        held,
+        (Log::ASYNC_SLOTS - 1, 1),
+        "(the slot records at rest, the requests counted) while the record is held"
+    );
+    assert!(woke, "the rest wait not finished once the record rested");
+    assert_eq!(
+        got.as_ref().and_then(|got| got.as_deref().ok()),
+        Some(&payload[..]),
+        "the record's payload read back, each wait finished within {SETTLE:?}"
+    );
+    assert!(
+        let_go,
+        "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+    );
+}
+
+/// D2c §3.8 (d), (e): a take that found its slot record held, and registers on the rest wait only
+/// once the release has made the record rest and before its let-go, takes the record at its second
+/// attempt. That wait, left registered, is finished by the let-go for no one and admits nothing
+/// twice: one record taken, one request counted, each read made once (mutant
+/// `rest-wait-no-second-take`: the wait returned once registered).
+#[test]
+fn a_take_registered_after_its_record_rests_takes_it_and_its_wait_left_admits_nothing_twice() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    let (at, end, payload) = durable_record(&log, &dyn_io, 300, 17);
+    // The preparer at rest and the log's units over once the record is durable: no
+    // request but the test's own is counted from here.
+    let rested = preparer_resting_within(&log) && settled(&log);
+    let requests = log.segments.counted_io().requests().clone();
+    io.probe.clear();
+    let hold = requests.hold_io_thread();
+    let mut dropped = ReadBack::default();
+    let first = in_frame(|| log.read_record(&mut dropped, 0, at, end));
+    let first_queued = queued_wait(&first).is_some();
+    drop((first, dropped));
+    let (rest_paused, rest_go) = requests.pause_slot(SlotPause::BeforeRest);
+    drop(hold);
+    let at_rest = rest_paused.recv_timeout(SETTLE).ok();
+    // The taker, on a thread of its own: its first take refused, it pauses before it registers.
+    let (registering, register) = requests.pause_slot(SlotPause::Registering);
+    let taker_log: Arc<Log> = Arc::clone(&log);
+    let taker = std::thread::spawn(move || {
+        let mut back = ReadBack::default();
+        let polled = in_frame(|| taker_log.read_record(&mut back, 0, at, end));
+        let queued = queued_wait(&polled).is_some() && back.reading();
+        drop(polled);
+        (back, queued)
+    });
+    let at_registering = registering.recv_timeout(SETTLE).ok();
+    let (let_go_paused, let_go_go) = requests.pause_slot(SlotPause::BeforeLetGo);
+    let _ = rest_go.send(());
+    let at_let_go = let_go_paused.recv_timeout(SETTLE).ok();
+    let _ = register.send(());
+    let (back, taken) = match taker.join() {
+        Ok((back, queued)) => (Some(back), queued),
+        Err(_) => (None, false),
+    };
+    let one_taken = (requests.slots_at_rest(), requests.outstanding());
+    let _ = let_go_go.send(());
+    let got = back.map(|mut back| {
+        in_frames(&dyn_io, || log.read_record(&mut back, 0, at, end))
+            .map(|(_, range)| back.bytes(range).to_vec())
+    });
+    let let_go = slots_let_go(&requests);
+    let let_goes = requests.slot_rest_woke(0);
+    let reads = io
+        .probe
+        .calls()
+        .iter()
+        .filter(|c| c.what == "pread")
+        .count();
+    drop(requests);
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(
+        rested,
+        "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+    );
+    assert!(
+        first_queued,
+        "the dropped read-back's read not returned queued"
+    );
+    assert_eq!(
+        (at_rest, at_registering, at_let_go),
+        (Some(0), Some(0), Some(0)),
+        "(the release before the rest, the take before it registers, the release before the \
+         let-go) never reached"
+    );
+    assert!(
+        taken,
+        "the take registered after its record rested did not take it at its second attempt"
+    );
+    assert_eq!(
+        one_taken,
+        (Log::ASYNC_SLOTS - 1, 2),
+        "(the slot records at rest, the requests counted) once the record was taken again, the \
+         last read's count not yet let go"
+    );
+    assert_eq!(
+        got.as_ref().and_then(|got| got.as_deref().ok()),
+        Some(&payload[..]),
+        "the record's payload read back"
+    );
+    assert!(
+        let_go,
+        "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+    );
+    assert_eq!(
+        let_goes, 1,
+        "the let-goes that found the wait left registered"
+    );
+    assert_eq!(reads, 2, "the reads that reached the backend");
+}
+
+/// D2c §3.9: a read-back's read cancelled before an IO thread takes it reaches no backend: the IO
+/// thread ends it with no call, its slot record comes back to rest and its count is let go, and
+/// the read-back's next step gives the record up with the cancel (mutant `slot-cancel-submits`: the
+/// cancelled read submitted all the same).
+#[test]
+fn a_read_back_cancelled_before_its_take_reaches_no_backend_and_gives_its_record_and_count_back() {
+    let io = UnitIO::new(false);
+    let dyn_io: Arc<dyn IO> = io.clone();
+    let log = open_async(&io, small(), 1);
+    let quiet = durable_start_async(&log, &dyn_io);
+    let (at, end, _) = durable_record(&log, &dyn_io, 300, 19);
+    // The preparer at rest and the log's units over once the record is durable: no
+    // request but the test's own is counted from here.
+    let rested = preparer_resting_within(&log) && settled(&log);
+    let requests = log.segments.counted_io().requests().clone();
+    io.probe.clear();
+    let hold = requests.hold_io_thread();
+    let mut back = ReadBack::default();
+    let first = in_frame(|| log.read_record(&mut back, 0, at, end));
+    let read = queued_wait(&first);
+    if let Some(c) = &read {
+        c.abort();
+    }
+    drop(hold);
+    let let_go = slots_let_go(&requests);
+    let given_up = in_frames(&dyn_io, || log.read_record(&mut back, 0, at, end))
+        .err()
+        .map(|e| e.to_string());
+    let calls = io.probe.calls();
+    drop((first, read, back, requests));
+    drop(log);
+    assert!(quiet, "the units did not end within {SETTLE:?}");
+    assert!(
+        rested,
+        "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c.what == "pread"),
+        "a read cancelled before its take reached the backend: {calls:?}"
+    );
+    assert!(
+        let_go,
+        "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+    );
+    assert!(
+        given_up.is_some(),
+        "the read-back's step after the cancel did not give its record up"
+    );
+}
+
+/// D2c §3.10 (child): §3.7 over the real ring: a rollback's read-back in a frame, of a record lying
+/// across two segments, each read queued in the slot's record and made by the IO thread, the frame
+/// census holding; its bytes exact, the record at rest and the count let go after.
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+#[test]
+fn over_the_ring_a_rollbacks_read_back_in_a_frame_is_queued_in_its_slots_record() {
+    let ended = crate::storage::atoll::testing::in_child(
+        concat!(
+            module_path!(),
+            "::over_the_ring_a_rollbacks_read_back_in_a_frame_is_queued_in_its_slots_record"
+        ),
+        || {
+            let dir = tempfile::tempdir().unwrap();
+            let (ring, log) = open_async_on_the_ring(&dir);
+            let quiet = durable_start_async(&log, &ring);
+            let (at, end, payload) = durable_record_across_a_segment(&log, &ring);
+            // The preparer at rest and the log's units over once the record is durable: no
+            // request but the test's own is counted from here.
+            let rested = preparer_resting_within(&log) && settled(&log);
+            let requests = log.segments.counted_io().requests().clone();
+            let mut back = ReadBack::default();
+            let got = in_frames(&ring, || log.read_record(&mut back, 1, at, end))
+                .map(|(_, range)| back.bytes(range).to_vec());
+            let let_go = slots_let_go(&requests);
+            drop((back, requests));
+            drop(log);
+            assert!(quiet, "the units did not end within {SETTLE:?}");
+            assert!(
+                rested,
+                "the preparer did not rest, or the log's units did not end, within {SETTLE:?}"
+            );
+            assert_eq!(
+                got.as_deref().ok(),
+                Some(&payload[..]),
+                "the record's payload read back"
+            );
+            assert!(
+                let_go,
+                "the slot records not at rest, or the count not let go, within {SETTLE:?}"
+            );
+        },
+    );
+    child_ended_cleanly(ended);
+}
+
+/// A record of `len` payload bytes counting up from `fill`, appended outside any group and made
+/// durable: where it starts and ends, and its payload.
+fn durable_record(
+    log: &Arc<Log>,
+    io: &Arc<dyn IO>,
+    len: usize,
+    fill: u8,
+) -> (GroupStart, Lsn, Vec<u8>) {
+    let payload: Vec<u8> = (0..len).map(|i| fill.wrapping_add(i as u8)).collect();
+    let mut admitted = drive(io, || log.admit(&mut LogWait::default(), framed_len(len))).unwrap();
+    let (at, end) = log.append_with(&mut admitted, &header(), &[&payload], |_| {});
+    drop(admitted);
+    drive(io, || log.wait_durable(&mut LogWait::default(), end)).unwrap();
+    (at, end, payload)
+}
+
+/// [`durable_record`] lying across the end of the log's first segment, so it is read back in two
+/// reads, one a segment.
+fn durable_record_across_a_segment(log: &Arc<Log>, io: &Arc<dyn IO>) -> (GroupStart, Lsn, Vec<u8>) {
+    let segment = small().segment_bytes;
+    while segment - log.end() % segment > 2 * BLOCK {
+        append(log, io, 996);
+    }
+    durable_record(log, io, 3 * BLOCK as usize, 5)
+}
+
+/// `f` polled inside a frame until done, each wait waited for outside it for at most [`SETTLE`],
+/// looked at once a millisecond: `None` once a wait is not finished by then, so a wait no one
+/// finishes fails its test instead of hanging it.
+fn in_frames_within<T>(mut f: impl FnMut() -> Result<IOResult<T>>) -> Option<Result<T>> {
+    loop {
+        match in_frame(&mut f) {
+            Ok(IOResult::Done(t)) => return Some(Ok(t)),
+            Ok(IOResult::IO(c)) => {
+                if !finished_within(&c.0) {
+                    return None;
+                }
+            }
+            Err(e) => return Some(Err(e)),
+        }
+    }
+}
+
+/// What a poll that returned `IO` waits on, if it did.
+fn queued_wait<T>(polled: &Result<IOResult<T>>) -> Option<Completion> {
+    match polled {
+        Ok(IOResult::IO(c)) => Some(c.0.clone()),
+        _ => None,
+    }
+}
+
+/// What a poll came to, for a failure's message.
+fn said<T>(polled: &Result<IOResult<T>>) -> String {
+    match polled {
+        Ok(IOResult::IO(_)) => "IO".to_string(),
+        Ok(IOResult::Done(_)) => "done".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Whether every slot record is at rest and no request is counted, within [`SETTLE`], looked at
+/// once a millisecond: for a release the IO thread makes.
+fn slots_let_go(requests: &Requests) -> bool {
+    let deadline = Instant::now() + SETTLE;
+    while requests.slots_at_rest() != Log::ASYNC_SLOTS || requests.outstanding() != 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
 }

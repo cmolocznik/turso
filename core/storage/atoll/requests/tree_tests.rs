@@ -296,6 +296,7 @@ fn an_open_whose_second_io_thread_does_not_start_fails_and_joins_the_first() {
             io_threads: 2,
             meta_reads: 1,
             frames: 0,
+            slots: 0,
         },
     );
     let refused = made.is_err();

@@ -250,6 +250,12 @@ const CALLBACKS: &[(&str, &str, &str, &str)] = &[
         "new_read",
         "a queued read's carrier: finishes its owner's request with what it read, submitting nothing",
     ),
+    (
+        "storage/atoll/requests/dispatch.rs",
+        "serve_slot_read",
+        "new_read",
+        "a queued read-back read's carrier: finishes the read-back's request with what it read, submitting nothing",
+    ),
     ("storage/atoll/store.rs", "erase_one", "new_sync", "nothing"),
     (
         "storage/atoll/store.rs",

@@ -263,7 +263,10 @@ fn walk_on(txns: &Transactions, txn: &Txn, op: &mut Rollback) -> Result<IOResult
             }
             Source::Spilled(part) => {
                 done!(txns.log.wait_durable(&mut op.log_wait, part.lsn));
-                let (header, range) = done!(txns.log.read_record(&mut op.back, part.at, part.lsn));
+                let (header, range) =
+                    done!(txns
+                        .log
+                        .read_record(&mut op.back, txn.slot, part.at, part.lsn));
                 let payload = op.back.bytes(range.clone());
                 let word = |at: usize| {
                     payload

@@ -336,7 +336,7 @@ impl Rereader {
             })
         };
         let (_, payload) = loop {
-            match self.back.step(segments, at, end, open)? {
+            match self.back.step(segments, at, end, in_place(open))? {
                 IOResult::Done(read) => break read,
                 // Its outcome, an error included, is the read-back's next step's to read.
                 IOResult::IO(io) => crate::storage::atoll::park::wait(self.io.as_ref(), &io.0),
@@ -394,15 +394,18 @@ struct Read {
 
 impl ReadBack {
     /// Steps the read-back of the record outside any group that starts at `at` and ends at `end`,
-    /// each segment's file found by `file`: its header and where its payload lies in
-    /// [`bytes`](Self::bytes), once read and checked as a reader of the log checks it. A read of
-    /// another record still under way, one asked for before and given up, is let go first.
+    /// each read handed to `submit` with its segment's number, its position in that segment and
+    /// its completion: done with the completion the read is then known by, or what to wait on
+    /// before the read is made again at the next step (a transaction slot's record not yet at
+    /// rest, D2c §2). Its header and where its payload lies in [`bytes`](Self::bytes), once read
+    /// and checked as a reader of the log checks it. A read of another record still under way, one
+    /// asked for before and given up, is let go first.
     pub(super) fn step<O: Opens>(
         &mut self,
         segments: &Segments<O>,
         at: Lsn,
         end: Lsn,
-        mut file: impl FnMut(u64) -> Result<Arc<dyn File>>,
+        mut submit: impl FnMut(u64, u64, Completion) -> Result<IOResult<Completion>>,
     ) -> Result<IOResult<(Header, Range<usize>)>> {
         let from = at - at % BLOCK;
         let want = (end.next_multiple_of(BLOCK) - from) as usize;
@@ -461,8 +464,8 @@ impl ReadBack {
                 }
                 Err(e) => Some(e),
             });
-            match file(number).and_then(|f| f.pread(pos - segments.start(number), c)) {
-                Ok(c) => {
+            match submit(number, pos - segments.start(number), c) {
+                Ok(IOResult::Done(c)) => {
                     self.read = Some(Read {
                         c,
                         len,
@@ -470,6 +473,8 @@ impl ReadBack {
                         retired: None,
                     })
                 }
+                // Not made: the read is made again, from where it stands, at the next step.
+                Ok(IOResult::IO(wait)) => return Ok(IOResult::IO(wait)),
                 Err(e) => return Err(self.failed(e)),
             }
         }
@@ -509,4 +514,12 @@ impl ReadBack {
     pub fn reading(&self) -> bool {
         self.read.is_some()
     }
+}
+
+/// A read-back's submitter that makes each read in place, through the segment file `file` finds by
+/// its number.
+pub(super) fn in_place(
+    mut file: impl FnMut(u64) -> Result<Arc<dyn File>>,
+) -> impl FnMut(u64, u64, Completion) -> Result<IOResult<Completion>> {
+    move |number, pos, c| Ok(IOResult::Done(file(number)?.pread(pos, c)?))
 }

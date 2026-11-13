@@ -176,3 +176,60 @@ fn every_forward_the_io_thread_may_not_make_refuses_it_there() {
     assert_eq!(guarding, 7, "forwards read guarding");
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Every site that queues a request into one of the dispatch's records for its IO threads, by the
+/// function that publishes it, with what admits the request there: the queued-request census (a
+/// site outside the list fails it, and so does one listed and gone).
+const QUEUED_SITES: &[(&str, &str)] = &[
+    (
+        "after_write",
+        "a chain's follow-on, made at its first request's retirement in the record held for the chain",
+    ),
+    (
+        "queue_read",
+        "a metadata read, under its read credit, whose index is the record's",
+    ),
+    (
+        "queue_frame",
+        "a frame request, under its frame's held record",
+    ),
+    (
+        "queue_slot_read",
+        "a rollback's read-back read, under its transaction slot's record taken at rest",
+    ),
+];
+
+/// Every record the dispatch publishes to its IO threads is published by one of the sites listed,
+/// each inside `impl Dispatch`, and each site listed still publishes one.
+#[test]
+fn every_site_that_queues_a_request_for_the_io_threads_is_listed() {
+    let code = code_of(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/storage/atoll/requests/dispatch.rs"
+        ))
+        .unwrap(),
+    );
+    let publishes = |body: &str| body.matches(".publish(&self.bits").count();
+    let sites: Vec<(String, usize)> = methods_of(&code, "impl Dispatch {")
+        .into_iter()
+        .filter_map(|(name, body)| (publishes(body) > 0).then(|| (name, publishes(body))))
+        .collect();
+    let mut found: Vec<&str> = sites.iter().map(|(name, _)| name.as_str()).collect();
+    let mut listed: Vec<&str> = QUEUED_SITES.iter().map(|(name, _)| *name).collect();
+    found.sort();
+    listed.sort();
+    assert_eq!(
+        found, listed,
+        "a site that queues a request for the IO threads not listed, or one listed that no longer does"
+    );
+    assert!(
+        sites.iter().all(|(_, n)| *n == 1),
+        "a site publishing more than one record: {sites:?}"
+    );
+    assert_eq!(
+        publishes(&code),
+        sites.len(),
+        "a record published outside `impl Dispatch`"
+    );
+}

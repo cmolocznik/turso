@@ -413,9 +413,16 @@ impl Log {
         })
     }
 
+    /// The transaction slots, each with its read-back record, of a log [`open_async`] opens.
+    ///
+    /// [`open_async`]: Self::open_async
+    #[cfg(test)]
+    pub(crate) const ASYNC_SLOTS: usize = 2;
+
     /// [`open`](Self::open) in a database opened async (D2c): its counted IO with one IO thread,
-    /// which queues what a cooperative frame asks, and an executor of its own with `workers`
-    /// workers, which step its preparer when there are any.
+    /// which queues what a cooperative frame asks, and [`ASYNC_SLOTS`](Self::ASYNC_SLOTS)
+    /// transaction slots' read-back records; and an executor of its own with `workers` workers,
+    /// which step its preparer when there are any.
     #[cfg(test)]
     pub(crate) fn open_async(
         io: Arc<dyn IO>,
@@ -423,7 +430,17 @@ impl Log {
         config: LogConfig,
         workers: usize,
     ) -> Result<AloneLog> {
-        let counted = super::requests::counted_async_for_test(io, 1, 1);
+        let counted = Arc::new(super::requests::Counted::with_shape(
+            io,
+            Arc::new(super::requests::Requests::default()),
+            super::requests::Shape {
+                opened_async: true,
+                io_threads: 1,
+                meta_reads: 1,
+                frames: 0,
+                slots: Self::ASYNC_SLOTS,
+            },
+        )?);
         let executor = Executor::new(counted.clone(), workers)?;
         let log = Self::open_with(counted, base, config, 0, &executor, |len| {
             Ok(AlignedBlock::zeroed(len))
@@ -1791,27 +1808,42 @@ impl Log {
     }
 
     /// Steps the read-back of the record outside any group that starts at `at` and ends at `end`, a
-    /// part of a running transaction's changes, for its rollback: read through the log's own open
-    /// segment files into `back`, its read queued and returned as `IO` while it is in flight, never
-    /// waited for in place (DESIGN.md 22.18). Its header and where its payload lies in `back` once
-    /// read and checked. The log must be durable past it; the segments it lies in stay open while
-    /// the transaction runs, since the log is held back for its parts ([`Transactions::held_from`]).
+    /// part of a running transaction's changes, for the rollback of the transaction in `slot`: read
+    /// through the log's own open segment files into `back`, its read returned as `IO` while it is
+    /// in flight, never waited for in place (DESIGN.md 22.18). Inside a cooperative frame each read
+    /// is queued in the slot's record for an IO thread (D2c §2), and a record its last read has not
+    /// yet let go returns its rest wait instead; outside one, it is made in place. Its header and
+    /// where its payload lies in `back` once read and checked. The log must be durable past it; the
+    /// segments it lies in stay open while the transaction runs, since the log is held back for its
+    /// parts ([`Transactions::held_from`]).
     ///
     /// [`Transactions::held_from`]: super::txn::Transactions::held_from
     pub fn read_record(
         &self,
         back: &mut ReadBack,
+        slot: u16,
         at: GroupStart,
         end: Lsn,
     ) -> Result<IOResult<(Header, std::ops::Range<usize>)>> {
         let segments = &self.segments;
-        back.step(segments, at.get(), end, |number| {
-            let file: Arc<dyn crate::io::File> = segments.get(number).ok_or_else(|| {
+        let counted = segments.counted_io();
+        let queued = counted.queues();
+        back.step(segments, at.get(), end, |number, pos, c| {
+            let file = segments.get(number).ok_or_else(|| {
                 LimboError::InternalError(format!(
                     "log segment {number}, which a running transaction's part lies in, is not open"
                 ))
             })?;
-            Ok(file)
+            if !queued {
+                let file: Arc<dyn crate::io::File> = file;
+                return Ok(IOResult::Done(file.pread(pos, c)?));
+            }
+            Ok(
+                match counted.queue_slot_read(slot as usize, file, pos, c.clone())? {
+                    IOResult::Done(()) => IOResult::Done(c),
+                    IOResult::IO(wait) => IOResult::IO(wait),
+                },
+            )
         })
     }
 

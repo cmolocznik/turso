@@ -693,6 +693,18 @@ const _: () = assert!(
         && std::mem::size_of::<Record<FrameQueued>>() == 24
 );
 
+/// A queued read of a rollback's read-back (D2c §2), from its acceptance to its retirement: the log
+/// segment's counted file, held from the take to the release, the position in it, and the
+/// completion the read-back made, which holds the region it reads into. Admitted only by its
+/// transaction slot's record at rest. A running transaction holds the log back for its parts, so
+/// the segment stays open while it runs, and the file's descriptor stays open through the
+/// carrier's retirement (RING-FD1).
+pub(in crate::storage::atoll) struct SlotQueued {
+    file: Arc<CountedFile>,
+    pos: u64,
+    completion: Completion,
+}
+
 /// The owner of the frame records, the pool, registered once at its open (D2b §1).
 pub(in crate::storage::atoll) trait FrameOwner:
     Send + Sync + 'static
@@ -728,6 +740,8 @@ pub(in crate::storage::atoll) struct Shape {
     pub(in crate::storage::atoll) meta_reads: usize,
     /// The pool's grains, one frame record each, by the grain's number (D2b §1).
     pub(in crate::storage::atoll) frames: usize,
+    /// The transaction slots, one read-back record each, by the slot's number (D2c §2).
+    pub(in crate::storage::atoll) slots: usize,
 }
 
 impl Default for Shape {
@@ -737,6 +751,7 @@ impl Default for Shape {
             io_threads: 1,
             meta_reads: 0,
             frames: 0,
+            slots: 0,
         }
     }
 }
@@ -751,6 +766,12 @@ pub(in crate::storage::atoll) struct Dispatch {
     frames: Box<[Record<FrameQueued>]>,
     /// The frame records' owner, the pool, set once at its open before any frame can queue.
     frames_owner: crate::sync::OnceLock<Weak<dyn FrameOwner>>,
+    /// The transaction slots' read-back records, one per slot, by the slot's number (D2c §2).
+    slot_reads: Box<[Record<SlotQueued>]>,
+    /// Each slot record's rest wait: what a take that found the record held waits on, finished by
+    /// the release once the record is at rest. Its let-go is a request's retirement, which a taker
+    /// on a pumped backend brings by stepping (`LetGo::stepped`).
+    slot_rest: Box<[crate::storage::atoll::notify::LetGo]>,
     bits: Bitmap,
     /// The log's doorbell, and the log it rings for, set once at the log's open.
     door: Door,
@@ -803,6 +824,26 @@ struct Notes {
     /// The next queued frame request's branch after its backend call, once run: its record.
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
     frame_served: Option<std::sync::mpsc::Sender<usize>>,
+    /// A pause at one point of a slot record's take or release (D2c §3.8): where, the record
+    /// there, and the release the paused thread waits for.
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    slot: Option<(
+        SlotPause,
+        std::sync::mpsc::Sender<usize>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+}
+
+/// Where a test pauses a slot record's take or release (D2c §3.8).
+#[cfg(all(test, not(any(shuttle, atoll_loom))))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::storage::atoll) enum SlotPause {
+    /// A take that found the record held, before it registers on the rest wait.
+    Registering,
+    /// The release, its request wholly retired and the record not yet at rest.
+    BeforeRest,
+    /// The release, the record at rest and its rest wait not yet let go.
+    BeforeLetGo,
 }
 
 /// The records of the metadata cache's writes, `checkpoint::WRITES` of them (DESIGN.md 22.18: the
@@ -831,7 +872,14 @@ impl Dispatch {
             queued: (0..shape.meta_reads).map(|_| Record::default()).collect(),
             frames: (0..shape.frames).map(|_| Record::default()).collect(),
             frames_owner: crate::sync::OnceLock::new(),
-            bits: Bitmap::new(QUEUED + shape.meta_reads + shape.frames, shape.io_threads),
+            slot_reads: (0..shape.slots).map(|_| Record::default()).collect(),
+            slot_rest: (0..shape.slots)
+                .map(|_| crate::storage::atoll::notify::LetGo::stepped())
+                .collect(),
+            bits: Bitmap::new(
+                QUEUED + shape.meta_reads + shape.frames + shape.slots,
+                shape.io_threads,
+            ),
             door: Door::new(),
             log: crate::sync::OnceLock::new(),
             threads: (0..shape.io_threads)
@@ -1014,19 +1062,25 @@ impl Dispatch {
     }
 
     /// Serves bit `bit` the IO thread took: the log's door, a follow-on's record, a queued
-    /// metadata read's or a queued frame request's.
+    /// metadata read's, a queued frame request's or a queued read-back read's.
     fn serve_bit(self: &Arc<Self>, bit: usize) {
         match bit {
             LOG => self.serve_log(),
             b if b < RECORDS => self.serve(b),
             b if b < self.frames_bit() => self.serve_queued(b - QUEUED),
-            b => self.serve_frame(b - self.frames_bit()),
+            b if b < self.slots_bit() => self.serve_frame(b - self.frames_bit()),
+            b => self.serve_slot_read(b - self.slots_bit()),
         }
     }
 
     /// The frame records' first bit, after the metadata reads' (D2b §1).
     fn frames_bit(&self) -> usize {
         QUEUED + self.shape.meta_reads
+    }
+
+    /// The slot records' first bit, after the frames' (D2c §2).
+    fn slots_bit(&self) -> usize {
+        self.frames_bit() + self.shape.frames
     }
 
     /// The log this dispatch serves: one per database, set once at its open.
@@ -1607,6 +1661,144 @@ impl Dispatch {
         }
     }
 
+    /// Queues the read-back read `c` at `pos` of the log segment `file` in transaction slot
+    /// `slot`'s record (D2c §2), all before this returns, as [`queue_read`](Self::queue_read)
+    /// does: the record taken; the request counted; accepted; its payload written; its bit set.
+    /// The record is the admission, never the completion's retirement, which comes before the
+    /// record is at rest. A record still held is no error: the take registers on the slot's rest
+    /// wait once and tries once more, and taken neither time returns that wait, which the release
+    /// finishes once the record is at rest; a wait left registered is finished by the next
+    /// let-go, for no one. A slot past the records, or a sealed count, a closed database's, is an
+    /// error, neither a wait.
+    pub(super) fn queue_slot_read(
+        self: &Arc<Self>,
+        requests: &Arc<Requests>,
+        slot: usize,
+        file: Arc<CountedFile>,
+        pos: u64,
+        c: Completion,
+    ) -> Result<crate::types::IOResult<()>> {
+        let (Some(record), Some(rest)) = (self.slot_reads.get(slot), self.slot_rest.get(slot))
+        else {
+            return Err(crate::LimboError::InternalError(format!(
+                "transaction slot {slot}'s read-back record of {}: a slot past the database's",
+                self.slot_reads.len()
+            )));
+        };
+        if !record.take() {
+            #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+            self.pause_at_slot(SlotPause::Registering, slot);
+            let wait = rest.wait();
+            if !record.take() {
+                return Ok(crate::types::IOResult::IO(crate::types::IOCompletions(
+                    wait,
+                )));
+            }
+        }
+        if !requests.count_one() {
+            // SAFETY: just taken, and never published.
+            drop(unsafe { record.finish() });
+            rest.let_go();
+            return Err(crate::LimboError::InternalError(
+                "a request on a file of a closed database".to_string(),
+            ));
+        }
+        c.accept();
+        // SAFETY: just taken.
+        unsafe {
+            record.with(|p| {
+                *p = Some(SlotQueued {
+                    file,
+                    pos,
+                    completion: c,
+                })
+            })
+        };
+        crate::race::point("requests.slot_writing");
+        if let Some(k) = record.publish(&self.bits, self.slots_bit() + slot) {
+            self.unpark(k);
+        }
+        Ok(crate::types::IOResult::Done(()))
+    }
+
+    /// Serves slot record `j` as [`serve_queued`](Self::serve_queued) serves a metadata read's
+    /// (D2c §2): a read cancelled before its take ended with no syscall; one whose backend refuses
+    /// it finished with that error and ended; any other carried to its backend by a read of the IO
+    /// thread's own into the read-back's region, which finishes the read-back's request from its
+    /// callback and ends it at its own retirement.
+    fn serve_slot_read(self: &Arc<Self>, j: usize) {
+        #[cfg(test)]
+        if let Some(hold) = self.hold.lock().take() {
+            let _ = hold.recv();
+        }
+        let record = &self.slot_reads[j];
+        let claimed = record.claim();
+        assert!(claimed, "a bit set for a slot record not READY");
+        // SAFETY: claimed. The payload, the file with it, stays in the record until the request
+        // retires.
+        let (file, pos, c) = unsafe {
+            record.with(|p| {
+                let q = p.as_ref().expect("a READY slot record's request");
+                (q.file.clone(), q.pos, q.completion.clone())
+            })
+        };
+        // The request's strong hold on its requests from its take to its release, as a metadata
+        // read's (#4831).
+        let requests = self.requests.upgrade();
+        if c.finished() {
+            crate::race::point("requests.slot_cancelled");
+            return self.end_slot_read(j, &c, requests);
+        }
+        let owner = c.clone();
+        let carrier = Completion::new_read(c.as_read().buf_arc(), move |res| {
+            match res {
+                Ok((_, n)) => owner.complete(n),
+                Err(e) => owner.error(e),
+            }
+            None
+        });
+        crate::race::point("requests.slot_submitting");
+        match file.file.pread(pos, carrier.clone()) {
+            Ok(_) => {
+                let me = self.clone();
+                carrier.on_retired(move || me.end_slot_read(j, &c, requests));
+            }
+            // Refused: the backend took nothing, and the carrier's callback never ran.
+            Err(e) => {
+                c.error(io_failure(&e));
+                self.end_slot_read(j, &c, requests);
+            }
+        }
+    }
+
+    /// Ends the queued read-back read `c` in slot record `j` as [`end_queued`](Self::end_queued)
+    /// ends a metadata read's: `c` retired, then the release once it has wholly retired.
+    fn end_slot_read(self: &Arc<Self>, j: usize, c: &Completion, requests: Option<Arc<Requests>>) {
+        c.retire();
+        let me = self.clone();
+        c.on_retired(move || me.release_slot_read(j, requests));
+    }
+
+    /// The read-back read in slot record `j` has wholly retired (D2c §2): the record at rest
+    /// first, `Release`, and only then its rest wait let go, so a taker the let-go finishes finds
+    /// it at rest, and one that registers after the let-go sees the rest at its second attempt;
+    /// the payload, the segment's file with it, dropped; the count let go, last, and the request's
+    /// hold on its requests with it, which may be their last.
+    fn release_slot_read(&self, j: usize, requests: Option<Arc<Requests>>) {
+        #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+        self.pause_at_slot(SlotPause::BeforeRest, j);
+        // SAFETY: the request's retirement, the record's last holder.
+        let payload = unsafe { self.slot_reads[j].finish() };
+        crate::race::point("requests.slot_rest");
+        #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+        self.pause_at_slot(SlotPause::BeforeLetGo, j);
+        self.slot_rest[j].let_go();
+        drop(payload);
+        if let Some(requests) = requests {
+            requests.uncount_one();
+        }
+    }
+
     /// The log units started so far.
     #[cfg(test)]
     pub(super) fn units(&self) -> usize {
@@ -1700,6 +1892,37 @@ impl Dispatch {
         }
     }
 
+    /// Pauses the next slot record take or release to reach `at`: the record there, and the
+    /// sender that lets it go on.
+    #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+    pub(super) fn pause_slot(
+        &self,
+        at: SlotPause,
+    ) -> (
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        self.notes.lock().slot = Some((at, seen_tx, go_rx));
+        (seen_rx, go_tx)
+    }
+
+    #[cfg(all(test, not(any(shuttle, atoll_loom))))]
+    fn pause_at_slot(&self, at: SlotPause, j: usize) {
+        let pause = {
+            let mut notes = self.notes.lock();
+            match &notes.slot {
+                Some((armed, _, _)) if *armed == at => notes.slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, seen, go)) = pause {
+            let _ = seen.send(j);
+            let _ = go.recv();
+        }
+    }
+
     #[cfg(test)]
     fn pause_at_end_gap(&self, requests: &Requests) {
         let gap = self.notes.lock().end_gap.take();
@@ -1765,6 +1988,18 @@ impl Dispatch {
     #[cfg(test)]
     pub(super) fn frames_at_rest(&self) -> usize {
         self.frames.iter().filter(|r| r.at_rest()).count()
+    }
+
+    /// The slot records at rest, by count.
+    #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+    pub(super) fn slots_at_rest(&self) -> usize {
+        self.slot_reads.iter().filter(|r| r.at_rest()).count()
+    }
+
+    /// Let-goes of slot `j`'s rest wait that found a taker waiting.
+    #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+    pub(super) fn slot_rest_woke(&self, j: usize) -> u64 {
+        self.slot_rest[j].woke()
     }
 }
 

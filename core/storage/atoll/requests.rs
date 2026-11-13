@@ -18,6 +18,8 @@
 mod dispatch;
 
 use dispatch::Dispatch;
+#[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+pub(super) use dispatch::SlotPause;
 pub(super) use dispatch::{
     Chain, FrameOwner, FrameRefused, Held, LogWork, OpensFile, Place, Shape, Source,
 };
@@ -298,6 +300,31 @@ impl Requests {
         self.dispatch().frames_at_rest()
     }
 
+    /// The slot records at rest, for a test's exact count of them.
+    #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+    pub(super) fn slots_at_rest(&self) -> usize {
+        self.dispatch().slots_at_rest()
+    }
+
+    /// Let-goes of slot `j`'s rest wait that found a taker waiting.
+    #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+    pub(super) fn slot_rest_woke(&self, j: usize) -> u64 {
+        self.dispatch().slot_rest_woke(j)
+    }
+
+    /// Pauses the next slot record take or release to reach `at` (D2c §3.8): the record there, and
+    /// the sender that lets it go on.
+    #[cfg(all(test, not(any(shuttle, atoll_loom, miri))))]
+    pub(super) fn pause_slot(
+        &self,
+        at: dispatch::SlotPause,
+    ) -> (
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.dispatch().pause_slot(at)
+    }
+
     /// Pauses the next queued frame request between its backend call's return and the branch
     /// after it, for a test that orders its own look after that branch (#4900).
     #[cfg(all(test, not(any(shuttle, atoll_loom))))]
@@ -399,6 +426,17 @@ impl Counted {
                 dispatch::MOST_RECORDS - dispatch::QUEUED
             )));
         }
+        if shape.slots > dispatch::MOST_RECORDS - dispatch::QUEUED - shape.meta_reads - shape.frames
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} slot records beside {} metadata read and {} frame records: a database takes \
+                 at most {} in all",
+                shape.slots,
+                shape.meta_reads,
+                shape.frames,
+                dispatch::MOST_RECORDS - dispatch::QUEUED
+            )));
+        }
         let dispatch = Arc::new(Dispatch::new(&requests, shape));
         #[cfg(test)]
         MADE.with(|m| {
@@ -449,6 +487,21 @@ impl Counted {
         self.requests
             .dispatch()
             .queue_frame(&self.requests, held, place, c)
+    }
+
+    /// Queues a rollback's read-back read `c` at `pos` of the log segment `file`, in transaction
+    /// slot `slot`'s record (D2c §2): done once queued, or the record's rest wait while its last
+    /// read is not yet let go.
+    pub(super) fn queue_slot_read(
+        &self,
+        slot: usize,
+        file: Arc<CountedFile>,
+        pos: u64,
+        c: Completion,
+    ) -> Result<crate::types::IOResult<()>> {
+        self.requests
+            .dispatch()
+            .queue_slot_read(&self.requests, slot, file, pos, c)
     }
 
     /// Queues the read `c` at `pos` of `source` under `credit`, in its record (D2a §3, §4).
@@ -955,6 +1008,7 @@ pub(super) fn counted_async_for_test(
                 io_threads,
                 meta_reads,
                 frames: 0,
+                slots: 0,
             },
         )
         .expect("a test's IO threads"),
@@ -979,6 +1033,7 @@ pub(super) fn counted_async_with_frames_for_test(
                 io_threads,
                 meta_reads,
                 frames,
+                slots: 0,
             },
         )
         .expect("a test's IO threads"),

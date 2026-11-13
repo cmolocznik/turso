@@ -413,6 +413,16 @@ mod tests {
         ),
         (
             "log/unit_tests.rs",
+            "a_rollbacks_read_back_in_a_frame_is_queued_in_its_slots_record_and_read_on_the_io_thread",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
+            "over_the_ring_a_rollbacks_read_back_in_a_frame_is_queued_in_its_slots_record",
+            "child",
+        ),
+        (
+            "log/unit_tests.rs",
             "an_admission_in_a_frame_that_must_wait_rings_the_log_and_is_granted_once_its_flush_lands",
             "child",
         ),

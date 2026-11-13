@@ -2374,7 +2374,7 @@ fn read_back_step(
     at: Lsn,
     end: Lsn,
 ) -> &'static str {
-    match back.step(segments, at, end, reads.file()) {
+    match back.step(segments, at, end, super::reader::in_place(reads.file())) {
         Ok(IOResult::IO(_)) => "io",
         Ok(IOResult::Done(_)) => "done",
         Err(_) => "err",
@@ -2400,7 +2400,7 @@ fn a_read_back_makes_its_next_read_only_once_the_last_one_retired() {
     let next = reads.counts();
     reads.deliver(1);
     reads.taken()[1].retire();
-    let payload = match back.step(&segments, 0, ends[0], reads.file()) {
+    let payload = match back.step(&segments, 0, ends[0], super::reader::in_place(reads.file())) {
         Ok(IOResult::Done((_, range))) => Some(back.bytes(range).to_vec()),
         _ => None,
     };
